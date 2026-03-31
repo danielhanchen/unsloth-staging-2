@@ -443,9 +443,7 @@ def fix_vllm_aimv2_issue():
 
 
 def fix_vllm_guided_decoding_params():
-    def _maybe_disable_vllm_transformers_mismatch(error):
-        """If vLLM fails due to transformers version mismatch, disable it gracefully."""
-        global VLLM_BROKEN
+    def _maybe_raise_vllm_transformers_mismatch(error):
         error_text = str(error)
         if (
             "ALLOWED_LAYER_TYPES" in error_text
@@ -455,17 +453,13 @@ def fix_vllm_guided_decoding_params():
                 vllm_version = importlib_version("vllm")
             except Exception:
                 vllm_version = "unknown"
-            logger.warning(
+            raise RuntimeError(
                 "Unsloth: vLLM with version "
                 f"{vllm_version} does not yet support transformers>=5.0.0. "
-                "Disabling vLLM and continuing without it. "
+                "Please downgrade to transformers==4.57.3 via "
+                'pip install --force-reinstall "transformers==4.57.3". '
                 f"Original error: {error}"
-            )
-            VLLM_BROKEN = True
-            _clear_vllm_modules()
-            _install_vllm_blocker()
-            return True
-        return False
+            ) from error
 
     if importlib.util.find_spec("vllm") is None:
         return
@@ -475,8 +469,7 @@ def fix_vllm_guided_decoding_params():
     try:
         import vllm
     except (ImportError, OSError) as e:
-        if _maybe_disable_vllm_transformers_mismatch(e):
-            return
+        _maybe_raise_vllm_transformers_mismatch(e):
         if disable_broken_vllm(e):
             return
         raise
@@ -484,8 +477,7 @@ def fix_vllm_guided_decoding_params():
     try:
         from vllm.sampling_params import GuidedDecodingParams
     except (ImportError, OSError) as e:
-        if _maybe_disable_vllm_transformers_mismatch(e):
-            return
+        _maybe_raise_vllm_transformers_mismatch(e)
         if disable_broken_vllm(e):
             return
         if not hasattr(vllm, "sampling_params") or not hasattr(
