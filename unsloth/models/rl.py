@@ -1202,10 +1202,6 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
             "        memory_gb_left = psutil.virtual_memory().available / (1024**3)\n"
             "        if memory_gb_left <= 2: dataset_num_proc = 1\n"
             "        else: dataset_num_proc = min(dataset_num_proc, int(memory_gb_left))\n"
-            "# XPU: forking corrupts Level-Zero context, force single process\n"
-            "import torch as _torch\n"
-            "if hasattr(_torch, 'xpu') and _torch.xpu.is_available():\n"
-            "    dataset_num_proc = 1\n"
         )
         extra_args += num_proc_check
 
