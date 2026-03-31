@@ -1643,7 +1643,8 @@ class InferenceBackend:
             + "<|text_end|>\n<|audio_start|><|global_features_start|>\n"
         )
         with torch.inference_mode():
-            with torch.amp.autocast("cuda", dtype = model.dtype):
+            from utils.hardware import get_torch_device_str
+            with torch.amp.autocast(get_torch_device_str(), dtype = model.dtype):
                 inputs = tokenizer([prompt], return_tensors = "pt").to(model.device)
                 generated = model.generate(
                     **inputs,

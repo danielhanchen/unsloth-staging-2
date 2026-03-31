@@ -1438,8 +1438,8 @@ class LlamaCppBackend:
                 LlamaCppBackend._codec_mgr = None
                 import torch
 
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                from utils.hardware import clear_gpu_cache
+                clear_gpu_cache()
             return True
 
     def _kill_process(self):
@@ -3016,7 +3016,8 @@ class LlamaCppBackend:
         if LlamaCppBackend._codec_mgr is None:
             LlamaCppBackend._codec_mgr = AudioCodecManager()
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        from utils.hardware import get_torch_device_str
+        device = get_torch_device_str()
         model_repo_path = None
 
         # BiCodec needs a repo with BiCodec/ weights — download canonical SparkTTS
@@ -3090,7 +3091,8 @@ class LlamaCppBackend:
 
         import torch
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        from utils.hardware import get_torch_device_str
+        device = get_torch_device_str()
         return LlamaCppBackend._codec_mgr.decode(
             audio_type, device, token_ids = token_ids, text = data.get("content", "")
         )

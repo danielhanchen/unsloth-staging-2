@@ -22,12 +22,16 @@ from .hardware import (
     get_backend_visible_gpu_info,
     get_physical_gpu_count,
     get_visible_gpu_count,
+<<<<<<< Updated upstream
     get_parent_visible_gpu_ids,
     resolve_requested_gpu_ids,
     estimate_fp16_model_size_bytes,
     estimate_required_model_memory_gb,
     auto_select_gpu_ids,
     prepare_gpu_selection,
+=======
+    get_torch_device_str,
+>>>>>>> Stashed changes
     safe_num_proc,
     safe_thread_num_proc,
     dataset_map_num_proc,
@@ -62,12 +66,16 @@ __all__ = [
     "get_backend_visible_gpu_info",
     "get_physical_gpu_count",
     "get_visible_gpu_count",
+<<<<<<< Updated upstream
     "get_parent_visible_gpu_ids",
     "resolve_requested_gpu_ids",
     "estimate_fp16_model_size_bytes",
     "estimate_required_model_memory_gb",
     "auto_select_gpu_ids",
     "prepare_gpu_selection",
+=======
+    "get_torch_device_str",
+>>>>>>> Stashed changes
     "safe_num_proc",
     "safe_thread_num_proc",
     "dataset_map_num_proc",

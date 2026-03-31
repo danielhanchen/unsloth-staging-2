@@ -238,11 +238,70 @@ async def get_system_info():
     import psutil
     from utils.hardware import get_device
 
+<<<<<<< Updated upstream
     visibility_info = get_backend_visible_gpu_info()
     gpu_info = {
         "available": visibility_info["available"],
         "devices": visibility_info["devices"],
     }
+=======
+        try:
+            result = subprocess.run(
+                [
+                    "nvidia-smi",
+                    "--query-gpu=index,name,memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output = True,
+                text = True,
+                timeout = 10,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.strip().splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) == 3:
+                        idx = int(parts[0])
+                        if allowed_indices is not None and idx not in allowed_indices:
+                            continue
+                        gpu_info["devices"].append(
+                            {
+                                "index": idx,
+                                "name": parts[1],
+                                "memory_total_gb": round(int(parts[2]) / 1024, 2),
+                            }
+                        )
+                gpu_info["available"] = len(gpu_info["devices"]) > 0
+        except Exception:
+            pass
+    elif device == DeviceType.XPU:
+        try:
+            import torch
+            for i in range(torch.xpu.device_count()):
+                props = torch.xpu.get_device_properties(i)
+                gpu_info["devices"].append(
+                    {
+                        "index": i,
+                        "name": props.name,
+                        "memory_total_gb": round(props.total_memory / (1024**3), 2),
+                    }
+                )
+            gpu_info["available"] = len(gpu_info["devices"]) > 0
+        except Exception:
+            pass
+
+    # Fallback to torch-based single-GPU detection
+    if not gpu_info["available"]:
+        mem_info = get_gpu_memory_info()
+        if mem_info.get("available"):
+            gpu_info["available"] = True
+            gpu_info["devices"].append(
+                {
+                    "index": mem_info.get("device", 0),
+                    "name": mem_info.get("device_name", "Unknown"),
+                    "memory_total_gb": round(mem_info.get("total_gb", 0), 2),
+                }
+            )
+>>>>>>> Stashed changes
 
     # CPU & Memory
     memory = psutil.virtual_memory()

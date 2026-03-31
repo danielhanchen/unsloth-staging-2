@@ -103,13 +103,14 @@ def format_error_message(error: Exception, model_name: str) -> str:
     if (
         "memory" in error_str
         or "cuda" in error_str
+        or "xpu" in error_str
         or "mlx" in error_str
         or "out of memory" in error_str
     ):
         from utils.hardware import get_device
 
         device = get_device()
-        device_label = {"cuda": "GPU", "mlx": "Apple Silicon GPU", "cpu": "system"}.get(
+        device_label = {"cuda": "GPU", "xpu": "Intel GPU", "mlx": "Apple Silicon GPU", "cpu": "system"}.get(
             device.value, "GPU"
         )
         return f"Not enough {device_label} memory to load '{model_short}'. Try a smaller model or free memory."
