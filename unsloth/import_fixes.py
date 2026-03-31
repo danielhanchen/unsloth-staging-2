@@ -469,7 +469,7 @@ def fix_vllm_guided_decoding_params():
     try:
         import vllm
     except (ImportError, OSError) as e:
-        _maybe_raise_vllm_transformers_mismatch(e):
+        _maybe_raise_vllm_transformers_mismatch(e)
         if disable_broken_vllm(e):
             return
         raise
