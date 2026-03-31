@@ -1533,6 +1533,7 @@ class UnslothTrainer:
         SNAC_MODEL_NAME = "hubertsiuzdak/snac_24khz"
         SNAC_SAMPLE_RATE = 24000
         from utils.hardware import get_torch_device_str
+
         device = get_torch_device_str()
         max_length = self.max_seq_length or 2048
         tokenizer = self.tokenizer
@@ -1710,6 +1711,7 @@ class UnslothTrainer:
 
         gc.collect()
         from utils.hardware import clear_gpu_cache
+
         clear_gpu_cache()
         self._cuda_audio_used = True
 
@@ -1739,6 +1741,7 @@ class UnslothTrainer:
         import subprocess
 
         from utils.hardware import get_torch_device_str
+
         device = get_torch_device_str()
 
         # The sparktts Python package lives in the SparkAudio/Spark-TTS GitHub repo,
@@ -1940,6 +1943,7 @@ class UnslothTrainer:
 
         gc.collect()
         from utils.hardware import clear_gpu_cache
+
         clear_gpu_cache()
         self._cuda_audio_used = True
 
@@ -1976,6 +1980,7 @@ class UnslothTrainer:
         from utils.paths import ensure_dir, tmp_root
 
         from utils.hardware import get_torch_device_str
+
         device = get_torch_device_str()
 
         # Clone OuteTTS repo (same as audio_codecs._load_dac)
@@ -2155,6 +2160,7 @@ class UnslothTrainer:
 
         gc.collect()
         from utils.hardware import clear_gpu_cache
+
         clear_gpu_cache()
         self._cuda_audio_used = True
 

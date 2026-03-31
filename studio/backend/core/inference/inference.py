@@ -1644,6 +1644,7 @@ class InferenceBackend:
         )
         with torch.inference_mode():
             from utils.hardware import get_torch_device_str
+
             with torch.amp.autocast(get_torch_device_str(), dtype = model.dtype):
                 inputs = tokenizer([prompt], return_tensors = "pt").to(model.device)
                 generated = model.generate(

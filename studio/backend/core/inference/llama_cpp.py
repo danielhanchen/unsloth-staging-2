@@ -1439,6 +1439,7 @@ class LlamaCppBackend:
                 import torch
 
                 from utils.hardware import clear_gpu_cache
+
                 clear_gpu_cache()
             return True
 
@@ -3017,6 +3018,7 @@ class LlamaCppBackend:
             LlamaCppBackend._codec_mgr = AudioCodecManager()
 
         from utils.hardware import get_torch_device_str
+
         device = get_torch_device_str()
         model_repo_path = None
 
@@ -3092,6 +3094,7 @@ class LlamaCppBackend:
         import torch
 
         from utils.hardware import get_torch_device_str
+
         device = get_torch_device_str()
         return LlamaCppBackend._codec_mgr.decode(
             audio_type, device, token_ids = token_ids, text = data.get("content", "")

@@ -394,7 +394,9 @@ def _get_xpu_utilization() -> Dict[str, Any]:
 
         result = subprocess.run(
             ["xpu-smi", "dump", "-d", "0", "-m", "0,1,2,18"],
-            capture_output=True, text=True, timeout=5,
+            capture_output = True,
+            text = True,
+            timeout = 5,
         )
         if result.returncode == 0 and result.stdout.strip():
             # xpu-smi dump outputs CSV: Timestamp, DeviceId, GPU Utilization (%), ...
@@ -1326,10 +1328,13 @@ def get_visible_gpu_count() -> int:
             if xpu_visible == "":
                 _visible_gpu_count = 0
             else:
-                _visible_gpu_count = len([x for x in xpu_visible.split(",") if x.strip()])
+                _visible_gpu_count = len(
+                    [x for x in xpu_visible.split(",") if x.strip()]
+                )
             return _visible_gpu_count
         try:
             import torch
+
             _visible_gpu_count = torch.xpu.device_count()
         except Exception:
             _visible_gpu_count = get_physical_gpu_count()
