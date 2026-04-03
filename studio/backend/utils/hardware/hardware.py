@@ -404,14 +404,21 @@ def _get_xpu_utilization() -> Dict[str, Any]:
         pass
 
     try:
+        import shutil
         import subprocess
+
+        # Skip subprocess entirely when xpu-smi is not on PATH, avoiding
+        # a multi-second timeout on systems without the Intel tooling.
+        xpu_smi = shutil.which("xpu-smi")
+        if xpu_smi is None:
+            raise FileNotFoundError("xpu-smi not found")
 
         # xpu-smi metric IDs: 0 = GPU Utilization (%), 2 = GPU Power (W),
         # 3 = GPU Core Temperature (C).
         # -n 1 requests exactly one sample so the command exits immediately.
         # CSV columns: Timestamp, DeviceId, <metric0>, <metric1>, <metric2>
         result = subprocess.run(
-            ["xpu-smi", "dump", "-d", str(dev_idx), "-m", "0,2,3", "-n", "1"],
+            [xpu_smi, "dump", "-d", str(dev_idx), "-m", "0,2,3", "-n", "1"],
             capture_output = True,
             text = True,
             timeout = 10,
