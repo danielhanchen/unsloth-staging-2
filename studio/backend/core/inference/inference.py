@@ -1651,6 +1651,10 @@ class InferenceBackend:
                 if hasattr(model.device, "type")
                 else str(model.device).split(":", 1)[0]
             )
+            # Clamp to autocast-supported backends so exotic devices
+            # (e.g. "meta" during accelerate offloaded loading) do not raise.
+            if device_type not in ("cuda", "xpu", "cpu"):
+                device_type = "cpu"
             with torch.amp.autocast(device_type, dtype = model.dtype):
                 inputs = tokenizer([prompt], return_tensors = "pt").to(model.device)
                 generated = model.generate(

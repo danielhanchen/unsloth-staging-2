@@ -102,9 +102,10 @@ def format_error_message(error: Exception, model_name: str) -> str:
 
     if (
         "out of memory" in error_str
-        or "cuda out of memory" in error_str
-        or "xpu out of memory" in error_str
-        or ("mlx" in error_str and "memory" in error_str)
+        or "out of device memory" in error_str
+        or "not enough memory" in error_str
+        or "cannot allocate memory" in error_str
+        or ("mlx" in error_str and ("memory" in error_str or "allocate" in error_str))
     ):
         from utils.hardware import get_device
 

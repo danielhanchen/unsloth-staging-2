@@ -326,6 +326,7 @@ def get_package_versions() -> Dict[str, Optional[str]]:
             versions["xpu"] = xpu_ver if xpu_ver is not None else "available"
     except Exception:
         versions["cuda"] = None
+        versions["xpu"] = None
 
     return versions
 
@@ -391,6 +392,29 @@ def _torch_get_per_device_info(device_indices: list[int]) -> list[Dict[str, Any]
 # ========== Live GPU Utilization ==========
 
 
+def _parse_ze_mask_roots(mask: str) -> list[int]:
+    """Parse a ``ZE_AFFINITY_MASK`` value into an ordered list of unique root device IDs.
+
+    Accepts subdevice syntax such as ``0.0,0.1`` which collapses to ``[0]``.
+    Returns an empty list if the mask is empty or contains no parseable digits.
+    Insertion order is preserved so callers can map logical ordinals back to
+    physical root IDs via the returned list.
+    """
+    roots: list[int] = []
+    if not mask:
+        return roots
+    for token in mask.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        root = token.split(".", 1)[0]
+        if root.isdigit():
+            root_id = int(root)
+            if root_id not in roots:
+                roots.append(root_id)
+    return roots
+
+
 def _resolve_xpu_smi_device_id() -> int:
     """Resolve the physical root device ID used by ``xpu-smi -d``.
 
@@ -412,19 +436,9 @@ def _resolve_xpu_smi_device_id() -> int:
         pass
 
     mask = (os.environ.get("ZE_AFFINITY_MASK") or "").strip()
-    if mask:
-        roots: list[int] = []
-        for token in mask.split(","):
-            token = token.strip()
-            if not token:
-                continue
-            root = token.split(".", 1)[0]
-            if root.isdigit():
-                root_id = int(root)
-                if root_id not in roots:
-                    roots.append(root_id)
-        if roots:
-            return roots[ordinal] if 0 <= ordinal < len(roots) else roots[0]
+    roots = _parse_ze_mask_roots(mask)
+    if roots:
+        return roots[ordinal] if 0 <= ordinal < len(roots) else roots[0]
 
     return ordinal if xpu_ok else 0
 
@@ -659,6 +673,42 @@ _visible_gpu_count: Optional[int] = None
 
 
 def _get_parent_visible_gpu_spec() -> Dict[str, Any]:
+    # On Intel XPU hosts, device visibility is controlled by ZE_AFFINITY_MASK
+    # (the Level Zero affinity variable) rather than CUDA_VISIBLE_DEVICES.
+    if get_device() == DeviceType.XPU:
+        xpu_mask_raw = os.environ.get("ZE_AFFINITY_MASK")
+        if xpu_mask_raw is None:
+            return {
+                "raw": None,
+                "numeric_ids": list(range(get_physical_gpu_count())),
+                "supports_explicit_gpu_ids": True,
+            }
+
+        xpu_mask = xpu_mask_raw.strip()
+        if xpu_mask == "":
+            return {
+                "raw": xpu_mask,
+                "numeric_ids": [],
+                "supports_explicit_gpu_ids": True,
+            }
+
+        roots = _parse_ze_mask_roots(xpu_mask)
+        if not roots:
+            # Non-digit wildcard (e.g. "*") or unparseable mask: treat the
+            # same as "all physical XPUs visible" but disable explicit ids
+            # since we cannot map logical ordinals to root IDs.
+            return {
+                "raw": xpu_mask,
+                "numeric_ids": None,
+                "supports_explicit_gpu_ids": False,
+            }
+
+        return {
+            "raw": xpu_mask,
+            "numeric_ids": roots,
+            "supports_explicit_gpu_ids": True,
+        }
+
     cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
 
     if cuda_visible is None:
@@ -1398,14 +1448,12 @@ def get_visible_gpu_count() -> int:
                 # Fallback: count unique root device IDs from the mask.
                 # ZE_AFFINITY_MASK can use "device.subdevice" notation,
                 # so "0.0,0.1" is 1 root device, not 2.
-                roots = set()
-                for token in xpu_visible.split(","):
-                    token = token.strip()
-                    if token:
-                        root = token.split(".", 1)[0]
-                        if root.isdigit():
-                            roots.add(int(root))
-                _visible_gpu_count = len(roots) if roots else 0
+                roots = _parse_ze_mask_roots(xpu_visible)
+                # Non-digit wildcards (e.g. "*") yield an empty roots list;
+                # treat those as "all physical XPUs visible".
+                _visible_gpu_count = (
+                    len(roots) if roots else get_physical_gpu_count()
+                )
             else:
                 _visible_gpu_count = get_physical_gpu_count()
         return _visible_gpu_count
@@ -1447,6 +1495,15 @@ def apply_gpu_ids(gpu_ids) -> None:
         value = ",".join(str(g) for g in gpu_ids)
     else:
         value = str(gpu_ids)
+
+    # Intel XPU uses Level Zero and honors ZE_AFFINITY_MASK, not
+    # CUDA_VISIBLE_DEVICES. Route XPU pinning through the correct env var
+    # so worker subprocesses are actually restricted to the intended GPU.
+    if get_device() == DeviceType.XPU:
+        os.environ["ZE_AFFINITY_MASK"] = value
+        _visible_gpu_count = None
+        logger.info("Applied gpu_ids: ZE_AFFINITY_MASK='%s'", value)
+        return
 
     os.environ["CUDA_VISIBLE_DEVICES"] = value
     _visible_gpu_count = None
