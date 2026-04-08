@@ -471,7 +471,7 @@ def _get_xpu_utilization() -> Dict[str, Any]:
             [xpu_smi, "dump", "-d", str(dev_idx), "-m", "0,1,3", "-n", "1"],
             capture_output = True,
             text = True,
-            timeout = 10,
+            timeout = 3,
         )
         if result.returncode == 0 and result.stdout.strip():
             lines = result.stdout.strip().splitlines()
@@ -711,11 +711,8 @@ def _get_parent_visible_gpu_spec() -> Dict[str, Any]:
 
         if has_subdevice:
             # Dedup for display: multiple subdevice entries under the same
-            # root collapse to that root ID.
-            unique_roots: list[int] = []
-            for rid in roots_with_dupes:
-                if rid not in unique_roots:
-                    unique_roots.append(rid)
+            # root collapse to that root ID while preserving insertion order.
+            unique_roots = list(dict.fromkeys(roots_with_dupes))
             return {
                 "raw": xpu_mask,
                 "numeric_ids": unique_roots,
@@ -1101,8 +1098,12 @@ def auto_select_gpu_ids(
 ) -> tuple[Optional[list[int]], Dict[str, Any]]:
     metadata: Dict[str, Any] = {"selection_mode": "auto"}
 
-    if get_device() != DeviceType.CUDA:
-        metadata["selection_mode"] = "non_cuda"
+    # Auto-selection relies on per-device free-VRAM telemetry which is
+    # available on both CUDA (via nvidia-smi) and XPU (via torch.xpu +
+    # xpu-smi). Other backends (MLX, CPU) do not expose the required
+    # information, so fall through to inheriting parent visibility.
+    if get_device() not in (DeviceType.CUDA, DeviceType.XPU):
+        metadata["selection_mode"] = "non_accelerator"
         return None, metadata
 
     required_gb, estimate_metadata = estimate_required_model_memory_gb(
@@ -1471,12 +1472,14 @@ def get_visible_gpu_count() -> int:
             if xpu_visible:
                 # Fallback: count unique root device IDs from the mask.
                 # ZE_AFFINITY_MASK can use "device.subdevice" notation,
-                # so "0.0,0.1" is 1 root device, not 2.
+                # so "0.0,0.1" is 1 root device, not 2. Without torch we
+                # cannot know which hierarchy mode is active, so fall back
+                # to root-device counting (the more conservative choice).
                 roots = _parse_ze_mask_roots(xpu_visible)
                 # Non-digit wildcards (e.g. "*") yield an empty roots list;
                 # treat those as "all physical XPUs visible".
                 _visible_gpu_count = (
-                    len(roots) if roots else get_physical_gpu_count()
+                    len(set(roots)) if roots else get_physical_gpu_count()
                 )
             else:
                 _visible_gpu_count = get_physical_gpu_count()
@@ -1541,24 +1544,26 @@ def get_device_map(
 
     Returns ``"balanced"`` (shard evenly across GPUs) when:
       - ``gpu_ids`` explicitly lists >1 GPU, **or**
-      - ``CUDA_VISIBLE_DEVICES`` uses UUID/MIG identifiers (non-numeric) and
-        more than one GPU is visible (fallback: we cannot resolve numeric IDs,
-        so we assume the caller intends multi-GPU).
+      - ``CUDA_VISIBLE_DEVICES``/``ZE_AFFINITY_MASK`` uses non-numeric
+        identifiers (UUID/MIG/wildcard) and more than one GPU is visible
+        (fallback: we cannot resolve numeric IDs, so we assume the caller
+        intends multi-GPU).
 
     Returns ``"sequential"`` (single device) in all other cases, including
-    non-CUDA backends (CPU, MLX).
+    CPU/MLX backends.
 
     Callers should use ``prepare_gpu_selection()`` upstream to determine the
     ``gpu_ids`` list -- that function handles the smart auto-selection of the
     minimum number of GPUs needed for a given model.
     """
     device = get_device()
-    if device == DeviceType.CUDA:
+    if device in (DeviceType.CUDA, DeviceType.XPU):
         multi_gpu = gpu_ids is not None and len(gpu_ids) > 1
 
         if not multi_gpu:
-            # UUID/MIG masks cannot be split into numeric IDs, so if multiple
-            # GPUs are visible we assume multi-GPU sharding is intended.
+            # UUID/MIG/wildcard masks cannot be split into numeric IDs, so if
+            # multiple GPUs are visible we assume multi-GPU sharding is
+            # intended.
             parent_visible_spec = _get_parent_visible_gpu_spec()
             if (
                 parent_visible_spec["numeric_ids"] is None
