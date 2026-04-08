@@ -319,7 +319,11 @@ def get_package_versions() -> Dict[str, Optional[str]]:
 
         versions["cuda"] = getattr(torch.version, "cuda", None)
         if hasattr(torch, "xpu") and torch.xpu.is_available():
-            versions["xpu"] = getattr(torch.version, "xpu", "available")
+            # torch.version.xpu exists on modern torch builds but may be None;
+            # fall back to "available" so the UI distinguishes present-but-unknown
+            # from "package not found".
+            xpu_ver = getattr(torch.version, "xpu", None)
+            versions["xpu"] = xpu_ver if xpu_ver is not None else "available"
     except Exception:
         versions["cuda"] = None
 
@@ -387,21 +391,51 @@ def _torch_get_per_device_info(device_indices: list[int]) -> list[Dict[str, Any]
 # ========== Live GPU Utilization ==========
 
 
+def _resolve_xpu_smi_device_id() -> int:
+    """Resolve the physical root device ID used by ``xpu-smi -d``.
+
+    ``torch.xpu.current_device()`` returns the logical ordinal after
+    ``ZE_AFFINITY_MASK`` remapping, whereas ``xpu-smi`` addresses physical
+    root devices. Translate the ordinal through the mask roots so telemetry
+    targets the GPU the process is actually running on. Subdevice syntax
+    such as ``0.0,0.1`` collapses to a single root device.
+    """
+    ordinal = 0
+    xpu_ok = False
+    try:
+        import torch
+
+        xpu_ok = hasattr(torch, "xpu") and torch.xpu.is_available()
+        if xpu_ok:
+            ordinal = int(torch.xpu.current_device())
+    except Exception:
+        pass
+
+    mask = (os.environ.get("ZE_AFFINITY_MASK") or "").strip()
+    if mask:
+        roots: list[int] = []
+        for token in mask.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            root = token.split(".", 1)[0]
+            if root.isdigit():
+                root_id = int(root)
+                if root_id not in roots:
+                    roots.append(root_id)
+        if roots:
+            return roots[ordinal] if 0 <= ordinal < len(roots) else roots[0]
+
+    return ordinal if xpu_ok else 0
+
+
 def _get_xpu_utilization() -> Dict[str, Any]:
     """Return a live snapshot of Intel XPU GPU utilization via ``xpu-smi`` or torch.xpu."""
     gpu_util = None
     temp = None
     power_w = None
 
-    # Resolve which physical device to query
-    dev_idx = 0
-    try:
-        import torch
-
-        if hasattr(torch, "xpu") and torch.xpu.is_available():
-            dev_idx = torch.xpu.current_device()
-    except Exception:
-        pass
+    dev_idx = _resolve_xpu_smi_device_id()
 
     try:
         import shutil
@@ -413,12 +447,15 @@ def _get_xpu_utilization() -> Dict[str, Any]:
         if xpu_smi is None:
             raise FileNotFoundError("xpu-smi not found")
 
-        # xpu-smi metric IDs: 0 = GPU Utilization (%), 2 = GPU Power (W),
-        # 3 = GPU Core Temperature (C).
+        # xpu-smi metric IDs (per Intel xpu-smi docs):
+        #   0 = GPU Utilization (%)
+        #   1 = GPU Power (W)
+        #   2 = GPU Frequency (MHz)
+        #   3 = GPU Core Temperature (C)
         # -n 1 requests exactly one sample so the command exits immediately.
         # CSV columns: Timestamp, DeviceId, <metric0>, <metric1>, <metric2>
         result = subprocess.run(
-            [xpu_smi, "dump", "-d", str(dev_idx), "-m", "0,2,3", "-n", "1"],
+            [xpu_smi, "dump", "-d", str(dev_idx), "-m", "0,1,3", "-n", "1"],
             capture_output = True,
             text = True,
             timeout = 10,
@@ -437,16 +474,19 @@ def _get_xpu_utilization() -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Get VRAM from torch.xpu (only reports PyTorch-managed memory)
+    # Get VRAM from torch.xpu (only reports PyTorch-managed memory).
+    # Use the same logical ordinal that torch exposes; xpu-smi physical id is
+    # only needed by the subprocess call above.
     vram_used_gb = None
     vram_total_gb = None
     try:
         import torch
 
-        idx = torch.xpu.current_device()
-        props = torch.xpu.get_device_properties(idx)
-        vram_total_gb = round(props.total_memory / (1024**3), 2)
-        vram_used_gb = round(torch.xpu.memory_allocated(idx) / (1024**3), 2)
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            idx = torch.xpu.current_device()
+            props = torch.xpu.get_device_properties(idx)
+            vram_total_gb = round(props.total_memory / (1024**3), 2)
+            vram_used_gb = round(torch.xpu.memory_allocated(idx) / (1024**3), 2)
     except Exception:
         pass
 
@@ -1340,12 +1380,12 @@ def get_visible_gpu_count() -> int:
     device = get_device()
 
     if device == DeviceType.XPU:
-        xpu_visible = os.environ.get("ZE_AFFINITY_MASK")
-        if xpu_visible is not None:
-            xpu_visible = xpu_visible.strip()
-            if xpu_visible == "":
-                _visible_gpu_count = 0
-                return _visible_gpu_count
+        xpu_mask_raw = os.environ.get("ZE_AFFINITY_MASK")
+        xpu_mask_set = xpu_mask_raw is not None
+        xpu_visible = (xpu_mask_raw or "").strip()
+        if xpu_mask_set and xpu_visible == "":
+            _visible_gpu_count = 0
+            return _visible_gpu_count
 
         # Prefer torch.xpu.device_count() as it correctly interprets
         # ZE_AFFINITY_MASK including subdevice syntax (e.g. "0.0,0.1").
@@ -1565,9 +1605,11 @@ def dataset_map_num_proc(desired: Optional[int] = None) -> Optional[int]:
     ``datasets`` treats ``num_proc=1`` as multiprocessing (creates ``Pool(1)``).
     Only ``num_proc=None`` guarantees in-process execution.
 
-    Also returns ``None`` on XPU devices because ``os.fork()`` corrupts the
-    Level-Zero GPU context, causing Triton kernel launches to fail with
-    "Pointer argument doesn't reference XPU device memory".
+    Also returns ``None`` on XPU devices once the XPU runtime has been
+    initialized in this process, because ``os.fork()`` corrupts the
+    Level-Zero GPU context and causes Triton kernel launches to fail with
+    "Pointer argument doesn't reference XPU device memory". Pre-init XPU
+    hosts can still parallelize pure CPU-side dataset preprocessing.
     """
     import sys
 
@@ -1575,6 +1617,12 @@ def dataset_map_num_proc(desired: Optional[int] = None) -> Optional[int]:
         return None
 
     if get_device() == DeviceType.XPU:
-        return None
+        try:
+            import torch
+
+            if hasattr(torch, "xpu") and torch.xpu.is_initialized():
+                return None
+        except Exception:
+            return None
 
     return safe_num_proc(desired)

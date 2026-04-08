@@ -1643,9 +1643,15 @@ class InferenceBackend:
             + "<|text_end|>\n<|audio_start|><|global_features_start|>\n"
         )
         with torch.inference_mode():
-            from utils.hardware import get_torch_device_str
-
-            with torch.amp.autocast(get_torch_device_str(), dtype = model.dtype):
+            # Derive the autocast device from the loaded model, not from the
+            # global backend: a CPU-fallback DAC on an XPU/CUDA host must not
+            # open a GPU autocast context around CPU tensors.
+            device_type = (
+                model.device.type
+                if hasattr(model.device, "type")
+                else str(model.device).split(":", 1)[0]
+            )
+            with torch.amp.autocast(device_type, dtype = model.dtype):
                 inputs = tokenizer([prompt], return_tensors = "pt").to(model.device)
                 generated = model.generate(
                     **inputs,
