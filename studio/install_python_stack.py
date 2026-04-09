@@ -144,10 +144,16 @@ def _detect_rocm_version() -> tuple[int, int] | None:
 
 
 def _rocm_devices_enabled() -> bool:
-    """Return True when no env var explicitly hides all AMD GPUs."""
+    """Return True when no env var explicitly hides all AMD GPUs.
+
+    On ROCm, ROCR_VISIBLE_DEVICES narrows the physical set, then
+    CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES further restricts within
+    that set. If ANY of the defined vars is "" or "-1", all GPUs are hidden.
+    """
     for name in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
-        if name in os.environ:
-            return os.environ[name].strip() not in {"", "-1"}
+        raw = os.environ.get(name)
+        if raw is not None and raw.strip() in {"", "-1"}:
+            return False
     return True
 
 
@@ -186,7 +192,14 @@ def _has_rocm_gpu() -> bool:
 
 
 def _has_usable_nvidia_gpu() -> bool:
-    """Return True only when nvidia-smi exists AND reports at least one GPU."""
+    """Return True only when nvidia-smi exists AND reports at least one GPU.
+
+    Respects CUDA_VISIBLE_DEVICES="" or "-1" so mixed NVIDIA+AMD hosts
+    where NVIDIA is intentionally hidden are correctly routed to ROCm.
+    """
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if raw is not None and raw.strip() in {"", "-1"}:
+        return False
     exe = shutil.which("nvidia-smi")
     if not exe:
         return False

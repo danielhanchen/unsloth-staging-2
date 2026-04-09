@@ -2574,13 +2574,14 @@ def detect_host() -> HostInfo:
         return bool(re.search(r"(?im)^gpu\s*[:\[]\s*\d", stdout))
 
     # Honour GPU visibility masks so hidden GPUs are not detected.
-    # Check HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES /
-    # CUDA_VISIBLE_DEVICES (HIP respects all three).
+    # On ROCm, ROCR_VISIBLE_DEVICES narrows the physical set, then
+    # CUDA/HIP_VISIBLE_DEVICES further restricts within that. If ANY
+    # is empty or "-1", all GPUs are hidden.
     _rocm_vis_enabled = True
     for _env_name in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
         _env_raw = os.environ.get(_env_name)
-        if _env_raw is not None:
-            _rocm_vis_enabled = _env_raw.strip() not in {"", "-1"}
+        if _env_raw is not None and _env_raw.strip() in {"", "-1"}:
+            _rocm_vis_enabled = False
             break
 
     has_rocm = False

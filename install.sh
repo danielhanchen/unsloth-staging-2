@@ -980,19 +980,20 @@ _find_no_torch_runtime() {
 
 # ── ROCm visibility-mask check ──
 # Returns 0 (true) when no env var explicitly hides all AMD GPUs,
-# 1 (false) when HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES /
+# 1 (false) when ANY of HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES /
 # CUDA_VISIBLE_DEVICES is set to "" or "-1".
+# On ROCm, ROCR narrows the physical set, then CUDA/HIP further
+# restricts within that. If any is empty, all GPUs are hidden.
 _rocm_devices_enabled() {
     if [ "${HIP_VISIBLE_DEVICES+x}" = x ]; then
-        _vis="$HIP_VISIBLE_DEVICES"
-    elif [ "${ROCR_VISIBLE_DEVICES+x}" = x ]; then
-        _vis="$ROCR_VISIBLE_DEVICES"
-    elif [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
-        _vis="$CUDA_VISIBLE_DEVICES"
-    else
-        return 0
+        case "$HIP_VISIBLE_DEVICES" in ""|-1) return 1 ;; esac
     fi
-    case "$_vis" in ""|-1) return 1 ;; esac
+    if [ "${ROCR_VISIBLE_DEVICES+x}" = x ]; then
+        case "$ROCR_VISIBLE_DEVICES" in ""|-1) return 1 ;; esac
+    fi
+    if [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
+        case "$CUDA_VISIBLE_DEVICES" in ""|-1) return 1 ;; esac
+    fi
     return 0
 }
 
@@ -1015,10 +1016,15 @@ _has_amd_rocm_gpu() {
 }
 
 # ── NVIDIA usable-GPU helper ──
-# Returns 0 (true) only if nvidia-smi is present AND actually lists a GPU.
+# Returns 0 (true) only if nvidia-smi is present AND actually lists a GPU
+# AND visibility masks do not hide all GPUs.
 # Prevents AMD-only hosts with a stale nvidia-smi on PATH from being routed
 # into the CUDA branch.
 _has_usable_nvidia_gpu() {
+    # Respect explicit "hide all NVIDIA GPUs" masks.
+    if [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
+        case "${CUDA_VISIBLE_DEVICES}" in ""|-1) return 1 ;; esac
+    fi
     _nvsmi=""
     if command -v nvidia-smi >/dev/null 2>&1; then
         _nvsmi="nvidia-smi"
