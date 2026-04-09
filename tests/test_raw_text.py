@@ -199,6 +199,14 @@ def test_raw_text_loader():
         assert preprocessor.clean_text("a \u00e9 b") == "a b"
         assert preprocessor.clean_text("prefix \U0001F600 suffix") == "prefix suffix"
 
+        # Stripping a non-ASCII character adjacent to a newline must not
+        # leave a stray leading/trailing space on the neighbouring line.
+        assert preprocessor.clean_text("foo \u00e9\nbar") == "foo\nbar"
+        assert preprocessor.clean_text("foo\n\u00e9 bar") == "foo\nbar"
+        # The double-space collapse pass must not swallow a legitimate
+        # paragraph break when a non-ASCII char sits near it.
+        assert preprocessor.clean_text("a \u00a9\n\nb") == "a\n\nb"
+
         # Idempotence: running clean_text twice should give the same result
         idempotent_inputs = [
             "  messy   text  \n\n\n  ",
