@@ -592,22 +592,85 @@ _physical_gpu_count: Optional[int] = None
 _visible_gpu_count: Optional[int] = None
 
 
+def _parse_visible_ids(raw: str) -> tuple:
+    """Parse a CUDA/HIP/ROCR visibility string into (numeric_ids, ok).
+
+    Returns ([int, ...], True) on success, (None, False) when tokens are
+    non-numeric (UUIDs, BDF addresses).
+    """
+    raw = raw.strip()
+    if raw in ("", "-1"):
+        return [], True
+    tokens = [v.strip() for v in raw.split(",") if v.strip()]
+    try:
+        return [int(v) for v in tokens], True
+    except ValueError:
+        return None, False
+
+
 def _get_parent_visible_gpu_spec() -> Dict[str, Any]:
-    # ROCm uses HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES in addition to
-    # CUDA_VISIBLE_DEVICES (which HIP also respects).  Check ROCm-specific
-    # env vars first so multi-GPU AMD setups are handled correctly.
-    # Use explicit None checks (not `or`) so empty string "" is honoured
-    # as "no visible GPUs" rather than falling through to CUDA_VISIBLE_DEVICES.
-    cuda_visible = None
+    # ── ROCm layered visibility ──
+    # On ROCm, ROCR_VISIBLE_DEVICES narrows the *physical* GPU set first.
+    # HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES then select *ordinals*
+    # within that narrowed set (not physical IDs).  Example:
+    #   ROCR_VISIBLE_DEVICES=2,3  HIP_VISIBLE_DEVICES=1
+    #     -> physical set is [2,3], HIP ordinal 1 = physical GPU 3
+    # We must compose through both layers to report the correct physical IDs.
     if IS_ROCM:
-        hip_vis = os.environ.get("HIP_VISIBLE_DEVICES")
-        rocr_vis = os.environ.get("ROCR_VISIBLE_DEVICES")
-        if hip_vis is not None:
-            cuda_visible = hip_vis
-        elif rocr_vis is not None:
-            cuda_visible = rocr_vis
-    if cuda_visible is None:
-        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        rocr_raw = os.environ.get("ROCR_VISIBLE_DEVICES")
+        hip_raw = os.environ.get("HIP_VISIBLE_DEVICES")
+        cuda_raw = os.environ.get("CUDA_VISIBLE_DEVICES")
+
+        # If any mask is explicitly empty / -1, all GPUs are hidden.
+        for val in (rocr_raw, hip_raw, cuda_raw):
+            if val is not None and val.strip() in ("", "-1"):
+                return {
+                    "raw": val.strip(),
+                    "numeric_ids": [],
+                    "supports_explicit_gpu_ids": True,
+                }
+
+        # Layer 1: ROCR narrows the physical set.
+        if rocr_raw is not None:
+            physical_ids, ok = _parse_visible_ids(rocr_raw)
+            if not ok:
+                return {
+                    "raw": rocr_raw,
+                    "numeric_ids": None,
+                    "supports_explicit_gpu_ids": False,
+                }
+        else:
+            physical_ids = list(range(get_physical_gpu_count()))
+
+        # Layer 2: HIP or CUDA selects ordinals within the ROCR set.
+        child_raw = hip_raw if hip_raw is not None else cuda_raw
+        if child_raw is not None:
+            ordinals, ok = _parse_visible_ids(child_raw)
+            if not ok:
+                return {
+                    "raw": child_raw,
+                    "numeric_ids": None,
+                    "supports_explicit_gpu_ids": False,
+                }
+            # Map ordinals back to physical IDs.
+            physical_ids = [
+                physical_ids[i] for i in ordinals
+                if 0 <= i < len(physical_ids)
+            ]
+            return {
+                "raw": child_raw,
+                "numeric_ids": physical_ids,
+                "supports_explicit_gpu_ids": True,
+            }
+
+        return {
+            "raw": rocr_raw,
+            "numeric_ids": physical_ids,
+            "supports_explicit_gpu_ids": True,
+        }
+
+    # ── NVIDIA / non-ROCm path (unchanged) ──
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
 
     if cuda_visible is None:
         return {
@@ -1391,15 +1454,30 @@ def apply_gpu_ids(gpu_ids) -> None:
     # parent process already set a ROCm visibility variable -- that
     # way a downstream ROCm process inherits the narrowed mask even
     # before Studio's hardware detection has classified the host.
+    #
+    # ROCm layered visibility: ROCR_VISIBLE_DEVICES holds *physical* IDs,
+    # while HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES hold *ordinals*
+    # within the ROCR set.  When narrowing to specific physical GPUs we
+    # set ROCR to the physical IDs and reset HIP/CUDA to a zero-based
+    # sequence so ordinals map 1:1 to the new ROCR set.
     _inherits_rocm_visibility = (
         "HIP_VISIBLE_DEVICES" in os.environ or "ROCR_VISIBLE_DEVICES" in os.environ
     )
     if IS_ROCM or _inherits_rocm_visibility:
-        os.environ["HIP_VISIBLE_DEVICES"] = value
         os.environ["ROCR_VISIBLE_DEVICES"] = value
+        # HIP/CUDA ordinals are relative to the ROCR set above.
+        n_gpus = len(value.split(",")) if value.strip() else 0
+        relative = ",".join(str(i) for i in range(n_gpus))
+        os.environ["HIP_VISIBLE_DEVICES"] = relative
+        os.environ["CUDA_VISIBLE_DEVICES"] = relative
     _visible_gpu_count = None
     if IS_ROCM or _inherits_rocm_visibility:
-        logger.info("Applied gpu_ids: CUDA_VISIBLE_DEVICES='%s' (rocm)", value)
+        logger.info(
+            "Applied gpu_ids: ROCR_VISIBLE_DEVICES='%s', "
+            "HIP_VISIBLE_DEVICES='%s' (rocm)",
+            value,
+            os.environ.get("HIP_VISIBLE_DEVICES", ""),
+        )
     else:
         logger.info("Applied gpu_ids: CUDA_VISIBLE_DEVICES='%s'", value)
 
