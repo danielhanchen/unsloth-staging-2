@@ -154,6 +154,54 @@ def test_raw_text_loader():
             paragraph_text == "Line 1\n\nLine 2"
         ), "Should preserve paragraph breaks while normalizing newlines"
 
+        # Non-ASCII horizontal whitespace separators (NBSP, thin space,
+        # ideographic space, narrow NBSP, em space, vertical tab, form feed)
+        # should be normalized to a single ASCII space, not deleted, otherwise
+        # adjacent words get silently fused together on HTML/PDF/OCR inputs.
+        unicode_whitespace_cases = [
+            ("hello\u00a0world", "hello world"),
+            ("hello\u202fworld", "hello world"),
+            ("hello\u2009world", "hello world"),
+            ("hello\u3000world", "hello world"),
+            ("hello\u2002world", "hello world"),
+            ("hello\x0bworld", "hello world"),
+            ("hello\x0cworld", "hello world"),
+        ]
+        for raw, expected in unicode_whitespace_cases:
+            assert preprocessor.clean_text(raw) == expected, (
+                f"Should normalize Unicode/control whitespace to a single space "
+                f"for {raw!r}"
+            )
+
+        # Mixed paragraph + Unicode whitespace realistic input
+        mixed = preprocessor.clean_text(
+            "Section\u00a01\r\n\r\nBody\ftext\u202Fhere"
+        )
+        assert mixed == "Section 1\n\nBody text here", (
+            "Should preserve paragraph breaks and normalize Unicode "
+            "whitespace simultaneously"
+        )
+
+        # Tabs should collapse to a single space
+        assert preprocessor.clean_text("a\tb") == "a b"
+        assert preprocessor.clean_text("a\t\tb") == "a b"
+
+        # Spaces around newlines should be trimmed on both sides, even with
+        # multiple consecutive newlines
+        assert preprocessor.clean_text("foo \n\n bar") == "foo\n\nbar"
+
+        # Idempotence: running clean_text twice should give the same result
+        idempotent_inputs = [
+            "  messy   text  \n\n\n  ",
+            "Line 1\r\n\r\n\r\nLine 2",
+            "hello\u00a0world",
+            "Section\u00a01\r\n\r\nBody\ftext\u202Fhere",
+        ]
+        for raw in idempotent_inputs:
+            once = preprocessor.clean_text(raw)
+            twice = preprocessor.clean_text(once)
+            assert once == twice, f"clean_text should be idempotent for {raw!r}"
+
         # Test validation
         stats = preprocessor.validate_dataset(text_dataset)
         assert stats["total_samples"] > 0, "Should count samples"
