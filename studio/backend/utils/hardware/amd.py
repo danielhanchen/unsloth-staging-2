@@ -262,13 +262,23 @@ def get_primary_gpu_utilization() -> dict[str, Any]:
     if data is None:
         return {"available": False}
 
-    # amd-smi may return a list with one entry or a dict
+    # amd-smi may return a list, a dict wrapping a list ({"gpus": [...]}),
+    # or a bare dict for a single GPU. Normalize to a single gpu_data dict.
     if isinstance(data, list):
-        if len(data) == 0:
-            return {"available": False}
-        gpu_data = data[0]
+        gpu_list = data
+    elif isinstance(data, dict):
+        gpu_list = data.get("gpus", data.get("gpu", [data]))
+        if isinstance(gpu_list, dict):
+            gpu_list = [gpu_list]
     else:
-        gpu_data = data
+        return {"available": False}
+
+    if not gpu_list:
+        return {"available": False}
+
+    gpu_data = gpu_list[0]
+    if not isinstance(gpu_data, dict):
+        return {"available": False}
 
     metrics = _extract_gpu_metrics(gpu_data)
     if not _has_real_metrics(metrics):

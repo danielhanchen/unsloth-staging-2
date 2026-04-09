@@ -978,11 +978,32 @@ _find_no_torch_runtime() {
     fi
 }
 
+# ── ROCm visibility-mask check ──
+# Returns 0 (true) when no env var explicitly hides all AMD GPUs,
+# 1 (false) when HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES /
+# CUDA_VISIBLE_DEVICES is set to "" or "-1".
+_rocm_devices_enabled() {
+    if [ "${HIP_VISIBLE_DEVICES+x}" = x ]; then
+        _vis="$HIP_VISIBLE_DEVICES"
+    elif [ "${ROCR_VISIBLE_DEVICES+x}" = x ]; then
+        _vis="$ROCR_VISIBLE_DEVICES"
+    elif [ "${CUDA_VISIBLE_DEVICES+x}" = x ]; then
+        _vis="$CUDA_VISIBLE_DEVICES"
+    else
+        return 0
+    fi
+    case "$_vis" in ""|-1) return 1 ;; esac
+    return 0
+}
+
 # ── AMD ROCm GPU detection helper ──
 # Returns 0 (true) if an actual AMD GPU is present, 1 (false) otherwise.
 # Checks rocminfo for gfx[1-9]* (excludes gfx000 CPU agent) and
 # amd-smi list for GPU data rows (excludes header-only output).
+# Respects HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES /
+# CUDA_VISIBLE_DEVICES so hidden GPUs are not detected.
 _has_amd_rocm_gpu() {
+    _rocm_devices_enabled || return 1
     if command -v rocminfo >/dev/null 2>&1 && \
        rocminfo 2>/dev/null | awk '/Name:[[:space:]]*gfx[1-9]/{found=1} END{exit !found}'; then
         return 0
@@ -1046,8 +1067,9 @@ get_torch_index_url() {
         _rocm_tag=$({ command -v amd-smi >/dev/null 2>&1 && \
             amd-smi version 2>/dev/null | awk -F'ROCm version: ' \
                 'NF>1{gsub(/[^0-9.]/, "", $2); split($2,a,"."); print "rocm"a[1]"."a[2]; ok=1; exit} END{exit !ok}'; } || \
-            { [ -r /opt/rocm/.info/version ] && \
-                awk -F. '{print "rocm"$1"."$2; exit}' /opt/rocm/.info/version; } || \
+            { _rocm_info_file="${ROCM_PATH:-/opt/rocm}/.info/version"; \
+              [ -r "$_rocm_info_file" ] && \
+                awk -F. '{print "rocm"$1"."$2; exit}' "$_rocm_info_file"; } || \
             { command -v hipconfig >/dev/null 2>&1 && \
                 hipconfig --version 2>/dev/null | awk 'NR==1 && /^[0-9]/{split($1,a,"."); if(a[1]+0>0){print "rocm"a[1]"."a[2]; found=1}} END{exit !found}'; } || \
             { command -v dpkg-query >/dev/null 2>&1 && \
@@ -1125,10 +1147,19 @@ get_radeon_wheel_url() {
     _full_ver=$({ command -v amd-smi >/dev/null 2>&1 && \
         amd-smi version 2>/dev/null | awk -F'ROCm version: ' \
             'NF>1{if(match($2,/[0-9]+\.[0-9]+(\.[0-9]+)?/)){print substr($2,RSTART,RLENGTH); ok=1; exit}} END{exit !ok}'; } || \
-        { [ -r /opt/rocm/.info/version ] && \
-            awk 'match($0,/[0-9]+\.[0-9]+(\.[0-9]+)?/){print substr($0,RSTART,RLENGTH); found=1; exit} END{exit !found}' /opt/rocm/.info/version; } || \
+        { _rocm_info_file="${ROCM_PATH:-/opt/rocm}/.info/version"; \
+          [ -r "$_rocm_info_file" ] && \
+            awk 'match($0,/[0-9]+\.[0-9]+(\.[0-9]+)?/){print substr($0,RSTART,RLENGTH); found=1; exit} END{exit !found}' "$_rocm_info_file"; } || \
         { command -v hipconfig >/dev/null 2>&1 && \
-            hipconfig --version 2>/dev/null | awk 'NR==1 && match($0,/[0-9]+\.[0-9]+(\.[0-9]+)?/){print substr($0,RSTART,RLENGTH); found=1} END{exit !found}'; }) 2>/dev/null
+            hipconfig --version 2>/dev/null | awk 'NR==1 && match($0,/[0-9]+\.[0-9]+(\.[0-9]+)?/){print substr($0,RSTART,RLENGTH); found=1} END{exit !found}'; } || \
+        { command -v dpkg-query >/dev/null 2>&1 && \
+            ver="$(dpkg-query -W -f='${Version}\n' rocm-core 2>/dev/null)" && \
+            [ -n "$ver" ] && \
+            printf '%s\n' "$ver" | sed 's/^[0-9]*://' | awk 'match($0,/[0-9]+\.[0-9]+(\.[0-9]+)?/){print substr($0,RSTART,RLENGTH); exit}'; } || \
+        { command -v rpm >/dev/null 2>&1 && \
+            ver="$(rpm -q --qf '%{VERSION}\n' rocm-core 2>/dev/null)" && \
+            [ -n "$ver" ] && \
+            printf '%s\n' "$ver" | awk 'match($0,/[0-9]+\.[0-9]+(\.[0-9]+)?/){print substr($0,RSTART,RLENGTH); exit}'; }) 2>/dev/null
 
     # Validate: must be X.Y or X.Y.Z with X >= 1
     case "$_full_ver" in
@@ -1193,7 +1224,7 @@ _pick_radeon_wheel() {
                     sub(/[?#].*/, "", base)
 
                     prefix = pkg "-"
-                    # Match cpXY-cpXY or cpXY-abi3 with any linux x86_64
+                    # Match cpXY-cpXY with any linux x86_64
                     # platform tag (linux_x86_64, manylinux_2_28_x86_64,
                     # manylinux2014_x86_64, etc.)
                     if (substr(base, 1, length(prefix)) == prefix &&
@@ -1290,12 +1321,22 @@ if [ "$_MIGRATED" = true ]; then
         substep "overlaying local repo (editable)..."
         run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
     fi
-    # AMD ROCm: install bitsandbytes even in migrated environments so
-    # existing ROCm installs gain the AMD bitsandbytes build without a
-    # fresh reinstall.
+    # AMD ROCm: ensure torch has HIP support and install bitsandbytes
+    # in migrated environments. Existing venvs created before ROCm support
+    # may have CPU-only torch that needs replacing.
     if [ "$SKIP_TORCH" = false ]; then
         case "$TORCH_INDEX_URL" in
             */rocm*)
+                if ! "$_VENV_PY" - <<'PY' >/dev/null 2>&1
+import sys, torch
+sys.exit(0 if getattr(torch.version, "hip", None) else 1)
+PY
+                then
+                    substep "reinstalling ROCm PyTorch ($TORCH_INDEX_URL)..."
+                    run_install_cmd "install PyTorch (ROCm)" uv pip install --python "$_VENV_PY" \
+                        --force-reinstall "$TORCH_CONSTRAINT" torchvision torchaudio \
+                        --index-url "$TORCH_INDEX_URL"
+                fi
                 substep "installing bitsandbytes for AMD ROCm..."
                 run_install_cmd "install bitsandbytes (AMD)" uv pip install --python "$_VENV_PY" --force-reinstall --no-cache-dir "bitsandbytes>=0.49.1"
                 ;;
@@ -1330,6 +1371,10 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
                 _tv_whl=$(_pick_radeon_wheel    "torchvision" 2>/dev/null) || _tv_whl=""
                 _ta_whl=$(_pick_radeon_wheel    "torchaudio"  2>/dev/null) || _ta_whl=""
                 _tri_whl=$(_pick_radeon_wheel   "triton"      2>/dev/null) || _tri_whl=""
+                # Some ROCm versions publish triton as pytorch_triton_rocm
+                if [ -z "$_tri_whl" ]; then
+                    _tri_whl=$(_pick_radeon_wheel "pytorch_triton_rocm" 2>/dev/null) || _tri_whl=""
+                fi
                 # Sanity-check torch / torchvision / torchaudio are a
                 # matching release. The Radeon repo publishes multiple
                 # generations simultaneously, so picking the highest-version
@@ -1338,7 +1383,7 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
                 # torchaudio 2.9.0 from the current rocm-rel-7.2.1 index).
                 # Check that torch and torchaudio share the same X.Y public
                 # version prefix, and that torchvision's minor correctly
-                # pairs with torch's minor (torchvision = torch.minor - 5
+                # pairs with torch's minor (torchvision = torch.minor + 15
                 # since torch 2.4 -> torchvision 0.19 -> torch 2.9 ->
                 # torchvision 0.24).
                 # URL-decode each wheel name so %2B -> + before version

@@ -2573,8 +2573,18 @@ def detect_host() -> HostInfo:
         """Check for 'GPU: <number>' data rows, not just a table header."""
         return bool(re.search(r"(?im)^gpu\s*[:\[]\s*\d", stdout))
 
+    # Honour GPU visibility masks so hidden GPUs are not detected.
+    # Check HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES /
+    # CUDA_VISIBLE_DEVICES (HIP respects all three).
+    _rocm_vis_enabled = True
+    for _env_name in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        _env_raw = os.environ.get(_env_name)
+        if _env_raw is not None:
+            _rocm_vis_enabled = _env_raw.strip() not in {"", "-1"}
+            break
+
     has_rocm = False
-    if is_linux:
+    if _rocm_vis_enabled and is_linux:
         for _cmd, _check in (
             # rocminfo: look for "gfxNNNN" with nonzero first digit (gfx000 is CPU agent)
             (["rocminfo"], lambda out: bool(re.search(r"gfx[1-9]", out.lower()))),
@@ -2591,7 +2601,7 @@ def detect_host() -> HostInfo:
                 if _check(_result.stdout):
                     has_rocm = True
                     break
-    elif is_windows:
+    elif _rocm_vis_enabled and is_windows:
         # Windows: prefer active probes that validate GPU presence
         for _cmd, _check in (
             (["hipinfo"], lambda out: "gcnarchname" in out.lower()),
@@ -3271,7 +3281,9 @@ def resolve_release_asset_choice(
         )
 
     published_choice: AssetChoice | None = None
-    if host.is_windows and host.is_x86_64:
+    if host.is_linux and host.is_x86_64 and host.has_rocm and not host.has_usable_nvidia:
+        published_choice = published_asset_choice_for_kind(release, "linux-rocm")
+    elif host.is_windows and host.is_x86_64:
         # AMD Windows hosts should prefer a hash-approved published
         # Windows HIP bundle when one exists, but otherwise fall through
         # to resolve_asset_choice() so the upstream HIP prebuilt is

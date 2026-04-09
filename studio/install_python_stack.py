@@ -91,10 +91,11 @@ def _detect_rocm_version() -> tuple[int, int] | None:
                 [hipconfig, "--version"],
                 stdout = subprocess.PIPE,
                 stderr = subprocess.DEVNULL,
+                text = True,
                 timeout = 5,
             )
             if result.returncode == 0:
-                raw = result.stdout.decode().strip().split("\n")[0]
+                raw = result.stdout.strip().split("\n")[0]
                 parts = raw.split(".")
                 if (
                     len(parts) >= 2
@@ -142,8 +143,18 @@ def _detect_rocm_version() -> tuple[int, int] | None:
     return None
 
 
+def _rocm_devices_enabled() -> bool:
+    """Return True when no env var explicitly hides all AMD GPUs."""
+    for name in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+        if name in os.environ:
+            return os.environ[name].strip() not in {"", "-1"}
+    return True
+
+
 def _has_rocm_gpu() -> bool:
     """Return True only if an actual AMD GPU is visible (not just ROCm tools installed)."""
+    if not _rocm_devices_enabled():
+        return False
     import re
 
     for cmd, check_fn in (
@@ -276,13 +287,28 @@ def _ensure_rocm_torch() -> None:
                 "--force-reinstall",
                 "--no-cache-dir",
                 "torch>=2.4,<2.11.0",
-                "torchvision<0.26.0",
+                "torchvision<0.26.0",  # TODO: bump to <0.27.0 when rocm7.2 is uncommented
                 "torchaudio<2.11.0",
                 "--index-url",
                 index_url,
                 constrain = False,
             )
-            rocm_torch_ready = True
+            # Re-probe: only mark ready if HIP torch is now actually present.
+            # pip_install() may have failed silently.
+            try:
+                probe2 = subprocess.run(
+                    [sys.executable, "-c",
+                     "import torch; print(getattr(torch.version,'hip','') or '')"],
+                    stdout = subprocess.PIPE,
+                    stderr = subprocess.DEVNULL,
+                    timeout = 30,
+                )
+                rocm_torch_ready = (
+                    probe2.returncode == 0
+                    and probe2.stdout.decode().strip() != ""
+                )
+            except Exception:
+                rocm_torch_ready = False
 
     # Install bitsandbytes only when the venv has a ROCm-compatible torch
     # (either already present or just installed). Avoids leaving an AMD

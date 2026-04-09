@@ -103,10 +103,11 @@ def is_rdna():
         "gfx1101",
         "gfx1102",
         "gfx1103",
-        # RDNA3.5 (Strix Point / Strix Halo)
+        # RDNA3.5 (Strix Point / Strix Halo / Krackan Point)
         "gfx1150",
         "gfx1151",
         "gfx1152",
+        "gfx1153",
         # RDNA4 (Navi 48-44)
         "gfx1200",
         "gfx1201",
