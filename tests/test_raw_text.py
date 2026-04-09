@@ -190,12 +190,23 @@ def test_raw_text_loader():
         # multiple consecutive newlines
         assert preprocessor.clean_text("foo \n\n bar") == "foo\n\nbar"
 
+        # Non-whitespace non-ASCII characters sitting between spaces should
+        # not leave an interior double space after being stripped. This
+        # guards the idempotence invariant too: without the extra collapse
+        # pass, "word1 (c) word2" first reduces to "word1  word2" and only
+        # becomes "word1 word2" on a second call.
+        assert preprocessor.clean_text("word1 \u00a9 word2") == "word1 word2"
+        assert preprocessor.clean_text("a \u00e9 b") == "a b"
+        assert preprocessor.clean_text("prefix \U0001F600 suffix") == "prefix suffix"
+
         # Idempotence: running clean_text twice should give the same result
         idempotent_inputs = [
             "  messy   text  \n\n\n  ",
             "Line 1\r\n\r\n\r\nLine 2",
             "hello\u00a0world",
             "Section\u00a01\r\n\r\nBody\ftext\u202Fhere",
+            "word1 \u00a9 word2",
+            "a \u00e9 b",
         ]
         for raw in idempotent_inputs:
             once = preprocessor.clean_text(raw)
