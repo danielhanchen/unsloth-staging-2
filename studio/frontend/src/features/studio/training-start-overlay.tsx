@@ -280,19 +280,19 @@ export function TrainingStartOverlay({
           <AnimatedSpan className="mt-2 text-muted-foreground">
             {`> ${message || "starting training..."} | waiting for first step... (${currentStep})`}
           </AnimatedSpan>
-          {datasetDownload.sawActiveProgress ? (
-            <AnimatedSpan className="mt-3">
-              <DownloadRow
-                label="Downloading dataset..."
-                state={datasetDownload}
-              />
-            </AnimatedSpan>
-          ) : null}
           {modelDownload.sawActiveProgress ? (
             <AnimatedSpan className="mt-3">
               <DownloadRow
                 label="Downloading model weights..."
                 state={modelDownload}
+              />
+            </AnimatedSpan>
+          ) : null}
+          {datasetDownload.sawActiveProgress ? (
+            <AnimatedSpan className="mt-3">
+              <DownloadRow
+                label="Downloading dataset..."
+                state={datasetDownload}
               />
             </AnimatedSpan>
           ) : null}
