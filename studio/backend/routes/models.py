@@ -1139,21 +1139,22 @@ async def get_download_progress(
         in_progress_bytes = 0
         cache_path: Optional[str] = None
 
-        for entry in cache_dir.iterdir():
-            if entry.name.lower() != target:
-                continue
-            cache_path = _resolve_hf_cache_realpath(entry)
-            blobs_dir = entry / "blobs"
-            if not blobs_dir.is_dir():
-                break
-            for f in blobs_dir.iterdir():
-                if not f.is_file():
+        if cache_dir.is_dir():
+            for entry in cache_dir.iterdir():
+                if entry.name.lower() != target:
                     continue
-                if f.name.endswith(".incomplete"):
-                    in_progress_bytes += f.stat().st_size
-                else:
-                    completed_bytes += f.stat().st_size
-            break
+                cache_path = _resolve_hf_cache_realpath(entry)
+                blobs_dir = entry / "blobs"
+                if not blobs_dir.is_dir():
+                    break
+                for f in blobs_dir.iterdir():
+                    if not f.is_file():
+                        continue
+                    if f.name.endswith(".incomplete"):
+                        in_progress_bytes += f.stat().st_size
+                    else:
+                        completed_bytes += f.stat().st_size
+                break
 
         downloaded_bytes = completed_bytes + in_progress_bytes
         if downloaded_bytes == 0:

@@ -47,6 +47,7 @@ type DownloadState = {
   totalBytes: number;
   percent: number;
   cachePath: string | null;
+  sawActiveProgress: boolean;
 };
 
 const EMPTY_DOWNLOAD_STATE: DownloadState = {
@@ -54,6 +55,7 @@ const EMPTY_DOWNLOAD_STATE: DownloadState = {
   totalBytes: 0,
   percent: 0,
   cachePath: null,
+  sawActiveProgress: false,
 };
 
 type Fetcher = (repoId: string) => Promise<DownloadProgressResponse>;
@@ -83,13 +85,14 @@ function useHfDownloadProgress(
     phase === "loading_dataset";
 
   useEffect(() => {
+    setState(EMPTY_DOWNLOAD_STATE);
     if (!repoId || !HF_REPO_REGEX.test(repoId) || !shouldPoll) {
       return;
     }
 
     let cancelled = false;
     let finished = false;
-    let interval: ReturnType<typeof setInterval> | null = null;
+    let timeout: ReturnType<typeof setTimeout> | null = null;
 
     const poll = async () => {
       if (cancelled || finished) return;
@@ -101,30 +104,31 @@ function useHfDownloadProgress(
         const ratio = prog.progress ?? 0;
         const pct =
           total > 0 ? Math.min(100, Math.round(ratio * 100)) : 0;
-        setState({
+        const activeNow = ratio > 0 && ratio < 1;
+        setState((prev) => ({
           downloadedBytes: downloaded,
           totalBytes: total,
           percent: pct,
           cachePath: prog.cache_path ?? null,
-        });
+          sawActiveProgress: prev.sawActiveProgress || activeNow,
+        }));
         if (ratio >= 1.0) {
           finished = true;
-          if (interval) {
-            clearInterval(interval);
-            interval = null;
-          }
+          return;
         }
       } catch {
         // Silently swallow; bar freezes at last value (matches chat flow).
       }
+      if (!cancelled && !finished) {
+        timeout = setTimeout(poll, 1500);
+      }
     };
 
     void poll();
-    interval = setInterval(poll, 1500);
 
     return () => {
       cancelled = true;
-      if (interval) clearInterval(interval);
+      if (timeout) clearTimeout(timeout);
     };
   }, [repoId, shouldPoll, fetcher]);
 
@@ -145,7 +149,7 @@ type DownloadRowProps = {
 };
 
 function DownloadRow({ label, state }: DownloadRowProps): ReactElement | null {
-  if (state.downloadedBytes <= 0 && !state.cachePath) return null;
+  if (!state.sawActiveProgress) return null;
   const sizeLabel =
     state.totalBytes > 0
       ? `${formatBytes(state.downloadedBytes)} / ${formatBytes(state.totalBytes)} · ${state.percent}%`
@@ -269,7 +273,7 @@ export function TrainingStartOverlay({
           <AnimatedSpan className="mt-2 text-muted-foreground">
             {`> ${message || "starting training..."} | waiting for first step... (${currentStep})`}
           </AnimatedSpan>
-          {datasetDownload.downloadedBytes > 0 || datasetDownload.cachePath ? (
+          {datasetDownload.sawActiveProgress ? (
             <AnimatedSpan className="mt-3">
               <DownloadRow
                 label="Downloading dataset..."
@@ -277,7 +281,7 @@ export function TrainingStartOverlay({
               />
             </AnimatedSpan>
           ) : null}
-          {modelDownload.downloadedBytes > 0 || modelDownload.cachePath ? (
+          {modelDownload.sawActiveProgress ? (
             <AnimatedSpan className="mt-3">
               <DownloadRow
                 label="Downloading model weights..."
