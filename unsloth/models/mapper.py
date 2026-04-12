@@ -34,10 +34,6 @@ __INT_TO_FLOAT_MAPPER = \
         "unsloth/gemma-4-26B-A4B-it",
         "google/gemma-4-26B-A4B-it",
     ),
-    "unsloth/gemma-4-31B-it" : (
-        "unsloth/gemma-4-31B-it",
-        "google/gemma-4-31B-it",
-    ),
     "unsloth/gemma-4-31B-it-unsloth-bnb-4bit" : (
         "unsloth/gemma-4-31B-it",
         "google/gemma-4-31B-it",
