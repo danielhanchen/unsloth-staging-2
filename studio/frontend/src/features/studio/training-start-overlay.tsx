@@ -84,8 +84,14 @@ function useHfDownloadProgress(
     phase === "loading_model" ||
     phase === "loading_dataset";
 
+  // Reset state only when the target repo changes, not when polling stops.
+  // This keeps the progress bar visible at its final value until the overlay
+  // unmounts, matching the intended "freeze at 100%" behavior.
   useEffect(() => {
     setState(EMPTY_DOWNLOAD_STATE);
+  }, [repoId, fetcher]);
+
+  useEffect(() => {
     if (!repoId || !HF_REPO_REGEX.test(repoId) || !shouldPoll) {
       return;
     }
@@ -104,7 +110,8 @@ function useHfDownloadProgress(
         const ratio = prog.progress ?? 0;
         const pct =
           total > 0 ? Math.min(100, Math.round(ratio * 100)) : 0;
-        const activeNow = ratio > 0 && ratio < 1;
+        const activeNow =
+          (ratio > 0 && ratio < 1) || (downloaded > 0 && total === 0);
         setState((prev) => ({
           downloadedBytes: downloaded,
           totalBytes: total,
