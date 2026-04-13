@@ -1715,7 +1715,7 @@ liquid_lfm2_template = \
 
 liquid_lfm2_template_eos_token = "<|im_end|>"
 CHAT_TEMPLATES["lfm-2"] = (liquid_lfm2_template, liquid_lfm2_template_eos_token, False, None)
-DEFAULT_SYSTEM_MESSAGE["lfm-2"] = None # No system message in Phi-3
+DEFAULT_SYSTEM_MESSAGE["lfm-2"] = None # No system message
 CHAT_TEMPLATES["lfm-2.5"] = (liquid_lfm2_template, liquid_lfm2_template_eos_token, False, None)
 DEFAULT_SYSTEM_MESSAGE["lfm-2.5"] = None
 

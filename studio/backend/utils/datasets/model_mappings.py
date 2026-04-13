@@ -440,7 +440,7 @@ for key, values in TEMPLATE_TO_MODEL_MAPPER.items():
 TEMPLATE_TO_RESPONSES_MAPPER = {
     "gemma-4-thinking": {
         "instruction": "<|turn>user\n",
-        "response": "<|turn>model\n",
+        "response": "<|turn>model\n<|channel>thought\n<channel|>",
     },
     "gemma-4": {
         "instruction": "<|turn>user\n",

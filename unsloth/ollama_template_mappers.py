@@ -1204,12 +1204,15 @@ gemma4_ollama = '''
 FROM {__FILE_LOCATION__}
 TEMPLATE """{{- range $i, $_ := .Messages }}
 {{- $last := eq (len (slice $.Messages $i)) 1 }}
-<|turn>{{ .Role }}
+{{- if or (eq .Role "user") (eq .Role "system") }}<|turn>{{ .Role }}
+{{ .Content }}<turn|>
+{{ if $last }}<|turn>model
+{{ end }}
+{{- else if eq .Role "assistant" }}<|turn>model
 {{ .Content }}{{ if not $last }}<turn|>
 {{ end }}
-{{- end }}<turn|>
-<|turn>model
-"""
+{{- end }}
+{{- end }}"""
 '''
 OLLAMA_TEMPLATES["gemma-4"] = gemma4_ollama
 OLLAMA_TEMPLATES["gemma4"] = gemma4_ollama
@@ -1979,11 +1982,15 @@ OLLAMA_TEMPLATE_TO_MODEL_MAPPER = {
     "gemma4": (
         "unsloth/gemma-4-E2B-it",
         "unsloth/gemma-4-E2B-it-unsloth-bnb-4bit",
+        "unsloth/gemma-4-E2B",
         "unsloth/gemma-4-E4B-it",
         "unsloth/gemma-4-E4B-it-unsloth-bnb-4bit",
+        "unsloth/gemma-4-E4B",
         "unsloth/gemma-4-31B-it",
         "unsloth/gemma-4-31B-it-unsloth-bnb-4bit",
+        "unsloth/gemma-4-31B",
         "unsloth/gemma-4-26B-A4B-it",
+        "unsloth/gemma-4-26B-A4B",
     ),
     "gemma3n": (
         "unsloth/gemma-3n-E4B-it-unsloth-bnb-4bit",
