@@ -1204,7 +1204,7 @@ gemma4_ollama = '''
 FROM {__FILE_LOCATION__}
 TEMPLATE """{{- range $i, $_ := .Messages }}
 {{- $last := eq (len (slice $.Messages $i)) 1 }}
-{{- if or (eq .Role "user") (eq .Role "system") }}<|turn>{{ .Role }}
+{{- if or (eq .Role "user") (eq .Role "system") }}<|turn>user
 {{ .Content }}<turn|>
 {{ if $last }}<|turn>model
 {{ end }}
@@ -1213,6 +1213,7 @@ TEMPLATE """{{- range $i, $_ := .Messages }}
 {{ end }}
 {{- end }}
 {{- end }}"""
+PARAMETER stop "<turn|>"
 '''
 OLLAMA_TEMPLATES["gemma-4"] = gemma4_ollama
 OLLAMA_TEMPLATES["gemma4"] = gemma4_ollama
