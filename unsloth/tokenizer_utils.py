@@ -771,6 +771,7 @@ def _derive_assistant_prefix_by_render(chat_template, is_sharegpt = False):
     """
     try:
         import jinja2
+        import jinja2.sandbox
     except Exception:
         return None
 
@@ -945,7 +946,7 @@ def _name_is_local_path(name_or_path):
         return False
 
 
-def _format_chat_template_message(name_or_path, repaired):
+def _format_chat_template_message(name_or_path, repaired, has_generation_block = False):
     """Build a user-facing warning/error message that points at the right
     responsible party (user's downstream tool vs. upstream model maintainer)."""
     local = _name_is_local_path(name_or_path)
@@ -966,6 +967,13 @@ def _format_chat_template_message(name_or_path, repaired):
         return (
             "Unsloth: Patched the chat_template on `{name}` to add a "
             "{{% if add_generation_prompt %}} block. {hint}"
+        ).format(name = name_or_path, hint = source_hint)
+    if has_generation_block:
+        return (
+            "Unsloth: The tokenizer `{name}` has a "
+            "{{% if add_generation_prompt %}} block, but it does not change "
+            "the rendered output. {hint} Set "
+            "UNSLOTH_STRICT_CHAT_TEMPLATE=1 to raise instead of warn."
         ).format(name = name_or_path, hint = source_hint)
     return (
         "Unsloth: The tokenizer `{name}` does not have a "
@@ -1093,7 +1101,7 @@ def _fix_chat_template_for_tokenizer(tokenizer, chat_template):
     if _has_add_generation_prompt_block(chat_template):
         # Template has the block but it does not change output. This is the
         # "wasn't provided correctly" case from the pre-warn code path.
-        msg = _format_chat_template_message(name, repaired = False)
+        msg = _format_chat_template_message(name, repaired = False, has_generation_block = True)
         if _is_strict_chat_template_mode():
             raise RuntimeError(msg)
         logger.warning_once(msg)
