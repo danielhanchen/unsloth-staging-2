@@ -126,7 +126,7 @@ router = APIRouter()
 # Routed separately from request.is_disconnected() polling because
 # some proxies (e.g. Colab's) do not propagate client-side fetch
 # aborts, so the backend never observes disconnect.
-_CANCEL_REGISTRY: dict = {}
+_CANCEL_REGISTRY: dict[str, threading.Event] = {}
 _CANCEL_LOCK = threading.Lock()
 
 
@@ -152,17 +152,17 @@ class _TrackedCancel:
         return False
 
 
-def _cancel_by_keys(keys) -> int:
-    """Set cancel_event for matching registry entries. Returns count set."""
-    events = []
+def _cancel_by_keys(keys: list[str]) -> int:
+    """Set cancel_event for matching registry entries. Returns count set.
+    Same event registered under multiple keys is deduplicated."""
+    events: list[threading.Event] = []
+    seen: set[int] = set()
     with _CANCEL_LOCK:
-        if keys:
-            for k in keys:
-                ev = _CANCEL_REGISTRY.get(k)
-                if ev is not None:
-                    events.append(ev)
-        else:
-            events.extend(_CANCEL_REGISTRY.values())
+        for k in keys:
+            ev = _CANCEL_REGISTRY.get(k)
+            if ev is not None and id(ev) not in seen:
+                events.append(ev)
+                seen.add(id(ev))
     for ev in events:
         ev.set()
     return len(events)
@@ -653,10 +653,11 @@ async def cancel_inference(
     """
     Cancel in-flight inference requests.
 
-    Body (optional JSON): {"session_id": str, "completion_id": str}
-    Cancels matching entries if provided, otherwise cancels ALL in-flight
-    requests. Returns {"cancelled": N} where N is the number of requests
-    signalled. Safe to call when nothing is running (returns 0).
+    Body (JSON): {"session_id": str, "completion_id": str} -- at least one
+    identifier must be present. Cancels matching entries and returns
+    {"cancelled": N}. An empty/missing body returns {"cancelled": 0} without
+    signalling anything (a stop without a target must not fan out to every
+    in-flight request).
 
     This exists because some proxies (Colab, etc.) do not propagate
     client-side fetch aborts to the backend, so relying solely on
@@ -674,6 +675,9 @@ async def cancel_inference(
         v = body.get(k)
         if v:
             keys.append(v)
+
+    if not keys:
+        return {"cancelled": 0}
 
     n = _cancel_by_keys(keys)
     return {"cancelled": n}
@@ -1372,10 +1376,10 @@ async def openai_chat_completions(
             _tool_sentinel = object()
 
             _cancel_keys = (payload.session_id, completion_id)
+            _tracker = _TrackedCancel(cancel_event, *_cancel_keys)
+            _tracker.__enter__()
 
             async def gguf_tool_stream():
-                _tracker = _TrackedCancel(cancel_event, *_cancel_keys)
-                _tracker.__enter__()
                 try:
                     first_chunk = ChatCompletionChunk(
                         id = completion_id,
@@ -1538,10 +1542,10 @@ async def openai_chat_completions(
 
         if payload.stream:
             _cancel_keys_nt = (payload.session_id, completion_id)
+            _tracker_nt = _TrackedCancel(cancel_event, *_cancel_keys_nt)
+            _tracker_nt.__enter__()
 
             async def gguf_stream_chunks():
-                _tracker_nt = _TrackedCancel(cancel_event, *_cancel_keys_nt)
-                _tracker_nt.__enter__()
                 try:
                     # First chunk: role
                     first_chunk = ChatCompletionChunk(
@@ -1660,25 +1664,27 @@ async def openai_chat_completions(
                 },
             )
         else:
+            _cancel_keys_ns = (payload.session_id, completion_id)
             try:
-                full_text = ""
-                for token in gguf_generate():
-                    if isinstance(token, dict):
-                        continue  # skip metadata dict in non-streaming path
-                    full_text = token
+                with _TrackedCancel(cancel_event, *_cancel_keys_ns):
+                    full_text = ""
+                    for token in gguf_generate():
+                        if isinstance(token, dict):
+                            continue  # skip metadata dict in non-streaming path
+                        full_text = token
 
-                response = ChatCompletion(
-                    id = completion_id,
-                    created = created,
-                    model = model_name,
-                    choices = [
-                        CompletionChoice(
-                            message = CompletionMessage(content = full_text),
-                            finish_reason = "stop",
-                        )
-                    ],
-                )
-                return JSONResponse(content = response.model_dump())
+                    response = ChatCompletion(
+                        id = completion_id,
+                        created = created,
+                        model = model_name,
+                        choices = [
+                            CompletionChoice(
+                                message = CompletionMessage(content = full_text),
+                                finish_reason = "stop",
+                            )
+                        ],
+                    )
+                    return JSONResponse(content = response.model_dump())
 
             except Exception as e:
                 logger.error(f"Error during GGUF completion: {e}", exc_info = True)
