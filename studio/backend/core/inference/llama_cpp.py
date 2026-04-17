@@ -54,8 +54,11 @@ _MAX_REPROMPTS = 3
 # Qwen3.5), producing many-minute "zombie" decodes that ignore stop-button
 # requests. Override per-call with explicit max_tokens (both caps are then
 # skipped so legitimate long generations on slow hardware finish cleanly).
+# The 10-minute wall-clock is sized to clear CPU-speed decodes (~1 tok/s)
+# and reasoning-model thinking passes that legitimately run multiple
+# minutes on mid-tier hardware, while still cutting off a true zombie.
 _DEFAULT_MAX_TOKENS = 4096
-_DEFAULT_T_MAX_PREDICT_MS = 120_000  # 2 minutes wall-clock runaway guard
+_DEFAULT_T_MAX_PREDICT_MS = 600_000  # 10 minutes wall-clock runaway guard
 _REPROMPT_MAX_CHARS = 2000
 
 # ── Pre-compiled patterns for GGUF shard detection ───────────

@@ -126,13 +126,16 @@ router = APIRouter()
 # Routed separately from request.is_disconnected() polling because
 # some proxies (e.g. Colab's) do not propagate client-side fetch
 # aborts, so the backend never observes disconnect.
-_CANCEL_REGISTRY: dict[str, threading.Event] = {}
+_CANCEL_REGISTRY: dict[str, set[threading.Event]] = {}
 _CANCEL_LOCK = threading.Lock()
 
 
 class _TrackedCancel:
     """Context manager: register cancel_event in _CANCEL_REGISTRY for the
-    duration of the block so external POST /inference/cancel can reach it."""
+    duration of the block so external POST /inference/cancel can reach it.
+    Each key can map to multiple events, so overlapping requests on the
+    same session_id (two tabs, rapid retry) coexist instead of the later
+    one silently evicting the earlier one."""
 
     def __init__(self, event: threading.Event, *keys):
         self.event = event
@@ -141,13 +144,17 @@ class _TrackedCancel:
     def __enter__(self):
         with _CANCEL_LOCK:
             for k in self.keys:
-                _CANCEL_REGISTRY[k] = self.event
+                _CANCEL_REGISTRY.setdefault(k, set()).add(self.event)
         return self.event
 
     def __exit__(self, *exc):
         with _CANCEL_LOCK:
             for k in self.keys:
-                if _CANCEL_REGISTRY.get(k) is self.event:
+                bucket = _CANCEL_REGISTRY.get(k)
+                if bucket is None:
+                    continue
+                bucket.discard(self.event)
+                if not bucket:
                     _CANCEL_REGISTRY.pop(k, None)
         return False
 
@@ -159,10 +166,10 @@ def _cancel_by_keys(keys: list[str]) -> int:
     seen: set[int] = set()
     with _CANCEL_LOCK:
         for k in keys:
-            ev = _CANCEL_REGISTRY.get(k)
-            if ev is not None and id(ev) not in seen:
-                events.append(ev)
-                seen.add(id(ev))
+            for ev in _CANCEL_REGISTRY.get(k, ()):
+                if id(ev) not in seen:
+                    events.append(ev)
+                    seen.add(id(ev))
     for ev in events:
         ev.set()
     return len(events)
@@ -670,10 +677,10 @@ async def cancel_inference(
     except Exception:
         body = {}
 
-    keys = []
+    keys: list[str] = []
     for k in ("session_id", "completion_id"):
         v = body.get(k)
-        if v:
+        if isinstance(v, str) and v:
             keys.append(v)
 
     if not keys:
@@ -1375,8 +1382,9 @@ async def openai_chat_completions(
 
             _tool_sentinel = object()
 
-            _cancel_keys = (payload.session_id, completion_id)
-            _tracker = _TrackedCancel(cancel_event, *_cancel_keys)
+            _tracker = _TrackedCancel(
+                cancel_event, payload.session_id, completion_id
+            )
             _tracker.__enter__()
 
             async def gguf_tool_stream():
@@ -1511,15 +1519,19 @@ async def openai_chat_completions(
                 finally:
                     _tracker.__exit__(None, None, None)
 
-            return StreamingResponse(
-                gguf_tool_stream(),
-                media_type = "text/event-stream",
-                headers = {
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
+            try:
+                return StreamingResponse(
+                    gguf_tool_stream(),
+                    media_type = "text/event-stream",
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            except BaseException:
+                _tracker.__exit__(None, None, None)
+                raise
 
         # ── Standard GGUF path (no tools) ─────────────────────
 
@@ -1541,8 +1553,9 @@ async def openai_chat_completions(
         _gguf_sentinel = object()
 
         if payload.stream:
-            _cancel_keys_nt = (payload.session_id, completion_id)
-            _tracker_nt = _TrackedCancel(cancel_event, *_cancel_keys_nt)
+            _tracker_nt = _TrackedCancel(
+                cancel_event, payload.session_id, completion_id
+            )
             _tracker_nt.__enter__()
 
             async def gguf_stream_chunks():
@@ -1654,23 +1667,37 @@ async def openai_chat_completions(
                 finally:
                     _tracker_nt.__exit__(None, None, None)
 
-            return StreamingResponse(
-                gguf_stream_chunks(),
-                media_type = "text/event-stream",
-                headers = {
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
-        else:
-            _cancel_keys_ns = (payload.session_id, completion_id)
             try:
-                with _TrackedCancel(cancel_event, *_cancel_keys_ns):
+                return StreamingResponse(
+                    gguf_stream_chunks(),
+                    media_type = "text/event-stream",
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            except BaseException:
+                _tracker_nt.__exit__(None, None, None)
+                raise
+        else:
+            try:
+                with _TrackedCancel(
+                    cancel_event, payload.session_id, completion_id
+                ):
                     full_text = ""
-                    for token in gguf_generate():
+                    gen = gguf_generate()
+                    _ns_sentinel = object()
+                    while True:
+                        # Run sync generator in a thread so the event loop
+                        # stays free to service POST /inference/cancel.
+                        token = await asyncio.to_thread(
+                            next, gen, _ns_sentinel
+                        )
+                        if token is _ns_sentinel:
+                            break
                         if isinstance(token, dict):
-                            continue  # skip metadata dict in non-streaming path
+                            continue  # skip metadata dict
                         full_text = token
 
                     response = ChatCompletion(
@@ -1754,6 +1781,10 @@ async def openai_chat_completions(
 
     # ── Streaming response ────────────────────────────────────────
     if payload.stream:
+        _tracker_std = _TrackedCancel(
+            cancel_event, payload.session_id, completion_id
+        )
+        _tracker_std.__enter__()
 
         async def stream_chunks():
             try:
@@ -1787,7 +1818,7 @@ async def openai_chat_completions(
                     cumulative = await loop.run_in_executor(None, next, gen, _DONE)
                     if cumulative is _DONE:
                         break
-                    if await request.is_disconnected():
+                    if await request.is_disconnected() or cancel_event.is_set():
                         cancel_event.set()
                         backend.reset_generation_state()
                         return
@@ -1836,23 +1867,42 @@ async def openai_chat_completions(
                     },
                 }
                 yield f"data: {json.dumps(error_chunk)}\n\n"
+            finally:
+                _tracker_std.__exit__(None, None, None)
 
-        return StreamingResponse(
-            stream_chunks(),
-            media_type = "text/event-stream",
-            headers = {
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
+        try:
+            return StreamingResponse(
+                stream_chunks(),
+                media_type = "text/event-stream",
+                headers = {
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        except BaseException:
+            _tracker_std.__exit__(None, None, None)
+            raise
 
     # ── Non-streaming response ────────────────────────────────────
     else:
         try:
-            full_text = ""
-            for token in generate():
-                full_text = token
+            with _TrackedCancel(
+                cancel_event, payload.session_id, completion_id
+            ):
+                full_text = ""
+                gen = generate()
+                _std_sentinel = object()
+                while True:
+                    # Run sync generator in a thread so the event loop
+                    # stays free to service POST /inference/cancel.
+                    token = await asyncio.to_thread(next, gen, _std_sentinel)
+                    if token is _std_sentinel:
+                        break
+                    if cancel_event.is_set():
+                        backend.reset_generation_state()
+                        break
+                    full_text = token
 
             response = ChatCompletion(
                 id = completion_id,
