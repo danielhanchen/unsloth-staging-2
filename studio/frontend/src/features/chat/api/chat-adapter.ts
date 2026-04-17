@@ -696,10 +696,8 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       const toolCallParts: ToolCallMessagePart[] = [];
       let serverMetadata: { usage?: ServerUsage; timings?: ServerTimings } | null = null;
 
-      // Some proxies (e.g. Colab) do not propagate fetch aborts to the
-      // backend, so request.is_disconnected() never fires server-side
-      // and the tool-loop keeps running. Explicitly POST /inference/cancel
-      // on abort so the backend can signal its cancel_event.
+      // Some proxies (e.g. Colab) swallow fetch aborts, so the backend
+      // never sees the disconnect; POST /inference/cancel explicitly.
       const onAbortCancel = () => {
         if (!resolvedThreadId) return;
         authFetch("/api/inference/cancel", {

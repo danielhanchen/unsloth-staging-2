@@ -48,17 +48,12 @@ _INTENT_SIGNAL = re.compile(
 )
 _MAX_REPROMPTS = 3
 
-# Default generation caps sent to llama-server when the caller does not
-# supply max_tokens. Prevents the runaway where a user-unset max_tokens
-# makes llama-server default to n_predict = n_ctx (up to 262144 tokens for
-# Qwen3.5), producing many-minute "zombie" decodes that ignore stop-button
-# requests. Override per-call with explicit max_tokens (both caps are then
-# skipped so legitimate long generations on slow hardware finish cleanly).
-# The 10-minute wall-clock is sized to clear CPU-speed decodes (~1 tok/s)
-# and reasoning-model thinking passes that legitimately run multiple
-# minutes on mid-tier hardware, while still cutting off a true zombie.
+# Fallbacks when the caller omits max_tokens, to bound the decode
+# instead of inheriting llama-server's n_predict = n_ctx default (up to
+# 262144 tokens for Qwen3.5). Explicit max_tokens skips both guards.
+# 10 min clears CPU-speed (~1 tok/s) and reasoning-model thinking passes.
 _DEFAULT_MAX_TOKENS = 4096
-_DEFAULT_T_MAX_PREDICT_MS = 600_000  # 10 minutes wall-clock runaway guard
+_DEFAULT_T_MAX_PREDICT_MS = 600_000
 _REPROMPT_MAX_CHARS = 2000
 
 # ── Pre-compiled patterns for GGUF shard detection ───────────
@@ -2351,10 +2346,8 @@ class LlamaCppBackend:
         payload["max_tokens"] = (
             max_tokens if max_tokens is not None else _DEFAULT_MAX_TOKENS
         )
-        # Only apply the wall-clock runaway guard when the caller did not
-        # set max_tokens. Explicit max_tokens already bounds the decode, and
-        # forcing t_max_predict_ms here silently truncates legitimate long
-        # generations on slow CPU / low-end GPU hardware.
+        # Explicit max_tokens already bounds the decode; skip the
+        # wall-clock cap so slow hardware is not cut off mid-generation.
         if max_tokens is None:
             payload["t_max_predict_ms"] = _DEFAULT_T_MAX_PREDICT_MS
         if stop:

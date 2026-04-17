@@ -131,11 +131,9 @@ _CANCEL_LOCK = threading.Lock()
 
 
 class _TrackedCancel:
-    """Context manager: register cancel_event in _CANCEL_REGISTRY for the
-    duration of the block so external POST /inference/cancel can reach it.
-    Each key can map to multiple events, so overlapping requests on the
-    same session_id (two tabs, rapid retry) coexist instead of the later
-    one silently evicting the earlier one."""
+    """Register cancel_event in _CANCEL_REGISTRY for the block's duration
+    so POST /inference/cancel can reach it. Multiple events may share a
+    key (e.g. two tabs on the same thread)."""
 
     def __init__(self, event: threading.Event, *keys):
         self.event = event
@@ -160,8 +158,7 @@ class _TrackedCancel:
 
 
 def _cancel_by_keys(keys: list[str]) -> int:
-    """Set cancel_event for matching registry entries. Returns count set.
-    Same event registered under multiple keys is deduplicated."""
+    """Signal every event under the given keys; returns events signalled."""
     events: list[threading.Event] = []
     seen: set[int] = set()
     with _CANCEL_LOCK:
@@ -660,15 +657,13 @@ async def cancel_inference(
     """
     Cancel in-flight inference requests.
 
-    Body (JSON): {"session_id": str, "completion_id": str} -- at least one
-    identifier must be present. Cancels matching entries and returns
-    {"cancelled": N}. An empty/missing body returns {"cancelled": 0} without
-    signalling anything (a stop without a target must not fan out to every
-    in-flight request).
+    Body JSON: {"session_id": str, "completion_id": str}; at least one
+    non-empty string is required. Returns {"cancelled": N}. An empty or
+    missing body returns {"cancelled": 0} rather than cancelling all
+    in-flight requests.
 
-    This exists because some proxies (Colab, etc.) do not propagate
-    client-side fetch aborts to the backend, so relying solely on
-    request.is_disconnected() is insufficient for the UI stop button.
+    Exists because some proxies (Colab, etc.) do not forward client
+    disconnects, so request.is_disconnected() alone is insufficient.
     """
     try:
         body = await request.json()
@@ -1689,15 +1684,14 @@ async def openai_chat_completions(
                     gen = gguf_generate()
                     _ns_sentinel = object()
                     while True:
-                        # Run sync generator in a thread so the event loop
-                        # stays free to service POST /inference/cancel.
+                        # Keep the event loop free to service /cancel.
                         token = await asyncio.to_thread(
                             next, gen, _ns_sentinel
                         )
                         if token is _ns_sentinel:
                             break
                         if isinstance(token, dict):
-                            continue  # skip metadata dict
+                            continue
                         full_text = token
 
                     response = ChatCompletion(
@@ -1894,8 +1888,7 @@ async def openai_chat_completions(
                 gen = generate()
                 _std_sentinel = object()
                 while True:
-                    # Run sync generator in a thread so the event loop
-                    # stays free to service POST /inference/cancel.
+                    # Keep the event loop free to service /cancel.
                     token = await asyncio.to_thread(next, gen, _std_sentinel)
                     if token is _std_sentinel:
                         break
