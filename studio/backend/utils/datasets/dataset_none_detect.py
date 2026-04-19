@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+
 """
 dataset_none_detect.py
 
@@ -158,6 +161,19 @@ def _probe_conversation(dataset: Dataset, candidates = None):
 # ---------------------------------------------------------------------------
 
 
+def _truncate_repr(val, max_len: int = 500) -> str:
+    """
+    Return a truncated repr(val) to avoid memory spikes and huge report lines.
+    Strings are truncated before repr() to avoid OOM on massive whitespace blocks.
+    """
+    if isinstance(val, str) and len(val) > max_len:
+        return repr(val[:max_len]) + "..."
+    r = repr(val)
+    if len(r) > max_len:
+        return r[:max_len] + "..."
+    return r
+
+
 def is_none_or_empty(value) -> bool:
     """True if value is None, empty string, whitespace-only, or an empty/whitespace-only VLM content block list."""
     if value is None:
@@ -254,16 +270,12 @@ def find_none_alpaca(dataset: Dataset) -> dict:
             if is_none_or_empty(val):
                 stats[f"none_{field}"] = stats.get(f"none_{field}", 0) + 1
                 bad = True
-                # Truncate raw_value to prevent OOM on huge whitespace blocks
-                raw = repr(val)
-                if len(raw) > 500:
-                    raw = raw[:500] + "..."
                 stats["findings"].append(
                     {
                         "row_index": i,
                         "field": field,
                         "value_type": _classify_empty(val),
-                        "raw_value": raw,
+                        "raw_value": _truncate_repr(val),
                     }
                 )
         if bad:
@@ -292,10 +304,15 @@ def find_none_chatml(dataset: Dataset, col: str = None) -> dict:
         if _cinfo is not None:
             col = _cinfo["column"]
 
-    if col is None or col not in dataset.column_names:
+    if col is None:
         raise ValueError(
             f"No conversation column found. "
             f"Expected one of {CONVERSATION_COLUMNS}, got columns: {dataset.column_names}"
+        )
+    if col not in dataset.column_names:
+        raise ValueError(
+            f"Conversation column {col!r} not found in dataset. "
+            f"Available columns: {dataset.column_names}"
         )
 
     stats = {
@@ -325,16 +342,13 @@ def find_none_chatml(dataset: Dataset, col: str = None) -> dict:
                 stats["none_by_role"].get("unknown", 0) + 1
             )
             stats["none_by_type"][vtype] = stats["none_by_type"].get(vtype, 0) + 1
-            raw = repr(conversation)
-            if len(raw) > 500:
-                raw = raw[:500] + "..."
             stats["findings"].append(
                 {
                     "row_index": i,
                     "turn_index": 0,
                     "role": "unknown",
                     "value_type": vtype,
-                    "raw_value": raw,
+                    "raw_value": _truncate_repr(conversation),
                 }
             )
             continue
@@ -367,17 +381,13 @@ def find_none_chatml(dataset: Dataset, col: str = None) -> dict:
         for turn_idx, turn in enumerate(conversation):
             # Non-dict turn — record it rather than crash or silently skip.
             if not isinstance(turn, dict):
-                # Truncate raw_value to prevent OOM on huge objects
-                raw = repr(turn)
-                if len(raw) > 500:
-                    raw = raw[:500] + "..."
                 row_findings.append(
                     {
                         "row_index": i,
                         "turn_index": turn_idx,
                         "role": "unknown",
                         "value_type": "None" if turn is None else "invalid_type",
-                        "raw_value": raw,
+                        "raw_value": _truncate_repr(turn),
                     }
                 )
                 stats["none_by_role"]["unknown"] = (
@@ -414,17 +424,13 @@ def find_none_chatml(dataset: Dataset, col: str = None) -> dict:
                 and is_none_or_empty(turn.get("thinking"))
             ):
                 vtype = _classify_empty(content)
-                # Truncate raw_value to prevent OOM on huge whitespace blocks
-                raw = repr(content)
-                if len(raw) > 500:
-                    raw = raw[:500] + "..."
                 row_findings.append(
                     {
                         "row_index": i,
                         "turn_index": turn_idx,
                         "role": role,
                         "value_type": vtype,
-                        "raw_value": raw,
+                        "raw_value": _truncate_repr(content),
                     }
                 )
                 stats["none_by_role"][role] = stats["none_by_role"].get(role, 0) + 1
@@ -573,6 +579,9 @@ FORMAT_REGISTRY = [
 # Derived list of known format names (used by CLI --format choices).
 FORMAT_NAMES = [entry["name"] for entry in FORMAT_REGISTRY]
 
+# Accepted format-name aliases (documented in the module docstring).
+FORMAT_ALIASES = {"gpt-oss": "gptoss"}
+
 
 def detect_format(dataset: Dataset) -> str:
     """
@@ -643,16 +652,25 @@ def scan_dataset(dataset: Dataset, fmt: str = "auto") -> dict:
             )
     except ImportError:
         pass
+    # Accept documented format-name aliases (e.g. "gpt-oss" → "gptoss").
+    fmt = FORMAT_ALIASES.get(fmt, fmt)
     was_auto = fmt == "auto"
     # Zero-row datasets have nothing to scan and would otherwise fall
     # through the probe to an "unknown format" or missing-column error.
     # Return a trivially clean stats dict for both auto and explicit
     # format paths so callers don't have to special-case empty inputs.
     if len(dataset) == 0:
-        if not was_auto and get_scanner(fmt) is None:
-            raise ValueError(f"Unknown or unsupported format: '{fmt}'")
+        if not was_auto:
+            scanner = get_scanner(fmt)
+            if scanner is None:
+                raise ValueError(f"Unknown or unsupported format: '{fmt}'")
+            # Run scanner so its column-existence guard (e.g. alpaca's
+            # instruction/output check) fires even on empty datasets.
+            stats = scanner(dataset)
+            stats["format"] = fmt
+            return stats
         return {
-            "format": fmt if not was_auto else "unknown",
+            "format": "unknown",
             "total_rows": 0,
             "findings": [],
             "bad_row_indices": [],
@@ -882,6 +900,14 @@ def show_row(dataset: Dataset, row_indices: list[int], fmt: str, col: str = None
                 print(f"  input: {input_val}")
         elif col:
             conversation = row[col]
+            if not isinstance(conversation, list):
+                # Non-list row (None, string, etc.) — surface the raw value
+                # so the user can see what the scanner flagged; otherwise the
+                # column would silently disappear from the report.
+                label = "None" if conversation is None else "invalid_type"
+                print(f"  {col}: [{label}]  {_truncate_repr(conversation, 150)}  << BAD")
+                print(f"{'=' * 64}")
+                continue
             if isinstance(conversation, list):
 
                 def _is_bad_turn(t):
@@ -980,7 +1006,7 @@ examples:
     parser.add_argument(
         "--format",
         default = "auto",
-        choices = ["auto"] + FORMAT_NAMES,
+        choices = ["auto"] + FORMAT_NAMES + list(FORMAT_ALIASES),
         help = "Force a specific format instead of auto-detecting (default: auto)",
     )
     parser.add_argument(
