@@ -502,6 +502,25 @@ def _brute_force_bad_rows(ds, fmt: str) -> set:
             return True
         return False
 
+    def _turn_is_bad(turn, content_key: str) -> bool:
+        # Mirror scanner exemptions: valid assistant tool-call stubs and
+        # reasoning-model turns with non-empty 'thinking' are not bad data.
+        if turn is None or not isinstance(turn, dict):
+            return True
+        if not _blank(turn.get(content_key)):
+            return False
+        role = turn.get("role") if "role" in turn else turn.get("from")
+        has_valid_tool_call = (
+            role == "assistant"
+            and isinstance(turn.get("tool_calls"), list)
+            and len(turn["tool_calls"]) > 0
+        )
+        if has_valid_tool_call:
+            return False
+        if not _blank(turn.get("thinking")):
+            return False
+        return True
+
     bad: set = set()
     for i, row in enumerate(ds):
         if fmt in ("chatml", "gptoss"):
@@ -510,9 +529,7 @@ def _brute_force_bad_rows(ds, fmt: str) -> set:
                 bad.add(i)
                 continue
             for turn in msgs:
-                if turn is None or (
-                    isinstance(turn, dict) and _blank(turn.get("content"))
-                ):
+                if _turn_is_bad(turn, "content"):
                     bad.add(i)
                     break
         elif fmt == "sharegpt":
@@ -521,9 +538,7 @@ def _brute_force_bad_rows(ds, fmt: str) -> set:
                 bad.add(i)
                 continue
             for turn in convs:
-                if turn is None or (
-                    isinstance(turn, dict) and _blank(turn.get("value"))
-                ):
+                if _turn_is_bad(turn, "value"):
                     bad.add(i)
                     break
         elif fmt == "alpaca":

@@ -1,5 +1,4 @@
-"""Tests for scan_dataset entry points, show_row rendering, and format-alias
-handling added in the review-round fixes to dataset_none_detect."""
+"""Behaviour tests for studio/backend/utils/datasets/dataset_none_detect."""
 
 from __future__ import annotations
 
@@ -17,12 +16,9 @@ sys.path.insert(0, str(REPO_ROOT / "studio" / "backend" / "utils" / "datasets"))
 import dataset_none_detect as mod  # noqa: E402
 
 
-# ---------------------------------------------------------------------------
-# Minimal dataset mock (pyarrow cannot store non-list messages alongside list messages)
-# ---------------------------------------------------------------------------
-
-
 class _MockDS:
+    """Datasets.Dataset stand-in; pyarrow rejects mixed list/non-list columns."""
+
     def __init__(self, rows, columns):
         self._rows = rows
         self.column_names = columns
@@ -37,48 +33,29 @@ class _MockDS:
         return self._rows[idx]
 
 
-# ---------------------------------------------------------------------------
-# show_row for non-list conversation columns (Fix L)
-# ---------------------------------------------------------------------------
+# show_row on rows where the conversation column is not a list ---------------
 
 
-def test_show_row_non_list_messages_none_is_displayed():
-    ds = _MockDS([{"messages": None, "label": "a"}], ["messages", "label"])
+@pytest.mark.parametrize(
+    "bad_value, expected_label",
+    [
+        (None, "[None]"),
+        ("oops not a list", "[invalid_type]"),
+        ({"stray": "dict"}, "[invalid_type]"),
+    ],
+)
+def test_show_row_non_list_conversation_is_displayed(bad_value, expected_label):
+    ds = _MockDS([{"messages": bad_value, "label": "x"}], ["messages", "label"])
     buf = io.StringIO()
     with redirect_stdout(buf):
         mod.show_row(ds, [0], fmt="chatml")
     out = buf.getvalue()
     assert "messages:" in out
-    assert "[None]" in out
+    assert expected_label in out
     assert "<< BAD" in out
 
 
-def test_show_row_non_list_messages_string_is_displayed():
-    ds = _MockDS([{"messages": "oops not a list", "label": "b"}],
-                 ["messages", "label"])
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        mod.show_row(ds, [0], fmt="chatml")
-    out = buf.getvalue()
-    assert "messages:" in out
-    assert "[invalid_type]" in out
-    assert "<< BAD" in out
-
-
-def test_show_row_non_list_messages_dict_is_displayed():
-    ds = _MockDS([{"messages": {"stray": "dict"}, "label": "c"}],
-                 ["messages", "label"])
-    buf = io.StringIO()
-    with redirect_stdout(buf):
-        mod.show_row(ds, [0], fmt="chatml")
-    out = buf.getvalue()
-    assert "messages:" in out
-    assert "[invalid_type]" in out
-
-
-# ---------------------------------------------------------------------------
-# scan_dataset on zero-row datasets with explicit format (Fix M)
-# ---------------------------------------------------------------------------
+# Zero-row datasets ---------------------------------------------------------
 
 
 def test_empty_alpaca_dataset_missing_columns_raises():
@@ -96,16 +73,11 @@ def test_empty_alpaca_dataset_with_columns_is_clean():
     assert stats["bad_row_indices"] == []
 
 
-def test_empty_sharegpt_dataset_without_conv_column_raises():
+@pytest.mark.parametrize("fmt", ["chatml", "sharegpt"])
+def test_empty_conversation_format_without_column_raises(fmt):
     ds = Dataset.from_list([{"instruction": "x", "output": "y"}]).select([])
     with pytest.raises(ValueError):
-        mod.scan_dataset(ds, fmt="sharegpt")
-
-
-def test_empty_chatml_dataset_without_conv_column_raises():
-    ds = Dataset.from_list([{"instruction": "x", "output": "y"}]).select([])
-    with pytest.raises(ValueError):
-        mod.scan_dataset(ds, fmt="chatml")
+        mod.scan_dataset(ds, fmt=fmt)
 
 
 def test_empty_auto_mode_returns_unknown_without_raising():
@@ -115,9 +87,7 @@ def test_empty_auto_mode_returns_unknown_without_raising():
     assert stats["total_rows"] == 0
 
 
-# ---------------------------------------------------------------------------
-# gpt-oss alias handling (Fix O)
-# ---------------------------------------------------------------------------
+# gpt-oss alias -------------------------------------------------------------
 
 
 def test_gpt_oss_alias_normalized_in_scan_dataset():
@@ -130,21 +100,17 @@ def test_gpt_oss_alias_normalized_in_scan_dataset():
     assert stats["bad_row_indices"] == [0]
 
 
-def test_gpt_oss_alias_cli_choice_is_accepted_by_argparse():
-    # Ensure the CLI argparse choices include the alias (regression guard).
-    assert "gpt-oss" in mod.FORMAT_ALIASES
-    assert mod.FORMAT_ALIASES["gpt-oss"] == "gptoss"
+def test_gpt_oss_alias_is_registered():
+    assert mod.FORMAT_ALIASES.get("gpt-oss") == "gptoss"
 
 
-def test_unknown_alias_still_raises():
+def test_unknown_alias_raises():
     ds = Dataset.from_list([{"messages": [{"role": "user", "content": "hi"}]}])
     with pytest.raises(ValueError):
         mod.scan_dataset(ds, fmt="not-a-real-alias")
 
 
-# ---------------------------------------------------------------------------
-# find_none_chatml error wording (Fix P)
-# ---------------------------------------------------------------------------
+# find_none_chatml error wording --------------------------------------------
 
 
 def test_find_none_chatml_names_explicit_missing_column():
@@ -156,7 +122,7 @@ def test_find_none_chatml_names_explicit_missing_column():
         mod.find_none_chatml(ds, col="nope_custom")
     msg = str(exc.value)
     assert "nope_custom" in msg
-    assert "Available columns" in msg or "column" in msg.lower()
+    assert "Available columns" in msg or "not found" in msg.lower()
 
 
 def test_find_none_chatml_auto_probe_failure_lists_defaults():
@@ -166,9 +132,7 @@ def test_find_none_chatml_auto_probe_failure_lists_defaults():
     assert "messages" in str(exc.value) or "conversations" in str(exc.value)
 
 
-# ---------------------------------------------------------------------------
-# _truncate_repr boundary behavior (Fix N)
-# ---------------------------------------------------------------------------
+# _truncate_repr ------------------------------------------------------------
 
 
 def test_truncate_repr_short_string_unchanged():
@@ -176,23 +140,17 @@ def test_truncate_repr_short_string_unchanged():
 
 
 def test_truncate_repr_long_string_truncates_before_repr():
-    # A 100k-character string: _truncate_repr must truncate BEFORE repr() so
-    # it never allocates the full repr of the 100k-char input.
-    huge = "x" * 100_000
-    out = mod._truncate_repr(huge, max_len=500)
+    out = mod._truncate_repr("x" * 100_000, max_len=500)
     assert len(out) < 600
     assert out.endswith("...")
 
 
 def test_truncate_repr_non_string_object_also_capped():
-    big_list = list(range(10_000))
-    out = mod._truncate_repr(big_list, max_len=500)
+    out = mod._truncate_repr(list(range(10_000)), max_len=500)
     assert len(out) < 600
 
 
-# ---------------------------------------------------------------------------
-# SPDX header present (Fix N)
-# ---------------------------------------------------------------------------
+# Module-level invariants ---------------------------------------------------
 
 
 def test_module_has_spdx_license_header():
