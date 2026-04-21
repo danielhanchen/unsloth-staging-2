@@ -867,15 +867,19 @@ DEFAULT_SYSTEM_MESSAGE["gemma3n"] = None # No system message in Gemma-3n
 # Gemma-4 uses <|turn>role\n...<turn|>\n format
 gemma4_template = \
 """{%- macro strip_thinking(text) -%}
-    {%- set ns = namespace(result='') -%}
-    {%- for part in text.split('<channel|>') -%}
-        {%- if '<|channel>' in part -%}
-            {%- set ns.result = ns.result + part.split('<|channel>')[0] -%}
-        {%- else -%}
-            {%- set ns.result = ns.result + part -%}
-        {%- endif -%}
-    {%- endfor -%}
-    {{- ns.result | trim -}}
+    {%- if '<|channel>' in text and '<channel|>' in text -%}
+        {%- set ns = namespace(result='') -%}
+        {%- for part in text.split('<channel|>') -%}
+            {%- if '<|channel>' in part -%}
+                {%- set ns.result = ns.result + part.split('<|channel>')[0] -%}
+            {%- else -%}
+                {%- set ns.result = ns.result + part -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {{- ns.result | trim -}}
+    {%- else -%}
+        {{- text | trim -}}
+    {%- endif -%}
 {%- endmacro -%}
 {%- set thinking = enable_thinking is defined and enable_thinking -%}
 {%- set loop_messages = messages -%}
@@ -917,7 +921,7 @@ gemma4_template = \
     {%- endif -%}
     {{ '<|turn>' + role + '\n' }}
     {%- if message['content'] is string -%}
-        {%- if role == "model" -%}
+        {%- if role == "model" and add_generation_prompt -%}
             {{ strip_thinking(message['content']) }}
         {%- else -%}
             {{ message['content'] | trim }}
@@ -931,7 +935,7 @@ gemma4_template = \
             {%- elif item['type'] == 'video' -%}
                 {{ '<|video|>' }}
             {%- elif item['type'] == 'text' -%}
-                {%- if role == "model" -%}
+                {%- if role == "model" and add_generation_prompt -%}
                     {{ strip_thinking(item['text']) }}
                 {%- else -%}
                     {{ item['text'] | trim }}
@@ -959,18 +963,25 @@ DEFAULT_SYSTEM_MESSAGE["gemma-4"] = None
 CHAT_TEMPLATES["gemma4"] = (gemma4_template, gemma4_template_eos_token, False, gemma4_ollama,)
 DEFAULT_SYSTEM_MESSAGE["gemma4"] = None
 
-# Gemma-4 thinking template
+# Gemma-4 thinking variant: enable_thinking defaults True (vs False in gemma4_template),
+# emitting <|think|> in the system turn so the model produces <|channel>...<channel|>.
+# strip_thinking only runs during inference history rendering (add_generation_prompt=True);
+# SFT label content is preserved.
 gemma4_thinking_template = \
 """{%- macro strip_thinking(text) -%}
-    {%- set ns = namespace(result='') -%}
-    {%- for part in text.split('<channel|>') -%}
-        {%- if '<|channel>' in part -%}
-            {%- set ns.result = ns.result + part.split('<|channel>')[0] -%}
-        {%- else -%}
-            {%- set ns.result = ns.result + part -%}
-        {%- endif -%}
-    {%- endfor -%}
-    {{- ns.result | trim -}}
+    {%- if '<|channel>' in text and '<channel|>' in text -%}
+        {%- set ns = namespace(result='') -%}
+        {%- for part in text.split('<channel|>') -%}
+            {%- if '<|channel>' in part -%}
+                {%- set ns.result = ns.result + part.split('<|channel>')[0] -%}
+            {%- else -%}
+                {%- set ns.result = ns.result + part -%}
+            {%- endif -%}
+        {%- endfor -%}
+        {{- ns.result | trim -}}
+    {%- else -%}
+        {{- text | trim -}}
+    {%- endif -%}
 {%- endmacro -%}
 {%- set thinking = enable_thinking is not defined or enable_thinking -%}
 {%- set loop_messages = messages -%}
@@ -1012,7 +1023,7 @@ gemma4_thinking_template = \
     {%- endif -%}
     {{ '<|turn>' + role + '\n' }}
     {%- if message['content'] is string -%}
-        {%- if role == "model" -%}
+        {%- if role == "model" and add_generation_prompt -%}
             {{ strip_thinking(message['content']) }}
         {%- else -%}
             {{ message['content'] | trim }}
@@ -1026,7 +1037,7 @@ gemma4_thinking_template = \
             {%- elif item['type'] == 'video' -%}
                 {{ '<|video|>' }}
             {%- elif item['type'] == 'text' -%}
-                {%- if role == "model" -%}
+                {%- if role == "model" and add_generation_prompt -%}
                     {{ strip_thinking(item['text']) }}
                 {%- else -%}
                     {{ item['text'] | trim }}
