@@ -258,7 +258,7 @@ def check_if_sentencepiece_model(
     return sentencepiece_model
 
 
-_TOKENIZER_MODEL_CACHE = set()
+_TOKENIZER_MODEL_CACHE = {}
 
 
 def _has_tokenizer_model(tokenizer, token = None):
@@ -272,18 +272,19 @@ def _has_tokenizer_model(tokenizer, token = None):
     if os.path.isdir(source):
         return os.path.isfile(os.path.join(source, "tokenizer.model"))
     if source in _TOKENIZER_MODEL_CACHE:
-        return True
+        return _TOKENIZER_MODEL_CACHE[source]
 
     try:
         repo_info = HfApi(token = token).model_info(source, files_metadata = False)
     except Exception:
+        _TOKENIZER_MODEL_CACHE[source] = False
         return False
 
     has_tokenizer_model = any(
-        sibling.rfilename == "tokenizer.model" for sibling in repo_info.siblings
+        sibling.rfilename == "tokenizer.model"
+        for sibling in (repo_info.siblings or [])
     )
-    if has_tokenizer_model:
-        _TOKENIZER_MODEL_CACHE.add(source)
+    _TOKENIZER_MODEL_CACHE[source] = has_tokenizer_model
     return has_tokenizer_model
 
 
@@ -291,12 +292,16 @@ def _preserve_sentencepiece_tokenizer_assets(
     tokenizer,
     save_directory,
     token = None,
+    filename_prefix = None,
 ):
     tokenizer = tokenizer.tokenizer if hasattr(tokenizer, "tokenizer") else tokenizer
     if tokenizer is None or not os.path.isdir(save_directory):
         return
 
-    tokenizer_config_path = os.path.join(save_directory, "tokenizer_config.json")
+    prefix = f"{filename_prefix}-" if filename_prefix else ""
+    tokenizer_config_path = os.path.join(
+        save_directory, f"{prefix}tokenizer_config.json"
+    )
     if os.path.isfile(tokenizer_config_path):
         desired_added_tokens_decoder = {}
         for token_id, added_token in getattr(
@@ -326,12 +331,15 @@ def _preserve_sentencepiece_tokenizer_assets(
                     f"{tokenizer_config_path}."
                 )
 
-    tokenizer_model = os.path.join(save_directory, "tokenizer.model")
+    tokenizer_model = os.path.join(save_directory, f"{prefix}tokenizer.model")
+    if os.path.isfile(tokenizer_model):
+        return
+
     downloaded_path = None
-    if not os.path.isfile(tokenizer_model) and _has_tokenizer_model(
-        tokenizer,
-        token = token,
-    ):
+    vocab_file = getattr(tokenizer, "vocab_file", None)
+    if isinstance(vocab_file, str) and os.path.isfile(vocab_file):
+        downloaded_path = vocab_file
+    else:
         source = getattr(tokenizer, "name_or_path", None)
         if isinstance(source, str) and source:
             if os.path.isdir(source):
@@ -346,11 +354,24 @@ def _preserve_sentencepiece_tokenizer_assets(
                         repo_id = source,
                         filename = "tokenizer.model",
                         token = token,
+                        local_files_only = True,
                     )
                 except Exception:
                     downloaded_path = None
+                if downloaded_path is None and _has_tokenizer_model(
+                    tokenizer, token = token,
+                ):
+                    try:
+                        downloaded_path = hf_hub_download(
+                            repo_id = source,
+                            filename = "tokenizer.model",
+                            token = token,
+                            local_files_only = False,
+                        )
+                    except Exception:
+                        downloaded_path = None
 
-    if not os.path.isfile(tokenizer_model) and downloaded_path is not None:
+    if downloaded_path is not None:
         shutil.copy2(downloaded_path, tokenizer_model)
         logger.warning_once(
             f"Unsloth: Preserved sentencepiece asset `tokenizer.model` in "
@@ -3477,18 +3498,56 @@ def patch_saving_functions(model, vision = False):
         push_to_hub = False,
         **kwargs,
     ):
+        # Save locally first with push_to_hub=False so preservation can run
+        # BEFORE any Hub upload sees the directory.
         result = self.original_save_pretrained(
             save_directory,
             legacy_format = legacy_format,
             filename_prefix = filename_prefix,
-            push_to_hub = push_to_hub,
+            push_to_hub = False,
             **kwargs,
         )
-        if not push_to_hub:
+
+        auth_token = kwargs.get("token", None)
+        if auth_token is None:
+            try:
+                auth_token = get_token()
+            except Exception:
+                auth_token = None
+
+        # why safe: legacy_format=False is an explicit opt-out of the
+        # SentencePiece artifact; preservation would violate that contract.
+        if legacy_format is not False:
             _preserve_sentencepiece_tokenizer_assets(
                 self,
                 save_directory,
-                token = kwargs.get("token", None),
+                token = auth_token,
+                filename_prefix = filename_prefix,
+            )
+
+        if push_to_hub:
+            repo_id = kwargs.get(
+                "repo_id",
+                os.path.basename(os.path.normpath(str(save_directory))),
+            )
+            hf_api = HfApi(token = auth_token)
+            try:
+                hf_api.create_repo(
+                    repo_id = repo_id,
+                    private = bool(kwargs.get("private", False)),
+                    repo_type = "model",
+                    exist_ok = True,
+                )
+            except Exception:
+                pass
+            hf_api.upload_folder(
+                repo_id = repo_id,
+                folder_path = save_directory,
+                repo_type = "model",
+                commit_message = kwargs.get("commit_message", None),
+                commit_description = kwargs.get("commit_description", None),
+                revision = kwargs.get("revision", None),
+                create_pr = bool(kwargs.get("create_pr", False)),
             )
         return result
 
@@ -3500,7 +3559,7 @@ def patch_saving_functions(model, vision = False):
         model.save_pretrained = types.MethodType(
             unsloth_tokenizer_save_pretrained, model
         )
-    elif hasattr(model, "tokenizer"):
+    elif getattr(model, "tokenizer", None) is not None:
         patch_saving_functions(model.tokenizer)
 
     original_model = model
