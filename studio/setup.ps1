@@ -1164,26 +1164,34 @@ if ($PyLauncher) {
                     $resolvedExe = (& $PyLauncher.Source "-$minor" -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1)
                     if ($resolvedExe -and (Test-Path $resolvedExe)) {
                         $resolvedDir = Split-Path -Parent $resolvedExe
-                        $alreadyOnPath = ($env:PATH -split ';' | Where-Object { $_.TrimEnd('\') -ieq $resolvedDir.TrimEnd('\') }).Count -gt 0
-                        if (-not $alreadyOnPath) {
-                            $env:PATH = "$resolvedDir;$env:PATH"
-                        }
+                        # Always put the supported interpreter first, even if its
+                        # directory is already present later in PATH behind an
+                        # unsupported Python (e.g., 3.14 ahead of 3.13). Trim
+                        # quotes so quoted PATH entries compare equal.
+                        $resolvedNorm = $resolvedDir.Trim().Trim('"').TrimEnd('\')
+                        $filtered = @($env:PATH -split ';' | Where-Object {
+                            ($_.Trim().Trim('"').TrimEnd('\')) -ine $resolvedNorm
+                        })
+                        $env:PATH = (@($resolvedDir) + $filtered) -join ';'
                         $HasPython = $true
+                        # why safe: only declare PythonOk once we have proven
+                        # the interpreter is reachable. On failure fall through
+                        # to the next minor or the winget branch.
+                        $PythonOk = $true
+                        break
                     }
                 } catch { }
-                $PythonOk = $true
-                break
             }
         } catch { }
     }
 }
 
 if (-not $PythonOk -and $HasPython) {
-    $PyVer = python --version 2>&1
+    $PyVer = (python --version 2>&1 | Out-String).Trim()
     if ($PyVer -match "(\d+)\.(\d+)") {
         $PyMajor = [int]$Matches[1]; $PyMinor = [int]$Matches[2]
         if ($PyMajor -eq 3 -and $PyMinor -ge 11 -and $PyMinor -lt 14) {
-            $DetectedPyVer = "$PyMajor.$PyMinor"
+            $DetectedPyVer = ($PyVer -replace '^Python\s+', '').Trim()
             $PythonOk = $true
         }
     }
@@ -1208,7 +1216,7 @@ if ($PythonOk) {
         Write-Host "        Install Python 3.12 from https://python.org/downloads/" -ForegroundColor Yellow
         exit 1
     }
-    step "python" "$(python --version 2>&1)"
+    step "python" "$((python --version 2>&1 | Out-String).Trim())"
     $PythonOk = $true
 } else {
     # python.exe is on PATH but its version is unsupported, and py.exe (if
