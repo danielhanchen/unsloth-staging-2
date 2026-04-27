@@ -926,6 +926,30 @@ shell.Run cmd, 0, False
         return $installed
     }
 
+    # ── Helper: convert a spaced path to its 8.3 short form for uv ──
+    # uv 0.11.x truncates `-r <path with space>` (and `-c <...>`) at the first
+    # space; pass paths through this helper before handing them to uv.
+    function Get-UvSafePath {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        if ($Path -notmatch ' ') { return $Path }
+        try {
+            if (-not ('UnslothShortPath' -as [type])) {
+                Add-Type -Namespace Unsloth -Name ShortPath -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern uint GetShortPathName(string longPath, System.Text.StringBuilder shortPath, uint bufferLength);
+'@ -ErrorAction Stop
+            }
+            $buf = New-Object System.Text.StringBuilder 32768
+            $rc = [Unsloth.ShortPath]::GetShortPathName($Path, $buf, [uint32]$buf.Capacity)
+            if ($rc -gt 0 -and $rc -lt $buf.Capacity) {
+                $short = $buf.ToString()
+                if ($short -and $short -notmatch ' ') { return $short }
+            }
+        } catch { }
+        Write-Host "[WARN] uv path still contains spaces; uv may truncate at the space: $Path" -ForegroundColor Yellow
+        return $Path
+    }
+
     if ($_Migrated) {
         # Migrated env: force-reinstall unsloth+unsloth-zoo to ensure clean state
         # in the new venv location, while preserving existing torch/CUDA
@@ -938,7 +962,8 @@ shell.Run cmd, 0, False
             if ($baseInstallExit -eq 0) {
                 $NoTorchReq = Find-NoTorchRuntimeFile
                 if ($NoTorchReq) {
-                    $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython --no-deps -r $NoTorchReq }
+                    $NoTorchReqUv = Get-UvSafePath $NoTorchReq
+                    $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython --no-deps -r $NoTorchReqUv }
                 }
             }
         } else {
@@ -979,7 +1004,8 @@ shell.Run cmd, 0, False
             if ($baseInstallExit -eq 0) {
                 $NoTorchReq = Find-NoTorchRuntimeFile
                 if ($NoTorchReq) {
-                    $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython --no-deps -r $NoTorchReq }
+                    $NoTorchReqUv = Get-UvSafePath $NoTorchReq
+                    $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython --no-deps -r $NoTorchReqUv }
                 }
             }
         } elseif ($StudioLocalInstall) {
@@ -1027,32 +1053,51 @@ shell.Run cmd, 0, False
         }
     }
 
-    # Hotfix: patch install_python_stack.py for Windows GUI stdout
-    # The PyPI version crashes with OSError when stdout is piped from a GUI app.
-    # Copy our fixed version (bundled by Tauri) over the installed one.
-    # Remove this block once PyPI ships the fix from commit 18c5aae7.
-    if ($TauriMode) {
+    # Overlay Tauri-bundled studio fixes that may be ahead of PyPI. Skipped
+    # for --local: the editable install above already makes _PACKAGE_ROOT in
+    # unsloth_cli/commands/studio.py resolve to the repo (PEP 660 __file__).
+    # Source paths match the Tauri bundle layout in studio/src-tauri/tauri.conf.json,
+    # which bundles install_python_stack.py at the bundle root next to install.ps1.
+    if ($TauriMode -and -not $StudioLocalInstall) {
         $rawPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.ScriptName }
-        $scriptDir = Split-Path -Parent ($rawPath -replace '^\\\\\?\\', '')
-        $fixedPy = Join-Path $scriptDir "install_python_stack.py"
-        $target = Join-Path $VenvDir "Lib\site-packages\studio\install_python_stack.py"
-        $sentinel = "# UNSLOTH_DESKTOP_HOTFIX_APPLIED_v1"
-        $sentinelPattern = [regex]::Escape($sentinel)
-        if ((Test-Path $fixedPy) -and (Test-Path $target)) {
-            $installed = Get-Content $target -Raw
-            if ($installed -notmatch $sentinelPattern) {
-                Copy-Item $fixedPy $target -Force
-                Add-Content -Path $target -Value "`n$sentinel"
-                substep "patched install_python_stack.py (stdout fix)"
-            } else {
-                substep "install_python_stack.py already has stdout fix"
+        if ($rawPath) {
+            # Strip leading \\?\ extended-length prefix if the launcher passed one.
+            $scriptDir = Split-Path -Parent ($rawPath -replace '^\\\\\?\\', '')
+            $overlayMap = [ordered]@{
+                "install_python_stack.py" = "Lib\site-packages\studio\install_python_stack.py"
             }
-        } elseif ((Test-Path $fixedPy) -and (Test-Path (Split-Path $target))) {
-            Copy-Item $fixedPy $target -Force
-            Add-Content -Path $target -Value "`n$sentinel"
-            substep "patched install_python_stack.py (stdout fix)"
+            foreach ($rel in $overlayMap.Keys) {
+                $src = Join-Path $scriptDir $rel
+                $dst = Join-Path $VenvDir $overlayMap[$rel]
+                if (-not (Test-Path $src)) {
+                    Write-Host "[WARN] Overlay source missing: $src; studio setup may use stale bundled file" -ForegroundColor Yellow
+                    continue
+                }
+                $dstParent = Split-Path -Parent $dst
+                if (-not (Test-Path $dstParent)) {
+                    Write-Host "[WARN] Overlay target dir missing: $dstParent; studio setup may use stale bundled file" -ForegroundColor Yellow
+                    continue
+                }
+                try {
+                    if (-not (Test-Path $dst)) {
+                        # Backfill: target file missing but parent dir exists.
+                        Copy-Item $src $dst -Force
+                        substep ("backfilled bundled " + (Split-Path -Leaf $rel))
+                    } else {
+                        # Hash-compare so re-runs are no-ops when files already match.
+                        $srcHash = (Get-FileHash $src -Algorithm SHA256).Hash
+                        $dstHash = (Get-FileHash $dst -Algorithm SHA256).Hash
+                        if ($srcHash -ne $dstHash) {
+                            Copy-Item $src $dst -Force
+                            substep ("applied bundled " + (Split-Path -Leaf $rel))
+                        }
+                    }
+                } catch {
+                    Write-Host "[WARN] Could not overlay $($rel): $($_.Exception.Message); studio setup may use stale bundled file" -ForegroundColor Yellow
+                }
+            }
         } else {
-            Write-Host "[WARN] Could not patch install_python_stack.py (bundled file or target dir missing)" -ForegroundColor Yellow
+            Write-Host "[WARN] Could not determine script directory; Tauri overlay skipped." -ForegroundColor Yellow
         }
     }
 
