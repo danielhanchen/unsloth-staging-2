@@ -926,6 +926,30 @@ shell.Run cmd, 0, False
         return $installed
     }
 
+    # ── Helper: convert a spaced path to its 8.3 short form for uv ──
+    # uv 0.11.x truncates `-r <path with space>` (and `-c <...>`) at the first
+    # space; pass paths through this helper before handing them to uv.
+    function Get-UvSafePath {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        if ($Path -notmatch ' ') { return $Path }
+        try {
+            if (-not ('UnslothShortPath' -as [type])) {
+                Add-Type -Namespace Unsloth -Name ShortPath -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode, SetLastError = true)]
+public static extern uint GetShortPathName(string longPath, System.Text.StringBuilder shortPath, uint bufferLength);
+'@ -ErrorAction Stop
+            }
+            $buf = New-Object System.Text.StringBuilder 32768
+            $rc = [Unsloth.ShortPath]::GetShortPathName($Path, $buf, [uint32]$buf.Capacity)
+            if ($rc -gt 0 -and $rc -lt $buf.Capacity) {
+                $short = $buf.ToString()
+                if ($short -and $short -notmatch ' ') { return $short }
+            }
+        } catch { }
+        Write-Host "[WARN] uv path still contains spaces; uv may truncate at the space: $Path" -ForegroundColor Yellow
+        return $Path
+    }
+
     if ($_Migrated) {
         # Migrated env: force-reinstall unsloth+unsloth-zoo to ensure clean state
         # in the new venv location, while preserving existing torch/CUDA
@@ -938,7 +962,8 @@ shell.Run cmd, 0, False
             if ($baseInstallExit -eq 0) {
                 $NoTorchReq = Find-NoTorchRuntimeFile
                 if ($NoTorchReq) {
-                    $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython --no-deps -r $NoTorchReq }
+                    $NoTorchReqUv = Get-UvSafePath $NoTorchReq
+                    $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython --no-deps -r $NoTorchReqUv }
                 }
             }
         } else {
@@ -979,7 +1004,8 @@ shell.Run cmd, 0, False
             if ($baseInstallExit -eq 0) {
                 $NoTorchReq = Find-NoTorchRuntimeFile
                 if ($NoTorchReq) {
-                    $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython --no-deps -r $NoTorchReq }
+                    $NoTorchReqUv = Get-UvSafePath $NoTorchReq
+                    $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython --no-deps -r $NoTorchReqUv }
                 }
             }
         } elseif ($StudioLocalInstall) {
@@ -1032,7 +1058,7 @@ shell.Run cmd, 0, False
     # unsloth_cli/commands/studio.py resolve to the repo (PEP 660 __file__).
     # Source paths match the Tauri bundle layout in studio/src-tauri/tauri.conf.json,
     # which bundles install_python_stack.py at the bundle root next to install.ps1.
-    if ($TauriMode) {
+    if ($TauriMode -and -not $StudioLocalInstall) {
         $rawPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.ScriptName }
         if ($rawPath) {
             # Strip leading \\?\ extended-length prefix if the launcher passed one.
@@ -1043,7 +1069,10 @@ shell.Run cmd, 0, False
             foreach ($rel in $overlayMap.Keys) {
                 $src = Join-Path $scriptDir $rel
                 $dst = Join-Path $VenvDir $overlayMap[$rel]
-                if (-not (Test-Path $src)) { continue }
+                if (-not (Test-Path $src)) {
+                    Write-Host "[WARN] Overlay source missing: $src; studio setup may use stale bundled file" -ForegroundColor Yellow
+                    continue
+                }
                 $dstParent = Split-Path -Parent $dst
                 if (-not (Test-Path $dstParent)) {
                     Write-Host "[WARN] Overlay target dir missing: $dstParent; studio setup may use stale bundled file" -ForegroundColor Yellow
@@ -1067,6 +1096,8 @@ shell.Run cmd, 0, False
                     Write-Host "[WARN] Could not overlay $($rel): $($_.Exception.Message); studio setup may use stale bundled file" -ForegroundColor Yellow
                 }
             }
+        } else {
+            Write-Host "[WARN] Could not determine script directory; Tauri overlay skipped." -ForegroundColor Yellow
         }
     }
 

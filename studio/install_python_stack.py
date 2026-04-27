@@ -359,6 +359,9 @@ def _ensure_rocm_torch() -> None:
             )
 
 
+_UV_SAFE_PATH_WARNED: set[str] = set()
+
+
 def _uv_safe_path(path: object) -> str:
     # uv 0.11.x: `-c <path with space>` truncates at the space; use 8.3 short form.
     s = str(path)
@@ -377,6 +380,14 @@ def _uv_safe_path(path: object) -> str:
             return buf.value
     except Exception:
         pass
+    # 8.3 short-name generation may be disabled on the volume; warn once per
+    # path so users know uv may truncate the argument at the first space.
+    if s not in _UV_SAFE_PATH_WARNED:
+        _UV_SAFE_PATH_WARNED.add(s)
+        sys.stderr.write(
+            f"[WARN] uv path still contains spaces; uv may truncate at the space: {s!r}\n"
+            "       8.3 short-name generation may be disabled on this volume.\n"
+        )
     return s
 
 
