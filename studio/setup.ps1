@@ -1157,26 +1157,21 @@ if ($PyLauncher) {
             $out = & $PyLauncher.Source "-$minor" --version 2>&1 | Out-String
             if ($out -match 'Python (3\.\d+\.\d+)') {
                 $DetectedPyVer = $Matches[1]
-                # Make `python` resolvable for the rest of setup. Without this,
-                # py-launcher-only installs (no python.exe on PATH) pass the gate
-                # and then crash on the first bare `python` call below.
+                # Resolve and prepend the interpreter dir so bare `python`
+                # downstream uses the supported minor (not e.g. a 3.14 ahead
+                # of it on PATH). Quote-trim makes dedupe match quoted entries.
                 try {
                     $resolvedExe = (& $PyLauncher.Source "-$minor" -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1)
                     if ($resolvedExe -and (Test-Path $resolvedExe)) {
                         $resolvedDir = Split-Path -Parent $resolvedExe
-                        # Always put the supported interpreter first, even if its
-                        # directory is already present later in PATH behind an
-                        # unsupported Python (e.g., 3.14 ahead of 3.13). Trim
-                        # quotes so quoted PATH entries compare equal.
                         $resolvedNorm = $resolvedDir.Trim().Trim('"').TrimEnd('\')
                         $filtered = @($env:PATH -split ';' | Where-Object {
                             ($_.Trim().Trim('"').TrimEnd('\')) -ine $resolvedNorm
                         })
                         $env:PATH = (@($resolvedDir) + $filtered) -join ';'
                         $HasPython = $true
-                        # why safe: only declare PythonOk once we have proven
-                        # the interpreter is reachable. On failure fall through
-                        # to the next minor or the winget branch.
+                        # why safe: only set PythonOk after the interpreter is
+                        # proven reachable; otherwise fall through to next minor.
                         $PythonOk = $true
                         break
                     }
@@ -1200,10 +1195,8 @@ if (-not $PythonOk -and $HasPython) {
 if ($PythonOk) {
     substep "Python $DetectedPyVer"
 } elseif (-not $HasPython) {
-    # No `python` on PATH (and py.exe either absent or only had unsupported
-    # minors). Try winget as before -- gating on $HasPython alone, not also
-    # on $PyLauncher, so a launcher-only install with just 3.14 still gets
-    # an automatic 3.12 install instead of a hard error.
+    # No `python` on PATH; gate on $HasPython only so a py.exe-only install
+    # with just 3.14 still falls through to winget instead of hard-failing.
     Write-Host "Python 3.11-3.13 not found -- installing Python 3.12 via winget..." -ForegroundColor Yellow
     $HasWinget = $null -ne (Get-Command winget -ErrorAction SilentlyContinue)
     if ($HasWinget) {
@@ -1219,8 +1212,7 @@ if ($PythonOk) {
     step "python" "$((python --version 2>&1 | Out-String).Trim())"
     $PythonOk = $true
 } else {
-    # python.exe is on PATH but its version is unsupported, and py.exe (if
-    # present) had no supported minor either.
+    # python on PATH is unsupported and py.exe had no supported minor.
     Write-Host "[ERROR] No supported Python (3.11-3.13) found on this system." -ForegroundColor Red
     Write-Host "        py.exe could not locate -3.11/-3.12/-3.13 and `python` on PATH is unsupported." -ForegroundColor Yellow
     Write-Host "        Install Python 3.12 from https://python.org/downloads/" -ForegroundColor Yellow

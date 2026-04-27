@@ -926,9 +926,8 @@ shell.Run cmd, 0, False
         return $installed
     }
 
-    # ── Helper: convert a spaced path to its 8.3 short form for uv ──
-    # uv 0.11.x truncates `-r <path with space>` (and `-c <...>`) at the first
-    # space; pass paths through this helper before handing them to uv.
+    # uv 0.11.x truncates `-r`/`-c <path with space>` at the first space;
+    # convert to 8.3 short form before passing to uv.
     function Get-UvSafePath {
         param([Parameter(Mandatory = $true)][string]$Path)
         if ($Path -notmatch ' ') { return $Path }
@@ -1054,10 +1053,8 @@ public static extern uint GetShortPathName(string longPath, System.Text.StringBu
     }
 
     # Overlay Tauri-bundled studio fixes that may be ahead of PyPI. Skipped
-    # for --local: the editable install above already makes _PACKAGE_ROOT in
-    # unsloth_cli/commands/studio.py resolve to the repo (PEP 660 __file__).
-    # Source paths match the Tauri bundle layout in studio/src-tauri/tauri.conf.json,
-    # which bundles install_python_stack.py at the bundle root next to install.ps1.
+    # for --local because the editable install makes the repo authoritative.
+    # Source layout matches studio/src-tauri/tauri.conf.json (bundle root).
     if ($TauriMode -and -not $StudioLocalInstall) {
         $rawPath = if ($PSCommandPath) { $PSCommandPath } else { $MyInvocation.ScriptName }
         if ($rawPath) {
