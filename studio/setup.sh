@@ -399,7 +399,18 @@ if [ -d "$SCRIPT_DIR/backend/core/data_recipe/oxc-validator" ] && command -v npm
 fi
 
 # ── Python venv + deps ──
-STUDIO_HOME="$HOME/.unsloth/studio"
+# UNSLOTH_STUDIO_HOME / STUDIO_HOME override the install root (mirrors install.sh).
+_studio_override="${UNSLOTH_STUDIO_HOME:-${STUDIO_HOME:-}}"
+case "$_studio_override" in
+    "~") _studio_override="$HOME" ;;
+    "~/"*) _studio_override="$HOME/${_studio_override#'~/'}" ;;
+esac
+if [ -n "$_studio_override" ]; then
+    mkdir -p -- "$_studio_override"
+    STUDIO_HOME="$(CDPATH= cd -P -- "$_studio_override" && pwd -P)" || exit 1
+else
+    STUDIO_HOME="$HOME/.unsloth/studio"
+fi
 VENV_DIR="$STUDIO_HOME/unsloth_studio"
 VENV_T5_530_DIR="$STUDIO_HOME/.venv_t5_530"
 VENV_T5_550_DIR="$STUDIO_HOME/.venv_t5_550"
@@ -555,7 +566,25 @@ fi
 fi
 
 # ── 7. Prefer prebuilt llama.cpp bundles before any source build path ──
-UNSLOTH_HOME="$HOME/.unsloth"
+# Nest llama.cpp under $STUDIO_HOME only for real env-overrides, never the
+# legacy default. Compare canonicalized paths so STUDIO_HOME (logical in
+# default mode, canonical in env mode) and the legacy side line up under
+# symlinked $HOME.
+_LEGACY_STUDIO_HOME="$HOME/.unsloth/studio"
+_studio_home_canon="$STUDIO_HOME"
+if [ -d "$_studio_home_canon" ]; then
+    _studio_home_canon=$(CDPATH= cd -P -- "$_studio_home_canon" 2>/dev/null && pwd -P) \
+        || _studio_home_canon="$STUDIO_HOME"
+fi
+if [ -d "$_LEGACY_STUDIO_HOME" ]; then
+    _LEGACY_STUDIO_HOME=$(CDPATH= cd -P -- "$_LEGACY_STUDIO_HOME" 2>/dev/null && pwd -P) \
+        || _LEGACY_STUDIO_HOME="$HOME/.unsloth/studio"
+fi
+if [ "$_studio_home_canon" = "$_LEGACY_STUDIO_HOME" ]; then
+    UNSLOTH_HOME="$HOME/.unsloth"
+else
+    UNSLOTH_HOME="$STUDIO_HOME"
+fi
 mkdir -p "$UNSLOTH_HOME"
 LLAMA_CPP_DIR="$UNSLOTH_HOME/llama.cpp"
 LLAMA_SERVER_BIN="$LLAMA_CPP_DIR/build/bin/llama-server"
