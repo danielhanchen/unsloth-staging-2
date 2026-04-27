@@ -3,6 +3,11 @@
 # Local:  Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass; .\install.ps1 --local
 # NoTorch: .\install.ps1 --no-torch  (skip PyTorch, GGUF-only mode)
 # Test:   .\install.ps1 --package roland-sloth
+#
+# Env vars (priority: UNSLOTH_STUDIO_HOME > USERPROFILE-redirect > default):
+#   UNSLOTH_STUDIO_HOME = path -> install under that path
+#   (DataDir nests inside; user PATH not modified persistently).
+# Default ($USERPROFILE\.unsloth\studio) is preserved when no env var is set.
 
 function Install-UnslothStudio {
     $ErrorActionPreference = "Stop"
@@ -61,7 +66,83 @@ function Install-UnslothStudio {
     }
 
     $PythonVersion = "3.13"
-    $StudioHome = Join-Path $env:USERPROFILE ".unsloth\studio"
+
+    # Resolve install destinations. Priority: UNSLOTH_STUDIO_HOME, then USERPROFILE-redirect, then default.
+    $envOverride = if ($env:UNSLOTH_STUDIO_HOME) { $env:UNSLOTH_STUDIO_HOME } else { $null }
+
+    # Custom Studio roots are not supported with --tauri (desktop app still
+    # resolves %USERPROFILE%\.unsloth\studio). Pass through if override == legacy.
+    if ($TauriMode -and $envOverride) {
+        $_tauriOverride = $envOverride
+        if ($_tauriOverride -eq "~" -or $_tauriOverride -like "~/*" -or $_tauriOverride -like "~\*") {
+            $_tauriOverride = (Join-Path $env:USERPROFILE $_tauriOverride.Substring(1).TrimStart('/','\'))
+        }
+        try {
+            $_tauriOverride = [System.IO.Path]::GetFullPath($_tauriOverride)
+        } catch {}
+        $_legacyTauriRoot = Join-Path $env:USERPROFILE ".unsloth\studio"
+        try {
+            $_legacyTauriRoot = [System.IO.Path]::GetFullPath($_legacyTauriRoot)
+        } catch {}
+        # Strip trailing separators so ".../studio\" matches ".../studio".
+        $_trimSeps = @(
+            [System.IO.Path]::DirectorySeparatorChar,
+            [System.IO.Path]::AltDirectorySeparatorChar
+        )
+        $_tauriOverride = $_tauriOverride.TrimEnd($_trimSeps)
+        $_legacyTauriRoot = $_legacyTauriRoot.TrimEnd($_trimSeps)
+        if ($_tauriOverride -ne $_legacyTauriRoot) {
+            Write-Host "ERROR: UNSLOTH_STUDIO_HOME is not supported with --tauri." -ForegroundColor Red
+            Write-Host "       The desktop app still uses the legacy %USERPROFILE%\.unsloth\studio root." -ForegroundColor Red
+            Write-Host "       Run install.ps1 without --tauri for custom-root shell installs," -ForegroundColor Yellow
+            Write-Host "       or unset the env var for default desktop installs." -ForegroundColor Yellow
+            throw "UNSLOTH_STUDIO_HOME is not supported with --tauri."
+        }
+    }
+
+    $defaultProfile = $null
+    try { $defaultProfile = [Environment]::GetFolderPath("UserProfile") } catch {}
+
+    # LOCALAPPDATA may be unset in service / CI contexts; Join-Path would abort
+    # under ErrorActionPreference=Stop without this guard.
+    $defaultDataDir = if ($env:LOCALAPPDATA -and -not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        Join-Path $env:LOCALAPPDATA "Unsloth Studio"
+    } else { $null }
+
+    if ($envOverride) {
+        # Tilde expansion: env vars aren't subject to it when quoted on assignment.
+        if ($envOverride -eq "~" -or $envOverride -like "~/*" -or $envOverride -like "~\*") {
+            $envOverride = (Join-Path $env:USERPROFILE $envOverride.Substring(1).TrimStart('/','\'))
+        }
+        try {
+            # .NET API: New-Item -Path treats brackets as wildcards and has no
+            # -LiteralPath in PS 5.1, so a root like C:\studio[abc] would fail.
+            [System.IO.Directory]::CreateDirectory($envOverride) | Out-Null
+            $StudioHome = (Resolve-Path -LiteralPath $envOverride).Path
+        } catch {
+            Write-Host "ERROR: UNSLOTH_STUDIO_HOME=$envOverride cannot be created or accessed." -ForegroundColor Red
+            throw "UNSLOTH_STUDIO_HOME=$envOverride cannot be created or accessed."
+        }
+        $probe = Join-Path $StudioHome (".unsloth-write-probe-" + [guid]::NewGuid())
+        try {
+            # WriteAllText: literal-path safe + closes handle so Remove-Item works.
+            [System.IO.File]::WriteAllText($probe, "")
+            Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Host "ERROR: UNSLOTH_STUDIO_HOME=$StudioHome is not writable." -ForegroundColor Red
+            throw "UNSLOTH_STUDIO_HOME=$StudioHome is not writable."
+        }
+        $StudioDataDir = Join-Path $StudioHome "share"
+        $StudioRedirectMode = 'env'
+    } elseif ($defaultProfile -and $env:USERPROFILE -and ($env:USERPROFILE -ne $defaultProfile)) {
+        $StudioHome = Join-Path $env:USERPROFILE ".unsloth\studio"
+        $StudioDataDir = $defaultDataDir
+        $StudioRedirectMode = 'profile'
+    } else {
+        $StudioHome = Join-Path $env:USERPROFILE ".unsloth\studio"
+        $StudioDataDir = $defaultDataDir
+        $StudioRedirectMode = 'default'
+    }
     $VenvDir = Join-Path $StudioHome "unsloth_studio"
 
     $Rule = [string]::new([char]0x2500, 52)
@@ -313,24 +394,24 @@ function Install-UnslothStudio {
             [Parameter(Mandatory = $true)][string]$UnslothExePath
         )
 
-        if (-not (Test-Path $UnslothExePath)) {
+        if (-not (Test-Path -LiteralPath $UnslothExePath)) {
             substep "cannot create shortcuts, unsloth.exe not found at $UnslothExePath" "Yellow"
             return
         }
         try {
             # Persist an absolute path in launcher scripts so shortcut working
             # directory changes do not break process startup.
-            $UnslothExePath = (Resolve-Path $UnslothExePath).Path
+            $UnslothExePath = (Resolve-Path -LiteralPath $UnslothExePath).Path
             # Escape for single-quoted embedding in generated launcher script.
             # This prevents runtime variable expansion for paths containing '$'.
             $SingleQuotedExePath = $UnslothExePath -replace "'", "''"
 
-            $localAppDataDir = $env:LOCALAPPDATA
-            if (-not $localAppDataDir -or [string]::IsNullOrWhiteSpace($localAppDataDir)) {
-                substep "LOCALAPPDATA path unavailable; skipped shortcut creation" "Yellow"
+            # $StudioDataDir = LOCALAPPDATA\Unsloth Studio, or $StudioHome\share in env-mode.
+            if (-not $StudioDataDir -or [string]::IsNullOrWhiteSpace($StudioDataDir)) {
+                substep "DataDir path unavailable; skipped shortcut creation" "Yellow"
                 return
             }
-            $appDir = Join-Path $localAppDataDir "Unsloth Studio"
+            $appDir = $StudioDataDir
             $launcherPs1 = Join-Path $appDir "launch-studio.ps1"
             $launcherVbs = Join-Path $appDir "launch-studio.vbs"
             $desktopDir = [Environment]::GetFolderPath("Desktop")
@@ -362,12 +443,34 @@ function Install-UnslothStudio {
             }
             $iconUrl = "https://raw.githubusercontent.com/unslothai/unsloth/main/studio/frontend/public/unsloth.ico"
 
-            if (-not (Test-Path $appDir)) {
-                New-Item -ItemType Directory -Path $appDir -Force | Out-Null
+            if (-not (Test-Path -LiteralPath $appDir)) {
+                [System.IO.Directory]::CreateDirectory($appDir) | Out-Null
             }
 
+            # Env-mode: persist UNSLOTH_STUDIO_HOME (and llama path) in the
+            # launcher so fresh shells don't need to re-export. Default installs
+            # get an empty prefix so behavior matches pre-PR exactly.
+            $studioHomeExport = if ($StudioRedirectMode -eq 'env') {
+                # When override == legacy default, llama.cpp stays at
+                # ~/.unsloth/llama.cpp (one shared build). Canonicalize the
+                # legacy side so the comparison survives path normalization.
+                $_legacyStudio = Join-Path $env:USERPROFILE ".unsloth\studio"
+                if (Test-Path -LiteralPath $_legacyStudio -PathType Container) {
+                    $_legacyStudio = (Resolve-Path -LiteralPath $_legacyStudio).Path
+                }
+                $_llamaPath = if ($StudioHome -eq $_legacyStudio) {
+                    Join-Path $env:USERPROFILE ".unsloth\llama.cpp"
+                } else {
+                    Join-Path $StudioHome "llama.cpp"
+                }
+                $_sq = $StudioHome -replace "'", "''"
+                $_llama = $_llamaPath -replace "'", "''"
+                # UNSLOTH_LLAMA_CPP_PATH is a pre-existing user override; only default if unset.
+                "`$env:UNSLOTH_STUDIO_HOME = '$_sq'`nif (-not `$env:UNSLOTH_LLAMA_CPP_PATH) {`n    `$env:UNSLOTH_LLAMA_CPP_PATH = '$_llama'`n}`n"
+            } else { "" }
+
             $launcherContent = @"
-`$ErrorActionPreference = 'Stop'
+$studioHomeExport`$ErrorActionPreference = 'Stop'
 `$basePort = 8888
 `$maxPortOffset = 20
 `$timeoutSec = 60
@@ -487,7 +590,9 @@ try {
         } catch {}
         exit 1
     }
-    `$studioCommand = '& "' + `$studioExe + '" studio -H 0.0.0.0 -p ' + `$launchPort
+    # Single-quote the path in the child -Command so `$` / backtick in custom
+    # roots don't get reparsed; double any apostrophes so 'O''Brien' survives.
+    `$studioCommand = "& '" + (`$studioExe -replace "'", "''") + "' studio -H 0.0.0.0 -p " + `$launchPort
     `$launchArgs = @(
         '-NoExit',
         '-NoProfile',
@@ -548,19 +653,19 @@ cmd = "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "
 shell.Run cmd, 0, False
 "@
             # WSH handles UTF-16LE reliably for .vbs files with non-ASCII paths.
-            Set-Content -Path $launcherVbs -Value $vbsContent -Encoding Unicode -Force
+            Set-Content -LiteralPath $launcherVbs -Value $vbsContent -Encoding Unicode -Force
 
             # Prefer bundled icon from local clone/dev installs.
             # If not available, best-effort download from raw GitHub.
             # We only attach the icon if the resulting file has a valid ICO header.
             $hasValidIcon = $false
-            if ($bundledIcon -and (Test-Path $bundledIcon)) {
+            if ($bundledIcon -and (Test-Path -LiteralPath $bundledIcon)) {
                 try {
-                    Copy-Item -Path $bundledIcon -Destination $iconPath -Force
+                    Copy-Item -LiteralPath $bundledIcon -Destination $iconPath -Force
                 } catch {
                     Write-Host "[DEBUG] Error copying bundled icon: $($_.Exception.Message)" -ForegroundColor DarkGray
                 }
-            } elseif (-not (Test-Path $iconPath)) {
+            } elseif (-not (Test-Path -LiteralPath $iconPath)) {
                 try {
                     Invoke-WebRequest -Uri $iconUrl -OutFile $iconPath -UseBasicParsing
                 } catch {
@@ -568,7 +673,7 @@ shell.Run cmd, 0, False
                 }
             }
 
-            if (Test-Path $iconPath) {
+            if (Test-Path -LiteralPath $iconPath) {
                 try {
                     $bytes = [System.IO.File]::ReadAllBytes($iconPath)
                     if (
@@ -580,12 +685,19 @@ shell.Run cmd, 0, False
                     ) {
                         $hasValidIcon = $true
                     } else {
-                        Remove-Item $iconPath -Force -ErrorAction SilentlyContinue
+                        Remove-Item -LiteralPath $iconPath -Force -ErrorAction SilentlyContinue
                     }
                 } catch {
                     Write-Host "[DEBUG] Error validating or removing icon: $($_.Exception.Message)" -ForegroundColor DarkGray
-                    Remove-Item $iconPath -Force -ErrorAction SilentlyContinue
+                    Remove-Item -LiteralPath $iconPath -Force -ErrorAction SilentlyContinue
                 }
+            }
+
+            # Env-mode: skip persistent Desktop / Start Menu .lnk shortcuts
+            # that may point at a deleted workspace; launcher + icon stay.
+            if ($StudioRedirectMode -eq 'env') {
+                substep "wrote launcher at $launcherPs1 (persistent shortcuts skipped in env-override mode)"
+                return
             }
 
             $wscriptExe = Join-Path $env:SystemRoot "System32\wscript.exe"
@@ -780,19 +892,25 @@ shell.Run cmd, 0, False
     # Pass the resolved executable path to uv so it does not re-resolve
     # a version string back to a conda interpreter.
     Write-TauriLog "STEP" "Creating virtual environment"
-    if (-not (Test-Path $StudioHome)) {
-        New-Item -ItemType Directory -Path $StudioHome -Force | Out-Null
+    if (-not (Test-Path -LiteralPath $StudioHome)) {
+        # .NET API: New-Item -Path treats brackets as wildcards.
+        [System.IO.Directory]::CreateDirectory($StudioHome) | Out-Null
     }
 
     $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
     $_Migrated = $false
 
-    if (Test-Path $VenvPython) {
+    if (Test-Path -LiteralPath $VenvPython) {
         # New layout already exists -- nuke for fresh install
         substep "removing existing environment for fresh install..."
-        Remove-Item -Recurse -Force $VenvDir
-    } elseif (Test-Path (Join-Path $StudioHome ".venv\Scripts\python.exe")) {
-        # Old layout (~/.unsloth/studio/.venv) exists -- validate before migrating
+        Remove-Item -LiteralPath $VenvDir -Recurse -Force
+    } elseif (
+        $StudioRedirectMode -ne 'env' `
+        -and (Test-Path -LiteralPath (Join-Path $StudioHome ".venv\Scripts\python.exe"))
+    ) {
+        # Old layout (~/.unsloth/studio/.venv) exists -- validate before migrating.
+        # Skip in env-mode so we don't blow away an unrelated .venv at the
+        # workspace root (e.g. user's existing project Python venv).
         $OldVenv = Join-Path $StudioHome ".venv"
         $OldPy = Join-Path $OldVenv "Scripts\python.exe"
         substep "found legacy Studio environment, validating..."
@@ -805,23 +923,28 @@ shell.Run cmd, 0, False
         $ErrorActionPreference = $prevEAP2
         if ($torchOk) {
             substep "legacy environment is healthy -- migrating..."
-            Move-Item -Path $OldVenv -Destination $VenvDir -Force
+            Move-Item -LiteralPath $OldVenv -Destination $VenvDir -Force
             substep "moved .venv -> unsloth_studio"
             $_Migrated = $true
         } else {
             substep "legacy environment failed validation -- creating fresh environment" "Yellow"
-            Remove-Item -Recurse -Force $OldVenv -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath $OldVenv -Recurse -Force -ErrorAction SilentlyContinue
         }
-    } elseif (Test-Path (Join-Path $env:USERPROFILE "unsloth_studio\Scripts\python.exe")) {
-        # CWD-relative venv from old install.ps1 -- migrate to absolute path
+    } elseif (
+        $StudioRedirectMode -ne 'env' `
+        -and (Test-Path -LiteralPath (Join-Path $env:USERPROFILE "unsloth_studio\Scripts\python.exe"))
+    ) {
+        # CWD-relative venv from old install.ps1 -> migrate to absolute path.
+        # Skip in env-mode so we don't relocate the default-install venv into
+        # the workspace root.
         $CwdVenv = Join-Path $env:USERPROFILE "unsloth_studio"
         substep "found CWD-relative Studio environment, migrating to $VenvDir..."
-        Move-Item -Path $CwdVenv -Destination $VenvDir -Force
+        Move-Item -LiteralPath $CwdVenv -Destination $VenvDir -Force
         substep "moved ~/unsloth_studio -> ~/.unsloth/studio/unsloth_studio"
         $_Migrated = $true
     }
 
-    if (-not (Test-Path $VenvPython)) {
+    if (-not (Test-Path -LiteralPath $VenvPython)) {
         step "venv" "creating Python $($DetectedPython.Version) virtual environment"
         substep "$VenvDir"
         $venvExit = Invoke-InstallCommand { uv venv $VenvDir --python "$($DetectedPython.Path)" }
@@ -920,7 +1043,7 @@ shell.Run cmd, 0, False
         if ($StudioLocalInstall -and (Test-Path (Join-Path $RepoRoot "studio\backend\requirements\no-torch-runtime.txt"))) {
             return Join-Path $RepoRoot "studio\backend\requirements\no-torch-runtime.txt"
         }
-        $installed = Get-ChildItem -Path $VenvDir -Recurse -Filter "no-torch-runtime.txt" -ErrorAction SilentlyContinue |
+        $installed = Get-ChildItem -LiteralPath $VenvDir -Recurse -Filter "no-torch-runtime.txt" -ErrorAction SilentlyContinue |
             Where-Object { $_.FullName -like "*studio*backend*requirements*no-torch-runtime.txt" } |
             Select-Object -ExpandProperty FullName -First 1
         return $installed
@@ -1062,7 +1185,7 @@ shell.Run cmd, 0, False
     Write-TauriLog "STEP" "Running studio setup"
     step "setup" "running unsloth studio setup..."
     $UnslothExe = Join-Path $VenvDir "Scripts\unsloth.exe"
-    if (-not (Test-Path $UnslothExe)) {
+    if (-not (Test-Path -LiteralPath $UnslothExe)) {
         Write-TauriLog "ERROR" "unsloth CLI was not installed correctly"
         Write-Host "[ERROR] unsloth CLI was not installed correctly." -ForegroundColor Red
         Write-Host "        Expected: $UnslothExe" -ForegroundColor Yellow
@@ -1088,10 +1211,27 @@ shell.Run cmd, 0, False
     # Use 'studio setup' (not 'studio update') because 'update' pops
     # SKIP_STUDIO_BASE, which would cause redundant package reinstallation
     # and bypass the fast-path version check from PR #4667.
+    # Propagate UNSLOTH_STUDIO_HOME only for env-override installs; otherwise
+    # an inherited value would put llama.cpp in the wrong place.
+    $previousUnslothStudioHome = $env:UNSLOTH_STUDIO_HOME
+    $hadPreviousUnslothStudioHome = ($null -ne $previousUnslothStudioHome)
+    if ($StudioRedirectMode -eq 'env') {
+        $env:UNSLOTH_STUDIO_HOME = $StudioHome
+    } else {
+        Remove-Item Env:UNSLOTH_STUDIO_HOME -ErrorAction SilentlyContinue
+    }
     $studioArgs = @('studio', 'setup')
     if ($script:UnslothVerbose) { $studioArgs += '--verbose' }
-    & $UnslothExe @studioArgs
-    $setupExit = $LASTEXITCODE
+    try {
+        & $UnslothExe @studioArgs
+        $setupExit = $LASTEXITCODE
+    } finally {
+        if ($hadPreviousUnslothStudioHome) {
+            $env:UNSLOTH_STUDIO_HOME = $previousUnslothStudioHome
+        } else {
+            Remove-Item Env:UNSLOTH_STUDIO_HOME -ErrorAction SilentlyContinue
+        }
+    }
     if ($setupExit -ne 0) {
         Write-TauriLog "ERROR" "unsloth studio setup failed (exit code $setupExit)"
         Write-Host "[ERROR] unsloth studio setup failed (exit code $setupExit)" -ForegroundColor Red
@@ -1135,20 +1275,31 @@ shell.Run cmd, 0, False
         }
     } catch { }
     $ShimDir = Join-Path $StudioHome "bin"
-    New-Item -ItemType Directory -Force -Path $ShimDir | Out-Null
+    [System.IO.Directory]::CreateDirectory($ShimDir) | Out-Null
     $ShimExe = Join-Path $ShimDir "unsloth.exe"
+    # Fatal preflight outside the lock-handling try/catch -- a directory at
+    # the shim path must not be downgraded to "Continuing with the existing
+    # launcher", or the install finishes with no usable shim.
+    if (Test-Path -LiteralPath $ShimExe -PathType Container) {
+        Write-Host "[ERROR] Cannot create unsloth launcher: $ShimExe is a directory." -ForegroundColor Red
+        Write-Host "        Move or remove it manually, then re-run the installer." -ForegroundColor Yellow
+        throw "Cannot create unsloth launcher: $ShimExe is a directory."
+    }
     # try/catch: if unsloth.exe is locked (Studio running), keep the old shim.
     $shimUpdated = $false
     try {
-        if (Test-Path $ShimExe) { Remove-Item $ShimExe -Force -ErrorAction Stop }
+        if (Test-Path -LiteralPath $ShimExe) { Remove-Item -LiteralPath $ShimExe -Force -ErrorAction Stop }
         try {
+            # New-Item -ItemType HardLink does NOT accept -LiteralPath in any
+            # PowerShell version, so use -Path. Bracket characters in $ShimExe
+            # are guarded by the directory-collision preflight earlier.
             New-Item -ItemType HardLink -Path $ShimExe -Target $UnslothExe -ErrorAction Stop | Out-Null
         } catch {
-            Copy-Item -Path $UnslothExe -Destination $ShimExe -Force -ErrorAction Stop # fallback: copy
+            Copy-Item -LiteralPath $UnslothExe -Destination $ShimExe -Force -ErrorAction Stop # fallback: copy
         }
         $shimUpdated = $true
     } catch {
-        if (Test-Path $ShimExe) {
+        if (Test-Path -LiteralPath $ShimExe) {
             Write-Host "[WARN] Could not refresh unsloth launcher at $ShimExe." -ForegroundColor Yellow
             Write-Host "       This usually means a running 'unsloth studio' process still holds the file open." -ForegroundColor Yellow
             Write-Host "       Close Studio and re-run the installer to pick up the latest launcher." -ForegroundColor Yellow
@@ -1159,15 +1310,25 @@ shell.Run cmd, 0, False
             Write-Host "       Launch unsloth studio directly via '$UnslothExe' until the next successful install." -ForegroundColor Yellow
         }
     }
-    # Only add to PATH when the launcher actually exists on disk.
+    # Add to PATH only when launcher exists. Env-mode: session-only export,
+    # no registry change (workspace path may be deleted later).
     $pathAdded = $false
-    if (Test-Path $ShimExe) {
-        $pathAdded = Add-ToUserPath -Directory $ShimDir -Position 'Prepend'
+    if (Test-Path -LiteralPath $ShimExe) {
+        if ($StudioRedirectMode -ne 'env') {
+            $pathAdded = Add-ToUserPath -Directory $ShimDir -Position 'Prepend'
+        }
     }
     if ($shimUpdated -and $pathAdded) {
         step "path" "added unsloth launcher to PATH"
     }
     Refresh-SessionPath  # sync current session with registry
+
+    # Env-mode session export AFTER Refresh-SessionPath; otherwise a legacy
+    # User PATH entry (Machine > User > current $env:Path) would win.
+    if ($StudioRedirectMode -eq 'env' -and (Test-Path -LiteralPath $ShimExe)) {
+        $env:Path = "$ShimDir;$env:Path"
+        step "path" "exported $ShimDir for this session (no registry PATH change in env-override mode)"
+    }
 
     # ── Tauri mode: done, skip shortcuts and auto-launch ──
     if ($TauriMode) {
@@ -1175,6 +1336,7 @@ shell.Run cmd, 0, False
         return
     }
 
+    # New-StudioShortcuts gates the .lnk shortcuts on env-mode internally.
     New-StudioShortcuts -UnslothExePath $UnslothExe
 
     # Launch studio automatically in interactive terminals;
@@ -1184,8 +1346,21 @@ shell.Run cmd, 0, False
         & $UnslothExe studio -H 0.0.0.0 -p 8888
     } else {
         step "launch" "manual commands:"
-        substep "& `"$VenvDir\Scripts\Activate.ps1`""
-        substep "unsloth studio -H 0.0.0.0 -p 8888"
+        # Single-quote the printed paths so $-vars / backticks in custom roots
+        # do not reparse when the user pastes the command.
+        $_actLiteral = "'" + ((Join-Path $VenvDir "Scripts\Activate.ps1") -replace "'", "''") + "'"
+        if ($StudioRedirectMode -eq 'env') {
+            # Env-mode skips registry PATH; print the absolute shim path.
+            $_shim = Join-Path $StudioHome "bin\unsloth.exe"
+            $_shimLiteral = "'" + ($_shim -replace "'", "''") + "'"
+            substep "& $_shimLiteral studio -H 0.0.0.0 -p 8888"
+            substep "or activate env first:"
+            substep "& $_actLiteral"
+            substep "unsloth studio -H 0.0.0.0 -p 8888"
+        } else {
+            substep "& $_actLiteral"
+            substep "unsloth studio -H 0.0.0.0 -p 8888"
+        }
         Write-Host ""
     }
 }
