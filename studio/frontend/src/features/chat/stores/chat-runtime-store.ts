@@ -9,10 +9,6 @@ import {
   type ChatModelSummary,
   type InferenceParams,
 } from "../types/runtime";
-import {
-  getPresetSource,
-  type ChatPresetSource,
-} from "../presets/preset-policy";
 
 const AUTO_TITLE_KEY = "unsloth_chat_auto_title";
 const AUTO_HEAL_TOOL_CALLS_KEY = "unsloth_auto_heal_tool_calls";
@@ -20,8 +16,6 @@ const MAX_TOOL_CALLS_KEY = "unsloth_max_tool_calls_per_message";
 const TOOL_CALL_TIMEOUT_KEY = "unsloth_tool_call_timeout";
 const HF_TOKEN_KEY = "unsloth_hf_token";
 const INFERENCE_PARAMS_KEY = "unsloth_chat_inference_params";
-const CHAT_ACTIVE_PRESET_KEY = "unsloth_chat_active_preset";
-const CHAT_ACTIVE_PRESET_SOURCE_KEY = "unsloth_chat_active_preset_source";
 const REASONING_EFFORT_KEY = "unsloth_reasoning_effort";
 const PRESERVE_THINKING_KEY = "unsloth_preserve_thinking";
 
@@ -163,24 +157,8 @@ function saveInferenceParams(params: InferenceParams): boolean {
   }
 }
 
-function loadPresetSource(): ChatPresetSource {
-  const activePreset = loadString(CHAT_ACTIVE_PRESET_KEY, "Default");
-  if (canUseStorage()) {
-    try {
-      const raw = localStorage.getItem(CHAT_ACTIVE_PRESET_SOURCE_KEY);
-      if (raw === "modified") {
-        return "modified";
-      }
-    } catch {
-      // ignore
-    }
-  }
-  return getPresetSource(activePreset);
-}
-
 type ChatRuntimeStore = {
   params: InferenceParams;
-  activePresetSource: ChatPresetSource;
   models: ChatModelSummary[];
   loras: ChatLoraSummary[];
   runningByThreadId: Record<string, boolean>;
@@ -226,11 +204,9 @@ type ChatRuntimeStore = {
     cachedTokens: number;
   } | null;
   modelLoading: boolean;
-  activeNativePathToken: string | null;
   setModelLoading: (loading: boolean) => void;
   setModelRequiresTrustRemoteCode: (required: boolean) => void;
   setParams: (params: InferenceParams) => void;
-  setActivePresetSource: (source: ChatPresetSource) => void;
   setModels: (models: ChatModelSummary[]) => void;
   setLoras: (loras: ChatLoraSummary[]) => void;
   setThreadRunning: (threadId: string, running: boolean) => void;
@@ -265,7 +241,6 @@ type ChatRuntimeStore = {
 
 export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   params: loadInferenceParams(),
-  activePresetSource: loadPresetSource(),
   models: [],
   loras: [],
   runningByThreadId: {},
@@ -306,7 +281,6 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   pendingAudioName: null,
   contextUsage: null,
   modelLoading: false,
-  activeNativePathToken: null,
   setModelLoading: (loading) => set({ modelLoading: loading }),
   setModelRequiresTrustRemoteCode: (modelRequiresTrustRemoteCode) =>
     set({ modelRequiresTrustRemoteCode }),
@@ -321,11 +295,6 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
         });
       }
       return { params };
-    }),
-  setActivePresetSource: (activePresetSource) =>
-    set(() => {
-      saveString(CHAT_ACTIVE_PRESET_SOURCE_KEY, activePresetSource);
-      return { activePresetSource };
     }),
   setModels: (models) => set({ models }),
   setLoras: (loras) => set({ loras }),
@@ -380,7 +349,6 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
         checkpoint: "",
       },
       activeGgufVariant: null,
-      activeNativePathToken: null,
       ggufContextLength: null,
       ggufMaxContextLength: null,
       ggufNativeContextLength: null,
