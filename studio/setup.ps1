@@ -1145,28 +1145,59 @@ if ($IsPipInstall) {
     }
 }
 
-# ============================================
-# 1g. Python (>= 3.11 and < 3.14, matching setup.sh)
-# ============================================
+# 1g. Python (>= 3.11 and < 3.14). Prefer py.exe so a 3.14 ahead of 3.13 on PATH does not trip the gate.
 $HasPython = $null -ne (Get-Command python -ErrorAction SilentlyContinue)
+$PyLauncher = Get-Command py -CommandType Application -ErrorAction SilentlyContinue
 $PythonOk = $false
+$DetectedPyVer = $null
 
-if ($HasPython) {
-    $PyVer = python --version 2>&1
+if ($PyLauncher) {
+    foreach ($minor in @("3.13", "3.12", "3.11")) {
+        try {
+            $out = & $PyLauncher.Source "-$minor" --version 2>&1 | Out-String
+            if ($out -match 'Python (3\.\d+\.\d+)') {
+                $DetectedPyVer = $Matches[1]
+                # Resolve and prepend the interpreter dir so bare `python`
+                # downstream uses the supported minor (not e.g. a 3.14 ahead
+                # of it on PATH). Quote-trim makes dedupe match quoted entries.
+                try {
+                    $resolvedExe = (& $PyLauncher.Source "-$minor" -c "import sys; print(sys.executable)" 2>$null | Select-Object -First 1)
+                    if ($resolvedExe -and (Test-Path $resolvedExe)) {
+                        $resolvedDir = Split-Path -Parent $resolvedExe
+                        $resolvedNorm = $resolvedDir.Trim().Trim('"').TrimEnd('\')
+                        $filtered = @($env:PATH -split ';' | Where-Object {
+                            ($_.Trim().Trim('"').TrimEnd('\')) -ine $resolvedNorm
+                        })
+                        $env:PATH = (@($resolvedDir) + $filtered) -join ';'
+                        $HasPython = $true
+                        # why safe: only set PythonOk after the interpreter is
+                        # proven reachable; otherwise fall through to next minor.
+                        $PythonOk = $true
+                        break
+                    }
+                } catch { }
+            }
+        } catch { }
+    }
+}
+
+if (-not $PythonOk -and $HasPython) {
+    $PyVer = (python --version 2>&1 | Out-String).Trim()
     if ($PyVer -match "(\d+)\.(\d+)") {
         $PyMajor = [int]$Matches[1]; $PyMinor = [int]$Matches[2]
         if ($PyMajor -eq 3 -and $PyMinor -ge 11 -and $PyMinor -lt 14) {
-            substep "Python $PyVer"
+            $DetectedPyVer = ($PyVer -replace '^Python\s+', '').Trim()
             $PythonOk = $true
-        } else {
-            Write-Host "[ERROR] Python $PyVer is outside supported range (need >= 3.11 and < 3.14)." -ForegroundColor Red
-            Write-Host "        Install Python 3.12 from https://python.org/downloads/" -ForegroundColor Yellow
-            exit 1
         }
     }
-} else {
-    # No Python at all -- install 3.12
-    Write-Host "Python not found -- installing Python 3.12 via winget..." -ForegroundColor Yellow
+}
+
+if ($PythonOk) {
+    substep "Python $DetectedPyVer"
+} elseif (-not $HasPython) {
+    # No `python` on PATH; gate on $HasPython only so a py.exe-only install
+    # with just 3.14 still falls through to winget instead of hard-failing.
+    Write-Host "Python 3.11-3.13 not found -- installing Python 3.12 via winget..." -ForegroundColor Yellow
     $HasWinget = $null -ne (Get-Command winget -ErrorAction SilentlyContinue)
     if ($HasWinget) {
         winget install -e --id Python.Python.3.12 --source winget --accept-package-agreements --accept-source-agreements
@@ -1178,8 +1209,14 @@ if ($HasPython) {
         Write-Host "        Install Python 3.12 from https://python.org/downloads/" -ForegroundColor Yellow
         exit 1
     }
-    step "python" "$(python --version 2>&1)"
+    step "python" "$((python --version 2>&1 | Out-String).Trim())"
     $PythonOk = $true
+} else {
+    # python on PATH is unsupported and py.exe had no supported minor.
+    Write-Host "[ERROR] No supported Python (3.11-3.13) found on this system." -ForegroundColor Red
+    Write-Host "        py.exe could not locate -3.11/-3.12/-3.13 and `python` on PATH is unsupported." -ForegroundColor Yellow
+    Write-Host "        Install Python 3.12 from https://python.org/downloads/" -ForegroundColor Yellow
+    exit 1
 }
 
 # Add user-scheme Python Scripts dir to PATH (nt_user only, no venv fallback).

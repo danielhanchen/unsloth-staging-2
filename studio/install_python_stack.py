@@ -359,6 +359,38 @@ def _ensure_rocm_torch() -> None:
             )
 
 
+_UV_SAFE_PATH_WARNED: set[str] = set()
+
+
+def _uv_safe_path(path: object) -> str:
+    # uv 0.11.x: `-c <path with space>` truncates at the space; use 8.3 short form.
+    s = str(path)
+    if not IS_WINDOWS or " " not in s:
+        return s
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        get_short = ctypes.windll.kernel32.GetShortPathNameW
+        get_short.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        get_short.restype = wintypes.DWORD
+        buf = ctypes.create_unicode_buffer(32768)
+        rc = get_short(s, buf, 32768)
+        if 0 < rc < 32768 and " " not in buf.value:
+            return buf.value
+    except Exception:
+        pass
+    # 8.3 short-name generation may be disabled on the volume; warn once per
+    # path so users know uv may truncate the argument at the first space.
+    if s not in _UV_SAFE_PATH_WARNED:
+        _UV_SAFE_PATH_WARNED.add(s)
+        sys.stderr.write(
+            f"[WARN] uv path still contains spaces; uv may truncate at the space: {s!r}\n"
+            "       8.3 short-name generation may be disabled on this volume.\n"
+        )
+    return s
+
+
 def _windows_hidden_subprocess_kwargs() -> dict[str, object]:
     """Return Windows-only subprocess kwargs that suppress console windows."""
     if not IS_WINDOWS:
@@ -751,14 +783,16 @@ def pip_install_try(
     """Like pip_install but returns False on failure instead of exiting.
     For optional installs with a follow-up fallback.
     """
-    constraint_args: list[str] = []
+    constraint_args_pip: list[str] = []
+    constraint_args_uv: list[str] = []
     if constrain and CONSTRAINTS.is_file():
-        constraint_args = ["-c", str(CONSTRAINTS)]
+        constraint_args_pip = ["-c", str(CONSTRAINTS)]
+        constraint_args_uv = ["-c", _uv_safe_path(CONSTRAINTS)]
 
     if USE_UV:
-        cmd = _build_uv_cmd(args) + constraint_args
+        cmd = _build_uv_cmd(args) + constraint_args_uv
     else:
-        cmd = _build_pip_cmd(args) + constraint_args
+        cmd = _build_pip_cmd(args) + constraint_args_pip
 
     if VERBOSE:
         _step(_LABEL, f"{label}...", _dim)
@@ -781,9 +815,11 @@ def pip_install(
     constrain: bool = True,
 ) -> None:
     """Build and run a pip install command (uses uv when available, falls back to pip)."""
-    constraint_args: list[str] = []
+    constraint_args_pip: list[str] = []
+    constraint_args_uv: list[str] = []
     if constrain and CONSTRAINTS.is_file():
-        constraint_args = ["-c", str(CONSTRAINTS)]
+        constraint_args_pip = ["-c", str(CONSTRAINTS)]
+        constraint_args_uv = ["-c", _uv_safe_path(CONSTRAINTS)]
 
     actual_req = req
     temp_reqs: list[Path] = []
@@ -793,13 +829,15 @@ def pip_install(
     if actual_req is not None and NO_TORCH and NO_TORCH_SKIP_PACKAGES:
         actual_req = _filter_requirements(actual_req, NO_TORCH_SKIP_PACKAGES)
         temp_reqs.append(actual_req)
-    req_args: list[str] = []
+    req_args_pip: list[str] = []
+    req_args_uv: list[str] = []
     if actual_req is not None:
-        req_args = ["-r", str(actual_req)]
+        req_args_pip = ["-r", str(actual_req)]
+        req_args_uv = ["-r", _uv_safe_path(actual_req)]
 
     try:
         if USE_UV:
-            uv_cmd = _build_uv_cmd(args) + constraint_args + req_args
+            uv_cmd = _build_uv_cmd(args) + constraint_args_uv + req_args_uv
             if VERBOSE:
                 print(f"   {label}...")
             result = subprocess.run(
@@ -814,7 +852,7 @@ def pip_install(
             if result.stdout:
                 print(result.stdout.decode(errors = "replace"))
 
-        pip_cmd = _build_pip_cmd(args) + constraint_args + req_args
+        pip_cmd = _build_pip_cmd(args) + constraint_args_pip + req_args_pip
         run(f"{label} (pip)" if USE_UV else label, pip_cmd)
     finally:
         for temp_req in temp_reqs:
