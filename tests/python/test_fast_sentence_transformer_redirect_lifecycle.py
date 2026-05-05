@@ -44,18 +44,18 @@ class _RaisingTransformer:
         raise RuntimeError("simulated init failure")
 
 
-def _build_driver(transformer_class):
+def _build_driver(transformer_class, monkeypatch):
     transformers_mod = types.ModuleType("transformers")
     transformers_mod.AutoModel = _FakeAuto("AutoModel")
     transformers_mod.AutoProcessor = _FakeAuto("AutoProcessor")
     transformers_mod.AutoTokenizer = _FakeAuto("AutoTokenizer")
-    sys.modules["transformers"] = transformers_mod
+    monkeypatch.setitem(sys.modules, "transformers", transformers_mod)
 
     st_root = types.ModuleType("sentence_transformers")
     st_models = types.ModuleType("sentence_transformers.models")
     st_models.Transformer = transformer_class
-    sys.modules["sentence_transformers"] = st_root
-    sys.modules["sentence_transformers.models"] = st_models
+    monkeypatch.setitem(sys.modules, "sentence_transformers", st_root)
+    monkeypatch.setitem(sys.modules, "sentence_transformers.models", st_models)
 
     captured = {"calls": None}
 
@@ -123,8 +123,8 @@ def _build_driver(transformer_class):
     return driver, transformers_mod, captured
 
 
-def test_redirect_substitutes_preloaded_objects_on_match():
-    driver, _mod, captured = _build_driver(_RecordingTransformerOk)
+def test_redirect_substitutes_preloaded_objects_on_match(monkeypatch):
+    driver, _mod, captured = _build_driver(_RecordingTransformerOk, monkeypatch)
     sentinel_model = object()
     sentinel_tok = object()
     driver("sentence-transformers/all-MiniLM-L6-v2", sentinel_model, sentinel_tok)
@@ -134,8 +134,8 @@ def test_redirect_substitutes_preloaded_objects_on_match():
     assert calls["tokenizer"] is sentinel_tok
 
 
-def test_redirect_restored_on_constructor_exception():
-    driver, transformers_mod, _ = _build_driver(_RaisingTransformer)
+def test_redirect_restored_on_constructor_exception(monkeypatch):
+    driver, transformers_mod, _ = _build_driver(_RaisingTransformer, monkeypatch)
     pre_model = transformers_mod.AutoModel.from_pretrained
     pre_processor = transformers_mod.AutoProcessor.from_pretrained
     pre_tokenizer = transformers_mod.AutoTokenizer.from_pretrained
@@ -150,7 +150,7 @@ def test_redirect_restored_on_constructor_exception():
     assert transformers_mod.AutoTokenizer.from_pretrained is pre_tokenizer
 
 
-def test_redirect_passes_through_for_other_model_names():
+def test_redirect_passes_through_for_other_model_names(monkeypatch):
     class _OtherNameTransformer:
         captured = None
 
@@ -159,7 +159,7 @@ def test_redirect_passes_through_for_other_model_names():
 
             type(self).captured = AutoModel.from_pretrained("some-other/aux-model")
 
-    driver, *_ = _build_driver(_OtherNameTransformer)
+    driver, *_ = _build_driver(_OtherNameTransformer, monkeypatch)
     sentinel = object()
     driver("primary/model-id", sentinel, object())
     assert _OtherNameTransformer.captured is not sentinel
@@ -167,7 +167,7 @@ def test_redirect_passes_through_for_other_model_names():
     assert _OtherNameTransformer.captured[0] == "orig"
 
 
-def test_is_requested_model_name_handles_pathlib_path(tmp_path):
+def test_is_requested_model_name_handles_pathlib_path(tmp_path, monkeypatch):
     target = tmp_path / "model_dir"
     target.mkdir()
 
@@ -179,13 +179,13 @@ def test_is_requested_model_name_handles_pathlib_path(tmp_path):
 
             type(self).last_calls = AutoModel.from_pretrained(pathlib.Path(model_name))
 
-    driver, *_ = _build_driver(_PathTransformer)
+    driver, *_ = _build_driver(_PathTransformer, monkeypatch)
     sentinel_model = object()
     driver(str(target), sentinel_model, object())
     assert _PathTransformer.last_calls is sentinel_model
 
 
-def test_is_requested_model_name_trailing_slash_local_path(tmp_path):
+def test_is_requested_model_name_trailing_slash_local_path(tmp_path, monkeypatch):
     target = tmp_path / "model_dir"
     target.mkdir()
 
@@ -197,13 +197,13 @@ def test_is_requested_model_name_trailing_slash_local_path(tmp_path):
 
             type(self).last_calls = AutoModel.from_pretrained(str(target) + "/")
 
-    driver, *_ = _build_driver(_SlashTransformer)
+    driver, *_ = _build_driver(_SlashTransformer, monkeypatch)
     sentinel_model = object()
     driver(str(target), sentinel_model, object())
     assert _SlashTransformer.last_calls is sentinel_model
 
 
-def test_is_requested_model_name_returns_false_when_no_identifier():
+def test_is_requested_model_name_returns_false_when_no_identifier(monkeypatch):
     captured = {"args": None}
 
     class _NoNameTransformer:
@@ -212,7 +212,7 @@ def test_is_requested_model_name_returns_false_when_no_identifier():
 
             captured["args"] = AutoModel.from_pretrained(some_other_kwarg = "x")
 
-    driver, *_ = _build_driver(_NoNameTransformer)
+    driver, *_ = _build_driver(_NoNameTransformer, monkeypatch)
     driver("primary/model-id", object(), object())
     assert isinstance(captured["args"], tuple)
     assert captured["args"][0] == "orig"
