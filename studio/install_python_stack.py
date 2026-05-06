@@ -21,6 +21,10 @@ import tempfile
 import urllib.request
 from pathlib import Path
 
+_BACKEND_DIR = Path(__file__).resolve().parent / "backend"
+if str(_BACKEND_DIR) not in sys.path:
+    sys.path.insert(1, str(_BACKEND_DIR))
+
 from backend.utils.wheel_utils import (
     flash_attn_package_version,
     flash_attn_wheel_url,
@@ -357,6 +361,27 @@ def _ensure_rocm_torch() -> None:
                 _BNB_ROCM_PYPI_FALLBACK,
                 constrain = False,
             )
+
+
+def _uv_safe_path(path: object) -> str:
+    # uv 0.11.x: `-c <path with space>` truncates at the space; use 8.3 short form.
+    s = str(path)
+    if not IS_WINDOWS or " " not in s:
+        return s
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        get_short = ctypes.windll.kernel32.GetShortPathNameW
+        get_short.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        get_short.restype = wintypes.DWORD
+        buf = ctypes.create_unicode_buffer(32768)
+        rc = get_short(s, buf, 32768)
+        if 0 < rc < 32768 and " " not in buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return s
 
 
 def _windows_hidden_subprocess_kwargs() -> dict[str, object]:
@@ -751,14 +776,16 @@ def pip_install_try(
     """Like pip_install but returns False on failure instead of exiting.
     For optional installs with a follow-up fallback.
     """
-    constraint_args: list[str] = []
+    constraint_args_pip: list[str] = []
+    constraint_args_uv: list[str] = []
     if constrain and CONSTRAINTS.is_file():
-        constraint_args = ["-c", str(CONSTRAINTS)]
+        constraint_args_pip = ["-c", str(CONSTRAINTS)]
+        constraint_args_uv = ["-c", _uv_safe_path(CONSTRAINTS)]
 
     if USE_UV:
-        cmd = _build_uv_cmd(args) + constraint_args
+        cmd = _build_uv_cmd(args) + constraint_args_uv
     else:
-        cmd = _build_pip_cmd(args) + constraint_args
+        cmd = _build_pip_cmd(args) + constraint_args_pip
 
     if VERBOSE:
         _step(_LABEL, f"{label}...", _dim)
@@ -781,9 +808,11 @@ def pip_install(
     constrain: bool = True,
 ) -> None:
     """Build and run a pip install command (uses uv when available, falls back to pip)."""
-    constraint_args: list[str] = []
+    constraint_args_pip: list[str] = []
+    constraint_args_uv: list[str] = []
     if constrain and CONSTRAINTS.is_file():
-        constraint_args = ["-c", str(CONSTRAINTS)]
+        constraint_args_pip = ["-c", str(CONSTRAINTS)]
+        constraint_args_uv = ["-c", _uv_safe_path(CONSTRAINTS)]
 
     actual_req = req
     temp_reqs: list[Path] = []
@@ -793,13 +822,15 @@ def pip_install(
     if actual_req is not None and NO_TORCH and NO_TORCH_SKIP_PACKAGES:
         actual_req = _filter_requirements(actual_req, NO_TORCH_SKIP_PACKAGES)
         temp_reqs.append(actual_req)
-    req_args: list[str] = []
+    req_args_pip: list[str] = []
+    req_args_uv: list[str] = []
     if actual_req is not None:
-        req_args = ["-r", str(actual_req)]
+        req_args_pip = ["-r", str(actual_req)]
+        req_args_uv = ["-r", _uv_safe_path(actual_req)]
 
     try:
         if USE_UV:
-            uv_cmd = _build_uv_cmd(args) + constraint_args + req_args
+            uv_cmd = _build_uv_cmd(args) + constraint_args_uv + req_args_uv
             if VERBOSE:
                 print(f"   {label}...")
             result = subprocess.run(
@@ -814,7 +845,7 @@ def pip_install(
             if result.stdout:
                 print(result.stdout.decode(errors = "replace"))
 
-        pip_cmd = _build_pip_cmd(args) + constraint_args + req_args
+        pip_cmd = _build_pip_cmd(args) + constraint_args_pip + req_args_pip
         run(f"{label} (pip)" if USE_UV else label, pip_cmd)
     finally:
         for temp_req in temp_reqs:
@@ -945,12 +976,22 @@ def install_python_stack() -> int:
             req = REQ_ROOT / "no-torch-runtime.txt",
         )
         if local_repo:
+            _step(_LABEL, f"overlaying local repo (editable): {local_repo}")
             pip_install(
                 "Overlaying local repo (editable)",
                 "--no-cache-dir",
                 "--no-deps",
                 "-e",
                 local_repo,
+                constrain = False,
+            )
+            _step(_LABEL, "overlaying unsloth-zoo from git main")
+            pip_install(
+                "Overlaying unsloth-zoo from git main",
+                "--no-cache-dir",
+                "--no-deps",
+                "--force-reinstall",
+                "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo",
                 constrain = False,
             )
     elif local_repo:
@@ -967,12 +1008,22 @@ def install_python_stack() -> int:
             "unsloth-zoo",
             req = REQ_ROOT / "base.txt",
         )
+        _step(_LABEL, f"overlaying local repo (editable): {local_repo}")
         pip_install(
             "Overlaying local repo (editable)",
             "--no-cache-dir",
             "--no-deps",
             "-e",
             local_repo,
+            constrain = False,
+        )
+        _step(_LABEL, "overlaying unsloth-zoo from git main")
+        pip_install(
+            "Overlaying unsloth-zoo from git main",
+            "--no-cache-dir",
+            "--no-deps",
+            "--force-reinstall",
+            "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo",
             constrain = False,
         )
     elif package_name != "unsloth":
