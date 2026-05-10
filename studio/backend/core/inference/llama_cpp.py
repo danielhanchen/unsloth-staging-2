@@ -439,6 +439,7 @@ class LlamaCppBackend:
         self._effective_context_length: Optional[int] = None
         self._max_context_length: Optional[int] = None
         self._chat_template: Optional[str] = None
+        self._chat_template_override: Optional[str] = None
         self._supports_reasoning: bool = False
         self._reasoning_always_on: bool = False
         self._reasoning_style: str = "enable_thinking"
@@ -622,6 +623,10 @@ class LlamaCppBackend:
     @property
     def chat_template(self) -> Optional[str]:
         return self._chat_template
+
+    @property
+    def chat_template_override(self) -> Optional[str]:
+        return self._chat_template_override
 
     @property
     def supports_reasoning(self) -> bool:
@@ -2249,12 +2254,12 @@ class LlamaCppBackend:
                 self._speculative_type = None
 
             # Apply custom chat template override if provided
+            self._chat_template_override = chat_template_override
             if chat_template_override:
                 import tempfile
 
-                self._chat_template = chat_template_override
                 flags = detect_reasoning_flags(
-                    self._chat_template,
+                    chat_template_override,
                     self._model_identifier,
                     log_source = "GGUF chat template override",
                 )
@@ -2595,6 +2600,7 @@ class LlamaCppBackend:
             self._effective_context_length = None
             self._max_context_length = None
             self._chat_template = None
+            self._chat_template_override = None
             self._supports_reasoning = False
             self._reasoning_always_on = False
             self._reasoning_style = "enable_thinking"
@@ -4281,6 +4287,8 @@ class LlamaCppBackend:
                     return "csm"
                 if len(_tok("<|startoftranscript|>")) == 1:
                     return "whisper"
+                if len(_tok("<audio_soft_token>")) == 1:
+                    return "audio_vlm"
                 if (
                     len(_tok("<|bicodec_semantic_0|>")) == 1
                     and len(_tok("<|bicodec_global_0|>")) == 1
