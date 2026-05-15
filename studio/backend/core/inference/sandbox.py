@@ -57,15 +57,10 @@ def _macos_probe() -> bool:
 
 
 def _linux_probe() -> bool:
-    """Smoke-test that ``bwrap`` can actually apply a minimal sandbox here.
+    """Smoke-test that ``bwrap`` can apply a minimal sandbox here.
 
-    On Ubuntu 24.04+ ``bwrap`` ships an AppArmor profile that grants the
-    unprivileged-user-namespace carve-out, but if the profile is not
-    loaded (custom kernel, container without the apt package's
-    post-install hook) ``bwrap`` fails with "Creating new namespace
-    failed: Permission denied". On older distros without the
-    ``kernel.unprivileged_userns_clone=1`` sysctl the same thing
-    happens. This probe catches both at startup.
+    Catches the cases where the kernel refuses to create unprivileged
+    user namespaces — surfacing at startup instead of first use.
     """
     return _probe(
         [
@@ -84,14 +79,10 @@ def _linux_probe() -> bool:
 def sandbox_available() -> bool:
     """True iff the platform's sandbox can be applied in this process context.
 
-    Existence of the binary alone is not enough: a Tauri-shipped or
-    otherwise nested-sandboxed parent may have ``sandbox-exec`` /
-    ``bwrap`` present but be unable to apply additional policies. We
-    confirm by spawning a no-op sandboxed ``/usr/bin/true`` once at
-    first call and caching the result. Subsequent calls are O(1).
-
-    Logs once on the first call so operators can see in startup logs
-    whether tool execution will be sandboxed.
+    Existence of the binary alone is not enough: a nested-sandboxed
+    parent may have ``sandbox-exec`` / ``bwrap`` present but be unable
+    to apply additional policies. Confirm by spawning a no-op sandboxed
+    ``/usr/bin/true`` once at first call and caching the result.
     """
     global _sandbox_available_cache
     if _sandbox_available_cache is not None:
@@ -119,10 +110,9 @@ def _safe_subpath(p: str) -> str:
     """Reject paths that cannot be safely embedded in a Seatbelt literal.
 
     Seatbelt string literals use ``"..."`` with ``\\`` escapes; a path
-    containing ``"``, ``\\``, a newline, or a NUL byte cannot be embedded
-    without risking a parser-level injection or a broken profile that
-    fails open. macOS paths in practice contain none of these, so
-    rejecting them loudly is safer than escaping.
+    containing ``"``, ``\\``, a newline, or a NUL byte could close the
+    string and inject Scheme into the profile. macOS paths in practice
+    contain none of these, so rejecting them is safer than escaping.
     """
     if any(c in p for c in ('"', "\\", "\n", "\r", "\x00")):
         raise ValueError(f"path unsafe for Seatbelt profile: {p!r}")
@@ -324,7 +314,7 @@ def _linux_bwrap_argv(inner_argv: list[str], workdir: str) -> list[str]:
         "bwrap",
         "--die-with-parent",
         "--new-session",
-        "--unshare-all",  # net, pid, ipc, uts, cgroup, user
+        "--unshare-all",
         "--proc",
         "/proc",
         "--dev",
@@ -353,9 +343,8 @@ def _linux_bwrap_argv(inner_argv: list[str], workdir: str) -> list[str]:
         args.extend(["--ro-bind-try", rp, rp])
 
     # Bind exec-chain symlinks whose parent isn't already covered by
-    # an existing bind — binding into a read-only mount fails with
-    # "Can't create file..."; symlinks under an existing bind are
-    # already reachable via path inheritance.
+    # an existing bind — binding into a read-only mount fails; symlinks
+    # under an existing bind are already reachable via path inheritance.
     bind_flags = ("--ro-bind", "--ro-bind-try", "--bind", "--bind-try")
     bound_dests = [
         args[i + 2]
