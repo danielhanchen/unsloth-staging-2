@@ -24,7 +24,10 @@ if str(backend_dir) not in sys.path:
 import _platform_compat  # noqa: F401
 
 from loggers import get_logger
-from startup_banner import print_studio_access_banner
+from startup_banner import (
+    print_sandbox_unavailable_notice,
+    print_studio_access_banner,
+)
 
 logger = get_logger(__name__)
 
@@ -426,6 +429,10 @@ def run_server(
         print(f"TAURI_PORT={port}", flush = True)
 
     if not silent:
+        from core.inference.sandbox import sandbox_available
+
+        if not sandbox_available():
+            print_sandbox_unavailable_notice()
         display_host = _resolve_external_ip() if host == "0.0.0.0" else host
         print_studio_access_banner(
             port = port,
