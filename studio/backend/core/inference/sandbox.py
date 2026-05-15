@@ -6,6 +6,7 @@ OS-level sandbox wrapper for tool execution.
 """
 
 import os
+import shutil
 import site
 import subprocess
 import sys
@@ -18,6 +19,11 @@ _SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 _BWRAP_PROBE_BIN = "/usr/bin/true"
 
 _sandbox_available_cache: bool | None = None
+# Absolute path to ``bwrap``, resolved once at probe time so the runtime
+# sandbox argv doesn't depend on the child's PATH (``_build_safe_env``
+# strips PATH down to a fixed allow-list that won't cover Nix-style or
+# custom-prefix installs).
+_linux_bwrap_path: str | None = None
 
 
 def _probe(argv: list[str], label: str) -> bool:
@@ -60,11 +66,16 @@ def _linux_probe() -> bool:
     """Smoke-test that ``bwrap`` can apply a minimal sandbox here.
 
     Catches the cases where the kernel refuses to create unprivileged
-    user namespaces — surfacing at startup instead of first use.
+    user namespaces — surfacing at startup instead of first use
     """
-    return _probe(
+    global _linux_bwrap_path
+    bwrap = shutil.which("bwrap")
+    if bwrap is None:
+        logger.warning("bwrap not found on PATH; tool execution will run unsandboxed")
+        return False
+    ok = _probe(
         [
-            "bwrap",
+            bwrap,
             "--ro-bind",
             "/",
             "/",
@@ -74,6 +85,9 @@ def _linux_probe() -> bool:
         ],
         "Linux bwrap",
     )
+    if ok:
+        _linux_bwrap_path = bwrap
+    return ok
 
 
 def sandbox_available() -> bool:
@@ -311,7 +325,7 @@ def _linux_bwrap_argv(inner_argv: list[str], workdir: str) -> list[str]:
     top_ro_dirs = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc")
 
     args: list[str] = [
-        "bwrap",
+        _linux_bwrap_path or "bwrap",
         "--die-with-parent",
         "--new-session",
         "--unshare-all",
@@ -330,16 +344,12 @@ def _linux_bwrap_argv(inner_argv: list[str], workdir: str) -> list[str]:
     def _is_under_top_ro(path: str) -> bool:
         return any(path == top or path.startswith(top + os.sep) for top in top_ro_dirs)
 
-    # Dedupe via realpath because sys.prefix and sys.base_prefix often
-    # resolve to the same thing on stock installs.
-    seen: set[str] = set()
-    for path in _python_read_paths() + _editable_source_paths():
-        if not path:
+    # _python_read_paths() already realpaths, filters non-dirs, dedupes,
+    # and includes editable-install source dirs (so `pip install -e .`
+    # repos like unsloth remain readable inside the sandbox).
+    for rp in _python_read_paths():
+        if _is_under_top_ro(rp):
             continue
-        rp = os.path.realpath(path)
-        if rp in seen or not os.path.isdir(rp) or _is_under_top_ro(rp):
-            continue
-        seen.add(rp)
         args.extend(["--ro-bind-try", rp, rp])
 
     # Bind exec-chain symlinks whose parent isn't already covered by
