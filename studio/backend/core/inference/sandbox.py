@@ -25,9 +25,9 @@ def _probe(argv: list[str], label: str) -> bool:
     try:
         proc = subprocess.run(
             argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=5,
+            stdout = subprocess.PIPE,
+            stderr = subprocess.PIPE,
+            timeout = 5,
         )
     except (OSError, subprocess.TimeoutExpired) as e:
         logger.warning(
@@ -35,7 +35,7 @@ def _probe(argv: list[str], label: str) -> bool:
         )
         return False
     if proc.returncode != 0:
-        stderr_tail = proc.stderr.decode("utf-8", errors="replace").strip()[-200:]
+        stderr_tail = proc.stderr.decode("utf-8", errors = "replace").strip()[-200:]
         logger.warning(
             "%s present but probe returned %s; tool execution will run unsandboxed. stderr: %s",
             label,
