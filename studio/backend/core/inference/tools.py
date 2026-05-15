@@ -25,6 +25,7 @@ import threading
 import urllib.request
 
 from loggers import get_logger
+from .sandbox import build_sandbox_argv, sandbox_available
 
 logger = get_logger(__name__)
 
@@ -1616,7 +1617,12 @@ def _python_exec(
         else:
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        proc = subprocess.Popen([sys.executable, tmp_path], **popen_kwargs)
+        inner_argv = [sys.executable, tmp_path]
+        if sandbox_available():
+            argv = build_sandbox_argv(inner_argv, workdir)
+        else:
+            argv = inner_argv
+        proc = subprocess.Popen(argv, **popen_kwargs)
 
         # Spawn cancel watcher if we have a cancel event
         if cancel_event is not None:
@@ -1705,8 +1711,12 @@ def _bash_exec(
         else:
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        proc = subprocess.Popen(_get_shell_cmd(command), **popen_kwargs)
-
+        inner_argv = _get_shell_cmd(command)
+        if sandbox_available():
+            argv = build_sandbox_argv(inner_argv, workdir)
+        else:
+            argv = inner_argv
+        proc = subprocess.Popen(argv, **popen_kwargs)
         if cancel_event is not None:
             watcher = threading.Thread(
                 target = _cancel_watcher, args = (proc, cancel_event), daemon = True
