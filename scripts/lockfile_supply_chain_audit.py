@@ -397,6 +397,23 @@ class Finding:
 def audit_npm_lockfile(path: Path) -> list[Finding]:
     findings: list[Finding] = []
     if not path.exists():
+        # A missing lockfile is a configuration error, not a clean bill
+        # of health: a default lockfile that quietly disappears (e.g.
+        # the install path was reverted to `npm install` without
+        # updating DEFAULT_NPM_LOCKFILES) would otherwise let this
+        # audit print `0 findings` while `npm ci` later fails. Fail
+        # loudly so the missing path surfaces as a finding.
+        findings.append(
+            Finding(
+                path = str(path),
+                package = "<root>",
+                kind = "missing-lockfile",
+                detail = (
+                    "expected lockfile not found; refusing to silently "
+                    "report a clean audit for a path that was not scanned"
+                ),
+            )
+        )
         return findings
 
     raw = path.read_text(encoding = "utf-8")
@@ -553,6 +570,19 @@ _PACKAGE_HEADER = re.compile(r"^\[\[package\]\]\s*$")
 def audit_cargo_lockfile(path: Path) -> list[Finding]:
     findings: list[Finding] = []
     if not path.exists():
+        # See audit_npm_lockfile: refuse to silently treat a missing
+        # default lockfile as a clean scan.
+        findings.append(
+            Finding(
+                path = str(path),
+                package = "<root>",
+                kind = "missing-lockfile",
+                detail = (
+                    "expected lockfile not found; refusing to silently "
+                    "report a clean audit for a path that was not scanned"
+                ),
+            )
+        )
         return findings
 
     raw = path.read_text(encoding = "utf-8")

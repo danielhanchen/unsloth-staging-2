@@ -38,7 +38,7 @@ trap _restore_gitignores EXIT
 # would always miss and silently regenerate (or fail under
 # --frozen-lockfile). Keep this single path until/unless a real
 # bun.lock lands.
-if ! npm ci; then
+if ! npm ci --no-fund --no-audit; then
     echo "❌ ERROR: npm ci failed" >&2
     exit 1
 fi

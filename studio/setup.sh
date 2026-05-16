@@ -211,6 +211,7 @@ else
 _NEED_FRONTEND_BUILD=true
 if [ -d "$SCRIPT_DIR/frontend/dist" ]; then
     _changed=$(find "$SCRIPT_DIR/frontend" -maxdepth 1 -type f \
+        ! -name 'bun.lock' \
         -newer "$SCRIPT_DIR/frontend/dist" -print -quit 2>/dev/null)
     if [ -z "$_changed" ]; then
         _changed=$(find "$SCRIPT_DIR/frontend/src" "$SCRIPT_DIR/frontend/public" \

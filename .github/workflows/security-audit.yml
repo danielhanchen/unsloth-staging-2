@@ -55,6 +55,8 @@ on:
       - 'studio/frontend/package-lock.json'
       - 'studio/backend/core/data_recipe/oxc-validator/package.json'
       - 'studio/backend/core/data_recipe/oxc-validator/package-lock.json'
+      - 'studio/package.json'
+      - 'studio/package-lock.json'
       - 'studio/src-tauri/Cargo.toml'
       - 'studio/src-tauri/Cargo.lock'
       - 'pyproject.toml'
@@ -280,7 +282,7 @@ jobs:
           {
             echo "## Lockfile supply-chain audit"
             echo
-            echo "Scanned: studio/frontend/package-lock.json + studio/backend/core/data_recipe/oxc-validator/package-lock.json + studio/src-tauri/Cargo.lock"
+            echo "Scanned: studio/frontend/package-lock.json + studio/backend/core/data_recipe/oxc-validator/package-lock.json + studio/package-lock.json + studio/src-tauri/Cargo.lock"
             echo
             echo "No structural anomalies or known IOC strings."
           } >> "$GITHUB_STEP_SUMMARY"
@@ -322,6 +324,23 @@ jobs:
             echo
             echo '```'
             tail -200 "$GITHUB_WORKSPACE/logs-npm-audit-oxc.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: npm audit (Studio Tauri CLI holder)
+        # Same audit surface, third npm project (@tauri-apps/cli for the
+        # signed desktop release; lockfile lives at studio/package-lock.json).
+        continue-on-error: true
+        working-directory: studio
+        run: |
+          set +e
+          npm audit --audit-level=high | tee "$GITHUB_WORKSPACE/logs-npm-audit-studio.txt"
+          npm audit --json > "$GITHUB_WORKSPACE/logs-npm-audit-studio.json" || true
+          {
+            echo "## npm audit (Studio Tauri CLI holder)"
+            echo
+            echo '```'
+            tail -200 "$GITHUB_WORKSPACE/logs-npm-audit-studio.txt"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -367,6 +386,7 @@ jobs:
           /tmp/osv-scanner scan source \
             --lockfile=studio/frontend/package-lock.json \
             --lockfile=studio/backend/core/data_recipe/oxc-validator/package-lock.json \
+            --lockfile=studio/package-lock.json \
             --lockfile=studio/src-tauri/Cargo.lock \
             --lockfile=requirements.txt:audit-reqs/unsloth-deps.txt \
             --lockfile=requirements.txt:audit-reqs/studio.txt \
@@ -930,16 +950,15 @@ jobs:
         # full log and surface it in the step summary either way. It
         # never runs `npm install`, never executes anything from a
         # downloaded tarball, and only fetches from registry.npmjs.org.
-        # Initially non-blocking so the baseline can settle; drop
-        # continue-on-error once the baseline is clean for a week.
+        # This step is blocking: the final exit code is the worst rc
+        # across all three npm projects (no continue-on-error).
         #
-        # Two separate npm projects share this scan surface; scan each.
-        # Capture exit codes via PIPESTATUS so a HIGH/CRITICAL on the
-        # frontend lockfile does not skip the OXC scan (both reports
-        # are most useful exactly when one already failed).
+        # Three separate npm projects share this scan surface; scan each.
+        # Capture exit codes via PIPESTATUS so a HIGH/CRITICAL on one
+        # lockfile does not skip the next scan (all reports are most
+        # useful exactly when one already failed).
         run: |
           set +e
-          set -o pipefail
 
           LOG=logs-scan-npm.txt
           python3 scripts/scan_npm_packages.py 2>&1 | tee "$LOG"
@@ -950,6 +969,12 @@ jobs:
             --lockfile studio/backend/core/data_recipe/oxc-validator/package-lock.json \
             2>&1 | tee "$LOG2"
           oxc_rc=${PIPESTATUS[0]}
+
+          LOG3=logs-scan-npm-studio.txt
+          python3 scripts/scan_npm_packages.py \
+            --lockfile studio/package-lock.json \
+            2>&1 | tee "$LOG3"
+          studio_rc=${PIPESTATUS[0]}
 
           {
             echo "## scan_npm_packages (Studio frontend)"
@@ -965,12 +990,22 @@ jobs:
             echo '```'
             tail -300 "$LOG2"
             echo '```'
+            echo
+            echo "## scan_npm_packages (Studio Tauri CLI holder)"
+            echo
+            echo '### Findings (tail)'
+            echo '```'
+            tail -300 "$LOG3"
+            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$frontend_rc" -ne 0 ]; then
             exit "$frontend_rc"
           fi
-          exit "$oxc_rc"
+          if [ "$oxc_rc" -ne 0 ]; then
+            exit "$oxc_rc"
+          fi
+          exit "$studio_rc"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
@@ -979,6 +1014,7 @@ jobs:
           path: |
             logs-scan-npm.txt
             logs-scan-npm-oxc.txt
+            logs-scan-npm-studio.txt
           retention-days: 30
 
   # ─────────────────────────────────────────────────────────────────────
@@ -1125,7 +1161,7 @@ jobs:
         working-directory: studio/frontend
         run: npm ci --ignore-scripts
 
-      - name: npm audit signatures (informational)
+      - name: npm audit signatures (Studio frontend, informational)
         # Surfaces unsigned / mis-signed packages from the npm
         # transparency log. continue-on-error during baseline-build
         # phase; promote to hard gate once the lockfile is fully
@@ -1134,10 +1170,48 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          LOG=logs-audit-signatures.txt
+          LOG="$GITHUB_WORKSPACE/logs-audit-signatures.txt"
           npm audit signatures 2>&1 | tee "$LOG"
           {
-            echo "## npm audit signatures"
+            echo "## npm audit signatures (Studio frontend)"
+            echo
+            echo '```'
+            tail -200 "$LOG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install oxc-validator deps (--ignore-scripts)
+        working-directory: studio/backend/core/data_recipe/oxc-validator
+        run: npm ci --ignore-scripts
+
+      - name: npm audit signatures (oxc-validator, informational)
+        working-directory: studio/backend/core/data_recipe/oxc-validator
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          LOG="$GITHUB_WORKSPACE/logs-audit-signatures-oxc.txt"
+          npm audit signatures 2>&1 | tee "$LOG"
+          {
+            echo "## npm audit signatures (oxc-validator)"
+            echo
+            echo '```'
+            tail -200 "$LOG"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install Studio Tauri CLI holder deps (--ignore-scripts)
+        working-directory: studio
+        run: npm ci --ignore-scripts
+
+      - name: npm audit signatures (Studio Tauri CLI holder, informational)
+        working-directory: studio
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          LOG="$GITHUB_WORKSPACE/logs-audit-signatures-studio.txt"
+          npm audit signatures 2>&1 | tee "$LOG"
+          {
+            echo "## npm audit signatures (Studio Tauri CLI holder)"
             echo
             echo '```'
             tail -200 "$LOG"
@@ -1154,6 +1228,9 @@ jobs:
           # OXC lockfile may not exist on the base ref (newly added).
           git show "$BASE_SHA:studio/backend/core/data_recipe/oxc-validator/package-lock.json" \
             > /tmp/base-oxc-package-lock.json 2>/dev/null || echo '{}' > /tmp/base-oxc-package-lock.json
+          # Tauri CLI holder lockfile may not exist on the base ref (newly added).
+          git show "$BASE_SHA:studio/package-lock.json" \
+            > /tmp/base-studio-package-lock.json 2>/dev/null || echo '{}' > /tmp/base-studio-package-lock.json
 
       - name: Diff for newly-added install-script deps
         if: github.event_name == 'pull_request'
@@ -1164,6 +1241,9 @@ jobs:
           python3 scripts/check_new_install_scripts.py \
             --base /tmp/base-oxc-package-lock.json \
             --head studio/backend/core/data_recipe/oxc-validator/package-lock.json
+          python3 scripts/check_new_install_scripts.py \
+            --base /tmp/base-studio-package-lock.json \
+            --head studio/package-lock.json
 
       - name: Skip install-script diff (non-PR trigger)
         if: github.event_name != 'pull_request'
@@ -1175,6 +1255,9 @@ jobs:
         if: always()
         with:
           name: npm-audit-signatures-log
-          path: studio/frontend/logs-audit-signatures.txt
+          path: |
+            logs-audit-signatures.txt
+            logs-audit-signatures-oxc.txt
+            logs-audit-signatures-studio.txt
           if-no-files-found: ignore
           retention-days: 30

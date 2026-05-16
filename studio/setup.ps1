@@ -1268,7 +1268,7 @@ if ($IsPipInstall) {
     # Also check all top-level files (package.json, vite.config.ts, index.html, etc.)
     if (-not $NewerFile) {
         $NewerFile = Get-ChildItem -Path $FrontendDir -File -ErrorAction SilentlyContinue |
-            Where-Object { $_.LastWriteTime -gt $DistTime } |
+            Where-Object { $_.Name -ne "bun.lock" -and $_.LastWriteTime -gt $DistTime } |
             Select-Object -First 1
     }
     if (-not $NewerFile) {
@@ -1354,7 +1354,7 @@ if (Test-Path $OxcValidatorDir) {
     $ErrorActionPreference = "Continue"
     Push-Location $OxcValidatorDir
     # npm ci: lockfile-strict (see frontend install above).
-    $oxcInstallExit = Invoke-SetupCommand { npm ci }
+    $oxcInstallExit = Invoke-SetupCommand { npm ci --no-fund --no-audit }
     if ($oxcInstallExit -ne 0) {
         Pop-Location
         $ErrorActionPreference = $prevEAP_oxc
