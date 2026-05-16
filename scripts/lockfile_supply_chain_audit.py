@@ -751,8 +751,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     root = Path(args.root).resolve()
-    npm_paths = [root / p for p in (args.npm_lockfile or DEFAULT_NPM_LOCKFILES)]
-    cargo_paths = [root / p for p in (args.cargo_lockfile or DEFAULT_CARGO_LOCKFILES)]
+    # When the user passes an explicit `--npm-lockfile` or
+    # `--cargo-lockfile` they are scoping the scan to exactly those
+    # paths; do NOT silently graft the other ecosystem's defaults on
+    # top. Falling back to defaults is reserved for the no-args CI
+    # invocation, where every default path must exist.
+    _user_explicit = args.npm_lockfile is not None or args.cargo_lockfile is not None
+    if _user_explicit:
+        npm_paths = [root / p for p in (args.npm_lockfile or ())]
+        cargo_paths = [root / p for p in (args.cargo_lockfile or ())]
+    else:
+        npm_paths = [root / p for p in DEFAULT_NPM_LOCKFILES]
+        cargo_paths = [root / p for p in DEFAULT_CARGO_LOCKFILES]
 
     all_findings: list[Finding] = []
     for p in npm_paths:
