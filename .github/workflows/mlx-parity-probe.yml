@@ -58,33 +58,33 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round C: zoom in on the bc=True convergence boundary.
-          # Round B established: 7 no, 15 yes, 20 yes, 30 yes, 50 no.
-          # Round C asks: where exactly does the "Unsloth" basin
-          # start and end with bc=True default?
-          - id: '17j'
+          # Round D: lock in max_steps=20 across multiple seeds + check
+          # 50/100 are the actual upper failure boundary (50 failed on
+          # seed 3407; does that hold across seeds, or is it a 3407
+          # quirk?). Also a third LR to characterize sensitivity.
+          - id: '17o'
             script: probe_17_curve_param.py
-            steps: '10'
-            seed: '3407'
+            steps: '20'
+            seed: '42'
             bias_correction: '1'
-          - id: '17k'
+          - id: '17p'
             script: probe_17_curve_param.py
-            steps: '12'
-            seed: '3407'
+            steps: '20'
+            seed: '999'
             bias_correction: '1'
-          - id: '17l'
+          - id: '17q'
             script: probe_17_curve_param.py
-            steps: '25'
-            seed: '3407'
+            steps: '20'
+            seed: '1337'
             bias_correction: '1'
-          - id: '17m'
+          - id: '17r'
             script: probe_17_curve_param.py
-            steps: '35'
-            seed: '3407'
+            steps: '50'
+            seed: '42'
             bias_correction: '1'
-          - id: '17n'
+          - id: '17s'
             script: probe_17_curve_param.py
-            steps: '40'
+            steps: '100'
             seed: '3407'
             bias_correction: '1'
     steps:
