@@ -58,34 +58,32 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round H: PIVOT to mlx-lm reference comparison.
-          # Round G showed the (steps, seed) basin is fundamentally non-
-          # monotonic: 60 steps fails for seeds 42 and 3407 even though
-          # 30 steps works for both. seed=12345 fails at 30 + 40 but works
-          # at 50. The post_train_loss reaches 0 across all configs, so
-          # the fragility is in greedy-decode geometry, not training.
-          # Run mlx-lm's NATIVE LoRA on the SAME fixture at the same
-          # (steps, seed) combos. If mlx-lm shows the same fragility,
-          # it's an MLX/optimizer geometry issue, not an unsloth-zoo bug.
-          - id: '19a'
+          # Round I: mlx-lm at higher iter counts to confirm it CAN
+          # memorize this fixture. Round H showed mlx-lm at 30-60 iters
+          # never drops loss below ~3 (vs unsloth-zoo's 0.0 by step 10).
+          # mlx-lm's defaults target fewer modules + smaller effective
+          # batch -> needs more iters. Check whether (a) mlx-lm does
+          # eventually memorize, and (b) if so, does its greedy decode
+          # ALSO exhibit the non-monotonic seed fragility?
+          - id: '19f'
             script: probe_19_mlx_lm_param.py
-            steps: '30'
+            steps: '200'
             seed: '3407'
-          - id: '19b'
+          - id: '19g'
             script: probe_19_mlx_lm_param.py
-            steps: '30'
+            steps: '500'
+            seed: '3407'
+          - id: '19h'
+            script: probe_19_mlx_lm_param.py
+            steps: '200'
             seed: '12345'
-          - id: '19c'
+          - id: '19i'
             script: probe_19_mlx_lm_param.py
-            steps: '60'
+            steps: '200'
             seed: '42'
-          - id: '19d'
+          - id: '19j'
             script: probe_19_mlx_lm_param.py
-            steps: '60'
-            seed: '3407'
-          - id: '19e'
-            script: probe_19_mlx_lm_param.py
-            steps: '50'
+            steps: '500'
             seed: '12345'
     steps:
       - name: Harden runner (audit)
