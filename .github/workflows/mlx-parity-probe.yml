@@ -58,49 +58,58 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round J: bc=False vs bc=True end-to-end.
-          # PR #663 head re-exposes adam_bias_correction (SHA 7312862).
-          # Pin to that SHA so the env var actually takes effect, then
-          # run unsloth-zoo MLXTrainer at the same diagnostic (steps,
-          # seed) pairs Round G exposed as bc=True-fragile, with bc=0
-          # vs bc=1 each. If bc=False is robust where bc=True wasn't,
-          # default False is justified beyond just MLX-ecosystem parity.
-          # Includes the seed=3407+30 control on both bc values.
-          - id: '17ai'
+          # Round K: verify PR-663 head (SHA ef003aa) with default
+          # adam_bias_correction=True keeps the smoke green AND that
+          # bc=False is still reachable via explicit opt-out.
+          # Round J empirically established bc=True is required to
+          # memorize within a 30-step budget. Round K is the final
+          # confirmation pass before merging PR #663:
+          #   17an : PR-663 head + DEFAULT (no env) + seed=3407 ->
+          #          should match HEAD bc=True behavior (loss=0, ok)
+          #   17ao : PR-663 head + bc=0 explicit + seed=3407 + 200 steps
+          #          (does bc=False eventually memorize given enough
+          #          budget? - validates the "opt-out for long fine-
+          #          tunes" rationale)
+          #   17ap : PR-663 head + bc=0 explicit + seed=3407 + 500 steps
+          #          (same question, larger budget)
+          #   17aq : PR-663 head + DEFAULT + seed=12345 -> does the
+          #          new default still hit the basin?
+          #   17ar : PR-663 head + DEFAULT + seed=42, 30 steps control
+          - id: '17an'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
+            bias_correction: ''
+            lr: '1e-3'
+            zoo_pin: 'ef003aa'
+          - id: '17ao'
+            script: probe_17_curve_param.py
+            steps: '200'
+            seed: '3407'
             bias_correction: '0'
             lr: '1e-3'
-            zoo_pin: '7312862'
-          - id: '17aj'
+            zoo_pin: 'ef003aa'
+          - id: '17ap'
+            script: probe_17_curve_param.py
+            steps: '500'
+            seed: '3407'
+            bias_correction: '0'
+            lr: '1e-3'
+            zoo_pin: 'ef003aa'
+          - id: '17aq'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '12345'
-            bias_correction: '0'
+            bias_correction: ''
             lr: '1e-3'
-            zoo_pin: '7312862'
-          - id: '17ak'
-            script: probe_17_curve_param.py
-            steps: '60'
-            seed: '3407'
-            bias_correction: '0'
-            lr: '1e-3'
-            zoo_pin: '7312862'
-          - id: '17al'
-            script: probe_17_curve_param.py
-            steps: '60'
-            seed: '42'
-            bias_correction: '0'
-            lr: '1e-3'
-            zoo_pin: '7312862'
-          - id: '17am'
+            zoo_pin: 'ef003aa'
+          - id: '17ar'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '3407'
-            bias_correction: '1'
+            seed: '42'
+            bias_correction: ''
             lr: '1e-3'
-            zoo_pin: '7312862'
+            zoo_pin: 'ef003aa'
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1

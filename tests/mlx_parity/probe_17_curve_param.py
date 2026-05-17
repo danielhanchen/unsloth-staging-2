@@ -82,10 +82,16 @@ def main() -> int:
     steps = _env_int("MLX_STEPS", 7)
     seed = _env_int("MLX_SEED", 3407)
     dtype = _env_str("MLX_DTYPE", "float16")
-    bc = _env_bool("MLX_BIAS_CORRECTION", False)
+    # Tri-state: empty/unset env var means "use trainer default" (don't
+    # pass adam_bias_correction at all); "0"/"1" forces explicit value.
+    bc_raw = (os.environ.get("MLX_BIAS_CORRECTION") or "").strip().lower()
+    if not bc_raw:
+        bc = None
+    else:
+        bc = bc_raw in ("1", "true", "yes", "y")
     lr = _env_float("MLX_LR", 1e-3)
 
-    banner(f"Probe 17: steps={steps} seed={seed} dtype={dtype} bc={bc} lr={lr}")
+    banner(f"Probe 17: steps={steps} seed={seed} dtype={dtype} bc={bc!r} lr={lr}")
 
     import random
     random.seed(seed)
@@ -114,13 +120,13 @@ def main() -> int:
         finetune_mlp_modules=True,
     )
 
-    # Only set adam_bias_correction if the field exists on this version
-    # of unsloth-zoo. HEAD (pre-PR-663) does not have it -- it forces
-    # True unconditionally, so MLX_BIAS_CORRECTION=0 on HEAD has no
-    # effect and the run characterizes the upstream broken default.
+    # Only set adam_bias_correction if (a) the field exists on this
+    # version of unsloth-zoo AND (b) the env var asked for an explicit
+    # value (bc is not None). bc=None means "use the trainer default"
+    # so the artifact records whatever the default actually is.
     fields_supported = {f.name for f in dataclasses.fields(MLXTrainingConfig)}
     extra = {}
-    if "adam_bias_correction" in fields_supported:
+    if "adam_bias_correction" in fields_supported and bc is not None:
         extra["adam_bias_correction"] = bc
 
     config = MLXTrainingConfig(
@@ -139,7 +145,7 @@ def main() -> int:
         use_cce=False,
         compile=False,
         gradient_checkpointing=False,
-        output_dir=str(OUT_DIR / f"probe17_outputs_s{steps}_d{seed}_bc{int(bc)}_lr{lr:g}"),
+        output_dir=str(OUT_DIR / f"probe17_outputs_s{steps}_d{seed}_bc{('d' if bc is None else int(bc))}_lr{lr:g}"),
         save_steps=0,
         eval_steps=0,
         dataset_text_field="text",
@@ -179,10 +185,15 @@ def main() -> int:
     report("generation", repr(gen[:160]))
     report("contains 'Unsloth'", contains)
 
+    # Record what the trainer actually used (post-construction) so the
+    # artifact reflects the trainer default when bc was None at probe-
+    # invocation time.
+    effective_bc = getattr(config, "adam_bias_correction", None)
     out = {
         "config": {
             "steps": steps, "seed": seed, "dtype": dtype,
             "adam_bias_correction": bc,
+            "effective_adam_bias_correction": effective_bc,
             "learning_rate": lr,
             "adam_bc_field_supported": "adam_bias_correction" in fields_supported,
         },
@@ -192,7 +203,8 @@ def main() -> int:
         "contains_unsloth": contains,
     }
     lr_tag = f"{lr:.0e}".replace("-0", "-").replace("+0", "")
-    fname = f"probe_17__s{steps}_d{seed}_bc{int(bc)}_lr{lr_tag}.json"
+    bc_tag = "d" if bc is None else int(bc)
+    fname = f"probe_17__s{steps}_d{seed}_bc{bc_tag}_lr{lr_tag}.json"
     (OUT_DIR / fname).write_text(json.dumps(out, indent=2))
     section("summary")
     if rows:
