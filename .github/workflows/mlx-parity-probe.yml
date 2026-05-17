@@ -58,35 +58,44 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round D: lock in max_steps=20 across multiple seeds + check
-          # 50/100 are the actual upper failure boundary (50 failed on
-          # seed 3407; does that hold across seeds, or is it a 3407
-          # quirk?). Also a third LR to characterize sensitivity.
-          - id: '17o'
-            script: probe_17_curve_param.py
-            steps: '20'
-            seed: '42'
-            bias_correction: '1'
-          - id: '17p'
-            script: probe_17_curve_param.py
-            steps: '20'
-            seed: '999'
-            bias_correction: '1'
-          - id: '17q'
+          # Round E: lock in max_steps=30 as seed-robust + characterize
+          # LR sensitivity. Earlier rounds showed:
+          #   - bc=True basin is non-monotonic: works 15-40, fails at 50,
+          #     re-enters at 100 (seed 3407)
+          #   - seed=1337 failed at 20 steps but worked at 30
+          # Round E asks: does max_steps=30 hold across more seeds, AND
+          # is the basin LR-sensitive (would a smaller/larger LR escape
+          # the 50-step pit)?
+          - id: '17t'
             script: probe_17_curve_param.py
             steps: '20'
             seed: '1337'
             bias_correction: '1'
-          - id: '17r'
+            lr: '1e-3'
+          - id: '17u'
             script: probe_17_curve_param.py
-            steps: '50'
-            seed: '42'
-            bias_correction: '1'
-          - id: '17s'
-            script: probe_17_curve_param.py
-            steps: '100'
+            steps: '30'
             seed: '3407'
             bias_correction: '1'
+            lr: '5e-4'
+          - id: '17v'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
+            bias_correction: '1'
+            lr: '2e-3'
+          - id: '17w'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '12345'
+            bias_correction: '1'
+            lr: '1e-3'
+          - id: '17x'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '7777'
+            bias_correction: '1'
+            lr: '1e-3'
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
@@ -140,6 +149,7 @@ jobs:
           MLX_SEED: ${{ matrix.seed }}
           MLX_DTYPE: ${{ matrix.dtype }}
           MLX_BIAS_CORRECTION: ${{ matrix.bias_correction }}
+          MLX_LR: ${{ matrix.lr }}
         run: |
           cd tests/mlx_parity && python ${{ matrix.script }}
 

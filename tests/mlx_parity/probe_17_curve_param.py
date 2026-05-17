@@ -68,13 +68,24 @@ def _env_str(name, default):
     return raw if raw else default
 
 
+def _env_float(name, default):
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
 def main() -> int:
     steps = _env_int("MLX_STEPS", 7)
     seed = _env_int("MLX_SEED", 3407)
     dtype = _env_str("MLX_DTYPE", "float16")
     bc = _env_bool("MLX_BIAS_CORRECTION", False)
+    lr = _env_float("MLX_LR", 1e-3)
 
-    banner(f"Probe 17: steps={steps} seed={seed} dtype={dtype} bc={bc}")
+    banner(f"Probe 17: steps={steps} seed={seed} dtype={dtype} bc={bc} lr={lr}")
 
     import random
     random.seed(seed)
@@ -116,7 +127,7 @@ def main() -> int:
         per_device_train_batch_size=2,
         gradient_accumulation_steps=3,
         max_steps=steps,
-        learning_rate=1e-3,
+        learning_rate=lr,
         warmup_steps=0,
         lr_scheduler_type="constant",
         optim="adamw",
@@ -128,7 +139,7 @@ def main() -> int:
         use_cce=False,
         compile=False,
         gradient_checkpointing=False,
-        output_dir=str(OUT_DIR / f"probe17_outputs_s{steps}_d{seed}_bc{int(bc)}"),
+        output_dir=str(OUT_DIR / f"probe17_outputs_s{steps}_d{seed}_bc{int(bc)}_lr{lr:g}"),
         save_steps=0,
         eval_steps=0,
         dataset_text_field="text",
@@ -172,6 +183,7 @@ def main() -> int:
         "config": {
             "steps": steps, "seed": seed, "dtype": dtype,
             "adam_bias_correction": bc,
+            "learning_rate": lr,
             "adam_bc_field_supported": "adam_bias_correction" in fields_supported,
         },
         "rows": rows,
@@ -179,7 +191,8 @@ def main() -> int:
         "generation": gen,
         "contains_unsloth": contains,
     }
-    fname = f"probe_17__s{steps}_d{seed}_bc{int(bc)}.json"
+    lr_tag = f"{lr:.0e}".replace("-0", "-").replace("+0", "")
+    fname = f"probe_17__s{steps}_d{seed}_bc{int(bc)}_lr{lr_tag}.json"
     (OUT_DIR / fname).write_text(json.dumps(out, indent=2))
     section("summary")
     if rows:
