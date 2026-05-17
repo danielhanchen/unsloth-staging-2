@@ -47,7 +47,8 @@ def main() -> int:
     # in "completions" / "chat" / "text" format. Use "text" format for the
     # closest analog to the smoke test: a flat string per row.
     train_rows = [{"text": TRAIN_TEXT} for _ in range(64)]
-    valid_rows = [{"text": TRAIN_TEXT}]  # 1 row for validation
+    # mlx_lm.lora's loader rejects validation sets smaller than batch_size.
+    valid_rows = [{"text": TRAIN_TEXT} for _ in range(4)]
     (data_dir / "train.jsonl").write_text("\n".join(json.dumps(r) for r in train_rows) + "\n")
     (data_dir / "valid.jsonl").write_text("\n".join(json.dumps(r) for r in valid_rows) + "\n")
     report("data dir", str(data_dir))
