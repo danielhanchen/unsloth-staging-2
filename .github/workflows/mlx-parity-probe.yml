@@ -58,34 +58,35 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # probe_17a: longer training -- 30 steps, canonical seed, HEAD default
-          - id: '17a'
+          # Round B: find the bc=True convergence boundary + verify
+          # stability across more seeds. Round A established that
+          # bc=True with 30 steps reliably emits "Unsloth"; 7 steps does
+          # not. Where is the cutover?
+          - id: '17e'
             script: probe_17_curve_param.py
-            steps: '30'
+            steps: '15'
             seed: '3407'
             bias_correction: '1'
-          # probe_17b: different seed -- 7 steps, seed=42, HEAD default
-          - id: '17b'
+          - id: '17f'
             script: probe_17_curve_param.py
-            steps: '7'
-            seed: '42'
-            bias_correction: '1'
-          # probe_17c: combined -- 30 steps + seed=42, HEAD default
-          - id: '17c'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '42'
-            bias_correction: '1'
-          # probe_17d: control with PR #663 head (bc=False default), 30 steps
-          - id: '17d'
-            script: probe_17_curve_param.py
-            steps: '30'
+            steps: '20'
             seed: '3407'
-            bias_correction: '0'
-            zoo_pin: 'fix-mlx-grad-clip-hf-parity'
-          # probe_18: mlx-lm native LoRA, 50 iters (upstream MLX trainer, long)
-          - id: '18'
-            script: probe_18_mlx_lm_long.py
+            bias_correction: '1'
+          - id: '17g'
+            script: probe_17_curve_param.py
+            steps: '50'
+            seed: '3407'
+            bias_correction: '1'
+          - id: '17h'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '999'
+            bias_correction: '1'
+          - id: '17i'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '1337'
+            bias_correction: '1'
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
@@ -156,8 +157,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: probe-${{ matrix.id }}
-          path: tests/mlx_parity/.out/probe_*.json
+          # Upload whole .out/ so probe scripts can write any filename
+          # (probe 17 writes per-config JSONs like probe_17__s30_d42_bc1.json)
+          path: tests/mlx_parity/.out/
           if-no-files-found: warn
+          include-hidden-files: true
 
   aggregate:
     name: aggregate
