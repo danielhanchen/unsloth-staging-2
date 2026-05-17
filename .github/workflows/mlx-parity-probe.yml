@@ -49,23 +49,43 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Mac runners are capped at 5 parallel jobs on the free tier.
-          # Active matrix: two known anchors + two fix candidates.
-          # 12 is the green anchor (pre-#634), 11 is the red anchor (HEAD).
-          # 14 + 15 test fix candidates against those anchors.
-          - id: '11'
-            script: probe_11_mlx_fp32_curve.py
-          - id: '12'
-            script: probe_12_zoo_prev634.py
-            zoo_pin: 'f37d510'
-          - id: '14'
-            script: probe_14_zoo_bias_correction_false.py
-            zoo_pin: 'try-bias-correction-false'
-          - id: '15'
-            script: probe_15_zoo_pr663.py
+          # ---- Extended-investigation matrix (5 Mac M1 jobs in parallel) ----
+          # Question: is MLX itself broken, or does post-#634 just need more
+          # steps / different seeds to memorize?
+          #
+          # Each probe_17 entry runs the unsloth-zoo HEAD trainer
+          # (broken default until #663 merges) with a different
+          # (steps, seed) combination so we can rule in/out a
+          # convergence-horizon effect.
+
+          # probe_17a: longer training -- 30 steps, canonical seed, HEAD default
+          - id: '17a'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
+            bias_correction: '1'
+          # probe_17b: different seed -- 7 steps, seed=42, HEAD default
+          - id: '17b'
+            script: probe_17_curve_param.py
+            steps: '7'
+            seed: '42'
+            bias_correction: '1'
+          # probe_17c: combined -- 30 steps + seed=42, HEAD default
+          - id: '17c'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '42'
+            bias_correction: '1'
+          # probe_17d: control with PR #663 head (bc=False default), 30 steps
+          - id: '17d'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
+            bias_correction: '0'
             zoo_pin: 'fix-mlx-grad-clip-hf-parity'
-          - id: '16'
-            script: probe_16_mlx_lm_native_lora.py
+          # probe_18: mlx-lm native LoRA, 50 iters (upstream MLX trainer, long)
+          - id: '18'
+            script: probe_18_mlx_lm_long.py
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
@@ -115,22 +135,28 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           UNSLOTH_COMPILE_DISABLE: '1'
+          MLX_STEPS: ${{ matrix.steps }}
+          MLX_SEED: ${{ matrix.seed }}
+          MLX_DTYPE: ${{ matrix.dtype }}
+          MLX_BIAS_CORRECTION: ${{ matrix.bias_correction }}
         run: |
           cd tests/mlx_parity && python ${{ matrix.script }}
 
       - name: Show JSON output
         if: always()
         run: |
-          F=tests/mlx_parity/.out/probe_${{ matrix.id }}.json
-          echo "=== ${F} ==="
-          cat "${F}" 2>/dev/null || echo "(no JSON written)"
+          echo "=== probe ${{ matrix.id }} JSON output(s) ==="
+          for f in tests/mlx_parity/.out/probe_*.json; do
+            echo "--- ${f} ---"
+            cat "$f" 2>/dev/null || true
+          done
 
       - name: Upload probe artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: probe-${{ matrix.id }}
-          path: tests/mlx_parity/.out/probe_${{ matrix.id }}.json
+          path: tests/mlx_parity/.out/probe_*.json
           if-no-files-found: warn
 
   aggregate:
@@ -151,8 +177,8 @@ jobs:
           echo "=== probe artifacts ==="
           ls -la probes/ || true
           echo
-          for n in 11 12 14 15 16; do
-            echo "--- probe_${n}.json ---"
-            cat probes/probe_${n}.json 2>/dev/null || echo "(missing -- probe ${n} job did not produce output)"
+          for f in probes/probe_*.json; do
+            echo "--- ${f} ---"
+            cat "$f" 2>/dev/null || echo "(empty)"
             echo
           done
