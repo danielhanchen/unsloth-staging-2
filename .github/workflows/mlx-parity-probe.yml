@@ -64,6 +64,8 @@ jobs:
           - id: '15'
             script: probe_15_zoo_pr663.py
             zoo_pin: 'fix-mlx-grad-clip-hf-parity'
+          - id: '16'
+            script: probe_16_mlx_lm_native_lora.py
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
@@ -149,7 +151,7 @@ jobs:
           echo "=== probe artifacts ==="
           ls -la probes/ || true
           echo
-          for n in 11 12 14 15; do
+          for n in 11 12 14 15 16; do
             echo "--- probe_${n}.json ---"
             cat probes/probe_${n}.json 2>/dev/null || echo "(missing -- probe ${n} job did not produce output)"
             echo
