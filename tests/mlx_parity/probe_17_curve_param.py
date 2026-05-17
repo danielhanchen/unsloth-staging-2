@@ -47,21 +47,31 @@ from _common import (
 
 
 def _env_bool(name, default=False):
-    raw = os.environ.get(name, str(default)).strip().lower()
+    raw = (os.environ.get(name) or "").strip().lower()
+    if not raw:
+        return default
     return raw in ("1", "true", "yes", "y")
 
 
 def _env_int(name, default):
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
     try:
-        return int(os.environ.get(name, default))
+        return int(raw)
     except ValueError:
         return default
+
+
+def _env_str(name, default):
+    raw = (os.environ.get(name) or "").strip()
+    return raw if raw else default
 
 
 def main() -> int:
     steps = _env_int("MLX_STEPS", 7)
     seed = _env_int("MLX_SEED", 3407)
-    dtype = os.environ.get("MLX_DTYPE", "float16")
+    dtype = _env_str("MLX_DTYPE", "float16")
     bc = _env_bool("MLX_BIAS_CORRECTION", False)
 
     banner(f"Probe 17: steps={steps} seed={seed} dtype={dtype} bc={bc}")
