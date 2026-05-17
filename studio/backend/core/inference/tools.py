@@ -302,6 +302,66 @@ def _sandbox_preexec():
             pass
 
 
+def _sandbox_preexec_bwrap_target():
+    """Preexec setup when the immediate exec target is bwrap.
+
+    Mirrors _sandbox_preexec but skips PR_SET_NO_NEW_PRIVS: setting it in
+    the parent before execve into a setuid-bwrap binary strips the setuid
+    bit and breaks namespace creation on kernels with unprivileged user
+    namespaces disabled. The Linux probe in sandbox.py runs without
+    preexec_fn so it cannot detect this asymmetry, which previously
+    surfaced only at first tool execution. bwrap reapplies NO_NEW_PRIVS
+    itself for the sandboxed inner process.
+    """
+    try:
+        os.setsid()
+    except OSError:
+        pass
+
+    try:
+        os.umask(0o077)
+    except OSError:
+        pass
+
+    if _libc is not None:
+        try:
+            _libc.prctl(1, 9, 0, 0, 0)  # PR_SET_PDEATHSIG = SIGKILL
+        except (OSError, AttributeError):
+            pass
+
+    if _resource is not None:
+        try:
+            nproc = int(os.environ.get("UNSLOTH_STUDIO_SANDBOX_NPROC", "10000"))
+            _resource.setrlimit(_resource.RLIMIT_NPROC, (nproc, nproc))
+        except (ValueError, OSError, AttributeError):
+            pass
+        try:
+            _resource.setrlimit(
+                _resource.RLIMIT_FSIZE, (100 * 1024 * 1024, 100 * 1024 * 1024)
+            )
+        except (ValueError, OSError):
+            pass
+        try:
+            as_bytes = (
+                int(os.environ.get("UNSLOTH_STUDIO_SANDBOX_AS_GB", "8"))
+                * 1024
+                * 1024
+                * 1024
+            )
+            _resource.setrlimit(_resource.RLIMIT_AS, (as_bytes, as_bytes))
+        except (ValueError, OSError, AttributeError):
+            pass
+        try:
+            cpu_s = int(os.environ.get("UNSLOTH_STUDIO_SANDBOX_CPU_S", "600"))
+            _resource.setrlimit(_resource.RLIMIT_CPU, (cpu_s, cpu_s))
+        except (ValueError, OSError, AttributeError):
+            pass
+        try:
+            _resource.setrlimit(_resource.RLIMIT_NOFILE, (1024, 1024))
+        except (ValueError, OSError, AttributeError):
+            pass
+
+
 def _get_shell_cmd(command: str) -> list[str]:
     """Return the platform-appropriate shell invocation for a command string."""
     if sys.platform == "win32":
@@ -1620,6 +1680,8 @@ def _python_exec(
         inner_argv = [sys.executable, tmp_path]
         if sandbox_available():
             argv = build_sandbox_argv(inner_argv, workdir)
+            if sys.platform == "linux":
+                popen_kwargs["preexec_fn"] = _sandbox_preexec_bwrap_target
         else:
             argv = inner_argv
         proc = subprocess.Popen(argv, **popen_kwargs)
@@ -1714,6 +1776,8 @@ def _bash_exec(
         inner_argv = _get_shell_cmd(command)
         if sandbox_available():
             argv = build_sandbox_argv(inner_argv, workdir)
+            if sys.platform == "linux":
+                popen_kwargs["preexec_fn"] = _sandbox_preexec_bwrap_target
         else:
             argv = inner_argv
         proc = subprocess.Popen(argv, **popen_kwargs)

@@ -207,11 +207,13 @@ def _python_read_paths() -> list[str]:
     for p in candidates:
         if not p:
             continue
+        if os.path.isdir(p) and p not in seen:
+            seen.add(p)
+            out.append(p)
         rp = os.path.realpath(p)
-        if rp in seen or not os.path.isdir(rp):
-            continue
-        seen.add(rp)
-        out.append(rp)
+        if rp != p and os.path.isdir(rp) and rp not in seen:
+            seen.add(rp)
+            out.append(rp)
     return out
 
 
@@ -272,7 +274,15 @@ def _macos_seatbelt_profile(workdir: str) -> str:
     (subpath "/usr/share/icu")             ; ICU data
     (subpath "/private/var/db/dyld")
     (subpath "/private/var/db/timezone")
-    (subpath "/private/etc")               ; /etc/hosts, /etc/ssl/cert.pem
+    ; Narrowed from (subpath "/private/etc") to avoid exposing
+    ; /etc/master.passwd, /etc/ssh/*, /etc/krb5.keytab, /etc/pam.d/* etc.
+    (literal "/private/etc/hosts")
+    (literal "/private/etc/localtime")
+    (literal "/private/etc/resolv.conf")
+    (literal "/private/etc/nsswitch.conf")
+    (literal "/private/etc/services")
+    (literal "/private/etc/protocols")
+    (subpath "/private/etc/ssl")
     (literal "/dev/null")
     (literal "/dev/zero")
     (literal "/dev/random")
@@ -296,11 +306,12 @@ def _macos_seatbelt_profile(workdir: str) -> str:
 (allow file-write* (literal "/dev/tty"))
 
 (allow mach-lookup
+    ; SecurityServer (Keychain) and trustd intentionally omitted:
+    ; network is denied below, so trustd CRL/OCSP has no role, and
+    ; SecurityServer reach-back would let sandboxed code read Keychain
+    ; items via SecItemCopyMatching.
     (global-name "com.apple.coreservices.launchservicesd")
     (global-name "com.apple.lsd.mapdb")
-    (global-name "com.apple.SecurityServer")
-    (global-name "com.apple.trustd.agent")
-    (global-name "com.apple.trustd")
     (global-name "com.apple.system.opendirectoryd.libinfo")
     (global-name "com.apple.system.opendirectoryd.membership")
     (global-name "com.apple.system.logger")
