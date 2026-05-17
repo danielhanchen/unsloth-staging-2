@@ -58,44 +58,41 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round F: investigate seed=12345 generation failure at 30 steps.
-          # Round E showed trainer drives post_train_loss to ~0 across all
-          # seeds + LRs, but greedy decode of PROMPT diverged for seed=12345.
-          # Two hypotheses:
-          #   (a) bc=True basin geometry is seed-fragile -> PR #663 bc=False
-          #       contract recovers generation;
-          #   (b) seed=12345 just needs more steps to escape its pit.
-          # Also sanity-check PR #663 doesn't itself regress known-good seeds.
-          - id: '17y'
+          # Round G: characterize whether 60 steps is universally seed-robust
+          # and locate seed=12345's basin entry point.
+          # Round F confirmed: 60 steps rescues the seed=12345 30-step
+          # generation failure ("Unsloth!" emitted). Round G asks:
+          #   (a) does 60-step robustness hold for seeds we previously saw
+          #       work at 30 (42, 1337, 3407)? If 60 is universal, max_steps
+          #       could move from 30 to 60 for higher safety margin.
+          #   (b) where exactly does seed=12345 enter the basin? 40 or 50?
+          - id: '17ad'
+            script: probe_17_curve_param.py
+            steps: '40'
+            seed: '12345'
+            bias_correction: '1'
+            lr: '1e-3'
+          - id: '17ae'
+            script: probe_17_curve_param.py
+            steps: '50'
+            seed: '12345'
+            bias_correction: '1'
+            lr: '1e-3'
+          - id: '17af'
             script: probe_17_curve_param.py
             steps: '60'
-            seed: '12345'
+            seed: '42'
             bias_correction: '1'
             lr: '1e-3'
-          - id: '17z'
+          - id: '17ag'
             script: probe_17_curve_param.py
-            steps: '30'
-            seed: '12345'
-            bias_correction: '0'
-            lr: '1e-3'
-            zoo_pin: '18596f229b2436c8004ecfd0e6a39e5d0656857a'
-          - id: '17aa'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '12345'
+            steps: '60'
+            seed: '1337'
             bias_correction: '1'
             lr: '1e-3'
-            zoo_pin: '18596f229b2436c8004ecfd0e6a39e5d0656857a'
-          - id: '17ab'
+          - id: '17ah'
             script: probe_17_curve_param.py
-            steps: '30'
-            seed: '3407'
-            bias_correction: '0'
-            lr: '1e-3'
-            zoo_pin: '18596f229b2436c8004ecfd0e6a39e5d0656857a'
-          - id: '17ac'
-            script: probe_17_curve_param.py
-            steps: '30'
+            steps: '60'
             seed: '3407'
             bias_correction: '1'
             lr: '1e-3'
