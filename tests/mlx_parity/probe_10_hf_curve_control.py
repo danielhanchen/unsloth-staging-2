@@ -6,6 +6,10 @@ optimizer backend. To isolate "MLX vs HF" from "CUDA vs Mac CPU" we
 re-run the HF leg here on the same macos-14-arm64 runner in fp32
 (CPU), with the exact same 7 LoRA targets / alpha=16 / hyperparams.
 
+Forces torch to CPU because the standard macos-14 GitHub runner has
+only 7 GB of shared memory; an fp32 LoRA training on MPS hits the
+GPU memory watermark.
+
 Compare probe_10.json with probe_7.json: same-host, same-precision
 expectations, only the trainer implementation changes.
 
@@ -13,7 +17,14 @@ Always exits 0 -- data dump for follow-up analysis.
 """
 
 import json
+import os
 import sys
+
+# Hide every accelerator from torch before importing it. macos-14 runners
+# expose MPS with a 7 GB shared cap; the fp32 7-module LoRA training
+# above does not fit. Force CPU.
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 import numpy as np
 
@@ -54,8 +65,15 @@ def main() -> int:
         return 0
 
     torch.manual_seed(SEED)
+    # Force CPU explicitly even if MPS is reported. setting empty
+    # CUDA_VISIBLE_DEVICES handles CUDA; here we shadow the MPS-pickup
+    # path by setting torch's default device.
+    try:
+        torch.set_default_device("cpu")
+    except Exception:
+        pass
     tok = AutoTokenizer.from_pretrained(MODEL_NAME)
-    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.float32)
+    model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, dtype=torch.float32).to("cpu")
     model = get_peft_model(
         model,
         LoraConfig(
@@ -103,6 +121,7 @@ def main() -> int:
             packing=False,
             bf16=False,
             fp16=False,
+            use_cpu=True,
             output_dir=str(OUT_DIR / "probe10_outputs"),
         ),
     )

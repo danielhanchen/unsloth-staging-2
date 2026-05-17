@@ -87,17 +87,38 @@ def main() -> int:
     lengths = mx.array([[1, L - 1]])
     labels_mlx = mx.array([ids])
 
-    import mlx.utils as mxu
-
     def loss_only(model):
         loss, _ntok = loss_fn(model, batch, lengths, labels_mlx)
         return loss
     loss_val, grads = mx.value_and_grad(loss_only)(mlx_model)
-    flat = mxu.tree_flatten(grads)
+
+    # `grads` is a nested dict tree; walk it manually, robust to mixed
+    # leaf types (mxu.tree_flatten only accepts pure mx.array leaves).
     mlx_norms = {}
-    for n, g in flat:
-        if (".0." in n or "layers.0" in n) and "q_proj" in n and ("lora_A" in n or "lora_B" in n or "lora_a" in n or "lora_b" in n):
-            mlx_norms[n.split(".0.")[-1] if ".0." in n else n] = float(mx.linalg.norm(g.astype(mx.float32)).item())
+    def _walk(tree, path):
+        if isinstance(tree, dict):
+            for k, v in tree.items():
+                _walk(v, path + (str(k),))
+            return
+        if isinstance(tree, (list, tuple)):
+            for i, v in enumerate(tree):
+                _walk(v, path + (str(i),))
+            return
+        if hasattr(tree, "shape") and hasattr(tree, "dtype"):
+            try:
+                arr = tree
+                if hasattr(arr, "astype"):
+                    arr = arr.astype(mx.float32)
+                norm = float(mx.linalg.norm(arr).item())
+                name = ".".join(path)
+                if "q_proj" in name and (".0." in name or "layers.0" in name):
+                    key = name
+                    if "lora_a" in name.lower() or "lora_b" in name.lower():
+                        mlx_norms[key] = norm
+            except Exception:
+                pass
+
+    _walk(grads, ())
     report("mlx grad norms (q_proj.lora_*)", mlx_norms)
     report("mlx loss", float(loss_val.item()))
 
