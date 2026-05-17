@@ -238,7 +238,7 @@ def _build_safe_env(workdir: str) -> dict[str, str]:
     return env
 
 
-def _sandbox_preexec():
+def _sandbox_preexec_impl(apply_no_new_privs: bool):
     """Best-effort sandbox setup for sandboxed subprocesses.
 
     Modules are resolved at import time so the forked child runs no imports.
@@ -254,10 +254,11 @@ def _sandbox_preexec():
         pass
 
     if _libc is not None:
-        try:
-            _libc.prctl(38, 1, 0, 0, 0)  # PR_SET_NO_NEW_PRIVS
-        except (OSError, AttributeError):
-            pass
+        if apply_no_new_privs:
+            try:
+                _libc.prctl(38, 1, 0, 0, 0)  # PR_SET_NO_NEW_PRIVS
+            except (OSError, AttributeError):
+                pass
 
         try:
             _libc.prctl(1, 9, 0, 0, 0)  # PR_SET_PDEATHSIG = SIGKILL
@@ -300,6 +301,18 @@ def _sandbox_preexec():
             _resource.setrlimit(_resource.RLIMIT_NOFILE, (1024, 1024))
         except (ValueError, OSError, AttributeError):
             pass
+
+
+def _sandbox_preexec():
+    _sandbox_preexec_impl(apply_no_new_privs = True)
+
+
+def _sandbox_preexec_for_bwrap():
+    # why: setuid bwrap (older Ubuntu LTS, some hardened distros) cannot
+    # acquire helper privileges if PR_SET_NO_NEW_PRIVS is set before execve.
+    # bwrap itself reapplies NNP to the inner payload, so the sandboxed
+    # program still runs with NNP=1.
+    _sandbox_preexec_impl(apply_no_new_privs = False)
 
 
 def _get_shell_cmd(command: str) -> list[str]:
@@ -345,7 +358,11 @@ def _get_workdir(session_id: str | None = None) -> str:
             os.chmod(workdir, 0o700)
         except OSError:
             pass
-        _workdirs[key] = workdir
+        # why: the bwrap argv binds os.path.realpath(workdir); if $HOME or a
+        # parent is a symlink (NixOS, Fedora Silverblue, /home -> /var/home)
+        # the non-realpath tmp_path passed via inner_argv is not reachable
+        # inside the sandbox namespace.
+        _workdirs[key] = os.path.realpath(workdir)
     return _workdirs[key]
 
 
@@ -1612,16 +1629,23 @@ def _python_exec(
             cwd = workdir,
             env = safe_env,
         )
-        if sys.platform != "win32":
-            popen_kwargs["preexec_fn"] = _sandbox_preexec
-        else:
-            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
         inner_argv = [sys.executable, tmp_path]
-        if sandbox_available():
+        sandboxed = sandbox_available()
+        if sandboxed:
             argv = build_sandbox_argv(inner_argv, workdir)
         else:
             argv = inner_argv
+
+        if sys.platform != "win32":
+            popen_kwargs["preexec_fn"] = (
+                _sandbox_preexec_for_bwrap
+                if sandboxed and sys.platform == "linux"
+                else _sandbox_preexec
+            )
+        else:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
         proc = subprocess.Popen(argv, **popen_kwargs)
 
         # Spawn cancel watcher if we have a cancel event
@@ -1706,16 +1730,23 @@ def _bash_exec(
             cwd = workdir,
             env = safe_env,
         )
-        if sys.platform != "win32":
-            popen_kwargs["preexec_fn"] = _sandbox_preexec
-        else:
-            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
         inner_argv = _get_shell_cmd(command)
-        if sandbox_available():
+        sandboxed = sandbox_available()
+        if sandboxed:
             argv = build_sandbox_argv(inner_argv, workdir)
         else:
             argv = inner_argv
+
+        if sys.platform != "win32":
+            popen_kwargs["preexec_fn"] = (
+                _sandbox_preexec_for_bwrap
+                if sandboxed and sys.platform == "linux"
+                else _sandbox_preexec
+            )
+        else:
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
         proc = subprocess.Popen(argv, **popen_kwargs)
         if cancel_event is not None:
             watcher = threading.Thread(

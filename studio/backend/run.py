@@ -429,9 +429,24 @@ def run_server(
         print(f"TAURI_PORT={port}", flush = True)
 
     if not silent:
+        # why: sandbox_available() spawns a probe with a 5s timeout; on
+        # hardened kernels (unprivileged_userns_clone=0) it stalls the
+        # banner output. Run it on a background thread and wait briefly.
+        import threading
+
         from core.inference.sandbox import sandbox_available
 
-        if not sandbox_available():
+        probe_result: list[bool] = []
+        probe_done = threading.Event()
+
+        def _bg_probe():
+            try:
+                probe_result.append(sandbox_available())
+            finally:
+                probe_done.set()
+
+        threading.Thread(target = _bg_probe, daemon = True).start()
+        if probe_done.wait(timeout = 2.0) and probe_result and not probe_result[0]:
             print_sandbox_unavailable_notice()
         display_host = _resolve_external_ip() if host == "0.0.0.0" else host
         print_studio_access_banner(

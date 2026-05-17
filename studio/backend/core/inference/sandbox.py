@@ -16,7 +16,7 @@ from loggers import get_logger
 logger = get_logger(__name__)
 
 _SANDBOX_EXEC = "/usr/bin/sandbox-exec"
-_BWRAP_PROBE_BIN = "/usr/bin/true"
+_BWRAP_PROBE_BIN = shutil.which("true") or "/usr/bin/true"
 
 _sandbox_available_cache: bool | None = None
 # Absolute path to ``bwrap``, resolved once at probe time so the runtime
@@ -197,9 +197,13 @@ def _python_read_paths() -> list[str]:
     """
     candidates: list[str] = [sys.prefix, sys.base_prefix]
     candidates.extend(site.getsitepackages())
-    user_site = site.getusersitepackages()
-    if user_site:
-        candidates.append(user_site)
+    # why: user-site lives under the real $HOME (~/.local/lib/...). HOME is
+    # rewritten to workdir for the sandboxed child, so exposing it would
+    # contradict the deny-$HOME stance. Opt in with the env var if needed.
+    if os.environ.get("UNSLOTH_STUDIO_SANDBOX_ALLOW_USER_SITE") == "1":
+        user_site = site.getusersitepackages()
+        if user_site:
+            candidates.append(user_site)
     candidates.extend(_editable_source_paths())
 
     seen: set[str] = set()
@@ -238,11 +242,27 @@ def _macos_seatbelt_profile(workdir: str) -> str:
         ]
     )
 
+    process_exec_block = "\n    ".join(
+        [
+            '(subpath "/usr/lib")',
+            '(subpath "/usr/bin")',
+            '(subpath "/bin")',
+            '(subpath "/System/Library/Frameworks")',
+            '(subpath "/System/Library/PrivateFrameworks")',
+            '(subpath "/System/Cryptexes")',
+            '(subpath "/System/Volumes/Preboot/Cryptexes")',
+            '(subpath "/Library/Frameworks")',
+            *py_subpaths,
+        ]
+    )
+
     return f"""(version 1)
 (deny default)
 
 (allow process-fork)
-(allow process-exec)
+(allow process-exec
+    {process_exec_block}
+)
 (allow signal (target self))
 (allow process-info-pidinfo (target self))
 (allow process-info-pidfdinfo (target self))
@@ -272,7 +292,15 @@ def _macos_seatbelt_profile(workdir: str) -> str:
     (subpath "/usr/share/icu")             ; ICU data
     (subpath "/private/var/db/dyld")
     (subpath "/private/var/db/timezone")
-    (subpath "/private/etc")               ; /etc/hosts, /etc/ssl/cert.pem
+    ; Narrow /private/etc to runtime essentials; deny passwd/shadow/sudoers etc.
+    (literal "/private/etc/hosts")
+    (literal "/private/etc/resolv.conf")
+    (literal "/private/etc/nsswitch.conf")
+    (literal "/private/etc/localtime")
+    (literal "/private/etc/protocols")
+    (literal "/private/etc/services")
+    (subpath "/private/etc/ssl")
+    (subpath "/private/etc/ca-certificates")
     (literal "/dev/null")
     (literal "/dev/zero")
     (literal "/dev/random")
@@ -292,8 +320,6 @@ def _macos_seatbelt_profile(workdir: str) -> str:
 (allow file-read* (subpath "{wd}"))
 (allow file-write* (subpath "{wd}"))
 (allow file-ioctl (subpath "{wd}"))
-(allow file-read* (literal "/dev/tty"))
-(allow file-write* (literal "/dev/tty"))
 
 (allow mach-lookup
     (global-name "com.apple.coreservices.launchservicesd")
@@ -322,10 +348,25 @@ def _linux_bwrap_argv(inner_argv: list[str], workdir: str) -> list[str]:
     is a fresh tmpfs so writes don't leak to the host.
     """
     wd = os.path.realpath(workdir)
-    top_ro_dirs = ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc")
+    top_ro_dirs = ("/usr", "/bin", "/sbin", "/lib", "/lib64")
+    # Narrow /etc: bind only runtime essentials so sandboxed code cannot read
+    # host identity/config (sshd_config, machine-id, cloud-init, etc.).
+    etc_ro_entries = (
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/etc/nsswitch.conf",
+        "/etc/localtime",
+        "/etc/ld.so.cache",
+        "/etc/ld.so.conf",
+        "/etc/ld.so.conf.d",
+        "/etc/ssl",
+        "/etc/ca-certificates",
+        "/etc/pki",
+    )
 
+    assert _linux_bwrap_path is not None, "bwrap path unset despite successful probe"
     args: list[str] = [
-        _linux_bwrap_path or "bwrap",
+        _linux_bwrap_path,
         "--die-with-parent",
         "--new-session",
         "--unshare-all",
@@ -339,6 +380,8 @@ def _linux_bwrap_argv(inner_argv: list[str], workdir: str) -> list[str]:
     # -try variants skip missing paths so the same argv works on
     # usrmerge distros (/lib, /lib64 are symlinks into /usr or absent).
     for d in top_ro_dirs:
+        args.extend(["--ro-bind-try", d, d])
+    for d in etc_ro_entries:
         args.extend(["--ro-bind-try", d, d])
 
     def _is_under_top_ro(path: str) -> bool:
@@ -382,8 +425,8 @@ def _linux_bwrap_argv(inner_argv: list[str], workdir: str) -> list[str]:
 def build_sandbox_argv(inner_argv: list[str], workdir: str) -> list[str]:
     """Return an argv that runs *inner_argv* under the platform sandbox.
 
-    Caller should gate with :func:`sandbox_available`. Raises
-    ``RuntimeError`` if the platform has no sandbox implementation here.
+    Caller MUST gate with :func:`sandbox_available`; reaching the final
+    AssertionError indicates the gate was bypassed.
     """
     if not inner_argv:
         raise ValueError("inner_argv must be non-empty")
@@ -393,4 +436,7 @@ def build_sandbox_argv(inner_argv: list[str], workdir: str) -> list[str]:
         return [_SANDBOX_EXEC, "-p", profile, *inner_argv]
     if sys.platform == "linux":
         return _linux_bwrap_argv(inner_argv, workdir)
-    raise RuntimeError(f"build_sandbox_argv: no sandbox for platform {sys.platform!r}")
+    raise AssertionError(
+        f"build_sandbox_argv called on unsupported platform {sys.platform!r}; "
+        "callers must gate with sandbox_available()"
+    )
