@@ -58,33 +58,49 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round I: mlx-lm at higher iter counts to confirm it CAN
-          # memorize this fixture. Round H showed mlx-lm at 30-60 iters
-          # never drops loss below ~3 (vs unsloth-zoo's 0.0 by step 10).
-          # mlx-lm's defaults target fewer modules + smaller effective
-          # batch -> needs more iters. Check whether (a) mlx-lm does
-          # eventually memorize, and (b) if so, does its greedy decode
-          # ALSO exhibit the non-monotonic seed fragility?
-          - id: '19f'
-            script: probe_19_mlx_lm_param.py
-            steps: '200'
+          # Round J: bc=False vs bc=True end-to-end.
+          # PR #663 head re-exposes adam_bias_correction (SHA 7312862).
+          # Pin to that SHA so the env var actually takes effect, then
+          # run unsloth-zoo MLXTrainer at the same diagnostic (steps,
+          # seed) pairs Round G exposed as bc=True-fragile, with bc=0
+          # vs bc=1 each. If bc=False is robust where bc=True wasn't,
+          # default False is justified beyond just MLX-ecosystem parity.
+          # Includes the seed=3407+30 control on both bc values.
+          - id: '17ai'
+            script: probe_17_curve_param.py
+            steps: '30'
             seed: '3407'
-          - id: '19g'
-            script: probe_19_mlx_lm_param.py
-            steps: '500'
-            seed: '3407'
-          - id: '19h'
-            script: probe_19_mlx_lm_param.py
-            steps: '200'
+            bias_correction: '0'
+            lr: '1e-3'
+            zoo_pin: '7312862'
+          - id: '17aj'
+            script: probe_17_curve_param.py
+            steps: '30'
             seed: '12345'
-          - id: '19i'
-            script: probe_19_mlx_lm_param.py
-            steps: '200'
+            bias_correction: '0'
+            lr: '1e-3'
+            zoo_pin: '7312862'
+          - id: '17ak'
+            script: probe_17_curve_param.py
+            steps: '60'
+            seed: '3407'
+            bias_correction: '0'
+            lr: '1e-3'
+            zoo_pin: '7312862'
+          - id: '17al'
+            script: probe_17_curve_param.py
+            steps: '60'
             seed: '42'
-          - id: '19j'
-            script: probe_19_mlx_lm_param.py
-            steps: '500'
-            seed: '12345'
+            bias_correction: '0'
+            lr: '1e-3'
+            zoo_pin: '7312862'
+          - id: '17am'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
+            bias_correction: '1'
+            lr: '1e-3'
+            zoo_pin: '7312862'
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
