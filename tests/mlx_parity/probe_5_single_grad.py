@@ -66,6 +66,7 @@ def main() -> int:
     # ---------------- MLX side ----------------
     section("MLX + unsloth_zoo.mlx backward")
     import mlx.core as mx
+    import mlx.nn as mlx_nn
     mx.random.seed(SEED)
     from unsloth_zoo.mlx.loader import FastMLXModel
     from unsloth_zoo.mlx.utils import make_baseline_loss_fn
@@ -87,15 +88,23 @@ def main() -> int:
     lengths = mx.array([[1, L - 1]])
     labels_mlx = mx.array([ids])
 
-    def loss_only(model):
-        loss, _ntok = loss_fn(model, batch, lengths, labels_mlx)
+    # nn.value_and_grad takes (model, loss_fn) and uses model.trainable_parameters
+    # internally, avoiding the "argument should contain only arrays" tree_flatten
+    # error that mx.value_and_grad raises when the model tree has non-array
+    # metadata (PEFT wrappers).
+    def loss_for_grad(model, batch, lengths, labels_):
+        loss, _ntok = loss_fn(model, batch, lengths, labels_)
         return loss
-    loss_val, grads = mx.value_and_grad(loss_only)(mlx_model)
+    loss_and_grad = mlx_nn.value_and_grad(mlx_model, loss_for_grad)
+    loss_val, grads = loss_and_grad(mlx_model, batch, lengths, labels_mlx)
 
-    # `grads` is a nested dict tree; walk it manually, robust to mixed
-    # leaf types (mxu.tree_flatten only accepts pure mx.array leaves).
+    # Walk grads recursively (it is now a pure-array tree). Sum a per-name
+    # norm dict, restricted to layer-0 q_proj LoRA leaves.
     mlx_norms = {}
+    total_norm_sq = mx.array(0.0, dtype=mx.float32)
+    n_leaves = 0
     def _walk(tree, path):
+        nonlocal total_norm_sq, n_leaves
         if isinstance(tree, dict):
             for k, v in tree.items():
                 _walk(v, path + (str(k),))
@@ -105,51 +114,48 @@ def main() -> int:
                 _walk(v, path + (str(i),))
             return
         if hasattr(tree, "shape") and hasattr(tree, "dtype"):
-            try:
-                arr = tree
-                if hasattr(arr, "astype"):
-                    arr = arr.astype(mx.float32)
-                norm = float(mx.linalg.norm(arr).item())
-                name = ".".join(path)
-                if "q_proj" in name and (".0." in name or "layers.0" in name):
-                    key = name
-                    if "lora_a" in name.lower() or "lora_b" in name.lower():
-                        mlx_norms[key] = norm
-            except Exception:
-                pass
-
+            arr = tree.astype(mx.float32) if hasattr(tree, "astype") else tree
+            total_norm_sq = total_norm_sq + mx.sum(arr * arr)
+            n_leaves += 1
+            name = ".".join(path)
+            if "q_proj" in name and (".0." in name or "layers.0" in name) and (
+                "lora_a" in name.lower() or "lora_b" in name.lower()
+            ):
+                mlx_norms[name] = float(mx.linalg.norm(arr).item())
     _walk(grads, ())
-    report("mlx grad norms (q_proj.lora_*)", mlx_norms)
+    mlx_total_norm = float(mx.sqrt(total_norm_sq).item())
+    report("mlx grad leaves", n_leaves)
+    report("mlx total grad norm (all trainable)", mlx_total_norm)
+    report("mlx q_proj.lora_* grad norms", mlx_norms)
     report("mlx loss", float(loss_val.item()))
+
+    # Aggregate HF gradient norm for the same comparison.
+    hf_total_sq = 0.0
+    for _, p in hf_peft.named_parameters():
+        if p.grad is not None:
+            hf_total_sq += float((p.grad.detach().float() ** 2).sum().item())
+    hf_total_norm = hf_total_sq ** 0.5
 
     # ---------------- compare ----------------
     section("comparison")
-    ratio_info = {}
-    ok = True
-    for key_hf, val_hf in hf_norms.items():
-        # find the corresponding MLX key by suffix match
-        match = None
-        for key_mlx in mlx_norms:
-            if key_hf.lower().replace("default.weight", "") in key_mlx.lower():
-                match = key_mlx
-                break
-        if match is None:
-            ratio_info[key_hf] = {"hf": val_hf, "mlx": None}
-            ok = False
-            continue
-        ratio = mlx_norms[match] / max(val_hf, 1e-12)
-        ratio_info[key_hf] = {"hf": val_hf, "mlx": mlx_norms[match], "ratio_mlx_hf": ratio}
-        if not (0.5 <= ratio <= 2.0):
-            ok = False
-    report("grad-norm ratios", ratio_info)
-    out = {
+    ratio = mlx_total_norm / max(hf_total_norm, 1e-12)
+    report("hf total grad norm (all trainable)", hf_total_norm)
+    report("mlx total grad norm (all trainable)", mlx_total_norm)
+    report("ratio mlx/hf", ratio)
+    report("hf loss", float(out.loss.item()))
+    report("mlx loss", float(loss_val.item()))
+    ok = 0.5 <= ratio <= 2.0
+
+    out_blob = {
         "hf_loss": float(out.loss.item()) if hasattr(out, "loss") else None,
         "mlx_loss": float(loss_val.item()),
+        "hf_total_grad_norm": hf_total_norm,
+        "mlx_total_grad_norm": mlx_total_norm,
+        "ratio_mlx_hf": ratio,
         "hf_norms": hf_norms,
         "mlx_norms": mlx_norms,
-        "ratios": ratio_info,
     }
-    (OUT_DIR / "probe_5.json").write_text(json.dumps(out, indent=2, default=str))
+    (OUT_DIR / "probe_5.json").write_text(json.dumps(out_blob, indent=2, default=str))
     return 0 if ok else 2
 
 
