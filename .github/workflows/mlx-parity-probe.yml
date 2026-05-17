@@ -50,18 +50,20 @@ jobs:
       matrix:
         include:
           # Mac runners are capped at 5 parallel jobs on the free tier.
-          # Keep the matrix lean: only probes that produce NEW information
-          # we have not already pinned via earlier runs. Other probe
-          # scripts remain on disk for ad-hoc reruns.
-          - id: '10'
-            script: probe_10_hf_curve_control.py
+          # Active matrix: two known anchors + two fix candidates.
+          # 12 is the green anchor (pre-#634), 11 is the red anchor (HEAD).
+          # 14 + 15 test fix candidates against those anchors.
           - id: '11'
             script: probe_11_mlx_fp32_curve.py
           - id: '12'
             script: probe_12_zoo_prev634.py
             zoo_pin: 'f37d510'
-          - id: '13'
-            script: probe_13_pure_mlx_inference.py
+          - id: '14'
+            script: probe_14_zoo_bias_correction_false.py
+            zoo_pin: 'try-bias-correction-false'
+          - id: '15'
+            script: probe_15_zoo_pr663.py
+            zoo_pin: 'fix-mlx-grad-clip-hf-parity'
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
@@ -147,7 +149,7 @@ jobs:
           echo "=== probe artifacts ==="
           ls -la probes/ || true
           echo
-          for n in 10 11 12 13; do
+          for n in 11 12 14 15; do
             echo "--- probe_${n}.json ---"
             cat probes/probe_${n}.json 2>/dev/null || echo "(missing -- probe ${n} job did not produce output)"
             echo
