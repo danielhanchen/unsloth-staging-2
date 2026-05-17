@@ -58,34 +58,34 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round B: find the bc=True convergence boundary + verify
-          # stability across more seeds. Round A established that
-          # bc=True with 30 steps reliably emits "Unsloth"; 7 steps does
-          # not. Where is the cutover?
-          - id: '17e'
+          # Round C: zoom in on the bc=True convergence boundary.
+          # Round B established: 7 no, 15 yes, 20 yes, 30 yes, 50 no.
+          # Round C asks: where exactly does the "Unsloth" basin
+          # start and end with bc=True default?
+          - id: '17j'
             script: probe_17_curve_param.py
-            steps: '15'
+            steps: '10'
             seed: '3407'
             bias_correction: '1'
-          - id: '17f'
+          - id: '17k'
             script: probe_17_curve_param.py
-            steps: '20'
+            steps: '12'
             seed: '3407'
             bias_correction: '1'
-          - id: '17g'
+          - id: '17l'
             script: probe_17_curve_param.py
-            steps: '50'
+            steps: '25'
             seed: '3407'
             bias_correction: '1'
-          - id: '17h'
+          - id: '17m'
             script: probe_17_curve_param.py
-            steps: '30'
-            seed: '999'
+            steps: '35'
+            seed: '3407'
             bias_correction: '1'
-          - id: '17i'
+          - id: '17n'
             script: probe_17_curve_param.py
-            steps: '30'
-            seed: '1337'
+            steps: '40'
+            seed: '3407'
             bias_correction: '1'
     steps:
       - name: Harden runner (audit)
