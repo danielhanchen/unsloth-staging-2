@@ -49,24 +49,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - id: '1'
-            script: probe_1_tokenization.py
-          - id: '2'
-            script: probe_2_forward_logits.py
-          - id: '3'
-            script: probe_3_loss_reduction.py
-          - id: '4'
-            script: probe_4_lora_init.py
-          - id: '5'
-            script: probe_5_single_grad.py
-          - id: '6'
-            script: probe_6_adamw_step.py
-          - id: '7'
-            script: probe_7_loss_curve.py
-          - id: '8'
-            script: probe_8_per_token_loss.py
-          - id: '9'
-            script: probe_9_attention_lengths.py
+          # Mac runners are capped at 5 parallel jobs on the free tier.
+          # Keep the matrix lean: only probes that produce NEW information
+          # we have not already pinned via earlier runs. Other probe
+          # scripts remain on disk for ad-hoc reruns.
           - id: '10'
             script: probe_10_hf_curve_control.py
           - id: '11'
@@ -74,6 +60,8 @@ jobs:
           - id: '12'
             script: probe_12_zoo_prev634.py
             zoo_pin: 'f37d510'
+          - id: '13'
+            script: probe_13_pure_mlx_inference.py
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
@@ -159,7 +147,7 @@ jobs:
           echo "=== probe artifacts ==="
           ls -la probes/ || true
           echo
-          for n in 1 2 3 4 5 6 7 8 9 10 11 12; do
+          for n in 10 11 12 13; do
             echo "--- probe_${n}.json ---"
             cat probes/probe_${n}.json 2>/dev/null || echo "(missing -- probe ${n} job did not produce output)"
             echo

@@ -69,9 +69,12 @@ def main() -> int:
 
     import mlx.core as mx
 
-    section("load + LoRA (fp32)")
+    # Mirror the SMOKE TEST AT 12295c1f exactly: dtype="float16" + identical LoRA
+    # config + identical hyperparams. We want to know if pre-#634 trainer
+    # behavior matches the green CI from that era.
+    section("load + LoRA (fp16, matches pre-#634 smoke)")
     model, tokenizer = FastMLXModel.from_pretrained(
-        MODEL_NAME, load_in_4bit=False, dtype="float32",
+        MODEL_NAME, load_in_4bit=False, dtype="float16",
         text_only=True, max_seq_length=128, random_state=SEED,
     )
     model = FastMLXModel.get_peft_model(
@@ -124,27 +127,22 @@ def main() -> int:
     )
 
     rows = []
-    cb_arity_used = None
-    def _on_step_9(step, total, loss, lr, tok_s, peak_gb, elapsed, num_tokens, grad_norm):
+    # Variadic callback so we work for both pre-#634 (8 args) and
+    # post-#634 (9 args). The trainer wraps `cb(...)` in try/except
+    # Exception, so an arity mismatch on a fixed-arg callback would
+    # silently no-op the entire logging path.
+    def _on_step(*args):
+        # args = (step, total, loss, lr, tok_s, peak_gb, elapsed, num_tokens[, grad_norm])
+        if len(args) < 3:
+            return
+        step, _total, loss = args[0], args[1], args[2]
+        grad_norm = args[8] if len(args) >= 9 else None
         rows.append({
             "step": int(step), "loss": float(loss),
             "grad_norm": None if grad_norm is None else float(grad_norm),
-            "num_tokens": int(num_tokens),
         })
-    def _on_step_8(step, total, loss, lr, tok_s, peak_gb, elapsed, num_tokens):
-        rows.append({
-            "step": int(step), "loss": float(loss),
-            "grad_norm": None,
-            "num_tokens": int(num_tokens),
-        })
-    # pre-#634 callback arity was 8; post-#634 is 9. Try the higher
-    # arity first (post-#634); fall back to 8 if the trainer rejects it.
-    try:
-        trainer.add_step_callback(_on_step_9)
-        cb_arity_used = 9
-    except Exception:
-        trainer.add_step_callback(_on_step_8)
-        cb_arity_used = 8
+    trainer.add_step_callback(_on_step)
+    cb_arity_used = "variadic"
     trainer.train()
 
     section("post-train forward")
