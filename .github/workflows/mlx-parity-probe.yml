@@ -58,42 +58,45 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round E: lock in max_steps=30 as seed-robust + characterize
-          # LR sensitivity. Earlier rounds showed:
-          #   - bc=True basin is non-monotonic: works 15-40, fails at 50,
-          #     re-enters at 100 (seed 3407)
-          #   - seed=1337 failed at 20 steps but worked at 30
-          # Round E asks: does max_steps=30 hold across more seeds, AND
-          # is the basin LR-sensitive (would a smaller/larger LR escape
-          # the 50-step pit)?
-          - id: '17t'
+          # Round F: investigate seed=12345 generation failure at 30 steps.
+          # Round E showed trainer drives post_train_loss to ~0 across all
+          # seeds + LRs, but greedy decode of PROMPT diverged for seed=12345.
+          # Two hypotheses:
+          #   (a) bc=True basin geometry is seed-fragile -> PR #663 bc=False
+          #       contract recovers generation;
+          #   (b) seed=12345 just needs more steps to escape its pit.
+          # Also sanity-check PR #663 doesn't itself regress known-good seeds.
+          - id: '17y'
             script: probe_17_curve_param.py
-            steps: '20'
-            seed: '1337'
+            steps: '60'
+            seed: '12345'
             bias_correction: '1'
             lr: '1e-3'
-          - id: '17u'
+          - id: '17z'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '3407'
-            bias_correction: '1'
-            lr: '5e-4'
-          - id: '17v'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '3407'
-            bias_correction: '1'
-            lr: '2e-3'
-          - id: '17w'
+            seed: '12345'
+            bias_correction: '0'
+            lr: '1e-3'
+            zoo_pin: '18596f229b2436c8004ecfd0e6a39e5d0656857a'
+          - id: '17aa'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '12345'
             bias_correction: '1'
             lr: '1e-3'
-          - id: '17x'
+            zoo_pin: '18596f229b2436c8004ecfd0e6a39e5d0656857a'
+          - id: '17ab'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '7777'
+            seed: '3407'
+            bias_correction: '0'
+            lr: '1e-3'
+            zoo_pin: '18596f229b2436c8004ecfd0e6a39e5d0656857a'
+          - id: '17ac'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
             bias_correction: '1'
             lr: '1e-3'
     steps:
