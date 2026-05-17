@@ -1,32 +1,26 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 #
-# MLX vs HF parity bisection probes.
+# MLX vs HF parity bisection probes -- one Mac M1 job per probe.
 #
-# Why this workflow exists:
-#   The upstream MLX CI on `unslothai/unsloth` is failing the
-#   in-memory generation assertion in tests/studio/run_real_mlx_smoke.py
-#   (model emits "5 lbs!" instead of containing "Unsloth"). The CUDA
-#   mirror in temp/torchcodec_test/cuda_mirror.py emits "Unsloth" under
-#   every clip setting tested. Step-1 forward-pass loss is 7.64 on CUDA
-#   and 10.55 on MLX for the IDENTICAL model + data + seed -- a 1.38x
-#   pre-optimizer-step discrepancy. The clipping override fixed by
-#   unsloth-zoo#663 is a real bug but does not explain the loss gap.
+# Why parallel matrix: each probe is fully independent (different
+# subprocess, different pip state matters not at all because the
+# install layer is the same for each). Fanning out lets:
+#   * a single failing probe NOT block the diagnostic data from the
+#     remaining probes (already had continue-on-error, but matrix gives
+#     each its own job log + artifact + duration);
+#   * total wall-time = max(probe_install + probe_run) instead of
+#     sum across probes;
+#   * future probes added without touching the existing ones.
 #
-#   This workflow runs 7 small probes on a real macos-14-arm64 runner
-#   that bisect the parity gap across the dispatch path:
-#     1. tokenization              identical input ids?
-#     2. base-model forward logits identical logits?
-#     3. loss reduction (synthetic)same CE-mean number?
-#     4. LoRA init                 B=0 in both; A std comparable?
-#     5. single backward           gradient norms comparable?
-#     6. AdamW step (synthetic)    same post-step weight?
-#     7. 7-step loss curve         data dump for follow-up analysis
+# Each probe job:
+#   1. installs the common dep set (MLX + torch CPU + transformers + zoo)
+#   2. runs ONE probe
+#   3. always uploads its probe_${N}.json as an artifact
 #
-#   continue-on-error: true on each probe so a single divergence does
-#   not hide the diagnostics for the later probes.
-#
-# Status: experimental / debug. Surfaces "MLX parity probes" PR check.
+# A final aggregate job downloads all artifacts and prints a single
+# summary table to its log so the human reader can see all probes
+# without clicking into 10 separate job logs.
 
 name: MLX parity probes
 
@@ -47,10 +41,34 @@ permissions:
   contents: read
 
 jobs:
-  probes:
-    name: probes
+  probe:
+    name: probe-${{ matrix.id }}
     runs-on: macos-14
-    timeout-minutes: 30
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: '1'
+            script: probe_1_tokenization.py
+          - id: '2'
+            script: probe_2_forward_logits.py
+          - id: '3'
+            script: probe_3_loss_reduction.py
+          - id: '4'
+            script: probe_4_lora_init.py
+          - id: '5'
+            script: probe_5_single_grad.py
+          - id: '6'
+            script: probe_6_adamw_step.py
+          - id: '7'
+            script: probe_7_loss_curve.py
+          - id: '8'
+            script: probe_8_per_token_loss.py
+          - id: '9'
+            script: probe_9_attention_lengths.py
+          - id: '10'
+            script: probe_10_hf_curve_control.py
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
@@ -69,99 +87,69 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          # MLX + mlx-lm for the MLX-side calls
           pip install \
             'mlx==0.30.0' \
             'mlx-lm==0.30.0' \
             'numpy==2.4.4' \
             'pytest==9.0.3'
-          # torch CPU for the HF-side calls; CPU is fine since we're
-          # measuring losses + grad norms, not throughput
           pip install --index-url https://download.pytorch.org/whl/cpu \
             'torch==2.10.0'
-          # transformers + peft for HF SFTTrainer parity
           pip install \
             'transformers==4.57.6' \
             'peft==0.18.0' \
             'datasets==4.3.0' \
             'accelerate==1.13.0' \
             'sentencepiece==0.2.1' \
-            'huggingface-hub==0.36.2'
-          # unsloth-zoo from git (provides unsloth_zoo.mlx.* on Apple Silicon)
+            'huggingface-hub==0.36.2' \
+            'trl==0.27.0'
           for attempt in 1 2 3; do
             if pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo"; then break; fi
             if [ "$attempt" -eq 3 ]; then exit 1; fi
             sleep $((5*attempt))
           done
 
-      - name: Probe 1 — tokenization parity
-        if: always()
-        continue-on-error: true
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          cd tests/mlx_parity && python probe_1_tokenization.py
-
-      - name: Probe 2 — base-model forward logits parity
-        if: always()
-        continue-on-error: true
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          cd tests/mlx_parity && python probe_2_forward_logits.py
-
-      - name: Probe 3 — loss reduction parity (synthetic)
-        if: always()
-        continue-on-error: true
-        run: |
-          cd tests/mlx_parity && python probe_3_loss_reduction.py
-
-      - name: Probe 4 — LoRA init parity
-        if: always()
-        continue-on-error: true
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          cd tests/mlx_parity && python probe_4_lora_init.py
-
-      - name: Probe 5 — single backward parity
-        if: always()
-        continue-on-error: true
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          cd tests/mlx_parity && python probe_5_single_grad.py
-
-      - name: Probe 6 — AdamW step parity (synthetic)
-        if: always()
-        continue-on-error: true
-        run: |
-          cd tests/mlx_parity && python probe_6_adamw_step.py
-
-      - name: Probe 7 — 7-step MLX loss curve (data dump)
-        if: always()
-        continue-on-error: true
+      - name: Run probe ${{ matrix.id }} — ${{ matrix.script }}
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
           UNSLOTH_COMPILE_DISABLE: '1'
         run: |
-          cd tests/mlx_parity && python probe_7_loss_curve.py
+          cd tests/mlx_parity && python ${{ matrix.script }}
 
-      - name: Aggregate probe results
+      - name: Show JSON output
         if: always()
         run: |
-          set +e
-          echo "=== Aggregated probe JSON dumps ==="
-          for i in 1 2 3 4 5 6 7; do
-            echo "--- probe_${i}.json ---"
-            cat tests/mlx_parity/.out/probe_${i}.json 2>/dev/null || echo "(missing -- probe ${i} did not run or crashed)"
-            echo
-          done
+          F=tests/mlx_parity/.out/probe_${{ matrix.id }}.json
+          echo "=== ${F} ==="
+          cat "${F}" 2>/dev/null || echo "(no JSON written)"
 
-      - name: Upload probe artifacts
+      - name: Upload probe artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: mlx-parity-probe-output
-          path: tests/mlx_parity/.out/
+          name: probe-${{ matrix.id }}
+          path: tests/mlx_parity/.out/probe_${{ matrix.id }}.json
           if-no-files-found: warn
+
+  aggregate:
+    name: aggregate
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all probe artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: probes
+          pattern: probe-*
+          merge-multiple: true
+
+      - name: Summary
+        run: |
+          echo "=== probe artifacts ==="
+          ls -la probes/ || true
+          echo
+          for n in 1 2 3 4 5 6 7 8 9 10; do
+            echo "--- probe_${n}.json ---"
+            cat probes/probe_${n}.json 2>/dev/null || echo "(missing -- probe ${n} job did not produce output)"
+            echo
+          done
