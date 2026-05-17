@@ -58,55 +58,45 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round K: verify PR-663 head (SHA ef003aa) with default
-          # adam_bias_correction=True keeps the smoke green AND that
-          # bc=False is still reachable via explicit opt-out.
-          # Round J empirically established bc=True is required to
-          # memorize within a 30-step budget. Round K is the final
-          # confirmation pass before merging PR #663:
-          #   17an : PR-663 head + DEFAULT (no env) + seed=3407 ->
-          #          should match HEAD bc=True behavior (loss=0, ok)
-          #   17ao : PR-663 head + bc=0 explicit + seed=3407 + 200 steps
-          #          (does bc=False eventually memorize given enough
-          #          budget? - validates the "opt-out for long fine-
-          #          tunes" rationale)
-          #   17ap : PR-663 head + bc=0 explicit + seed=3407 + 500 steps
-          #          (same question, larger budget)
-          #   17aq : PR-663 head + DEFAULT + seed=12345 -> does the
-          #          new default still hit the basin?
-          #   17ar : PR-663 head + DEFAULT + seed=42, 30 steps control
-          - id: '17an'
+          # Round L: locate bc=False divergence boundary and verify
+          # PR-663 default reproduces known-good seeds (1337, 7777).
+          # Round K showed bc=False at 200/500 steps NaN-diverges
+          # (not just slow). The "opt-out for long fine-tunes"
+          # rationale in the commit message overstates bc=False's
+          # safety. Locate where divergence kicks in so the docstring
+          # can be honest.
+          - id: '17as'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '3407'
+            seed: '1337'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'ef003aa'
-          - id: '17ao'
+          - id: '17at'
             script: probe_17_curve_param.py
-            steps: '200'
+            steps: '30'
+            seed: '7777'
+            bias_correction: ''
+            lr: '1e-3'
+            zoo_pin: 'ef003aa'
+          - id: '17au'
+            script: probe_17_curve_param.py
+            steps: '50'
             seed: '3407'
             bias_correction: '0'
             lr: '1e-3'
             zoo_pin: 'ef003aa'
-          - id: '17ap'
+          - id: '17av'
             script: probe_17_curve_param.py
-            steps: '500'
+            steps: '100'
             seed: '3407'
             bias_correction: '0'
             lr: '1e-3'
             zoo_pin: 'ef003aa'
-          - id: '17aq'
+          - id: '17aw'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '12345'
-            bias_correction: ''
-            lr: '1e-3'
-            zoo_pin: 'ef003aa'
-          - id: '17ar'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '42'
+            seed: '3407'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'ef003aa'
