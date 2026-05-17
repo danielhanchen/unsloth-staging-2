@@ -58,44 +58,35 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round G: characterize whether 60 steps is universally seed-robust
-          # and locate seed=12345's basin entry point.
-          # Round F confirmed: 60 steps rescues the seed=12345 30-step
-          # generation failure ("Unsloth!" emitted). Round G asks:
-          #   (a) does 60-step robustness hold for seeds we previously saw
-          #       work at 30 (42, 1337, 3407)? If 60 is universal, max_steps
-          #       could move from 30 to 60 for higher safety margin.
-          #   (b) where exactly does seed=12345 enter the basin? 40 or 50?
-          - id: '17ad'
-            script: probe_17_curve_param.py
-            steps: '40'
+          # Round H: PIVOT to mlx-lm reference comparison.
+          # Round G showed the (steps, seed) basin is fundamentally non-
+          # monotonic: 60 steps fails for seeds 42 and 3407 even though
+          # 30 steps works for both. seed=12345 fails at 30 + 40 but works
+          # at 50. The post_train_loss reaches 0 across all configs, so
+          # the fragility is in greedy-decode geometry, not training.
+          # Run mlx-lm's NATIVE LoRA on the SAME fixture at the same
+          # (steps, seed) combos. If mlx-lm shows the same fragility,
+          # it's an MLX/optimizer geometry issue, not an unsloth-zoo bug.
+          - id: '19a'
+            script: probe_19_mlx_lm_param.py
+            steps: '30'
+            seed: '3407'
+          - id: '19b'
+            script: probe_19_mlx_lm_param.py
+            steps: '30'
             seed: '12345'
-            bias_correction: '1'
-            lr: '1e-3'
-          - id: '17ae'
-            script: probe_17_curve_param.py
-            steps: '50'
-            seed: '12345'
-            bias_correction: '1'
-            lr: '1e-3'
-          - id: '17af'
-            script: probe_17_curve_param.py
+          - id: '19c'
+            script: probe_19_mlx_lm_param.py
             steps: '60'
             seed: '42'
-            bias_correction: '1'
-            lr: '1e-3'
-          - id: '17ag'
-            script: probe_17_curve_param.py
-            steps: '60'
-            seed: '1337'
-            bias_correction: '1'
-            lr: '1e-3'
-          - id: '17ah'
-            script: probe_17_curve_param.py
+          - id: '19d'
+            script: probe_19_mlx_lm_param.py
             steps: '60'
             seed: '3407'
-            bias_correction: '1'
-            lr: '1e-3'
+          - id: '19e'
+            script: probe_19_mlx_lm_param.py
+            steps: '50'
+            seed: '12345'
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
