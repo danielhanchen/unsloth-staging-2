@@ -58,47 +58,48 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AB: Q1 MLX side -- max_grad_value vs max_grad_norm.
-          # Sweep MLX_MAX_GRAD_VALUE at 0.5, 1.0, 5.0 with norm=0
-          # (elementwise-only) and the smoke default (norm=1.0,
-          # value=None) at seed=3407 + 30 steps as control.
-          - id: '17du'
+          # Round AC: does value=1.0 elementwise clip have BETTER
+          # multi-seed Unsloth-decode pass-rate than the smoke
+          # default (norm=1.0, value=None)? Round AB showed
+          # value=1.0 rescued seed=42 (✗ at default -> ✓).
+          # Sweep the smoke-default-failing seeds at value=1.0.
+          - id: '17dz'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '3407'
-            bias_correction: ''
-            lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '0.5'
-            zoo_pin: 'c1821e4'
-          - id: '17dv'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '3407'
+            seed: '999'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
             max_grad_value: '1.0'
             zoo_pin: 'c1821e4'
-          - id: '17dw'
+          - id: '17ea'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '3407'
-            bias_correction: ''
-            lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '5.0'
-            zoo_pin: 'c1821e4'
-          - id: '17dx'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '42'
+            seed: '12345'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
             max_grad_value: '1.0'
             zoo_pin: 'c1821e4'
-          - id: '17dy'
+          - id: '17eb'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '22222'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'c1821e4'
+          - id: '17ec'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '2024'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'c1821e4'
+          - id: '17ed'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
