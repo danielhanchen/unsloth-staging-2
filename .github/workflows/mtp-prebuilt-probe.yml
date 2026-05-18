@@ -54,77 +54,8 @@ jobs:
           echo "$HELP" | grep -E "^\s*--spec-draft-p-min" >/dev/null
           echo "$HELP" | grep -E "^\s*--spec-ngram-mod-n-(match|min|max)" | wc -l
 
-  probe-macos:
-    name: Probe llama-server (macos-14)
-    runs-on: macos-14
-    timeout-minutes: 10
-    steps:
-      - name: Download prebuilt llama-server
-        run: |
-          # macOS prebuilt is named differently in the b9204 release; if
-          # there is no -macos asset we skip with a clear message.
-          mkdir -p prebuilt && cd prebuilt
-          set +e
-          curl -fsSL --retry 3 -o app.tar.gz "https://github.com/unslothai/llama.cpp/releases/download/${PREBUILT_TAG}/app-${PREBUILT_TAG}-macos-arm64.tar.gz"
-          rc=$?
-          set -e
-          if [ $rc -ne 0 ]; then
-            echo "No prebuilt macOS arm64 asset for ${PREBUILT_TAG}. Listing assets:"
-            curl -fsSL "https://api.github.com/repos/unslothai/llama.cpp/releases/tags/${PREBUILT_TAG}" | grep '"name":'
-            echo "::warning::macOS prebuilt asset not available; skipping probe."
-            exit 0
-          fi
-          tar -xzf app.tar.gz
-          ls -la
-
-      - name: Probe llama-server for MTP spec advertisement
-        run: |
-          BIN=$(find prebuilt -name llama-server -type f 2>/dev/null | head -1)
-          if [ -z "$BIN" ]; then
-            echo "::warning::no llama-server in prebuilt directory; skip"
-            exit 0
-          fi
-          chmod +x "$BIN" 2>/dev/null || true
-          HELP=$("$BIN" --help 2>&1 || true)
-          echo "$HELP" | grep -E "^\s*--spec-type" | head -2
-          echo "$HELP" | grep -E "^\s*--spec-type" | grep -E "draft-mtp|[|,\\[]mtp[|,\\]]"
-          echo "$HELP" | grep -E "^\s*--spec-draft-n-max" >/dev/null
-          echo "$HELP" | grep -E "^\s*--spec-draft-p-min" >/dev/null
-
-  probe-windows:
-    name: Probe llama-server (windows-latest)
-    runs-on: windows-latest
-    timeout-minutes: 10
-    steps:
-      - name: Download prebuilt llama-server
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path prebuilt | Out-Null
-          $url = "https://github.com/unslothai/llama.cpp/releases/download/$env:PREBUILT_TAG/app-$env:PREBUILT_TAG-win-x64-cuda12.zip"
-          try {
-            Invoke-WebRequest -Uri $url -OutFile prebuilt/app.zip -UseBasicParsing
-          } catch {
-            Write-Host "No Windows prebuilt asset for $env:PREBUILT_TAG. Listing assets:"
-            $assets = Invoke-RestMethod -Uri "https://api.github.com/repos/unslothai/llama.cpp/releases/tags/$env:PREBUILT_TAG"
-            $assets.assets | ForEach-Object { Write-Host $_.name }
-            Write-Host "::warning::Windows prebuilt asset not available; skipping probe."
-            exit 0
-          }
-          Expand-Archive -Path prebuilt/app.zip -DestinationPath prebuilt
-          Get-ChildItem prebuilt -Recurse | Select-Object -First 20
-
-      - name: Probe llama-server for MTP spec advertisement
-        shell: pwsh
-        run: |
-          $bin = Get-ChildItem -Path prebuilt -Recurse -Filter llama-server.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $bin) {
-            Write-Host "::warning::no llama-server.exe in prebuilt; skip"
-            exit 0
-          }
-          $help = & $bin.FullName --help 2>&1 | Out-String
-          $specLine = ($help -split "`n") | Where-Object { $_ -match '^\s*--spec-type' } | Select-Object -First 1
-          if (-not $specLine) { throw "no --spec-type line in help" }
-          Write-Host $specLine
-          if ($specLine -notmatch 'draft-mtp|[|,\[]mtp[|,\]]') { throw "spec-type does not advertise draft-mtp / mtp" }
-          if (-not ($help -match '--spec-draft-n-max')) { throw "missing --spec-draft-n-max" }
-          if (-not ($help -match '--spec-draft-p-min')) { throw "missing --spec-draft-p-min" }
+  # Note: Unsloth only publishes Linux-x64-CUDA prebuilts at this tag.
+  # macOS / Windows builds llama-server from source via install.sh /
+  # install.ps1 at user install time. Cross-OS argv coverage for the
+  # MTP emit path is enforced by `MTP tests CI`, which runs the Python
+  # unit suite on all three OSes.
