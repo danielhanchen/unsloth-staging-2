@@ -2,7 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { create } from "zustand";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import {
   DEFAULT_INFERENCE_PARAMS,
   type ChatLoraSummary,
@@ -258,6 +258,9 @@ type ChatRuntimeStore = {
   loadedKvCacheDtype: string | null;
   speculativeType: string | null;
   loadedSpeculativeType: string | null;
+  /** User --spec-draft-n-max override (null = platform default). */
+  specDraftNMax: number | null;
+  loadedSpecDraftNMax: number | null;
   loadedIsMultimodal: boolean;
   customContextLength: number | null;
   defaultChatTemplate: string | null;
@@ -305,6 +308,7 @@ type ChatRuntimeStore = {
   setToolCallTimeout: (value: number) => void;
   setKvCacheDtype: (dtype: string | null) => void;
   setSpeculativeType: (type: string | null) => void;
+  setSpecDraftNMax: (value: number | null) => void;
   setCustomContextLength: (v: number | null) => void;
   setChatTemplateOverride: (template: string | null) => void;
   setPendingAudio: (base64: string, name: string) => void;
@@ -351,6 +355,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
   loadedKvCacheDtype: null,
   speculativeType: "default",
   loadedSpeculativeType: null,
+  specDraftNMax: null,
+  loadedSpecDraftNMax: null,
   loadedIsMultimodal: false,
   customContextLength: null,
   defaultChatTemplate: null,
@@ -459,6 +465,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
       loadedKvCacheDtype: null,
       speculativeType: "default",
       loadedSpeculativeType: null,
+      specDraftNMax: null,
+      loadedSpecDraftNMax: null,
       loadedIsMultimodal: false,
       customContextLength: null,
       defaultChatTemplate: null,
@@ -506,6 +514,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set) => ({
     }),
   setKvCacheDtype: (kvCacheDtype) => set({ kvCacheDtype }),
   setSpeculativeType: (speculativeType) => set({ speculativeType }),
+  setSpecDraftNMax: (specDraftNMax) => set({ specDraftNMax }),
   setCustomContextLength: (customContextLength) => set({ customContextLength }),
   setChatTemplateOverride: (chatTemplateOverride) => set({ chatTemplateOverride }),
   setPendingAudio: (base64, name) =>

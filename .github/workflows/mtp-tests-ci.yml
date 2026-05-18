@@ -1,0 +1,74 @@
+# MTP plumbing unit tests across Linux, macOS, Windows.
+#
+# Runs the two pytest files that pin Studio's MTP argv emission and
+# spec_draft_n_max plumbing. Pure-Python, no llama-server, no GPU.
+# Goal: catch any platform-specific issue (path handling, pyobjc,
+# Windows long-paths, etc.) in the spec-decoding code before merging
+# to the upstream repo's main.
+
+name: MTP tests CI
+
+on:
+  push:
+    branches: [studio-mtp-ci]
+    paths:
+      - 'studio/backend/core/inference/**'
+      - 'studio/backend/tests/test_llama_cpp_mtp_detection.py'
+      - 'studio/backend/tests/test_llama_server_args.py'
+      - '.github/workflows/mtp-tests-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install minimal backend deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Tests stub structlog, httpx, loggers (see file headers). The
+          # backend import chain still touches pydantic, anyio, fastapi.
+          # Keep this install lean -- studio.txt is too heavy and the
+          # MTP tests do not need it.
+          pip install \
+            pytest \
+            pydantic \
+            'fastapi>=0.110' \
+            anyio \
+            python-multipart \
+            sqlalchemy \
+            cryptography \
+            pyyaml \
+            jinja2 \
+            requests
+
+      - name: Run MTP plumbing tests
+        working-directory: studio/backend
+        shell: bash
+        run: |
+          python -m pytest \
+            tests/test_llama_cpp_mtp_detection.py \
+            tests/test_llama_server_args.py \
+            -q --tb=short

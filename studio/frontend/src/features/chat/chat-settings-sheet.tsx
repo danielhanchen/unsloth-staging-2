@@ -62,7 +62,7 @@ import { Tooltip as TooltipPrimitive } from "radix-ui";
 import { ChevronDown } from "lucide-react";
 import { Fragment, type ReactNode } from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { useChatRuntimeStore } from "./stores/chat-runtime-store";
 import {
   type ExternalProviderConfig,
@@ -570,6 +570,11 @@ export function ChatSettingsPanel({
   const loadedSpeculativeType = useChatRuntimeStore(
     (s) => s.loadedSpeculativeType,
   );
+  const specDraftNMax = useChatRuntimeStore((s) => s.specDraftNMax);
+  const setSpecDraftNMax = useChatRuntimeStore((s) => s.setSpecDraftNMax);
+  const loadedSpecDraftNMax = useChatRuntimeStore(
+    (s) => s.loadedSpecDraftNMax,
+  );
   const modelRequiresTrustRemoteCode = useChatRuntimeStore(
     (s) => s.modelRequiresTrustRemoteCode,
   );
@@ -608,7 +613,8 @@ export function ChatSettingsPanel({
   const kvDirty = kvCacheDtype !== loadedKvCacheDtype;
   const ctxDirty = customContextLength !== null;
   const specDirty = speculativeType !== loadedSpeculativeType;
-  const modelSettingsDirty = kvDirty || ctxDirty || specDirty;
+  const specDraftDirty = specDraftNMax !== loadedSpecDraftNMax;
+  const modelSettingsDirty = kvDirty || ctxDirty || specDirty || specDraftDirty;
   const chatTemplateOverride = useChatRuntimeStore(
     (s) => s.chatTemplateOverride,
   );
@@ -979,23 +985,64 @@ export function ChatSettingsPanel({
                     </Select>
                   </div>
                 </div>
-                {!currentModelIsMultimodal && (
+                <div className="flex items-center justify-between gap-3">
+                  <div className="flex min-w-0 items-center gap-1.5">
+                    <span className="min-w-0 text-[13px] font-medium leading-[1.25] tracking-nav text-nav-fg">
+                      Speculative Decoding
+                    </span>
+                    <InfoHint>
+                      Faster generation with 0% accuracy hit.
+                    </InfoHint>
+                  </div>
+                  <Switch
+                    className="panel-switch shrink-0"
+                    checked={
+                      speculativeType !== "off" && speculativeType != null
+                    }
+                    onCheckedChange={(checked) => {
+                      setSpeculativeType(checked ? "default" : "off");
+                      if (!checked) {
+                        setSpecDraftNMax(null);
+                      }
+                    }}
+                  />
+                </div>
+                {speculativeType !== "off" && speculativeType != null && (
                   <div className="flex items-center justify-between gap-3">
                     <div className="flex min-w-0 items-center gap-1.5">
                       <span className="min-w-0 text-[13px] font-medium leading-[1.25] tracking-nav text-nav-fg">
-                        Speculative Decoding
+                        Draft Tokens
                       </span>
                       <InfoHint>
-                        N-gram speculation; faster generation with negligible
-                        VRAM overhead. Text-only models.
+                        Max MTP draft tokens per step
+                        (--spec-draft-n-max). Lower = less VRAM at the
+                        cost of speedup; higher = bigger speedup when
+                        draft acceptance is high. Default: 6 on GPU,
+                        3 on CPU/Mac.
                       </InfoHint>
                     </div>
-                    <Switch
-                      className="panel-switch shrink-0"
-                      checked={speculativeType != null}
-                      onCheckedChange={(checked) => {
-                        setSpeculativeType(checked ? "default" : null);
+                    <input
+                      type="number"
+                      min={1}
+                      max={16}
+                      step={1}
+                      value={specDraftNMax ?? ""}
+                      placeholder="auto"
+                      onChange={(e) => {
+                        const raw = e.target.value;
+                        if (raw === "") {
+                          setSpecDraftNMax(null);
+                          return;
+                        }
+                        const parsed = Number.parseInt(raw, 10);
+                        if (Number.isFinite(parsed)) {
+                          const clamped = Math.max(1, Math.min(16, parsed));
+                          setSpecDraftNMax(clamped);
+                        }
                       }}
+                      data-test-id="spec-draft-n-max-input"
+                      aria-label="Speculative decoding draft tokens"
+                      className="h-7 w-[72px] rounded-[10px] border-transparent bg-black/[0.04] dark:bg-white/[0.05] hover:bg-black/[0.06] dark:hover:bg-white/[0.07] px-2 py-0 text-[13px] font-medium text-nav-fg outline-none focus-visible:ring-0"
                     />
                   </div>
                 )}
@@ -1052,6 +1099,7 @@ export function ChatSettingsPanel({
                     setCustomContextLength(null);
                     setKvCacheDtype(loadedKvCacheDtype);
                     setSpeculativeType(loadedSpeculativeType);
+                    setSpecDraftNMax(loadedSpecDraftNMax);
                     setChatTemplateOverride(loadedChatTemplateOverride);
                   }}
                   className="h-7 px-3 text-[12px] font-medium tracking-nav text-muted-foreground"

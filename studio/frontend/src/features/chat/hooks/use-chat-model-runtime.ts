@@ -2,7 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { createElement, useCallback, useRef, useState } from "react";
-import { toast } from "sonner";
+import { toast } from "@/lib/toast";
 import { consumeNativePathToken } from "@/features/native-intents/api";
 import {
   notifyNative,
@@ -323,6 +323,12 @@ export function useChatModelRuntime() {
             speculativeType: currentSpecType,
             loadedSpeculativeType: currentSpecType,
           }),
+          ...(statusRes.spec_draft_n_max !== undefined &&
+            prevState.loadedSpecDraftNMax === null &&
+            prevState.specDraftNMax === null && {
+              specDraftNMax: statusRes.spec_draft_n_max ?? null,
+              loadedSpecDraftNMax: statusRes.spec_draft_n_max ?? null,
+            }),
           ...(statusRes.cache_type_kv !== undefined &&
             prevState.loadedKvCacheDtype === null && {
               kvCacheDtype: statusRes.cache_type_kv,
@@ -534,6 +540,7 @@ export function useChatModelRuntime() {
               customContextLength,
               ggufContextLength,
               speculativeType,
+              specDraftNMax,
               activePresetSource,
               activeGgufVariant,
             } = useChatRuntimeStore.getState();
@@ -561,6 +568,7 @@ export function useChatModelRuntime() {
               chat_template_override: effectiveChatTemplateOverride,
               cache_type_kv: kvCacheDtype,
               speculative_type: speculativeType,
+              spec_draft_n_max: specDraftNMax,
             });
 
             // If cancelled while loading, don't update UI to show
@@ -635,6 +643,8 @@ export function useChatModelRuntime() {
               loadedKvCacheDtype: loadedKv,
               speculativeType: loadedSpec,
               loadedSpeculativeType: loadedSpec,
+              specDraftNMax: loadResponse.spec_draft_n_max ?? null,
+              loadedSpecDraftNMax: loadResponse.spec_draft_n_max ?? null,
               customContextLength: keepCustomCtx,
               defaultChatTemplate: loadResponse.chat_template ?? null,
               chatTemplateOverride: effectiveChatTemplateOverride,
@@ -729,7 +739,6 @@ export function useChatModelRuntime() {
               cancelLoading,
             ),
             duration: Infinity,
-            closeButton: false,
             classNames: MODEL_LOAD_TOAST_CLASSNAMES,
             onDismiss: (dismissedToast) => {
               if (loadToastIdRef.current !== dismissedToast.id) {
@@ -852,7 +861,6 @@ export function useChatModelRuntime() {
                   cancelLoading,
                 ),
                 duration: Infinity,
-                closeButton: false,
                 classNames: MODEL_LOAD_TOAST_CLASSNAMES,
                 onDismiss: (dismissedToast) => {
                   if (loadToastIdRef.current !== dismissedToast.id) return;
@@ -892,7 +900,6 @@ export function useChatModelRuntime() {
                     cancelLoading,
                   ),
                   duration: Infinity,
-                  closeButton: false,
                   classNames: MODEL_LOAD_TOAST_CLASSNAMES,
                   onDismiss: (dismissedToast) => {
                     if (loadToastIdRef.current !== dismissedToast.id) return;
@@ -955,7 +962,6 @@ export function useChatModelRuntime() {
                 cancelLoading,
               ),
               duration: Infinity,
-              closeButton: false,
               classNames: MODEL_LOAD_TOAST_CLASSNAMES,
               onDismiss: (dismissedToast) => {
                 if (loadToastIdRef.current !== dismissedToast.id) return;
@@ -987,8 +993,7 @@ export function useChatModelRuntime() {
             toast.success(`${displayName} loaded`, {
               id: toastId,
               description: undefined,
-              closeButton: false,
-              duration: 2000,
+              duration: 8000,
             });
           }
           notifyNative({
@@ -1007,8 +1012,7 @@ export function useChatModelRuntime() {
               toast.error(message, {
                 id: toastId,
                 description: undefined,
-                closeButton: false,
-                duration: 5000,
+                duration: 8000,
               });
             }
             notifyNative({
