@@ -58,4 +58,9 @@ jobs:
       - name: Verify dist artifacts exist
         run: |
           test -f dist/index.html
-          ls dist/assets | head -5
+          test -d dist/assets
+          # Count is enough; piping ls into head triggers SIGPIPE under
+          # `set -e -o pipefail` on ubuntu-latest's bash.
+          count=$(ls dist/assets | wc -l)
+          echo "dist/assets contains $count files"
+          test "$count" -gt 0
