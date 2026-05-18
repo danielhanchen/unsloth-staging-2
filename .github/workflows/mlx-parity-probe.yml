@@ -58,43 +58,45 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AL: does bc=True have a Goldilocks intermediate
-          # (lr, steps) zone between smoke (lr=1e-3, 30 = 46% ✓)
-          # and slow-LR (lr=1e-4, 500 = 0% ✓)? Test lr=5e-4 + 100
-          # steps across 5 seeds.
-          - id: '17fs'
+          # Round AM: bc=False at intermediate (lr=5e-4, 100) to
+          # complete the bc head-to-head at 3 envelopes:
+          #   smoke      (lr=1e-3, 30):  bc=T 46% > bc=F 0%
+          #   intermediate(lr=5e-4, 100): bc=T 20% > bc=F ?
+          #   slow       (lr=1e-4, 500): bc=T 0%  < bc=F 33%
+          # Pin down where the bc=T<->bc=F crossover happens.
+          - id: '17fx'
             script: probe_17_curve_param.py
             steps: '100'
             seed: '3407'
-            bias_correction: '1'
+            bias_correction: '0'
             lr: '5e-4'
             zoo_pin: 'c1821e4'
-          - id: '17ft'
+          - id: '17fy'
             script: probe_17_curve_param.py
             steps: '100'
             seed: '42'
-            bias_correction: '1'
+            bias_correction: '0'
             lr: '5e-4'
             zoo_pin: 'c1821e4'
-          - id: '17fu'
+          - id: '17fz'
             script: probe_17_curve_param.py
             steps: '100'
             seed: '999'
-            bias_correction: '1'
+            bias_correction: '0'
             lr: '5e-4'
             zoo_pin: 'c1821e4'
-          - id: '17fv'
+          - id: '17ga'
             script: probe_17_curve_param.py
             steps: '100'
             seed: '12345'
-            bias_correction: '1'
+            bias_correction: '0'
             lr: '5e-4'
             zoo_pin: 'c1821e4'
-          - id: '17fw'
+          - id: '17gb'
             script: probe_17_curve_param.py
             steps: '100'
             seed: '22222'
-            bias_correction: '1'
+            bias_correction: '0'
             lr: '5e-4'
             zoo_pin: 'c1821e4'
     steps:
