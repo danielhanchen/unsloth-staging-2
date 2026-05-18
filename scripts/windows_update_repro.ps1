@@ -50,10 +50,13 @@ Write-Host "[repro] writing sentinel into launcher"
 $BeforeHash = (Get-FileHash -LiteralPath $LauncherPs1 -Algorithm SHA256).Hash
 Write-Host "[repro] sentinel sha256 = $BeforeHash"
 
-Write-Host "[repro] running 'unsloth studio update --local'"
-# update() renames unsloth.exe to .deleteme before invoking pip so the entry
-# point is replaceable; we can invoke unsloth.exe directly again.
-& $UnslothExe studio update --local
+Write-Host "[repro] running update via venv python -m unsloth_cli"
+# Windows refuses to delete a running unsloth.exe (WinError 32 from pip).
+# Production users should invoke `python -m unsloth_cli studio update` from
+# PowerShell in that scenario. The CI test exercises that path so we validate
+# the launcher rebuild logic end-to-end without tripping the OS-level lock.
+$VenvPython = Join-Path $VenvScripts 'python.exe'
+& $VenvPython -m unsloth_cli studio update --local
 if ($LASTEXITCODE -ne 0) {
     Write-Host "FAIL: unsloth studio update exited $LASTEXITCODE"
     exit 1
