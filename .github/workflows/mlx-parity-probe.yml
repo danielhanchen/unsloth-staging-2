@@ -58,54 +58,53 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AR: value=0.1 (tighter than 0.25). AQ got 4/5 ✓
-          # at value=0.25 (better than value=0.5's 3/5 on same
-          # seeds). Does the trend continue, or does over-clip
-          # finally kick in?
-          - id: '17gw'
+          # Round AS: complete value=0.25 13-seed sample (best-
+          # so-far MLX clip config). AQ tested 5 seeds; AS adds
+          # 5 more (1337, 11111, 5555, 7777, 8888).
+          - id: '17hb'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '3407'
+            seed: '1337'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '0.1'
+            max_grad_value: '0.25'
             zoo_pin: 'c1821e4'
-          - id: '17gx'
+          - id: '17hc'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '42'
+            seed: '11111'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '0.1'
+            max_grad_value: '0.25'
             zoo_pin: 'c1821e4'
-          - id: '17gy'
+          - id: '17hd'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '999'
+            seed: '5555'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '0.1'
+            max_grad_value: '0.25'
             zoo_pin: 'c1821e4'
-          - id: '17gz'
+          - id: '17he'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '22222'
+            seed: '7777'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '0.1'
+            max_grad_value: '0.25'
             zoo_pin: 'c1821e4'
-          - id: '17ha'
+          - id: '17hf'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '12345'
+            seed: '8888'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '0.1'
+            max_grad_value: '0.25'
             zoo_pin: 'c1821e4'
     steps:
       - name: Harden runner (audit)
