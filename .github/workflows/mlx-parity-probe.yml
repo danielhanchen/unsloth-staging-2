@@ -58,43 +58,41 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round P: tighten bc=False NaN boundary + 1000-step bc=True
-          # stability. Round O established:
-          #   * bc=True at 100/200/500 stays finite (loss=0);
-          #   * bc=False NaN at 90 (Round M: 80 finite at loss 2.64).
-          # Round P narrows the boundary to single-step precision so
-          # the PR-663 docstring "past ~80 steps" can be tightened if
-          # needed, and adds a 1000-step bc=True run to extend the
-          # finite-stays-finite claim.
-          - id: '17bm'
+          # Round Q: LR axis at long horizons.
+          # Rounds A-P characterized (steps, seed, bc) thoroughly at
+          # lr=1e-3. The remaining question for the PR-663 docstring:
+          # does smaller LR rescue bc=False from NaN, and does larger
+          # LR push bc=True into instability? Tightens the safety
+          # envelope around the recommended defaults.
+          - id: '17br'
             script: probe_17_curve_param.py
-            steps: '85'
+            steps: '100'
             seed: '3407'
             bias_correction: '0'
-            lr: '1e-3'
+            lr: '1e-4'
             zoo_pin: '669a792'
-          - id: '17bn'
+          - id: '17bs'
             script: probe_17_curve_param.py
-            steps: '88'
+            steps: '200'
             seed: '3407'
             bias_correction: '0'
-            lr: '1e-3'
+            lr: '1e-4'
             zoo_pin: '669a792'
-          - id: '17bo'
+          - id: '17bt'
             script: probe_17_curve_param.py
-            steps: '1000'
+            steps: '100'
             seed: '3407'
             bias_correction: ''
-            lr: '1e-3'
+            lr: '5e-3'
             zoo_pin: '669a792'
-          - id: '17bp'
+          - id: '17bu'
             script: probe_17_curve_param.py
-            steps: '50'
+            steps: '500'
             seed: '3407'
             bias_correction: ''
-            lr: '1e-3'
+            lr: '5e-3'
             zoo_pin: '669a792'
-          - id: '17bq'
+          - id: '17bv'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
