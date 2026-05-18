@@ -1,0 +1,140 @@
+"""Probe 14 — pin unsloth-zoo to `try-bias-correction-false` and rerun.
+
+Hypothesis: PR #634 flipped MLX AdamW `bias_correction` from False to
+True (matching torch.AdamW). With bias_correction=True step-1 updates
+are ~3x smaller than the historical MLX default; the 7-step smoke
+never reaches the "Unsloth" basin.
+
+This probe installs unsloth-zoo from the experimental branch
+`try-bias-correction-false` (which sits on top of PR #663 and ONLY
+reverts bias_correction back to False) and re-runs the standard 7-step
+config in fp16, byte-matched to the green-era smoke test.
+
+Outcome:
+  * generates "Unsloth"  =>  bias_correction=True is the breakage.
+  * still gibberish      =>  there is a second regression inside #634.
+"""
+
+import json
+import sys
+
+from _common import (
+    MODEL_NAME,
+    TRAIN_TEXT,
+    PROMPT,
+    SEED,
+    MAX_SEQ_LEN,
+    OUT_DIR,
+    banner,
+    section,
+    report,
+    seed_everything,
+)
+
+
+def main() -> int:
+    seed_everything()
+    banner("Probe 14: MLX with bias_correction=False (experimental fix branch)")
+
+    import mlx.core as mx
+    from unsloth_zoo.mlx.loader import FastMLXModel
+    from unsloth_zoo.mlx.trainer import MLXTrainer, MLXTrainingConfig
+    from unsloth_zoo.mlx.utils import make_baseline_loss_fn
+
+    section("load + LoRA (fp16, smoke parity)")
+    model, tokenizer = FastMLXModel.from_pretrained(
+        MODEL_NAME, load_in_4bit=False, dtype="float16",
+        text_only=True, max_seq_length=128, random_state=SEED,
+    )
+    model = FastMLXModel.get_peft_model(
+        model,
+        r=8, lora_alpha=16, lora_dropout=0.0,
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+        random_state=SEED,
+        finetune_language_layers=True,
+        finetune_attention_modules=True,
+        finetune_mlp_modules=True,
+    )
+
+    config = MLXTrainingConfig(
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=3,
+        max_steps=7,
+        learning_rate=1e-3,
+        warmup_steps=0,
+        lr_scheduler_type="constant",
+        optim="adamw",
+        weight_decay=0.0,
+        max_grad_norm=1.0,
+        max_grad_value=None,
+        logging_steps=1,
+        max_seq_length=MAX_SEQ_LEN,
+        seed=SEED,
+        use_cce=False,
+        compile=False,
+        gradient_checkpointing=False,
+        output_dir=str(OUT_DIR / "probe14_outputs"),
+        save_steps=0,
+        eval_steps=0,
+        dataset_text_field="text",
+    )
+    trainer = MLXTrainer(
+        model=model, tokenizer=tokenizer,
+        train_dataset=[{"text": TRAIN_TEXT}] * 64,
+        args=config,
+    )
+
+    rows = []
+    def _on_step(*args):
+        if len(args) < 3:
+            return
+        rows.append({
+            "step": int(args[0]),
+            "loss": float(args[2]),
+            "grad_norm": float(args[8]) if len(args) >= 9 and args[8] is not None else None,
+        })
+    trainer.add_step_callback(_on_step)
+    trainer.train()
+
+    section("post-train forward")
+    loss_fn = make_baseline_loss_fn()
+    ids = tokenizer.encode(TRAIN_TEXT)
+    if tokenizer.eos_token_id is not None and ids[-1] != tokenizer.eos_token_id:
+        ids.append(tokenizer.eos_token_id)
+    L = len(ids)
+    batch = mx.array([ids])
+    lengths = mx.array([[1, L - 1]])
+    labels_mlx = mx.array([ids])
+    post_loss, _ = loss_fn(model, batch, lengths, labels_mlx)
+    post_loss_val = float(post_loss.item())
+
+    section("greedy generation")
+    from mlx_lm import generate
+    gen = generate(model, tokenizer, prompt=PROMPT, max_tokens=48, verbose=False)
+    contains = "Unsloth" in gen
+    report("generation", repr(gen))
+    report("contains 'Unsloth'", contains)
+
+    out = {
+        "branch": "try-bias-correction-false",
+        "bias_correction": False,
+        "rows": rows,
+        "post_train_loss": post_loss_val,
+        "generation": gen,
+        "contains_unsloth": contains,
+    }
+    (OUT_DIR / "probe_14.json").write_text(json.dumps(out, indent=2))
+    section("summary")
+    if rows:
+        report("step-1 loss", rows[0]["loss"])
+        report("step-7 loss", rows[-1]["loss"])
+    report("post_train_loss", post_loss_val)
+    report("contains 'Unsloth'", contains)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

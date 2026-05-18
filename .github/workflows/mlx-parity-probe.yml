@@ -1,0 +1,210 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+#
+# MLX vs HF parity bisection probes -- one Mac M1 job per probe.
+#
+# Why parallel matrix: each probe is fully independent (different
+# subprocess, different pip state matters not at all because the
+# install layer is the same for each). Fanning out lets:
+#   * a single failing probe NOT block the diagnostic data from the
+#     remaining probes (already had continue-on-error, but matrix gives
+#     each its own job log + artifact + duration);
+#   * total wall-time = max(probe_install + probe_run) instead of
+#     sum across probes;
+#   * future probes added without touching the existing ones.
+#
+# Each probe job:
+#   1. installs the common dep set (MLX + torch CPU + transformers + zoo)
+#   2. runs ONE probe
+#   3. always uploads its probe_${N}.json as an artifact
+#
+# A final aggregate job downloads all artifacts and prints a single
+# summary table to its log so the human reader can see all probes
+# without clicking into 10 separate job logs.
+
+name: MLX parity probes
+
+on:
+  pull_request:
+    paths:
+      - 'tests/mlx_parity/**'
+      - '.github/workflows/mlx-parity-probe.yml'
+  push:
+    branches: [mlx-parity-probes]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: probe-${{ matrix.id }}
+    runs-on: macos-14
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ---- Extended-investigation matrix (5 Mac M1 jobs in parallel) ----
+          # Question: is MLX itself broken, or does post-#634 just need more
+          # steps / different seeds to memorize?
+          #
+          # Each probe_17 entry runs the unsloth-zoo HEAD trainer
+          # (broken default until #663 merges) with a different
+          # (steps, seed) combination so we can rule in/out a
+          # convergence-horizon effect.
+
+          # Round AC: does value=1.0 elementwise clip have BETTER
+          # multi-seed Unsloth-decode pass-rate than the smoke
+          # default (norm=1.0, value=None)? Round AB showed
+          # value=1.0 rescued seed=42 (✗ at default -> ✓).
+          # Sweep the smoke-default-failing seeds at value=1.0.
+          - id: '17dz'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '999'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'c1821e4'
+          - id: '17ea'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '12345'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'c1821e4'
+          - id: '17eb'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '22222'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'c1821e4'
+          - id: '17ec'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '2024'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'c1821e4'
+          - id: '17ed'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
+            bias_correction: ''
+            lr: '1e-3'
+            zoo_pin: 'c1821e4'
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            'mlx==0.30.0' \
+            'mlx-lm==0.30.0' \
+            'numpy==2.4.4' \
+            'pytest==9.0.3'
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch==2.10.0'
+          pip install \
+            'transformers==4.57.6' \
+            'peft==0.18.0' \
+            'datasets==4.3.0' \
+            'accelerate==1.13.0' \
+            'sentencepiece==0.2.1' \
+            'huggingface-hub==0.36.2' \
+            'trl==0.27.0'
+          ZOO_REF='${{ matrix.zoo_pin }}'
+          if [ -z "$ZOO_REF" ]; then
+            ZOO_SPEC='unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo'
+          else
+            ZOO_SPEC="unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@${ZOO_REF}"
+          fi
+          for attempt in 1 2 3; do
+            if pip install "$ZOO_SPEC"; then break; fi
+            if [ "$attempt" -eq 3 ]; then exit 1; fi
+            sleep $((5*attempt))
+          done
+
+      - name: Run probe ${{ matrix.id }} — ${{ matrix.script }}
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          UNSLOTH_COMPILE_DISABLE: '1'
+          MLX_STEPS: ${{ matrix.steps }}
+          MLX_SEED: ${{ matrix.seed }}
+          MLX_DTYPE: ${{ matrix.dtype }}
+          MLX_BIAS_CORRECTION: ${{ matrix.bias_correction }}
+          MLX_LR: ${{ matrix.lr }}
+          MLX_MAX_GRAD_NORM: ${{ matrix.max_grad_norm }}
+          MLX_MAX_GRAD_VALUE: ${{ matrix.max_grad_value }}
+        run: |
+          cd tests/mlx_parity && python ${{ matrix.script }}
+
+      - name: Show JSON output
+        if: always()
+        run: |
+          echo "=== probe ${{ matrix.id }} JSON output(s) ==="
+          for f in tests/mlx_parity/.out/probe_*.json; do
+            echo "--- ${f} ---"
+            cat "$f" 2>/dev/null || true
+          done
+
+      - name: Upload probe artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-${{ matrix.id }}
+          # Upload whole .out/ so probe scripts can write any filename
+          # (probe 17 writes per-config JSONs like probe_17__s30_d42_bc1.json)
+          path: tests/mlx_parity/.out/
+          if-no-files-found: warn
+          include-hidden-files: true
+
+  aggregate:
+    name: aggregate
+    needs: probe
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all probe artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: probes
+          pattern: probe-*
+          merge-multiple: true
+
+      - name: Summary
+        run: |
+          echo "=== probe artifacts ==="
+          ls -la probes/ || true
+          echo
+          for f in probes/probe_*.json; do
+            echo "--- ${f} ---"
+            cat "$f" 2>/dev/null || echo "(empty)"
+            echo
+          done
