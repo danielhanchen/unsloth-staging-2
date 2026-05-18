@@ -317,22 +317,16 @@ const ReasoningGroupImpl: ReasoningGroupComponent = ({
       return false;
     }
 
-    let groupHasReasoning = false;
+    // Streaming if this group contains a reasoning part. The trailing
+    // walk that demanded only tool-calls after the group flipped this
+    // false as soon as any text part appeared post-reasoning, which
+    // hid the thinking panel during tool-heavy responses.
     for (let i = startIndex; i <= endIndex && i < len; i += 1) {
       if (parts[i]?.type === "reasoning") {
-        groupHasReasoning = true;
-        break;
+        return true;
       }
     }
-    if (!groupHasReasoning) {
-      return false;
-    }
-    for (let i = endIndex + 1; i < len; i += 1) {
-      if (parts[i]?.type !== "tool-call") {
-        return false;
-      }
-    }
-    return true;
+    return false;
   });
 
   const persistedDuration = useAuiState(({ message }) => {

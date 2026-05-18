@@ -286,7 +286,18 @@ export function useIntentAwareAutoScroll(): {
         requestTick();
       };
 
+      // Window during which an onScroll upward delta counts as user
+      // intent. Wheel/touch bumps it forward; layout-induced scroll
+      // events (shiki re-render, Radix animation) outside the window
+      // are treated as DOM growth and do not detach.
+      const USER_GESTURE_GRACE_MS = 250;
+      let userGestureUntil = 0;
+      const noteGesture = () => {
+        userGestureUntil = performance.now() + USER_GESTURE_GRACE_MS;
+      };
+
       const onWheel = (e: WheelEvent) => {
+        noteGesture();
         if (
           e.deltaY < 0 &&
           canScrollUp() &&
@@ -301,6 +312,7 @@ export function useIntentAwareAutoScroll(): {
       };
 
       const onTouchMove = (e: TouchEvent) => {
+        noteGesture();
         const y = e.touches[0]?.clientY ?? 0;
         // Finger moves DOWN on the screen = content scrolls UP.
         if (
@@ -338,9 +350,21 @@ export function useIntentAwareAutoScroll(): {
             extendFollow();
           }
         } else if (delta < 0 && !userDetachedRef.current) {
-          // Upward: sum across events. Middle-click autoscroll and
-          // some trackpads deliver 1px-per-event scrolls that each
-          // slip under a per-event threshold; summing catches them.
+          // Upward: only count if a real user gesture happened
+          // recently. Scroll-anchoring from shiki re-render or
+          // Radix close-animations otherwise leaks negative deltas
+          // that look like upward intent and would detach.
+          if (performance.now() > userGestureUntil) {
+            lastScrollTop = scrollTop;
+            lastClientWidth = clientWidth;
+            lastClientHeight = clientHeight;
+            lastDistanceFromBottom = distanceNow;
+            requestTick();
+            return;
+          }
+          // Sum across events. Middle-click autoscroll and some
+          // trackpads deliver 1px-per-event scrolls that each slip
+          // under a per-event threshold; summing catches them.
           //
           // Count distance-from-bottom growth, not raw scrollTop
           // delta. When content above collapses (reasoning panels
