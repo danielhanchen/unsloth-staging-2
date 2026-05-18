@@ -58,55 +58,55 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AG: complete value=5.0 13-seed sample. Round AE
-          # gave us 4 seeds (42, 999, 12345, 22222) + 3407 control;
-          # Round AG adds the remaining 8 (1337, 11111, 5555, 7777,
-          # 8888, 2024, 33333, 0). Stay within 5 jobs per round so
-          # pick the 5 most informative remaining seeds.
-          - id: '17et'
+          # Round AH: finish value=5.0 + value=0.5 13-seed samples
+          # so the docstring table is empirically defensible.
+          # value=5.0 needs 3 more (2024, 33333, 0); value=0.5
+          # needs 5 more (7777, 8888, 22222, 12345, 2024). Pick
+          # the 5 most diagnostic.
+          - id: '17ey'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '1337'
+            seed: '2024'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
             max_grad_value: '5.0'
             zoo_pin: 'c1821e4'
-          - id: '17eu'
+          - id: '17ez'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '11111'
+            seed: '33333'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
             max_grad_value: '5.0'
             zoo_pin: 'c1821e4'
-          - id: '17ev'
+          - id: '17fa'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '5555'
+            seed: '12345'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '5.0'
+            max_grad_value: '0.5'
             zoo_pin: 'c1821e4'
-          - id: '17ew'
+          - id: '17fb'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '7777'
+            seed: '22222'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '5.0'
+            max_grad_value: '0.5'
             zoo_pin: 'c1821e4'
-          - id: '17ex'
+          - id: '17fc'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '8888'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '5.0'
+            max_grad_value: '0.5'
             zoo_pin: 'c1821e4'
     steps:
       - name: Harden runner (audit)
