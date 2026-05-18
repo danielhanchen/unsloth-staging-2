@@ -58,41 +58,42 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round U: confirm 500-step basin recovery generalizes.
-          # Round T showed 42 + 22222 ✗ at 30 -> ✓ at 500. If 999,
-          # 7777, 12345, 2024 also recover at 500, the basin
-          # recurrence is universal across failing seeds and
-          # PR-663's training math is empirically sound; only
-          # greedy-decode geometry is fragile at the smoke horizon.
-          - id: '17cl'
+          # Round V: do "empty-output basin" seeds (999, 2024) recover
+          # at 200 or 1000 steps? Round U found 5/7 failing seeds
+          # transition ✗->✓ at 500 steps, but seeds 999, 2024 stayed
+          # ✗ generating empty strings (greedy decoded EOS immediately).
+          # If they recover at 200 or 1000, the basin landscape is
+          # truly oscillatory and step count alone determines decode
+          # outcome.
+          - id: '17cq'
             script: probe_17_curve_param.py
-            steps: '500'
+            steps: '200'
             seed: '999'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17cm'
+          - id: '17cr'
             script: probe_17_curve_param.py
-            steps: '500'
-            seed: '7777'
+            steps: '1000'
+            seed: '999'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17cn'
+          - id: '17cs'
             script: probe_17_curve_param.py
-            steps: '500'
-            seed: '12345'
-            bias_correction: ''
-            lr: '1e-3'
-            zoo_pin: 'c1821e4'
-          - id: '17co'
-            script: probe_17_curve_param.py
-            steps: '500'
+            steps: '200'
             seed: '2024'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17cp'
+          - id: '17ct'
+            script: probe_17_curve_param.py
+            steps: '1000'
+            seed: '2024'
+            bias_correction: ''
+            lr: '1e-3'
+            zoo_pin: 'c1821e4'
+          - id: '17cu'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
