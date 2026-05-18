@@ -366,9 +366,14 @@ jobs:
             'sentencepiece==0.2.1' \
             'huggingface-hub==0.36.2' \
             'trl==0.27.0'
-          # Round BH: pin to the finetune_last_n_layers fix branch
-          # (b137b40) so probe 32 sees the new parameter.
-          ZOO_SPEC='unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@b137b4058eabf20a3122b67a2c9f04b63fb59568'
+          # Round BO: pin to the create_text_batches pad-fix branch
+          # (b265d99) which both (a) contains the finetune_last_n_layers
+          # parameter from b137b40 and (b) adds the +1 to MLXTrainer's
+          # padding so it matches mlx-lm's iterate_batches value-for-value.
+          # Re-runs probes 30/31/34/37 against this build to check whether
+          # the pad fix closes the basin gap (expected: zoo MLXTrainer
+          # probes 34/37 should rise from 47%/40% toward probe 31's 67%).
+          ZOO_SPEC='unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@b265d99710d7c61f704c4c740e7917cb0a543c7b'
           for attempt in 1 2 3; do
             if pip install "$ZOO_SPEC"; then break; fi
             if [ "$attempt" -eq 3 ]; then exit 1; fi
