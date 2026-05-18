@@ -58,49 +58,48 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AE: value=5.0 (PR #634's old default) multi-seed
-          # on MLX. CUDA at value=5.0 with same seeds will follow
-          # from the CUDA sweep. If MLX value=5.0 is comparable or
-          # worse than value=1.0, that confirms there's no large
-          # "magic" elementwise value — they're all in the same
-          # basin-geometry-fragile regime.
-          - id: '17ej'
+          # Round AF: MLX value=0.5 multi-seed. CUDA at value=0.5
+          # hits 13/13 ✓ on the same fixture+seeds, but MLX seed=3407
+          # at value=0.5 fails (over-clipped, generates " "). If MLX
+          # at value=0.5 is universally bad across seeds, the
+          # over-clip failure is MLX-specific.
+          - id: '17eo'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '42'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '5.0'
+            max_grad_value: '0.5'
             zoo_pin: 'c1821e4'
-          - id: '17ek'
+          - id: '17ep'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '999'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '5.0'
+            max_grad_value: '0.5'
             zoo_pin: 'c1821e4'
-          - id: '17el'
+          - id: '17eq'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '12345'
+            seed: '1337'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '5.0'
+            max_grad_value: '0.5'
             zoo_pin: 'c1821e4'
-          - id: '17em'
+          - id: '17er'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '22222'
+            seed: '11111'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '5.0'
+            max_grad_value: '0.5'
             zoo_pin: 'c1821e4'
-          - id: '17en'
+          - id: '17es'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
