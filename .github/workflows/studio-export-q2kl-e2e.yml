@@ -70,10 +70,15 @@ jobs:
           python -m pip install \
             'git+https://github.com/danielhanchen/unsloth-zoo-staging-1@studio-export-q2kl-fix#egg=unsloth_zoo' \
             --no-deps
-          # CPU torch + the minimum module-level imports of unsloth_zoo.
+          # CPU torch + the module-level imports unsloth_zoo/__init__.py
+          # eagerly resolves at import time (temporary_patches/gemma.py
+          # pulls transformers.processing_utils.Unpack). Keep this list
+          # narrow but complete so the e2e job stays under ~10 min total.
           python -m pip install \
             'torch>=2.4,<2.11' \
-            psutil tqdm requests pytest
+            'transformers>=4.50' \
+            huggingface_hub \
+            psutil tqdm requests pytest packaging
 
       - name: Apply CUDA spoof + build llama.cpp
         shell: bash
