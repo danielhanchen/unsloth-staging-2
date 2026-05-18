@@ -16,12 +16,6 @@ on:
       - 'studio/backend/core/inference/llama_cpp.py'
       - 'tests/cross_os/test_llama_cpp_trailing_plan.py'
       - '.github/workflows/cross-os-llama-regex.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'studio/backend/core/inference/llama_cpp.py'
-      - 'tests/cross_os/test_llama_cpp_trailing_plan.py'
-      - '.github/workflows/cross-os-llama-regex.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

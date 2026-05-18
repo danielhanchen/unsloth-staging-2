@@ -19,14 +19,6 @@ on:
       - 'tests/_zoo_aggressive_cuda_spoof.py'
       - 'tests/cross_os/test_studio_backend_import_smoke.py'
       - '.github/workflows/cross-os-backend-import.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'studio/backend/**'
-      - 'tests/conftest.py'
-      - 'tests/_zoo_aggressive_cuda_spoof.py'
-      - 'tests/cross_os/test_studio_backend_import_smoke.py'
-      - '.github/workflows/cross-os-backend-import.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

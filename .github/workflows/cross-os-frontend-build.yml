@@ -14,11 +14,6 @@ on:
     paths:
       - 'studio/frontend/**'
       - '.github/workflows/cross-os-frontend-build.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'studio/frontend/**'
-      - '.github/workflows/cross-os-frontend-build.yml'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
