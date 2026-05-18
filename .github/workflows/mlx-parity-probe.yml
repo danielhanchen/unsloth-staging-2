@@ -58,41 +58,39 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round S: fresh-seed pass-rate sampling for the recommended
-          # config (30 steps, lr=1e-3, default bc=True, PR-663 head
-          # SHA c1821e4). Earlier rounds saw basin shifts for seeds
-          # 42, 999, 7777 between HEAD and PR-663 head. Quantify how
-          # many of N random seeds produce "Unsloth" in greedy decode
-          # on PR-663 head:
-          - id: '17cb'
+          # Round T: do failing seeds re-enter the "Unsloth" basin
+          # at longer step counts? Round B showed seed=3407 went
+          # OK->BAD->OK across 30/60/100/500. Test the recurrence
+          # for failing seeds 42, 22222 across step counts.
+          - id: '17cg'
             script: probe_17_curve_param.py
-            steps: '30'
+            steps: '100'
             seed: '42'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17cc'
+          - id: '17ch'
             script: probe_17_curve_param.py
-            steps: '30'
-            seed: '11111'
+            steps: '500'
+            seed: '42'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17cd'
+          - id: '17ci'
             script: probe_17_curve_param.py
-            steps: '30'
+            steps: '500'
             seed: '22222'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17ce'
+          - id: '17cj'
             script: probe_17_curve_param.py
-            steps: '30'
-            seed: '2024'
+            steps: '100'
+            seed: '22222'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17cf'
+          - id: '17ck'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
