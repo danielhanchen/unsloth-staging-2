@@ -15,6 +15,7 @@ on:
       - 'studio/backend/core/inference/**'
       - 'studio/backend/tests/test_llama_cpp_mtp_detection.py'
       - 'studio/backend/tests/test_llama_server_args.py'
+      - 'studio/backend/tests/test_kv_cache_estimation.py'
       - '.github/workflows/mtp-tests-ci.yml'
   workflow_dispatch:
 
@@ -71,4 +72,6 @@ jobs:
           python -m pytest \
             tests/test_llama_cpp_mtp_detection.py \
             tests/test_llama_server_args.py \
-            -q --tb=short
+            tests/test_kv_cache_estimation.py \
+            -q --tb=short \
+            -k "mtp or spec or ngram or _fit_"
