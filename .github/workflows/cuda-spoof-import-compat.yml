@@ -29,7 +29,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-          python -m pip install transformers pytest
+          python -m pip install transformers pytest bitsandbytes peft accelerate
           python -m pip install git+https://github.com/unslothai/unsloth_zoo
 
       - name: Activate CUDA spoof + vllm_compat imports
