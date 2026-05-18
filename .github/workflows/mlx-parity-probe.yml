@@ -228,6 +228,33 @@ jobs:
           - {id: '34_22222', script: 'probe_34_zoo_loader_no_dtype.py', seed: '22222'}
           - {id: '34_31415', script: 'probe_34_zoo_loader_no_dtype.py', seed: '31415'}
           - {id: '34_65535', script: 'probe_34_zoo_loader_no_dtype.py', seed: '65535'}
+
+          # ---- Round BK: MLXTrainer compile-flag hypothesis ----
+          # Probe 33 (mlx_lm.load + MLXTrainer + nl=16 + compile=False): 53%
+          # Probe 31 (mlx_lm.load + manual loop + nl=16 + @mx.compile): 67%
+          # Hypothesis: the -14pp gap between zoo MLXTrainer and the
+          # manual loop at the same loader / layer count is purely the
+          # compile flag. Probe 33 disabled compile via `compile=False`
+          # while probe 31's manual loop always uses `@mx.compile`. If
+          # probe 35 (= probe 33 verbatim + compile=True) recovers to
+          # ~67%, the -14pp is a probe-configuration artifact, not a
+          # MLXTrainer defect.
+
+          - {id: '35_1',     script: 'probe_35_zoo_trainer_compile_on.py', seed: '1'}
+          - {id: '35_7',     script: 'probe_35_zoo_trainer_compile_on.py', seed: '7'}
+          - {id: '35_42',    script: 'probe_35_zoo_trainer_compile_on.py', seed: '42'}
+          - {id: '35_123',   script: 'probe_35_zoo_trainer_compile_on.py', seed: '123'}
+          - {id: '35_456',   script: 'probe_35_zoo_trainer_compile_on.py', seed: '456'}
+          - {id: '35_789',   script: 'probe_35_zoo_trainer_compile_on.py', seed: '789'}
+          - {id: '35_999',   script: 'probe_35_zoo_trainer_compile_on.py', seed: '999'}
+          - {id: '35_1234',  script: 'probe_35_zoo_trainer_compile_on.py', seed: '1234'}
+          - {id: '35_3407',  script: 'probe_35_zoo_trainer_compile_on.py', seed: '3407'}
+          - {id: '35_5678',  script: 'probe_35_zoo_trainer_compile_on.py', seed: '5678'}
+          - {id: '35_9012',  script: 'probe_35_zoo_trainer_compile_on.py', seed: '9012'}
+          - {id: '35_12345', script: 'probe_35_zoo_trainer_compile_on.py', seed: '12345'}
+          - {id: '35_22222', script: 'probe_35_zoo_trainer_compile_on.py', seed: '22222'}
+          - {id: '35_31415', script: 'probe_35_zoo_trainer_compile_on.py', seed: '31415'}
+          - {id: '35_65535', script: 'probe_35_zoo_trainer_compile_on.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
