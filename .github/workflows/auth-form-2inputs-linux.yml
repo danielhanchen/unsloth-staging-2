@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Staging-only contract: Studio's first-boot change-password page must
+# render exactly 2 password inputs (no Current password input), and the
+# admin-forced reset path (bootstrap absent) must still render 3.
+# Linux runner.
+
+name: Auth form 2-inputs (Linux)
+
+on:
+  push:
+    branches: [auth-form-2inputs-staging]
+  pull_request:
+    branches: [auth-form-2inputs-staging]
+    paths:
+      - 'studio/frontend/src/features/auth/components/auth-form.tsx'
+      - 'studio/backend/main.py'
+      - 'studio/frontend/**'
+      - 'tests/studio/test_auth_form_inputs.py'
+      - '.github/workflows/auth-form-2inputs-linux.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Auth form inputs (Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      STUDIO_PORT: '18897'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq curl
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Studio (--local, --no-torch)
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install 'playwright>=1.45'
+          python -m playwright install --with-deps chromium
+
+      - name: Reset auth + boot Studio (API-only)
+        run: |
+          unsloth studio reset-password
+          mkdir -p logs
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" \
+            > logs/studio.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for /api/health
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json; then
+              jq -e '.status == "healthy"' /tmp/health.json && break
+            fi
+            sleep 1
+          done
+          jq -e '.status == "healthy"' /tmp/health.json
+
+      - name: Confirm first-boot bootstrap is being served
+        # Sanity check: index.html must contain the inline bootstrap
+        # script tag, otherwise the bootstrap-present assertion below
+        # would be a false negative.
+        run: |
+          curl -fs "http://127.0.0.1:${STUDIO_PORT}/" > /tmp/index.html
+          grep -q 'window.__UNSLOTH_BOOTSTRAP__' /tmp/index.html
+
+      - name: Run the input-count Playwright test
+        env:
+          BASE_URL: http://127.0.0.1:18897
+          PW_ART_DIR: logs/playwright_auth_form
+        run: python tests/studio/test_auth_form_inputs.py
+
+      - name: Stop Studio
+        if: always()
+        run: |
+          kill "${STUDIO_PID}" 2>/dev/null || true
+          sleep 2
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: auth-form-2inputs-linux
+          path: |
+            logs/install.log
+            logs/studio.log
+            logs/playwright_auth_form
+          retention-days: 7

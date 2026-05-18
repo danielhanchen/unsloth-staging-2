@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Windows counterpart to auth-form-2inputs-linux.yml. windows-latest
+# runner so install.ps1 (the only supported Windows installer) and the
+# Studio CLI's Windows process-management branches get exercised.
+
+name: Auth form 2-inputs (Windows)
+
+on:
+  push:
+    branches: [auth-form-2inputs-staging]
+  pull_request:
+    branches: [auth-form-2inputs-staging]
+    paths:
+      - 'studio/frontend/src/features/auth/components/auth-form.tsx'
+      - 'studio/backend/main.py'
+      - 'studio/frontend/**'
+      - 'install.ps1'
+      - 'tests/studio/test_auth_form_inputs.py'
+      - '.github/workflows/auth-form-2inputs-windows.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Auth form inputs (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    # Default to Git Bash; install.ps1 step overrides to pwsh.
+    defaults:
+      run:
+        shell: bash
+    env:
+      STUDIO_PORT: '18897'
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Defender exclusions (avoid scan-induced flakiness)
+        shell: pwsh
+        run: |
+          $paths = @("$env:USERPROFILE\.unsloth", "$env:USERPROFILE\AppData\Local\uv", "$env:RUNNER_TEMP")
+          foreach ($p in $paths) {
+            try {
+              Add-MpPreference -ExclusionPath $p -ErrorAction Stop
+              Write-Host "Defender exclusion added: $p"
+            } catch {
+              Write-Host "Defender exclusion skipped ($($_.Exception.Message)): $p"
+            }
+          }
+
+      - name: Install Studio (--local, --no-torch)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
+
+      - name: Add Studio shim to GITHUB_PATH
+        run: |
+          SHIM_DIR=~/.unsloth/studio/bin
+          if [ ! -f "$SHIM_DIR/unsloth.exe" ]; then
+            echo "::error::unsloth.exe shim not found at $SHIM_DIR"
+            ls -la ~/.unsloth/studio/ || true
+            exit 1
+          fi
+          cygpath -w "$SHIM_DIR" >> "$GITHUB_PATH"
+
+      - name: Install Playwright + Chromium
+        run: |
+          pip install 'playwright>=1.45'
+          python -m playwright install chromium
+
+      - name: Reset auth + boot Studio (API-only)
+        run: |
+          unsloth studio reset-password
+          mkdir -p logs
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" \
+            > logs/studio.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for /api/health
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json; then
+              python -c 'import json,sys; d=json.load(open("/tmp/health.json")); sys.exit(0 if d.get("status")=="healthy" else 1)' && break
+            fi
+            sleep 1
+          done
+          python -c 'import json,sys; d=json.load(open("/tmp/health.json")); sys.exit(0 if d.get("status")=="healthy" else 1)'
+
+      - name: Confirm first-boot bootstrap is being served
+        run: |
+          curl -fs "http://127.0.0.1:${STUDIO_PORT}/" > /tmp/index.html
+          grep -q 'window.__UNSLOTH_BOOTSTRAP__' /tmp/index.html
+
+      - name: Run the input-count Playwright test
+        env:
+          BASE_URL: http://127.0.0.1:18897
+          PW_ART_DIR: logs/playwright_auth_form
+        run: python tests/studio/test_auth_form_inputs.py
+
+      - name: Stop Studio
+        if: always()
+        run: |
+          kill "${STUDIO_PID}" 2>/dev/null || true
+          sleep 2
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: auth-form-2inputs-windows
+          path: |
+            logs/install.log
+            logs/studio.log
+            logs/playwright_auth_form
+          retention-days: 7
