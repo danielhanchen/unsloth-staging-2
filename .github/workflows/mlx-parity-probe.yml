@@ -58,48 +58,48 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round L: locate bc=False divergence boundary and verify
-          # PR-663 default reproduces known-good seeds (1337, 7777).
-          # Round K showed bc=False at 200/500 steps NaN-diverges
-          # (not just slow). The "opt-out for long fine-tunes"
-          # rationale in the commit message overstates bc=False's
-          # safety. Locate where divergence kicks in so the docstring
-          # can be honest.
-          - id: '17as'
+          # Round M: narrow bc=False NaN boundary (Round L: 50 OK-ish,
+          # 100 NaN) AND verify default(bc=True implicit) is exactly
+          # equivalent to bc=1 explicit on PR-663 head (Round K + L
+          # showed basin shifts for seeds 42, 7777 vs HEAD bc=True;
+          # is that explicit-vs-default plumbing or HEAD-vs-PR-663
+          # codepath?). Pin to PR-663 head SHA 669a792 (docstring-only
+          # follow-up to ef003aa).
+          - id: '17ax'
+            script: probe_17_curve_param.py
+            steps: '70'
+            seed: '3407'
+            bias_correction: '0'
+            lr: '1e-3'
+            zoo_pin: '669a792'
+          - id: '17ay'
+            script: probe_17_curve_param.py
+            steps: '80'
+            seed: '3407'
+            bias_correction: '0'
+            lr: '1e-3'
+            zoo_pin: '669a792'
+          - id: '17az'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '1337'
-            bias_correction: ''
+            seed: '42'
+            bias_correction: '1'
             lr: '1e-3'
-            zoo_pin: 'ef003aa'
-          - id: '17at'
+            zoo_pin: '669a792'
+          - id: '17ba'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '7777'
-            bias_correction: ''
+            bias_correction: '1'
             lr: '1e-3'
-            zoo_pin: 'ef003aa'
-          - id: '17au'
-            script: probe_17_curve_param.py
-            steps: '50'
-            seed: '3407'
-            bias_correction: '0'
-            lr: '1e-3'
-            zoo_pin: 'ef003aa'
-          - id: '17av'
-            script: probe_17_curve_param.py
-            steps: '100'
-            seed: '3407'
-            bias_correction: '0'
-            lr: '1e-3'
-            zoo_pin: 'ef003aa'
-          - id: '17aw'
+            zoo_pin: '669a792'
+          - id: '17bb'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
             bias_correction: ''
             lr: '1e-3'
-            zoo_pin: 'ef003aa'
+            zoo_pin: '669a792'
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
