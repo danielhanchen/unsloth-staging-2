@@ -99,21 +99,50 @@ jobs:
           #   pass_rate ~40% -> gap is in unsloth-zoo's TRAINER
           # Same 15 seeds used in AX for direct paired comparison.
 
-          - {id: '21_1',     script: 'probe_21_hybrid_loader_trainer.py', seed: '1'}
-          - {id: '21_7',     script: 'probe_21_hybrid_loader_trainer.py', seed: '7'}
-          - {id: '21_42',    script: 'probe_21_hybrid_loader_trainer.py', seed: '42'}
-          - {id: '21_123',   script: 'probe_21_hybrid_loader_trainer.py', seed: '123'}
-          - {id: '21_456',   script: 'probe_21_hybrid_loader_trainer.py', seed: '456'}
-          - {id: '21_789',   script: 'probe_21_hybrid_loader_trainer.py', seed: '789'}
-          - {id: '21_999',   script: 'probe_21_hybrid_loader_trainer.py', seed: '999'}
-          - {id: '21_1234',  script: 'probe_21_hybrid_loader_trainer.py', seed: '1234'}
-          - {id: '21_3407',  script: 'probe_21_hybrid_loader_trainer.py', seed: '3407'}
-          - {id: '21_5678',  script: 'probe_21_hybrid_loader_trainer.py', seed: '5678'}
-          - {id: '21_9012',  script: 'probe_21_hybrid_loader_trainer.py', seed: '9012'}
-          - {id: '21_12345', script: 'probe_21_hybrid_loader_trainer.py', seed: '12345'}
-          - {id: '21_22222', script: 'probe_21_hybrid_loader_trainer.py', seed: '22222'}
-          - {id: '21_31415', script: 'probe_21_hybrid_loader_trainer.py', seed: '31415'}
-          - {id: '21_65535', script: 'probe_21_hybrid_loader_trainer.py', seed: '65535'}
+          # ---- Round AZ: numpy-reset hypothesis + triple-confirm mlx-lm ----
+          # Round AY proved gap is in TRAINER (probe_21 hybrid 47% =
+          # zoo 47%, not mlx-lm 67%). Leading suspect: numpy RNG state.
+          # mlx-lm calls np.random.seed(args.seed) at lora.py:320
+          # immediately before the training loop. Probe 22 = same hybrid
+          # as 21 but with np.random.seed reset right before train().
+          # If 22 ~= 67%, numpy RNG is the cause. If ~= 47%, RNG isn't.
+          # Also re-runs probe_20 (mlx-lm native) on the same 15 seeds
+          # to triple-confirm the original mlx-lm 67% number.
+          # Same 15 seeds as AX/AY.
+
+          # -- probe 22: hybrid + np.seed reset just before train() --
+          - {id: '22_1',     script: 'probe_22_hybrid_reseed.py', seed: '1'}
+          - {id: '22_7',     script: 'probe_22_hybrid_reseed.py', seed: '7'}
+          - {id: '22_42',    script: 'probe_22_hybrid_reseed.py', seed: '42'}
+          - {id: '22_123',   script: 'probe_22_hybrid_reseed.py', seed: '123'}
+          - {id: '22_456',   script: 'probe_22_hybrid_reseed.py', seed: '456'}
+          - {id: '22_789',   script: 'probe_22_hybrid_reseed.py', seed: '789'}
+          - {id: '22_999',   script: 'probe_22_hybrid_reseed.py', seed: '999'}
+          - {id: '22_1234',  script: 'probe_22_hybrid_reseed.py', seed: '1234'}
+          - {id: '22_3407',  script: 'probe_22_hybrid_reseed.py', seed: '3407'}
+          - {id: '22_5678',  script: 'probe_22_hybrid_reseed.py', seed: '5678'}
+          - {id: '22_9012',  script: 'probe_22_hybrid_reseed.py', seed: '9012'}
+          - {id: '22_12345', script: 'probe_22_hybrid_reseed.py', seed: '12345'}
+          - {id: '22_22222', script: 'probe_22_hybrid_reseed.py', seed: '22222'}
+          - {id: '22_31415', script: 'probe_22_hybrid_reseed.py', seed: '31415'}
+          - {id: '22_65535', script: 'probe_22_hybrid_reseed.py', seed: '65535'}
+
+          # -- triple-confirm: re-run probe 20 (mlx-lm native) on same seeds --
+          - {id: '20z_1',     script: 'probe_20_mlx_lm_aggressive.py', seed: '1'}
+          - {id: '20z_7',     script: 'probe_20_mlx_lm_aggressive.py', seed: '7'}
+          - {id: '20z_42',    script: 'probe_20_mlx_lm_aggressive.py', seed: '42'}
+          - {id: '20z_123',   script: 'probe_20_mlx_lm_aggressive.py', seed: '123'}
+          - {id: '20z_456',   script: 'probe_20_mlx_lm_aggressive.py', seed: '456'}
+          - {id: '20z_789',   script: 'probe_20_mlx_lm_aggressive.py', seed: '789'}
+          - {id: '20z_999',   script: 'probe_20_mlx_lm_aggressive.py', seed: '999'}
+          - {id: '20z_1234',  script: 'probe_20_mlx_lm_aggressive.py', seed: '1234'}
+          - {id: '20z_3407',  script: 'probe_20_mlx_lm_aggressive.py', seed: '3407'}
+          - {id: '20z_5678',  script: 'probe_20_mlx_lm_aggressive.py', seed: '5678'}
+          - {id: '20z_9012',  script: 'probe_20_mlx_lm_aggressive.py', seed: '9012'}
+          - {id: '20z_12345', script: 'probe_20_mlx_lm_aggressive.py', seed: '12345'}
+          - {id: '20z_22222', script: 'probe_20_mlx_lm_aggressive.py', seed: '22222'}
+          - {id: '20z_31415', script: 'probe_20_mlx_lm_aggressive.py', seed: '31415'}
+          - {id: '20z_65535', script: 'probe_20_mlx_lm_aggressive.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
