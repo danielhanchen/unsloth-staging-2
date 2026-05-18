@@ -76,50 +76,23 @@ def main() -> int:
     with sync_playwright() as pw:
         browser = pw.chromium.launch(args=["--no-sandbox"])
 
-        # ----- Case 1: bootstrap PRESENT (first boot) ---------------------
-        ctx_a = browser.new_context()
-        page_a = ctx_a.new_page()
-        page_a.goto(f"{BASE}/", wait_until="networkidle")
-        # On first boot the SPA auto-redirects login -> /change-password.
-        expect(page_a).to_have_url(f"{BASE}/change-password", timeout=15_000)
-        page_a.wait_for_selector("input[type='password']", timeout=15_000)
-        _shoot(page_a, "01_bootstrap_present")
+        # Order matters. Case A submits the change-password form, which
+        # flips the server's requires_password_change to false; that
+        # would auto-redirect any subsequent /change-password navigation
+        # to /login (1 input), making case B a false negative. Run
+        # case B first while the server is still in must-change state.
 
-        n_a = _count_password_inputs(page_a)
-        has_cur_a = _has_current_password_input(page_a)
-        if n_a != 2:
-            failures.append(f"bootstrap-present: expected 2 password inputs, got {n_a}")
-        if has_cur_a:
-            failures.append(
-                "bootstrap-present: #current-password input is still rendered; "
-                "PR #5490 regression on first boot"
-            )
-
-        # End-to-end: drive the 2-input form and confirm we enter /chat.
-        new_pw = f"CIauth-{secrets.token_urlsafe(12)}"
-        page_a.fill("#new-password", new_pw)
-        page_a.fill("#confirm-password", new_pw)
-        page_a.get_by_role("button", name="Change password").click()
-        try:
-            expect(page_a).to_have_url(f"{BASE}/chat", timeout=30_000)
-            _shoot(page_a, "02_landed_on_chat")
-        except Exception as exc:
-            failures.append(f"bootstrap-present: did not land on /chat ({exc})")
-            _shoot(page_a, "02_landed_on_chat_FAIL")
-        ctx_a.close()
-
-        # ----- Case 2: bootstrap ABSENT (admin-forced reset) --------------
-        # The backend will still inject the inline script because we left
-        # requires_password_change true on the install; the init script
-        # below makes the assignment a no-op in the page context.
+        # ----- Case B: bootstrap ABSENT (admin-forced reset) --------------
+        # Backend keeps injecting the inline script while
+        # requires_password_change is true; the init script below
+        # makes the assignment a no-op in the page context.
         ctx_b = browser.new_context()
         ctx_b.add_init_script(SUPPRESS_BOOTSTRAP)
         page_b = ctx_b.new_page()
         page_b.goto(f"{BASE}/change-password", wait_until="networkidle")
         page_b.wait_for_selector("input[type='password']", timeout=15_000)
-        _shoot(page_b, "03_bootstrap_absent")
+        _shoot(page_b, "01_bootstrap_absent")
 
-        # Confirm the suppression actually worked in this context.
         boot_undef = page_b.evaluate(
             "() => typeof window.__UNSLOTH_BOOTSTRAP__ === 'undefined'"
         )
@@ -141,6 +114,38 @@ def main() -> int:
                 "PR #5490's admin-forced-reset fix would be regressed"
             )
         ctx_b.close()
+
+        # ----- Case A: bootstrap PRESENT (first boot) ---------------------
+        ctx_a = browser.new_context()
+        page_a = ctx_a.new_page()
+        page_a.goto(f"{BASE}/", wait_until="networkidle")
+        # On first boot the SPA auto-redirects login -> /change-password.
+        expect(page_a).to_have_url(f"{BASE}/change-password", timeout=15_000)
+        page_a.wait_for_selector("input[type='password']", timeout=15_000)
+        _shoot(page_a, "02_bootstrap_present")
+
+        n_a = _count_password_inputs(page_a)
+        has_cur_a = _has_current_password_input(page_a)
+        if n_a != 2:
+            failures.append(f"bootstrap-present: expected 2 password inputs, got {n_a}")
+        if has_cur_a:
+            failures.append(
+                "bootstrap-present: #current-password input is still rendered; "
+                "PR #5490 regression on first boot"
+            )
+
+        # End-to-end: drive the 2-input form and confirm we enter /chat.
+        new_pw = f"CIauth-{secrets.token_urlsafe(12)}"
+        page_a.fill("#new-password", new_pw)
+        page_a.fill("#confirm-password", new_pw)
+        page_a.get_by_role("button", name="Change password").click()
+        try:
+            expect(page_a).to_have_url(f"{BASE}/chat", timeout=30_000)
+            _shoot(page_a, "03_landed_on_chat")
+        except Exception as exc:
+            failures.append(f"bootstrap-present: did not land on /chat ({exc})")
+            _shoot(page_a, "03_landed_on_chat_FAIL")
+        ctx_a.close()
         browser.close()
 
     if failures:
