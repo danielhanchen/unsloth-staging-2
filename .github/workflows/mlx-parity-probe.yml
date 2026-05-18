@@ -58,46 +58,51 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round M: narrow bc=False NaN boundary (Round L: 50 OK-ish,
-          # 100 NaN) AND verify default(bc=True implicit) is exactly
-          # equivalent to bc=1 explicit on PR-663 head (Round K + L
-          # showed basin shifts for seeds 42, 7777 vs HEAD bc=True;
-          # is that explicit-vs-default plumbing or HEAD-vs-PR-663
-          # codepath?). Pin to PR-663 head SHA 669a792 (docstring-only
-          # follow-up to ef003aa).
-          - id: '17ax'
-            script: probe_17_curve_param.py
-            steps: '70'
-            seed: '3407'
-            bias_correction: '0'
-            lr: '1e-3'
-            zoo_pin: '669a792'
-          - id: '17ay'
-            script: probe_17_curve_param.py
-            steps: '80'
-            seed: '3407'
-            bias_correction: '0'
-            lr: '1e-3'
-            zoo_pin: '669a792'
-          - id: '17az'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '42'
-            bias_correction: '1'
-            lr: '1e-3'
-            zoo_pin: '669a792'
-          - id: '17ba'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '7777'
-            bias_correction: '1'
-            lr: '1e-3'
-            zoo_pin: '669a792'
-          - id: '17bb'
+          # Round N: final sanity pass on PR-663 head (SHA 669a792).
+          # 13 rounds in, conclusions are stable:
+          #   - PR #634 introduced both max_grad_value=5.0 and the
+          #     hidden bc=True default; PR #663 fixes the first
+          #     (->None, HF parity) and exposes the second as a
+          #     proper field with default True;
+          #   - bc=False on this fixture: loss 2-5 at 30-80 steps,
+          #     NaN at 100. Documented as a warning;
+          #   - greedy decode is fragile across (steps, seed); the
+          #     load-bearing smoke gate is post_train_loss < 0.1.
+          # Round N verifies the smoke-critical config is stable
+          # across the smoke seed and the explicit/default knob:
+          - id: '17bc'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
             bias_correction: ''
+            lr: '1e-3'
+            zoo_pin: '669a792'
+          - id: '17bd'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
+            bias_correction: '1'
+            lr: '1e-3'
+            zoo_pin: '669a792'
+          - id: '17be'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '1337'
+            bias_correction: '1'
+            lr: '1e-3'
+            zoo_pin: '669a792'
+          - id: '17bf'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '999'
+            bias_correction: '1'
+            lr: '1e-3'
+            zoo_pin: '669a792'
+          - id: '17bg'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
+            bias_correction: '0'
             lr: '1e-3'
             zoo_pin: '669a792'
     steps:
