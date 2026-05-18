@@ -58,41 +58,42 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round W: try LR x bc on the persistent-failure seeds.
-          # Round V: 999 + 2024 fail at every step count we tested
-          # at (default bc=True, lr=1e-3). Round W asks whether a
-          # different (bc, lr) interior to the safe envelope rescues
-          # those seeds at long horizons, or whether the basin shape
-          # is fundamentally seed-determined.
-          - id: '17cv'
+          # Round X: hunt for a universal (bc, lr, steps) tuple.
+          # Round W found bc=False + lr=1e-4 + 500/1000 steps lifts
+          # seed=999 out of its empty-output basin into "Unsloth!".
+          # Test the same config for seeds that were failing at the
+          # smoke default (bc=True, lr=1e-3, 30 steps). If 4/4 hit
+          # Unsloth, this is a true "universal-robust" config for
+          # this fixture (modulo seed=2024 which Round W kept ✗).
+          - id: '17da'
             script: probe_17_curve_param.py
-            steps: '1000'
-            seed: '999'
+            steps: '500'
+            seed: '42'
             bias_correction: '0'
             lr: '1e-4'
             zoo_pin: 'c1821e4'
-          - id: '17cw'
+          - id: '17db'
             script: probe_17_curve_param.py
-            steps: '1000'
+            steps: '500'
+            seed: '22222'
+            bias_correction: '0'
+            lr: '1e-4'
+            zoo_pin: 'c1821e4'
+          - id: '17dc'
+            script: probe_17_curve_param.py
+            steps: '500'
             seed: '2024'
             bias_correction: '0'
             lr: '1e-4'
             zoo_pin: 'c1821e4'
-          - id: '17cx'
+          - id: '17dd'
             script: probe_17_curve_param.py
             steps: '500'
-            seed: '999'
+            seed: '12345'
             bias_correction: '0'
             lr: '1e-4'
             zoo_pin: 'c1821e4'
-          - id: '17cy'
-            script: probe_17_curve_param.py
-            steps: '500'
-            seed: '999'
-            bias_correction: ''
-            lr: '5e-4'
-            zoo_pin: 'c1821e4'
-          - id: '17cz'
+          - id: '17de'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
