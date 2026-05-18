@@ -58,53 +58,55 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AF: MLX value=0.5 multi-seed. CUDA at value=0.5
-          # hits 13/13 ✓ on the same fixture+seeds, but MLX seed=3407
-          # at value=0.5 fails (over-clipped, generates " "). If MLX
-          # at value=0.5 is universally bad across seeds, the
-          # over-clip failure is MLX-specific.
-          - id: '17eo'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '42'
-            bias_correction: ''
-            lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '0.5'
-            zoo_pin: 'c1821e4'
-          - id: '17ep'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '999'
-            bias_correction: ''
-            lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '0.5'
-            zoo_pin: 'c1821e4'
-          - id: '17eq'
+          # Round AG: complete value=5.0 13-seed sample. Round AE
+          # gave us 4 seeds (42, 999, 12345, 22222) + 3407 control;
+          # Round AG adds the remaining 8 (1337, 11111, 5555, 7777,
+          # 8888, 2024, 33333, 0). Stay within 5 jobs per round so
+          # pick the 5 most informative remaining seeds.
+          - id: '17et'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '1337'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '0.5'
+            max_grad_value: '5.0'
             zoo_pin: 'c1821e4'
-          - id: '17er'
+          - id: '17eu'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '11111'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '0.5'
+            max_grad_value: '5.0'
             zoo_pin: 'c1821e4'
-          - id: '17es'
+          - id: '17ev'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '3407'
+            seed: '5555'
             bias_correction: ''
             lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '5.0'
+            zoo_pin: 'c1821e4'
+          - id: '17ew'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '7777'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '5.0'
+            zoo_pin: 'c1821e4'
+          - id: '17ex'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '8888'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '5.0'
             zoo_pin: 'c1821e4'
     steps:
       - name: Harden runner (audit)
