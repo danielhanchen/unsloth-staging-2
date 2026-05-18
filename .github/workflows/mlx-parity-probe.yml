@@ -204,21 +204,30 @@ jobs:
           # + get_peft_model) adds the extra basin instability.
           # If 33 ~= 15%, zoo's TRAINER (MLXTrainer.train) does.
 
-          - {id: '33_1',     script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '1'}
-          - {id: '33_7',     script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '7'}
-          - {id: '33_42',    script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '42'}
-          - {id: '33_123',   script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '123'}
-          - {id: '33_456',   script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '456'}
-          - {id: '33_789',   script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '789'}
-          - {id: '33_999',   script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '999'}
-          - {id: '33_1234',  script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '1234'}
-          - {id: '33_3407',  script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '3407'}
-          - {id: '33_5678',  script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '5678'}
-          - {id: '33_9012',  script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '9012'}
-          - {id: '33_12345', script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '12345'}
-          - {id: '33_22222', script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '22222'}
-          - {id: '33_31415', script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '31415'}
-          - {id: '33_65535', script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '65535'}
+          # ---- Round BJ: dtype hypothesis (FastMLXModel cast bf16->fp16) ----
+          # Probe 32 (FastMLXModel(dtype='float16') + MLXTrainer + nl=16): 15%.
+          # Probe 33 (mlx_lm.load                  + MLXTrainer + nl=16): 53%.
+          # Hypothesis: gemma-3-270m-it is bf16 on HF. FastMLXModel forces
+          # fp16 cast via _convert_mlx_dtype. fp16 has 5-bit exponent vs
+          # bf16's 8-bit, so any param outside fp16 range gets clamped.
+          # Probe 34 uses FastMLXModel(dtype=None) -- keeps storage dtype.
+          # If 34 ~= 53%, the dtype cast is the offender.
+
+          - {id: '34_1',     script: 'probe_34_zoo_loader_no_dtype.py', seed: '1'}
+          - {id: '34_7',     script: 'probe_34_zoo_loader_no_dtype.py', seed: '7'}
+          - {id: '34_42',    script: 'probe_34_zoo_loader_no_dtype.py', seed: '42'}
+          - {id: '34_123',   script: 'probe_34_zoo_loader_no_dtype.py', seed: '123'}
+          - {id: '34_456',   script: 'probe_34_zoo_loader_no_dtype.py', seed: '456'}
+          - {id: '34_789',   script: 'probe_34_zoo_loader_no_dtype.py', seed: '789'}
+          - {id: '34_999',   script: 'probe_34_zoo_loader_no_dtype.py', seed: '999'}
+          - {id: '34_1234',  script: 'probe_34_zoo_loader_no_dtype.py', seed: '1234'}
+          - {id: '34_3407',  script: 'probe_34_zoo_loader_no_dtype.py', seed: '3407'}
+          - {id: '34_5678',  script: 'probe_34_zoo_loader_no_dtype.py', seed: '5678'}
+          - {id: '34_9012',  script: 'probe_34_zoo_loader_no_dtype.py', seed: '9012'}
+          - {id: '34_12345', script: 'probe_34_zoo_loader_no_dtype.py', seed: '12345'}
+          - {id: '34_22222', script: 'probe_34_zoo_loader_no_dtype.py', seed: '22222'}
+          - {id: '34_31415', script: 'probe_34_zoo_loader_no_dtype.py', seed: '31415'}
+          - {id: '34_65535', script: 'probe_34_zoo_loader_no_dtype.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
