@@ -36,10 +36,12 @@ jobs:
           Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE" -ErrorAction SilentlyContinue
         continue-on-error: true
 
-      - name: Run Windows installer
-        shell: pwsh
+      - name: Install CPU torch + unsloth_zoo + spoof deps (system python)
         run: |
-          & .\install.ps1 -Local -SkipFrontend
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install transformers peft accelerate bitsandbytes
+          python -m pip install git+https://github.com/unslothai/unsloth_zoo
 
       - name: Import smoke under CUDA spoof
         env:

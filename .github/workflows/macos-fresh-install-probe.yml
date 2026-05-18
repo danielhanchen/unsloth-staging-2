@@ -49,12 +49,15 @@ jobs:
 
       - name: Health-check
         run: |
-          "$UNSLOTH_STUDIO_HOME/share/launch-studio.sh" &
-          for i in $(seq 1 90); do
-            [[ -s "$UNSLOTH_STUDIO_HOME/share/studio.port" ]] && break
-            sleep 2
+          PORT=8889
+          nohup "$UNSLOTH_STUDIO_HOME/bin/unsloth" studio -H 127.0.0.1 -p $PORT \
+            > "$UNSLOTH_STUDIO_HOME/share/studio.log" 2>&1 &
+          for i in $(seq 1 240); do
+            if curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1; then
+              break
+            fi
+            sleep 1
           done
-          PORT=$(cat "$UNSLOTH_STUDIO_HOME/share/studio.port")
           curl -fsS "http://127.0.0.1:$PORT/api/health"
           curl -fsS "http://127.0.0.1:$PORT/api/auth/status"
 
