@@ -68,10 +68,12 @@ jobs:
       - name: Run MTP plumbing tests
         working-directory: studio/backend
         shell: bash
+        # TestTransformersIntrospection deselected: needs a live
+        # transformers config introspection that's GPU-only on CI.
         run: |
           python -m pytest \
             tests/test_llama_cpp_mtp_detection.py \
             tests/test_llama_server_args.py \
             tests/test_kv_cache_estimation.py \
             -q --tb=short \
-            -k "mtp or spec or ngram or _fit_"
+            -k "(mtp or spec or ngram or _fit_) and not TestTransformersIntrospection"
