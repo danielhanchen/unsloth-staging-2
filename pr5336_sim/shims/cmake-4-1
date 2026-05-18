@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+if [[ "$1" == "--version" ]]; then
+  cat <<'EOF'
+cmake version 4.1.5
+
+CMake suite maintained and supported by Kitware (kitware.com/cmake).
+EOF
+  exit 0
+fi
+exit 0

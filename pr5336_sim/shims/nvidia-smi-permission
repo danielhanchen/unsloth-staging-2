@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Mock: nvidia-smi present but exits 9 (permission/insufficient privilege).
+echo "nvidia-smi: permission denied" >&2
+exit 9

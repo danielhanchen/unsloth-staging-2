@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Mock vswhere returning the version number ('17') instead of the year — exercises
+# the defensive fallback in $map.
+args="$*"
+if [[ "$args" == *"-property catalog_productLineVersion"* ]]; then
+  echo "17"
+elif [[ "$args" == *"-property installationPath"* ]]; then
+  echo "C:\\Program Files\\Microsoft Visual Studio\\2022\\BuildTools"
+fi
+exit 0

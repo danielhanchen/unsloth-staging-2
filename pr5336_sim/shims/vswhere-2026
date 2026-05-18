@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Mock vswhere for a host with only VS 2026 (internal version 18.x).
+args="$*"
+
+# Honour -version range filter: if the caller asks for a range that excludes
+# 18 (e.g. '[17.0,18.0)'), return nothing — vswhere semantics.
+if [[ "$args" == *"-version "* ]]; then
+    if [[ "$args" == *"[17.0,18.0)"* ]] || [[ "$args" == *"-version 17"* ]] \
+       || [[ "$args" == *"[16"* ]] || [[ "$args" == *"-version 16"* ]] \
+       || [[ "$args" == *"[15"* ]] || [[ "$args" == *"-version 15"* ]]; then
+        exit 0
+    fi
+fi
+
+if [[ "$args" == *"-property catalog_productLineVersion"* ]]; then
+    echo "18"
+elif [[ "$args" == *"-property installationPath"* ]]; then
+    echo "C:\\Program Files\\Microsoft Visual Studio\\18\\BuildTools"
+fi
+exit 0

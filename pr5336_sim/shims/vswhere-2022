@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Mock vswhere: returns a single VS 2022 install.
+# Distinguish queries by walking the args.
+args="$*"
+if [[ "$args" == *"-property catalog_productLineVersion"* ]]; then
+  echo "2022"
+elif [[ "$args" == *"-property installationPath"* ]]; then
+  echo "C:\\Program Files\\Microsoft Visual Studio\\2022\\BuildTools"
+fi
+exit 0

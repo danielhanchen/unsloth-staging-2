@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Mock: nvidia-smi binary present but driver communication failure.
+echo "NVIDIA-SMI has failed because it couldn't communicate with the NVIDIA driver." >&2
+exit 1
