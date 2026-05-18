@@ -107,7 +107,10 @@ jobs:
       - name: Lint install.ps1 and studio/setup.ps1
         shell: pwsh
         run: |
-          $results = Invoke-ScriptAnalyzer -Path install.ps1, studio/setup.ps1 -Severity Error,Warning
+          $results = @()
+          foreach ($p in @('install.ps1','studio/setup.ps1')) {
+            $results += Invoke-ScriptAnalyzer -Path $p -Severity Error,Warning
+          }
           if ($results) {
             $results | Format-Table -AutoSize
             $errors = @($results | Where-Object { $_.Severity -eq 'Error' })
