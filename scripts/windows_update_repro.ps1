@@ -50,12 +50,10 @@ Write-Host "[repro] writing sentinel into launcher"
 $BeforeHash = (Get-FileHash -LiteralPath $LauncherPs1 -Algorithm SHA256).Hash
 Write-Host "[repro] sentinel sha256 = $BeforeHash"
 
-Write-Host "[repro] running 'unsloth studio update --local' via python -c"
-# Workaround: invoking unsloth.exe directly holds the file open and pip's
-# uninstall step then fails with WinError 32. Invoke the CLI through the
-# venv's python so unsloth.exe is replaceable during the update.
-$VenvPython = Join-Path $VenvScripts 'python.exe'
-& $VenvPython -c "from unsloth_cli import app; app(['studio', 'update', '--local'])"
+Write-Host "[repro] running 'unsloth studio update --local'"
+# update() renames unsloth.exe to .deleteme before invoking pip so the entry
+# point is replaceable; we can invoke unsloth.exe directly again.
+& $UnslothExe studio update --local
 if ($LASTEXITCODE -ne 0) {
     Write-Host "FAIL: unsloth studio update exited $LASTEXITCODE"
     exit 1
