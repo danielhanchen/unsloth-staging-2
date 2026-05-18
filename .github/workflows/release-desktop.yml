@@ -361,14 +361,19 @@ jobs:
         with:
           node-version: 24
 
+      # Pre-install lockfile structural audit. Has to fire BEFORE
+      # `npm ci` so any tarball's `prepare` / `postinstall` cannot run
+      # ahead of the scan. Pure-Python read-only; safe everywhere.
+      - name: Lockfile supply-chain audit (pre-install scan)
+        shell: bash
+        run: python3 scripts/lockfile_supply_chain_audit.py
+
       - name: Install pinned Tauri CLI
-        # Lifecycle scripts (esbuild native-binary postinstall, etc.) are
-        # required for `vite build`. The pre-install lockfile structural
-        # audit (lockfile_supply_chain_audit.py) is the practical defence
-        # against the npm postinstall-dropper class -- it fires BEFORE any
-        # tarball runs, on the injection pattern itself rather than an
-        # advisory-DB lookup.
-        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+        # `npm ci` resolves @tauri-apps/cli and its 11 platform-specific
+        # optional native binaries from studio/package-lock.json --
+        # transitive versions are fully pinned, integrity hashes are
+        # verified, and the install is reproducible across re-runs.
+        run: npm ci --prefix studio --no-fund --no-audit
 
       - name: Verify pinned Tauri CLI
         shell: bash
@@ -443,13 +448,11 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: studio/frontend
-        # Lifecycle scripts (esbuild native-binary postinstall, etc.) are
-        # required for `vite build`. The pre-install lockfile structural
-        # audit (lockfile_supply_chain_audit.py) is the practical defence
-        # against the npm postinstall-dropper class -- it fires BEFORE any
-        # tarball runs, on the injection pattern itself rather than an
-        # advisory-DB lookup.
-        run: npm install --no-fund --no-audit
+        # npm ci: release build installs exactly what the lockfile pins.
+        # Lifecycle scripts (esbuild native-binary postinstall) are required
+        # for vite build; lockfile_supply_chain_audit.py runs pre-install as
+        # the defence against the postinstall-dropper class.
+        run: npm ci --no-fund --no-audit
 
       # ── Rust ──
       - name: Install Rust stable

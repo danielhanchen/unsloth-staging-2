@@ -295,20 +295,6 @@ fi
 step "node" "$(node -v) | npm $(npm -v)"
 verbose_substep "node check: NEED_NODE=$NEED_NODE NODE_OK=${NODE_OK:-unknown} NPM_MAJOR=${NPM_MAJOR:-unknown}"
 
-# ── Install bun (optional, faster package installs) ──
-# Uses npm to install bun globally -- Node is already guaranteed above,
-# avoids platform-specific installers, PATH issues, and admin requirements.
-if ! command -v bun &>/dev/null; then
-    substep "installing bun..."
-    if run_maybe_quiet npm install -g bun && command -v bun &>/dev/null; then
-        substep "bun installed ($(bun --version))"
-    else
-        substep "bun install skipped (npm will be used instead)"
-    fi
-else
-    substep "bun already installed ($(bun --version))"
-fi
-
 # ── Build frontend ──
 substep "building frontend..."
 cd "$SCRIPT_DIR/frontend"
@@ -329,63 +315,15 @@ _restore_gitignores() {
 }
 trap _restore_gitignores EXIT
 
-# Use bun for install if available (faster), fall back to npm.
-# Build always uses npm (Node runtime -- avoids bun runtime issues on some platforms).
-# NOTE: We intentionally avoid run_quiet for the bun install attempt because
-# run_quiet calls exit on failure, which would kill the script before the npm
-# fallback can run. Instead we capture output manually and only show it on failure.
-#
-# IMPORTANT: bun's package cache can become corrupt -- packages get stored
-# with only metadata (package.json, README) but no actual content (bin/,
-# lib/). When this happens bun install exits 0 but leaves binaries missing.
-# We verify critical binaries after install. If missing, we clear the cache
-# and retry once before falling back to npm.
-_try_bun_install() {
-    local _log _exit_code=0
-    _log=$(mktemp)
-    bun install >"$_log" 2>&1 || _exit_code=$?
-
-    # bun may create .exe shims on Windows (Git Bash / MSYS2) instead of plain scripts
-    if [ "$_exit_code" -eq 0 ] \
-        && { [ -x node_modules/.bin/tsc ] || [ -f node_modules/.bin/tsc.exe ] || [ -f node_modules/.bin/tsc.bunx ]; } \
-        && { [ -x node_modules/.bin/vite ] || [ -f node_modules/.bin/vite.exe ] || [ -f node_modules/.bin/vite.bunx ]; }; then
-        rm -f "$_log"
-        return 0
-    fi
-
-    # Either bun install failed or it exited 0 but left packages missing
-    if [ "$_exit_code" -ne 0 ]; then
-        echo "   bun install failed (exit code $_exit_code):"
-    else
-        echo "   bun install exited 0 but critical binaries are missing:"
-    fi
-    sed 's/^/   | /' "$_log" >&2
-    rm -f "$_log"
-    rm -rf node_modules
-    return 1
-}
-
-_bun_install_ok=false
-if command -v bun &>/dev/null; then
-    substep "using bun for package install (faster)"
-    if _try_bun_install; then
-        _bun_install_ok=true
-    else
-        # First attempt failed, likely due to corrupt cache entries.
-        # Clear the cache and retry once.
-        echo "   Clearing bun cache and retrying..."
-        run_maybe_quiet bun pm cache rm || true
-        if _try_bun_install; then
-            _bun_install_ok=true
-        fi
-    fi
-fi
-if [ "$_bun_install_ok" = false ]; then
-    run_quiet_no_exit "npm install" npm install --no-fund --no-audit --loglevel=error
-    _npm_install_rc=$?
-    if [ "$_npm_install_rc" -ne 0 ]; then
-        exit "$_npm_install_rc"
-    fi
+# npm ci: install exactly what package-lock.json pins, fail on drift.
+# There is no committed bun.lock so we don't dispatch to bun; a bun
+# branch here would always miss and silently regenerate (or fail under
+# --frozen-lockfile). Keep this single path until/unless a real
+# bun.lock lands.
+run_quiet_no_exit "npm ci" npm ci --no-fund --no-audit --loglevel=error
+_npm_install_rc=$?
+if [ "$_npm_install_rc" -ne 0 ]; then
+    exit "$_npm_install_rc"
 fi
 run_quiet "npm run build" npm run build
 
@@ -408,7 +346,8 @@ fi  # end frontend build check
 # ── oxc-validator runtime ──
 if [ -d "$SCRIPT_DIR/backend/core/data_recipe/oxc-validator" ] && command -v npm &>/dev/null; then
     cd "$SCRIPT_DIR/backend/core/data_recipe/oxc-validator"
-    run_quiet_no_exit "npm install (oxc validator runtime)" npm install --no-fund --no-audit --loglevel=error
+    # npm ci: lockfile-strict (see frontend install above).
+    run_quiet_no_exit "npm ci (oxc validator runtime)" npm ci --no-fund --no-audit --loglevel=error
     _oxc_install_rc=$?
     if [ "$_oxc_install_rc" -ne 0 ]; then
         exit "$_oxc_install_rc"
