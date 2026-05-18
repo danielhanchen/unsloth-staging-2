@@ -48,7 +48,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: macos-update-regression-${{ github.run_id }}
+          # Default mode install lands under $HOME/.unsloth/studio.
           path: |
-            ${{ env.UNSLOTH_STUDIO_HOME }}/share/studio.log
-            ${{ env.UNSLOTH_STUDIO_HOME }}/share/studio.conf
+            ~/.unsloth/studio/share/studio.log
+            ~/.unsloth/studio/share/studio.conf
+            ~/.local/share/unsloth/studio.log
           if-no-files-found: ignore
