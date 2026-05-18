@@ -58,41 +58,47 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AA: Q3 missing piece -- bc=True at lr=1e-4 + 500
-          # steps across seeds, to compare head-to-head with the
-          # bc=False data from Rounds W/X at the SAME (lr, steps).
-          # Existing: bc=False + lr=1e-4 + 500 across {3407, 42,
-          # 22222, 2024, 12345, 999} = 2/6 contains-Unsloth.
-          # Round AA collects bc=True at the matching seeds:
-          - id: '17dp'
+          # Round AB: Q1 MLX side -- max_grad_value vs max_grad_norm.
+          # Sweep MLX_MAX_GRAD_VALUE at 0.5, 1.0, 5.0 with norm=0
+          # (elementwise-only) and the smoke default (norm=1.0,
+          # value=None) at seed=3407 + 30 steps as control.
+          - id: '17du'
             script: probe_17_curve_param.py
-            steps: '500'
+            steps: '30'
             seed: '3407'
-            bias_correction: '1'
-            lr: '1e-4'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '0.5'
             zoo_pin: 'c1821e4'
-          - id: '17dq'
+          - id: '17dv'
             script: probe_17_curve_param.py
-            steps: '500'
+            steps: '30'
+            seed: '3407'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'c1821e4'
+          - id: '17dw'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '5.0'
+            zoo_pin: 'c1821e4'
+          - id: '17dx'
+            script: probe_17_curve_param.py
+            steps: '30'
             seed: '42'
-            bias_correction: '1'
-            lr: '1e-4'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
             zoo_pin: 'c1821e4'
-          - id: '17dr'
-            script: probe_17_curve_param.py
-            steps: '500'
-            seed: '999'
-            bias_correction: '1'
-            lr: '1e-4'
-            zoo_pin: 'c1821e4'
-          - id: '17ds'
-            script: probe_17_curve_param.py
-            steps: '500'
-            seed: '12345'
-            bias_correction: '1'
-            lr: '1e-4'
-            zoo_pin: 'c1821e4'
-          - id: '17dt'
+          - id: '17dy'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
@@ -153,6 +159,8 @@ jobs:
           MLX_DTYPE: ${{ matrix.dtype }}
           MLX_BIAS_CORRECTION: ${{ matrix.bias_correction }}
           MLX_LR: ${{ matrix.lr }}
+          MLX_MAX_GRAD_NORM: ${{ matrix.max_grad_norm }}
+          MLX_MAX_GRAD_VALUE: ${{ matrix.max_grad_value }}
         run: |
           cd tests/mlx_parity && python ${{ matrix.script }}
 

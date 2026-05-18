@@ -90,8 +90,25 @@ def main() -> int:
     else:
         bc = bc_raw in ("1", "true", "yes", "y")
     lr = _env_float("MLX_LR", 1e-3)
+    # Grad clip knobs:
+    #   MLX_MAX_GRAD_NORM=  empty -> trainer default (1.0 in this probe)
+    #   MLX_MAX_GRAD_VALUE= empty -> trainer default (None on PR-663 head)
+    # Use "off"/"0"/explicit floats to override; "none" maps to None.
+    def _env_grad(name):
+        raw = (os.environ.get(name) or "").strip().lower()
+        if not raw:
+            return "default"
+        if raw in ("none", "off"):
+            return None
+        try:
+            return float(raw)
+        except ValueError:
+            return "default"
+    grad_norm_override = _env_grad("MLX_MAX_GRAD_NORM")
+    grad_value_override = _env_grad("MLX_MAX_GRAD_VALUE")
 
-    banner(f"Probe 17: steps={steps} seed={seed} dtype={dtype} bc={bc!r} lr={lr}")
+    banner(f"Probe 17: steps={steps} seed={seed} dtype={dtype} bc={bc!r} lr={lr} "
+           f"max_grad_norm={grad_norm_override!r} max_grad_value={grad_value_override!r}")
 
     import random
     random.seed(seed)
@@ -128,6 +145,10 @@ def main() -> int:
     extra = {}
     if "adam_bias_correction" in fields_supported and bc is not None:
         extra["adam_bias_correction"] = bc
+    if grad_value_override != "default" and "max_grad_value" in fields_supported:
+        extra["max_grad_value"] = grad_value_override
+
+    cfg_grad_norm = 1.0 if grad_norm_override == "default" else (grad_norm_override or 0.0)
 
     config = MLXTrainingConfig(
         per_device_train_batch_size=2,
@@ -138,7 +159,7 @@ def main() -> int:
         lr_scheduler_type="constant",
         optim="adamw",
         weight_decay=0.0,
-        max_grad_norm=1.0,
+        max_grad_norm=cfg_grad_norm,
         logging_steps=1,
         max_seq_length=MAX_SEQ_LEN,
         seed=seed,
