@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+args="$*"
+if [[ "$args" == *"-property catalog_productLineVersion"* ]]; then
+  echo "2019"
+elif [[ "$args" == *"-property installationPath"* ]]; then
+  echo "C:\\Program Files (x86)\\Microsoft Visual Studio\\2019\\Community"
+fi
+exit 0

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Mock vswhere returning nothing (VS not registered).
+exit 0

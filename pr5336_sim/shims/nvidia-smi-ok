@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Mock: nvidia-smi that prints a normal-looking header and exits 0.
+cat <<'EOF'
++-----------------------------------------------------------------------------+
+| NVIDIA-SMI 550.40.07 Driver Version: 550.40.07  CUDA Version: 12.4          |
+EOF
+exit 0

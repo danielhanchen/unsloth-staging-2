@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Mock vswhere with multiple VS instances installed.
+# For VS 2026, vswhere reports the version number ('18'); for VS 2017-2022 it
+# reports the year. -latest with multi-instance prints one line per match.
+args="$*"
+if [[ "$args" == *"-property catalog_productLineVersion"* ]]; then
+  printf '18\n2022\n'
+elif [[ "$args" == *"-property installationPath"* ]]; then
+  printf 'C:\\Program Files\\Microsoft Visual Studio\\18\\BuildTools\nC:\\Program Files\\Microsoft Visual Studio\\2022\\BuildTools\n'
+fi
+exit 0
