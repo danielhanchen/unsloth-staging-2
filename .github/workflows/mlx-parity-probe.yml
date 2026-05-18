@@ -144,21 +144,28 @@ jobs:
           # verbatim copy of mlx-lm's default_loss (bool mask, no
           # astype(fp32) on the mask).
 
-          - {id: '24_1',     script: 'probe_24_hybrid_mlxlm_loss.py', seed: '1'}
-          - {id: '24_7',     script: 'probe_24_hybrid_mlxlm_loss.py', seed: '7'}
-          - {id: '24_42',    script: 'probe_24_hybrid_mlxlm_loss.py', seed: '42'}
-          - {id: '24_123',   script: 'probe_24_hybrid_mlxlm_loss.py', seed: '123'}
-          - {id: '24_456',   script: 'probe_24_hybrid_mlxlm_loss.py', seed: '456'}
-          - {id: '24_789',   script: 'probe_24_hybrid_mlxlm_loss.py', seed: '789'}
-          - {id: '24_999',   script: 'probe_24_hybrid_mlxlm_loss.py', seed: '999'}
-          - {id: '24_1234',  script: 'probe_24_hybrid_mlxlm_loss.py', seed: '1234'}
-          - {id: '24_3407',  script: 'probe_24_hybrid_mlxlm_loss.py', seed: '3407'}
-          - {id: '24_5678',  script: 'probe_24_hybrid_mlxlm_loss.py', seed: '5678'}
-          - {id: '24_9012',  script: 'probe_24_hybrid_mlxlm_loss.py', seed: '9012'}
-          - {id: '24_12345', script: 'probe_24_hybrid_mlxlm_loss.py', seed: '12345'}
-          - {id: '24_22222', script: 'probe_24_hybrid_mlxlm_loss.py', seed: '22222'}
-          - {id: '24_31415', script: 'probe_24_hybrid_mlxlm_loss.py', seed: '31415'}
-          - {id: '24_65535', script: 'probe_24_hybrid_mlxlm_loss.py', seed: '65535'}
+          # ---- Round BC: complement of probe 24 to isolate loop vs loss ----
+          # Probe 24 (mlx-lm loss in zoo trainer): 50% — barely above zoo.
+          # Probe 25 inverts: mlx-lm verbatim training loop using ZOO's
+          # make_baseline_loss_fn. If 67% — loss is irrelevant, loop is
+          # the cause. If 47% — loss IS the cause. Combined with 24, this
+          # bracket-tests both sides of the trainer/loss boundary.
+
+          - {id: '25_1',     script: 'probe_25_mlxlm_loop.py', seed: '1'}
+          - {id: '25_7',     script: 'probe_25_mlxlm_loop.py', seed: '7'}
+          - {id: '25_42',    script: 'probe_25_mlxlm_loop.py', seed: '42'}
+          - {id: '25_123',   script: 'probe_25_mlxlm_loop.py', seed: '123'}
+          - {id: '25_456',   script: 'probe_25_mlxlm_loop.py', seed: '456'}
+          - {id: '25_789',   script: 'probe_25_mlxlm_loop.py', seed: '789'}
+          - {id: '25_999',   script: 'probe_25_mlxlm_loop.py', seed: '999'}
+          - {id: '25_1234',  script: 'probe_25_mlxlm_loop.py', seed: '1234'}
+          - {id: '25_3407',  script: 'probe_25_mlxlm_loop.py', seed: '3407'}
+          - {id: '25_5678',  script: 'probe_25_mlxlm_loop.py', seed: '5678'}
+          - {id: '25_9012',  script: 'probe_25_mlxlm_loop.py', seed: '9012'}
+          - {id: '25_12345', script: 'probe_25_mlxlm_loop.py', seed: '12345'}
+          - {id: '25_22222', script: 'probe_25_mlxlm_loop.py', seed: '22222'}
+          - {id: '25_31415', script: 'probe_25_mlxlm_loop.py', seed: '31415'}
+          - {id: '25_65535', script: 'probe_25_mlxlm_loop.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
