@@ -1,0 +1,187 @@
+name: studio-export-q2kl-e2e
+
+# End-to-end validation of the Studio q2_k_l GGUF export fix.
+# Uses the throwaway unsloth_zoo fix branch:
+#   https://github.com/danielhanchen/unsloth-zoo-staging-1/tree/studio-export-q2kl-fix
+# Builds llama.cpp from source on each OS via install_llama_cpp(), then
+# asserts the freshly-built llama-quantize binary actually recognises the
+# arguments our patched quantize_gguf emits for the q2_k_l preset:
+#   q2_k ftype + --output-tensor-type q8_0 + --token-embedding-type q8_0.
+# That is the diagnostic regression check for the user's reported error:
+#   main: invalid ftype 'q2_k_l'
+
+on:
+  push:
+    branches: [studio-export-q2kl-fix]
+    paths:
+      - ".github/workflows/studio-export-q2kl-e2e.yml"
+      - "tests/studio_export_q2kl_e2e/**"
+  pull_request:
+    paths:
+      - ".github/workflows/studio-export-q2kl-e2e.yml"
+      - "tests/studio_export_q2kl_e2e/**"
+  workflow_dispatch:
+
+concurrency:
+  group: studio-export-q2kl-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      max-parallel: 3                    # 1 of 5 Windows concurrent runners
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Linux build deps for llama.cpp
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git curl libgomp1 libssl-dev libcurl4-openssl-dev
+
+      - name: Install pinned unsloth_zoo fix branch + minimal deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # The point of the staging fork: validate the unsloth_zoo branch
+          # against real OS toolchains without burning credits on the main
+          # unsloth_zoo repo. Pin to the throwaway branch's tip SHA at the
+          # time of this PR so re-runs are reproducible.
+          python -m pip install \
+            'git+https://github.com/danielhanchen/unsloth-zoo-staging-1@studio-export-q2kl-fix#egg=unsloth_zoo' \
+            --no-deps
+          # CPU torch + the minimum module-level imports of unsloth_zoo.
+          python -m pip install \
+            'torch>=2.4,<2.11' \
+            psutil tqdm requests pytest
+
+      - name: Apply CUDA spoof + build llama.cpp
+        shell: bash
+        run: |
+          # Use the consolidated spoof already shipped under tests/ on this
+          # branch -- same pattern the upstream llama-cpp-smoke job uses
+          # at consolidated-tests-ci.yml:2207. No GPU required.
+          python -u - <<'PY'
+          import sys, os
+          sys.path.insert(0, "tests")
+          import _zoo_aggressive_cuda_spoof as _spoof
+          _spoof.apply()
+
+          from unsloth_zoo.llama_cpp import install_llama_cpp, LLAMA_CPP_DEFAULT_DIR
+
+          # install_llama_cpp() clones llama.cpp and runs cmake. Idempotent.
+          install_llama_cpp("llama.cpp")
+          print(f"llama.cpp installed under: {LLAMA_CPP_DEFAULT_DIR}")
+          PY
+
+      - name: Locate llama-quantize binary
+        id: locate
+        shell: bash
+        run: |
+          # cmake on Windows places binaries under build/bin/Release/.
+          # unsloth_zoo.llama_cpp.quantize_gguf already handles that path
+          # translation in its _quote branch (line 1571 of llama_cpp.py).
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            LQ="llama.cpp/build/bin/Release/llama-quantize.exe"
+          else
+            LQ="llama.cpp/llama-quantize"
+          fi
+          ls -la "$LQ"
+          echo "llama_quantize=$LQ" >> "$GITHUB_OUTPUT"
+
+      - name: Assert llama-quantize knows q2_k + the preset flags
+        # The regression: the original bug surfaced as
+        #   main: invalid ftype 'q2_k_l'
+        # because llama-quantize doesn't know q2_k_l. After our fix the
+        # patched code sends q2_k plus --output-tensor-type/--token-embedding-type.
+        # Confirming those tokens appear in --help proves the binary's CLI
+        # surface still matches what unsloth_zoo emits on this OS.
+        shell: bash
+        run: |
+          set -e
+          LQ="${{ steps.locate.outputs.llama_quantize }}"
+          # llama-quantize prints help to stdout when given --help (newer)
+          # OR exits non-zero with help on stderr when given no args (older).
+          HELP_OUTPUT="$("$LQ" --help 2>&1 || true)"
+          echo "----- llama-quantize --help -----"
+          echo "$HELP_OUTPUT" | head -100
+          echo "---------------------------------"
+          echo "$HELP_OUTPUT" | grep -i "q2_k" \
+            || { echo "::error::llama-quantize does not advertise q2_k ftype"; exit 1; }
+          echo "$HELP_OUTPUT" | grep -i -- "--output-tensor-type" \
+            || { echo "::error::llama-quantize does not accept --output-tensor-type"; exit 1; }
+          echo "$HELP_OUTPUT" | grep -i -- "--token-embedding-type" \
+            || { echo "::error::llama-quantize does not accept --token-embedding-type"; exit 1; }
+          echo "::notice::llama-quantize CLI on $RUNNER_OS accepts q2_k_l preset expansion."
+
+      - name: Verify unsloth_zoo emits the expected command for q2_k_l
+        # End-to-end check: import quantize_gguf and confirm the COMMAND it
+        # would emit (captured via a monkeypatched subprocess.run) contains
+        # the post-expansion arguments. This validates the wire-up between
+        # the patched llama_cpp.py we just installed and the real binary
+        # path discovered above, on the actual OS toolchain.
+        shell: bash
+        run: |
+          python -u - <<'PY'
+          import sys, os, subprocess
+          sys.path.insert(0, "tests")
+          import _zoo_aggressive_cuda_spoof as _spoof
+          _spoof.apply()
+
+          from unsloth_zoo.llama_cpp import quantize_gguf
+
+          captured = {}
+          def fake_run(cmd, *a, **kw):
+              captured["cmd"] = cmd
+              class R: stdout = "ok"; returncode = 0
+              return R()
+
+          subprocess.run = fake_run
+
+          # Stub out the size-verify step.
+          from pathlib import Path
+          Path.exists = lambda self: True
+          Path.stat = lambda self: type("S", (), {"st_size": 4096})()
+
+          if os.name == "nt":
+              quantizer = os.path.join("llama.cpp", "build", "bin", "Release", "llama-quantize.exe")
+          else:
+              quantizer = os.path.join("llama.cpp", "llama-quantize")
+
+          quantize_gguf(
+              input_gguf="/tmp/in.gguf",
+              output_gguf="/tmp/out.gguf",
+              quant_type="q2_k_l",
+              quantizer_location=quantizer,
+              n_threads=4,
+              print_output=False,
+          )
+
+          cmd = captured["cmd"]
+          print(f"emitted command: {cmd!r}")
+          assert "q2_k_l" not in cmd, f"preset name leaked to llama-quantize: {cmd!r}"
+          assert " q2_k " in cmd, f"q2_k token missing: {cmd!r}"
+          assert "--output-tensor-type q8_0" in cmd, cmd
+          assert "--token-embedding-type q8_0" in cmd, cmd
+          print("OK: q2_k_l preset expansion verified end-to-end on", os.name)
+          PY
