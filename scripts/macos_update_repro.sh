@@ -17,7 +17,11 @@ DATA_DIR_DEFAULT="$HOME/.local/share/unsloth"
 APP_DIR="$HOME/Applications/Unsloth Studio.app"
 LAUNCHER_STUB="$APP_DIR/Contents/MacOS/launch-studio"
 LAUNCHER_SHARED="$DATA_DIR_DEFAULT/launch-studio.sh"
-UNSLOTH_BIN="$STUDIO_HOME_DEFAULT/bin/unsloth"
+# Default mode: shim under ~/.local/bin; env mode: $STUDIO_HOME/bin.
+UNSLOTH_BIN="$HOME/.local/bin/unsloth"
+if [[ ! -x "$UNSLOTH_BIN" && -x "$STUDIO_HOME_DEFAULT/bin/unsloth" ]]; then
+    UNSLOTH_BIN="$STUDIO_HOME_DEFAULT/bin/unsloth"
+fi
 
 REPO_ROOT="${REPO_ROOT:-$(pwd)}"
 [[ -f "$REPO_ROOT/install.sh" ]] || {
