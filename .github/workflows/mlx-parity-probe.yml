@@ -307,6 +307,32 @@ jobs:
           - {id: '37_22222', script: 'probe_37_zoo_trainer_clip_off.py', seed: '22222'}
           - {id: '37_31415', script: 'probe_37_zoo_trainer_clip_off.py', seed: '31415'}
           - {id: '37_65535', script: 'probe_37_zoo_trainer_clip_off.py', seed: '65535'}
+
+          # ---- Round BM: re-baseline probe 31 to reset confidence ----
+          # Round BL data (probe 37 at 40%, probe 30 at 47%, probe 34/36 at 47%,
+          # probe 35 at 53%) suggests probe 31's earlier 67% may have been
+          # within seed noise. Re-run probe 31 (manual loop + nl=16 + no clip)
+          # on the SAME 15 seeds and the same run as probes 30/34/35/36/37 to
+          # get a paired fresh number. If probe 31 reproduces ~67%, the
+          # trainer DOES add a real -20pp gap (MLXTrainer 47-53% << manual
+          # loop 67%). If probe 31 lands at 47-53%, the entire 'gap' is
+          # within noise and there is no trainer defect to chase.
+
+          - {id: '31_1',     script: 'probe_31_num_layers_16.py', seed: '1'}
+          - {id: '31_7',     script: 'probe_31_num_layers_16.py', seed: '7'}
+          - {id: '31_42',    script: 'probe_31_num_layers_16.py', seed: '42'}
+          - {id: '31_123',   script: 'probe_31_num_layers_16.py', seed: '123'}
+          - {id: '31_456',   script: 'probe_31_num_layers_16.py', seed: '456'}
+          - {id: '31_789',   script: 'probe_31_num_layers_16.py', seed: '789'}
+          - {id: '31_999',   script: 'probe_31_num_layers_16.py', seed: '999'}
+          - {id: '31_1234',  script: 'probe_31_num_layers_16.py', seed: '1234'}
+          - {id: '31_3407',  script: 'probe_31_num_layers_16.py', seed: '3407'}
+          - {id: '31_5678',  script: 'probe_31_num_layers_16.py', seed: '5678'}
+          - {id: '31_9012',  script: 'probe_31_num_layers_16.py', seed: '9012'}
+          - {id: '31_12345', script: 'probe_31_num_layers_16.py', seed: '12345'}
+          - {id: '31_22222', script: 'probe_31_num_layers_16.py', seed: '22222'}
+          - {id: '31_31415', script: 'probe_31_num_layers_16.py', seed: '31415'}
+          - {id: '31_65535', script: 'probe_31_num_layers_16.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
