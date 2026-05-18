@@ -58,47 +58,51 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round Q: LR axis at long horizons.
-          # Rounds A-P characterized (steps, seed, bc) thoroughly at
-          # lr=1e-3. The remaining question for the PR-663 docstring:
-          # does smaller LR rescue bc=False from NaN, and does larger
-          # LR push bc=True into instability? Tightens the safety
-          # envelope around the recommended defaults.
-          - id: '17br'
-            script: probe_17_curve_param.py
-            steps: '100'
-            seed: '3407'
-            bias_correction: '0'
-            lr: '1e-4'
-            zoo_pin: '669a792'
-          - id: '17bs'
-            script: probe_17_curve_param.py
-            steps: '200'
-            seed: '3407'
-            bias_correction: '0'
-            lr: '1e-4'
-            zoo_pin: '669a792'
-          - id: '17bt'
-            script: probe_17_curve_param.py
-            steps: '100'
-            seed: '3407'
-            bias_correction: ''
-            lr: '5e-3'
-            zoo_pin: '669a792'
-          - id: '17bu'
+          # Round R: extend the safe-envelope claims from Round Q so
+          # the trainer.py docstring is empirically defensible:
+          #   17bw : bc=0 + 500 steps + lr=1e-4 (extend safe past 200)
+          #   17bx : bc=0 + 1000 steps + lr=1e-4 (does small-LR bc=False
+          #          eventually diverge or stay finite indefinitely?)
+          #   17by : default + 30 steps + lr=5e-3 (does 5e-3 bc=True
+          #          break even at smoke horizon?)
+          #   17bz : bc=0 + 100 steps + lr=5e-4 (mid-LR bc=False:
+          #          is 5e-4 the crossover safe/unsafe LR?)
+          #   17ca : default + 30 + lr=1e-3 (control, pin SHA c1821e4)
+          - id: '17bw'
             script: probe_17_curve_param.py
             steps: '500'
             seed: '3407'
+            bias_correction: '0'
+            lr: '1e-4'
+            zoo_pin: 'c1821e4'
+          - id: '17bx'
+            script: probe_17_curve_param.py
+            steps: '1000'
+            seed: '3407'
+            bias_correction: '0'
+            lr: '1e-4'
+            zoo_pin: 'c1821e4'
+          - id: '17by'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
             bias_correction: ''
             lr: '5e-3'
-            zoo_pin: '669a792'
-          - id: '17bv'
+            zoo_pin: 'c1821e4'
+          - id: '17bz'
+            script: probe_17_curve_param.py
+            steps: '100'
+            seed: '3407'
+            bias_correction: '0'
+            lr: '5e-4'
+            zoo_pin: 'c1821e4'
+          - id: '17ca'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
             bias_correction: ''
             lr: '1e-3'
-            zoo_pin: '669a792'
+            zoo_pin: 'c1821e4'
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
