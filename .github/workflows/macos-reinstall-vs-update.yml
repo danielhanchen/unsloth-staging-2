@@ -1,0 +1,85 @@
+name: macos-reinstall-vs-update
+
+on:
+  push:
+    branches: [studio-regression-ci]
+    paths:
+      - install.sh
+      - studio/setup.sh
+      - unsloth_cli/**
+      - .github/workflows/macos-reinstall-vs-update.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compare:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Studio (default mode)
+        run: bash install.sh --local
+
+      - name: Capture launcher fingerprint (post-install)
+        id: fp1
+        run: |
+          APP="$HOME/Applications/Unsloth Studio.app"
+          [[ -d "$APP" ]] || { echo "missing .app"; exit 1; }
+          SHA=$(shasum -a 256 "$APP/Contents/MacOS/launch-studio" | awk '{print $1}')
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "[install] launcher sha = $SHA"
+
+      - name: Sentinel + run `unsloth studio update --local`
+        id: update
+        run: |
+          APP="$HOME/Applications/Unsloth Studio.app"
+          STUB="$APP/Contents/MacOS/launch-studio"
+          printf '#!/bin/sh\necho UPDATE_SENTINEL\n' > "$STUB"
+          chmod +x "$STUB"
+          BEFORE=$(shasum -a 256 "$STUB" | awk '{print $1}')
+          UNSLOTH_BIN="$HOME/.local/bin/unsloth"
+          [[ -x "$UNSLOTH_BIN" ]] || UNSLOTH_BIN="$HOME/.unsloth/studio/bin/unsloth"
+          "$UNSLOTH_BIN" studio update --local
+          AFTER=$(shasum -a 256 "$STUB" | awk '{print $1}')
+          echo "before=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "after=$AFTER"   >> "$GITHUB_OUTPUT"
+          if [[ "$BEFORE" == "$AFTER" ]]; then
+            echo "FAIL: update did not rewrite the launcher"; exit 1
+          fi
+          echo "[update] BEFORE=$BEFORE AFTER=$AFTER (rewrote)"
+
+      - name: Sentinel + run install.sh --local again (reinstall)
+        id: reinstall
+        run: |
+          APP="$HOME/Applications/Unsloth Studio.app"
+          STUB="$APP/Contents/MacOS/launch-studio"
+          printf '#!/bin/sh\necho REINSTALL_SENTINEL\n' > "$STUB"
+          chmod +x "$STUB"
+          BEFORE=$(shasum -a 256 "$STUB" | awk '{print $1}')
+          bash install.sh --local
+          AFTER=$(shasum -a 256 "$STUB" | awk '{print $1}')
+          echo "before=$BEFORE" >> "$GITHUB_OUTPUT"
+          echo "after=$AFTER"   >> "$GITHUB_OUTPUT"
+          if [[ "$BEFORE" == "$AFTER" ]]; then
+            echo "FAIL: reinstall did not rewrite the launcher"; exit 1
+          fi
+          echo "[reinstall] BEFORE=$BEFORE AFTER=$AFTER (rewrote)"
+
+      - name: Assert update + reinstall produced equivalent launchers
+        run: |
+          UPDATE_AFTER="${{ steps.update.outputs.after }}"
+          REINSTALL_AFTER="${{ steps.reinstall.outputs.after }}"
+          echo "update_after    = $UPDATE_AFTER"
+          echo "reinstall_after = $REINSTALL_AFTER"
+          if [[ "$UPDATE_AFTER" != "$REINSTALL_AFTER" ]]; then
+            echo "FAIL: post-update and post-reinstall launchers differ"
+            exit 1
+          fi
+          echo "PASS: update and reinstall converge to the same launcher."
