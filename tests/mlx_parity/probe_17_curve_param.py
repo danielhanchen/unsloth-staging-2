@@ -200,6 +200,25 @@ def main() -> int:
     post_loss, _ = loss_fn(model, batch, lengths, labels_mlx)
     post_loss_val = float(post_loss.item())
 
+    # Teacher-forced completion loss: same shape as the new PR-5537
+    # smoke gate. CE on the "Unsloth!" tokens given the "<<HELLO!!>> My
+    # name is " prompt, no decoding involved. Should be tiny across
+    # every config that hits post_train_loss < 0.1.
+    import mlx.nn as nn
+    prompt_ids = list(tokenizer.encode(PROMPT))
+    full_ids = list(tokenizer.encode(PROMPT + "Unsloth!"))
+    if len(full_ids) > len(prompt_ids):
+        cf_inputs = mx.array([full_ids[:-1]], dtype=mx.int32)
+        cf_targets = mx.array([full_ids[1:]], dtype=mx.int32)
+        cf_logits = model(cf_inputs)
+        start = len(prompt_ids) - 1
+        completion_loss = float(nn.losses.cross_entropy(
+            cf_logits[:, start:, :], cf_targets[:, start:], reduction="mean"
+        ).item())
+    else:
+        completion_loss = float("nan")
+    report("completion_teacher_forced_loss", completion_loss)
+
     from mlx_lm import generate
     gen = generate(model, tokenizer, prompt=PROMPT, max_tokens=48, verbose=False)
     contains = "Unsloth" in gen
@@ -220,6 +239,7 @@ def main() -> int:
         },
         "rows": rows,
         "post_train_loss": post_loss_val,
+        "completion_teacher_forced_loss": completion_loss,
         "generation": gen,
         "contains_unsloth": contains,
     }

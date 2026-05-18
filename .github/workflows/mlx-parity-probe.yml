@@ -58,31 +58,56 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AU: mlx-lm NATIVE LoRA matched to unsloth-zoo
-          # settings (all 7 modules, scale=2.0, bs=6 effective,
-          # bc=True). If multi-seed pass rate matches unsloth-zoo's
-          # 33-77%, fragility is MLX-level. If it hits CUDA-like
-          # 100%, unsloth-zoo's wrapper has a material extra source.
-          - id: '20a'
-            script: probe_20_mlx_lm_aggressive.py
-            steps: '30'
-            seed: '3407'
-          - id: '20b'
-            script: probe_20_mlx_lm_aggressive.py
+          # Round AV: validate teacher-forced completion loss across
+          # the seeds where greedy decode FAILED on PR-663 head with
+          # smoke defaults (value=1.0 elementwise, bc=True, 30 steps).
+          # If completion_loss is consistently << 0.5 on these
+          # failing-at-greedy seeds, the PR-5537 hard gate is sound.
+          - id: '17hl'
+            script: probe_17_curve_param.py
             steps: '30'
             seed: '42'
-          - id: '20c'
-            script: probe_20_mlx_lm_aggressive.py
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'aed74d9'
+          - id: '17hm'
+            script: probe_17_curve_param.py
             steps: '30'
             seed: '999'
-          - id: '20d'
-            script: probe_20_mlx_lm_aggressive.py
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'aed74d9'
+          - id: '17hn'
+            script: probe_17_curve_param.py
             steps: '30'
             seed: '12345'
-          - id: '20e'
-            script: probe_20_mlx_lm_aggressive.py
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'aed74d9'
+          - id: '17ho'
+            script: probe_17_curve_param.py
             steps: '30'
             seed: '22222'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'aed74d9'
+          - id: '17hp'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
+            zoo_pin: 'aed74d9'
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
