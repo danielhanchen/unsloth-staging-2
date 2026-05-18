@@ -1,0 +1,49 @@
+name: windows-update-regression
+
+on:
+  push:
+    branches: [studio-regression-ci]
+    paths:
+      - install.ps1
+      - studio/setup.ps1
+      - scripts/windows_update_repro.ps1
+      - unsloth_cli/**
+      - .github/workflows/windows-update-regression.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reproduce:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Defender exclusions
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE" -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.unsloth" -ErrorAction SilentlyContinue
+        continue-on-error: true
+
+      - name: Run Windows update repro
+        run: ./scripts/windows_update_repro.ps1
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-update-regression-${{ github.run_id }}
+          path: |
+            ${{ env.USERPROFILE }}/.unsloth/studio/share/studio.log
+            ${{ env.LOCALAPPDATA }}/Unsloth Studio/launch-studio.ps1
+          if-no-files-found: ignore
