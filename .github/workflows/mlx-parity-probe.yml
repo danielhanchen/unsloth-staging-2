@@ -58,54 +58,31 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AT: finish value=0.25 13-seed sample. AQ + AS
-          # gave 6/10. Add 3 remaining seeds (2024, 33333, 0) +
-          # control + a 8888 re-check (Round Z showed bit-exact
-          # determinism, so re-runs should match; if they don't,
-          # we have a problem).
-          - id: '17hg'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '2024'
-            bias_correction: ''
-            lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '0.25'
-            zoo_pin: 'c1821e4'
-          - id: '17hh'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '33333'
-            bias_correction: ''
-            lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '0.25'
-            zoo_pin: 'c1821e4'
-          - id: '17hi'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '0'
-            bias_correction: ''
-            lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '0.25'
-            zoo_pin: 'c1821e4'
-          - id: '17hj'
-            script: probe_17_curve_param.py
+          # Round AU: mlx-lm NATIVE LoRA matched to unsloth-zoo
+          # settings (all 7 modules, scale=2.0, bs=6 effective,
+          # bc=True). If multi-seed pass rate matches unsloth-zoo's
+          # 33-77%, fragility is MLX-level. If it hits CUDA-like
+          # 100%, unsloth-zoo's wrapper has a material extra source.
+          - id: '20a'
+            script: probe_20_mlx_lm_aggressive.py
             steps: '30'
             seed: '3407'
-            bias_correction: ''
-            lr: '1e-3'
-            zoo_pin: 'c1821e4'
-          - id: '17hk'
-            script: probe_17_curve_param.py
+          - id: '20b'
+            script: probe_20_mlx_lm_aggressive.py
             steps: '30'
-            seed: '8888'
-            bias_correction: ''
-            lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '0.25'
-            zoo_pin: 'c1821e4'
+            seed: '42'
+          - id: '20c'
+            script: probe_20_mlx_lm_aggressive.py
+            steps: '30'
+            seed: '999'
+          - id: '20d'
+            script: probe_20_mlx_lm_aggressive.py
+            steps: '30'
+            seed: '12345'
+          - id: '20e'
+            script: probe_20_mlx_lm_aggressive.py
+            steps: '30'
+            seed: '22222'
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
