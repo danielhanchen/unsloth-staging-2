@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Cross-platform smoke for the Studio safetensors agentic tool loop.
+# Runs the new test_safetensors_tool_loop.py plus the directly-adjacent
+# tool / inference / anthropic suites against three runner OSes
+# (ubuntu-latest, macos-14, windows-latest) under the same CPU-only
+# torch + transformers shape Studio's main backend job uses.
+#
+# Why a dedicated workflow:
+#   - The safetensors loop ships with 41 unit tests that exercise the
+#     state machine, parser, allowlist, IPC kwarg forwarding, and
+#     template fallback path. None of them call into torch's CUDA
+#     subsystem or load a model, so a free CPU runner is enough.
+#   - Path filter pins the workflow to files this PR actually changes
+#     plus the workflow itself, so unrelated commits don't re-trigger.
+#   - Concurrency.cancel-in-progress: each new push to the staging
+#     branch supersedes the previous run -- iterating is cheap.
+#
+# Cost guard: one Python version, three OS matrix cells, ~3 min each.
+# No Windows-runner queue pressure beyond a single matrix entry.
+
+name: Safetensors tool loop CI
+
+on:
+  pull_request:
+    paths:
+      - 'studio/backend/core/inference/**'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/tests/test_safetensors_tool_loop.py'
+      - 'studio/backend/utils/datasets/**'
+      - '.github/workflows/safetensors-tool-loop-ci.yml'
+  push:
+    branches: [safetensors-tool-loop-staging]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  safetensors-loop:
+    name: ${{ matrix.os }} / py3.11
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # The safetensors tool loop talks to no GPU and does not call
+      # model.generate; it parses cumulative text and fakes tool
+      # results. Install the CPU torch wheel only because Studio's
+      # `from utils.hardware import ...` chain imports torch at module
+      # scope. Same shape Studio's main backend job uses.
+      - name: Install CPU torch + transformers (Linux / macOS)
+        if: matrix.os != 'windows-latest'
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch>=2.4,<2.11'
+          pip install 'transformers>=4.51,<5.5'
+
+      # Windows torch CPU wheels live on the same PyTorch index but the
+      # `--index-url` flag bypasses PyPI, so install transformers in a
+      # second step. The torch CPU wheel on Windows is ~250 MB.
+      - name: Install CPU torch + transformers (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.4,<2.11'
+          pip install 'transformers>=4.51,<5.5'
+
+      - name: Install Studio backend dependencies (CPU only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            pytest pytest-asyncio httpx \
+            fastapi 'pydantic>=2' pyjwt cryptography python-multipart \
+            structlog pyyaml jinja2 mammoth unpdf requests typer \
+            aiofiles sqlalchemy huggingface_hub matplotlib datasets \
+            'numpy<3'
+
+      - name: Run safetensors tool-loop tests
+        working-directory: studio/backend
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio/backend
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: |
+          python -m pytest tests/test_safetensors_tool_loop.py -v --tb=short
+
+      - name: Run adjacent tool / inference suites (regression guard)
+        working-directory: studio/backend
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio/backend
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: |
+          python -m pytest \
+            tests/test_openai_tool_passthrough.py \
+            tests/test_responses_tool_passthrough.py \
+            tests/test_inference_model_validation.py \
+            tests/test_anthropic_thinking_translation.py \
+            tests/test_anthropic_code_execution.py \
+            tests/test_anthropic_messages.py \
+            -q --tb=short

@@ -416,6 +416,18 @@ def _handle_generate(
             "cancel_event": cancel_event,
         }
 
+        # Optional template/tool plumbing: only forward keys that are
+        # actually present so the backend signature can evolve without
+        # breaking older command payloads.
+        for opt_key in (
+            "tools",
+            "enable_thinking",
+            "reasoning_effort",
+            "preserve_thinking",
+        ):
+            if opt_key in cmd:
+                gen_kwargs[opt_key] = cmd[opt_key]
+
         # Choose generation path
         use_adapter = cmd.get("use_adapter")
         if use_adapter is not None:
