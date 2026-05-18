@@ -6,7 +6,13 @@ $ErrorActionPreference = 'Stop'
 # instead grep the actual setup.ps1 file to confirm the hardcoded v170 is still
 # the literal at line 1098 (regression detector).
 
-$setupPs1 = (Resolve-Path "$PSScriptRoot/../../../studio/setup.ps1").Path
+# Walk up from $PSScriptRoot until install.ps1 is found, then anchor.
+$repoRoot = $PSScriptRoot
+for ($i = 0; $i -lt 6; $i++) {
+    if (Test-Path (Join-Path $repoRoot 'install.ps1')) { break }
+    $repoRoot = Split-Path -Parent $repoRoot
+}
+$setupPs1 = Join-Path $repoRoot 'studio/setup.ps1'
 $content = Get-Content $setupPs1 -Raw
 
 if ($env:HARNESS_MODE -eq 'fixed') {

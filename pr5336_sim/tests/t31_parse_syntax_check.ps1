@@ -3,7 +3,12 @@ $ErrorActionPreference = 'Stop'
 # AST parse of the actual .ps1 files in the repo — picks up syntax errors that
 # wouldn't surface from unit tests of extracted helpers.
 
-$repoRoot = (Resolve-Path "$PSScriptRoot/../../..").Path
+# Walk up from $PSScriptRoot until install.ps1 is found.
+$repoRoot = $PSScriptRoot
+for ($i = 0; $i -lt 6; $i++) {
+    if (Test-Path (Join-Path $repoRoot 'install.ps1')) { break }
+    $repoRoot = Split-Path -Parent $repoRoot
+}
 $files = @(
     Join-Path $repoRoot 'install.ps1'
     Join-Path $repoRoot 'studio/setup.ps1'
