@@ -67,33 +67,32 @@ def _has_current_password_input(page) -> bool:
 
 
 def _shoot(page, name: str) -> None:
-    page.screenshot(path=str(ART / f"{name}.png"), full_page=True)
+    # Viewport-only -- full_page=True has been a recurring source of
+    # "Connection closed while reading from the driver" flakes on
+    # macos-14 arm64 runners running Node 24.
+    try:
+        page.screenshot(path=str(ART / f"{name}.png"))
+    except Exception:
+        pass
 
 
-def main() -> int:
-    failures: list[str] = []
+# Chromium launch args that play nice with the free GitHub runners
+# (especially the arm64 macos-14 box, where the default shm size +
+# sandbox combination triggers driver-pipe crashes).
+LAUNCH_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(args=["--no-sandbox"])
 
-        # Order matters. Case A submits the change-password form, which
-        # flips the server's requires_password_change to false; that
-        # would auto-redirect any subsequent /change-password navigation
-        # to /login (1 input), making case B a false negative. Run
-        # case B first while the server is still in must-change state.
+def _case_bootstrap_absent(pw, failures: list[str]) -> None:
+    browser = pw.chromium.launch(args=LAUNCH_ARGS)
+    try:
+        ctx = browser.new_context()
+        ctx.add_init_script(SUPPRESS_BOOTSTRAP)
+        page = ctx.new_page()
+        page.goto(f"{BASE}/change-password", wait_until="domcontentloaded")
+        page.wait_for_selector("input[type='password']", timeout=15_000)
+        _shoot(page, "01_bootstrap_absent")
 
-        # ----- Case B: bootstrap ABSENT (admin-forced reset) --------------
-        # Backend keeps injecting the inline script while
-        # requires_password_change is true; the init script below
-        # makes the assignment a no-op in the page context.
-        ctx_b = browser.new_context()
-        ctx_b.add_init_script(SUPPRESS_BOOTSTRAP)
-        page_b = ctx_b.new_page()
-        page_b.goto(f"{BASE}/change-password", wait_until="networkidle")
-        page_b.wait_for_selector("input[type='password']", timeout=15_000)
-        _shoot(page_b, "01_bootstrap_absent")
-
-        boot_undef = page_b.evaluate(
+        boot_undef = page.evaluate(
             "() => typeof window.__UNSLOTH_BOOTSTRAP__ === 'undefined'"
         )
         if not boot_undef:
@@ -102,33 +101,37 @@ def main() -> int:
                 "input-count assertion below would be a false positive"
             )
 
-        n_b = _count_password_inputs(page_b)
-        has_cur_b = _has_current_password_input(page_b)
-        if n_b != 3:
+        n = _count_password_inputs(page)
+        has_cur = _has_current_password_input(page)
+        if n != 3:
             failures.append(
-                f"bootstrap-absent: expected 3 password inputs (Current + New + Confirm), got {n_b}"
+                f"bootstrap-absent: expected 3 password inputs (Current + New + Confirm), got {n}"
             )
-        if not has_cur_b:
+        if not has_cur:
             failures.append(
                 "bootstrap-absent: #current-password input missing -- "
                 "PR #5490's admin-forced-reset fix would be regressed"
             )
-        ctx_b.close()
+    finally:
+        browser.close()
 
-        # ----- Case A: bootstrap PRESENT (first boot) ---------------------
-        ctx_a = browser.new_context()
-        page_a = ctx_a.new_page()
-        page_a.goto(f"{BASE}/", wait_until="networkidle")
+
+def _case_bootstrap_present(pw, failures: list[str]) -> None:
+    browser = pw.chromium.launch(args=LAUNCH_ARGS)
+    try:
+        ctx = browser.new_context()
+        page = ctx.new_page()
+        page.goto(f"{BASE}/", wait_until="domcontentloaded")
         # On first boot the SPA auto-redirects login -> /change-password.
-        expect(page_a).to_have_url(f"{BASE}/change-password", timeout=15_000)
-        page_a.wait_for_selector("input[type='password']", timeout=15_000)
-        _shoot(page_a, "02_bootstrap_present")
+        expect(page).to_have_url(f"{BASE}/change-password", timeout=15_000)
+        page.wait_for_selector("input[type='password']", timeout=15_000)
+        _shoot(page, "02_bootstrap_present")
 
-        n_a = _count_password_inputs(page_a)
-        has_cur_a = _has_current_password_input(page_a)
-        if n_a != 2:
-            failures.append(f"bootstrap-present: expected 2 password inputs, got {n_a}")
-        if has_cur_a:
+        n = _count_password_inputs(page)
+        has_cur = _has_current_password_input(page)
+        if n != 2:
+            failures.append(f"bootstrap-present: expected 2 password inputs, got {n}")
+        if has_cur:
             failures.append(
                 "bootstrap-present: #current-password input is still rendered; "
                 "PR #5490 regression on first boot"
@@ -136,17 +139,30 @@ def main() -> int:
 
         # End-to-end: drive the 2-input form and confirm we enter /chat.
         new_pw = f"CIauth-{secrets.token_urlsafe(12)}"
-        page_a.fill("#new-password", new_pw)
-        page_a.fill("#confirm-password", new_pw)
-        page_a.get_by_role("button", name="Change password").click()
+        page.fill("#new-password", new_pw)
+        page.fill("#confirm-password", new_pw)
+        page.get_by_role("button", name="Change password").click()
         try:
-            expect(page_a).to_have_url(f"{BASE}/chat", timeout=30_000)
-            _shoot(page_a, "03_landed_on_chat")
+            expect(page).to_have_url(f"{BASE}/chat", timeout=30_000)
+            _shoot(page, "03_landed_on_chat")
         except Exception as exc:
             failures.append(f"bootstrap-present: did not land on /chat ({exc})")
-            _shoot(page_a, "03_landed_on_chat_FAIL")
-        ctx_a.close()
+            _shoot(page, "03_landed_on_chat_FAIL")
+    finally:
         browser.close()
+
+
+def main() -> int:
+    failures: list[str] = []
+
+    with sync_playwright() as pw:
+        # Order matters. The PRESENT case submits the form and flips
+        # the server's requires_password_change to false; any later
+        # /change-password navigation then auto-redirects to /login
+        # (1 input), which would falsely fail the ABSENT case's
+        # 3-input assertion. Run ABSENT (read-only) first.
+        _case_bootstrap_absent(pw, failures)
+        _case_bootstrap_present(pw, failures)
 
     if failures:
         print("FAILURES:")
