@@ -58,39 +58,41 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round T: do failing seeds re-enter the "Unsloth" basin
-          # at longer step counts? Round B showed seed=3407 went
-          # OK->BAD->OK across 30/60/100/500. Test the recurrence
-          # for failing seeds 42, 22222 across step counts.
-          - id: '17cg'
-            script: probe_17_curve_param.py
-            steps: '100'
-            seed: '42'
-            bias_correction: ''
-            lr: '1e-3'
-            zoo_pin: 'c1821e4'
-          - id: '17ch'
+          # Round U: confirm 500-step basin recovery generalizes.
+          # Round T showed 42 + 22222 ✗ at 30 -> ✓ at 500. If 999,
+          # 7777, 12345, 2024 also recover at 500, the basin
+          # recurrence is universal across failing seeds and
+          # PR-663's training math is empirically sound; only
+          # greedy-decode geometry is fragile at the smoke horizon.
+          - id: '17cl'
             script: probe_17_curve_param.py
             steps: '500'
-            seed: '42'
+            seed: '999'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17ci'
+          - id: '17cm'
             script: probe_17_curve_param.py
             steps: '500'
-            seed: '22222'
+            seed: '7777'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17cj'
+          - id: '17cn'
             script: probe_17_curve_param.py
-            steps: '100'
-            seed: '22222'
+            steps: '500'
+            seed: '12345'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17ck'
+          - id: '17co'
+            script: probe_17_curve_param.py
+            steps: '500'
+            seed: '2024'
+            bias_correction: ''
+            lr: '1e-3'
+            zoo_pin: 'c1821e4'
+          - id: '17cp'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
