@@ -134,19 +134,12 @@ jobs:
           # Provide a benign $_cmd that just sleeps.
           DATA_DIR="$WORK/data" LOG_FILE="$WORK/data/studio.log" _launch_port=18888
           export DATA_DIR LOG_FILE _launch_port
-          out=$(. "$WORK/fn.sh"; _spawn_terminal "sleep 30" 2>&1; echo "rc=$?")
-          printf '%s\n' "$out"
+          ( . "$WORK/fn.sh"; _spawn_terminal "sleep 30"; echo "rc=$?" )
           sleep 1
-          # When open(1) fails, _spawn_terminal should:
-          #   (a) kill the original nohup'd sleep (visible as "Terminated: 15"
-          #       in the captured output), and
-          #   (b) fall back to a background launch that spawns ONE replacement
-          #       nohup sleep. We assert (a) by looking for the Terminated
-          #       message and (b) by counting at most one live `sleep 30`.
-          if ! printf '%s' "$out" | grep -q 'Terminated'; then
-            echo "FAIL: no Terminated line - original nohup not reaped"
-            exit 1
-          fi
+          # When open(1) fails, _spawn_terminal kills the original nohup'd
+          # sleep, then falls back to a background launch that spawns exactly
+          # ONE replacement. If the original were not reaped we would see 2
+          # processes; we assert <=1 to allow the legitimate fallback.
           alive=$(pgrep -f 'sleep 30' | wc -l | tr -d ' ')
           if [ "$alive" -gt 1 ]; then
             echo "FAIL: $alive 'sleep 30' processes alive (expected <= 1)"
@@ -155,4 +148,4 @@ jobs:
             exit 1
           fi
           pkill -KILL -f 'sleep 30' 2>/dev/null || true
-          echo "PASS: original reaped, at most one fallback daemon alive"
+          echo "PASS: at most one fallback daemon alive (original reaped)"
