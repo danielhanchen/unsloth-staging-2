@@ -77,113 +77,53 @@ jobs:
           # is high, interaction effect. If C high & B not, accum is
           # the dominant cause.
 
-          # ---- Cell A: clip=1.0, bs=2, accum=3 (Round AV baseline) ----
-          - id: '17ja_42'
-            seed: '42'
-            max_grad_value: '1.0'
-            bs: '2'
-            accum: '3'
-          - id: '17ja_999'
-            seed: '999'
-            max_grad_value: '1.0'
-            bs: '2'
-            accum: '3'
-          - id: '17ja_12345'
-            seed: '12345'
-            max_grad_value: '1.0'
-            bs: '2'
-            accum: '3'
-          - id: '17ja_22222'
-            seed: '22222'
-            max_grad_value: '1.0'
-            bs: '2'
-            accum: '3'
-          - id: '17ja_3407'
-            seed: '3407'
-            max_grad_value: '1.0'
-            bs: '2'
-            accum: '3'
+          # ---- Round AX: expand n on Cells A and D + add mlx-lm native ----
+          # Round AW (n=5) showed cell A=3/5 and cell D=2/5 -- the
+          # putative 20% gap with mlx-lm (4/5 in Round AU) is within
+          # 1-seed binomial noise. To distinguish noise from real
+          # effect we add 10 new seeds at three configurations:
+          #   Cell A (unsloth-zoo, smoke default): clip=1.0 bs=2 acc=3
+          #   Cell D (unsloth-zoo, mlx-lm match) : clip=off bs=6 acc=1
+          #   mlx-lm native (probe_20)
+          # Combined with prior data: 15 seeds x 3 conditions = 45
+          # observations to call the gap real or not.
+          # Seeds: 1, 7, 123, 456, 789, 1234, 5678, 9012, 31415, 65535.
 
-          # ---- Cell B: clip=off, bs=2, accum=3 (drop clip only) ----
-          - id: '17jb_42'
-            seed: '42'
-            max_grad_value: 'off'
-            bs: '2'
-            accum: '3'
-          - id: '17jb_999'
-            seed: '999'
-            max_grad_value: 'off'
-            bs: '2'
-            accum: '3'
-          - id: '17jb_12345'
-            seed: '12345'
-            max_grad_value: 'off'
-            bs: '2'
-            accum: '3'
-          - id: '17jb_22222'
-            seed: '22222'
-            max_grad_value: 'off'
-            bs: '2'
-            accum: '3'
-          - id: '17jb_3407'
-            seed: '3407'
-            max_grad_value: 'off'
-            bs: '2'
-            accum: '3'
+          # -- AX Cell A: unsloth-zoo baseline (clip=1.0, bs=2, acc=3) --
+          - {id: '17ka_1',     script: 'probe_17_curve_param.py', seed: '1',     max_grad_value: '1.0', bs: '2', accum: '3'}
+          - {id: '17ka_7',     script: 'probe_17_curve_param.py', seed: '7',     max_grad_value: '1.0', bs: '2', accum: '3'}
+          - {id: '17ka_123',   script: 'probe_17_curve_param.py', seed: '123',   max_grad_value: '1.0', bs: '2', accum: '3'}
+          - {id: '17ka_456',   script: 'probe_17_curve_param.py', seed: '456',   max_grad_value: '1.0', bs: '2', accum: '3'}
+          - {id: '17ka_789',   script: 'probe_17_curve_param.py', seed: '789',   max_grad_value: '1.0', bs: '2', accum: '3'}
+          - {id: '17ka_1234',  script: 'probe_17_curve_param.py', seed: '1234',  max_grad_value: '1.0', bs: '2', accum: '3'}
+          - {id: '17ka_5678',  script: 'probe_17_curve_param.py', seed: '5678',  max_grad_value: '1.0', bs: '2', accum: '3'}
+          - {id: '17ka_9012',  script: 'probe_17_curve_param.py', seed: '9012',  max_grad_value: '1.0', bs: '2', accum: '3'}
+          - {id: '17ka_31415', script: 'probe_17_curve_param.py', seed: '31415', max_grad_value: '1.0', bs: '2', accum: '3'}
+          - {id: '17ka_65535', script: 'probe_17_curve_param.py', seed: '65535', max_grad_value: '1.0', bs: '2', accum: '3'}
 
-          # ---- Cell C: clip=1.0, bs=6, accum=1 (drop accum only) ----
-          - id: '17jc_42'
-            seed: '42'
-            max_grad_value: '1.0'
-            bs: '6'
-            accum: '1'
-          - id: '17jc_999'
-            seed: '999'
-            max_grad_value: '1.0'
-            bs: '6'
-            accum: '1'
-          - id: '17jc_12345'
-            seed: '12345'
-            max_grad_value: '1.0'
-            bs: '6'
-            accum: '1'
-          - id: '17jc_22222'
-            seed: '22222'
-            max_grad_value: '1.0'
-            bs: '6'
-            accum: '1'
-          - id: '17jc_3407'
-            seed: '3407'
-            max_grad_value: '1.0'
-            bs: '6'
-            accum: '1'
+          # -- AX Cell D: unsloth-zoo mlx-lm-matching (clip=off, bs=6, acc=1) --
+          - {id: '17kd_1',     script: 'probe_17_curve_param.py', seed: '1',     max_grad_value: 'off', bs: '6', accum: '1'}
+          - {id: '17kd_7',     script: 'probe_17_curve_param.py', seed: '7',     max_grad_value: 'off', bs: '6', accum: '1'}
+          - {id: '17kd_123',   script: 'probe_17_curve_param.py', seed: '123',   max_grad_value: 'off', bs: '6', accum: '1'}
+          - {id: '17kd_456',   script: 'probe_17_curve_param.py', seed: '456',   max_grad_value: 'off', bs: '6', accum: '1'}
+          - {id: '17kd_789',   script: 'probe_17_curve_param.py', seed: '789',   max_grad_value: 'off', bs: '6', accum: '1'}
+          - {id: '17kd_1234',  script: 'probe_17_curve_param.py', seed: '1234',  max_grad_value: 'off', bs: '6', accum: '1'}
+          - {id: '17kd_5678',  script: 'probe_17_curve_param.py', seed: '5678',  max_grad_value: 'off', bs: '6', accum: '1'}
+          - {id: '17kd_9012',  script: 'probe_17_curve_param.py', seed: '9012',  max_grad_value: 'off', bs: '6', accum: '1'}
+          - {id: '17kd_31415', script: 'probe_17_curve_param.py', seed: '31415', max_grad_value: 'off', bs: '6', accum: '1'}
+          - {id: '17kd_65535', script: 'probe_17_curve_param.py', seed: '65535', max_grad_value: 'off', bs: '6', accum: '1'}
 
-          # ---- Cell D: clip=off, bs=6, accum=1 (full mlx-lm match) ----
-          - id: '17jd_42'
-            seed: '42'
-            max_grad_value: 'off'
-            bs: '6'
-            accum: '1'
-          - id: '17jd_999'
-            seed: '999'
-            max_grad_value: 'off'
-            bs: '6'
-            accum: '1'
-          - id: '17jd_12345'
-            seed: '12345'
-            max_grad_value: 'off'
-            bs: '6'
-            accum: '1'
-          - id: '17jd_22222'
-            seed: '22222'
-            max_grad_value: 'off'
-            bs: '6'
-            accum: '1'
-          - id: '17jd_3407'
-            seed: '3407'
-            max_grad_value: 'off'
-            bs: '6'
-            accum: '1'
+          # -- AX mlx-lm native (probe_20, aggressive config matches unsloth-zoo) --
+          - {id: '20k_1',      script: 'probe_20_mlx_lm_aggressive.py', seed: '1',     max_grad_value: '', bs: '', accum: ''}
+          - {id: '20k_7',      script: 'probe_20_mlx_lm_aggressive.py', seed: '7',     max_grad_value: '', bs: '', accum: ''}
+          - {id: '20k_123',    script: 'probe_20_mlx_lm_aggressive.py', seed: '123',   max_grad_value: '', bs: '', accum: ''}
+          - {id: '20k_456',    script: 'probe_20_mlx_lm_aggressive.py', seed: '456',   max_grad_value: '', bs: '', accum: ''}
+          - {id: '20k_789',    script: 'probe_20_mlx_lm_aggressive.py', seed: '789',   max_grad_value: '', bs: '', accum: ''}
+          - {id: '20k_1234',   script: 'probe_20_mlx_lm_aggressive.py', seed: '1234',  max_grad_value: '', bs: '', accum: ''}
+          - {id: '20k_5678',   script: 'probe_20_mlx_lm_aggressive.py', seed: '5678',  max_grad_value: '', bs: '', accum: ''}
+          - {id: '20k_9012',   script: 'probe_20_mlx_lm_aggressive.py', seed: '9012',  max_grad_value: '', bs: '', accum: ''}
+          - {id: '20k_31415',  script: 'probe_20_mlx_lm_aggressive.py', seed: '31415', max_grad_value: '', bs: '', accum: ''}
+          - {id: '20k_65535',  script: 'probe_20_mlx_lm_aggressive.py', seed: '65535', max_grad_value: '', bs: '', accum: ''}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
@@ -243,7 +183,10 @@ jobs:
           MLX_BS: ${{ matrix.bs }}
           MLX_ACCUM: ${{ matrix.accum }}
         run: |
-          cd tests/mlx_parity && python probe_17_curve_param.py
+          # script is per-cell; AW Cells A/B/C omit it -> default to probe_17.
+          SCRIPT="${{ matrix.script }}"
+          if [ -z "$SCRIPT" ]; then SCRIPT="probe_17_curve_param.py"; fi
+          cd tests/mlx_parity && python "$SCRIPT"
 
       - name: Show JSON output
         if: always()
