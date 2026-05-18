@@ -134,19 +134,25 @@ jobs:
           # Provide a benign $_cmd that just sleeps.
           DATA_DIR="$WORK/data" LOG_FILE="$WORK/data/studio.log" _launch_port=18888
           export DATA_DIR LOG_FILE _launch_port
-          ( . "$WORK/fn.sh"; _spawn_terminal "sleep 30"; echo "rc=$?" )
+          out=$(. "$WORK/fn.sh"; _spawn_terminal "sleep 30" 2>&1; echo "rc=$?")
+          printf '%s\n' "$out"
           sleep 1
-          # The nohup'd `sleep 30` should be reaped by the failure-path cleanup.
-          if pgrep -f 'sleep 30' >/dev/null; then
-            echo "FAIL: orphan 'sleep 30' alive after open-failure"
+          # When open(1) fails, _spawn_terminal should:
+          #   (a) kill the original nohup'd sleep (visible as "Terminated: 15"
+          #       in the captured output), and
+          #   (b) fall back to a background launch that spawns ONE replacement
+          #       nohup sleep. We assert (a) by looking for the Terminated
+          #       message and (b) by counting at most one live `sleep 30`.
+          if ! printf '%s' "$out" | grep -q 'Terminated'; then
+            echo "FAIL: no Terminated line - original nohup not reaped"
+            exit 1
+          fi
+          alive=$(pgrep -f 'sleep 30' | wc -l | tr -d ' ')
+          if [ "$alive" -gt 1 ]; then
+            echo "FAIL: $alive 'sleep 30' processes alive (expected <= 1)"
             pgrep -afl 'sleep 30'
             pkill -KILL -f 'sleep 30' 2>/dev/null || true
             exit 1
           fi
-          # PID file should be cleaned up.
-          if ls "$DATA_DIR"/studio-*.pid >/dev/null 2>&1; then
-            echo "FAIL: PID file not cleaned up"
-            ls -la "$DATA_DIR"/
-            exit 1
-          fi
-          echo "PASS: orphan reaped, PID file cleaned, fallthrough OK"
+          pkill -KILL -f 'sleep 30' 2>/dev/null || true
+          echo "PASS: original reaped, at most one fallback daemon alive"

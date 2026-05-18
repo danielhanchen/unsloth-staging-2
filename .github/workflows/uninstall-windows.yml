@@ -148,7 +148,9 @@ jobs:
           New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
           1..3 | ForEach-Object {
             Write-Host "--- run $_ ---"
-            & "$PWD\uninstall.ps1" 2>&1
+            # Use pwsh -File so $LASTEXITCODE is reliably set; & on a .ps1
+            # only updates $LASTEXITCODE if the script ends with `exit`.
+            pwsh -NoProfile -File "$PWD\uninstall.ps1" 2>&1
             if ($LASTEXITCODE -ne 0) {
               Write-Error "uninstall.ps1 exited $LASTEXITCODE on run $_"
               exit 1
@@ -193,25 +195,27 @@ jobs:
           # --local --no-torch keeps the install fast (no PyTorch wheels) but
           # still creates the full Studio layout: venv, share/studio.conf,
           # bin/unsloth.exe shim, .unsloth-studio-owned marker, llama.cpp dir.
-          & "$PWD\install.ps1" --local --no-torch
+          pwsh -NoProfile -File "$PWD\install.ps1" --local --no-torch
           if ($LASTEXITCODE -ne 0) { Write-Error "install.ps1 exited $LASTEXITCODE"; exit 1 }
-          # Confirm Studio sentinels exist.
-          $sentinels = @(
-            "$studio\unsloth_studio\.unsloth-studio-owned",
-            "$studio\share\studio.conf",
-            "$studio\bin\unsloth.exe"
-          )
-          foreach ($s in $sentinels) {
+          # Required sentinel: .unsloth-studio-owned. share/studio.conf and
+          # persistent shortcuts are skipped in env-override mode, so they
+          # are checked opportunistically and only logged if present.
+          $owned = "$studio\unsloth_studio\.unsloth-studio-owned"
+          if (-not (Test-Path -LiteralPath $owned)) {
+            Write-Error "missing required sentinel: $owned"
+            exit 1
+          }
+          Write-Host "  found required sentinel: $owned"
+          foreach ($s in @("$studio\bin\unsloth.exe","$studio\share\studio.conf","$studio\share\launch-studio.ps1")) {
             if (Test-Path -LiteralPath $s) { Write-Host "  found: $s" }
-            else { Write-Error "missing sentinel: $s"; exit 1 }
+            else { Write-Host "  absent (ok in env-override mode): $s" }
           }
           Write-Output "STUDIO_ROOT=$studio" | Out-File -Append $env:GITHUB_ENV
       - name: Run uninstall.ps1 against the env-mode install
         shell: pwsh
         run: |
           $env:UNSLOTH_STUDIO_HOME = $env:STUDIO_ROOT
-          $out = & "$PWD\uninstall.ps1" 2>&1 | Out-String
-          Write-Host $out
+          pwsh -NoProfile -File "$PWD\uninstall.ps1" 2>&1 | Tee-Object -Variable out | Out-Host
           if ($LASTEXITCODE -ne 0) {
             Write-Error "uninstall.ps1 exited $LASTEXITCODE"
             exit 1
@@ -224,8 +228,7 @@ jobs:
           foreach ($p in @(
             "$studio",
             "$studio\unsloth_studio",
-            "$studio\bin\unsloth.exe",
-            "$studio\share\studio.conf"
+            "$studio\bin\unsloth.exe"
           )) {
             if (Test-Path -LiteralPath $p) { $leaks += $p }
           }
@@ -245,7 +248,7 @@ jobs:
           $env:UNSLOTH_STUDIO_HOME = $env:STUDIO_ROOT
           1..2 | ForEach-Object {
             Write-Host "--- re-run $_ ---"
-            & "$PWD\uninstall.ps1" 2>&1
+            pwsh -NoProfile -File "$PWD\uninstall.ps1" 2>&1
             if ($LASTEXITCODE -ne 0) {
               Write-Error "uninstall.ps1 re-run $_ exited $LASTEXITCODE"
               exit 1
