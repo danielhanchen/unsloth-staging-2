@@ -6,6 +6,9 @@
 # studio/backend/core/inference/llama_cpp.py with ast and recompiles
 # them in-place, so the matrix only needs Python + pytest (no torch,
 # no transformers, no native deps).
+#
+# Refresh trigger: re-run all three cross-OS workflows on the same HEAD
+# so the PR check rollup shows a complete pass.
 
 name: Cross-OS llama regex
 

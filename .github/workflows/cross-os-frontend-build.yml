@@ -5,6 +5,9 @@
 # macOS and Windows. tsc -b runs the project references graph, then
 # vite build emits dist/. Catches OS-specific path / lockfile / build
 # regressions that only ubuntu-latest CI would miss today.
+#
+# Refresh trigger: re-run all three cross-OS workflows on the same HEAD
+# so the PR check rollup shows a complete pass.
 
 name: Cross-OS frontend build
 

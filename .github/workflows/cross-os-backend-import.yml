@@ -7,6 +7,9 @@
 # to satisfy the unsloth_zoo.device_type @cache, then imports the key
 # Studio modules and asserts the regex constants and helper functions
 # I rely on are present.
+#
+# Refresh trigger: re-run all three cross-OS workflows on the same HEAD
+# so the PR check rollup shows a complete pass.
 
 name: Cross-OS backend import
 
