@@ -644,9 +644,11 @@ const ReasoningToggle: FC = () => {
       aria-label={
         reasoningLockedOn
           ? "Thinking is required for this model"
-          : effectiveReasoningEnabled
-            ? "Disable thinking"
-            : "Enable thinking"
+          : disabled
+            ? "Thinking (model not loaded)"
+            : effectiveReasoningEnabled
+              ? "Disable thinking"
+              : "Enable thinking"
       }
     >
       {reasoningLockedOn || (effectiveReasoningEnabled && !disabled) ? (
@@ -939,6 +941,43 @@ const GeneratingIndicator: FC = () => {
   return <span className="text-sm text-muted-foreground">Generating...</span>;
 };
 
+// Surfaces the currently-running tool at the bottom of the assistant
+// bubble. The tool group lives at the top of the message and can
+// scroll out of view during long tool waits (git clone, big web
+// fetches); this keeps activity visible in the viewport pin region.
+const RunningToolIndicator: FC = () => {
+  const running = useAuiState(({ message }) => {
+    if (message.status?.type !== "running") return null;
+    const parts = message.parts;
+    // Walk from the end so the most recent in-flight tool wins.
+    for (let i = parts.length - 1; i >= 0; i -= 1) {
+      const p = parts[i] as
+        | { type?: string; toolName?: string; status?: { type?: string } }
+        | undefined;
+      if (p?.type === "tool-call" && p.status?.type === "running") {
+        return p.toolName ?? "tool";
+      }
+    }
+    return null;
+  });
+  if (!running) return null;
+  return (
+    <div
+      data-slot="running-tool-indicator"
+      className="aui-running-tool-indicator mt-2 flex items-center gap-2 text-sm text-muted-foreground"
+      aria-live="polite"
+    >
+      <span
+        aria-hidden
+        className="aui-running-tool-indicator-dot inline-block size-2 animate-pulse rounded-full bg-muted-foreground/60"
+      />
+      <span>
+        Running <span className="font-mono text-xs">{running}</span>...
+      </span>
+    </div>
+  );
+};
+
 const AssistantMessage: FC = () => {
   return (
     <MessagePrimitive.Root
@@ -966,6 +1005,7 @@ const AssistantMessage: FC = () => {
           }}
         />
         <SourcesGroup />
+        <RunningToolIndicator />
         <MessageError />
       </div>
 

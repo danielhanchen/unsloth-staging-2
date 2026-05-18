@@ -253,6 +253,25 @@ function collectTextParts(message: RunMessage): string[] {
   return textParts;
 }
 
+// Wrap prior assistant reasoning as <think>...</think> so the chat
+// template sees a populated reasoning block on replay. Without this,
+// the server template injects an empty <think></think> and some
+// models emit "I cannot complete this thought" boilerplate on the
+// next turn.
+function collectReasoningTexts(message: RunMessage): string[] {
+  const out: string[] = [];
+  for (const part of message.content ?? []) {
+    if (part.type === "reasoning") {
+      const text = (part as { text?: string }).text ?? "";
+      const trimmed = text.trim();
+      if (trimmed.length > 0) {
+        out.push(`<think>${text}</think>`);
+      }
+    }
+  }
+  return out;
+}
+
 function collectImageParts(
   message: RunMessage,
 ): Array<{ type: "image_url"; image_url: { url: string } }> {
@@ -307,7 +326,12 @@ function toOpenAIMessage(message: RunMessage): {
     return null;
   }
 
-  let textContent = collectTextParts(message).join("\n");
+  const textBody = collectTextParts(message).join("\n");
+  // Re-inject <think> blocks on assistant history so the next turn's
+  // chat template does not see an empty reasoning block.
+  const reasoning =
+    message.role === "assistant" ? collectReasoningTexts(message) : [];
+  let textContent = [...reasoning, textBody].filter(Boolean).join("");
   // Strip inline audio base64 from prior assistant messages to avoid
   // inflating token counts (e.g. audio-player responses with embedded WAV).
   if (message.role === "assistant") {
