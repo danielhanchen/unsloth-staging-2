@@ -1,0 +1,254 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Run install.ps1 and uninstall.ps1 end-to-end on Windows runners to
+# verify the new uninstall script actually removes everything install.ps1
+# creates, and that the safety guards (refuse-non-Studio, refuse-unsafe)
+# fire on the documented bad inputs.
+
+name: Uninstall Windows CI
+
+on:
+  pull_request:
+    paths:
+      - 'install.ps1'
+      - 'uninstall.ps1'
+      - 'studio/setup.ps1'
+      - '.github/workflows/uninstall-windows.yml'
+  push:
+    branches: [main, studio-uninstall-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. Static validation: pwsh parser + uninstall.ps1 syntax, fast and free.
+  parse:
+    name: pwsh parse uninstall.ps1
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Parse uninstall.ps1
+        shell: pwsh
+        run: |
+          $errs = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/uninstall.ps1", [ref]$null, [ref]$errs) | Out-Null
+          if ($errs -and $errs.Count -gt 0) {
+            $errs | ForEach-Object { Write-Host $_ }
+            exit 1
+          }
+          Write-Host "uninstall.ps1: parse OK"
+
+  # 2. Safety smoke: refuse $env:USERPROFILE, refuse non-Studio dir, accept
+  # real Studio root. No real install (fast, cheap, deterministic).
+  safety-smoke:
+    name: Uninstall safety guards
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Stage safe / unsafe / Studio fake roots
+        shell: pwsh
+        run: |
+          $work = "$env:RUNNER_TEMP\unstest"
+          $stagedHome = "$work\HOME"
+          $other = "$work\OTHER"
+          $studio = "$work\STUDIO"
+          New-Item -ItemType Directory -Force -Path "$stagedHome",
+            "$other","$studio\unsloth_studio\bin","$studio\share","$studio\bin",
+            "$stagedHome\AppData\Local","$stagedHome\AppData\Roaming","$stagedHome\Desktop" | Out-Null
+          "PRECIOUS" | Set-Content "$stagedHome\PRECIOUS.txt"
+          "USER PROJECT" | Set-Content "$other\important.txt"
+          New-Item -ItemType File -Force -Path "$studio\unsloth_studio\.unsloth-studio-owned" | Out-Null
+          New-Item -ItemType File -Force -Path "$studio\unsloth_studio\bin\unsloth.exe" | Out-Null
+          New-Item -ItemType File -Force -Path "$studio\bin\unsloth.exe" | Out-Null
+          "UNSLOTH_EXE='$studio\unsloth_studio\bin\unsloth.exe'" | Set-Content "$studio\share\studio.conf"
+          Write-Output "STAGE=$work" | Out-File -Append $env:GITHUB_ENV
+          Write-Output "STAGED_HOME=$stagedHome" | Out-File -Append $env:GITHUB_ENV
+          Write-Output "OTHER=$other" | Out-File -Append $env:GITHUB_ENV
+          Write-Output "STUDIO=$studio" | Out-File -Append $env:GITHUB_ENV
+      - name: A. UNSLOTH_STUDIO_HOME=USERPROFILE - must refuse
+        shell: pwsh
+        run: |
+          $env:USERPROFILE = $env:STAGED_HOME
+          $env:LOCALAPPDATA = "$env:STAGED_HOME\AppData\Local"
+          $env:APPDATA = "$env:STAGED_HOME\AppData\Roaming"
+          $env:UNSLOTH_STUDIO_HOME = $env:STAGED_HOME
+          $out = & "$PWD\uninstall.ps1" 2>&1 | Out-String
+          Write-Host $out
+          if (-not (Test-Path "$env:STAGED_HOME\PRECIOUS.txt")) {
+            Write-Error "PRECIOUS.txt deleted - safety guard failed!"
+            exit 1
+          }
+          Write-Host "PASS: USERPROFILE refused, PRECIOUS preserved"
+      - name: B. UNSLOTH_STUDIO_HOME=non-Studio dir - must refuse
+        shell: pwsh
+        run: |
+          $env:USERPROFILE = $env:STAGED_HOME
+          $env:LOCALAPPDATA = "$env:STAGED_HOME\AppData\Local"
+          $env:APPDATA = "$env:STAGED_HOME\AppData\Roaming"
+          $env:UNSLOTH_STUDIO_HOME = $env:OTHER
+          $out = & "$PWD\uninstall.ps1" 2>&1 | Out-String
+          Write-Host $out
+          if (-not (Test-Path "$env:OTHER\important.txt")) {
+            Write-Error "important.txt deleted from non-Studio dir!"
+            exit 1
+          }
+          Write-Host "PASS: non-Studio dir refused, user data preserved"
+      - name: C. UNSLOTH_STUDIO_HOME=real Studio root - must remove
+        shell: pwsh
+        run: |
+          $env:USERPROFILE = $env:STAGED_HOME
+          $env:LOCALAPPDATA = "$env:STAGED_HOME\AppData\Local"
+          $env:APPDATA = "$env:STAGED_HOME\AppData\Roaming"
+          $env:UNSLOTH_STUDIO_HOME = $env:STUDIO
+          $out = & "$PWD\uninstall.ps1" 2>&1 | Out-String
+          Write-Host $out
+          if (Test-Path $env:STUDIO) {
+            Write-Error "Studio root not removed!"
+            exit 1
+          }
+          Write-Host "PASS: real Studio root removed"
+      - name: D. Tilde expansion - UNSLOTH_STUDIO_HOME='~\studio2' must remove
+        shell: pwsh
+        run: |
+          $env:USERPROFILE = $env:STAGED_HOME
+          $env:LOCALAPPDATA = "$env:STAGED_HOME\AppData\Local"
+          $env:APPDATA = "$env:STAGED_HOME\AppData\Roaming"
+          $studio2 = "$env:STAGED_HOME\studio2"
+          New-Item -ItemType Directory -Force -Path "$studio2\unsloth_studio\bin","$studio2\share","$studio2\bin" | Out-Null
+          New-Item -ItemType File -Force -Path "$studio2\unsloth_studio\.unsloth-studio-owned" | Out-Null
+          New-Item -ItemType File -Force -Path "$studio2\bin\unsloth.exe" | Out-Null
+          "UNSLOTH_EXE='$studio2\unsloth_studio\bin\unsloth.exe'" | Set-Content "$studio2\share\studio.conf"
+          $env:UNSLOTH_STUDIO_HOME = '~\studio2'
+          $out = & "$PWD\uninstall.ps1" 2>&1 | Out-String
+          Write-Host $out
+          if (Test-Path $studio2) {
+            Write-Error "tilde-form root not removed!"
+            exit 1
+          }
+          Write-Host "PASS: tilde expansion worked, root removed"
+      - name: E. Idempotency - empty stage, 3 consecutive runs
+        shell: pwsh
+        run: |
+          $env:USERPROFILE = "$env:RUNNER_TEMP\emptyHome"
+          $env:LOCALAPPDATA = "$env:USERPROFILE\AppData\Local"
+          $env:APPDATA = "$env:USERPROFILE\AppData\Roaming"
+          New-Item -ItemType Directory -Force -Path $env:USERPROFILE | Out-Null
+          1..3 | ForEach-Object {
+            Write-Host "--- run $_ ---"
+            & "$PWD\uninstall.ps1" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "uninstall.ps1 exited $LASTEXITCODE on run $_"
+              exit 1
+            }
+          }
+          Write-Host "PASS: 3 consecutive runs all clean"
+
+  # 3. Full install+uninstall round-trip via install.ps1 --no-torch.
+  # This is the most expensive (uses winget / uv / vite), so it runs in a
+  # single job and is the canonical proof that uninstall.ps1 removes
+  # everything install.ps1 actually creates.
+  round-trip:
+    name: install.ps1 then uninstall.ps1 round-trip
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22'
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Pre-install Windows tweaks (npm 11)
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          npm install -g 'npm@^11' 2>&1 | Out-Host
+          Write-Host "npm version: $(npm -v)"
+      - name: Install Studio with custom UNSLOTH_STUDIO_HOME
+        shell: pwsh
+        env:
+          UNSLOTH_VERBOSE: '1'
+        run: |
+          $studio = "$env:RUNNER_TEMP\studio_install"
+          $env:UNSLOTH_STUDIO_HOME = $studio
+          # --local --no-torch keeps the install fast (no PyTorch wheels) but
+          # still creates the full Studio layout: venv, share/studio.conf,
+          # bin/unsloth.exe shim, .unsloth-studio-owned marker, llama.cpp dir.
+          & "$PWD\install.ps1" --local --no-torch
+          if ($LASTEXITCODE -ne 0) { Write-Error "install.ps1 exited $LASTEXITCODE"; exit 1 }
+          # Confirm Studio sentinels exist.
+          $sentinels = @(
+            "$studio\unsloth_studio\.unsloth-studio-owned",
+            "$studio\share\studio.conf",
+            "$studio\bin\unsloth.exe"
+          )
+          foreach ($s in $sentinels) {
+            if (Test-Path -LiteralPath $s) { Write-Host "  found: $s" }
+            else { Write-Error "missing sentinel: $s"; exit 1 }
+          }
+          Write-Output "STUDIO_ROOT=$studio" | Out-File -Append $env:GITHUB_ENV
+      - name: Run uninstall.ps1 against the env-mode install
+        shell: pwsh
+        run: |
+          $env:UNSLOTH_STUDIO_HOME = $env:STUDIO_ROOT
+          $out = & "$PWD\uninstall.ps1" 2>&1 | Out-String
+          Write-Host $out
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "uninstall.ps1 exited $LASTEXITCODE"
+            exit 1
+          }
+      - name: Verify nothing left behind
+        shell: pwsh
+        run: |
+          $studio = $env:STUDIO_ROOT
+          $leaks = @()
+          foreach ($p in @(
+            "$studio",
+            "$studio\unsloth_studio",
+            "$studio\bin\unsloth.exe",
+            "$studio\share\studio.conf"
+          )) {
+            if (Test-Path -LiteralPath $p) { $leaks += $p }
+          }
+          # llama.cpp is intentionally NOT removed (matches uninstall.sh).
+          # Document this gap; do not fail.
+          if (Test-Path -LiteralPath "$studio\llama.cpp") {
+            Write-Warning "llama.cpp dir left behind (known gap, mirrors uninstall.sh): $studio\llama.cpp"
+          }
+          if ($leaks.Count -gt 0) {
+            $leaks | ForEach-Object { Write-Error "LEAK: $_" }
+            exit 1
+          }
+          Write-Host "PASS: install -> uninstall round-trip leaves no expected artifact"
+      - name: Idempotency on cleaned tree
+        shell: pwsh
+        run: |
+          $env:UNSLOTH_STUDIO_HOME = $env:STUDIO_ROOT
+          1..2 | ForEach-Object {
+            Write-Host "--- re-run $_ ---"
+            & "$PWD\uninstall.ps1" 2>&1
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "uninstall.ps1 re-run $_ exited $LASTEXITCODE"
+              exit 1
+            }
+          }
+          Write-Host "PASS: post-cleanup re-runs exit 0"

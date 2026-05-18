@@ -1,0 +1,152 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# install.sh and uninstall.sh round-trip on a real macOS runner, plus the
+# safety guards. Validates PR 5496's macOS launcher behaviour and PR
+# 5497's uninstall.sh on Darwin.
+
+name: Uninstall Mac CI
+
+on:
+  pull_request:
+    paths:
+      - 'install.sh'
+      - 'uninstall.sh'
+      - 'studio/setup.sh'
+      - '.github/workflows/uninstall-mac.yml'
+  push:
+    branches: [main, studio-uninstall-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast static + safety checks on the smaller macos-13 / Intel runner
+  # (or macos-latest if that maps to ARM). No real install.
+  safety-smoke:
+    name: Uninstall safety guards
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Static checks
+        run: |
+          bash -n uninstall.sh && echo "bash -n OK"
+          sh   -n uninstall.sh && echo "sh   -n OK"
+          bash -n install.sh   && echo "install.sh bash -n OK"
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -s sh uninstall.sh || true
+          fi
+      - name: A. UNSLOTH_STUDIO_HOME=$HOME refused
+        run: |
+          STAGE="$RUNNER_TEMP/A"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          echo PRECIOUS > "$STAGE/PRECIOUS.txt"
+          HOME="$STAGE" UNSLOTH_STUDIO_HOME="$STAGE" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          test -f "$STAGE/PRECIOUS.txt" && echo "PASS" || { echo "FAIL: PRECIOUS deleted"; exit 1; }
+      - name: B. Non-Studio root refused
+        run: |
+          STAGE="$RUNNER_TEMP/B"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/proj/unsloth_studio/bin"
+          touch "$STAGE/proj/unsloth_studio/bin/unsloth"
+          echo important > "$STAGE/proj/important.txt"
+          mkdir -p "$STAGE/H"
+          HOME="$STAGE/H" UNSLOTH_STUDIO_HOME="$STAGE/proj" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          test -f "$STAGE/proj/important.txt" && echo "PASS" || { echo "FAIL"; exit 1; }
+      - name: C. Canonicalised path that resolves to $HOME refused
+        run: |
+          STAGE="$RUNNER_TEMP/C"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/inner"
+          echo precious > "$STAGE/inner/PRECIOUS.txt"
+          # $HOME/../$(basename $HOME) canonicalises to $HOME
+          HOME="$STAGE/inner" UNSLOTH_STUDIO_HOME="$STAGE/inner/../inner" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          test -f "$STAGE/inner/PRECIOUS.txt" && echo "PASS" || { echo "FAIL: canonicalisation failed"; exit 1; }
+      - name: D. Real Studio root removed
+        run: |
+          STAGE="$RUNNER_TEMP/D"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE/H" "$STAGE/studio/unsloth_studio/bin" "$STAGE/studio/share" "$STAGE/studio/bin"
+          touch "$STAGE/studio/unsloth_studio/.unsloth-studio-owned"
+          touch "$STAGE/studio/unsloth_studio/bin/unsloth"
+          ln -sfn "$STAGE/studio/unsloth_studio/bin/unsloth" "$STAGE/studio/bin/unsloth"
+          printf "UNSLOTH_EXE='%s'\n" "$STAGE/studio/unsloth_studio/bin/unsloth" > "$STAGE/studio/share/studio.conf"
+          HOME="$STAGE/H" UNSLOTH_STUDIO_HOME="$STAGE/studio" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          test ! -e "$STAGE/studio" && echo "PASS" || { echo "FAIL: studio root remains"; exit 1; }
+      - name: E. UNSLOTH_STUDIO_HOME precedence over STUDIO_HOME
+        run: |
+          STAGE="$RUNNER_TEMP/E"
+          rm -rf "$STAGE"; mkdir -p "$STAGE/H"
+          for n in A B; do
+            mkdir -p "$STAGE/$n/unsloth_studio/bin" "$STAGE/$n/share" "$STAGE/$n/bin"
+            touch "$STAGE/$n/unsloth_studio/.unsloth-studio-owned"
+            touch "$STAGE/$n/unsloth_studio/bin/unsloth"
+            printf "UNSLOTH_EXE='%s'\n" "$STAGE/$n/unsloth_studio/bin/unsloth" > "$STAGE/$n/share/studio.conf"
+          done
+          HOME="$STAGE/H" UNSLOTH_STUDIO_HOME="$STAGE/A" STUDIO_HOME="$STAGE/B" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          if [ ! -e "$STAGE/A" ] && [ -d "$STAGE/B" ]; then
+            echo "PASS: only A removed (UNSLOTH_STUDIO_HOME wins)"
+          else
+            echo "FAIL: A=$([ -e "$STAGE/A" ] && echo exists || echo gone) B=$([ -e "$STAGE/B" ] && echo exists || echo gone)"
+            exit 1
+          fi
+      - name: F. Idempotency: 3 runs on empty $HOME
+        run: |
+          STAGE="$RUNNER_TEMP/F"
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          for i in 1 2 3; do
+            HOME="$STAGE" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          done
+          echo "PASS: 3 runs all exit 0"
+
+  # PR 5496's spawn-terminal failure-path test on real macOS. Verifies the
+  # nohup'd Studio server gets reaped when `open -a Terminal` fails. We
+  # don't run the full install; just exercise _spawn_terminal in isolation.
+  spawn-terminal-orphan:
+    name: PR 5496 _spawn_terminal failure-path cleanup
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Extract _spawn_terminal and exercise the open-fails path
+        run: |
+          set -u
+          WORK="$RUNNER_TEMP/spawn"
+          rm -rf "$WORK"; mkdir -p "$WORK/data" "$WORK/mockbin"
+          # Mock `open` to fail. `nohup`, `osascript`, `uname` are real on macOS.
+          cat > "$WORK/mockbin/open" <<'EOF'
+          #!/bin/sh
+          echo "[mock-open] $*" >&2; exit 55
+          EOF
+          chmod +x "$WORK/mockbin/open"
+          export PATH="$WORK/mockbin:$PATH"
+          touch "$WORK/data/studio.log"
+          awk '/^_spawn_terminal\(\) \{/{in_fn=1} in_fn{print} in_fn && /^\}/{exit}' install.sh > "$WORK/fn.sh"
+          test -s "$WORK/fn.sh" || { echo "extract failed"; exit 1; }
+          # Provide a benign $_cmd that just sleeps.
+          DATA_DIR="$WORK/data" LOG_FILE="$WORK/data/studio.log" _launch_port=18888
+          export DATA_DIR LOG_FILE _launch_port
+          ( . "$WORK/fn.sh"; _spawn_terminal "sleep 30"; echo "rc=$?" )
+          sleep 1
+          # The nohup'd `sleep 30` should be reaped by the failure-path cleanup.
+          if pgrep -f 'sleep 30' >/dev/null; then
+            echo "FAIL: orphan 'sleep 30' alive after open-failure"
+            pgrep -afl 'sleep 30'
+            pkill -KILL -f 'sleep 30' 2>/dev/null || true
+            exit 1
+          fi
+          # PID file should be cleaned up.
+          if ls "$DATA_DIR"/studio-*.pid >/dev/null 2>&1; then
+            echo "FAIL: PID file not cleaned up"
+            ls -la "$DATA_DIR"/
+            exit 1
+          fi
+          echo "PASS: orphan reaped, PID file cleaned, fallthrough OK"

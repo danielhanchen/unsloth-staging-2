@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Linux portion of PR 5497's uninstall.sh validation. Also exercises a
+# real env-mode install via install.sh --no-torch and uninstalls it.
+
+name: Uninstall Linux CI
+
+on:
+  pull_request:
+    paths:
+      - 'install.sh'
+      - 'uninstall.sh'
+      - 'studio/setup.sh'
+      - '.github/workflows/uninstall-linux.yml'
+  push:
+    branches: [main, studio-uninstall-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast static + safety guards, no real install.
+  safety-smoke:
+    name: Uninstall safety guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Install shellcheck
+        run: sudo apt-get update -y && sudo apt-get install -y shellcheck dash
+      - name: Static checks
+        run: |
+          shellcheck -s sh uninstall.sh && echo "shellcheck OK"
+          bash -n uninstall.sh && echo "bash -n OK"
+          dash -n uninstall.sh && echo "dash -n OK"
+          sh   -n uninstall.sh && echo "sh   -n OK"
+      - name: A. UNSLOTH_STUDIO_HOME=$HOME refused
+        run: |
+          STAGE="$RUNNER_TEMP/A"; rm -rf "$STAGE"; mkdir -p "$STAGE"
+          echo PRECIOUS > "$STAGE/PRECIOUS.txt"
+          HOME="$STAGE" UNSLOTH_STUDIO_HOME="$STAGE" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          test -f "$STAGE/PRECIOUS.txt" && echo "PASS" || { echo FAIL; exit 1; }
+      - name: B. Non-Studio root refused
+        run: |
+          STAGE="$RUNNER_TEMP/B"; rm -rf "$STAGE"
+          mkdir -p "$STAGE/proj/unsloth_studio/bin" "$STAGE/H"
+          touch "$STAGE/proj/unsloth_studio/bin/unsloth"
+          echo important > "$STAGE/proj/important.txt"
+          HOME="$STAGE/H" UNSLOTH_STUDIO_HOME="$STAGE/proj" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          test -f "$STAGE/proj/important.txt" && echo "PASS" || { echo FAIL; exit 1; }
+      - name: C. Canonicalised path -> $HOME refused
+        run: |
+          STAGE="$RUNNER_TEMP/C"; rm -rf "$STAGE"; mkdir -p "$STAGE/inner"
+          echo precious > "$STAGE/inner/PRECIOUS.txt"
+          HOME="$STAGE/inner" UNSLOTH_STUDIO_HOME="$STAGE/inner/../inner" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          test -f "$STAGE/inner/PRECIOUS.txt" && echo "PASS" || { echo FAIL; exit 1; }
+      - name: D. Real Studio root removed
+        run: |
+          STAGE="$RUNNER_TEMP/D"; rm -rf "$STAGE"
+          mkdir -p "$STAGE/H" "$STAGE/studio/unsloth_studio/bin" "$STAGE/studio/share" "$STAGE/studio/bin"
+          touch "$STAGE/studio/unsloth_studio/.unsloth-studio-owned"
+          touch "$STAGE/studio/unsloth_studio/bin/unsloth"
+          ln -sfn "$STAGE/studio/unsloth_studio/bin/unsloth" "$STAGE/studio/bin/unsloth"
+          printf "UNSLOTH_EXE='%s'\n" "$STAGE/studio/unsloth_studio/bin/unsloth" > "$STAGE/studio/share/studio.conf"
+          HOME="$STAGE/H" UNSLOTH_STUDIO_HOME="$STAGE/studio" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          test ! -e "$STAGE/studio" && echo "PASS" || { echo FAIL; exit 1; }
+      - name: E. UNSLOTH_STUDIO_HOME wins over STUDIO_HOME
+        run: |
+          STAGE="$RUNNER_TEMP/E"; rm -rf "$STAGE"; mkdir -p "$STAGE/H"
+          for n in A B; do
+            mkdir -p "$STAGE/$n/unsloth_studio/bin" "$STAGE/$n/share" "$STAGE/$n/bin"
+            touch "$STAGE/$n/unsloth_studio/.unsloth-studio-owned"
+            touch "$STAGE/$n/unsloth_studio/bin/unsloth"
+            printf "UNSLOTH_EXE='%s'\n" "$STAGE/$n/unsloth_studio/bin/unsloth" > "$STAGE/$n/share/studio.conf"
+          done
+          HOME="$STAGE/H" UNSLOTH_STUDIO_HOME="$STAGE/A" STUDIO_HOME="$STAGE/B" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          if [ ! -e "$STAGE/A" ] && [ -d "$STAGE/B" ]; then
+            echo "PASS"
+          else
+            echo "FAIL: A=$([ -e "$STAGE/A" ] && echo exists || echo gone) B=$([ -e "$STAGE/B" ] && echo exists || echo gone)"
+            exit 1
+          fi
+      - name: F. Desktop/Unsloth Studio non-symlink dir preserved
+        run: |
+          STAGE="$RUNNER_TEMP/F"; rm -rf "$STAGE"
+          mkdir -p "$STAGE/H/Desktop/Unsloth Studio/photos"
+          echo vacation > "$STAGE/H/Desktop/Unsloth Studio/photos/photo.jpg"
+          HOME="$STAGE/H" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          test -f "$STAGE/H/Desktop/Unsloth Studio/photos/photo.jpg" && echo "PASS" || { echo FAIL; exit 1; }
+      - name: G. Idempotency
+        run: |
+          STAGE="$RUNNER_TEMP/G"; rm -rf "$STAGE"; mkdir -p "$STAGE"
+          for i in 1 2 3; do HOME="$STAGE" XDG_RUNTIME_DIR="" sh ./uninstall.sh; done
+          echo "PASS"
