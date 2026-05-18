@@ -58,55 +58,52 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AH: finish value=5.0 + value=0.5 13-seed samples
-          # so the docstring table is empirically defensible.
-          # value=5.0 needs 3 more (2024, 33333, 0); value=0.5
-          # needs 5 more (7777, 8888, 22222, 12345, 2024). Pick
-          # the 5 most diagnostic.
-          - id: '17ey'
+          # Round AI: fp32 dtype hypothesis test. CUDA hits 100%
+          # on this fixture across all clip configs. MLX (default
+          # fp16) hits 46-62%. If MLX with fp32 ALSO hits ~100%,
+          # the CUDA-vs-MLX gap is dtype-driven (bf16/fp32 dynamic
+          # range > fp16) and the smoke fragility is fundamentally
+          # about the fp16 representation, not anything trainer-
+          # specific. Use 5 seeds known to fail at fp16 smoke default.
+          - id: '17fd'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '2024'
+            seed: '42'
             bias_correction: ''
             lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '5.0'
+            dtype: 'float32'
             zoo_pin: 'c1821e4'
-          - id: '17ez'
+          - id: '17fe'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '33333'
+            seed: '999'
             bias_correction: ''
             lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '5.0'
+            dtype: 'float32'
             zoo_pin: 'c1821e4'
-          - id: '17fa'
+          - id: '17ff'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '12345'
             bias_correction: ''
             lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '0.5'
+            dtype: 'float32'
             zoo_pin: 'c1821e4'
-          - id: '17fb'
+          - id: '17fg'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '22222'
             bias_correction: ''
             lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '0.5'
+            dtype: 'float32'
             zoo_pin: 'c1821e4'
-          - id: '17fc'
+          - id: '17fh'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '8888'
+            seed: '3407'
             bias_correction: ''
             lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '0.5'
+            dtype: 'float32'
             zoo_pin: 'c1821e4'
     steps:
       - name: Harden runner (audit)
