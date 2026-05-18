@@ -255,6 +255,58 @@ jobs:
           - {id: '35_22222', script: 'probe_35_zoo_trainer_compile_on.py', seed: '22222'}
           - {id: '35_31415', script: 'probe_35_zoo_trainer_compile_on.py', seed: '31415'}
           - {id: '35_65535', script: 'probe_35_zoo_trainer_compile_on.py', seed: '65535'}
+
+          # ---- Round BK: zoo loader + MLXTrainer(compile=True) ----
+          # Probe 34 (FastMLXModel(dtype=None) + MLXTrainer + nl=16 + compile=False): ~47%
+          # Probe 35 (mlx_lm.load            + MLXTrainer + nl=16 + compile=True ): ?
+          # Probe 36 (FastMLXModel(dtype=None) + MLXTrainer + nl=16 + compile=True ): ?
+          # If 35 ~= 67% closing the trainer gap, 36 isolates loader-only delta:
+          #   36 ~= 67% -> compile alone explains the trainer+loader gap;
+          #               FastMLXModel loader patches add no real basin drift.
+          #   36 ~= 47% -> compile fixes the trainer half, but loader patches
+          #               independently add a -10pp drift to bisect next.
+
+          - {id: '36_1',     script: 'probe_36_zoo_loader_compile_on.py', seed: '1'}
+          - {id: '36_7',     script: 'probe_36_zoo_loader_compile_on.py', seed: '7'}
+          - {id: '36_42',    script: 'probe_36_zoo_loader_compile_on.py', seed: '42'}
+          - {id: '36_123',   script: 'probe_36_zoo_loader_compile_on.py', seed: '123'}
+          - {id: '36_456',   script: 'probe_36_zoo_loader_compile_on.py', seed: '456'}
+          - {id: '36_789',   script: 'probe_36_zoo_loader_compile_on.py', seed: '789'}
+          - {id: '36_999',   script: 'probe_36_zoo_loader_compile_on.py', seed: '999'}
+          - {id: '36_1234',  script: 'probe_36_zoo_loader_compile_on.py', seed: '1234'}
+          - {id: '36_3407',  script: 'probe_36_zoo_loader_compile_on.py', seed: '3407'}
+          - {id: '36_5678',  script: 'probe_36_zoo_loader_compile_on.py', seed: '5678'}
+          - {id: '36_9012',  script: 'probe_36_zoo_loader_compile_on.py', seed: '9012'}
+          - {id: '36_12345', script: 'probe_36_zoo_loader_compile_on.py', seed: '12345'}
+          - {id: '36_22222', script: 'probe_36_zoo_loader_compile_on.py', seed: '22222'}
+          - {id: '36_31415', script: 'probe_36_zoo_loader_compile_on.py', seed: '31415'}
+          - {id: '36_65535', script: 'probe_36_zoo_loader_compile_on.py', seed: '65535'}
+
+          # ---- Round BL: bypass the max_grad_value=None silent-clip bug ----
+          # Probe 35 (compile=True) hit 53% (same as probe 33's 53%) -- so
+          # compile flag is NOT the trainer-side gap. Next live candidate:
+          # MLXTrainer's resolver rebinds `max_grad_value=None` to the
+          # default 1.0 (fixed in PR #671), so the no-clip intent in
+          # probes 33/35 was silently overridden to clip at +/-1.0.
+          # Probe 37 = probe 33 but explicit max_grad_value=0.0 (always
+          # disabled, regardless of PR #671). If 37 ~= 67%, elementwise
+          # clipping at 1.0 was the entire trainer-side gap.
+
+          - {id: '37_1',     script: 'probe_37_zoo_trainer_clip_off.py', seed: '1'}
+          - {id: '37_7',     script: 'probe_37_zoo_trainer_clip_off.py', seed: '7'}
+          - {id: '37_42',    script: 'probe_37_zoo_trainer_clip_off.py', seed: '42'}
+          - {id: '37_123',   script: 'probe_37_zoo_trainer_clip_off.py', seed: '123'}
+          - {id: '37_456',   script: 'probe_37_zoo_trainer_clip_off.py', seed: '456'}
+          - {id: '37_789',   script: 'probe_37_zoo_trainer_clip_off.py', seed: '789'}
+          - {id: '37_999',   script: 'probe_37_zoo_trainer_clip_off.py', seed: '999'}
+          - {id: '37_1234',  script: 'probe_37_zoo_trainer_clip_off.py', seed: '1234'}
+          - {id: '37_3407',  script: 'probe_37_zoo_trainer_clip_off.py', seed: '3407'}
+          - {id: '37_5678',  script: 'probe_37_zoo_trainer_clip_off.py', seed: '5678'}
+          - {id: '37_9012',  script: 'probe_37_zoo_trainer_clip_off.py', seed: '9012'}
+          - {id: '37_12345', script: 'probe_37_zoo_trainer_clip_off.py', seed: '12345'}
+          - {id: '37_22222', script: 'probe_37_zoo_trainer_clip_off.py', seed: '22222'}
+          - {id: '37_31415', script: 'probe_37_zoo_trainer_clip_off.py', seed: '31415'}
+          - {id: '37_65535', script: 'probe_37_zoo_trainer_clip_off.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
