@@ -16,7 +16,9 @@ set -uo pipefail
 # legacy default) as an env-override and skips the .app bundle.
 STUDIO_HOME_DEFAULT="$HOME/.unsloth/studio"
 DATA_DIR_DEFAULT="$HOME/.local/share/unsloth"
-: "${UPDATE_FROM_SHA:=5c473fab}"        # v0.1.37-beta (2026.4.x)
+# Default to a recent SHA whose frontend still builds with current upstream
+# npm deps; older SHAs hit @assistant-ui/core internal-path drift.
+: "${UPDATE_FROM_SHA:=518782b1}"        # v0.1.39-beta (2026.5.2)
 : "${UPDATE_TO_SHA:=07e2fccf}"          # current pip tip
 : "${IDLE_SECONDS:=60}"
 : "${LOAD_THRESHOLD:=3}"
@@ -36,12 +38,19 @@ echo "[repro] WORK=$WORK"
 git clone https://github.com/unslothai/unsloth "$WORK/pinned_old"
 (cd "$WORK/pinned_old" && git checkout "$UPDATE_FROM_SHA")
 echo "[repro] installing older Studio @ $UPDATE_FROM_SHA (default mode)"
-(cd "$WORK/pinned_old" && bash install.sh --local) || {
-    echo "FAIL: older install failed -- cannot establish baseline"
-    exit 1
-}
+# Older frontends sometimes fail to tsc against current npm deps, but the
+# shortcut step runs before the build error aborts the script. Treat the
+# install as good as long as the .app bundle made it onto disk.
+(cd "$WORK/pinned_old" && bash install.sh --local) || true
 
-[[ -d "$APP_DIR" ]] || { echo "FAIL: .app bundle missing after older install: $APP_DIR"; exit 1; }
+if [[ ! -d "$APP_DIR" ]]; then
+    echo "FAIL: .app bundle missing after older install: $APP_DIR"
+    exit 1
+fi
+if [[ ! -x "$UNSLOTH_BIN" ]]; then
+    echo "FAIL: unsloth binary missing after older install: $UNSLOTH_BIN"
+    exit 1
+fi
 
 # --- Phase 2: fingerprint launcher / plist / icon ---
 fingerprint_target() {
