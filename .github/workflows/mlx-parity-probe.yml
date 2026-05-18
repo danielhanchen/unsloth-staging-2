@@ -135,21 +135,30 @@ jobs:
           # False in prior probes). Probe 23 = probe 22 + compile=True
           # to test if compile-mode is the missing piece.
 
-          - {id: '23_1',     script: 'probe_23_hybrid_compile.py', seed: '1'}
-          - {id: '23_7',     script: 'probe_23_hybrid_compile.py', seed: '7'}
-          - {id: '23_42',    script: 'probe_23_hybrid_compile.py', seed: '42'}
-          - {id: '23_123',   script: 'probe_23_hybrid_compile.py', seed: '123'}
-          - {id: '23_456',   script: 'probe_23_hybrid_compile.py', seed: '456'}
-          - {id: '23_789',   script: 'probe_23_hybrid_compile.py', seed: '789'}
-          - {id: '23_999',   script: 'probe_23_hybrid_compile.py', seed: '999'}
-          - {id: '23_1234',  script: 'probe_23_hybrid_compile.py', seed: '1234'}
-          - {id: '23_3407',  script: 'probe_23_hybrid_compile.py', seed: '3407'}
-          - {id: '23_5678',  script: 'probe_23_hybrid_compile.py', seed: '5678'}
-          - {id: '23_9012',  script: 'probe_23_hybrid_compile.py', seed: '9012'}
-          - {id: '23_12345', script: 'probe_23_hybrid_compile.py', seed: '12345'}
-          - {id: '23_22222', script: 'probe_23_hybrid_compile.py', seed: '22222'}
-          - {id: '23_31415', script: 'probe_23_hybrid_compile.py', seed: '31415'}
-          - {id: '23_65535', script: 'probe_23_hybrid_compile.py', seed: '65535'}
+          # ---- Round BB: loss-fn dtype-propagation hypothesis ----
+          # Round BA rejected compile (probe 23 = 43% = zoo, not 67%).
+          # Next live suspect: backward through zoo's
+          # `mask.astype(float32) * ce_fp16` carries gradients in fp32,
+          # while mlx-lm's `bool_mask * ce_fp16` keeps them in fp16.
+          # Probe 24 monkey-patches make_baseline_loss_fn with a
+          # verbatim copy of mlx-lm's default_loss (bool mask, no
+          # astype(fp32) on the mask).
+
+          - {id: '24_1',     script: 'probe_24_hybrid_mlxlm_loss.py', seed: '1'}
+          - {id: '24_7',     script: 'probe_24_hybrid_mlxlm_loss.py', seed: '7'}
+          - {id: '24_42',    script: 'probe_24_hybrid_mlxlm_loss.py', seed: '42'}
+          - {id: '24_123',   script: 'probe_24_hybrid_mlxlm_loss.py', seed: '123'}
+          - {id: '24_456',   script: 'probe_24_hybrid_mlxlm_loss.py', seed: '456'}
+          - {id: '24_789',   script: 'probe_24_hybrid_mlxlm_loss.py', seed: '789'}
+          - {id: '24_999',   script: 'probe_24_hybrid_mlxlm_loss.py', seed: '999'}
+          - {id: '24_1234',  script: 'probe_24_hybrid_mlxlm_loss.py', seed: '1234'}
+          - {id: '24_3407',  script: 'probe_24_hybrid_mlxlm_loss.py', seed: '3407'}
+          - {id: '24_5678',  script: 'probe_24_hybrid_mlxlm_loss.py', seed: '5678'}
+          - {id: '24_9012',  script: 'probe_24_hybrid_mlxlm_loss.py', seed: '9012'}
+          - {id: '24_12345', script: 'probe_24_hybrid_mlxlm_loss.py', seed: '12345'}
+          - {id: '24_22222', script: 'probe_24_hybrid_mlxlm_loss.py', seed: '22222'}
+          - {id: '24_31415', script: 'probe_24_hybrid_mlxlm_loss.py', seed: '31415'}
+          - {id: '24_65535', script: 'probe_24_hybrid_mlxlm_loss.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
