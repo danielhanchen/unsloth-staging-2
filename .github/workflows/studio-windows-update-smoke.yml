@@ -268,21 +268,12 @@ jobs:
           echo "post-update Studio /api/health OK"
 
       - name: Uninstall and verify clean
-        # Round-trip through uninstall.ps1. Default install lives under
-        # %USERPROFILE%\.unsloth\studio, so the env-var-less path is
-        # exercised here (the env-mode path is exercised by
-        # uninstall-windows.yml's round-trip job).
+        # Round-trip through uninstall.ps1 against the default install
+        # tree at %USERPROFILE%\.unsloth\studio. Env-mode and safety
+        # guards are covered by uninstall-windows.yml.
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path logs | Out-Null
-          # PR 5513 guard: refuse $USERPROFILE.
-          $env:UNSLOTH_STUDIO_HOME = $env:USERPROFILE
-          pwsh -NoProfile -File "$PWD\uninstall.ps1" *>&1 | Tee-Object -FilePath logs/uninstall-guard.log
-          if (-not (Test-Path "$env:USERPROFILE\.unsloth\studio")) {
-            Write-Error "install dir gone before guard test!"; exit 1
-          }
-          # Real uninstall against the default tree.
-          $env:UNSLOTH_STUDIO_HOME = $null
           pwsh -NoProfile -File "$PWD\uninstall.ps1" *>&1 | Tee-Object -FilePath logs/uninstall.log
           $leak = 0
           foreach ($p in @(
@@ -312,5 +303,4 @@ jobs:
             logs/update2.log
             logs/studio.log
             logs/uninstall.log
-            logs/uninstall-guard.log
           retention-days: 7

@@ -139,12 +139,11 @@ jobs:
           echo "post-update Studio /api/health OK"
 
       - name: Uninstall and verify clean
-        # Round-trip through uninstall.sh. Also exercises the macOS-only
-        # .app bundle + Launch Services entry that uninstall.sh removes.
+        # Round-trip through uninstall.sh on real macOS. Exercises the
+        # macOS-only .app bundle + Launch Services removal as a side
+        # effect. Safety-guard scenarios are covered by uninstall-mac.yml.
         run: |
           set -o pipefail
-          UNSLOTH_STUDIO_HOME="$HOME" sh uninstall.sh 2>&1 | tee logs/uninstall-guard.log
-          test -d "$HOME/.unsloth/studio" || { echo "::error::install dir gone before guard test"; exit 1; }
           sh uninstall.sh 2>&1 | tee logs/uninstall.log
           leak=0
           for p in \
@@ -174,5 +173,4 @@ jobs:
             logs/update2.log
             logs/studio.log
             logs/uninstall.log
-            logs/uninstall-guard.log
           retention-days: 7

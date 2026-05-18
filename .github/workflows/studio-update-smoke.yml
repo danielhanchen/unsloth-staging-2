@@ -144,12 +144,10 @@ jobs:
         # Round-trip the installer through uninstall.sh: confirms the
         # uninstaller actually finds and removes everything install.sh +
         # update wrote. Runs LAST so a failure here is independent of
-        # the install / update path. Trace each removal step.
+        # the install / update path. Safety-guard scenarios are covered
+        # by uninstall-linux.yml; this is the happy-path cleanup test.
         run: |
           set -o pipefail
-          # PR 5497 guards: $HOME refusal, then real-root removal.
-          UNSLOTH_STUDIO_HOME="$HOME" sh uninstall.sh 2>&1 | tee logs/uninstall-guard.log
-          test -d "$HOME/.unsloth/studio" || { echo "::error::install dir gone before guard test"; exit 1; }
           sh uninstall.sh 2>&1 | tee logs/uninstall.log
           # Required: install dir, data dir, desktop shortcut, ~/.local/bin shim.
           leak=0
@@ -183,5 +181,4 @@ jobs:
             logs/update2.log
             logs/studio.log
             logs/uninstall.log
-            logs/uninstall-guard.log
           retention-days: 7
