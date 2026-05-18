@@ -58,53 +58,54 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AC: does value=1.0 elementwise clip have BETTER
-          # multi-seed Unsloth-decode pass-rate than the smoke
-          # default (norm=1.0, value=None)? Round AB showed
-          # value=1.0 rescued seed=42 (✗ at default -> ✓).
-          # Sweep the smoke-default-failing seeds at value=1.0.
-          - id: '17dz'
+          # Round AD: complete value=1.0 across remaining seeds to
+          # finish the 13-seed sample for an apples-to-apples
+          # comparison vs norm=1.0 smoke default. Round AB+AC gave
+          # us 4/6 ✓ for value=1.0; need 7 more seeds for full set.
+          - id: '17ee'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '999'
+            seed: '1337'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
             max_grad_value: '1.0'
             zoo_pin: 'c1821e4'
-          - id: '17ea'
+          - id: '17ef'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '12345'
+            seed: '11111'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
             max_grad_value: '1.0'
             zoo_pin: 'c1821e4'
-          - id: '17eb'
+          - id: '17eg'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '22222'
+            seed: '5555'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
             max_grad_value: '1.0'
             zoo_pin: 'c1821e4'
-          - id: '17ec'
+          - id: '17eh'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '2024'
+            seed: '7777'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
             max_grad_value: '1.0'
             zoo_pin: 'c1821e4'
-          - id: '17ed'
+          - id: '17ei'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '3407'
+            seed: '8888'
             bias_correction: ''
             lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '1.0'
             zoo_pin: 'c1821e4'
     steps:
       - name: Harden runner (audit)
