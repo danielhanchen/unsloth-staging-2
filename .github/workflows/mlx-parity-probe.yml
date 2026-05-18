@@ -58,47 +58,55 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AP: expand norm=0.5 sample. AO got 2/2 ✓
-          # (3407, 42). Add 5 more failing-at-smoke seeds:
-          - id: '17gm'
+          # Round AQ: does value=0.25 (tighter than the 0.5 winner)
+          # do even better or start to over-clip? If pass rate is
+          # >= 77% at 0.25, the optimum sits in the [0.1, 0.5] band
+          # and value=0.5 may not be the apex. If it drops, value
+          # ~= 0.5 is the apex.
+          - id: '17gr'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '3407'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '0.25'
+            zoo_pin: 'c1821e4'
+          - id: '17gs'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '42'
+            bias_correction: ''
+            lr: '1e-3'
+            max_grad_norm: '0'
+            max_grad_value: '0.25'
+            zoo_pin: 'c1821e4'
+          - id: '17gt'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '999'
             bias_correction: ''
             lr: '1e-3'
-            max_grad_norm: '0.5'
+            max_grad_norm: '0'
+            max_grad_value: '0.25'
             zoo_pin: 'c1821e4'
-          - id: '17gn'
+          - id: '17gu'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '12345'
             bias_correction: ''
             lr: '1e-3'
-            max_grad_norm: '0.5'
+            max_grad_norm: '0'
+            max_grad_value: '0.25'
             zoo_pin: 'c1821e4'
-          - id: '17go'
+          - id: '17gv'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '22222'
             bias_correction: ''
             lr: '1e-3'
-            max_grad_norm: '0.5'
-            zoo_pin: 'c1821e4'
-          - id: '17gp'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '7777'
-            bias_correction: ''
-            lr: '1e-3'
-            max_grad_norm: '0.5'
-            zoo_pin: 'c1821e4'
-          - id: '17gq'
-            script: probe_17_curve_param.py
-            steps: '30'
-            seed: '2024'
-            bias_correction: ''
-            lr: '1e-3'
-            max_grad_norm: '0.5'
+            max_grad_norm: '0'
+            max_grad_value: '0.25'
             zoo_pin: 'c1821e4'
     steps:
       - name: Harden runner (audit)
