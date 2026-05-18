@@ -58,54 +58,54 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round AD: complete value=1.0 across remaining seeds to
-          # finish the 13-seed sample for an apples-to-apples
-          # comparison vs norm=1.0 smoke default. Round AB+AC gave
-          # us 4/6 ✓ for value=1.0; need 7 more seeds for full set.
-          - id: '17ee'
+          # Round AE: value=5.0 (PR #634's old default) multi-seed
+          # on MLX. CUDA at value=5.0 with same seeds will follow
+          # from the CUDA sweep. If MLX value=5.0 is comparable or
+          # worse than value=1.0, that confirms there's no large
+          # "magic" elementwise value — they're all in the same
+          # basin-geometry-fragile regime.
+          - id: '17ej'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '1337'
+            seed: '42'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '1.0'
+            max_grad_value: '5.0'
             zoo_pin: 'c1821e4'
-          - id: '17ef'
+          - id: '17ek'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '11111'
+            seed: '999'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '1.0'
+            max_grad_value: '5.0'
             zoo_pin: 'c1821e4'
-          - id: '17eg'
+          - id: '17el'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '5555'
+            seed: '12345'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '1.0'
+            max_grad_value: '5.0'
             zoo_pin: 'c1821e4'
-          - id: '17eh'
+          - id: '17em'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '7777'
+            seed: '22222'
             bias_correction: ''
             lr: '1e-3'
             max_grad_norm: '0'
-            max_grad_value: '1.0'
+            max_grad_value: '5.0'
             zoo_pin: 'c1821e4'
-          - id: '17ei'
+          - id: '17en'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '8888'
+            seed: '3407'
             bias_correction: ''
             lr: '1e-3'
-            max_grad_norm: '0'
-            max_grad_value: '1.0'
             zoo_pin: 'c1821e4'
     steps:
       - name: Harden runner (audit)
