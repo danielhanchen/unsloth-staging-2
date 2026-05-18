@@ -88,8 +88,14 @@ def _case_bootstrap_absent(pw, failures: list[str]) -> None:
         ctx = browser.new_context()
         ctx.add_init_script(SUPPRESS_BOOTSTRAP)
         page = ctx.new_page()
-        page.goto(f"{BASE}/change-password", wait_until="domcontentloaded")
-        page.wait_for_selector("input[type='password']", timeout=15_000)
+        # Wait until the SPA has fetched /api/auth/status (which gates
+        # the form's first render). On windows-latest the React boot
+        # routinely exceeds the previous 15 s selector timeout.
+        with page.expect_response(
+            lambda r: r.url.endswith("/api/auth/status"), timeout=45_000
+        ):
+            page.goto(f"{BASE}/change-password", wait_until="domcontentloaded")
+        page.wait_for_selector("input[type='password']", timeout=45_000)
         _shoot(page, "01_bootstrap_absent")
 
         boot_undef = page.evaluate(
@@ -123,8 +129,8 @@ def _case_bootstrap_present(pw, failures: list[str]) -> None:
         page = ctx.new_page()
         page.goto(f"{BASE}/", wait_until="domcontentloaded")
         # On first boot the SPA auto-redirects login -> /change-password.
-        expect(page).to_have_url(f"{BASE}/change-password", timeout=15_000)
-        page.wait_for_selector("input[type='password']", timeout=15_000)
+        expect(page).to_have_url(f"{BASE}/change-password", timeout=45_000)
+        page.wait_for_selector("input[type='password']", timeout=45_000)
         _shoot(page, "02_bootstrap_present")
 
         n = _count_password_inputs(page)
