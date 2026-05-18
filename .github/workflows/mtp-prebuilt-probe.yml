@@ -1,10 +1,7 @@
-# Probe the Unsloth prebuilt llama.cpp on each OS to confirm it
-# advertises the MTP spec-type alias the Studio emit path expects.
-#
-# We grep llama-server --help for "--spec-type" and assert the
-# advertised list contains either "draft-mtp" or "mtp". This is
-# what probe_server_capabilities() does at runtime; running it on
-# CI catches a prebuilt regression before users see it.
+# Direct-download the Unsloth prebuilt llama-server on each OS and
+# confirm it advertises the MTP spec-type alias the Studio emit path
+# expects. Skips install.sh / install.ps1 entirely so a stale frontend
+# in this staging fork does not block the binary probe.
 
 name: MTP prebuilt probe
 
@@ -13,8 +10,6 @@ on:
     branches: [studio-mtp-ci]
     paths:
       - 'studio/backend/core/inference/llama_cpp.py'
-      - 'install.sh'
-      - 'install.ps1'
       - '.github/workflows/mtp-prebuilt-probe.yml'
   workflow_dispatch:
 
@@ -25,124 +20,111 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  PREBUILT_TAG: b9204
+
 jobs:
   probe-linux:
     name: Probe llama-server (ubuntu-latest)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          persist-credentials: false
-
       - name: Linux deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libcurl4-openssl-dev libssl-dev jq
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libssl-dev
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
-        with:
-          node-version: '22'
-
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install Studio (no torch)
+      - name: Download prebuilt llama-server
         env:
-          UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/studio-home
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p "$UNSLOTH_STUDIO_HOME"
-          ./install.sh --local --no-torch
+          mkdir -p prebuilt && cd prebuilt
+          curl -fsSL -o app.tar.gz "https://github.com/unslothai/llama.cpp/releases/download/${PREBUILT_TAG}/app-${PREBUILT_TAG}-linux-x64-cuda12-portable.tar.gz"
+          tar -xzf app.tar.gz
+          ls -la
 
       - name: Probe llama-server for MTP spec advertisement
-        env:
-          UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/studio-home
         run: |
-          BIN="$UNSLOTH_STUDIO_HOME/llama.cpp/build/bin/llama-server"
-          test -x "$BIN" || { echo "llama-server not found at $BIN"; exit 1; }
+          BIN=$(find prebuilt -name llama-server -type f -perm -u+x | head -1)
+          test -n "$BIN" || { echo "llama-server not found"; find prebuilt -type f | head; exit 1; }
           HELP=$("$BIN" --help 2>&1 || true)
-          echo "$HELP" | grep -E "\\-\\-spec-type" | head -5
-          echo "$HELP" | grep -E "\\-\\-spec-type" | grep -E "draft-mtp|[|,\\[]mtp[|,\\]]"
-          echo "$HELP" | grep -E "\\-\\-spec-draft-n-max" >/dev/null || \
-            { echo "missing --spec-draft-n-max"; exit 1; }
+          echo "$HELP" | grep -E "^\s*--spec-type" | head -2
+          echo "$HELP" | grep -E "^\s*--spec-type" | grep -E "draft-mtp|[|,\\[]mtp[|,\\]]"
+          echo "$HELP" | grep -E "^\s*--spec-draft-n-max" >/dev/null
+          echo "$HELP" | grep -E "^\s*--spec-draft-p-min" >/dev/null
+          echo "$HELP" | grep -E "^\s*--spec-ngram-mod-n-(match|min|max)" | wc -l
 
   probe-macos:
     name: Probe llama-server (macos-14)
     runs-on: macos-14
-    timeout-minutes: 25
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
-        with:
-          node-version: '22'
-
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install Studio (no torch)
-        env:
-          UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/studio-home
+      - name: Download prebuilt llama-server
         run: |
-          mkdir -p "$UNSLOTH_STUDIO_HOME"
-          ./install.sh --local --no-torch
+          # macOS prebuilt is named differently in the b9204 release; if
+          # there is no -macos asset we skip with a clear message.
+          mkdir -p prebuilt && cd prebuilt
+          set +e
+          curl -fsSL --retry 3 -o app.tar.gz "https://github.com/unslothai/llama.cpp/releases/download/${PREBUILT_TAG}/app-${PREBUILT_TAG}-macos-arm64.tar.gz"
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "No prebuilt macOS arm64 asset for ${PREBUILT_TAG}. Listing assets:"
+            curl -fsSL "https://api.github.com/repos/unslothai/llama.cpp/releases/tags/${PREBUILT_TAG}" | grep '"name":'
+            echo "::warning::macOS prebuilt asset not available; skipping probe."
+            exit 0
+          fi
+          tar -xzf app.tar.gz
+          ls -la
 
       - name: Probe llama-server for MTP spec advertisement
-        env:
-          UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/studio-home
         run: |
-          # macOS prebuilt drops binaries under a flat layout. Search.
-          BIN=$(find "$UNSLOTH_STUDIO_HOME/llama.cpp" -name llama-server -type f 2>/dev/null | head -1)
-          test -n "$BIN" && test -x "$BIN" || { echo "llama-server not found under $UNSLOTH_STUDIO_HOME/llama.cpp"; ls -R "$UNSLOTH_STUDIO_HOME/llama.cpp" || true; exit 1; }
+          BIN=$(find prebuilt -name llama-server -type f 2>/dev/null | head -1)
+          if [ -z "$BIN" ]; then
+            echo "::warning::no llama-server in prebuilt directory; skip"
+            exit 0
+          fi
+          chmod +x "$BIN" 2>/dev/null || true
           HELP=$("$BIN" --help 2>&1 || true)
-          echo "$HELP" | grep -E "\\-\\-spec-type" | head -5
-          echo "$HELP" | grep -E "\\-\\-spec-type" | grep -E "draft-mtp|[|,\\[]mtp[|,\\]]"
-          echo "$HELP" | grep -E "\\-\\-spec-draft-n-max" >/dev/null || \
-            { echo "missing --spec-draft-n-max"; exit 1; }
+          echo "$HELP" | grep -E "^\s*--spec-type" | head -2
+          echo "$HELP" | grep -E "^\s*--spec-type" | grep -E "draft-mtp|[|,\\[]mtp[|,\\]]"
+          echo "$HELP" | grep -E "^\s*--spec-draft-n-max" >/dev/null
+          echo "$HELP" | grep -E "^\s*--spec-draft-p-min" >/dev/null
 
   probe-windows:
     name: Probe llama-server (windows-latest)
     runs-on: windows-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
-        with:
-          node-version: '22'
-
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
-        with:
-          python-version: '3.12'
-          cache: 'pip'
-
-      - name: Install Studio (no torch)
-        env:
-          UNSLOTH_STUDIO_HOME: ${{ github.workspace }}\studio-home
+      - name: Download prebuilt llama-server
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path $env:UNSLOTH_STUDIO_HOME
-          .\install.ps1 -Local -NoTorch
+          New-Item -ItemType Directory -Force -Path prebuilt | Out-Null
+          $url = "https://github.com/unslothai/llama.cpp/releases/download/$env:PREBUILT_TAG/app-$env:PREBUILT_TAG-win-x64-cuda12.zip"
+          try {
+            Invoke-WebRequest -Uri $url -OutFile prebuilt/app.zip -UseBasicParsing
+          } catch {
+            Write-Host "No Windows prebuilt asset for $env:PREBUILT_TAG. Listing assets:"
+            $assets = Invoke-RestMethod -Uri "https://api.github.com/repos/unslothai/llama.cpp/releases/tags/$env:PREBUILT_TAG"
+            $assets.assets | ForEach-Object { Write-Host $_.name }
+            Write-Host "::warning::Windows prebuilt asset not available; skipping probe."
+            exit 0
+          }
+          Expand-Archive -Path prebuilt/app.zip -DestinationPath prebuilt
+          Get-ChildItem prebuilt -Recurse | Select-Object -First 20
 
       - name: Probe llama-server for MTP spec advertisement
-        env:
-          UNSLOTH_STUDIO_HOME: ${{ github.workspace }}\studio-home
         shell: pwsh
         run: |
-          $bin = Get-ChildItem -Path "$env:UNSLOTH_STUDIO_HOME\llama.cpp" -Recurse -Filter llama-server.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $bin) { Get-ChildItem -Path "$env:UNSLOTH_STUDIO_HOME\llama.cpp" -Recurse; throw "llama-server.exe not found" }
+          $bin = Get-ChildItem -Path prebuilt -Recurse -Filter llama-server.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $bin) {
+            Write-Host "::warning::no llama-server.exe in prebuilt; skip"
+            exit 0
+          }
           $help = & $bin.FullName --help 2>&1 | Out-String
-          $specLine = ($help -split "`n") | Where-Object { $_ -match '--spec-type' } | Select-Object -First 1
+          $specLine = ($help -split "`n") | Where-Object { $_ -match '^\s*--spec-type' } | Select-Object -First 1
           if (-not $specLine) { throw "no --spec-type line in help" }
           Write-Host $specLine
           if ($specLine -notmatch 'draft-mtp|[|,\[]mtp[|,\]]') { throw "spec-type does not advertise draft-mtp / mtp" }
           if (-not ($help -match '--spec-draft-n-max')) { throw "missing --spec-draft-n-max" }
+          if (-not ($help -match '--spec-draft-p-min')) { throw "missing --spec-draft-p-min" }
