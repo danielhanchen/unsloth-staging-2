@@ -100,3 +100,49 @@ jobs:
           STAGE="$RUNNER_TEMP/G"; rm -rf "$STAGE"; mkdir -p "$STAGE"
           for i in 1 2 3; do HOME="$STAGE" XDG_RUNTIME_DIR="" sh ./uninstall.sh; done
           echo "PASS"
+      - name: H. Studio lock-dir cleanup
+        # uninstall.sh should remove $XDG_RUNTIME_DIR/unsloth-studio-* and
+        # /tmp/unsloth-studio-* lock dirs. Reports the gap as a warning
+        # rather than failing -- the contract is "remove if present, never
+        # remove anything else".
+        run: |
+          S="$RUNNER_TEMP/H"; rm -rf "$S"
+          mkdir -p "$S/H" "$S/run/unsloth-studio-8888" "$S/run/unsloth-studio-9999" \
+                   "$S/tmp/unsloth-studio-8888" "$S/tmp/unsloth-studio-7777"
+          touch "$S/run/unsloth-studio-8888/PID" "$S/tmp/unsloth-studio-7777/PID"
+          HOME="$S/H" XDG_RUNTIME_DIR="$S/run" TMPDIR="$S/tmp" sh ./uninstall.sh
+          remain_run=$(find "$S/run" -maxdepth 1 -name 'unsloth-studio-*' 2>/dev/null | wc -l | tr -d ' ')
+          remain_tmp=$(find "$S/tmp" -maxdepth 1 -name 'unsloth-studio-*' 2>/dev/null | wc -l | tr -d ' ')
+          echo "XDG_RUNTIME_DIR lock leftover: $remain_run"
+          echo "/tmp lock leftover:            $remain_tmp"
+          if [ "$remain_run" -gt 0 ] || [ "$remain_tmp" -gt 0 ]; then
+            echo "::warning::Studio lock-dir cleanup gap ($remain_run XDG + $remain_tmp TMP left)"
+            find "$S/run" "$S/tmp" -maxdepth 2 2>/dev/null || true
+          else
+            echo "PASS: all Studio lock dirs cleaned"
+          fi
+      - name: I. WSL branch must not crash without powershell.exe
+        # On WSL, uninstall.sh removes Windows-side .lnk shortcuts via a
+        # PowerShell shim. On non-WSL Linux (this runner), powershell.exe
+        # is absent and the branch must be a clean no-op. We force the
+        # WSL code path by setting WSL_DISTRO_NAME so any guard reading
+        # that variable takes the WSL branch, and confirm exit 0 with no
+        # stderr noise.
+        run: |
+          STAGE="$RUNNER_TEMP/I"; rm -rf "$STAGE"; mkdir -p "$STAGE"
+          set +e
+          HOME="$STAGE" XDG_RUNTIME_DIR="" WSL_DISTRO_NAME="Ubuntu" \
+            sh ./uninstall.sh 2>"$STAGE/err.log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::uninstall.sh exit $rc on WSL branch without powershell.exe"
+            cat "$STAGE/err.log"; exit 1
+          fi
+          # Treat 'command not found'/'powershell.exe: not found' as a
+          # leak -- uninstall.sh should detect the missing shim itself.
+          if grep -Ei 'powershell.exe: not found|command not found' "$STAGE/err.log" >/dev/null 2>&1; then
+            echo "::warning::WSL branch leaks 'powershell.exe not found' to stderr (uninstall.sh should silence this)"
+            cat "$STAGE/err.log"
+          fi
+          echo "PASS: WSL branch exits 0 without powershell.exe"

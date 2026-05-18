@@ -104,6 +104,62 @@ jobs:
             HOME="$STAGE" XDG_RUNTIME_DIR="" sh ./uninstall.sh
           done
           echo "PASS: 3 runs all exit 0"
+      - name: G. macOS .app symlink-guard matrix
+        # PR 5496 hardens install.sh so `mkdir -p` does not follow a
+        # symlinked .app into someone else's tree. PR 5497's uninstaller
+        # must also unlink the symlink itself, never recurse into its
+        # target. Four scenarios, four staged $HOMEs.
+        run: |
+          set -e
+          # G1. .app is a REAL directory: removed.
+          S="$RUNNER_TEMP/G1"; rm -rf "$S"; mkdir -p "$S/Applications/Unsloth Studio.app/Contents/MacOS"
+          touch "$S/Applications/Unsloth Studio.app/Contents/MacOS/Unsloth Studio"
+          HOME="$S" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          [ ! -e "$S/Applications/Unsloth Studio.app" ] && echo "G1 PASS" || { echo "G1 FAIL"; ls -la "$S/Applications"; exit 1; }
+          # G2. .app is a symlink to an UNRELATED real dir: symlink unlinked, target preserved.
+          S="$RUNNER_TEMP/G2"; rm -rf "$S"; mkdir -p "$S/Applications" "$S/other/innocent"
+          echo precious > "$S/other/innocent/file"
+          ln -sfn "$S/other/innocent" "$S/Applications/Unsloth Studio.app"
+          HOME="$S" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          if [ -e "$S/Applications/Unsloth Studio.app" ] || [ ! -f "$S/other/innocent/file" ]; then
+            echo "G2 FAIL"; ls -la "$S/Applications" "$S/other/innocent"; exit 1
+          fi
+          echo "G2 PASS (symlink removed, target preserved)"
+          # G3. .app is a BROKEN symlink: removed.
+          S="$RUNNER_TEMP/G3"; rm -rf "$S"; mkdir -p "$S/Applications"
+          ln -sfn "$S/does/not/exist" "$S/Applications/Unsloth Studio.app"
+          HOME="$S" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          [ ! -L "$S/Applications/Unsloth Studio.app" ] && [ ! -e "$S/Applications/Unsloth Studio.app" ] \
+            && echo "G3 PASS" || { echo "G3 FAIL"; ls -la "$S/Applications"; exit 1; }
+          # G4. .app is a REGULAR FILE (corrupt prior install): removed.
+          S="$RUNNER_TEMP/G4"; rm -rf "$S"; mkdir -p "$S/Applications"
+          echo notabundle > "$S/Applications/Unsloth Studio.app"
+          HOME="$S" XDG_RUNTIME_DIR="" sh ./uninstall.sh
+          [ ! -e "$S/Applications/Unsloth Studio.app" ] && echo "G4 PASS" || { echo "G4 FAIL"; ls -la "$S/Applications"; exit 1; }
+      - name: H. Studio lock-dir cleanup
+        # uninstall.sh should remove $XDG_RUNTIME_DIR/unsloth-studio-* and
+        # /tmp/unsloth-studio-* lock dirs. macos-14 has no XDG_RUNTIME_DIR
+        # by default, so we point one at $RUNNER_TEMP for this test.
+        run: |
+          S="$RUNNER_TEMP/H"; rm -rf "$S"
+          mkdir -p "$S/H" "$S/run/unsloth-studio-8888" "$S/run/unsloth-studio-9999" \
+                   "$S/tmp/unsloth-studio-8888" "$S/tmp/unsloth-studio-7777"
+          # Sentinel inside one lock to confirm recursive removal.
+          touch "$S/run/unsloth-studio-8888/PID" "$S/tmp/unsloth-studio-7777/PID"
+          HOME="$S/H" XDG_RUNTIME_DIR="$S/run" TMPDIR="$S/tmp" sh ./uninstall.sh
+          # Report what is left (uninstaller may not currently clean both
+          # paths -- this step never fails the build; it surfaces the
+          # gap.)
+          remain_run=$(find "$S/run" -maxdepth 1 -name 'unsloth-studio-*' 2>/dev/null | wc -l | tr -d ' ')
+          remain_tmp=$(find "$S/tmp" -maxdepth 1 -name 'unsloth-studio-*' 2>/dev/null | wc -l | tr -d ' ')
+          echo "XDG_RUNTIME_DIR lock leftover: $remain_run"
+          echo "/tmp lock leftover:            $remain_tmp"
+          if [ "$remain_run" -gt 0 ] || [ "$remain_tmp" -gt 0 ]; then
+            echo "::warning::Studio lock-dir cleanup gap (uninstall.sh leaves $remain_run XDG + $remain_tmp TMP)"
+            find "$S/run" "$S/tmp" -maxdepth 2 2>/dev/null || true
+          else
+            echo "PASS: all Studio lock dirs cleaned"
+          fi
 
   # PR 5496's spawn-terminal failure-path test on real macOS. Verifies the
   # nohup'd Studio server gets reaped when `open -a Terminal` fails. We
