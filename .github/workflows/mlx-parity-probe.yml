@@ -58,41 +58,43 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round O: counterfactual on bc=True at long horizons.
-          # Round L pinned bc=False NaN-divergence to ~80-100 steps
-          # on this fixture. The natural follow-up is: is the
-          # divergence specific to bc=False, or does bc=True also
-          # blow up at the same horizons (would mean the fixture +
-          # LR are the issue, not the bc value)?
-          - id: '17bh'
+          # Round P: tighten bc=False NaN boundary + 1000-step bc=True
+          # stability. Round O established:
+          #   * bc=True at 100/200/500 stays finite (loss=0);
+          #   * bc=False NaN at 90 (Round M: 80 finite at loss 2.64).
+          # Round P narrows the boundary to single-step precision so
+          # the PR-663 docstring "past ~80 steps" can be tightened if
+          # needed, and adds a 1000-step bc=True run to extend the
+          # finite-stays-finite claim.
+          - id: '17bm'
             script: probe_17_curve_param.py
-            steps: '200'
-            seed: '3407'
-            bias_correction: ''
-            lr: '1e-3'
-            zoo_pin: '669a792'
-          - id: '17bi'
-            script: probe_17_curve_param.py
-            steps: '500'
-            seed: '3407'
-            bias_correction: ''
-            lr: '1e-3'
-            zoo_pin: '669a792'
-          - id: '17bj'
-            script: probe_17_curve_param.py
-            steps: '100'
-            seed: '3407'
-            bias_correction: ''
-            lr: '1e-3'
-            zoo_pin: '669a792'
-          - id: '17bk'
-            script: probe_17_curve_param.py
-            steps: '90'
+            steps: '85'
             seed: '3407'
             bias_correction: '0'
             lr: '1e-3'
             zoo_pin: '669a792'
-          - id: '17bl'
+          - id: '17bn'
+            script: probe_17_curve_param.py
+            steps: '88'
+            seed: '3407'
+            bias_correction: '0'
+            lr: '1e-3'
+            zoo_pin: '669a792'
+          - id: '17bo'
+            script: probe_17_curve_param.py
+            steps: '1000'
+            seed: '3407'
+            bias_correction: ''
+            lr: '1e-3'
+            zoo_pin: '669a792'
+          - id: '17bp'
+            script: probe_17_curve_param.py
+            steps: '50'
+            seed: '3407'
+            bias_correction: ''
+            lr: '1e-3'
+            zoo_pin: '669a792'
+          - id: '17bq'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
