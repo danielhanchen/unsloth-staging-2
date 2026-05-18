@@ -96,7 +96,7 @@ jobs:
             echo "FAIL: A=$([ -e "$STAGE/A" ] && echo exists || echo gone) B=$([ -e "$STAGE/B" ] && echo exists || echo gone)"
             exit 1
           fi
-      - name: F. Idempotency: 3 runs on empty $HOME
+      - name: "F. Idempotency: 3 runs on empty $HOME"
         run: |
           STAGE="$RUNNER_TEMP/F"
           rm -rf "$STAGE"; mkdir -p "$STAGE"
