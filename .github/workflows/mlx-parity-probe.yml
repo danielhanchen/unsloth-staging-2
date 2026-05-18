@@ -77,53 +77,43 @@ jobs:
           # is high, interaction effect. If C high & B not, accum is
           # the dominant cause.
 
-          # ---- Round AX: expand n on Cells A and D + add mlx-lm native ----
-          # Round AW (n=5) showed cell A=3/5 and cell D=2/5 -- the
-          # putative 20% gap with mlx-lm (4/5 in Round AU) is within
-          # 1-seed binomial noise. To distinguish noise from real
-          # effect we add 10 new seeds at three configurations:
-          #   Cell A (unsloth-zoo, smoke default): clip=1.0 bs=2 acc=3
-          #   Cell D (unsloth-zoo, mlx-lm match) : clip=off bs=6 acc=1
-          #   mlx-lm native (probe_20)
-          # Combined with prior data: 15 seeds x 3 conditions = 45
-          # observations to call the gap real or not.
-          # Seeds: 1, 7, 123, 456, 789, 1234, 5678, 9012, 31415, 65535.
+          # ---- Round AY: disambiguate LOADER vs TRAINER as source of the gap ----
+          # Round AX (n=15) confirmed the gap is real:
+          #   mlx-lm native      10/15 = 67%
+          #   zoo Cell A (smoke)  7/15 = 47%
+          #   zoo Cell D (match)  6/15 = 40%
+          # mlx-lm strictly dominates zoo across paired seeds. The gap is
+          # NOT from clip or grad-accum (Round AW). Remaining candidates
+          # split into two buckets:
+          #   - LOADER: FastMLXModel.from_pretrained (dtype cast +
+          #             mx.eval(params)) + get_peft_model (different
+          #             freeze/unfreeze order, sets memory limits)
+          #   - TRAINER: data sampler RNG, extra mx.eval(grad_norm),
+          #             optimizer wiring, callback overhead
+          #
+          # Probe 21 builds a HYBRID: mlx-lm's load() + linear_to_lora_layers()
+          # then drives training via unsloth-zoo MLXTrainer (clip=off,
+          # bs=6, acc=1 -- matching the closest possible config).
+          # Reading:
+          #   pass_rate ~67% -> gap is in unsloth-zoo's LOADER
+          #   pass_rate ~40% -> gap is in unsloth-zoo's TRAINER
+          # Same 15 seeds used in AX for direct paired comparison.
 
-          # -- AX Cell A: unsloth-zoo baseline (clip=1.0, bs=2, acc=3) --
-          - {id: '17ka_1',     script: 'probe_17_curve_param.py', seed: '1',     max_grad_value: '1.0', bs: '2', accum: '3'}
-          - {id: '17ka_7',     script: 'probe_17_curve_param.py', seed: '7',     max_grad_value: '1.0', bs: '2', accum: '3'}
-          - {id: '17ka_123',   script: 'probe_17_curve_param.py', seed: '123',   max_grad_value: '1.0', bs: '2', accum: '3'}
-          - {id: '17ka_456',   script: 'probe_17_curve_param.py', seed: '456',   max_grad_value: '1.0', bs: '2', accum: '3'}
-          - {id: '17ka_789',   script: 'probe_17_curve_param.py', seed: '789',   max_grad_value: '1.0', bs: '2', accum: '3'}
-          - {id: '17ka_1234',  script: 'probe_17_curve_param.py', seed: '1234',  max_grad_value: '1.0', bs: '2', accum: '3'}
-          - {id: '17ka_5678',  script: 'probe_17_curve_param.py', seed: '5678',  max_grad_value: '1.0', bs: '2', accum: '3'}
-          - {id: '17ka_9012',  script: 'probe_17_curve_param.py', seed: '9012',  max_grad_value: '1.0', bs: '2', accum: '3'}
-          - {id: '17ka_31415', script: 'probe_17_curve_param.py', seed: '31415', max_grad_value: '1.0', bs: '2', accum: '3'}
-          - {id: '17ka_65535', script: 'probe_17_curve_param.py', seed: '65535', max_grad_value: '1.0', bs: '2', accum: '3'}
-
-          # -- AX Cell D: unsloth-zoo mlx-lm-matching (clip=off, bs=6, acc=1) --
-          - {id: '17kd_1',     script: 'probe_17_curve_param.py', seed: '1',     max_grad_value: 'off', bs: '6', accum: '1'}
-          - {id: '17kd_7',     script: 'probe_17_curve_param.py', seed: '7',     max_grad_value: 'off', bs: '6', accum: '1'}
-          - {id: '17kd_123',   script: 'probe_17_curve_param.py', seed: '123',   max_grad_value: 'off', bs: '6', accum: '1'}
-          - {id: '17kd_456',   script: 'probe_17_curve_param.py', seed: '456',   max_grad_value: 'off', bs: '6', accum: '1'}
-          - {id: '17kd_789',   script: 'probe_17_curve_param.py', seed: '789',   max_grad_value: 'off', bs: '6', accum: '1'}
-          - {id: '17kd_1234',  script: 'probe_17_curve_param.py', seed: '1234',  max_grad_value: 'off', bs: '6', accum: '1'}
-          - {id: '17kd_5678',  script: 'probe_17_curve_param.py', seed: '5678',  max_grad_value: 'off', bs: '6', accum: '1'}
-          - {id: '17kd_9012',  script: 'probe_17_curve_param.py', seed: '9012',  max_grad_value: 'off', bs: '6', accum: '1'}
-          - {id: '17kd_31415', script: 'probe_17_curve_param.py', seed: '31415', max_grad_value: 'off', bs: '6', accum: '1'}
-          - {id: '17kd_65535', script: 'probe_17_curve_param.py', seed: '65535', max_grad_value: 'off', bs: '6', accum: '1'}
-
-          # -- AX mlx-lm native (probe_20, aggressive config matches unsloth-zoo) --
-          - {id: '20k_1',      script: 'probe_20_mlx_lm_aggressive.py', seed: '1',     max_grad_value: '', bs: '', accum: ''}
-          - {id: '20k_7',      script: 'probe_20_mlx_lm_aggressive.py', seed: '7',     max_grad_value: '', bs: '', accum: ''}
-          - {id: '20k_123',    script: 'probe_20_mlx_lm_aggressive.py', seed: '123',   max_grad_value: '', bs: '', accum: ''}
-          - {id: '20k_456',    script: 'probe_20_mlx_lm_aggressive.py', seed: '456',   max_grad_value: '', bs: '', accum: ''}
-          - {id: '20k_789',    script: 'probe_20_mlx_lm_aggressive.py', seed: '789',   max_grad_value: '', bs: '', accum: ''}
-          - {id: '20k_1234',   script: 'probe_20_mlx_lm_aggressive.py', seed: '1234',  max_grad_value: '', bs: '', accum: ''}
-          - {id: '20k_5678',   script: 'probe_20_mlx_lm_aggressive.py', seed: '5678',  max_grad_value: '', bs: '', accum: ''}
-          - {id: '20k_9012',   script: 'probe_20_mlx_lm_aggressive.py', seed: '9012',  max_grad_value: '', bs: '', accum: ''}
-          - {id: '20k_31415',  script: 'probe_20_mlx_lm_aggressive.py', seed: '31415', max_grad_value: '', bs: '', accum: ''}
-          - {id: '20k_65535',  script: 'probe_20_mlx_lm_aggressive.py', seed: '65535', max_grad_value: '', bs: '', accum: ''}
+          - {id: '21_1',     script: 'probe_21_hybrid_loader_trainer.py', seed: '1'}
+          - {id: '21_7',     script: 'probe_21_hybrid_loader_trainer.py', seed: '7'}
+          - {id: '21_42',    script: 'probe_21_hybrid_loader_trainer.py', seed: '42'}
+          - {id: '21_123',   script: 'probe_21_hybrid_loader_trainer.py', seed: '123'}
+          - {id: '21_456',   script: 'probe_21_hybrid_loader_trainer.py', seed: '456'}
+          - {id: '21_789',   script: 'probe_21_hybrid_loader_trainer.py', seed: '789'}
+          - {id: '21_999',   script: 'probe_21_hybrid_loader_trainer.py', seed: '999'}
+          - {id: '21_1234',  script: 'probe_21_hybrid_loader_trainer.py', seed: '1234'}
+          - {id: '21_3407',  script: 'probe_21_hybrid_loader_trainer.py', seed: '3407'}
+          - {id: '21_5678',  script: 'probe_21_hybrid_loader_trainer.py', seed: '5678'}
+          - {id: '21_9012',  script: 'probe_21_hybrid_loader_trainer.py', seed: '9012'}
+          - {id: '21_12345', script: 'probe_21_hybrid_loader_trainer.py', seed: '12345'}
+          - {id: '21_22222', script: 'probe_21_hybrid_loader_trainer.py', seed: '22222'}
+          - {id: '21_31415', script: 'probe_21_hybrid_loader_trainer.py', seed: '31415'}
+          - {id: '21_65535', script: 'probe_21_hybrid_loader_trainer.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
