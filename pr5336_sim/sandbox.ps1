@@ -6,7 +6,15 @@ $script:ShimRoot = Join-Path $script:SimRoot 'shims'
 function New-Sandbox {
     param([string]$Name)
     $root = Join-Path $script:SimRoot "sandboxes/$Name"
-    if (Test-Path $root) { Remove-Item $root -Recurse -Force }
+    if (Test-Path $root) {
+        # pwsh's Remove-Item -Recurse follows symlinks on macOS (it tries to
+        # recurse into /bin/bash on the tools symlink). Use rm -rf on POSIX.
+        if ($IsWindows) {
+            Remove-Item $root -Recurse -Force
+        } else {
+            & /bin/rm -rf -- $root | Out-Null
+        }
+    }
     New-Item -ItemType Directory -Path $root -Force | Out-Null
 
     # Map Windows-style env vars to subdirectories under $root.
