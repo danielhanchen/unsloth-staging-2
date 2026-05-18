@@ -190,21 +190,27 @@ jobs:
           # (or expose it as an arg with sensible default) in
           # get_peft_model / linear_to_lora_layers calls.
 
-          - {id: '31_1',     script: 'probe_31_num_layers_16.py', seed: '1'}
-          - {id: '31_7',     script: 'probe_31_num_layers_16.py', seed: '7'}
-          - {id: '31_42',    script: 'probe_31_num_layers_16.py', seed: '42'}
-          - {id: '31_123',   script: 'probe_31_num_layers_16.py', seed: '123'}
-          - {id: '31_456',   script: 'probe_31_num_layers_16.py', seed: '456'}
-          - {id: '31_789',   script: 'probe_31_num_layers_16.py', seed: '789'}
-          - {id: '31_999',   script: 'probe_31_num_layers_16.py', seed: '999'}
-          - {id: '31_1234',  script: 'probe_31_num_layers_16.py', seed: '1234'}
-          - {id: '31_3407',  script: 'probe_31_num_layers_16.py', seed: '3407'}
-          - {id: '31_5678',  script: 'probe_31_num_layers_16.py', seed: '5678'}
-          - {id: '31_9012',  script: 'probe_31_num_layers_16.py', seed: '9012'}
-          - {id: '31_12345', script: 'probe_31_num_layers_16.py', seed: '12345'}
-          - {id: '31_22222', script: 'probe_31_num_layers_16.py', seed: '22222'}
-          - {id: '31_31415', script: 'probe_31_num_layers_16.py', seed: '31415'}
-          - {id: '31_65535', script: 'probe_31_num_layers_16.py', seed: '65535'}
+          # ---- Round BH: end-to-end fix verification via zoo's API ----
+          # Probe 32 = FastMLXModel.from_pretrained + get_peft_model(
+          # finetune_last_n_layers=16) + MLXTrainer. If 67% with the
+          # same per-seed pattern as probe 20 (mlx-lm CLI), the PR
+          # works end-to-end through zoo's public API.
+
+          - {id: '32_1',     script: 'probe_32_zoo_with_fix.py', seed: '1'}
+          - {id: '32_7',     script: 'probe_32_zoo_with_fix.py', seed: '7'}
+          - {id: '32_42',    script: 'probe_32_zoo_with_fix.py', seed: '42'}
+          - {id: '32_123',   script: 'probe_32_zoo_with_fix.py', seed: '123'}
+          - {id: '32_456',   script: 'probe_32_zoo_with_fix.py', seed: '456'}
+          - {id: '32_789',   script: 'probe_32_zoo_with_fix.py', seed: '789'}
+          - {id: '32_999',   script: 'probe_32_zoo_with_fix.py', seed: '999'}
+          - {id: '32_1234',  script: 'probe_32_zoo_with_fix.py', seed: '1234'}
+          - {id: '32_3407',  script: 'probe_32_zoo_with_fix.py', seed: '3407'}
+          - {id: '32_5678',  script: 'probe_32_zoo_with_fix.py', seed: '5678'}
+          - {id: '32_9012',  script: 'probe_32_zoo_with_fix.py', seed: '9012'}
+          - {id: '32_12345', script: 'probe_32_zoo_with_fix.py', seed: '12345'}
+          - {id: '32_22222', script: 'probe_32_zoo_with_fix.py', seed: '22222'}
+          - {id: '32_31415', script: 'probe_32_zoo_with_fix.py', seed: '31415'}
+          - {id: '32_65535', script: 'probe_32_zoo_with_fix.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
@@ -238,9 +244,9 @@ jobs:
             'sentencepiece==0.2.1' \
             'huggingface-hub==0.36.2' \
             'trl==0.27.0'
-          # Round AW: pin to PR-663 head so all cells run against the
-          # same zoo state we measured in Round AV.
-          ZOO_SPEC='unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@aed74d9'
+          # Round BH: pin to the finetune_last_n_layers fix branch
+          # (b137b40) so probe 32 sees the new parameter.
+          ZOO_SPEC='unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@b137b4058eabf20a3122b67a2c9f04b63fb59568'
           for attempt in 1 2 3; do
             if pip install "$ZOO_SPEC"; then break; fi
             if [ "$attempt" -eq 3 ]; then exit 1; fi
