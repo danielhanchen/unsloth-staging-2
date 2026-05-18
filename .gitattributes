@@ -1,2 +1,6 @@
 # Normalize Python files to LF line endings
 *.py text eol=lf
+
+# Preserve staging-only files during upstream merges
+.gemini/**  merge=ours
+.gitattributes  merge=ours
