@@ -177,53 +177,34 @@ jobs:
           #   29 = probe 26 but call train() directly (uses train()'s actual setup)
           # If any hits 67%, that isolation IS the cause.
 
-          - {id: '27_1',     script: 'probe_27_subprocess_wrap.py', seed: '1'}
-          - {id: '27_7',     script: 'probe_27_subprocess_wrap.py', seed: '7'}
-          - {id: '27_42',    script: 'probe_27_subprocess_wrap.py', seed: '42'}
-          - {id: '27_123',   script: 'probe_27_subprocess_wrap.py', seed: '123'}
-          - {id: '27_456',   script: 'probe_27_subprocess_wrap.py', seed: '456'}
-          - {id: '27_789',   script: 'probe_27_subprocess_wrap.py', seed: '789'}
-          - {id: '27_999',   script: 'probe_27_subprocess_wrap.py', seed: '999'}
-          - {id: '27_1234',  script: 'probe_27_subprocess_wrap.py', seed: '1234'}
-          - {id: '27_3407',  script: 'probe_27_subprocess_wrap.py', seed: '3407'}
-          - {id: '27_5678',  script: 'probe_27_subprocess_wrap.py', seed: '5678'}
-          - {id: '27_9012',  script: 'probe_27_subprocess_wrap.py', seed: '9012'}
-          - {id: '27_12345', script: 'probe_27_subprocess_wrap.py', seed: '12345'}
-          - {id: '27_22222', script: 'probe_27_subprocess_wrap.py', seed: '22222'}
-          - {id: '27_31415', script: 'probe_27_subprocess_wrap.py', seed: '31415'}
-          - {id: '27_65535', script: 'probe_27_subprocess_wrap.py', seed: '65535'}
+          # ---- Round BG: THE FIX — num_layers=16 (mlx-lm CLI default) ----
+          # CRITICAL DISCOVERY: gemma-3-270m-it has 18 hidden layers.
+          # mlx-lm CLI's CONFIG_DEFAULTS['num_layers']=16 -> probe 20
+          # trains LoRA on the LAST 16 layers only. My inline probes
+          # 22-26+30 used len(model.layers)=18, training all 18 layers.
+          # The extra 2 layers x 7 modules = 14 extra LoRA modules
+          # consume mx.random state during init AND add trainable
+          # parameters that differ from mlx-lm CLI's behavior.
+          # Probe 31 = probe 30 + num_layers=16. If 67%, this IS the
+          # fix. The unsloth-zoo fix is to default num_layers to 16
+          # (or expose it as an arg with sensible default) in
+          # get_peft_model / linear_to_lora_layers calls.
 
-          - {id: '28_1',     script: 'probe_28_set_wired_limit.py', seed: '1'}
-          - {id: '28_7',     script: 'probe_28_set_wired_limit.py', seed: '7'}
-          - {id: '28_42',    script: 'probe_28_set_wired_limit.py', seed: '42'}
-          - {id: '28_123',   script: 'probe_28_set_wired_limit.py', seed: '123'}
-          - {id: '28_456',   script: 'probe_28_set_wired_limit.py', seed: '456'}
-          - {id: '28_789',   script: 'probe_28_set_wired_limit.py', seed: '789'}
-          - {id: '28_999',   script: 'probe_28_set_wired_limit.py', seed: '999'}
-          - {id: '28_1234',  script: 'probe_28_set_wired_limit.py', seed: '1234'}
-          - {id: '28_3407',  script: 'probe_28_set_wired_limit.py', seed: '3407'}
-          - {id: '28_5678',  script: 'probe_28_set_wired_limit.py', seed: '5678'}
-          - {id: '28_9012',  script: 'probe_28_set_wired_limit.py', seed: '9012'}
-          - {id: '28_12345', script: 'probe_28_set_wired_limit.py', seed: '12345'}
-          - {id: '28_22222', script: 'probe_28_set_wired_limit.py', seed: '22222'}
-          - {id: '28_31415', script: 'probe_28_set_wired_limit.py', seed: '31415'}
-          - {id: '28_65535', script: 'probe_28_set_wired_limit.py', seed: '65535'}
-
-          - {id: '29_1',     script: 'probe_29_call_train_fn.py', seed: '1'}
-          - {id: '29_7',     script: 'probe_29_call_train_fn.py', seed: '7'}
-          - {id: '29_42',    script: 'probe_29_call_train_fn.py', seed: '42'}
-          - {id: '29_123',   script: 'probe_29_call_train_fn.py', seed: '123'}
-          - {id: '29_456',   script: 'probe_29_call_train_fn.py', seed: '456'}
-          - {id: '29_789',   script: 'probe_29_call_train_fn.py', seed: '789'}
-          - {id: '29_999',   script: 'probe_29_call_train_fn.py', seed: '999'}
-          - {id: '29_1234',  script: 'probe_29_call_train_fn.py', seed: '1234'}
-          - {id: '29_3407',  script: 'probe_29_call_train_fn.py', seed: '3407'}
-          - {id: '29_5678',  script: 'probe_29_call_train_fn.py', seed: '5678'}
-          - {id: '29_9012',  script: 'probe_29_call_train_fn.py', seed: '9012'}
-          - {id: '29_12345', script: 'probe_29_call_train_fn.py', seed: '12345'}
-          - {id: '29_22222', script: 'probe_29_call_train_fn.py', seed: '22222'}
-          - {id: '29_31415', script: 'probe_29_call_train_fn.py', seed: '31415'}
-          - {id: '29_65535', script: 'probe_29_call_train_fn.py', seed: '65535'}
+          - {id: '31_1',     script: 'probe_31_num_layers_16.py', seed: '1'}
+          - {id: '31_7',     script: 'probe_31_num_layers_16.py', seed: '7'}
+          - {id: '31_42',    script: 'probe_31_num_layers_16.py', seed: '42'}
+          - {id: '31_123',   script: 'probe_31_num_layers_16.py', seed: '123'}
+          - {id: '31_456',   script: 'probe_31_num_layers_16.py', seed: '456'}
+          - {id: '31_789',   script: 'probe_31_num_layers_16.py', seed: '789'}
+          - {id: '31_999',   script: 'probe_31_num_layers_16.py', seed: '999'}
+          - {id: '31_1234',  script: 'probe_31_num_layers_16.py', seed: '1234'}
+          - {id: '31_3407',  script: 'probe_31_num_layers_16.py', seed: '3407'}
+          - {id: '31_5678',  script: 'probe_31_num_layers_16.py', seed: '5678'}
+          - {id: '31_9012',  script: 'probe_31_num_layers_16.py', seed: '9012'}
+          - {id: '31_12345', script: 'probe_31_num_layers_16.py', seed: '12345'}
+          - {id: '31_22222', script: 'probe_31_num_layers_16.py', seed: '22222'}
+          - {id: '31_31415', script: 'probe_31_num_layers_16.py', seed: '31415'}
+          - {id: '31_65535', script: 'probe_31_num_layers_16.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
