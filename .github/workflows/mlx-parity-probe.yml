@@ -159,21 +159,61 @@ jobs:
           # import side effect is the cause. If 47% — subprocess
           # isolation in probe 20 was the actual cause.
 
-          - {id: '26_1',     script: 'probe_26_pure_mlxlm.py', seed: '1'}
-          - {id: '26_7',     script: 'probe_26_pure_mlxlm.py', seed: '7'}
-          - {id: '26_42',    script: 'probe_26_pure_mlxlm.py', seed: '42'}
-          - {id: '26_123',   script: 'probe_26_pure_mlxlm.py', seed: '123'}
-          - {id: '26_456',   script: 'probe_26_pure_mlxlm.py', seed: '456'}
-          - {id: '26_789',   script: 'probe_26_pure_mlxlm.py', seed: '789'}
-          - {id: '26_999',   script: 'probe_26_pure_mlxlm.py', seed: '999'}
-          - {id: '26_1234',  script: 'probe_26_pure_mlxlm.py', seed: '1234'}
-          - {id: '26_3407',  script: 'probe_26_pure_mlxlm.py', seed: '3407'}
-          - {id: '26_5678',  script: 'probe_26_pure_mlxlm.py', seed: '5678'}
-          - {id: '26_9012',  script: 'probe_26_pure_mlxlm.py', seed: '9012'}
-          - {id: '26_12345', script: 'probe_26_pure_mlxlm.py', seed: '12345'}
-          - {id: '26_22222', script: 'probe_26_pure_mlxlm.py', seed: '22222'}
-          - {id: '26_31415', script: 'probe_26_pure_mlxlm.py', seed: '31415'}
-          - {id: '26_65535', script: 'probe_26_pure_mlxlm.py', seed: '65535'}
+          # ---- Round BE: subprocess boundary, set_wired_limit, train() ----
+          # Probe 26 (pure mlx-lm inline) hits 47%. Probe 20 (mlx-lm CLI
+          # via subprocess.run) hits 67%. Three candidate isolations:
+          #   27 = probe 26 + subprocess.run wrap     (subprocess boundary)
+          #   28 = probe 26 + mx.set_wired_limit      (mlx-lm train() side effect)
+          #   29 = probe 26 but call train() directly (uses train()'s actual setup)
+          # If any hits 67%, that isolation IS the cause.
+
+          - {id: '27_1',     script: 'probe_27_subprocess_wrap.py', seed: '1'}
+          - {id: '27_7',     script: 'probe_27_subprocess_wrap.py', seed: '7'}
+          - {id: '27_42',    script: 'probe_27_subprocess_wrap.py', seed: '42'}
+          - {id: '27_123',   script: 'probe_27_subprocess_wrap.py', seed: '123'}
+          - {id: '27_456',   script: 'probe_27_subprocess_wrap.py', seed: '456'}
+          - {id: '27_789',   script: 'probe_27_subprocess_wrap.py', seed: '789'}
+          - {id: '27_999',   script: 'probe_27_subprocess_wrap.py', seed: '999'}
+          - {id: '27_1234',  script: 'probe_27_subprocess_wrap.py', seed: '1234'}
+          - {id: '27_3407',  script: 'probe_27_subprocess_wrap.py', seed: '3407'}
+          - {id: '27_5678',  script: 'probe_27_subprocess_wrap.py', seed: '5678'}
+          - {id: '27_9012',  script: 'probe_27_subprocess_wrap.py', seed: '9012'}
+          - {id: '27_12345', script: 'probe_27_subprocess_wrap.py', seed: '12345'}
+          - {id: '27_22222', script: 'probe_27_subprocess_wrap.py', seed: '22222'}
+          - {id: '27_31415', script: 'probe_27_subprocess_wrap.py', seed: '31415'}
+          - {id: '27_65535', script: 'probe_27_subprocess_wrap.py', seed: '65535'}
+
+          - {id: '28_1',     script: 'probe_28_set_wired_limit.py', seed: '1'}
+          - {id: '28_7',     script: 'probe_28_set_wired_limit.py', seed: '7'}
+          - {id: '28_42',    script: 'probe_28_set_wired_limit.py', seed: '42'}
+          - {id: '28_123',   script: 'probe_28_set_wired_limit.py', seed: '123'}
+          - {id: '28_456',   script: 'probe_28_set_wired_limit.py', seed: '456'}
+          - {id: '28_789',   script: 'probe_28_set_wired_limit.py', seed: '789'}
+          - {id: '28_999',   script: 'probe_28_set_wired_limit.py', seed: '999'}
+          - {id: '28_1234',  script: 'probe_28_set_wired_limit.py', seed: '1234'}
+          - {id: '28_3407',  script: 'probe_28_set_wired_limit.py', seed: '3407'}
+          - {id: '28_5678',  script: 'probe_28_set_wired_limit.py', seed: '5678'}
+          - {id: '28_9012',  script: 'probe_28_set_wired_limit.py', seed: '9012'}
+          - {id: '28_12345', script: 'probe_28_set_wired_limit.py', seed: '12345'}
+          - {id: '28_22222', script: 'probe_28_set_wired_limit.py', seed: '22222'}
+          - {id: '28_31415', script: 'probe_28_set_wired_limit.py', seed: '31415'}
+          - {id: '28_65535', script: 'probe_28_set_wired_limit.py', seed: '65535'}
+
+          - {id: '29_1',     script: 'probe_29_call_train_fn.py', seed: '1'}
+          - {id: '29_7',     script: 'probe_29_call_train_fn.py', seed: '7'}
+          - {id: '29_42',    script: 'probe_29_call_train_fn.py', seed: '42'}
+          - {id: '29_123',   script: 'probe_29_call_train_fn.py', seed: '123'}
+          - {id: '29_456',   script: 'probe_29_call_train_fn.py', seed: '456'}
+          - {id: '29_789',   script: 'probe_29_call_train_fn.py', seed: '789'}
+          - {id: '29_999',   script: 'probe_29_call_train_fn.py', seed: '999'}
+          - {id: '29_1234',  script: 'probe_29_call_train_fn.py', seed: '1234'}
+          - {id: '29_3407',  script: 'probe_29_call_train_fn.py', seed: '3407'}
+          - {id: '29_5678',  script: 'probe_29_call_train_fn.py', seed: '5678'}
+          - {id: '29_9012',  script: 'probe_29_call_train_fn.py', seed: '9012'}
+          - {id: '29_12345', script: 'probe_29_call_train_fn.py', seed: '12345'}
+          - {id: '29_22222', script: 'probe_29_call_train_fn.py', seed: '22222'}
+          - {id: '29_31415', script: 'probe_29_call_train_fn.py', seed: '31415'}
+          - {id: '29_65535', script: 'probe_29_call_train_fn.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
