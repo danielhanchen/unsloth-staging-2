@@ -58,43 +58,41 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round Z: determinism check. Across rounds we've seen the
-          # same (seed, config) tuple produce identical-looking
-          # generations on different commits (e.g. 17am vs 17ck vs
-          # 17de vs 17dj for 3407+30+default all printed "_______
-          # My name is Unsloth!"). Round Z runs the SAME tuple in
-          # parallel matrix entries to verify bit-exact reproducibility
-          # within a single workflow run, then a different seed
-          # twice to triangulate.
-          - id: '17dk'
+          # Round AA: Q3 missing piece -- bc=True at lr=1e-4 + 500
+          # steps across seeds, to compare head-to-head with the
+          # bc=False data from Rounds W/X at the SAME (lr, steps).
+          # Existing: bc=False + lr=1e-4 + 500 across {3407, 42,
+          # 22222, 2024, 12345, 999} = 2/6 contains-Unsloth.
+          # Round AA collects bc=True at the matching seeds:
+          - id: '17dp'
             script: probe_17_curve_param.py
-            steps: '30'
+            steps: '500'
             seed: '3407'
-            bias_correction: ''
-            lr: '1e-3'
+            bias_correction: '1'
+            lr: '1e-4'
             zoo_pin: 'c1821e4'
-          - id: '17dl'
+          - id: '17dq'
             script: probe_17_curve_param.py
-            steps: '30'
-            seed: '3407'
-            bias_correction: ''
-            lr: '1e-3'
-            zoo_pin: 'c1821e4'
-          - id: '17dm'
-            script: probe_17_curve_param.py
-            steps: '30'
+            steps: '500'
             seed: '42'
-            bias_correction: ''
-            lr: '1e-3'
+            bias_correction: '1'
+            lr: '1e-4'
             zoo_pin: 'c1821e4'
-          - id: '17dn'
+          - id: '17dr'
             script: probe_17_curve_param.py
-            steps: '30'
-            seed: '42'
-            bias_correction: ''
-            lr: '1e-3'
+            steps: '500'
+            seed: '999'
+            bias_correction: '1'
+            lr: '1e-4'
             zoo_pin: 'c1821e4'
-          - id: '17do'
+          - id: '17ds'
+            script: probe_17_curve_param.py
+            steps: '500'
+            seed: '12345'
+            bias_correction: '1'
+            lr: '1e-4'
+            zoo_pin: 'c1821e4'
+          - id: '17dt'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
