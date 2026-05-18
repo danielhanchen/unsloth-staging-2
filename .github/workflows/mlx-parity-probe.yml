@@ -58,45 +58,41 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round R: extend the safe-envelope claims from Round Q so
-          # the trainer.py docstring is empirically defensible:
-          #   17bw : bc=0 + 500 steps + lr=1e-4 (extend safe past 200)
-          #   17bx : bc=0 + 1000 steps + lr=1e-4 (does small-LR bc=False
-          #          eventually diverge or stay finite indefinitely?)
-          #   17by : default + 30 steps + lr=5e-3 (does 5e-3 bc=True
-          #          break even at smoke horizon?)
-          #   17bz : bc=0 + 100 steps + lr=5e-4 (mid-LR bc=False:
-          #          is 5e-4 the crossover safe/unsafe LR?)
-          #   17ca : default + 30 + lr=1e-3 (control, pin SHA c1821e4)
-          - id: '17bw'
-            script: probe_17_curve_param.py
-            steps: '500'
-            seed: '3407'
-            bias_correction: '0'
-            lr: '1e-4'
-            zoo_pin: 'c1821e4'
-          - id: '17bx'
-            script: probe_17_curve_param.py
-            steps: '1000'
-            seed: '3407'
-            bias_correction: '0'
-            lr: '1e-4'
-            zoo_pin: 'c1821e4'
-          - id: '17by'
+          # Round S: fresh-seed pass-rate sampling for the recommended
+          # config (30 steps, lr=1e-3, default bc=True, PR-663 head
+          # SHA c1821e4). Earlier rounds saw basin shifts for seeds
+          # 42, 999, 7777 between HEAD and PR-663 head. Quantify how
+          # many of N random seeds produce "Unsloth" in greedy decode
+          # on PR-663 head:
+          - id: '17cb'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '3407'
+            seed: '42'
             bias_correction: ''
-            lr: '5e-3'
+            lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17bz'
+          - id: '17cc'
             script: probe_17_curve_param.py
-            steps: '100'
-            seed: '3407'
-            bias_correction: '0'
-            lr: '5e-4'
+            steps: '30'
+            seed: '11111'
+            bias_correction: ''
+            lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17ca'
+          - id: '17cd'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '22222'
+            bias_correction: ''
+            lr: '1e-3'
+            zoo_pin: 'c1821e4'
+          - id: '17ce'
+            script: probe_17_curve_param.py
+            steps: '30'
+            seed: '2024'
+            bias_correction: ''
+            lr: '1e-3'
+            zoo_pin: 'c1821e4'
+          - id: '17cf'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
