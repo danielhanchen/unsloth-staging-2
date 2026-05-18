@@ -106,9 +106,16 @@ def main() -> int:
             return "default"
     grad_norm_override = _env_grad("MLX_MAX_GRAD_NORM")
     grad_value_override = _env_grad("MLX_MAX_GRAD_VALUE")
+    # Round AW: bisect mlx-lm-vs-unsloth-zoo 80%-vs-60% gap. The two
+    # axes still live (CCE off + GC off in this probe already eliminate
+    # those candidates): grad-accum mechanic (B = bs2*accum3 with token-
+    # weighted mean; A = native bs6 unweighted) + elementwise clip.
+    bs = _env_int("MLX_BS", 2)
+    accum = _env_int("MLX_ACCUM", 3)
 
     banner(f"Probe 17: steps={steps} seed={seed} dtype={dtype} bc={bc!r} lr={lr} "
-           f"max_grad_norm={grad_norm_override!r} max_grad_value={grad_value_override!r}")
+           f"max_grad_norm={grad_norm_override!r} max_grad_value={grad_value_override!r} "
+           f"bs={bs} accum={accum}")
 
     import random
     random.seed(seed)
@@ -151,8 +158,8 @@ def main() -> int:
     cfg_grad_norm = 1.0 if grad_norm_override == "default" else (grad_norm_override or 0.0)
 
     config = MLXTrainingConfig(
-        per_device_train_batch_size=2,
-        gradient_accumulation_steps=3,
+        per_device_train_batch_size=bs,
+        gradient_accumulation_steps=accum,
         max_steps=steps,
         learning_rate=lr,
         warmup_steps=0,
@@ -235,6 +242,11 @@ def main() -> int:
             "adam_bias_correction": bc,
             "effective_adam_bias_correction": effective_bc,
             "learning_rate": lr,
+            "per_device_train_batch_size": bs,
+            "gradient_accumulation_steps": accum,
+            "effective_batch_size": bs * accum,
+            "max_grad_value": grad_value_override,
+            "max_grad_norm_setting": cfg_grad_norm,
             "adam_bc_field_supported": "adam_bias_correction" in fields_supported,
         },
         "rows": rows,
@@ -245,7 +257,14 @@ def main() -> int:
     }
     lr_tag = f"{lr:.0e}".replace("-0", "-").replace("+0", "")
     bc_tag = "d" if bc is None else int(bc)
-    fname = f"probe_17__s{steps}_d{seed}_bc{bc_tag}_lr{lr_tag}.json"
+    if grad_value_override == "default":
+        gv_tag = "def"
+    elif grad_value_override is None:
+        gv_tag = "off"
+    else:
+        gv_tag = f"{grad_value_override:g}"
+    fname = (f"probe_17__s{steps}_d{seed}_bc{bc_tag}_lr{lr_tag}"
+             f"_bs{bs}_ac{accum}_gv{gv_tag}.json")
     (OUT_DIR / fname).write_text(json.dumps(out, indent=2))
     section("summary")
     if rows:
