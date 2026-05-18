@@ -30,7 +30,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 60
     env:
-      UNSLOTH_STUDIO_HOME: ${{ runner.temp }}/studio_home
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/.studio_home
       UPDATE_FROM_SHA: ${{ inputs.from_sha || '5c473fab' }}
       UPDATE_TO_SHA: ${{ inputs.to_sha || '07e2fccf' }}
     steps:
