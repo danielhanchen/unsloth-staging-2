@@ -58,40 +58,43 @@ jobs:
           # (steps, seed) combination so we can rule in/out a
           # convergence-horizon effect.
 
-          # Round Y: expand seed cube at the smoke config to tighten
-          # the pass-rate statistic. Round S got 3/9 random seeds
-          # producing "Unsloth" at (30, lr=1e-3, default bc=True).
-          # Round Y adds 3 more fresh seeds + replays the two known
-          # outcomes for sanity.
-          - id: '17df'
+          # Round Z: determinism check. Across rounds we've seen the
+          # same (seed, config) tuple produce identical-looking
+          # generations on different commits (e.g. 17am vs 17ck vs
+          # 17de vs 17dj for 3407+30+default all printed "_______
+          # My name is Unsloth!"). Round Z runs the SAME tuple in
+          # parallel matrix entries to verify bit-exact reproducibility
+          # within a single workflow run, then a different seed
+          # twice to triangulate.
+          - id: '17dk'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '5555'
+            seed: '3407'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17dg'
+          - id: '17dl'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '8888'
+            seed: '3407'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17dh'
+          - id: '17dm'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '33333'
+            seed: '42'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17di'
+          - id: '17dn'
             script: probe_17_curve_param.py
             steps: '30'
-            seed: '0'
+            seed: '42'
             bias_correction: ''
             lr: '1e-3'
             zoo_pin: 'c1821e4'
-          - id: '17dj'
+          - id: '17do'
             script: probe_17_curve_param.py
             steps: '30'
             seed: '3407'
