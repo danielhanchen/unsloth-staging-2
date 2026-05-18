@@ -111,21 +111,31 @@ jobs:
           # Same 15 seeds as AX/AY.
 
           # -- probe 22: hybrid + np.seed reset just before train() --
-          - {id: '22_1',     script: 'probe_22_hybrid_reseed.py', seed: '1'}
-          - {id: '22_7',     script: 'probe_22_hybrid_reseed.py', seed: '7'}
-          - {id: '22_42',    script: 'probe_22_hybrid_reseed.py', seed: '42'}
-          - {id: '22_123',   script: 'probe_22_hybrid_reseed.py', seed: '123'}
-          - {id: '22_456',   script: 'probe_22_hybrid_reseed.py', seed: '456'}
-          - {id: '22_789',   script: 'probe_22_hybrid_reseed.py', seed: '789'}
-          - {id: '22_999',   script: 'probe_22_hybrid_reseed.py', seed: '999'}
-          - {id: '22_1234',  script: 'probe_22_hybrid_reseed.py', seed: '1234'}
-          - {id: '22_3407',  script: 'probe_22_hybrid_reseed.py', seed: '3407'}
-          - {id: '22_5678',  script: 'probe_22_hybrid_reseed.py', seed: '5678'}
-          - {id: '22_9012',  script: 'probe_22_hybrid_reseed.py', seed: '9012'}
-          - {id: '22_12345', script: 'probe_22_hybrid_reseed.py', seed: '12345'}
-          - {id: '22_22222', script: 'probe_22_hybrid_reseed.py', seed: '22222'}
-          - {id: '22_31415', script: 'probe_22_hybrid_reseed.py', seed: '31415'}
-          - {id: '22_65535', script: 'probe_22_hybrid_reseed.py', seed: '65535'}
+          # ---- Round BF: THE FIX — seed mx.random AFTER model load ----
+          # CRITICAL DISCOVERY: nn.Linear.__init__ (mlx-src/python/mlx/nn/
+          # layers/linear.py:51) calls mx.random.uniform. So every Linear
+          # module constructed during model load consumes mx.random state.
+          # mlx-lm CLI seeds AFTER load (lora.py:223); my inline probes
+          # seeded BEFORE load. Result: lora_a init from different RNG
+          # positions, leading to different basins.
+          # Probe 30 reseeds AFTER load + adds set_wired_limit. If 67%,
+          # the seed-order is the bug; the FIX is to seed AFTER load.
+
+          - {id: '30_1',     script: 'probe_30_seed_after_load.py', seed: '1'}
+          - {id: '30_7',     script: 'probe_30_seed_after_load.py', seed: '7'}
+          - {id: '30_42',    script: 'probe_30_seed_after_load.py', seed: '42'}
+          - {id: '30_123',   script: 'probe_30_seed_after_load.py', seed: '123'}
+          - {id: '30_456',   script: 'probe_30_seed_after_load.py', seed: '456'}
+          - {id: '30_789',   script: 'probe_30_seed_after_load.py', seed: '789'}
+          - {id: '30_999',   script: 'probe_30_seed_after_load.py', seed: '999'}
+          - {id: '30_1234',  script: 'probe_30_seed_after_load.py', seed: '1234'}
+          - {id: '30_3407',  script: 'probe_30_seed_after_load.py', seed: '3407'}
+          - {id: '30_5678',  script: 'probe_30_seed_after_load.py', seed: '5678'}
+          - {id: '30_9012',  script: 'probe_30_seed_after_load.py', seed: '9012'}
+          - {id: '30_12345', script: 'probe_30_seed_after_load.py', seed: '12345'}
+          - {id: '30_22222', script: 'probe_30_seed_after_load.py', seed: '22222'}
+          - {id: '30_31415', script: 'probe_30_seed_after_load.py', seed: '31415'}
+          - {id: '30_65535', script: 'probe_30_seed_after_load.py', seed: '65535'}
 
           # ---- Round BA: compile-mode hypothesis ----
           # Round AZ rejected numpy-RNG (probe 22 = probe 21). The
