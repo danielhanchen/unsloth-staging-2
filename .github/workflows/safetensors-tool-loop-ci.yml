@@ -65,28 +65,21 @@ jobs:
       # results. Install the CPU torch wheel only because Studio's
       # `from utils.hardware import ...` chain imports torch at module
       # scope. Same shape Studio's main backend job uses.
-      - name: Install CPU torch + transformers (Linux / macOS)
-        if: matrix.os != 'windows-latest'
+      #
+      # `shell: bash` everywhere -- windows-latest ships Git Bash, and
+      # using one shell across the matrix keeps the `\` line
+      # continuations valid without forking the script per OS.
+      - name: Install CPU torch + transformers
+        shell: bash
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu \
             'torch>=2.4,<2.11'
           pip install 'transformers>=4.51,<5.5'
 
-      # Windows torch CPU wheels live on the same PyTorch index but the
-      # `--index-url` flag bypasses PyPI, so install transformers in a
-      # second step. The torch CPU wheel on Windows is ~250 MB.
-      - name: Install CPU torch + transformers (Windows)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          python -m pip install --upgrade pip
-          pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.4,<2.11'
-          pip install 'transformers>=4.51,<5.5'
-
       - name: Install Studio backend dependencies (CPU only)
+        shell: bash
         run: |
-          python -m pip install --upgrade pip
           pip install \
             pytest pytest-asyncio httpx \
             fastapi 'pydantic>=2' pyjwt cryptography python-multipart \
@@ -95,14 +88,19 @@ jobs:
             'numpy<3'
 
       - name: Run safetensors tool-loop tests
+        shell: bash
         working-directory: studio/backend
         env:
+          # Windows: GITHUB_WORKSPACE is a Windows path with backslashes
+          # but bash + setup-python resolve mixed separators just fine
+          # for PYTHONPATH purposes.
           PYTHONPATH: ${{ github.workspace }}/studio/backend
           UNSLOTH_COMPILE_DISABLE: '1'
         run: |
           python -m pytest tests/test_safetensors_tool_loop.py -v --tb=short
 
       - name: Run adjacent tool / inference suites (regression guard)
+        shell: bash
         working-directory: studio/backend
         env:
           PYTHONPATH: ${{ github.workspace }}/studio/backend
