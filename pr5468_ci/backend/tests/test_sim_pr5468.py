@@ -169,6 +169,12 @@ class TestSeatbeltProfile:
     """We're on Linux so we can't load the profile, but we can pin its shape
     and verify it doesn't accidentally drop required allows."""
 
+    pytestmark = pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Seatbelt profile interpolates sys.prefix which on Windows "
+        "contains backslashes that _safe_subpath rejects (correctly)",
+    )
+
     def _profile(self, workdir):
         return sb._macos_seatbelt_profile(workdir)
 
@@ -325,6 +331,8 @@ class TestFailOpenOnThisHost:
     def test_probe_fails_on_this_host(self):
         # This is the host configuration: bwrap exists but userns is locked.
         # We pre-seed the bwrap path so we don't depend on it being on PATH.
+        if sys.platform != "linux":
+            pytest.skip("Linux-specific: tests the bwrap probe vs sandbox_available")
         ok = sb._linux_probe()
         # Two valid outcomes: probe succeeds (lucky host) or fails (this host).
         # Either way, we just want to know which branch we're on for the
@@ -370,6 +378,11 @@ class TestPrePostBehavior:
     $HOME. On THIS host the post-PR code falls open, so the behavior is
     identical to pre-PR. We document that explicitly."""
 
+    pytestmark = pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="cmd /c shell on Windows differs; pre-PR leak shape is POSIX-specific",
+    )
+
     def test_bash_leak_pre_pr(self, tmp_path, monkeypatch):
         """Simulate the pre-PR _bash_exec by patching sandbox_available."""
         monkeypatch.setattr(tools, "sandbox_available", lambda: False)
@@ -402,6 +415,10 @@ class TestExecChainSymlinks:
         out = sb._exec_chain_symlinks(str(target))
         assert out == []
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Windows requires Administrator / Developer Mode to create symlinks",
+    )
     def test_simple_chain(self, tmp_path):
         real = tmp_path / "real_bin"
         real.write_text("")
@@ -604,6 +621,10 @@ class TestEndToEndOnThisHost:
 # ---------------------------------------------------------------------------
 
 class TestDeterminism:
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="Seatbelt profile uses sys.prefix which on Windows contains '\\'",
+    )
     def test_seatbelt_profile_idempotent(self, workdir):
         p1 = sb._macos_seatbelt_profile(workdir)
         p2 = sb._macos_seatbelt_profile(workdir)
