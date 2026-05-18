@@ -1146,24 +1146,6 @@ if ($IsPipInstall) {
     }
 
     step "node" "$(node -v) | npm $(npm -v)"
-
-    # ── bun (optional, faster package installs) ──
-    # Installed via npm — Node is already guaranteed above. Works on all platforms.
-    if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
-        substep "installing bun (faster frontend package installs)..."
-        $prevEAP_bun = $ErrorActionPreference
-        $ErrorActionPreference = "Continue"
-        Invoke-SetupCommand { npm install -g bun } | Out-Null
-        $ErrorActionPreference = $prevEAP_bun
-        Refresh-Environment
-        if (Get-Command bun -ErrorAction SilentlyContinue) {
-            substep "bun installed ($(bun --version))"
-        } else {
-            substep "bun install skipped (npm will be used instead)"
-        }
-    } else {
-        substep "bun already installed ($(bun --version))"
-    }
 }
 
 # 1g. Python (>= 3.11 and < 3.14). Prefer py.exe so a 3.14 ahead of 3.13 on PATH does not trip the gate.
@@ -1321,65 +1303,25 @@ if ($NeedFrontendBuild -and -not $IsPipInstall) {
         $WalkDir = Split-Path $WalkDir -Parent
     }
 
-    # Use bun if available (faster install), fall back to npm.
-    # Bun is used only as package manager; Node runs the actual build (Vite 8).
+    # npm ci: install exactly what package-lock.json pins, fail on drift.
+    # There is no committed bun.lock so we don't dispatch to bun; a bun
+    # branch here would always miss and silently regenerate (or fail
+    # under --frozen-lockfile). Keep this single path until/unless a
+    # real bun.lock lands.
     $prevEAP_npm = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     Push-Location $FrontendDir
 
-    $UseBun = $null -ne (Get-Command bun -ErrorAction SilentlyContinue)
-
-    # bun's package cache can become corrupt -- packages get stored with only
-    # metadata but no actual content (bin/, lib/). When this happens bun install
-    # exits 0 but leaves binaries missing. We validate after install and clear
-    # the cache + retry once before falling back to npm.
-    if ($UseBun) {
-        Write-Host "   Using bun for package install (faster)" -ForegroundColor DarkGray
-        $bunExit = Invoke-SetupCommand { bun install }
-        # On Windows, .bin/ entries vary by package manager:
-        #   npm  → tsc, tsc.cmd, tsc.ps1
-        #   bun  → tsc.exe, tsc.bunx
-        $hasTsc = (Test-Path "node_modules\.bin\tsc") -or (Test-Path "node_modules\.bin\tsc.cmd") -or (Test-Path "node_modules\.bin\tsc.exe") -or (Test-Path "node_modules\.bin\tsc.bunx")
-        $hasVite = (Test-Path "node_modules\.bin\vite") -or (Test-Path "node_modules\.bin\vite.cmd") -or (Test-Path "node_modules\.bin\vite.exe") -or (Test-Path "node_modules\.bin\vite.bunx")
-        if ($bunExit -eq 0 -and $hasTsc -and $hasVite) {
-            # bun install succeeded and critical binaries are present
-        } elseif ($bunExit -eq 0) {
-            Write-Host "   bun install exited 0 but critical binaries are missing, clearing cache and retrying..." -ForegroundColor Yellow
-            if (Test-Path "node_modules") {
-                Remove-Item "node_modules" -Recurse -Force -ErrorAction SilentlyContinue
-            }
-            Invoke-SetupCommand { bun pm cache rm } | Out-Null
-            $bunExit = Invoke-SetupCommand { bun install }
-            $hasTsc = (Test-Path "node_modules\.bin\tsc") -or (Test-Path "node_modules\.bin\tsc.cmd") -or (Test-Path "node_modules\.bin\tsc.exe") -or (Test-Path "node_modules\.bin\tsc.bunx")
-            $hasVite = (Test-Path "node_modules\.bin\vite") -or (Test-Path "node_modules\.bin\vite.cmd") -or (Test-Path "node_modules\.bin\vite.exe") -or (Test-Path "node_modules\.bin\vite.bunx")
-            if ($bunExit -ne 0 -or -not $hasTsc -or -not $hasVite) {
-                Write-Host "   bun retry failed, falling back to npm" -ForegroundColor Yellow
-                if (Test-Path "node_modules") {
-                    Remove-Item "node_modules" -Recurse -Force -ErrorAction SilentlyContinue
-                }
-                $UseBun = $false
-            }
-        } else {
-            substep "bun install failed (exit $bunExit), falling back to npm" "Yellow"
-            if (Test-Path "node_modules") {
-                Remove-Item "node_modules" -Recurse -Force -ErrorAction SilentlyContinue
-            }
-            $UseBun = $false
-        }
-    }
-    if (-not $UseBun) {
-        $npmExit = Invoke-SetupCommand { npm install }
-        if ($npmExit -ne 0) {
-            Pop-Location
-            $ErrorActionPreference = $prevEAP_npm
-            foreach ($gi in $HiddenGitignores) { Rename-Item -Path "$gi._twbuild" -NewName (Split-Path $gi -Leaf) -Force -ErrorAction SilentlyContinue }
-            Write-Host "[ERROR] npm install failed (exit code $npmExit)" -ForegroundColor Red
-            Write-Host "   Try running 'npm install' manually in frontend/ to see errors" -ForegroundColor Yellow
-            exit 1
-        }
+    $npmExit = Invoke-SetupCommand { npm ci }
+    if ($npmExit -ne 0) {
+        Pop-Location
+        $ErrorActionPreference = $prevEAP_npm
+        foreach ($gi in $HiddenGitignores) { Rename-Item -Path "$gi._twbuild" -NewName (Split-Path $gi -Leaf) -Force -ErrorAction SilentlyContinue }
+        Write-Host "[ERROR] npm ci failed (exit code $npmExit)" -ForegroundColor Red
+        Write-Host "   Try running 'npm ci' manually in frontend/ to see errors" -ForegroundColor Yellow
+        exit 1
     }
 
-    # Always use npm to run the build (Node runtime — avoids bun Windows runtime issues)
     $buildExit = Invoke-SetupCommand { npm run build }
     if ($buildExit -ne 0) {
         Pop-Location
@@ -1411,11 +1353,12 @@ if (Test-Path $OxcValidatorDir) {
     $prevEAP_oxc = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     Push-Location $OxcValidatorDir
-    $oxcInstallExit = Invoke-SetupCommand { npm install }
+    # npm ci: lockfile-strict (see frontend install above).
+    $oxcInstallExit = Invoke-SetupCommand { npm ci --no-fund --no-audit }
     if ($oxcInstallExit -ne 0) {
         Pop-Location
         $ErrorActionPreference = $prevEAP_oxc
-        Write-Host "[ERROR] OXC validator npm install failed (exit code $oxcInstallExit)" -ForegroundColor Red
+        Write-Host "[ERROR] OXC validator npm ci failed (exit code $oxcInstallExit)" -ForegroundColor Red
         exit 1
     }
     Pop-Location

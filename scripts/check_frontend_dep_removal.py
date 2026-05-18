@@ -49,6 +49,8 @@ EXPECTED_NOISE_FILES = {
     "studio/frontend/package-lock.json",
     "studio/backend/core/data_recipe/oxc-validator/package.json",
     "studio/backend/core/data_recipe/oxc-validator/package-lock.json",
+    "studio/package.json",
+    "studio/package-lock.json",
 }
 
 # Only quoted-string occurrences in these file types can be module specifiers.

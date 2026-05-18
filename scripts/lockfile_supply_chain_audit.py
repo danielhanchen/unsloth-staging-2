@@ -397,6 +397,23 @@ class Finding:
 def audit_npm_lockfile(path: Path) -> list[Finding]:
     findings: list[Finding] = []
     if not path.exists():
+        # A missing lockfile is a configuration error, not a clean bill
+        # of health: a default lockfile that quietly disappears (e.g.
+        # the install path was reverted to `npm install` without
+        # updating DEFAULT_NPM_LOCKFILES) would otherwise let this
+        # audit print `0 findings` while `npm ci` later fails. Fail
+        # loudly so the missing path surfaces as a finding.
+        findings.append(
+            Finding(
+                path = str(path),
+                package = "<root>",
+                kind = "missing-lockfile",
+                detail = (
+                    "expected lockfile not found; refusing to silently "
+                    "report a clean audit for a path that was not scanned"
+                ),
+            )
+        )
         return findings
 
     raw = path.read_text(encoding = "utf-8")
@@ -553,6 +570,19 @@ _PACKAGE_HEADER = re.compile(r"^\[\[package\]\]\s*$")
 def audit_cargo_lockfile(path: Path) -> list[Finding]:
     findings: list[Finding] = []
     if not path.exists():
+        # See audit_npm_lockfile: refuse to silently treat a missing
+        # default lockfile as a clean scan.
+        findings.append(
+            Finding(
+                path = str(path),
+                package = "<root>",
+                kind = "missing-lockfile",
+                detail = (
+                    "expected lockfile not found; refusing to silently "
+                    "report a clean audit for a path that was not scanned"
+                ),
+            )
+        )
         return findings
 
     raw = path.read_text(encoding = "utf-8")
@@ -652,7 +682,11 @@ def audit_cargo_lockfile(path: Path) -> list[Finding]:
 # ─────────────────────────────────────────────────────────────────────
 
 
-DEFAULT_NPM_LOCKFILES = ("studio/frontend/package-lock.json",)
+DEFAULT_NPM_LOCKFILES = (
+    "studio/frontend/package-lock.json",
+    "studio/backend/core/data_recipe/oxc-validator/package-lock.json",
+    "studio/package-lock.json",
+)
 DEFAULT_CARGO_LOCKFILES = ("studio/src-tauri/Cargo.lock",)
 
 
@@ -671,7 +705,9 @@ def main(argv: list[str] | None = None) -> int:
         default = None,
         help = (
             "Path to a package-lock.json (repeatable). "
-            "Default: studio/frontend/package-lock.json."
+            "Default: studio/frontend/package-lock.json, "
+            "studio/backend/core/data_recipe/oxc-validator/package-lock.json, "
+            "and studio/package-lock.json (Tauri CLI for desktop release)."
         ),
     )
     parser.add_argument(
@@ -715,8 +751,18 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
     root = Path(args.root).resolve()
-    npm_paths = [root / p for p in (args.npm_lockfile or DEFAULT_NPM_LOCKFILES)]
-    cargo_paths = [root / p for p in (args.cargo_lockfile or DEFAULT_CARGO_LOCKFILES)]
+    # When the user passes an explicit `--npm-lockfile` or
+    # `--cargo-lockfile` they are scoping the scan to exactly those
+    # paths; do NOT silently graft the other ecosystem's defaults on
+    # top. Falling back to defaults is reserved for the no-args CI
+    # invocation, where every default path must exist.
+    _user_explicit = args.npm_lockfile is not None or args.cargo_lockfile is not None
+    if _user_explicit:
+        npm_paths = [root / p for p in (args.npm_lockfile or ())]
+        cargo_paths = [root / p for p in (args.cargo_lockfile or ())]
+    else:
+        npm_paths = [root / p for p in DEFAULT_NPM_LOCKFILES]
+        cargo_paths = [root / p for p in DEFAULT_CARGO_LOCKFILES]
 
     all_findings: list[Finding] = []
     for p in npm_paths:
