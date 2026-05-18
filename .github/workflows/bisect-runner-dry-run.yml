@@ -1,0 +1,52 @@
+name: bisect-runner-dry-run
+
+on:
+  workflow_dispatch:
+    inputs:
+      good_sha:
+        description: known-good SHA (lower bound)
+        required: false
+        default: 5fa8683b
+      bad_sha:
+        description: known-bad SHA (upper bound)
+        required: false
+        default: 07e2fccf
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dry-run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/.studio_home
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify good/bad SHAs are reachable
+        run: |
+          git fetch --tags --prune
+          git rev-parse "${{ inputs.good_sha }}"
+          git rev-parse "${{ inputs.bad_sha }}"
+
+      - name: Dry-run bisect (no install -- just walk first 3 midpoints)
+        run: |
+          mkdir -p "$UNSLOTH_STUDIO_HOME"
+          git bisect start
+          git bisect bad  "${{ inputs.bad_sha }}"
+          git bisect good "${{ inputs.good_sha }}"
+          # walk a few midpoints, exit-code 0 each so bisect records "good" for the dry run
+          for _ in 1 2 3; do
+            CUR=$(git rev-parse --short HEAD)
+            echo "[dry-run] would test commit $CUR -- treating as good"
+            git bisect good || true
+          done
+          git bisect log
+          git bisect reset || true

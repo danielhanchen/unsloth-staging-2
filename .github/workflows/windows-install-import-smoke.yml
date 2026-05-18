@@ -1,0 +1,54 @@
+name: windows-install-import-smoke
+
+on:
+  push:
+    branches: [studio-regression-ci]
+    paths:
+      - install.ps1
+      - studio/setup.ps1
+      - unsloth_cli/**
+      - tests/_zoo_aggressive_cuda_spoof.py
+      - tests/conftest.py
+      - .github/workflows/windows-install-import-smoke.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Defender exclusions
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE" -ErrorAction SilentlyContinue
+        continue-on-error: true
+
+      - name: Run Windows installer
+        shell: pwsh
+        run: |
+          & .\install.ps1 -Local -SkipFrontend
+
+      - name: Import smoke under CUDA spoof
+        env:
+          PYTHONPATH: tests
+        run: |
+          cat > tests/_apply_spoof.py <<'PY'
+          import sys, pathlib
+          sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+          import _zoo_aggressive_cuda_spoof as _spoof
+          _spoof.apply()
+          PY
+          python -c "import _apply_spoof; import unsloth_zoo; print('import ok')"

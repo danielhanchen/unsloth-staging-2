@@ -1,0 +1,47 @@
+name: version-compat-matrix
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  compat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        include:
+          - transformers: "4.51.3"
+            trl: "0.18.2"
+          - transformers: "5.5.0"
+            trl: "0.24.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install "transformers==${{ matrix.transformers }}" "trl==${{ matrix.trl }}" pytest
+          python -m pip install git+https://github.com/unslothai/unsloth_zoo
+
+      - name: Imports under spoof
+        env:
+          PYTHONPATH: tests
+        run: |
+          cat > tests/_apply_spoof.py <<'PY'
+          import sys, pathlib
+          sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+          import _zoo_aggressive_cuda_spoof as _spoof
+          _spoof.apply()
+          PY
+          python -c "import _apply_spoof; import unsloth_zoo; print('ok')"

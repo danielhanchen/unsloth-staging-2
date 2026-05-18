@@ -1,0 +1,53 @@
+name: macos-update-regression
+
+on:
+  push:
+    branches: [studio-regression-ci]
+    paths:
+      - install.sh
+      - studio/setup.sh
+      - scripts/macos_update_repro.sh
+      - scripts/log_spam_detector.py
+      - unsloth_cli/**
+      - .github/workflows/macos-update-regression.yml
+  workflow_dispatch:
+    inputs:
+      from_sha:
+        description: Older Studio SHA (good baseline)
+        required: false
+        default: 5c473fab
+      to_sha:
+        description: Target Studio SHA (current tip)
+        required: false
+        default: 07e2fccf
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reproduce:
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ runner.temp }}/studio_home
+      UPDATE_FROM_SHA: ${{ inputs.from_sha || '5c473fab' }}
+      UPDATE_TO_SHA: ${{ inputs.to_sha || '07e2fccf' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run macOS update repro
+        run: bash scripts/macos_update_repro.sh
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-update-regression-${{ github.run_id }}
+          path: |
+            ${{ env.UNSLOTH_STUDIO_HOME }}/share/studio.log
+            ${{ env.UNSLOTH_STUDIO_HOME }}/share/studio.conf
+          if-no-files-found: ignore

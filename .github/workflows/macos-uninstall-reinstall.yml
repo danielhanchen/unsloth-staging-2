@@ -1,0 +1,48 @@
+name: macos-uninstall-reinstall
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lifecycle:
+    runs-on: macos-14
+    timeout-minutes: 40
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ runner.temp }}/studio_home
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: |
+          mkdir -p "$UNSLOTH_STUDIO_HOME"
+          bash install.sh --local
+
+      - name: Uninstall
+        run: |
+          if [[ -x uninstall.sh ]]; then
+            bash uninstall.sh --yes || bash uninstall.sh || true
+          fi
+          rm -rf "$UNSLOTH_STUDIO_HOME"
+          rm -rf "$HOME/Applications/Unsloth Studio.app" || true
+
+      - name: Reinstall
+        run: |
+          mkdir -p "$UNSLOTH_STUDIO_HOME"
+          bash install.sh --local
+
+      - name: Health-check
+        run: |
+          "$UNSLOTH_STUDIO_HOME/share/launch-studio.sh" &
+          for i in $(seq 1 90); do
+            [[ -s "$UNSLOTH_STUDIO_HOME/share/studio.port" ]] && break
+            sleep 2
+          done
+          PORT=$(cat "$UNSLOTH_STUDIO_HOME/share/studio.port")
+          curl -fsS "http://127.0.0.1:$PORT/api/health"

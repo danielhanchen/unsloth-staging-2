@@ -1,0 +1,75 @@
+name: macos-fresh-install-probe
+
+on:
+  push:
+    branches: [studio-regression-ci]
+    paths:
+      - install.sh
+      - studio/setup.sh
+      - studio/**
+      - unsloth_cli/**
+      - scripts/studio_lifecycle_probe.sh
+      - scripts/log_spam_detector.py
+      - .github/workflows/macos-fresh-install-probe.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: macos-14
+    timeout-minutes: 40
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/.studio_home
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Studio from this checkout
+        run: |
+          mkdir -p "$UNSLOTH_STUDIO_HOME"
+          bash install.sh --local
+
+      - name: Capture launcher fingerprint (BEFORE)
+        run: |
+          APP="$HOME/Applications/Unsloth Studio.app"
+          if [[ -d "$APP" ]]; then
+            shasum -a 256 "$APP/Contents/MacOS/launch-studio"           > before_launcher.sha
+            shasum -a 256 "$APP/Contents/Info.plist"                    > before_plist.sha
+            shasum -a 256 "$APP/Contents/Resources/AppIcon.icns"        > before_icon.sha
+          else
+            echo "no .app bundle (env-mode install)"
+          fi
+        continue-on-error: true
+
+      - name: Health-check
+        run: |
+          "$UNSLOTH_STUDIO_HOME/share/launch-studio.sh" &
+          for i in $(seq 1 90); do
+            [[ -s "$UNSLOTH_STUDIO_HOME/share/studio.port" ]] && break
+            sleep 2
+          done
+          PORT=$(cat "$UNSLOTH_STUDIO_HOME/share/studio.port")
+          curl -fsS "http://127.0.0.1:$PORT/api/health"
+          curl -fsS "http://127.0.0.1:$PORT/api/auth/status"
+
+      - name: Idle log-spam check
+        run: |
+          sleep 60
+          python scripts/log_spam_detector.py --log "$UNSLOTH_STUDIO_HOME/share/studio.log" --threshold 3
+        if: always()
+
+      - name: Upload studio.log + fingerprints
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: studio-log-macos-${{ github.run_id }}
+          path: |
+            ${{ env.UNSLOTH_STUDIO_HOME }}/share/studio.log
+            before_*.sha
+          if-no-files-found: ignore
