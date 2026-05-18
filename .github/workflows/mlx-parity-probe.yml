@@ -196,21 +196,29 @@ jobs:
           # same per-seed pattern as probe 20 (mlx-lm CLI), the PR
           # works end-to-end through zoo's public API.
 
-          - {id: '32_1',     script: 'probe_32_zoo_with_fix.py', seed: '1'}
-          - {id: '32_7',     script: 'probe_32_zoo_with_fix.py', seed: '7'}
-          - {id: '32_42',    script: 'probe_32_zoo_with_fix.py', seed: '42'}
-          - {id: '32_123',   script: 'probe_32_zoo_with_fix.py', seed: '123'}
-          - {id: '32_456',   script: 'probe_32_zoo_with_fix.py', seed: '456'}
-          - {id: '32_789',   script: 'probe_32_zoo_with_fix.py', seed: '789'}
-          - {id: '32_999',   script: 'probe_32_zoo_with_fix.py', seed: '999'}
-          - {id: '32_1234',  script: 'probe_32_zoo_with_fix.py', seed: '1234'}
-          - {id: '32_3407',  script: 'probe_32_zoo_with_fix.py', seed: '3407'}
-          - {id: '32_5678',  script: 'probe_32_zoo_with_fix.py', seed: '5678'}
-          - {id: '32_9012',  script: 'probe_32_zoo_with_fix.py', seed: '9012'}
-          - {id: '32_12345', script: 'probe_32_zoo_with_fix.py', seed: '12345'}
-          - {id: '32_22222', script: 'probe_32_zoo_with_fix.py', seed: '22222'}
-          - {id: '32_31415', script: 'probe_32_zoo_with_fix.py', seed: '31415'}
-          - {id: '32_65535', script: 'probe_32_zoo_with_fix.py', seed: '65535'}
+          # ---- Round BI: bisect zoo loader vs zoo trainer at num_layers=16 ----
+          # Probe 31 (mlx_lm.load + manual loop + 16): 67%
+          # Probe 32 (FastMLXModel    + MLXTrainer  + 16): 15%
+          # Probe 33 (mlx_lm.load     + MLXTrainer  + 16): ? — bisects.
+          # If 33 = 67%, zoo's LOADER (FastMLXModel.from_pretrained
+          # + get_peft_model) adds the extra basin instability.
+          # If 33 ~= 15%, zoo's TRAINER (MLXTrainer.train) does.
+
+          - {id: '33_1',     script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '1'}
+          - {id: '33_7',     script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '7'}
+          - {id: '33_42',    script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '42'}
+          - {id: '33_123',   script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '123'}
+          - {id: '33_456',   script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '456'}
+          - {id: '33_789',   script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '789'}
+          - {id: '33_999',   script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '999'}
+          - {id: '33_1234',  script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '1234'}
+          - {id: '33_3407',  script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '3407'}
+          - {id: '33_5678',  script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '5678'}
+          - {id: '33_9012',  script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '9012'}
+          - {id: '33_12345', script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '12345'}
+          - {id: '33_22222', script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '22222'}
+          - {id: '33_31415', script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '31415'}
+          - {id: '33_65535', script: 'probe_33_mlxlm_loader_zoo_trainer_nl16.py', seed: '65535'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
