@@ -1,0 +1,75 @@
+name: PR5468 sandbox simulation tests
+
+# Trigger on direct pushes to the staging branch (no PR re-trigger needed)
+# and on PR open / sync. paths: filter so unrelated commits don't re-run.
+on:
+  push:
+    branches:
+      - "pr5468-sim-ci-*"
+    paths:
+      - "pr5468_ci/**"
+      - ".github/workflows/pr5468-tests.yml"
+  pull_request:
+    paths:
+      - "pr5468_ci/**"
+      - ".github/workflows/pr5468-tests.yml"
+  workflow_dispatch:
+
+# Cancel any in-flight run for the same branch when a new commit lands.
+concurrency:
+  group: pr5468-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / py${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pytest
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest
+
+      - name: Install bubblewrap (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+
+      - name: Sanity probe — sandbox_available()
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/pr5468_ci/backend
+        run: |
+          python -c "
+          import sys
+          sys.path.insert(0, 'pr5468_ci/backend')
+          from core.inference import sandbox as sb
+          print('platform:', sys.platform)
+          print('sandbox_available():', sb.sandbox_available())
+          print('bwrap path:', getattr(sb, '_linux_bwrap_path', None))
+          "
+
+      - name: Run pytest
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/pr5468_ci/backend
+        run: |
+          python -m pytest -v --tb=short -rs pr5468_ci/backend/tests/
