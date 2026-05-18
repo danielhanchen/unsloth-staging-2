@@ -1,0 +1,55 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Cross-OS validation for the mid-plan EOS regex constants used by the
+# llama.cpp auto-continue path. The test extracts the patterns from
+# studio/backend/core/inference/llama_cpp.py with ast and recompiles
+# them in-place, so the matrix only needs Python + pytest (no torch,
+# no transformers, no native deps).
+
+name: Cross-OS llama regex
+
+on:
+  push:
+    branches: [studio/cross-os-validation]
+    paths:
+      - 'studio/backend/core/inference/llama_cpp.py'
+      - 'tests/cross_os/test_llama_cpp_trailing_plan.py'
+      - '.github/workflows/cross-os-llama-regex.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/core/inference/llama_cpp.py'
+      - 'tests/cross_os/test_llama_cpp_trailing_plan.py'
+      - '.github/workflows/cross-os-llama-regex.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  regex:
+    name: regex (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install pytest only
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run regex unit tests
+        run: python -m pytest tests/cross_os/test_llama_cpp_trailing_plan.py -v

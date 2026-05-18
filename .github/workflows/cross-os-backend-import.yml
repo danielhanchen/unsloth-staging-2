@@ -1,0 +1,78 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Cross-OS validation that the Studio backend import chain survives on
+# Ubuntu, macOS and Windows with no GPU. Uses tests/conftest.py's
+# preload harness (and tests/_zoo_aggressive_cuda_spoof.py when needed)
+# to satisfy the unsloth_zoo.device_type @cache, then imports the key
+# Studio modules and asserts the regex constants and helper functions
+# I rely on are present.
+
+name: Cross-OS backend import
+
+on:
+  push:
+    branches: [studio/cross-os-validation]
+    paths:
+      - 'studio/backend/**'
+      - 'tests/conftest.py'
+      - 'tests/_zoo_aggressive_cuda_spoof.py'
+      - 'tests/cross_os/test_studio_backend_import_smoke.py'
+      - '.github/workflows/cross-os-backend-import.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/**'
+      - 'tests/conftest.py'
+      - 'tests/_zoo_aggressive_cuda_spoof.py'
+      - 'tests/cross_os/test_studio_backend_import_smoke.py'
+      - '.github/workflows/cross-os-backend-import.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  import:
+    name: import (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Studio backend deps (CPU only)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth unpdf requests typer \
+            'numpy<3' pytest pytest-asyncio httpx structlog
+          # Torch CPU wheel. The pytorch index requires CPU-tagged wheels
+          # for all three OSes; bound the major to keep the install small.
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch>=2.4,<2.11' 'torchvision<0.26'
+          pip install 'transformers>=4.51,<5.5'
+          # unsloth_zoo provides the real device_type module the conftest
+          # tries to preload first; without it the stub kicks in.
+          pip install 'unsloth_zoo>=2026.5.1'
+
+      - name: Backend import smoke
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio/backend
+        run: python -m pytest tests/cross_os/test_studio_backend_import_smoke.py -v
