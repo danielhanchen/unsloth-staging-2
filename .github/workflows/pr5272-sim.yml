@@ -2,7 +2,7 @@ name: PR5272 Backend Sim
 
 on:
   push:
-    branches: [pr5272-validate]
+    branches: [pr5272-validate, pr5272-fixed-a]
     paths:
       - "studio/backend/storage/studio_db.py"
       - "studio/backend/routes/chat_history.py"
