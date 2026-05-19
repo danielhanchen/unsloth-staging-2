@@ -65,7 +65,7 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: |
           cd studio/backend/tests/pr5272_sim
-          python -m pytest -v --tb=short test_pr5272.py test_pr5272_more.py
+          python -m pytest -v --tb=short test_pr5272.py test_pr5272_more.py test_pr5272_pr_b_c.py
 
       - name: Run the PR's own backend test file
         shell: bash
