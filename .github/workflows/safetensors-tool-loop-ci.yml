@@ -365,6 +365,10 @@ jobs:
               "<|python_tag|>",
               "[TOOL_CALLS]",
               "<|tool_call>",
+              "<｜tool▁calls▁begin｜>",
+              "<｜tool▁call▁begin｜>",
+              "<|tool_calls_section_begin|>",
+              "<|tool_call_begin|>",
           ):
               assert marker in TOOL_XML_SIGNALS, marker
 
@@ -399,6 +403,42 @@ jobs:
                'location:<|"|>Tokyo<|"|>,units:<|"|>celsius<|"|>'
                '}<tool_call|>',
                "get_weather", {"location": "Tokyo", "units": "celsius"}),
+              # DeepSeek R1 (code-fenced).
+              ("DeepSeek R1 fence",
+               "<｜tool▁calls▁begin｜>"
+               "<｜tool▁call▁begin｜>function"
+               "<｜tool▁sep｜>special_function\n"
+               "```json\n"
+               '{"arg1": 1}\n'
+               "```"
+               "<｜tool▁call▁end｜>"
+               "<｜tool▁calls▁end｜>",
+               "special_function", {"arg1": 1}),
+              # DeepSeek V3.1 (bare JSON).
+              ("DeepSeek V3.1 bare",
+               "<｜tool▁calls▁begin｜>"
+               "<｜tool▁call▁begin｜>get_time"
+               "<｜tool▁sep｜>"
+               '{"city": "Tokyo"}'
+               "<｜tool▁call▁end｜>"
+               "<｜tool▁calls▁end｜>",
+               "get_time", {"city": "Tokyo"}),
+              # GLM 4.x.
+              ("GLM 4.x <tool_call>+<arg_key>",
+               "<tool_call>web_search\n"
+               "<arg_key>query</arg_key>\n"
+               "<arg_value>weather Tokyo</arg_value>\n"
+               "</tool_call>",
+               "web_search", {"query": "weather Tokyo"}),
+              # Kimi K2.
+              ("Kimi K2 section",
+               "<|tool_calls_section_begin|>"
+               "<|tool_call_begin|>functions.special_function:0"
+               "<|tool_call_argument_begin|>"
+               '{"arg1": 1}'
+               "<|tool_call_end|>"
+               "<|tool_calls_section_end|>",
+               "special_function", {"arg1": 1}),
           ]
 
           for label, text, expected_name, expected_args in fixtures:
@@ -427,6 +467,8 @@ jobs:
                   assert "<tool_call" not in stripped
                   assert "<function=" not in stripped
                   assert "<|python_tag|>" not in stripped
+                  assert "<｜tool▁calls" not in stripped
+                  assert "<|tool_calls_section" not in stripped
                   assert "[TOOL_CALLS]" not in stripped
                   assert "<|tool_call>" not in stripped
               print(f"  OK  {label:28s} -> {expected_name}({expected_args})")
