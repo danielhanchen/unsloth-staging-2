@@ -321,12 +321,22 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      # No heavy deps -- the parser is pure Python.
-      - name: Install minimal deps
+      # The parser itself is pure Python, but importing
+      # ``core.inference.tool_call_parser`` triggers the package
+      # __init__ which loads ``orchestrator.py`` and pulls in
+      # structlog / fastapi / pydantic. Install the same minimal
+      # backend deps the other jobs use; still no torch / mlx since
+      # the parser does not need them.
+      - name: Install backend deps (CPU only, no torch / mlx)
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          pip install pytest
+          pip install \
+            pytest pytest-asyncio httpx \
+            fastapi 'pydantic>=2' pyjwt cryptography python-multipart \
+            structlog pyyaml jinja2 mammoth unpdf requests typer \
+            aiofiles sqlalchemy huggingface_hub matplotlib datasets \
+            'numpy<3'
 
       - name: Probe all five emission formats end-to-end
         shell: bash
