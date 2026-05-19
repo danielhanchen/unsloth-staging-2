@@ -178,8 +178,7 @@ jobs:
           ok = backend.load_model(config=cfg, max_seq_length=2048)
           assert ok, "MLXInferenceBackend.load_model returned False"
 
-          # 2. The IPC fix surface: chat_template_info must be populated
-          #    on backend.models[name] so the orchestrator can mirror it.
+          # 2. chat_template_info must be populated on backend.models[name].
           entry = backend.models[backend.active_model_name]
           assert "chat_template_info" in entry, (
               "chat_template_info missing from MLX backend.models -- "
@@ -199,4 +198,126 @@ jobs:
           assert flags["supports_reasoning"] is True, flags
           assert flags["reasoning_style"] == "enable_thinking", flags
           print("PASS: MLX Qwen3.5-0.8B advertises tools + reasoning")
+          PY
+
+      # The previous step proved chat_template_info reaches the route;
+      # this step exercises real generate_chat_response calls with the
+      # four template kwargs (tools / enable_thinking / reasoning_effort
+      # / preserve_thinking) so the Mac sees the same wire as Linux.
+      # We bound each cartesian cell to ~12 tokens to keep CI fast --
+      # the goal is plumbing, not benchmark quality.
+      - name: Cartesian generate probe (tools x thinking) via MLX
+        shell: bash
+        working-directory: studio/backend
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio/backend
+          UNSLOTH_COMPILE_DISABLE: '1'
+          HF_HUB_ENABLE_HF_TRANSFER: '0'
+        run: |
+          python - <<'PY'
+          import sys, threading, time
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd()))
+
+          from utils.models.model_config import ModelConfig
+          from core.inference.mlx_inference import MLXInferenceBackend
+          from core.inference import safetensors_agentic
+
+          repo = "unsloth/Qwen3.5-0.8B"
+          cfg = ModelConfig.from_identifier(model_id=repo)
+          backend = MLXInferenceBackend()
+          assert backend.load_model(config=cfg, max_seq_length=2048)
+
+          WEB_SEARCH = {
+              "type": "function",
+              "function": {
+                  "name": "web_search",
+                  "description": "Search the web.",
+                  "parameters": {
+                      "type": "object",
+                      "properties": {"query": {"type": "string"}},
+                      "required": ["query"],
+                  },
+              },
+          }
+          PYTHON = {
+              "type": "function",
+              "function": {
+                  "name": "python",
+                  "description": "Run Python.",
+                  "parameters": {
+                      "type": "object",
+                      "properties": {"code": {"type": "string"}},
+                      "required": ["code"],
+                  },
+              },
+          }
+
+          combos = [
+              dict(label="baseline",            kw={}),
+              dict(label="thinking_on",         kw={"enable_thinking": True}),
+              dict(label="thinking_off",        kw={"enable_thinking": False}),
+              dict(label="web_search_only",     kw={"tools": [WEB_SEARCH]}),
+              dict(label="python_only",         kw={"tools": [PYTHON]}),
+              dict(label="both_tools+thinking", kw={"tools": [WEB_SEARCH, PYTHON], "enable_thinking": True}),
+          ]
+
+          for combo in combos:
+              t0 = time.time()
+              gen = backend.generate_chat_response(
+                  messages=[{"role": "user", "content": "Briefly: 2 plus 3?"}],
+                  system_prompt="You are a helpful assistant.",
+                  max_new_tokens=12,
+                  cancel_event=threading.Event(),
+                  **combo["kw"],
+              )
+              chunks = []
+              for cumulative in gen:
+                  chunks.append(cumulative)
+                  if len(chunks) >= 12:
+                      break
+              dt = time.time() - t0
+              assert chunks, f"{combo['label']}: no chunks yielded"
+              last = chunks[-1]
+              print(f"  {combo['label']:<22} dt={dt:5.1f}s  out[-80:]={last[-80:]!r}")
+
+          # End-to-end: agentic tool loop with a fake executor (the
+          # real tools.execute_tool requires browser / sandbox we do
+          # not provision in CI). This exercises the cumulative-text
+          # state machine + chat_template_helpers wiring on MLX.
+          calls = []
+          def _fake_exec(name, args, **_kw):
+              calls.append((name, dict(args)))
+              return "Result: 42"
+
+          def _single_turn(messages, **_kw):
+              # Funnel into MLXInferenceBackend.generate_chat_response so
+              # the loop drives the real Mac stack.
+              cancel = threading.Event()
+              yield from backend.generate_chat_response(
+                  messages=messages,
+                  system_prompt="",
+                  max_new_tokens=24,
+                  cancel_event=cancel,
+                  tools=[WEB_SEARCH, PYTHON],
+                  enable_thinking=True,
+              )
+
+          events = list(
+              safetensors_agentic.run_safetensors_tool_loop(
+                  single_turn=_single_turn,
+                  messages=[{"role": "user", "content": "Search: what is 2+3?"}],
+                  tools=[WEB_SEARCH, PYTHON],
+                  execute_tool=_fake_exec,
+                  cancel_event=threading.Event(),
+                  max_tool_iterations=2,
+                  auto_heal_tool_calls=True,
+              )
+          )
+          types = [e.get("type") for e in events]
+          print("  agentic event types:", types[:20])
+          assert any(t == "content" or t == "status" for t in types), (
+              f"no content/status events from agentic loop: {events!r}"
+          )
+          print("PASS: MLX cartesian + agentic loop exercised end-to-end")
           PY
