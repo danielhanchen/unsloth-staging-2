@@ -195,36 +195,39 @@ def test_count_threads_accuracy(http_env):
 # ==========================================================================
 
 
+SUB = "test-subject"
+
+
 def test_concurrent_thread_upserts_dont_throw(env):
     _, db, _ = env
 
     def w(i):
         for _ in range(50):
-            db.upsert_chat_thread(_thread(f"t{i}", title=f"v{_}"))
+            db.upsert_chat_thread(_thread(f"t{i}", title=f"v{_}"), subject=SUB)
 
     threads = [threading.Thread(target=w, args=(i,)) for i in range(8)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    assert db.count_chat_threads() == 8
+    assert db.count_chat_threads(subject=SUB) == 8
 
 
 def test_concurrent_message_upserts_no_duplicate_rows(env):
     """Same id from many writers: should produce exactly one row each."""
     _, db, _ = env
-    db.upsert_chat_thread(_thread("t1"))
+    db.upsert_chat_thread(_thread("t1"), subject=SUB)
 
     def w(i):
         for _ in range(50):
-            db.upsert_chat_message(_msg(f"m{i}", thread_id="t1", content=f"r{_}"))
+            db.upsert_chat_message(_msg(f"m{i}", thread_id="t1", content=f"r{_}"), subject=SUB)
 
     threads = [threading.Thread(target=w, args=(i,)) for i in range(8)]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
-    assert len(db.list_chat_messages("t1")) == 8
+    assert len(db.list_chat_messages("t1", subject=SUB)) == 8
 
 
 # ==========================================================================
@@ -234,17 +237,17 @@ def test_concurrent_message_upserts_no_duplicate_rows(env):
 
 def test_sync_empty_with_prune_wipes_thread(env):
     _, db, _ = env
-    db.upsert_chat_thread(_thread("t1"))
-    db.sync_chat_messages("t1", [_msg("a"), _msg("b")], prune_missing=True)
-    out = db.sync_chat_messages("t1", [], prune_missing=True)
+    db.upsert_chat_thread(_thread("t1"), subject=SUB)
+    db.sync_chat_messages("t1", [_msg("a"), _msg("b")], subject=SUB, prune_missing=True)
+    out = db.sync_chat_messages("t1", [], subject=SUB, prune_missing=True)
     assert out == []
 
 
 def test_sync_empty_no_prune_no_op(env):
     _, db, _ = env
-    db.upsert_chat_thread(_thread("t1"))
-    db.sync_chat_messages("t1", [_msg("a"), _msg("b")], prune_missing=True)
-    out = db.sync_chat_messages("t1", [])
+    db.upsert_chat_thread(_thread("t1"), subject=SUB)
+    db.sync_chat_messages("t1", [_msg("a"), _msg("b")], subject=SUB, prune_missing=True)
+    out = db.sync_chat_messages("t1", [], subject=SUB)
     assert {m["id"] for m in out} == {"a", "b"}
 
 
@@ -276,7 +279,7 @@ def test_export_ordering_stable(http_env):
 
 def test_schema_survives_drop_and_recreate(env):
     home, db, _ = env
-    db.upsert_chat_thread(_thread("t1"))
+    db.upsert_chat_thread(_thread("t1"), subject=SUB)
     conn = db.get_connection()
     conn.execute("DROP TABLE chat_threads")
     conn.execute("DROP TABLE chat_messages")
@@ -287,8 +290,8 @@ def test_schema_survives_drop_and_recreate(env):
     # Should re-create on next connection
     db.get_connection().close()
     # And we can write again
-    db.upsert_chat_thread(_thread("t2"))
-    assert db.get_chat_thread("t2") is not None
+    db.upsert_chat_thread(_thread("t2"), subject=SUB)
+    assert db.get_chat_thread("t2", subject=SUB) is not None
 
 
 # ==========================================================================
