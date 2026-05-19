@@ -114,3 +114,89 @@ jobs:
             tests/test_anthropic_code_execution.py \
             tests/test_anthropic_messages.py \
             -q --tb=short
+
+  # macos-14 is Apple Silicon (M-series), so we can exercise the MLX
+  # path that workspace_40 / GGUF runners cannot reach. Loads
+  # unsloth/Qwen3.5-0.8B for real via MLXInferenceBackend and asserts
+  # the chat_template_info forwarded over IPC produces
+  # supports_tools=True + supports_reasoning=True. This is the exact
+  # bug the user reported on Mac.
+  mlx-qwen35-probe:
+    name: macos-14 / MLX Qwen3.5-0.8B
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # mlx + mlx-lm are macOS / Apple Silicon only.
+      - name: Install MLX + Studio backend deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'mlx>=0.20' 'mlx-lm>=0.20' 'mlx-vlm>=0.1' || \
+            pip install mlx mlx-lm mlx-vlm
+          pip install 'transformers>=4.51,<5.5'
+          pip install \
+            pytest pytest-asyncio httpx \
+            fastapi 'pydantic>=2' pyjwt cryptography python-multipart \
+            structlog pyyaml jinja2 mammoth unpdf requests typer \
+            aiofiles sqlalchemy huggingface_hub matplotlib datasets \
+            'numpy<3'
+          # unsloth-zoo carries unsloth_zoo.mlx.loader.FastMLXModel.
+          pip install --no-deps 'unsloth-zoo' || true
+
+      - name: Probe Qwen3.5-0.8B chat_template + capability flags via MLX
+        shell: bash
+        working-directory: studio/backend
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio/backend
+          UNSLOTH_COMPILE_DISABLE: '1'
+          HF_HUB_ENABLE_HF_TRANSFER: '0'
+        run: |
+          python - <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd()))
+
+          # 1. Load model via MLXInferenceBackend (the real Mac path).
+          from utils.models.model_config import ModelConfig
+          from core.inference.mlx_inference import MLXInferenceBackend
+          from routes.inference import _detect_safetensors_features
+
+          repo = "unsloth/Qwen3.5-0.8B"
+          cfg = ModelConfig.from_identifier(model_id=repo)
+          assert cfg is not None, "ModelConfig.from_identifier returned None"
+
+          backend = MLXInferenceBackend()
+          ok = backend.load_model(config=cfg, max_seq_length=2048)
+          assert ok, "MLXInferenceBackend.load_model returned False"
+
+          # 2. The IPC fix surface: chat_template_info must be populated
+          #    on backend.models[name] so the orchestrator can mirror it.
+          entry = backend.models[backend.active_model_name]
+          assert "chat_template_info" in entry, (
+              "chat_template_info missing from MLX backend.models -- "
+              "the Mac IPC fix did not land"
+          )
+          tpl = entry["chat_template_info"].get("template")
+          assert tpl, "chat_template is None / empty after MLX load"
+          assert "<tool_call>" in tpl, "Qwen3.5 template missing <tool_call>"
+
+          # 3. Route-layer classification -- the LoadResponse contract.
+          class _Stub:
+              def __init__(self): self.active_model_name = repo
+              def _is_gpt_oss_model(self): return False
+          flags = _detect_safetensors_features(_Stub(), tpl)
+          print("MLX flags for", repo, "=", flags)
+          assert flags["supports_tools"] is True, flags
+          assert flags["supports_reasoning"] is True, flags
+          assert flags["reasoning_style"] == "enable_thinking", flags
+          print("PASS: MLX Qwen3.5-0.8B advertises tools + reasoning")
+          PY
