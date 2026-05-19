@@ -175,14 +175,17 @@ def _run_zoo_trainer(seed, steps, lr, last_n):
     grad_norms_by_step = {}
 
     def _on_step(*args):
-        # MLXTrainingArguments callback signature: (step, max_steps, loss, grad_norm, lr, tokens_sec, peak_mem)
-        # We capture step + loss; grad_norm may be the 4th arg.
+        # MLXTrainer callback signature (unsloth_zoo/mlx/trainer.py:1190):
+        #   (current_step, total_steps, train_loss, lr_val, tokens_sec,
+        #    peak_mem, elapsed_total, trained_tokens, grad_norm_val)
+        # grad_norm is args[8], NOT args[3]. (args[3] is lr_val and was being
+        # mis-read as a constant 0.001 placeholder in earlier probe runs.)
         if len(args) < 3: return
         step_no = int(args[0])
         loss = float(args[2])
         gn = None
-        if len(args) >= 4 and args[3] is not None:
-            try: gn = float(args[3])
+        if len(args) >= 9 and args[8] is not None:
+            try: gn = float(args[8])
             except (TypeError, ValueError): gn = None
         rows.append({"step": step_no, "loss": loss, "grad_norm": gn})
 
