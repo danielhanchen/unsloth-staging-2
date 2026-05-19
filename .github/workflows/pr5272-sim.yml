@@ -1,0 +1,71 @@
+name: PR5272 Backend Sim
+
+on:
+  push:
+    branches: [pr5272-validate]
+    paths:
+      - "studio/backend/storage/studio_db.py"
+      - "studio/backend/routes/chat_history.py"
+      - "studio/backend/routes/__init__.py"
+      - "studio/backend/main.py"
+      - "studio/backend/tests/test_chat_history_storage.py"
+      - "studio/backend/tests/pr5272_sim/**"
+      - "studio/frontend/src/features/chat/utils/chat-history-storage.ts"
+      - "studio/frontend/src/features/chat/utils/chat-thread-tombstones.ts"
+      - ".github/workflows/pr5272-sim.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "studio/backend/storage/studio_db.py"
+      - "studio/backend/routes/chat_history.py"
+      - "studio/backend/routes/__init__.py"
+      - "studio/backend/main.py"
+      - "studio/backend/tests/test_chat_history_storage.py"
+      - "studio/backend/tests/pr5272_sim/**"
+      - ".github/workflows/pr5272-sim.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: pr5272-sim-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sim:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi 'pydantic>=2' httpx pytest structlog
+
+      - name: Print env
+        shell: bash
+        run: |
+          python -V
+          python -c "import platform, sqlite3, sys; print('platform:', platform.platform()); print('sqlite:', sqlite3.sqlite_version)"
+
+      - name: Run PR5272 simulation suite
+        shell: bash
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          cd studio/backend/tests/pr5272_sim
+          python -m pytest -v --tb=short test_pr5272.py test_pr5272_more.py
+
+      - name: Run the PR's own backend test file
+        shell: bash
+        run: |
+          cd studio/backend
+          python -m pytest -v --tb=short tests/test_chat_history_storage.py
