@@ -36,6 +36,12 @@ $DefaultLlamaSource = "https://github.com/ggml-org/llama.cpp"
 $DefaultLlamaTag = "latest"
 $DefaultLlamaForceCompileRef = "master"
 
+# Bun pin. Tracks the version used to generate the committed bun.lock
+# files. Auto-installed on absence; force-reinstalled only as a
+# cache-corruption recovery step (we don't overwrite a user's existing
+# bun unless their install is producing corrupt output).
+$Script:BunPinVersion = "1.3.11"
+
 # Verbose can be enabled either by CLI flag or by UNSLOTH_VERBOSE=1.
 $script:UnslothVerbose = ($env:UNSLOTH_VERBOSE -eq '1')
 foreach ($a in $args) {
@@ -1147,22 +1153,31 @@ if ($IsPipInstall) {
 
     step "node" "$(node -v) | npm $(npm -v)"
 
-    # ── bun (optional, faster package installs) ──
-    # Installed via npm — Node is already guaranteed above. Works on all platforms.
+    # ── Bun (optional, used for faster lockfile-strict installs) ──
+    # Auto-install only when missing. We do NOT overwrite a user's
+    # existing bun unless their install is producing corrupt output
+    # (handled inside the frontend install block below as a cache-
+    # recovery step). Pin tracks the version used to generate the
+    # committed bun.lock files.
     if (-not (Get-Command bun -ErrorAction SilentlyContinue)) {
-        substep "installing bun (faster frontend package installs)..."
+        substep "installing bun@$Script:BunPinVersion (pinned)..."
         $prevEAP_bun = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
-        Invoke-SetupCommand { npm install -g bun } | Out-Null
+        Invoke-SetupCommand { npm install -g "bun@$Script:BunPinVersion" } | Out-Null
         $ErrorActionPreference = $prevEAP_bun
         Refresh-Environment
         if (Get-Command bun -ErrorAction SilentlyContinue) {
-            substep "bun installed ($(bun --version))"
+            substep "bun $(bun --version) installed"
         } else {
-            substep "bun install skipped (npm will be used instead)"
+            substep "bun install skipped (npm ci will be used instead)"
         }
     } else {
-        substep "bun already installed ($(bun --version))"
+        $bunVer = (bun --version 2>$null)
+        if ($bunVer -eq $Script:BunPinVersion) {
+            substep "bun $bunVer at pin"
+        } else {
+            substep "bun $bunVer present (pin is $Script:BunPinVersion; not overwriting user install)"
+        }
     }
 }
 
@@ -1321,65 +1336,76 @@ if ($NeedFrontendBuild -and -not $IsPipInstall) {
         $WalkDir = Split-Path $WalkDir -Parent
     }
 
-    # Use bun if available (faster install), fall back to npm.
-    # Bun is used only as package manager; Node runs the actual build (Vite 8).
+    # Frontend install: Bun --frozen-lockfile first (faster, typically
+    # 5-10x) when a committed bun.lock is present, npm ci as the
+    # always-available fallback. Both run in lockfile-strict mode so
+    # the install is byte-reproducible from whichever lockfile the
+    # chosen package manager understands. The build always runs through
+    # Node (npm run build) -- avoids bun runtime quirks on some
+    # platforms.
+    #
+    # Bun's package cache can occasionally store metadata-only entries
+    # that pass exit 0 but leave binaries (tsc, vite) missing. We
+    # verify both binaries after install; on failure we clear the cache
+    # and let npm ci take over rather than retrying bun, since npm ci
+    # is the more defensive path under cache corruption.
     $prevEAP_npm = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     Push-Location $FrontendDir
 
-    $UseBun = $null -ne (Get-Command bun -ErrorAction SilentlyContinue)
-
-    # bun's package cache can become corrupt -- packages get stored with only
-    # metadata but no actual content (bin/, lib/). When this happens bun install
-    # exits 0 but leaves binaries missing. We validate after install and clear
-    # the cache + retry once before falling back to npm.
+    # Cache-corruption recovery ladder. Bun's package cache can store
+    # metadata-only entries that pass `bun install` exit 0 but leave
+    # binaries (tsc, vite) missing. We verify both binaries after each
+    # attempt and escalate:
+    #   try 1: bun install --frozen-lockfile
+    #   try 2: remove node_modules + bun pm cache rm, retry
+    #   try 3: force-reinstall bun@$Script:BunPinVersion (a corrupted
+    #          bun binary itself can produce empty payloads), retry
+    #   final: npm ci (always-available safety net)
+    $InstallOk = $false
+    $UseBun = (Test-Path "bun.lock" -PathType Leaf) -and ($null -ne (Get-Command bun -ErrorAction SilentlyContinue))
     if ($UseBun) {
-        Write-Host "   Using bun for package install (faster)" -ForegroundColor DarkGray
-        $bunExit = Invoke-SetupCommand { bun install }
-        # On Windows, .bin/ entries vary by package manager:
-        #   npm  → tsc, tsc.cmd, tsc.ps1
-        #   bun  → tsc.exe, tsc.bunx
-        $hasTsc = (Test-Path "node_modules\.bin\tsc") -or (Test-Path "node_modules\.bin\tsc.cmd") -or (Test-Path "node_modules\.bin\tsc.exe") -or (Test-Path "node_modules\.bin\tsc.bunx")
-        $hasVite = (Test-Path "node_modules\.bin\vite") -or (Test-Path "node_modules\.bin\vite.cmd") -or (Test-Path "node_modules\.bin\vite.exe") -or (Test-Path "node_modules\.bin\vite.bunx")
-        if ($bunExit -eq 0 -and $hasTsc -and $hasVite) {
-            # bun install succeeded and critical binaries are present
-        } elseif ($bunExit -eq 0) {
-            Write-Host "   bun install exited 0 but critical binaries are missing, clearing cache and retrying..." -ForegroundColor Yellow
-            if (Test-Path "node_modules") {
-                Remove-Item "node_modules" -Recurse -Force -ErrorAction SilentlyContinue
-            }
-            Invoke-SetupCommand { bun pm cache rm } | Out-Null
-            $bunExit = Invoke-SetupCommand { bun install }
+        $bunVer = (bun --version 2>$null)
+        Write-Host "   Using bun $bunVer --frozen-lockfile (faster)" -ForegroundColor DarkGray
+        $bunAttempt = 0
+        while ($bunAttempt -lt 3 -and -not $InstallOk) {
+            $bunAttempt++
+            $bunExit = Invoke-SetupCommand { bun install --frozen-lockfile --no-progress }
+            # On Windows, .bin/ entries vary by package manager:
+            #   npm -> tsc, tsc.cmd, tsc.ps1
+            #   bun -> tsc.exe, tsc.bunx
             $hasTsc = (Test-Path "node_modules\.bin\tsc") -or (Test-Path "node_modules\.bin\tsc.cmd") -or (Test-Path "node_modules\.bin\tsc.exe") -or (Test-Path "node_modules\.bin\tsc.bunx")
             $hasVite = (Test-Path "node_modules\.bin\vite") -or (Test-Path "node_modules\.bin\vite.cmd") -or (Test-Path "node_modules\.bin\vite.exe") -or (Test-Path "node_modules\.bin\vite.bunx")
-            if ($bunExit -ne 0 -or -not $hasTsc -or -not $hasVite) {
-                Write-Host "   bun retry failed, falling back to npm" -ForegroundColor Yellow
-                if (Test-Path "node_modules") {
-                    Remove-Item "node_modules" -Recurse -Force -ErrorAction SilentlyContinue
-                }
-                $UseBun = $false
+            if ($bunExit -eq 0 -and $hasTsc -and $hasVite) {
+                $InstallOk = $true
+                break
             }
-        } else {
-            substep "bun install failed (exit $bunExit), falling back to npm" "Yellow"
-            if (Test-Path "node_modules") {
-                Remove-Item "node_modules" -Recurse -Force -ErrorAction SilentlyContinue
+            if (Test-Path "node_modules") { Remove-Item "node_modules" -Recurse -Force -ErrorAction SilentlyContinue }
+            if ($bunAttempt -eq 1) {
+                substep "bun install incomplete (try 1); clearing cache + retrying" "Yellow"
+                Invoke-SetupCommand { bun pm cache rm } | Out-Null
+            } elseif ($bunAttempt -eq 2) {
+                substep "bun install still incomplete (try 2); reinstalling bun@$Script:BunPinVersion + retrying" "Yellow"
+                Invoke-SetupCommand { bun pm cache rm } | Out-Null
+                Invoke-SetupCommand { npm install -g "bun@$Script:BunPinVersion" } | Out-Null
+                Refresh-Environment
             }
-            $UseBun = $false
         }
     }
-    if (-not $UseBun) {
-        $npmExit = Invoke-SetupCommand { npm install }
+    if (-not $InstallOk) {
+        substep "falling back to npm ci" "Yellow"
+        if (Test-Path "node_modules") { Remove-Item "node_modules" -Recurse -Force -ErrorAction SilentlyContinue }
+        $npmExit = Invoke-SetupCommand { npm ci }
         if ($npmExit -ne 0) {
             Pop-Location
             $ErrorActionPreference = $prevEAP_npm
             foreach ($gi in $HiddenGitignores) { Rename-Item -Path "$gi._twbuild" -NewName (Split-Path $gi -Leaf) -Force -ErrorAction SilentlyContinue }
-            Write-Host "[ERROR] npm install failed (exit code $npmExit)" -ForegroundColor Red
-            Write-Host "   Try running 'npm install' manually in frontend/ to see errors" -ForegroundColor Yellow
+            Write-Host "[ERROR] npm ci failed (exit code $npmExit)" -ForegroundColor Red
+            Write-Host "   Try running 'npm ci' manually in frontend/ to see errors" -ForegroundColor Yellow
             exit 1
         }
     }
 
-    # Always use npm to run the build (Node runtime — avoids bun Windows runtime issues)
     $buildExit = Invoke-SetupCommand { npm run build }
     if ($buildExit -ne 0) {
         Pop-Location
@@ -1411,12 +1437,26 @@ if (Test-Path $OxcValidatorDir) {
     $prevEAP_oxc = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
     Push-Location $OxcValidatorDir
-    $oxcInstallExit = Invoke-SetupCommand { npm install }
-    if ($oxcInstallExit -ne 0) {
-        Pop-Location
-        $ErrorActionPreference = $prevEAP_oxc
-        Write-Host "[ERROR] OXC validator npm install failed (exit code $oxcInstallExit)" -ForegroundColor Red
-        exit 1
+    # Same Bun-first / npm-fallback pattern as the frontend install
+    # above; both lockfile-strict.
+    $OxcInstallOk = $false
+    $UseBunOxc = (Test-Path "bun.lock" -PathType Leaf) -and ($null -ne (Get-Command bun -ErrorAction SilentlyContinue))
+    if ($UseBunOxc) {
+        $bunOxcExit = Invoke-SetupCommand { bun install --frozen-lockfile --no-progress }
+        if ($bunOxcExit -eq 0 -and (Test-Path "node_modules\oxc-parser" -PathType Container)) {
+            $OxcInstallOk = $true
+        } else {
+            if (Test-Path "node_modules") { Remove-Item "node_modules" -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+    }
+    if (-not $OxcInstallOk) {
+        $oxcInstallExit = Invoke-SetupCommand { npm ci --no-fund --no-audit }
+        if ($oxcInstallExit -ne 0) {
+            Pop-Location
+            $ErrorActionPreference = $prevEAP_oxc
+            Write-Host "[ERROR] OXC validator npm ci failed (exit code $oxcInstallExit)" -ForegroundColor Red
+            exit 1
+        }
     }
     Pop-Location
     $ErrorActionPreference = $prevEAP_oxc

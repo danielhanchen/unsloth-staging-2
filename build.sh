@@ -33,19 +33,36 @@ _restore_gitignores() {
 }
 trap _restore_gitignores EXIT
 
-# Use bun for install if available (faster), fall back to npm.
+# Frontend install: Bun --frozen-lockfile first (faster) if a
+# committed bun.lock is present, npm ci as the always-available
+# fallback. Both run lockfile-strict so the install is byte-
+# reproducible from whichever lockfile the chosen package manager
+# understands. Build always runs through Node -- avoids bun runtime
+# quirks on some platforms. This is build.sh (release wheel build,
+# typically CI); we do NOT auto-install bun here -- the calling
+# environment should provide it explicitly. The cache-corruption
+# recovery ladder mirrors studio/setup.sh.
 _install_ok=false
-if command -v bun &>/dev/null; then
-    if bun install; then
-        _install_ok=true
-    else
-        echo "⚠ bun install failed, falling back to npm"
+if [ -f bun.lock ] && command -v bun &>/dev/null; then
+    _attempts=0
+    while [ "$_attempts" -lt 2 ] && [ "$_install_ok" != "true" ]; do
+        _attempts=$((_attempts + 1))
+        if bun install --frozen-lockfile --no-progress \
+            && { [ -x node_modules/.bin/tsc ] || [ -f node_modules/.bin/tsc.exe ]; } \
+            && { [ -x node_modules/.bin/vite ] || [ -f node_modules/.bin/vite.exe ]; }; then
+            _install_ok=true
+            break
+        fi
+        echo "⚠ bun --frozen-lockfile incomplete (try $_attempts); clearing cache + retrying"
         rm -rf node_modules
-    fi
+        bun pm cache rm >/dev/null 2>&1 || true
+    done
 fi
 if [ "$_install_ok" != "true" ]; then
-    if ! npm install; then
-        echo "❌ ERROR: package install failed" >&2
+    echo "→ falling back to npm ci"
+    rm -rf node_modules
+    if ! npm ci --no-fund --no-audit; then
+        echo "❌ ERROR: npm ci failed" >&2
         exit 1
     fi
 fi

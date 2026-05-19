@@ -1,0 +1,167 @@
+name: PR5479 validate (macOS)
+
+on:
+  push:
+    branches: [pr5479-validate]
+    paths:
+      - '.github/workflows/pr5479-validate-macos.yml'
+      - 'studio/package.json'
+      - 'studio/package-lock.json'
+      - 'studio/bun.lock'
+      - 'studio/frontend/package.json'
+      - 'studio/frontend/package-lock.json'
+      - 'studio/frontend/bun.lock'
+      - 'studio/backend/core/data_recipe/oxc-validator/package.json'
+      - 'studio/backend/core/data_recipe/oxc-validator/package-lock.json'
+      - 'studio/backend/core/data_recipe/oxc-validator/bun.lock'
+      - 'scripts/lockfile_supply_chain_audit.py'
+      - 'studio/setup.sh'
+      - 'build.sh'
+  pull_request:
+    paths: ['.github/workflows/pr5479-validate-macos.yml', '**/package.json', '**/package-lock.json', '**/bun.lock', 'scripts/lockfile_supply_chain_audit.py', 'studio/setup.sh', 'build.sh']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate-macos:
+    name: PR5479 install / pin / recovery
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Setup Bun (pinned)
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: '1.3.11' }
+
+      - name: Toolchain
+        run: |
+          node --version; npm --version; bun --version; python3 --version
+
+      - name: Parse install scripts
+        run: bash -n studio/setup.sh && bash -n build.sh
+
+      - name: Lockfile integrity (npm + bun)
+        run: |
+          python3 - <<'PY'
+          import json, re, sys
+          def pb(p): return json.loads(re.sub(r',(\s*[}\]])', r'\1', open(p).read()))
+          f=0
+          for p in ["studio/package-lock.json","studio/backend/core/data_recipe/oxc-validator/package-lock.json","studio/frontend/package-lock.json"]:
+              L=json.load(open(p)); bad=[k for k,v in (L.get('packages') or {}).items() if k and v.get('resolved') and not v.get('integrity')]
+              print(f"npm {p}: total={len(L.get('packages') or {})} missing={len(bad)}");
+              if bad: f+=1
+          for p in ["studio/bun.lock","studio/backend/core/data_recipe/oxc-validator/bun.lock","studio/frontend/bun.lock"]:
+              L=pb(p); pkgs=L.get('packages') or {}; bad=[]
+              for n,e in pkgs.items():
+                  if not isinstance(e,list) or len(e)<2: continue
+                  s=e[1] if isinstance(e[1],str) else ""; t=e[-1] if e else ""
+                  has=isinstance(t,str) and t.startswith(("sha512-","sha256-","sha1-"))
+                  if not s and not has: bad.append(n)
+              print(f"bun {p}: total={len(pkgs)} missing_sha={len(bad)}")
+              if bad: f+=1
+          sys.exit(1 if f else 0)
+          PY
+
+      - name: BUN INSTALL --frozen-lockfile (all 3 surfaces)
+        run: |
+          for D in studio studio/backend/core/data_recipe/oxc-validator studio/frontend; do
+            echo "=== $D ==="
+            (cd $D && bun install --frozen-lockfile --no-progress)
+          done
+
+      - name: Verify binaries after bun install
+        run: |
+          test -x studio/node_modules/.bin/tauri
+          test -d studio/backend/core/data_recipe/oxc-validator/node_modules/oxc-parser
+          test -x studio/frontend/node_modules/.bin/tsc
+          test -x studio/frontend/node_modules/.bin/vite
+          (cd studio/frontend && npm run build && test -d dist)
+
+      - name: Verify no lockfile mutation after bun install
+        run: git diff --exit-code -- '**/bun.lock' '**/package-lock.json' '**/package.json'
+
+      - name: NPM CI fallback path (wipe + reinstall)
+        run: |
+          for D in studio studio/backend/core/data_recipe/oxc-validator studio/frontend; do
+            (cd $D && rm -rf node_modules)
+          done
+          (cd studio && npm ci --no-fund --no-audit)
+          (cd studio/backend/core/data_recipe/oxc-validator && npm ci --no-fund --no-audit --loglevel=error)
+          (cd studio/frontend && rm -rf dist && npm ci --no-fund --no-audit --loglevel=error && npm run build && test -d dist)
+          test -x studio/node_modules/.bin/tauri
+          test -d studio/backend/core/data_recipe/oxc-validator/node_modules/oxc-parser
+          test -x studio/frontend/node_modules/.bin/tsc
+          test -x studio/frontend/node_modules/.bin/vite
+          git diff --exit-code -- '**/bun.lock' '**/package-lock.json' '**/package.json'
+
+      - name: "Pin: setup.sh declares _BUN_PIN_VERSION = bun.lock generator version"
+        run: |
+          PIN=$(grep -E '^_BUN_PIN_VERSION=' studio/setup.sh | cut -d'"' -f2)
+          PS1_PIN=$(grep -E 'BunPinVersion =' studio/setup.ps1 | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          echo "setup.sh pin: $PIN"
+          echo "setup.ps1 pin: $PS1_PIN"
+          if [ "$PIN" != "$PS1_PIN" ]; then echo "FAIL: pin mismatch between setup.sh and setup.ps1"; exit 1; fi
+          if [ -z "$PIN" ]; then echo "FAIL: pin missing"; exit 1; fi
+          # Confirm runtime bun version matches the pin
+          if [ "$(bun --version)" != "$PIN" ]; then echo "FAIL: runtime bun $(bun --version) != pin $PIN"; exit 1; fi
+          echo "PASS: pin $PIN consistent across setup.sh / setup.ps1 / runtime"
+
+      - name: "Recovery: cache-corruption simulation (delete a critical binary post-install, expect rebuild)"
+        run: |
+          # Force bun cache clean, then a fresh install, then simulate
+          # cache corruption by deleting tsc from node_modules. Re-run
+          # bun install --frozen-lockfile and verify tsc is rebuilt.
+          (cd studio/frontend && rm -rf node_modules)
+          (cd studio/frontend && bun install --frozen-lockfile --no-progress)
+          test -x studio/frontend/node_modules/.bin/tsc
+          rm -f studio/frontend/node_modules/.bin/tsc studio/frontend/node_modules/.bin/vite
+          (cd studio/frontend && bun install --frozen-lockfile --no-progress)
+          test -x studio/frontend/node_modules/.bin/tsc
+          test -x studio/frontend/node_modules/.bin/vite
+          echo "PASS: bun rebuilt missing binaries"
+
+      - name: Audit (positive - now 3 npm + 3 bun + 1 cargo)
+        run: |
+          out=$(python3 scripts/lockfile_supply_chain_audit.py 2>&1)
+          rc=$?
+          echo "$out"
+          [ $rc -eq 0 ] || exit $rc
+          echo "$out" | grep -q 'bun:' || { echo "FAIL: bun: missing in output"; exit 1; }
+
+      - name: Audit (negative - missing each bun.lock)
+        run: |
+          set +e; f=0
+          for L in studio/bun.lock studio/backend/core/data_recipe/oxc-validator/bun.lock studio/frontend/bun.lock; do
+            cp "$L" /tmp/h; rm "$L"
+            python3 scripts/lockfile_supply_chain_audit.py >/dev/null 2>&1; rc=$?
+            mv /tmp/h "$L"
+            [ "$rc" -eq 1 ] && echo "PASS missing $L" || { echo "FAIL rc=$rc missing $L"; f=$((f+1)); }
+          done
+          exit $f
+
+      - name: Audit (negative - unreadable bun.lock chmod 000)
+        run: |
+          set +e
+          mkdir -p /tmp/u; cp studio/bun.lock /tmp/u/bun.lock; chmod 000 /tmp/u/bun.lock
+          out=$(python3 scripts/lockfile_supply_chain_audit.py --bun-lockfile /tmp/u/bun.lock 2>&1); rc=$?
+          chmod 644 /tmp/u/bun.lock; rm -rf /tmp/u
+          echo "$out"
+          [ "$rc" -eq 1 ] || { echo "FAIL rc=$rc"; exit 1; }
+          echo "$out" | grep -q 'unreadable-lockfile' || { echo "FAIL: no finding"; exit 1; }
+          echo "$out" | grep -q 'Traceback' && { echo "FAIL: traceback leaked"; exit 1; } || true
+          echo "PASS"
