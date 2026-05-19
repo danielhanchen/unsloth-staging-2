@@ -1,0 +1,163 @@
+name: windows-update-from-older-release
+
+on:
+  push:
+    branches: [studio-regression-ci]
+    paths:
+      - install.ps1
+      - studio/setup.ps1
+      - studio/install_python_stack.py
+      - unsloth_cli/**
+      - .github/workflows/windows-update-from-older-release.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upgrade:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout current tip
+        uses: actions/checkout@v4
+        with:
+          path: current
+      - name: Clone unsloth pip branch + checkout 3 releases back
+        run: |
+          git clone --depth 200 -b pip https://github.com/unslothai/unsloth older
+          cd older
+          git checkout v0.1.38-beta
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Defender exclusions
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE" -ErrorAction SilentlyContinue
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.unsloth" -ErrorAction SilentlyContinue
+        continue-on-error: true
+
+      - name: Install Studio at v0.1.38-beta
+        run: |
+          cd older
+          ./install.ps1 --local
+
+      - name: Capture pre-update state
+        id: before
+        run: |
+          $Launcher = Join-Path $env:LOCALAPPDATA 'Unsloth Studio\launch-studio.ps1'
+          $Index = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Lib\site-packages\studio\frontend\dist\index.html'
+          $VenvPy = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          if (-not (Test-Path -LiteralPath $Launcher)) { Write-Host "FAIL: launcher missing"; exit 1 }
+          $LH = (Get-FileHash -LiteralPath $Launcher -Algorithm SHA256).Hash
+          $IH = if (Test-Path -LiteralPath $Index) {
+            (Get-FileHash -LiteralPath $Index -Algorithm SHA256).Hash
+          } else { "missing" }
+          $Ver = & $VenvPy -c "import importlib.metadata as m; print(m.version('unsloth'))" 2>$null
+          "launcher_hash=$LH" | Out-File -Append $env:GITHUB_OUTPUT
+          "index_hash=$IH"    | Out-File -Append $env:GITHUB_OUTPUT
+          "version=$Ver"      | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "[before] launcher=$LH index=$IH version=$Ver"
+
+      - name: Overlay current tip into venv (simulate post-PR-merge upgrade)
+        run: |
+          $VenvPy = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          & $VenvPy -m pip install --no-deps --force-reinstall -e current
+
+      - name: Run unsloth studio update via venv python
+        run: |
+          # Avoid the unsloth.exe lock that pip cannot replace while running.
+          $VenvPy = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          cd current
+          & $VenvPy -c "from unsloth_cli import app; app(['studio', 'update', '--local'])"
+
+      - name: Capture post-update state
+        id: after
+        run: |
+          $Launcher = Join-Path $env:LOCALAPPDATA 'Unsloth Studio\launch-studio.ps1'
+          $Index = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Lib\site-packages\studio\frontend\dist\index.html'
+          $VenvPy = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          if (-not (Test-Path -LiteralPath $Launcher)) { Write-Host "FAIL: launcher gone after update"; exit 1 }
+          $LH = (Get-FileHash -LiteralPath $Launcher -Algorithm SHA256).Hash
+          $IH = if (Test-Path -LiteralPath $Index) {
+            (Get-FileHash -LiteralPath $Index -Algorithm SHA256).Hash
+          } else { "missing" }
+          $Ver = & $VenvPy -c "import importlib.metadata as m; print(m.version('unsloth'))" 2>$null
+          "launcher_hash=$LH" | Out-File -Append $env:GITHUB_OUTPUT
+          "index_hash=$IH"    | Out-File -Append $env:GITHUB_OUTPUT
+          "version=$Ver"      | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "[after] launcher=$LH index=$IH version=$Ver"
+
+      - name: Assert launcher refreshed
+        run: |
+          $bl = "${{ steps.before.outputs.launcher_hash }}"
+          $al = "${{ steps.after.outputs.launcher_hash }}"
+          if ($bl -eq $al) {
+            Write-Host "FAIL: launcher unchanged after update ($bl)"
+            exit 1
+          }
+          Write-Host "PASS: launcher rewrote ($bl -> $al)"
+
+      - name: Assert frontend bundle refreshed
+        run: |
+          $bi = "${{ steps.before.outputs.index_hash }}"
+          $ai = "${{ steps.after.outputs.index_hash }}"
+          if ($bi -eq $ai) {
+            Write-Host "FAIL: frontend index.html unchanged after update ($bi)"
+            exit 1
+          }
+          Write-Host "PASS: frontend rewrote ($bi -> $ai)"
+
+      - name: Launch Studio + idle 90s + check load spam + auth status
+        run: |
+          $Port = 8889
+          $StudioHome = Join-Path $env:USERPROFILE '.unsloth\studio'
+          $Log = Join-Path $StudioHome 'share\studio.log'
+          New-Item -ItemType Directory -Force -Path (Split-Path $Log) | Out-Null
+          Set-Content -LiteralPath $Log -Value ""
+
+          $VenvPy = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          $proc = Start-Process -FilePath $VenvPy `
+            -ArgumentList @('-c', "from unsloth_cli import app; app(['studio', '-H', '127.0.0.1', '-p', '$Port'])") `
+            -RedirectStandardOutput $Log -RedirectStandardError ($Log + '.err') -PassThru -WindowStyle Hidden
+
+          for ($i = 0; $i -lt 180; $i++) {
+            try {
+              $r = Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/api/health" -TimeoutSec 2 -ErrorAction Stop
+              if ($r.StatusCode -eq 200) { break }
+            } catch { Start-Sleep -Seconds 1 }
+          }
+
+          $Status = (Invoke-WebRequest -UseBasicParsing -Uri "http://127.0.0.1:$Port/api/auth/status").Content
+          Write-Host "[auth/status] $Status"
+          if ($Status -match '"requires_password_change":\s*true') {
+            Write-Host "FAIL: server reports requires_password_change=true"
+            exit 1
+          }
+          Write-Host "PASS: requires_password_change=false"
+
+          Write-Host "[idle] sleeping 90s to surface any /api/inference/load spam"
+          Start-Sleep -Seconds 90
+          $Spam = (Get-Content -LiteralPath $Log -ErrorAction SilentlyContinue | Select-String -Pattern '"path": "/api/inference/load"').Count
+          Write-Host "[idle] /api/inference/load POST count = $Spam"
+          if ($Spam -gt 3) {
+            Write-Host "FAIL: load-spam regression (>3 /api/inference/load posts in 90s idle)"
+            Get-Content -LiteralPath $Log -Tail 40
+            exit 1
+          }
+          Write-Host "PASS: no load-spam after update"
+
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-update-from-older-release-${{ github.run_id }}
+          path: |
+            ${{ env.USERPROFILE }}/.unsloth/studio/share/studio.log
+          if-no-files-found: ignore

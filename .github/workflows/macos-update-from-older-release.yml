@@ -1,0 +1,139 @@
+name: macos-update-from-older-release
+
+on:
+  push:
+    branches: [studio-regression-ci]
+    paths:
+      - install.sh
+      - studio/setup.sh
+      - studio/install_python_stack.py
+      - unsloth_cli/**
+      - .github/workflows/macos-update-from-older-release.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  upgrade:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - name: Checkout current tip
+        uses: actions/checkout@v4
+        with:
+          path: current
+      - name: Clone unsloth pip branch + checkout 3 releases back
+        run: |
+          git clone --depth 200 -b pip https://github.com/unslothai/unsloth older
+          cd older && git checkout v0.1.38-beta
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Studio at v0.1.38-beta
+        run: |
+          cd older
+          bash install.sh --local
+
+      - name: Capture pre-update state
+        id: before
+        run: |
+          STUB="$HOME/Applications/Unsloth Studio.app/Contents/MacOS/launch-studio"
+          INDEX="$HOME/.unsloth/studio/unsloth_studio/lib/python3.12/site-packages/studio/frontend/dist/index.html"
+          UNSLOTH_BIN="$HOME/.local/bin/unsloth"
+          [[ -f "$STUB" ]] || { echo "FAIL: missing .app launcher stub"; exit 1; }
+          SH=$(shasum -a 256 "$STUB" | awk '{print $1}')
+          IH=$(shasum -a 256 "$INDEX" 2>/dev/null | awk '{print $1}' || echo missing)
+          VER=$("$UNSLOTH_BIN" --version 2>/dev/null || echo unknown)
+          echo "stub_hash=$SH"  >> "$GITHUB_OUTPUT"
+          echo "index_hash=$IH" >> "$GITHUB_OUTPUT"
+          echo "version=$VER"   >> "$GITHUB_OUTPUT"
+          echo "[before] stub=$SH index=$IH version=$VER"
+
+      - name: Overlay current tip into venv (simulate post-PR-merge upgrade)
+        run: |
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          "$VENV_PY" -m pip install --no-deps --force-reinstall -e current
+
+      - name: Run unsloth studio update --local
+        run: |
+          cd current
+          "$HOME/.local/bin/unsloth" studio update --local
+
+      - name: Capture post-update state
+        id: after
+        run: |
+          STUB="$HOME/Applications/Unsloth Studio.app/Contents/MacOS/launch-studio"
+          INDEX="$HOME/.unsloth/studio/unsloth_studio/lib/python3.12/site-packages/studio/frontend/dist/index.html"
+          UNSLOTH_BIN="$HOME/.local/bin/unsloth"
+          [[ -f "$STUB" ]] || { echo "FAIL: .app launcher stub gone after update"; exit 1; }
+          SH=$(shasum -a 256 "$STUB" | awk '{print $1}')
+          IH=$(shasum -a 256 "$INDEX" 2>/dev/null | awk '{print $1}' || echo missing)
+          VER=$("$UNSLOTH_BIN" --version 2>/dev/null || echo unknown)
+          echo "stub_hash=$SH"  >> "$GITHUB_OUTPUT"
+          echo "index_hash=$IH" >> "$GITHUB_OUTPUT"
+          echo "version=$VER"   >> "$GITHUB_OUTPUT"
+          echo "[after] stub=$SH index=$IH version=$VER"
+
+      - name: Assert .app launcher refreshed
+        run: |
+          BS='${{ steps.before.outputs.stub_hash }}'
+          AS='${{ steps.after.outputs.stub_hash }}'
+          if [[ "$BS" == "$AS" ]]; then
+            echo "FAIL: .app launcher stub unchanged after update ($BS)"
+            exit 1
+          fi
+          echo "PASS: .app launcher rewrote ($BS -> $AS)"
+
+      - name: Assert frontend bundle refreshed
+        run: |
+          BI='${{ steps.before.outputs.index_hash }}'
+          AI='${{ steps.after.outputs.index_hash }}'
+          if [[ "$BI" == "$AI" ]]; then
+            echo "FAIL: frontend index.html unchanged after update ($BI)"
+            exit 1
+          fi
+          echo "PASS: frontend rewrote ($BI -> $AI)"
+
+      - name: Launch Studio + idle 90s + check load spam + auth status
+        run: |
+          PORT=8889
+          LOG="$HOME/.unsloth/studio/share/studio.log"
+          mkdir -p "$(dirname "$LOG")"
+          : > "$LOG"
+          nohup "$HOME/.local/bin/unsloth" studio -H 127.0.0.1 -p $PORT \
+            >>"$LOG" 2>&1 &
+          for i in $(seq 1 240); do
+            curl -fsS "http://127.0.0.1:$PORT/api/health" >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS "http://127.0.0.1:$PORT/api/health"
+
+          STATUS=$(curl -fsS "http://127.0.0.1:$PORT/api/auth/status")
+          echo "[auth/status] $STATUS"
+          if echo "$STATUS" | grep -q '"requires_password_change": *true'; then
+            echo "FAIL: server reports requires_password_change=true on fresh install"
+            exit 1
+          fi
+          echo "PASS: requires_password_change=false"
+
+          echo "[idle] sleeping 90s to surface any /api/inference/load spam"
+          sleep 90
+          SPAM=$(grep -c '"path": "/api/inference/load"' "$LOG" || true)
+          echo "[idle] /api/inference/load POST count = $SPAM"
+          if [[ "$SPAM" -gt 3 ]]; then
+            echo "FAIL: load-spam regression (>3 /api/inference/load posts in 90s idle)"
+            tail -40 "$LOG"
+            exit 1
+          fi
+          echo "PASS: no load-spam after update"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: macos-update-from-older-release-${{ github.run_id }}
+          path: |
+            ~/.unsloth/studio/share/studio.log
+          if-no-files-found: ignore
