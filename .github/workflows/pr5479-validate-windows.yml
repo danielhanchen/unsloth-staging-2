@@ -1,0 +1,176 @@
+name: PR5479 validate (Windows)
+
+on:
+  push:
+    branches: [pr5479-validate]
+    paths:
+      - '.github/workflows/pr5479-validate-windows.yml'
+      - 'studio/package.json'
+      - 'studio/package-lock.json'
+      - 'studio/bun.lock'
+      - 'studio/frontend/package.json'
+      - 'studio/frontend/package-lock.json'
+      - 'studio/frontend/bun.lock'
+      - 'studio/backend/core/data_recipe/oxc-validator/package.json'
+      - 'studio/backend/core/data_recipe/oxc-validator/package-lock.json'
+      - 'studio/backend/core/data_recipe/oxc-validator/bun.lock'
+      - 'scripts/lockfile_supply_chain_audit.py'
+      - 'studio/setup.ps1'
+  pull_request:
+    paths: ['.github/workflows/pr5479-validate-windows.yml', '**/package.json', '**/package-lock.json', '**/bun.lock', 'scripts/lockfile_supply_chain_audit.py', 'studio/setup.ps1']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate-windows:
+    name: PR5479 install / pin / recovery
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with: { node-version: '22' }
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with: { python-version: '3.11' }
+
+      - name: Setup Bun (pinned)
+        uses: oven-sh/setup-bun@v2
+        with: { bun-version: '1.3.11' }
+
+      - name: Toolchain
+        run: |
+          node --version; npm --version; bun --version; python --version
+
+      - name: Parse setup.ps1
+        run: |
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile("studio/setup.ps1", [ref]$null, [ref]$errors)
+          if ($errors.Count) { $errors | Format-List; exit 1 } else { "OK" }
+
+      - name: BUN INSTALL --frozen-lockfile (all 3 surfaces)
+        run: |
+          foreach ($D in @("studio","studio/backend/core/data_recipe/oxc-validator","studio/frontend")) {
+              Push-Location $D
+              bun install --frozen-lockfile --no-progress
+              if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+              Pop-Location
+          }
+
+      - name: Verify binaries after bun install
+        run: |
+          if (-not ((Test-Path studio/node_modules/.bin/tauri) -or (Test-Path studio/node_modules/.bin/tauri.cmd) -or (Test-Path studio/node_modules/.bin/tauri.exe) -or (Test-Path studio/node_modules/.bin/tauri.bunx))) { "FAIL tauri"; exit 1 }
+          if (-not (Test-Path studio/backend/core/data_recipe/oxc-validator/node_modules/oxc-parser)) { "FAIL oxc-parser"; exit 1 }
+          $tsc = (Test-Path studio/frontend/node_modules/.bin/tsc) -or (Test-Path studio/frontend/node_modules/.bin/tsc.cmd) -or (Test-Path studio/frontend/node_modules/.bin/tsc.exe) -or (Test-Path studio/frontend/node_modules/.bin/tsc.bunx)
+          $vite = (Test-Path studio/frontend/node_modules/.bin/vite) -or (Test-Path studio/frontend/node_modules/.bin/vite.cmd) -or (Test-Path studio/frontend/node_modules/.bin/vite.exe) -or (Test-Path studio/frontend/node_modules/.bin/vite.bunx)
+          if (-not ($tsc -and $vite)) { "FAIL tsc/vite"; exit 1 }
+          Push-Location studio/frontend; npm run build
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+          if (-not (Test-Path dist -PathType Container)) { Pop-Location; exit 1 }
+          Pop-Location
+
+      - name: Verify no lockfile mutation
+        run: |
+          git diff --exit-code -- '**/bun.lock' '**/package-lock.json' '**/package.json'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: NPM CI fallback path
+        run: |
+          foreach ($D in @("studio","studio/backend/core/data_recipe/oxc-validator","studio/frontend")) {
+              Push-Location $D
+              Remove-Item -Recurse -Force -ErrorAction SilentlyContinue node_modules
+              if ($D -eq "studio/frontend") { Remove-Item -Recurse -Force -ErrorAction SilentlyContinue dist }
+              Pop-Location
+          }
+          Push-Location studio; npm ci --no-fund --no-audit; $rc=$LASTEXITCODE; Pop-Location
+          if ($rc -ne 0) { exit $rc }
+          Push-Location studio/backend/core/data_recipe/oxc-validator; npm ci --no-fund --no-audit --loglevel=error; $rc=$LASTEXITCODE; Pop-Location
+          if ($rc -ne 0) { exit $rc }
+          Push-Location studio/frontend
+          npm ci --no-fund --no-audit --loglevel=error
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+          npm run build
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+          if (-not (Test-Path dist -PathType Container)) { Pop-Location; exit 1 }
+          Pop-Location
+          git diff --exit-code -- '**/bun.lock' '**/package-lock.json' '**/package.json'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: "Pin: setup.ps1 declares BunPinVersion = bun.lock generator version"
+        run: |
+          $line = Select-String -Path studio/setup.ps1 -Pattern 'BunPinVersion =' | Select-Object -First 1
+          if (-not $line) { "FAIL: pin missing"; exit 1 }
+          $pin = ($line.Line -split '"')[1]
+          $runtime = (bun --version)
+          "setup.ps1 pin: $pin"
+          "runtime bun: $runtime"
+          if ($pin -ne $runtime) { "FAIL: runtime != pin"; exit 1 }
+          "PASS"
+
+      - name: "Recovery: cache-corruption simulation"
+        run: |
+          # Wipe + reinstall, then delete a binary, then re-run frozen install
+          Push-Location studio/frontend
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue node_modules
+          bun install --frozen-lockfile --no-progress
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+          # Delete tsc + vite binaries (simulate cache corruption)
+          Get-ChildItem -Path node_modules/.bin -Filter "tsc*" -ErrorAction SilentlyContinue | Remove-Item -Force
+          Get-ChildItem -Path node_modules/.bin -Filter "vite*" -ErrorAction SilentlyContinue | Remove-Item -Force
+          bun install --frozen-lockfile --no-progress
+          if ($LASTEXITCODE -ne 0) { Pop-Location; exit $LASTEXITCODE }
+          $tsc = (Test-Path node_modules/.bin/tsc) -or (Test-Path node_modules/.bin/tsc.cmd) -or (Test-Path node_modules/.bin/tsc.exe) -or (Test-Path node_modules/.bin/tsc.bunx)
+          $vite = (Test-Path node_modules/.bin/vite) -or (Test-Path node_modules/.bin/vite.cmd) -or (Test-Path node_modules/.bin/vite.exe) -or (Test-Path node_modules/.bin/vite.bunx)
+          Pop-Location
+          if (-not ($tsc -and $vite)) { "FAIL: bun did not rebuild missing binaries"; exit 1 }
+          "PASS: bun rebuilt missing binaries"
+
+      - name: Audit (positive)
+        run: |
+          $out = & python scripts/lockfile_supply_chain_audit.py 2>&1 | Out-String
+          $rc = $LASTEXITCODE
+          $out
+          if ($rc -ne 0) { exit $rc }
+          if ($out -notmatch 'bun:') { "FAIL: bun: missing"; exit 1 }
+
+      - name: Audit (negative - missing each bun.lock)
+        run: |
+          $f = 0
+          foreach ($L in @("studio/bun.lock","studio/backend/core/data_recipe/oxc-validator/bun.lock","studio/frontend/bun.lock")) {
+              Move-Item $L $env:RUNNER_TEMP/h
+              python scripts/lockfile_supply_chain_audit.py *> $null
+              $rc = $LASTEXITCODE
+              Move-Item $env:RUNNER_TEMP/h $L
+              if ($rc -ne 1) { "FAIL rc=$rc for $L"; $f++ } else { "PASS for $L" }
+          }
+          $global:LASTEXITCODE = 0
+          exit $f
+
+      - name: "Audit (negative - unreadable bun.lock via Deny ACL)"
+        run: |
+          $d = "$env:RUNNER_TEMP\u"; New-Item -ItemType Directory -Force -Path $d | Out-Null
+          $L = "$d\bun.lock"; Copy-Item studio\bun.lock $L
+          icacls $L /deny "${env:USERNAME}:R" | Out-Null
+          $out = & python scripts/lockfile_supply_chain_audit.py --bun-lockfile $L 2>&1 | Out-String
+          $rc = $LASTEXITCODE
+          icacls $L /remove:d "${env:USERNAME}" | Out-Null
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $d
+          $out
+          if ($rc -ne 1) { "FAIL rc=$rc"; exit 1 }
+          if ($out -notmatch 'unreadable-lockfile') { "FAIL"; exit 1 }
+          if ($out -match 'Traceback') { "FAIL: traceback leaked"; exit 1 }
+          "PASS"
+          $global:LASTEXITCODE = 0
+          exit 0
