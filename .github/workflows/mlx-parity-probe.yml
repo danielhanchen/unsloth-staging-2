@@ -333,6 +333,21 @@ jobs:
           - {id: '31_22222', script: 'probe_31_num_layers_16.py', seed: '22222'}
           - {id: '31_31415', script: 'probe_31_num_layers_16.py', seed: '31415'}
           - {id: '31_65535', script: 'probe_31_num_layers_16.py', seed: '65535'}
+
+          # ---- Round BP: strict step-by-step parity diagnostic ----
+          # Round BO per-step loss data showed probe 31 (manual loop) and
+          # zoo probes 35/37 diverge from step 2 onwards by 0.01-0.06,
+          # even though step 1's forward loss is identical. The gradient
+          # applied at step 1 differs. Probe 38 runs both paths back-to-back
+          # in a single process and captures per-step loss AND per-step
+          # grad_norm so we can pin where the numerical divergence starts.
+          # Only 5 seeds needed for a value-for-value diagnostic.
+
+          - {id: '38_1',     script: 'probe_38_strict_parity.py', seed: '1'}
+          - {id: '38_42',    script: 'probe_38_strict_parity.py', seed: '42'}
+          - {id: '38_999',   script: 'probe_38_strict_parity.py', seed: '999'}
+          - {id: '38_3407',  script: 'probe_38_strict_parity.py', seed: '3407'}
+          - {id: '38_22222', script: 'probe_38_strict_parity.py', seed: '22222'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
