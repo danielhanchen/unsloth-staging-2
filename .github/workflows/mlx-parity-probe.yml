@@ -348,6 +348,24 @@ jobs:
           - {id: '38_999',   script: 'probe_38_strict_parity.py', seed: '999'}
           - {id: '38_3407',  script: 'probe_38_strict_parity.py', seed: '3407'}
           - {id: '38_22222', script: 'probe_38_strict_parity.py', seed: '22222'}
+
+          # ---- Round BQ: FastMLXModel.get_peft_model parity ----
+          # Probe 38 v2 proved mlx_lm.load + linear_to_lora_layers matches
+          # zoo MLXTrainer step-for-step at the loss level. But probes that
+          # went through FastMLXModel + get_peft_model (32 / 34 / 36) still
+          # diverge from mlx-lm CLI's basin family (47% vs 67% greedy pass).
+          # Probe 39 isolates the LoRA-init pipeline by running BOTH paths
+          # through the same manual training loop. If the per-step loss
+          # diff is non-zero, the divergence is in
+          # FastMLXModel.from_pretrained or .get_peft_model upstream of
+          # the trainer. If zero, the LoRA init matches and the basin
+          # gap must come from somewhere we haven't bisected yet.
+
+          - {id: '39_1',     script: 'probe_39_fastmlxmodel_parity.py', seed: '1'}
+          - {id: '39_42',    script: 'probe_39_fastmlxmodel_parity.py', seed: '42'}
+          - {id: '39_999',   script: 'probe_39_fastmlxmodel_parity.py', seed: '999'}
+          - {id: '39_3407',  script: 'probe_39_fastmlxmodel_parity.py', seed: '3407'}
+          - {id: '39_22222', script: 'probe_39_fastmlxmodel_parity.py', seed: '22222'}
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
