@@ -537,14 +537,19 @@ def test_thread_response_shape_matches_old_dexie_record(http_env):
 
 
 def test_studio_db_path_uses_pathlib(env):
-    """studio_db_path returns a pathlib.Path. We don't run on Windows here,
-    but the helper uses Path.home()/'.unsloth'/'studio' which is OS-correct."""
+    """studio_db_path returns a pathlib.Path that uses the host OS native
+    separator -- `\\` on Windows, `/` on POSIX."""
+    import os as _os
+
     _, db, _ = env
     p = db.studio_db_path()
     assert isinstance(p, Path)
-    # On Linux this resolves under /tmp/... (UNSLOTH_STUDIO_HOME); make sure
-    # no backslashes leak even though we set a Linux-style env var.
-    assert "\\" not in str(p)
+    # Native separator present (Windows: '\\', POSIX: '/')
+    assert _os.sep in str(p)
+    # Round-trips through Path without changing
+    assert Path(str(p)) == p
+    # Ends with studio.db on every platform
+    assert p.name == "studio.db"
 
 
 def test_no_hardcoded_posix_paths_in_chat_history_routes():
