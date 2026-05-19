@@ -486,6 +486,38 @@ def _extra_args_set_spec_type(extra_args: Optional[Iterable[str]]) -> bool:
     return False
 
 
+def _backfill_usage_from_timings(usage, timings):
+    """Synthesize ``usage`` from llama-server's ``timings`` when the
+    OpenAI-style usage block is missing or reports zero tokens.
+
+    The Studio chat UI computes generation t/s from
+    ``meta.usage.completion_tokens / totalStreamTime``. llama-server
+    always populates ``timings.predicted_n`` (true decoded count) and
+    ``timings.prompt_n``, but the ``usage`` field on the final SSE chunk
+    can be absent or zero on some server builds / streaming
+    configurations, which makes the UI fall back to wall-clock t/s and
+    dilute speculative-decoding speedups.
+    """
+    if not timings:
+        return usage
+    if usage and usage.get("completion_tokens"):
+        return usage
+    predicted_n = timings.get("predicted_n")
+    prompt_n = timings.get("prompt_n")
+    if predicted_n is None and prompt_n is None:
+        return usage
+    out = dict(usage or {})
+    if not out.get("completion_tokens") and predicted_n is not None:
+        out["completion_tokens"] = predicted_n
+    if not out.get("prompt_tokens") and prompt_n is not None:
+        out["prompt_tokens"] = prompt_n
+    out["total_tokens"] = (
+        int(out.get("prompt_tokens") or 0)
+        + int(out.get("completion_tokens") or 0)
+    )
+    return out
+
+
 class LlamaCppBackend:
     """
     Manages a llama-server subprocess for GGUF model inference.
@@ -1479,7 +1511,6 @@ class LlamaCppBackend:
         kv_unified: bool = True,
         ctx_checkpoints: int = 0,
         kv_on_gpu: bool = True,
-        mtp_engaged: bool = False,
     ) -> int:
         """Return the largest context length that fits in GPU VRAM.
 
@@ -1493,12 +1524,6 @@ class LlamaCppBackend:
         the KV cache lives in CPU RAM and doesn't compete with weights
         for VRAM; the requested context is honored verbatim. The other
         keyword args mirror ``_estimate_kv_cache_bytes``.
-
-        ``mtp_engaged`` reserves extra VRAM for the MTP draft model's
-        KV cache + compute graph buffers. llama.cpp's MTP path keeps a
-        secondary cache sized off the target's KV; on tight VRAM tiers
-        (e.g. 32 GB) auto-fit at native context would otherwise spill
-        and force llama-server into a slower partial-offload path.
         """
         if not self._can_estimate_kv():
             logger.debug(
@@ -1519,9 +1544,7 @@ class LlamaCppBackend:
             ctx_checkpoints = ctx_checkpoints,
         )
 
-        # MTP needs a tighter budget; drop from 0.90 to 0.85.
-        budget_frac = 0.85 if mtp_engaged else 0.90
-        budget_bytes = available_mib * 1024 * 1024 * budget_frac
+        budget_bytes = available_mib * 1024 * 1024 * 0.90
         model_footprint = model_size_bytes
 
         # Check if requested context already fits
@@ -2407,22 +2430,6 @@ class LlamaCppBackend:
                     # GPU/VRAM-fit logic below may shrink this if hardware is limited.
                     max_available_ctx = self._context_length or effective_ctx
 
-                    # Will MTP engage on this load? If so, the auto-fit
-                    # budget needs to reserve extra VRAM for the draft
-                    # model's KV cache + compute graph.
-                    _normalized_spec = (
-                        speculative_type.lower().strip()
-                        if speculative_type else None
-                    )
-                    _mtp_will_engage = bool(
-                        (
-                            bool(self._nextn_predict_layers)
-                            or _is_mtp_model_name(model_identifier, model_path)
-                        )
-                        and _normalized_spec not in {"off"}
-                        and not _extra_args_set_spec_type(extra_args)
-                    )
-
                     # Auto-cap context to fit in GPU VRAM and select GPUs.
                     #
                     # Two policies depending on whether the user set n_ctx:
@@ -2458,7 +2465,6 @@ class LlamaCppBackend:
                                     model_size,
                                     cache_type_kv,
                                     n_parallel = n_parallel,
-                                    mtp_engaged = _mtp_will_engage,
                                 )
                                 kv = self._estimate_kv_cache_bytes(
                                     capped, cache_type_kv, n_parallel = n_parallel
@@ -2510,7 +2516,6 @@ class LlamaCppBackend:
                                     model_size,
                                     cache_type_kv,
                                     n_parallel = n_parallel,
-                                    mtp_engaged = _mtp_will_engage,
                                 )
                                 kv = self._estimate_kv_cache_bytes(
                                     capped, cache_type_kv, n_parallel = n_parallel
@@ -2688,15 +2693,38 @@ class LlamaCppBackend:
                     _is_mtp_model_name(model_identifier, model_path)
                 )
                 user_owns_spec_type = _extra_args_set_spec_type(extra_args)
+                # Sub-2B dense MTP regresses vs spec-off (draft cost > savings).
+                # Bench on Q4_K_XL B200: Qwen3.5-0.8B 452 -> 283 t/s (0.63x),
+                # CPU 0.8B 84.5 -> 64.9 t/s. >=2B is the inflection point;
+                # 4B is +1.07x, 9B +1.14x, 27B +1.44x.
+                _mtp_size_b = _extract_model_size_b(model_identifier)
+                _mtp_too_small = (
+                    _mtp_size_b is not None and _mtp_size_b < 2.0
+                )
                 # Auto-promote unset/"default" to draft-mtp on MTP GGUFs.
                 # llama.cpp #22673: MTP is compatible with mmproj, so the
                 # vision gate previously here was wrong.
                 if (
                     is_mtp_model
+                    and not _mtp_too_small
                     and not user_owns_spec_type
                     and normalized_spec in (None, "", "default")
                 ):
                     normalized_spec = "draft-mtp"
+                elif (
+                    is_mtp_model
+                    and _mtp_too_small
+                    and not user_owns_spec_type
+                    and normalized_spec in (None, "", "default")
+                ):
+                    # Bench confirms tiny dense MTP is a net loss.
+                    # User can still force via --spec-type or the UI toggle.
+                    logger.info(
+                        f"MTP GGUF detected but model size {_mtp_size_b:.1f}B "
+                        "is below the 2B speedup threshold; auto-disabling "
+                        "speculative decoding. Override via --spec-type or "
+                        "the Studio Speculative Decoding toggle."
+                    )
                 if user_owns_spec_type:
                     # User --spec-type wins; suppress auto-emit so we
                     # don't emit a duplicate (single-flag, comma-chained).
@@ -2723,12 +2751,21 @@ class LlamaCppBackend:
                             )
                             self._speculative_type = None
                         else:
-                            # User override > platform default (6 GPU / 3 CPU).
+                            # User override > platform default. Bench on
+                            # Qwen3.6-27B-MTP-GGUF UD-Q4_K_XL on B200 across
+                            # essay / code / story / math / science prompts
+                            # shows n_max=2 is the universal sweet spot
+                            # (1.18x-1.47x vs spec-off). At n_max=6 the essay
+                            # prompt fell BELOW spec-off (64.6 vs 79.1 t/s)
+                            # because wasted draft decode dominates once
+                            # acceptance rate drops past n=3 or so. Matches
+                            # the dataset README "n_max=2 is the sweet spot
+                            # for 36 of 42 quants".
                             if spec_draft_n_max is not None:
                                 draft_n_max = int(spec_draft_n_max)
                                 self._spec_draft_n_max = draft_n_max
                             else:
-                                draft_n_max = 6 if gpus else 3
+                                draft_n_max = 2 if gpus else 3
                             if gpus:
                                 cmd.extend(
                                     [
@@ -3163,11 +3200,17 @@ class LlamaCppBackend:
 
         # Mirror load_model's auto-promotion. Vision is no longer a
         # spec blocker (llama.cpp #22673: MTP is compatible with mmproj).
+        # Skip auto-promote on sub-2B models (MTP regresses below 2B params).
         raw_spec = _norm(speculative_type)
         req_spec = raw_spec or "off"
+        _reload_size_b = _extract_model_size_b(model_identifier)
+        _reload_too_small = (
+            _reload_size_b is not None and _reload_size_b < 2.0
+        )
         if (
             raw_spec in (None, "default")
             and _is_mtp_model_name(model_identifier, gguf_path)
+            and not _reload_too_small
             and not _extra_args_set_spec_type(extra_args)
         ):
             req_spec = "draft-mtp"
@@ -3989,6 +4032,9 @@ class LlamaCppBackend:
                         if _stream_done:
                             break  # exit outer for
                     if _metadata_usage or _metadata_timings:
+                        _metadata_usage = _backfill_usage_from_timings(
+                            _metadata_usage, _metadata_timings
+                        )
                         yield {
                             "type": "metadata",
                             "usage": _metadata_usage,
@@ -4441,7 +4487,9 @@ class LlamaCppBackend:
                                 }
                             )
                             # Accumulate tokens and timing from this iteration
-                            _fu_r = _iter_usage or {}
+                            _fu_r = _backfill_usage_from_timings(
+                                _iter_usage, _iter_timings
+                            ) or {}
                             _accumulated_completion_tokens += _fu_r.get(
                                 "completion_tokens", 0
                             )
@@ -4453,7 +4501,9 @@ class LlamaCppBackend:
 
                         # Content was already streamed.  Yield metadata.
                         yield {"type": "status", "text": ""}
-                        _fu = _iter_usage or {}
+                        _fu = _backfill_usage_from_timings(
+                            _iter_usage, _iter_timings
+                        ) or {}
                         _fc = _fu.get("completion_tokens", 0)
                         _fp = _fu.get("prompt_tokens", 0)
                         _tc = _fc + _accumulated_completion_tokens
@@ -4543,7 +4593,9 @@ class LlamaCppBackend:
                             )
                         if content_accum:
                             yield {"type": "content", "text": content_accum}
-                        _fu = _iter_usage or {}
+                        _fu = _backfill_usage_from_timings(
+                            _iter_usage, _iter_timings
+                        ) or {}
                         _fc = _fu.get("completion_tokens", 0)
                         _fp = _fu.get("prompt_tokens", 0)
                         _tc = _fc + _accumulated_completion_tokens
@@ -4577,9 +4629,9 @@ class LlamaCppBackend:
                         return
 
                 # ── Execute tool calls ──
-                _accumulated_completion_tokens += (_iter_usage or {}).get(
-                    "completion_tokens", 0
-                )
+                _accumulated_completion_tokens += (
+                    _backfill_usage_from_timings(_iter_usage, _iter_timings) or {}
+                ).get("completion_tokens", 0)
                 _it = _iter_timings or {}
                 _accumulated_predicted_ms += _it.get("predicted_ms", 0)
                 _accumulated_predicted_n += _it.get("predicted_n", 0)
