@@ -1,0 +1,26 @@
+sandbox-hardening: cross-OS CI for Patches A / B / D
+
+Validates the three software-sandbox hardening patches against
+unslothai/unsloth main:
+
+  * Patch A — static-string resolution in _extract_string_from_node
+    handles ast.BinOp(Add) of resolvable strings + ast.JoinedStr
+    f-strings. Closes open('/etc/' + 'shadow') and
+    open(f'/etc/{"shadow"}').
+
+  * Patch B — _find_sensitive_paths() gates clear-cut credential and
+    process-state paths in both bash commands and Python shell-exec
+    arguments. Home-anchored regex keeps project-local rc files
+    readable (project rc files) while denying personal ones in HOME.
+
+  * Patch D — eval/exec literal payloads parsed and recursively
+    visited by SignalEscapeVisitor + NetworkAndIoVisitor (depth-
+    capped at 3). Non-literal payloads flagged as dynamic shell
+    escapes.
+
+The hardening_ci/ folder is a self-contained copy of the relevant
+backend tree + tests with a stub loggers module so the suite runs
+without the rest of Studio.
+
+Local sweep (Linux): 255/255 (131 upstream + 124 hardening, zero
+regressions). This workflow verifies the same on macOS-14 + Windows.
