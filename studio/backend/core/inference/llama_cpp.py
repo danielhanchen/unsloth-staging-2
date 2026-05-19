@@ -1639,19 +1639,26 @@ class LlamaCppBackend:
         kv_unified: bool = True,
         ctx_checkpoints: int = 0,
         kv_on_gpu: bool = True,
+        mtp_engaged: bool = False,
     ) -> int:
         """Return the largest context length that fits in GPU VRAM.
 
-        Uses 90% of available VRAM as the ctx-fit budget. Tighter than
-        ``_GPU_PIN_VRAM_FRACTION`` on purpose: over-promising context
-        OOMs at runtime, while pinning conservatively just defers to
-        --fit on. If the weights alone don't fit, returns
-        ``requested_ctx`` unchanged.
+        Uses 90% of available VRAM as the ctx-fit budget (85% when MTP
+        is engaged). Tighter than ``_GPU_PIN_VRAM_FRACTION`` on purpose:
+        over-promising context OOMs at runtime, while pinning
+        conservatively just defers to --fit on. If the weights alone
+        don't fit, returns ``requested_ctx`` unchanged.
 
         ``kv_on_gpu`` mirrors ``--kv-offload`` (default on). When False
         the KV cache lives in CPU RAM and doesn't compete with weights
         for VRAM; the requested context is honored verbatim. The other
         keyword args mirror ``_estimate_kv_cache_bytes``.
+
+        ``mtp_engaged`` reserves extra VRAM for the MTP draft model's
+        KV cache + compute graph buffers. llama.cpp's MTP path keeps a
+        secondary cache sized off the target's KV; on tight VRAM tiers
+        (e.g. 32 GB) auto-fit at native context would otherwise spill
+        and force llama-server into a slower partial-offload path.
         """
         if not self._can_estimate_kv():
             logger.debug(
@@ -1672,7 +1679,9 @@ class LlamaCppBackend:
             ctx_checkpoints = ctx_checkpoints,
         )
 
-        budget_bytes = available_mib * 1024 * 1024 * 0.90
+        # MTP needs a tighter budget; drop from 0.90 to 0.85.
+        budget_frac = 0.85 if mtp_engaged else 0.90
+        budget_bytes = available_mib * 1024 * 1024 * budget_frac
         model_footprint = model_size_bytes
 
         # Check if requested context already fits
@@ -2573,6 +2582,21 @@ class LlamaCppBackend:
                     #   specific context length.
                     gpu_indices, use_fit = None, True
                     explicit_ctx = n_ctx > 0
+                    # MTP will engage iff the GGUF is MTP-named (or has
+                    # nextn_predict_layers) AND the user hasn't forced
+                    # --spec-type to something else. Tighter fit budget.
+                    _normalized_spec_pref = (
+                        speculative_type.lower().strip()
+                        if speculative_type else None
+                    )
+                    _mtp_will_engage = bool(
+                        (
+                            bool(self._nextn_predict_layers)
+                            or _is_mtp_model_name(model_identifier, model_path)
+                        )
+                        and not _extra_args_set_spec_type(extra_args)
+                        and _normalized_spec_pref in (None, "", "default")
+                    )
 
                     if gpus and self._can_estimate_kv() and effective_ctx > 0:
                         # Compute the largest hardware-aware cap from the model's
@@ -2593,6 +2617,7 @@ class LlamaCppBackend:
                                     model_size,
                                     cache_type_kv,
                                     n_parallel = n_parallel,
+                                    mtp_engaged = _mtp_will_engage,
                                 )
                                 kv = self._estimate_kv_cache_bytes(
                                     capped, cache_type_kv, n_parallel = n_parallel
@@ -2643,6 +2668,7 @@ class LlamaCppBackend:
                                     pool_mib,
                                     model_size,
                                     cache_type_kv,
+                                    mtp_engaged = _mtp_will_engage,
                                     n_parallel = n_parallel,
                                 )
                                 kv = self._estimate_kv_cache_bytes(
