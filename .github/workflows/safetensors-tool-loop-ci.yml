@@ -296,3 +296,141 @@ jobs:
           # complete a VLM generation pass within the job timeout.
           print("PASS: MLX cartesian probe exercised end-to-end")
           PY
+
+  # Multi-format parser probe: exercise the extended tool_call_parser
+  # (Llama-3 <|python_tag|>, Llama-3.2 bare JSON, Mistral pre-v11 +
+  # v11+ + [ARGS], Gemma 4 <|tool_call>) against synthetic emissions
+  # drawn from each family's official chat template. Runs on the
+  # three matrix OSes so we catch any regex / json edge case the
+  # parser still has cross-platform.
+  multi-format-parser:
+    name: ${{ matrix.os }} / multi-format parser
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # No heavy deps -- the parser is pure Python.
+      - name: Install minimal deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest
+
+      - name: Probe all five emission formats end-to-end
+        shell: bash
+        working-directory: studio/backend
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio/backend
+        run: |
+          python - <<'PY'
+          """Verify the shared parser turns every supported family's
+          emission shape into the same OpenAI-format tool call."""
+          import json, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path.cwd()))
+
+          from core.inference.tool_call_parser import (
+              parse_tool_calls_from_text,
+              has_tool_signal,
+              strip_tool_markup,
+              TOOL_XML_SIGNALS,
+          )
+
+          # Every emission marker the streaming loop watches for.
+          for marker in (
+              "<tool_call>",
+              "<function=",
+              "<|python_tag|>",
+              "[TOOL_CALLS]",
+              "<|tool_call>",
+          ):
+              assert marker in TOOL_XML_SIGNALS, marker
+
+          fixtures = [
+              # (label, raw_text, expected_name, expected_args)
+              ("Qwen <tool_call>",
+               '<tool_call>{"name":"web_search","arguments":{"q":"x"}}</tool_call>',
+               "web_search", {"q": "x"}),
+              ("Qwen3.5 <function=name>",
+               "<function=python><parameter=code>print(1)</parameter></function>",
+               "python", {"code": "print(1)"}),
+              ("Llama-3 <|python_tag|>.call",
+               '<|python_tag|>brave_search.call(query="Tokyo")',
+               "brave_search", {"query": "Tokyo"}),
+              ("Llama-3 <|python_tag|>JSON",
+               '<|python_tag|>{"name":"web_search","parameters":{"q":"x"}}',
+               "web_search", {"q": "x"}),
+              ("Llama-3.2 bare JSON",
+               '{"name":"web_search","parameters":{"q":"Tokyo weather"}}',
+               "web_search", {"q": "Tokyo weather"}),
+              ("Mistral pre-v11 array",
+               '[TOOL_CALLS] [{"name":"web_search","arguments":{"q":"x"}}]',
+               "web_search", {"q": "x"}),
+              ("Mistral v11+ name{json}",
+               '[TOOL_CALLS]add{"a":3.5,"b":4}',
+               "add", {"a": 3.5, "b": 4}),
+              ("Ministral v11+ [ARGS]",
+               '[TOOL_CALLS]add[ARGS]{"a":1,"b":2}',
+               "add", {"a": 1, "b": 2}),
+              ("Gemma 4 <|tool_call>",
+               '<|tool_call>call:get_weather{'
+               'location:<|"|>Tokyo<|"|>,units:<|"|>celsius<|"|>'
+               '}<tool_call|>',
+               "get_weather", {"location": "Tokyo", "units": "celsius"}),
+          ]
+
+          for label, text, expected_name, expected_args in fixtures:
+              assert has_tool_signal(text) or label == "Llama-3.2 bare JSON", (
+                  f"{label}: streaming loop would NOT wake -- "
+                  f"has_tool_signal returned False"
+              )
+              result = parse_tool_calls_from_text(text)
+              assert result, f"{label}: parser returned no calls for {text!r}"
+              assert result[0]["function"]["name"] == expected_name, (
+                  f"{label}: got name={result[0]['function']['name']!r} "
+                  f"expected {expected_name!r}"
+              )
+              args = json.loads(result[0]["function"]["arguments"])
+              assert args == expected_args, (
+                  f"{label}: got args={args!r} expected {expected_args!r}"
+              )
+              # Stripping must remove the markup so downstream UI does
+              # not echo it as assistant prose.
+              stripped = strip_tool_markup(text, final=True)
+              if label == "Llama-3.2 bare JSON":
+                  # Bare JSON path does not strip (the JSON itself is
+                  # the entire response) -- ensure stripping is safe.
+                  assert isinstance(stripped, str)
+              else:
+                  assert "<tool_call" not in stripped
+                  assert "<function=" not in stripped
+                  assert "<|python_tag|>" not in stripped
+                  assert "[TOOL_CALLS]" not in stripped
+                  assert "<|tool_call>" not in stripped
+              print(f"  OK  {label:28s} -> {expected_name}({expected_args})")
+
+          print("PASS: all 9 emission shapes parsed correctly")
+          PY
+
+      - name: Run the new multi-format parser unit tests
+        shell: bash
+        working-directory: studio/backend
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio/backend
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: |
+          python -m pytest \
+            tests/test_safetensors_tool_loop.py::TestParserMultiFormat \
+            -v --tb=short
