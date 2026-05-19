@@ -12,6 +12,9 @@ on:
       - "studio/backend/tests/pr5272_sim/**"
       - "studio/frontend/src/features/chat/utils/chat-history-storage.ts"
       - "studio/frontend/src/features/chat/utils/chat-thread-tombstones.ts"
+      - "studio/frontend/src/features/chat/stores/chat-runtime-store.ts"
+      - "studio/frontend/src/features/chat/hooks/use-chat-sidebar-items.ts"
+      - "studio/frontend/src/features/chat/api/chat-api.ts"
       - ".github/workflows/pr5272-sim.yml"
   pull_request:
     branches: [main]

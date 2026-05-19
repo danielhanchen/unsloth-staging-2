@@ -675,8 +675,9 @@ def test_frontend_legacy_dexie_is_never_cleared_implicitly():
     assert "db.messages.clear" not in body
     clear_idx = storage.find("export async function clearStoredChats")
     assert clear_idx >= 0
-    assert "db.threads.clear" in storage[clear_idx : clear_idx + 1000]
-    assert "db.messages.clear" in storage[clear_idx : clear_idx + 1000]
+    # PR-B4 grew the function body; widen the search window.
+    assert "db.threads.clear" in storage[clear_idx : clear_idx + 4000]
+    assert "db.messages.clear" in storage[clear_idx : clear_idx + 4000]
 
 
 def test_frontend_legacy_import_writes_via_upsert_so_idempotent_on_retry():

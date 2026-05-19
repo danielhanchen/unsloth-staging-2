@@ -86,6 +86,21 @@ class ChatDeleteRequest(BaseModel):
     ids: list[str]
 
 
+class ChatMessagesBatchRequest(BaseModel):
+    """PR-C2: request payload for the batched messages endpoint."""
+
+    thread_ids: list[str] = Field(default_factory=list)
+
+
+class ChatMessagesBatchResponse(BaseModel):
+    """PR-C2: response for the batched messages endpoint. Maps each
+    requested `thread_id` to its full ordered message list, so the frontend
+    sidebar/search can fetch every thread's messages in ONE HTTP round-trip
+    instead of N (one per thread)."""
+
+    threads: dict[str, list[ChatMessage]]
+
+
 class ChatCountResponse(BaseModel):
     count: int
 
@@ -288,6 +303,30 @@ async def replace_thread_messages(
     return ChatMessageListResponse(
         messages = [ChatMessage(**m) for m in rows]
     )
+
+
+@router.post("/messages:batch", response_model = ChatMessagesBatchResponse)
+async def batch_get_messages(
+    payload: ChatMessagesBatchRequest,
+    current_subject: str = Depends(get_current_subject),
+):
+    """PR-C2: batched message fetch. Replaces N HTTP round-trips (one per
+    thread for sidebar / search rebuild) with one. Subject-scoped, so a
+    caller can only see their own threads' messages; ids belonging to a
+    different subject (or not existing at all) come back with an empty
+    list rather than 404, since the typical caller is rebuilding a UI
+    index for many threads and partial failure is the wrong default."""
+    if not payload.thread_ids:
+        return ChatMessagesBatchResponse(threads={})
+    rows = list_chat_messages_for_threads(
+        payload.thread_ids, subject = current_subject
+    )
+    bucket: dict[str, list[ChatMessage]] = {tid: [] for tid in payload.thread_ids}
+    for row in rows:
+        thread_id = row["threadId"]
+        if thread_id in bucket:
+            bucket[thread_id].append(ChatMessage(**row))
+    return ChatMessagesBatchResponse(threads = bucket)
 
 
 @router.get("/count", response_model = ChatCountResponse)

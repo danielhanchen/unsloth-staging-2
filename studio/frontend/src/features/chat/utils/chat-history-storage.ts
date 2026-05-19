@@ -7,6 +7,7 @@ import {
   deleteChatThreads,
   getChatMessage,
   getChatThread,
+  batchListChatMessages,
   listChatMessages,
   listChatThreads,
   saveChatMessage,
@@ -418,15 +419,31 @@ export async function listStoredChatThreadsWithMessages(
   args: ThreadListArgs = {},
 ): Promise<ThreadRecord[]> {
   const threads = await listStoredChatThreads(args);
+  if (threads.length === 0) return [];
+  // PR-C2: one batched HTTP call instead of N. The batch endpoint is
+  // subject-scoped server-side; it returns an empty list for unknown ids
+  // so we still need the local-Dexie fallback for legacy threads not yet
+  // materialized into the backend.
+  const threadIds = threads.map((t) => t.id);
+  let backendByThread: Map<string, MessageRecord[]>;
+  try {
+    backendByThread = await batchListChatMessages(threadIds);
+  } catch {
+    backendByThread = new Map();
+  }
   const entries = await Promise.all(
-    threads.map(async (thread) => ({
-      thread,
-      messages: await listStoredChatMessages(thread.id),
-    })),
+    threads.map(async (thread) => {
+      const backendMessages = backendByThread.get(thread.id) ?? [];
+      if (backendMessages.length > 0) {
+        return { thread, hasContent: true };
+      }
+      // Fall back to a per-thread fetch only when the batch result was
+      // empty AND we might still have legacy Dexie messages to consider.
+      const legacy = await listStoredChatMessages(thread.id).catch(() => []);
+      return { thread, hasContent: legacy.length > 0 };
+    }),
   );
-  return entries
-    .filter((entry) => entry.messages.length > 0)
-    .map((entry) => entry.thread);
+  return entries.filter((e) => e.hasContent).map((e) => e.thread);
 }
 
 export async function saveStoredChatMessage(
@@ -476,22 +493,54 @@ export async function countStoredChats(): Promise<number> {
   return (await listStoredChatThreads()).length;
 }
 
-export async function clearStoredChats(): Promise<void> {
+export interface ClearStoredChatsResult {
+  backend: "cleared" | "failed" | "skipped";
+  legacy: "cleared" | "failed" | "skipped";
+}
+
+export async function clearStoredChats(): Promise<ClearStoredChatsResult> {
+  // PR-B4: clear both sides independently and report each outcome so the
+  // caller's toast can distinguish "all gone" from "backend cleared, local
+  // legacy survived" from "backend down, only local cleared". Previously
+  // backend failure threw before legacy clear ran and Dexie cleanup was
+  // silently swallowed, producing a misleading success toast.
   const [backendThreads, legacyThreads] = await Promise.all([
     listChatThreads().catch(() => []),
-    db.threads.toArray(),
+    db.threads.toArray().catch(() => []),
   ]);
   const threadIds = [...backendThreads, ...legacyThreads].map(
     (thread) => thread.id,
   );
-  await clearBackendChats();
-  await db
-    .transaction("rw", db.threads, db.messages, async () => {
+
+  const result: ClearStoredChatsResult = { backend: "skipped", legacy: "skipped" };
+  try {
+    await clearBackendChats();
+    result.backend = "cleared";
+  } catch (error) {
+    result.backend = "failed";
+    console.error("clearStoredChats: backend clear failed", error);
+  }
+
+  try {
+    await db.transaction("rw", db.threads, db.messages, async () => {
       await db.messages.clear();
       await db.threads.clear();
-    })
-    .catch(() => undefined);
+    });
+    result.legacy = "cleared";
+  } catch (error) {
+    result.legacy = "failed";
+    console.error("clearStoredChats: legacy Dexie clear failed", error);
+  }
+
+  // Tombstone everything we knew about, so even partial failures hide the
+  // residual rows from the sidebar. Callers that want hard guarantees
+  // should retry on `failed` outcomes.
   markChatThreadsDeleted(threadIds);
+
+  if (result.backend === "failed" && result.legacy === "failed") {
+    throw new Error("clearStoredChats: both backend and legacy clear failed");
+  }
+  return result;
 }
 
 export async function buildStoredChatExport(): Promise<ExportedChat> {
