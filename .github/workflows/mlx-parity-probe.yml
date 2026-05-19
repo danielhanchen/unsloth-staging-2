@@ -241,21 +241,9 @@ jobs:
           #   36 ~= 47% -> compile fixes the trainer half, but loader patches
           #               independently add a -10pp drift to bisect next.
 
-          - {id: '36_1',     script: 'probe_36_zoo_loader_compile_on.py', seed: '1'}
-          - {id: '36_7',     script: 'probe_36_zoo_loader_compile_on.py', seed: '7'}
-          - {id: '36_42',    script: 'probe_36_zoo_loader_compile_on.py', seed: '42'}
-          - {id: '36_123',   script: 'probe_36_zoo_loader_compile_on.py', seed: '123'}
-          - {id: '36_456',   script: 'probe_36_zoo_loader_compile_on.py', seed: '456'}
-          - {id: '36_789',   script: 'probe_36_zoo_loader_compile_on.py', seed: '789'}
-          - {id: '36_999',   script: 'probe_36_zoo_loader_compile_on.py', seed: '999'}
-          - {id: '36_1234',  script: 'probe_36_zoo_loader_compile_on.py', seed: '1234'}
-          - {id: '36_3407',  script: 'probe_36_zoo_loader_compile_on.py', seed: '3407'}
-          - {id: '36_5678',  script: 'probe_36_zoo_loader_compile_on.py', seed: '5678'}
-          - {id: '36_9012',  script: 'probe_36_zoo_loader_compile_on.py', seed: '9012'}
-          - {id: '36_12345', script: 'probe_36_zoo_loader_compile_on.py', seed: '12345'}
-          - {id: '36_22222', script: 'probe_36_zoo_loader_compile_on.py', seed: '22222'}
-          - {id: '36_31415', script: 'probe_36_zoo_loader_compile_on.py', seed: '31415'}
-          - {id: '36_65535', script: 'probe_36_zoo_loader_compile_on.py', seed: '65535'}
+          # (probe 36 dropped for Round BS -- Round BR established it has
+          # an identical pass/fail pattern to probe 34, so compile flag is
+          # a no-op for the basin.)
 
           # ---- Round BL: bypass the max_grad_value=None silent-clip bug ----
           # Probe 35 (compile=True) hit 53% (same as probe 33's 53%) -- so
@@ -320,11 +308,35 @@ jobs:
           # the trainer. If zero, the LoRA init matches and the basin
           # gap must come from somewhere we haven't bisected yet.
 
-          - {id: '39_1',     script: 'probe_39_fastmlxmodel_parity.py', seed: '1'}
-          - {id: '39_42',    script: 'probe_39_fastmlxmodel_parity.py', seed: '42'}
-          - {id: '39_999',   script: 'probe_39_fastmlxmodel_parity.py', seed: '999'}
-          - {id: '39_3407',  script: 'probe_39_fastmlxmodel_parity.py', seed: '3407'}
-          - {id: '39_22222', script: 'probe_39_fastmlxmodel_parity.py', seed: '22222'}
+          # (probe 39 dropped for Round BS -- Round BR already verified
+          # dloss=0 step-for-step under PR #674; no need to re-check.)
+
+          # ---- Round BS: bisect residual MLXTrainer vs manual-loop gap ----
+          # PR #674 verified by probe 39 (dloss = 0 step-for-step across 5 seeds).
+          # But probes 34/36 (FastMLXModel + MLXTrainer) still hit 47% greedy
+          # pass vs probe 31's (mlx_lm.load + manual loop) 67% on 15 seeds, and
+          # probes 34/36 share an identical pass/fail pattern (compile flag is
+          # a no-op for the basin). Probe 40 = FastMLXModel loader + probe 31's
+          # exact manual @mx.compile loop. If 67%, MLXTrainer.train IS the
+          # remaining gap. If 47%, FastMLXModel.from_pretrained adds drift
+          # downstream of get_peft_model that probe 39's 5-seed diagnostic
+          # missed -- bisect the loader next round.
+
+          - {id: '40_1',     script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '1'}
+          - {id: '40_7',     script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '7'}
+          - {id: '40_42',    script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '42'}
+          - {id: '40_123',   script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '123'}
+          - {id: '40_456',   script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '456'}
+          - {id: '40_789',   script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '789'}
+          - {id: '40_999',   script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '999'}
+          - {id: '40_1234',  script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '1234'}
+          - {id: '40_3407',  script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '3407'}
+          - {id: '40_5678',  script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '5678'}
+          - {id: '40_9012',  script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '9012'}
+          - {id: '40_12345', script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '12345'}
+          - {id: '40_22222', script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '22222'}
+          - {id: '40_31415', script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '31415'}
+          - {id: '40_65535', script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '65535'}
 
           # ---- Round BR: verify PR #674 seed-ordering fix end-to-end ----
           # PR #674 (unsloth-zoo) moves _seed_mlx_random_state(random_state)
