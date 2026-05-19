@@ -121,21 +121,10 @@ jobs:
           # Probe 30 reseeds AFTER load + adds set_wired_limit. If 67%,
           # the seed-order is the bug; the FIX is to seed AFTER load.
 
-          - {id: '30_1',     script: 'probe_30_seed_after_load.py', seed: '1'}
-          - {id: '30_7',     script: 'probe_30_seed_after_load.py', seed: '7'}
-          - {id: '30_42',    script: 'probe_30_seed_after_load.py', seed: '42'}
-          - {id: '30_123',   script: 'probe_30_seed_after_load.py', seed: '123'}
-          - {id: '30_456',   script: 'probe_30_seed_after_load.py', seed: '456'}
-          - {id: '30_789',   script: 'probe_30_seed_after_load.py', seed: '789'}
-          - {id: '30_999',   script: 'probe_30_seed_after_load.py', seed: '999'}
-          - {id: '30_1234',  script: 'probe_30_seed_after_load.py', seed: '1234'}
-          - {id: '30_3407',  script: 'probe_30_seed_after_load.py', seed: '3407'}
-          - {id: '30_5678',  script: 'probe_30_seed_after_load.py', seed: '5678'}
-          - {id: '30_9012',  script: 'probe_30_seed_after_load.py', seed: '9012'}
-          - {id: '30_12345', script: 'probe_30_seed_after_load.py', seed: '12345'}
-          - {id: '30_22222', script: 'probe_30_seed_after_load.py', seed: '22222'}
-          - {id: '30_31415', script: 'probe_30_seed_after_load.py', seed: '31415'}
-          - {id: '30_65535', script: 'probe_30_seed_after_load.py', seed: '65535'}
+          # Round BR drops probes 30/35/37/38 from this matrix (they
+          # targeted the mlx-lm CLI path and earlier zoo variants that are
+          # no longer the live suspect after PR #674). Git history retains
+          # them.
 
           # ---- Round BA: compile-mode hypothesis ----
           # Round AZ rejected numpy-RNG (probe 22 = probe 21). The
@@ -240,21 +229,7 @@ jobs:
           # ~67%, the -14pp is a probe-configuration artifact, not a
           # MLXTrainer defect.
 
-          - {id: '35_1',     script: 'probe_35_zoo_trainer_compile_on.py', seed: '1'}
-          - {id: '35_7',     script: 'probe_35_zoo_trainer_compile_on.py', seed: '7'}
-          - {id: '35_42',    script: 'probe_35_zoo_trainer_compile_on.py', seed: '42'}
-          - {id: '35_123',   script: 'probe_35_zoo_trainer_compile_on.py', seed: '123'}
-          - {id: '35_456',   script: 'probe_35_zoo_trainer_compile_on.py', seed: '456'}
-          - {id: '35_789',   script: 'probe_35_zoo_trainer_compile_on.py', seed: '789'}
-          - {id: '35_999',   script: 'probe_35_zoo_trainer_compile_on.py', seed: '999'}
-          - {id: '35_1234',  script: 'probe_35_zoo_trainer_compile_on.py', seed: '1234'}
-          - {id: '35_3407',  script: 'probe_35_zoo_trainer_compile_on.py', seed: '3407'}
-          - {id: '35_5678',  script: 'probe_35_zoo_trainer_compile_on.py', seed: '5678'}
-          - {id: '35_9012',  script: 'probe_35_zoo_trainer_compile_on.py', seed: '9012'}
-          - {id: '35_12345', script: 'probe_35_zoo_trainer_compile_on.py', seed: '12345'}
-          - {id: '35_22222', script: 'probe_35_zoo_trainer_compile_on.py', seed: '22222'}
-          - {id: '35_31415', script: 'probe_35_zoo_trainer_compile_on.py', seed: '31415'}
-          - {id: '35_65535', script: 'probe_35_zoo_trainer_compile_on.py', seed: '65535'}
+          # (probe 35 dropped for Round BR — see header note.)
 
           # ---- Round BK: zoo loader + MLXTrainer(compile=True) ----
           # Probe 34 (FastMLXModel(dtype=None) + MLXTrainer + nl=16 + compile=False): ~47%
@@ -292,21 +267,7 @@ jobs:
           # disabled, regardless of PR #671). If 37 ~= 67%, elementwise
           # clipping at 1.0 was the entire trainer-side gap.
 
-          - {id: '37_1',     script: 'probe_37_zoo_trainer_clip_off.py', seed: '1'}
-          - {id: '37_7',     script: 'probe_37_zoo_trainer_clip_off.py', seed: '7'}
-          - {id: '37_42',    script: 'probe_37_zoo_trainer_clip_off.py', seed: '42'}
-          - {id: '37_123',   script: 'probe_37_zoo_trainer_clip_off.py', seed: '123'}
-          - {id: '37_456',   script: 'probe_37_zoo_trainer_clip_off.py', seed: '456'}
-          - {id: '37_789',   script: 'probe_37_zoo_trainer_clip_off.py', seed: '789'}
-          - {id: '37_999',   script: 'probe_37_zoo_trainer_clip_off.py', seed: '999'}
-          - {id: '37_1234',  script: 'probe_37_zoo_trainer_clip_off.py', seed: '1234'}
-          - {id: '37_3407',  script: 'probe_37_zoo_trainer_clip_off.py', seed: '3407'}
-          - {id: '37_5678',  script: 'probe_37_zoo_trainer_clip_off.py', seed: '5678'}
-          - {id: '37_9012',  script: 'probe_37_zoo_trainer_clip_off.py', seed: '9012'}
-          - {id: '37_12345', script: 'probe_37_zoo_trainer_clip_off.py', seed: '12345'}
-          - {id: '37_22222', script: 'probe_37_zoo_trainer_clip_off.py', seed: '22222'}
-          - {id: '37_31415', script: 'probe_37_zoo_trainer_clip_off.py', seed: '31415'}
-          - {id: '37_65535', script: 'probe_37_zoo_trainer_clip_off.py', seed: '65535'}
+          # (probe 37 dropped for Round BR — see header note.)
 
           # ---- Round BM: re-baseline probe 31 to reset confidence ----
           # Round BL data (probe 37 at 40%, probe 30 at 47%, probe 34/36 at 47%,
@@ -343,11 +304,9 @@ jobs:
           # grad_norm so we can pin where the numerical divergence starts.
           # Only 5 seeds needed for a value-for-value diagnostic.
 
-          - {id: '38_1',     script: 'probe_38_strict_parity.py', seed: '1'}
-          - {id: '38_42',    script: 'probe_38_strict_parity.py', seed: '42'}
-          - {id: '38_999',   script: 'probe_38_strict_parity.py', seed: '999'}
-          - {id: '38_3407',  script: 'probe_38_strict_parity.py', seed: '3407'}
-          - {id: '38_22222', script: 'probe_38_strict_parity.py', seed: '22222'}
+          # (probe 38 dropped for Round BR — already proved per-step parity
+          # for the non-FastMLXModel path; Round BR rotates focus onto the
+          # FastMLXModel path's probe 39 strict diagnostic.)
 
           # ---- Round BQ: FastMLXModel.get_peft_model parity ----
           # Probe 38 v2 proved mlx_lm.load + linear_to_lora_layers matches
@@ -366,6 +325,28 @@ jobs:
           - {id: '39_999',   script: 'probe_39_fastmlxmodel_parity.py', seed: '999'}
           - {id: '39_3407',  script: 'probe_39_fastmlxmodel_parity.py', seed: '3407'}
           - {id: '39_22222', script: 'probe_39_fastmlxmodel_parity.py', seed: '22222'}
+
+          # ---- Round BR: verify PR #674 seed-ordering fix end-to-end ----
+          # PR #674 (unsloth-zoo) moves _seed_mlx_random_state(random_state)
+          # in FastMLXModel.get_peft_model from the top of the function
+          # (~165 lines above linear_to_lora_layers) to immediately before
+          # each linear_to_lora_layers call. Hypothesis: lazy mx.* state
+          # advances between the old seed call and lora_a init were causing
+          # lora_a to draw from a different RNG position than mlx-lm CLI
+          # despite both paths re-seeding to the same int.
+          #
+          # ZOO_SPEC is now pinned to 0124424 (PR #674 HEAD). Re-run the
+          # FastMLXModel-path probes that were divergent in Rounds BJ-BQ:
+          #   * probe 34 x 15 seeds: FastMLXModel(dtype=None) + MLXTrainer
+          #                          + nl=16. Was 47%. Expected: ~67%.
+          #   * probe 36 x 15 seeds: same + compile=True. Was 47%. Expected: ~67%.
+          #   * probe 39 x 5 seeds : strict step-by-step diff vs mlx-lm CLI.
+          #                          Expected: dloss = 0 step-for-step.
+          #   * probe 31 x 15 seeds: mlx-lm CLI manual loop. Unchanged
+          #                          control. Expected: ~67% as before.
+          # If probes 34/36 now match probe 31's pass rate and probe 39's
+          # diff drops to zero, the seed-ordering fix closes the basin gap
+          # end-to-end through the public FastMLXModel API.
     steps:
       - name: Harden runner (audit)
         uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450  # v2.19.1
@@ -399,14 +380,15 @@ jobs:
             'sentencepiece==0.2.1' \
             'huggingface-hub==0.36.2' \
             'trl==0.27.0'
-          # Round BO: pin to the create_text_batches pad-fix branch
-          # (b265d99) which both (a) contains the finetune_last_n_layers
-          # parameter from b137b40 and (b) adds the +1 to MLXTrainer's
-          # padding so it matches mlx-lm's iterate_batches value-for-value.
-          # Re-runs probes 30/31/34/37 against this build to check whether
-          # the pad fix closes the basin gap (expected: zoo MLXTrainer
-          # probes 34/37 should rise from 47%/40% toward probe 31's 67%).
-          ZOO_SPEC='unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@b265d99710d7c61f704c4c740e7917cb0a543c7b'
+          # Round BR: pin to PR #674's fix-mlx-get-peft-model-seed branch
+          # (0124424). The commit stacks on top of PR #669's b137b40 so it
+          # carries BOTH the finetune_last_n_layers parameter AND the new
+          # seed-immediately-before-linear_to_lora_layers ordering inside
+          # FastMLXModel.get_peft_model. Round BR re-runs the previously
+          # divergent FastMLXModel-path probes (34, 36) plus the strict
+          # diagnostic probe 39 to check whether moving the seed call
+          # closer to the LoRA construction closes the basin gap end-to-end.
+          ZOO_SPEC='unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@012442488894bea07b045c12fcfb27f9f691095d'
           for attempt in 1 2 3; do
             if pip install "$ZOO_SPEC"; then break; fi
             if [ "$attempt" -eq 3 ]; then exit 1; fi
