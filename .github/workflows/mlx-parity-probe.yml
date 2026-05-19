@@ -322,21 +322,39 @@ jobs:
           # downstream of get_peft_model that probe 39's 5-seed diagnostic
           # missed -- bisect the loader next round.
 
-          - {id: '40_1',     script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '1'}
-          - {id: '40_7',     script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '7'}
-          - {id: '40_42',    script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '42'}
-          - {id: '40_123',   script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '123'}
-          - {id: '40_456',   script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '456'}
-          - {id: '40_789',   script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '789'}
-          - {id: '40_999',   script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '999'}
-          - {id: '40_1234',  script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '1234'}
-          - {id: '40_3407',  script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '3407'}
-          - {id: '40_5678',  script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '5678'}
-          - {id: '40_9012',  script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '9012'}
-          - {id: '40_12345', script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '12345'}
-          - {id: '40_22222', script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '22222'}
-          - {id: '40_31415', script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '31415'}
-          - {id: '40_65535', script: 'probe_40_fastmlxmodel_manual_loop.py', seed: '65535'}
+          # ---- Round BT: test whether elementwise clip-at-1 IS the
+          # ---- residual MLXTrainer gap ----
+          # Reading trainer.py:731-732, MLXTrainer reinterprets
+          # `max_grad_value=None` as 1.0 (clip at +/-1.0 elementwise).
+          # PR #671 (mlx: honor max_grad_value=None as a disable signal,
+          # OPEN, head 265534b) would fix this. Probe 34 sets
+          # max_grad_value=None expecting "disable" -- actually gets
+          # clipped. Probe 41 = probe 34 with max_grad_value=0.0
+          # (explicit zero hits the disable branch on the current build).
+          # If 67% (matching probes 31 / 40), elementwise clip-at-1 IS
+          # the entire residual basin gap and PR #671 is the missing
+          # piece. Same 15 seeds for direct paired comparison.
+
+          - {id: '41_1',     script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '1'}
+          - {id: '41_7',     script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '7'}
+          - {id: '41_42',    script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '42'}
+          - {id: '41_123',   script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '123'}
+          - {id: '41_456',   script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '456'}
+          - {id: '41_789',   script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '789'}
+          - {id: '41_999',   script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '999'}
+          - {id: '41_1234',  script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '1234'}
+          - {id: '41_3407',  script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '3407'}
+          - {id: '41_5678',  script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '5678'}
+          - {id: '41_9012',  script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '9012'}
+          - {id: '41_12345', script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '12345'}
+          - {id: '41_22222', script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '22222'}
+          - {id: '41_31415', script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '31415'}
+          - {id: '41_65535', script: 'probe_41_zoo_trainer_clip_explicit_zero.py', seed: '65535'}
+
+          # ---- Round BS: bisect residual MLXTrainer vs manual-loop gap ----
+          # (probe 40 dropped for Round BT -- already verified in BS that
+          # FastMLXModel + manual loop reproduces probe 31's 67% on
+          # 15/15 seeds. Round BT focuses on probe 41 to isolate clip.)
 
           # ---- Round BR: verify PR #674 seed-ordering fix end-to-end ----
           # PR #674 (unsloth-zoo) moves _seed_mlx_random_state(random_state)
