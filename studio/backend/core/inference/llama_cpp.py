@@ -683,6 +683,15 @@ class LlamaCppBackend:
         self._llama_log_path: Optional[Path] = None
         self._cancel_event = threading.Event()
         self._api_key: Optional[str] = None
+        # Audio metadata cache. _audio_probed records whether the
+        # currently-loaded model has been probed for audio support;
+        # for non-audio models detect_audio_type returns None so we
+        # cannot use _audio_type as a "probed?" sentinel. Mirror of
+        # upstream PR #5669 fix for chatgpt-codex P2 on commit
+        # f63ac224.
+        self._is_audio: bool = False
+        self._audio_type: Optional[str] = None
+        self._audio_probed: bool = False
 
         self._kill_orphaned_servers()
         atexit.register(self._cleanup)
@@ -2558,9 +2567,17 @@ class LlamaCppBackend:
                 # acquire it mid-probe; init inside self._lock so it
                 # cannot race against an unload that already cleared
                 # backend state.
-                if self._audio_type is None:
+                # Re-probe only when no probe has completed (transient
+                # probe failure / exception). For non-audio models the
+                # previous load set _audio_probed=True with
+                # _audio_type=None, so this branch is skipped and no-op
+                # /load calls do not re-run 8 HTTP probes under
+                # _serial_load_lock (chatgpt-codex P2 on upstream
+                # commit f63ac224).
+                if not self._audio_probed:
                     try:
                         detected = self.detect_audio_type()
+                        self._audio_probed = True
                     except Exception:
                         detected = None
                     if detected in ("snac", "bicodec", "dac"):
@@ -3310,8 +3327,13 @@ class LlamaCppBackend:
             # serialises.
             self._is_audio = False
             self._audio_type = None
+            self._audio_probed = False
             try:
                 detected = self.detect_audio_type()
+                # Cache the probe result (non-audio counts as a
+                # probed outcome too; chatgpt-codex P2 on upstream
+                # commit f63ac224).
+                self._audio_probed = True
             except Exception:
                 detected = None
             if detected in ("snac", "bicodec", "dac"):
@@ -3676,6 +3698,7 @@ class LlamaCppBackend:
             self._is_vision = False
             self._is_audio = False
             self._audio_type = None
+            self._audio_probed = False
             self._port = None
             self._healthy = False
             self._context_length = None
