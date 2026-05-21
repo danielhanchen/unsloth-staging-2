@@ -2608,6 +2608,10 @@ class LlamaCppBackend:
                                     detected,
                                     exc,
                                 )
+                                # Clear so next /load re-probes
+                                # (chatgpt-codex P2 3284516915 on
+                                # upstream eb3a52a1).
+                                self._audio_probed = False
                     elif detected:
                         self._audio_type = detected
                 # Recheck _healthy: unload between fast-path arrival
@@ -3373,6 +3377,11 @@ class LlamaCppBackend:
                             detected,
                             exc,
                         )
+                        # Clear _audio_probed so next /load
+                        # re-probes + re-attempts codec init
+                        # (chatgpt-codex P2 3284516915 on upstream
+                        # commit eb3a52a1).
+                        self._audio_probed = False
             elif detected:
                 self._audio_type = detected
 
