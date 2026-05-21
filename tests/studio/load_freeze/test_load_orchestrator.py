@@ -156,10 +156,12 @@ def _build_app(backend, *, wrap_in_thread: bool):
         return {"status": "ok"}
 
     if wrap_in_thread:
+
         @app.get("/probe")
         async def probe():
             return {"audio_type": await asyncio.to_thread(backend.detect_audio_type)}
     else:
+
         @app.get("/probe")
         async def probe():
             return {"audio_type": backend.detect_audio_type()}
@@ -271,7 +273,9 @@ def test_functional_equivalence_no_match(shim_no_match):
 def test_functional_equivalence_snac_match():
     # snac match requires _detok(128258) AND _detok(128259) to start
     # with "<custom_token_".
-    with FakeLlamaServer(detok_map = {128258: "<custom_token_99>", 128259: "<custom_token_98>"}) as srv:
+    with FakeLlamaServer(
+        detok_map = {128258: "<custom_token_99>", 128259: "<custom_token_98>"}
+    ) as srv:
         backend = _make_backend(srv.port)
         sync_result = backend.detect_audio_type()
         threaded = asyncio.run(asyncio.to_thread(backend.detect_audio_type))
@@ -414,7 +418,9 @@ def test_50_concurrent_probes_complete_without_deadlock():
             with ThreadPoolExecutor(max_workers = 50) as pool:
                 futs = [
                     pool.submit(
-                        lambda: httpx.get(f"http://127.0.0.1:{uv.port}/probe", timeout = 30.0)
+                        lambda: httpx.get(
+                            f"http://127.0.0.1:{uv.port}/probe", timeout = 30.0
+                        )
                     )
                     for _ in range(50)
                 ]
@@ -424,7 +430,9 @@ def test_50_concurrent_probes_complete_without_deadlock():
     # 50 probes at ~0.4s each, threadpool size 32 default -> ~1-2 batches.
     # Bound generously to absorb CI jitter while catching pathological
     # serialisation (would be ~20s).
-    assert elapsed < 15.0, f"50 concurrent probes took {elapsed:.1f}s; threadpool may be serialising"
+    assert (
+        elapsed < 15.0
+    ), f"50 concurrent probes took {elapsed:.1f}s; threadpool may be serialising"
 
 
 def test_100_concurrent_healths_during_slow_probe_all_responsive():
@@ -467,34 +475,81 @@ def test_100_concurrent_healths_during_slow_probe_all_responsive():
 # ---------------------------------------------------------------------------
 
 
-def test_routes_inference_wraps_detect_audio_type_in_to_thread():
-    f = _REPO_ROOT / "studio" / "backend" / "routes" / "inference.py"
+def test_load_model_caches_audio_type_inside_serial_load_lock():
+    """The audio-type detection (and codec init, where applicable) must
+    happen inside ``LlamaCppBackend.load_model`` so the full load
+    sequence is atomic under ``_serial_load_lock``. Running it from the
+    route opens a race where a concurrent /load can replace the backend
+    mid-probe (gemini-code-assist review on #5669)."""
+    f = _REPO_ROOT / "studio" / "backend" / "core" / "inference" / "llama_cpp.py"
     text = f.read_text()
-    assert "await asyncio.to_thread(llama_backend.detect_audio_type)" in text
-    assert "llama_backend.detect_audio_type()" not in text
+    # The lock must be acquired.
+    assert "with self._serial_load_lock" in text, (
+        "LlamaCppBackend.load_model must hold self._serial_load_lock"
+    )
+    # The cache writes must be present.
+    assert "self._audio_type = self.detect_audio_type()" in text or \
+           "detected = self.detect_audio_type()" in text, (
+        "LlamaCppBackend.load_model must call self.detect_audio_type and cache "
+        "the result on self._audio_type (#5642 follow-up)."
+    )
 
 
-def test_init_audio_codec_still_wrapped_in_to_thread():
-    """Drift guard: the neighbouring init_audio_codec call must keep
-    its to_thread wrap so any future copy-paste from this block keeps
-    the right pattern."""
+def test_routes_inference_reads_cached_audio_type_not_calls_detect():
+    """Static guard: routes/inference.py must NOT call
+    ``llama_backend.detect_audio_type`` or
+    ``llama_backend.init_audio_codec`` directly any more -- both moved
+    inside ``LlamaCppBackend.load_model`` under the lock. The route
+    reads the cached ``_audio_type`` / ``_is_audio`` attributes."""
     f = _REPO_ROOT / "studio" / "backend" / "routes" / "inference.py"
     text = f.read_text()
-    assert "await asyncio.to_thread(llama_backend.init_audio_codec" in text
+    assert "llama_backend.detect_audio_type(" not in text, (
+        "routes/inference.py should not call detect_audio_type directly; "
+        "load_model already cached it under the lock."
+    )
+    assert "llama_backend.init_audio_codec(" not in text, (
+        "routes/inference.py should not call init_audio_codec directly; "
+        "load_model already invoked it under the lock when audio_type was a TTS codec."
+    )
+    # Verify the route DOES read the cached values somewhere.
+    assert "llama_backend._audio_type" in text
+    assert "llama_backend._is_audio" in text
 
 
 def test_no_other_async_route_calls_detect_audio_type_unwrapped():
     """Walk every .py under studio/backend/routes/ and confirm no file
-    contains a bare ``detect_audio_type()`` call inside an async function
-    (would re-introduce the bug). We accept a wrapped form."""
+    contains a ``LlamaCppBackend.detect_audio_type()`` call inside an
+    async function. Re-introducing the bug means putting back the sync
+    call AND opening the race condition the lock fix closes."""
     routes_dir = _REPO_ROOT / "studio" / "backend" / "routes"
     offenders = []
-    pattern = re.compile(r"\.detect_audio_type\s*\(\)")
+    # Match `<anything>.detect_audio_type(` so this catches both
+    # `llama_backend.detect_audio_type(` and `self.detect_audio_type(`.
+    # We exclude the `utils.models.model_config.detect_audio_type`
+    # free function which is a separate, harmless static helper.
+    pattern = re.compile(r"\b\w+\.detect_audio_type\s*\(")
     for path in routes_dir.rglob("*.py"):
         for i, line in enumerate(path.read_text().splitlines(), start = 1):
-            if pattern.search(line) and "asyncio.to_thread" not in line:
-                offenders.append(f"{path.relative_to(_REPO_ROOT)}:{i}: {line.strip()}")
-    assert not offenders, "bare detect_audio_type() in async route(s): " + "; ".join(offenders)
+            m = pattern.search(line)
+            if not m:
+                continue
+            # Skip the free function import-site uses (no llama_backend prefix
+            # and called outside async context). Easiest: only treat the
+            # LlamaCppBackend instance call as an offender.
+            if "llama_backend.detect_audio_type" not in line:
+                continue
+            if "asyncio.to_thread" in line:
+                # Wrapped sync call is acceptable (event-loop responsive)
+                # but not preferred -- detect_audio_type belongs inside
+                # load_model now. Surface but don't fail; comment in PR
+                # if seen.
+                continue
+            offenders.append(f"{path.relative_to(_REPO_ROOT)}:{i}: {line.strip()}")
+    assert not offenders, (
+        "routes/*.py contains llama_backend.detect_audio_type() calls; "
+        "the call should live inside load_model now: "
+        + "; ".join(offenders)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +599,7 @@ def test_response_is_valid_browser_parseable_json():
     through json.loads() (the canonical equivalent of
     JSON.parse() in any browser) and assert the expected keys."""
     import json as _json
+
     with FakeLlamaServer(tok_delay = 0.0, detok_delay = 0.0) as shim:
         backend = _make_backend(shim.port)
         app = _build_app(backend, wrap_in_thread = True)
@@ -573,13 +629,18 @@ def test_response_shape_matches_pre_fix_for_no_match():
     bodies for the no-match scenario (the dominant code path in
     practice for non-audio models)."""
     import json as _json
+
     with FakeLlamaServer(
         detok_map = {128258: "abc", 128259: "def"},
         tok_response_map = {
-            "<|AUDIO|>": [0, 1], "<|audio_eos|>": [0, 1],
-            "<|startoftranscript|>": [0, 1], "<audio_soft_token>": [0, 1],
-            "<|bicodec_semantic_0|>": [0, 1], "<|bicodec_global_0|>": [0, 1],
-            "<|c1_0|>": [0, 1], "<|c2_0|>": [0, 1],
+            "<|AUDIO|>": [0, 1],
+            "<|audio_eos|>": [0, 1],
+            "<|startoftranscript|>": [0, 1],
+            "<audio_soft_token>": [0, 1],
+            "<|bicodec_semantic_0|>": [0, 1],
+            "<|bicodec_global_0|>": [0, 1],
+            "<|c1_0|>": [0, 1],
+            "<|c2_0|>": [0, 1],
         },
     ) as shim:
         backend = _make_backend(shim.port)

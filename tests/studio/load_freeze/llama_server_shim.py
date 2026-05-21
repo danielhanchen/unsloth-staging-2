@@ -67,7 +67,9 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def _send_raw(self, status: int, body: bytes, *, content_type: str = "application/json") -> None:
+    def _send_raw(
+        self, status: int, body: bytes, *, content_type: str = "application/json"
+    ) -> None:
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
@@ -79,7 +81,9 @@ class _Handler(BaseHTTPRequestHandler):
         crashed llama-server returning a RemoteProtocolError to httpx."""
         # Don't call send_response -- write a half-finished response.
         try:
-            self.wfile.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 9999\r\n\r\n")
+            self.wfile.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 9999\r\n\r\n"
+            )
             self.wfile.write(partial)
             self.wfile.flush()
         except Exception:
@@ -142,7 +146,9 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_raw(srv.config.detok_status, srv.config.detok_body)
                 return
             tids = body.get("tokens") or []
-            content = "".join(srv.config.detok_map.get(int(t), f"<tok_{t}>") for t in tids)
+            content = "".join(
+                srv.config.detok_map.get(int(t), f"<tok_{t}>") for t in tids
+            )
             self._send_json(srv.config.detok_status, {"content": content})
             return
         if path == "/completion":
@@ -218,7 +224,13 @@ class FakeLlamaServer:
         detok_body: Optional[bytes] = None,
         detok_map: Optional[dict] = None,
         completion_delay: float = 0.0,
-        model_path: str = "C:\\Users\\Admin\\.cache\\hf\\gemma-4.gguf",
+        # Cosmetic only -- only appears in the synthesised stdout
+        # template's "loading model '<path>'" line. The production code
+        # we drive from the tests does not parse this value. Default is
+        # OS-portable so the shim does not bake any one developer's
+        # machine path into the test surface (gemini-code-assist review
+        # on PR #5669).
+        model_path: str = "<test-fixture>/gemma-4.gguf",
     ) -> None:
         self.host = host
         self._requested_port = port
