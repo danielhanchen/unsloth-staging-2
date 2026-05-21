@@ -2576,9 +2576,16 @@ class LlamaCppBackend:
                 # commit f63ac224).
                 if not self._audio_probed:
                     try:
-                        detected = self.detect_audio_type()
+                        # Strict variant raises on transient HTTP/JSON
+                        # errors (chatgpt-codex P2 3284185168 on
+                        # upstream f63ac224).
+                        detected = self._detect_audio_type_strict()
                         self._audio_probed = True
-                    except Exception:
+                    except Exception as exc:
+                        logger.debug(
+                            "Fast-path audio probe failed transiently: %s",
+                            exc,
+                        )
                         detected = None
                     if detected in ("snac", "bicodec", "dac"):
                         with self._lock:
@@ -2603,6 +2610,15 @@ class LlamaCppBackend:
                                 )
                     elif detected:
                         self._audio_type = detected
+                # Recheck _healthy: unload between fast-path arrival
+                # and now could have torn down the backend
+                # (chatgpt-codex P2 3284185172).
+                if not self._healthy:
+                    logger.info(
+                        "load_model fast-path: unload won race; "
+                        "reporting load failure"
+                    )
+                    return False
                 return True
 
             self._cancel_event.clear()
@@ -3329,12 +3345,14 @@ class LlamaCppBackend:
             self._audio_type = None
             self._audio_probed = False
             try:
-                detected = self.detect_audio_type()
-                # Cache the probe result (non-audio counts as a
-                # probed outcome too; chatgpt-codex P2 on upstream
-                # commit f63ac224).
+                # Strict variant raises on transient HTTP/JSON errors
+                # so we cache only definitive non-audio verdicts and
+                # still recover from transient probe failures
+                # (chatgpt-codex P2 3284185168 on upstream f63ac224).
+                detected = self._detect_audio_type_strict()
                 self._audio_probed = True
-            except Exception:
+            except Exception as exc:
+                logger.debug("Audio probe failed transiently: %s", exc)
                 detected = None
             if detected in ("snac", "bicodec", "dac"):
                 with self._lock:
@@ -3358,6 +3376,16 @@ class LlamaCppBackend:
             elif detected:
                 self._audio_type = detected
 
+            # Recheck _healthy before reporting load success: audio
+            # probe runs outside self._lock so /unload can tear down
+            # the backend mid-probe. chatgpt-codex P2 3284185172 on
+            # upstream f63ac224.
+            if not self._healthy:
+                logger.info(
+                    "load_model: unload won race after probe; "
+                    "reporting load failure"
+                )
+                return False
             return True
 
     def _build_speculative_flags(
@@ -5275,48 +5303,64 @@ class LlamaCppBackend:
     # ── TTS support ────────────────────────────────────────────
 
     def detect_audio_type(self) -> Optional[str]:
-        """Detect audio/TTS codec by probing the loaded model's vocabulary."""
-        if not self.is_loaded:
-            return None
+        """Detect audio/TTS codec by probing the loaded model's vocabulary.
+
+        Backwards-compatible API: returns codec name on match, None
+        for non-audio models, and None on transient transport/JSON
+        errors. Callers that need to distinguish should use
+        ``_detect_audio_type_strict`` (chatgpt-codex P2 3284185168
+        on upstream commit 0f55615d).
+        """
         try:
-            _auth_headers = (
-                {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
-            )
-            with httpx.Client(timeout = 10, headers = _auth_headers) as client:
-
-                def _detok(tid: int) -> str:
-                    r = client.post(
-                        f"{self.base_url}/detokenize", json = {"tokens": [tid]}
-                    )
-                    return r.json().get("content", "") if r.status_code == 200 else ""
-
-                def _tok(text: str) -> list[int]:
-                    r = client.post(
-                        f"{self.base_url}/tokenize",
-                        json = {"content": text, "add_special": False},
-                    )
-                    return r.json().get("tokens", []) if r.status_code == 200 else []
-
-                # Check codec-specific tokens (not generic ones that may exist in non-audio models)
-                if "<custom_token_" in _detok(128258) and "<custom_token_" in _detok(
-                    128259
-                ):
-                    return "snac"
-                if len(_tok("<|AUDIO|>")) == 1 and len(_tok("<|audio_eos|>")) == 1:
-                    return "csm"
-                if len(_tok("<|startoftranscript|>")) == 1:
-                    return "whisper"
-                if len(_tok("<audio_soft_token>")) == 1:
-                    return "audio_vlm"
-                if (
-                    len(_tok("<|bicodec_semantic_0|>")) == 1
-                    and len(_tok("<|bicodec_global_0|>")) == 1
-                ):
-                    return "bicodec"
-                if len(_tok("<|c1_0|>")) == 1 and len(_tok("<|c2_0|>")) == 1:
-                    return "dac"
+            return self._detect_audio_type_strict()
         except Exception as e:
             logger.debug(f"Audio type detection failed: {e}")
+            return None
+
+    def _detect_audio_type_strict(self) -> Optional[str]:
+        """Raises on transient HTTP / JSON errors instead of
+        swallowing them; returns codec name or None for definitive
+        non-audio."""
+        if not self.is_loaded:
+            return None
+        _auth_headers = (
+            {"Authorization": f"Bearer {self._api_key}"} if self._api_key else None
+        )
+        with httpx.Client(timeout = 10, headers = _auth_headers) as client:
+
+            def _detok(tid: int) -> str:
+                r = client.post(
+                    f"{self.base_url}/detokenize", json = {"tokens": [tid]}
+                )
+                r.raise_for_status()
+                return r.json().get("content", "")
+
+            def _tok(text: str) -> list[int]:
+                r = client.post(
+                    f"{self.base_url}/tokenize",
+                    json = {"content": text, "add_special": False},
+                )
+                r.raise_for_status()
+                return r.json().get("tokens", [])
+
+            # Check codec-specific tokens (not generic ones that may exist in non-audio models)
+            if "<custom_token_" in _detok(128258) and "<custom_token_" in _detok(
+                128259
+            ):
+                return "snac"
+            if len(_tok("<|AUDIO|>")) == 1 and len(_tok("<|audio_eos|>")) == 1:
+                return "csm"
+            if len(_tok("<|startoftranscript|>")) == 1:
+                return "whisper"
+            if len(_tok("<audio_soft_token>")) == 1:
+                return "audio_vlm"
+            if (
+                len(_tok("<|bicodec_semantic_0|>")) == 1
+                and len(_tok("<|bicodec_global_0|>")) == 1
+            ):
+                return "bicodec"
+            if len(_tok("<|c1_0|>")) == 1 and len(_tok("<|c2_0|>")) == 1:
+                return "dac"
         return None
 
     # Prompt format per codec: (template, stop_tokens, needs_token_ids)

@@ -487,11 +487,15 @@ def test_load_model_caches_audio_type_inside_serial_load_lock():
     assert "with self._serial_load_lock" in text, (
         "LlamaCppBackend.load_model must hold self._serial_load_lock"
     )
-    # The cache writes must be present.
+    # The cache writes must be present. The strict variant
+    # `_detect_audio_type_strict` was added in chatgpt-codex P2
+    # 3284185168 on upstream commit 0f55615d; accept either.
     assert "self._audio_type = self.detect_audio_type()" in text or \
-           "detected = self.detect_audio_type()" in text, (
-        "LlamaCppBackend.load_model must call self.detect_audio_type and cache "
-        "the result on self._audio_type (#5642 follow-up)."
+           "detected = self.detect_audio_type()" in text or \
+           "detected = self._detect_audio_type_strict()" in text, (
+        "LlamaCppBackend.load_model must call detect_audio_type / "
+        "_detect_audio_type_strict and cache the result on "
+        "self._audio_type (#5642 follow-up)."
     )
 
 
