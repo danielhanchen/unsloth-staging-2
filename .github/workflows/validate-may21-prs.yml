@@ -68,7 +68,9 @@ jobs:
           python -m pip install -U pip setuptools wheel
           # CPU torch (~10x smaller than CUDA wheels, matches runner profile)
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-          python -m pip install pytest pytest-asyncio fastapi httpx pydantic packaging
+          python -m pip install \
+            pytest pytest-asyncio fastapi httpx pydantic packaging \
+            pyyaml structlog tomli numpy
           # Editable install of unsloth + zoo from main so the spoofed conftest
           # imports resolve identically to upstream CI.
           python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@main"
