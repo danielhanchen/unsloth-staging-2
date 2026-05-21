@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+#
+# Cross-OS validation for the May 18-21 2026 PR cohort:
+#   - PR #5603 (sandbox hardening)         -> studio/backend/tests/test_sandbox_hardening.py
+#   - PR #5582 (MTP --spec-draft-n-max)    -> studio/backend/tests/test_llama_cpp_mtp_detection.py
+#                                             studio/backend/tests/test_gguf_reload_inheritance.py
+#   - PR #5604 (lockfile audit)            -> tests/security/test_lockfile_supply_chain_audit.py
+#                                             python3 scripts/lockfile_supply_chain_audit.py
+#
+# All tests are CPU-only (no real model load) and run under the CUDA spoof from
+# tests/conftest.py + tests/_zoo_aggressive_cuda_spoof.py, so they finish on
+# vanilla GitHub runners (ubuntu-latest, macos-14, windows-latest) without GPUs.
+#
+# Concurrency cap: cancel-in-progress per (workflow, ref) keeps Windows runners
+# below the 5-concurrent cap when iterating.
+
+name: Validate May 21 PR cohort
+
+on:
+  push:
+    branches: [validate-may21-prs]
+    paths:
+      - 'studio/backend/core/inference/tools.py'
+      - 'studio/backend/core/inference/llama_cpp.py'
+      - 'studio/backend/core/inference/llama_server_args.py'
+      - 'studio/backend/models/inference.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/tests/test_sandbox_hardening.py'
+      - 'studio/backend/tests/test_llama_cpp_mtp_detection.py'
+      - 'studio/backend/tests/test_gguf_reload_inheritance.py'
+      - 'studio/backend/tests/test_llama_server_args*.py'
+      - 'tests/security/test_lockfile_supply_chain_audit.py'
+      - 'scripts/lockfile_supply_chain_audit.py'
+      - 'tests/conftest.py'
+      - 'tests/_zoo_aggressive_cuda_spoof.py'
+      - '.github/workflows/validate-may21-prs.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend-tests:
+    name: backend / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install minimal test deps (CPU-only)
+        shell: bash
+        run: |
+          python -m pip install -U pip setuptools wheel
+          # CPU torch (~10x smaller than CUDA wheels, matches runner profile)
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install pytest pytest-asyncio fastapi httpx pydantic packaging
+          # Editable install of unsloth + zoo from main so the spoofed conftest
+          # imports resolve identically to upstream CI.
+          python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@main"
+          python -m pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+
+      - name: PR #5603 sandbox-hardening tests
+        if: ${{ hashFiles('studio/backend/tests/test_sandbox_hardening.py') != '' }}
+        shell: bash
+        run: |
+          python -m pytest studio/backend/tests/test_sandbox_hardening.py -q --no-header -rN
+
+      - name: PR #5582 MTP detection + reload inheritance
+        if: ${{ hashFiles('studio/backend/tests/test_llama_cpp_mtp_detection.py') != '' }}
+        shell: bash
+        run: |
+          python -m pytest \
+            studio/backend/tests/test_llama_cpp_mtp_detection.py \
+            studio/backend/tests/test_gguf_reload_inheritance.py \
+            -q --no-header -rN
+
+      - name: PR #5604 lockfile audit (advisory)
+        if: ${{ hashFiles('scripts/lockfile_supply_chain_audit.py') != '' }}
+        shell: bash
+        run: |
+          python -m pytest tests/security/test_lockfile_supply_chain_audit.py -q --no-header -rN
+          python3 scripts/lockfile_supply_chain_audit.py
