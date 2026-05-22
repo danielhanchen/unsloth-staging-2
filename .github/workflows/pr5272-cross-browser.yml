@@ -1,0 +1,293 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Cross-browser smoke for the legacy-Dexie -> studio.db migration in
+# Unsloth Studio PR #5272 (move-chat-history-to-studio-db).
+#
+# The local maintainer probe only drives chromium via @playwright/mcp.
+# This workflow validates the same migration code path
+# (chat-history-storage.ts:246 importLegacyChatsIfNeeded) against
+# every browser Playwright supports, on real Linux + macOS + Windows
+# runners.
+#
+# No GPU and no chat model are required: the migration runs purely on
+# Dexie -> SQLite copy semantics. install.sh --local --no-torch skips
+# the PyTorch wheel entirely so the install completes in ~2 min on a
+# free runner. Studio is booted with UNSLOTH_API_ONLY=1 so it never
+# tries to spawn llama-server.
+#
+# Matrix (6 jobs, well under the 5-Windows-concurrent cap):
+#   ubuntu-latest  : chromium, firefox
+#   macos-14       : chromium, webkit       (webkit = Safari engine)
+#   windows-latest : chromium, msedge       (webkit not supported on Windows)
+
+name: PR5272 cross-browser migration
+
+on:
+  # Push-only trigger so an open PR doesn't double-run this on every
+  # commit (push event + synchronize event both fire otherwise).
+  push:
+    branches:
+      - pr5272-cross-browser-migration
+    paths:
+      - 'studio/frontend/src/features/chat/**'
+      - 'studio/backend/storage/studio_db.py'
+      - 'studio/backend/routes/chat_history.py'
+      - 'studio/backend/main.py'
+      - 'tests/studio/playwright_pr5272_migration.py'
+      - '.github/workflows/pr5272-cross-browser.yml'
+      - 'install.sh'
+      - 'install.ps1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    name: ${{ matrix.os }} / ${{ matrix.browser }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            browser: chromium
+            port: '18901'
+          - os: ubuntu-latest
+            browser: firefox
+            port: '18902'
+          - os: macos-14
+            browser: chromium
+            port: '18903'
+          - os: macos-14
+            browser: webkit
+            port: '18904'
+          - os: windows-latest
+            browser: chromium
+            port: '18905'
+          - os: windows-latest
+            browser: msedge
+            port: '18906'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      STUDIO_PORT: ${{ matrix.port }}
+      PW_BROWSER: ${{ matrix.browser }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      # Linux-only OS deps for Studio install + curl/jq used by the
+      # health probe step below.
+      - name: Linux OS deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libssl-dev jq
+
+      - name: Install Studio (--local --no-torch) [unix]
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Install Studio (--local --no-torch) [windows]
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          # install.ps1 mirrors install.sh's --local + --no-torch flags
+          # (see install.ps1 line 101).
+          .\install.ps1 --local --no-torch 2>&1 | Tee-Object -FilePath logs/install.log
+
+      - name: Add Studio bin to GITHUB_PATH [windows]
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # install.ps1 updates persistent User PATH but the subsequent
+          # bash steps see a Git-Bash PATH built from the runner's
+          # initial env. Push the bin dir explicitly so `unsloth` is on
+          # PATH for the boot + health steps. install.ps1 defaults to
+          # $env:USERPROFILE\.unsloth\studio which Git Bash maps to
+          # /c/Users/<user>/.unsloth/studio.
+          STUDIO_BIN="$HOME/.unsloth/studio/bin"
+          if [ ! -d "$STUDIO_BIN" ]; then
+            echo "Studio bin dir not found at $STUDIO_BIN" >&2
+            ls -la "$HOME/.unsloth" 2>/dev/null || true
+            exit 1
+          fi
+          echo "$STUDIO_BIN" >> "$GITHUB_PATH"
+          echo "added to PATH: $STUDIO_BIN"
+
+      - name: Install Playwright + ${{ matrix.browser }}
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # Pin to a known-good Playwright. Floating "latest" on macos-14
+          # arm64 has hit driver-level JSON parse crashes in webkit
+          # (coreBundle.js:37990 -- run 26265056342 macos-14 / webkit).
+          python -m pip install 'playwright==1.55.0'
+          # --with-deps is only meaningful on Linux (and benign elsewhere).
+          # For msedge we install chromium binary set since msedge
+          # piggybacks on chromium; Playwright detects the system-
+          # installed Edge channel via channel='msedge'.
+          if [ "${{ matrix.browser }}" = "msedge" ]; then
+            python -m playwright install --with-deps chromium
+            python -m playwright install msedge || true
+          else
+            python -m playwright install --with-deps "${{ matrix.browser }}"
+          fi
+
+      - name: Reset auth + boot Studio
+        shell: bash
+        run: |
+          unsloth studio reset-password
+          mkdir -p logs
+          # UNSLOTH_API_ONLY=1 skips llama-server bootstrap so no GPU /
+          # GGUF is needed.
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" \
+            > logs/studio.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for /api/health
+        shell: bash
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fs "http://127.0.0.1:$STUDIO_PORT/api/health" \
+                > /tmp/health.json 2>/dev/null; then
+              jq -e '.status == "healthy"' /tmp/health.json && exit 0
+            fi
+            sleep 1
+          done
+          echo "Studio never became healthy" >&2
+          tail -200 logs/studio.log >&2 || true
+          exit 1
+
+      # Bypass UI login: rotate the bootstrap password via the auth
+      # API + capture access/refresh tokens, so the Playwright test
+      # can pre-inject them into localStorage. This avoids browser-
+      # specific quirks in the /change-password and /login forms
+      # (Firefox headless silently dropped the submit click; webkit
+      # macos-14 has a separate driver-network issue).
+      - name: Rotate bootstrap password + capture tokens
+        shell: bash
+        run: |
+          set -euo pipefail
+          PW_FILE="$HOME/.unsloth/studio/auth/.bootstrap_password"
+          if [ ! -f "$PW_FILE" ]; then
+            echo "bootstrap password not at $PW_FILE" >&2
+            find "$HOME" -maxdepth 4 -name '.bootstrap_password' 2>/dev/null || true
+            exit 1
+          fi
+          OLD=$(tr -d '\r\n' < "$PW_FILE")
+          NEW="CrossBrowserCI2026!$(python -c 'import secrets;print(secrets.token_urlsafe(8))')"
+          export OLD NEW
+          PORT="${STUDIO_PORT}"
+          BASE="http://127.0.0.1:${PORT}"
+
+          # Build the JSON payloads via python so passwords with shell
+          # metacharacters survive serialization.
+          LOGIN_OLD=$(python -c 'import json,os;print(json.dumps({"username":"unsloth","password":os.environ["OLD"]}))')
+          LOGIN_NEW=$(python -c 'import json,os;print(json.dumps({"username":"unsloth","password":os.environ["NEW"]}))')
+          CHGPW=$(python -c 'import json,os;print(json.dumps({"current_password":os.environ["OLD"],"new_password":os.environ["NEW"]}))')
+
+          # Bootstrap login (only the seeded admin uses the bootstrap pw)
+          BOOT=$(curl -fsSL -X POST "$BASE/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "$LOGIN_OLD")
+          BOOT_TOKEN=$(python -c 'import json,sys;print(json.loads(sys.stdin.read())["access_token"])' <<< "$BOOT")
+
+          # Rotate the password using the bootstrap token
+          curl -fsSL -X POST "$BASE/api/auth/change-password" \
+            -H "Authorization: Bearer $BOOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$CHGPW" \
+            > /dev/null
+
+          # Re-login with the new password to capture full session tokens
+          RESP=$(curl -fsSL -X POST "$BASE/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "$LOGIN_NEW")
+          ACCESS=$(python -c 'import json,sys;print(json.loads(sys.stdin.read())["access_token"])' <<< "$RESP")
+          REFRESH=$(python -c 'import json,sys;print(json.loads(sys.stdin.read())["refresh_token"])' <<< "$RESP")
+
+          echo "::add-mask::$ACCESS"
+          echo "::add-mask::$REFRESH"
+          echo "STUDIO_ACCESS_TOKEN=$ACCESS" >> "$GITHUB_ENV"
+          echo "STUDIO_REFRESH_TOKEN=$REFRESH" >> "$GITHUB_ENV"
+          echo "STUDIO_DB_PATH=$HOME/.unsloth/studio/studio.db" >> "$GITHUB_ENV"
+          echo "tokens captured for $(echo "$RESP" | wc -c)-byte response"
+
+      - name: Run PR-5272 migration test
+        shell: bash
+        env:
+          BASE_URL: http://127.0.0.1:${{ matrix.port }}
+          PW_ART_DIR: logs/playwright_pr5272
+        run: |
+          mkdir -p logs/playwright_pr5272
+          # WebKit on macos-14 arm64 has a flaky Playwright pipe driver
+          # that intermittently dies with "Unexpected end of JSON input"
+          # before the test can even reach its first page.goto. Three
+          # attempts gives the driver odds of catching a stable run.
+          if [ "${{ matrix.browser }}" = "webkit" ]; then
+            ATTEMPTS=3
+          else
+            ATTEMPTS=1
+          fi
+          for n in $(seq 1 $ATTEMPTS); do
+            echo "::group::test attempt $n / $ATTEMPTS"
+            if python tests/studio/playwright_pr5272_migration.py; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            RC=$?
+            echo "::endgroup::"
+            echo "::warning::attempt $n exited $RC"
+            if [ "$n" -lt "$ATTEMPTS" ]; then
+              sleep 5
+            fi
+          done
+          exit 1
+
+      - name: Stop Studio
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${STUDIO_PID:-}" ]; then
+            kill "$STUDIO_PID" 2>/dev/null || true
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr5272-${{ matrix.os }}-${{ matrix.browser }}
+          path: |
+            logs/install.log
+            logs/studio.log
+            logs/playwright_pr5272
+          retention-days: 7
+          if-no-files-found: warn
