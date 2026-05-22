@@ -298,7 +298,26 @@ def main() -> int:
         page.set_default_timeout(30000)
 
         # 1. Initial navigation (tokens already in localStorage).
-        page.goto(f"{BASE_URL}/chat", wait_until="domcontentloaded", timeout=45000)
+        # WebKit on macos-14 has occasionally crashed the Playwright
+        # driver on the very first goto with "SyntaxError: Unexpected
+        # end of JSON input" out of coreBundle.js. Wrap in a short
+        # retry so a transient driver hiccup does not fail the run.
+        nav_err = None
+        for attempt in range(3):
+            try:
+                page.goto(
+                    f"{BASE_URL}/chat",
+                    wait_until="domcontentloaded",
+                    timeout=45000,
+                )
+                nav_err = None
+                break
+            except Exception as e:
+                nav_err = e
+                print(f"[goto] attempt {attempt+1}/3 failed: {e}")
+                time.sleep(2.0)
+        if nav_err is not None:
+            raise nav_err
         _screenshot(page, "01_logged_in")
 
         # 2a. Wait for Studio's chat module to mount + open Dexie
