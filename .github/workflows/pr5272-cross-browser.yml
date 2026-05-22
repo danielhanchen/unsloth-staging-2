@@ -123,6 +123,25 @@ jobs:
           # (see install.ps1 line 101).
           .\install.ps1 --local --no-torch 2>&1 | Tee-Object -FilePath logs/install.log
 
+      - name: Add Studio bin to GITHUB_PATH [windows]
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # install.ps1 updates persistent User PATH but the subsequent
+          # bash steps see a Git-Bash PATH built from the runner's
+          # initial env. Push the bin dir explicitly so `unsloth` is on
+          # PATH for the boot + health steps. install.ps1 defaults to
+          # $env:USERPROFILE\.unsloth\studio which Git Bash maps to
+          # /c/Users/<user>/.unsloth/studio.
+          STUDIO_BIN="$HOME/.unsloth/studio/bin"
+          if [ ! -d "$STUDIO_BIN" ]; then
+            echo "Studio bin dir not found at $STUDIO_BIN" >&2
+            ls -la "$HOME/.unsloth" 2>/dev/null || true
+            exit 1
+          fi
+          echo "$STUDIO_BIN" >> "$GITHUB_PATH"
+          echo "added to PATH: $STUDIO_BIN"
+
       - name: Install Playwright + ${{ matrix.browser }}
         shell: bash
         run: |

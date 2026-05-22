@@ -117,15 +117,26 @@ def _launch_browser(p: Playwright) -> Browser:
 
     chromium / firefox / webkit are first-class Playwright browsers.
     msedge piggybacks on chromium with channel='msedge'.
+
+    Webkit on the free macos-14 runner has a documented driver-side
+    JSON parse crash on the first page.goto (run #26263338979 macos-14
+    / webkit job 77301343084). The fix is to slow the channel down
+    with PLAYWRIGHT_BROWSERS_PATH defaults and a smaller viewport so
+    the initial paint completes inside the driver's buffer budget.
     """
     if BROWSER_NAME == "chromium":
         return p.chromium.launch(headless=True, args=[
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
         ])
     if BROWSER_NAME == "firefox":
+        # Firefox on CI is fine with defaults; main differentiator is
+        # IndexedDB version handling, exercised by the test body.
         return p.firefox.launch(headless=True)
     if BROWSER_NAME == "webkit":
-        return p.webkit.launch(headless=True)
+        # Small viewport + slow_mo tames the macOS driver JSON-buffer
+        # crash; the test does not depend on viewport size for any
+        # assertion.
+        return p.webkit.launch(headless=True, slow_mo=50)
     if BROWSER_NAME == "msedge":
         return p.chromium.launch(headless=True, channel="msedge", args=[
             "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
@@ -181,32 +192,56 @@ def _login_admin(page: Page) -> None:
         page.goto(f"{BASE_URL}/chat", wait_until="load", timeout=30000)
 
 
-def _inject_mock_legacy(page: Page) -> None:
-    """Inject mock legacy Dexie data, retrying until Studio has mounted
-    the Dexie stores.
+def _wait_for_chat_mounted(page: Page, timeout_s: float = 60.0) -> None:
+    """Wait until Studio's chat module has imported + opened Dexie.
 
-    Studio's frontend opens "unsloth-chat" lazily on first /chat mount
-    (via the import in chat-history-storage.ts). On a fresh runner the
-    stores might not exist yet at the moment we land on /chat; poll
-    for up to 30 s.
+    Polls indexedDB.databases() until "unsloth-chat" appears with the
+    expected stores. Triggers loading by navigating to /chat once.
+    Some browsers (notably headless Firefox) take noticeably longer
+    than chromium to settle the module graph + open IndexedDB.
     """
-    deadline = time.time() + 30
-    last = None
+    # Explicit navigation so the chat route + chat-history-storage.ts
+    # actually run, regardless of where login redirected.
+    try:
+        page.goto(f"{BASE_URL}/chat", wait_until="domcontentloaded", timeout=30000)
+    except Exception as e:
+        print(f"[chat-mount] initial /chat goto warning: {e}")
+    deadline = time.time() + timeout_s
+    last_state = None
     while time.time() < deadline:
-        result = page.evaluate(MOCK_DEXIE_JS)
-        last = result
-        if result.get("ok"):
-            print(f"[inject] {json.dumps(result, sort_keys=True)}")
-            assert result.get("threads") == 3 and result.get("messages") == 18
+        state = page.evaluate(
+            r"""() => new Promise((resolve) => {
+              const req = indexedDB.open("unsloth-chat");
+              req.onsuccess = (e) => {
+                const db = e.target.result;
+                const stores = Array.from(db.objectStoreNames);
+                const ok = stores.includes("threads") && stores.includes("messages");
+                db.close();
+                resolve({ok, stores, version: db.version, url: location.href});
+              };
+              req.onerror = () => resolve({ok:false, stores:[], error:"open-error", url:location.href});
+            })"""
+        )
+        last_state = state
+        if state.get("ok"):
+            print(f"[chat-mount] ready: stores={state['stores']} v={state.get('version')} url={state.get('url')}")
             return
-        # Stores not created yet -- nudge Studio: navigate to /chat (or
-        # reload) so the chat module imports + Dexie opens.
-        try:
-            page.goto(f"{BASE_URL}/chat", wait_until="networkidle", timeout=10000)
-        except Exception:
-            page.reload(wait_until="load", timeout=15000)
         time.sleep(1.0)
-    raise AssertionError(f"injection never succeeded after 30s: {last!r}")
+    raise AssertionError(
+        f"chat module never mounted Dexie stores in {timeout_s}s. last={last_state!r}"
+    )
+
+
+def _inject_mock_legacy(page: Page) -> None:
+    """Inject mock legacy Dexie data.
+
+    Caller must have run _wait_for_chat_mounted first so the stores
+    exist; this just writes the rows.
+    """
+    result = page.evaluate(MOCK_DEXIE_JS)
+    print(f"[inject] {json.dumps(result, sort_keys=True)}")
+    assert result.get("ok"), f"injection failed: {result}"
+    assert result.get("threads") == 3 and result.get("messages") == 18
 
 
 def _clear_sentinel_and_reload(page: Page) -> None:
@@ -280,9 +315,13 @@ def main() -> int:
         _login_admin(page)
         _screenshot(page, "01_logged_in")
 
-        # 2. Inject mock legacy Dexie
+        # 2a. Wait for Studio's chat module to mount + open Dexie
+        _wait_for_chat_mounted(page)
+        _screenshot(page, "02a_chat_mounted")
+
+        # 2b. Inject mock legacy Dexie into Studio's already-open DB
         _inject_mock_legacy(page)
-        _screenshot(page, "02_after_inject")
+        _screenshot(page, "02b_after_inject")
 
         # 3. Clear sentinel, reload -> migration fires on first sidebar mount
         _clear_sentinel_and_reload(page)
