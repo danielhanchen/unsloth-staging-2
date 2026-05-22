@@ -248,7 +248,29 @@ jobs:
           PW_ART_DIR: logs/playwright_pr5272
         run: |
           mkdir -p logs/playwright_pr5272
-          python tests/studio/playwright_pr5272_migration.py
+          # WebKit on macos-14 arm64 has a flaky Playwright pipe driver
+          # that intermittently dies with "Unexpected end of JSON input"
+          # before the test can even reach its first page.goto. Three
+          # attempts gives the driver odds of catching a stable run.
+          if [ "${{ matrix.browser }}" = "webkit" ]; then
+            ATTEMPTS=3
+          else
+            ATTEMPTS=1
+          fi
+          for n in $(seq 1 $ATTEMPTS); do
+            echo "::group::test attempt $n / $ATTEMPTS"
+            if python tests/studio/playwright_pr5272_migration.py; then
+              echo "::endgroup::"
+              exit 0
+            fi
+            RC=$?
+            echo "::endgroup::"
+            echo "::warning::attempt $n exited $RC"
+            if [ "$n" -lt "$ATTEMPTS" ]; then
+              sleep 5
+            fi
+          done
+          exit 1
 
       - name: Stop Studio
         if: always()
