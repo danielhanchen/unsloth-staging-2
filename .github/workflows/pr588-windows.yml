@@ -71,6 +71,15 @@ jobs:
               'from ..__init__ import Linear4bit, Linear8bitLt\n'
               'class Params4bit:\n'
               '    def __init__(self, *a, **k): pass\n'
+              'from . import modules\n'
+          )
+          # zoo's vllm_utils does `import bitsandbytes.nn.modules` and
+          # pokes at Linear4bit / Params4bit on it; expose the same shapes.
+          (root / "bitsandbytes" / "nn" / "modules.py").write_text(
+              'from ..__init__ import Linear4bit, Linear8bitLt\n'
+              'from . import Params4bit\n'
+              'class Int8Params:\n'
+              '    def __init__(self, *a, **k): pass\n'
           )
           # unsloth_zoo.vllm_utils does `from bitsandbytes.utils import
           # pack_dict_to_tensor, unpack_tensor_to_dict` at import time;
