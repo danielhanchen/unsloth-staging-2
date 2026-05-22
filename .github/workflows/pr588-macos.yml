@@ -65,12 +65,55 @@ jobs:
               'from . import language, runtime, compiler\n'
           )
           (root / "triton" / "language" / "__init__.py").write_text(
-              'class constexpr: pass\n'
-              'float16 = float32 = bfloat16 = int8 = int16 = int32 = int64 = "dtype"\n'
+              'class dtype:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              'class constexpr:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              'float16 = dtype()\n'
+              'float32 = dtype()\n'
+              'bfloat16 = dtype()\n'
+              'int8 = dtype()\n'
+              'int16 = dtype()\n'
+              'int32 = dtype()\n'
+              'int64 = dtype()\n'
+              'pointer_type = dtype\n'
               'def program_id(*a, **k): return 0\n'
               'def arange(*a, **k): return None\n'
               'def load(*a, **k): return None\n'
               'def store(*a, **k): return None\n'
+          )
+          # Also stub bitsandbytes on macOS (Linux-only wheel; we only need
+          # imports to succeed for the Studio CLI smoke).
+          (root / "bitsandbytes").mkdir(exist_ok=True)
+          (root / "bitsandbytes" / "__init__.py").write_text(
+              '__version__ = "0.49.2-macos-stub"\n'
+              'class Linear4bit:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              'class Linear8bitLt:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              'class _Params4bit:\n'
+              '    pass\n'
+              'class nn:\n'
+              '    Linear4bit = Linear4bit\n'
+              '    Linear8bitLt = Linear8bitLt\n'
+              'class functional:\n'
+              '    @staticmethod\n'
+              '    def dequantize_4bit(*a, **k): return None\n'
+              '    @staticmethod\n'
+              '    def quantize_4bit(*a, **k): return None\n'
+          )
+          (root / "bitsandbytes" / "functional.py").write_text(
+              'def dequantize_4bit(*a, **k): return None\n'
+              'def quantize_4bit(*a, **k): return None\n'
+              'class QuantState:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              '    def as_dict(self, packed=True): return {}\n'
+          )
+          (root / "bitsandbytes" / "nn").mkdir(exist_ok=True)
+          (root / "bitsandbytes" / "nn" / "__init__.py").write_text(
+              'from ..__init__ import Linear4bit, Linear8bitLt\n'
+              'class Params4bit:\n'
+              '    def __init__(self, *a, **k): pass\n'
           )
           (root / "triton" / "runtime" / "__init__.py").write_text('')
           (root / "triton" / "runtime" / "autotuner.py").write_text(

@@ -39,9 +39,41 @@ jobs:
       - name: Install CPU torch + deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
-          python -m pip install transformers pytest accelerate peft trl datasets triton-windows Pillow torchvision
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          python -m pip install transformers pytest accelerate peft trl datasets triton-windows Pillow
           # bitsandbytes wheel is Linux-only; skip on Windows.
+
+      - name: Install bitsandbytes stub (Linux-only wheel)
+        run: |
+          python - <<PY
+          import os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "bnb_stub"
+          (root / "bitsandbytes").mkdir(parents=True, exist_ok=True)
+          (root / "bitsandbytes" / "__init__.py").write_text(
+              '__version__ = "0.49.2-windows-stub"\n'
+              'class Linear4bit:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              'class Linear8bitLt:\n'
+              '    def __init__(self, *a, **k): pass\n'
+          )
+          (root / "bitsandbytes" / "functional.py").write_text(
+              'def dequantize_4bit(*a, **k): return None\n'
+              'def quantize_4bit(*a, **k): return None\n'
+              'class QuantState:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              '    def as_dict(self, packed=True): return {}\n'
+          )
+          (root / "bitsandbytes" / "nn").mkdir(exist_ok=True)
+          (root / "bitsandbytes" / "nn" / "__init__.py").write_text(
+              'from ..__init__ import Linear4bit, Linear8bitLt\n'
+              'class Params4bit:\n'
+              '    def __init__(self, *a, **k): pass\n'
+          )
+          print("bnb stub written to", root)
+          PY
+          STUB="$RUNNER_TEMP/bnb_stub"
+          echo "PYTHONPATH=$STUB:${PYTHONPATH:-}" >> "$GITHUB_ENV"
+          PYTHONPATH="$STUB" python -c "import bitsandbytes; print('bnb stub:', bitsandbytes.__version__)"
 
       - name: Install unsloth_zoo @ PR-588 head
         run: python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/Datta0/unsloth-zoo.git@qwen35-shared-final"
