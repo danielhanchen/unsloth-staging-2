@@ -37,7 +37,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch
-          python -m pip install transformers pytest accelerate peft trl datasets Pillow
+          python -m pip install transformers pytest accelerate peft trl datasets Pillow torchvision
           # bitsandbytes + triton wheels are Linux-only; the PR's sim tests
           # that touch bnb/triton code only inspect source (no real call).
           # Install a minimal triton-stub so the unsloth_zoo top-level
@@ -45,38 +45,45 @@ jobs:
       - name: Install triton stub (macOS has no official triton)
         run: |
           STUB="$RUNNER_TEMP/triton_stub"
-          mkdir -p "$STUB/triton/runtime" "$STUB/triton/language" "$STUB/triton/compiler"
-          cat > "$STUB/triton/__init__.py" <<'PYSTUB'
-          __version__ = "3.5.0-macos-stub"
-          def jit(fn=None, *a, **k):
-              return fn if fn is not None else (lambda f: f)
-          def autotune(*a, **k):
-              return lambda fn: fn
-          def heuristics(*a, **k):
-              return lambda fn: fn
-          def Config(*a, **k):
-              return None
-          PYSTUB
-          cat > "$STUB/triton/language/__init__.py" <<'PYSTUB'
-          class constexpr: pass
-          float16 = float32 = bfloat16 = int8 = int16 = int32 = int64 = "dtype"
-          def program_id(*a, **k): return 0
-          def arange(*a, **k): return None
-          def load(*a, **k): return None
-          def store(*a, **k): return None
-          PYSTUB
-          cat > "$STUB/triton/runtime/autotuner.py" <<'PYSTUB'
-          class Autotuner: pass
-          PYSTUB
-          cat > "$STUB/triton/runtime/__init__.py" <<'PYSTUB'
-          PYSTUB
-          cat > "$STUB/triton/compiler/__init__.py" <<'PYSTUB'
-          PYSTUB
-          cat > "$STUB/triton/compiler/compiler.py" <<'PYSTUB'
-          class AttrsDescriptor: pass
-          PYSTUB
+          python - <<PY
+          import os, pathlib
+          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "triton_stub"
+          (root / "triton").mkdir(parents=True, exist_ok=True)
+          (root / "triton" / "language").mkdir(exist_ok=True)
+          (root / "triton" / "runtime").mkdir(exist_ok=True)
+          (root / "triton" / "compiler").mkdir(exist_ok=True)
+          (root / "triton" / "__init__.py").write_text(
+              '__version__ = "3.5.0-macos-stub"\n'
+              'def jit(fn=None, *a, **k):\n'
+              '    return fn if fn is not None else (lambda f: f)\n'
+              'def autotune(*a, **k):\n'
+              '    return lambda fn: fn\n'
+              'def heuristics(*a, **k):\n'
+              '    return lambda fn: fn\n'
+              'def Config(*a, **k):\n'
+              '    return None\n'
+              'from . import language, runtime, compiler\n'
+          )
+          (root / "triton" / "language" / "__init__.py").write_text(
+              'class constexpr: pass\n'
+              'float16 = float32 = bfloat16 = int8 = int16 = int32 = int64 = "dtype"\n'
+              'def program_id(*a, **k): return 0\n'
+              'def arange(*a, **k): return None\n'
+              'def load(*a, **k): return None\n'
+              'def store(*a, **k): return None\n'
+          )
+          (root / "triton" / "runtime" / "__init__.py").write_text('')
+          (root / "triton" / "runtime" / "autotuner.py").write_text(
+              'class Autotuner: pass\n'
+          )
+          (root / "triton" / "compiler" / "__init__.py").write_text('')
+          (root / "triton" / "compiler" / "compiler.py").write_text(
+              'class AttrsDescriptor: pass\n'
+          )
+          print("stub written to", root)
+          PY
           echo "PYTHONPATH=$STUB:${PYTHONPATH:-}" >> "$GITHUB_ENV"
-          python -c "import sys; sys.path.insert(0, '$STUB'); import triton; import triton.language; print('triton stub:', triton.__version__)"
+          PYTHONPATH="$STUB" python -c "import triton; import triton.language; from triton.compiler.compiler import AttrsDescriptor; print('triton stub:', triton.__version__)"
 
       - name: Install unsloth_zoo @ PR-588 head
         run: python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/Datta0/unsloth-zoo.git@qwen35-shared-final"
