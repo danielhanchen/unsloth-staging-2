@@ -1,0 +1,122 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Cross-platform validation for the NVIDIA-only guard added on top of PR
+# #5435. Runs the flash-attn / FLA install-path tests on Linux, macOS, and
+# Windows runners (all GPU-less), and asserts that `has_nvidia_gpu()` and
+# `has_blackwell_gpu()` both return False so the install gate fires on
+# non-NVIDIA hosts.
+
+name: flash-attn NVIDIA guard
+
+on:
+  push:
+    branches: [studio_flashattn_nvidia_guard]
+  pull_request:
+    paths:
+      - 'studio/backend/utils/wheel_utils.py'
+      - 'studio/backend/core/training/worker.py'
+      - 'studio/install_python_stack.py'
+      - 'studio/backend/tests/test_wheel_utils_optional_kernel.py'
+      - 'studio/backend/tests/test_mlx_training_worker_config.py'
+      - 'studio/backend/tests/test_training_worker_flash_attn.py'
+      - 'tests/python/test_flash_attn_install_python_stack.py'
+      - '.github/workflows/flash-attn-nvidia-guard.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: nvidia-guard (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install test deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest structlog
+
+      - name: Assert nvidia-smi missing on this runner
+        shell: bash
+        run: |
+          if command -v nvidia-smi >/dev/null 2>&1; then
+            echo "Unexpected nvidia-smi present on a GitHub-hosted runner."
+            exit 1
+          fi
+          echo "Confirmed: no nvidia-smi on $RUNNER_OS runner."
+
+      - name: has_nvidia_gpu / has_blackwell_gpu return False on GPU-less host
+        shell: bash
+        run: |
+          python - <<'PY'
+          import sys
+          sys.path.insert(0, "studio/backend")
+          from utils.wheel_utils import has_nvidia_gpu, has_blackwell_gpu
+          assert has_nvidia_gpu() is False, "has_nvidia_gpu should be False on GPU-less runner"
+          assert has_blackwell_gpu() is False, "has_blackwell_gpu should be False on GPU-less runner"
+          print("PASS: both helpers return False on GPU-less runner")
+          PY
+
+      - name: install_python_stack._ensure_flash_attn skips with no-NVIDIA warning
+        shell: bash
+        run: |
+          python - <<'PY'
+          import sys
+          from unittest import mock
+          sys.path.insert(0, "studio")
+          sys.path.insert(0, "studio/backend")
+          import install_python_stack as ips
+
+          step_messages = []
+          def fake_step(label, value, color_fn=None):
+              step_messages.append((label, value))
+
+          with (
+              mock.patch.object(ips, "NO_TORCH", False),
+              mock.patch.object(ips, "IS_WINDOWS", False),
+              mock.patch.object(ips, "IS_MACOS", False),
+              mock.patch.object(ips, "has_blackwell_gpu", return_value=False),
+              mock.patch.object(ips, "install_optional_kernel") as install_mock,
+              mock.patch.object(ips, "_step", side_effect=fake_step),
+          ):
+              ips._ensure_flash_attn()
+
+          assert install_mock.call_count == 0, "install should not be attempted on GPU-less host"
+          assert any("no NVIDIA GPU" in msg for _, msg in step_messages), \
+              f"expected 'no NVIDIA GPU' warning, got: {step_messages}"
+          print("PASS: _ensure_flash_attn skipped with NVIDIA warning")
+          PY
+
+      - name: Run unit tests (wheel_utils + flash-attn install + worker)
+        shell: bash
+        run: |
+          python -m pytest \
+            tests/python/test_flash_attn_install_python_stack.py \
+            studio/backend/tests/test_wheel_utils_optional_kernel.py \
+            studio/backend/tests/test_mlx_training_worker_config.py \
+            studio/backend/tests/test_training_worker_flash_attn.py::test_should_try_runtime_flash_attn_install_threshold_and_skip \
+            studio/backend/tests/test_training_worker_flash_attn.py::test_runtime_flash_attn_uses_shared_optional_kernel_installer \
+            studio/backend/tests/test_training_worker_flash_attn.py::test_runtime_flash_attn_reports_shared_installer_failure \
+            studio/backend/tests/test_training_worker_flash_attn.py::test_runtime_flash_attn_skip_env_avoids_all_install_work \
+            studio/backend/tests/test_training_worker_flash_attn.py::test_runtime_flash_attn_skips_on_blackwell \
+            studio/backend/tests/test_training_worker_flash_attn.py::test_runtime_flash_attn_skips_without_nvidia_gpu \
+            studio/backend/tests/test_training_worker_flash_attn.py::test_flash_linear_attention_skipped_on_blackwell \
+            studio/backend/tests/test_training_worker_flash_attn.py::test_flash_linear_attention_skipped_without_nvidia_gpu \
+            -v
