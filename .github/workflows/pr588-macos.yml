@@ -69,6 +69,20 @@ jobs:
               'def backends():\n'
               '    return {}\n'
           )
+          # torch._inductor.runtime.hints does `import triton.backends.compiler`
+          # at top-level on torch>=2.5; satisfy it with a minimal stub.
+          (root / "triton" / "backends" / "compiler.py").write_text(
+              'class BaseBackend:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              'class GPUTarget:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              'class AttrsDescriptor:\n'
+              '    def __init__(self, *a, **k): pass\n'
+          )
+          (root / "triton" / "backends" / "driver.py").write_text(
+              'class DriverBase:\n'
+              '    def __init__(self, *a, **k): pass\n'
+          )
           (root / "triton" / "language" / "__init__.py").write_text(
               'class dtype:\n'
               '    def __init__(self, *a, **k): pass\n'
@@ -141,7 +155,7 @@ jobs:
           python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo.git@main"
           # Resolve site-packages WITHOUT importing unsloth_zoo (its top-level
           # init crashes on a GPU-less runner unless the CUDA spoof is loaded).
-          SITE=$(python -c "import site; print(site.getsitepackages()[0])")
+          SITE=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
           ZOO_DIR="$SITE/unsloth_zoo"
           for f in empty_model.py hf_utils.py vllm_utils.py; do
             curl -sL "https://raw.githubusercontent.com/Datta0/unsloth-zoo/qwen35-shared-final/unsloth_zoo/$f" -o "$ZOO_DIR/$f"
@@ -196,5 +210,6 @@ jobs:
           # Skip sim_extract_gdn_fp8 and merger_fc_quant_regression: both touch
           # bnb-shaped tensors that need bitsandbytes (Linux-only).
           python -m pytest tests/pr588 -v --tb=short \
+            -o python_files="sim_*.py test_*.py" \
             --deselect tests/pr588/sim_extract_gdn.py::test_non_square_dimensions \
             -k "not merger_fc"
