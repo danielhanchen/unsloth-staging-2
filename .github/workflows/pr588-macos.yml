@@ -139,13 +139,15 @@ jobs:
           # (e.g. _unsloth_get_mm_token_id) is present. The PR-588 head fork
           # is too old to satisfy current unsloth main.
           python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo.git@main"
-          # Overlay the PR-588 3 modified source files (the actual diff under test).
-          ZOO_DIR=$(python -c "import os, unsloth_zoo; print(os.path.dirname(unsloth_zoo.__file__))")
+          # Resolve site-packages WITHOUT importing unsloth_zoo (its top-level
+          # init crashes on a GPU-less runner unless the CUDA spoof is loaded).
+          SITE=$(python -c "import site; print(site.getsitepackages()[0])")
+          ZOO_DIR="$SITE/unsloth_zoo"
           for f in empty_model.py hf_utils.py vllm_utils.py; do
             curl -sL "https://raw.githubusercontent.com/Datta0/unsloth-zoo/qwen35-shared-final/unsloth_zoo/$f" -o "$ZOO_DIR/$f"
           done
-          python -c "import unsloth_zoo; print('zoo with overlay:', unsloth_zoo.__version__)" || true
           echo "Overlay complete -- PR-588's 3 modified files now in $ZOO_DIR"
+          ls -la "$ZOO_DIR/empty_model.py" "$ZOO_DIR/hf_utils.py" "$ZOO_DIR/vllm_utils.py"
 
       - name: Install unsloth from this staging branch
         run: python -m pip install --no-deps -e .
