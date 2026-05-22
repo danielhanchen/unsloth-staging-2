@@ -26,6 +26,11 @@ jobs:
   smoke:
     runs-on: windows-latest
     timeout-minutes: 30
+    env:
+      # TRL's chat_template_utils.py reads deepseekv3.jinja without
+      # encoding=, which on Windows hits cp1252 and crashes on bytes >0x7F.
+      # PYTHONUTF8=1 forces UTF-8 for all default file IO (PEP 540).
+      PYTHONUTF8: "1"
     defaults:
       run:
         shell: bash

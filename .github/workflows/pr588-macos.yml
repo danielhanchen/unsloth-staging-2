@@ -63,6 +63,8 @@ jobs:
               '    return lambda fn: fn\n'
               'def Config(*a, **k):\n'
               '    return None\n'
+              'def next_power_of_2(x):\n'
+              '    return 1 if x <= 1 else 1 << (int(x) - 1).bit_length()\n'
               'from . import language, runtime, compiler, backends\n'
           )
           (root / "triton" / "backends" / "__init__.py").write_text(
