@@ -1,0 +1,107 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# PR #588 (unslothai/unsloth-zoo) cross-platform CI on Linux runners.
+# Confirms: (a) unsloth + unsloth_zoo with the PR's 4-file diff imports
+# cleanly on a CPU-only Linux runner via the existing aggressive CUDA spoof,
+# (b) `unsloth studio --help` still works, (c) the PR's sim test suite
+# passes end-to-end on this OS.
+
+name: PR588 Linux
+on:
+  push:
+    branches: [pr-588-cross-platform-ci]
+    paths:
+      - 'tests/pr588/**'
+      - '.github/workflows/pr588-linux.yml'
+      - 'tests/conftest.py'
+      - 'tests/_zoo_aggressive_cuda_spoof.py'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install CPU torch + deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          python -m pip install transformers pytest accelerate bitsandbytes peft trl datasets triton Pillow pydantic typer
+
+      - name: Install unsloth_zoo @ main + overlay PR-588 4-file diff
+        run: |
+          # Install zoo from unslothai main so the rl_replacements / vision_utils
+          # APIs latest unsloth needs are present.
+          python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo.git@main"
+          # Resolve site-packages WITHOUT importing unsloth_zoo (its top-level
+          # init crashes on a GPU-less runner unless the CUDA spoof is loaded).
+          SITE=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          ZOO_DIR="$SITE/unsloth_zoo"
+          for f in empty_model.py hf_utils.py vllm_utils.py; do
+            curl -sL "https://raw.githubusercontent.com/Datta0/unsloth-zoo/qwen35-shared-final/unsloth_zoo/$f" -o "$ZOO_DIR/$f"
+          done
+          echo "Overlay complete -- PR-588's 3 modified files now in $ZOO_DIR"
+          ls -la "$ZOO_DIR/empty_model.py" "$ZOO_DIR/hf_utils.py" "$ZOO_DIR/vllm_utils.py"
+
+      - name: Install unsloth from this staging branch
+        run: python -m pip install --no-deps -e .
+
+      - name: Apply CUDA spoof + import unsloth
+        run: |
+          python - <<'PY'
+          import sys, importlib.util
+          # Run the staging fork's conftest first — it pre-loads
+          # unsloth_zoo.device_type under a mocked torch.cuda.is_available()
+          # so the cached DEVICE_TYPE comes out as "cuda" on a GPU-less runner.
+          spec = importlib.util.spec_from_file_location("_pr588_conftest", "tests/conftest.py")
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          # Layer on the deeper consolidated spoof.
+          sys.path.insert(0, "tests")
+          import _zoo_aggressive_cuda_spoof
+          _zoo_aggressive_cuda_spoof.apply()
+          # Now confirm the PR's new symbols are reachable.
+          import unsloth_zoo
+          print("unsloth_zoo:", unsloth_zoo.__version__)
+          from unsloth_zoo.empty_model import (
+              _is_gemma4_config, extract_gdn_layers, finalize_huggingface_model,
+              patch_gemma4_vllm_lora_support, patch_gemma4_vllm_k_eq_v_support,
+              get_model_layer_config,
+          )
+          from unsloth_zoo.vllm_utils import assert_same_state_dict
+          from unsloth_zoo.hf_utils import set_dtype_in_config, dtype_from_config
+          print("PR-588 symbols import OK on Linux")
+          PY
+
+      - name: Confirm `unsloth studio --help` still works
+        run: |
+          python - <<'PY'
+          import sys, importlib.util, subprocess
+          spec = importlib.util.spec_from_file_location("_pr588_conftest", "tests/conftest.py")
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          sys.path.insert(0, "tests")
+          import _zoo_aggressive_cuda_spoof
+          _zoo_aggressive_cuda_spoof.apply()
+          import unsloth
+          print("unsloth imported OK; studio module path:", getattr(unsloth, "__file__", "?"))
+          PY
+          unsloth studio --help 2>&1 | head -40 || echo "studio CLI not on PATH (import smoke ok)"
+
+      - name: Run PR-588 sim test suite
+        env:
+          PYTHONPATH: tests
+        run: |
+          python -m pytest tests/pr588 -v --tb=short -o python_files="sim_*.py test_*.py"

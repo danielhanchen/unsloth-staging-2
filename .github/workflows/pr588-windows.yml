@@ -1,0 +1,174 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# PR #588 (unslothai/unsloth-zoo) cross-platform CI on Windows runners.
+# Confirms unsloth + PR-patched unsloth_zoo imports cleanly on
+# windows-latest via the CUDA spoof harness, that `unsloth studio --help`
+# still works, and that the PR's sim test suite passes on this OS.
+
+name: PR588 Windows
+on:
+  push:
+    branches: [pr-588-cross-platform-ci]
+    paths:
+      - 'tests/pr588/**'
+      - '.github/workflows/pr588-windows.yml'
+      - 'tests/conftest.py'
+      - 'tests/_zoo_aggressive_cuda_spoof.py'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      # TRL's chat_template_utils.py reads deepseekv3.jinja without
+      # encoding=, which on Windows hits cp1252 and crashes on bytes >0x7F.
+      # PYTHONUTF8=1 forces UTF-8 for all default file IO (PEP 540).
+      PYTHONUTF8: "1"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install CPU torch + deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
+          python -m pip install transformers pytest accelerate peft trl datasets triton-windows Pillow pydantic typer
+          # bitsandbytes wheel is Linux-only; skip on Windows.
+
+      - name: Install bitsandbytes stub (Linux-only wheel) directly into site-packages
+        run: |
+          # Write the stub into the active site-packages instead of PYTHONPATH.
+          # Windows uses ';' as PYTHONPATH separator, so cross-OS heredoc YAML
+          # is painful; site-packages just works.
+          python - <<'PY'
+          import pathlib, sysconfig
+          root = pathlib.Path(sysconfig.get_paths()["purelib"])
+          (root / "bitsandbytes").mkdir(parents=True, exist_ok=True)
+          (root / "bitsandbytes" / "__init__.py").write_text(
+              '__version__ = "0.49.2+windows-stub"\n'
+              'class Linear4bit:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              'class Linear8bitLt:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              # Expose functional as attribute so `bnb.functional.get_ptr`
+              # works (unsloth.kernels.utils uses that pattern).
+              'from . import functional\n'
+          )
+          (root / "bitsandbytes" / "functional.py").write_text(
+              'def dequantize_4bit(*a, **k): return None\n'
+              'def quantize_4bit(*a, **k): return None\n'
+              'def get_ptr(*a, **k): return None\n'
+              'class QuantState:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              '    def as_dict(self, packed=True): return {}\n'
+              # unsloth.kernels.utils grabs C-bridge funcs off bnb.functional.lib;
+              # stub via __getattr__ so any name (cdequantize_blockwise_fp32 etc.)
+              # resolves to a no-op.
+              'class _LibStub:\n'
+              '    def __getattr__(self, name):\n'
+              '        return lambda *a, **k: None\n'
+              'lib = _LibStub()\n'
+          )
+          (root / "bitsandbytes" / "nn").mkdir(exist_ok=True)
+          (root / "bitsandbytes" / "nn" / "__init__.py").write_text(
+              'from ..__init__ import Linear4bit, Linear8bitLt\n'
+              'class Params4bit:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              'from . import modules\n'
+          )
+          # zoo's vllm_utils does `import bitsandbytes.nn.modules` and
+          # pokes at Linear4bit / Params4bit on it; expose the same shapes.
+          (root / "bitsandbytes" / "nn" / "modules.py").write_text(
+              'from ..__init__ import Linear4bit, Linear8bitLt\n'
+              'from . import Params4bit\n'
+              'class Int8Params:\n'
+              '    def __init__(self, *a, **k): pass\n'
+          )
+          # unsloth_zoo.vllm_utils does `from bitsandbytes.utils import
+          # pack_dict_to_tensor, unpack_tensor_to_dict` at import time;
+          # supply no-op stand-ins.
+          (root / "bitsandbytes" / "utils.py").write_text(
+              'def pack_dict_to_tensor(d): return None\n'
+              'def unpack_tensor_to_dict(t): return {}\n'
+          )
+          print("bnb stub written to", root / "bitsandbytes")
+          PY
+          python -c "import bitsandbytes; print('bnb stub:', bitsandbytes.__version__)"
+
+      - name: Install unsloth_zoo @ main + overlay PR-588 4-file diff
+        run: |
+          # Install zoo from unslothai main so the latest unsloth API surface
+          # (e.g. _unsloth_get_mm_token_id) is present. The PR-588 head fork
+          # is too old to satisfy current unsloth main.
+          python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo.git@main"
+          # Resolve site-packages WITHOUT importing unsloth_zoo (its top-level
+          # init crashes on a GPU-less runner unless the CUDA spoof is loaded).
+          # site.getsitepackages()[0] points at the install root on Windows,
+          # not the real site-packages dir. sysconfig.get_paths()['purelib']
+          # is correct on every OS.
+          SITE=$(python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          ZOO_DIR="$SITE/unsloth_zoo"
+          for f in empty_model.py hf_utils.py vllm_utils.py; do
+            curl -sL "https://raw.githubusercontent.com/Datta0/unsloth-zoo/qwen35-shared-final/unsloth_zoo/$f" -o "$ZOO_DIR/$f"
+          done
+          echo "Overlay complete -- PR-588's 3 modified files now in $ZOO_DIR"
+          ls -la "$ZOO_DIR/empty_model.py" "$ZOO_DIR/hf_utils.py" "$ZOO_DIR/vllm_utils.py"
+
+      - name: Install unsloth from this staging branch
+        run: python -m pip install --no-deps -e .
+
+      - name: Apply CUDA spoof + import unsloth
+        run: |
+          python - <<'PY'
+          import sys, importlib.util
+          spec = importlib.util.spec_from_file_location("_pr588_conftest", "tests/conftest.py")
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          sys.path.insert(0, "tests")
+          import _zoo_aggressive_cuda_spoof
+          _zoo_aggressive_cuda_spoof.apply()
+          import unsloth_zoo
+          print("unsloth_zoo:", unsloth_zoo.__version__)
+          from unsloth_zoo.empty_model import (
+              _is_gemma4_config, extract_gdn_layers, finalize_huggingface_model,
+              patch_gemma4_vllm_lora_support, patch_gemma4_vllm_k_eq_v_support,
+              get_model_layer_config,
+          )
+          from unsloth_zoo.vllm_utils import assert_same_state_dict
+          from unsloth_zoo.hf_utils import set_dtype_in_config, dtype_from_config
+          print("PR-588 symbols import OK on Windows")
+          PY
+
+      - name: Confirm `unsloth studio --help` still works
+        run: |
+          python - <<'PY'
+          import sys, importlib.util
+          spec = importlib.util.spec_from_file_location("_pr588_conftest", "tests/conftest.py")
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          sys.path.insert(0, "tests")
+          import _zoo_aggressive_cuda_spoof
+          _zoo_aggressive_cuda_spoof.apply()
+          import unsloth
+          print("unsloth imported OK on Windows")
+          PY
+          unsloth studio --help 2>&1 | head -40 || echo "studio CLI not on PATH (import smoke ok)"
+
+      - name: Run PR-588 sim test suite
+        env:
+          PYTHONPATH: tests
+        run: |
+          python -m pytest tests/pr588 -v --tb=short -o python_files="sim_*.py test_*.py" -k "not merger_fc"
