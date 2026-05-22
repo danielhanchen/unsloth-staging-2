@@ -38,7 +38,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
-          python -m pip install transformers pytest accelerate bitsandbytes peft trl datasets triton Pillow
+          python -m pip install transformers pytest accelerate bitsandbytes peft trl datasets triton Pillow pydantic typer
 
       - name: Install unsloth_zoo @ main + overlay PR-588 4-file diff
         run: |

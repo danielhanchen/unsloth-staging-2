@@ -37,7 +37,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install torch
-          python -m pip install transformers pytest accelerate peft trl datasets Pillow torchvision
+          python -m pip install transformers pytest accelerate peft trl datasets Pillow torchvision pydantic typer
           # bitsandbytes + triton wheels are Linux-only; the PR's sim tests
           # that touch bnb/triton code only inspect source (no real call).
           # Install a minimal triton-stub so the unsloth_zoo top-level
