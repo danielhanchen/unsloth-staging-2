@@ -146,7 +146,10 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install 'playwright>=1.45'
+          # Pin to a known-good Playwright. Floating "latest" on macos-14
+          # arm64 has hit driver-level JSON parse crashes in webkit
+          # (coreBundle.js:37990 -- run 26265056342 macos-14 / webkit).
+          python -m pip install 'playwright==1.55.0'
           # --with-deps is only meaningful on Linux (and benign elsewhere).
           # For msedge we install chromium binary set since msedge
           # piggybacks on chromium; Playwright detects the system-
