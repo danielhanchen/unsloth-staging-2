@@ -105,7 +105,7 @@ jobs:
           # imports to succeed for the Studio CLI smoke).
           (root / "bitsandbytes").mkdir(exist_ok=True)
           (root / "bitsandbytes" / "__init__.py").write_text(
-              '__version__ = "0.49.2-macos-stub"\n'
+              '__version__ = "0.49.2+macos-stub"\n'
               'class Linear4bit:\n'
               '    def __init__(self, *a, **k): pass\n'
               'class Linear8bitLt:\n'
@@ -176,6 +176,13 @@ jobs:
           sys.path.insert(0, "tests")
           import _zoo_aggressive_cuda_spoof
           _zoo_aggressive_cuda_spoof.apply()
+          # macOS-specific: zoo's temporary_patches/gemma3n.py applies
+          # @torch.compile at module import time, which on macOS pulls in
+          # the full torch._inductor chain that ultimately demands a real
+          # triton (CompiledKernel etc.). Stub out torch.compile so the
+          # decorator becomes a no-op and the inductor chain stays cold.
+          import torch
+          torch.compile = lambda fn=None, *a, **k: (fn if fn is not None else (lambda f: f))
           import unsloth_zoo
           print("unsloth_zoo:", unsloth_zoo.__version__)
           from unsloth_zoo.empty_model import (
@@ -198,6 +205,8 @@ jobs:
           sys.path.insert(0, "tests")
           import _zoo_aggressive_cuda_spoof
           _zoo_aggressive_cuda_spoof.apply()
+          import torch
+          torch.compile = lambda fn=None, *a, **k: (fn if fn is not None else (lambda f: f))
           import unsloth
           print("unsloth imported OK on macOS")
           PY
