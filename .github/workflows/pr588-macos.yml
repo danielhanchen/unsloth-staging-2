@@ -54,7 +54,7 @@ jobs:
           (root / "triton" / "compiler").mkdir(exist_ok=True)
           (root / "triton" / "backends").mkdir(exist_ok=True)
           (root / "triton" / "__init__.py").write_text(
-              '__version__ = "3.5.0-macos-stub"\n'
+              '__version__ = "3.5.0+macos-stub"\n'
               'def jit(fn=None, *a, **k):\n'
               '    return fn if fn is not None else (lambda f: f)\n'
               'def autotune(*a, **k):\n'
@@ -121,6 +121,12 @@ jobs:
               'class QuantState:\n'
               '    def __init__(self, *a, **k): pass\n'
               '    def as_dict(self, packed=True): return {}\n'
+              # unsloth.kernels.utils grabs C-bridge funcs off bnb.functional.lib;
+              # stub via __getattr__ so any name resolves to a no-op.
+              'class _LibStub:\n'
+              '    def __getattr__(self, name):\n'
+              '        return lambda *a, **k: None\n'
+              'lib = _LibStub()\n'
           )
           (root / "bitsandbytes" / "nn").mkdir(exist_ok=True)
           (root / "bitsandbytes" / "nn" / "__init__.py").write_text(

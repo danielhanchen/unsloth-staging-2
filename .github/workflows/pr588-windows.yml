@@ -69,6 +69,13 @@ jobs:
               'class QuantState:\n'
               '    def __init__(self, *a, **k): pass\n'
               '    def as_dict(self, packed=True): return {}\n'
+              # unsloth.kernels.utils grabs C-bridge funcs off bnb.functional.lib;
+              # stub via __getattr__ so any name (cdequantize_blockwise_fp32 etc.)
+              # resolves to a no-op.
+              'class _LibStub:\n'
+              '    def __getattr__(self, name):\n'
+              '        return lambda *a, **k: None\n'
+              'lib = _LibStub()\n'
           )
           (root / "bitsandbytes" / "nn").mkdir(exist_ok=True)
           (root / "bitsandbytes" / "nn" / "__init__.py").write_text(
