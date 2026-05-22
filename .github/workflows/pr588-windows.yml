@@ -44,9 +44,7 @@ jobs:
           # bitsandbytes wheel is Linux-only; skip on Windows.
 
       - name: Install unsloth_zoo @ PR-588 head
-        run: |
-          python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/Datta0/unsloth-zoo.git@qwen35-shared-final"
-          python -c "import unsloth_zoo; print('unsloth_zoo version:', unsloth_zoo.__version__)"
+        run: python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/Datta0/unsloth-zoo.git@qwen35-shared-final"
 
       - name: Install unsloth from this staging branch
         run: python -m pip install --no-deps -e .
@@ -54,14 +52,15 @@ jobs:
       - name: Apply CUDA spoof + import unsloth
         run: |
           python - <<'PY'
-          import sys
-          sys.path.insert(0, "tests")
-          import _zoo_aggressive_cuda_spoof
-          _zoo_aggressive_cuda_spoof.apply()
-          import importlib.util
+          import sys, importlib.util
           spec = importlib.util.spec_from_file_location("_pr588_conftest", "tests/conftest.py")
           mod = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(mod)
+          sys.path.insert(0, "tests")
+          import _zoo_aggressive_cuda_spoof
+          _zoo_aggressive_cuda_spoof.apply()
+          import unsloth_zoo
+          print("unsloth_zoo:", unsloth_zoo.__version__)
           from unsloth_zoo.empty_model import (
               _is_gemma4_config, extract_gdn_layers, finalize_huggingface_model,
               patch_gemma4_vllm_lora_support, patch_gemma4_vllm_k_eq_v_support,
@@ -74,8 +73,18 @@ jobs:
 
       - name: Confirm `unsloth studio --help` still works
         run: |
-          python -m unsloth --help 2>&1 | head -20 || true
-          unsloth studio --help 2>&1 | head -40 || echo "studio CLI not available (smoke ok if imports above passed)"
+          python - <<'PY'
+          import sys, importlib.util
+          spec = importlib.util.spec_from_file_location("_pr588_conftest", "tests/conftest.py")
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)
+          sys.path.insert(0, "tests")
+          import _zoo_aggressive_cuda_spoof
+          _zoo_aggressive_cuda_spoof.apply()
+          import unsloth
+          print("unsloth imported OK on Windows")
+          PY
+          unsloth studio --help 2>&1 | head -40 || echo "studio CLI not on PATH (import smoke ok)"
 
       - name: Run PR-588 sim test suite
         env:
