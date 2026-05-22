@@ -28,7 +28,7 @@ on:
   # commit (push event + synchronize event both fire otherwise).
   push:
     branches:
-      - pr5272-cross-browser-migration
+      - 'pr5272-**'
     paths:
       - 'studio/frontend/src/features/chat/**'
       - 'studio/backend/storage/studio_db.py'
