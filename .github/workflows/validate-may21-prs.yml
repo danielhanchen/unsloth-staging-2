@@ -71,7 +71,7 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -m pip install \
             pytest pytest-asyncio fastapi httpx pydantic packaging \
-            pyyaml structlog tomli numpy
+            pyyaml structlog tomli numpy datasets matplotlib jwt cryptography aiosqlite python-multipart pyjwt
           python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@main"
           python -m pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
 
@@ -107,7 +107,7 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -m pip install \
             pytest pytest-asyncio fastapi httpx pydantic packaging \
-            pyyaml structlog tomli numpy
+            pyyaml structlog tomli numpy datasets matplotlib jwt cryptography aiosqlite python-multipart pyjwt
           python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@main"
           python -m pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
 
@@ -146,7 +146,7 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -m pip install \
             pytest pytest-asyncio fastapi httpx pydantic packaging \
-            pyyaml structlog tomli numpy
+            pyyaml structlog tomli numpy datasets matplotlib jwt cryptography aiosqlite python-multipart pyjwt
           python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@main"
           python -m pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
 
