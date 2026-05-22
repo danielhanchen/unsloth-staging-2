@@ -1,19 +1,31 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 #
-# Cross-OS validation for the May 18-21 2026 PR cohort:
-#   - PR #5603 (sandbox hardening)         -> studio/backend/tests/test_sandbox_hardening.py
-#   - PR #5582 (MTP --spec-draft-n-max)    -> studio/backend/tests/test_llama_cpp_mtp_detection.py
-#                                             studio/backend/tests/test_gguf_reload_inheritance.py
-#   - PR #5604 (lockfile audit)            -> tests/security/test_lockfile_supply_chain_audit.py
-#                                             python3 scripts/lockfile_supply_chain_audit.py
+# Cross-OS validation for the May 18-21 2026 PR cohort, refactored to
+# check out each PR head directly so the staging branch does not have
+# to stage source files itself (the prior approach went stale when the
+# upstream PR commits advanced):
 #
-# All tests are CPU-only (no real model load) and run under the CUDA spoof from
-# tests/conftest.py + tests/_zoo_aggressive_cuda_spoof.py, so they finish on
-# vanilla GitHub runners (ubuntu-latest, macos-14, windows-latest) without GPUs.
+#   - PR #5603  (sandbox hardening)  -> ref: studio-sandbox-hardening
+#                                       test: test_sandbox_hardening.py
+#   - PR #5620  (parser parity)      -> ref: studio-tools-multi-format-v2
+#                                       test: test_safetensors_tool_loop.py
+#                                             test_safetensors_capability_advertise.py
+#   - PR #5696  (MTP reload guards,  -> ref: followup-mtp-reload-guards
+#                followup to #5582)     test: test_llama_cpp_mtp_detection.py
+#                                             test_gguf_reload_inheritance.py
+#   - PR #5695  (lockfile audit,     -> ref: followup-lockfile-audit-regressions
+#                followup to #5604)     test: test_lockfile_supply_chain_audit.py
+#                                       + python3 scripts/lockfile_supply_chain_audit.py
 #
-# Concurrency cap: cancel-in-progress per (workflow, ref) keeps Windows runners
-# below the 5-concurrent cap when iterating.
+# Each PR runs as its own job with its own ``actions/checkout`` ref, so
+# changes to one branch can't poison the others. All tests are CPU-only
+# (no real model load) and rely on the CUDA spoof under
+# tests/conftest.py + tests/_zoo_aggressive_cuda_spoof.py.
+#
+# 4 jobs x 3 OSes = 12 runs total; Windows = 4, below the 5-concurrent
+# Windows-runner cap. ``cancel-in-progress`` keeps the staging branch
+# clean when iterating.
 
 name: Validate May 21 PR cohort
 
@@ -21,19 +33,6 @@ on:
   push:
     branches: [validate-may21-prs]
     paths:
-      - 'studio/backend/core/inference/tools.py'
-      - 'studio/backend/core/inference/llama_cpp.py'
-      - 'studio/backend/core/inference/llama_server_args.py'
-      - 'studio/backend/models/inference.py'
-      - 'studio/backend/routes/inference.py'
-      - 'studio/backend/tests/test_sandbox_hardening.py'
-      - 'studio/backend/tests/test_llama_cpp_mtp_detection.py'
-      - 'studio/backend/tests/test_gguf_reload_inheritance.py'
-      - 'studio/backend/tests/test_llama_server_args*.py'
-      - 'tests/security/test_lockfile_supply_chain_audit.py'
-      - 'scripts/lockfile_supply_chain_audit.py'
-      - 'tests/conftest.py'
-      - 'tests/_zoo_aggressive_cuda_spoof.py'
       - '.github/workflows/validate-may21-prs.yml'
   workflow_dispatch:
 
@@ -45,8 +44,9 @@ permissions:
   contents: read
 
 jobs:
-  backend-tests:
-    name: backend / ${{ matrix.os }}
+  # ── PR #5603: studio sandbox hardening (followup commit d64c2a10) ──
+  pr-5603-sandbox:
+    name: 5603 sandbox / ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
@@ -56,6 +56,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          repository: unslothai/unsloth
+          ref: studio-sandbox-hardening
           persist-credentials: false
 
       - uses: actions/setup-python@v5
@@ -66,24 +68,89 @@ jobs:
         shell: bash
         run: |
           python -m pip install -U pip setuptools wheel
-          # CPU torch (~10x smaller than CUDA wheels, matches runner profile)
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -m pip install \
             pytest pytest-asyncio fastapi httpx pydantic packaging \
             pyyaml structlog tomli numpy
-          # Editable install of unsloth + zoo from main so the spoofed conftest
-          # imports resolve identically to upstream CI.
           python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@main"
           python -m pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
 
-      - name: PR #5603 sandbox-hardening tests
-        if: ${{ hashFiles('studio/backend/tests/test_sandbox_hardening.py') != '' }}
+      - name: Sandbox hardening tests
         shell: bash
         run: |
           python -m pytest studio/backend/tests/test_sandbox_hardening.py -q --no-header -rN
 
-      - name: PR #5582 MTP detection + reload inheritance
-        if: ${{ hashFiles('studio/backend/tests/test_llama_cpp_mtp_detection.py') != '' }}
+  # ── PR #5620: tool-call parser parity (followup commit 7ef4b115) ──
+  pr-5620-parser:
+    name: 5620 parser / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: studio-tools-multi-format-v2
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install minimal test deps (CPU-only)
+        shell: bash
+        run: |
+          python -m pip install -U pip setuptools wheel
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install \
+            pytest pytest-asyncio fastapi httpx pydantic packaging \
+            pyyaml structlog tomli numpy
+          python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@main"
+          python -m pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+
+      - name: Tool-call parser tests
+        shell: bash
+        run: |
+          python -m pytest \
+            studio/backend/tests/test_safetensors_tool_loop.py \
+            studio/backend/tests/test_safetensors_capability_advertise.py \
+            -q --no-header -rN
+
+  # ── PR #5696: MTP reload-guards + asymmetric spec flags (followup to #5582) ──
+  pr-5696-mtp:
+    name: 5696 mtp / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: followup-mtp-reload-guards
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install minimal test deps (CPU-only)
+        shell: bash
+        run: |
+          python -m pip install -U pip setuptools wheel
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+          python -m pip install \
+            pytest pytest-asyncio fastapi httpx pydantic packaging \
+            pyyaml structlog tomli numpy
+          python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@main"
+          python -m pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+
+      - name: MTP detection + reload-guard tests
         shell: bash
         run: |
           python -m pytest \
@@ -91,8 +158,32 @@ jobs:
             studio/backend/tests/test_gguf_reload_inheritance.py \
             -q --no-header -rN
 
-      - name: PR #5604 lockfile audit (advisory)
-        if: ${{ hashFiles('scripts/lockfile_supply_chain_audit.py') != '' }}
+  # ── PR #5695: lockfile supply-chain audit (followup to #5604) ──
+  pr-5695-lockfile:
+    name: 5695 lockfile / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: followup-lockfile-audit-regressions
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test deps (audit script is stdlib-only)
+        shell: bash
+        run: |
+          python -m pip install -U pip pytest
+
+      - name: Lockfile audit tests + advisory run on real lockfiles
         shell: bash
         run: |
           python -m pytest tests/security/test_lockfile_supply_chain_audit.py -q --no-header -rN
