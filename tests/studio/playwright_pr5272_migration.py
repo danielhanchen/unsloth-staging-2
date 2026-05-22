@@ -144,52 +144,24 @@ def _launch_browser(p: Playwright) -> Browser:
     raise SystemExit(f"unknown PW_BROWSER: {BROWSER_NAME!r}")
 
 
-def _read_bootstrap_password() -> str:
-    """Studio writes a one-shot admin password on first boot.
+def _auth_tokens() -> tuple[str, str]:
+    """Read access + refresh tokens that the workflow captured.
 
-    The CI workflow exports STUDIO_BOOTSTRAP_PASSWORD pulled from
-    ~/.unsloth/studio/auth/.bootstrap_password so this script doesn't
-    have to know the OS-specific home path.
+    The workflow's "Rotate bootstrap password + capture tokens" step
+    rotates the seeded admin password via /api/auth/login + /api/auth/
+    change-password, then exports the tokens as env vars. The test
+    pre-injects them into localStorage via context.add_init_script so
+    no UI login is needed -- this sidesteps browser-specific quirks
+    in the /change-password and /login forms (firefox headless drops
+    the submit click; webkit macos-14 has TCP-level driver weirdness).
     """
-    pw = os.environ.get("STUDIO_BOOTSTRAP_PASSWORD")
-    if pw:
-        return pw
-    candidates = [
-        Path("~/.unsloth/studio/auth/.bootstrap_password").expanduser(),
-        Path(os.environ.get("UNSLOTH_STUDIO_HOME", "")) / "auth" / ".bootstrap_password",
-    ]
-    for c in candidates:
-        if c.is_file():
-            return c.read_text().strip()
-    raise SystemExit(
-        "Could not find bootstrap password. Set STUDIO_BOOTSTRAP_PASSWORD."
-    )
-
-
-def _login_admin(page: Page) -> None:
-    """First-boot Studio shows /change-password. Fill it once."""
-    page.goto(BASE_URL, wait_until="load", timeout=60000)
-    page.wait_for_load_state("networkidle", timeout=30000)
-    if "/change-password" in page.url:
-        old = _read_bootstrap_password()
-        new = "CrossBrowserCI2026!"
-        pw_inputs = page.locator('input[type="password"]')
-        # Old / new / confirm. Some flows omit "old"; handle both.
-        count = pw_inputs.count()
-        if count == 3:
-            pw_inputs.nth(0).fill(old)
-            pw_inputs.nth(1).fill(new)
-            pw_inputs.nth(2).fill(new)
-        elif count == 2:
-            pw_inputs.nth(0).fill(new)
-            pw_inputs.nth(1).fill(new)
-        else:
-            raise SystemExit(f"unexpected password input count: {count}")
-        page.locator('button[type="submit"]').first.click()
-        page.wait_for_url("**/chat**", timeout=30000)
-    elif "/chat" not in page.url:
-        # No change-password redirect; click into chat manually.
-        page.goto(f"{BASE_URL}/chat", wait_until="load", timeout=30000)
+    access = os.environ.get("STUDIO_ACCESS_TOKEN")
+    refresh = os.environ.get("STUDIO_REFRESH_TOKEN")
+    if not access or not refresh:
+        raise SystemExit(
+            "STUDIO_ACCESS_TOKEN / STUDIO_REFRESH_TOKEN env vars are required."
+        )
+    return access, refresh
 
 
 def _wait_for_chat_mounted(page: Page, timeout_s: float = 60.0) -> None:
@@ -305,14 +277,28 @@ def _screenshot(page: Page, name: str) -> None:
 def main() -> int:
     deadline = time.time() + WALL_TIMEOUT_S
     print(f"[start] browser={BROWSER_NAME} base={BASE_URL} db={STUDIO_DB}")
+    access, refresh = _auth_tokens()
     with sync_playwright() as p:
         browser = _launch_browser(p)
         context = browser.new_context()
+        # Pre-inject auth tokens so the very first navigation lands on
+        # /chat as a logged-in user; no /change-password redirect, no
+        # form filling, no browser-specific submit-button quirks.
+        # localStorage init-script runs in every page in the context
+        # before any other JS.
+        context.add_init_script(
+            "try {{"
+            "  localStorage.setItem('unsloth_auth_token', {access});"
+            "  localStorage.setItem('unsloth_auth_refresh_token', {refresh});"
+            "}} catch (e) {{}}".format(
+                access=json.dumps(access), refresh=json.dumps(refresh),
+            )
+        )
         page = context.new_page()
         page.set_default_timeout(30000)
 
-        # 1. Login
-        _login_admin(page)
+        # 1. Initial navigation (tokens already in localStorage).
+        page.goto(f"{BASE_URL}/chat", wait_until="domcontentloaded", timeout=45000)
         _screenshot(page, "01_logged_in")
 
         # 2a. Wait for Studio's chat module to mount + open Dexie
