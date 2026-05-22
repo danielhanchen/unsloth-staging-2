@@ -102,6 +102,17 @@ jobs:
               'def arange(*a, **k): return None\n'
               'def load(*a, **k): return None\n'
               'def store(*a, **k): return None\n'
+              'from . import extra\n'
+          )
+          (root / "triton" / "language" / "extra").mkdir(exist_ok=True)
+          # unsloth.kernels.utils does `from triton.language.extra import libdevice`.
+          # libdevice wraps CUDA math intrinsics; stub via __getattr__ so any name
+          # resolves to a no-op callable.
+          (root / "triton" / "language" / "extra" / "__init__.py").write_text(
+              'class _LibdeviceStub:\n'
+              '    def __getattr__(self, name):\n'
+              '        return lambda *a, **k: None\n'
+              'libdevice = _LibdeviceStub()\n'
           )
           # Also stub bitsandbytes on macOS (Linux-only wheel; we only need
           # imports to succeed for the Studio CLI smoke).
