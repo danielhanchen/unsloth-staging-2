@@ -44,10 +44,11 @@ jobs:
           # imports succeed.
       - name: Install triton stub (macOS has no official triton)
         run: |
-          STUB="$RUNNER_TEMP/triton_stub"
           python - <<PY
-          import os, pathlib
-          root = pathlib.Path(os.environ["RUNNER_TEMP"]) / "triton_stub"
+          import os, pathlib, sysconfig
+          # Write directly to site-packages so PYTHONPATH overrides in
+          # later steps (pytest sets env: PYTHONPATH: tests) don't drop us.
+          root = pathlib.Path(sysconfig.get_paths()["purelib"])
           (root / "triton").mkdir(parents=True, exist_ok=True)
           (root / "triton" / "language").mkdir(exist_ok=True)
           (root / "triton" / "runtime").mkdir(exist_ok=True)
@@ -186,8 +187,7 @@ jobs:
           )
           print("stub written to", root)
           PY
-          echo "PYTHONPATH=$STUB:${PYTHONPATH:-}" >> "$GITHUB_ENV"
-          PYTHONPATH="$STUB" python -c "import triton; import triton.language; from triton.compiler.compiler import AttrsDescriptor; print('triton stub:', triton.__version__)"
+          python -c "import triton; import triton.language; from triton.compiler.compiler import AttrsDescriptor; print('triton stub:', triton.__version__)"
 
       - name: Install unsloth_zoo @ main + overlay PR-588 4-file diff
         run: |
