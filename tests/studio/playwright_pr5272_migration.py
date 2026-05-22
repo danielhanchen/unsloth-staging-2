@@ -31,10 +31,31 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 
 from playwright.sync_api import Browser, Page, Playwright, sync_playwright
+
+
+def _install_wall_clock_watchdog(seconds: float) -> None:
+    """Hard-exit the process after `seconds`.
+
+    Playwright's driver on macos-14 occasionally crashes mid-test with
+    "Unexpected end of JSON input" out of pipeTransport.js; the next
+    page.* call then hangs forever waiting on a dead pipe (run
+    26265679346 macos-14 / chromium hit the job's 25-min cap from a
+    crash at ~02:57). Use a daemon thread with os._exit so the job
+    fails fast with a debuggable trace instead of getting cancelled.
+    Cross-platform (signal.alarm is Unix-only; Windows is in the
+    matrix).
+    """
+    def _kill() -> None:
+        print(f"[watchdog] wall-clock {seconds:.0f}s exceeded -- aborting", file=sys.stderr)
+        os._exit(124)
+    t = threading.Timer(seconds, _kill)
+    t.daemon = True
+    t.start()
 
 
 BASE_URL = os.environ["BASE_URL"].rstrip("/")
@@ -267,16 +288,28 @@ def _assert_studio_db_has_imports() -> None:
 
 
 def _screenshot(page: Page, name: str) -> None:
+    """Best-effort screenshot. A driver-level failure (e.g. "Connection
+    closed while reading from the driver") here usually means the
+    Playwright driver crashed; subsequent page.* calls will hang. Mark
+    that explicitly so the watchdog can step in.
+    """
     path = ART_DIR / f"{name}.png"
     try:
         page.screenshot(path=str(path), full_page=True)
     except Exception as e:
+        msg = str(e)
         print(f"[screenshot] {name} failed: {e}", file=sys.stderr)
+        if "Connection closed" in msg or "Unexpected end of JSON" in msg:
+            # Driver pipe is dead; nothing useful can follow. Exit now
+            # with a distinct code so the failure is debuggable.
+            print("[screenshot] driver pipe is dead -- aborting", file=sys.stderr)
+            os._exit(2)
 
 
 def main() -> int:
+    _install_wall_clock_watchdog(WALL_TIMEOUT_S)
     deadline = time.time() + WALL_TIMEOUT_S
-    print(f"[start] browser={BROWSER_NAME} base={BASE_URL} db={STUDIO_DB}")
+    print(f"[start] browser={BROWSER_NAME} base={BASE_URL} db={STUDIO_DB} wall_cap={WALL_TIMEOUT_S}s")
     access, refresh = _auth_tokens()
     with sync_playwright() as p:
         browser = _launch_browser(p)
