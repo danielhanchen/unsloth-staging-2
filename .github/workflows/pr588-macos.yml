@@ -103,6 +103,11 @@ jobs:
               'def load(*a, **k): return None\n'
               'def store(*a, **k): return None\n'
               'from . import extra\n'
+              # PEP 562 module-level __getattr__: catch any other names
+              # unsloth.kernels.utils grabs off triton.language (cast, etc.)
+              # and resolve them to no-op callables.
+              'def __getattr__(name):\n'
+              '    return lambda *a, **k: None\n'
           )
           (root / "triton" / "language" / "extra").mkdir(exist_ok=True)
           # unsloth.kernels.utils does `from triton.language.extra import libdevice`.
