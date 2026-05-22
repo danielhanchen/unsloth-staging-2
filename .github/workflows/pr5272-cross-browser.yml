@@ -201,26 +201,33 @@ jobs:
           fi
           OLD=$(tr -d '\r\n' < "$PW_FILE")
           NEW="CrossBrowserCI2026!$(python -c 'import secrets;print(secrets.token_urlsafe(8))')"
+          export OLD NEW
           PORT="${STUDIO_PORT}"
           BASE="http://127.0.0.1:${PORT}"
+
+          # Build the JSON payloads via python so passwords with shell
+          # metacharacters survive serialization.
+          LOGIN_OLD=$(python -c 'import json,os;print(json.dumps({"username":"unsloth","password":os.environ["OLD"]}))')
+          LOGIN_NEW=$(python -c 'import json,os;print(json.dumps({"username":"unsloth","password":os.environ["NEW"]}))')
+          CHGPW=$(python -c 'import json,os;print(json.dumps({"current_password":os.environ["OLD"],"new_password":os.environ["NEW"]}))')
 
           # Bootstrap login (only the seeded admin uses the bootstrap pw)
           BOOT=$(curl -fsSL -X POST "$BASE/api/auth/login" \
             -H "Content-Type: application/json" \
-            -d "$(python -c 'import json,os;print(json.dumps({"username":"unsloth","password":os.environ["OLD_PW"]}))' OLD_PW="$OLD")")
+            -d "$LOGIN_OLD")
           BOOT_TOKEN=$(python -c 'import json,sys;print(json.loads(sys.stdin.read())["access_token"])' <<< "$BOOT")
 
           # Rotate the password using the bootstrap token
           curl -fsSL -X POST "$BASE/api/auth/change-password" \
             -H "Authorization: Bearer $BOOT_TOKEN" \
             -H "Content-Type: application/json" \
-            -d "$(python -c 'import json,os;print(json.dumps({"current_password":os.environ["OLD_PW"],"new_password":os.environ["NEW_PW"]}))' OLD_PW="$OLD" NEW_PW="$NEW")" \
+            -d "$CHGPW" \
             > /dev/null
 
           # Re-login with the new password to capture full session tokens
           RESP=$(curl -fsSL -X POST "$BASE/api/auth/login" \
             -H "Content-Type: application/json" \
-            -d "$(python -c 'import json,os;print(json.dumps({"username":"unsloth","password":os.environ["NEW_PW"]}))' NEW_PW="$NEW")")
+            -d "$LOGIN_NEW")
           ACCESS=$(python -c 'import json,sys;print(json.loads(sys.stdin.read())["access_token"])' <<< "$RESP")
           REFRESH=$(python -c 'import json,sys;print(json.loads(sys.stdin.read())["refresh_token"])' <<< "$RESP")
 
