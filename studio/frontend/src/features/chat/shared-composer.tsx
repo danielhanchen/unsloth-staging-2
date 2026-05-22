@@ -3,6 +3,10 @@
 
 import { TooltipIconButton } from "@/components/assistant-ui/tooltip-icon-button";
 import { CodeToggleIcon } from "@/components/assistant-ui/code-toggle-icon";
+import {
+  thinkEffortAriaLabel,
+  thinkToggleAriaLabel,
+} from "@/components/assistant-ui/think-aria-label";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import {
@@ -298,7 +302,11 @@ export function SharedComposer({
     return s.models.find((m) => m.id === checkpoint);
   });
   const checkpoint = useChatRuntimeStore((s) => s.params.checkpoint);
-  const externalProviders = useExternalProvidersStore((s) => s.providers);
+  const connectionsEnabled = useExternalProvidersStore(
+    (s) => s.connectionsEnabled,
+  );
+  const externalProvidersAll = useExternalProvidersStore((s) => s.providers);
+  const externalProviders = connectionsEnabled ? externalProvidersAll : [];
   const modelLoaded = useChatRuntimeStore(
     (s) => !!s.params.checkpoint && !s.modelLoading,
   );
@@ -894,7 +902,11 @@ export function SharedComposer({
                         ? "text-primary hover:bg-primary/10 dark:hover:bg-white/[0.08]"
                         : "hover:bg-primary/10 dark:hover:bg-white/[0.08]",
                   )}
-                  aria-label={`Reasoning effort: ${reasoningEffort}`}
+                  aria-label={thinkEffortAriaLabel({
+                    modelLoaded,
+                    reasoningDisabled,
+                    reasoningEffort,
+                  })}
                 >
                   {effectiveReasoningVisualEnabled ? (
                     <LightbulbIcon className="size-3.5" />
@@ -944,7 +956,7 @@ export function SharedComposer({
                       // Mutual exclusion: turning thinking on for a
                       // Kimi model forces the web_search builtin off.
                       if (isKimiExternal && toolsEnabled) {
-                        setToolsEnabled(false);
+                        setToolsEnabled(false, { persist: false });
                       }
                     }}
                   >
@@ -973,7 +985,7 @@ export function SharedComposer({
                 // requires thinking off, so turning thinking on flips
                 // the Search pill off (and vice versa).
                 if (isKimiExternal && next && toolsEnabled) {
-                  setToolsEnabled(false);
+                  setToolsEnabled(false, { persist: false });
                 }
               }}
               className={cn(
@@ -986,13 +998,12 @@ export function SharedComposer({
                       ? "text-primary hover:bg-primary/10 dark:hover:bg-white/[0.08]"
                       : "hover:bg-primary/10 dark:hover:bg-white/[0.08]",
               )}
-              aria-label={
-                reasoningLockedOn
-                  ? "Thinking is required for this model"
-                  : effectiveReasoningEnabled
-                    ? "Disable thinking"
-                    : "Enable thinking"
-              }
+              aria-label={thinkToggleAriaLabel({
+                reasoningLockedOn,
+                modelLoaded,
+                reasoningDisabled,
+                effectiveReasoningEnabled,
+              })}
             >
               {reasoningLockedOn ||
               (effectiveReasoningEnabled && !reasoningDisabled) ? (
@@ -1041,7 +1052,7 @@ export function SharedComposer({
               // back on when Search goes off — mutual exclusion that
               // mirrors what the backend enforces.
               if (isKimiExternal) {
-                setReasoningEnabled(!next);
+                setReasoningEnabled(!next, { persist: false });
                 applyQwenThinkingParams(!next);
               }
             }}

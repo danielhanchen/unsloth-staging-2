@@ -48,6 +48,7 @@ import {
   providerSupportsBuiltinWebSearch,
 } from "../provider-capabilities";
 import { useChatRuntimeStore } from "../stores/chat-runtime-store";
+import { useExternalProvidersStore } from "../stores/external-providers-store";
 import { isMultimodalResponse } from "../types/api";
 import type { ChatModelSummary } from "../types/runtime";
 import { getImageInputUnavailableReason } from "../utils/image-input-support";
@@ -768,6 +769,16 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       } = runtime;
       const externalSelection = parseExternalModelId(params.checkpoint);
       const isExternalRequest = externalSelection !== null;
+      if (
+        isExternalRequest &&
+        !useExternalProvidersStore.getState().connectionsEnabled
+      ) {
+        toast.error("Connections are disabled.", {
+          description:
+            "Turn on Enable connections in Settings → Connections to use hosted models.",
+        });
+        throw new Error("Connections disabled.");
+      }
       const externalProvider = isExternalRequest
         ? loadExternalProviders().find(
             (provider) => provider.id === externalSelection.providerId,
@@ -778,20 +789,20 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
         : "";
 
       if (isExternalRequest && !externalProvider) {
-        toast.error("External provider not found.", {
-          description: "Open Connections and re-add this provider.",
+        toast.error("Connection not found.", {
+          description: "Open Settings → Connections and add it again.",
         });
-        throw new Error("External provider not found.");
+        throw new Error("Connection not found.");
       }
       // Local providers (llama.cpp / vLLM / Ollama) allow an empty key — only block hosted providers.
       const externalProviderIsCustom = externalProvider
         ? isCustomProviderType(externalProvider.providerType)
         : false;
       if (isExternalRequest && !externalApiKey && !externalProviderIsCustom) {
-        toast.error("Missing API key for selected external provider.", {
-          description: "Open Connections and set the API key again.",
+        toast.error("Missing API key for selected connection.", {
+          description: "Open Settings → Connections and set the API key again.",
         });
-        throw new Error("Missing external provider API key.");
+        throw new Error("Missing connection API key.");
       }
 
       const outboundMessages = messages
