@@ -24,6 +24,8 @@
 name: PR5272 cross-browser migration
 
 on:
+  # Push-only trigger so an open PR doesn't double-run this on every
+  # commit (push event + synchronize event both fire otherwise).
   push:
     branches:
       - pr5272-cross-browser-migration
@@ -35,15 +37,7 @@ on:
       - 'tests/studio/playwright_pr5272_migration.py'
       - '.github/workflows/pr5272-cross-browser.yml'
       - 'install.sh'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'studio/frontend/src/features/chat/**'
-      - 'studio/backend/storage/studio_db.py'
-      - 'studio/backend/routes/chat_history.py'
-      - 'studio/backend/main.py'
-      - 'tests/studio/playwright_pr5272_migration.py'
-      - '.github/workflows/pr5272-cross-browser.yml'
+      - 'install.ps1'
   workflow_dispatch:
 
 concurrency:
@@ -107,7 +101,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libcurl4-openssl-dev libssl-dev jq
 
-      - name: Install Studio (--local --no-torch)
+      - name: Install Studio (--local --no-torch) [unix]
+        if: runner.os != 'Windows'
         shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -115,6 +110,18 @@ jobs:
           mkdir -p logs
           set -o pipefail
           bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Install Studio (--local --no-torch) [windows]
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          # install.ps1 mirrors install.sh's --local + --no-torch flags
+          # (see install.ps1 line 101).
+          .\install.ps1 --local --no-torch 2>&1 | Tee-Object -FilePath logs/install.log
 
       - name: Install Playwright + ${{ matrix.browser }}
         shell: bash
