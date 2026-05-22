@@ -1,0 +1,206 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Cross-browser smoke for the legacy-Dexie -> studio.db migration in
+# Unsloth Studio PR #5272 (move-chat-history-to-studio-db).
+#
+# The local maintainer probe only drives chromium via @playwright/mcp.
+# This workflow validates the same migration code path
+# (chat-history-storage.ts:246 importLegacyChatsIfNeeded) against
+# every browser Playwright supports, on real Linux + macOS + Windows
+# runners.
+#
+# No GPU and no chat model are required: the migration runs purely on
+# Dexie -> SQLite copy semantics. install.sh --local --no-torch skips
+# the PyTorch wheel entirely so the install completes in ~2 min on a
+# free runner. Studio is booted with UNSLOTH_API_ONLY=1 so it never
+# tries to spawn llama-server.
+#
+# Matrix (6 jobs, well under the 5-Windows-concurrent cap):
+#   ubuntu-latest  : chromium, firefox
+#   macos-14       : chromium, webkit       (webkit = Safari engine)
+#   windows-latest : chromium, msedge       (webkit not supported on Windows)
+
+name: PR5272 cross-browser migration
+
+on:
+  push:
+    branches:
+      - pr5272-cross-browser-migration
+    paths:
+      - 'studio/frontend/src/features/chat/**'
+      - 'studio/backend/storage/studio_db.py'
+      - 'studio/backend/routes/chat_history.py'
+      - 'studio/backend/main.py'
+      - 'tests/studio/playwright_pr5272_migration.py'
+      - '.github/workflows/pr5272-cross-browser.yml'
+      - 'install.sh'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/frontend/src/features/chat/**'
+      - 'studio/backend/storage/studio_db.py'
+      - 'studio/backend/routes/chat_history.py'
+      - 'studio/backend/main.py'
+      - 'tests/studio/playwright_pr5272_migration.py'
+      - '.github/workflows/pr5272-cross-browser.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    name: ${{ matrix.os }} / ${{ matrix.browser }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            browser: chromium
+            port: '18901'
+          - os: ubuntu-latest
+            browser: firefox
+            port: '18902'
+          - os: macos-14
+            browser: chromium
+            port: '18903'
+          - os: macos-14
+            browser: webkit
+            port: '18904'
+          - os: windows-latest
+            browser: chromium
+            port: '18905'
+          - os: windows-latest
+            browser: msedge
+            port: '18906'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    env:
+      STUDIO_PORT: ${{ matrix.port }}
+      PW_BROWSER: ${{ matrix.browser }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      # Linux-only OS deps for Studio install + curl/jq used by the
+      # health probe step below.
+      - name: Linux OS deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libcurl4-openssl-dev libssl-dev jq
+
+      - name: Install Studio (--local --no-torch)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Install Playwright + ${{ matrix.browser }}
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install 'playwright>=1.45'
+          # --with-deps is only meaningful on Linux (and benign elsewhere).
+          # For msedge we install chromium binary set since msedge
+          # piggybacks on chromium; Playwright detects the system-
+          # installed Edge channel via channel='msedge'.
+          if [ "${{ matrix.browser }}" = "msedge" ]; then
+            python -m playwright install --with-deps chromium
+            python -m playwright install msedge || true
+          else
+            python -m playwright install --with-deps "${{ matrix.browser }}"
+          fi
+
+      - name: Reset auth + boot Studio
+        shell: bash
+        run: |
+          unsloth studio reset-password
+          mkdir -p logs
+          # UNSLOTH_API_ONLY=1 skips llama-server bootstrap so no GPU /
+          # GGUF is needed.
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" \
+            > logs/studio.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for /api/health
+        shell: bash
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fs "http://127.0.0.1:$STUDIO_PORT/api/health" \
+                > /tmp/health.json 2>/dev/null; then
+              jq -e '.status == "healthy"' /tmp/health.json && exit 0
+            fi
+            sleep 1
+          done
+          echo "Studio never became healthy" >&2
+          tail -200 logs/studio.log >&2 || true
+          exit 1
+
+      # Export the bootstrap password Studio wrote on first boot. The
+      # test reads it via STUDIO_BOOTSTRAP_PASSWORD so it doesn't have
+      # to chase the OS-specific home path.
+      - name: Export bootstrap password
+        shell: bash
+        run: |
+          # Cross-OS home resolution. ~/.unsloth/studio is the install
+          # default for all three OSes (linux, mac, win-msys/git-bash).
+          PW_FILE="$HOME/.unsloth/studio/auth/.bootstrap_password"
+          if [ ! -f "$PW_FILE" ]; then
+            echo "bootstrap password not at $PW_FILE" >&2
+            find "$HOME" -maxdepth 4 -name '.bootstrap_password' 2>/dev/null
+            exit 1
+          fi
+          PW=$(tr -d '\r\n' < "$PW_FILE")
+          echo "::add-mask::$PW"
+          echo "STUDIO_BOOTSTRAP_PASSWORD=$PW" >> "$GITHUB_ENV"
+          echo "STUDIO_DB_PATH=$HOME/.unsloth/studio/studio.db" >> "$GITHUB_ENV"
+
+      - name: Run PR-5272 migration test
+        shell: bash
+        env:
+          BASE_URL: http://127.0.0.1:${{ matrix.port }}
+          PW_ART_DIR: logs/playwright_pr5272
+        run: |
+          mkdir -p logs/playwright_pr5272
+          python tests/studio/playwright_pr5272_migration.py
+
+      - name: Stop Studio
+        if: always()
+        shell: bash
+        run: |
+          if [ -n "${STUDIO_PID:-}" ]; then
+            kill "$STUDIO_PID" 2>/dev/null || true
+          fi
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr5272-${{ matrix.os }}-${{ matrix.browser }}
+          path: |
+            logs/install.log
+            logs/studio.log
+            logs/playwright_pr5272
+          retention-days: 7
+          if-no-files-found: warn
