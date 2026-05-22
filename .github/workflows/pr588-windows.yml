@@ -58,10 +58,14 @@ jobs:
               '    def __init__(self, *a, **k): pass\n'
               'class Linear8bitLt:\n'
               '    def __init__(self, *a, **k): pass\n'
+              # Expose functional as attribute so `bnb.functional.get_ptr`
+              # works (unsloth.kernels.utils uses that pattern).
+              'from . import functional\n'
           )
           (root / "bitsandbytes" / "functional.py").write_text(
               'def dequantize_4bit(*a, **k): return None\n'
               'def quantize_4bit(*a, **k): return None\n'
+              'def get_ptr(*a, **k): return None\n'
               'class QuantState:\n'
               '    def __init__(self, *a, **k): pass\n'
               '    def as_dict(self, packed=True): return {}\n'

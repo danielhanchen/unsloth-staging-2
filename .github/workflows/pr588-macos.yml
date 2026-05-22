@@ -110,20 +110,14 @@ jobs:
               '    def __init__(self, *a, **k): pass\n'
               'class Linear8bitLt:\n'
               '    def __init__(self, *a, **k): pass\n'
-              'class _Params4bit:\n'
-              '    pass\n'
-              'class nn:\n'
-              '    Linear4bit = Linear4bit\n'
-              '    Linear8bitLt = Linear8bitLt\n'
-              'class functional:\n'
-              '    @staticmethod\n'
-              '    def dequantize_4bit(*a, **k): return None\n'
-              '    @staticmethod\n'
-              '    def quantize_4bit(*a, **k): return None\n'
+              # Expose functional as attribute so `bnb.functional.get_ptr`
+              # works (unsloth.kernels.utils uses that pattern).
+              'from . import functional\n'
           )
           (root / "bitsandbytes" / "functional.py").write_text(
               'def dequantize_4bit(*a, **k): return None\n'
               'def quantize_4bit(*a, **k): return None\n'
+              'def get_ptr(*a, **k): return None\n'
               'class QuantState:\n'
               '    def __init__(self, *a, **k): pass\n'
               '    def as_dict(self, packed=True): return {}\n'
@@ -152,9 +146,19 @@ jobs:
           (root / "triton" / "runtime" / "autotuner.py").write_text(
               'class Autotuner: pass\n'
           )
-          (root / "triton" / "compiler" / "__init__.py").write_text('')
+          # zoo/torch import `from triton.compiler import CompiledKernel`
+          # AND unsloth/import_fixes.py does `triton.compiler.compiler.CompiledKernel`,
+          # so expose CompiledKernel on both surfaces.
+          (root / "triton" / "compiler" / "__init__.py").write_text(
+              'from .compiler import CompiledKernel, AttrsDescriptor\n'
+          )
           (root / "triton" / "compiler" / "compiler.py").write_text(
-              'class AttrsDescriptor: pass\n'
+              'class AttrsDescriptor:\n'
+              '    def __init__(self, *a, **k): pass\n'
+              'class CompiledKernel:\n'
+              '    launch_enter_hook = None\n'
+              '    launch_exit_hook = None\n'
+              '    def __init__(self, *a, **k): pass\n'
           )
           print("stub written to", root)
           PY
