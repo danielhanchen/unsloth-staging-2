@@ -188,3 +188,4 @@ jobs:
         run: |
           python -m pytest tests/security/test_lockfile_supply_chain_audit.py -q --no-header -rN
           python3 scripts/lockfile_supply_chain_audit.py
+# retrigger: pull in followup-mtp-reload-guards@28e70bb27 (httpx-stub real-first)
