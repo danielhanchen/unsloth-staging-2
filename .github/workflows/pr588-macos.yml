@@ -38,10 +38,19 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch==2.6.0
           python -m pip install transformers pytest accelerate peft trl datasets
-          # bitsandbytes wheel is Linux-only; the PR's sim tests that touch
-          # bnb code only inspect source (no import). Skip the install on
-          # macOS to keep this job fast and red-light only on real PR-588
-          # issues.
+          # bitsandbytes + triton wheels are Linux-only; the PR's sim tests
+          # that touch bnb/triton code only inspect source (no real call).
+          # Install a minimal triton-stub so the unsloth_zoo top-level
+          # imports succeed.
+      - name: Install triton stub (macOS has no official triton)
+        run: |
+          STUB="$RUNNER_TEMP/triton_stub"
+          mkdir -p "$STUB/triton/runtime"
+          printf '%s\n' '__version__ = "3.5.0-macos-stub"' 'def jit(fn=None, *a, **k):' '    return fn if fn is not None else (lambda f: f)' > "$STUB/triton/__init__.py"
+          printf '%s\n' 'class Autotuner: pass' > "$STUB/triton/runtime/autotuner.py"
+          printf '%s\n' '' > "$STUB/triton/runtime/__init__.py"
+          echo "PYTHONPATH=$STUB:${PYTHONPATH:-}" >> "$GITHUB_ENV"
+          python -c "import sys; sys.path.insert(0, '$STUB'); import triton; print('triton stub:', triton.__version__)"
 
       - name: Install unsloth_zoo @ PR-588 head
         run: python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/Datta0/unsloth-zoo.git@qwen35-shared-final"

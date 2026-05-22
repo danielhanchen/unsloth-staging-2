@@ -40,7 +40,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.6.0
-          python -m pip install transformers pytest accelerate peft trl datasets
+          python -m pip install transformers pytest accelerate peft trl datasets triton-windows
           # bitsandbytes wheel is Linux-only; skip on Windows.
 
       - name: Install unsloth_zoo @ PR-588 head
