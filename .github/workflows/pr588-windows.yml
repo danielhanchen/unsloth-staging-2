@@ -72,6 +72,13 @@ jobs:
               'class Params4bit:\n'
               '    def __init__(self, *a, **k): pass\n'
           )
+          # unsloth_zoo.vllm_utils does `from bitsandbytes.utils import
+          # pack_dict_to_tensor, unpack_tensor_to_dict` at import time;
+          # supply no-op stand-ins.
+          (root / "bitsandbytes" / "utils.py").write_text(
+              'def pack_dict_to_tensor(d): return None\n'
+              'def unpack_tensor_to_dict(t): return {}\n'
+          )
           print("bnb stub written to", root / "bitsandbytes")
           PY
           python -c "import bitsandbytes; print('bnb stub:', bitsandbytes.__version__)"
