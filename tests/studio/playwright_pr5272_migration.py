@@ -52,26 +52,25 @@ WALL_TIMEOUT_S = float(os.environ.get("PW5272_WALL_TIMEOUT_S", "360"))
 # Mock legacy Dexie payload. Three threads, each carrying the regen
 # tree A -> B -> {C, D-E, F}. The migration must preserve three rows
 # with parent_id = "<thread>-msgB".
+#
+# Note on the version handling: Dexie internally multiplies the
+# declared schema version by 10 (db.version(3) -> IndexedDB v30). The
+# Studio frontend opens "unsloth-chat" at v30 on /chat mount, so by
+# the time we get here the DB exists with both stores populated by
+# Dexie. We open WITHOUT specifying a version so IndexedDB returns the
+# existing schema as-is, and write through plain transactions. If the
+# stores don't exist yet (we got here before Studio mounted /chat),
+# the caller polls until they do.
 MOCK_DEXIE_JS = r"""
 () => new Promise((resolve, reject) => {
-  const req = indexedDB.open("unsloth-chat", 3);
-  req.onupgradeneeded = (e) => {
-    const db = e.target.result;
-    if (!db.objectStoreNames.contains("threads")) {
-      const ts = db.createObjectStore("threads", {keyPath:"id"});
-      ts.createIndex("modelType", "modelType");
-      ts.createIndex("pairId", "pairId");
-      ts.createIndex("archived", "archived");
-      ts.createIndex("createdAt", "createdAt");
-    }
-    if (!db.objectStoreNames.contains("messages")) {
-      const ms = db.createObjectStore("messages", {keyPath:"id"});
-      ms.createIndex("threadId", "threadId");
-      ms.createIndex("createdAt", "createdAt");
-    }
-  };
+  const req = indexedDB.open("unsloth-chat");
   req.onsuccess = (e) => {
     const db = e.target.result;
+    if (!db.objectStoreNames.contains("threads") || !db.objectStoreNames.contains("messages")) {
+      db.close();
+      resolve({ok:false, reason:"stores not yet created by Studio", stores:Array.from(db.objectStoreNames)});
+      return;
+    }
     const tx = db.transaction(["threads","messages"], "readwrite");
     const baseTs = Date.now() - 3600000;
     const threads = [
@@ -183,10 +182,31 @@ def _login_admin(page: Page) -> None:
 
 
 def _inject_mock_legacy(page: Page) -> None:
-    result = page.evaluate(MOCK_DEXIE_JS)
-    print(f"[inject] {json.dumps(result, sort_keys=True)}")
-    assert result.get("ok"), f"injection failed: {result}"
-    assert result.get("threads") == 3 and result.get("messages") == 18
+    """Inject mock legacy Dexie data, retrying until Studio has mounted
+    the Dexie stores.
+
+    Studio's frontend opens "unsloth-chat" lazily on first /chat mount
+    (via the import in chat-history-storage.ts). On a fresh runner the
+    stores might not exist yet at the moment we land on /chat; poll
+    for up to 30 s.
+    """
+    deadline = time.time() + 30
+    last = None
+    while time.time() < deadline:
+        result = page.evaluate(MOCK_DEXIE_JS)
+        last = result
+        if result.get("ok"):
+            print(f"[inject] {json.dumps(result, sort_keys=True)}")
+            assert result.get("threads") == 3 and result.get("messages") == 18
+            return
+        # Stores not created yet -- nudge Studio: navigate to /chat (or
+        # reload) so the chat module imports + Dexie opens.
+        try:
+            page.goto(f"{BASE_URL}/chat", wait_until="networkidle", timeout=10000)
+        except Exception:
+            page.reload(wait_until="load", timeout=15000)
+        time.sleep(1.0)
+    raise AssertionError(f"injection never succeeded after 30s: {last!r}")
 
 
 def _clear_sentinel_and_reload(page: Page) -> None:
