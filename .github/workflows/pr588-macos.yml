@@ -249,6 +249,12 @@ jobs:
           _zoo_aggressive_cuda_spoof.apply()
           import torch
           torch.compile = lambda fn=None, *a, **k: (fn if fn is not None else (lambda f: f))
+          # unsloth.kernels.utils builds a {device: stream} dict using
+          # torch._C._cuda_getCurrentRawStream(index); macOS torch has no
+          # CUDA bindings, so stub that to a dummy stream handle (0).
+          import ctypes
+          if not hasattr(torch._C, "_cuda_getCurrentRawStream"):
+              torch._C._cuda_getCurrentRawStream = lambda index: 0
           import unsloth
           print("unsloth imported OK on macOS")
           PY
