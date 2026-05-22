@@ -183,24 +183,53 @@ jobs:
           tail -200 logs/studio.log >&2 || true
           exit 1
 
-      # Export the bootstrap password Studio wrote on first boot. The
-      # test reads it via STUDIO_BOOTSTRAP_PASSWORD so it doesn't have
-      # to chase the OS-specific home path.
-      - name: Export bootstrap password
+      # Bypass UI login: rotate the bootstrap password via the auth
+      # API + capture access/refresh tokens, so the Playwright test
+      # can pre-inject them into localStorage. This avoids browser-
+      # specific quirks in the /change-password and /login forms
+      # (Firefox headless silently dropped the submit click; webkit
+      # macos-14 has a separate driver-network issue).
+      - name: Rotate bootstrap password + capture tokens
         shell: bash
         run: |
-          # Cross-OS home resolution. ~/.unsloth/studio is the install
-          # default for all three OSes (linux, mac, win-msys/git-bash).
+          set -euo pipefail
           PW_FILE="$HOME/.unsloth/studio/auth/.bootstrap_password"
           if [ ! -f "$PW_FILE" ]; then
             echo "bootstrap password not at $PW_FILE" >&2
-            find "$HOME" -maxdepth 4 -name '.bootstrap_password' 2>/dev/null
+            find "$HOME" -maxdepth 4 -name '.bootstrap_password' 2>/dev/null || true
             exit 1
           fi
-          PW=$(tr -d '\r\n' < "$PW_FILE")
-          echo "::add-mask::$PW"
-          echo "STUDIO_BOOTSTRAP_PASSWORD=$PW" >> "$GITHUB_ENV"
+          OLD=$(tr -d '\r\n' < "$PW_FILE")
+          NEW="CrossBrowserCI2026!$(python -c 'import secrets;print(secrets.token_urlsafe(8))')"
+          PORT="${STUDIO_PORT}"
+          BASE="http://127.0.0.1:${PORT}"
+
+          # Bootstrap login (only the seeded admin uses the bootstrap pw)
+          BOOT=$(curl -fsSL -X POST "$BASE/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "$(python -c 'import json,os;print(json.dumps({"username":"unsloth","password":os.environ["OLD_PW"]}))' OLD_PW="$OLD")")
+          BOOT_TOKEN=$(python -c 'import json,sys;print(json.loads(sys.stdin.read())["access_token"])' <<< "$BOOT")
+
+          # Rotate the password using the bootstrap token
+          curl -fsSL -X POST "$BASE/api/auth/change-password" \
+            -H "Authorization: Bearer $BOOT_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(python -c 'import json,os;print(json.dumps({"current_password":os.environ["OLD_PW"],"new_password":os.environ["NEW_PW"]}))' OLD_PW="$OLD" NEW_PW="$NEW")" \
+            > /dev/null
+
+          # Re-login with the new password to capture full session tokens
+          RESP=$(curl -fsSL -X POST "$BASE/api/auth/login" \
+            -H "Content-Type: application/json" \
+            -d "$(python -c 'import json,os;print(json.dumps({"username":"unsloth","password":os.environ["NEW_PW"]}))' NEW_PW="$NEW")")
+          ACCESS=$(python -c 'import json,sys;print(json.loads(sys.stdin.read())["access_token"])' <<< "$RESP")
+          REFRESH=$(python -c 'import json,sys;print(json.loads(sys.stdin.read())["refresh_token"])' <<< "$RESP")
+
+          echo "::add-mask::$ACCESS"
+          echo "::add-mask::$REFRESH"
+          echo "STUDIO_ACCESS_TOKEN=$ACCESS" >> "$GITHUB_ENV"
+          echo "STUDIO_REFRESH_TOKEN=$REFRESH" >> "$GITHUB_ENV"
           echo "STUDIO_DB_PATH=$HOME/.unsloth/studio/studio.db" >> "$GITHUB_ENV"
+          echo "tokens captured for $(echo "$RESP" | wc -c)-byte response"
 
       - name: Run PR-5272 migration test
         shell: bash
