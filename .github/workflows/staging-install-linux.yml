@@ -77,7 +77,7 @@ jobs:
             exit 1
           fi
 
-      - name: Confirm impl shared libraries copied into install dir
+      - name: Confirm impl shared libraries copied next to binaries
         run: |
           set -o pipefail
           install_dir="$HOME/.unsloth/llama.cpp"
@@ -86,12 +86,23 @@ jobs:
             ls -la "$HOME/.unsloth" || true
             exit 1
           fi
-          echo "Contents of $install_dir:"
-          ls -la "$install_dir"
-          # Sample the impl libs we expect (NEEDED by llama-server and llama-quantize).
+          # The installer overlays the prebuilt binaries into build/bin/
+          # (and symlinks llama-server / llama-quantize at the root).
+          # The binaries have RUNPATH=$ORIGIN so the impl libs MUST live
+          # next to them, not at the install root.
+          server_real="$(readlink -f "$install_dir/llama-server")"
+          quant_real="$(readlink -f "$install_dir/llama-quantize")"
+          server_dir="$(dirname "$server_real")"
+          quant_dir="$(dirname "$quant_real")"
+          echo "llama-server resolved to: $server_real"
+          echo "llama-quantize resolved to: $quant_real"
+          echo "Contents of $server_dir:"
+          ls -la "$server_dir"
           for lib in libllama-server-impl.so libllama-quantize-impl.so; do
-            if [ ! -f "$install_dir/$lib" ]; then
-              echo "::error::Missing $lib in $install_dir -- runtime_patterns_for_choice regression"
+            target_dir="$server_dir"
+            [ "$lib" = "libllama-quantize-impl.so" ] && target_dir="$quant_dir"
+            if [ ! -f "$target_dir/$lib" ]; then
+              echo "::error::Missing $lib in $target_dir -- runtime_patterns_for_choice regression"
               exit 1
             fi
           done
@@ -100,19 +111,30 @@ jobs:
         run: |
           set -o pipefail
           install_dir="$HOME/.unsloth/llama.cpp"
-          export LD_LIBRARY_PATH="$install_dir:${LD_LIBRARY_PATH:-}"
           for bin in llama-server llama-quantize; do
-            if ! ldd "$install_dir/$bin" > "logs/ldd-$bin.txt"; then
-              echo "::error::ldd failed on $bin"
+            binary="$(readlink -f "$install_dir/$bin")"
+            if ! ldd "$binary" > "logs/ldd-$bin.txt"; then
+              echo "::error::ldd failed on $bin ($binary)"
               cat "logs/ldd-$bin.txt" || true
               exit 1
             fi
             if grep -q "not found" "logs/ldd-$bin.txt"; then
-              echo "::error::Unresolved libraries for $bin"
+              echo "::error::Unresolved libraries for $bin ($binary)"
               cat "logs/ldd-$bin.txt"
               exit 1
             fi
           done
+
+      - name: Run llama-server --version (real binary load test)
+        run: |
+          set -o pipefail
+          install_dir="$HOME/.unsloth/llama.cpp"
+          # No LD_LIBRARY_PATH override -- relies entirely on
+          # RUNPATH=$ORIGIN finding the impl .so files next to the
+          # binary. This is what the runtime preflight in
+          # install_llama_prebuilt.py exercises.
+          "$install_dir/llama-server" --version 2>&1 | head -10
+          "$install_dir/llama-quantize" --help 2>&1 | head -5 || true
 
       - name: Confirm pydantic / pydantic-core pair is consistent
         run: |
