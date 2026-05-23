@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Staging-fork-only smoke. Verifies the Windows --local --no-torch
+# install no longer trips pydantic's `_ensure_pydantic_core_version`
+# check by resolving pydantic + pydantic-core to a compatible pair
+# (install.ps1 now runs a separate `uv pip install pydantic` WITH deps
+# before the --no-deps install of no-torch-runtime.txt).
+#
+# No NVIDIA GPU is available on the free runner; we rely on the
+# CUDA-spoof harness Unsloth already ships (tests/conftest.py +
+# tests/_zoo_aggressive_cuda_spoof.py) for any import-time CUDA assertions.
+
+name: Staging Install (Windows)
+
+on:
+  push:
+    branches: [ci/general-fix-2026-05-23]
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - 'studio/install_llama_prebuilt.py'
+      - 'studio/install_python_stack.py'
+      - 'studio/backend/requirements/no-torch-runtime.txt'
+      - 'studio/frontend/src/features/auth/components/auth-form.tsx'
+      - '.github/workflows/staging-install-windows.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows-install:
+    name: Windows Studio install (--local, --no-torch) pydantic mismatch repro
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      UNSLOTH_DISABLE_AUTO_INSTALL_CHECK: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Run installer (--local --no-torch)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::install.ps1 failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+      - name: Assert no pydantic_core mismatch in install log
+        run: |
+          if grep -q "incompatible with the current pydantic version" logs/install.log; then
+            echo "::error::pydantic-core mismatch reappeared (the install.ps1 / no-torch-runtime.txt fix did not take effect)."
+            grep -E "pydantic" logs/install.log | tail -40 || true
+            exit 1
+          fi
+          if grep -q "unsloth studio setup failed" logs/install.log; then
+            echo "::error::unsloth studio setup failed during install"
+            grep -E "ERROR|error|Traceback|setup" logs/install.log | tail -80 || true
+            exit 1
+          fi
+
+      - name: Confirm pydantic / pydantic-core pair is consistent
+        shell: pwsh
+        run: |
+          $studio_py = Join-Path $HOME ".unsloth/studio/unsloth_studio/Scripts/python.exe"
+          if (-not (Test-Path $studio_py)) {
+            Write-Host "::error::Studio venv python not at $studio_py"
+            exit 1
+          }
+          & $studio_py -c "import pydantic; import pydantic_core; print('pydantic', pydantic.VERSION); print('pydantic_core', pydantic_core.__version__)"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: unsloth studio --help (smoke)
+        shell: pwsh
+        run: |
+          $studio_bin = Join-Path $HOME ".unsloth/studio/unsloth_studio/Scripts"
+          $env:PATH = "$studio_bin;$env:PATH"
+          & unsloth studio --help | Select-Object -First 40
+
+      - name: Upload install logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-install-logs
+          path: |
+            logs/

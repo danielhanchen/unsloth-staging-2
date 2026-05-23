@@ -1,0 +1,161 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Staging-fork-only smoke. Two purposes:
+#   1. Verify the Linux llama.cpp prebuilt install picks up the new
+#      libllama-<binary>-impl.so* shared libraries upstream introduced
+#      around release b9261. Without copying those alongside the
+#      binaries, ldd reports them missing and the installer falls back
+#      to a source build (slow + breaks the update CI assertion).
+#   2. Confirm `unsloth studio setup` boots without the pydantic /
+#      pydantic-core mismatch that hit fresh venvs on the --no-torch
+#      path.
+#
+# No NVIDIA GPU is available on the free runner; we rely on the
+# CUDA-spoof harness Unsloth already ships
+# (tests/conftest.py + tests/_zoo_aggressive_cuda_spoof.py) for any
+# import-time CUDA assertions.
+
+name: Staging Install (Linux)
+
+on:
+  push:
+    branches: [ci/general-fix-2026-05-23]
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - 'studio/install_llama_prebuilt.py'
+      - 'studio/install_python_stack.py'
+      - 'studio/backend/requirements/no-torch-runtime.txt'
+      - 'studio/frontend/src/features/auth/components/auth-form.tsx'
+      - '.github/workflows/staging-install-linux.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-install:
+    name: Linux Studio install (--local, --no-torch) + llama.cpp prebuilt
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      UNSLOTH_DISABLE_AUTO_INSTALL_CHECK: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Linux deps for llama.cpp prebuilt
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build curl ca-certificates jq
+
+      - name: Run installer (--local --no-torch)
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          chmod +x install.sh
+          ./install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Assert installer never fell back to source build
+        run: |
+          if grep -E "prebuilt fallback reason|falling back to source build" logs/install.log; then
+            echo "::error::Linux prebuilt llama.cpp fell back to source build. The libllama-*-impl.so* pattern fix did not take effect."
+            grep -E "llama-prebuilt|llama.cpp" logs/install.log | tail -120 || true
+            exit 1
+          fi
+
+      - name: Confirm impl shared libraries copied next to binaries
+        run: |
+          set -o pipefail
+          install_dir="$HOME/.unsloth/llama.cpp"
+          if [ ! -d "$install_dir" ]; then
+            echo "::error::Expected llama.cpp install dir at $install_dir"
+            ls -la "$HOME/.unsloth" || true
+            exit 1
+          fi
+          # The installer overlays the prebuilt binaries into build/bin/
+          # (and symlinks llama-server / llama-quantize at the root).
+          # The binaries have RUNPATH=$ORIGIN so the impl libs MUST live
+          # next to them, not at the install root.
+          server_real="$(readlink -f "$install_dir/llama-server")"
+          quant_real="$(readlink -f "$install_dir/llama-quantize")"
+          server_dir="$(dirname "$server_real")"
+          quant_dir="$(dirname "$quant_real")"
+          echo "llama-server resolved to: $server_real"
+          echo "llama-quantize resolved to: $quant_real"
+          echo "Contents of $server_dir:"
+          ls -la "$server_dir"
+          for lib in libllama-server-impl.so libllama-quantize-impl.so; do
+            target_dir="$server_dir"
+            [ "$lib" = "libllama-quantize-impl.so" ] && target_dir="$quant_dir"
+            if [ ! -f "$target_dir/$lib" ]; then
+              echo "::error::Missing $lib in $target_dir -- runtime_patterns_for_choice regression"
+              exit 1
+            fi
+          done
+
+      - name: Confirm ldd finds all libs for llama-server / llama-quantize
+        run: |
+          set -o pipefail
+          install_dir="$HOME/.unsloth/llama.cpp"
+          for bin in llama-server llama-quantize; do
+            binary="$(readlink -f "$install_dir/$bin")"
+            if ! ldd "$binary" > "logs/ldd-$bin.txt"; then
+              echo "::error::ldd failed on $bin ($binary)"
+              cat "logs/ldd-$bin.txt" || true
+              exit 1
+            fi
+            if grep -q "not found" "logs/ldd-$bin.txt"; then
+              echo "::error::Unresolved libraries for $bin ($binary)"
+              cat "logs/ldd-$bin.txt"
+              exit 1
+            fi
+          done
+
+      - name: Run llama-server --version (real binary load test)
+        run: |
+          set -o pipefail
+          install_dir="$HOME/.unsloth/llama.cpp"
+          # No LD_LIBRARY_PATH override -- relies entirely on
+          # RUNPATH=$ORIGIN finding the impl .so files next to the
+          # binary. This is what the runtime preflight in
+          # install_llama_prebuilt.py exercises.
+          "$install_dir/llama-server" --version 2>&1 | head -10
+          "$install_dir/llama-quantize" --help 2>&1 | head -5 || true
+
+      - name: Confirm pydantic / pydantic-core pair is consistent
+        run: |
+          set -o pipefail
+          studio_py="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          if [ ! -x "$studio_py" ]; then
+            echo "::error::Studio venv python not at $studio_py"
+            ls -la "$HOME/.unsloth/studio" || true
+            exit 1
+          fi
+          "$studio_py" -c "import pydantic; import pydantic_core; print('pydantic', pydantic.VERSION); print('pydantic_core', pydantic_core.__version__)"
+
+      - name: unsloth studio --help (smoke)
+        run: |
+          export PATH="$HOME/.unsloth/studio/unsloth_studio/bin:$PATH"
+          unsloth studio --help | head -40
+
+      - name: Upload install logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-install-logs
+          path: |
+            logs/

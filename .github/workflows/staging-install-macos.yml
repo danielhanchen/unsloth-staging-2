@@ -1,0 +1,97 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Staging-fork-only smoke. Sanity-checks the Mac --local --no-torch
+# install path: the pydantic fix should not have regressed anything on
+# Mac (the SystemError was Windows-canonical, but the change touches
+# install.sh which is shared with macOS), and the change-password gate
+# tightening in auth-form.tsx is frontend-only TypeScript so a build
+# would catch syntax regressions.
+#
+# No NVIDIA GPU is available on the runner; we rely on the CUDA-spoof
+# harness Unsloth already ships (tests/conftest.py +
+# tests/_zoo_aggressive_cuda_spoof.py) for any import-time CUDA assertions.
+
+name: Staging Install (macOS)
+
+on:
+  push:
+    branches: [ci/general-fix-2026-05-23]
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - 'studio/install_llama_prebuilt.py'
+      - 'studio/install_python_stack.py'
+      - 'studio/backend/requirements/no-torch-runtime.txt'
+      - 'studio/frontend/src/features/auth/components/auth-form.tsx'
+      - '.github/workflows/staging-install-macos.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  macos-install:
+    name: macOS Studio install (--local, --no-torch)
+    runs-on: macos-14
+    timeout-minutes: 25
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+      UNSLOTH_DISABLE_AUTO_INSTALL_CHECK: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Run installer (--local --no-torch)
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          chmod +x install.sh
+          ./install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Assert no pydantic_core mismatch in install log
+        run: |
+          if grep -q "incompatible with the current pydantic version" logs/install.log; then
+            echo "::error::pydantic-core mismatch reappeared on macOS"
+            grep -E "pydantic" logs/install.log | tail -40 || true
+            exit 1
+          fi
+          if grep -q "unsloth studio setup failed" logs/install.log; then
+            echo "::error::unsloth studio setup failed during install"
+            grep -E "ERROR|error|Traceback|setup" logs/install.log | tail -80 || true
+            exit 1
+          fi
+
+      - name: Confirm pydantic / pydantic-core pair is consistent
+        run: |
+          set -o pipefail
+          studio_py="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          if [ ! -x "$studio_py" ]; then
+            echo "::error::Studio venv python not at $studio_py"
+            ls -la "$HOME/.unsloth/studio" || true
+            exit 1
+          fi
+          "$studio_py" -c "import pydantic; import pydantic_core; print('pydantic', pydantic.VERSION); print('pydantic_core', pydantic_core.__version__)"
+
+      - name: unsloth studio --help (smoke)
+        run: |
+          export PATH="$HOME/.unsloth/studio/unsloth_studio/bin:$PATH"
+          unsloth studio --help | head -40
+
+      - name: Upload install logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-install-logs
+          path: |
+            logs/
