@@ -382,11 +382,11 @@ def test_strict_mode_refuses_when_sandbox_unavailable(tmp_path, monkeypatch):
     sid = "_strict_refuse"
     monkeypatch.setitem(tools._workdirs, sid, str(tmp_path))
 
-    py_out = tools._python_exec("print('would have leaked')", session_id=sid)
+    py_out = tools._python_exec("print('would have leaked')", session_id = sid)
     assert "Execution blocked" in py_out, py_out
     assert "UNSLOTH_STUDIO_SANDBOX_STRICT" in py_out, py_out
 
-    bash_out = tools._bash_exec("echo would have leaked", session_id=sid)
+    bash_out = tools._bash_exec("echo would have leaked", session_id = sid)
     assert "Execution blocked" in bash_out, bash_out
     assert "would have leaked" not in bash_out, bash_out
 
@@ -395,11 +395,11 @@ def test_strict_mode_off_falls_back_unsandboxed(tmp_path, monkeypatch):
     from core.inference import tools
 
     monkeypatch.setattr(tools, "sandbox_available", lambda: False)
-    monkeypatch.delenv("UNSLOTH_STUDIO_SANDBOX_STRICT", raising=False)
+    monkeypatch.delenv("UNSLOTH_STUDIO_SANDBOX_STRICT", raising = False)
     sid = "_strict_off"
     monkeypatch.setitem(tools._workdirs, sid, str(tmp_path))
 
-    out = tools._python_exec("print('hello-unsandboxed')", session_id=sid)
+    out = tools._python_exec("print('hello-unsandboxed')", session_id = sid)
     assert "hello-unsandboxed" in out, out
 
 
@@ -410,7 +410,7 @@ def test_strict_mode_off_falls_back_unsandboxed(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="Unix-only")
+@pytest.mark.skipif(sys.platform == "win32", reason = "Unix-only")
 def test_get_shell_cmd_uses_absolute_bin_bash():
     from core.inference import tools
 
@@ -425,7 +425,24 @@ def test_get_shell_cmd_uses_absolute_bin_bash():
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
+def _slice_top_form(text: str, opener: str) -> str:
+    """Return the substring of *text* spanning the top-level Scheme form
+    that begins with *opener*. Counts parens so it skips past nested
+    `(subpath ...)` entries inside the form."""
+    start = text.index(opener)
+    depth = 0
+    for i in range(start, len(text)):
+        c = text[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    raise AssertionError(f"unterminated form starting with {opener!r}")
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason = "Seatbelt is macOS-only")
 def test_macos_profile_allows_workdir_exec(tmp_path):
     sandbox = _load_sandbox_module()
     # _macos_seatbelt_profile realpaths the workdir before embedding it,
@@ -435,12 +452,10 @@ def test_macos_profile_allows_workdir_exec(tmp_path):
     profile = sandbox._macos_seatbelt_profile(str(tmp_path))
     # Workdir should appear inside both (allow process-exec ...) and
     # (allow file-map-executable ...), not just file-read*/file-write*.
-    process_exec_idx = profile.index("(allow process-exec")
-    process_exec_close = profile.index(")", process_exec_idx)
-    file_map_idx = profile.index("(allow file-map-executable")
-    file_map_close = profile.index(")", file_map_idx)
-    assert wd in profile[process_exec_idx:process_exec_close], profile
-    assert wd in profile[file_map_idx:file_map_close], profile
+    process_exec_form = _slice_top_form(profile, "(allow process-exec")
+    file_map_form = _slice_top_form(profile, "(allow file-map-executable")
+    assert wd in process_exec_form, process_exec_form
+    assert wd in file_map_form, file_map_form
 
 
 # ---------------------------------------------------------------------------
@@ -464,7 +479,7 @@ def test_sandbox_available_concurrent_calls_consistent(monkeypatch):
         barrier.wait()
         results.append(sandbox.sandbox_available())
 
-    threads = [threading.Thread(target=worker) for _ in range(8)]
+    threads = [threading.Thread(target = worker) for _ in range(8)]
     for t in threads:
         t.start()
     for t in threads:
