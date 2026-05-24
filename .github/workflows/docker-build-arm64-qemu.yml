@@ -1,0 +1,77 @@
+# Cross-build the linux/arm64 image on an x86_64 ubuntu-latest runner via
+# QEMU binfmt. Validates the local-dev path documented in
+# docker/setup_qemu.sh -- contributors on x86_64 laptops use this to test
+# the arm64 build without an ARM host.
+#
+# We do NOT smoke-test the resulting arm64 image here: CUDA does not work
+# under user-space QEMU emulation, and nvidia-container-toolkit cannot
+# bridge a QEMU guest to a real GPU. End-to-end arm64 validation lives in
+# docker-build-arm64-native.yml.
+#
+# Coverage delta vs the native arm64 workflow:
+#   * Catches QEMU-specific regressions (e.g. an apt package whose
+#     post-install script segfaults under emulation but works natively)
+#   * Validates the QEMU recipe in our README / setup_qemu.sh
+#   * Provides a fallback CI signal if ubuntu-24.04-arm runners are
+#     unavailable
+
+name: docker-build-arm64-qemu
+
+on:
+  push:
+    branches: [docker-blackwell-ci]
+    paths:
+      - 'docker/**'
+      - '.github/workflows/docker-build-arm64-qemu.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - '.github/workflows/docker-build-arm64-qemu.yml'
+
+concurrency:
+  group: docker-build-arm64-qemu-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # QEMU emulation is ~2.5-3x slower than native. The full Dockerfile
+    # (apt installs + 4.5 GB of wheel downloads + verification) needs ~75
+    # min worst case on a noisy runner; leave headroom.
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Cross-build arm64 image (QEMU)
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            --progress=plain \
+            --load \
+            --tag unsloth-blackwell:test-arm64-qemu \
+            --build-arg CUDA_VERSION=12.8.1 \
+            --build-arg UBUNTU_VERSION=24.04 \
+            --build-arg PYTHON_VERSION=3.12 \
+            -f docker/Dockerfile docker/
+
+      - name: Inspect built image
+        run: |
+          docker image inspect unsloth-blackwell:test-arm64-qemu \
+              --format 'image_id={{.Id}} arch={{.Architecture}} os={{.Os}} size={{.Size}}'
+
+      # No `docker run` here -- foreign-arch + nvidia-container-toolkit
+      # cannot share a GPU under QEMU. We trust the in-image build-time
+      # arch-flags assertion (`assert "sm_120" in arches`) caught any
+      # wheel regression already.

@@ -1,0 +1,90 @@
+# Build the Unsloth Blackwell Docker image for linux/amd64 on a fresh
+# ubuntu-latest GitHub Actions runner -- no GPU attached. Validates the PR's
+# core claim that the image builds entirely from prebuilt wheels with NO
+# GPU at build time. Then loads the image and runs an import-only sanity
+# check inside the container with the aggressive CUDA spoof preloaded.
+#
+# Why this catches regressions:
+#   * Build-time `torch._C._cuda_getArchFlags()` assertion in the Dockerfile
+#     fails the job if the cu128 wheel's SASS list ever loses sm_120.
+#   * The post-build import test catches dep-resolution regressions
+#     (e.g. xformers cu128 URL changing, unsloth_zoo init order).
+#   * Running on a fresh runner with no buildx cache flushes out any
+#     "works on my machine" assumptions.
+
+name: docker-build-amd64
+
+on:
+  push:
+    branches: [docker-blackwell-ci]
+    paths:
+      - 'docker/**'
+      - 'tests/conftest.py'
+      - 'tests/_zoo_aggressive_cuda_spoof.py'
+      - '.github/workflows/docker-build-amd64.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - '.github/workflows/docker-build-amd64.yml'
+
+concurrency:
+  group: docker-build-amd64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Free ~20 GB so cu128 wheels + cudnn fit on a 14 GB-free runner.
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build amd64 image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --progress=plain \
+            --load \
+            --tag unsloth-blackwell:test \
+            --build-arg CUDA_VERSION=12.8.1 \
+            --build-arg UBUNTU_VERSION=24.04 \
+            --build-arg PYTHON_VERSION=3.12 \
+            -f docker/Dockerfile docker/
+
+      - name: Inspect built image
+        run: |
+          docker image inspect unsloth-blackwell:test \
+              --format 'image_id={{.Id}} arch={{.Architecture}} os={{.Os}} size={{.Size}}'
+          docker image ls unsloth-blackwell
+
+      # CUDA-free import test inside the container. UNSLOTH_SKIP_GPU_CHECK=1
+      # bypasses the entrypoint's GPU pre-flight; the spoof patches the
+      # device-probe surface so unsloth + unsloth_zoo init paths reach EOF.
+      - name: Verify image imports under CUDA spoof
+        run: |
+          docker run --rm \
+              -e UNSLOTH_SKIP_GPU_CHECK=1 \
+              -e PYTHONDONTWRITEBYTECODE=1 \
+              -v "${{ github.workspace }}/tests:/spoof:ro" \
+              unsloth-blackwell:test \
+              python -c "
+          import sys
+          sys.path.insert(0, '/spoof')
+          import _zoo_aggressive_cuda_spoof
+          _zoo_aggressive_cuda_spoof.apply()
+          import torch
+          print('torch', torch.__version__, 'cuda', torch.version.cuda)
+          print('arches:', torch._C._cuda_getArchFlags())
+          import unsloth_zoo
+          import unsloth
+          print('imports OK')
+          "

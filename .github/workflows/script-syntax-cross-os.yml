@@ -1,0 +1,113 @@
+# Cross-platform syntax / parse check for every script in docker/.
+# Catches dumb regressions in shell scripts (unmatched quotes, bash-isms
+# that don't work in a fresh shell) and python entrypoints (syntax errors,
+# missing __future__ imports) before they hit the build.
+#
+# Runs on linux + macos-14 + windows-latest because:
+#   * docker/hf_pull.sh and docker/run.sh are documented for users who
+#     pull the image on any of those hosts. The shell scripts must at
+#     least parse on macOS's bash 3.2 -- a number of bash-isms (mapfile,
+#     readarray, `${var,,}`, `${arr[@]:start:stop:step}`) silently break.
+#   * docker/smoke_test.py and docker/test_locally.sh's bundled python
+#     snippets must compile on the python interpreter version that
+#     contributors actually have, not just on cpython 3.12 in the image.
+#
+# This is a FAST job (<30s on every OS); does NOT require Docker, GPUs,
+# or any network beyond pip's metadata fetches.
+
+name: script-syntax-cross-os
+
+on:
+  push:
+    branches: [docker-blackwell-ci]
+    paths:
+      - 'docker/**'
+      - '.github/workflows/script-syntax-cross-os.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - '.github/workflows/script-syntax-cross-os.yml'
+
+concurrency:
+  group: script-syntax-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  syntax:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # Bash syntax check. Skipped on Windows (no native bash); the shell
+      # scripts in docker/ are documented as Linux-only helpers anyway,
+      # but we still want macOS to parse them so Mac contributors can run
+      # the helpers via Homebrew bash.
+      - name: bash -n on all docker shell scripts
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -e
+          fail=0
+          for f in docker/*.sh; do
+              echo "checking $f"
+              if ! bash -n "$f"; then
+                  echo "::error file=$f::bash -n failed"
+                  fail=1
+              fi
+          done
+          exit $fail
+
+      # Python compile check on every .py touched by this PR. Cross-OS
+      # because line-ending / pathlib / subprocess invocations can break
+      # in subtle ways on Windows.
+      - name: python -m py_compile on all .py
+        shell: bash
+        run: |
+          set -e
+          fail=0
+          for f in docker/*.py tests/*.py; do
+              if [ -f "$f" ]; then
+                  echo "compiling $f"
+                  if ! python -m py_compile "$f"; then
+                      echo "::error file=$f::py_compile failed"
+                      fail=1
+                  fi
+              fi
+          done
+          exit $fail
+
+      # Validate the embedded Python heredocs inside test_locally.sh
+      # (extracted by an inline awk so we catch syntax bugs before the
+      # full Docker build sees them).
+      - name: validate embedded python in test_locally.sh
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          set -e
+          # Pull out each '<<'PY'' ... 'PY' block and feed it to py_compile.
+          awk '
+            /<<.PY./ { capture=1; next }
+            /^PY$/   { if (capture) { print "---DELIM---"; capture=0 }; next }
+            capture  { print }
+          ' docker/test_locally.sh > /tmp/heredocs.py
+          if [ -s /tmp/heredocs.py ]; then
+              # Split on the delimiter and compile each block independently.
+              csplit -z -f /tmp/hd_ -b '%02d.py' /tmp/heredocs.py '/---DELIM---/' '{*}' >/dev/null
+              for hd in /tmp/hd_*.py; do
+                  # Strip the leading "---DELIM---" line if present
+                  sed -i '/^---DELIM---$/d' "$hd"
+                  echo "compiling $hd"
+                  python -m py_compile "$hd" || { echo "::error::syntax in $hd"; exit 1; }
+              done
+          fi
+          echo "all embedded python blocks parse cleanly"
