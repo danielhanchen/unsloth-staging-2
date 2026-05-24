@@ -20,11 +20,23 @@ from __future__ import annotations
 
 import ast
 import importlib
+import platform
 import py_compile
 import sys
 from pathlib import Path
 
 import pytest
+
+# The actual module-import test requires the full unsloth dep stack
+# (bitsandbytes on Linux, triton on Windows). On non-Mac platforms the
+# patched lines never execute (gated on _IS_MLX), so AST + py_compile +
+# kwarg-presence are the only meaningful signal there; the real import
+# test is reserved for macOS Apple Silicon where it actually means
+# something. The macos-14 workflow runs run_pr5727_non_peft_base_export.py
+# which already loads ExportBackend end-to-end on real MLX.
+_IS_APPLE_ARM = (
+    platform.system() == "Darwin" and platform.machine() == "arm64"
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXPORT_PY = REPO_ROOT / "studio" / "backend" / "core" / "export" / "export.py"
@@ -126,6 +138,17 @@ def test_pr5727_kwargs_inside_export_base_model_mlx_branch():
     )
 
 
+@pytest.mark.skipif(
+    not _IS_APPLE_ARM,
+    reason = (
+        "ExportBackend full import requires the unsloth dep stack "
+        "(bitsandbytes on Linux, triton on Windows) which we do not "
+        "install on the cross-platform smoke; the change is _IS_MLX-gated "
+        "anyway, so AST + py_compile + kwarg-presence already cover non-Mac "
+        "platforms. The macos-14 workflow runs the real ExportBackend "
+        "end-to-end."
+    ),
+)
 def test_export_backend_imports():
     """ExportBackend imports with the Studio backend dep set. On a
     runner with no real CUDA/XPU/MPS, tests/conftest.py:140 has
