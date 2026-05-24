@@ -1,0 +1,98 @@
+name: PR5749 Targeted Studio CI
+
+# Validates unslothai/unsloth#5749 (Windows GGUF cancel hang + spinlock)
+# plus the three code-review patches:
+#   1. _await_disconnect_then_close sets cancel_event before resp.aclose()
+#   2. Windows OMP env vars gated on _fully_gpu_offloaded
+#   3. Windows --cache-ram/--no-cache-prompt block gated on _fully_gpu_offloaded
+#
+# Runs the existing cancel-infrastructure tests plus two new regression
+# locks (test_disconnect_watcher.py, test_llama_cpp_windows_launch_gating.py).
+# The launch-gating test is AST/exec-based, so it runs identically on
+# ubuntu / macos / windows; that gives us cross-platform sanity on the
+# inference.py disconnect-watcher signature change (which is platform-neutral)
+# AND on Windows-specific source text without needing a real llama-server.
+
+on:
+  push:
+    branches: [ci-pr5749-studio-cancel]
+    paths:
+      - "studio/backend/routes/inference.py"
+      - "studio/backend/core/inference/llama_cpp.py"
+      - "tests/studio/test_cancel_atomicity.py"
+      - "tests/studio/test_cancel_id_wiring.py"
+      - "tests/studio/test_stream_cancel_registration_timing.py"
+      - "tests/studio/test_disconnect_watcher.py"
+      - "tests/studio/test_llama_cpp_windows_launch_gating.py"
+      - "tests/conftest.py"
+      - "tests/_zoo_aggressive_cuda_spoof.py"
+      - ".github/workflows/pr5749-targeted.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  targeted:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: "1"
+      UNSLOTH_COMPILE_DISABLE: "1"
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install targeted test deps (CPU torch)
+        run: |
+          set -euxo pipefail
+          python -m pip install --upgrade pip
+          # Minimal: the new tests are AST + asyncio only; cancel-infra
+          # tests need fastapi/starlette/httpx + the project's CUDA spoof,
+          # which imports unsloth + unsloth_zoo at session start.
+          pip install pytest pytest-asyncio httpx "fastapi>=0.110" "starlette>=0.40" \
+              "transformers>=4.51,<5.5" "numpy<3" psutil pyyaml typer requests
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+              "torch>=2.4,<2.11"
+          # unsloth + unsloth_zoo are imported by tests/conftest.py during
+          # the spoof bootstrap. Install both editable / from git head.
+          pip install -e . --no-deps
+          pip install "unsloth_zoo>=2026.5.1" --no-deps || \
+              pip install git+https://github.com/unslothai/unsloth-zoo --no-deps
+
+      - name: Run cancel-infrastructure tests (unchanged from main)
+        run: |
+          python -m pytest -q --tb=short \
+            tests/studio/test_cancel_atomicity.py \
+            tests/studio/test_cancel_id_wiring.py \
+            tests/studio/test_stream_cancel_registration_timing.py
+
+      - name: Run new disconnect-watcher regression lock (PR 5749 fix 1)
+        run: |
+          python -m pytest -q --tb=short \
+            tests/studio/test_disconnect_watcher.py
+
+      - name: Run new Windows launch-gating regression lock (PR 5749 fixes 2 + 3)
+        run: |
+          python -m pytest -q --tb=short \
+            tests/studio/test_llama_cpp_windows_launch_gating.py
