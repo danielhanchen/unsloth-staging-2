@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Cross-platform typecheck for the frontend half of PR
+# unslothai/unsloth#5711. Confirms the new InferenceParams / ServiceTier
+# / chat-adapter changes compile cleanly on Linux, macOS, and Windows
+# (Windows in particular surfaces npm path / line-ending issues that
+# the maintainer's Linux dev box silently passes over).
+
+name: PR5711 Frontend Typecheck
+
+on:
+  push:
+    branches: [pr5711-cross-platform-validation]
+    paths:
+      - 'studio/frontend/src/**'
+      - 'studio/frontend/package*.json'
+      - 'studio/frontend/tsconfig*.json'
+      - '.github/workflows/pr5711-frontend-typecheck.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/frontend/src/**'
+      - 'studio/frontend/package*.json'
+      - 'studio/frontend/tsconfig*.json'
+      - '.github/workflows/pr5711-frontend-typecheck.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: pr5711-frontend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  typecheck:
+    name: ${{ matrix.os }} / node20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: npm install (no audit / no fund)
+        shell: bash
+        run: |
+          npm install --no-audit --no-fund
+
+      - name: TypeScript build (tsc -b)
+        shell: bash
+        run: |
+          npx tsc -b --pretty false

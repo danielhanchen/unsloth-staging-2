@@ -1,0 +1,102 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# Cross-platform validation for PR unslothai/unsloth#5711
+# "Studio: expose Anthropic / OpenAI sampling knobs per provider"
+#
+# Runs the new sampling-params routing test suite plus the related
+# existing Anthropic / OpenAI translation tests on real Linux, macOS,
+# and Windows runners. CPU-only (no GPU), no model weights — just
+# pure-Python pytest against httpx MockTransport.
+
+name: PR5711 Backend Sampling Tests
+
+on:
+  push:
+    branches: [pr5711-cross-platform-validation]
+    paths:
+      - 'studio/backend/core/inference/external_provider.py'
+      - 'studio/backend/models/inference.py'
+      - 'studio/backend/routes/chat_history.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/tests/test_sampling_params_routing.py'
+      - 'studio/backend/tests/test_anthropic_**'
+      - 'studio/backend/tests/test_openai_**'
+      - 'studio/backend/tests/conftest.py'
+      - '.github/workflows/pr5711-backend-sampling-tests.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/core/inference/external_provider.py'
+      - 'studio/backend/models/inference.py'
+      - 'studio/backend/routes/chat_history.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/tests/test_sampling_params_routing.py'
+      - '.github/workflows/pr5711-backend-sampling-tests.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: pr5711-backend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sampling-tests:
+    name: ${{ matrix.os }} / py3.11
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install backend test deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            pytest \
+            pytest-asyncio \
+            httpx \
+            'pydantic>=2' \
+            'fastapi>=0.115' \
+            anyio \
+            structlog \
+            cryptography \
+            orjson \
+            python-multipart \
+            python-dotenv \
+            'transformers>=4.40' \
+            tokenizers \
+            datasets \
+            pyyaml \
+            pyjwt \
+            sse_starlette \
+            matplotlib \
+            jsonschema \
+            anthropic \
+            openai
+
+      - name: Run sampling-params routing tests
+        shell: bash
+        working-directory: studio/backend
+        run: |
+          python -m pytest tests/test_sampling_params_routing.py -v --no-header
+
+      - name: Run related existing translation / cache / compaction tests
+        shell: bash
+        working-directory: studio/backend
+        run: |
+          python -m pytest \
+            tests/test_anthropic_cache_ttl.py \
+            tests/test_anthropic_compaction.py \
+            tests/test_openai_compaction.py \
+            tests/test_anthropic_messages.py \
+            tests/test_openai_responses_translation.py \
+            tests/test_openai_image_generation.py \
+            tests/test_openai_tool_passthrough.py \
+            -q --no-header
