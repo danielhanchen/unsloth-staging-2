@@ -1,0 +1,116 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# PR #5727 cross-platform parse/import smoke (Linux).
+#
+# The PR's change is gated on _IS_MLX which is False on Linux, so the
+# patched lines never execute here. This job exists to catch syntax /
+# indentation / kwarg regressions in studio/backend/core/export/export.py
+# and to confirm the file still imports cleanly with the rest of the
+# Studio backend on a CUDA-spoofed non-MLX target. We deliberately do
+# NOT install mlx -- the goal is to ensure the file is a clean Python
+# module on Linux+spoof, the same condition CI hits for non-Mac PRs.
+#
+# Also runs tests/studio/test_export_output_path_contract.py which AST-
+# checks the four ExportBackend methods; the PR-changed function
+# export_base_model is one of them, so this AST gate catches a future
+# diff that breaks the contract.
+
+name: PR5727 Linux import smoke
+
+on:
+  push:
+    branches:
+      - 'pr5727-validate-**'
+    paths:
+      - 'studio/backend/core/export/export.py'
+      - 'tests/studio/test_export_output_path_contract.py'
+      - '.github/workflows/pr5727-linux-import.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'studio/backend/core/export/export.py'
+      - 'tests/studio/test_export_output_path_contract.py'
+      - '.github/workflows/pr5727-linux-import.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  parse-and-import:
+    name: parse-and-import
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      # Minimum deps to import studio.backend.core.export.export. The
+      # CUDA-spoof under tests/_zoo_aggressive_cuda_spoof.py + tests/conftest.py
+      # is loaded via PYTHONPATH so the import chain does not require a
+      # real CUDA device.
+      - name: Install minimum import deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' pytest pytest-asyncio httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch>=2.4,<2.11'
+          pip install 'transformers>=4.51,<5.5'
+          # unsloth_zoo + unsloth from git so the `from unsloth import _IS_MLX`
+          # at the top of export.py resolves cleanly.
+          for attempt in 1 2 3; do
+            if pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo"; then
+              break
+            fi
+            sleep $((5 * attempt))
+          done
+          pip install -e . --no-deps
+
+      - name: AST + py_compile gate
+        run: |
+          python -c "import ast; ast.parse(open('studio/backend/core/export/export.py').read()); print('ast.parse OK')"
+          python -c "import py_compile; py_compile.compile('studio/backend/core/export/export.py', doraise=True); print('py_compile OK')"
+
+      - name: Import the patched module
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio
+        run: |
+          python -c "
+          from backend.core.export.export import ExportBackend
+          assert hasattr(ExportBackend, 'export_base_model')
+          assert hasattr(ExportBackend, 'export_merged_model')
+          print('OK: ExportBackend imported on Linux')
+          "
+
+      - name: AST contract test (tests/studio/test_export_output_path_contract.py)
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio
+        run: |
+          python -m pytest -v tests/studio/test_export_output_path_contract.py
+
+      - name: Assert PR change applied (sanity)
+        run: |
+          python - <<'PY'
+          src = open('studio/backend/core/export/export.py').read()
+          # The patched module MUST contain two save_method="merged_16bit"
+          # kwargs inside the _IS_MLX branch of export_base_model.
+          # Count occurrences and require >= 2.
+          c = src.count('save_method = "merged_16bit"')
+          assert c >= 2, f"expected >=2 occurrences of save_method = \"merged_16bit\" in export.py, got {c}"
+          print(f"OK: found {c} save_method='merged_16bit' kwargs in export.py")
+          PY

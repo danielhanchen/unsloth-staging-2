@@ -1,0 +1,96 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# PR #5727 cross-platform parse/import smoke (Windows).
+#
+# Same intent as pr5727-linux-import.yml: _IS_MLX is False on Windows,
+# so the patched lines never execute here. This job ensures the patched
+# studio/backend/core/export/export.py parses + imports cleanly with the
+# Studio backend dep set on Windows. Keeps us under the 5-concurrent
+# Windows runner cap (only this single Windows job in this branch).
+
+name: PR5727 Windows import smoke
+
+on:
+  push:
+    branches:
+      - 'pr5727-validate-**'
+    paths:
+      - 'studio/backend/core/export/export.py'
+      - '.github/workflows/pr5727-windows-import.yml'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'studio/backend/core/export/export.py'
+      - '.github/workflows/pr5727-windows-import.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  parse-and-import:
+    name: parse-and-import
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install minimum import deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' pytest pytest-asyncio httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch>=2.4,<2.11'
+          pip install 'transformers>=4.51,<5.5'
+          for attempt in 1 2 3; do
+            if pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo"; then
+              break
+            fi
+            sleep $((5 * attempt))
+          done
+          pip install -e . --no-deps
+
+      - name: AST + py_compile gate
+        shell: bash
+        run: |
+          python -c "import ast; ast.parse(open('studio/backend/core/export/export.py').read()); print('ast.parse OK')"
+          python -c "import py_compile; py_compile.compile('studio/backend/core/export/export.py', doraise=True); print('py_compile OK')"
+
+      - name: Import the patched module
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio
+        run: |
+          python -c "
+          from backend.core.export.export import ExportBackend
+          assert hasattr(ExportBackend, 'export_base_model')
+          assert hasattr(ExportBackend, 'export_merged_model')
+          print('OK: ExportBackend imported on Windows')
+          "
+
+      - name: Assert PR change applied
+        shell: bash
+        run: |
+          python - <<'PY'
+          src = open('studio/backend/core/export/export.py').read()
+          c = src.count('save_method = "merged_16bit"')
+          assert c >= 2, f"expected >=2 occurrences of save_method = \"merged_16bit\" in export.py, got {c}"
+          print(f"OK: found {c} save_method='merged_16bit' kwargs in export.py")
+          PY
