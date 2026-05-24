@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# PR #5727 cross-platform parse/import smoke (Windows).
+#
+# Same intent as pr5727-linux-import.yml: _IS_MLX is False on Windows,
+# so the patched lines never execute here. tests/conftest.py CUDA-spoof
+# is applied automatically by pytest so `import unsloth` survives on a
+# Windows runner with no real accelerator.
+
+name: PR5727 Windows import smoke
+
+on:
+  push:
+    branches:
+      - 'pr5727-validate-**'
+    paths:
+      - 'studio/backend/core/export/export.py'
+      - 'tests/studio/test_pr5727_export_kwargs.py'
+      - 'tests/conftest.py'
+      - '.github/workflows/pr5727-windows-import.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  parse-and-import:
+    name: parse-and-import
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install minimum import deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' pytest pytest-asyncio httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch>=2.4,<2.11'
+          pip install 'transformers>=4.51,<5.5'
+          for attempt in 1 2 3; do
+            if pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo"; then
+              break
+            fi
+            sleep $((5 * attempt))
+          done
+          pip install -e . --no-deps
+
+      - name: Run PR5727 test (pytest, conftest spoof)
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio
+        run: |
+          python -m pytest -v --tb=short \
+            tests/studio/test_pr5727_export_kwargs.py

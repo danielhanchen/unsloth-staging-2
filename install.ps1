@@ -1302,6 +1302,12 @@ shell.Run cmd, 0, False
             # runtime deps (typer, safetensors, transformers, etc.) with --no-deps.
             $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython --no-deps --reinstall-package unsloth --reinstall-package unsloth-zoo "unsloth>=2026.5.6" unsloth-zoo }
             if ($baseInstallExit -eq 0) {
+                # Resolve pydantic WITH deps so pip pins pydantic-core
+                # to the matching version (no-torch-runtime.txt below
+                # is --no-deps). All transitive deps are torch-free.
+                $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython pydantic }
+            }
+            if ($baseInstallExit -eq 0) {
                 $NoTorchReq = Find-NoTorchRuntimeFile
                 if ($NoTorchReq) {
                     $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython --no-deps -r $NoTorchReq }
@@ -1347,6 +1353,10 @@ shell.Run cmd, 0, False
             # No-torch: install unsloth + unsloth-zoo with --no-deps, then
             # runtime deps (typer, safetensors, transformers, etc.) with --no-deps.
             $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython --no-deps --upgrade-package unsloth --upgrade-package unsloth-zoo "unsloth>=2026.5.6" unsloth-zoo }
+            if ($baseInstallExit -eq 0) {
+                # Same pydantic-with-deps trick as the migrated branch.
+                $baseInstallExit = Invoke-InstallCommand { uv pip install --python $VenvPython pydantic }
+            }
             if ($baseInstallExit -eq 0) {
                 $NoTorchReq = Find-NoTorchRuntimeFile
                 if ($NoTorchReq) {

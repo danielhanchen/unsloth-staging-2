@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# PR #5727 validation: exercise the patched export_base_model on real
+# Apple Silicon. The PR adds save_method="merged_16bit" to two MLX
+# save_pretrained_merged calls; this workflow loads gemma-3-270m-it as a
+# non-PEFT model and runs the smoke test at
+# tests/studio/run_pr5727_non_peft_base_export.py.
+#
+# Runner: macos-14 (M1 Apple Silicon, free for public repos).
+
+name: PR5727 MLX base export
+
+on:
+  push:
+    branches:
+      - 'pr5727-validate-**'
+    paths:
+      - 'studio/backend/core/export/export.py'
+      - 'tests/studio/run_pr5727_non_peft_base_export.py'
+      - '.github/workflows/pr5727-mlx-base-export.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-base-export:
+    name: mlx-base-export
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      # Same install ladder as the existing mlx-ci.yml so the dispatch
+      # stack + real mlx/mlx-lm/mlx-vlm + Studio backend deps are present.
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            'python-multipart==0.0.27' \
+            'aiofiles==25.1.0' \
+            'sqlalchemy==2.0.49' \
+            'cryptography==48.0.0' \
+            'pyyaml==6.0.3' \
+            'jinja2==3.1.6' \
+            'mammoth==1.12.0' \
+            'unpdf==1.0.0' \
+            'requests==2.33.1' \
+            'typer==0.25.1' \
+            'numpy==2.4.4' \
+            'pytest==9.0.3' \
+            'pytest-asyncio==1.3.0' \
+            'httpx==0.28.1'
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            'torch==2.10.0'
+          # Retry the zoo install -- github.com occasionally 500s on the
+          # git fetch.
+          for attempt in 1 2 3; do
+            if pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo"; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "::error::pip install unsloth_zoo failed after 3 attempts"
+              exit 1
+            fi
+            delay=$((5 * attempt))
+            echo "::warning::unsloth_zoo install failed (attempt $attempt/3), retrying in ${delay}s..."
+            sleep "$delay"
+          done
+          pip install -e . --no-deps
+
+      - name: Verify _IS_MLX flips True
+        run: |
+          python -c "
+          import platform
+          assert platform.system() == 'Darwin' and platform.machine() == 'arm64'
+          import unsloth
+          assert unsloth._IS_MLX is True, f'expected _IS_MLX=True, got {unsloth._IS_MLX}'
+          print('OK: _IS_MLX activated on real Apple Silicon')
+          "
+
+      - name: PR #5727 non-PEFT base export smoke
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          UNSLOTH_COMPILE_DISABLE: '1'
+          PR5727_WORKDIR: ${{ github.workspace }}/pr5727_workdir
+        run: |
+          mkdir -p "$PR5727_WORKDIR"
+          python tests/studio/run_pr5727_non_peft_base_export.py
+
+      - name: PR #5727 metrics
+        if: always()
+        run: |
+          F="${{ github.workspace }}/pr5727_workdir/pr5727_metrics.json"
+          if [ -f "$F" ]; then
+            echo "=== $F ==="
+            cat "$F"
+          else
+            echo "::warning::no pr5727_metrics.json produced"
+          fi
