@@ -419,7 +419,7 @@ async def _await_cancel_then_close(cancel_event, resp) -> None:
         return
 
 
-async def _await_disconnect_then_close(request, resp) -> None:
+async def _await_disconnect_then_close(request, resp, cancel_event) -> None:
     """Watch ``request.is_disconnected()`` and close ``resp`` when the client
     disconnects (tab closed, navigation away, fetch abort).  This prevents
     llama-server from continuing to decode after the client is gone — a
@@ -432,10 +432,17 @@ async def _await_disconnect_then_close(request, resp) -> None:
     Starlette Request directly, so it covers client-initiated aborts that
     never reach the /cancel POST path (proxied fetches, Colab, mobile
     tab-close, etc.).
+
+    Sets ``cancel_event`` before closing ``resp`` so the streamer's
+    ``except (RemoteProtocolError, ReadError, CloseError)`` clause -- which
+    only suppresses the re-raise when ``cancel_event.is_set()`` -- treats
+    the watcher-driven close as a normal client cancellation rather than
+    an upstream error.  Mirrors the in-loop fallback path.
     """
     try:
         while not await request.is_disconnected():
             await asyncio.sleep(0.1)
+        cancel_event.set()
         try:
             await resp.aclose()
         except Exception as e:
@@ -5073,7 +5080,7 @@ async def _anthropic_passthrough_stream(
                 _await_cancel_then_close(cancel_event, resp)
             )
             disconnect_watcher = asyncio.create_task(
-                _await_disconnect_then_close(request, resp)
+                _await_disconnect_then_close(request, resp, cancel_event)
             )
             lines_iter = resp.aiter_lines()
             async for raw_line in lines_iter:
@@ -5499,7 +5506,7 @@ async def _openai_passthrough_stream(
                 _await_cancel_then_close(cancel_event, resp)
             )
             disconnect_watcher = asyncio.create_task(
-                _await_disconnect_then_close(request, resp)
+                _await_disconnect_then_close(request, resp, cancel_event)
             )
             try:
                 lines_iter = resp.aiter_lines()

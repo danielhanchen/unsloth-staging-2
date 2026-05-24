@@ -3118,12 +3118,13 @@ class LlamaCppBackend:
                 else:
                     self._api_key = None
 
-                # On Windows, llama-server's default KV-cache checkpoints write
-                # prompt-cache snapshots to system RAM over the WDDM driver /
-                # PCI-E bus.  This adds substantial overhead even when the model
-                # is fully GPU-offloaded.  Disable all checkpoint machinery to
-                # keep the cache entirely in VRAM.  #5692.
-                if _sys.platform == "win32":
+                # On Windows with full GPU offload, llama-server's default
+                # KV-cache checkpoints write prompt-cache snapshots to system
+                # RAM over the WDDM driver / PCI-E bus.  Disable all checkpoint
+                # machinery to keep the cache entirely in VRAM.  Scoped to
+                # full-offload only: CPU-only / partial-offload Windows runs
+                # still benefit from prompt caching across turns.  #5692.
+                if _sys.platform == "win32" and _fully_gpu_offloaded:
                     cmd.extend(
                         [
                             "--cache-ram",
@@ -3177,9 +3178,12 @@ class LlamaCppBackend:
                     # PASSIVE tells the runtime to yield instead of spinning;
                     # limiting to 2 threads keeps the few remaining CPU-side
                     # operations (tokenisation, copy) from monopolising the
-                    # scheduler.  #5692.
-                    env.setdefault("OMP_WAIT_POLICY", "PASSIVE")
-                    env.setdefault("OMP_NUM_THREADS", "2")
+                    # scheduler.  Scoped to full-offload only so CPU-only and
+                    # partial-offload runs keep their default OpenMP parallelism.
+                    # #5692.
+                    if _fully_gpu_offloaded:
+                        env.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+                        env.setdefault("OMP_NUM_THREADS", "2")
                 else:
                     # Linux: set LD_LIBRARY_PATH for shared libs next to the binary
                     # and CUDA runtime libs (libcudart, libcublas, etc.)
