@@ -61,15 +61,27 @@ jobs:
           path = pathlib.Path("core/inference/sandbox.py")
           spec = importlib.util.spec_from_file_location("sb", path)
           m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+          def _slice_top_form(text, opener):
+              start = text.index(opener)
+              depth = 0
+              for i in range(start, len(text)):
+                  c = text[i]
+                  if c == "(":
+                      depth += 1
+                  elif c == ")":
+                      depth -= 1
+                      if depth == 0:
+                          return text[start:i + 1]
+              raise AssertionError("unterminated form " + opener)
+
           with tempfile.TemporaryDirectory() as wd:
               p = m._macos_seatbelt_profile(wd)
               wd_rp = os.path.realpath(wd)
-              pe_idx = p.index("(allow process-exec")
-              pe_end = p.index(")", pe_idx)
-              fm_idx = p.index("(allow file-map-executable")
-              fm_end = p.index(")", fm_idx)
-              assert wd_rp in p[pe_idx:pe_end], "workdir not in process-exec"
-              assert wd_rp in p[fm_idx:fm_end], "workdir not in file-map-executable"
+              pe_form = _slice_top_form(p, "(allow process-exec")
+              fm_form = _slice_top_form(p, "(allow file-map-executable")
+              assert wd_rp in pe_form, "workdir not in process-exec"
+              assert wd_rp in fm_form, "workdir not in file-map-executable"
               print("OK: workdir present in process-exec + file-map-executable")
               # Pre-validate the profile actually parses by running a no-op.
               import subprocess
