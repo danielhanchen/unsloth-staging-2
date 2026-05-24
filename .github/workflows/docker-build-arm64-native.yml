@@ -95,7 +95,8 @@ jobs:
           arches = torch._C._cuda_getArchFlags().split()
           assert 'sm_100' in arches, arches
           assert 'sm_120' in arches, arches
-          import unsloth_zoo
+          # unsloth FIRST -- see docker-build-amd64.yml for rationale.
           import unsloth
+          import unsloth_zoo
           print('imports OK; SASS coverage verified')
           "

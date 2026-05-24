@@ -84,7 +84,11 @@ jobs:
           import torch
           print('torch', torch.__version__, 'cuda', torch.version.cuda)
           print('arches:', torch._C._cuda_getArchFlags())
-          import unsloth_zoo
+          # IMPORTANT: import unsloth FIRST -- unsloth's __init__ sets
+          # UNSLOTH_IS_PRESENT which unsloth_zoo's __init__ then checks.
+          # Reversing the order trips ImportError('Please install Unsloth
+          # via pip install unsloth!') even though both are installed.
           import unsloth
+          import unsloth_zoo
           print('imports OK')
           "
