@@ -3,10 +3,9 @@
 # PR #5727 cross-platform parse/import smoke (Windows).
 #
 # Same intent as pr5727-linux-import.yml: _IS_MLX is False on Windows,
-# so the patched lines never execute here. This job ensures the patched
-# studio/backend/core/export/export.py parses + imports cleanly with the
-# Studio backend dep set on Windows. Keeps us under the 5-concurrent
-# Windows runner cap (only this single Windows job in this branch).
+# so the patched lines never execute here. tests/conftest.py CUDA-spoof
+# is applied automatically by pytest so `import unsloth` survives on a
+# Windows runner with no real accelerator.
 
 name: PR5727 Windows import smoke
 
@@ -16,12 +15,8 @@ on:
       - 'pr5727-validate-**'
     paths:
       - 'studio/backend/core/export/export.py'
-      - '.github/workflows/pr5727-windows-import.yml'
-  pull_request:
-    branches:
-      - main
-    paths:
-      - 'studio/backend/core/export/export.py'
+      - 'tests/studio/test_pr5727_export_kwargs.py'
+      - 'tests/conftest.py'
       - '.github/workflows/pr5727-windows-import.yml'
   workflow_dispatch: {}
 
@@ -67,30 +62,10 @@ jobs:
           done
           pip install -e . --no-deps
 
-      - name: AST + py_compile gate
-        shell: bash
-        run: |
-          python -c "import ast; ast.parse(open('studio/backend/core/export/export.py').read()); print('ast.parse OK')"
-          python -c "import py_compile; py_compile.compile('studio/backend/core/export/export.py', doraise=True); print('py_compile OK')"
-
-      - name: Import the patched module
+      - name: Run PR5727 test (pytest, conftest spoof)
         shell: bash
         env:
           PYTHONPATH: ${{ github.workspace }}/studio
         run: |
-          python -c "
-          from backend.core.export.export import ExportBackend
-          assert hasattr(ExportBackend, 'export_base_model')
-          assert hasattr(ExportBackend, 'export_merged_model')
-          print('OK: ExportBackend imported on Windows')
-          "
-
-      - name: Assert PR change applied
-        shell: bash
-        run: |
-          python - <<'PY'
-          src = open('studio/backend/core/export/export.py').read()
-          c = src.count('save_method = "merged_16bit"')
-          assert c >= 2, f"expected >=2 occurrences of save_method = \"merged_16bit\" in export.py, got {c}"
-          print(f"OK: found {c} save_method='merged_16bit' kwargs in export.py")
-          PY
+          python -m pytest -v --tb=short \
+            tests/studio/test_pr5727_export_kwargs.py

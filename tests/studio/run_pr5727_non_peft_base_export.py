@@ -158,6 +158,14 @@ def phase_3_export_backend(workdir: Path) -> dict[str, Any]:
         f"expected unsloth._IS_MLX=True on Apple Silicon, got {_unsloth._IS_MLX}"
     )
 
+    # Pin UNSLOTH_STUDIO_HOME so storage_roots.resolve_export_dir
+    # accepts a relative save_directory by anchoring it under
+    # $UNSLOTH_STUDIO_HOME/exports/. resolve_export_dir refuses any
+    # absolute path outside that sandbox.
+    studio_home = workdir / "studio_home"
+    studio_home.mkdir(parents = True, exist_ok = True)
+    os.environ["UNSLOTH_STUDIO_HOME"] = str(studio_home)
+
     from backend.core.export.export import ExportBackend
 
     backend = ExportBackend()
@@ -169,9 +177,10 @@ def phase_3_export_backend(workdir: Path) -> dict[str, Any]:
     # tolerates missing context, so we leave the rest of the attributes at
     # their defaults.
 
-    save_dir = workdir / "phase_3_export_base_model"
+    # Use a relative export name so resolve_export_dir places it under
+    # $UNSLOTH_STUDIO_HOME/exports/pr5727_phase3.
     success, message, output_path = backend.export_base_model(
-        save_directory = str(save_dir),
+        save_directory = "pr5727_phase3",
         push_to_hub = False,
     )
     print(f"  export_base_model -> success={success}, msg={message!r}, path={output_path}",

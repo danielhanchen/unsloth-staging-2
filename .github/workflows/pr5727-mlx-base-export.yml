@@ -18,13 +18,6 @@ on:
       - 'studio/backend/core/export/export.py'
       - 'tests/studio/run_pr5727_non_peft_base_export.py'
       - '.github/workflows/pr5727-mlx-base-export.yml'
-  pull_request:
-    branches:
-      - main
-    paths:
-      - 'studio/backend/core/export/export.py'
-      - 'tests/studio/run_pr5727_non_peft_base_export.py'
-      - '.github/workflows/pr5727-mlx-base-export.yml'
   workflow_dispatch: {}
 
 concurrency:
