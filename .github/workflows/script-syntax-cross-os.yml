@@ -86,28 +86,31 @@ jobs:
           done
           exit $fail
 
-      # Validate the embedded Python heredocs inside test_locally.sh
-      # (extracted by an inline awk so we catch syntax bugs before the
-      # full Docker build sees them).
+      # Validate the embedded Python heredocs inside test_locally.sh.
+      # Pure-Python implementation: BSD csplit on macOS lacks GNU's -z/-b
+      # flags, and Windows has neither csplit nor sed -i. py_compile-ing
+      # each heredoc lets us catch syntax bugs in the Dockerized notebook
+      # patches before the full Docker build sees them.
       - name: validate embedded python in test_locally.sh
-        if: matrix.os != 'windows-latest'
         shell: bash
         run: |
-          set -e
-          # Pull out each '<<'PY'' ... 'PY' block and feed it to py_compile.
-          awk '
-            /<<.PY./ { capture=1; next }
-            /^PY$/   { if (capture) { print "---DELIM---"; capture=0 }; next }
-            capture  { print }
-          ' docker/test_locally.sh > /tmp/heredocs.py
-          if [ -s /tmp/heredocs.py ]; then
-              # Split on the delimiter and compile each block independently.
-              csplit -z -f /tmp/hd_ -b '%02d.py' /tmp/heredocs.py '/---DELIM---/' '{*}' >/dev/null
-              for hd in /tmp/hd_*.py; do
-                  # Strip the leading "---DELIM---" line if present
-                  sed -i '/^---DELIM---$/d' "$hd"
-                  echo "compiling $hd"
-                  python -m py_compile "$hd" || { echo "::error::syntax in $hd"; exit 1; }
-              done
-          fi
-          echo "all embedded python blocks parse cleanly"
+          python - <<'PY'
+          import ast, pathlib, re, sys
+          src = pathlib.Path("docker/test_locally.sh").read_text()
+          # Match `python - <<'PY'` ... `PY` blocks. The closing PY must be
+          # on its own line (heredoc rules).
+          blocks = re.findall(r"<<\s*'PY'\n(.*?)\nPY\b", src, flags=re.DOTALL)
+          if not blocks:
+              print("no PY heredocs found in docker/test_locally.sh -- skipping")
+              sys.exit(0)
+          print(f"found {len(blocks)} python heredoc(s)")
+          failed = 0
+          for i, blk in enumerate(blocks, 1):
+              try:
+                  ast.parse(blk)
+                  print(f"  heredoc #{i}: OK ({blk.count(chr(10))+1} lines)")
+              except SyntaxError as e:
+                  print(f"::error::heredoc #{i} in docker/test_locally.sh: {e}")
+                  failed += 1
+          sys.exit(failed)
+          PY
