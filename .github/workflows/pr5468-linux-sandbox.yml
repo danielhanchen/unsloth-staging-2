@@ -30,9 +30,13 @@ jobs:
           python-version: '3.12'
 
       - name: Install bubblewrap and confirm probe passes
+        # ubuntu-latest ships AppArmor with apparmor_restrict_unprivileged_userns=1
+        # which blocks bwrap from creating the namespaces it needs.
+        # Disable just for this job so the probe can succeed.
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
           bwrap --ro-bind / / --unshare-all --die-with-parent /usr/bin/true
           bwrap --version
 

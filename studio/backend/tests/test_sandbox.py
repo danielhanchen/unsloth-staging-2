@@ -428,8 +428,11 @@ def test_get_shell_cmd_uses_absolute_bin_bash():
 @pytest.mark.skipif(sys.platform != "darwin", reason="Seatbelt is macOS-only")
 def test_macos_profile_allows_workdir_exec(tmp_path):
     sandbox = _load_sandbox_module()
-    profile = sandbox._macos_seatbelt_profile(str(tmp_path))
+    # _macos_seatbelt_profile realpaths the workdir before embedding it,
+    # so the test must also realpath because macOS /var is symlinked to
+    # /private/var (and pytest tmp_path lives under /var).
     wd = os.path.realpath(str(tmp_path))
+    profile = sandbox._macos_seatbelt_profile(str(tmp_path))
     # Workdir should appear inside both (allow process-exec ...) and
     # (allow file-map-executable ...), not just file-read*/file-write*.
     process_exec_idx = profile.index("(allow process-exec")
