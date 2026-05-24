@@ -25,6 +25,7 @@ import threading
 import urllib.request
 
 from loggers import get_logger
+from .sandbox import build_sandbox_argv, sandbox_available
 
 logger = get_logger(__name__)
 
@@ -320,7 +321,7 @@ def _build_safe_env(workdir: str) -> dict[str, str]:
     return env
 
 
-def _sandbox_preexec():
+def _sandbox_preexec_impl(apply_no_new_privs: bool):
     """Best-effort sandbox setup for sandboxed subprocesses.
 
     Modules are resolved at import time so the forked child runs no imports.
@@ -336,10 +337,11 @@ def _sandbox_preexec():
         pass
 
     if _libc is not None:
-        try:
-            _libc.prctl(38, 1, 0, 0, 0)  # PR_SET_NO_NEW_PRIVS
-        except (OSError, AttributeError):
-            pass
+        if apply_no_new_privs:
+            try:
+                _libc.prctl(38, 1, 0, 0, 0)  # PR_SET_NO_NEW_PRIVS
+            except (OSError, AttributeError):
+                pass
 
         try:
             _libc.prctl(1, 9, 0, 0, 0)  # PR_SET_PDEATHSIG = SIGKILL
@@ -394,10 +396,52 @@ def _sandbox_preexec():
             pass
 
 
+def _sandbox_preexec():
+    _sandbox_preexec_impl(apply_no_new_privs = True)
+
+
+def _sandbox_preexec_for_bwrap():
+    # Setuid bwrap can't acquire helper privileges with NNP set pre-execve.
+    # bwrap reapplies NNP to the inner payload, so the child still runs NNP=1.
+    _sandbox_preexec_impl(apply_no_new_privs = False)
+
+
+# Sentinel returned by tool entry points when the operator asked for
+# strict sandboxing and the OS primitive cannot be applied. Surfaces as
+# the tool output so the LLM (and the user) see why the call refused.
+_SANDBOX_REQUIRED_UNAVAILABLE_MSG = (
+    "Execution blocked: UNSLOTH_STUDIO_SANDBOX_STRICT=1 is set but the OS "
+    "sandbox is unavailable. Install / enable bubblewrap on Linux "
+    "(apt install bubblewrap, ensure unprivileged user namespaces are "
+    "permitted) or sandbox-exec on macOS, or unset "
+    "UNSLOTH_STUDIO_SANDBOX_STRICT to allow unsandboxed execution."
+)
+
+
+def _strict_sandbox_required() -> bool:
+    """True iff the operator wants tool execution to fail closed.
+
+    Opt-in: default is the original fail-open behavior so installs
+    without bubblewrap (locked-down kernels, nested containers, hosts
+    without bwrap) keep working. Operators who care about the security
+    boundary set UNSLOTH_STUDIO_SANDBOX_STRICT=1.
+    """
+    return os.environ.get("UNSLOTH_STUDIO_SANDBOX_STRICT", "").strip() in ("1", "true", "True", "yes")
+
+
 def _get_shell_cmd(command: str) -> list[str]:
-    """Return the platform-appropriate shell invocation for a command string."""
+    """Return the platform-appropriate shell invocation for a command string.
+
+    Uses an absolute /bin/bash on Unix so the Seatbelt profile's /bin
+    allowlist actually matches; bare "bash" would resolve to whatever
+    PATH lookup finds first, e.g. /usr/local/bin/bash from Homebrew on
+    Intel macs, which Seatbelt denies. /bin/bash is ABI-stable on both
+    macOS (SIP-protected) and Linux (usrmerge symlink or real binary).
+    """
     if sys.platform == "win32":
         return ["cmd", "/c", command]
+    if os.path.exists("/bin/bash"):
+        return ["/bin/bash", "-c", command]
     return ["bash", "-c", command]
 
 
@@ -437,7 +481,9 @@ def _get_workdir(session_id: str | None = None) -> str:
             os.chmod(workdir, 0o700)
         except OSError:
             pass
-        _workdirs[key] = workdir
+        # bwrap binds the realpath; cache the same value so tmp_path resolves
+        # inside the sandbox when $HOME or a parent is a symlink.
+        _workdirs[key] = os.path.realpath(workdir)
     return _workdirs[key]
 
 
@@ -1902,12 +1948,26 @@ def _python_exec(
             cwd = workdir,
             env = safe_env,
         )
+
+        inner_argv = [sys.executable, tmp_path]
+        sandboxed = sandbox_available()
+        if not sandboxed and _strict_sandbox_required() and sys.platform in ("darwin", "linux"):
+            return _SANDBOX_REQUIRED_UNAVAILABLE_MSG
+        if sandboxed:
+            argv = build_sandbox_argv(inner_argv, workdir)
+        else:
+            argv = inner_argv
+
         if sys.platform != "win32":
-            popen_kwargs["preexec_fn"] = _sandbox_preexec
+            popen_kwargs["preexec_fn"] = (
+                _sandbox_preexec_for_bwrap
+                if sandboxed and sys.platform == "linux"
+                else _sandbox_preexec
+            )
         else:
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        proc = subprocess.Popen([sys.executable, tmp_path], **popen_kwargs)
+        proc = subprocess.Popen(argv, **popen_kwargs)
 
         # Spawn cancel watcher if we have a cancel event
         if cancel_event is not None:
@@ -1991,13 +2051,26 @@ def _bash_exec(
             cwd = workdir,
             env = safe_env,
         )
+
+        inner_argv = _get_shell_cmd(command)
+        sandboxed = sandbox_available()
+        if not sandboxed and _strict_sandbox_required() and sys.platform in ("darwin", "linux"):
+            return _SANDBOX_REQUIRED_UNAVAILABLE_MSG
+        if sandboxed:
+            argv = build_sandbox_argv(inner_argv, workdir)
+        else:
+            argv = inner_argv
+
         if sys.platform != "win32":
-            popen_kwargs["preexec_fn"] = _sandbox_preexec
+            popen_kwargs["preexec_fn"] = (
+                _sandbox_preexec_for_bwrap
+                if sandboxed and sys.platform == "linux"
+                else _sandbox_preexec
+            )
         else:
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-        proc = subprocess.Popen(_get_shell_cmd(command), **popen_kwargs)
-
+        proc = subprocess.Popen(argv, **popen_kwargs)
         if cancel_event is not None:
             watcher = threading.Thread(
                 target = _cancel_watcher, args = (proc, cancel_event), daemon = True

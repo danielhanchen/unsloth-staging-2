@@ -1,0 +1,80 @@
+# PR 5468 cross-platform sandbox validation: macOS.
+# Uses the system sandbox-exec to validate the Seatbelt profile end to end,
+# including the new workdir-exec symmetry and Homebrew-prefix entries.
+
+name: PR 5468 macOS sandbox
+
+on:
+  push:
+    branches: [pr-5468-ci-test]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  macos-sandbox:
+    name: macOS sandbox (real Seatbelt)
+    runs-on: macos-14
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Confirm sandbox-exec exists and probe passes
+        run: |
+          ls -l /usr/bin/sandbox-exec
+          /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
+          /bin/bash --version | head -1
+
+      - name: Install minimal backend deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest fastapi structlog python-multipart httpx \
+            uvicorn pydantic loguru rich shellingham typer pyyaml \
+            jinja2 sqlalchemy cryptography aiofiles requests \
+            'numpy<3' pytest-asyncio
+
+      - name: Sandbox tests (enforcement gate ON)
+        working-directory: studio/backend
+        env:
+          CI: 'true'
+        run: |
+          python -m pytest tests/test_sandbox.py -v --tb=short
+
+      - name: Render Seatbelt profile and assert workdir exec
+        # Belt and suspenders: emit the actual profile that ships at runtime
+        # so a maintainer can eyeball it in the CI logs without running mac.
+        working-directory: studio/backend
+        run: |
+          python - <<'PY'
+          import importlib.util, os, tempfile, sys, pathlib
+          path = pathlib.Path("core/inference/sandbox.py")
+          spec = importlib.util.spec_from_file_location("sb", path)
+          m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+          with tempfile.TemporaryDirectory() as wd:
+              p = m._macos_seatbelt_profile(wd)
+              wd_rp = os.path.realpath(wd)
+              pe_idx = p.index("(allow process-exec")
+              pe_end = p.index(")", pe_idx)
+              fm_idx = p.index("(allow file-map-executable")
+              fm_end = p.index(")", fm_idx)
+              assert wd_rp in p[pe_idx:pe_end], "workdir not in process-exec"
+              assert wd_rp in p[fm_idx:fm_end], "workdir not in file-map-executable"
+              print("OK: workdir present in process-exec + file-map-executable")
+              # Pre-validate the profile actually parses by running a no-op.
+              import subprocess
+              subprocess.run([
+                  "/usr/bin/sandbox-exec", "-p", p, "/usr/bin/true",
+              ], check=True)
+              print("OK: generated Seatbelt profile parses and runs")
+          PY

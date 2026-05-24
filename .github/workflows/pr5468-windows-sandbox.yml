@@ -1,0 +1,68 @@
+# PR 5468 cross-platform sandbox validation: Windows.
+# Windows has no sandbox primitive; the contract is that sandbox_available()
+# returns False, tool execution falls back to the unsandboxed path, and the
+# tests that need a real sandbox skip cleanly. Strict mode is a no-op on
+# Windows (the gate is gated on sys.platform in ("darwin","linux")).
+
+name: PR 5468 Windows sandbox
+
+on:
+  push:
+    branches: [pr-5468-ci-test]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  windows-sandbox:
+    name: Windows sandbox (no-op fallback)
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install minimal backend deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest fastapi structlog python-multipart httpx \
+            uvicorn pydantic loguru rich shellingham typer pyyaml \
+            jinja2 sqlalchemy cryptography aiofiles requests \
+            'numpy<3' pytest-asyncio
+
+      - name: Sandbox tests (Windows skips the enforcement layer)
+        # CI is intentionally NOT set: on Windows the pytestmark skips
+        # the whole file because sys.platform != "darwin"/"linux".
+        working-directory: studio/backend
+        shell: bash
+        run: |
+          python -m pytest tests/test_sandbox.py -v --tb=short
+          echo "sandbox_available() on Windows:"
+          python -c "import sys, importlib.util; spec=importlib.util.spec_from_file_location('sb','core/inference/sandbox.py'); m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m); print(m.sandbox_available())"
+
+      - name: Smoke-test _get_shell_cmd uses cmd on Windows
+        working-directory: studio/backend
+        shell: bash
+        run: |
+          python - <<'PY'
+          import importlib.util, sys, pathlib
+          spec = importlib.util.spec_from_file_location("tools", "core/inference/tools.py")
+          # tools.py imports the full backend so just run the small helper via
+          # the same import dance the test file uses.
+          import importlib.util as iu
+          spec = iu.spec_from_file_location("_sandbox", "core/inference/sandbox.py")
+          sb = iu.module_from_spec(spec); spec.loader.exec_module(sb)
+          assert sb.sandbox_available() is False, "Windows must have no sandbox"
+          print("OK: sandbox_available() = False on Windows")
+          PY

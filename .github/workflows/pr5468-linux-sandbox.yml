@@ -1,0 +1,68 @@
+# PR 5468 cross-platform sandbox validation: Linux.
+# Installs bubblewrap and runs the new sandbox tests with real enforcement.
+
+name: PR 5468 Linux sandbox
+
+on:
+  push:
+    branches: [pr-5468-ci-test]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux-sandbox:
+    name: Linux sandbox (real bwrap)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install bubblewrap and confirm probe passes
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --ro-bind / / --unshare-all --die-with-parent /usr/bin/true
+          bwrap --version
+
+      - name: Install minimal backend deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install pytest fastapi structlog python-multipart httpx \
+            uvicorn pydantic loguru rich shellingham typer pyyaml \
+            jinja2 sqlalchemy cryptography aiofiles requests \
+            'numpy<3' pytest-asyncio
+
+      - name: Show kernel / userns state for diagnostics
+        run: |
+          uname -a
+          cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || true
+          cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || true
+
+      - name: Sandbox tests (enforcement gate ON)
+        working-directory: studio/backend
+        env:
+          CI: 'true'
+        run: |
+          python -m pytest tests/test_sandbox.py -v --tb=short
+
+      - name: Strict-mode round trip without bwrap
+        # Re-run the strict-mode tests with bwrap forced off so the
+        # opt-in fail-closed path is exercised end-to-end on a real
+        # GitHub runner, not just via monkeypatch.
+        working-directory: studio/backend
+        env:
+          UNSLOTH_STUDIO_SANDBOX_STRICT: '1'
+        run: |
+          python -m pytest tests/test_sandbox.py::test_strict_mode_refuses_when_sandbox_unavailable -v --tb=short
