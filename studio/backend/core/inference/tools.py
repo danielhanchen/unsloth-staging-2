@@ -1352,9 +1352,7 @@ def _check_signal_escape_patterns(code: str):
                     if alias.name == "join":
                         bare_path_join_aliases.add(alias.asname or "join")
                     elif alias.name == "expanduser":
-                        bare_path_expanduser_aliases.add(
-                            alias.asname or "expanduser"
-                        )
+                        bare_path_expanduser_aliases.add(alias.asname or "expanduser")
             elif _node.module == "shutil":
                 for alias in _node.names:
                     if alias.name in _SHUTIL_COPY_NAMES:
@@ -1364,50 +1362,35 @@ def _check_signal_escape_patterns(code: str):
             elif _node.module == "pathlib":
                 for alias in _node.names:
                     if alias.name in _PATHLIB_PATH_CLASSES_PREPASS:
-                        path_class_aliases_prepass.add(
-                            alias.asname or alias.name
-                        )
-
-    # Cheap hint set used to bias ``string_bindings`` toward the most
-    # sensitive value of a name when multiple literals are assigned.
-    # Substring match against the full set of credential / process-state
-    # root tokens (kept intentionally loose; the real per-spec match
-    # still runs downstream in the file-read / shutil / bash gates).
-    _SENSITIVE_HINTS = (
-        "/etc/",
-        "/proc/",
-        "/var/spool/",
-        "/root/",
-        ".ssh/",
-        ".aws/",
-        ".gnupg",
-        ".kube",
-        ".docker",
-        ".config/gcloud",
-        ".pypirc",
-        ".npmrc",
-        ".netrc",
-        ".cargo/credentials",
-        ".password-store",
-        "credentials",
-        "id_rsa",
-        "id_dsa",
-        "id_ecdsa",
-        "id_ed25519",
-        "shadow",
-        "sudoers",
-    )
+                        path_class_aliases_prepass.add(alias.asname or alias.name)
 
     def _looks_sensitive(value: str) -> bool:
+        """True if *value* matches any host-credential / process-state
+        path that the bash / file gates already flag. Uses the
+        authoritative ``_find_sensitive_paths`` so the bias distinguishes
+        ``/etc/shadow`` (sensitive) from ``/etc/hosts`` (allow-listed) --
+        a substring hint set conflates them and admits a chained-
+        reassignment bypass ``p='/etc/hosts'; p='/etc/shadow'``."""
         if not value:
             return False
-        low = value.lower()
-        return any(hint in low for hint in _SENSITIVE_HINTS)
+        return bool(_find_sensitive_paths(value))
 
     def _record_string_binding(name: str, value: str) -> None:
         """Append ``value`` to ``string_bindings_all[name]`` and update
-        ``string_bindings[name]`` to favour a sensitive-shaped value
-        when one exists. Resists the second-assignment bypass."""
+        ``string_bindings[name]`` so the gate sees the most sensitive
+        value the variable could carry at runtime. The selection rule
+        mirrors Python's last-wins semantics for sensitive values:
+
+          * If the new value is sensitive, it always wins (even if the
+            current is also sensitive) -- a later sensitive assignment
+            is at least as concerning as an earlier one, and the chain
+            ``p='/etc/hosts'; p='/etc/shadow'`` must surface the shadow.
+          * If the new value is benign and the current sensitive, keep
+            the sensitive value (Python would last-wins to benign, but
+            statically we cannot prove the new value executes and we
+            err on the side of blocking the path the attacker reached
+            for).
+          * If both are benign, latest seen wins."""
         bucket = string_bindings_all.setdefault(name, [])
         if value not in bucket:
             bucket.append(value)
@@ -1415,8 +1398,12 @@ def _check_signal_escape_patterns(code: str):
         if cur is None:
             string_bindings[name] = value
             return
-        if _looks_sensitive(value) and not _looks_sensitive(cur):
+        if _looks_sensitive(value):
             string_bindings[name] = value
+            return
+        if _looks_sensitive(cur):
+            return
+        string_bindings[name] = value
 
     def _extract_string_literal(node, _depth = 0):
         """Strict literal-string extraction: no name binding lookup,
@@ -1658,9 +1645,7 @@ def _check_signal_escape_patterns(code: str):
                         "eval",
                         "exec",
                     ):
-                        eval_exec_aliases.setdefault(
-                            _target.id, _assign.value.id
-                        )
+                        eval_exec_aliases.setdefault(_target.id, _assign.value.id)
                 elif isinstance(_target, (ast.Tuple, ast.List)) and isinstance(
                     _assign.value, (ast.Tuple, ast.List)
                 ):
@@ -3218,10 +3203,15 @@ def _check_signal_escape_patterns(code: str):
                 # shutil alias. The suffix-match guards against random
                 # ``something.copy(...)`` calls on unrelated objects.
                 _attr = node.func.attr
-                _recv_chain = fq[: -(len(_attr) + 1)] if _attr in _SHUTIL_COPY_NAMES else ""
+                _recv_chain = (
+                    fq[: -(len(_attr) + 1)] if _attr in _SHUTIL_COPY_NAMES else ""
+                )
                 if _recv_chain in shutil_module_aliases and _attr in _SHUTIL_COPY_NAMES:
                     file_copy_fq = f"shutil.{_attr}"
-            elif isinstance(node.func, ast.Name) and node.func.id in bare_shutil_copy_aliases:
+            elif (
+                isinstance(node.func, ast.Name)
+                and node.func.id in bare_shutil_copy_aliases
+            ):
                 file_copy_fq = bare_shutil_copy_aliases[node.func.id]
             if file_copy_fq is not None:
                 # Use the canonical ``shutil.X`` name in the error
