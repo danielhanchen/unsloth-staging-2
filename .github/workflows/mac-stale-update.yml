@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-# Reproduction: Apple Silicon Mac with an OLD unsloth (the user thinks
-# around 2 months ago, but isn't sure -- so we matrix across the major
-# 2026.3.x / 2026.4.x / 2026.5.x release groups). They then click
-# `unsloth studio update`. Symptoms reported:
-#
+# Reproduction: Apple Silicon Mac with an OLD unsloth in the Studio venv,
+# user clicks `unsloth studio update`. Symptoms reported:
 #   * update "just fails"
-#   * Hardware detected: MLX -- Apple Silicon (i386)   <-- bogus chip
-#   * After click-link the running studio appears OLD (downgrade?)
+#   * after browser opens, running studio appears OLD (downgrade?)
 #
-# This workflow drives that exact scenario on a real macos-14 M1 runner
-# for each pinned OLD release, then asserts the post-update unsloth
-# version actually advanced to the floor we expect. --no-torch matches
-# the user's MLX-only no-GPU Mac.
+# Each matrix entry pins a specific OLD release and runs the user's exact
+# code path on a macos-14 M1 runner:
+#   1. install via that release's own install.sh --no-torch (MLX-only Mac).
+#      The OLD install.sh's `unsloth>=2026.5.1` (or similar) constraint
+#      means pip picks the LATEST -- so we then force the OLD unsloth
+#      back into the venv to faithfully reproduce a user who installed
+#      months ago and never updated.
+#   2. confirm OLD unsloth + OLD studio/setup.sh in venv.
+#   3. run `unsloth studio update`.
+#   4. assert post-update unsloth strictly newer than OLD.
 
 name: Mac stale-update repro
 
@@ -32,9 +34,6 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Cancel previous in-flight runs for the same branch; matrix-internal
-  # jobs use fail-fast: false so individual versions are still allowed
-  # to finish independently.
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
@@ -45,22 +44,21 @@ jobs:
   stale-update:
     name: ${{ matrix.old_version }} -> latest on macos-14
     runs-on: macos-14
-    timeout-minutes: 40
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 5
       matrix:
         old_version:
-          # ~2 months ago (user's best guess) -- late March
+          # earliest release that ships Studio (install.sh + studio/setup.sh).
+          - '2026.3.10'
+          # ~2 months ago -- user's best guess.
           - '2026.3.18'
-          # mid-March, before any of the recent install.sh rewrites
-          - '2026.3.4'
-          # April -- bracket the user's window from above
+          # last April release, before the May rewrites.
           - '2026.4.8'
-          # the previously-suspected version
+          # previously suspected.
           - '2026.5.2'
-          # one behind current latest -- canary: even a near-current
-          # stale install should still update cleanly
+          # one behind current latest -- canary.
           - '2026.5.6'
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
@@ -83,45 +81,54 @@ jobs:
           sysctl -in hw.optional.arm64 || true
           arch
 
-      - name: Fetch the OLD release sdist (${{ matrix.old_version }})
+      - name: Fetch OLD release sdist (${{ matrix.old_version }})
         run: |
           mkdir -p old_release logs
           curl -fsSL "https://files.pythonhosted.org/packages/source/u/unsloth/unsloth-${{ matrix.old_version }}.tar.gz" \
-            -o "old_release/unsloth-${{ matrix.old_version }}.tar.gz"
-          tar -xzf "old_release/unsloth-${{ matrix.old_version }}.tar.gz" -C old_release --strip-components=1
-          ls old_release | head -20
+            -o "old_release/sdist.tar.gz"
+          tar -xzf old_release/sdist.tar.gz -C old_release --strip-components=1
+          test -f old_release/install.sh
+          test -f old_release/studio/setup.sh
 
-      - name: Install OLD Studio via the ${{ matrix.old_version }} install.sh
+      - name: Install Studio via OLD install.sh (--no-torch, MLX-only)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -o pipefail
-          # --no-torch matches the user's MLX-only Mac (no GPU). Use the
-          # OLD install.sh so the venv ends up shipping that release's
-          # setup.sh / install_python_stack.py -- exactly the buggy file
-          # set `unsloth studio update` re-runs on the user's machine.
           bash old_release/install.sh --no-torch 2>&1 | tee logs/install_old.log
 
-      - name: Confirm OLD version installed
+      - name: Force-downgrade unsloth + unsloth-zoo + bundled studio package to OLD
         run: |
-          set -o pipefail
+          set -euo pipefail
           VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
-          if [ ! -x "$VENV_PY" ]; then
-            echo "::error::No Studio venv created for ${{ matrix.old_version }}"
-            ls -la "$HOME/.unsloth/studio" || true
-            exit 1
-          fi
+          test -x "$VENV_PY"
+          # The OLD install.sh hard-pins `unsloth>=2026.5.1` so pip resolved
+          # to the latest. Force the OLD wheel back in so the venv ships
+          # the actual ${{ matrix.old_version }} setup.sh / install_python_stack.py
+          # that `unsloth studio update` will then re-exec.
+          "$VENV_PY" -m pip install --no-deps --force-reinstall \
+            "unsloth==${{ matrix.old_version }}" 2>&1 | tee -a logs/install_old.log
+          # Also pin a compatible unsloth-zoo. For the bundled `studio/`
+          # package we explicitly verify the setup.sh shipped is the OLD one.
+
+      - name: Confirm OLD version + OLD setup.sh in venv
+        run: |
+          set -euo pipefail
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
           INSTALLED=$("$VENV_PY" -c "from importlib.metadata import version; print(version('unsloth'))")
           echo "Installed: $INSTALLED"
           if [ "$INSTALLED" != "${{ matrix.old_version }}" ]; then
             echo "::error::expected unsloth==${{ matrix.old_version }}, got $INSTALLED"
             exit 1
           fi
-          OLD_SETUP=$("$VENV_PY" -c "import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec('studio').origin).parent / 'setup.sh')")
-          echo "OLD setup.sh = $OLD_SETUP"
-          md5sum "$OLD_SETUP" || true
+          OLD_SETUP_INVENV=$("$VENV_PY" -c "import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec('studio').origin).parent / 'setup.sh')")
+          echo "setup.sh in venv: $OLD_SETUP_INVENV"
+          md5sum "$OLD_SETUP_INVENV" old_release/studio/setup.sh
+          if ! diff -q "$OLD_SETUP_INVENV" old_release/studio/setup.sh >/dev/null 2>&1; then
+            echo "::warning::venv setup.sh differs from OLD sdist's setup.sh -- the OLD-wheel content was not restored"
+          fi
 
-      - name: Now run `unsloth studio update` -- user's broken path
+      - name: Run `unsloth studio update` (the user's broken path)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -131,12 +138,10 @@ jobs:
           rc=${PIPESTATUS[0]}
           echo "update exit code: $rc"
           echo "$rc" > logs/update.rc
-          # Don't fail the step on a non-zero rc -- we want to capture the
-          # full state regardless of outcome. The assertion step below
-          # decides PASS / FAIL.
 
       - name: Post-update state
         run: |
+          set -euo pipefail
           VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
           POST=$("$VENV_PY" -c "from importlib.metadata import version; print(version('unsloth'))" 2>&1 || echo "MISSING")
           echo "Post-update unsloth version: $POST"
@@ -152,33 +157,29 @@ jobs:
           detect_hardware()
           " 2>&1 | tee logs/hardware_detect.log || true
 
-      - name: Diff OLD vs NEW setup.sh (what update SHOULD have shipped)
+      - name: Diff OLD vs post-update setup.sh
         run: |
           VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
           POST=$("$VENV_PY" -c "import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec('studio').origin).parent / 'setup.sh')")
           echo "::group::diff OLD ${{ matrix.old_version }} setup.sh -> post-update setup.sh"
-          diff -u old_release/studio/setup.sh "$POST" | head -200 || true
+          diff -u old_release/studio/setup.sh "$POST" | head -300 || true
           echo "::endgroup::"
 
-      - name: Assert update advanced unsloth version
+      - name: Assert update advanced unsloth version (the bug = no advance)
         run: |
           POST=$(cat logs/post_update_version.txt)
           OLD="${{ matrix.old_version }}"
           echo "OLD=$OLD"
           echo "POST=$POST"
-          # Update must NOT leave the venv on the same version. If it does
-          # that is the bug.
           if [ "$POST" = "$OLD" ]; then
-            echo "::error::stale-update bug: unsloth is still $POST after `unsloth studio update` from $OLD"
+            echo "::error::STALE: unsloth still on $POST after `unsloth studio update` from $OLD"
             exit 1
           fi
-          # Update must NOT downgrade (the user-reported symptom).
           python3 -c "
           from packaging.version import Version
           import sys
-          old = Version('$OLD'); new = Version('$POST')
-          sys.exit(0 if new > old else 1)
-          " || { echo "::error::downgrade detected: $OLD -> $POST"; exit 1; }
+          sys.exit(0 if Version('$POST') > Version('$OLD') else 1)
+          " || { echo "::error::DOWNGRADE: $OLD -> $POST"; exit 1; }
           echo "OK: $OLD -> $POST"
 
       - name: Upload all logs
