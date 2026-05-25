@@ -1,0 +1,62 @@
+# Cross-platform validation of PR 5717 Studio backend / middleware changes.
+# Runs the test_middleware.py suite (CSP nonce splice, frame-src,
+# img-src favicons, MaxBodyMiddleware chunked-upload cap, /api/health
+# auth gate) on Linux, macOS, and Windows. No GPU required.
+
+name: PR 5717 Studio backend middleware (Linux + macOS + Windows)
+
+on:
+  push:
+    branches: [pr5717-xplatform]
+    paths:
+      - 'studio/backend/main.py'
+      - 'studio/backend/tests/test_middleware.py'
+      - 'studio/backend/auth/**'
+      - 'studio/backend/requirements/**'
+      - '.github/workflows/xplatform-studio-backend.yml'
+  pull_request:
+    paths:
+      - 'studio/backend/main.py'
+      - 'studio/backend/tests/test_middleware.py'
+      - 'studio/backend/auth/**'
+      - 'studio/backend/requirements/**'
+      - '.github/workflows/xplatform-studio-backend.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  middleware:
+    name: ${{ matrix.os }} / py ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        python: ['3.12']
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: ${{ matrix.python }}
+          cache: 'pip'
+
+      - name: pip install backend deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r studio/backend/requirements/studio.txt
+          python -m pip install python-multipart pytest
+
+      - name: pytest test_middleware.py
+        run: |
+          python -m pytest -q studio/backend/tests/test_middleware.py

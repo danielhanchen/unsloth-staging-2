@@ -1,0 +1,64 @@
+# Cross-platform validation of PR 5717 Studio frontend changes.
+# Covers vitest (22 tests for html-svg-renderer) + typecheck + vite build
+# on Linux, macOS, and Windows so reviewers can be confident the new
+# HtmlSvgRenderer, sanitizer hooks, and the install-script gate's lockfile
+# parsing all work cross-platform without needing GPU runners.
+
+name: PR 5717 Studio frontend (Linux + macOS + Windows)
+
+on:
+  push:
+    branches: [pr5717-xplatform]
+    paths:
+      - 'studio/frontend/**'
+      - '.github/workflows/xplatform-studio-frontend.yml'
+  pull_request:
+    paths:
+      - 'studio/frontend/**'
+      - '.github/workflows/xplatform-studio-frontend.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: ${{ matrix.os }} / node ${{ matrix.node }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        node: ['20']
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: ${{ matrix.node }}
+          cache: 'npm'
+          cache-dependency-path: studio/frontend/package-lock.json
+
+      - name: npm ci
+        working-directory: studio/frontend
+        run: npm ci --no-audit --no-fund
+
+      - name: typecheck
+        working-directory: studio/frontend
+        run: npm run typecheck
+
+      - name: vitest
+        working-directory: studio/frontend
+        run: npm run test -- --run
+
+      - name: vite build
+        working-directory: studio/frontend
+        run: npm run build

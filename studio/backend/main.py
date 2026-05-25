@@ -327,6 +327,17 @@ def _build_csp(script_nonce: "str | None" = None) -> str:
         "style-src 'self' 'unsafe-inline'; "
         f"{script_src}; "
         "font-src 'self' data:; "
+        # Restrict iframe sources to same-origin only. The assistant
+        # HTML/SVG previews use srcdoc (no URL fetch), so allowing
+        # data: / blob: here would not unlock interactive scripts
+        # anyway -- Chromium inherits the embedder CSP for srcdoc,
+        # data:, AND blob: iframes per HTML / CSP3, so the only way
+        # to escape ``script-src 'self'`` for the preview would be a
+        # same-origin backend route serving with overriding response
+        # CSP headers. Tracked as a follow-up; for now the explicit
+        # ``'self'`` setting leaves a visible directive that grep
+        # picks up if a future change tries to relax it.
+        "frame-src 'self'; "
         "frame-ancestors 'none'; "
         "form-action 'self'; "
         "base-uri 'self'"

@@ -1,0 +1,118 @@
+# Cross-platform validation of PR 5717's install-script supply-chain gate.
+# Runs scripts/check_new_install_scripts.py on Linux, macOS, and Windows
+# against the committed lockfile + allowlist. Catches platform-specific
+# path / encoding bugs in the gate itself before they land upstream.
+
+name: PR 5717 install-script gate (Linux + macOS + Windows)
+
+on:
+  push:
+    branches: [pr5717-xplatform]
+    paths:
+      - 'scripts/check_new_install_scripts.py'
+      - 'studio/frontend/package-lock.json'
+      - 'studio/frontend/.install-script-allowlist'
+      - '.github/workflows/xplatform-install-script-gate.yml'
+  pull_request:
+    paths:
+      - 'scripts/check_new_install_scripts.py'
+      - 'studio/frontend/package-lock.json'
+      - 'studio/frontend/.install-script-allowlist'
+      - '.github/workflows/xplatform-install-script-gate.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: ${{ matrix.os }} / py ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        python: ['3.12']
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Set up cross-platform fixtures
+        # Cross-platform Python so we do not depend on bash / /dev/null
+        # (absent on Windows runners).
+        shell: python
+        run: |
+          import json
+          from pathlib import Path
+
+          # Empty base lockfile -- forces the gate to treat every head
+          # install-script package as NEW.
+          Path("base_lock.json").write_text(
+              json.dumps({"lockfileVersion": 3, "packages": {}}),
+              encoding = "utf-8",
+          )
+          # Empty allowlists (no trailing newline issue across OSes).
+          Path("empty_allowlist.txt").write_text("", encoding = "utf-8")
+          print("fixtures ready")
+
+      - name: Case 1 -- bootstrap path accepts committed allowlist
+        # Base allowlist file genuinely missing -> bootstrap path
+        # accepts the head allowlist as-is. Exit 0 expected.
+        shell: python
+        run: |
+          import subprocess, sys
+          rc = subprocess.call([
+              sys.executable, "scripts/check_new_install_scripts.py",
+              "--base", "base_lock.json",
+              "--head", "studio/frontend/package-lock.json",
+              "--allowlist", "studio/frontend/.install-script-allowlist",
+              "--base-allowlist", "does_not_exist.txt",
+          ])
+          print(f"rc={rc}")
+          sys.exit(0 if rc == 0 else 1)
+
+      - name: Case 2 -- head=base lockfile, empty allowlist
+        # No diff between base and head -> no new install scripts -> pass.
+        shell: python
+        run: |
+          import subprocess, sys
+          rc = subprocess.call([
+              sys.executable, "scripts/check_new_install_scripts.py",
+              "--base", "studio/frontend/package-lock.json",
+              "--head", "studio/frontend/package-lock.json",
+              "--allowlist", "empty_allowlist.txt",
+              "--base-allowlist", "empty_allowlist.txt",
+          ])
+          print(f"rc={rc}")
+          sys.exit(0 if rc == 0 else 1)
+
+      - name: Case 3 -- empty base + empty allowlists -> gate must reject
+        # Bootstrap also signals "missing on base" via the absent base
+        # allowlist, so here we provide an EXPLICIT empty base allowlist
+        # file (exists, content empty). Bootstrap path is NOT triggered,
+        # head_allowlist is empty too, so every install-script in the head
+        # lockfile is a new unallowlisted entry. Gate must exit non-zero.
+        shell: python
+        run: |
+          import subprocess, sys
+          rc = subprocess.call([
+              sys.executable, "scripts/check_new_install_scripts.py",
+              "--base", "base_lock.json",
+              "--head", "studio/frontend/package-lock.json",
+              "--allowlist", "empty_allowlist.txt",
+              "--base-allowlist", "empty_allowlist.txt",
+          ])
+          print(f"rc={rc}")
+          # Non-zero is the expected outcome.
+          sys.exit(0 if rc != 0 else 1)
