@@ -176,30 +176,93 @@ jobs:
           diff -u old_release/studio/setup.sh "$POST_SETUP" | head -300 || true
           echo "::endgroup::"
 
-      - name: Assert update advanced unsloth version (the bug = no advance)
+      - name: Record pre-fix update outcome (the bug = no advance)
         run: |
           POST=$(cat logs/post_update_version.txt)
           OLD="${{ matrix.old_version }}"
           LATEST=$(curl -fsSL https://pypi.org/pypi/unsloth/json | python3 -c "import json,sys; print(json.load(sys.stdin)['info']['version'])")
+          echo "$LATEST" > logs/latest_version.txt
           echo "OLD=$OLD"
           echo "POST=$POST"
           echo "LATEST=$LATEST"
+          # We do NOT exit non-zero here even if POST != LATEST -- the OLD-code
+          # path is expected to fail (that is the bug we're documenting). The
+          # decisive assertion runs after the overlay-the-fix step below.
+          if [ "$POST" = "$LATEST" ]; then
+            echo "pre-fix update reached LATEST (no bug reproduced for $OLD)" > logs/prefix_status.txt
+          else
+            echo "pre-fix update did NOT reach LATEST: OLD=$OLD POST=$POST LATEST=$LATEST" > logs/prefix_status.txt
+          fi
+          cat logs/prefix_status.txt
+
+      - name: Overlay FIXED files from the checkout into the venv
+        # Simulates the recovery path: user re-ran `curl install.sh | sh` so
+        # the NEW install_python_stack.py + hardware.py land in their venv,
+        # but the rest of the OLD release's state (lower unsloth version,
+        # studio/setup.sh shell wrapper) is still on disk. The subsequent
+        # `unsloth studio update` should then advance to LATEST.
+        run: |
+          set -euo pipefail
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          SITE=$("$VENV_PY" -I -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          cp -f "$GITHUB_WORKSPACE/studio/install_python_stack.py" "$SITE/studio/install_python_stack.py"
+          cp -f "$GITHUB_WORKSPACE/studio/backend/utils/hardware/hardware.py" \
+                "$SITE/studio/backend/utils/hardware/hardware.py"
+          echo "overlaid:"
+          shasum "$SITE/studio/install_python_stack.py" \
+                 "$SITE/studio/backend/utils/hardware/hardware.py"
+
+      - name: Force-downgrade unsloth again so the second update has work to do
+        run: |
+          set -euo pipefail
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          # The first `unsloth studio update` may have partially advanced
+          # (e.g. 2026.3.18 -> 2026.5.2). Force back to OLD so the second
+          # update is a clean retry of the broken upgrade path under the
+          # FIXED install_python_stack.py.
+          "$VENV_PY" -m pip install --no-deps --force-reinstall \
+            "unsloth==${{ matrix.old_version }}" 2>&1 | tee -a logs/install_old.log
+          # Restore the overlay (force-reinstall just wrote the OLD wheel's
+          # install_python_stack.py back over our copy).
+          SITE=$("$VENV_PY" -I -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          cp -f "$GITHUB_WORKSPACE/studio/install_python_stack.py" "$SITE/studio/install_python_stack.py"
+          cp -f "$GITHUB_WORKSPACE/studio/backend/utils/hardware/hardware.py" \
+                "$SITE/studio/backend/utils/hardware/hardware.py"
+
+      - name: Run `unsloth studio update --verbose` with the FIX in place
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          set -o pipefail
+          unsloth studio update --verbose 2>&1 | tee logs/update_with_fix.log
+          rc=${PIPESTATUS[0]}
+          echo "update-with-fix exit code: $rc"
+          echo "$rc" > logs/update_with_fix.rc
+
+      - name: Assert FIXED update advances unsloth to LATEST
+        run: |
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          POST=$("$VENV_PY" -c "from importlib.metadata import version; print(version('unsloth'))")
+          OLD="${{ matrix.old_version }}"
+          LATEST=$(cat logs/latest_version.txt)
+          echo "OLD=$OLD"
+          echo "POST(with fix)=$POST"
+          echo "LATEST=$LATEST"
+          echo "$POST" > logs/post_update_with_fix_version.txt
           if [ "$POST" = "$OLD" ]; then
-            echo "::error::STALE: unsloth still on $POST after update from $OLD"
+            echo "::error::FIX-FAILED-STALE: unsloth still on $POST after fixed update from $OLD"
             exit 1
           fi
-          # Use the venv python (has packaging) so the version compare
-          # doesn't fall through to the false-DOWNGRADE branch on stock macOS.
-          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
           if ! "$VENV_PY" -c "from packaging.version import Version; import sys; sys.exit(0 if Version('$POST') > Version('$OLD') else 1)"; then
-            echo "::error::DOWNGRADE: $OLD -> $POST"
+            echo "::error::FIX-FAILED-DOWNGRADE: $OLD -> $POST"
             exit 1
           fi
           if [ "$POST" != "$LATEST" ]; then
-            echo "::error::PARTIAL: advanced $OLD -> $POST but stopped short of LATEST=$LATEST"
+            echo "::error::FIX-FAILED-PARTIAL: $OLD -> $POST but LATEST=$LATEST"
             exit 1
           fi
-          echo "OK: $OLD -> $POST (== LATEST)"
+          echo "FIX OK: $OLD -> $POST (== LATEST)"
 
       - name: Upload all logs
         if: always()
