@@ -1,0 +1,37 @@
+name: i18n macOS
+
+on:
+  push:
+    branches: [i18n-cross-platform-ci]
+    paths:
+      - "studio/frontend/**"
+      - ".github/workflows/i18n-macos.yml"
+  pull_request:
+    paths:
+      - "studio/frontend/**"
+      - ".github/workflows/i18n-macos.yml"
+
+concurrency:
+  group: i18n-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  macos:
+    name: macOS i18n checks
+    runs-on: macos-14
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run i18n:check
+      - run: npm run build

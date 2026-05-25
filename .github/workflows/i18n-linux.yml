@@ -1,0 +1,43 @@
+name: i18n Linux
+
+on:
+  push:
+    branches: [i18n-cross-platform-ci]
+    paths:
+      - "studio/frontend/**"
+      - ".github/workflows/i18n-linux.yml"
+  pull_request:
+    paths:
+      - "studio/frontend/**"
+      - ".github/workflows/i18n-linux.yml"
+
+concurrency:
+  group: i18n-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux i18n checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm run i18n:check
+      - run: npm run build
+      - name: i18n parity gate (no missing critical keys, no placeholder drift)
+        run: |
+          set -e
+          # Re-run check and assert it exits 0 (already validated above, but
+          # mark the step name distinctly for triage).
+          npm run i18n:check
