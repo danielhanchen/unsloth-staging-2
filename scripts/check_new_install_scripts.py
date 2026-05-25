@@ -235,6 +235,42 @@ def diff_new_install_scripts(base_lock: dict, head_lock: dict) -> list[Finding]:
 # ─────────────────────────────────────────────────────────────────────
 
 
+def _load_allowlist(path: Path) -> set[str]:
+    """Read a file of newline-separated ``name@version`` entries to skip.
+
+    Each entry MUST be pinned to an exact version (``esbuild@0.21.5``,
+    ``@scope/pkg@1.2.3``). Bare names are rejected so allowlisting
+    ``esbuild`` cannot silently approve a later malicious
+    ``esbuild@99.0.0`` published by a compromised maintainer -- every
+    new version requires its own review. Lines starting with ``#`` are
+    comments; blank lines are ignored. Missing file = empty allowlist.
+    """
+    if not path.exists():
+        return set()
+    out: set[str] = set()
+    try:
+        text = path.read_text(encoding = "utf-8")
+    except OSError:
+        return set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        name, sep, version = line.rpartition("@")
+        if not sep or not name or not version:
+            raise ValueError(
+                f"{path}: allowlist entry {line!r} must be pinned to an "
+                "exact version (e.g. 'esbuild@0.21.5'). Bare names are "
+                "rejected so we cannot silently approve a later release.",
+            )
+        out.add(line.lower())
+    return out
+
+
+def _finding_allowlist_key(finding: Finding) -> str:
+    return f"{finding.name}@{finding.version}".lower()
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description = (
@@ -252,6 +288,24 @@ def main(argv: list[str] | None = None) -> int:
         required = True,
         help = "Path to the HEAD package-lock.json (this PR).",
     )
+    parser.add_argument(
+        "--allowlist",
+        default = None,
+        help = (
+            "Path to the HEAD newline-separated 'name@version' allowlist "
+            "to skip. Defaults to '<head dir>/.install-script-allowlist'."
+        ),
+    )
+    parser.add_argument(
+        "--base-allowlist",
+        default = None,
+        help = (
+            "Path to the TRUSTED BASE allowlist. Defaults to "
+            "'<base dir>/.install-script-allowlist'. Entries that exist "
+            "only on HEAD fail the gate so a PR cannot allowlist its "
+            "own new postinstall dependency."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -261,7 +315,113 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[install-script-diff] ERROR: {exc}", file = sys.stderr)
         return 2
 
-    findings = diff_new_install_scripts(base_lock, head_lock)
+    head_allowlist_path = (
+        Path(args.allowlist)
+        if args.allowlist
+        else Path(args.head).parent / ".install-script-allowlist"
+    )
+    base_allowlist_path = (
+        Path(args.base_allowlist)
+        if args.base_allowlist
+        else Path(args.base).parent / ".install-script-allowlist"
+    )
+
+    try:
+        head_allowlist = _load_allowlist(head_allowlist_path)
+    except ValueError as exc:
+        print(f"[install-script-diff] ERROR: {exc}", file = sys.stderr)
+        return 2
+
+    raw_findings = diff_new_install_scripts(base_lock, head_lock)
+    raw_findings_keys = {_finding_allowlist_key(f) for f in raw_findings}
+
+    # Bootstrap: if the BASE ref has no allowlist file at all, this is
+    # the PR that creates it. There is no prior allowlist to diff
+    # against, and refusing every head entry here would make the gate
+    # unlandable. The workflow signals "missing on base" by NOT writing
+    # the temp file (rm -f after a failed ``git show``), which is what
+    # we detect here. Once the file exists on base, future PRs must
+    # respect the head-only / deletion rules below.
+    if not base_allowlist_path.exists():
+        print(
+            f"[install-script-diff] bootstrap: {base_allowlist_path} "
+            "missing on base; accepting head allowlist as-is for this run.",
+            flush = True,
+        )
+        allowlist = head_allowlist
+    else:
+        try:
+            base_allowlist = _load_allowlist(base_allowlist_path)
+        except ValueError as exc:
+            print(f"[install-script-diff] ERROR: {exc}", file = sys.stderr)
+            return 2
+
+        added_head_only = head_allowlist - base_allowlist
+        # Refuse the bypass shape where a PR introduces a new postinstall
+        # dep AND allowlists it in the same diff -- head-only allowlist
+        # entries that match install-script findings in the same PR are
+        # rejected. Entries that match no current finding are allowed:
+        # they prepare the trust list for a follow-up PR that actually
+        # adds the dependency, and the human-review path still sees the
+        # allowlist diff before that follow-up can land.
+        self_approving = sorted(added_head_only & raw_findings_keys)
+        if self_approving:
+            print(
+                "[install-script-diff] FAIL: this PR both introduces an "
+                "install-script dependency AND allowlists it in the "
+                "same diff. Allowlist entries that approve a NEW "
+                "postinstall must land on the base branch first.",
+                file = sys.stderr,
+            )
+            for entry in self_approving:
+                print(
+                    f"  self-approving allowlist entry: {entry}",
+                    file = sys.stderr,
+                )
+            return 1
+
+        # Refuse a PR that DROPS trusted base entries. Without this,
+        # an attacker could land a two-step bypass:
+        #   1. PR A removes ``.install-script-allowlist`` from base
+        #      (no new lockfile findings -> passes today).
+        #   2. PR B then hits the bootstrap path (base allowlist
+        #      missing) and self-allowlists a newly introduced
+        #      install-script dependency.
+        # Allowlist deletions are rare; doing them via an
+        # admin-override / branch-protection bypass keeps the
+        # bootstrap path closed for the everyday gate.
+        removed_from_head = sorted(base_allowlist - head_allowlist)
+        if removed_from_head:
+            print(
+                "[install-script-diff] FAIL: PR removes trusted base "
+                "allowlist entries. Allowlist deletions must land in a "
+                "separate, isolated commit so a follow-up PR cannot "
+                "exploit the bootstrap path.",
+                file = sys.stderr,
+            )
+            for entry in removed_from_head:
+                print(
+                    f"  dropped allowlist entry: {entry}",
+                    file = sys.stderr,
+                )
+            return 1
+
+        # Only the trusted base allowlist participates in the skip set.
+        # Head-only entries that survived the self-approval check above
+        # are deliberately NOT honored here -- they wait for the next
+        # PR (running against this PR's merged base) to take effect.
+        allowlist = base_allowlist
+
+    findings = raw_findings
+    if allowlist:
+        skipped = [f for f in findings if _finding_allowlist_key(f) in allowlist]
+        findings = [f for f in findings if _finding_allowlist_key(f) not in allowlist]
+        for f in skipped:
+            print(
+                f"[install-script-diff] SKIP {_finding_allowlist_key(f)} "
+                "(allowlisted via trusted base allowlist)",
+                flush = True,
+            )
     if not findings:
         print(
             "[install-script-diff] OK: no newly-added install-script "

@@ -1,0 +1,175 @@
+# Cross-platform validation of PR 5717's install-script supply-chain gate.
+# Runs scripts/check_new_install_scripts.py on Linux, macOS, and Windows.
+# Cases:
+#   1. Real-world bootstrap path -- base lockfile from main, no base
+#      allowlist; PR adds esbuild + allowlists it. Expect rc=0.
+#   2. No diff -- head==base lockfile; allowlists empty. Expect rc=0.
+#   3. Empty base lockfile, empty explicit allowlist -- every install-
+#      script in head is unallowlisted and gate must reject (rc!=0).
+#   4. Self-approval rejection -- base lockfile has NO install scripts
+#      and an existing (non-empty) base allowlist; head allowlists a
+#      package that ships an install script and is new vs base. Gate
+#      must reject (rc!=0).
+
+name: PR 5717 install-script gate (Linux + macOS + Windows)
+
+on:
+  push:
+    branches: [pr5717-xplatform]
+    paths:
+      - 'scripts/check_new_install_scripts.py'
+      - 'studio/frontend/package-lock.json'
+      - 'studio/frontend/.install-script-allowlist'
+      - '.github/workflows/xplatform-install-script-gate.yml'
+  pull_request:
+    paths:
+      - 'scripts/check_new_install_scripts.py'
+      - 'studio/frontend/package-lock.json'
+      - 'studio/frontend/.install-script-allowlist'
+      - '.github/workflows/xplatform-install-script-gate.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: ${{ matrix.os }} / py ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        python: ['3.12']
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          # Need history so we can `git show <merge-base>:...` for case 1.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Set up cross-platform fixtures
+        # Cross-platform Python so we never depend on /dev/null or bash.
+        shell: python
+        run: |
+          import json, subprocess, sys
+          from pathlib import Path
+
+          # Real-world base lockfile from the merge base with main.
+          # If this is the first push and merge-base resolution fails, fall
+          # back to origin/main HEAD lockfile -- either way it's the
+          # upstream-shape lockfile, not PR 5717's head.
+          try:
+              base_sha = subprocess.check_output(
+                  ["git", "merge-base", "origin/main", "HEAD"],
+                  text = True,
+              ).strip()
+          except subprocess.CalledProcessError:
+              base_sha = "origin/main"
+          print(f"using base sha: {base_sha}")
+          lock = subprocess.check_output(
+              ["git", "show", f"{base_sha}:studio/frontend/package-lock.json"],
+              text = True,
+          )
+          Path("base_main_lock.json").write_text(lock, encoding = "utf-8")
+
+          # Empty base lockfile (no install scripts at all).
+          Path("empty_lock.json").write_text(
+              json.dumps({"lockfileVersion": 3, "packages": {}}),
+              encoding = "utf-8",
+          )
+          # Two empty allowlists (one for parity, one for case 3).
+          Path("empty_allowlist.txt").write_text("", encoding = "utf-8")
+          # A "base allowlist exists, non-empty" file for case 4.
+          Path("nonempty_base_allowlist.txt").write_text(
+              "# pre-existing allowlist on base\n", encoding = "utf-8",
+          )
+          # A head allowlist that allowlists a NEW install-script entry
+          # (self-approval shape). For this, point to the real head
+          # allowlist file; esbuild is the new entry in PR 5717.
+          print("fixtures ready")
+
+      - name: Case 1 -- real-world bootstrap (base=main, no base allowlist)
+        shell: python
+        run: |
+          import subprocess, sys
+          rc = subprocess.call([
+              sys.executable, "scripts/check_new_install_scripts.py",
+              "--base", "base_main_lock.json",
+              "--head", "studio/frontend/package-lock.json",
+              "--allowlist", "studio/frontend/.install-script-allowlist",
+              "--base-allowlist", "does_not_exist.txt",
+          ])
+          print(f"rc={rc}")
+          sys.exit(0 if rc == 0 else 1)
+
+      - name: Case 2 -- head==base, empty allowlists
+        shell: python
+        run: |
+          import subprocess, sys
+          rc = subprocess.call([
+              sys.executable, "scripts/check_new_install_scripts.py",
+              "--base", "studio/frontend/package-lock.json",
+              "--head", "studio/frontend/package-lock.json",
+              "--allowlist", "empty_allowlist.txt",
+              "--base-allowlist", "empty_allowlist.txt",
+          ])
+          print(f"rc={rc}")
+          sys.exit(0 if rc == 0 else 1)
+
+      - name: Case 3 -- empty base lockfile, empty explicit allowlists -> reject
+        shell: python
+        run: |
+          import subprocess, sys
+          rc = subprocess.call([
+              sys.executable, "scripts/check_new_install_scripts.py",
+              "--base", "empty_lock.json",
+              "--head", "studio/frontend/package-lock.json",
+              "--allowlist", "empty_allowlist.txt",
+              "--base-allowlist", "empty_allowlist.txt",
+          ])
+          print(f"rc={rc}")
+          # Non-zero is the expected outcome.
+          sys.exit(0 if rc != 0 else 1)
+
+      - name: Case 4 -- self-approval (head allowlists a NEW install-script) -> reject
+        shell: python
+        run: |
+          import subprocess, sys
+          # base has the same lockfile as head BUT base lockfile is
+          # synthesised with the install-script entries stripped. That
+          # makes every install-script in head appear new vs base, and
+          # the committed head allowlist allowlists esbuild -- self-approval.
+          import json
+          from pathlib import Path
+          head_lock = json.loads(
+              Path("studio/frontend/package-lock.json").read_text("utf-8")
+          )
+          stripped = {"lockfileVersion": head_lock.get("lockfileVersion", 3), "packages": {}}
+          for k, v in head_lock.get("packages", {}).items():
+              if v.get("hasInstallScript"):
+                  continue
+              stripped["packages"][k] = v
+          Path("stripped_base_lock.json").write_text(
+              json.dumps(stripped), encoding = "utf-8",
+          )
+          rc = subprocess.call([
+              sys.executable, "scripts/check_new_install_scripts.py",
+              "--base", "stripped_base_lock.json",
+              "--head", "studio/frontend/package-lock.json",
+              "--allowlist", "studio/frontend/.install-script-allowlist",
+              "--base-allowlist", "nonempty_base_allowlist.txt",
+          ])
+          print(f"rc={rc}")
+          # Non-zero is the expected outcome (self-approval rejection).
+          sys.exit(0 if rc != 0 else 1)
