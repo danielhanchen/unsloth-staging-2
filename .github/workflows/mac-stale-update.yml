@@ -26,8 +26,10 @@ on:
     paths:
       - 'install.sh'
       - 'studio/setup.sh'
+      - 'studio/setup.ps1'
       - 'studio/install_python_stack.py'
       - 'studio/backend/utils/hardware/**'
+      - 'studio/backend/requirements/**'
       - 'unsloth_cli/commands/studio.py'
       - 'pyproject.toml'
       - '.github/workflows/mac-stale-update.yml'
