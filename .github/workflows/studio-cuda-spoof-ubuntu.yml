@@ -37,11 +37,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -54,7 +54,6 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m pip install -r studio/backend/requirements/studio.txt
-          python -m pip install python-multipart
           # torch is not a hard dep of `unsloth` core; install the CPU-only
           # wheel explicitly so the CUDA spoof has a real torch.cuda to
           # monkey-patch.
@@ -81,12 +80,17 @@ jobs:
           # CLI dispatch must not crash either.
           PY
 
-      - name: CLI help under spoof
+      - name: CLI help + subprocess spoof under PYTHONPATH
         env:
           UNSLOTH_DISABLE_AUTO_UPDATES: '1'
         run: |
-          # Pre-apply the spoof via sitecustomize so subprocess CLI dispatch
-          # also sees it.
+          # Pre-apply the spoof via sitecustomize. `unsloth --help` is
+          # an in-process typer dispatch and does not need this; we
+          # invoke it here anyway as cheap CLI smoke. The harder test
+          # is the explicit `python -c` subprocess below, which proves
+          # PYTHONPATH-based sitecustomize survives a fresh Python
+          # interpreter -- the path users will hit if Studio spawns
+          # background helpers.
           export PYTHONSTARTUP=""
           mkdir -p ./_sitespoof
           cat > ./_sitespoof/sitecustomize.py <<'PY'
@@ -103,6 +107,16 @@ jobs:
           export UNSLOTH_SPOOF_CUDA=1
           unsloth --help
           unsloth studio --help
+          # Fresh-process check: proves the sitecustomize layer fires
+          # for subprocess invocations, not just the typer in-process
+          # dispatch above.
+          python -c "
+          import torch, sys
+          assert torch.cuda.is_available(), 'spoof did not propagate to subprocess'
+          cap = torch.cuda.get_device_capability()
+          assert cap == (8, 0), f'unexpected capability under spoof: {cap}'
+          print('subprocess spoof ok:', torch.cuda.get_device_name(), cap)
+          "
 
       - name: Run vllm-compat smoke under spoof (best effort)
         run: |

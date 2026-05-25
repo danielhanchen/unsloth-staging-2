@@ -38,11 +38,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -58,12 +58,8 @@ jobs:
           # Install editable so we cover the source layout
           python -m pip install -e .
           # Studio backend deps live in studio/backend/requirements/studio.txt
+          # (python-multipart is now declared there; no separate pin needed).
           python -m pip install -r studio/backend/requirements/studio.txt
-          # python-multipart is required by FastAPI's Form(...) decorator
-          # in studio/backend/routes/datasets.py but is not declared in
-          # studio.txt; install.sh pulls it in transitively via fastapi[all].
-          # Pin to match the runtime install.
-          python -m pip install python-multipart
 
       - name: Smoke import (no CUDA)
         env:

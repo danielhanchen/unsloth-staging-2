@@ -40,11 +40,11 @@ jobs:
       UNSLOTH_DISABLE_AUTO_UPDATES: '1'
       STUDIO_PORT: '18895'
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -57,26 +57,40 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m pip install -r studio/backend/requirements/studio.txt
-          python -m pip install python-multipart
 
       - name: Launch CPU-only with uvicorn
         run: |
           mkdir -p logs
-          (python -m uvicorn studio.backend.main:app \
+          # `setsid` puts uvicorn in its own process group so we can
+          # tear down children reliably. The PID we capture from `$!` is
+          # the setsid leader, NOT a transient subshell, so the kill in
+          # the teardown step actually targets uvicorn.
+          setsid python -m uvicorn studio.backend.main:app \
               --host 127.0.0.1 --port "$STUDIO_PORT" \
-              --log-level info 2>&1 | tee logs/studio.log) &
+              --log-level info > logs/studio.log 2>&1 &
           STUDIO_PID=$!
           echo "STUDIO_PID=$STUDIO_PID" >> "$GITHUB_ENV"
-          # Wait up to 90 s for the health probe to come up. Studio first
-          # boot pulls a few models / warms cache, so we are generous.
+          # Wait up to 90 s for an HTTP endpoint to come up. Studio
+          # backend exposes /api/health (not /healthz), so probe that
+          # first and fall back to /docs / /openapi.json for older
+          # variants. Bail early if the uvicorn process exited.
           for i in $(seq 1 90); do
-              if curl -fsS "http://127.0.0.1:$STUDIO_PORT/healthz" > /dev/null 2>&1 || \
+              if ! kill -0 "$STUDIO_PID" 2>/dev/null; then
+                  echo "studio process exited before health probe came up"
+                  echo "--- last 200 lines of studio.log ---"
+                  tail -200 logs/studio.log || true
+                  exit 1
+              fi
+              if curl -fsS "http://127.0.0.1:$STUDIO_PORT/api/health" > /dev/null 2>&1 || \
                  curl -fsS "http://127.0.0.1:$STUDIO_PORT/docs" > /dev/null 2>&1 || \
                  curl -fsS "http://127.0.0.1:$STUDIO_PORT/openapi.json" > /dev/null 2>&1; then
                   echo "studio up on attempt $i"; break
               fi
               sleep 1
           done
+          # Diagnostic: confirm the port is actually bound.
+          ss -tlnp 2>/dev/null | grep ":$STUDIO_PORT" || \
+              echo "warning: port $STUDIO_PORT not bound; subsequent probe may 404"
 
       - name: Probe a public endpoint
         run: |
@@ -92,5 +106,10 @@ jobs:
       - name: Tear down
         if: always()
         run: |
-          [[ -n "${STUDIO_PID:-}" ]] && kill "$STUDIO_PID" 2>/dev/null || true
+          # Kill the whole process group so uvicorn's child workers
+          # also exit. `setsid` made $STUDIO_PID the group leader.
+          if [[ -n "${STUDIO_PID:-}" ]]; then
+              kill -- -"$STUDIO_PID" 2>/dev/null || \
+                  kill "$STUDIO_PID" 2>/dev/null || true
+          fi
           sleep 1

@@ -34,11 +34,11 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -53,10 +53,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m pip install -r studio/backend/requirements/studio.txt
-          python -m pip install python-multipart
           # MLX wheels are Apple-Silicon-only; macos-14 runners are M1, so
-          # the install should succeed.
-          python -m pip install mlx mlx-lm || echo "mlx not available"
+          # this MUST succeed -- don't swallow the error or a future MLX
+          # wheel break would silently masquerade as a passing job.
+          python -m pip install mlx mlx-lm
 
       - name: Smoke import (MLX-aware)
         env:

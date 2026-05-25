@@ -36,11 +36,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: '3.12'
           cache: 'pip'
@@ -75,10 +75,11 @@ jobs:
           python -m pip install -e . --no-deps
           python -m pip install unsloth_zoo
           python -m pip install -r studio/backend/requirements/studio.txt
-          python -m pip install python-multipart
           # Minimal unsloth runtime deps that don't touch the torch
           # backend choice. Keep this list narrow so a new dep showing
-          # up in pyproject doesn't silently slip through.
+          # up in pyproject doesn't silently slip through. nest_asyncio
+          # and pyyaml come in via studio.txt; the rest are
+          # ML-pipeline core.
           python -m pip install \
               transformers \
               accelerate \
@@ -90,10 +91,8 @@ jobs:
               protobuf \
               huggingface_hub \
               hf_transfer \
-              packaging \
               psutil \
-              tqdm \
-              pyyaml
+              tqdm
 
       - name: Import probe under ROCm torch
         env:
