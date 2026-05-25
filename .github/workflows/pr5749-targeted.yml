@@ -77,8 +77,8 @@ jobs:
           pip install pytest pytest-asyncio httpx "fastapi>=0.110" "starlette>=0.40" \
               "transformers>=4.51,<5.5" "numpy<3" psutil pyyaml typer requests \
               structlog cryptography python-multipart aiofiles sqlalchemy \
-              "jinja2>=3" "pydantic>=2" python-jose passlib bcrypt \
-              "uvicorn>=0.30"
+              "jinja2>=3" "pydantic>=2" python-jose passlib bcrypt pyjwt \
+              datasets matplotlib "uvicorn>=0.30"
           pip install --index-url https://download.pytorch.org/whl/cpu \
               "torch>=2.4,<2.11"
           pip install -e . --no-deps
