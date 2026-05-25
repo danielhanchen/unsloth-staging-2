@@ -6,12 +6,13 @@ name: PR5749 Targeted Studio CI
 #   2. Windows OMP env vars gated on _fully_gpu_offloaded
 #   3. Windows --cache-ram/--no-cache-prompt block gated on _fully_gpu_offloaded
 #
-# Runs the existing cancel-infrastructure tests plus two new regression
-# locks (test_disconnect_watcher.py, test_llama_cpp_windows_launch_gating.py).
-# The launch-gating test is AST/exec-based, so it runs identically on
-# ubuntu / macos / windows; that gives us cross-platform sanity on the
-# inference.py disconnect-watcher signature change (which is platform-neutral)
-# AND on Windows-specific source text without needing a real llama-server.
+# Runs the existing cancel-infrastructure tests plus three new locks:
+#   * test_disconnect_watcher.py (AST + behavioral)
+#   * test_llama_cpp_windows_launch_gating.py (AST + exec on all 3 OSes)
+#   * test_pr5749_imports_under_spoof.py (LIVE-IMPORT of patched modules
+#     under the project's existing CUDA spoof harness in
+#     tests/_zoo_aggressive_cuda_spoof.py, so the real signatures and
+#     module-level code are exercised on a no-GPU runner)
 
 on:
   push:
@@ -24,6 +25,7 @@ on:
       - "tests/studio/test_stream_cancel_registration_timing.py"
       - "tests/studio/test_disconnect_watcher.py"
       - "tests/studio/test_llama_cpp_windows_launch_gating.py"
+      - "tests/studio/test_pr5749_imports_under_spoof.py"
       - "tests/conftest.py"
       - "tests/_zoo_aggressive_cuda_spoof.py"
       - ".github/workflows/pr5749-targeted.yml"
@@ -67,15 +69,18 @@ jobs:
         run: |
           set -euxo pipefail
           python -m pip install --upgrade pip
-          # Minimal: the new tests are AST + asyncio only; cancel-infra
-          # tests need fastapi/starlette/httpx + the project's CUDA spoof,
-          # which imports unsloth + unsloth_zoo at session start.
+          # Cancel-infra tests + the new live-import-under-spoof test need
+          # fastapi/starlette/httpx + the project's CUDA spoof harness
+          # which imports unsloth + unsloth_zoo at conftest session start.
+          # structlog is required by studio/backend/utils/hardware/hardware.py
+          # which inference.py transitively imports.
           pip install pytest pytest-asyncio httpx "fastapi>=0.110" "starlette>=0.40" \
-              "transformers>=4.51,<5.5" "numpy<3" psutil pyyaml typer requests
+              "transformers>=4.51,<5.5" "numpy<3" psutil pyyaml typer requests \
+              structlog cryptography python-multipart aiofiles sqlalchemy \
+              "jinja2>=3" "pydantic>=2" python-jose passlib bcrypt \
+              "uvicorn>=0.30"
           pip install --index-url https://download.pytorch.org/whl/cpu \
               "torch>=2.4,<2.11"
-          # unsloth + unsloth_zoo are imported by tests/conftest.py during
-          # the spoof bootstrap. Install both editable / from git head.
           pip install -e . --no-deps
           pip install "unsloth_zoo>=2026.5.1" --no-deps || \
               pip install git+https://github.com/unslothai/unsloth-zoo --no-deps
@@ -96,3 +101,8 @@ jobs:
         run: |
           python -m pytest -q --tb=short \
             tests/studio/test_llama_cpp_windows_launch_gating.py
+
+      - name: Run live-import test under CUDA spoof (no-GPU runners)
+        run: |
+          python -m pytest -q --tb=short \
+            tests/studio/test_pr5749_imports_under_spoof.py
