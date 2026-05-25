@@ -55,6 +55,11 @@ jobs:
           python -m pip install -e .
           # Studio backend deps live in studio/backend/requirements/studio.txt
           python -m pip install -r studio/backend/requirements/studio.txt
+          # python-multipart is required by FastAPI's Form(...) decorator
+          # in studio/backend/routes/datasets.py but is not declared in
+          # studio.txt; install.sh pulls it in transitively via fastapi[all].
+          # Pin to match the runtime install.
+          python -m pip install python-multipart
 
       - name: Smoke import (no CUDA)
         env:

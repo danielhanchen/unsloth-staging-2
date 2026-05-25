@@ -57,6 +57,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m pip install -r studio/backend/requirements/studio.txt
+          python -m pip install python-multipart
 
       - name: Launch CPU-only with uvicorn
         run: |

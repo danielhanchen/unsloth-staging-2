@@ -53,6 +53,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m pip install -r studio/backend/requirements/studio.txt
+          python -m pip install python-multipart
           # MLX wheels are Apple-Silicon-only; macos-14 runners are M1, so
           # the install should succeed.
           python -m pip install mlx mlx-lm || echo "mlx not available"

@@ -54,6 +54,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e .
           python -m pip install -r studio/backend/requirements/studio.txt
+          python -m pip install python-multipart
+          # torch is not a hard dep of `unsloth` core; install the CPU-only
+          # wheel explicitly so the CUDA spoof has a real torch.cuda to
+          # monkey-patch.
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
           python -m pip install pytest pytest-timeout
 
       - name: Verify spoof activates cleanly
