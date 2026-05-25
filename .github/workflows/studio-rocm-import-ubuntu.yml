@@ -65,10 +65,35 @@ jobs:
               torch torchvision torchaudio
 
       - name: Install studio + unsloth (no-deps; torch already pinned)
+        # --no-deps on the editable install prevents pip from re-pulling
+        # the cu* torch wheel and clobbering the rocm one we just pinned.
+        # unsloth_zoo is a runtime dep of unsloth/_gpu_init.py, so install
+        # it explicitly (it ships pure-Python; no torch backend mismatch).
+        # Then re-state the rest of unsloth's runtime deps that the
+        # editable install would normally have resolved.
         run: |
           python -m pip install -e . --no-deps
+          python -m pip install unsloth_zoo
           python -m pip install -r studio/backend/requirements/studio.txt
           python -m pip install python-multipart
+          # Minimal unsloth runtime deps that don't touch the torch
+          # backend choice. Keep this list narrow so a new dep showing
+          # up in pyproject doesn't silently slip through.
+          python -m pip install \
+              transformers \
+              accelerate \
+              peft \
+              trl \
+              datasets \
+              tyro \
+              sentencepiece \
+              protobuf \
+              huggingface_hub \
+              hf_transfer \
+              packaging \
+              psutil \
+              tqdm \
+              pyyaml
 
       - name: Import probe under ROCm torch
         env:
