@@ -1,5 +1,9 @@
 # Studio install + import smoke on a GPU-less Ubuntu runner.
-# Validates the "Linux box with no NVIDIA card" pip path.
+# Validates the "Linux box with no NVIDIA card" pip path. The same
+# wheel set is what WSL2 users see, since WSL2 runs an upstream Linux
+# kernel and pip installs the linux_x86_64 wheel exactly as a native
+# Ubuntu install would; we therefore deliberately do NOT spin up a
+# separate WSL job (GitHub-hosted runners do not offer one anyway).
 name: Studio install Ubuntu
 
 on:
