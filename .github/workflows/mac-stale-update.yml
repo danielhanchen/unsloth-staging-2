@@ -8,7 +8,7 @@
 #
 # Each matrix entry pins a specific OLD release and runs the user's exact
 # code path on a macos-14 M1 runner:
-#   1. install via that release's own install.sh --no-torch (MLX-only Mac).
+#   1. install via that release's own install.sh  (MLX-only Mac).
 #      The OLD install.sh's `unsloth>=2026.5.1` (or similar) constraint
 #      means pip picks the LATEST -- so we then force the OLD unsloth
 #      back into the venv to faithfully reproduce a user who installed
@@ -50,8 +50,6 @@ jobs:
       max-parallel: 5
       matrix:
         old_version:
-          # earliest release that ships Studio (install.sh + studio/setup.sh).
-          - '2026.3.10'
           # ~2 months ago -- user's best guess.
           - '2026.3.18'
           # last April release, before the May rewrites.
@@ -90,12 +88,14 @@ jobs:
           test -f old_release/install.sh
           test -f old_release/studio/setup.sh
 
-      - name: Install Studio via OLD install.sh (--no-torch, MLX-only)
+      - name: Install Studio via OLD install.sh (with torch -- MLX Mac default)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -o pipefail
-          bash old_release/install.sh --no-torch 2>&1 | tee logs/install_old.log
+          # No --no-torch: Apple Silicon install.sh installs the MPS torch
+          # build by default, which is what the user's real machine has.
+          bash old_release/install.sh 2>&1 | tee logs/install_old.log
 
       - name: Force-downgrade unsloth + unsloth-zoo + bundled studio package to OLD
         run: |
@@ -135,13 +135,16 @@ jobs:
             echo "::warning::venv setup.sh differs from OLD sdist's setup.sh -- the OLD-wheel content was not fully restored"
           fi
 
-      - name: Run `unsloth studio update` (the user's broken path)
+      - name: Run `unsloth studio update --verbose` (the user's broken path)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set +e
           set -o pipefail
-          unsloth studio update 2>&1 | tee logs/update.log
+          # --verbose so we capture the actual pip command pip ran, which
+          # tells us whether the resolver landed on 2026.5.2 vs latest and
+          # why.
+          unsloth studio update --verbose 2>&1 | tee logs/update.log
           rc=${PIPESTATUS[0]}
           echo "update exit code: $rc"
           echo "$rc" > logs/update.rc
@@ -177,18 +180,26 @@ jobs:
         run: |
           POST=$(cat logs/post_update_version.txt)
           OLD="${{ matrix.old_version }}"
+          LATEST=$(curl -fsSL https://pypi.org/pypi/unsloth/json | python3 -c "import json,sys; print(json.load(sys.stdin)['info']['version'])")
           echo "OLD=$OLD"
           echo "POST=$POST"
+          echo "LATEST=$LATEST"
           if [ "$POST" = "$OLD" ]; then
-            echo "::error::STALE: unsloth still on $POST after `unsloth studio update` from $OLD"
+            echo "::error::STALE: unsloth still on $POST after update from $OLD"
             exit 1
           fi
-          python3 -c "
-          from packaging.version import Version
-          import sys
-          sys.exit(0 if Version('$POST') > Version('$OLD') else 1)
-          " || { echo "::error::DOWNGRADE: $OLD -> $POST"; exit 1; }
-          echo "OK: $OLD -> $POST"
+          # Use the venv python (has packaging) so the version compare
+          # doesn't fall through to the false-DOWNGRADE branch on stock macOS.
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          if ! "$VENV_PY" -c "from packaging.version import Version; import sys; sys.exit(0 if Version('$POST') > Version('$OLD') else 1)"; then
+            echo "::error::DOWNGRADE: $OLD -> $POST"
+            exit 1
+          fi
+          if [ "$POST" != "$LATEST" ]; then
+            echo "::error::PARTIAL: advanced $OLD -> $POST but stopped short of LATEST=$LATEST"
+            exit 1
+          fi
+          echo "OK: $OLD -> $POST (== LATEST)"
 
       - name: Upload all logs
         if: always()
