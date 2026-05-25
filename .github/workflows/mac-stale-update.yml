@@ -203,22 +203,30 @@ jobs:
           fi
           cat logs/prefix_status.txt
 
-      - name: Overlay FIXED files from the checkout into the venv
+      - name: Overlay the FIXED studio/ tree from the checkout into the venv
         # Simulates the recovery path: user re-ran `curl install.sh | sh` so
-        # the NEW install_python_stack.py + hardware.py land in their venv,
-        # but the rest of the OLD release's state (lower unsloth version,
-        # studio/setup.sh shell wrapper) is still on disk. The subsequent
-        # `unsloth studio update` should then advance to LATEST.
+        # the NEW studio/ files land in their venv, but the venv still has
+        # the OLD unsloth core (so an `unsloth studio update` has real work
+        # to do). We overlay the entire studio/ directory rather than just
+        # install_python_stack.py because install_python_stack.py imports
+        # symbols (e.g. has_blackwell_gpu) from backend/utils/wheel_utils.py
+        # that only exist in the newer wheel -- partial overlay raises
+        # ImportError before the resolver fix can even run.
         run: |
           set -euo pipefail
           VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
           SITE=$("$VENV_PY" -I -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
-          cp -f "$GITHUB_WORKSPACE/studio/install_python_stack.py" "$SITE/studio/install_python_stack.py"
-          cp -f "$GITHUB_WORKSPACE/studio/backend/utils/hardware/hardware.py" \
-                "$SITE/studio/backend/utils/hardware/hardware.py"
-          echo "overlaid:"
+          # rsync preserves layout; --exclude='frontend/' so we don't drag in
+          # the LATEST frontend source over the OLD release's compatible
+          # dist (the frontend rebuild is gated by SKIP_STUDIO_FRONTEND=1
+          # anyway, but skipping the copy keeps the venv lean).
+          rsync -a --exclude='frontend/' "$GITHUB_WORKSPACE/studio/" "$SITE/studio/"
+          echo "overlaid sha:"
           shasum "$SITE/studio/install_python_stack.py" \
-                 "$SITE/studio/backend/utils/hardware/hardware.py"
+                 "$SITE/studio/backend/utils/hardware/hardware.py" \
+                 "$SITE/studio/backend/utils/wheel_utils.py" 2>/dev/null \
+                 || shasum "$SITE/studio/install_python_stack.py" \
+                           "$SITE/studio/backend/utils/hardware/hardware.py"
 
       - name: Force-downgrade unsloth again so the second update has work to do
         run: |
@@ -231,11 +239,9 @@ jobs:
           "$VENV_PY" -m pip install --no-deps --force-reinstall \
             "unsloth==${{ matrix.old_version }}" 2>&1 | tee -a logs/install_old.log
           # Restore the overlay (force-reinstall just wrote the OLD wheel's
-          # install_python_stack.py back over our copy).
+          # studio/ tree back over our copy).
           SITE=$("$VENV_PY" -I -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
-          cp -f "$GITHUB_WORKSPACE/studio/install_python_stack.py" "$SITE/studio/install_python_stack.py"
-          cp -f "$GITHUB_WORKSPACE/studio/backend/utils/hardware/hardware.py" \
-                "$SITE/studio/backend/utils/hardware/hardware.py"
+          rsync -a --exclude='frontend/' "$GITHUB_WORKSPACE/studio/" "$SITE/studio/"
 
       - name: Run `unsloth studio update --verbose` with the FIX in place
         env:
