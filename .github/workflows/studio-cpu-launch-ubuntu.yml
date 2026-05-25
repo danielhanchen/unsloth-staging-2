@@ -1,0 +1,95 @@
+# Studio: launch in CPU-only mode and probe a public endpoint on Ubuntu.
+# Replicates the "Linux laptop without a CUDA card" full launch path:
+# pip install, start the FastAPI server via uvicorn in the background,
+# hit a non-auth endpoint, kill cleanly. Catches startup-order and
+# port-binding bugs that import-only smoke tests miss.
+name: Studio CPU launch Ubuntu
+
+on:
+  push:
+    branches: [studio-cross-platform-ci]
+    paths:
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'unsloth_cli/**'
+      - 'install.sh'
+      - 'pyproject.toml'
+      - '.github/workflows/studio-cpu-launch-ubuntu.yml'
+  pull_request:
+    paths:
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'unsloth_cli/**'
+      - 'install.sh'
+      - 'pyproject.toml'
+      - '.github/workflows/studio-cpu-launch-ubuntu.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UNSLOTH_DISABLE_AUTO_UPDATES: '1'
+      STUDIO_PORT: '18895'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Linux deps
+        run: sudo apt-get update && sudo apt-get install -y curl jq
+
+      - name: Install studio
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install -r studio/backend/requirements/studio.txt
+
+      - name: Launch CPU-only with uvicorn
+        run: |
+          mkdir -p logs
+          (python -m uvicorn studio.backend.main:app \
+              --host 127.0.0.1 --port "$STUDIO_PORT" \
+              --log-level info 2>&1 | tee logs/studio.log) &
+          STUDIO_PID=$!
+          echo "STUDIO_PID=$STUDIO_PID" >> "$GITHUB_ENV"
+          # Wait up to 90 s for the health probe to come up. Studio first
+          # boot pulls a few models / warms cache, so we are generous.
+          for i in $(seq 1 90); do
+              if curl -fsS "http://127.0.0.1:$STUDIO_PORT/healthz" > /dev/null 2>&1 || \
+                 curl -fsS "http://127.0.0.1:$STUDIO_PORT/docs" > /dev/null 2>&1 || \
+                 curl -fsS "http://127.0.0.1:$STUDIO_PORT/openapi.json" > /dev/null 2>&1; then
+                  echo "studio up on attempt $i"; break
+              fi
+              sleep 1
+          done
+
+      - name: Probe a public endpoint
+        run: |
+          set +e
+          curl -fsS "http://127.0.0.1:$STUDIO_PORT/openapi.json" | jq -r '.info.title // "no-title"'
+          PROBE_RC=$?
+          if [[ $PROBE_RC -ne 0 ]]; then
+              echo "--- last 200 lines of studio.log ---"
+              tail -200 logs/studio.log 2>/dev/null || true
+          fi
+          exit $PROBE_RC
+
+      - name: Tear down
+        if: always()
+        run: |
+          [[ -n "${STUDIO_PID:-}" ]] && kill "$STUDIO_PID" 2>/dev/null || true
+          sleep 1
