@@ -121,11 +121,18 @@ jobs:
             echo "::error::expected unsloth==${{ matrix.old_version }}, got $INSTALLED"
             exit 1
           fi
-          OLD_SETUP_INVENV=$("$VENV_PY" -c "import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec('studio').origin).parent / 'setup.sh')")
+          # Resolve the venv's studio/setup.sh directly via its site-packages
+          # instead of `import studio` -- the checkout's repo root has a
+          # `studio/` package on the CWD-sys.path and Python finds that one
+          # first.
+          SITE=$("$VENV_PY" -I -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          OLD_SETUP_INVENV="$SITE/studio/setup.sh"
           echo "setup.sh in venv: $OLD_SETUP_INVENV"
-          md5sum "$OLD_SETUP_INVENV" old_release/studio/setup.sh
+          ls -la "$OLD_SETUP_INVENV" old_release/studio/setup.sh
+          # md5sum is missing on macOS; use shasum which exists everywhere.
+          shasum "$OLD_SETUP_INVENV" old_release/studio/setup.sh
           if ! diff -q "$OLD_SETUP_INVENV" old_release/studio/setup.sh >/dev/null 2>&1; then
-            echo "::warning::venv setup.sh differs from OLD sdist's setup.sh -- the OLD-wheel content was not restored"
+            echo "::warning::venv setup.sh differs from OLD sdist's setup.sh -- the OLD-wheel content was not fully restored"
           fi
 
       - name: Run `unsloth studio update` (the user's broken path)
@@ -146,12 +153,12 @@ jobs:
           POST=$("$VENV_PY" -c "from importlib.metadata import version; print(version('unsloth'))" 2>&1 || echo "MISSING")
           echo "Post-update unsloth version: $POST"
           echo "$POST" > logs/post_update_version.txt
-          "$VENV_PY" -c "import platform; print('machine =', platform.machine()); print('processor =', platform.processor())" \
+          "$VENV_PY" -I -c "import platform; print('machine =', platform.machine()); print('processor =', platform.processor())" \
             | tee logs/platform_probe.txt
-          "$VENV_PY" -c "
-          import sys, pathlib, importlib.util
-          spec = importlib.util.find_spec('studio')
-          backend = pathlib.Path(spec.origin).parent / 'backend'
+          SITE=$("$VENV_PY" -I -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          "$VENV_PY" -I -c "
+          import sys, pathlib
+          backend = pathlib.Path(r'$SITE') / 'studio' / 'backend'
           sys.path.insert(0, str(backend))
           from utils.hardware.hardware import detect_hardware
           detect_hardware()
@@ -160,9 +167,10 @@ jobs:
       - name: Diff OLD vs post-update setup.sh
         run: |
           VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
-          POST=$("$VENV_PY" -c "import importlib.util,pathlib; print(pathlib.Path(importlib.util.find_spec('studio').origin).parent / 'setup.sh')")
+          SITE=$("$VENV_PY" -I -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          POST_SETUP="$SITE/studio/setup.sh"
           echo "::group::diff OLD ${{ matrix.old_version }} setup.sh -> post-update setup.sh"
-          diff -u old_release/studio/setup.sh "$POST" | head -300 || true
+          diff -u old_release/studio/setup.sh "$POST_SETUP" | head -300 || true
           echo "::endgroup::"
 
       - name: Assert update advanced unsloth version (the bug = no advance)
