@@ -138,6 +138,14 @@ jobs:
       - name: Run `unsloth studio update --verbose` (the user's broken path)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Skip the frontend rebuild. The force-reinstall above replaces
+          # studio/frontend/{src,package.json} with the OLD release's source
+          # tree, which references @assistant-ui/core/runtime/utils paths
+          # the current frontend package no longer ships (upstream issue
+          # 5231). On a real user's machine the frontend was built fresh
+          # by the original install, so this is a CI-only artifact -- we
+          # do not want it gating the resolver-correctness assertion.
+          SKIP_STUDIO_FRONTEND: '1'
         run: |
           set +e
           set -o pipefail
@@ -232,6 +240,7 @@ jobs:
       - name: Run `unsloth studio update --verbose` with the FIX in place
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SKIP_STUDIO_FRONTEND: '1'
         run: |
           set +e
           set -o pipefail
