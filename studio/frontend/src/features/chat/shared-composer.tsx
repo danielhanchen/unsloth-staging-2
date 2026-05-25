@@ -376,6 +376,7 @@ export function SharedComposer({
           {
             isReasoningProvider:
               selectedExternalProvider?.isReasoningModel === true,
+            baseUrl: selectedExternalProvider?.baseUrl ?? null,
           },
         )
       : null;
@@ -426,16 +427,23 @@ export function SharedComposer({
     effectiveExternalModelId,
     selectedExternalProvider?.baseUrl,
   );
+  // Gemini rejects codeExecution alongside image modalities. Search is
+  // blocked on older Gemini image ids but allowed on Gemini 3 image
+  // models -- supportsBuiltinWebSearch already encodes the per-model
+  // allowance, so we only disable Code unconditionally in Gemini
+  // image mode.
+  const isExternalGemini = selectedExternalProvider?.providerType === "gemini";
+  const imageDisabled = !modelLoaded || !supportsBuiltinImageGeneration;
+  const imageModeDisablesCode =
+    isExternalGemini && imageToolsEnabled && !imageDisabled;
   const searchDisabled =
     !modelLoaded || !(supportsTools || supportsBuiltinWebSearch);
   const codeDisabled =
-    !modelLoaded || !(supportsTools || supportsBuiltinCodeExecution);
-  // Images pill is only ever lit on OpenAI cloud's Responses-API models.
-  // No local tool runtime fallback because the only image-generation
-  // server tool we wire today is OpenAI's; local models cannot dispatch
-  // it. Hidden entirely when the active model does not advertise it so
-  // the pill row stays compact for providers without the capability.
-  const imageDisabled = !modelLoaded || !supportsBuiltinImageGeneration;
+    !modelLoaded ||
+    !(supportsTools || supportsBuiltinCodeExecution) ||
+    imageModeDisablesCode;
+  // Images pill is only ever lit on OpenAI cloud's Responses-API models
+  // and Gemini Nano Banana family. No local tool runtime fallback.
   const showImagePill = supportsBuiltinImageGeneration;
   // Backwards-compatible alias for any other call site that may still
   // reference `toolsDisabled` (rare; both pills used it before).

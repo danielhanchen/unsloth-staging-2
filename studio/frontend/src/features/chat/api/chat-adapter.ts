@@ -24,6 +24,7 @@ import {
   getExternalMinOutputTokens,
   getExternalReasoningCapabilities,
   getProviderCapabilities,
+  isGeminiCustomOpenAICompatBase,
   providerSupportsBuiltinCodeExecution,
   providerSupportsBuiltinImageGeneration,
   providerSupportsBuiltinWebFetch,
@@ -90,6 +91,52 @@ type RunMessage = RunMessages[number];
 
 /** Tracks which user messages were sent with an audio file (messageId → filename). */
 export const sentAudioNames = new Map<string, string>();
+
+// Canonical names for synthetic provider-side tool cards (Gemini
+// grounding/code/image, Anthropic web_search/web_fetch/code_execution,
+// OpenAI hosted code/image). The backend stamps these with
+// args._server_tool so we can drop them from outbound history without
+// also dropping a user function that happens to share the name. Keep
+// in sync with _SERVER_SIDE_BUILTIN_TOOL_NAMES on the backend.
+const SERVER_SIDE_BUILTIN_TOOL_NAMES = new Set<string>([
+  "web_search",
+  "web_fetch",
+  "code_execution",
+  "image_generation",
+]);
+
+/**
+ * Decide whether a persisted tool-call part is a provider-side
+ * synthetic card (Gemini grounding, Anthropic / OpenAI hosted tools)
+ * that should be stripped from outbound history rather than replayed
+ * as a real user function call.
+ *
+ * Rules in priority order:
+ *   1. Marker present (`args._server_tool === true`) → server-side.
+ *      The backend always stamps new synthetic events with this.
+ *   2. Gemini `native_part` payload present in `args.google` →
+ *      server-side. Gemini code_execution / image_generation always
+ *      stow `executableCode` / `codeExecutionResult` / `inlineData`
+ *      here so the native translator can replay them.
+ *
+ * No shape heuristic on `args.kind` / `args.command` / `args.prompt`:
+ * those can legitimately appear in a user-declared function with one
+ * of the canonical builtin names, and dropping a real user function
+ * call from chat history breaks function-calling round-trips. Old
+ * pre-PR persisted hosted cards lacking the marker now leak through
+ * to a non-native provider on a provider switch, which is the lesser
+ * of the two evils.
+ */
+function isServerSideBuiltinToolPart(
+  toolNameLower: string,
+  _argsObj: Record<string, unknown> | null,
+  hasServerToolMarker: boolean,
+  hasNativePart: boolean,
+): boolean {
+  if (!SERVER_SIDE_BUILTIN_TOOL_NAMES.has(toolNameLower)) return false;
+  if (hasServerToolMarker) return true;
+  return hasNativePart;
+}
 
 /**
  * Match error messages that indicate the request filled or would fill
@@ -340,21 +387,204 @@ function collectImageParts(
   return parts;
 }
 
-function toOpenAIMessage(message: RunMessage): {
-  role: "system" | "user" | "assistant";
-  content: OpenAIMessageContent;
-} | null {
+function collectAssistantToolCalls(
+  message: RunMessage,
+): Array<{
+  id: string;
+  type: "function";
+  function: { name: string; arguments: string };
+  extra_content?: unknown;
+}> {
+  const out: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+    extra_content?: unknown;
+  }> = [];
+  for (const part of message.content ?? []) {
+    if (part.type !== "tool-call") continue;
+    const tc = part as ToolCallMessagePart & {
+      argsText?: string;
+      extra_content?: unknown;
+    };
+    const toolNameLower = (tc.toolName ?? "").toLowerCase();
+    const argsObj =
+      tc.args && typeof tc.args === "object"
+        ? (tc.args as Record<string, unknown>)
+        : null;
+    const argsGoogle =
+      argsObj && typeof argsObj.google === "object" && argsObj.google !== null
+        ? (argsObj.google as Record<string, unknown>)
+        : null;
+    const hasNativePart = Boolean(
+      argsGoogle &&
+        typeof argsGoogle.native_part === "object" &&
+        argsGoogle.native_part !== null,
+    );
+    const hasServerToolMarker = Boolean(
+      argsObj && (argsObj as Record<string, unknown>)._server_tool === true,
+    );
+    const isServerSideBuiltin = isServerSideBuiltinToolPart(
+      toolNameLower,
+      argsObj,
+      hasServerToolMarker,
+      hasNativePart,
+    );
+    if (isServerSideBuiltin) {
+      // Gemini code_execution / image_generation still need to round-
+      // trip the native_part payload for native replay; drop the rest.
+      if (!hasNativePart) continue;
+    }
+    const argumentsStr =
+      typeof tc.argsText === "string" && tc.argsText.length > 0
+        ? tc.argsText
+        : JSON.stringify(tc.args ?? {});
+    const entry: {
+      id: string;
+      type: "function";
+      function: { name: string; arguments: string };
+      extra_content?: unknown;
+    } = {
+      id: tc.toolCallId,
+      type: "function" as const,
+      function: {
+        name: tc.toolName ?? "",
+        arguments: argumentsStr,
+      },
+    };
+    // Promote args.google to extra_content.google so the backend
+    // native_part replay branch can find it. The backend only inspects
+    // extra_content, not function.arguments.
+    if (tc.extra_content !== undefined) {
+      entry.extra_content = tc.extra_content;
+    } else if (argsGoogle) {
+      entry.extra_content = { google: argsGoogle };
+    }
+    out.push(entry);
+  }
+  return out;
+}
+
+function collectToolResultMessages(
+  message: RunMessage,
+): Array<{
+  role: "tool";
+  content: string;
+  tool_call_id: string;
+  name?: string;
+}> {
+  const out: Array<{
+    role: "tool";
+    content: string;
+    tool_call_id: string;
+    name?: string;
+  }> = [];
+  for (const part of message.content ?? []) {
+    if (part.type !== "tool-call") continue;
+    const tc = part as ToolCallMessagePart;
+    const result = (tc as { result?: unknown }).result;
+    // Skip provider-side builtins (marker, native_part, or legacy
+    // shape heuristic). See `isServerSideBuiltinToolPart` for the
+    // exact rules; in particular, unmarked `web_search` / `web_fetch`
+    // are NOT dropped because a user function may legitimately share
+    // the name.
+    const argsObj =
+      tc.args && typeof tc.args === "object"
+        ? (tc.args as Record<string, unknown>)
+        : null;
+    const argsGoogle =
+      argsObj && typeof argsObj.google === "object" && argsObj.google !== null
+        ? (argsObj.google as Record<string, unknown>)
+        : null;
+    const toolNameLower = (tc.toolName ?? "").toLowerCase();
+    const hasServerToolMarker = Boolean(
+      argsObj && argsObj._server_tool === true,
+    );
+    const hasNativePart = Boolean(
+      argsGoogle &&
+        typeof argsGoogle.native_part === "object" &&
+        argsGoogle.native_part !== null,
+    );
+    if (
+      isServerSideBuiltinToolPart(
+        toolNameLower,
+        argsObj,
+        hasServerToolMarker,
+        hasNativePart,
+      )
+    ) {
+      continue;
+    }
+    if (result === undefined || result === null) continue;
+    let content: string;
+    if (typeof result === "string") {
+      // Backend ChatMessage validator rejects role="tool" with empty
+      // content; serialise a sentinel JSON so legitimately empty tool
+      // outputs still round-trip the follow-up turn to the provider.
+      content = result.length > 0 ? result : JSON.stringify({ result: "" });
+    } else {
+      try {
+        content = JSON.stringify(result);
+      } catch {
+        content = String(result);
+      }
+    }
+    out.push({
+      role: "tool",
+      content,
+      tool_call_id: tc.toolCallId,
+      ...(tc.toolName ? { name: tc.toolName } : {}),
+    });
+  }
+  return out;
+}
+
+type SerializedMessage = {
+  role: "system" | "user" | "assistant" | "tool";
+  content: OpenAIMessageContent | null;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+    extra_content?: unknown;
+  }>;
+  tool_call_id?: string;
+  name?: string;
+  /**
+   * Gemini text-part thoughtSignature stashed during streaming on the
+   * last text MessagePart. Backend reads
+   * `extra_content.google.thought_signature` and attaches it to the
+   * matching Gemini text part on the outbound turn.
+   */
+  extra_content?: unknown;
+};
+
+function collectAssistantTextThoughtSignature(
+  message: RunMessage,
+): string | undefined {
+  if (!Array.isArray(message.content)) return undefined;
+  for (let i = message.content.length - 1; i >= 0; i -= 1) {
+    const part = message.content[i] as { type?: string } & Record<
+      string,
+      unknown
+    >;
+    if (part?.type !== "text") continue;
+    const sig = part._google_thought_signature;
+    if (typeof sig === "string" && sig) return sig;
+  }
+  return undefined;
+}
+
+function toOpenAIMessages(message: RunMessage): SerializedMessage[] {
   if (
     message.role !== "system" &&
     message.role !== "user" &&
     message.role !== "assistant"
   ) {
-    return null;
+    return [];
   }
 
   let textContent = collectTextParts(message).join("\n");
-  // Strip inline audio base64 from prior assistant messages to avoid
-  // inflating token counts (e.g. audio-player responses with embedded WAV).
   if (message.role === "assistant") {
     textContent = textContent.replace(
       /data:audio\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+/g,
@@ -363,14 +593,35 @@ function toOpenAIMessage(message: RunMessage): {
   }
 
   const imageParts = collectImageParts(message);
-  if (imageParts.length > 0) {
-    return {
-      role: message.role,
-      content: [{ type: "text", text: textContent }, ...imageParts],
-    };
+  const toolCalls =
+    message.role === "assistant" ? collectAssistantToolCalls(message) : [];
+  const toolResults =
+    message.role === "assistant" ? collectToolResultMessages(message) : [];
+
+  const base: SerializedMessage = {
+    role: message.role,
+    content:
+      imageParts.length > 0
+        ? [{ type: "text", text: textContent }, ...imageParts]
+        : textContent,
+  };
+  if (toolCalls.length > 0) {
+    base.tool_calls = toolCalls;
+    // OpenAI requires content === null on assistant turns whose
+    // payload is entirely tool_calls (matches the wire shape Gemini
+    // expects for the next functionCall replay).
+    if (!textContent && imageParts.length === 0) {
+      base.content = null;
+    }
+  }
+  if (message.role === "assistant") {
+    const sig = collectAssistantTextThoughtSignature(message);
+    if (sig) {
+      base.extra_content = { google: { thought_signature: sig } };
+    }
   }
 
-  return { role: message.role, content: textContent };
+  return toolResults.length > 0 ? [base, ...toolResults] : [base];
 }
 
 function extractImageBase64(input: string): string | undefined {
@@ -862,27 +1113,73 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
         throw new Error("Connection not found.");
       }
       // Local providers (llama.cpp / vLLM / Ollama) allow an empty key — only block hosted providers.
+      // Custom non-Google Gemini bases (LiteLLM, OAI-compat gateways)
+      // also allow an empty key because the backend routes them through
+      // the OpenAI-compatible path and skips the Authorization header
+      // when api_key is empty.
       const externalProviderIsCustom = externalProvider
         ? isCustomProviderType(externalProvider.providerType)
         : false;
-      if (isExternalRequest && !externalApiKey && !externalProviderIsCustom) {
+      const externalProviderIsGeminiCustomBase = Boolean(
+        externalProvider &&
+          externalProvider.providerType === "gemini" &&
+          isGeminiCustomOpenAICompatBase(externalProvider.baseUrl),
+      );
+      if (
+        isExternalRequest &&
+        !externalApiKey &&
+        !externalProviderIsCustom &&
+        !externalProviderIsGeminiCustomBase
+      ) {
         toast.error("Missing API key for selected connection.", {
           description: "Open Settings → Connections and set the API key again.",
         });
         throw new Error("Missing connection API key.");
       }
 
+      // OpenAI Responses-API image_generation server tool. Pill is
+      // gated on OpenAI cloud + a Responses-API model id; the backend
+      // additionally re-checks is_openai_cloud before appending
+      // {type:"image_generation"} to the request tools array. Computed
+      // ahead of Search/Code so Gemini image mode can suppress them.
+      const imageGenerationEnabledForThisTurn = Boolean(
+        externalProvider &&
+          externalSelection &&
+          imageToolsEnabled &&
+          providerSupportsBuiltinImageGeneration(
+            externalProvider.providerType,
+            externalSelection.modelId,
+            externalProvider.baseUrl,
+          ),
+      );
+      // Gemini rejects codeExecution alongside
+      // responseModalities=[TEXT,IMAGE]. Search is also blocked on the
+      // older 2.5 image family but explicitly allowed on the Gemini 3
+      // image family (gemini-3-pro-image-preview,
+      // gemini-3.1-flash-image-preview, Nano Banana Pro) per Google's
+      // docs. providerSupportsBuiltinWebSearch / Code already encode
+      // the per-model allowance, so we lean on them instead of a
+      // blanket image-mode disable.
+      const geminiImageModeForThisTurn =
+        externalProvider?.providerType === "gemini" &&
+        imageGenerationEnabledForThisTurn;
       const webSearchEnabledForThisTurn =
         Boolean(
           externalProvider &&
+            externalSelection &&
             toolsEnabled &&
-            providerSupportsBuiltinWebSearch(externalProvider.providerType),
+            providerSupportsBuiltinWebSearch(
+              externalProvider.providerType,
+              externalSelection.modelId,
+              externalProvider.baseUrl,
+            ),
         );
       const codeExecEnabledForThisTurn =
         Boolean(
           externalProvider &&
             externalSelection &&
             codeToolsEnabled &&
+            !geminiImageModeForThisTurn &&
             providerSupportsBuiltinCodeExecution(
               externalProvider.providerType,
               externalSelection.modelId,
@@ -903,23 +1200,17 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
         externalProvider &&
           providerSupportsBuiltinWebFetch(externalProvider.providerType),
       );
-      // OpenAI Responses-API image_generation server tool. Pill is
-      // gated on OpenAI cloud + a Responses-API model id; the backend
-      // additionally re-checks is_openai_cloud before appending
-      // {type:"image_generation"} to the request tools array.
-      const imageGenerationEnabledForThisTurn = Boolean(
-        externalProvider &&
-          externalSelection &&
-          imageToolsEnabled &&
-          providerSupportsBuiltinImageGeneration(
-            externalProvider.providerType,
-            externalSelection.modelId,
-            externalProvider.baseUrl,
-          ),
-      );
 
+      // Use toOpenAIMessages so assistant turns that ran a function
+      // tool emit BOTH `tool_calls` on the assistant message AND a
+      // separate `role="tool"` follow-up message keyed by
+      // `tool_call_id`. Gemini 3 multi-turn function calling needs
+      // the prior `tool_calls[].extra_content.google.thought_signature`
+      // echoed back; the backend translator at
+      // `external_provider._stream_gemini` rebuilds the native
+      // functionCall+functionResponse parts from this shape.
       const outboundMessages = messages
-        .map(toOpenAIMessage)
+        .flatMap(toOpenAIMessages)
         .filter((message): message is NonNullable<typeof message> =>
           Boolean(message),
         );
@@ -976,7 +1267,9 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
             outboundMessages[0] = {
               ...firstMessage,
               content: [
-                ...firstMessage.content,
+                ...(Array.isArray(firstMessage.content)
+                  ? firstMessage.content
+                  : []),
                 { type: "text", text: `\n\n${disabledToolGuard}` },
               ],
             };
@@ -1136,6 +1429,28 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
       // Tool call content parts — accumulated and yielded cumulatively.
       // result is set directly on the tool-call part when tool_end arrives.
       const toolCallParts: ToolCallMessagePart[] = [];
+      // Latest Gemini text-part thoughtSignature observed during this
+      // stream. The backend emits delta.extra_content.google.thought_signature
+      // when Gemini returns a signed text part; we stow it on the final
+      // text MessagePart so toOpenAIMessages can replay it on the next
+      // turn (Gemini 3 strict function-calling rejects history that
+      // drops returned signatures).
+      let latestTextThoughtSignature: string | undefined;
+      const pinTextThoughtSignature = <T extends { type: string }>(
+        parts: T[],
+      ): T[] => {
+        if (!latestTextThoughtSignature || parts.length === 0) return parts;
+        for (let i = parts.length - 1; i >= 0; i -= 1) {
+          if (parts[i].type === "text") {
+            parts[i] = {
+              ...parts[i],
+              _google_thought_signature: latestTextThoughtSignature,
+            } as T;
+            break;
+          }
+        }
+        return parts;
+      };
       let serverMetadata: {
         usage?: ServerUsage;
         timings?: ServerTimings;
@@ -1201,6 +1516,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
                 {
                   isReasoningProvider:
                     externalProvider.isReasoningModel === true,
+                  baseUrl: externalProvider.baseUrl ?? null,
                 },
               )
             : {
@@ -1668,14 +1984,106 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
                     } else {
                       parsedResult = rawResult;
                     }
+                    // Merge any Gemini native_part on the tool_end
+                    // into the existing tool-call's args.google so the
+                    // outbound translator can replay both the
+                    // executableCode (tool_start) and the
+                    // codeExecutionResult / inlineData (tool_end) on
+                    // the same assistant turn. Concatenate the `parts`
+                    // list so each entry keeps its own per-part
+                    // `thoughtSignature` (Gemini 3 strict validators
+                    // reject a signature placed on the wrong part).
+                    const endGoogle = (
+                      toolEvent as { google?: { native_part?: unknown } }
+                    ).google;
+                    const mergedArgs: ToolCallMessagePart["args"] = {
+                      ...(toolCallParts[idx].args ?? {}),
+                    } as ToolCallMessagePart["args"];
+                    if (
+                      endGoogle &&
+                      typeof endGoogle === "object" &&
+                      endGoogle.native_part &&
+                      typeof endGoogle.native_part === "object"
+                    ) {
+                      const argsObj = mergedArgs as Record<string, unknown>;
+                      const existingGoogle = (argsObj.google ?? {}) as Record<
+                        string,
+                        unknown
+                      >;
+                      const existingNative =
+                        (existingGoogle.native_part as Record<
+                          string,
+                          unknown
+                        >) ?? {};
+                      const endNative = endGoogle.native_part as Record<
+                        string,
+                        unknown
+                      >;
+                      // Extract part entries from either the new
+                      // `parts: [...]` shape or a legacy single-object
+                      // native_part. Legacy entries had at most one of
+                      // executableCode/codeExecutionResult/inlineData
+                      // plus an optional `thoughtSignature` sibling,
+                      // and on Gemini 3 that signature was always
+                      // emitted on `executableCode`, so move it onto
+                      // that key only when we synthesise a part.
+                      const collectParts = (
+                        native: Record<string, unknown>,
+                      ): Record<string, unknown>[] => {
+                        if (Array.isArray(native.parts)) {
+                          return (native.parts as unknown[]).filter(
+                            (entry): entry is Record<string, unknown> =>
+                              Boolean(entry) &&
+                              typeof entry === "object" &&
+                              !Array.isArray(entry),
+                          );
+                        }
+                        const out: Record<string, unknown>[] = [];
+                        const legacySig =
+                          typeof native.thoughtSignature === "string"
+                            ? native.thoughtSignature
+                            : typeof native.thought_signature === "string"
+                              ? (native.thought_signature as string)
+                              : null;
+                        for (const key of [
+                          "executableCode",
+                          "codeExecutionResult",
+                          "inlineData",
+                        ] as const) {
+                          const sub = native[key];
+                          if (sub && typeof sub === "object") {
+                            const entry: Record<string, unknown> = {
+                              [key]: sub,
+                            };
+                            if (key === "executableCode" && legacySig) {
+                              entry.thoughtSignature = legacySig;
+                            }
+                            out.push(entry);
+                          }
+                        }
+                        return out;
+                      };
+                      const mergedParts = [
+                        ...collectParts(existingNative),
+                        ...collectParts(endNative),
+                      ];
+                      argsObj.google = {
+                        ...existingGoogle,
+                        native_part: { parts: mergedParts },
+                      };
+                    }
                     toolCallParts[idx] = {
                       ...toolCallParts[idx],
+                      args: mergedArgs,
+                      argsText: JSON.stringify(mergedArgs ?? {}),
                       result: parsedResult,
                     };
                   }
                 }
                 // Yield cumulative state so tool UI updates (tools first, text after)
-                const textParts = parseAssistantContent(cumulativeText);
+                const textParts = pinTextThoughtSignature(
+                  parseAssistantContent(cumulativeText),
+                );
                 yield {
                   content: [...toolCallParts, ...textParts],
                   metadata: {
@@ -1730,6 +2138,29 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
               // parts re-wrapped as inline <think> tags) so the rest of the
               // accumulator stays string-based.
               const delta = extractDeltaText(rawDelta);
+              // Gemini text parts carry `thoughtSignature` on the
+              // delta's extra_content. Stash the latest one so the
+              // assistant message persists it and the next outbound
+              // turn replays it on the matching text part.
+              const deltaExtraContent = (
+                chunk.choices?.[0]?.delta as
+                  | { extra_content?: unknown }
+                  | undefined
+              )?.extra_content;
+              if (
+                deltaExtraContent &&
+                typeof deltaExtraContent === "object"
+              ) {
+                const eGoogle = (deltaExtraContent as Record<string, unknown>)
+                  .google;
+                if (eGoogle && typeof eGoogle === "object") {
+                  const sig = (eGoogle as Record<string, unknown>)
+                    .thought_signature;
+                  if (typeof sig === "string" && sig) {
+                    latestTextThoughtSignature = sig;
+                  }
+                }
+              }
               // Kimi (kimi-k2.6, kimi-k2-thinking) and DeepSeek reasoner
               // stream thinking via `delta.reasoning_content` as a plain
               // string field — separate from `delta.content` which carries
@@ -1766,6 +2197,145 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
               const reasoning =
                 (typeof rawReasoning === "string" ? rawReasoning : "") +
                 reasoningFromDetails;
+              // OpenAI-shape `delta.tool_calls`. The standard contract
+              // emits each tool call across multiple chunks keyed by
+              // `index`: the first carries `id`/`name`, later chunks
+              // carry partial `function.arguments`. Accumulate by
+              // index/id so the assembled call is one tool-call part
+              // (Gemini's translator currently batches whole parts,
+              // but local llama.cpp and any other OAI-compatible
+              // provider stream fragments). The frontend also stows
+              // `extra_content` so Gemini 3 `thoughtSignature` can
+              // round-trip on the next turn.
+              const rawDeltaToolCalls = (
+                chunk.choices?.[0]?.delta as
+                  | { tool_calls?: unknown }
+                  | undefined
+              )?.tool_calls;
+              if (
+                Array.isArray(rawDeltaToolCalls) &&
+                rawDeltaToolCalls.length > 0
+              ) {
+                for (const tc of rawDeltaToolCalls) {
+                  if (!tc || typeof tc !== "object") continue;
+                  const call = tc as {
+                    id?: string;
+                    index?: number;
+                    function?: { name?: string; arguments?: string };
+                    extra_content?: unknown;
+                  };
+                  const idx =
+                    typeof call.index === "number" ? call.index : undefined;
+                  const stableId = call.id;
+                  // Match an existing fragment by id first (canonical),
+                  // then by index slot. Fall back to a freshly-minted
+                  // tool_call_<n> id for streams that send neither.
+                  let existing = stableId
+                    ? toolCallParts.find((p) => p.toolCallId === stableId)
+                    : undefined;
+                  if (!existing && idx !== undefined) {
+                    existing = toolCallParts.find(
+                      (p) =>
+                        (
+                          p as ToolCallMessagePart & { _delta_index?: number }
+                        )._delta_index === idx,
+                    );
+                  }
+                  const argsFragment = call.function?.arguments ?? "";
+                  if (existing) {
+                    const prevName = existing.toolName ?? "";
+                    const nextName = call.function?.name ?? prevName;
+                    const merged =
+                      (existing.argsText ?? "") + argsFragment;
+                    let parsedArgs:
+                      ToolCallMessagePart["args"] = existing.args ?? {};
+                    if (merged) {
+                      try {
+                        parsedArgs = JSON.parse(
+                          merged,
+                        ) as ToolCallMessagePart["args"];
+                      } catch {
+                        parsedArgs = {
+                          _raw: merged,
+                        } as ToolCallMessagePart["args"];
+                      }
+                    }
+                    const prevExtra = (
+                      existing as ToolCallMessagePart & {
+                        extra_content?: unknown;
+                      }
+                    ).extra_content;
+                    const updated: ToolCallMessagePart & {
+                      _delta_index?: number;
+                      extra_content?: unknown;
+                    } = {
+                      ...(existing as ToolCallMessagePart),
+                      toolName: nextName,
+                      argsText: merged,
+                      args: parsedArgs,
+                      ...(call.extra_content !== undefined
+                        ? { extra_content: call.extra_content }
+                        : prevExtra !== undefined
+                        ? { extra_content: prevExtra }
+                        : {}),
+                      ...(idx !== undefined ? { _delta_index: idx } : {}),
+                    };
+                    const replaceIdx = toolCallParts.indexOf(existing);
+                    if (replaceIdx >= 0) {
+                      toolCallParts[replaceIdx] = updated;
+                    }
+                  } else {
+                    const callId =
+                      stableId ||
+                      `tool_call_${idx ?? toolCallParts.length}`;
+                    const argsText = argsFragment;
+                    let parsedArgs: ToolCallMessagePart["args"] = {};
+                    if (argsText) {
+                      try {
+                        parsedArgs = JSON.parse(
+                          argsText,
+                        ) as ToolCallMessagePart["args"];
+                      } catch {
+                        parsedArgs = {
+                          _raw: argsText,
+                        } as ToolCallMessagePart["args"];
+                      }
+                    }
+                    const fresh: ToolCallMessagePart & {
+                      _delta_index?: number;
+                      extra_content?: unknown;
+                    } = {
+                      type: "tool-call" as const,
+                      toolCallId: callId,
+                      toolName: call.function?.name ?? "",
+                      argsText,
+                      args: parsedArgs,
+                      ...(call.extra_content !== undefined
+                        ? { extra_content: call.extra_content }
+                        : {}),
+                      ...(idx !== undefined ? { _delta_index: idx } : {}),
+                    };
+                    toolCallParts.push(fresh);
+                  }
+                }
+                yield {
+                  content: [
+                    ...toolCallParts,
+                    ...pinTextThoughtSignature(
+                      parseAssistantContent(cumulativeText),
+                    ),
+                  ],
+                  metadata: {
+                    timing: buildTiming(
+                      streamStartTime,
+                      totalChunks,
+                      firstTokenTime,
+                    ),
+                    custom: { reasoningDuration },
+                  },
+                };
+                continue;
+              }
               if (!delta && !reasoning) {
                 continue;
               }
@@ -1805,7 +2375,9 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
                   "",
                 );
               }
-              const parts = parseAssistantContent(cumulativeText);
+              const parts = pinTextThoughtSignature(
+                parseAssistantContent(cumulativeText),
+              );
 
               if (
                 parts.some((part) => part.type === "reasoning") &&
@@ -1909,7 +2481,7 @@ export function createOpenAIStreamAdapter(): ChatModelAdapter {
         yield {
           content: [
             ...toolCallParts,
-            ...parseAssistantContent(cumulativeText),
+            ...pinTextThoughtSignature(parseAssistantContent(cumulativeText)),
             ...sourceParts,
           ],
           metadata: {

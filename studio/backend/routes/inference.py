@@ -427,9 +427,17 @@ _TOOL_ACTION_NUDGE = (
     " Do NOT output code blocks -- use the python tool instead."
 )
 
-# Regex for stripping leaked tool-call XML from assistant messages/stream
+# Strip tool-call XML the speculative buffer in core/inference/llama_cpp.py
+# split across the visible/DRAIN boundary. Four leak shapes:
+#   1. well-formed `<tool_call>...</tool_call>` / `<function=...>...</function>`
+#   2. orphan opening to EOF (close was DRAINED)
+#   3. bare orphan close (open was DRAINED)
+#   4. tail-only `</parameter>` (outer close truncated by EOS); anchored to
+#      `\Z` so mid-text `<parameter>` in user code samples survives.
 _TOOL_XML_RE = _re.compile(
-    r"<tool_call>.*?</tool_call>|<function=\w+>.*?</function>",
+    r"<(?:tool_call|function=\w+)>.*?(?:</(?:tool_call|function)>|\Z)"
+    r"|</(?:tool_call|function)>"
+    r"|</parameter>\s*\Z",
     _re.DOTALL,
 )
 logger = get_logger(__name__)
@@ -1689,6 +1697,7 @@ def _build_external_messages(
     messages: list,
     supports_vision: bool,
     provider_type: Optional[str] = None,
+    base_url: Optional[str] = None,
 ) -> list[dict]:
     """
     Convert ChatMessage list to OpenAI-compatible dicts for external providers.
@@ -1709,14 +1718,171 @@ def _build_external_messages(
     """
     document_provider = provider_type in _INPUT_DOCUMENT_PROVIDERS
     anthropic = provider_type == "anthropic"
+    # `extra_content` is a Gemini-specific carrier for the assistant's
+    # text-part `thoughtSignature` round-trip on the native
+    # streamGenerateContent endpoint. Custom Gemini OpenAI-compatible
+    # gateways (LiteLLM etc.) route through /chat/completions where
+    # the field is unknown and can be rejected -- gate strictly on the
+    # Google-hosted Gemini base.
+    _native_gemini = False
+    if provider_type == "gemini" and base_url:
+        try:
+            from urllib.parse import urlparse as _urlparse
+
+            _host = (_urlparse(base_url).hostname or "").lower()
+            _native_gemini = _host == "generativelanguage.googleapis.com"
+        except Exception:
+            _native_gemini = False
+    emit_extra_content = _native_gemini
+
+    _SERVER_BUILTIN_TOOL_NAMES = frozenset(
+        {"web_search", "web_fetch", "code_execution", "image_generation"}
+    )
+
+    def _is_marked_server_builtin_tool_call(tc: Any) -> bool:
+        """Return True iff `tc` is a synthetic provider-side tool card
+        with one of the canonical builtin names and either:
+          - the new `args._server_tool` marker stamped by the backend, or
+          - a Gemini `args.google.native_part` payload (durable replay
+            signal for code_execution / image_generation that predates
+            the marker).
+        Such cards must not be forwarded to non-native providers
+        because they are not real user functions and the receiving API
+        will reject the orphan tool history. Real user functions with
+        these names normally have neither signal.
+        """
+        if not isinstance(tc, dict):
+            return False
+        fn = tc.get("function")
+        if not isinstance(fn, dict):
+            return False
+        name = (fn.get("name") or "").lower()
+        if name not in _SERVER_BUILTIN_TOOL_NAMES:
+            return False
+        raw_args = fn.get("arguments") or ""
+        try:
+            args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
+        except Exception:
+            return False
+        if not isinstance(args, dict):
+            return False
+        if args.get("_server_tool") is True:
+            return True
+        google = args.get("google")
+        return isinstance(google, dict) and isinstance(google.get("native_part"), dict)
+
+    # When we drop a server-side builtin tool_call here, the matching
+    # `role="tool"` follow-up must also be dropped from the outbound
+    # history -- otherwise the provider receives an orphan
+    # tool_call_id with no matching assistant call, which OpenAI
+    # Responses and Anthropic both reject.
+    dropped_server_builtin_tool_call_ids: set[str] = set()
+
+    def _filter_tool_calls(tool_calls: Any) -> Optional[list]:
+        """Sanitize assistant `tool_calls` for non-native-Gemini providers.
+
+        Two concerns:
+          1. `tool_calls[i].extra_content` carries Gemini-only
+             thoughtSignature metadata; strip it for providers that
+             cannot parse the unknown key.
+          2. Marked server-side builtin cards (`_server_tool: true` on
+             a canonical builtin name, or a Gemini `native_part`
+             payload) are provider-internal Studio tool cards from a
+             prior native Gemini turn; forwarding them to OpenAI /
+             Anthropic / custom OAI-compat gateways sends an orphan
+             `tool_calls` entry (no matching tool declaration, often
+             no matching `role="tool"` reply) that can be rejected.
+             We record the dropped call_ids so the matching role=tool
+             message is also skipped below.
+        Native Gemini keeps both untouched so the native translator can
+        replay them via `native_part`.
+        """
+        if not tool_calls:
+            return None
+        if not isinstance(tool_calls, list):
+            return tool_calls
+        if emit_extra_content:
+            return tool_calls
+        cleaned: list = []
+        for _tc in tool_calls:
+            if _is_marked_server_builtin_tool_call(_tc):
+                _tc_id = _tc.get("id") if isinstance(_tc, dict) else None
+                if isinstance(_tc_id, str) and _tc_id:
+                    dropped_server_builtin_tool_call_ids.add(_tc_id)
+                continue
+            if not isinstance(_tc, dict):
+                cleaned.append(_tc)
+                continue
+            if "extra_content" not in _tc:
+                cleaned.append(_tc)
+                continue
+            _stripped = {k: v for k, v in _tc.items() if k != "extra_content"}
+            cleaned.append(_stripped)
+        return cleaned
+
     result = []
     for msg in messages:
+        # Drop role=tool messages whose matching server-builtin
+        # tool_call was already filtered above. Forwarding an orphan
+        # tool_result with no matching tool_call would be rejected by
+        # OpenAI Responses and Anthropic.
+        if (
+            msg.role == "tool"
+            and isinstance(msg.tool_call_id, str)
+            and msg.tool_call_id in dropped_server_builtin_tool_call_ids
+        ):
+            continue
         if isinstance(msg.content, str):
-            # Skip assistant messages with empty content (some providers reject them)
-            if msg.role == "assistant" and not msg.content.strip():
+            # Drop bare assistant messages with no content AND no
+            # tool_calls (some providers reject empty assistant turns).
+            # Preserve assistant turns whose only payload is tool_calls
+            # so multi-turn function-call loops round-trip.
+            if (
+                msg.role == "assistant"
+                and not msg.content.strip()
+                and not msg.tool_calls
+            ):
                 continue
-            result.append({"role": msg.role, "content": msg.content})
-        elif isinstance(msg.content, list):
+            out: dict[str, Any] = {"role": msg.role, "content": msg.content}
+            if msg.role == "assistant" and msg.tool_calls:
+                _tcs = _filter_tool_calls(msg.tool_calls)
+                if _tcs:
+                    out["tool_calls"] = _tcs
+                elif not msg.content.strip():
+                    # Every tool_call was a synthetic provider-side
+                    # card and was dropped; the assistant turn would
+                    # be an empty `{"role":"assistant","content":""}`
+                    # which some providers reject. Skip it entirely.
+                    continue
+            if msg.role == "tool":
+                if msg.tool_call_id:
+                    out["tool_call_id"] = msg.tool_call_id
+                if msg.name:
+                    out["name"] = msg.name
+            if emit_extra_content and msg.role == "assistant" and msg.extra_content:
+                out["extra_content"] = msg.extra_content
+            result.append(out)
+            continue
+        # Assistant messages with content=None but populated tool_calls
+        # are valid (post-tool-call assistant turn). Forward them so the
+        # provider helper can rebuild the functionCall part.
+        if msg.content is None and msg.role == "assistant" and msg.tool_calls:
+            _filtered_tcs = _filter_tool_calls(msg.tool_calls)
+            if not _filtered_tcs:
+                # Every tool_call on this turn was provider-side
+                # synthetic and dropped; skipping the whole message
+                # avoids forwarding an empty assistant turn.
+                continue
+            _assistant_only: dict[str, Any] = {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": _filtered_tcs,
+            }
+            if emit_extra_content and msg.extra_content:
+                _assistant_only["extra_content"] = msg.extra_content
+            result.append(_assistant_only)
+            continue
+        if isinstance(msg.content, list):
             if supports_vision:
                 parts = []
                 for part in msg.content:
@@ -1750,7 +1916,25 @@ def _build_external_messages(
                         # provider would 400 on the unknown part, so
                         # gate by provider_type.
                         parts.append({"type": "compaction", "content": part.content})
-                result.append({"role": msg.role, "content": parts})
+                entry: dict[str, Any] = {"role": msg.role, "content": parts}
+                if msg.role == "assistant" and msg.tool_calls:
+                    _tcs = _filter_tool_calls(msg.tool_calls)
+                    if _tcs:
+                        entry["tool_calls"] = _tcs
+                    elif not parts:
+                        # All tool_calls were synthetic and dropped,
+                        # and no preserved content parts survived.
+                        # Skip rather than forward an empty assistant
+                        # turn that downstream providers reject.
+                        continue
+                if msg.role == "tool":
+                    if msg.tool_call_id:
+                        entry["tool_call_id"] = msg.tool_call_id
+                    if msg.name:
+                        entry["name"] = msg.name
+                if emit_extra_content and msg.role == "assistant" and msg.extra_content:
+                    entry["extra_content"] = msg.extra_content
+                result.append(entry)
             else:
                 # Non-vision provider: strip images / documents, keep
                 # text, optionally keep compaction (Anthropic only --
@@ -1766,9 +1950,32 @@ def _build_external_messages(
                 if len(preserved) == 1 and preserved[0]["type"] == "text":
                     # Single text part collapses back to a string for
                     # providers that don't accept content arrays.
-                    result.append({"role": msg.role, "content": preserved[0]["text"]})
+                    entry = {"role": msg.role, "content": preserved[0]["text"]}
                 else:
-                    result.append({"role": msg.role, "content": preserved})
+                    entry = {"role": msg.role, "content": preserved}
+                if msg.role == "assistant" and msg.tool_calls:
+                    _tcs = _filter_tool_calls(msg.tool_calls)
+                    if _tcs:
+                        entry["tool_calls"] = _tcs
+                    else:
+                        # All tool_calls were synthetic and dropped;
+                        # skip if there's no surviving content either.
+                        _entry_content = entry.get("content")
+                        _has_text = (
+                            isinstance(_entry_content, str) and _entry_content.strip()
+                        ) or (
+                            isinstance(_entry_content, list) and len(_entry_content) > 0
+                        )
+                        if not _has_text:
+                            continue
+                if msg.role == "tool":
+                    if msg.tool_call_id:
+                        entry["tool_call_id"] = msg.tool_call_id
+                    if msg.name:
+                        entry["name"] = msg.name
+                if emit_extra_content and msg.role == "assistant" and msg.extra_content:
+                    entry["extra_content"] = msg.extra_content
+                result.append(entry)
     return result
 
 
@@ -1843,6 +2050,7 @@ async def _proxy_to_external_provider(
         payload.messages,
         _supports_vision,
         provider_type = provider_type,
+        base_url = base_url,
     )
 
     client = ExternalProviderClient(
@@ -1850,6 +2058,14 @@ async def _proxy_to_external_provider(
         base_url = base_url,
         api_key = api_key,
     )
+
+    # `top_k` defaults to 20 in ChatCompletionRequest because the local
+    # inference path expects an int, but the external-provider path
+    # should treat "field omitted from JSON" as "use provider default"
+    # so callers that send only model/messages do not silently get
+    # different sampling than before this PR. Pydantic's
+    # `model_fields_set` tracks explicit-vs-default per request.
+    _top_k_explicit = payload.top_k if "top_k" in payload.model_fields_set else None
 
     async def _stream():
         gen = client.stream_chat_completion(
@@ -1859,7 +2075,7 @@ async def _proxy_to_external_provider(
             top_p = payload.top_p,
             max_tokens = payload.max_tokens,
             presence_penalty = payload.presence_penalty,
-            top_k = payload.top_k,
+            top_k = _top_k_explicit,
             enable_thinking = payload.enable_thinking,
             reasoning_effort = payload.reasoning_effort,
             enabled_tools = payload.enabled_tools,
@@ -1868,6 +2084,8 @@ async def _proxy_to_external_provider(
             anthropic_code_exec_container_id = payload.anthropic_code_exec_container_id,
             prompt_cache_ttl = payload.prompt_cache_ttl,
             compaction_threshold = payload.compaction_threshold,
+            tools = payload.tools,
+            tool_choice = payload.tool_choice,
             stream = payload.stream,
         )
         try:
