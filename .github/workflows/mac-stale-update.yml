@@ -1,0 +1,153 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Reproduction: user is on Apple Silicon Mac with unsloth==2026.5.2
+# installed via the old install.sh. They click `unsloth studio update`.
+# Symptoms reported:
+#   * update "just fails"
+#   * Hardware detected: MLX -- Apple Silicon (i386)   <-- bogus chip
+#   * After click-link the running studio appears OLD (downgrade?)
+#
+# This workflow drives the user's exact scenario on a real macos-14 M1
+# runner: install the OLD 2026.5.2 release wheels into the Studio
+# venv layout, then call `unsloth studio update` and capture the full
+# log + the resulting venv state. CPU-only, no torch (matches the user's
+# no-GPU MLX Mac).
+
+name: Mac stale-update repro
+
+on:
+  push:
+    branches:
+      - mac-stale-update-investigation
+    paths:
+      - 'install.sh'
+      - 'studio/setup.sh'
+      - 'studio/install_python_stack.py'
+      - 'studio/backend/utils/hardware/**'
+      - 'unsloth_cli/commands/studio.py'
+      - 'pyproject.toml'
+      - '.github/workflows/mac-stale-update.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  stale-update:
+    name: 2026.5.2 -> latest update on macos-14
+    runs-on: macos-14
+    timeout-minutes: 35
+    env:
+      OLD_VERSION: '2026.5.2'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.12'
+
+      - name: Sanity -- runner is arm64
+        run: |
+          uname -a
+          uname -m
+          uname -p
+          sysctl -in hw.optional.arm64 || true
+          arch
+
+      - name: Fetch the OLD release sdist (2026.5.2)
+        run: |
+          mkdir -p old_release logs
+          curl -fsSL "https://files.pythonhosted.org/packages/source/u/unsloth/unsloth-${OLD_VERSION}.tar.gz" \
+            -o "old_release/unsloth-${OLD_VERSION}.tar.gz"
+          tar -xzf "old_release/unsloth-${OLD_VERSION}.tar.gz" -C old_release --strip-components=1
+          ls old_release
+
+      - name: Install OLD Studio via 2026.5.2 install.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          # --no-torch matches the user's MLX-only Mac (no GPU).
+          # Use the OLD install.sh so the venv ends up with 2026.5.2's
+          # setup.sh / install_python_stack.py shipped into it -- which is
+          # exactly the buggy file set `unsloth studio update` would re-run
+          # on the user's machine.
+          bash old_release/install.sh --no-torch 2>&1 | tee logs/install_old.log
+
+      - name: Confirm OLD version is installed
+        run: |
+          set -o pipefail
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          if [ ! -x "$VENV_PY" ]; then
+            echo "::error::No Studio venv created"
+            ls -la "$HOME/.unsloth/studio" || true
+            exit 1
+          fi
+          INSTALLED=$("$VENV_PY" -c "from importlib.metadata import version; print(version('unsloth'))")
+          echo "Installed: $INSTALLED"
+          if [ "$INSTALLED" != "$OLD_VERSION" ]; then
+            echo "::error::expected unsloth==$OLD_VERSION, got $INSTALLED"
+            exit 1
+          fi
+          # Capture the setup.sh / install_python_stack.py shipped in this OLD venv.
+          OLD_SETUP=$("$VENV_PY" -c "import importlib.util; spec=importlib.util.find_spec('studio'); import pathlib; print(pathlib.Path(spec.origin).parent / 'setup.sh')")
+          echo "OLD setup.sh = $OLD_SETUP"
+          md5sum "$OLD_SETUP" || true
+
+      - name: Now run `unsloth studio update` -- the user's broken path
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set +e
+          set -o pipefail
+          unsloth studio update 2>&1 | tee logs/update.log
+          rc=${PIPESTATUS[0]}
+          echo "update exit code: $rc"
+          echo "$rc" > logs/update.rc
+
+      - name: Post-update state
+        run: |
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          POST=$("$VENV_PY" -c "from importlib.metadata import version; print(version('unsloth'))" 2>&1 || echo "MISSING")
+          echo "Post-update unsloth version: $POST"
+          echo "$POST" > logs/post_update_version.txt
+          "$VENV_PY" -c "import platform; print('machine =', platform.machine()); print('processor =', platform.processor())"
+          # MLX boot smoke -- this is where the "Hardware detected: MLX -- Apple Silicon (i386)"
+          # log line is emitted. Reproduces the bogus chip string regardless of
+          # whether the update succeeded.
+          "$VENV_PY" -c "
+          import sys
+          import pathlib
+          import importlib.util
+          spec = importlib.util.find_spec('studio')
+          backend = pathlib.Path(spec.origin).parent / 'backend'
+          sys.path.insert(0, str(backend))
+          from utils.hardware.hardware import detect_hardware
+          detect_hardware()
+          " 2>&1 | tee logs/hardware_detect.log
+
+      - name: Diff OLD vs NEW setup.sh (what update SHOULD have shipped)
+        run: |
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          POST=$("$VENV_PY" -c "import importlib.util; spec=importlib.util.find_spec('studio'); import pathlib; print(pathlib.Path(spec.origin).parent / 'setup.sh')")
+          diff -u old_release/studio/setup.sh "$POST" | head -120 || true
+
+      - name: Upload all logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: mac-stale-update-logs-${{ github.run_id }}
+          path: |
+            logs/
+          retention-days: 7
