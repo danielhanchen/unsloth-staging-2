@@ -44,9 +44,9 @@ jobs:
             pydantic loguru rich shellingham typer pyyaml jinja2 \
             sqlalchemy cryptography aiofiles requests 'numpy<3'
 
-      - name: Download stress test harness
+      - name: Confirm bundled stress test harness
         run: |
-          curl -fsSL https://huggingface.co/datasets/danielhanchen/minimax-2.7-analysis/resolve/main/pr5468-sandbox-stress-test/sandbox_stress_test.py -o sandbox_stress_test.py
+          test -f sandbox_stress_test.py
           wc -l sandbox_stress_test.py
 
       - name: Stress test (sandbox_on, must produce 0 leaks)
