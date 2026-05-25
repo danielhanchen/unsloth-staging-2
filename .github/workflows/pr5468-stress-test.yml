@@ -1,0 +1,86 @@
+# PR 5468 100-prompt sandbox stress test on a clean ubuntu-latest runner.
+# Runs the same harness as in the PR comment so any reviewer can reproduce
+# the 0-leak result on real GitHub infrastructure.
+
+name: PR 5468 stress test
+
+on:
+  push:
+    branches: [pr-5468-ci-test]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: 100-prompt sandbox stress test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install bubblewrap + drop AppArmor userns gate
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap dnsutils
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --ro-bind / / --unshare-all --die-with-parent /usr/bin/true
+
+      - name: Install backend deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi structlog python-multipart httpx uvicorn \
+            pydantic loguru rich shellingham typer pyyaml jinja2 \
+            sqlalchemy cryptography aiofiles requests 'numpy<3'
+
+      - name: Download stress test harness
+        run: |
+          curl -fsSL https://huggingface.co/datasets/danielhanchen/minimax-2.7-analysis/resolve/main/pr5468-sandbox-stress-test/sandbox_stress_test.py -o sandbox_stress_test.py
+          wc -l sandbox_stress_test.py
+
+      - name: Stress test (sandbox_on, must produce 0 leaks)
+        env:
+          STUDIO_BACKEND_ROOT: ${{ github.workspace }}/studio/backend
+        run: |
+          python sandbox_stress_test.py --mode sandbox_on --output sandbox_on.json
+          python - <<'PY'
+          import json
+          d = json.load(open("sandbox_on.json"))
+          print(f"sandbox_on: leaked={d['leaked']} by_outcome={d['by_outcome']}")
+          assert d["leaked"] == 0, f"sandbox_on leaked {d['leaked']} attacks; expected 0"
+          PY
+
+      - name: Stress test (strict mode without sandbox, must produce 0 leaks)
+        env:
+          STUDIO_BACKEND_ROOT: ${{ github.workspace }}/studio/backend
+          UNSLOTH_STUDIO_SANDBOX_STRICT: '1'
+        run: |
+          # Disable the sandbox primitive so strict mode is the only line of defence.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1 || true
+          python sandbox_stress_test.py --mode strict --output strict.json
+          python - <<'PY'
+          import json
+          d = json.load(open("strict.json"))
+          print(f"strict: leaked={d['leaked']} by_outcome={d['by_outcome']}")
+          assert d["leaked"] == 0, f"strict leaked {d['leaked']} attacks; expected 0"
+          PY
+
+      - name: Upload artefacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stress-results
+          path: |
+            sandbox_on.json
+            strict.json
