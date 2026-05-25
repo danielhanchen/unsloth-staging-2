@@ -2389,6 +2389,231 @@ def test_function_declarations_strip_openai_only_schema_keys(monkeypatch):
     assert params["required"] == ["key"]
 
 
+def test_function_declarations_inline_local_refs_into_gemini_schema(monkeypatch):
+    """Round 25: Pydantic-generated tool schemas hoist nested object
+    shapes into `$defs` and reference them with `{"$ref": "#/$defs/..."}`.
+    Gemini's OpenAPI subset has no $ref, so a naive allowlist sanitizer
+    drops the reference and reduces the nested property to `{}`, losing
+    its type, fields, and required keys. The sanitizer must resolve
+    local `#/...` pointers and inline the referenced schema."""
+    captured = _capture_body(
+        monkeypatch,
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_user",
+                    "description": "Persist a user.",
+                    "parameters": {
+                        "type": "object",
+                        "$defs": {
+                            "Address": {
+                                "type": "object",
+                                "properties": {
+                                    "street": {"type": "string"},
+                                    "zip": {"type": "string"},
+                                },
+                                "required": ["street", "zip"],
+                            },
+                        },
+                        "properties": {
+                            "name": {"type": "string"},
+                            "address": {"$ref": "#/$defs/Address"},
+                        },
+                        "required": ["name", "address"],
+                    },
+                },
+            }
+        ],
+    )
+    tools_arr = captured["body"].get("tools") or []
+    decls = next(
+        (
+            t.get("functionDeclarations")
+            for t in tools_arr
+            if "functionDeclarations" in t
+        ),
+        None,
+    )
+    assert decls is not None, captured["body"]
+    params = decls[0]["parameters"]
+    assert "$defs" not in params
+    address = params["properties"]["address"]
+    assert address.get("type") == "object", address
+    assert address.get("properties", {}).get("street", {}).get("type") == "string"
+    assert address.get("properties", {}).get("zip", {}).get("type") == "string"
+    assert address.get("required") == ["street", "zip"]
+
+
+def test_function_declarations_inline_local_refs_in_anyof_and_items(monkeypatch):
+    """The recursive inliner must reach through `anyOf` branches and
+    `items` (array element schemas) as well, not just top-level
+    property refs."""
+    captured = _capture_body(
+        monkeypatch,
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "bulk_set",
+                    "parameters": {
+                        "type": "object",
+                        "$defs": {
+                            "Address": {
+                                "type": "object",
+                                "properties": {"zip": {"type": "string"}},
+                                "required": ["zip"],
+                            },
+                        },
+                        "properties": {
+                            "primary": {
+                                "anyOf": [
+                                    {"$ref": "#/$defs/Address"},
+                                    {"type": "null"},
+                                ],
+                            },
+                            "extras": {
+                                "type": "array",
+                                "items": {"$ref": "#/$defs/Address"},
+                            },
+                        },
+                    },
+                },
+            }
+        ],
+    )
+    tools_arr = captured["body"].get("tools") or []
+    decls = next(
+        (
+            t.get("functionDeclarations")
+            for t in tools_arr
+            if "functionDeclarations" in t
+        ),
+        None,
+    )
+    assert decls is not None
+    params = decls[0]["parameters"]
+    primary = params["properties"]["primary"]
+    # anyOf with single non-null branch + null collapses to inline +
+    # nullable: true, and the inlined branch must contain the resolved
+    # Address shape.
+    assert primary.get("nullable") is True
+    assert primary.get("type") == "object"
+    assert primary.get("properties", {}).get("zip", {}).get("type") == "string"
+    extras = params["properties"]["extras"]
+    assert extras.get("type") == "array"
+    assert extras.get("items", {}).get("type") == "object"
+    assert (
+        extras.get("items", {}).get("properties", {}).get("zip", {}).get("type")
+        == "string"
+    )
+
+
+def test_function_declarations_self_referential_schema_terminates(monkeypatch):
+    """Self-referential / cyclic JSON Schemas (a `Node` that contains
+    `children: [Node]`) must not infinite-loop. The inliner tracks the
+    set of refs in flight and short-circuits to `{}` on a cycle."""
+    captured = _capture_body(
+        monkeypatch,
+        tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "set_tree",
+                    "parameters": {
+                        "type": "object",
+                        "$defs": {
+                            "Node": {
+                                "type": "object",
+                                "properties": {
+                                    "value": {"type": "string"},
+                                    "children": {
+                                        "type": "array",
+                                        "items": {"$ref": "#/$defs/Node"},
+                                    },
+                                },
+                            },
+                        },
+                        "properties": {
+                            "root": {"$ref": "#/$defs/Node"},
+                        },
+                    },
+                },
+            }
+        ],
+    )
+    tools_arr = captured["body"].get("tools") or []
+    decls = next(
+        (
+            t.get("functionDeclarations")
+            for t in tools_arr
+            if "functionDeclarations" in t
+        ),
+        None,
+    )
+    assert decls is not None
+    root = decls[0]["parameters"]["properties"]["root"]
+    assert root.get("type") == "object"
+    assert root.get("properties", {}).get("value", {}).get("type") == "string"
+
+
+def test_gemini_native_skips_synthetic_server_builtin_replay(monkeypatch):
+    """Round 25: Marked server-side builtin tool_calls (web_search /
+    web_fetch with `_server_tool` or `args.google.native_part`) must
+    not fall through to the generic Gemini `functionCall` replay path
+    when no replayable native part exists. Without this guard the
+    outbound body contains a fake `functionCall` whose name is not a
+    declared user function, and the Gemini turn 400s."""
+    from models.inference import ChatCompletionRequest
+    from routes.inference import _build_external_messages
+
+    req = ChatCompletionRequest.model_validate(
+        {
+            "model": "gemini-2.5-flash",
+            "messages": [
+                {"role": "user", "content": "search please"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_s",
+                            "type": "function",
+                            "function": {
+                                "name": "web_search",
+                                "arguments": (
+                                    '{"_server_tool": true, "query": "x"}'
+                                ),
+                            },
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_s",
+                    "content": "[search result]",
+                },
+                {"role": "user", "content": "again"},
+            ],
+            "max_tokens": 64,
+            "stream": True,
+        }
+    )
+    built = _build_external_messages(
+        req.messages,
+        supports_vision = True,
+        provider_type = "gemini",
+        base_url = "https://generativelanguage.googleapis.com/v1beta",
+    )
+    captured = _capture_body(monkeypatch, messages = built)
+    contents = captured["body"].get("contents") or []
+    for entry in contents:
+        for part in entry.get("parts", []):
+            fc = part.get("functionCall")
+            if isinstance(fc, dict):
+                assert fc.get("name") != "web_search", contents
+
+
 def test_chat_message_extra_content_round_trips_through_validation():
     """Round 9: ChatMessage was missing `extra_content`, so Pydantic
     discarded the field during request validation and the text-part
@@ -4608,3 +4833,488 @@ def test_openai_chat_delta_type_includes_tool_calls_and_extra_content():
     assert "tool_calls?: OpenAIToolCallPart[]" in src, src[:200]
     assert "extra_content?: Record<string, unknown>" in src, src[:200]
     assert "boolean | string | null" in src, src[:200]
+
+
+def test_anthropic_forced_function_tool_choice_drops_hosted_tools(monkeypatch):
+    """Round 22: forced-function tool_choice must suppress Anthropic
+    hosted builtins the same way it does for Gemini. Pinning a user
+    function (`tool_choice={"type":"function","function":{"name":...}}`)
+    while also passing `enabled_tools=["web_search","web_fetch",
+    "code_execution"]` should not still fire those server-side."""
+    captured: dict = {"body": None}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            content = b'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+            headers = {"content-type": "text/event-stream"},
+        )
+
+    _mock_http(monkeypatch, handler)
+
+    async def run():
+        client = ExternalProviderClient(
+            provider_type = "anthropic",
+            base_url = "https://api.anthropic.com",
+            api_key = "sk-ant-test",
+        )
+        async for _ in client.stream_chat_completion(
+            messages = [{"role": "user", "content": "hi"}],
+            model = "claude-sonnet-4-5",
+            temperature = 0.7,
+            top_p = 0.95,
+            max_tokens = 16,
+            enabled_tools = ["web_search", "web_fetch", "code_execution"],
+            tool_choice = {
+                "type": "function",
+                "function": {"name": "lookup_record"},
+            },
+        ):
+            pass
+        await client.close()
+
+    _drive(run())
+    body = captured["body"] or {}
+    # No hosted tools should be in the body — only the caller's user-
+    # function declarations (which this test doesn't pass any of).
+    tools = body.get("tools") or []
+    hosted_tool_names = {"web_search", "web_fetch", "code_execution"}
+    for tool in tools:
+        assert tool.get("name") not in hosted_tool_names, body
+
+
+def test_openrouter_forced_function_tool_choice_drops_web_plugin(monkeypatch):
+    """Round 22: forced-function tool_choice must drop the OpenRouter
+    web plugin too — caller pinned a user function, OpenRouter must not
+    still attach the hosted web-search plugin."""
+    captured: dict = {"body": None}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            content = b"data: [DONE]\n\n",
+            headers = {"content-type": "text/event-stream"},
+        )
+
+    _mock_http(monkeypatch, handler)
+
+    async def run():
+        client = ExternalProviderClient(
+            provider_type = "openrouter",
+            base_url = "https://openrouter.ai/api/v1",
+            api_key = "sk-or-test",
+        )
+        async for _ in client.stream_chat_completion(
+            messages = [{"role": "user", "content": "hi"}],
+            model = "openai/gpt-5.5",
+            temperature = 0.7,
+            top_p = 0.95,
+            max_tokens = 16,
+            enabled_tools = ["web_search"],
+            tool_choice = {
+                "type": "function",
+                "function": {"name": "lookup_record"},
+            },
+        ):
+            pass
+        await client.close()
+
+    _drive(run())
+    body = captured["body"] or {}
+    assert body.get("plugins") in (None, []), body
+
+
+def test_kimi_forced_function_tool_choice_skips_web_search_helper(monkeypatch):
+    """Round 22: forced-function tool_choice plus enabled_tools=
+    ["web_search"] on Kimi must NOT route into `_stream_kimi_web_search`.
+    Caller pinned a user function; hosted $web_search should be
+    suppressed for the same privacy/billing reason."""
+    routed_to_helper = {"called": False}
+
+    async def fake_helper(self, *args, **kwargs):  # noqa: ARG001
+        routed_to_helper["called"] = True
+        if False:
+            yield ""  # pragma: no cover
+
+    monkeypatch.setattr(
+        ExternalProviderClient,
+        "_stream_kimi_web_search",
+        fake_helper,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content = b"data: [DONE]\n\n",
+            headers = {"content-type": "text/event-stream"},
+        )
+
+    _mock_http(monkeypatch, handler)
+
+    async def run():
+        client = ExternalProviderClient(
+            provider_type = "kimi",
+            base_url = "https://api.moonshot.ai/v1",
+            api_key = "sk-kimi-test",
+        )
+        async for _ in client.stream_chat_completion(
+            messages = [{"role": "user", "content": "hi"}],
+            model = "kimi-k2.6",
+            temperature = 0.7,
+            top_p = 0.95,
+            max_tokens = 16,
+            enabled_tools = ["web_search"],
+            tool_choice = {
+                "type": "function",
+                "function": {"name": "lookup_record"},
+            },
+        ):
+            pass
+        await client.close()
+
+    _drive(run())
+    assert not routed_to_helper["called"]
+
+
+def test_openai_responses_forced_function_tool_choice_drops_hosted_tools(monkeypatch):
+    """Round 23: forced-function tool_choice on the OpenAI Responses
+    path must suppress hosted builtins (web_search, shell,
+    image_generation) the same way it does for Gemini / Anthropic /
+    OpenRouter / Kimi. User-defined function tools still flow through
+    so the pinned function can resolve."""
+    captured: dict = {"body": None}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content.decode("utf-8"))
+        return httpx.Response(
+            200,
+            content = b"event: response.completed\ndata: {}\n\n",
+            headers = {"content-type": "text/event-stream"},
+        )
+
+    _mock_http(monkeypatch, handler)
+
+    async def run():
+        client = ExternalProviderClient(
+            provider_type = "openai",
+            base_url = "https://api.openai.com/v1",
+            api_key = "sk-openai-test",
+        )
+        async for _ in client.stream_chat_completion(
+            messages = [{"role": "user", "content": "hi"}],
+            model = "gpt-5",
+            temperature = 0.7,
+            top_p = 0.95,
+            max_tokens = 16,
+            enabled_tools = ["web_search", "code_execution", "image_generation"],
+            tools = [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_record",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                },
+            ],
+            tool_choice = {
+                "type": "function",
+                "function": {"name": "lookup_record"},
+            },
+        ):
+            pass
+        await client.close()
+
+    _drive(run())
+    body = captured["body"] or {}
+    tools = body.get("tools") or []
+    hosted_types = {"web_search", "shell", "image_generation"}
+    hosted_seen = {t.get("type") for t in tools if isinstance(t, dict)}
+    assert not (hosted_seen & hosted_types), body
+    # The user function declaration must still be present so the pin
+    # has something to target.
+    user_function_seen = any(
+        isinstance(t, dict) and t.get("type") == "function" for t in tools
+    )
+    assert user_function_seen, body
+    # And the forced-function tool_choice must be forwarded in Responses
+    # shape: `{type:"function", name:"..."}`.
+    tc = body.get("tool_choice")
+    assert isinstance(tc, dict) and tc.get("type") == "function", body
+    assert tc.get("name") == "lookup_record", body
+
+
+def test_strip_provider_synthetic_tool_history_drops_text_only_extra_content():
+    """Round 24: a plain text Gemini reply (no tool_calls) carrying
+    `extra_content.google.thought_signature` must still have that
+    metadata stripped before being forwarded to a local llama-server
+    backend. Without this, switching a Gemini thread mid-stream to a
+    local GGUF model leaks Gemini-only fields to llama-server."""
+    from routes.inference import _strip_provider_synthetic_tool_history
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "Hello!",
+            "extra_content": {"google": {"thought_signature": "SIG_ABC"}},
+        },
+        {"role": "user", "content": "now in pirate voice"},
+    ]
+    out = _strip_provider_synthetic_tool_history(messages)
+    # Same three turns, but the assistant's `extra_content` is gone.
+    assert [m["role"] for m in out] == ["user", "assistant", "user"]
+    assistant = out[1]
+    assert "extra_content" not in assistant, assistant
+    assert assistant["content"] == "Hello!"
+
+
+def test_validate_and_resolve_host_blocks_shared_address_space():
+    """Round 24 SSRF P1: 100.64.0.0/10 carrier-grade NAT addresses are
+    `is_private=False` AND `is_global=False` per Python's ipaddress
+    docs. The previous denylist (is_private/loopback/link_local/etc.)
+    missed them. Adding `not ip.is_global` as the primary gate covers
+    all non-public ranges, current and future."""
+    import socket as _socket
+    from core.inference import tools as _tools
+
+    orig_getaddrinfo = _socket.getaddrinfo
+
+    def fake_getaddrinfo(hostname, port, *args, **kwargs):
+        if hostname == "shared.example":
+            return [
+                (
+                    _socket.AF_INET,
+                    _socket.SOCK_STREAM,
+                    0,
+                    "",
+                    ("100.64.0.1", port),
+                ),
+            ]
+        return orig_getaddrinfo(hostname, port, *args, **kwargs)
+
+    _socket.getaddrinfo = fake_getaddrinfo
+    try:
+        ok, reason, _ip = _tools._validate_and_resolve_host("shared.example", 443)
+    finally:
+        _socket.getaddrinfo = orig_getaddrinfo
+    assert ok is False, (ok, reason)
+    assert "non-public" in reason.lower() or "100.64.0.1" in reason
+
+
+def test_gemini_custom_oai_compat_base_skips_native_allowlist():
+    """Round 24: a custom Gemini OAI-compatible base (LiteLLM/proxy)
+    must NOT have its model list filtered through the native Gemini
+    allowlist regex. A LiteLLM gateway returning
+    `["google/gemini-2.5-flash", "my-team/gemini", "gemini-2.5-flash"]`
+    should be passed through; the native filter would strip the
+    prefixed IDs even though the chat dispatch routes them via the
+    OpenAI-compatible client."""
+    import asyncio as _asyncio
+
+    from routes import providers as _providers
+    from routes.providers import (
+        ProviderModelsRequest,
+        list_provider_models,
+    )
+
+    captured: dict = {"base": None}
+
+    class _FakeClient:
+        def __init__(self, *, base_url, **kwargs):
+            captured["base"] = base_url
+
+        async def list_models(self):
+            return [
+                {"id": "google/gemini-2.5-flash"},
+                {"id": "my-team/gemini"},
+                {"id": "gemini-2.5-flash"},
+            ]
+
+        async def close(self):
+            return None
+
+    orig = _providers.ExternalProviderClient
+    _providers.ExternalProviderClient = _FakeClient
+    try:
+        req = ProviderModelsRequest(
+            provider_type = "gemini",
+            base_url = "https://litellm.example/v1",
+        )
+        result = _asyncio.run(list_provider_models(req, current_subject = "unsloth"))
+    finally:
+        _providers.ExternalProviderClient = orig
+    ids = {m.id for m in result}
+    # All three IDs survive — the native allowlist was bypassed.
+    assert "google/gemini-2.5-flash" in ids, ids
+    assert "my-team/gemini" in ids, ids
+    assert "gemini-2.5-flash" in ids, ids
+
+
+def test_strip_provider_synthetic_tool_history_drops_synthetic_only():
+    """Round 22: switching a thread from native Gemini (code_execution
+    / image_generation tool_cards in history) to a local GGUF backend
+    must strip the synthetic tool_calls + matching role=tool replies
+    before llama-server sees them. Real user-function tool_calls and
+    their matching tool replies must survive."""
+    from routes.inference import _strip_provider_synthetic_tool_history
+
+    messages = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": "let me run it",
+            "tool_calls": [
+                {
+                    "id": "synth_ce_1",
+                    "type": "function",
+                    "function": {
+                        "name": "code_execution",
+                        "arguments": json.dumps(
+                            {
+                                "_server_tool": True,
+                                "google": {"native_part": {"parts": []}},
+                            }
+                        ),
+                    },
+                    "extra_content": {"google": {"thought_signature": "abc"}},
+                },
+                {
+                    "id": "real_lookup",
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_user",
+                        "arguments": json.dumps({"id": 42}),
+                    },
+                },
+            ],
+            "extra_content": {"google": {"thought_signature": "msglevel"}},
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "synth_ce_1",
+            "content": "Gemini-only result text",
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "real_lookup",
+            "content": '{"name": "alice"}',
+        },
+    ]
+    out = _strip_provider_synthetic_tool_history(messages)
+    assistant = next(m for m in out if m.get("role") == "assistant")
+    tcs = assistant["tool_calls"]
+    assert len(tcs) == 1, tcs
+    assert tcs[0]["id"] == "real_lookup"
+    assert "extra_content" not in tcs[0]
+    assert "extra_content" not in assistant
+    tool_msgs = [m for m in out if m.get("role") == "tool"]
+    assert len(tool_msgs) == 1
+    assert tool_msgs[0]["tool_call_id"] == "real_lookup"
+
+
+def test_strip_provider_synthetic_tool_history_drops_empty_assistant():
+    """If every tool_call was synthetic and the assistant turn had no
+    content, the entire turn must be dropped (llama-server rejects
+    empty assistant messages with no tool_calls)."""
+    from routes.inference import _strip_provider_synthetic_tool_history
+
+    messages = [
+        {"role": "user", "content": "draw a sloth"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "synth_imggen",
+                    "type": "function",
+                    "function": {
+                        "name": "image_generation",
+                        "arguments": json.dumps(
+                            {
+                                "google": {
+                                    "native_part": {
+                                        "parts": [
+                                            {
+                                                "inlineData": {
+                                                    "mimeType": "image/png",
+                                                    "data": "Zm9v",
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        ),
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "synth_imggen", "content": "(image)"},
+        {"role": "user", "content": "now try in pirate voice"},
+    ]
+    out = _strip_provider_synthetic_tool_history(messages)
+    roles = [m.get("role") for m in out]
+    # The synthetic assistant + its tool reply are both gone; only the
+    # two user turns survive.
+    assert roles == ["user", "user"], out
+
+
+def test_openrouter_no_synthetic_web_search_event_on_forced_function_tool_choice(
+    monkeypatch,
+):
+    """Round 22 sibling of the round-20 `tool_choice='none'` test: when
+    the caller forces a specific function via `tool_choice={"type":
+    "function", ...}` AND passes `enabled_tools=["web_search"]`, the
+    OpenRouter path must NOT synthesize a fake `web_search` tool card.
+    The plugin was not attached upstream so the UI must not see a
+    server-tool card."""
+    captured_events: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            content = (
+                b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+                b"data: [DONE]\n\n"
+            ),
+            headers = {"content-type": "text/event-stream"},
+        )
+
+    _mock_http(monkeypatch, handler)
+
+    async def run():
+        client = ExternalProviderClient(
+            provider_type = "openrouter",
+            base_url = "https://openrouter.ai/api/v1",
+            api_key = "sk-or-test",
+        )
+        async for line in client.stream_chat_completion(
+            messages = [{"role": "user", "content": "hi"}],
+            model = "openai/gpt-5.5",
+            temperature = 0.7,
+            top_p = 0.95,
+            max_tokens = 16,
+            enabled_tools = ["web_search"],
+            tool_choice = {
+                "type": "function",
+                "function": {"name": "lookup_record"},
+            },
+        ):
+            payload = line.strip().removeprefix("data: ")
+            if payload and payload != "[DONE]":
+                try:
+                    captured_events.append(json.loads(payload))
+                except Exception:
+                    pass
+        await client.close()
+
+    _drive(run())
+    for evt in captured_events:
+        for choice in evt.get("choices") or []:
+            delta = choice.get("delta") or {}
+            extra = delta.get("extra_content") or {}
+            tool_event = extra.get("toolEvent") if isinstance(extra, dict) else None
+            if isinstance(tool_event, dict):
+                assert tool_event.get("tool_name") != "web_search", evt

@@ -753,9 +753,20 @@ class ExternalProviderClient:
         # disabling thinking while $web_search is active. Route to a
         # dedicated helper so the default OAI-compat path stays single-pass.
         #   https://platform.kimi.ai/docs/guide/use-web-search
+        # Forced-function tool_choice must also suppress Kimi's hosted
+        # $web_search the same way it does for Gemini/Anthropic/OpenRouter:
+        # an explicit user-function pin should not still trigger a
+        # provider-side search round-trip.
+        _kimi_tool_choice_forced_function = (
+            isinstance(tool_choice, dict)
+            and tool_choice.get("type") == "function"
+            and isinstance(tool_choice.get("function"), dict)
+            and bool(tool_choice["function"].get("name"))
+        )
         if (
             self.provider_type == "kimi"
             and not tool_choice_disabled
+            and not _kimi_tool_choice_forced_function
             and enabled_tools
             and "web_search" in enabled_tools
         ):
@@ -857,8 +868,20 @@ class ExternalProviderClient:
             # `plugins: [{id: "web"}]` works everywhere, no model id
             # rewrite needed, and idempotent if some future call site
             # adds the entry first.
+            # Forced-function tool_choice must also suppress the hosted
+            # web plugin: an explicit user-function pin like
+            # tool_choice={"type":"function","function":{"name":"lookup"}}
+            # should not still trigger OpenRouter's server-side web
+            # search, same as the Gemini and Anthropic gates above.
+            _or_tool_choice_forced_function = (
+                isinstance(tool_choice, dict)
+                and tool_choice.get("type") == "function"
+                and isinstance(tool_choice.get("function"), dict)
+                and bool(tool_choice["function"].get("name"))
+            )
             if (
                 not tool_choice_disabled
+                and not _or_tool_choice_forced_function
                 and enabled_tools
                 and "web_search" in enabled_tools
             ):
@@ -947,6 +970,7 @@ class ExternalProviderClient:
                 web_search_active = (
                     self.provider_type == "openrouter"
                     and not tool_choice_disabled
+                    and not _or_tool_choice_forced_function
                     and bool(enabled_tools)
                     and "web_search" in (enabled_tools or [])
                 )
@@ -1993,6 +2017,22 @@ class ExternalProviderClient:
         _anthropic_tool_choice_disabled = (
             isinstance(tool_choice, str) and tool_choice.strip().lower() == "none"
         )
+        # Forced-function tool_choice (caller pinned a specific user
+        # function) must also suppress hosted server-side tools, same as
+        # the Gemini gate. Otherwise `tool_choice={"type":"function",
+        # "function":{"name":"lookup"}}` plus `enabled_tools=["web_search"]`
+        # still lets Anthropic run web_search server-side, billing the
+        # caller and violating the explicit function pin.
+        _anthropic_tool_choice_forced_function = (
+            isinstance(tool_choice, dict)
+            and tool_choice.get("type") == "function"
+            and isinstance(tool_choice.get("function"), dict)
+            and bool(tool_choice["function"].get("name"))
+        )
+        _anthropic_hosted_builtins_allowed = (
+            not _anthropic_tool_choice_disabled
+            and not _anthropic_tool_choice_forced_function
+        )
 
         # Anthropic server-side web_search — see
         #   https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool
@@ -2007,7 +2047,7 @@ class ExternalProviderClient:
         # that into our local _toolEvent shape so the chat UI renders
         # web_search exactly like OpenAI's path.
         if (
-            not _anthropic_tool_choice_disabled
+            _anthropic_hosted_builtins_allowed
             and enabled_tools
             and "web_search" in enabled_tools
         ):
@@ -2035,7 +2075,7 @@ class ExternalProviderClient:
         # because the frontend already paints source pills from the
         # generic tool_end payload.
         web_fetch_enabled = bool(
-            not _anthropic_tool_choice_disabled
+            _anthropic_hosted_builtins_allowed
             and enabled_tools
             and "web_fetch" in enabled_tools
         )
@@ -2068,7 +2108,7 @@ class ExternalProviderClient:
         # content blocks and generated-file retrieval via the Files
         # API) are a deliberate follow-up.
         code_execution_enabled = bool(
-            not _anthropic_tool_choice_disabled
+            _anthropic_hosted_builtins_allowed
             and enabled_tools
             and "code_execution" in enabled_tools
         )
@@ -3442,6 +3482,38 @@ class ExternalProviderClient:
                         if isinstance(_ge, dict):
                             _google_extra = _ge
                             _native_part = _ge.get("native_part")
+
+                    # Synthetic provider-side server-tool cards
+                    # (web_search, web_fetch, etc.) tagged with
+                    # `args._server_tool` or `args.google.native_part`
+                    # must NOT fall through to the generic functionCall
+                    # path -- those names are not declared user
+                    # functions on the Gemini side, and emitting them
+                    # turns the request into a fake functionCall the
+                    # model never wrote. The native code_execution /
+                    # image_generation cards have replayable native
+                    # parts and continue into the branch below; the
+                    # other server-builtin names (web_search/web_fetch)
+                    # are dropped entirely from outbound Gemini history.
+                    _name_lc = fn_name.lower() if isinstance(fn_name, str) else ""
+                    _is_synthetic_server_builtin = (
+                        _name_lc
+                        in ("web_search", "web_fetch", "code_execution", "image_generation")
+                        and isinstance(args, dict)
+                        and (
+                            args.get("_server_tool") is True
+                            or isinstance(
+                                (args.get("google") or {}).get("native_part"), dict
+                            )
+                        )
+                    )
+                    if _is_synthetic_server_builtin and not (
+                        _name_lc in ("code_execution", "image_generation")
+                        and isinstance(_native_part, dict)
+                    ):
+                        # No replayable Gemini native part -- skip
+                        # entirely rather than send a fake functionCall.
+                        continue
                     if fn_name in ("code_execution", "image_generation") and isinstance(
                         _native_part, dict
                     ):
@@ -3865,7 +3937,31 @@ class ExternalProviderClient:
             }
         )
 
-        def _sanitize_gemini_schema(node: Any) -> Any:
+        def _resolve_local_schema_ref(
+            root: Optional[dict[str, Any]], ref: str
+        ) -> Optional[Any]:
+            # Walk a `#/foo/bar` JSON pointer against the schema root.
+            # Returns None if the pointer doesn't resolve to a dict, so
+            # the caller can fall back to the unresolved node.
+            if not isinstance(root, dict) or not isinstance(ref, str):
+                return None
+            if not ref.startswith("#/"):
+                return None
+            node: Any = root
+            for raw_part in ref[2:].split("/"):
+                if not raw_part:
+                    continue
+                part = raw_part.replace("~1", "/").replace("~0", "~")
+                if not isinstance(node, dict) or part not in node:
+                    return None
+                node = node[part]
+            return node
+
+        def _sanitize_gemini_schema(
+            node: Any,
+            root: Optional[dict[str, Any]] = None,
+            _seen_refs: Optional[frozenset[str]] = None,
+        ) -> Any:
             # Recursively filter to Gemini's OpenAPI 3.0 subset. At a
             # Schema-keyword dict layer we drop keys not in the
             # allowlist; under `properties` the keys are user-defined
@@ -3875,7 +3971,32 @@ class ExternalProviderClient:
             # `"type": ["string", "null"]` form for nullable fields;
             # Gemini's OpenAPI Schema uses `"type": "string"` plus
             # `"nullable": true`. Translate that here.
+            if root is None and isinstance(node, dict):
+                root = node
+            if _seen_refs is None:
+                _seen_refs = frozenset()
             if isinstance(node, dict):
+                # Pydantic / OpenAI strict tools commonly hoist nested
+                # object schemas into `$defs` and reference them via
+                # `{"$ref": "#/$defs/Address"}`. Gemini's OpenAPI subset
+                # has no $ref and drops anything not in the allowlist,
+                # so the referenced shape would vanish if we didn't
+                # inline it here. Recurse into the resolved target with
+                # local siblings overriding the reference (normal JSON
+                # Schema composition), guarding against ref cycles.
+                _ref = node.get("$ref")
+                if isinstance(_ref, str):
+                    if _ref in _seen_refs:
+                        return {}
+                    _target = _resolve_local_schema_ref(root, _ref)
+                    if isinstance(_target, dict):
+                        _merged = {
+                            **_target,
+                            **{k: v for k, v in node.items() if k != "$ref"},
+                        }
+                        return _sanitize_gemini_schema(
+                            _merged, root, _seen_refs | {_ref}
+                        )
                 cleaned: dict[str, Any] = {}
                 _nullable_from_union = False
                 _flattened_type: Optional[str] = None
@@ -3902,11 +4023,13 @@ class ExternalProviderClient:
                         continue
                     if _k == "properties" and isinstance(_v, dict):
                         cleaned[_k] = {
-                            _name: _sanitize_gemini_schema(_subschema)
+                            _name: _sanitize_gemini_schema(
+                                _subschema, root, _seen_refs
+                            )
                             for _name, _subschema in _v.items()
                         }
                     elif _k == "items":
-                        cleaned[_k] = _sanitize_gemini_schema(_v)
+                        cleaned[_k] = _sanitize_gemini_schema(_v, root, _seen_refs)
                     elif _k == "anyOf" and isinstance(_v, list):
                         # Optional[X] / Union[A, B, None]: Pydantic emits
                         # `anyOf: [..., {"type":"null"}]`. Gemini's
@@ -3929,14 +4052,16 @@ class ExternalProviderClient:
                             )
                         ]
                         if len(_non_null_entries) == 1 and _saw_null:
-                            _inner = _sanitize_gemini_schema(_non_null_entries[0])
+                            _inner = _sanitize_gemini_schema(
+                                _non_null_entries[0], root, _seen_refs
+                            )
                             if isinstance(_inner, dict):
                                 for _ik, _iv in _inner.items():
                                     cleaned.setdefault(_ik, _iv)
                                 cleaned.setdefault("nullable", True)
                         else:
                             cleaned[_k] = [
-                                _sanitize_gemini_schema(_entry)
+                                _sanitize_gemini_schema(_entry, root, _seen_refs)
                                 for _entry in _non_null_entries
                             ]
                             if _saw_null:
@@ -3948,7 +4073,8 @@ class ExternalProviderClient:
                         cleaned[_k] = _v
                 if _union_any_of is not None and "anyOf" not in cleaned:
                     cleaned["anyOf"] = [
-                        _sanitize_gemini_schema(_s) for _s in _union_any_of
+                        _sanitize_gemini_schema(_s, root, _seen_refs)
+                        for _s in _union_any_of
                     ]
                 elif _flattened_type is not None:
                     cleaned["type"] = _flattened_type
@@ -5228,14 +5354,35 @@ class ExternalProviderClient:
                 responses_tool_choice = {"type": "function", "name": _name}
 
         _responses_tool_choice_none = _responses_tc_string == "none"
+        # Forced-function tool_choice must also suppress hosted Responses
+        # builtins (web_search, shell, image_generation) on this path,
+        # matching the Gemini / Anthropic / OpenRouter / Kimi gates
+        # applied elsewhere. The caller pinned a specific user function,
+        # so OpenAI must not also fire server-side search / code exec /
+        # image gen for privacy + billing reasons. User-defined function
+        # declarations stay available so the pinned function can resolve.
+        _responses_tool_choice_forced_function = (
+            isinstance(tool_choice, dict)
+            and tool_choice.get("type") == "function"
+            and isinstance(tool_choice.get("function"), dict)
+            and bool(tool_choice["function"].get("name"))
+        )
+        _responses_hosted_builtins_allowed = (
+            not _responses_tool_choice_none
+            and not _responses_tool_choice_forced_function
+        )
 
         if (
             enabled_tools or responses_user_function_tools
         ) and not _responses_tool_choice_none:
             tools_array: list[dict[str, Any]] = list(responses_user_function_tools)
-            if enabled_tools and "web_search" in enabled_tools:
+            if (
+                _responses_hosted_builtins_allowed
+                and enabled_tools
+                and "web_search" in enabled_tools
+            ):
                 tools_array.append({"type": "web_search"})
-            if code_execution_enabled_openai:
+            if _responses_hosted_builtins_allowed and code_execution_enabled_openai:
                 # `container_auto` lets OpenAI auto-create a fresh
                 # container per request; we capture the resulting
                 # container_id off the SSE stream and the chat-adapter
@@ -5257,7 +5404,7 @@ class ExternalProviderClient:
                 else:
                     shell_env = {"type": "container_auto"}
                 tools_array.append({"type": "shell", "environment": shell_env})
-            if image_generation_enabled_openai:
+            if _responses_hosted_builtins_allowed and image_generation_enabled_openai:
                 tools_array.append({"type": "image_generation"})
             if tools_array:
                 body["tools"] = tools_array
@@ -5282,9 +5429,13 @@ class ExternalProviderClient:
                 tools_array_attempt: list[dict[str, Any]] = list(
                     responses_user_function_tools
                 )
-                if enabled_tools and "web_search" in enabled_tools:
+                if (
+                    _responses_hosted_builtins_allowed
+                    and enabled_tools
+                    and "web_search" in enabled_tools
+                ):
                     tools_array_attempt.append({"type": "web_search"})
-                if code_execution_enabled_openai:
+                if _responses_hosted_builtins_allowed and code_execution_enabled_openai:
                     if container_id_for_this_attempt:
                         env_attempt: dict[str, Any] = {
                             "type": "container_reference",
@@ -5295,7 +5446,10 @@ class ExternalProviderClient:
                     tools_array_attempt.append(
                         {"type": "shell", "environment": env_attempt}
                     )
-                if image_generation_enabled_openai:
+                if (
+                    _responses_hosted_builtins_allowed
+                    and image_generation_enabled_openai
+                ):
                     tools_array_attempt.append({"type": "image_generation"})
                 if tools_array_attempt:
                     attempt_body["tools"] = tools_array_attempt
