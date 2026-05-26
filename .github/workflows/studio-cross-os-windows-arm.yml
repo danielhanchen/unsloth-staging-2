@@ -1,0 +1,176 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Cross-OS staging validation: Unsloth Studio on Windows ARM64.
+# `windows-11-arm` is the only GitHub-hosted Windows ARM runner.
+# PyTorch's Windows ARM64 wheels are not generally available, so this
+# uses --no-torch (the same flag every existing Windows smoke job uses
+# anyway). The Get-TauriDiagArch path in install.ps1 specifically
+# normalises PROCESSOR_ARCHITECTURE=arm64; that branch is what we are
+# trying to exercise here.
+
+name: Studio cross-OS smoke (Windows ARM)
+
+on:
+  push:
+    branches: [studio-cross-os-validation]
+  pull_request:
+    branches: [main]
+    paths:
+      - 'install.ps1'
+      - 'studio/**'
+      - 'unsloth_cli/**'
+      - 'pyproject.toml'
+      - '.github/workflows/studio-cross-os-windows-arm.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: install + boot Studio (Windows ARM64)
+    runs-on: windows-11-arm
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    env:
+      STUDIO_PORT: '18904'
+      # Force UTF-8 stdio (Windows defaults to cp1252; hf prints a
+      # "✓" checkmark mid-install otherwise). Same pattern as
+      # studio-windows-api-smoke.yml.
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Record platform fingerprint
+        shell: pwsh
+        run: |
+          $env:PROCESSOR_ARCHITECTURE
+          [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          [System.Runtime.InteropServices.RuntimeInformation]::OSDescription
+          python -c "import platform, sys; print('python', sys.version); print('machine', platform.machine())"
+
+      - name: Pre-install Windows tweaks (npm 11 + Defender exclusions)
+        shell: pwsh
+        # Same rationale as studio-windows-api-smoke.yml. Newer npm
+        # avoids a 35 s winget Node reinstall in setup.ps1, and
+        # Defender real-time scan dominates the frontend npm install
+        # step on Windows. Add-MpPreference accepts paths that do not
+        # yet exist; do NOT pre-create studio/frontend/dist (see
+        # studio-windows-api-smoke.yml for the staleness-check trap).
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          try {
+            npm install -g 'npm@^11' 2>&1 | Out-Host
+          } catch {
+            Write-Host "npm upgrade skipped: $($_.Exception.Message)"
+          }
+          foreach ($p in @(
+            "$env:USERPROFILE\.unsloth",
+            "$env:USERPROFILE\AppData\Local\uv",
+            "$env:GITHUB_WORKSPACE\studio\frontend\node_modules",
+            "$env:GITHUB_WORKSPACE\studio\frontend\dist"
+          )) {
+            try {
+              Add-MpPreference -ExclusionPath $p -ErrorAction Stop
+              Write-Host "Defender exclusion added: $p"
+            } catch {
+              Write-Host "Defender exclusion skipped ($($_.Exception.Message)): $p"
+            }
+          }
+
+      - name: Install Studio (--local, --no-torch)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          # *>&1 captures Write-Host (Information stream); plain 2>&1
+          # does not. setup.ps1 emits "prebuilt installed and
+          # validated" via Write-Host and we grep for it below.
+          & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
+
+      - name: Assert install.ps1 emitted arm64 in the Tauri DIAG line
+        # install.ps1's Write-TauriDiag emits
+        #   [TAURI:DIAG] diag_schema=1 platform=windows arch=arm64 ...
+        # If the arch field comes through as x86_64 we've fallen
+        # off the arm64 normaliser in Get-TauriDiagArch.
+        run: |
+          if ! grep -Eq "platform=windows .*arch=arm64" logs/install.log; then
+            echo "::error::install.ps1 did not normalise PROCESSOR_ARCHITECTURE to arm64 in the Tauri DIAG line."
+            grep -Ei "TAURI:DIAG|arch=" logs/install.log | tail -40
+            exit 1
+          fi
+          if grep -q "falling back to source build" logs/install.log; then
+            echo "::error::install.ps1 fell back to source-build llama.cpp on Windows ARM."
+            grep -E "llama-prebuilt|llama.cpp|prebuilt" logs/install.log | tail -60
+            exit 1
+          fi
+          echo "install.ps1 Tauri DIAG line reports arch=arm64"
+
+      - name: Add Studio shim to GITHUB_PATH
+        # install.ps1's User-PATH update does not propagate to the
+        # currently-running Git Bash session; export the shim dir so
+        # the next `unsloth ...` invocation can find it.
+        run: |
+          SHIM_DIR=~/.unsloth/studio/bin
+          if [ ! -f "$SHIM_DIR/unsloth.exe" ]; then
+            echo "::error::unsloth.exe shim not found at $SHIM_DIR"
+            ls -la ~/.unsloth/studio/ || true
+            exit 1
+          fi
+          cygpath -w "$SHIM_DIR" >> "$GITHUB_PATH"
+
+      - name: Boot Studio (API-only) + /api/health probe
+        run: |
+          mkdir -p logs
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" \
+            > logs/studio.log 2>&1 &
+          PID=$!
+          ok=0
+          for i in $(seq 1 240); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json 2>/dev/null; then
+              if jq -e '.status == "healthy"' /tmp/health.json >/dev/null 2>&1; then
+                ok=1
+                break
+              fi
+            fi
+            sleep 1
+          done
+          kill "$PID" 2>/dev/null || true
+          sleep 2
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Studio did not reach healthy /api/health within 240s on Windows ARM64."
+            echo "----- studio.log (tail 200) -----"
+            tail -200 logs/studio.log || true
+            exit 1
+          fi
+          echo "Studio /api/health healthy on Windows ARM64"
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: studio-cross-os-windows-arm-log
+          path: |
+            logs/install.log
+            logs/studio.log
+          retention-days: 7
