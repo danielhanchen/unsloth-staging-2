@@ -419,6 +419,38 @@ async def _await_cancel_then_close(cancel_event, resp) -> None:
         return
 
 
+async def _await_disconnect_then_close(request, resp, cancel_event) -> None:
+    """Watch ``request.is_disconnected()`` and close ``resp`` when the client
+    disconnects (tab closed, navigation away, fetch abort).  This prevents
+    llama-server from continuing to decode after the client is gone — a
+    particularly expensive leak on Windows where Keep-Alive + WDDM makes
+    llama-server unaware the downstream socket has closed (#5692).
+
+    100ms cadence is a trade-off: fast enough that the GPU waste after a
+    client disconnect is ≤100ms of decode, slow enough to avoid flooding
+    the event loop.  Unlike the cancel-event watcher this polls the
+    Starlette Request directly, so it covers client-initiated aborts that
+    never reach the /cancel POST path (proxied fetches, Colab, mobile
+    tab-close, etc.).
+
+    Sets ``cancel_event`` before closing ``resp`` so the streamer's
+    ``except (RemoteProtocolError, ReadError, CloseError)`` clause -- which
+    only suppresses the re-raise when ``cancel_event.is_set()`` -- treats
+    the watcher-driven close as a normal client cancellation rather than
+    an upstream error.  Mirrors the in-loop fallback path.
+    """
+    try:
+        while not await request.is_disconnected():
+            await asyncio.sleep(0.1)
+        cancel_event.set()
+        try:
+            await resp.aclose()
+        except Exception as e:
+            logger.debug("Failed to close response on disconnect: %s", e)
+    except asyncio.CancelledError:
+        return
+
+
 # Appended to tool-use nudge to discourage plan-without-action
 _TOOL_ACTION_NUDGE = (
     " IMPORTANT: Always call tools directly -- never write code yourself."
@@ -427,9 +459,17 @@ _TOOL_ACTION_NUDGE = (
     " Do NOT output code blocks -- use the python tool instead."
 )
 
-# Regex for stripping leaked tool-call XML from assistant messages/stream
+# Strip tool-call XML the speculative buffer in core/inference/llama_cpp.py
+# split across the visible/DRAIN boundary. Four leak shapes:
+#   1. well-formed `<tool_call>...</tool_call>` / `<function=...>...</function>`
+#   2. orphan opening to EOF (close was DRAINED)
+#   3. bare orphan close (open was DRAINED)
+#   4. tail-only `</parameter>` (outer close truncated by EOS); anchored to
+#      `\Z` so mid-text `<parameter>` in user code samples survives.
 _TOOL_XML_RE = _re.compile(
-    r"<tool_call>.*?</tool_call>|<function=\w+>.*?</function>",
+    r"<(?:tool_call|function=\w+)>.*?(?:</(?:tool_call|function)>|\Z)"
+    r"|</(?:tool_call|function)>"
+    r"|</parameter>\s*\Z",
     _re.DOTALL,
 )
 logger = get_logger(__name__)
@@ -1313,7 +1353,7 @@ async def generate_stream(
         media_type = "text/event-stream",
         headers = {
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
+            "Connection": "close",
         },
     )
 
@@ -2246,7 +2286,7 @@ async def openai_chat_completions(
                     media_type = "text/event-stream",
                     headers = {
                         "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
+                        "Connection": "close",
                         "X-Accel-Buffering": "no",
                     },
                 )
@@ -2630,7 +2670,7 @@ async def openai_chat_completions(
                 media_type = "text/event-stream",
                 headers = {
                     "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
+                    "Connection": "close",
                     "X-Accel-Buffering": "no",
                 },
             )
@@ -2777,7 +2817,7 @@ async def openai_chat_completions(
                 media_type = "text/event-stream",
                 headers = {
                     "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
+                    "Connection": "close",
                     "X-Accel-Buffering": "no",
                 },
             )
@@ -3086,7 +3126,7 @@ async def openai_chat_completions(
                 media_type = "text/event-stream",
                 headers = {
                     "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
+                    "Connection": "close",
                     "X-Accel-Buffering": "no",
                 },
             )
@@ -3262,7 +3302,7 @@ async def openai_chat_completions(
             media_type = "text/event-stream",
             headers = {
                 "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
+                "Connection": "close",
                 "X-Accel-Buffering": "no",
             },
         )
@@ -3466,7 +3506,9 @@ async def openai_completions(
             resp = None
             bytes_iter = None
             try:
-                req = client.build_request("POST", target_url, json = body)
+                req = client.build_request(
+                    "POST", target_url, json = body, headers = {"Connection": "close"}
+                )
                 resp = await client.send(req, stream = True)
                 bytes_iter = resp.aiter_bytes()
                 async for chunk in bytes_iter:
@@ -4020,7 +4062,9 @@ async def _responses_stream(
         resp = None
         lines_iter = None
         try:
-            req = client.build_request("POST", target_url, json = body)
+            req = client.build_request(
+                "POST", target_url, json = body, headers = {"Connection": "close"}
+            )
             try:
                 resp = await client.send(req, stream = True)
             except httpx.RequestError as e:
@@ -4246,7 +4290,7 @@ async def _responses_stream(
         media_type = "text/event-stream",
         headers = {
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
+            "Connection": "close",
             "X-Accel-Buffering": "no",
         },
     )
@@ -4729,7 +4773,7 @@ async def _anthropic_tool_stream(
         media_type = "text/event-stream",
         headers = {
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
+            "Connection": "close",
             "X-Accel-Buffering": "no",
         },
     )
@@ -4778,7 +4822,7 @@ async def _anthropic_plain_stream(
         media_type = "text/event-stream",
         headers = {
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
+            "Connection": "close",
             "X-Accel-Buffering": "no",
         },
     )
@@ -5021,16 +5065,22 @@ async def _anthropic_passthrough_stream(
         resp = None
         lines_iter = None
         cancel_watcher = None
+        disconnect_watcher = None
         try:
-            req = client.build_request("POST", target_url, json = body)
+            req = client.build_request(
+                "POST", target_url, json = body, headers = {"Connection": "close"}
+            )
             resp = await client.send(req, stream = True)
 
             # See _openai_passthrough_stream for rationale: aiter_lines()
             # blocks during llama-server prefill, so the in-loop cancel
             # check is unreachable until the first SSE chunk arrives.
-            # The watcher closes `resp` on cancel, raising in aiter_lines.
+            # Two background watchers: cancel POST + client disconnect.
             cancel_watcher = asyncio.create_task(
                 _await_cancel_then_close(cancel_event, resp)
+            )
+            disconnect_watcher = asyncio.create_task(
+                _await_disconnect_then_close(request, resp, cancel_event)
             )
             lines_iter = resp.aiter_lines()
             async for raw_line in lines_iter:
@@ -5062,6 +5112,12 @@ async def _anthropic_passthrough_stream(
                     await cancel_watcher
                 except (asyncio.CancelledError, Exception):
                     pass
+            if disconnect_watcher is not None:
+                disconnect_watcher.cancel()
+                try:
+                    await disconnect_watcher
+                except (asyncio.CancelledError, Exception):
+                    pass
             if lines_iter is not None:
                 try:
                     await lines_iter.aclose()
@@ -5086,7 +5142,7 @@ async def _anthropic_passthrough_stream(
         media_type = "text/event-stream",
         headers = {
             "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
+            "Connection": "close",
             "X-Accel-Buffering": "no",
         },
     )
@@ -5388,7 +5444,9 @@ async def _openai_passthrough_stream(
         )
         resp = None
         try:
-            req = client.build_request("POST", target_url, json = body)
+            req = client.build_request(
+                "POST", target_url, json = body, headers = {"Connection": "close"}
+            )
             resp = await client.send(req, stream = True)
         except httpx.RequestError as e:
             # llama-server subprocess crashed / still starting / unreachable.
@@ -5437,12 +5495,18 @@ async def _openai_passthrough_stream(
             # During llama-server prefill, `aiter_lines()` blocks until the
             # first SSE chunk arrives. The in-loop `cancel_event` check
             # cannot fire until then, which is the exact proxy/Colab
-            # scenario the cancel POST is meant to recover from. Run a
-            # tiny watcher that closes `resp` as soon as cancel fires,
-            # unblocking the iterator with a RemoteProtocolError caught
-            # in the except clause below.
+            # scenario the cancel POST is meant to recover from. Run two
+            # background watchers:
+            #   1. cancel watcher — closes `resp` when the cancel POST fires
+            #   2. disconnect watcher — closes `resp` when the client
+            #      disconnects (tab close, navigation, proxy abort).
+            # Either watcher closes `resp`, unblocking the iterator with a
+            # RemoteProtocolError caught in the except clause below.
             cancel_watcher = asyncio.create_task(
                 _await_cancel_then_close(cancel_event, resp)
+            )
+            disconnect_watcher = asyncio.create_task(
+                _await_disconnect_then_close(request, resp, cancel_event)
             )
             try:
                 lines_iter = resp.aiter_lines()
@@ -5482,6 +5546,11 @@ async def _openai_passthrough_stream(
                     await cancel_watcher
                 except (asyncio.CancelledError, Exception):
                     pass
+                disconnect_watcher.cancel()
+                try:
+                    await disconnect_watcher
+                except (asyncio.CancelledError, Exception):
+                    pass
                 if lines_iter is not None:
                     try:
                         await lines_iter.aclose()
@@ -5502,7 +5571,7 @@ async def _openai_passthrough_stream(
             media_type = "text/event-stream",
             headers = {
                 "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
+                "Connection": "close",
                 "X-Accel-Buffering": "no",
             },
         )

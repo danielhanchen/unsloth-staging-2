@@ -2964,18 +2964,27 @@ class LlamaCppBackend:
                     "--no-context-shift",
                 ]
 
+                _fully_gpu_offloaded = False
                 if use_fit:
                     cmd.extend(["--fit", "on"])
                 elif gpu_indices is not None:
                     # Model fits on selected GPU(s) -- offload all layers
                     cmd.extend(["-ngl", "-1"])
+                    _fully_gpu_offloaded = True
 
                 # -1 = llama.cpp auto-detect (physical cores). Pass explicitly so we
                 # do not inherit llama-server's internal default, which has historically
                 # varied (hardware concurrency incl. hyperthreads on some builds).
-                cmd.extend(
-                    ["--threads", str(n_threads if n_threads is not None else -1)]
-                )
+                # On Windows with full GPU offload (ngl -1), limit CPU threads to 2 so
+                # OpenMP's spin-wait pool doesn't burn 100% of logical cores polling
+                # for GPU completion — #5692.
+                import sys as _sys
+
+                if _sys.platform == "win32" and _fully_gpu_offloaded:
+                    _t = 2
+                else:
+                    _t = n_threads if n_threads is not None else -1
+                cmd.extend(["--threads", str(_t)])
 
                 # Always enable Jinja chat template rendering for proper template support
                 cmd.extend(["--jinja"])
@@ -3109,6 +3118,25 @@ class LlamaCppBackend:
                 else:
                     self._api_key = None
 
+                # On Windows with full GPU offload, llama-server's default
+                # KV-cache checkpoints write prompt-cache snapshots to system
+                # RAM over the WDDM driver / PCI-E bus.  Disable all checkpoint
+                # machinery to keep the cache entirely in VRAM.  Scoped to
+                # full-offload only: CPU-only / partial-offload Windows runs
+                # still benefit from prompt caching across turns.  #5692.
+                if _sys.platform == "win32" and _fully_gpu_offloaded:
+                    cmd.extend(
+                        [
+                            "--cache-ram",
+                            "0",
+                            "--ctx-checkpoints",
+                            "0",
+                            "--no-cache-prompt",
+                            "--checkpoint-every-n-tokens",
+                            "-1",
+                        ]
+                    )
+
                 # User-supplied pass-through args go last so llama.cpp's
                 # last-wins flag parsing lets the user override Studio's
                 # auto-set tier-2 flags (e.g. --cache-type-k, --spec-type).
@@ -3143,6 +3171,19 @@ class LlamaCppBackend:
                     )
                     existing_path = env.get("PATH", "")
                     env["PATH"] = ";".join(path_dirs) + ";" + existing_path
+
+                    # Windows OpenMP defaults to active spin-wait (Intel
+                    # compiler runtime), burning 100% CPU across all logical
+                    # cores even when the model is fully GPU-offloaded.
+                    # PASSIVE tells the runtime to yield instead of spinning;
+                    # limiting to 2 threads keeps the few remaining CPU-side
+                    # operations (tokenisation, copy) from monopolising the
+                    # scheduler.  Scoped to full-offload only so CPU-only and
+                    # partial-offload runs keep their default OpenMP parallelism.
+                    # #5692.
+                    if _fully_gpu_offloaded:
+                        env.setdefault("OMP_WAIT_POLICY", "PASSIVE")
+                        env.setdefault("OMP_NUM_THREADS", "2")
                 else:
                     # Linux: set LD_LIBRARY_PATH for shared libs next to the binary
                     # and CUDA runtime libs (libcudart, libcublas, etc.)
