@@ -75,8 +75,8 @@ jobs:
       - name: Assert install.sh used the Linux ARM64 llama.cpp prebuilt
         run: |
           # install.sh logs the prebuilt URL it downloads. On ARM64 it
-          # MUST be the *-bin-ubuntu-arm64-*.zip asset; if we see x64 or
-          # source-build fallback, the aarch64 branch is broken.
+          # MUST be the *-bin-ubuntu-arm64-*.tar.gz asset; if we see x64
+          # or source-build fallback, the aarch64 branch is broken.
           if grep -q "falling back to source build" logs/install.log; then
             echo "::error::install.sh fell back to source-build llama.cpp on Linux ARM64."
             grep -E "llama-prebuilt|llama.cpp|prebuilt" logs/install.log | tail -60
@@ -87,6 +87,17 @@ jobs:
             grep -E "llama-prebuilt|llama.cpp|prebuilt" logs/install.log | tail -60
             exit 1
           fi
+          INFO=$HOME/.unsloth/llama.cpp/UNSLOTH_PREBUILT_INFO.json
+          if [ ! -f "$INFO" ]; then
+            echo "::error::no UNSLOTH_PREBUILT_INFO.json at $INFO."
+            ls -la "$(dirname "$INFO")" || true
+            exit 1
+          fi
+          jq . "$INFO"
+          jq -e '.asset | test("bin-ubuntu-arm64\\.tar\\.gz$")' "$INFO" || {
+            echo "::error::UNSLOTH_PREBUILT_INFO.json asset is not a bin-ubuntu-arm64 tarball."
+            exit 1
+          }
           echo "install.sh prebuilt selection looks correct for aarch64"
 
       - name: Boot Studio (API-only) + /api/health probe
@@ -115,6 +126,54 @@ jobs:
           fi
           echo "Studio /api/health healthy on Linux ARM64"
 
+      - name: unsloth studio update --local should be a no-op
+        # Re-runs studio/setup.sh against the local repo. On a fresh
+        # install the llama.cpp prebuilt is already validated, so the
+        # update must take the "prebuilt up to date and validated" code
+        # path -- a source-build fallback or re-download here means the
+        # idempotency or the aarch64 prebuilt selection regressed.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          unsloth studio update --local 2>&1 | tee logs/update.log
+          if grep -q "falling back to source build" logs/update.log; then
+            echo "::error::unsloth studio update fell back to source-build llama.cpp on Linux ARM64."
+            grep -E "llama-prebuilt|llama.cpp" logs/update.log | tail -60
+            exit 1
+          fi
+          if ! grep -qE "prebuilt up to date and validated|prebuilt installed and validated" logs/update.log; then
+            echo "::error::no prebuilt up-to-date marker in update.log."
+            grep -E "llama-prebuilt|llama.cpp" logs/update.log | tail -60
+            exit 1
+          fi
+          echo "unsloth studio update --local took the prebuilt fast path on Linux ARM64"
+
+      - name: Re-boot Studio after update
+        run: |
+          mkdir -p logs
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" \
+            > logs/studio_post_update.log 2>&1 &
+          PID=$!
+          ok=0
+          for i in $(seq 1 120); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json 2>/dev/null; then
+              if jq -e '.status == "healthy"' /tmp/health.json >/dev/null 2>&1; then
+                ok=1
+                break
+              fi
+            fi
+            sleep 1
+          done
+          kill "$PID" 2>/dev/null || true
+          sleep 2
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Studio did not reach healthy /api/health within 120s after update on Linux ARM64."
+            tail -200 logs/studio_post_update.log || true
+            exit 1
+          fi
+          echo "Studio /api/health healthy after update on Linux ARM64"
+
       - name: Upload smoke logs
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
@@ -123,4 +182,6 @@ jobs:
           path: |
             logs/install.log
             logs/studio.log
+            logs/update.log
+            logs/studio_post_update.log
           retention-days: 7
