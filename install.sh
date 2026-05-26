@@ -1858,6 +1858,12 @@ if [ "$_MIGRATED" = true ]; then
     # Migrated env: force-reinstall unsloth+unsloth-zoo to ensure clean state
     # in the new venv location, while preserving existing torch/CUDA
     substep "upgrading unsloth in migrated environment..."
+    # Apple Silicon: MLX stack --no-deps before unsloth-zoo (see below).
+    if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
+        substep "installing MLX stack (mlx + mlx-lm + mlx-vlm, --no-deps)..."
+        run_install_cmd "install MLX stack" uv pip install --python "$_VENV_PY" \
+            --no-deps --upgrade mlx mlx-metal mlx-lm mlx-vlm
+    fi
     if [ "$SKIP_TORCH" = true ]; then
         # No-torch: install unsloth + unsloth-zoo with --no-deps (current
         # PyPI metadata still declares torch as a hard dep), then install
@@ -1865,7 +1871,12 @@ if [ "$_MIGRATED" = true ]; then
         # to prevent transitive torch resolution.
         run_install_cmd "install unsloth (migrated no-torch)" uv pip install --python "$_VENV_PY" --no-deps \
             --reinstall-package unsloth --reinstall-package unsloth-zoo \
-            "unsloth>=2026.5.6" unsloth-zoo
+            "unsloth>=2026.5.7" unsloth-zoo
+        # Resolve pydantic WITH deps so pip pins pydantic-core to the
+        # matching version (no-torch-runtime.txt below is --no-deps).
+        # All transitive deps are torch-free.
+        run_install_cmd "install pydantic (with deps for compatible core)" \
+            uv pip install --python "$_VENV_PY" pydantic
         _NO_TORCH_RT="$(_find_no_torch_runtime)"
         if [ -n "$_NO_TORCH_RT" ]; then
             run_install_cmd "install no-torch runtime deps" uv pip install --python "$_VENV_PY" --no-deps -r "$_NO_TORCH_RT"
@@ -1873,7 +1884,7 @@ if [ "$_MIGRATED" = true ]; then
     else
         run_install_cmd "install unsloth (migrated)" uv pip install --python "$_VENV_PY" \
             --reinstall-package unsloth --reinstall-package unsloth-zoo \
-            "unsloth>=2026.5.6" unsloth-zoo
+            "unsloth>=2026.5.7" unsloth-zoo
     fi
     if [ "$STUDIO_LOCAL_INSTALL" = true ]; then
         substep "overlaying local repo (editable)..."
@@ -2033,6 +2044,13 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
                 ;;
         esac
     fi
+    # Apple Silicon: install MLX stack --no-deps before unsloth so the resolver
+    # does not see mlx-vlm's transformers>=5.5.0 pin (would backtrack unsloth).
+    if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
+        substep "installing MLX stack (mlx + mlx-lm + mlx-vlm, --no-deps)..."
+        run_install_cmd "install MLX stack" uv pip install --python "$_VENV_PY" \
+            --no-deps --upgrade mlx mlx-metal mlx-lm mlx-vlm
+    fi
     # Fresh: Step 2 - install unsloth, preserving pre-installed torch
     tauri_log "STEP" "Installing Unsloth"
     substep "installing unsloth (this may take a few minutes)..."
@@ -2041,7 +2059,10 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
         # runtime deps (typer, safetensors, transformers, etc.) with --no-deps.
         run_install_cmd "install unsloth (no-torch)" uv pip install --python "$_VENV_PY" --no-deps \
             --upgrade-package unsloth --upgrade-package unsloth-zoo \
-            "unsloth>=2026.5.6" unsloth-zoo
+            "unsloth>=2026.5.7" unsloth-zoo
+        # Same pydantic-with-deps trick as the migrated branch.
+        run_install_cmd "install pydantic (with deps for compatible core)" \
+            uv pip install --python "$_VENV_PY" pydantic
         _NO_TORCH_RT="$(_find_no_torch_runtime)"
         if [ -n "$_NO_TORCH_RT" ]; then
             run_install_cmd "install no-torch runtime deps" uv pip install --python "$_VENV_PY" --no-deps -r "$_NO_TORCH_RT"
@@ -2056,7 +2077,7 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
         fi
     elif [ "$STUDIO_LOCAL_INSTALL" = true ]; then
         run_install_cmd "install unsloth (local)" uv pip install --python "$_VENV_PY" \
-            --upgrade-package unsloth "unsloth>=2026.5.6" unsloth-zoo
+            --upgrade-package unsloth "unsloth>=2026.5.7" unsloth-zoo
         substep "overlaying local repo (editable)..."
         run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
         substep "overlaying unsloth-zoo from git main..."
@@ -2088,7 +2109,7 @@ else
     tauri_log "STEP" "Installing Unsloth"
     substep "installing unsloth (this may take a few minutes)..."
     if [ "$STUDIO_LOCAL_INSTALL" = true ]; then
-        run_install_cmd "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" unsloth-zoo "unsloth>=2026.5.6" --torch-backend=auto
+        run_install_cmd "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" unsloth-zoo "unsloth>=2026.5.7" --torch-backend=auto
         substep "overlaying local repo (editable)..."
         run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
         substep "overlaying unsloth-zoo from git main..."
@@ -2098,12 +2119,6 @@ else
     else
         run_install_cmd "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" --torch-backend=auto -- "$PACKAGE_NAME"
     fi
-fi
-
-# ── Install mlx-vlm on Apple Silicon (optional, for VLM training) ──
-if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
-    substep "installing mlx-vlm (VLM training support)..."
-    run_install_cmd "install mlx-vlm" uv pip install --python "$_VENV_PY" mlx-vlm
 fi
 
 # ── Run studio setup ──
