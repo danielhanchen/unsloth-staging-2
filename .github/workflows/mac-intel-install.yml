@@ -1,0 +1,178 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Verify the upstream PR #5767 fix does NOT regress Intel Mac (x86_64).
+# Intel Mac auto-routes through the no-torch / GGUF-only path
+# (install.sh: MAC_INTEL=true => SKIP_TORCH=true). The mlx-vlm chain that
+# triggered the Apple Silicon downgrade does not exist on Intel because
+# unsloth-zoo only declares mlx-vlm on darwin arm64. The PR's MLX install
+# step is gated on IS_MAC_ARM, so Intel Mac should be untouched.
+#
+# Matrix entries reproduce the same OLD -> LATEST advance check used on
+# Apple Silicon to confirm the fix is a no-op on Intel rather than
+# accidentally breaking GGUF-only mode.
+
+name: Mac Intel install
+
+on:
+  push:
+    branches:
+      - mac-stale-update-investigation
+    paths:
+      - 'install.sh'
+      - 'studio/setup.sh'
+      - 'studio/install_python_stack.py'
+      - 'studio/backend/utils/hardware/**'
+      - 'studio/backend/requirements/**'
+      - 'unsloth_cli/commands/studio.py'
+      - 'pyproject.toml'
+      - '.github/workflows/mac-intel-install.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: ${{ matrix.old_version }} -> latest on macos-15-intel
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        old_version:
+          - '2026.3.18'
+          - '2026.4.8'
+          - '2026.5.2'
+          - '2026.5.6'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+        with:
+          python-version: '3.12'
+
+      - name: Sanity -- runner arch
+        run: |
+          uname -a
+          uname -m
+          sysctl -in hw.optional.arm64 || true
+          arch
+
+      - name: Fetch OLD release sdist (${{ matrix.old_version }})
+        run: |
+          mkdir -p old_release logs
+          curl -fsSL "https://files.pythonhosted.org/packages/source/u/unsloth/unsloth-${{ matrix.old_version }}.tar.gz" \
+            -o "old_release/sdist.tar.gz"
+          tar -xzf old_release/sdist.tar.gz -C old_release --strip-components=1
+          test -f old_release/install.sh
+
+      - name: Install Studio via OLD install.sh (Intel = auto SKIP_TORCH)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          # Intel Mac: install.sh sets MAC_INTEL=true => SKIP_TORCH=true
+          # No --no-torch flag needed -- the auto-detect routes us to
+          # the GGUF-only install path.
+          bash old_release/install.sh 2>&1 | tee logs/install_old.log
+
+      - name: Force-downgrade unsloth to OLD
+        run: |
+          set -euo pipefail
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          test -x "$VENV_PY"
+          "$VENV_PY" -m pip install --no-deps --force-reinstall \
+            "unsloth==${{ matrix.old_version }}" 2>&1 | tee -a logs/install_old.log
+
+      - name: Confirm OLD version in venv
+        run: |
+          set -euo pipefail
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          INSTALLED=$("$VENV_PY" -c "from importlib.metadata import version; print(version('unsloth'))")
+          echo "Installed: $INSTALLED"
+          if [ "$INSTALLED" != "${{ matrix.old_version }}" ]; then
+            echo "::error::expected unsloth==${{ matrix.old_version }}, got $INSTALLED"
+            exit 1
+          fi
+
+      - name: Overlay the FIXED studio/ tree from the checkout into the venv
+        run: |
+          set -euo pipefail
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          SITE=$("$VENV_PY" -I -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+          rsync -a --exclude='frontend/' "$GITHUB_WORKSPACE/studio/" "$SITE/studio/"
+          # Also overlay install.sh in case the OLD wheel shipped one that
+          # the studio update path re-executes.
+          if [ -f "$SITE/unsloth/install.sh" ]; then
+            cp -f "$GITHUB_WORKSPACE/install.sh" "$SITE/unsloth/install.sh"
+          fi
+          echo "overlaid sha:"
+          shasum "$SITE/studio/install_python_stack.py" \
+                 "$SITE/studio/backend/utils/hardware/hardware.py" 2>/dev/null
+
+      - name: Run `unsloth studio update --verbose` with the FIX in place
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SKIP_STUDIO_FRONTEND: '1'
+        run: |
+          set +e
+          set -o pipefail
+          unsloth studio update --verbose 2>&1 | tee logs/update_with_fix.log
+          rc=${PIPESTATUS[0]}
+          echo "update-with-fix exit code: $rc"
+          echo "$rc" > logs/update_with_fix.rc
+
+      - name: Assert FIXED update advances unsloth to LATEST
+        run: |
+          set -euo pipefail
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          POST=$("$VENV_PY" -c "from importlib.metadata import version; print(version('unsloth'))")
+          OLD="${{ matrix.old_version }}"
+          LATEST=$(curl -fsSL https://pypi.org/pypi/unsloth/json | python3 -c "import json,sys; print(json.load(sys.stdin)['info']['version'])")
+          echo "OLD=$OLD"
+          echo "POST(with fix)=$POST"
+          echo "LATEST=$LATEST"
+          echo "$POST" > logs/post_update_with_fix_version.txt
+          echo "$LATEST" > logs/latest_version.txt
+          if [ "$POST" = "$OLD" ]; then
+            echo "::error::FIX-FAILED-STALE: unsloth still on $POST after fixed update from $OLD"
+            exit 1
+          fi
+          if ! "$VENV_PY" -c "from packaging.version import Version; import sys; sys.exit(0 if Version('$POST') > Version('$OLD') else 1)"; then
+            echo "::error::FIX-FAILED-DOWNGRADE: $OLD -> $POST"
+            exit 1
+          fi
+          if [ "$POST" != "$LATEST" ]; then
+            echo "::error::FIX-FAILED-PARTIAL: $OLD -> $POST but LATEST=$LATEST"
+            exit 1
+          fi
+          echo "FIX OK: $OLD -> $POST (== LATEST)"
+
+      - name: Confirm Intel Mac stays no-torch (no MLX install)
+        run: |
+          VENV_PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          # Intel Mac should NOT have torch, mlx, mlx-lm, or mlx-vlm installed.
+          for pkg in torch mlx mlx-lm mlx-vlm; do
+            v=$("$VENV_PY" -c "from importlib.metadata import version; print(version('$pkg'))" 2>/dev/null || echo "absent")
+            echo "$pkg=$v"
+            if [ "$v" != "absent" ]; then
+              echo "::warning::Intel Mac venv has $pkg=$v -- expected absent (GGUF-only mode)"
+            fi
+          done
+
+      - name: Upload all logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: mac-intel-install-${{ matrix.old_version }}-${{ github.run_id }}
+          path: |
+            logs/
+          retention-days: 7

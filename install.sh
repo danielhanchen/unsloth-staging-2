@@ -1858,12 +1858,6 @@ if [ "$_MIGRATED" = true ]; then
     # Migrated env: force-reinstall unsloth+unsloth-zoo to ensure clean state
     # in the new venv location, while preserving existing torch/CUDA
     substep "upgrading unsloth in migrated environment..."
-    # Apple Silicon: MLX stack --no-deps before unsloth-zoo (see below).
-    if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
-        substep "installing MLX stack (mlx + mlx-lm + mlx-vlm, --no-deps)..."
-        run_install_cmd "install MLX stack" uv pip install --python "$_VENV_PY" \
-            --no-deps --upgrade mlx mlx-metal mlx-lm mlx-vlm
-    fi
     if [ "$SKIP_TORCH" = true ]; then
         # No-torch: install unsloth + unsloth-zoo with --no-deps (current
         # PyPI metadata still declares torch as a hard dep), then install
@@ -2044,13 +2038,6 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
                 ;;
         esac
     fi
-    # Apple Silicon: install MLX stack --no-deps before unsloth so the resolver
-    # does not see mlx-vlm's transformers>=5.5.0 pin (would backtrack unsloth).
-    if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
-        substep "installing MLX stack (mlx + mlx-lm + mlx-vlm, --no-deps)..."
-        run_install_cmd "install MLX stack" uv pip install --python "$_VENV_PY" \
-            --no-deps --upgrade mlx mlx-metal mlx-lm mlx-vlm
-    fi
     # Fresh: Step 2 - install unsloth, preserving pre-installed torch
     tauri_log "STEP" "Installing Unsloth"
     substep "installing unsloth (this may take a few minutes)..."
@@ -2119,6 +2106,12 @@ else
     else
         run_install_cmd "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" --torch-backend=auto -- "$PACKAGE_NAME"
     fi
+fi
+
+# ── Install mlx-vlm on Apple Silicon (optional, for VLM training) ──
+if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
+    substep "installing mlx-vlm (VLM training support)..."
+    run_install_cmd "install mlx-vlm" uv pip install --python "$_VENV_PY" mlx-vlm
 fi
 
 # ── Run studio setup ──
