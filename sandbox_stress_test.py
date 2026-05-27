@@ -348,6 +348,14 @@ def main():
     parser.add_argument("--mode", required=True,
                         choices=["sandbox_on", "fallback", "strict"])
     parser.add_argument("--output", required=True)
+    # On macOS Seatbelt and Linux bwrap are always available when the OS
+    # primitive is present, so strict mode normally cannot be exercised
+    # without disabling the primitive (apparmor sysctl on Linux, no clean
+    # way on macOS). --force-unavailable monkey-patches sandbox_available
+    # to False so the strict gate is the only line of defence and the
+    # harness can validate that path on every platform.
+    parser.add_argument("--force-unavailable", action="store_true",
+                        help="Force sandbox_available()=False after import")
     args = parser.parse_args()
 
     # Plant leak material the test cases reference.
@@ -375,6 +383,17 @@ def main():
         os.environ["UNSLOTH_STUDIO_SANDBOX_STRICT"] = "1"
     else:
         os.environ.pop("UNSLOTH_STUDIO_SANDBOX_STRICT", None)
+
+    if args.force_unavailable:
+        tools.sandbox_available = lambda: False
+        # Also patch the sandbox module's cache so any background probe
+        # in run.py would see False if it ever loaded.
+        try:
+            from core.inference import sandbox as _sb
+            _sb.sandbox_available = lambda: False
+            _sb._sandbox_available_cache = False
+        except ImportError:
+            pass
 
     sid = "_stress"
     workdir = tempfile.mkdtemp(prefix="stress_wd_")
