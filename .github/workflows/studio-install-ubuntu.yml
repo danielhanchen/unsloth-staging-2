@@ -1,0 +1,77 @@
+# Studio install + import smoke on a GPU-less Ubuntu runner.
+# Validates the "Linux box with no NVIDIA card" pip path. The same
+# wheel set is what WSL2 users see, since WSL2 runs an upstream Linux
+# kernel and pip installs the linux_x86_64 wheel exactly as a native
+# Ubuntu install would; we therefore deliberately do NOT spin up a
+# separate WSL job (GitHub-hosted runners do not offer one anyway).
+name: Studio install Ubuntu
+
+on:
+  push:
+    branches: [studio-cross-platform-ci]
+    paths:
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'unsloth_cli/**'
+      - 'install.sh'
+      - 'pyproject.toml'
+      - '.github/workflows/studio-install-ubuntu.yml'
+  pull_request:
+    paths:
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'unsloth_cli/**'
+      - 'install.sh'
+      - 'pyproject.toml'
+      - '.github/workflows/studio-install-ubuntu.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Show env
+        run: |
+          python -V; pip --version; uname -a
+          nvidia-smi 2>/dev/null || echo "no NVIDIA GPU (expected)"
+
+      - name: Pip install unsloth + studio backend deps
+        run: |
+          python -m pip install --upgrade pip
+          # Install editable so we cover the source layout
+          python -m pip install -e .
+          # Studio backend deps live in studio/backend/requirements/studio.txt
+          # (python-multipart is now declared there; no separate pin needed).
+          python -m pip install -r studio/backend/requirements/studio.txt
+
+      - name: Smoke import (no CUDA)
+        env:
+          UNSLOTH_DISABLE_AUTO_UPDATES: '1'
+        run: |
+          python -c "import sys; print('python:', sys.version)"
+          python -c "import unsloth_cli; print('unsloth_cli ok')"
+          python -c "from studio.backend.main import app; print('studio.backend.main:app ok', type(app).__name__)"
+
+      - name: CLI help
+        env:
+          UNSLOTH_DISABLE_AUTO_UPDATES: '1'
+        run: |
+          unsloth --help
+          unsloth studio --help

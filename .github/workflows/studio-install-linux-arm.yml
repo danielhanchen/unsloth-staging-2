@@ -1,0 +1,74 @@
+# Studio install + import smoke on Linux ARM64 (ubuntu-24.04-arm).
+# This is the same hardware shape as DGX Spark / Grace; matters because
+# the upcoming Docker image ships multi-arch (amd64 + arm64) and we
+# want a host-level signal that Studio installs cleanly on aarch64.
+name: "Studio install Linux ARM64"
+
+on:
+  push:
+    branches: [studio-cross-platform-ci]
+    paths:
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'unsloth_cli/**'
+      - 'install.sh'
+      - 'pyproject.toml'
+      - '.github/workflows/studio-install-linux-arm.yml'
+  pull_request:
+    paths:
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'unsloth_cli/**'
+      - 'install.sh'
+      - 'pyproject.toml'
+      - '.github/workflows/studio-install-linux-arm.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Show env
+        run: |
+          python -V
+          pip --version
+          uname -a
+          dpkg --print-architecture || true
+
+      - name: Pip install unsloth + studio backend deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install -r studio/backend/requirements/studio.txt
+
+      - name: Smoke import (no CUDA expected on aarch64 runner)
+        env:
+          UNSLOTH_DISABLE_AUTO_UPDATES: '1'
+        run: |
+          python -c "import platform; print('arch:', platform.machine(), 'system:', platform.system())"
+          python -c "import unsloth_cli; print('unsloth_cli ok')"
+          python -c "from studio.backend.main import app; print('studio.backend.main:app ok', type(app).__name__)"
+
+      - name: CLI help
+        env:
+          UNSLOTH_DISABLE_AUTO_UPDATES: '1'
+        run: |
+          unsloth --help
+          unsloth studio --help

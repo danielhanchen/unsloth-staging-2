@@ -1,0 +1,134 @@
+# Studio: AMD/ROCm torch import smoke on Ubuntu.
+# Pulls the official PyTorch ROCm wheel and verifies Studio + unsloth
+# import cleanly against it. No AMD GPU is attached, so torch.cuda
+# remains False; the point is to catch packaging regressions where a
+# Studio import breaks specifically under the ROCm torch build (it
+# diverges from the cu* build in a handful of internal modules).
+name: Studio ROCm import Ubuntu
+
+on:
+  push:
+    branches: [studio-cross-platform-ci]
+    paths:
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'unsloth_cli/**'
+      - 'pyproject.toml'
+      - '.github/workflows/studio-rocm-import-ubuntu.yml'
+  pull_request:
+    paths:
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'unsloth_cli/**'
+      - 'pyproject.toml'
+      - '.github/workflows/studio-rocm-import-ubuntu.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  rocm-import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Linux deps
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends jq
+
+      - name: Free up runner disk
+        # ROCm torch wheel is large (~3GB unpacked); GitHub-hosted ubuntu
+        # only ships ~14 GB free. Drop the toolcache extras we don't use.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install torch+rocm
+        # Stable ROCm 6.2 wheels (Ubuntu 22.04+). Matches what AMD GPU
+        # users would do on a Linux box without a CUDA card.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/rocm6.2 \
+              torch torchvision torchaudio
+
+      - name: Install studio + unsloth (no-deps; torch already pinned)
+        # --no-deps on the editable install prevents pip from re-pulling
+        # the cu* torch wheel and clobbering the rocm one we just pinned.
+        # unsloth_zoo is a runtime dep of unsloth/_gpu_init.py, so install
+        # it explicitly (it ships pure-Python; no torch backend mismatch).
+        # Then re-state the rest of unsloth's runtime deps that the
+        # editable install would normally have resolved.
+        run: |
+          python -m pip install -e . --no-deps
+          python -m pip install unsloth_zoo
+          python -m pip install -r studio/backend/requirements/studio.txt
+          # Minimal unsloth runtime deps that don't touch the torch
+          # backend choice. Keep this list narrow so a new dep showing
+          # up in pyproject doesn't silently slip through. nest_asyncio
+          # and pyyaml come in via studio.txt; the rest are
+          # ML-pipeline core.
+          python -m pip install \
+              transformers \
+              accelerate \
+              peft \
+              trl \
+              datasets \
+              tyro \
+              sentencepiece \
+              protobuf \
+              huggingface_hub \
+              hf_transfer \
+              psutil \
+              tqdm
+
+      - name: Import probe under ROCm torch
+        env:
+          UNSLOTH_DISABLE_AUTO_UPDATES: '1'
+        run: |
+          python - <<'PY'
+          import torch
+          print("torch:", torch.__version__, "hip:", getattr(torch.version, "hip", None))
+          # No AMD GPU attached on a free runner. torch.cuda.is_available()
+          # is False -- that's expected. The point of this job is to
+          # confirm Studio + torch+rocm don't blow up at IMPORT time:
+          # unsloth_zoo.device_type.get_device_type() correctly raises
+          # NotImplementedError on a no-GPU box, so we expect the
+          # `import unsloth` line below to raise on this runner. Catch
+          # it explicitly so the assertion-style smoke remains green
+          # while preserving the real check (Studio + torch+rocm
+          # interop), and surface the error message for visibility.
+          assert hasattr(torch, "cuda"), "torch.cuda namespace missing"
+          import studio.backend.main as m
+          print("studio.backend.main:", type(m.app).__name__)
+          try:
+              import unsloth  # noqa: F401
+              print("unsloth import ok under torch+rocm")
+          except NotImplementedError as e:
+              # Expected on a no-GPU CI runner.
+              print(f"unsloth import raised NotImplementedError (expected, no GPU): {e}")
+          PY
+
+      - name: CLI help under ROCm torch
+        # `unsloth --help` triggers the same _gpu_init module-level
+        # device detection as `import unsloth`, so on a no-GPU runner
+        # it exits non-zero. Mark this step as best-effort; a future
+        # runner with an actual AMD GPU would make it a hard check.
+        env:
+          UNSLOTH_DISABLE_AUTO_UPDATES: '1'
+        continue-on-error: true
+        run: |
+          unsloth --help
+          unsloth studio --help
