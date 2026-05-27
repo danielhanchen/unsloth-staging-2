@@ -1,0 +1,70 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Cross-OS validation for PR #5760 (Studio CPU thread cap). Windows x64.
+# Verifies that os.environ.setdefault behaves identically on Windows and that
+# the AST-based ordering test handles CRLF / forward-slash path differences.
+name: PR5760 Windows
+
+on:
+  push:
+    branches: [pr5760-cross-os]
+    paths:
+      - 'studio/backend/utils/cpu_threads.py'
+      - 'studio/backend/run.py'
+      - 'studio/backend/main.py'
+      - 'studio/backend/tests/test_cpu_threads.py'
+      - '.github/workflows/pr5760-windows.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: 'pip'
+
+      - name: Install minimal deps
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run cpu_threads tests
+        working-directory: studio/backend
+        run: python -m pytest tests/test_cpu_threads.py -v
+
+      - name: Behavioural probe (sched_getaffinity unavailable on Windows)
+        working-directory: studio/backend
+        shell: pwsh
+        run: |
+          $code = @'
+          import os, sys
+          sys.path.insert(0, '.')
+          from utils.cpu_threads import configure_cpu_threads, _DEFAULT_IDLE_CAP, _resolve_cpu_count
+          assert _resolve_cpu_count() == (os.cpu_count() or 8), _resolve_cpu_count()
+          env = {}
+          configure_cpu_threads(env)
+          assert env['OMP_NUM_THREADS'] == str(min(os.cpu_count() or 8, _DEFAULT_IDLE_CAP)), env
+          env = {'UNSLOTH_CPU_THREADS': 'off'}
+          configure_cpu_threads(env)
+          assert 'OMP_NUM_THREADS' not in env, env
+          env = {'UNSLOTH_CPU_THREADS': '3'}
+          configure_cpu_threads(env)
+          assert env['OMP_NUM_THREADS'] == '3', env
+          print("OK -- Windows cpu_count =", os.cpu_count(), "auto cap =", min(os.cpu_count() or 8, _DEFAULT_IDLE_CAP))
+          '@
+          $code | python -
