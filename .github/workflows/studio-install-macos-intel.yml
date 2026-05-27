@@ -1,0 +1,86 @@
+# Studio install + import smoke on macOS Intel (macos-15-intel).
+# Apple Silicon (macos-14) is the MLX path; the Intel runner exercises
+# the macOS-no-MLX fallback: no torch.cuda, no MLX wheel, llama-server
+# only. Worth covering because every dev box pre-2020 is still Intel.
+name: "Studio install macOS Intel"
+
+on:
+  push:
+    branches: [studio-cross-platform-ci]
+    paths:
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'unsloth_cli/**'
+      - 'install.sh'
+      - 'pyproject.toml'
+      - '.github/workflows/studio-install-macos-intel.yml'
+  pull_request:
+    paths:
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'unsloth_cli/**'
+      - 'install.sh'
+      - 'pyproject.toml'
+      - '.github/workflows/studio-install-macos-intel.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Show env
+        run: |
+          python -V
+          pip --version
+          uname -a
+          system_profiler SPHardwareDataType | grep -E "Chip|Processor|Memory" || true
+
+      - name: Pip install unsloth + studio backend deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install -r studio/backend/requirements/studio.txt
+          # MLX wheels are arm64-only -- on Intel macOS this MUST be
+          # skipped. The smoke step below asserts that absence explicitly.
+
+      - name: Smoke import (Intel macOS, no MLX)
+        env:
+          UNSLOTH_DISABLE_AUTO_UPDATES: '1'
+        run: |
+          python -c "import platform; print('arch:', platform.machine(), 'system:', platform.system())"
+          python -c "import unsloth_cli; print('unsloth_cli ok')"
+          python -c "from studio.backend.main import app; print('studio.backend.main:app ok', type(app).__name__)"
+          # MLX must NOT be importable on Intel macOS. A passing import
+          # here would mean the wheel got built for x86_64 by accident
+          # and we'd silently ship a broken path. So assert ImportError.
+          python -c "
+          try:
+              import mlx.core as mx
+              raise SystemExit(f'unexpected: mlx imported on Intel macOS at {mx.default_device()}')
+          except ImportError:
+              print('ok: mlx not importable on Intel macOS, as expected')
+          "
+
+      - name: CLI help
+        env:
+          UNSLOTH_DISABLE_AUTO_UPDATES: '1'
+        run: |
+          unsloth --help
+          unsloth studio --help
