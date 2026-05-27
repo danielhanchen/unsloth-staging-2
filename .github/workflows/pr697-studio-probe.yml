@@ -1,0 +1,162 @@
+# Staging-fork CI: drive Unsloth Studio on macos-14 with PR #697 unsloth-zoo
+# overlaid, then exercise the 11 MLX save / GGUF export fix surfaces against
+# REAL Apple Silicon mlx / mlx-vlm wheels (not the torch shim used in the
+# pr697-cross-os branch). Sister job pr697-ubuntu.yml on the other branch
+# covers the shim path; this branch is the high-signal "real hardware" probe.
+
+name: "PR-697 Studio probe macos-14"
+
+on:
+  push:
+    branches: [pr697-studio-probe]
+    paths:
+      - 'install.sh'
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'tests/pr697/**'
+      - 'studio_test_kit/**'
+      - '.github/workflows/pr697-studio-probe.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'install.sh'
+      - 'studio/**'
+      - 'unsloth/**'
+      - 'tests/pr697/**'
+      - 'studio_test_kit/**'
+      - '.github/workflows/pr697-studio-probe.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  studio-probe:
+    name: Studio + PR-697 unsloth-zoo overlay (Apple Silicon)
+    runs-on: macos-14
+    timeout-minutes: 35
+    env:
+      STUDIO_PORT: '18897'
+      # Pinned Studio home keeps the install isolated from the runner's $HOME.
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/.studio-home
+      UNSLOTH_PROBE_TMP: ${{ github.workspace }}/probe-tmp
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Studio (--local, --no-torch)
+        # --no-torch keeps macOS-14 install fast and stable (no CUDA noise);
+        # mlx-vlm path is unaffected. install.sh resolves the Studio venv at
+        # $UNSLOTH_STUDIO_HOME/.venv_*; the python is at $UNSLOTH_STUDIO_HOME/bin/python
+        # via the unsloth CLI shim.
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Resolve Studio venv python
+        id: venv
+        run: |
+          # install.sh writes the venv into UNSLOTH_STUDIO_HOME. The python is
+          # the first .venv_*/bin/python under that root.
+          VENV_PY="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -type f -path '*.venv_*/bin/python' | head -1)"
+          if [ -z "$VENV_PY" ]; then
+            echo "::error::Could not locate Studio venv python under $UNSLOTH_STUDIO_HOME"
+            find "$UNSLOTH_STUDIO_HOME" -maxdepth 4 -type d | head -50
+            exit 1
+          fi
+          echo "venv_py=$VENV_PY" >> "$GITHUB_OUTPUT"
+          echo "Resolved Studio venv python: $VENV_PY"
+          "$VENV_PY" --version
+          "$VENV_PY" -c "import sys; print(sys.executable)"
+
+      - name: Overlay PR #697 unsloth-zoo (Lyxot:fix/mlx-save-gguf-export-parity)
+        # install.sh by default overlays unsloth-zoo from unslothai/unsloth-zoo:main.
+        # We want PR #697's head instead. Force-reinstall just the unsloth-zoo
+        # package without touching its deps so the rest of the Studio environment
+        # is unchanged.
+        run: |
+          "${{ steps.venv.outputs.venv_py }}" -m pip install \
+            --no-deps --force-reinstall \
+            "unsloth-zoo @ git+https://github.com/Lyxot/unsloth-zoo@fix/mlx-save-gguf-export-parity"
+
+      - name: Install MLX wheels (mlx / mlx-lm / mlx-vlm) into Studio venv
+        # --no-torch skipped the [mlx] extras at install.sh time. We need them
+        # for the probe to exercise REAL Apple Silicon kernels.
+        run: |
+          "${{ steps.venv.outputs.venv_py }}" -m pip install \
+            "mlx>=0.22.0" "mlx-lm>=0.22.0" "mlx-vlm>=0.4.4"
+
+      - name: Verify subpackage import paths (post-migration)
+        run: |
+          "${{ steps.venv.outputs.venv_py }}" -c "
+          import unsloth_zoo, unsloth_zoo.mlx.utils, unsloth_zoo.mlx.loader, \
+                 unsloth_zoo.mlx.compile, unsloth_zoo.mlx.trainer, \
+                 unsloth_zoo.mlx.cce, unsloth_zoo.mlx.runtime
+          print('unsloth_zoo', unsloth_zoo.__version__)
+          import mlx.core as mx, mlx_vlm
+          print('mlx', mx.__version__ if hasattr(mx, '__version__') else 'present')
+          print('mlx_vlm', mlx_vlm.__version__ if hasattr(mlx_vlm, '__version__') else 'present')
+          "
+
+      - name: Run PR-697 real-MLX probe
+        # This is the high-signal step. The script exercises every PR-697 helper
+        # against real mlx / mlx-vlm wheels. Exits non-zero on any mismatch.
+        run: |
+          mkdir -p "$UNSLOTH_PROBE_TMP"
+          PYTHONPATH="${{ github.workspace }}" \
+            "${{ steps.venv.outputs.venv_py }}" -m tests.pr697.probe_real_mlx
+
+      - name: Boot Studio (API-only) + /api/health
+        # Sanity: PR-697 unsloth-zoo overlay must NOT break Studio boot. Use
+        # API-only to skip the desktop / web UI bring-up.
+        run: |
+          unset GH_TOKEN || true
+          # Reset auth so we don't hit a stale bootstrap password.
+          unsloth studio reset-password || true
+          mkdir -p logs
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" \
+            > logs/studio.log 2>&1 &
+          STUDIO_PID=$!
+          echo "STUDIO_PID=$STUDIO_PID" >> "$GITHUB_ENV"
+          for i in $(seq 1 180); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json 2>/dev/null; then
+              cat /tmp/health.json
+              if grep -q '"status"' /tmp/health.json && grep -q 'healthy' /tmp/health.json; then
+                echo "Studio API healthy after ${i}s"
+                exit 0
+              fi
+            fi
+            sleep 1
+          done
+          echo "::error::Studio API did not report healthy"
+          tail -200 logs/studio.log
+          exit 1
+
+      - name: Tear down Studio
+        if: always()
+        run: |
+          if [ -n "${STUDIO_PID:-}" ]; then
+            kill "$STUDIO_PID" 2>/dev/null || true
+          fi
+          pkill -f "unsloth studio" 2>/dev/null || true
+
+      - name: Upload probe artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr697-studio-probe-macos14
+          path: |
+            logs/
+            probe-tmp/
+          if-no-files-found: ignore
