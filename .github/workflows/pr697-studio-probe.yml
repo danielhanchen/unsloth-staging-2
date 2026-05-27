@@ -67,15 +67,23 @@ jobs:
       - name: Resolve Studio venv python
         id: venv
         run: |
-          # install.sh writes the venv into UNSLOTH_STUDIO_HOME. The python is
-          # the first .venv_*/bin/python under that root.
-          VENV_PY="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -type f -path '*.venv_*/bin/python' | head -1)"
-          if [ -z "$VENV_PY" ]; then
+          # install.sh writes the venv at $UNSLOTH_STUDIO_HOME/unsloth_studio
+          # (confirmed via install log: "creating Python 3.13 virtual environment
+          # /.../.studio-home/unsloth_studio"). The CLI shim is in bin/unsloth.
+          VENV_PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          if [ ! -x "$VENV_PY" ]; then
+            # Fallback: glob any bin/python under the studio home.
+            VENV_PY="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 4 -type f -name python -path '*/bin/python' | head -1)"
+          fi
+          if [ -z "$VENV_PY" ] || [ ! -x "$VENV_PY" ]; then
             echo "::error::Could not locate Studio venv python under $UNSLOTH_STUDIO_HOME"
             find "$UNSLOTH_STUDIO_HOME" -maxdepth 4 -type d | head -50
             exit 1
           fi
           echo "venv_py=$VENV_PY" >> "$GITHUB_OUTPUT"
+          # Also expose UNSLOTH_STUDIO_HOME/bin to PATH so subsequent steps see
+          # the unsloth CLI shim.
+          echo "$UNSLOTH_STUDIO_HOME/bin" >> "$GITHUB_PATH"
           echo "Resolved Studio venv python: $VENV_PY"
           "$VENV_PY" --version
           "$VENV_PY" -c "import sys; print(sys.executable)"
