@@ -93,6 +93,21 @@ jobs:
           fi
           echo "ok: Windows ARM64 install used the prebuilt fast path"
 
+      - name: Add Studio shim to GITHUB_PATH
+        # install.ps1's User-PATH update does not propagate to the
+        # currently-running shell session; export the shim dir so the
+        # next `unsloth ...` invocation can find it. Same pattern as
+        # studio-cross-os-validation #154.
+        shell: bash
+        run: |
+          SHIM_DIR=~/.unsloth/studio/bin
+          if [ ! -f "$SHIM_DIR/unsloth.exe" ]; then
+            echo "::error::unsloth.exe shim not found at $SHIM_DIR"
+            ls -la ~/.unsloth/studio/ || true
+            exit 1
+          fi
+          cygpath -w "$SHIM_DIR" >> "$GITHUB_PATH"
+
       - name: CLI help
         env:
           UNSLOTH_DISABLE_AUTO_UPDATES: '1'
