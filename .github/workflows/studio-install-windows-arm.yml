@@ -1,7 +1,16 @@
 # Studio install + import smoke on Windows ARM64 (windows-11-arm).
-# Rare but real: Snapdragon X / Surface Pro / Surface Laptop fall in
-# this bucket. Exercising the path catches Path/encoding bugs that
-# only surface on the native arm64 Python.
+# Snapdragon X / Surface Pro / Surface Laptop fall in this bucket.
+# Drives install.ps1 --local --no-torch (rather than the raw pip
+# install of studio.txt that the Windows x64 job uses) because:
+#   - cryptography and pyarrow do not ship Windows arm64 wheels and
+#     fail to build from source on the runner (no MSVC OpenSSL, no
+#     Arrow C++ libs). That's not a real platform gap -- it's a
+#     transitive-dep gap that the --no-torch path filters out by
+#     using studio/backend/requirements/no-torch-runtime.txt instead.
+#   - install.ps1 itself is what users actually run on Windows ARM64,
+#     so this exercises the same code path as a real install.
+# PR 5790 (unblock cross-platform install on Linux ARM64 + Windows
+# ARM64 + Intel Mac) is overlaid here via cherry-pick.
 name: "Studio install Windows ARM64"
 
 on:
@@ -34,7 +43,10 @@ permissions:
 jobs:
   install:
     runs-on: windows-11-arm
-    timeout-minutes: 30
+    timeout-minutes: 40
+    env:
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
     defaults:
       run:
         shell: pwsh
@@ -43,30 +55,43 @@ jobs:
         with:
           persist-credentials: false
 
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '22'
+
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: '3.12'
-          cache: 'pip'
 
       - name: Show env
         run: |
           python -V
           pip --version
-          Get-ComputerInfo OsName, OsVersion, OsArchitecture, CsProcessors 2>$null
+          $env:PROCESSOR_ARCHITECTURE
+          python -c "import platform; print('arch:', platform.machine())"
 
-      - name: Pip install unsloth + studio backend deps
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e .
-          python -m pip install -r studio/backend/requirements/studio.txt
-
-      - name: Smoke import (Windows arm64, no CUDA)
+      - name: Install Studio (--local, --no-torch)
         env:
-          UNSLOTH_DISABLE_AUTO_UPDATES: '1'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          python -c "import platform; print('arch:', platform.machine(), 'system:', platform.system())"
-          python -c "import unsloth_cli; print('unsloth_cli ok')"
-          python -c "from studio.backend.main import app; print('studio.backend.main:app ok', type(app).__name__)"
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
+
+      - name: Assert install used the win-cpu-arm64 prebuilt (not source build)
+        shell: bash
+        run: |
+          if grep -q "falling back to source build" logs/install.log; then
+            echo "::error::install.ps1 fell back to source-build llama.cpp on Windows ARM64."
+            grep -E "llama-prebuilt|llama.cpp|prebuilt" logs/install.log | tail -40
+            exit 1
+          fi
+          INFO=~/.unsloth/llama.cpp/UNSLOTH_PREBUILT_INFO.json
+          if [ -f "$INFO" ]; then
+            jq -e '.asset | test("bin-win-cpu-arm64\\.zip$")' "$INFO" \
+              || { echo "::error::wrong prebuilt asset on Windows ARM64"; jq . "$INFO"; exit 1; }
+          fi
+          echo "ok: Windows ARM64 install used the prebuilt fast path"
 
       - name: CLI help
         env:
