@@ -1,0 +1,27 @@
+name: "cuda133-fix macos-14"
+on:
+  push:
+    branches: [pr-cuda133-staging]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  shell:
+    runs-on: macos-14
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: bash --version
+        run: bash --version
+      - name: nvcc helper test (macOS bash)
+        run: bash tests/sh/test_nvcc_meets_llama_minimum.sh
+      - name: torch index test (macOS bash)
+        run: bash tests/sh/test_get_torch_index_url.sh
+      - name: setup.sh syntax check on macOS
+        run: bash -n studio/setup.sh
