@@ -54,10 +54,16 @@ jobs:
 
       - name: Install unsloth-zoo with MLX extras
         # pyproject [mlx] resolves mlx / mlx-lm / mlx-vlm wheels on darwin+arm64.
+        # NOTE: pyproject gates `torch` OFF on darwin+arm64 (since mlx is the
+        # native path on Apple Silicon), but tests/mlx_simulation/__init__.py
+        # unconditionally `import torch` so the autouse `_install_mlx_torch_shim`
+        # fixture in tests/test_mlx_save_export_regressions.py needs it. Install
+        # the CPU wheel explicitly first.
         # --no-deps unsloth satisfies the find_spec("unsloth") guard at
         # unsloth_zoo/__init__.py:199 without dragging CUDA-only deps.
         run: |
           python -m pip install --upgrade pip
+          pip install "torch>=2.4.0,<2.11.0"
           pip install -e .[mlx]
           pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
           pip install pytest==9.0.3
