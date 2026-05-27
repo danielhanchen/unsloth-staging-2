@@ -1,4 +1,4 @@
-name: i18n Windows
+name: "i18n PR-5765 Windows"
 
 on:
   push:
@@ -10,9 +10,10 @@ on:
     paths:
       - "studio/frontend/**"
       - ".github/workflows/i18n-windows.yml"
+  workflow_dispatch:
 
 concurrency:
-  group: i18n-windows-${{ github.ref }}
+  group: i18n-pr5765-windows-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -35,3 +36,44 @@ jobs:
       - run: npm run typecheck
       - run: npm run i18n:check
       - run: npm run build
+
+      - name: Serve dist + locale round-trip (en + zh-CN)
+        shell: pwsh
+        run: |
+          $job = Start-Job -ScriptBlock {
+            Set-Location $using:PWD
+            npx --yes vite preview --host 127.0.0.1 --port 4173 *>&1 |
+              Out-File -FilePath preview.log
+          }
+          $up = $false
+          for ($i = 1; $i -le 40; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $r = Invoke-WebRequest -Uri http://127.0.0.1:4173/ -UseBasicParsing -TimeoutSec 2
+              if ($r.StatusCode -eq 200) {
+                Write-Host "vite preview is up after ${i}s"
+                $up = $true
+                break
+              }
+            } catch {}
+          }
+          if (-not $up) {
+            Write-Host "::error::vite preview did not start in time"
+            Get-Content preview.log -Tail 80
+            exit 1
+          }
+          $assets = Get-ChildItem dist\assets -Filter *.js
+          $hasEn = $false
+          $hasZh = $false
+          foreach ($f in $assets) {
+            $bytes = [System.IO.File]::ReadAllBytes($f.FullName)
+            $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+            if ($text -match "Display language") { $hasEn = $true }
+            if ($text -match "显示语言") { $hasZh = $true }
+          }
+          if (-not ($hasEn -and $hasZh)) {
+            Write-Host "::error::Bundle is missing one locale set (en=$hasEn zh=$hasZh)"
+            exit 1
+          }
+          Write-Host "Both locale strings present in built bundle"
+          Stop-Job $job -PassThru | Remove-Job -Force

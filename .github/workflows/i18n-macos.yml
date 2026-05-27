@@ -1,4 +1,4 @@
-name: i18n macOS
+name: "i18n PR-5765 macOS"
 
 on:
   push:
@@ -10,9 +10,10 @@ on:
     paths:
       - "studio/frontend/**"
       - ".github/workflows/i18n-macos.yml"
+  workflow_dispatch:
 
 concurrency:
-  group: i18n-macos-${{ github.ref }}
+  group: i18n-pr5765-macos-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -35,3 +36,27 @@ jobs:
       - run: npm run typecheck
       - run: npm run i18n:check
       - run: npm run build
+
+      - name: Serve dist + locale round-trip (en + zh-CN)
+        shell: bash
+        run: |
+          set -e
+          ( npx --yes vite preview --host 127.0.0.1 --port 4173 > preview.log 2>&1 ) &
+          PV_PID=$!
+          for i in $(seq 1 30); do
+            sleep 1
+            if curl -fs http://127.0.0.1:4173/ > index.html; then
+              echo "vite preview is up after ${i}s"
+              break
+            fi
+          done
+          grep -E "<title>|<html" index.html
+          curl -fs http://127.0.0.1:4173/ -o /dev/null
+          if grep -RE "Display language" dist/assets/*.js >/dev/null && \
+             grep -RE "显示语言" dist/assets/*.js >/dev/null; then
+            echo "Both locale strings present in built bundle"
+          else
+            echo "::error::Bundle is missing one locale set"
+            exit 1
+          fi
+          kill "$PV_PID" 2>/dev/null || true
