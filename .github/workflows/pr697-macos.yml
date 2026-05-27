@@ -1,0 +1,78 @@
+# Staging-fork CI for unslothai/unsloth-zoo#697 (MLX save / GGUF export parity).
+# Single-OS pin (macos-14 == Apple Silicon, M1) so concurrency cancellation and
+# paths: filters scope per OS. NEVER merge this workflow upstream.
+name: "PR-697 macos-14"
+
+on:
+  push:
+    branches: [pr697-cross-os]
+    paths:
+      - 'unsloth_zoo/mlx/**'
+      - 'tests/test_mlx_save_export_regressions.py'
+      - 'tests/test_mlx_torch_shim_smoke.py'
+      - 'tests/mlx_simulation/**'
+      - 'tests/conftest.py'
+      - 'pyproject.toml'
+      - '.github/workflows/pr697-macos.yml'
+  pull_request:
+    branches: [main, pr697-base]
+    paths:
+      - 'unsloth_zoo/mlx/**'
+      - 'tests/test_mlx_save_export_regressions.py'
+      - 'tests/test_mlx_torch_shim_smoke.py'
+      - 'tests/mlx_simulation/**'
+      - 'tests/conftest.py'
+      - 'pyproject.toml'
+      - '.github/workflows/pr697-macos.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-regressions:
+    name: MLX save/export regressions (Apple Silicon)
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ALLOW_CPU: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install unsloth-zoo with MLX extras
+        # pyproject [mlx] resolves mlx / mlx-lm / mlx-vlm wheels on darwin+arm64.
+        # --no-deps unsloth satisfies the find_spec("unsloth") guard at
+        # unsloth_zoo/__init__.py:199 without dragging CUDA-only deps.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[mlx]
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          pip install pytest==9.0.3
+
+      - name: MLX subpackage import smoke (post-migration paths)
+        run: |
+          python -c "import unsloth_zoo.mlx.loader;   print('mlx.loader OK')"
+          python -c "import unsloth_zoo.mlx.compile;  print('mlx.compile OK')"
+          python -c "import unsloth_zoo.mlx.utils;    print('mlx.utils OK')"
+          python -c "import unsloth_zoo.mlx.trainer;  print('mlx.trainer OK')"
+          python -c "import unsloth_zoo.mlx.cce;      print('mlx.cce OK')"
+          python -c "import unsloth_zoo.mlx.runtime;  print('mlx.runtime OK')"
+
+      - name: tests/test_mlx_save_export_regressions.py (PR #697 deliverable, 23 tests)
+        run: python -m pytest tests/test_mlx_save_export_regressions.py -v
+
+      - name: tests/test_mlx_torch_shim_smoke.py (shim self-test)
+        run: python -m pytest tests/test_mlx_torch_shim_smoke.py -v

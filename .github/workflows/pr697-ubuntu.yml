@@ -1,0 +1,80 @@
+# Staging-fork CI for unslothai/unsloth-zoo#697 (MLX save / GGUF export parity).
+# Linux runs the tests via the tests/mlx_simulation/ torch-spoof shim (no real
+# mlx wheels needed on x86_64). Catches shim regressions and cross-platform
+# Path / os.environ handling on the new save/export helpers.
+name: "PR-697 ubuntu-latest"
+
+on:
+  push:
+    branches: [pr697-cross-os]
+    paths:
+      - 'unsloth_zoo/mlx/**'
+      - 'tests/test_mlx_save_export_regressions.py'
+      - 'tests/test_mlx_torch_shim_smoke.py'
+      - 'tests/mlx_simulation/**'
+      - 'tests/conftest.py'
+      - 'pyproject.toml'
+      - '.github/workflows/pr697-ubuntu.yml'
+  pull_request:
+    branches: [main, pr697-base]
+    paths:
+      - 'unsloth_zoo/mlx/**'
+      - 'tests/test_mlx_save_export_regressions.py'
+      - 'tests/test_mlx_torch_shim_smoke.py'
+      - 'tests/mlx_simulation/**'
+      - 'tests/conftest.py'
+      - 'pyproject.toml'
+      - '.github/workflows/pr697-ubuntu.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-regressions-shim:
+    name: MLX save/export regressions (Linux shim path)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ALLOW_CPU: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install CPU torch + zoo [core]
+        # CPU index avoids the multi-GB CUDA wheel set; [core] gives transformers
+        # / datasets / trl / peft / accelerate. mlx is intentionally absent --
+        # the shim (tests/mlx_simulation/simulate_mlx_on_torch) provides the API
+        # surface PR #697 exercises.
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.4.0,<2.11.0"
+          pip install -e .[core]
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          pip install pytest==9.0.3
+
+      - name: pytest --collect-only (verify imports load on Linux)
+        run: |
+          python -m pytest \
+            tests/test_mlx_save_export_regressions.py \
+            tests/test_mlx_torch_shim_smoke.py \
+            --collect-only -q
+
+      - name: tests/test_mlx_save_export_regressions.py (shim path)
+        run: python -m pytest tests/test_mlx_save_export_regressions.py -v
+
+      - name: tests/test_mlx_torch_shim_smoke.py (shim path)
+        run: python -m pytest tests/test_mlx_torch_shim_smoke.py -v

@@ -1,0 +1,70 @@
+# Staging-fork CI for unslothai/unsloth-zoo#697 (MLX save / GGUF export parity).
+# Windows shim path -- low-cost coverage for Windows-native pathlib behaviour in
+# the new save/export helpers (_copy_source_sidecars, Path.iterdir, os.environ
+# mutations). Same shim as ubuntu; no mlx wheels needed.
+name: "PR-697 windows-latest"
+
+on:
+  push:
+    branches: [pr697-cross-os]
+    paths:
+      - 'unsloth_zoo/mlx/**'
+      - 'tests/test_mlx_save_export_regressions.py'
+      - 'tests/test_mlx_torch_shim_smoke.py'
+      - 'tests/mlx_simulation/**'
+      - 'tests/conftest.py'
+      - 'pyproject.toml'
+      - '.github/workflows/pr697-windows.yml'
+  pull_request:
+    branches: [main, pr697-base]
+    paths:
+      - 'unsloth_zoo/mlx/**'
+      - 'tests/test_mlx_save_export_regressions.py'
+      - 'tests/test_mlx_torch_shim_smoke.py'
+      - 'tests/mlx_simulation/**'
+      - 'tests/conftest.py'
+      - 'pyproject.toml'
+      - '.github/workflows/pr697-windows.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-regressions-shim:
+    name: MLX save/export regressions (Windows shim path)
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ALLOW_CPU: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install CPU torch + zoo [core]
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            "torch>=2.4.0,<2.11.0"
+          pip install -e .[core]
+          pip install --no-deps "unsloth @ git+https://github.com/unslothai/unsloth@main" || true
+          pip install pytest==9.0.3
+
+      - name: tests/test_mlx_save_export_regressions.py (Windows shim path)
+        run: python -m pytest tests/test_mlx_save_export_regressions.py -v
+
+      - name: tests/test_mlx_torch_shim_smoke.py (Windows shim path)
+        run: python -m pytest tests/test_mlx_torch_shim_smoke.py -v
