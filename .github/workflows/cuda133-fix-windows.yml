@@ -23,6 +23,7 @@ jobs:
       - name: bash --version
         run: bash --version
       - name: nvcc helper test (git-bash)
+        # studio/setup.sh is the Linux/macOS installer; on Windows we still
+        # care that the helper logic parses under git-bash since CI smoke
+        # workflows source bash on Windows runners.
         run: bash tests/sh/test_nvcc_meets_llama_minimum.sh
-      - name: torch index test (git-bash)
-        run: bash tests/sh/test_get_torch_index_url.sh

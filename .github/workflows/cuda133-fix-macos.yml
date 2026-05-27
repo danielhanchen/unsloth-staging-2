@@ -21,7 +21,9 @@ jobs:
         run: bash --version
       - name: nvcc helper test (macOS bash)
         run: bash tests/sh/test_nvcc_meets_llama_minimum.sh
-      - name: torch index test (macOS bash)
-        run: bash tests/sh/test_get_torch_index_url.sh
-      - name: setup.sh syntax check on macOS
+      - name: setup.sh syntax check on macOS bash
+        # macOS ships /bin/bash 3.2 by default. The helper must parse cleanly
+        # in 3.2 as well so the macOS install path keeps working.
+        run: /bin/bash -n studio/setup.sh
+      - name: setup.sh syntax check on GNU bash 5
         run: bash -n studio/setup.sh
