@@ -1,0 +1,167 @@
+# PR 5468 multi-platform Studio sandbox confirmation.
+# Runs the same 100-prompt stress harness against the real
+# _python_exec / _bash_exec entry points on each platform:
+#   - ubuntu-latest: bwrap sandbox_on + strict.
+#   - macos-14:      Seatbelt sandbox_on + strict.
+#   - windows-latest: strict only (no OS sandbox primitive on Windows).
+# Each job asserts leaked == 0 in every mode it runs.
+
+name: PR 5468 multi-platform Studio sandbox
+
+on:
+  push:
+    branches: [pr-5468-ci-test]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux Studio sandbox (bwrap)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install bubblewrap + drop AppArmor userns gate
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap dnsutils
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bwrap --ro-bind / / --unshare-all --die-with-parent /usr/bin/true
+      - name: Install backend deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi structlog python-multipart httpx uvicorn \
+            pydantic loguru rich shellingham typer pyyaml jinja2 \
+            sqlalchemy cryptography aiofiles requests 'numpy<3'
+      - name: sandbox_on (bwrap actively enforcing)
+        env:
+          STUDIO_BACKEND_ROOT: ${{ github.workspace }}/studio/backend
+        run: |
+          python sandbox_stress_test.py --mode sandbox_on --output sandbox_on.json
+          python - <<'PY'
+          import json
+          d = json.load(open("sandbox_on.json"))
+          print(f"linux sandbox_on: leaked={d['leaked']} by_outcome={d['by_outcome']}")
+          assert d["leaked"] == 0, f"linux sandbox_on leaked {d['leaked']}"
+          PY
+      - name: strict (sandbox unavailable, refuse outright)
+        env:
+          STUDIO_BACKEND_ROOT: ${{ github.workspace }}/studio/backend
+          UNSLOTH_STUDIO_SANDBOX_STRICT: '1'
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1 || true
+          python sandbox_stress_test.py --mode strict --output strict.json
+          python - <<'PY'
+          import json
+          d = json.load(open("strict.json"))
+          print(f"linux strict: leaked={d['leaked']} by_outcome={d['by_outcome']}")
+          assert d["leaked"] == 0, f"linux strict leaked {d['leaked']}"
+          PY
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-results
+          path: |
+            sandbox_on.json
+            strict.json
+
+  macos:
+    name: macOS Studio sandbox (Seatbelt)
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Confirm Seatbelt primitive present
+        run: |
+          test -x /usr/bin/sandbox-exec
+          /usr/bin/sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
+      - name: Install backend deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi structlog python-multipart httpx uvicorn \
+            pydantic loguru rich shellingham typer pyyaml jinja2 \
+            sqlalchemy cryptography aiofiles requests 'numpy<3'
+      - name: sandbox_on (Seatbelt actively enforcing)
+        env:
+          STUDIO_BACKEND_ROOT: ${{ github.workspace }}/studio/backend
+        run: |
+          python sandbox_stress_test.py --mode sandbox_on --output sandbox_on.json
+          python - <<'PY'
+          import json
+          d = json.load(open("sandbox_on.json"))
+          print(f"macos sandbox_on: leaked={d['leaked']} by_outcome={d['by_outcome']}")
+          assert d["leaked"] == 0, f"macos sandbox_on leaked {d['leaked']}"
+          PY
+      - name: strict (sandbox forced unavailable, refuse outright)
+        env:
+          STUDIO_BACKEND_ROOT: ${{ github.workspace }}/studio/backend
+          UNSLOTH_STUDIO_SANDBOX_STRICT: '1'
+        run: |
+          python sandbox_stress_test.py --mode strict --force-unavailable --output strict.json
+          python - <<'PY'
+          import json
+          d = json.load(open("strict.json"))
+          print(f"macos strict: leaked={d['leaked']} by_outcome={d['by_outcome']}")
+          assert d["leaked"] == 0, f"macos strict leaked {d['leaked']}"
+          PY
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-results
+          path: |
+            sandbox_on.json
+            strict.json
+
+  windows:
+    name: Windows Studio sandbox (strict gate only)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install backend deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install fastapi structlog python-multipart httpx uvicorn \
+            pydantic loguru rich shellingham typer pyyaml jinja2 \
+            sqlalchemy cryptography aiofiles requests 'numpy<3'
+      - name: strict (Windows has no OS sandbox; the gate is the only line)
+        shell: bash
+        env:
+          STUDIO_BACKEND_ROOT: ${{ github.workspace }}/studio/backend
+          UNSLOTH_STUDIO_SANDBOX_STRICT: '1'
+        run: |
+          python sandbox_stress_test.py --mode strict --force-unavailable --output strict.json
+          python - <<'PY'
+          import json
+          d = json.load(open("strict.json"))
+          print(f"windows strict: leaked={d['leaked']} by_outcome={d['by_outcome']}")
+          assert d["leaked"] == 0, f"windows strict leaked {d['leaked']}"
+          PY
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-results
+          path: |
+            strict.json

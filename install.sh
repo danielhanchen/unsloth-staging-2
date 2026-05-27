@@ -455,12 +455,23 @@ _smart_apt_install() {
         echo "    If you accept, we'll run sudo now, and it'll prompt your password."
         echo "    !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
         echo ""
-        printf "    Accept? [Y/n] "
-        if [ -r /dev/tty ]; then
-            read -r REPLY </dev/tty || REPLY="y"
-        else
-            REPLY="y"
+        # Detect non-interactive contexts (curl | sh, docker run -i without -t,
+        # CI runners). Without a TTY we cannot prompt for a sudo password, and
+        # sudo without -n would block forever waiting for stdin that never arrives.
+        if [ ! -r /dev/tty ] || [ ! -t 1 ]; then
+            if sudo -n true >/dev/null 2>&1; then
+                # Passwordless sudo configured; safe to escalate non-interactively.
+                sudo apt-get update -y </dev/null
+                sudo apt-get install -y $_STILL_MISSING </dev/null
+                return 0
+            fi
+            echo "    No TTY available and sudo would require a password."
+            echo "    Please install these packages first, then re-run Unsloth Studio setup:"
+            echo "    sudo apt-get update -y && sudo apt-get install -y $_STILL_MISSING"
+            exit 1
         fi
+        printf "    Accept? [Y/n] "
+        read -r REPLY </dev/tty || REPLY="y"
         case "$REPLY" in
             [nN]*)
                 echo ""
@@ -1290,6 +1301,14 @@ if [ "$_NO_TORCH_FLAG" = true ] || [ "$MAC_INTEL" = true ]; then
     SKIP_TORCH=true
 fi
 
+# Apple Silicon: override mlx-vlm / mlx-lm's transformers pin (see overrides file).
+if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
+    _OVERRIDES_FILE="$(cd "$(dirname "$0" 2>/dev/null || echo ".")" && pwd)/studio/backend/requirements/single-env/overrides-darwin-arm64.txt"
+    if [ -f "$_OVERRIDES_FILE" ]; then
+        export UV_OVERRIDE="$_OVERRIDES_FILE"
+    fi
+fi
+
 _TAURI_INITIAL_GPU_BRANCH="unknown"
 if [ "$SKIP_TORCH" = true ]; then
     _TAURI_INITIAL_GPU_BRANCH="no_torch"
@@ -1327,6 +1346,14 @@ case "$OS" in
         command -v gcc  >/dev/null 2>&1 || MISSING="$MISSING build-essential"
         # libcurl dev headers for llama.cpp HTTPS support
         command -v curl-config >/dev/null 2>&1 || MISSING="$MISSING libcurl4-openssl-dev"
+        # bubblewrap provides the OS-level sandbox the studio backend wraps
+        # python/bash tool execution in. If missing, tool execution falls
+        # back to the existing AST/blocklist/env-whitelist defences and the
+        # startup banner warns the operator (set UNSLOTH_STUDIO_SANDBOX_STRICT=1
+        # to refuse instead of falling back). On Ubuntu 23.10+ bwrap still
+        # needs apparmor_restrict_unprivileged_userns=0; that hint is in
+        # the banner too.
+        command -v bwrap >/dev/null 2>&1 || MISSING="$MISSING bubblewrap"
         ;;
 esac
 
@@ -1357,9 +1384,9 @@ if [ -n "$MISSING" ]; then
                 echo "    $MISSING"
                 echo ""
                 echo "    Examples:"
-                echo "      Fedora/RHEL: sudo dnf install cmake git gcc gcc-c++ make libcurl-devel"
-                echo "      Arch:       sudo pacman -S --needed cmake git base-devel curl"
-                echo "      openSUSE:   sudo zypper install cmake git gcc gcc-c++ make libcurl-devel"
+                echo "      Fedora/RHEL: sudo dnf install cmake git gcc gcc-c++ make libcurl-devel bubblewrap"
+                echo "      Arch:       sudo pacman -S --needed cmake git base-devel curl bubblewrap"
+                echo "      openSUSE:   sudo zypper install cmake git gcc gcc-c++ make libcurl-devel bubblewrap"
                 exit 1
             fi
             ;;
@@ -1865,7 +1892,12 @@ if [ "$_MIGRATED" = true ]; then
         # to prevent transitive torch resolution.
         run_install_cmd "install unsloth (migrated no-torch)" uv pip install --python "$_VENV_PY" --no-deps \
             --reinstall-package unsloth --reinstall-package unsloth-zoo \
-            "unsloth>=2026.5.6" unsloth-zoo
+            "unsloth>=2026.5.8" unsloth-zoo
+        # Resolve pydantic WITH deps so pip pins pydantic-core to the
+        # matching version (no-torch-runtime.txt below is --no-deps).
+        # All transitive deps are torch-free.
+        run_install_cmd "install pydantic (with deps for compatible core)" \
+            uv pip install --python "$_VENV_PY" pydantic
         _NO_TORCH_RT="$(_find_no_torch_runtime)"
         if [ -n "$_NO_TORCH_RT" ]; then
             run_install_cmd "install no-torch runtime deps" uv pip install --python "$_VENV_PY" --no-deps -r "$_NO_TORCH_RT"
@@ -1873,7 +1905,7 @@ if [ "$_MIGRATED" = true ]; then
     else
         run_install_cmd "install unsloth (migrated)" uv pip install --python "$_VENV_PY" \
             --reinstall-package unsloth --reinstall-package unsloth-zoo \
-            "unsloth>=2026.5.6" unsloth-zoo
+            "unsloth>=2026.5.8" unsloth-zoo
     fi
     if [ "$STUDIO_LOCAL_INSTALL" = true ]; then
         substep "overlaying local repo (editable)..."
@@ -2041,7 +2073,10 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
         # runtime deps (typer, safetensors, transformers, etc.) with --no-deps.
         run_install_cmd "install unsloth (no-torch)" uv pip install --python "$_VENV_PY" --no-deps \
             --upgrade-package unsloth --upgrade-package unsloth-zoo \
-            "unsloth>=2026.5.6" unsloth-zoo
+            "unsloth>=2026.5.8" unsloth-zoo
+        # Same pydantic-with-deps trick as the migrated branch.
+        run_install_cmd "install pydantic (with deps for compatible core)" \
+            uv pip install --python "$_VENV_PY" pydantic
         _NO_TORCH_RT="$(_find_no_torch_runtime)"
         if [ -n "$_NO_TORCH_RT" ]; then
             run_install_cmd "install no-torch runtime deps" uv pip install --python "$_VENV_PY" --no-deps -r "$_NO_TORCH_RT"
@@ -2056,7 +2091,7 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
         fi
     elif [ "$STUDIO_LOCAL_INSTALL" = true ]; then
         run_install_cmd "install unsloth (local)" uv pip install --python "$_VENV_PY" \
-            --upgrade-package unsloth "unsloth>=2026.5.6" unsloth-zoo
+            --upgrade-package unsloth "unsloth>=2026.5.8" unsloth-zoo
         substep "overlaying local repo (editable)..."
         run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
         substep "overlaying unsloth-zoo from git main..."
@@ -2088,7 +2123,7 @@ else
     tauri_log "STEP" "Installing Unsloth"
     substep "installing unsloth (this may take a few minutes)..."
     if [ "$STUDIO_LOCAL_INSTALL" = true ]; then
-        run_install_cmd "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" unsloth-zoo "unsloth>=2026.5.6" --torch-backend=auto
+        run_install_cmd "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" unsloth-zoo "unsloth>=2026.5.8" --torch-backend=auto
         substep "overlaying local repo (editable)..."
         run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
         substep "overlaying unsloth-zoo from git main..."
@@ -2098,12 +2133,6 @@ else
     else
         run_install_cmd "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" --torch-backend=auto -- "$PACKAGE_NAME"
     fi
-fi
-
-# ── Install mlx-vlm on Apple Silicon (optional, for VLM training) ──
-if [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
-    substep "installing mlx-vlm (VLM training support)..."
-    run_install_cmd "install mlx-vlm" uv pip install --python "$_VENV_PY" mlx-vlm
 fi
 
 # ── Run studio setup ──
@@ -2253,6 +2282,38 @@ _commit_studio_venv_replacement
 if [ "$TAURI_MODE" = true ]; then
     tauri_log "DONE" ""
     exit 0
+fi
+
+# Warn if another 'unsloth' wins on PATH (different venv, system pip, etc).
+# Users typing `unsloth studio` later would hit that binary instead of the
+# one just installed; the runtime now falls back via UNSLOTH_STUDIO_HOME
+# but the absolute path is still the most reliable launch.
+# Uses the venv python (just created above) for path canonicalization so
+# this works on macOS (BSD readlink has no -f) as well as Linux/WSL.
+_installed_bin="$VENV_DIR/bin/unsloth"
+_path_unsloth=$(command -v unsloth 2>/dev/null || true)
+if [ -n "$_path_unsloth" ] && [ -x "$VENV_DIR/bin/python" ]; then
+    # Canonicalize via the venv python (BSD readlink lacks -f on macOS).
+    # If either side fails to resolve, skip the check entirely rather than
+    # comparing raw paths (which would false-trigger on symlink targets).
+    _canon() {
+        "$VENV_DIR/bin/python" -c \
+            'import os, sys; print(os.path.realpath(sys.argv[1]))' \
+            "$1" 2>/dev/null
+    }
+    _installed_real=$(_canon "$_installed_bin")
+    _path_real=$(_canon "$_path_unsloth")
+    if [ -n "$_installed_real" ] && [ -n "$_path_real" ] \
+        && [ "$_installed_real" != "$_path_real" ]; then
+        echo ""
+        step "warning" "another 'unsloth' wins on PATH:" "$C_WARN"
+        substep "$_path_unsloth"
+        substep "this installer's binary is at:"
+        substep "$_installed_bin"
+        substep "to use this install, run the absolute path above,"
+        substep "alias unsloth, or put its dir earlier on PATH."
+        echo ""
+    fi
 fi
 
 echo ""
