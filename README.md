@@ -82,6 +82,13 @@ irm https://unsloth.ai/install.ps1 | iex
 unsloth studio -p 8888
 ```
 For cloud or global access, add `-H 0.0.0.0`. By default, Unsloth is accessible only locally.
+By default Studio caps its native CPU thread pools (OpenMP, MKL, OpenBLAS,
+NumExpr) at `min(cpu_count, 8)` so high-core hosts do not spawn dozens of
+idle workers. Override with `UNSLOTH_CPU_THREADS=<N>` for a custom cap,
+`UNSLOTH_CPU_THREADS=off` to disable the cap entirely (one thread per
+core), or set any of `OMP_NUM_THREADS` / `MKL_NUM_THREADS` /
+`OPENBLAS_NUM_THREADS` / `NUMEXPR_NUM_THREADS` explicitly to override a
+single runtime.
 
 #### Update
 To update, use the same install commands above or use `unsloth studio update`.

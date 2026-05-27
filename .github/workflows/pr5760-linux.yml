@@ -1,0 +1,71 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Cross-OS validation for PR #5760 (Studio CPU thread cap). Linux x64.
+name: PR5760 Linux
+
+on:
+  push:
+    branches: [pr5760-cross-os]
+    paths:
+      - 'studio/backend/utils/cpu_threads.py'
+      - 'studio/backend/run.py'
+      - 'studio/backend/main.py'
+      - 'studio/backend/tests/test_cpu_threads.py'
+      - '.github/workflows/pr5760-linux.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: 'pip'
+
+      - name: Install minimal deps (pytest only - helper is pure stdlib)
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run cpu_threads tests
+        working-directory: studio/backend
+        run: python -m pytest tests/test_cpu_threads.py -v
+
+      - name: Behavioural probe (verify auto-default actually seeds env)
+        working-directory: studio/backend
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, sys
+          sys.path.insert(0, '.')
+          from utils.cpu_threads import configure_cpu_threads, _DEFAULT_IDLE_CAP
+          # 1) unset -> auto-default
+          env = {}
+          configure_cpu_threads(env)
+          assert env['OMP_NUM_THREADS'] == str(min(os.cpu_count() or 8, _DEFAULT_IDLE_CAP)), env
+          # 2) opt-out
+          env = {'UNSLOTH_CPU_THREADS': 'off'}
+          configure_cpu_threads(env)
+          assert 'OMP_NUM_THREADS' not in env, env
+          # 3) explicit value
+          env = {'UNSLOTH_CPU_THREADS': '3'}
+          configure_cpu_threads(env)
+          assert env == {'UNSLOTH_CPU_THREADS': '3', 'OMP_NUM_THREADS': '3',
+                         'MKL_NUM_THREADS': '3', 'OPENBLAS_NUM_THREADS': '3',
+                         'NUMEXPR_NUM_THREADS': '3'}, env
+          print("OK -- Linux cpu_count =", os.cpu_count(), "auto cap =", min(os.cpu_count() or 8, _DEFAULT_IDLE_CAP))
+          PY
