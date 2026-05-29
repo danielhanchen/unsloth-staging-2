@@ -61,6 +61,50 @@ ALL_GFX = list(GFX_TO_FAMILY)
 # gfx targets lemonade does NOT publish -> must fall through, never silent CPU.
 UNSUPPORTED_GFX = ["gfx900", "gfx906", "gfx908", "gfx999"]
 
+# Full AMD catalog: new + old + data center. Each row is
+# (gfx, product, era, expected_lemonade_family_or_None). lemonade-sdk only
+# publishes RDNA *consumer* families (gfx103X / gfx110X / gfx1150 / gfx1151 /
+# gfx120X), so everything else -- in particular every CDNA / Instinct data
+# center accelerator -- must map to None and fall through to the upstream HIP
+# prebuilt (Windows) or the HIP source build (Linux), never a silent CPU
+# binary. gfx -> product mapping per AMD ROCm GPU-arch docs + LLVM targets.
+AMD_CATALOG: list[tuple[str, str, str, str | None]] = [
+    # --- Data center / Instinct (Vega20 + CDNA 1/2/3/4) -> NOT in lemonade ---
+    ("gfx906", "Instinct MI50 / MI60 (Vega20)",          "datacenter", None),
+    ("gfx908", "Instinct MI100 (CDNA1)",                 "datacenter", None),
+    ("gfx90a", "Instinct MI210/MI250/MI250X (CDNA2)",    "datacenter", None),
+    ("gfx940", "Instinct MI300A pre-release (CDNA3)",    "datacenter", None),
+    ("gfx941", "Instinct MI300 (CDNA3)",                 "datacenter", None),
+    ("gfx942", "Instinct MI300X / MI325X (CDNA3)",       "datacenter", None),
+    ("gfx950", "Instinct MI350X / MI355X (CDNA4)",       "datacenter", None),
+    # --- Old consumer (Vega10 + RDNA1) -> NOT in lemonade ---
+    ("gfx900", "Radeon RX Vega 56/64 (Vega10)",          "old",        None),
+    ("gfx1010", "Radeon RX 5700 XT (RDNA1)",             "old",        None),
+    ("gfx1011", "Radeon Pro V520 (RDNA1)",               "old",        None),
+    ("gfx1012", "Radeon RX 5500 XT (RDNA1)",             "old",        None),
+    # --- RDNA2 (gfx103X) -> covered ---
+    ("gfx1030", "Radeon RX 6800 / 6900 XT (RDNA2)",      "rdna2",      "gfx103X"),
+    ("gfx1031", "Radeon RX 6700 XT (RDNA2)",             "rdna2",      "gfx103X"),
+    ("gfx1032", "Radeon RX 6600 (RDNA2)",                "rdna2",      "gfx103X"),
+    ("gfx1034", "Radeon RX 6500 XT (RDNA2)",             "rdna2",      "gfx103X"),
+    ("gfx1035", "Radeon 680M iGPU (RDNA2)",              "rdna2",      "gfx103X"),
+    ("gfx1036", "Raphael iGPU (RDNA2)",                  "rdna2",      "gfx103X"),
+    # --- RDNA3 (gfx110X) -> covered ---
+    ("gfx1100", "Radeon RX 7900 XTX (RDNA3)",            "rdna3",      "gfx110X"),
+    ("gfx1101", "Radeon RX 7800 / 7700 XT (RDNA3)",      "rdna3",      "gfx110X"),
+    ("gfx1102", "Radeon RX 7600 (RDNA3)",                "rdna3",      "gfx110X"),
+    ("gfx1103", "Radeon 780M iGPU (RDNA3)",              "rdna3",      "gfx110X"),
+    # --- RDNA3.5 APU (Strix) -> covered (exact targets only) ---
+    ("gfx1150", "Strix Point 880M iGPU (RDNA3.5)",       "rdna3.5",    "gfx1150"),
+    ("gfx1151", "Strix Halo 8060S iGPU (RDNA3.5)",       "rdna3.5",    "gfx1151"),
+    # --- RDNA4 (gfx120X) -> covered ---
+    ("gfx1200", "Radeon RX 9060 (RDNA4)",                "rdna4",      "gfx120X"),
+    ("gfx1201", "Radeon RX 9070 / AI PRO R9700 (RDNA4)", "rdna4",      "gfx120X"),
+]
+CATALOG_COVERED = [g for g, _, _, fam in AMD_CATALOG if fam is not None]
+CATALOG_DATACENTER = [g for g, _, era, _ in AMD_CATALOG if era == "datacenter"]
+CATALOG_OLD = [g for g, _, era, _ in AMD_CATALOG if era == "old"]
+
 _STUB_TAG = "b9334"
 _LEMONADE_OS_PREFIXES = ("ubuntu", "windows")
 
@@ -410,6 +454,66 @@ def test_offhost_download_url_rejected(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
+# 8. Full AMD catalog (new + old + data center): family mapping + detection
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("gfx,product,era,expected_family", AMD_CATALOG)
+def test_full_catalog_family_and_detection(gfx, product, era, expected_family):
+    # The gfx must be detected from a rocminfo/hipinfo-style probe ...
+    probe = f"***\nAgent 1\n***\n  Name:                    {gfx}\n  ISA: amdgcn-amd-amdhsa--{gfx}"
+    assert _mod._pick_rocm_gfx_target(probe) == gfx, f"{gfx} ({product}) not detected"
+    # ... and map to exactly the documented lemonade family (or None).
+    assert _lemonade_gfx_family(gfx) == expected_family, (
+        f"{gfx} ({product}, {era}) family mismatch"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 9. Data center / Instinct (CDNA) GPUs: NO lemonade prebuilt -> fall through
+#    (Linux -> PrebuiltFallback => HIP source build; never a silent CPU binary)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("gfx", CATALOG_DATACENTER)
+def test_datacenter_gpu_has_no_lemonade_prebuilt(monkeypatch, gfx):
+    _patch_lemonade(monkeypatch)
+    # No lemonade GPU prebuilt for any data center accelerator, on any OS.
+    assert resolve_lemonade_rocm_choice(linux_amd(gfx), "ubuntu", "linux-rocm") is None
+    assert resolve_lemonade_rocm_choice(windows_amd(gfx), "windows", "windows-hip") is None
+    # Linux Instinct host -> source-build fallback, NOT a CPU downgrade.
+    with pytest.raises(PrebuiltFallback):
+        direct_linux_release_plan(
+            stub_unsloth_linux_release(), linux_amd(gfx), "unslothai/llama.cpp", "latest"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 10. Old GPUs (Vega10 / RDNA1): also not in lemonade -> fall through
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("gfx", CATALOG_OLD)
+def test_old_gpu_falls_through(monkeypatch, gfx):
+    _patch_lemonade(monkeypatch)
+    assert resolve_lemonade_rocm_choice(linux_amd(gfx), "ubuntu", "linux-rocm") is None
+    with pytest.raises(PrebuiltFallback):
+        direct_linux_release_plan(
+            stub_unsloth_linux_release(), linux_amd(gfx), "unslothai/llama.cpp", "latest"
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 11. Every covered consumer gfx (incl. RDNA2 6700/6600, RDNA4) -> lemonade GPU
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("gfx", CATALOG_COVERED)
+def test_every_covered_gfx_gets_lemonade(monkeypatch, gfx):
+    _patch_lemonade(monkeypatch)
+    family = _lemonade_gfx_family(gfx)
+    for host, prefix, kind in (
+        (linux_amd(gfx), "ubuntu", "linux-rocm"),
+        (windows_amd(gfx), "windows", "windows-hip"),
+    ):
+        c = resolve_lemonade_rocm_choice(host, prefix, kind, llama_tag = "latest")
+        assert c is not None and c.repo == "lemonade-sdk/llamacpp-rocm"
+        assert c.name == f"llama-{_STUB_TAG}-{prefix}-rocm-{family}-x64.zip"
+
+
+# --------------------------------------------------------------------------- #
 # Standalone matrix printer (python test_amd_spoof_prebuilt_matrix.py)
 # --------------------------------------------------------------------------- #
 def _build_matrix_rows() -> list[tuple[str, str, str, str]]:
@@ -452,6 +556,27 @@ def _build_matrix_rows() -> list[tuple[str, str, str, str]]:
     return rows
 
 
+def _build_catalog_rows() -> list[tuple[str, str, str, str]]:
+    """Return (era, gfx/product, lemonade prebuilt?, what gets installed) rows
+    for the full new+old+data center AMD catalog."""
+    import unittest.mock as _um
+    rows: list[tuple[str, str, str, str]] = []
+    with _um.patch.object(_mod, "fetch_json", lambda *a, **k: stub_lemonade_release()):
+        for gfx, product, era, expected in AMD_CATALOG:
+            _mod._fetch_lemonade_release_cached.cache_clear()
+            fam = _lemonade_gfx_family(gfx)
+            assert fam == expected
+            if fam is not None:
+                prebuilt = f"YES ({fam})"
+                installed = f"lemonade {fam} GPU prebuilt"
+            else:
+                prebuilt = "no"
+                installed = "Linux: HIP source build / Win: upstream HIP prebuilt"
+            rows.append((era, f"{gfx}  {product}", prebuilt, installed))
+    _mod._fetch_lemonade_release_cached.cache_clear()
+    return rows
+
+
 def main() -> None:
     rows = _build_matrix_rows()
     w0 = max(len(r[0]) for r in rows) + 2
@@ -464,6 +589,18 @@ def main() -> None:
     print("-" * len(hdr))
     for os_, gpu, binary, src in rows:
         print(f"{os_:<{w0}}{gpu:<{w1}}{binary:<{w2}}{src}")
+    print()
+
+    crows = _build_catalog_rows()
+    c0 = max(len(r[0]) for r in crows) + 2
+    c1 = max(len(r[1]) for r in crows) + 2
+    c2 = max(len(r[2]) for r in crows) + 2
+    print("Full AMD catalog (new + old + data center) lemonade prebuilt coverage\n")
+    chdr = f"{'era':<{c0}}{'gfx / product':<{c1}}{'lemonade prebuilt?':<{c2}}{'what gets installed'}"
+    print(chdr)
+    print("-" * len(chdr))
+    for era, prod, prebuilt, installed in crows:
+        print(f"{era:<{c0}}{prod:<{c1}}{prebuilt:<{c2}}{installed}")
     print()
 
 
