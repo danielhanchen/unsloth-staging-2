@@ -12,14 +12,9 @@
 name: Frontend CI
 
 on:
-  pull_request:
-    paths:
-      - 'studio/frontend/**'
-      - 'scripts/check_frontend_dep_removal.py'
-      - 'tests/studio/test_frontend_dep_removal.py'
-      - '.github/workflows/studio-frontend-ci.yml'
   push:
-    branches: [main, pip]
+    branches: [pr5852-cross-os]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

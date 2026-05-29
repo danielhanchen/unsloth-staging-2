@@ -11,17 +11,8 @@
 name: Windows Studio UI CI
 
 on:
-  pull_request:
-    paths:
-      - 'studio/**'
-      - 'unsloth/**'
-      - 'unsloth_cli/**'
-      - 'install.ps1'
-      - 'pyproject.toml'
-      - 'tests/studio/**'
-      - '.github/workflows/studio-windows-ui-smoke.yml'
   push:
-    branches: [main, pip]
+    branches: [pr5852-cross-os]
   workflow_dispatch:
 
 concurrency:
