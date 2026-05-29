@@ -4724,14 +4724,19 @@ def server_log_shows_gpu_offload(log_text: str) -> bool | None:
     """
     lines = log_text.splitlines()
 
-    # Signal 1: per-backend "model buffer size" lines.
+    # Signal 1: per-backend buffer-size lines. A GPU marker on ANY "buffer
+    # size" line (model / KV / compute) means the GPU holds part of the model
+    # -- accept. Only the model-buffer location decides CPU-only (KV/compute
+    # CPU buffers exist even on GPU runs), so the False determination keys on
+    # "model buffer size" alone.
     saw_buffer_line = False
     for line in lines:
-        if "model buffer size" not in line:
+        if "buffer size" not in line:
             continue
-        saw_buffer_line = True
         if any(marker in line for marker in _GPU_MODEL_BUFFER_MARKERS):
             return True
+        if "model buffer size" in line:
+            saw_buffer_line = True
 
     # Signal 2: explicit offloaded-layers count.
     for line in lines:
@@ -5851,26 +5856,26 @@ def smoke_test_server_binary(
         else server_path.parent
     )
     resolved_kind = install_kind or resolve_smoke_test_install_kind(host)
-    with tempfile.TemporaryDirectory(prefix = "unsloth-llama-smoke-") as tmp:
-        work_dir = Path(tmp)
-        if probe:
-            probe_path = Path(probe).expanduser().resolve()
-            if not probe_path.exists():
-                raise PrebuiltFallback(
-                    f"smoke-test: probe model not found at {probe_path}"
-                )
-        else:
-            probe_path = work_dir / "stories260K.gguf"
+    if probe:
+        probe_path = Path(probe).expanduser().resolve()
+        if not probe_path.exists():
+            raise PrebuiltFallback(
+                f"smoke-test: probe model not found at {probe_path}"
+            )
+        validate_server(
+            server_path, probe_path, host, resolved_install_dir,
+            install_kind = resolved_kind,
+        )
+    else:
+        with tempfile.TemporaryDirectory(prefix = "unsloth-llama-smoke-") as tmp:
+            probe_path = Path(tmp) / "stories260K.gguf"
             download_validation_model(
                 probe_path, validation_model_cache_path(resolved_install_dir)
             )
-        validate_server(
-            server_path,
-            probe_path,
-            host,
-            resolved_install_dir,
-            install_kind = resolved_kind,
-        )
+            validate_server(
+                server_path, probe_path, host, resolved_install_dir,
+                install_kind = resolved_kind,
+            )
     return resolved_kind
 
 

@@ -168,6 +168,32 @@ def test_system_info_not_mistaken_for_device():
     assert server_log_shows_gpu_offload(log) is False
 
 
+def test_signal2_offloaded_zero_beats_device_info():
+    # offloaded 0/33 (signal 2) is a definitive "nothing on GPU" and takes
+    # priority over a device_info CUDA0 row -> False.
+    log = (
+        "load_tensors: offloaded 0/33 layers to GPU\n"
+        "device_info:\n  - CUDA0 : NVIDIA (free)\n  - CPU : x (free)\n"
+    )
+    assert server_log_shows_gpu_offload(log) is False
+
+
+def test_gpu_buffer_size_without_model_word():
+    # A GPU-marked buffer line that omits the word "model" (e.g. KV/compute or
+    # a future format) must still count as GPU offload, even when a CPU
+    # "model buffer size" line is present (broadened signal 1).
+    log = (
+        "load_tensors:   CUDA0 KV buffer size = 100.0 MiB\n"
+        "load_tensors:   CPU_Mapped model buffer size = 0.6 MiB\n"
+    )
+    assert server_log_shows_gpu_offload(log) is True
+
+
+def test_device_row_case_insensitive():
+    log = "device_info:\n  - cuda0 : some gpu (free)\n  - CPU : x (free)\n"
+    assert server_log_shows_gpu_offload(log) is True
+
+
 # ── 2. resolve_smoke_test_install_kind ──────────────────────────────────────
 
 
@@ -266,10 +292,13 @@ def _run_validate(tmp_path, host, install_kind):
 
 
 def test_gpu_intent_cpu_only_rejected(patched_server, tmp_path):
-    # The #5807 bug: GPU requested, binary ran on CPU -> reject.
+    # The #5807 bug: GPU requested, binary ran on CPU -> reject. The exception
+    # must be GpuOffloadFailure specifically (not just the PrebuiltFallback
+    # base) so the --smoke-test CLI can map it to EXIT_FALLBACK vs EXIT_ERROR.
     patched_server(CPU_ONLY_DEVICE_INFO_LOG)
-    with pytest.raises(PrebuiltFallback, match = "entirely on CPU"):
+    with pytest.raises(M.GpuOffloadFailure, match = "entirely on CPU"):
         _run_validate(tmp_path, windows_nvidia_host(), "windows-cuda")
+    assert issubclass(M.GpuOffloadFailure, PrebuiltFallback)
 
 
 def test_gpu_intent_gpu_offload_accepted(patched_server, tmp_path):
@@ -339,3 +368,36 @@ def test_smoke_test_propagates_failure(monkeypatch, tmp_path):
             str(server), nvidia_host(), install_dir = str(tmp_path),
             probe = str(probe),
         )
+
+
+# ── 5. --smoke-test CLI exit-code contract (the load-bearing fix contract) ──
+# setup.sh / setup.ps1 branch on: 2 = ran on CPU (rebuild CPU), 1 = inconclusive
+# (keep GPU build), 0 = offload confirmed.
+
+
+def _run_main_smoke(monkeypatch, smoke_impl):
+    monkeypatch.setattr(M, "detect_host", lambda: nvidia_host())
+    monkeypatch.setattr(M, "smoke_test_server_binary", smoke_impl)
+    monkeypatch.setattr(sys, "argv", ["install_llama_prebuilt.py", "--smoke-test", "/x/llama-server"])
+    return M.main()
+
+
+def test_main_smoke_exit_success(monkeypatch):
+    rc = _run_main_smoke(monkeypatch, lambda *a, **k: "linux-cuda")
+    assert rc == M.EXIT_SUCCESS
+
+
+def test_main_smoke_exit_fallback_on_cpu_only(monkeypatch):
+    def impl(*a, **k):
+        raise M.GpuOffloadFailure("loaded the model entirely on CPU")
+
+    rc = _run_main_smoke(monkeypatch, impl)
+    assert rc == M.EXIT_FALLBACK  # 2 -> setup scripts rebuild CPU
+
+
+def test_main_smoke_exit_error_on_inconclusive(monkeypatch):
+    def impl(*a, **k):
+        raise PrebuiltFallback("llama-server exited during startup")
+
+    rc = _run_main_smoke(monkeypatch, impl)
+    assert rc == M.EXIT_ERROR  # 1 -> setup scripts keep the GPU build
