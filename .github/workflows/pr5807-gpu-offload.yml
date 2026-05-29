@@ -1,0 +1,78 @@
+# Cross-OS validation for the #5807 GPU-offload fix. GitHub runners have no
+# GPU, so the real GPU offload is proven on Blackwell hardware separately; here
+# we validate the log-classification + smoke-test logic and the script syntax
+# on the affected platform (Windows) plus Linux, with the GPU mocked.
+name: "PR-5807 gpu-offload"
+on:
+  push:
+    branches: [pr5807-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  installer-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test deps
+        run: python -m pip install --upgrade pip pytest filelock
+      - name: GPU-offload validation tests (stdlib-only, GPU mocked)
+        run: python -m pytest tests/studio/install/test_validate_server_gpu_offload.py -v
+      - name: setup.sh syntax + shell unit tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          bash -n studio/setup.sh
+          bash tests/sh/test_llama_gpu_smoke.sh
+          bash tests/sh/test_nvcc_meets_llama_minimum.sh
+      - name: setup.ps1 parse check (Windows PowerShell)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $tokens = $null; $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path studio/setup.ps1), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors -and $errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Host ("{0}: {1}" -f $_.Extent.StartLineNumber, $_.Message) }
+            exit 1
+          }
+          Write-Host "setup.ps1 parse OK (no syntax errors)"
+      - name: --smoke-test CLI wiring (CPU binary tagged as GPU is rejected)
+        shell: python
+        run: |
+          # No GPU on CI: a CPU-only "binary" (any executable that does not
+          # emit a GPU device_info row) tagged windows-cuda/linux-cuda must be
+          # rejected by the classifier. This exercises the exact decision the
+          # source-build smoke test relies on, cross-OS.
+          import importlib.util, sys
+          from pathlib import Path
+          root = Path.cwd()
+          spec = importlib.util.spec_from_file_location(
+              "m", root / "studio" / "install_llama_prebuilt.py")
+          m = importlib.util.module_from_spec(spec); sys.modules["m"] = m
+          spec.loader.exec_module(m)
+          cpu_log = ("device_info:\n  - CPU : generic (free)\n"
+                     "system_info: | CPU : AVX2 = 1\n")
+          cuda_log = ("device_info:\n  - CUDA0 : NVIDIA (free)\n  - CPU : x (free)\n")
+          assert m.server_log_shows_gpu_offload(cpu_log) is False, "CPU-only must be False"
+          assert m.server_log_shows_gpu_offload(cuda_log) is True, "CUDA must be True"
+          assert "windows-cuda" in m._GPU_INSTALL_KINDS
+          assert "windows-cpu" not in m._GPU_INSTALL_KINDS
+          print("smoke-test classifier wiring OK on", sys.platform)

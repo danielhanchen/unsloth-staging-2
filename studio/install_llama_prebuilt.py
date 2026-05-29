@@ -328,6 +328,16 @@ class PrebuiltFallback(RuntimeError):
     pass
 
 
+class GpuOffloadFailure(PrebuiltFallback):
+    """The binary started and served a completion but loaded the model only on
+    CPU despite GPU offload being requested. A subclass of PrebuiltFallback so
+    the prebuilt resolver still advances to the next candidate, while the
+    --smoke-test CLI can tell this apart from an inconclusive start/serve
+    failure (definite CPU-only -> EXIT_FALLBACK; inconclusive -> EXIT_ERROR)."""
+
+    pass
+
+
 class BusyInstallConflict(RuntimeError):
     pass
 
@@ -1349,6 +1359,24 @@ def direct_upstream_release_plan(
                     install_kind = "windows-cpu",
                 )
             )
+    elif host.is_windows and host.is_arm64:
+        # Upstream ggml-org/llama.cpp ships llama-bNNNN-bin-win-cpu-arm64.zip
+        # (visible in the b9334 release manifest). Without this branch the
+        # selector returned 0 attempts and the installer fell back to a
+        # source build on every Windows ARM64 host.
+        cpu_asset = f"llama-{release_tag}-bin-win-cpu-arm64.zip"
+        cpu_url = assets.get(cpu_asset)
+        if cpu_url:
+            attempts.append(
+                AssetChoice(
+                    repo = repo,
+                    tag = release_tag,
+                    name = cpu_asset,
+                    url = cpu_url,
+                    source_label = "upstream",
+                    install_kind = "windows-arm64",
+                )
+            )
     elif host.is_macos and host.is_arm64:
         asset_name = f"llama-{release_tag}-bin-macos-arm64.tar.gz"
         asset_url = assets.get(asset_name)
@@ -1389,6 +1417,25 @@ def direct_upstream_release_plan(
                     url = asset_url,
                     source_label = "upstream",
                     install_kind = "linux-cpu",
+                )
+            )
+    elif host.is_linux and host.is_arm64 and not host.has_usable_nvidia:
+        # Upstream ggml-org/llama.cpp ships llama-bNNNN-bin-ubuntu-arm64.tar.gz
+        # (visible in the b9334 release manifest). Without this branch the
+        # selector returned 0 attempts and the installer fell back to a
+        # source build on every Linux ARM64 host (DGX Spark, Ampere
+        # Altra, GitHub-hosted ubuntu-24.04-arm runners, etc.).
+        asset_name = f"llama-{release_tag}-bin-ubuntu-arm64.tar.gz"
+        asset_url = assets.get(asset_name)
+        if asset_url:
+            attempts.append(
+                AssetChoice(
+                    repo = repo,
+                    tag = release_tag,
+                    name = asset_name,
+                    url = asset_url,
+                    source_label = "upstream",
+                    install_kind = "linux-arm64",
                 )
             )
     if not attempts:
@@ -2603,12 +2650,18 @@ def detect_host() -> HostInfo:
         try:
             result = run_capture([nvidia_smi], timeout = 20)
             merged = "\n".join(part for part in (result.stdout, result.stderr) if part)
-            for line in merged.splitlines():
-                if "CUDA Version:" in line:
-                    raw = line.split("CUDA Version:", 1)[1].strip().split()[0]
-                    major, minor = raw.split(".", 1)
-                    driver_cuda_version = (int(major), int(minor))
-                    break
+            # Newer NVIDIA drivers (e.g. 610.x on Windows) print
+            # "CUDA UMD Version: X.Y" instead of the legacy
+            # "CUDA Version: X.Y"; accept both spellings.
+            cuda_match = re.search(
+                r"CUDA(?: UMD)? Version:\s*(\d+)\.(\d+)",
+                merged,
+            )
+            if cuda_match is not None:
+                driver_cuda_version = (
+                    int(cuda_match.group(1)),
+                    int(cuda_match.group(2)),
+                )
         except Exception:
             pass
 
@@ -3827,24 +3880,23 @@ def paired_runtime_dll_patterns(choice: AssetChoice) -> list[str]:
 
 
 def runtime_patterns_for_choice(choice: AssetChoice) -> list[str]:
-    if choice.install_kind in {"linux-cpu", "linux-cuda", "linux-rocm"}:
-        return [
-            "llama-server",
-            "llama-quantize",
-            "libllama-common.so*",
-            "libllama.so*",
-            "libggml.so*",
-            "libggml-base.so*",
-            "libmtmd.so*",
-            "libggml-cpu-*.so*",
-            "libggml-cuda.so*",
-            "libggml-hip.so*",
-            "libggml-rpc.so*",
-        ]
+    # Broad shared-library glob + explicit binary names. Lets upstream
+    # repackage the SO/DLL set (e.g. ggml-org/llama.cpp#23462 split the
+    # per-binary entry code into paired ``lib<binary>-impl.so`` shared
+    # libraries between b9279 and b9283) without us re-enumerating
+    # every new file. Studio only invokes llama-server and llama-quantize;
+    # other CLIs upstream ships (llama-cli, llama-bench, ...) are skipped.
+    if choice.install_kind in {"linux-cpu", "linux-cuda", "linux-rocm", "linux-arm64"}:
+        return ["llama-server", "llama-quantize", "lib*.so*"]
     if choice.install_kind in {"macos-arm64", "macos-x64"}:
         return ["llama-server", "llama-quantize", "lib*.dylib"]
-    if choice.install_kind in {"windows-cpu", "windows-cuda", "windows-hip"}:
-        return ["*.exe", "*.dll"]
+    if choice.install_kind in {
+        "windows-cpu",
+        "windows-cuda",
+        "windows-hip",
+        "windows-arm64",
+    }:
+        return ["llama-server.exe", "llama-quantize.exe", "*.dll"]
     raise PrebuiltFallback(
         f"unsupported install kind for runtime overlay: {choice.install_kind}"
     )
@@ -4621,6 +4673,110 @@ def validate_quantize(
         )
 
 
+# GPU backend markers that appear in llama-server's "... model buffer size ..."
+# load lines (older llama.cpp) and in its "device_info:" enumeration (current
+# llama.cpp). CUDA0 / ROCm0 / Metal / Vulkan0 / OpenCL0 / SYCL0 / HIP0 / MUSA0
+# / CANN0 are GPU; CPU / CPU_Mapped are not. Kept broad so a single helper
+# covers every backend Studio ships.
+_GPU_MODEL_BUFFER_MARKERS = ("CUDA", "ROCm", "Metal", "Vulkan", "OpenCL", "SYCL")
+
+# A device_info row looks like "<ts> I   - CUDA0   : NVIDIA B200 (...)" or
+# "<ts> I   - CPU : ...". Matched on the "- <backend> :" shape (the leading
+# "- " distinguishes it from the system_info line, which prints
+# "| CUDA : ARCHS = ..." for a *compiled* backend even when the CUDA runtime
+# failed to initialize at load time). Scanned only after a "device_info:" line.
+_DEVICE_ROW_RE = re.compile(
+    r"-\s*(?P<dev>(?:CUDA|ROCm|ROCM|HIP|Metal|Vulkan|SYCL|OpenCL|MUSA|CANN|CPU)\w*)\s*:",
+    re.IGNORECASE,
+)
+_GPU_DEVICE_PREFIXES = ("cuda", "rocm", "hip", "metal", "vulkan", "sycl", "musa", "cann")
+
+# "load_tensors: offloaded 33/33 layers to GPU" (or "offloading ... to GPU").
+_OFFLOADED_LAYERS_RE = re.compile(
+    r"offloaded\s+(\d+)\s*/\s*(\d+)\s+layers?\s+to\s+gpu", re.IGNORECASE
+)
+
+# install_kind values that ship a real GPU backend and must offload to the GPU.
+# A binary launched with --n-gpu-layers 1 under one of these is held to the
+# GPU-offload check; CPU kinds (windows-cpu, linux-cpu, ...) are exempt.
+_GPU_INSTALL_KINDS = frozenset(
+    {"linux-cuda", "linux-rocm", "windows-cuda", "windows-hip", "macos-arm64"}
+)
+
+
+def server_log_shows_gpu_offload(log_text: str) -> bool | None:
+    """Classify whether llama-server put the model on the GPU.
+
+    Robust across llama.cpp log formats (the "model buffer size" lines were
+    dropped in recent builds), in priority order:
+
+    1. ``<backend> model buffer size = N`` lines -- GPU marker => True
+       (older llama.cpp).
+    2. ``offloaded N/M layers to GPU`` -- N>0 => True, 0/M => False.
+    3. ``device_info:`` enumeration -- a GPU device row (``- CUDA0 :`` etc.)
+       => True; only a ``- CPU :`` row => False. This is the version-stable
+       signal and matches how the CPU-only-binary bug is diagnosed in the
+       field (``device_info`` shows only CPU, CUDA0 missing -- #5830).
+
+    Returns True (GPU offload confirmed), False (started but stayed on CPU
+    despite GPU intent -- the silent fallback in #5807 / #5106), or None when
+    the log carries no usable signal so callers never reject on no evidence.
+    """
+    lines = log_text.splitlines()
+
+    # Signal 1: per-backend "model buffer size" lines.
+    saw_buffer_line = False
+    for line in lines:
+        if "model buffer size" not in line:
+            continue
+        saw_buffer_line = True
+        if any(marker in line for marker in _GPU_MODEL_BUFFER_MARKERS):
+            return True
+
+    # Signal 2: explicit offloaded-layers count.
+    for line in lines:
+        match = _OFFLOADED_LAYERS_RE.search(line)
+        if match:
+            return int(match.group(1)) > 0
+        low = line.lower()
+        if "offloading" in low and "to gpu" in low:
+            return True
+
+    # Signal 3: device_info enumeration. Only trust device rows once the
+    # "device_info:" header has appeared, so the compiled-backend system_info
+    # line ("| CUDA : ARCHS = ...") is never mistaken for an available device.
+    after_device_info = False
+    saw_device_row = False
+    for line in lines:
+        if "device_info:" in line:
+            after_device_info = True
+            continue
+        if not after_device_info:
+            continue
+        match = _DEVICE_ROW_RE.search(line)
+        if not match:
+            continue
+        saw_device_row = True
+        dev = match.group("dev").lower()
+        if any(dev.startswith(prefix) for prefix in _GPU_DEVICE_PREFIXES):
+            return True
+
+    if saw_buffer_line or saw_device_row:
+        # We had a concrete signal, but every buffer/device was CPU.
+        return False
+    return None
+
+
+def read_full_log(log_path: Path, *, max_chars: int = 1_000_000) -> str:
+    """Read a server log from the start (model-load buffer lines appear early,
+    so unlike read_log_excerpt this keeps the head rather than the tail)."""
+    try:
+        content = log_path.read_text(encoding = "utf-8", errors = "replace")
+    except FileNotFoundError:
+        return ""
+    return content[:max_chars]
+
+
 def validate_server(
     server_path: Path,
     probe_path: Path,
@@ -4659,13 +4815,7 @@ def validate_server(
         # validation. Use the resolved install_kind as the source of
         # truth and fall back to host detection when the caller did not
         # pass one (keeps backwards compatibility with older call sites).
-        _gpu_kinds = {
-            "linux-cuda",
-            "linux-rocm",
-            "windows-cuda",
-            "windows-hip",
-            "macos-arm64",
-        }
+        _gpu_kinds = _GPU_INSTALL_KINDS
         if install_kind is not None:
             _enable_gpu_layers = install_kind in _gpu_kinds
         else:
@@ -4701,6 +4851,7 @@ def validate_server(
                 startup_started = time.time()
                 response_body = ""
                 last_error: Exception | None = None
+                completion_succeeded = False
                 while time.time() < deadline:
                     if process.poll() is not None:
                         process.wait(timeout = 5)
@@ -4741,7 +4892,8 @@ def validate_server(
                             status_code = response.status
                             response_body = response.read().decode("utf-8", "replace")
                             if status_code == 200:
-                                return
+                                completion_succeeded = True
+                                break
                             last_error = RuntimeError(
                                 f"unexpected HTTP status {status_code}"
                             )
@@ -4761,6 +4913,35 @@ def validate_server(
                         + output
                         + ("\n" + response_body if response_body else "")
                     )
+                if completion_succeeded:
+                    # The server started and served a completion. When GPU
+                    # offload was requested, make sure the model actually
+                    # landed on the GPU -- a binary whose GPU backend failed
+                    # to load (CPU-only build, unresolved cudart64_*/cublas64_*
+                    # DLLs on Windows, or a PTX-only build on an older driver)
+                    # still serves HTTP 200 from CPU, and accepting it ships a
+                    # silently CPU-only install (issues #5807, #5106). Reject so
+                    # the resolver tries the next bundle / source build / CPU
+                    # fallback instead of stopping at the first 200.
+                    if _enable_gpu_layers:
+                        log_handle.flush()
+                        if (
+                            server_log_shows_gpu_offload(read_full_log(log_path))
+                            is False
+                        ):
+                            raise GpuOffloadFailure(
+                                "llama-server served a completion but loaded the "
+                                "model entirely on CPU despite GPU offload being "
+                                f"requested (install_kind={install_kind}). The "
+                                "binary's GPU backend did not initialize -- on "
+                                "Windows this is usually unresolved "
+                                "cudart64_*.dll / cublas64_*.dll, or a build that "
+                                "does not match the driver (PTX-only). Rejecting "
+                                "so a GPU-capable bundle is selected "
+                                "(unslothai/unsloth#5807, #5106):\n"
+                                + read_log_excerpt(log_path)
+                            )
+                    return
         finally:
             if process is not None and process.poll() is None:
                 process.terminate()
@@ -5194,7 +5375,7 @@ def load_prebuilt_metadata(install_dir: Path) -> dict[str, Any] | None:
 
 
 def runtime_payload_health_groups(choice: AssetChoice) -> list[list[str]]:
-    if choice.install_kind == "linux-cpu":
+    if choice.install_kind in {"linux-cpu", "linux-arm64"}:
         return [
             ["libllama-common.so*"],
             ["libllama.so*"],
@@ -5229,7 +5410,7 @@ def runtime_payload_health_groups(choice: AssetChoice) -> list[list[str]]:
             ["libmtmd.so*"],
             ["libggml-hip.so*"],
         ]
-    if choice.install_kind == "windows-cpu":
+    if choice.install_kind in {"windows-cpu", "windows-arm64"}:
         return [["llama.dll"]]
     if choice.install_kind == "windows-cuda":
         groups = [["llama.dll"], ["ggml-cuda.dll"]]
@@ -5303,6 +5484,15 @@ def existing_install_matches_choice(
     ext = ".exe" if host.is_windows else ""
     for binary in ("llama-server", "llama-quantize"):
         if not (runtime_dir / f"{binary}{ext}").exists():
+            return False
+    if host.is_linux:
+        try:
+            preflight_linux_installed_binaries(
+                [runtime_dir / "llama-server", runtime_dir / "llama-quantize"],
+                install_dir,
+                host,
+            )
+        except Exception:
             return False
     expected_fingerprint = expected_install_fingerprint(
         llama_tag = llama_tag,
@@ -5618,6 +5808,72 @@ def install_prebuilt(
         raise SystemExit(EXIT_FALLBACK) from exc
 
 
+def resolve_smoke_test_install_kind(host: HostInfo) -> str:
+    """Best-effort install_kind for a post-build GPU smoke test, derived from
+    the host. setup.sh / setup.ps1 can override with --install-kind. GPU kinds
+    (in validate_server's _gpu_kinds) make the smoke test require real GPU
+    offload; CPU kinds skip that check."""
+    if host.is_macos and host.is_arm64:
+        return "macos-arm64"
+    if host.has_rocm:
+        return "windows-hip" if host.is_windows else "linux-rocm"
+    if host.has_usable_nvidia:
+        return "windows-cuda" if host.is_windows else "linux-cuda"
+    if host.is_windows:
+        return "windows-cpu"
+    if host.is_macos:
+        return "macos-cpu"
+    return "linux-cpu"
+
+
+def smoke_test_server_binary(
+    server_binary: str,
+    host: HostInfo,
+    *,
+    install_dir: str | None = None,
+    probe: str | None = None,
+    install_kind: str | None = None,
+) -> str:
+    """Run validate_server against an already-built llama-server binary.
+
+    Raises PrebuiltFallback when the binary fails to start, fails the
+    completion probe, or (on a GPU host) loads the model only on CPU.
+    Returns the resolved install_kind on success.
+    """
+    server_path = Path(server_binary).expanduser().resolve()
+    if not server_path.exists():
+        raise PrebuiltFallback(
+            f"smoke-test: llama-server binary not found at {server_path}"
+        )
+    resolved_install_dir = (
+        Path(install_dir).expanduser().resolve()
+        if install_dir
+        else server_path.parent
+    )
+    resolved_kind = install_kind or resolve_smoke_test_install_kind(host)
+    with tempfile.TemporaryDirectory(prefix = "unsloth-llama-smoke-") as tmp:
+        work_dir = Path(tmp)
+        if probe:
+            probe_path = Path(probe).expanduser().resolve()
+            if not probe_path.exists():
+                raise PrebuiltFallback(
+                    f"smoke-test: probe model not found at {probe_path}"
+                )
+        else:
+            probe_path = work_dir / "stories260K.gguf"
+            download_validation_model(
+                probe_path, validation_model_cache_path(resolved_install_dir)
+            )
+        validate_server(
+            server_path,
+            probe_path,
+            host,
+            resolved_install_dir,
+            install_kind = resolved_kind,
+        )
+    return resolved_kind
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description = "Install and validate a prebuilt llama.cpp bundle for Unsloth Studio."
@@ -5648,6 +5904,32 @@ def parse_args() -> argparse.Namespace:
         "--simple-policy",
         action = "store_true",
         help = "Use the simplified platform-specific prebuilt selection policy.",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        metavar = "LLAMA_SERVER",
+        help = (
+            "Validate an already-built llama-server binary instead of "
+            "installing. Launches it against a tiny probe model and, on a GPU "
+            "host, verifies the model actually offloaded to the GPU. Exits 0 "
+            "on success, non-zero (EXIT_FALLBACK) when the binary only ran on "
+            "CPU -- used by setup.sh / setup.ps1 to validate source builds."
+        ),
+    )
+    parser.add_argument(
+        "--probe",
+        help = (
+            "Optional probe GGUF for --smoke-test. Defaults to the bundled "
+            "validation model (downloaded if absent)."
+        ),
+    )
+    parser.add_argument(
+        "--install-kind",
+        help = (
+            "Override the install_kind used by --smoke-test (e.g. linux-cuda, "
+            "windows-cuda, linux-rocm, windows-hip, macos-arm64). Auto-derived "
+            "from the host when omitted."
+        ),
     )
     resolve_group = parser.add_mutually_exclusive_group()
     resolve_group.add_argument(
@@ -5756,6 +6038,35 @@ def main() -> int:
                 "compatibility_upstream_tag": plan.compatibility_upstream_tag,
             },
             output_format = args.output_format,
+        )
+        return EXIT_SUCCESS
+
+    if args.smoke_test is not None:
+        host = detect_host()
+        try:
+            resolved_kind = smoke_test_server_binary(
+                args.smoke_test,
+                host,
+                install_dir = args.install_dir,
+                probe = args.probe,
+                install_kind = args.install_kind,
+            )
+        except GpuOffloadFailure as exc:
+            # Definitive: GPU was requested but the model loaded on CPU. Exit
+            # EXIT_FALLBACK so the caller (setup.sh / setup.ps1) rebuilds CPU.
+            log(f"smoke-test failed (CPU-only): {exc}")
+            return EXIT_FALLBACK
+        except PrebuiltFallback as exc:
+            # Inconclusive: the binary could not be exercised (failed to start,
+            # missing probe, ...). Exit EXIT_ERROR so the caller keeps the GPU
+            # build rather than downgrading it on uncertain evidence.
+            log(f"smoke-test inconclusive: {exc}")
+            return EXIT_ERROR
+        log(
+            f"smoke-test passed: {args.smoke_test} "
+            f"(install_kind={resolved_kind}) offloaded to the GPU"
+            if resolved_kind in _GPU_INSTALL_KINDS
+            else f"smoke-test passed: {args.smoke_test} (install_kind={resolved_kind})"
         )
         return EXIT_SUCCESS
 
