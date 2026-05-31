@@ -144,13 +144,19 @@ def test_linux_runtime_lines_unchanged_for_existing_majors(driver):
 # ---------------------------------------------------------------------------
 # 2. The bug, before and after (real ggml-org b9437 asset shape: 12.4 + 13.3)
 # ---------------------------------------------------------------------------
-@pytest.mark.parametrize("driver", [(13, 1), (13, 2), (13, 3)])
-def test_old_misses_cuda13_new_fixes_it(driver):
+def test_13_3_driver_old_misses_new_fixes():
+    # The #5861 case: driver advertises 13.3, ggml-org ships 12.4 + 13.3.
     assets = win_assets("12.4", "13.3")
-    old = win_select(OLD, "Windows", driver, assets)
-    new = win_select(NEW, "Windows", driver, assets)
-    assert old == f"llama-{TAG}-bin-win-cuda-12.4-x64.zip"  # bug: fell back to 12.4
-    assert new == f"llama-{TAG}-bin-win-cuda-13.3-x64.zip"  # fixed: real cuda13
+    assert win_select(OLD, "Windows", (13, 3), assets) == f"llama-{TAG}-bin-win-cuda-12.4-x64.zip"
+    assert win_select(NEW, "Windows", (13, 3), assets) == f"llama-{TAG}-bin-win-cuda-13.3-x64.zip"
+
+
+@pytest.mark.parametrize("driver", [(13, 0), (13, 1), (13, 2)])
+def test_sub_13_3_driver_gated_to_12_4(driver):
+    # A driver below 13.3 cannot safely run the 13.3 build, so the new code
+    # gates it to the 12.4 build (guaranteed by backward compatibility).
+    assets = win_assets("12.4", "13.3")
+    assert win_select(NEW, "Windows", driver, assets) == f"llama-{TAG}-bin-win-cuda-12.4-x64.zip"
 
 
 def test_cuda12_host_identical_old_and_new():
