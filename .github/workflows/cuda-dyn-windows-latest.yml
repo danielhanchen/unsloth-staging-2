@@ -1,0 +1,30 @@
+name: cuda dynamic selection sim - windows-latest
+on:
+  push:
+    branches: [cuda-dynamic-cross-os]
+    paths: ['sim/**', '.github/workflows/cuda-dyn-windows-latest.yml']
+  pull_request:
+    branches: [main]
+    paths: ['sim/**', '.github/workflows/cuda-dyn-windows-latest.yml']
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  sim:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: python -m pip install --upgrade pip pytest
+      - name: Offline simulation (old vs new, exhaustive grid)
+        run: python -m pytest sim/test_simulation.py -v --no-header -p no:cacheprovider
+      - name: Live feed simulation (real ggml-org + unsloth releases)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python sim/live_feed_sim.py
