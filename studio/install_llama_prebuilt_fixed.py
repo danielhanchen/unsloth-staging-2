@@ -3044,6 +3044,29 @@ def detect_torch_cuda_runtime_preference(host: HostInfo) -> CudaRuntimePreferenc
     return CudaRuntimePreference(runtime_line = runtime_line, selection_log = selection_log)
 
 
+def _best_upstream_cuda_minor(
+    upstream_assets: "dict[str, str]", llama_tag: str, runtime_line: str
+) -> str | None:
+    """Highest cuda-<major>.<minor> minor actually published upstream for this
+    runtime line (cuda13 -> major 13, cuda12 -> major 12). Returns "<major>.<minor>"
+    or None when no matching asset is present. This lets the Windows resolver
+    follow ggml-org when they bump the published minor (e.g. 13.1 -> 13.3)
+    instead of requesting a stale, now-missing asset name."""
+    major = "13" if runtime_line == "cuda13" else "12"
+    pattern = re.compile(
+        r"^(?:llama-" + re.escape(llama_tag) + r"|cudart-llama)"
+        r"-bin-win-cuda-" + major + r"\.(?P<minor>\d+)-x64\.zip$"
+    )
+    best: int | None = None
+    for name in upstream_assets:
+        m = pattern.match(name)
+        if m:
+            minor = int(m.group("minor"))
+            if best is None or minor > best:
+                best = minor
+    return f"{major}.{best}" if best is not None else None
+
+
 def windows_cuda_attempts(
     host: HostInfo,
     llama_tag: str,
@@ -3135,7 +3158,9 @@ def windows_cuda_attempts(
 
     attempts: list[AssetChoice] = []
     for runtime_line in runtime_order:
-        runtime = runtime_by_line[runtime_line]
+        runtime = _best_upstream_cuda_minor(
+            upstream_assets, llama_tag, runtime_line
+        ) or runtime_by_line[runtime_line]
         selected_name = None
         asset_url = None
         for candidate_name in windows_cuda_upstream_asset_names(llama_tag, runtime):
