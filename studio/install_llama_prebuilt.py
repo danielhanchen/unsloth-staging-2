@@ -1106,7 +1106,88 @@ def github_releases(
     return releases
 
 
+_RELEASE_TAG_PATH_RE = re.compile(r"/releases/tag/(?P<tag>[^/?#]+)")
+
+
+def web_request_headers() -> dict[str, str]:
+    # github.com release web endpoints are NOT part of the rate-limited
+    # api.github.com surface (60 req/hour anonymous), so this path is
+    # deliberately unauthenticated: never attach a token and never log headers.
+    return {"User-Agent": "unsloth-studio-llama-prebuilt"}
+
+
+def upstream_release_download_url(repo: str, tag: str, asset_name: str) -> str:
+    """Deterministic release-asset download URL that needs no REST API call.
+
+    github.com/<repo>/releases/download/<tag>/<asset> redirects to the release
+    CDN and is not part of the rate-limited api.github.com surface.
+    """
+    return (
+        f"https://github.com/{repo}/releases/download/"
+        f"{urllib.parse.quote(tag, safe = '')}/{asset_name}"
+    )
+
+
+def _tag_from_release_location(location: str | None) -> str | None:
+    if not location:
+        return None
+    try:
+        path = urllib.parse.urlparse(location).path
+    except Exception:
+        return None
+    match = _RELEASE_TAG_PATH_RE.search(path)
+    if not match:
+        return None
+    tag = urllib.parse.unquote(match.group("tag")).strip()
+    return tag or None
+
+
+def _resolve_latest_release_tag_via_redirect(repo: str) -> str | None:
+    """Resolve a repo's latest release tag without the rate-limited REST API.
+
+    github.com/<repo>/releases/latest 302-redirects to
+    github.com/<repo>/releases/tag/<TAG>. Reading that redirect Location yields
+    the latest tag while spending none of the anonymous api.github.com
+    60-req/hour budget, so tokenless installs behind shared/NAT IPs keep using
+    prebuilt binaries instead of falling back to a slow source build. Returns
+    None on any failure so callers fall back to the REST listing.
+    """
+
+    class _NoFollowRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args, **kwargs):  # type: ignore[override]
+            return None
+
+    url = f"https://github.com/{repo}/releases/latest"
+    opener = urllib.request.build_opener(_NoFollowRedirect)
+    last_exc: Exception | None = None
+    for attempt in range(1, JSON_FETCH_ATTEMPTS + 1):
+        try:
+            request = urllib.request.Request(url, headers = web_request_headers())
+            try:
+                with opener.open(request, timeout = 30) as response:
+                    location = response.headers.get("Location")
+            except urllib.error.HTTPError as exc:
+                # Disabling redirects surfaces the 3xx as an HTTPError whose
+                # Location header still carries the resolved release-tag URL.
+                if exc.code in {301, 302, 303, 307, 308}:
+                    location = exc.headers.get("Location") if exc.headers else None
+                else:
+                    raise
+            return _tag_from_release_location(location)
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= JSON_FETCH_ATTEMPTS or not is_retryable_url_error(exc):
+                break
+            sleep_backoff(attempt, exc = exc)
+    if last_exc is not None:
+        log(f"latest-release redirect resolution failed for {repo}: {last_exc}")
+    return None
+
+
 def latest_upstream_release_tag() -> str:
+    redirect_tag = _resolve_latest_release_tag_via_redirect(UPSTREAM_REPO)
+    if redirect_tag:
+        return redirect_tag
     payload = fetch_json(UPSTREAM_RELEASES_API)
     tag = payload.get("tag_name")
     if not isinstance(tag, str) or not tag:
@@ -1138,14 +1219,56 @@ def release_time_sort_key(release: dict[str, Any]) -> tuple[str, int]:
     return (timestamp, normalized_id)
 
 
+def _needs_dynamic_asset_enumeration(host: HostInfo | None) -> bool:
+    # Windows x64 NVIDIA/AMD hosts choose among multiple CUDA/HIP runtime
+    # archives by probing which assets a release actually published, so the
+    # deterministic redirect fast path (which carries no enumerated assets)
+    # cannot drive that selection. Returning True keeps those hosts on the REST
+    # listing so they are never silently downgraded to a CPU build.
+    if host is None:
+        return False
+    return bool(
+        host.is_windows
+        and host.is_x86_64
+        and (host.has_usable_nvidia or host.has_rocm)
+    )
+
+
 def iter_release_payloads_by_time(
     repo: str,
     published_release_tag: str = "",
     requested_tag: str = "",
+    host: HostInfo | None = None,
 ) -> Iterable[dict[str, Any]]:
     if published_release_tag:
         yield github_release(repo, published_release_tag)
         return
+
+    # Anonymous-friendly fast path for the upstream "latest" request: resolve
+    # the tag via the github.com release redirect (which does NOT consume the
+    # api.github.com 60-req/hour anonymous budget) and synthesize a release
+    # whose assets are addressed by deterministic download URLs. This keeps
+    # `unsloth studio update` on the prebuilt path even when the REST API is
+    # rate-limited (HTTP 403) for tokenless users. Gated to the upstream repo
+    # and to platforms whose asset choice is a single deterministic file; the
+    # listing fallback below still runs if the redirect cannot be resolved.
+    if (
+        repo == UPSTREAM_REPO
+        and (not requested_tag or requested_tag == "latest")
+        and not _needs_dynamic_asset_enumeration(host)
+    ):
+        redirect_tag = _resolve_latest_release_tag_via_redirect(repo)
+        if redirect_tag:
+            log(
+                f"resolved latest {repo} release {redirect_tag} via release "
+                "redirect; skipping GitHub REST release listing"
+            )
+            yield {
+                "tag_name": redirect_tag,
+                "assets": [],
+                "_unsloth_download_repo": repo,
+            }
+            return
 
     if (
         requested_tag
@@ -1375,6 +1498,17 @@ def direct_upstream_release_plan(
         return None
 
     assets = release_asset_map(release)
+    # When the release was resolved via the github.com redirect fast path it
+    # carries no enumerated assets; addresses are then built deterministically
+    # from the known tag. Absent this sentinel, behavior is unchanged.
+    download_repo = release.get("_unsloth_download_repo")
+
+    def asset_url_for(asset_name: str) -> str | None:
+        url = assets.get(asset_name)
+        if not url and download_repo:
+            return upstream_release_download_url(download_repo, release_tag, asset_name)
+        return url
+
     attempts: list[AssetChoice] = []
     if host.is_windows and host.is_x86_64:
         if host.has_usable_nvidia:
@@ -1395,7 +1529,7 @@ def direct_upstream_release_plan(
             if lemonade_choice is not None:
                 attempts.append(lemonade_choice)
             hip_asset = f"llama-{release_tag}-bin-win-hip-radeon-x64.zip"
-            hip_url = assets.get(hip_asset)
+            hip_url = asset_url_for(hip_asset)
             if hip_url:
                 attempts.append(
                     AssetChoice(
@@ -1408,7 +1542,7 @@ def direct_upstream_release_plan(
                     )
                 )
         cpu_asset = f"llama-{release_tag}-bin-win-cpu-x64.zip"
-        cpu_url = assets.get(cpu_asset)
+        cpu_url = asset_url_for(cpu_asset)
         if cpu_url:
             attempts.append(
                 AssetChoice(
@@ -1426,7 +1560,7 @@ def direct_upstream_release_plan(
         # selector returned 0 attempts and the installer fell back to a
         # source build on every Windows ARM64 host.
         cpu_asset = f"llama-{release_tag}-bin-win-cpu-arm64.zip"
-        cpu_url = assets.get(cpu_asset)
+        cpu_url = asset_url_for(cpu_asset)
         if cpu_url:
             attempts.append(
                 AssetChoice(
@@ -1440,7 +1574,7 @@ def direct_upstream_release_plan(
             )
     elif host.is_macos and host.is_arm64:
         asset_name = f"llama-{release_tag}-bin-macos-arm64.tar.gz"
-        asset_url = assets.get(asset_name)
+        asset_url = asset_url_for(asset_name)
         if asset_url:
             attempts.append(
                 AssetChoice(
@@ -1454,7 +1588,7 @@ def direct_upstream_release_plan(
             )
     elif host.is_macos and host.is_x86_64:
         asset_name = f"llama-{release_tag}-bin-macos-x64.tar.gz"
-        asset_url = assets.get(asset_name)
+        asset_url = asset_url_for(asset_name)
         if asset_url:
             attempts.append(
                 AssetChoice(
@@ -1468,7 +1602,7 @@ def direct_upstream_release_plan(
             )
     elif host.is_linux and host.is_x86_64 and not host.has_usable_nvidia:
         asset_name = f"llama-{release_tag}-bin-ubuntu-x64.tar.gz"
-        asset_url = assets.get(asset_name)
+        asset_url = asset_url_for(asset_name)
         if asset_url:
             attempts.append(
                 AssetChoice(
@@ -1487,7 +1621,7 @@ def direct_upstream_release_plan(
         # source build on every Linux ARM64 host (DGX Spark, Ampere
         # Altra, GitHub-hosted ubuntu-24.04-arm runners, etc.).
         asset_name = f"llama-{release_tag}-bin-ubuntu-arm64.tar.gz"
-        asset_url = assets.get(asset_name)
+        asset_url = asset_url_for(asset_name)
         if asset_url:
             attempts.append(
                 AssetChoice(
@@ -1533,7 +1667,7 @@ def resolve_simple_install_release_plans(
 
     try:
         releases = iter_release_payloads_by_time(
-            repo, published_release_tag, requested_tag
+            repo, published_release_tag, requested_tag, host
         )
         for release in releases:
             try:

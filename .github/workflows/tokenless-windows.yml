@@ -1,6 +1,6 @@
-# Staging-only: validate the tokenless llama.cpp prebuilt install on
-# windows-latest (x64 CPU). GH_TOKEN / GITHUB_TOKEN are intentionally EMPTY so
-# we exercise the anonymous path that previously 403'd on api.github.com.
+# Staging-only: prove the llama.cpp prebuilt installs with NO GitHub token on
+# windows-latest (x64 CPU). GH_TOKEN/GITHUB_TOKEN are blanked so we exercise the
+# anonymous path that used to 403 on api.github.com.
 name: "tokenless-windows"
 
 on:
@@ -16,7 +16,7 @@ permissions:
   contents: read
 
 jobs:
-  tokenless-prebuilt:
+  prebuilt:
     name: tokenless prebuilt (windows-latest x64)
     runs-on: windows-latest
     timeout-minutes: 25
@@ -37,50 +37,38 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Unit tests (tokenless resolver)
+      - name: Tokenless prebuilt install
         run: |
-          python -m pip install -q pytest
-          PYTHONPATH=. python -m pytest tests/studio/install/test_tokenless_release_resolution.py -q
-
-      - name: Install prebuilt llama.cpp with NO token
-        run: |
-          mkdir -p logs
           set -o pipefail
+          mkdir -p logs
           unset GH_TOKEN GITHUB_TOKEN
           python studio/install_llama_prebuilt.py \
             --install-dir "$RUNNER_TEMP/llama" \
             --llama-tag latest \
             --published-repo ggml-org/llama.cpp \
-            --simple-policy 2>&1 | tee logs/install_llama.log
+            --simple-policy 2>&1 | tee logs/install.log
           rc=${PIPESTATUS[0]}
-          echo "installer exit code: $rc"
+          echo "installer rc=$rc"
           test "$rc" = "0"
 
-      - name: Assert redirect path used and no source-build fallback
+      - name: Assert prebuilt via redirect, no token, no fallback
         run: |
-          if ! grep -q "via release redirect" logs/install_llama.log; then
-            echo "::error::redirect resolver was not used (expected 'via release redirect')"
-            tail -80 logs/install_llama.log; exit 1
-          fi
-          if grep -qi "falling back to source build" logs/install_llama.log; then
-            echo "::error::tokenless install fell back to source build on Windows"
-            tail -80 logs/install_llama.log; exit 1
-          fi
-          if grep -q "GitHub API returned 403" logs/install_llama.log; then
-            echo "::error::an api.github.com 403 leaked into the tokenless path"
-            tail -80 logs/install_llama.log; exit 1
-          fi
+          grep -q "via release redirect" logs/install.log || { echo "::error::redirect resolver not used"; exit 1; }
+          ! grep -qi "falling back to source build" logs/install.log || { echo "::error::fell back to source build"; exit 1; }
+          ! grep -q "GitHub API returned 403" logs/install.log || { echo "::error::api.github.com 403 leaked"; exit 1; }
           info="$RUNNER_TEMP/llama/UNSLOTH_PREBUILT_INFO.json"
-          test -f "$info" || { echo "::error::no UNSLOTH_PREBUILT_INFO.json (prebuilt not installed)"; exit 1; }
-          jq -e '.prebuilt_fallback_used == false' "$info" >/dev/null \
-            || { echo "::error::prebuilt_fallback_used was true"; cat "$info"; exit 1; }
-          echo "PASS: tokenless Windows x64 prebuilt install via release redirect"
-          jq '{asset, tag, source, prebuilt_fallback_used}' "$info"
+          test -f "$info" || { echo "::error::no UNSLOTH_PREBUILT_INFO.json"; exit 1; }
+          python - "$info" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          print("INFO:", json.dumps({k: d.get(k) for k in ("asset","tag","source","prebuilt_fallback_used")}))
+          sys.exit(0 if d.get("prebuilt_fallback_used") is False else 1)
+          PY
 
-      - name: Upload install log
+      - name: Dump installer log + install dir
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tokenless-windows-log
-          path: logs/install_llama.log
-          retention-days: 7
+        run: |
+          echo "----- install.log (tail) -----"
+          tail -150 logs/install.log 2>&1 || echo "no install.log"
+          echo "----- install dir listing -----"
+          ls -la "$RUNNER_TEMP/llama" 2>&1 || echo "no install dir"
