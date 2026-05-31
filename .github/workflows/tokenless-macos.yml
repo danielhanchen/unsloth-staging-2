@@ -1,0 +1,84 @@
+# Staging-only: validate the tokenless llama.cpp prebuilt install on real
+# Apple Silicon (macos-14). This is the OS from the user report. GH_TOKEN /
+# GITHUB_TOKEN are intentionally EMPTY so we exercise the anonymous path that
+# previously 403'd on api.github.com and fell back to a Metal source build.
+name: "tokenless-macos"
+
+on:
+  push:
+    branches: [pr-llama-tokenless-cross-os]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  tokenless-prebuilt:
+    name: tokenless prebuilt (macos-14 arm64)
+    runs-on: macos-14
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ''
+      GITHUB_TOKEN: ''
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Unit tests (tokenless resolver)
+        run: |
+          python -m pip install -q pytest
+          PYTHONPATH=. python -m pytest tests/studio/install/test_tokenless_release_resolution.py -q
+
+      - name: Install prebuilt llama.cpp with NO token
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          unset GH_TOKEN GITHUB_TOKEN
+          python studio/install_llama_prebuilt.py \
+            --install-dir "$RUNNER_TEMP/llama" \
+            --llama-tag latest \
+            --published-repo ggml-org/llama.cpp \
+            --simple-policy 2>&1 | tee logs/install_llama.log
+          rc=${PIPESTATUS[0]}
+          echo "installer exit code: $rc"
+          test "$rc" = "0"
+
+      - name: Assert redirect path used and no source-build fallback
+        run: |
+          if ! grep -q "via release redirect" logs/install_llama.log; then
+            echo "::error::redirect resolver was not used (expected 'via release redirect')"
+            tail -80 logs/install_llama.log; exit 1
+          fi
+          if grep -qi "falling back to source build" logs/install_llama.log; then
+            echo "::error::tokenless install fell back to source build on macOS"
+            tail -80 logs/install_llama.log; exit 1
+          fi
+          if grep -q "GitHub API returned 403" logs/install_llama.log; then
+            echo "::error::an api.github.com 403 leaked into the tokenless path"
+            tail -80 logs/install_llama.log; exit 1
+          fi
+          info="$RUNNER_TEMP/llama/UNSLOTH_PREBUILT_INFO.json"
+          test -f "$info" || { echo "::error::no UNSLOTH_PREBUILT_INFO.json (prebuilt not installed)"; exit 1; }
+          jq -e '.prebuilt_fallback_used == false' "$info" >/dev/null \
+            || { echo "::error::prebuilt_fallback_used was true"; cat "$info"; exit 1; }
+          grep -q "bin-macos-arm64" logs/install_llama.log \
+            || { echo "::error::macOS arm64 prebuilt asset not selected"; exit 1; }
+          echo "PASS: tokenless macOS arm64 prebuilt install via release redirect"
+          jq '{asset, tag, source, prebuilt_fallback_used}' "$info"
+
+      - name: Upload install log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tokenless-macos-log
+          path: logs/install_llama.log
+          retention-days: 7
