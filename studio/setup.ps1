@@ -2351,7 +2351,9 @@ $LlamaCppDir = Join-Path $UnslothHome "llama.cpp"
 $NeedLlamaSourceBuild = $false
 $SkipPrebuiltInstall = $false
 $RequestedLlamaTag = if ($env:UNSLOTH_LLAMA_TAG) { $env:UNSLOTH_LLAMA_TAG } else { $DefaultLlamaTag }
-$HelperReleaseRepo = "ggml-org/llama.cpp"
+# GPU Windows (CUDA / ROCm) installs the fork's app-* prebuilts; CPU-only stays
+# on ggml-org (the fork ships no windows-cpu bundle). Mirrors setup.sh's routing.
+$HelperReleaseRepo = if ($HasNvidiaSmi -or $HasROCm) { "unslothai/llama.cpp" } else { "ggml-org/llama.cpp" }
 $LlamaPr = if ($env:UNSLOTH_LLAMA_PR) { $env:UNSLOTH_LLAMA_PR.Trim() } else { "" }
 
 $LlamaPrForce = if ($env:UNSLOTH_LLAMA_PR_FORCE) { $env:UNSLOTH_LLAMA_PR_FORCE.Trim() } else { $DefaultLlamaPrForce }
@@ -2478,8 +2480,7 @@ if ($env:UNSLOTH_LLAMA_FORCE_COMPILE -eq "1") {
             "$PSScriptRoot\install_llama_prebuilt.py",
             "--install-dir", $LlamaCppDir,
             "--llama-tag", $RequestedLlamaTag,
-            "--published-repo", $HelperReleaseRepo,
-            "--simple-policy"
+            "--published-repo", $HelperReleaseRepo
         )
         if ($HasROCm) {
             $prebuiltArgs += "--has-rocm"
