@@ -1,0 +1,52 @@
+# Quoted name (hyphen, not '#') so per-OS workflows do not collapse to "PR"
+# and collide on the shared concurrency group.
+name: "PR-5963 Windows x64"
+
+on:
+  push:
+    branches: [pr5963-cross-os]
+    paths:
+      - 'studio/install_llama_prebuilt.py'
+      - 'studio/setup.sh'
+      - 'studio/setup.ps1'
+      - 'tests/studio/install/**'
+      - 'studio/backend/tests/test_lemonade_llamacpp_rocm_bins_mock.py'
+      - '.github/workflows/pr5963-windows-x64.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/install_llama_prebuilt.py'
+      - 'studio/setup.sh'
+      - 'studio/setup.ps1'
+      - 'tests/studio/install/**'
+      - 'studio/backend/tests/test_lemonade_llamacpp_rocm_bins_mock.py'
+      - '.github/workflows/pr5963-windows-x64.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  selection-tests:
+    name: llama.cpp prebuilt selection (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+      - name: Show runner host
+        run: python -c "import platform,sys; print('system=',platform.system(),'machine=',platform.machine()); print(sys.version)"
+      - name: Detect host via installer (real per-OS detection)
+        run: python tests/studio/install/_print_detected_host.py
+      - name: Run llama.cpp prebuilt selection + install unit tests
+        run: python -m pytest tests/studio/install/test_selection_logic.py tests/studio/install/test_install_llama_prebuilt_logic.py studio/backend/tests/test_lemonade_llamacpp_rocm_bins_mock.py -q
