@@ -38,7 +38,7 @@ try:
 except ImportError:
     FileLock = None
     FileLockTimeout = None
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Iterable, Iterator
 
 
@@ -4166,7 +4166,18 @@ def extract_archive(archive_path: Path, destination: Path) -> None:
         if repaired is not None:
             normalized = repaired
         link_path = Path(normalized)
-        if link_path.is_absolute():
+        # Detect absolute targets independently of the host OS. Archive link
+        # names are POSIX-style ("/tmp/..."), but Path.is_absolute() follows the
+        # host's flavour: on Windows, Path("/tmp/x").is_absolute() is False (no
+        # drive letter), so a POSIX-absolute symlink would slip past this gate
+        # and only be caught later as "escaped destination". Check both POSIX
+        # ("/...") and Windows ("C:/...", UNC "//server/...") semantics so the
+        # classification is the same on every platform.
+        if (
+            link_path.is_absolute()
+            or PurePosixPath(normalized).is_absolute()
+            or PureWindowsPath(normalized).is_absolute()
+        ):
             raise PrebuiltFallback(
                 f"archive link used an absolute target: {member_name} -> {link_name}"
             )
