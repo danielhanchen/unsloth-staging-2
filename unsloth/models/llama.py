@@ -309,12 +309,7 @@ def _fast_prepare_inputs_for_generation(
                     )
 
     if kwargs.get("position_ids", None) is None:
-        if original_attention_mask is not None and original_attention_mask.dim() == 2:
-            position_ids = original_attention_mask.long().cumsum(-1) - 1
-            position_ids.masked_fill_(original_attention_mask == 0, 1)
-            position_ids = position_ids[:, -seq_length:]
-            kwargs["position_ids"] = position_ids
-        elif kwargs.get("cache_position", None) is not None:
+        if kwargs.get("cache_position", None) is not None:
             cp = kwargs["cache_position"]
             if cp.dim() == 1:
                 cp = cp.unsqueeze(0).expand(bs, -1)
