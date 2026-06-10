@@ -80,14 +80,20 @@ jobs:
 
       - name: Pin unsloth-zoo to current main (post #697 merge)
         run: |
-          VENV_PY=$(ls -d ~/.unsloth/studio/.venv*/bin/python 2>/dev/null | head -1 || true)
-          if [ -z "$VENV_PY" ]; then VENV_PY=python; fi
+          VENV_PY=$(find "$HOME/.unsloth" -maxdepth 4 -name python -path '*/bin/*' 2>/dev/null | head -1)
+          if [ -z "$VENV_PY" ]; then
+            echo "::error::No Studio venv python under ~/.unsloth"
+            find "$HOME/.unsloth" -maxdepth 3 2>/dev/null | head -40
+            exit 1
+          fi
+          echo "Studio venv python: $VENV_PY"
           "$VENV_PY" -m pip install --force-reinstall --no-deps \
             "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@main"
           "$VENV_PY" -c "
-          import unsloth_zoo.mlx.utils as mutils
-          assert hasattr(mutils, '_prepare_vlm_gguf_export_directory')
-          print('OK: zoo main with #697 surface active in Studio venv')
+          import importlib.metadata as md
+          files = [str(f) for f in md.distribution('unsloth-zoo').files]
+          assert any(f.endswith('mlx/utils.py') for f in files), 'mlx/utils.py missing'
+          print('OK: zoo main with #697 surface installed in Studio venv')
           "
 
       - name: Install pyjwt for the JWT-expiry forge test

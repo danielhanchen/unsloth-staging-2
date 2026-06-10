@@ -163,7 +163,11 @@ def probe_save_config_real_backends():
         )
         saved = json.loads(target.read_text(encoding="utf-8"))
         assert saved["model_type"] == "llama"
-        assert "quantization_config" not in saved
+        assert saved["quantization"] == {"bits": 4}
+        # Real mlx_lm.save_config mirrors quantization into
+        # quantization_config itself; if present it must agree.
+        if "quantization_config" in saved:
+            assert saved["quantization_config"] == {"bits": 4}
     with tempfile.TemporaryDirectory() as tmp:
         target = Path(tmp) / "config.json"
         mutils._save_mlx_config(
