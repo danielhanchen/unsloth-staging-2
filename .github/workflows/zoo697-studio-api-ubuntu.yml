@@ -12,10 +12,6 @@ on:
     branches: [zoo697-postmerge-mlx]
     paths:
       - '.github/workflows/zoo697-studio-api-ubuntu.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - '.github/workflows/zoo697-studio-api-ubuntu.yml'
   workflow_dispatch:
 
 concurrency:

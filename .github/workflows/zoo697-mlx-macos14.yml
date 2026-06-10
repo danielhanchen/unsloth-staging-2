@@ -4,20 +4,19 @@
 #   1. import smoke of the mlx subpackage + llama_cpp against real wheels
 #   2. tests/test_mlx_runtime_cce_compile.py for real (self-skips under
 #      the shim everywhere else in CI)
-#   3. the full zoo MLX suite (shim-backed) on macOS
-#   4. tests/staging/zoo697_real_mlx_probes.py: targeted #697 helper
+#   3. tests/staging/zoo697_real_mlx_probes.py: targeted #697 helper
 #      probes on real mx arrays and real mlx_lm / mlx_vlm save_config
+#
+# The shim-backed MLX suite is deliberately NOT run here: with real mlx
+# wheels installed, zoo's init imports real mlx before the simulation
+# stubs install, so the suite mixes torch fakes into real mx ops. Zoo's
+# own CI already runs the shim suite green on macos-14 without wheels.
 
 name: "zoo697 mlx macos-14"
 
 on:
   push:
     branches: [zoo697-postmerge-mlx]
-    paths:
-      - 'tests/staging/**'
-      - '.github/workflows/zoo697-mlx-macos14.yml'
-  pull_request:
-    branches: [main]
     paths:
       - 'tests/staging/**'
       - '.github/workflows/zoo697-mlx-macos14.yml'
@@ -95,10 +94,6 @@ jobs:
       - name: Runtime CCE compile suite on REAL mlx
         working-directory: zoo
         run: python -m pytest tests/test_mlx_runtime_cce_compile.py -v --tb=short -p no:cacheprovider
-
-      - name: Full zoo MLX suite (shim) on macOS
-        working-directory: zoo
-        run: python -m pytest tests/test_mlx_*.py -q --ignore=tests/test_mlx_runtime_cce_compile.py -p no:cacheprovider
 
       - name: zoo697 real-MLX probes
         run: python tests/staging/zoo697_real_mlx_probes.py
