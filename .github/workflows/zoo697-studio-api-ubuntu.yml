@@ -1,34 +1,21 @@
-# SPDX-License-Identifier: AGPL-3.0-only
-# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+# Post-merge validation for unslothai/unsloth-zoo#697: the proven Studio
+# API & Auth smoke (from studio-api-smoke.yml) with unsloth-zoo force
+# pinned to current main, which now contains the #697 MLX save / GGUF
+# export changes. Proves Studio installs, boots API-only, serves
+# /api/health, and passes the HTTP auth/inference surface with the
+# merged zoo.
 
-# Studio API & Auth Tests -- HTTP-level integration tests for the
-# FastAPI surface. No Playwright, no model UI; tests/studio/test_studio_api_smoke.py
-# runs ~30 s and asserts:
-#   - CORS hardening (no wildcard + credentials, no bootstrap leak)
-#   - /api/system + /api/system/hardware require auth
-#   - Auth state machine + JWT expiry
-#   - API key lifecycle E2E (create / list / use / delete / reject)
-#   - Auth file-mode hardening (Linux only)
-#   - Inference lifecycle (force reload, bogus variant, /v1/models, /v1/embeddings, /v1/responses)
-#   - Endpoint-by-endpoint auth audit
-#
-# Reuses the GGUF cache key from studio-ui-smoke.yml so the model
-# download is one cache-hit on the second job.
-
-name: Studio API CI
+name: "zoo697 studio api ubuntu"
 
 on:
-  pull_request:
-    paths:
-      - 'studio/**'
-      - 'unsloth/**'
-      - 'unsloth_cli/**'
-      - 'install.sh'
-      - 'pyproject.toml'
-      - 'tests/studio/**'
-      - '.github/workflows/studio-api-smoke.yml'
   push:
-    branches: [main, pip]
+    branches: [zoo697-postmerge-mlx]
+    paths:
+      - '.github/workflows/zoo697-studio-api-ubuntu.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/zoo697-studio-api-ubuntu.yml'
   workflow_dispatch:
 
 concurrency:
@@ -40,9 +27,9 @@ permissions:
 
 jobs:
   api-smoke:
-    name: Studio API & Auth Tests
+    name: studio api with zoo main
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 15
     env:
       GGUF_REPO: unsloth/gemma-3-270m-it-GGUF
       GGUF_VARIANT: UD-Q4_K_XL
@@ -75,8 +62,6 @@ jobs:
         continue-on-error: true
         with:
           path: hf-cache
-          # Same key as studio-ui-smoke.yml so the two jobs share a
-          # single GGUF download across CI.
           key: ${{ runner.os }}-hf-${{ env.GGUF_REPO }}-${{ env.GGUF_VARIANT }}-v1
 
       - name: Prime HF_HOME with the GGUF
@@ -89,13 +74,6 @@ jobs:
           mkdir -p hf-cache
           bash .github/scripts/hf-download-with-retry.sh "$GGUF_REPO" "$GGUF_FILE"
 
-      - name: Save HF_HOME for ${{ env.GGUF_REPO }}
-        if: always() && steps.prime-hf.outcome == 'success'
-        uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
-        with:
-          path: hf-cache
-          key: ${{ runner.os }}-hf-${{ env.GGUF_REPO }}-${{ env.GGUF_VARIANT }}-v1
-
       - name: Install Studio (--local, --no-torch)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -103,6 +81,18 @@ jobs:
           mkdir -p logs
           set -o pipefail
           bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Pin unsloth-zoo to current main (post #697 merge)
+        run: |
+          VENV_PY=$(ls -d ~/.unsloth/studio/.venv*/bin/python 2>/dev/null | head -1 || true)
+          if [ -z "$VENV_PY" ]; then VENV_PY=python; fi
+          "$VENV_PY" -m pip install --force-reinstall --no-deps \
+            "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@main"
+          "$VENV_PY" -c "
+          import unsloth_zoo.mlx.utils as mutils
+          assert hasattr(mutils, '_prepare_vlm_gguf_export_directory')
+          print('OK: zoo main with #697 surface active in Studio venv')
+          "
 
       - name: Install pyjwt for the JWT-expiry forge test
         run: pip install 'pyjwt>=2.6'
@@ -126,9 +116,6 @@ jobs:
           jq -e '.status == "healthy"' /tmp/health.json
 
       - name: Pass bootstrap password + rotated targets to the test
-        # The test does its own bootstrap-login + rotation to exercise
-        # the auth state machine; we just pre-mint two random rotated
-        # passwords for it. Mask them so the log is clean.
         run: |
           OLD=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
           NEW="ApiSmoke-$(python -c 'import secrets; print(secrets.token_urlsafe(16))')"
@@ -141,9 +128,6 @@ jobs:
           echo "STUDIO_NEW2_PW=$NEW2" >> "$GITHUB_ENV"
 
       - name: Run Studio API & Auth tests
-        # The script is named WITHOUT a `test_` prefix so it isn't
-        # auto-collected by pytest in Backend CI's `tests/` walk
-        # (which doesn't set BASE_URL and would crash at import).
         env:
           BASE_URL: http://127.0.0.1:18893
           STUDIO_AUTH_DIR: /home/runner/.unsloth/studio/auth
@@ -159,7 +143,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: studio-api-smoke-log
+          name: zoo697-studio-api-log
           path: |
             logs/install.log
             logs/studio.log

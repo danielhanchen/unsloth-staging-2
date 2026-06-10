@@ -1,0 +1,104 @@
+# Post-merge validation for unslothai/unsloth-zoo#697 (MLX save / GGUF
+# export parity) on a real Apple Silicon runner with REAL mlx / mlx-lm /
+# mlx-vlm wheels:
+#   1. import smoke of the mlx subpackage + llama_cpp against real wheels
+#   2. tests/test_mlx_runtime_cce_compile.py for real (self-skips under
+#      the shim everywhere else in CI)
+#   3. the full zoo MLX suite (shim-backed) on macOS
+#   4. tests/staging/zoo697_real_mlx_probes.py: targeted #697 helper
+#      probes on real mx arrays and real mlx_lm / mlx_vlm save_config
+
+name: "zoo697 mlx macos-14"
+
+on:
+  push:
+    branches: [zoo697-postmerge-mlx]
+    paths:
+      - 'tests/staging/**'
+      - '.github/workflows/zoo697-mlx-macos14.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tests/staging/**'
+      - '.github/workflows/zoo697-mlx-macos14.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  real-mlx:
+    name: real mlx zoo main
+    runs-on: macos-14
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo main with real MLX wheels
+        run: |
+          python -m pip install --upgrade pip
+          git clone --depth 5 https://github.com/unslothai/unsloth-zoo zoo
+          git -C zoo log --oneline -1
+          # torch first: zoo's pyproject excludes it on darwin+arm64, but
+          # the shim-backed test suite needs it importable.
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
+          pip install -e './zoo[mlx]'
+          pip install 'pytest==9.0.3' safetensors
+
+      - name: Real Apple Silicon sanity
+        run: |
+          python -c "
+          import platform
+          assert platform.system() == 'Darwin' and platform.machine() == 'arm64'
+          import mlx.core as mx
+          assert 'mlx_simulation' not in (getattr(mx, '__file__', '') or '')
+          from unsloth_zoo.mlx.runtime import is_mlx_available
+          assert is_mlx_available() is True
+          import mlx_lm, mlx_vlm
+          print('OK: real mlx', mx.__version__)
+          "
+
+      - name: Import smoke (mlx subpackage + llama_cpp)
+        run: |
+          python -c "
+          import importlib
+          for name in [
+              'unsloth_zoo.mlx.runtime',
+              'unsloth_zoo.mlx.utils',
+              'unsloth_zoo.mlx.loader',
+              'unsloth_zoo.mlx.compile',
+              'unsloth_zoo.mlx.trainer',
+              'unsloth_zoo.llama_cpp',
+          ]:
+              importlib.import_module(name)
+              print('OK:', name)
+          import unsloth_zoo.mlx.utils as mutils
+          for helper in [
+              '_save_mlx_config', '_mlx_arrays_match',
+              '_rewrite_mlx_vlm_tensor_for_gguf',
+              '_prepare_vlm_gguf_export_directory', '_copy_source_sidecars',
+          ]:
+              assert hasattr(mutils, helper), helper
+          print('OK: #697 surface present')
+          "
+
+      - name: Runtime CCE compile suite on REAL mlx
+        working-directory: zoo
+        run: python -m pytest tests/test_mlx_runtime_cce_compile.py -v --tb=short -p no:cacheprovider
+
+      - name: Full zoo MLX suite (shim) on macOS
+        working-directory: zoo
+        run: python -m pytest tests/test_mlx_*.py -q --ignore=tests/test_mlx_runtime_cce_compile.py -p no:cacheprovider
+
+      - name: zoo697 real-MLX probes
+        run: python tests/staging/zoo697_real_mlx_probes.py
