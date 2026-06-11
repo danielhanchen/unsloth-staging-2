@@ -118,6 +118,12 @@ def main() -> int:
     upd._find_binary = lambda b=real_binary: b
     upd._resolve_memo.clear()
     upd._reset_job_for_tests()
+    # A real setup.sh source build has no git tags, so `llama-server --version`
+    # reports 'version: 1' -> unknown -> treated as behind. Our markerless tree
+    # reuses a prebuilt binary (the only macOS binary the fork ships), which
+    # reports the real latest version, so model the real source-build version
+    # string here. Everything else (resolve, install, apply) stays fully real.
+    upd._installed_build_number = lambda b = None: None
 
     print("\n[3] installer --resolve-prebuilt latest --output-format json", flush=True)
     res = upd._resolve_prebuilt_for_host(force_refresh=True)
