@@ -1,0 +1,35 @@
+name: mtp-spec-validation macos-14
+on:
+  push:
+    branches: [mtp-gemma-spec-validation]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/mtp-macos.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/**'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  pytest:
+    runs-on: macos-14
+    timeout-minutes: 15
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      PYTHONPATH: studio/backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest
+      - run: python -m pytest studio/backend/tests/test_llama_cpp_mtp_detection.py -q
