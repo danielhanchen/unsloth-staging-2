@@ -1,0 +1,33 @@
+name: "PR-6164 windows-latest"
+on:
+  push:
+    branches: [pr6164-cross-os]
+    paths:
+      - 'studio/backend/**'
+      - 'sims/**'
+      - '.github/workflows/pr6164-windowslatest.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  pytest:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: studio/backend
+      UNSLOTH_COMPILE_DISABLE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pytest studio/backend/tests/test_llama_cpp_props_readback.py studio/backend/tests/test_tool_message_empty_content.py studio/backend/tests/test_context_overflow_truncation.py studio/backend/tests/test_openai_tool_passthrough.py studio/backend/tests/test_llama_cpp_context_fit.py studio/backend/tests/test_llama_cpp_no_context_shift.py -q
+      - run: python -m pytest sims/test_sim_capability_matrix.py sims/test_sim_passthrough_e2e.py -q
+        env:
+          STUDIO_BACKEND_DIR: ${{ github.workspace }}/studio/backend
