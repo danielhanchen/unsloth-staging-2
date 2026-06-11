@@ -1,0 +1,37 @@
+name: llama-update macos-latest
+on:
+  push:
+    branches: [llama-update-macos]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/macos-llama-update.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/macos-llama-update.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  macos-update-e2e:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      # Authenticated GitHub API: the freshness check and installer list
+      # releases; 60/hr unauthenticated would flake under repeated CI runs.
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install backend freshness dep
+        run: python -m pip install 'structlog>=24.1.0'
+      - name: macOS in-app update e2e
+        run: python studio/backend/tests/macos_update_e2e.py
