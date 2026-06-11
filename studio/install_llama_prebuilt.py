@@ -5701,6 +5701,12 @@ def validate_quantize(
         raise PrebuiltFallback(prefix + "llama-quantize validation failed:\n" + combined)
 
 
+def _env_flag_true(name: str) -> bool:
+    """True when env var `name` is a truthy string (matches the
+    UNSLOTH_DISABLE_LEMONADE_ROCM idiom)."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
 def validate_server(
     server_path: Path,
     probe_path: Path,
@@ -5709,6 +5715,7 @@ def validate_server(
     *,
     runtime_line: str | None = None,
     install_kind: str | None = None,
+    integrity_verified: bool = False,
 ) -> None:
     last_failure: PrebuiltFallback | None = None
     for port_attempt in range(1, SERVER_PORT_BIND_ATTEMPTS + 1):
@@ -5758,6 +5765,14 @@ def validate_server(
             _enable_gpu_layers = (
                 host.has_usable_nvidia or host.has_rocm or (host.is_macos and host.is_arm64)
             )
+        # When the bundle's bytes already matched the approved sha256 manifest,
+        # integrity is proven; the GPU forward pass only re-checks runtime
+        # compatibility and pays a cold CUDA-JIT cost (minutes on Blackwell
+        # sm_100). Load on CPU instead so the server still proves it links and
+        # serves. Unapproved/lemonade builds keep the GPU smoke test;
+        # UNSLOTH_LLAMA_SKIP_GPU_VALIDATION=1 forces the cheap path everywhere.
+        if integrity_verified or _env_flag_true("UNSLOTH_LLAMA_SKIP_GPU_VALIDATION"):
+            _enable_gpu_layers = False
         if _enable_gpu_layers:
             command.extend(["--n-gpu-layers", "1"])
 
@@ -6550,6 +6565,7 @@ def validate_prebuilt_choice(
         install_dir,
         runtime_line = choice.runtime_line,
         install_kind = choice.install_kind,
+        integrity_verified = choice.expected_sha256 is not None,
     )
     log(f"staged prebuilt validation succeeded for {choice.name}")
     return server_path, quantize_path
