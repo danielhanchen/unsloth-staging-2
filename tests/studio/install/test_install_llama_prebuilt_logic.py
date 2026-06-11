@@ -2761,3 +2761,91 @@ def test_python_runtime_dirs_covers_cu13_and_library_bin(monkeypatch, tmp_path: 
     assert str(cu13_arch) in dirs
     assert str(library_bin) in dirs
     assert str(torch_lib) in dirs
+
+
+def _nvidia_linux_host():
+    return HostInfo(
+        system = "Linux",
+        machine = "x86_64",
+        is_windows = False,
+        is_linux = True,
+        is_macos = False,
+        is_x86_64 = True,
+        is_arm64 = False,
+        nvidia_smi = None,
+        driver_cuda_version = None,
+        compute_caps = ["10.0"],
+        visible_cuda_devices = None,
+        has_physical_nvidia = True,
+        has_usable_nvidia = True,
+    )
+
+
+def _captured_validate_server_command(monkeypatch, tmp_path, **kwargs):
+    """Run validate_server with the server subprocess + HTTP poll stubbed and
+    return the launched command list (asserts whether GPU offload was used)."""
+    captured: dict = {}
+
+    class _FakePopen:
+        def __init__(self, command, **_):
+            captured["command"] = list(command)
+
+        def poll(self):
+            return None  # keep "running" so the loop reaches the HTTP probe
+
+        def wait(self, timeout = None):
+            return 0
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    class _FakeResp:
+        status = 200
+
+        def read(self):
+            return b"{}"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT.subprocess, "Popen", lambda command, **kw: _FakePopen(command, **kw)
+    )
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT.urllib.request, "urlopen", lambda *a, **k: _FakeResp()
+    )
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "binary_env", lambda *a, **k: {})
+    INSTALL_LLAMA_PREBUILT.validate_server(
+        tmp_path / "llama-server",
+        tmp_path / "stories260K.gguf",
+        _nvidia_linux_host(),
+        tmp_path / "install",
+        install_kind = "linux-cuda",
+        **kwargs,
+    )
+    return captured["command"]
+
+
+def test_validate_server_skips_gpu_for_integrity_verified(tmp_path, monkeypatch):
+    # Approved (sha256-verified) build: validate on CPU, never pay the CUDA JIT.
+    cmd = _captured_validate_server_command(monkeypatch, tmp_path, integrity_verified = True)
+    assert "--n-gpu-layers" not in cmd
+
+
+def test_validate_server_uses_gpu_for_unapproved(tmp_path, monkeypatch):
+    # Unapproved/lemonade build on a GPU host: keep the full GPU smoke test.
+    cmd = _captured_validate_server_command(monkeypatch, tmp_path, integrity_verified = False)
+    assert "--n-gpu-layers" in cmd
+
+
+def test_validate_server_env_flag_forces_cpu(tmp_path, monkeypatch):
+    # UNSLOTH_LLAMA_SKIP_GPU_VALIDATION forces the cheap CPU path even when unapproved.
+    monkeypatch.setenv("UNSLOTH_LLAMA_SKIP_GPU_VALIDATION", "1")
+    cmd = _captured_validate_server_command(monkeypatch, tmp_path, integrity_verified = False)
+    assert "--n-gpu-layers" not in cmd
