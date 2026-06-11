@@ -1,0 +1,62 @@
+# Staging replica of the upstream Backend CI pytest job
+# (.github/workflows/studio-backend-ci.yml) to validate the PR #6171 test
+# fix: studio/backend/tests/test_responses_tool_passthrough.py previously
+# faked the llama backend without _request_reasoning_kwargs.
+name: "PR-6171 backend ubuntu"
+
+on:
+  push:
+    branches: [pr6171-backend-ci]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/pr-6171-backend-ci.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/pr-6171-backend-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '${{ matrix.python }}'
+          cache: 'pip'
+
+      - name: Install backend test dependencies (CPU only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' pytest pytest-asyncio httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.4,<2.11'
+          pip install 'transformers>=4.51,<5.5'
+
+      - name: Backend tests
+        working-directory: studio/backend
+        run: |
+          python -m pytest tests/ -q --tb=short \
+            --ignore=tests/test_studio_api.py \
+            -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda'
