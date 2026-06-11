@@ -1,0 +1,37 @@
+name: source-build-update macos-latest
+on:
+  push:
+    branches: [llama-update-source-build]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/macos-source-build-update.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/macos-source-build-update.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  macos-source-build-update:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps
+        run: python -m pip install 'structlog>=24.1.0' pytest
+      - name: Unit tests (markerless detection + apply, resolve mode)
+        run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_llama_cpp_update.py studio/backend/tests/test_install_resolve_prebuilt.py -q
+      - name: macOS source-build update e2e
+        run: python studio/backend/tests/macos_source_build_e2e.py
