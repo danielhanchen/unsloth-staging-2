@@ -46,3 +46,6 @@ jobs:
           & ./docker/docker_confirm.ps1
           if ($LASTEXITCODE -eq 0) { Write-Host "unexpected pass on a Windows-container host"; exit 1 }
           Write-Host "script failed gracefully as expected (exit $LASTEXITCODE)"
+          # The runner appends `exit $LASTEXITCODE`; clear it so the expected
+          # script failure does not fail the step.
+          exit 0
