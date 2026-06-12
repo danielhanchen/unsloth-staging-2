@@ -1,6 +1,6 @@
 # STAGING ONLY - DO NOT MERGE.
 # Cross-OS product validation for unslothai/unsloth#5748 at head SHA
-# 9d39aeec2b505541e6be6ef44c8bddb28cc17802. macOS runners have no Docker, so
+# 5c5b5348d3560358de294f7ef8b6613d8e82c311. macOS runners have no Docker, so
 # this validates the POSIX installer + confirm scripts on real macOS bash
 # across arm64 (macos-14) and intel (macos-15-intel):
 #   * bash -n on install.sh and docker/docker_confirm.sh (syntax-clean under
@@ -12,7 +12,7 @@
 name: "PR-5748 product installers macos"
 on:
   push:
-    branches: [pr5748-product-cross-os]
+    branches: [pr5748-product-cross-os-r2]
     paths:
       - '.github/workflows/product-installers-macos.yml'
   workflow_dispatch:
@@ -34,7 +34,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: unslothai/unsloth
-          ref: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+          ref: 5c5b5348d3560358de294f7ef8b6613d8e82c311
           persist-credentials: false
 
       - name: bash -n syntax check (macOS /bin/bash 3.2)

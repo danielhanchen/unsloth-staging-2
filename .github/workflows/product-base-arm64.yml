@@ -1,6 +1,6 @@
 # STAGING ONLY - DO NOT MERGE.
 # Cross-OS product validation for unslothai/unsloth#5748 at head SHA
-# 9d39aeec2b505541e6be6ef44c8bddb28cc17802: the arm64 leg (DGX Spark / GB10 /
+# 5c5b5348d3560358de294f7ef8b6613d8e82c311: the arm64 leg (DGX Spark / GB10 /
 # Grace shape) built NATIVELY on the free ubuntu-24.04-arm runner.
 #   * native aarch64 build of docker/Dockerfile (INSTALL_VLLM=auto so the
 #     arm64 vLLM fail-soft path is exercised exactly as shipped)
@@ -13,7 +13,7 @@
 name: "PR-5748 product base ubuntu-24.04-arm"
 on:
   push:
-    branches: [pr5748-product-cross-os]
+    branches: [pr5748-product-cross-os-r2]
     paths:
       - '.github/workflows/product-base-arm64.yml'
   workflow_dispatch:
@@ -23,7 +23,7 @@ concurrency:
 permissions:
   contents: read
 env:
-  UNSLOTH_REF: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+  UNSLOTH_REF: 5c5b5348d3560358de294f7ef8b6613d8e82c311
 jobs:
   build-and-cpu-smoke:
     runs-on: ubuntu-24.04-arm
@@ -33,7 +33,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: unslothai/unsloth
-          ref: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+          ref: 5c5b5348d3560358de294f7ef8b6613d8e82c311
           persist-credentials: false
 
       - name: Reclaim disk

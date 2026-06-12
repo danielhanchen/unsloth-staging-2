@@ -1,6 +1,6 @@
 # STAGING ONLY - DO NOT MERGE.
 # Cross-OS product validation for unslothai/unsloth#5748 at head SHA
-# 9d39aeec2b505541e6be6ef44c8bddb28cc17802. Windows runners cannot run Linux
+# 5c5b5348d3560358de294f7ef8b6613d8e82c311. Windows runners cannot run Linux
 # containers, so this validates the Windows installer + confirm scripts
 # directly on real PowerShell across amd64 and arm64:
 #   * [Parser]::ParseFile on install.ps1 and docker/docker_confirm.ps1 with a
@@ -14,7 +14,7 @@
 name: "PR-5748 product installers windows"
 on:
   push:
-    branches: [pr5748-product-cross-os]
+    branches: [pr5748-product-cross-os-r2]
     paths:
       - '.github/workflows/product-installers-windows.yml'
   workflow_dispatch:
@@ -36,7 +36,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: unslothai/unsloth
-          ref: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+          ref: 5c5b5348d3560358de294f7ef8b6613d8e82c311
           persist-credentials: false
 
       - name: Parse install.ps1 and docker_confirm.ps1

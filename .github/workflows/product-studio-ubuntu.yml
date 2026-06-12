@@ -1,6 +1,6 @@
 # STAGING ONLY - DO NOT MERGE.
 # Cross-OS product validation for unslothai/unsloth#5748 at head SHA
-# 9d39aeec2b505541e6be6ef44c8bddb28cc17802.
+# 5c5b5348d3560358de294f7ef8b6613d8e82c311.
 #
 # This goes beyond the PR-187 build-and-curl sweep: it builds the base image
 # and then the Studio image FROM the just-built base, boots Studio CPU-only,
@@ -20,7 +20,7 @@
 name: "PR-5748 product studio ubuntu-latest"
 on:
   push:
-    branches: [pr5748-product-cross-os]
+    branches: [pr5748-product-cross-os-r2]
     paths:
       - '.github/workflows/product-studio-ubuntu.yml'
   workflow_dispatch:
@@ -30,7 +30,7 @@ concurrency:
 permissions:
   contents: read
 env:
-  UNSLOTH_REF: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+  UNSLOTH_REF: 5c5b5348d3560358de294f7ef8b6613d8e82c311
 jobs:
   build-boot-and-drive:
     runs-on: ubuntu-latest
@@ -40,7 +40,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: unslothai/unsloth
-          ref: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+          ref: 5c5b5348d3560358de294f7ef8b6613d8e82c311
           persist-credentials: false
 
       - name: Reclaim disk
