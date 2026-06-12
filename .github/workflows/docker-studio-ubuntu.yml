@@ -31,8 +31,16 @@ jobs:
 
       - name: Reclaim disk
         run: |
+          # The previous run died with ENOSPC during the Studio venv install:
+          # base image + builder-stage cache + studio layer do not fit in the
+          # runner's default free space. Drop every preinstalled toolchain.
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+                      /opt/hostedtoolcache "$AGENT_TOOLSDIRECTORY" \
+                      /usr/local/.ghcup /usr/share/swift \
+                      /usr/local/share/powershell /usr/local/lib/node_modules \
+                      /usr/local/julia* /opt/microsoft /usr/share/miniconda \
+                      /opt/az /usr/local/share/boost /usr/local/share/chromium || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
           df -h /
 
 # No setup-buildx-action here on purpose: its docker-container driver
@@ -46,6 +54,14 @@ jobs:
             --build-arg UNSLOTH_ZOO_REF=main \
             --build-arg INSTALL_VLLM=0 \
             -t unsloth-blackwell:staging docker/
+          df -h /
+
+      - name: Drop base build cache (tagged image stays)
+        run: |
+          # The base Dockerfile is multi-stage; once unsloth-blackwell:staging
+          # is tagged, the builder-stage layers in the buildkit cache are dead
+          # weight the studio build never reuses (it FROMs the tagged image).
+          docker builder prune -af >/dev/null 2>&1 || true
           df -h /
 
       - name: Build studio image on top
