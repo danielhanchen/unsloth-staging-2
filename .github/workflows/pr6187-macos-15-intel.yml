@@ -1,0 +1,77 @@
+# Cross-OS validation for upstream unslothai/unsloth PR #6187
+# "Studio: show Apple GPU temperature and power in the GPU monitor (macOS)".
+# Intel macOS (x86_64). TestLiveSensors is gated to arm64 Darwin, so it
+# SKIPS here -- this job confirms apple.py imports cleanly and the pure
+# helpers pass on an Intel Mac (cross-arch safety), and that the sensor
+# readers latch to None without raising on hardware that lacks the keys.
+name: "PR-6187 macos-15-intel apple-gpu-sensors"
+
+on:
+  push:
+    branches: [pr6187-cross-os]
+    paths:
+      - 'studio/backend/utils/hardware/apple.py'
+      - 'studio/backend/utils/hardware/hardware.py'
+      - 'studio/backend/tests/test_apple_gpu_sensors.py'
+      - 'studio/backend/tests/_apple_sensor_probe.py'
+      - '.github/workflows/pr6187-macos-15-intel.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/utils/hardware/apple.py'
+      - 'studio/backend/utils/hardware/hardware.py'
+      - 'studio/backend/tests/test_apple_gpu_sensors.py'
+      - 'studio/backend/tests/_apple_sensor_probe.py'
+      - '.github/workflows/pr6187-macos-15-intel.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  apple-gpu-sensors:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: studio/backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Show host
+        run: |
+          python -c "import platform; print(platform.platform()); print('machine:', platform.machine())"
+          sw_vers || true
+
+      - name: Install import-chain deps (no torch needed)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install structlog fastapi pytest
+
+      - name: Core tests (import + pure helpers) [gating]
+        env:
+          PYTHONPATH: .
+        run: python -m pytest tests/test_apple_gpu_sensors.py -k "not TestLiveSensors" -v --tb=short
+
+      - name: Live sensor probe [informational, live tests skip on Intel]
+        if: always()
+        continue-on-error: true
+        env:
+          PYTHONPATH: .
+        run: |
+          echo "::group::direct sensor probe"
+          python tests/_apple_sensor_probe.py
+          echo "::endgroup::"
+          echo "::group::live pytest (TestLiveSensors, skips on x86_64)"
+          python -m pytest tests/test_apple_gpu_sensors.py -k "TestLiveSensors" -v --tb=short
+          echo "::endgroup::"
