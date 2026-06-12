@@ -47,4 +47,10 @@ jobs:
           RUN="docker run --rm -e UNSLOTH_ALLOW_CPU=1 unsloth-blackwell:staging"
           $RUN python -c 'import platform, torch; print(platform.machine(), "torch", torch.__version__)'
           $RUN bash -c 'set -ex; "$UNSLOTH_LLAMA_CPP_PATH/llama-server" --version; grep -o "linux-arm64-cuda" "$UNSLOTH_LLAMA_CPP_PATH/UNSLOTH_PREBUILT_INFO.json" | head -1; grep -o "cuda13-portable" "$UNSLOTH_LLAMA_CPP_PATH/UNSLOTH_PREBUILT_INFO.json" | head -1'
-          $RUN python -c 'import os; from unsloth_zoo.llama_cpp import check_llama_cpp; print("check_llama_cpp OK:", *check_llama_cpp(os.environ["UNSLOTH_LLAMA_CPP_PATH"]))'
+          # UNSLOTH_IS_PRESENT=1: unsloth_zoo refuses direct import unless
+          # unsloth was imported first, and `import unsloth` needs a GPU.
+          # The llama.cpp contract function itself is GPU-independent, which
+          # is exactly what this CPU runner validates. Real GPU users hit
+          # this path via `import unsloth`, which sets the var itself.
+          docker run --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_IS_PRESENT=1 unsloth-blackwell:staging \
+            python -c 'import os; from unsloth_zoo.llama_cpp import check_llama_cpp; print("check_llama_cpp OK:", *check_llama_cpp(os.environ["UNSLOTH_LLAMA_CPP_PATH"]))'
