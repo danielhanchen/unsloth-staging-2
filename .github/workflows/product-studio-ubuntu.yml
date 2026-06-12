@@ -69,7 +69,7 @@ jobs:
             -t unsloth-blackwell:staging docker/
           df -h /
 
-      - name: Base image: import unsloth + check_llama_cpp contract (CPU)
+      - name: "Base image: import unsloth + check_llama_cpp contract (CPU)"
         run: |
           # `import unsloth` needs no GPU under UNSLOTH_ALLOW_CPU=1.
           docker run --rm -e UNSLOTH_ALLOW_CPU=1 unsloth-blackwell:staging \
