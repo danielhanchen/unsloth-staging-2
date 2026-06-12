@@ -1,0 +1,74 @@
+# STAGING ONLY - DO NOT MERGE.
+# Cross-OS product validation for unslothai/unsloth#5748 at head SHA
+# 9d39aeec2b505541e6be6ef44c8bddb28cc17802: the arm64 leg (DGX Spark / GB10 /
+# Grace shape) built NATIVELY on the free ubuntu-24.04-arm runner.
+#   * native aarch64 build of docker/Dockerfile (INSTALL_VLLM=auto so the
+#     arm64 vLLM fail-soft path is exercised exactly as shipped)
+#   * import unsloth smoke (UNSLOTH_ALLOW_CPU=1)
+#   * assert the vLLM Dockerfile contract on arm64: vLLM may be absent (the
+#     Dockerfile fail-soft uninstalls it and restores numpy/numba on non-amd64
+#     install/import failure); the image MUST still import unsloth cleanly and
+#     numpy.testing must be importable (the broken numpy 2.2.6 testing module
+#     is the thing the fail-soft path repairs)
+name: "PR-5748 product base ubuntu-24.04-arm"
+on:
+  push:
+    branches: [pr5748-product-cross-os]
+    paths:
+      - '.github/workflows/product-base-arm64.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  UNSLOTH_REF: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+jobs:
+  build-and-cpu-smoke:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 150
+    steps:
+      - name: Checkout PR head of unslothai/unsloth
+        uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+          persist-credentials: false
+
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Build base image (native arm64)
+        run: |
+          docker build \
+            --build-arg UNSLOTH_REF="$UNSLOTH_REF" \
+            --build-arg UNSLOTH_ZOO_REF=main \
+            -t unsloth-blackwell:staging docker/
+          docker images unsloth-blackwell:staging
+          df -h /
+
+      - name: arm64 import unsloth + numpy/numba integrity (vLLM fail-soft contract)
+        run: |
+          set -euo pipefail
+          RUN="docker run --rm -e UNSLOTH_ALLOW_CPU=1 unsloth-blackwell:staging"
+          $RUN python -c 'import platform, torch; print(platform.machine(), "torch", torch.__version__)'
+          # Core contract: the image imports unsloth cleanly on arm64 whether
+          # or not vLLM survived its fail-soft install path.
+          $RUN python -c 'import unsloth; print("import unsloth OK")'
+          # The fail-soft path must leave numpy.testing importable (the broken
+          # numpy 2.2.6 testing module pulled in by vLLM is what would break
+          # `import unsloth`; the Dockerfile restores numpy>=2.4 on failure).
+          $RUN python -c 'import numpy, numpy.testing, numba; print("numpy", numpy.__version__, "numba", numba.__version__, "testing OK")'
+          # Report (do not require) vLLM presence on arm64.
+          $RUN python -c 'import importlib.util as u; print("vllm present:", u.find_spec("vllm") is not None)'
+
+      - name: arm64 llama.cpp prebuilt bundle + check_llama_cpp contract
+        run: |
+          RUN="docker run --rm -e UNSLOTH_ALLOW_CPU=1 unsloth-blackwell:staging"
+          $RUN bash -c 'set -ex; "$UNSLOTH_LLAMA_CPP_PATH/llama-server" --version; grep -o "linux-arm64-cuda" "$UNSLOTH_LLAMA_CPP_PATH/UNSLOTH_PREBUILT_INFO.json" | head -1; grep -o "cuda13-portable" "$UNSLOTH_LLAMA_CPP_PATH/UNSLOTH_PREBUILT_INFO.json" | head -1'
+          docker run --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_IS_PRESENT=1 unsloth-blackwell:staging \
+            python -c 'import os; from unsloth_zoo.llama_cpp import check_llama_cpp; print("check_llama_cpp OK:", *check_llama_cpp(os.environ["UNSLOTH_LLAMA_CPP_PATH"]))'

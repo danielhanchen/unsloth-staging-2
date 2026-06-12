@@ -1,0 +1,106 @@
+# STAGING ONLY - DO NOT MERGE.
+# Cross-OS product validation for unslothai/unsloth#5748 at head SHA
+# 9d39aeec2b505541e6be6ef44c8bddb28cc17802. Windows runners cannot run Linux
+# containers, so this validates the Windows installer + confirm scripts
+# directly on real PowerShell across amd64 and arm64:
+#   * [Parser]::ParseFile on install.ps1 and docker/docker_confirm.ps1 with a
+#     hard error-count == 0 assertion
+#   * run install.ps1's nested Get-TorchIndexUrl in isolation with
+#     UNSLOTH_TORCH_INDEX_FAMILY=cu128 and assert the URL ends with /cu128
+#     (validates the env override on Windows without a GPU). The function is
+#     nested inside Install-UnslothStudio, so it is lifted out via the AST and
+#     re-defined standalone -- it short-circuits on the env var before
+#     touching any enclosing-scope variable.
+name: "PR-5748 product installers windows"
+on:
+  push:
+    branches: [pr5748-product-cross-os]
+    paths:
+      - '.github/workflows/product-installers-windows.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  parse-and-probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR head of unslothai/unsloth
+        uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+          persist-credentials: false
+
+      - name: Parse install.ps1 and docker_confirm.ps1
+        shell: pwsh
+        run: |
+          $failed = $false
+          foreach ($rel in @('install.ps1', 'docker/docker_confirm.ps1')) {
+            $path = Join-Path $PWD $rel
+            $tokens = $null; $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              Write-Host "PARSE ERRORS in ${rel}:"
+              $errors | ForEach-Object { Write-Host "  $_" }
+              $failed = $true
+            } else {
+              Write-Host "OK ${rel} parses cleanly ($($tokens.Count) tokens)"
+            }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Get-TorchIndexUrl honors UNSLOTH_TORCH_INDEX_FAMILY=cu128
+        shell: pwsh
+        run: |
+          $env:UNSLOTH_TORCH_INDEX_FAMILY = 'cu128'
+          # Make sure no mirror override leaks in from the runner environment.
+          Remove-Item Env:UNSLOTH_PYTORCH_MIRROR -ErrorAction SilentlyContinue
+
+          $path = Join-Path $PWD 'install.ps1'
+          $tokens = $null; $errors = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$tokens, [ref]$errors)
+          if ($errors.Count -gt 0) { Write-Host "parse errors"; exit 1 }
+
+          # Lift the nested Get-TorchIndexUrl function definition out of the AST.
+          $fnAst = $ast.FindAll(
+            { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-TorchIndexUrl' },
+            $true) | Select-Object -First 1
+          if (-not $fnAst) { Write-Host "Get-TorchIndexUrl not found in AST"; exit 1 }
+
+          # Re-create it standalone. With UNSLOTH_TORCH_INDEX_FAMILY set the
+          # function returns on its first branch, before referencing any
+          # enclosing-scope variable ($NvidiaSmiExe) or helper (substep).
+          $src = $fnAst.Extent.Text
+          Invoke-Expression $src
+          $url = Get-TorchIndexUrl
+          Write-Host "Get-TorchIndexUrl -> $url"
+          if ($url -ne 'https://download.pytorch.org/whl/cu128') {
+            Write-Host "FAIL: expected https://download.pytorch.org/whl/cu128"
+            exit 1
+          }
+          if (-not $url.EndsWith('/cu128')) {
+            Write-Host "FAIL: URL does not end with /cu128"
+            exit 1
+          }
+          Write-Host "OK: env override resolves to /cu128 on $($PSVersionTable.OS)"
+
+      - name: docker_confirm.ps1 no-docker error path is graceful
+        shell: pwsh
+        run: |
+          # windows-latest ships Docker (Windows-container mode); windows-11-arm
+          # ships none. Either way the script must exit non-zero with FAIL
+          # lines, never crash with a parser/runtime exception.
+          $env:GPUS = "none"; $env:SKIP_TRAIN = "1"
+          & ./docker/docker_confirm.ps1
+          $rc = $LASTEXITCODE
+          if ($rc -eq 0) { Write-Host "unexpected pass (no Linux-container Docker here)"; exit 1 }
+          Write-Host "script failed gracefully as expected (exit $rc)"
+          exit 0

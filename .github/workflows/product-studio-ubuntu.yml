@@ -1,0 +1,194 @@
+# STAGING ONLY - DO NOT MERGE.
+# Cross-OS product validation for unslothai/unsloth#5748 at head SHA
+# 9d39aeec2b505541e6be6ef44c8bddb28cc17802.
+#
+# This goes beyond the PR-187 build-and-curl sweep: it builds the base image
+# and then the Studio image FROM the just-built base, boots Studio CPU-only,
+# and drives the real product surface at the FastAPI level (no GPU, no loaded
+# model):
+#   * wait for /api/health
+#   * read the first-boot bootstrap password from
+#     /opt/unsloth-studio/auth/.bootstrap_password inside the container
+#   * POST /api/auth/login -> access_token (must_change_password = true)
+#   * confirm a protected route is 403 while the password change is pending
+#   * POST /api/auth/change-password -> fresh token (must_change_password=false)
+#   * with the new token: GET /api/health, GET /api/models/list,
+#     GET /api/settings/upload-limit, GET /api/chat/threads
+#   * re-login with the NEW password -> access_token
+#   * inside the base image: import unsloth (UNSLOTH_ALLOW_CPU=1) and the
+#     unsloth_zoo check_llama_cpp() contract against the baked llama.cpp
+name: "PR-5748 product studio ubuntu-latest"
+on:
+  push:
+    branches: [pr5748-product-cross-os]
+    paths:
+      - '.github/workflows/product-studio-ubuntu.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  UNSLOTH_REF: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+jobs:
+  build-boot-and-drive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 170
+    steps:
+      - name: Checkout PR head of unslothai/unsloth
+        uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+          persist-credentials: false
+
+      - name: Reclaim disk
+        run: |
+          # base image + builder cache + studio venv do not fit in the
+          # runner's default free space; drop every preinstalled toolchain.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache "$AGENT_TOOLSDIRECTORY" \
+                      /usr/local/.ghcup /usr/share/swift \
+                      /usr/local/share/powershell /usr/local/lib/node_modules \
+                      /usr/local/julia* /opt/microsoft /usr/share/miniconda \
+                      /opt/az /usr/local/share/boost /usr/local/share/chromium || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      # No setup-buildx-action: its docker-container driver cannot see images
+      # in the host daemon, so the studio build's FROM unsloth-blackwell:staging
+      # would try to pull from Docker Hub. The default docker driver builds
+      # against the local store.
+      - name: Build base image (INSTALL_VLLM=0 for disk headroom)
+        run: |
+          docker build \
+            --build-arg UNSLOTH_REF="$UNSLOTH_REF" \
+            --build-arg UNSLOTH_ZOO_REF=main \
+            --build-arg INSTALL_VLLM=0 \
+            -t unsloth-blackwell:staging docker/
+          df -h /
+
+      - name: Base image: import unsloth + check_llama_cpp contract (CPU)
+        run: |
+          # `import unsloth` needs no GPU under UNSLOTH_ALLOW_CPU=1.
+          docker run --rm -e UNSLOTH_ALLOW_CPU=1 unsloth-blackwell:staging \
+            python -c "import unsloth; print('import unsloth OK')"
+          # unsloth_zoo refuses a direct import unless unsloth set
+          # UNSLOTH_IS_PRESENT first; the check_llama_cpp contract function
+          # itself is GPU-independent, which is what this CPU runner validates.
+          docker run --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_IS_PRESENT=1 unsloth-blackwell:staging \
+            python -c 'import os; from unsloth_zoo.llama_cpp import check_llama_cpp; print("check_llama_cpp OK:", *check_llama_cpp("/opt/unsloth/llama.cpp"))'
+
+      - name: Drop base build cache (tagged image stays)
+        run: |
+          docker builder prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - name: Build studio image FROM the just-built base
+        run: |
+          docker build \
+            --build-arg BASE_IMAGE=unsloth-blackwell:staging \
+            --build-arg UNSLOTH_STUDIO_REF="$UNSLOTH_REF" \
+            -f docker/Dockerfile.studio \
+            -t unsloth-blackwell:studio-staging docker/
+          docker images
+          df -h /
+
+      - name: Boot Studio CPU-only and drive the product surface
+        run: |
+          set -euo pipefail
+          CID=$(docker run -d -e UNSLOTH_ALLOW_CPU=1 -p 18000:8000 -p 18888:8888 unsloth-blackwell:studio-staging)
+          trap 'echo "=== container logs (tail 120) ==="; docker logs --tail 120 "$CID" || true; docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+
+          BASE=http://localhost:18000
+
+          # 1) wait for /api/health 200
+          ok=0
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/health" || true)
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            sleep 4
+          done
+          test "$ok" = 1
+          echo "[health] /api/health -> 200"
+
+          # 2) read the first-boot bootstrap password from inside the container
+          PW=""
+          for i in $(seq 1 30); do
+            PW=$(docker exec "$CID" sh -c 'cat /opt/unsloth-studio/auth/.bootstrap_password 2>/dev/null' | tr -d "\r\n" || true)
+            [ -n "$PW" ] && break
+            sleep 2
+          done
+          test -n "$PW"
+          echo "[bootstrap] read .bootstrap_password (${#PW} chars)"
+
+          # helper: assert HTTP status of a curl call
+          assert_code() { # $1=expected $2=actual $3=label
+            if [ "$2" != "$1" ]; then echo "FAIL $3: expected $1 got $2"; exit 1; fi
+            echo "[ok] $3 -> $2"
+          }
+
+          # 3) POST /api/auth/login with the bootstrap password
+          LOGIN=$(curl -s -w '\n%{http_code}' -X POST "$BASE/api/auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "$(python3 -c 'import json,sys; print(json.dumps({"username":"unsloth","password":sys.argv[1]}))' "$PW")")
+          CODE=$(printf '%s' "$LOGIN" | tail -n1)
+          BODY=$(printf '%s' "$LOGIN" | sed '$d')
+          assert_code 200 "$CODE" "POST /api/auth/login (bootstrap)"
+          TOKEN=$(printf '%s' "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("access_token"); print(d["access_token"])')
+          MUST=$(printf '%s' "$BODY" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("must_change_password")).lower())')
+          echo "[login] got access_token, must_change_password=$MUST"
+          test "$MUST" = "true"
+
+          # 4) protected route is 403 while password change pending
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/models/list" -H "Authorization: Bearer $TOKEN")
+          assert_code 403 "$CODE" "GET /api/models/list (pre-change token, must be 403)"
+
+          # 5) change password -> fresh token
+          NEWPW='Unsloth-Staging-Pw-1'
+          RESP=$(curl -s -w '\n%{http_code}' -X POST "$BASE/api/auth/change-password" \
+            -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+            -d "$(python3 -c 'import json,sys; print(json.dumps({"current_password":sys.argv[1],"new_password":sys.argv[2]}))' "$PW" "$NEWPW")")
+          CODE=$(printf '%s' "$RESP" | tail -n1)
+          BODY=$(printf '%s' "$RESP" | sed '$d')
+          assert_code 200 "$CODE" "POST /api/auth/change-password"
+          TOKEN=$(printf '%s' "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("access_token"); print(d["access_token"])')
+          MUST=$(printf '%s' "$BODY" | python3 -c 'import json,sys; print(str(json.load(sys.stdin).get("must_change_password")).lower())')
+          echo "[change-password] new token, must_change_password=$MUST"
+          test "$MUST" = "false"
+
+          # 6) authenticated reads with the post-change token (no model loaded)
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/health")
+          assert_code 200 "$CODE" "GET /api/health (post-change)"
+
+          RESP=$(curl -s -w '\n%{http_code}' "$BASE/api/models/list" -H "Authorization: Bearer $TOKEN")
+          CODE=$(printf '%s' "$RESP" | tail -n1)
+          BODY=$(printf '%s' "$RESP" | sed '$d')
+          assert_code 200 "$CODE" "GET /api/models/list"
+          printf '%s' "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("[models] keys:", sorted(d)[:8])'
+
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/settings/upload-limit" -H "Authorization: Bearer $TOKEN")
+          assert_code 200 "$CODE" "GET /api/settings/upload-limit"
+
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/chat/threads" -H "Authorization: Bearer $TOKEN")
+          assert_code 200 "$CODE" "GET /api/chat/threads"
+
+          # missing-token control: protected route is 401/403 without a token
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/settings/upload-limit")
+          case "$CODE" in 401|403) echo "[ok] unauthenticated /api/settings/upload-limit -> $CODE" ;; *) echo "FAIL: unauthenticated request returned $CODE"; exit 1 ;; esac
+
+          # 7) re-login with the NEW password
+          RESP=$(curl -s -w '\n%{http_code}' -X POST "$BASE/api/auth/login" \
+            -H 'Content-Type: application/json' \
+            -d "$(python3 -c 'import json,sys; print(json.dumps({"username":"unsloth","password":sys.argv[1]}))' "$NEWPW")")
+          CODE=$(printf '%s' "$RESP" | tail -n1)
+          BODY=$(printf '%s' "$RESP" | sed '$d')
+          assert_code 200 "$CODE" "POST /api/auth/login (new password)"
+          printf '%s' "$BODY" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d.get("access_token"); print("[relogin] access_token present, must_change_password=", d.get("must_change_password"))'
+
+          # 8) JupyterLab also up
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "http://localhost:18888/api" || true)
+          case "$CODE" in 200|403) echo "[ok] jupyter /api -> $CODE" ;; *) echo "FAIL jupyter /api -> $CODE"; exit 1 ;; esac
+
+          echo "ALL PRODUCT-SURFACE CHECKS PASSED"

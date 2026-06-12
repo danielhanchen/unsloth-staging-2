@@ -1,0 +1,88 @@
+# STAGING ONLY - DO NOT MERGE.
+# Cross-OS product validation for unslothai/unsloth#5748 at head SHA
+# 9d39aeec2b505541e6be6ef44c8bddb28cc17802. macOS runners have no Docker, so
+# this validates the POSIX installer + confirm scripts on real macOS bash
+# across arm64 (macos-14) and intel (macos-15-intel):
+#   * bash -n on install.sh and docker/docker_confirm.sh (syntax-clean under
+#     the macOS /bin/bash 3.2 default, the strictest common target)
+#   * extract install.sh::get_torch_index_url and run it in isolation with
+#     UNSLOTH_TORCH_INDEX_FAMILY=cu128, asserting the output ends in /cu128
+#     (validates the env override on macOS without a GPU; the function
+#     short-circuits on the env var before any nvidia / rocm probing)
+name: "PR-5748 product installers macos"
+on:
+  push:
+    branches: [pr5748-product-cross-os]
+    paths:
+      - '.github/workflows/product-installers-macos.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  parse-and-probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Checkout PR head of unslothai/unsloth
+        uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+          persist-credentials: false
+
+      - name: bash -n syntax check (macOS /bin/bash 3.2)
+        run: |
+          echo "bash: $(/bin/bash --version | head -1)"
+          /bin/bash -n install.sh
+          /bin/bash -n docker/docker_confirm.sh
+          echo "OK: install.sh and docker_confirm.sh are syntax-clean"
+
+      - name: get_torch_index_url honors UNSLOTH_TORCH_INDEX_FAMILY=cu128
+        run: |
+          set -eu
+          # Extract the top-level get_torch_index_url function (from its opening
+          # line to the matching column-0 closing brace) into a standalone
+          # snippet, so we exercise the real function without running the rest
+          # of install.sh. With UNSLOTH_TORCH_INDEX_FAMILY set the function
+          # returns before touching any helper (_has_usable_nvidia_gpu etc).
+          awk '
+            /^get_torch_index_url\(\) \{/ { capture = 1 }
+            capture { print }
+            capture && /^\}/ && NR > 1 && $0 == "}" { exit }
+          ' install.sh > /tmp/gtiu.sh
+          echo "--- extracted function ---"; cat /tmp/gtiu.sh; echo "--- end ---"
+          # Guard: the snippet must define exactly the function and nothing else.
+          /bin/bash -n /tmp/gtiu.sh
+
+          unset UNSLOTH_PYTORCH_MIRROR || true
+          export UNSLOTH_TORCH_INDEX_FAMILY=cu128
+          # shellcheck disable=SC1091
+          url=$(/bin/bash -c '. /tmp/gtiu.sh; get_torch_index_url')
+          echo "get_torch_index_url -> $url"
+          if [ "$url" != "https://download.pytorch.org/whl/cu128" ]; then
+            echo "FAIL: expected https://download.pytorch.org/whl/cu128"; exit 1
+          fi
+          case "$url" in
+            */cu128) echo "OK: env override resolves to /cu128 on $(uname -sm)" ;;
+            *) echo "FAIL: URL does not end with /cu128"; exit 1 ;;
+          esac
+
+      - name: docker_confirm.sh no-docker error path is graceful
+        run: |
+          # macOS runners have no docker binary; the script must fail non-zero
+          # with the explicit "docker not found" message, not crash.
+          set +e
+          out=$(/bin/bash docker/docker_confirm.sh 2>&1)
+          rc=$?
+          set -e
+          echo "$out" | tail -5
+          test "$rc" -ne 0
+          echo "$out" | grep -q "docker not found"
+          echo "OK: docker_confirm.sh failed gracefully (exit $rc)"

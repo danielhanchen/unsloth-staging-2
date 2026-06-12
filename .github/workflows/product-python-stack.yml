@@ -1,0 +1,81 @@
+# STAGING ONLY - DO NOT MERGE.
+# Cross-OS product validation for unslothai/unsloth#5748 at head SHA
+# 9d39aeec2b505541e6be6ef44c8bddb28cc17802. Validates
+# studio/install_python_stack.py's CUDA wheel-index override on plain Python
+# (no torch, no installs) across Linux, Windows and macOS:
+#   * import the module file directly via importlib (it must NOT run any
+#     installs at import time -- everything is guarded behind
+#     `if __name__ == "__main__"`)
+#   * set UNSLOTH_TORCH_INDEX_FAMILY=cu999test and assert
+#     _detect_cuda_torch_index_url() == https://download.pytorch.org/whl/cu999test
+#     (the env override must win before any nvidia-smi probing). cu999test is a
+#     deliberately non-existent family so a false pass cannot mask a real
+#     probe leaking through.
+name: "PR-5748 product python-stack"
+on:
+  push:
+    branches: [pr5748-product-cross-os]
+    paths:
+      - '.github/workflows/product-python-stack.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  detect-cuda-index:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - name: Checkout PR head of unslothai/unsloth
+        uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: 9d39aeec2b505541e6be6ef44c8bddb28cc17802
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: _detect_cuda_torch_index_url honors UNSLOTH_TORCH_INDEX_FAMILY
+        env:
+          UNSLOTH_TORCH_INDEX_FAMILY: cu999test
+        shell: python
+        run: |
+          import importlib.util, os, pathlib, sys
+
+          # No mirror override may leak in: _PYTORCH_WHL_BASE is read at import
+          # time, and we assert the plain download.pytorch.org base.
+          os.environ.pop("UNSLOTH_PYTORCH_MIRROR", None)
+
+          # When run as a script the module's own dir (studio/) is sys.path[0],
+          # which is what makes its `from backend.utils...` import resolve. An
+          # importlib load from the repo root has no such entry, so add it
+          # explicitly -- exactly what running `python studio/install_python_stack.py`
+          # would provide. The module then adds studio/backend itself.
+          studio_dir = pathlib.Path("studio").resolve()
+          sys.path.insert(0, str(studio_dir))
+
+          mod_path = studio_dir / "install_python_stack.py"
+
+          # Verify the module body has no top-level install/exec outside the
+          # __main__ guard before importing it. (Defensive read; the import
+          # itself is the real proof, but this makes intent explicit.)
+          text = mod_path.read_text(encoding="utf-8")
+          assert 'if __name__ == "__main__"' in text, "missing __main__ guard"
+
+          spec = importlib.util.spec_from_file_location("ips_under_test", str(mod_path))
+          mod = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(mod)  # must not run installs at import time
+
+          url = mod._detect_cuda_torch_index_url()
+          print("_detect_cuda_torch_index_url ->", url)
+          expected = "https://download.pytorch.org/whl/cu999test"
+          assert url == expected, f"FAIL: expected {expected!r}, got {url!r}"
+          print("OK on", sys.platform, "/", os.uname().machine if hasattr(os, "uname") else "windows")
