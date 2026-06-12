@@ -35,24 +35,26 @@ jobs:
                       /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
           df -h /
 
-      - uses: docker/setup-buildx-action@v3
-
+# No setup-buildx-action here on purpose: its docker-container driver
+      # cannot see images loaded into the host daemon, so the studio build's
+      # FROM unsloth-blackwell:staging would try (and fail) to pull from
+      # Docker Hub. The default docker driver builds against the local store.
       - name: Build base image (no vLLM, disk headroom)
         run: |
-          docker buildx build \
+          docker build \
             --build-arg UNSLOTH_REF=docker-blackwell-build \
             --build-arg UNSLOTH_ZOO_REF=main \
             --build-arg INSTALL_VLLM=0 \
-            -t unsloth-blackwell:staging --load docker/
+            -t unsloth-blackwell:staging docker/
           df -h /
 
       - name: Build studio image on top
         run: |
-          docker buildx build \
+          docker build \
             --build-arg BASE_IMAGE=unsloth-blackwell:staging \
             --build-arg UNSLOTH_STUDIO_REF=docker-blackwell-build \
             -f docker/Dockerfile.studio \
-            -t unsloth-blackwell:studio-staging --load docker/
+            -t unsloth-blackwell:studio-staging docker/
           docker images
           df -h /
 
