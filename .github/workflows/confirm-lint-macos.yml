@@ -1,0 +1,52 @@
+# STAGING ONLY - DO NOT MERGE.
+# unslothai/unsloth#5748: macOS runners have no Docker, so the real Docker
+# Desktop validation happens via docker_confirm.sh on the physical M4/M5
+# machines. This job keeps the script bash-clean on macOS bash 3.2 (the
+# default /bin/bash, the strictest common target) and checks the no-docker
+# error path.
+name: "PR-5748 confirm script macos-14"
+on:
+  push:
+    branches: [pr5748-docker-cross-os]
+    paths:
+      - '.github/workflows/confirm-lint-macos.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  parse-and-dry-run:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - name: Checkout PR branch of unslothai/unsloth
+        uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: docker-blackwell-build
+          persist-credentials: false
+
+      - name: Syntax check under macOS /bin/bash 3.2 and shellcheck
+        run: |
+          /bin/bash -n docker/docker_confirm.sh
+          /bin/bash -n docker/run.sh
+          /bin/bash -n docker/build.sh
+          /bin/bash -n docker/entrypoint.sh
+          /bin/bash -n docker/studio_launch.sh
+          brew install shellcheck >/dev/null 2>&1 || true
+          if command -v shellcheck >/dev/null 2>&1; then
+            shellcheck -S warning docker/docker_confirm.sh docker/run.sh docker/build.sh || exit 1
+          fi
+
+      - name: No-docker error path is graceful
+        run: |
+          set +e
+          out=$(/bin/bash docker/docker_confirm.sh 2>&1)
+          rc=$?
+          set -e
+          echo "$out" | tail -5
+          test "$rc" -ne 0
+          echo "$out" | grep -q "docker not found"
+          echo "script failed gracefully as expected"

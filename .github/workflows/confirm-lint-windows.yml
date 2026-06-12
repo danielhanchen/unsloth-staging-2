@@ -1,0 +1,48 @@
+# STAGING ONLY - DO NOT MERGE.
+# unslothai/unsloth#5748: Windows runners cannot run Linux containers, so
+# the real Docker Desktop validation happens via docker_confirm.ps1 on the
+# physical test machines. This job keeps the script parseable and its
+# no-docker error path sane on a real Windows PowerShell.
+name: "PR-5748 confirm script windows-latest"
+on:
+  push:
+    branches: [pr5748-docker-cross-os]
+    paths:
+      - '.github/workflows/confirm-lint-windows.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  parse-and-dry-run:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout PR branch of unslothai/unsloth
+        uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: docker-blackwell-build
+          persist-credentials: false
+
+      - name: Parse docker_confirm.ps1
+        shell: pwsh
+        run: |
+          $tokens = $null; $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            "$PWD/docker/docker_confirm.ps1", [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) { $errors | ForEach-Object { Write-Host $_ }; exit 1 }
+          Write-Host "docker_confirm.ps1 parses cleanly ($($tokens.Count) tokens)"
+
+      - name: Smoke the script against the runner's Docker (Windows containers)
+        shell: pwsh
+        run: |
+          # windows-latest has Docker in Windows-container mode; the script
+          # must detect that and fail with the explicit OSType message, not
+          # crash. Exit code 1 with FAIL lines is the expected outcome here.
+          $env:GPUS = "none"; $env:SKIP_TRAIN = "1"
+          & ./docker/docker_confirm.ps1
+          if ($LASTEXITCODE -eq 0) { Write-Host "unexpected pass on a Windows-container host"; exit 1 }
+          Write-Host "script failed gracefully as expected (exit $LASTEXITCODE)"

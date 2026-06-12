@@ -1,0 +1,50 @@
+# STAGING ONLY - DO NOT MERGE.
+# Cross-OS validation for unslothai/unsloth#5748: the arm64 leg (DGX Spark /
+# GB10 / Grace shape) built NATIVELY on the free ubuntu-24.04-arm runner.
+# Validates the aarch64 wheel resolution, the build-time arch assertion
+# (sm_100 + sm_120 SASS in the cu128 aarch64 torch wheel), and the
+# linux-arm64-cuda13 llama.cpp prebuilt bake.
+name: "PR-5748 docker base ubuntu-24.04-arm"
+on:
+  push:
+    branches: [pr5748-docker-cross-os]
+    paths:
+      - '.github/workflows/docker-base-arm64.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  build-and-cpu-smoke:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 110
+    steps:
+      - name: Checkout PR branch of unslothai/unsloth
+        uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: docker-blackwell-build
+          persist-credentials: false
+
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build base image (native arm64)
+        run: |
+          cd docker
+          UNSLOTH_REF=docker-blackwell-build UNSLOTH_ZOO_REF=main TAG=staging bash build.sh
+          docker images unsloth-blackwell:staging
+
+      - name: CPU import smoke + arm64 llama.cpp bundle
+        run: |
+          RUN="docker run --rm -e UNSLOTH_ALLOW_CPU=1 unsloth-blackwell:staging"
+          $RUN python -c 'import platform, torch; print(platform.machine(), "torch", torch.__version__)'
+          $RUN bash -c 'set -ex; "$UNSLOTH_LLAMA_CPP_PATH/llama-server" --version; grep -o "linux-arm64-cuda13[a-z-]*" "$UNSLOTH_LLAMA_CPP_PATH/UNSLOTH_PREBUILT_INFO.json"'
+          $RUN python -c 'import os; from unsloth_zoo.llama_cpp import check_llama_cpp; print("check_llama_cpp OK:", *check_llama_cpp(os.environ["UNSLOTH_LLAMA_CPP_PATH"]))'

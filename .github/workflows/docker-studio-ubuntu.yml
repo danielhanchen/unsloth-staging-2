@@ -1,0 +1,73 @@
+# STAGING ONLY - DO NOT MERGE.
+# Cross-OS validation for unslothai/unsloth#5748: the full image
+# (Dockerfile.studio = base + Studio + JupyterLab + sshd under supervisord)
+# built and booted CPU-only on ubuntu-latest, the same way Docker Desktop
+# users on macOS / Windows-without-GPU run it. INSTALL_VLLM=0 keeps the
+# base small enough for the runner disk; the vLLM leg is covered by the
+# docker-base-ubuntu workflow and the GPU validation on the B200 host.
+name: "PR-5748 docker studio ubuntu-latest"
+on:
+  push:
+    branches: [pr5748-docker-cross-os]
+    paths:
+      - '.github/workflows/docker-studio-ubuntu.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  build-and-boot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 160
+    steps:
+      - name: Checkout PR branch of unslothai/unsloth
+        uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: docker-blackwell-build
+          persist-credentials: false
+
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build base image (no vLLM, disk headroom)
+        run: |
+          docker buildx build \
+            --build-arg UNSLOTH_REF=docker-blackwell-build \
+            --build-arg UNSLOTH_ZOO_REF=main \
+            --build-arg INSTALL_VLLM=0 \
+            -t unsloth-blackwell:staging --load docker/
+          df -h /
+
+      - name: Build studio image on top
+        run: |
+          docker buildx build \
+            --build-arg BASE_IMAGE=unsloth-blackwell:staging \
+            --build-arg UNSLOTH_STUDIO_REF=docker-blackwell-build \
+            -f docker/Dockerfile.studio \
+            -t unsloth-blackwell:studio-staging --load docker/
+          docker images
+          df -h /
+
+      - name: Boot CPU-only and probe Studio + Jupyter
+        run: |
+          CID=$(docker run -d -e UNSLOTH_ALLOW_CPU=1 -p 18000:8000 -p 18888:8888 unsloth-blackwell:studio-staging)
+          trap 'docker logs --tail 80 "$CID"; docker rm -f "$CID"' EXIT
+          ok_studio=0; ok_jupyter=0
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:18000/api/health >/dev/null 2>&1; then ok_studio=1; fi
+            if curl -fsS http://localhost:18888/api        >/dev/null 2>&1; then ok_jupyter=1; fi
+            [ "$ok_studio" = 1 ] && [ "$ok_jupyter" = 1 ] && break
+            sleep 5
+          done
+          test "$ok_studio" = 1
+          test "$ok_jupyter" = 1
+          curl -fsS http://localhost:18000/api/health
+          echo "studio + jupyter healthy (CPU mode)"

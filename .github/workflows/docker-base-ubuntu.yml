@@ -1,0 +1,81 @@
+# STAGING ONLY - DO NOT MERGE.
+# Cross-OS validation for unslothai/unsloth#5748 (Blackwell Docker image).
+# Builds the base image from the PR branch on a GPU-less amd64 runner, then
+# runs the CPU-mode container checks that need no GPU:
+#   * entrypoint UNSLOTH_ALLOW_CPU=1 degrade path
+#   * torch import (cu128 wheels run CPU-only)
+#   * baked llama.cpp prebuilt layout (unsloth_zoo check_llama_cpp contract)
+#   * JupyterLab boots and serves /api
+name: "PR-5748 docker base ubuntu-latest"
+on:
+  push:
+    branches: [pr5748-docker-cross-os]
+    paths:
+      - '.github/workflows/docker-base-ubuntu.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  UNSLOTH_REF: docker-blackwell-build
+jobs:
+  build-and-cpu-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    steps:
+      - name: Checkout PR branch of unslothai/unsloth
+        uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: docker-blackwell-build
+          persist-credentials: false
+
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build base image (amd64, no GPU on this runner)
+        run: |
+          cd docker
+          UNSLOTH_REF="$UNSLOTH_REF" UNSLOTH_ZOO_REF=main TAG=staging bash build.sh
+          docker images unsloth-blackwell:staging
+
+      - name: Entrypoint blocks GPU-less runs by default
+        run: |
+          set +e
+          docker run --rm unsloth-blackwell:staging python -c "print('should not run')" > out.log 2>&1
+          rc=$?
+          set -e
+          cat out.log
+          test "$rc" -ne 0
+          grep -q "No GPU visible" out.log
+
+      - name: UNSLOTH_ALLOW_CPU=1 degrades to CPU mode
+        run: |
+          docker run --rm -e UNSLOTH_ALLOW_CPU=1 unsloth-blackwell:staging \
+            python -c "import torch; print('torch', torch.__version__, 'cuda_available', torch.cuda.is_available())"
+
+      - name: Baked llama.cpp satisfies the unsloth_zoo export contract
+        run: |
+          RUN="docker run --rm -e UNSLOTH_ALLOW_CPU=1 unsloth-blackwell:staging"
+          $RUN bash -c 'set -ex; test -x "$UNSLOTH_LLAMA_CPP_PATH/llama-quantize"; test -x "$UNSLOTH_LLAMA_CPP_PATH/llama-server"; test -f "$UNSLOTH_LLAMA_CPP_PATH/convert_hf_to_gguf.py"; test -d "$UNSLOTH_LLAMA_CPP_PATH/gguf-py"; "$UNSLOTH_LLAMA_CPP_PATH/llama-server" --version; cat "$UNSLOTH_LLAMA_CPP_PATH/UNSLOTH_PREBUILT_INFO.json"'
+          $RUN python -c 'import os; from unsloth_zoo.llama_cpp import check_llama_cpp; print("check_llama_cpp OK:", *check_llama_cpp(os.environ["UNSLOTH_LLAMA_CPP_PATH"]))'
+
+      - name: JupyterLab boots and serves /api
+        run: |
+          CID=$(docker run -d -e UNSLOTH_ALLOW_CPU=1 -p 18888:8888 unsloth-blackwell:staging \
+            jupyter lab --ip 0.0.0.0 --port 8888 --allow-root --no-browser --IdentityProvider.token='')
+          trap 'docker logs --tail 30 "$CID"; docker rm -f "$CID"' EXIT
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:18888/api >/dev/null 2>&1; then ok=1; break; fi
+            sleep 4
+          done
+          test "$ok" = 1
+          curl -fsS http://localhost:18888/api
