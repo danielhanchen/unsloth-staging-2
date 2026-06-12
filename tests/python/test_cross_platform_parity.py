@@ -21,24 +21,17 @@ class TestNoTorchBackendAutoInInstallSh:
 
     def test_no_torch_backend_auto_outside_fallback(self):
         lines = INSTALL_SH.read_text().splitlines()
-        # Find the fallback block: starts with the "else" after the
-        # TORCH_INDEX_URL check and ends at the next "fi".
+        # Fallback block: from "GPU detection failed" to the next "fi".
         fallback_start = None
         fallback_end = None
         for i, line in enumerate(lines):
             if fallback_start is None and "GPU detection failed" in line:
                 fallback_start = i
-            elif (
-                fallback_start is not None
-                and fallback_end is None
-                and line.strip() == "fi"
-            ):
+            elif fallback_start is not None and fallback_end is None and line.strip() == "fi":
                 fallback_end = i
                 break
         fallback_range = (
-            range(fallback_start or 0, (fallback_end or 0) + 1)
-            if fallback_start
-            else range(0)
+            range(fallback_start or 0, (fallback_end or 0) + 1) if fallback_start else range(0)
         )
 
         matches = [
@@ -151,3 +144,43 @@ class TestPyTorchMirrorEnvVar:
         assert (
             "UNSLOTH_PYTORCH_MIRROR" in text
         ), "install.ps1 should reference UNSLOTH_PYTORCH_MIRROR"
+
+
+class TestUvBytecodeCompileTimeout:
+    """Installers should relax uv bytecode compilation timeout by default."""
+
+    @staticmethod
+    def _version_tuple(version: str) -> tuple[int, ...]:
+        return tuple(int(part) for part in version.split("."))
+
+    def test_install_sh_uses_uv_version_with_timeout_env(self):
+        text = INSTALL_SH.read_text()
+        match = re.search(r'^UV_MIN_VERSION="([^"]+)"$', text, re.MULTILINE)
+        assert match, "install.sh should declare UV_MIN_VERSION"
+        assert self._version_tuple(match.group(1)) >= self._version_tuple("0.7.22")
+
+    def test_install_ps1_uses_uv_version_with_timeout_env(self):
+        text = INSTALL_PS1.read_text()
+        match = re.search(r'^\s*\$UvMinVersion = "([^"]+)"$', text, re.MULTILINE)
+        assert match, "install.ps1 should declare $UvMinVersion"
+        assert self._version_tuple(match.group(1)) >= self._version_tuple("0.7.22")
+        assert "function Test-UvVersionOk" in text
+        assert "if (-not (Test-UvVersionOk))" in text
+
+    def test_install_sh_preserves_timeout_override(self):
+        text = INSTALL_SH.read_text()
+        assert (
+            ': "${UV_COMPILE_BYTECODE_TIMEOUT:=180}"' in text
+        ), "install.sh should default UV_COMPILE_BYTECODE_TIMEOUT without overwriting callers"
+        assert (
+            "export UV_COMPILE_BYTECODE_TIMEOUT" in text
+        ), "install.sh should export UV_COMPILE_BYTECODE_TIMEOUT for uv subprocesses"
+
+    def test_install_ps1_preserves_timeout_override(self):
+        text = INSTALL_PS1.read_text()
+        assert (
+            "if (-not $env:UV_COMPILE_BYTECODE_TIMEOUT)" in text
+        ), "install.ps1 should preserve caller UV_COMPILE_BYTECODE_TIMEOUT overrides"
+        assert (
+            '$env:UV_COMPILE_BYTECODE_TIMEOUT = "180"' in text
+        ), "install.ps1 should default UV_COMPILE_BYTECODE_TIMEOUT"
