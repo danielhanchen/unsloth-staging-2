@@ -39,6 +39,8 @@ jobs:
         run: python -m pytest tests/python/test_cross_platform_parity.py -q
       - name: install.ps1 logic (PowerShell 7)
         run: pwsh -NoProfile -File ci_validation/test_install_ps1.ps1
+      - name: install.ps1 PATH-shadow recovery (real uv shims)
+        run: pwsh -NoProfile -File ci_validation/test_install_ps1_shadow.ps1
       - name: install.ps1 parse under Windows PowerShell 5.1 (informational)
         shell: powershell
         continue-on-error: true
