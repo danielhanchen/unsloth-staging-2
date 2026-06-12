@@ -1,0 +1,96 @@
+# Measures peak host memory while compiling ggml-cuda for the cuda12-older arch
+# set (70 75 80 86 89) on stock ubuntu-latest runners (4 vCPU / 16 GB) -- the
+# same nvcc multi-arch fanout the unslothai/llama.cpp prebuild compiles. Goal:
+# decide whether `-j 2` is genuinely RAM-bound or has headroom for -j 3/4, and
+# measure the OOM/flake rate. One push -> a 5-job matrix over -j {2,2,3,4,4}.
+# Build is best-effort: an OOM is recorded as data, not a job failure. Name has
+# no '#' (a '#' would be parsed as a YAML comment and collide concurrency).
+name: memcheck-cuda12-older
+on:
+  push:
+    branches: [prebuild-memcheck]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+permissions:
+  contents: read
+jobs:
+  mem:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { jn: '2', rep: 'a' }
+          - { jn: '2', rep: 'b' }
+          - { jn: '3', rep: 'a' }
+          - { jn: '4', rep: 'a' }
+          - { jn: '4', rep: 'b' }
+    name: j${{ matrix.jn }}-${{ matrix.rep }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container:
+      image: nvidia/cuda:12.8.0-devel-ubuntu22.04
+    steps:
+      - name: Toolchain
+        shell: bash
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq git cmake ninja-build build-essential ca-certificates procps
+          nvcc --version | tail -2
+          echo "nproc=$(nproc)"; grep -E "MemTotal" /proc/meminfo
+
+      - name: Clone llama.cpp (#24423 head, branch diffusion-visual-updates)
+        shell: bash
+        run: |
+          set -eux
+          git clone --depth 1 -b diffusion-visual-updates \
+            https://github.com/danielhanchen/llama.cpp src
+          ( cd src && git rev-parse HEAD )
+
+      - name: Configure (cuda12-older arch set 70 75 80 86 89)
+        shell: bash
+        working-directory: src
+        run: |
+          set -eux
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DGGML_NATIVE=OFF \
+            -DGGML_BACKEND_DL=ON \
+            -DGGML_CUDA=ON \
+            -DGGML_CUDA_CUB_3DOT2=ON \
+            -DLLAMA_BUILD_TESTS=OFF \
+            -DLLAMA_BUILD_EXAMPLES=OFF \
+            -DLLAMA_BUILD_TOOLS=OFF \
+            -DLLAMA_BUILD_SERVER=OFF \
+            -DLLAMA_CURL=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES="70;75;80;86;89"
+
+      - name: Build ggml-cuda with memory sampling (-j ${{ matrix.jn }})
+        shell: bash
+        working-directory: src
+        run: |
+          set -uxo pipefail
+          JN="${{ matrix.jn }}"
+          TOTAL_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+          # background sampler: lowest MemAvailable over the build = peak usage
+          ( while true; do awk '/MemAvailable/{print $2}' /proc/meminfo; sleep 1; done ) > /tmp/mem.log &
+          SAMP=$!
+          START=$(date +%s)
+          cmake --build build --target ggml-cuda -j "$JN" 2>&1 | tee /tmp/build.log
+          RC=${PIPESTATUS[0]}
+          END=$(date +%s)
+          kill "$SAMP" 2>/dev/null || true
+          MIN_AVAIL_KB=$(awk 'NR==1{m=$1} $1<m{m=$1} END{print m+0}' /tmp/mem.log)
+          PEAK_USED_MB=$(( (TOTAL_KB - MIN_AVAIL_KB) / 1024 ))
+          MIN_AVAIL_MB=$(( MIN_AVAIL_KB / 1024 ))
+          TOTAL_MB=$(( TOTAL_KB / 1024 ))
+          OOM=no
+          grep -qiE "killed|signal 9|cicc.*(died|terminated)|out of memory|cannot allocate|virtual memory exhausted|c\+\+: fatal error" /tmp/build.log && OOM=yes
+          echo "==================== SUMMARY ===================="
+          echo "MEMCHECK_RESULT jn=$JN rep=${{ matrix.rep }} rc=$RC oom=$OOM peak_used_mb=$PEAK_USED_MB min_avail_mb=$MIN_AVAIL_MB total_mb=$TOTAL_MB nproc=$(nproc) duration_s=$((END-START))"
+          echo "================================================"
+          # never fail the job: an OOM is the measurement, not an error
+          exit 0
