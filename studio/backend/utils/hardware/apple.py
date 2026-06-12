@@ -347,11 +347,18 @@ class _IOReportEnergy:
         )
         if not self._sub:
             raise OSError("IOReportCreateSubscription failed")
+        # IOReportCreateSubscription writes the channel descriptor that later
+        # samples must use into `subscribed`; on hosts that normalize/replace
+        # the requested channels, sampling with the original `self._channels`
+        # returns no Energy Model entries (matches macmon's use of the
+        # subscribed descriptor). Keep a reference so it is not collected, and
+        # fall back to the requested channels if the OS left it unset.
+        self._sample_channels = subscribed if subscribed else self._channels
         self._channels_key = _cfstr(self._cf, "IOReportChannels")
         self._prev: Optional[tuple[int, float]] = None  # (sample ref, monotonic s)
 
     def gpu_power_w(self) -> Optional[float]:
-        sample = self._ior.IOReportCreateSamples(self._sub, self._channels, None)
+        sample = self._ior.IOReportCreateSamples(self._sub, self._sample_channels, None)
         if not sample:
             return None
         now = time.monotonic()
