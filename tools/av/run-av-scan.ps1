@@ -70,6 +70,18 @@ function Invoke-DefenderFileScan {
   $out = & $MpCmd -Scan -ScanType 3 -File $File -DisableRemediation 2>&1
   $code = $LASTEXITCODE
   $text = ($out | Out-String)
+  # The WinDefend RPC endpoint is flaky on hosted runners; on an RPC failure,
+  # bounce the service and retry up to twice so a transient does not masquerade
+  # as an inconclusive result.
+  $tries = 0
+  while ($text -match 'RPC server is unavailable|0x800106ba|CmdTool: Failed' -and $tries -lt 2) {
+    $tries++
+    try { Restart-Service WinDefend -Force -ErrorAction SilentlyContinue } catch {}
+    Start-Sleep -Seconds 5
+    $out = & $MpCmd -Scan -ScanType 3 -File $File -DisableRemediation 2>&1
+    $code = $LASTEXITCODE
+    $text = ($out | Out-String)
+  }
   $threat = Parse-DefenderThreat $text
   # Authoritative cross-check: a recorded detection referencing this file.
   $rec = $null

@@ -102,11 +102,25 @@ jobs:
         shell: pwsh
         continue-on-error: true
         run: |
-          $url = "https://devbuilds.s.kaspersky-labs.com/devbuilds/KVRT/latest/full/KVRT.exe"
-          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\KVRT.exe" -UseBasicParsing
-          $sig = Get-AuthenticodeSignature "$env:RUNNER_TEMP\KVRT.exe"
-          "KVRT signature: $($sig.Status) / $($sig.SignerCertificate.Subject)" | Out-Host
-          if ($sig.Status -ne 'Valid') { Write-Warning "KVRT signature not Valid; KVRT step may be skipped" }
+          $urls = @(
+            "https://devbuilds.s.kaspersky-labs.com/devbuilds/KVRT/latest/full/KVRT.exe",
+            "https://devbuilds.kaspersky-labs.com/devbuilds/KVRT/latest/full/KVRT.exe",
+            "https://media.kaspersky.com/utilities/VirusUtilities/EN/KVRT.exe"
+          )
+          $dest = "$env:RUNNER_TEMP\KVRT.exe"
+          foreach ($url in $urls) {
+            for ($i=0; $i -lt 2; $i++) {
+              try {
+                Invoke-WebRequest -Uri $url -OutFile $dest -UseBasicParsing -TimeoutSec 180
+                if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 5MB)) { break }
+              } catch { Write-Host "KVRT download attempt failed: $($_.Exception.Message)" }
+            }
+            if ((Test-Path $dest) -and ((Get-Item $dest).Length -gt 5MB)) { break }
+          }
+          if (Test-Path $dest) {
+            $sig = Get-AuthenticodeSignature $dest
+            "KVRT size: $((Get-Item $dest).Length) signature: $($sig.Status) / $($sig.SignerCertificate.Subject)" | Out-Host
+          } else { Write-Warning "KVRT download failed from all mirrors" }
 
       # ---- Run drivers ----
       - name: Scan (Windows)
