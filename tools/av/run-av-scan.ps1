@@ -6,15 +6,19 @@
   Keyless engines only (no VirusTotal here -- VT runs locally off-box with the
   private key). Each variant folder is materialised into a real .lnk (from
   shortcut.json) so the shortcut binary is scanned alongside the .vbs / .ps1.
+  Defender is scanned per-file so a detection is attributed to launch-studio.vbs
+  vs the .lnk vs the .ps1.
 
 .PARAMETER ArtifactsDir  Folder containing <variant>/ subfolders + manifest.json
 .PARAMETER OutDir        Where to write <variant>.json result files
 .PARAMETER KvrtExe       Optional path to a pre-downloaded KVRT.exe
+.PARAMETER ClamDb        Optional ClamAV database dir (Windows choco layout)
 #>
 param(
   [Parameter(Mandatory = $true)][string]$ArtifactsDir,
   [Parameter(Mandatory = $true)][string]$OutDir,
-  [string]$KvrtExe = ""
+  [string]$KvrtExe = "",
+  [string]$ClamDb = ""
 )
 
 $ErrorActionPreference = 'Continue'
@@ -56,42 +60,60 @@ function New-VariantShortcut {
   }
 }
 
+function Parse-DefenderThreat {
+  param([string]$Text)
+  if ($Text -match 'Threat\s+(?:information|name)?\s*:\s*(.+)') { return $Matches[1].Trim() }
+  $m = [regex]::Match($Text,
+    '((?:Trojan|Behavior|HackTool|VirTool|PUA|PUADlMaster|Trojan:Script|Trojan:VBS|Trojan:Win32|Trojan:PowerShell|Exploit)[:/][\w./!\-]+)')
+  if ($m.Success) { return $m.Value }
+  return $null
+}
+
 function Scan-Defender {
   param([string]$VariantDir, [string]$MpCmd)
-  $res = @{ verdict = "error"; exit = $null; threats = @(); raw = "" }
+  $res = @{ verdict = "error"; threats = @(); perfile = @{}; raw = "" }
   if (-not $MpCmd) { $res.verdict = "unavailable"; return $res }
-  $before = @(Get-MpThreatDetection -ErrorAction SilentlyContinue)
-  $out = & $MpCmd -Scan -ScanType 3 -File $VariantDir -DisableRemediation 2>&1
-  $res.exit = $LASTEXITCODE
-  $res.raw = ($out | Out-String)
-  Start-Sleep -Seconds 2
-  $after = @(Get-MpThreatDetection -ErrorAction SilentlyContinue)
-  $new = $after | Where-Object {
-    $_.Resources -and ($_.Resources -join ';') -match [regex]::Escape($VariantDir)
+  $anyDetected = $false; $allClean = $true
+  foreach ($f in (Get-ChildItem $VariantDir -File)) {
+    if ($f.Name -eq "shortcut.json") { continue }   # our metadata, not an artifact
+    $out = & $MpCmd -Scan -ScanType 3 -File $f.FullName -DisableRemediation 2>&1
+    $code = $LASTEXITCODE
+    $text = ($out | Out-String)
+    $res.raw += "`n--- $($f.Name) (exit $code) ---`n$text"
+    $threat = Parse-DefenderThreat $text
+    $v = if ($code -eq 2) { "detected" } elseif ($code -eq 0) { "clean" } else { "error" }
+    $res.perfile[$f.Name] = @{ verdict = $v; exit = $code; threat = $threat }
+    if ($v -eq "detected") {
+      $anyDetected = $true
+      $res.threats += "$($f.Name): $(if ($threat) { $threat } else { 'exit2 (name unparsed)' })"
+    }
+    if ($v -ne "clean") { $allClean = $false }
   }
-  if ($new) {
-    $res.verdict = "detected"
-    $res.threats = @($new | ForEach-Object { $_.ThreatName + " :: " + ($_.Resources -join ';') })
-  } elseif ($res.exit -eq 2) {
-    # exit 2 without a matched resource: treat as detected-but-unattributed
-    $res.verdict = "detected"
-    $res.threats = @("MpCmdRun exit 2 (unattributed); see raw")
-  } elseif ($res.exit -eq 0) {
-    $res.verdict = "clean"
-  } else {
-    $res.verdict = "error"
-  }
+  if ($anyDetected) { $res.verdict = "detected" }
+  elseif ($allClean)  { $res.verdict = "clean" }
+  else                { $res.verdict = "error" }
+  try {
+    $res.history = @(Get-MpThreatDetection -ErrorAction SilentlyContinue |
+      Where-Object { ($_.Resources -join ';') -match [regex]::Escape($VariantDir) } |
+      ForEach-Object { @{ name = $_.ThreatName; resources = ($_.Resources -join ';') } })
+  } catch {}
   return $res
 }
 
 function Scan-ClamAV {
-  param([string]$VariantDir)
+  param([string]$VariantDir, [string]$ClamDb)
   $res = @{ verdict = "error"; exit = $null; raw = "" }
   $clam = (Get-Command clamscan -ErrorAction SilentlyContinue)
   if (-not $clam) { $res.verdict = "unavailable"; return $res }
-  $out = & clamscan --recursive --infected --no-summary $VariantDir 2>&1
+  $clamArgs = @("--recursive", "--infected", "--no-summary")
+  if ($ClamDb -and (Test-Path $ClamDb)) { $clamArgs += "--database=$ClamDb" }
+  $clamArgs += $VariantDir
+  $out = & clamscan @clamArgs 2>&1
   $res.exit = $LASTEXITCODE
   $res.raw = ($out | Out-String)
+  if ($res.raw -match 'cl_load|No such file or directory.*database|Can.t get file status') {
+    $res.verdict = "unavailable"; return $res    # DB not provisioned -> don't gate on it
+  }
   switch ($res.exit) {
     0 { $res.verdict = "clean" }
     1 { $res.verdict = "detected" }
@@ -105,26 +127,31 @@ function Scan-KVRT {
   $res = @{ verdict = "inconclusive"; exit = $null; detected = 0; raw = "" }
   if (-not $Kvrt -or -not (Test-Path $Kvrt)) { $res.verdict = "unavailable"; return $res }
   New-Item -ItemType Directory -Force -Path $ReportRoot | Out-Null
-  # Custom-only scan of just this variant folder; keep reports plaintext.
-  $args = @("-accepteula","-silent","-fixednames","-dontcryptsupportinfo",
-            "-processlevel","2","-d",$ReportRoot,"-custom",$VariantDir)
-  $out = & $Kvrt @args 2>&1
+  $kvrtArgs = @("-accepteula", "-silent", "-fixednames", "-dontcryptsupportinfo",
+               "-processlevel", "2", "-noads", "-d", $ReportRoot, "-custom", $VariantDir)
+  $out = & $Kvrt @kvrtArgs 2>&1
   $res.exit = $LASTEXITCODE
   $res.raw = ($out | Out-String)
-  $reports = Get-ChildItem $ReportRoot -Recurse -Include *.txt,*.klr -ErrorAction SilentlyContinue
-  $detected = 0
-  foreach ($r in $reports) {
-    $txt = Get-Content $r.FullName -Raw -ErrorAction SilentlyContinue
-    if ($txt -match 'Detected:\s*(\d+)') { $detected += [int]$Matches[1] }
-    # Threat lines that reference our files.
-    if ($txt -match 'launch-studio\.(vbs|ps1)' -and
-        $txt -match '(Trojan|HEUR|UDS|VirTool|not-a-virus|Backdoor)') {
-      $res.raw += "`n[report match] " + $r.FullName
+  # KVRT may write its report to -d, a Reports subdir, or a default data dir.
+  $searchDirs = @($ReportRoot, "$env:SystemDrive\KVRT_Data", "$env:SystemDrive\KVRT2024_Data",
+                  "$env:SystemDrive\KVRT2020_Data") | Where-Object { Test-Path $_ }
+  $detected = 0; $reportSeen = $false
+  foreach ($d in $searchDirs) {
+    foreach ($r in (Get-ChildItem $d -Recurse -File -Include *.txt,*.klr,*.log -ErrorAction SilentlyContinue)) {
+      $reportSeen = $true
+      $txt = Get-Content $r.FullName -Raw -ErrorAction SilentlyContinue
+      if ($txt -match 'Detected:\s*(\d+)') { $detected += [int]$Matches[1] }
+      if ($txt -match 'launch-studio\.(vbs|ps1|lnk)' -and
+          $txt -match '(Trojan|HEUR|UDS|VirTool|not-a-virus|Backdoor)') {
+        $res.raw += "`n[report threat match] $($r.FullName)"
+      }
     }
   }
+  # Also parse stdout for inline detections.
+  if ($res.raw -match 'Detected:\s*(\d+)') { $detected = [Math]::Max($detected, [int]$Matches[1]) }
   $res.detected = $detected
   if ($detected -gt 0) { $res.verdict = "detected" }
-  elseif ($reports.Count -gt 0) { $res.verdict = "clean" }
+  elseif ($reportSeen) { $res.verdict = "clean" }
   else { $res.verdict = "inconclusive" }
   return $res
 }
@@ -132,12 +159,13 @@ function Scan-KVRT {
 $mp = Resolve-MpCmdRun
 Write-Host "MpCmdRun: $mp"
 Write-Host "KVRT: $KvrtExe"
-& Update-MpSignature -ErrorAction SilentlyContinue 2>&1 | Out-Null
+Write-Host "ClamDb: $ClamDb"
+Update-MpSignature -ErrorAction SilentlyContinue
 
 $variants = Get-ChildItem $ArtifactsDir -Directory | Where-Object { $_.Name -like 'V*' }
 foreach ($v in $variants) {
   Write-Host "=== scanning $($v.Name) ==="
-  $lnk = New-VariantShortcut -VariantDir $v.FullName
+  $null = New-VariantShortcut -VariantDir $v.FullName
   $files = @(Get-ChildItem $v.FullName -File | ForEach-Object { $_.Name })
   $result = [ordered]@{
     variant = $v.Name
@@ -145,16 +173,15 @@ foreach ($v in $variants) {
     files   = $files
     engines = [ordered]@{
       defender = (Scan-Defender -VariantDir $v.FullName -MpCmd $mp)
-      clamav   = (Scan-ClamAV   -VariantDir $v.FullName)
+      clamav   = (Scan-ClamAV   -VariantDir $v.FullName -ClamDb $ClamDb)
       kvrt     = (Scan-KVRT     -VariantDir $v.FullName -Kvrt $KvrtExe `
                                 -ReportRoot (Join-Path $env:RUNNER_TEMP "kvrt_$($v.Name)"))
     }
   }
   $outFile = Join-Path $OutDir "$($v.Name).json"
-  $result | ConvertTo-Json -Depth 8 | Set-Content -Path $outFile -Encoding UTF8
-  $d = $result.engines.defender.verdict
-  $c = $result.engines.clamav.verdict
-  $k = $result.engines.kvrt.verdict
-  Write-Host "    defender=$d clamav=$c kvrt=$k -> $outFile"
+  $result | ConvertTo-Json -Depth 9 | Set-Content -Path $outFile -Encoding UTF8
+  $d = $result.engines.defender
+  Write-Host "    defender=$($d.verdict) [$($d.threats -join ', ')] clamav=$($result.engines.clamav.verdict) kvrt=$($result.engines.kvrt.verdict)"
 }
 Write-Host "done."
+exit 0

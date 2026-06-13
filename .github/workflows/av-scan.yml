@@ -86,11 +86,15 @@ jobs:
         continue-on-error: true
         run: |
           choco install clamav -y --no-progress
-          $clam = "C:\Program Files\ClamAV"
-          Copy-Item "$clam\conf_examples\freshclam.conf.sample" "$clam\freshclam.conf" -ErrorAction SilentlyContinue
-          (Get-Content "$clam\freshclam.conf") -notmatch '^Example' | Set-Content "$clam\freshclam.conf"
-          & "$clam\freshclam.exe" 2>&1 | Out-Host
-          "$clam" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          $tools = (Get-ChildItem "C:\ProgramData\chocolatey\lib\clamav\tools" -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -like 'clamav-*' } | Select-Object -First 1).FullName
+          if (-not $tools) { $tools = "C:\Program Files\ClamAV" }
+          $db = Join-Path $tools "database"
+          New-Item -ItemType Directory -Force -Path $db | Out-Null
+          "DatabaseDirectory $db`nDatabaseMirror database.clamav.net" | Set-Content (Join-Path $tools "freshclam.conf")
+          & (Join-Path $tools "freshclam.exe") --config-file (Join-Path $tools "freshclam.conf") --datadir $db 2>&1 | Out-Host
+          "$tools" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          "CLAMAV_DB=$db" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       # ---- Kaspersky KVRT (Windows only, best-effort) ----
       - name: Download Kaspersky KVRT (Windows)
@@ -111,7 +115,7 @@ jobs:
         run: |
           $kvrt = "$env:RUNNER_TEMP\KVRT.exe"
           if (-not (Test-Path $kvrt)) { $kvrt = "" }
-          ./tools/av/run-av-scan.ps1 -ArtifactsDir artifacts -OutDir av-results -KvrtExe $kvrt
+          ./tools/av/run-av-scan.ps1 -ArtifactsDir artifacts -OutDir av-results -KvrtExe $kvrt -ClamDb "$env:CLAMAV_DB"
       - name: Scan (Unix)
         if: runner.os != 'Windows'
         run: bash tools/av/run-av-scan.sh artifacts av-results "${{ matrix.os }}"
