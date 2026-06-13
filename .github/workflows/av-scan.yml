@@ -1,0 +1,152 @@
+# Antivirus scan of Unsloth Studio launcher variants.
+# Keyless engines only (Microsoft Defender, ClamAV, Kaspersky KVRT). VirusTotal
+# is intentionally NOT here -- it runs locally off-box with a private key.
+# Name is hyphenated so a '#' never turns it into a YAML comment.
+name: studio-launcher-av-scan
+on:
+  workflow_dispatch:
+  push:
+    branches: [studio-av-harden]
+    paths:
+      - 'tools/av/**'
+      - 'install.ps1'
+      - 'install.sh'
+      - '.github/workflows/av-scan.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tools/av/**'
+      - 'install.ps1'
+      - 'install.sh'
+      - '.github/workflows/av-scan.yml'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  build-variants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b1f4be73e509bd1992c5772d0c7e74539  # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Generate launcher variants
+        run: python tools/av/generate_launcher_variants.py --install-ps1 install.ps1 --out artifacts
+      - name: Hash artifacts
+        run: |
+          find artifacts -type f -exec sha256sum {} \; | sort > artifacts/SHA256SUMS.txt
+          cat artifacts/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: launcher-variants
+          path: artifacts
+
+  scan:
+    needs: build-variants
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: launcher-variants
+          path: artifacts
+
+      # ---- ClamAV (all OSes) ----
+      - name: Install ClamAV (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clamav
+          sudo systemctl stop clamav-freshclam || true
+          sudo freshclam || true
+      - name: Install ClamAV (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install clamav
+          CFG="$(brew --prefix)/etc/clamav"
+          sudo cp "$CFG/freshclam.conf.sample" "$CFG/freshclam.conf" || true
+          sudo sed -i '' '/^Example/d' "$CFG/freshclam.conf" || true
+          freshclam || true
+      - name: Install ClamAV (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          choco install clamav -y --no-progress
+          $clam = "C:\Program Files\ClamAV"
+          Copy-Item "$clam\conf_examples\freshclam.conf.sample" "$clam\freshclam.conf" -ErrorAction SilentlyContinue
+          (Get-Content "$clam\freshclam.conf") -notmatch '^Example' | Set-Content "$clam\freshclam.conf"
+          & "$clam\freshclam.exe" 2>&1 | Out-Host
+          "$clam" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # ---- Kaspersky KVRT (Windows only, best-effort) ----
+      - name: Download Kaspersky KVRT (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $url = "https://devbuilds.s.kaspersky-labs.com/devbuilds/KVRT/latest/full/KVRT.exe"
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\KVRT.exe" -UseBasicParsing
+          $sig = Get-AuthenticodeSignature "$env:RUNNER_TEMP\KVRT.exe"
+          "KVRT signature: $($sig.Status) / $($sig.SignerCertificate.Subject)" | Out-Host
+          if ($sig.Status -ne 'Valid') { Write-Warning "KVRT signature not Valid; KVRT step may be skipped" }
+
+      # ---- Run drivers ----
+      - name: Scan (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $kvrt = "$env:RUNNER_TEMP\KVRT.exe"
+          if (-not (Test-Path $kvrt)) { $kvrt = "" }
+          ./tools/av/run-av-scan.ps1 -ArtifactsDir artifacts -OutDir av-results -KvrtExe $kvrt
+      - name: Scan (Unix)
+        if: runner.os != 'Windows'
+        run: bash tools/av/run-av-scan.sh artifacts av-results "${{ matrix.os }}"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: av-results-${{ matrix.os }}
+          path: av-results
+
+  summarize:
+    needs: scan
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b1f4be73e509bd1992c5772d0c7e74539  # v6.2.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: av-results-*
+          merge-multiple: false
+          path: av-results
+      - name: Summarize
+        run: |
+          python tools/av/summarize_av_results.py --results av-results \
+            --out-md av-matrix.md --out-json av-merged.json || true
+          cat av-matrix.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: av-matrix
+          path: |
+            av-matrix.md
+            av-merged.json
