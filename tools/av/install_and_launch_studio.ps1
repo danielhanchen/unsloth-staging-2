@@ -143,13 +143,22 @@ function Invoke-Driver { param([string]$Base,[string]$Origin,[string]$Actions)
       *>&1 | Tee-Object -FilePath (Join-Path $OutDir "driver_$Origin.log")
   return $LASTEXITCODE }
 
+# DiffusionGemma is GPU-only and its GGUF is ~17 GB (won't fit a 14 GB hosted
+# runner), so it is covered for real on the Linux/ClamAV track; here we drive the
+# CPU-capable inference plus a small training attempt (graceful no-GPU on --no-torch).
 $driverRc = @{}
-if ($launched) { $driverRc["localhost"] = Invoke-Driver -Base "http://127.0.0.1:8888" -Origin "localhost" -Actions "inference,image,training" }
+if ($launched) { $driverRc["localhost"] = Invoke-Driver -Base "http://127.0.0.1:8888" -Origin "localhost" -Actions "inference,training" }
 
 # ── 6. 0.0.0.0 bind + Cloudflare tunnel ──────────────────────────────
 $cfUrl = $null
 $cfLog = Join-Path $OutDir "studio_0000.log"
-$studioCmd = if ($bootPw) { (Get-Command unsloth -ErrorAction SilentlyContinue).Source } else { $null }
+# PATH is not refreshed in this session post-install; fall back to a direct search.
+$studioCmd = (Get-Command unsloth -ErrorAction SilentlyContinue).Source
+if (-not $studioCmd) {
+  $cand = Get-ChildItem -Path @($env:USERPROFILE, $env:LOCALAPPDATA) -Recurse -Filter "unsloth.exe" -ErrorAction SilentlyContinue |
+          Where-Object { $_.FullName -match '\\bin\\unsloth\.exe$' } | Select-Object -First 1
+  if ($cand) { $studioCmd = $cand.FullName }
+}
 if ($studioCmd) {
   Start-Process -FilePath $studioCmd -ArgumentList @("studio","-H","0.0.0.0","-p","8890","--cloudflare") `
     -RedirectStandardOutput $cfLog -RedirectStandardError (Join-Path $OutDir "studio_0000.err.log") -WindowStyle Hidden
