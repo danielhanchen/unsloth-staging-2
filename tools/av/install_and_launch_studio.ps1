@@ -226,6 +226,9 @@ $addedEx = @()
 foreach ($k in 'paths','procs','ext') {
   $addedEx += @($exEnd[$k] | Where-Object { $_ -and ($exBase[$k] -notcontains $_) })
 }
+# A stopped WinDefend service reports bare drive roots (C:\, D:\) as "exclusions";
+# those are state artifacts, not something Studio added, so drop them.
+$addedEx = @($addedEx | Where-Object { $_ -notmatch '^[A-Za-z]:\\?$' })
 
 # Did we actually exercise Studio (so "no detections" is meaningful)?
 $executed = $launched -and ($driverRc.ContainsKey("localhost"))
