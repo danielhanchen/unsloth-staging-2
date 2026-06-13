@@ -1,0 +1,33 @@
+name: "studio-lifespan-shutdown windows-latest"
+on:
+  push:
+    branches: [studio-lifespan-shutdown-windows]
+    paths:
+      - 'studio/backend/utils/lifespan_shutdown.py'
+      - 'studio/backend/tests/test_lifespan_shutdown.py'
+      - '.github/workflows/shutdown-windows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/utils/lifespan_shutdown.py'
+      - 'studio/backend/tests/test_lifespan_shutdown.py'
+      - '.github/workflows/shutdown-windows.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  pytest:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.13', cache: 'pip' }
+      - run: python -m pip install --upgrade pip structlog pytest pytest-timeout
+      - run: python -m pytest studio/backend/tests/test_lifespan_shutdown.py -q
+        env:
+          PYTHONPATH: studio/backend
