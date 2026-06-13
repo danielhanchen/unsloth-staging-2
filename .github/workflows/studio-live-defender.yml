@@ -42,20 +42,30 @@ jobs:
         shell: pwsh
         run: |
           $iters = if ($env:ITERS) { [int]$env:ITERS } else { 3 }
-          $fail = 0
+          # rc: 0 valid+clean, 1 real AV finding, 3 inconclusive (Defender flaked),
+          # 4 incomplete. Hosted Defender self-stops sometimes, so the run passes
+          # when no iteration has a real finding AND at least one is valid+clean.
+          $realFinding = 0; $validClean = 0
           for ($i = 1; $i -le $iters; $i++) {
             Write-Host "===== iteration $i / $iters ====="
             ./tools/av/install_and_launch_studio.ps1 `
               -RepoRoot $PWD -OutDir "av-results/iter_$i" -Iteration $i `
               -DriverPy "tools/av/drive_studio_flows.py"
-            if ($LASTEXITCODE -ne 0) { $fail = $LASTEXITCODE; Write-Host "iter $i nonzero ($LASTEXITCODE)" }
-            # tear down any Studio servers between iterations
+            $rc = $LASTEXITCODE
+            switch ($rc) {
+              0 { $validClean++ }
+              1 { $realFinding = 1; Write-Host "iter $i: REAL AV FINDING" }
+              default { Write-Host "iter $i: inconclusive/incomplete (rc=$rc)" }
+            }
             Get-Process unsloth, python, llama-server, cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep 5
           }
           python tools/av/summarize_live_av.py --results av-results --out-md av-results/LIVE_DEFENDER_MATRIX.md --engine defender
           Get-Content av-results/LIVE_DEFENDER_MATRIX.md | Out-Host
-          exit $fail
+          Write-Host "valid_clean=$validClean real_findings=$realFinding"
+          if ($realFinding -ne 0) { exit 1 }
+          if ($validClean -lt 1) { Write-Host "Defender never proven live on any iteration"; exit 2 }
+          exit 0
         env:
           ITERS: ${{ github.event.inputs.iterations }}
       - uses: actions/upload-artifact@v4

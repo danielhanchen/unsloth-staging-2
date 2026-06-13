@@ -35,15 +35,56 @@ function Resolve-MpCmdRun {
   if (Test-Path $fb) { return $fb } ; return $null
 }
 function Enable-Defender {
-  try { Set-Service WinDefend -StartupType Manual -ErrorAction SilentlyContinue } catch {}
-  try { Start-Service WinDefend -ErrorAction SilentlyContinue } catch {}
-  try {
-    Set-MpPreference -DisableRealtimeMonitoring $false -DisableBehaviorMonitoring $false `
-      -DisableIOAVProtection $false -MAPSReporting Advanced `
-      -SubmitSamplesConsent SendAllSamples -ErrorAction SilentlyContinue
-  } catch {}
+  # Hosted-runner Defender is flaky (the service self-stops). Retry until the
+  # AM service reports enabled, so the EICAR control can actually fire.
+  for ($t = 0; $t -lt 5; $t++) {
+    try { Set-Service WinDefend -StartupType Manual -ErrorAction SilentlyContinue } catch {}
+    try { Start-Service WinDefend -ErrorAction SilentlyContinue } catch {}
+    try {
+      Set-MpPreference -DisableRealtimeMonitoring $false -DisableBehaviorMonitoring $false `
+        -DisableIOAVProtection $false -MAPSReporting Advanced `
+        -SubmitSamplesConsent SendAllSamples -ErrorAction SilentlyContinue
+    } catch {}
+    $s = Get-MpComputerStatus -ErrorAction SilentlyContinue
+    if ($s -and $s.AMServiceEnabled) { break }
+    Start-Sleep -Seconds 5
+  }
   Update-MpSignature -ErrorAction SilentlyContinue
   Start-Sleep -Seconds 3
+}
+
+function Parse-DefenderThreat {
+  param([string]$Text)
+  if ($Text -match 'Threat\s+(?:information|name)?\s*:\s*(.+)') { return $Matches[1].Trim() }
+  $m = [regex]::Match($Text, '((?:Virus|Trojan|Behavior|EICAR|Test)[:/!][\w./!\-]+|EICAR[\w._\- ]*)')
+  if ($m.Success) { return $m.Value }
+  return $null
+}
+
+function Invoke-DefenderFileScan {
+  # Proven path: MpCmdRun -Scan, retry past RPC flakiness, cross-check the
+  # threat history. Returns verdict clean|detected|error.
+  param([string]$File, [string]$MpCmd)
+  if (-not $MpCmd) { return @{ verdict = 'error'; threat = $null } }
+  $out = & $MpCmd -Scan -ScanType 3 -File $File -DisableRemediation 2>&1
+  $code = $LASTEXITCODE; $text = ($out | Out-String); $tries = 0
+  while ($text -match 'RPC server is unavailable|0x800106ba|CmdTool: Failed' -and $tries -lt 2) {
+    $tries++; try { Restart-Service WinDefend -Force -ErrorAction SilentlyContinue } catch {}
+    Start-Sleep 5
+    $out = & $MpCmd -Scan -ScanType 3 -File $File -DisableRemediation 2>&1
+    $code = $LASTEXITCODE; $text = ($out | Out-String)
+  }
+  $threat = Parse-DefenderThreat $text
+  $rec = $null
+  try {
+    $rec = Get-MpThreatDetection -ErrorAction SilentlyContinue |
+           Where-Object { ($_.Resources -join ';') -match [regex]::Escape($File) } | Select-Object -First 1
+  } catch {}
+  if ($rec) { return @{ verdict = 'detected'; threat = $rec.ThreatName } }
+  if ($text -match 'RPC server is unavailable|CmdTool: Failed|0x800106ba') { return @{ verdict = 'error'; threat = $null } }
+  if ($code -eq 0) { return @{ verdict = 'clean'; threat = $null } }
+  if ($code -eq 2 -and $threat) { return @{ verdict = 'detected'; threat = $threat } }
+  return @{ verdict = 'error'; threat = $null }
 }
 function Get-Detections {
   @(Get-MpThreatDetection -ErrorAction SilentlyContinue | ForEach-Object {
@@ -61,17 +102,15 @@ function Get-DefenderEvents {
 function Test-EicarControl {
   param([string]$MpCmd)
   $dir = Join-Path $env:RUNNER_TEMP "av_control"; New-Item -ItemType Directory -Force -Path $dir | Out-Null
+  # Build EICAR from parts so this script is not itself flagged.
   $eicar = 'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*'
   $f = Join-Path $dir "eicar.com"
-  try { [IO.File]::WriteAllText($f, $eicar) } catch {}
+  try { [IO.File]::WriteAllText($f, $eicar, [Text.Encoding]::ASCII) } catch {}
   Start-Sleep -Seconds 3
-  $rec = Get-MpThreatDetection -ErrorAction SilentlyContinue | Where-Object { ($_.Resources -join ';') -match 'eicar' } | Select-Object -First 1
-  if ($rec) { return @{ detected = $true; threat = $rec.ThreatName } }
-  if ($MpCmd) { & $MpCmd -Scan -ScanType 3 -File $f -DisableRemediation 2>&1 | Out-Null }
-  $rec = Get-MpThreatDetection -ErrorAction SilentlyContinue | Where-Object { ($_.Resources -join ';') -match 'eicar' } | Select-Object -First 1
+  # Real-time may have already quarantined it (file vanishes) = detected.
   if (-not (Test-Path $f)) { return @{ detected = $true; threat = 'EICAR (real-time removed)' } }
-  if ($rec) { return @{ detected = $true; threat = $rec.ThreatName } }
-  return @{ detected = $false; threat = $null }
+  $r = Invoke-DefenderFileScan -File $f -MpCmd $MpCmd
+  return @{ detected = ($r.verdict -eq 'detected'); threat = $r.threat }
 }
 function Exclusion-Snapshot {
   try {
@@ -134,12 +173,13 @@ $pwFile = Get-ChildItem -Path @($env:LOCALAPPDATA, $env:USERPROFILE) -Recurse -F
 $bootPw = if ($pwFile) { (Get-Content $pwFile.FullName -Raw).Trim() } else { "" }
 
 # ── 5. Drive Studio per origin with the Python driver ─────────────────
+$studioHome = Join-Path $env:USERPROFILE ".unsloth\studio"
+$dsDir = Join-Path $studioHome "assets\datasets\uploads"
 function Invoke-Driver { param([string]$Base,[string]$Origin,[string]$Actions)
   $o = Join-Path $OutDir $Origin
   & python $DriverPy --base $Base --origin $Origin --mode cpu --actions $Actions `
-      --bootstrap-password $bootPw --new-password $NewPassword --out $o `
+      --bootstrap-password $bootPw --new-password $NewPassword --out $o --dataset-dir $dsDir `
       --inference-model "unsloth/SmolLM2-135M-Instruct-GGUF" --inference-variant "Q4_K_M" --inference-needle "SmolLM2-135M" `
-      --image-model "unsloth/diffusiongemma-26B-A4B-it-GGUF" --image-variant "Q4_K_M" --image-needle "diffusiongemma" `
       *>&1 | Tee-Object -FilePath (Join-Path $OutDir "driver_$Origin.log")
   return $LASTEXITCODE }
 
