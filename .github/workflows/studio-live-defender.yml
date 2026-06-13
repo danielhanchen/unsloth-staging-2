@@ -1,0 +1,67 @@
+# Live behavioral AV test: install Studio, launch via the real shortcut/VBS,
+# open localhost/0.0.0.0/cloudflare, drive inference + image-gen + training while
+# Microsoft Defender (real-time + behavior + cloud) watches. Keyless; no secrets.
+# Name hyphenated so '#' is never parsed as a comment.
+name: studio-live-defender
+on:
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: launch/use cycles (install once, reuse after)
+        default: "3"
+  push:
+    branches: [studio-av-harden]
+    paths:
+      - 'tools/av/install_and_launch_studio.ps1'
+      - 'tools/av/drive_studio_flows.py'
+      - 'tools/av/studio-live-defender.yml'
+      - 'studio_test_kit/**'
+      - 'install.ps1'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  live-defender:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install driver deps + chromium
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install playwright httpx pillow
+          python -m playwright install chromium
+      - name: Run live Defender behavioral test
+        shell: pwsh
+        run: |
+          $iters = if ($env:ITERS) { [int]$env:ITERS } else { 3 }
+          $fail = 0
+          for ($i = 1; $i -le $iters; $i++) {
+            Write-Host "===== iteration $i / $iters ====="
+            ./tools/av/install_and_launch_studio.ps1 `
+              -RepoRoot $PWD -OutDir "av-results/iter_$i" -Iteration $i `
+              -DriverPy "tools/av/drive_studio_flows.py"
+            if ($LASTEXITCODE -ne 0) { $fail = $LASTEXITCODE; Write-Host "iter $i nonzero ($LASTEXITCODE)" }
+            # tear down any Studio servers between iterations
+            Get-Process unsloth, python, llama-server, cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep 5
+          }
+          python tools/av/summarize_live_av.py --results av-results --out-md av-results/LIVE_DEFENDER_MATRIX.md --engine defender
+          Get-Content av-results/LIVE_DEFENDER_MATRIX.md | Out-Host
+          exit $fail
+        env:
+          ITERS: ${{ github.event.inputs.iterations }}
+          PLAYWRIGHT_BROWSERS_PATH: '0'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-live-defender-results
+          path: av-results
+          retention-days: 14
