@@ -54,8 +54,8 @@ jobs:
             $rc = $LASTEXITCODE
             switch ($rc) {
               0 { $validClean++ }
-              1 { $realFinding = 1; Write-Host "iter $i: REAL AV FINDING" }
-              default { Write-Host "iter $i: inconclusive/incomplete (rc=$rc)" }
+              1 { $realFinding = 1; Write-Host "iter ${i}: REAL AV FINDING" }
+              default { Write-Host "iter ${i}: inconclusive/incomplete (rc=$rc)" }
             }
             Get-Process unsloth, python, llama-server, cloudflared -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             Start-Sleep 5
