@@ -115,7 +115,21 @@ jobs:
         run: |
           $kvrt = "$env:RUNNER_TEMP\KVRT.exe"
           if (-not (Test-Path $kvrt)) { $kvrt = "" }
-          ./tools/av/run-av-scan.ps1 -ArtifactsDir artifacts -OutDir av-results -KvrtExe $kvrt -ClamDb "$env:CLAMAV_DB"
+          ./tools/av/run-av-scan.ps1 -ArtifactsDir artifacts -OutDir av-results -KvrtExe $kvrt -ClamDb "$env:CLAMAV_DB" -Repeats 3
+      - name: Dynamic launch behavioral test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          New-Item -ItemType Directory -Force -Path av-results/dynamic | Out-Null
+          # Actually launch each variant the way the desktop shortcut would and watch
+          # Defender at runtime, several iterations (cloud verdicts are nondeterministic).
+          foreach ($v in 'V0-baseline','V3-lnk-powershell-hidden','V4-lnk-conhost-headless','V5-native-launcher') {
+            if (Test-Path "artifacts/$v") {
+              ./tools/av/launch_and_watch.ps1 -VariantDir "artifacts/$v" `
+                -OutFile "av-results/dynamic/$v.json" -Iterations 5 -WatchSeconds 12
+            }
+          }
       - name: Scan (Unix)
         if: runner.os != 'Windows'
         run: bash tools/av/run-av-scan.sh artifacts av-results "${{ matrix.os }}"
