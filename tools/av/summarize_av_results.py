@@ -1,22 +1,12 @@
 #!/usr/bin/env python3
-"""Merge AV results (CI keyless engines, static + dynamic) and local VirusTotal
-into a variant x engine matrix, and apply the ship/no-ship gate.
+"""Merge AV results (CI keyless engines, static + dynamic + a _defender_control
+EICAR proof) and local VirusTotal into a variant x engine matrix, and gate.
+Defender static is reported as a detection RATE (cloud verdicts are
+non-deterministic) and only real threats count, never RPC/scan errors.
 
-Handles the methodology hardening:
-  * Defender verdicts are non-deterministic cloud/ML, so static scans run several
-    passes per file; we report a detection RATE and only count REAL detections
-    (never RPC/scan errors).
-  * A _defender_control.json proves whether Defender was actually live (EICAR
-    detected + benign clean); if not functional, Defender results are advisory.
-  * Dynamic results (av-results/**/dynamic/<variant>.json) record whether Defender
-    fired when the launcher was actually executed, across iterations.
-
-Inputs:
-  --results DIR   tree of <os>/<variant>.json, <os>/_defender_control.json,
-                  and <os>/dynamic/<variant>.json
-  --vt FILE       local VirusTotal results json (from vt_scan.py)
-  --out-md FILE   markdown matrix
-  --out-json FILE merged json
+  --results DIR  tree of <os>/{<variant>.json,_defender_control.json,dynamic/*}
+  --vt FILE      local VirusTotal results (vt_scan.py)
+  --out-md / --out-json  outputs
 """
 from __future__ import annotations
 

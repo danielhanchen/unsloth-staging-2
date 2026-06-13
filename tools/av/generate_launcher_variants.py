@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
-"""Generate Unsloth Studio Windows launcher variants for antivirus scanning.
+"""Generate Unsloth Studio Windows launcher variants (V0 = current install.ps1
+output, V1..V5 = hardening candidates) for antivirus scanning. The .ps1 body is
+lifted from install.ps1 so we scan the real launcher, not a paraphrase.
 
-V0 reproduces, byte-faithfully, the launch-studio.vbs / launch-studio.ps1 that
-install.ps1's New-StudioShortcuts emits. V1..V5 are hardening candidates. Each
-variant lands in <out>/<variant>/ with the files that variant would write to
-%LOCALAPPDATA%\\Unsloth Studio plus a shortcut.json describing the .lnk target.
-
-The launcher .ps1 body is lifted directly out of install.ps1 (single source of
-truth) so we scan the real orchestration text, not a paraphrase.
-
-Usage:
   python generate_launcher_variants.py --install-ps1 <path> --out <dir>
 """
 from __future__ import annotations
@@ -19,8 +12,7 @@ import json
 import re
 from pathlib import Path
 
-# Representative install paths (the AV heuristic keys on structure, not the
-# concrete path; we use a realistic Windows path so the artifact looks genuine).
+# Representative paths (heuristics key on structure, not the concrete path).
 APP_DIR = r"C:\Users\runner\AppData\Local\Unsloth Studio"
 PS1_PATH = APP_DIR + r"\launch-studio.ps1"
 VBS_PATH = APP_DIR + r"\launch-studio.vbs"
@@ -67,8 +59,7 @@ def extract_launcher_ps1(install_ps1: str) -> str:
     if start is None or end is None:
         raise RuntimeError("could not locate $launcherContent here-string in install.ps1")
     body = "\n".join(lines[start:end]) + "\n"
-    # Substitute the three generation-time interpolations (bare $vars), then
-    # unescape the deferred ones (`$...).
+    # Fill the generation-time interpolations, then unescape the deferred (`$...).
     body = body.replace("$studioHomeExport", STUDIO_HOME_EXPORT_DEFAULT, 1)
     body = body.replace("'$_studioRootId'", f"'{FAKE_ROOT_ID}'")
     body = body.replace("'$SingleQuotedExePath'", f"'{EXE_PATH}'")
@@ -101,7 +92,6 @@ def write_utf8_bom(path: Path, text: str) -> None:
     path.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
 
 
-# variant -> (description, has_vbs, vbs kwargs or None, shortcut dict)
 VARIANTS = {
     "V0-baseline": dict(
         desc="Current install.ps1 output (control; reproduce the Kaspersky flag).",
@@ -159,7 +149,6 @@ def main() -> None:
         vdir = args.out / name
         vdir.mkdir(parents=True, exist_ok=True)
         files = []
-        # Every variant ships the launch-studio.ps1 orchestration file.
         write_utf8_bom(vdir / "launch-studio.ps1", launcher_ps1)
         files.append("launch-studio.ps1")
         if spec["vbs"] is not None:

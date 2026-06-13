@@ -1,7 +1,5 @@
-# Antivirus scan of Unsloth Studio launcher variants.
-# Keyless engines only (Microsoft Defender, ClamAV, Kaspersky KVRT). VirusTotal
-# is intentionally NOT here -- it runs locally off-box with a private key.
-# Name is hyphenated so a '#' never turns it into a YAML comment.
+# Antivirus scan of launcher variants. Keyless engines only (Defender, ClamAV,
+# KVRT); VirusTotal runs locally off-box. Name hyphenated so '#' is not a comment.
 name: studio-launcher-av-scan
 on:
   workflow_dispatch:
@@ -136,8 +134,7 @@ jobs:
         continue-on-error: true
         run: |
           New-Item -ItemType Directory -Force -Path av-results/dynamic | Out-Null
-          # Actually launch each variant the way the desktop shortcut would and watch
-          # Defender at runtime, several iterations (cloud verdicts are nondeterministic).
+          # Launch each variant like the shortcut, watch Defender, several iters.
           foreach ($v in 'V0-baseline','V3-lnk-powershell-hidden','V4-lnk-conhost-headless','V5-native-launcher') {
             if (Test-Path "artifacts/$v") {
               ./tools/av/launch_and_watch.ps1 -VariantDir "artifacts/$v" `

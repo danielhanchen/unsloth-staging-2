@@ -1,24 +1,16 @@
 <#
 .SYNOPSIS
-  Dynamic / behavioral Defender check: actually EXECUTE a launcher variant the
-  way the desktop shortcut would (wscript -> hidden PowerShell, or .lnk target
-  directly), repeatedly, and watch Microsoft Defender for runtime detections.
-
-  This is the runtime counterpart to the static file scan: it answers "when you
-  launch Unsloth Studio, does Defender's real-time / behavioral / cloud engine
-  raise anything?". We run several iterations to catch intermittent
-  cloud-reputation / behavioral detections.
-
-  We point the launcher at a tiny stub "unsloth.exe" that serves one healthy
-  /api/health response, so the launch chain completes (mutex -> health -> browser
-  open) instead of looping; the behavioral IOC we care about (a script engine
-  spawning a hidden, ExecutionPolicy-Bypass PowerShell) fires regardless.
-
-.PARAMETER VariantDir   artifacts/<variant> (contains launch-studio.* + shortcut.json)
+  Runtime Defender check: EXECUTE a launcher variant the way the shortcut would
+  (wscript -> hidden PowerShell, or the .lnk target) several times and watch
+  Defender, answering "does launching Studio raise anything?". The launcher
+  points at a stub unsloth.exe serving one healthy /api/health so the chain
+  completes; the behavioral IOC (script engine -> hidden Bypass PowerShell) fires
+  either way.
+.PARAMETER VariantDir   artifacts/<variant>
 .PARAMETER OutFile      result JSON
-.PARAMETER Iterations   how many launch cycles (default 5)
-.PARAMETER WatchSeconds seconds to watch Defender after each launch (default 12)
-.PARAMETER StubExe      optional prebuilt stub unsloth.exe; else one is compiled
+.PARAMETER Iterations   launch cycles (default 5)
+.PARAMETER WatchSeconds watch window per launch (default 12)
+.PARAMETER StubExe      prebuilt stub unsloth.exe; else compiled
 #>
 param(
   [Parameter(Mandatory = $true)][string]$VariantDir,
@@ -31,8 +23,7 @@ $ErrorActionPreference = 'Continue'
 
 function New-StubUnslothExe {
   param([string]$Path)
-  # A console exe that serves a single healthy /api/health response on -p <port>,
-  # so the real launcher's health check passes and it exits cleanly.
+  # Console exe serving one healthy /api/health on -p <port> so the chain exits.
   $src = @'
 using System; using System.Net; using System.Text; using System.Threading;
 class Stub {
@@ -80,9 +71,8 @@ if (-not $StubExe -or -not (Test-Path $StubExe)) {
   $StubExe = Join-Path $env:RUNNER_TEMP "unsloth.exe"
   try { New-StubUnslothExe -Path $StubExe } catch { Write-Host "[warn] stub compile failed: $($_.Exception.Message)" }
 }
-# Rewrite the variant's launch-studio.ps1 so $studioExe points at the stub and
-# the install-id gate is disabled (empty -> accept any healthy backend), so the
-# chain completes deterministically.
+# Point launch-studio.ps1's $studioExe at the stub and clear the install-id gate
+# (empty = accept any healthy backend) so the chain completes deterministically.
 $ps1 = Join-Path $VariantDir "launch-studio.ps1"
 if (Test-Path $ps1) {
   $txt = Get-Content $ps1 -Raw
@@ -96,8 +86,7 @@ $sc = Get-Content (Join-Path $VariantDir "shortcut.json") -Raw | ConvertFrom-Jso
 $target = [Environment]::ExpandEnvironmentVariables($sc.target)
 $argline = $sc.args
 
-# Best-effort: ensure Defender is live with real-time + behavior monitoring + cloud,
-# so a runtime/behavioral detection can actually fire.
+# Ensure Defender is live (real-time + behavior + cloud) so a detection can fire.
 try { Set-Service WinDefend -StartupType Manual -ErrorAction SilentlyContinue; Start-Service WinDefend -ErrorAction SilentlyContinue } catch {}
 try {
   Set-MpPreference -DisableRealtimeMonitoring $false -ErrorAction SilentlyContinue

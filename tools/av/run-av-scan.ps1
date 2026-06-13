@@ -1,25 +1,15 @@
 <#
 .SYNOPSIS
-  Scan launcher variants on Windows with Microsoft Defender, ClamAV, and
-  Kaspersky KVRT. Writes one JSON per variant to <OutDir>, plus a
-  _defender_control.json proving whether Defender actually works on this runner.
-
-  IMPORTANT methodology:
-   * MpCmdRun exit code 2 is NOT a reliable "malware found" signal -- it is also
-     returned on scan/RPC errors (0x800106ba "RPC server is unavailable" when the
-     WinDefend service is stopped, which is common on hosted runners). We only
-     call a result "detected" when a real threat name / MpThreatDetection record
-     exists; RPC/other failures are "error", never "detected".
-   * Defender cloud/ML verdicts on never-before-seen files are non-deterministic,
-     so each file is scanned -Repeats times and we report a detection RATE.
-   * An EICAR positive control + a benign negative control verify the engine is
-     live before we trust any "clean".
-
-.PARAMETER ArtifactsDir  Folder containing <variant>/ subfolders
-.PARAMETER OutDir        Where to write result JSONs
-.PARAMETER KvrtExe       Optional path to a pre-downloaded KVRT.exe
-.PARAMETER ClamDb        Optional ClamAV database dir
-.PARAMETER Repeats       Defender scan passes per file (default 3)
+  Scan launcher variants with Defender, ClamAV, and Kaspersky KVRT; write one
+  JSON per variant plus _defender_control.json (EICAR proof the engine is live).
+  MpCmdRun exit 2 also means a scan/RPC error (0x800106ba when WinDefend is
+  stopped), so "detected" requires a real threat record, never an error; cloud
+  verdicts vary, so each file is scanned -Repeats times for a detection rate.
+.PARAMETER ArtifactsDir  <variant>/ subfolders
+.PARAMETER OutDir        result JSONs
+.PARAMETER KvrtExe       pre-downloaded KVRT.exe
+.PARAMETER ClamDb        ClamAV database dir
+.PARAMETER Repeats       Defender passes per file (default 3)
 #>
 param(
   [Parameter(Mandatory = $true)][string]$ArtifactsDir,
@@ -44,8 +34,7 @@ function Resolve-MpCmdRun {
 }
 
 function Enable-Defender {
-  # Best-effort: bring WinDefend up and enable real-time + cloud (MAPS) so cloud
-  # heuristics (the thing that flags these launchers) are in play.
+  # Bring WinDefend up with real-time + cloud (MAPS) so cloud heuristics apply.
   try { Set-Service WinDefend -StartupType Manual -ErrorAction SilentlyContinue } catch {}
   try { Start-Service WinDefend -ErrorAction SilentlyContinue } catch {}
   try {
@@ -70,9 +59,8 @@ function Invoke-DefenderFileScan {
   $out = & $MpCmd -Scan -ScanType 3 -File $File -DisableRemediation 2>&1
   $code = $LASTEXITCODE
   $text = ($out | Out-String)
-  # The WinDefend RPC endpoint is flaky on hosted runners; on an RPC failure,
-  # bounce the service and retry up to twice so a transient does not masquerade
-  # as an inconclusive result.
+  # WinDefend RPC is flaky on hosted runners; bounce + retry so a transient
+  # isn't read as inconclusive.
   $tries = 0
   while ($text -match 'RPC server is unavailable|0x800106ba|CmdTool: Failed' -and $tries -lt 2) {
     $tries++
