@@ -17,13 +17,22 @@ $PASS = 0; $FAIL = 0
 function ok($n)  { $script:PASS++; Write-Host "  PASS  $n" }
 function bad($n) { $script:FAIL++; Write-Host "  FAIL  $n" }
 
-# mock `uv` on PATH that prints a chosen version
+# mock `uv` on PATH that prints a chosen version (cross-platform: a shell shim on
+# Unix, a .cmd shim on Windows where a shebang file is not executable as `uv`).
 $mockdir = Join-Path $TestsDir "ps_mockuv"
 New-Item -ItemType Directory -Force -Path $mockdir | Out-Null
+$onWindows = ($IsWindows -or $env:OS -eq 'Windows_NT')
 function Set-MockUv([string]$ver) {
-    $p = Join-Path $mockdir "uv"
-    Set-Content -LiteralPath $p -Value "#!/bin/sh`necho `"uv $ver`""
-    & chmod +x $p
+    if ($onWindows) {
+        # Clear any stale shim, then write uv.cmd. PATH order (mockdir first) +
+        # PATHEXT make `uv` resolve to this .cmd ahead of the real uv.exe.
+        Remove-Item -LiteralPath (Join-Path $mockdir "uv") -ErrorAction SilentlyContinue
+        Set-Content -LiteralPath (Join-Path $mockdir "uv.cmd") -Value "@echo off`r`necho uv $ver"
+    } else {
+        $p = Join-Path $mockdir "uv"
+        Set-Content -LiteralPath $p -Value "#!/bin/sh`necho `"uv $ver`""
+        & chmod +x $p
+    }
 }
 $env:PATH = "$mockdir" + [IO.Path]::PathSeparator + $env:PATH
 
