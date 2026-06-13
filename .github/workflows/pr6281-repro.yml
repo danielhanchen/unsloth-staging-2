@@ -1,0 +1,89 @@
+# Reproduces unslothai/unsloth#6274 (uv connection-reset on update) and proves
+# the fix on REAL Linux / macOS / Windows runners. For each OS:
+#   - unit-tests the retry wrapper extracted from the real install.sh / install.ps1
+#   - runs a real `uv` against a mock index that resets the connection mid-download,
+#     showing the failure reproduces with retries off and the fix recovers it.
+# Self-contained: tests run against the install.sh / install.ps1 in this branch.
+name: PR6281 reset repro+fix (multi-OS)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [pr6281-repro]
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+      - name: uv version + install.sh syntax
+        run: |
+          uv --version
+          sh -n install.sh && echo "install.sh syntax OK"
+      - name: Shell unit suites (sh / dash / bash)
+        run: |
+          set -e
+          for s in sh dash bash; do
+            echo "===== $s ====="
+            $s tests/suite_a.sh tests ./install.sh
+            $s tests/suite_b.sh tests ./install.sh
+            $s tests/suite_f.sh tests ./install.sh
+          done
+      - name: Real uv connection-reset repro + fix
+        run: python3 tests/suite_e.py
+
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+      - name: Shell unit suites (sh / bash)
+        run: |
+          set -e
+          for s in sh bash; do
+            echo "===== $s ====="
+            $s tests/suite_a.sh tests ./install.sh
+            $s tests/suite_b.sh tests ./install.sh
+            $s tests/suite_f.sh tests ./install.sh
+          done
+      - name: Real uv connection-reset repro + fix
+        run: python3 tests/suite_e.py
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+      - name: install.ps1 parses
+        shell: pwsh
+        run: |
+          $t=$null;$e=$null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./install.ps1).Path,[ref]$t,[ref]$e) | Out-Null
+          if ($e.Count) { $e | ForEach-Object { $_.Message }; exit 1 } else { "parse OK" }
+      - name: PowerShell unit suite A (helper edge cases)
+        run: pwsh -NoProfile -File tests/suite_ps_a.ps1 "$PWD/install.ps1" "$PWD/tests"
+      - name: PowerShell unit suite B (version floor + env)
+        run: pwsh -NoProfile -File tests/suite_ps_b.ps1 "$PWD/install.ps1" "$PWD/tests"
+      - name: Real uv connection-reset repro + fix (uv + pwsh)
+        run: python tests/suite_e.py
