@@ -17,6 +17,7 @@ the heavy backend import graph so it can be unit-tested in isolation.
 """
 
 import asyncio
+import contextvars
 from typing import Callable
 
 import structlog
@@ -25,9 +26,7 @@ logger = structlog.get_logger(__name__)
 
 
 async def run_lifespan_shutdown(
-    terminate_downloads: Callable[[], None],
-    clear_compiled_cache: Callable[[], None],
-    hw_module,
+    terminate_downloads: Callable[[], None], clear_compiled_cache: Callable[[], None], hw_module
 ) -> None:
     """Run shutdown cleanup defensively; never raise.
 
@@ -35,17 +34,32 @@ async def run_lifespan_shutdown(
     others (the original bug: an unguarded ``to_thread`` failure dropped the
     later cleanup and the whole nested-lifespan shutdown).
     """
+    # Schedule and await separately (rather than asyncio.to_thread) so the two
+    # failure modes stay distinct: a dead default executor makes run_in_executor
+    # raise synchronously at submit time, whereas an exception from
+    # terminate_downloads itself only surfaces when the future is awaited. That
+    # way we only retry inline when the work never got scheduled, never when the
+    # body ran and raised (which would double-execute it).
+    loop = asyncio.get_running_loop()
+    # Copy the current context so terminate_downloads runs with the same
+    # contextvars asyncio.to_thread would have given it (exact parity with the
+    # previous implementation). The only intended behaviour change is the inline
+    # fallback below, taken when scheduling onto a dead executor fails.
+    ctx = contextvars.copy_context()
     try:
-        await asyncio.to_thread(terminate_downloads)
+        future = loop.run_in_executor(None, ctx.run, terminate_downloads)
     except RuntimeError:
         # Default executor already gone (teardown race). terminate_downloads is
         # itself best-effort and quick, so run it inline on the loop thread.
         try:
-            terminate_downloads()
+            ctx.run(terminate_downloads)
         except Exception as exc:
             logger.warning("terminate_downloads (inline) failed at shutdown: %s", exc)
-    except Exception as exc:
-        logger.warning("terminate_downloads failed at shutdown: %s", exc)
+    else:
+        try:
+            await future
+        except Exception as exc:
+            logger.warning("terminate_downloads failed at shutdown: %s", exc)
 
     try:
         hw_module.DEVICE = None
