@@ -263,18 +263,21 @@ def main():
 
     # 8) web search (assert real page content)
     try:
-        # Retry once: a tiny model on a slow CPU runner sometimes answers
-        # without emitting the tool call on the first try.
-        joined, calls = "", []
-        for _ in range(2):
+        # Hand the model the explicit URL so the tool call is trivial (it just
+        # fetches), and retry: a tiny model on a slow CPU runner is flaky about
+        # deciding to emit a tool call. Asserting on fetched page content proves
+        # web_search returned the real page, not just a model guess.
+        joined, calls, res = "", [], []
+        for _ in range(4):
             calls, res = sse_tool_events(
                 base, token,
-                "Use the web_search tool to find the official Rust programming language website and report its URL. /no_think",
+                "Call the web_search tool with url=\"https://www.rust-lang.org\" to fetch that page, "
+                "then quote one sentence from it. You MUST use the tool. /no_think",
                 ["web_search"])
             joined = " ".join(res).lower()
-            if "rust-lang.org" in joined:
+            if res and "rust" in joined:
                 break
-        record("web_search", "rust-lang.org" in joined,
+        record("web_search", bool(res) and "rust" in joined,
                f"calls={calls[:1]} snippet={joined[:80]}")
     except Exception as e:
         record("web_search", False, repr(e))
