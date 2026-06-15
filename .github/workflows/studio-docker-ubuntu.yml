@@ -1,0 +1,91 @@
+# STAGING ONLY - DO NOT MERGE.
+# Cross-OS validation for unslothai/unsloth#5748: pull the PREBUILT Studio Docker
+# image from Hugging Face (danielhanchen/unsloth-blackwell-docker, the exact
+# artifact uploaded from PR head d0d5f3c27), load it, boot CPU-only the way
+# Docker users on a GPU-less host run it, and drive the full feature battery:
+# auth, model load (unsloth/Qwen3.5-0.8B-MTP-GGUF:UD-Q4_K_XL), /v1 chat +
+# responses, terminal tool, python code-exec, web search, MCP, and the
+# Cloudflare quick-tunnel. No in-CI build: this tests the shipped image itself.
+name: "PR-5748 studio docker ubuntu-latest"
+on:
+  push:
+    branches: [pr5748-studio-xos-r3]
+    paths:
+      - '.github/workflows/studio-docker-ubuntu.yml'
+      - '.github/scripts/validate_studio_features.py'
+      - '.github/scripts/mcp_test_server.py'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  IMAGE_BLOB: unsloth-blackwell-studio-test11.tar.gz
+  IMAGE_TAG: unsloth-blackwell:studio-test11
+  BASE: http://127.0.0.1:18000
+jobs:
+  pull-boot-and-drive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Reclaim disk (25GB image needs headroom)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache "$AGENT_TOOLSDIRECTORY" \
+                      /usr/local/.ghcup /usr/share/swift \
+                      /usr/local/share/powershell /usr/local/lib/node_modules \
+                      /usr/local/julia* /opt/microsoft /usr/share/miniconda \
+                      /opt/az /usr/local/share/boost /usr/local/share/chromium || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h /
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Hugging Face CLI
+        run: python -m pip install -U "huggingface_hub[cli]"
+
+      - name: Download the prebuilt Studio image from HF
+        run: |
+          hf download danielhanchen/unsloth-blackwell-docker "$IMAGE_BLOB" \
+            --repo-type=model --local-dir hfimg
+          ls -lh hfimg/"$IMAGE_BLOB"
+
+      - name: docker load + free the tarball
+        run: |
+          gzip -dc hfimg/"$IMAGE_BLOB" | docker load
+          rm -f hfimg/"$IMAGE_BLOB"
+          docker image ls | grep -i unsloth || true
+          df -h /
+
+      - name: Boot Studio CPU-only
+        run: |
+          docker run -d --name studio -e UNSLOTH_ALLOW_CPU=1 \
+            -p 18000:8000 -p 18888:8888 "$IMAGE_TAG"
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/health" || true)
+            [ "$code" = "200" ] && { echo "health 200 after ~$((i*4))s"; break; }
+            sleep 4
+          done
+          curl -fsS "$BASE/api/health"
+
+      - name: Feature battery (docker mode)
+        run: |
+          python3 .github/scripts/validate_studio_features.py \
+            --mode docker --base-url "$BASE" --container studio \
+            --studio-home /opt/unsloth-studio --out battery.json
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          echo "=== studio logs (tail 150) ==="
+          docker logs --tail 150 studio 2>&1 || true
+          echo "=== battery.json ==="
+          cat battery.json 2>/dev/null || true
+          docker rm -f studio >/dev/null 2>&1 || true
