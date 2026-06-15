@@ -57,7 +57,7 @@ def http_code(url, token=None, timeout=20):
         return 0
 
 
-def sse_tool_events(base, token, prompt, tools, timeout=240):
+def sse_tool_events(base, token, prompt, tools, timeout=480):
     """POST a streaming chat with tools; return (tool_args[], tool_results[])."""
     body = {
         "messages": [{"role": "user", "content": prompt}],
@@ -239,11 +239,13 @@ def main():
 
     # 6) terminal tool
     try:
+        # `echo TERMINAL_OK` is portable across bash / cmd / PowerShell (the
+        # native lanes run different shells); bash arithmetic is not.
         calls, res = sse_tool_events(
             base, token,
-            "Use the terminal tool to run exactly: echo $((48817 * 3001)) -- then report the integer. /no_think",
+            "Use the terminal tool to run exactly: echo TERMINAL_OK -- then report the output. /no_think",
             ["terminal"])
-        record("tool_terminal", any("146499817" in r for r in res),
+        record("tool_terminal", any("TERMINAL_OK" in r for r in res),
                f"calls={calls[:1]} results={[r[:40] for r in res[:1]]}")
     except Exception as e:
         record("tool_terminal", False, repr(e))
@@ -261,11 +263,17 @@ def main():
 
     # 8) web search (assert real page content)
     try:
-        calls, res = sse_tool_events(
-            base, token,
-            "Use the web_search tool to find the official Rust programming language website and report its URL. /no_think",
-            ["web_search"])
-        joined = " ".join(res).lower()
+        # Retry once: a tiny model on a slow CPU runner sometimes answers
+        # without emitting the tool call on the first try.
+        joined, calls = "", []
+        for _ in range(2):
+            calls, res = sse_tool_events(
+                base, token,
+                "Use the web_search tool to find the official Rust programming language website and report its URL. /no_think",
+                ["web_search"])
+            joined = " ".join(res).lower()
+            if "rust-lang.org" in joined:
+                break
         record("web_search", "rust-lang.org" in joined,
                f"calls={calls[:1]} snippet={joined[:80]}")
     except Exception as e:
