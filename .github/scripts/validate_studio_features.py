@@ -291,11 +291,13 @@ def main():
             base, token,
             "Use the add_numbers MCP tool to add 19 and 23, then report the sum. /no_think",
             None, timeout=180) if False else ([], [])
-        # mcp tools are enabled via mcp_enabled flag, not enabled_tools
+        # MCP tools come via mcp_enabled; disable local tools (enabled_tools=[])
+        # so the tiny model can't satisfy the request with the local python tool
+        # and must call the MCP add_numbers tool.
         body = {"messages": [{"role": "user",
                 "content": "Use the add_numbers tool to add 19 and 23, then report the sum. /no_think"}],
                 "max_tokens": 600, "temperature": 0.0,
-                "enable_tools": True, "mcp_enabled": True, "stream": True}
+                "enable_tools": True, "enabled_tools": [], "mcp_enabled": True, "stream": True}
         resp = http("POST", f"{base}/v1/chat/completions", token=token, body=body, timeout=180, stream=True)
         names, mres = [], []
         for ln in resp:
