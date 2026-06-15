@@ -1,0 +1,80 @@
+# STAGING ONLY - DO NOT MERGE.
+# Cross-OS validation for unslothai/unsloth#5748: NATIVE Studio on a real Apple
+# Silicon runner (macos-14). macOS hosted runners cannot run Docker and a Linux
+# image cannot use Apple MLX, so this installs Studio natively via install.sh
+# and runs the feature battery. GGUF (llama.cpp/Metal) AND MLX (safetensors) are
+# both exercised. No GPU spoof needed: Apple Silicon gives Studio the full
+# (CHAT_ONLY=False) feature set.
+name: "PR-5748 studio native macos-14"
+on:
+  push:
+    branches: [pr5748-studio-xos-r3]
+    paths:
+      - '.github/workflows/studio-native-macos.yml'
+      - '.github/scripts/validate_studio_features.py'
+      - '.github/scripts/mcp_test_server.py'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+env:
+  PRREF: docker-blackwell-build
+  BASE: http://127.0.0.1:8888
+  MODEL: unsloth/Qwen3.5-0.8B-MTP-GGUF
+  GGUF_VARIANT: UD-Q4_K_XL
+  MLX_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-4bit
+jobs:
+  native-studio:
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: ${{ env.PRREF }}
+          path: pr
+          persist-credentials: false
+
+      - name: Install Studio natively (install.sh --local)
+        run: |
+          set -eu
+          echo "UNSLOTH_STUDIO_HOME=${RUNNER_TEMP}/ustudio" >> "$GITHUB_ENV"
+          cd pr
+          UNSLOTH_STUDIO_HOME="${RUNNER_TEMP}/ustudio" bash install.sh --local
+
+      - name: Launch Studio (MLX + GGUF; bind 0.0.0.0 for cloudflare)
+        run: |
+          set -u
+          UNS="${UNSLOTH_STUDIO_HOME}/bin/unsloth"
+          [ -x "$UNS" ] || UNS="$(command -v unsloth || true)"
+          echo "launcher: $UNS"
+          "$UNS" studio -H 0.0.0.0 -p 8888 --cloudflare > studio.log 2>&1 &
+          for i in $(seq 1 120); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/api/health" || true)
+            [ "$code" = "200" ] && { echo "health 200 after ~$((i*5))s"; break; }
+            sleep 5
+          done
+          curl -fsS "$BASE/api/health"
+
+      - name: Feature battery (native; GGUF + MLX)
+        run: |
+          python3 .github/scripts/validate_studio_features.py \
+            --mode native --base-url "$BASE" \
+            --studio-home "${UNSLOTH_STUDIO_HOME}" --log-file studio.log \
+            --model "$MODEL" --gguf-variant "$GGUF_VARIANT" \
+            --mlx-model "$MLX_MODEL" \
+            --mcp-python "${UNSLOTH_STUDIO_HOME}/unsloth_studio/bin/python" \
+            --out battery.json
+
+      - name: Diagnostics
+        if: always()
+        run: |
+          echo "=== studio.log (tail 200) ==="
+          tail -200 studio.log 2>/dev/null || true
+          echo "=== battery.json ==="
+          cat battery.json 2>/dev/null || true
