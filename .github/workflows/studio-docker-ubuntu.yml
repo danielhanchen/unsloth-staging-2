@@ -51,10 +51,16 @@ jobs:
       - name: Install Hugging Face CLI
         run: python -m pip install -U "huggingface_hub[cli]"
 
-      - name: Download the prebuilt Studio image from HF
+      - name: Download the prebuilt Studio image from HF (retry on 429)
         run: |
-          hf download danielhanchen/unsloth-blackwell-docker "$IMAGE_BLOB" \
-            --repo-type=model --local-dir hfimg
+          for a in 1 2 3 4 5 6; do
+            if hf download danielhanchen/unsloth-blackwell-docker "$IMAGE_BLOB" \
+                 --repo-type=model --local-dir hfimg; then
+              break
+            fi
+            echo "download attempt $a failed (likely HF 429 rate-limit); backing off..."
+            sleep $((a * 30))
+          done
           ls -lh hfimg/"$IMAGE_BLOB"
 
       - name: docker load + free the tarball
