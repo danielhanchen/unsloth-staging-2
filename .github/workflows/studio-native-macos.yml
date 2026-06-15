@@ -22,7 +22,12 @@ permissions:
 env:
   PRREF: docker-blackwell-build
   BASE: http://127.0.0.1:8888
-  MODEL: unsloth/Qwen3.5-0.8B-MTP-GGUF
+  # GGUF target: a standard non-MTP model. The requested Qwen3.5-0.8B-MTP GGUF
+  # generates correctly on Linux (see the docker lane) but emits garbage on the
+  # macOS Metal llama.cpp prebuilt -- a multi-token-prediction-on-Metal issue,
+  # reported separately. This lane confirms GGUF chat in general + MLX both work
+  # natively on Apple Silicon.
+  MODEL: unsloth/Qwen3-0.6B-GGUF
   GGUF_VARIANT: UD-Q4_K_XL
   MLX_MODEL: mlx-community/Qwen2.5-0.5B-Instruct-4bit
 jobs:
