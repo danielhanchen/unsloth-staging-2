@@ -47,14 +47,17 @@ jobs:
           Set-Location pr
           .\install.ps1 --local
 
-      - name: Launch Studio (bind 0.0.0.0 for cloudflare)
+      - name: Launch Studio + feature battery (one step so Studio survives)
         shell: pwsh
         run: |
+          # NOTE: launch + battery MUST share one step. A Start-Process child is
+          # terminated when its launching step's shell exits, so a separate
+          # battery step would find a dead server. Keep them together.
           $uns = Join-Path $env:UNSLOTH_STUDIO_HOME 'bin\unsloth.exe'
           if (-not (Test-Path $uns)) { $uns = 'unsloth' }
           Write-Host "launcher: $uns"
-          Start-Process -FilePath $uns -ArgumentList 'studio','-H','0.0.0.0','-p','8888','--cloudflare' `
-            -RedirectStandardOutput studio.log -RedirectStandardError studio.err -NoNewWindow
+          $proc = Start-Process -FilePath $uns -ArgumentList 'studio','-H','0.0.0.0','-p','8888','--cloudflare' `
+            -RedirectStandardOutput studio.log -RedirectStandardError studio.err -NoNewWindow -PassThru
           $ok = $false
           for ($i=0; $i -lt 120; $i++) {
             try { if ((Invoke-WebRequest -UseBasicParsing "$env:BASE/api/health").StatusCode -eq 200) { $ok=$true; break } } catch {}
@@ -62,10 +65,6 @@ jobs:
           }
           if (-not $ok) { throw "Studio did not become healthy" }
           Write-Host "health 200"
-
-      - name: Feature battery (native, CPU)
-        shell: pwsh
-        run: |
           $py = Join-Path $env:UNSLOTH_STUDIO_HOME 'unsloth_studio\Scripts\python.exe'
           if (-not (Test-Path $py)) { $py = 'python' }
           python .github/scripts/validate_studio_features.py `
