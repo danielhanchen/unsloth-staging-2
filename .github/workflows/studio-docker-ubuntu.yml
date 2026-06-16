@@ -9,11 +9,12 @@
 name: "PR-5748 studio docker ubuntu-latest"
 on:
   push:
-    branches: [pr5748-studio-xos-r3]
+    branches: [pr5748-nbrefresh-r1]
     paths:
       - '.github/workflows/studio-docker-ubuntu.yml'
       - '.github/scripts/validate_studio_features.py'
       - '.github/scripts/mcp_test_server.py'
+      - '.github/scripts/notebook_refresh_probe.sh'
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -21,8 +22,8 @@ concurrency:
 permissions:
   contents: read
 env:
-  IMAGE_BLOB: unsloth-blackwell-studio-test11.tar.gz
-  IMAGE_TAG: unsloth-blackwell:studio-test11
+  IMAGE_BLOB: unsloth-blackwell-studio-test12.tar.gz
+  IMAGE_TAG: unsloth-blackwell:studio-test12
   BASE: http://127.0.0.1:18000
 jobs:
   pull-boot-and-drive:

@@ -8,11 +8,13 @@
 name: "PR-5748 studio native macos-14"
 on:
   push:
-    branches: [pr5748-studio-xos-r3]
+    branches: [pr5748-nbrefresh-r1]
     paths:
       - '.github/workflows/studio-native-macos.yml'
       - '.github/scripts/validate_studio_features.py'
       - '.github/scripts/mcp_test_server.py'
+      - '.github/scripts/test_nb_content_sig.py'
+      - '.github/scripts/unsloth_nb_content_sig.py'
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -44,6 +46,9 @@ jobs:
           ref: ${{ env.PRREF }}
           path: pr
           persist-credentials: false
+
+      - name: Notebook body-aware helper portability test (macOS python3)
+        run: python3 .github/scripts/test_nb_content_sig.py
 
       - name: Install Studio natively (install.sh --local)
         run: |

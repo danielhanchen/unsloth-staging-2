@@ -366,6 +366,34 @@ def main():
         except Exception as e:
             record("mlx_safetensors", False, repr(e))
 
+    # 12) notebook refresh (docker only): delete/edit/restore behavior in the
+    # real container. A probe deletes one baked notebook, edits another, runs the
+    # boot-time sync, and reports whether the deleted one healed back, the edited
+    # one was left intact, and a third stayed unchanged. Native lanes have no
+    # in-container notebook sync, so this check is docker-only.
+    if args.mode == "docker":
+        try:
+            here = os.path.dirname(os.path.abspath(__file__))
+            probe = os.path.join(here, "notebook_refresh_probe.sh")
+            subprocess.run(["docker", "cp", probe, f"{args.container}:/tmp/nb_probe.sh"],
+                           check=True, timeout=30)
+            out = subprocess.run(["docker", "exec", args.container, "bash", "/tmp/nb_probe.sh"],
+                                 capture_output=True, text=True, timeout=300)
+            line = ""
+            for ln in (out.stdout + out.stderr).splitlines():
+                if ln.startswith("NBRESULT"):
+                    line = ln.strip()
+            flags = dict(kv.split("=", 1) for kv in line.split()[1:]) if line else {}
+            a_off = flags.get("a_off") == "1"     # deleted -> restored (offline)
+            b_kept = flags.get("b_kept") == "1"   # edited  -> kept
+            c_same = flags.get("c_same") == "1"   # other   -> unchanged
+            a_net = flags.get("a_net") == "1"     # deleted -> restored from upstream (bonus)
+            record("notebook_refresh", a_off and b_kept and c_same,
+                   f"deleted_restored={a_off} edited_kept={b_kept} "
+                   f"others_unchanged={c_same} upstream_restore={a_net}")
+        except Exception as e:
+            record("notebook_refresh", False, repr(e))
+
     return finish(results, args)
 
 

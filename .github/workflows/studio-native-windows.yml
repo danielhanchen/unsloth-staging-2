@@ -7,11 +7,13 @@
 name: "PR-5748 studio native windows-latest"
 on:
   push:
-    branches: [pr5748-studio-xos-r3]
+    branches: [pr5748-nbrefresh-r1]
     paths:
       - '.github/workflows/studio-native-windows.yml'
       - '.github/scripts/validate_studio_features.py'
       - '.github/scripts/mcp_test_server.py'
+      - '.github/scripts/test_nb_content_sig.py'
+      - '.github/scripts/unsloth_nb_content_sig.py'
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -37,6 +39,10 @@ jobs:
           ref: ${{ env.PRREF }}
           path: pr
           persist-credentials: false
+
+      - name: Notebook body-aware helper portability test (Windows python)
+        shell: pwsh
+        run: python .github/scripts/test_nb_content_sig.py
 
       - name: Install Studio natively (install.ps1 --local, CPU)
         shell: pwsh
