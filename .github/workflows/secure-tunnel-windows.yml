@@ -1,0 +1,33 @@
+name: "secure-tunnel windows-latest"
+on:
+  push:
+    branches: [secure-tunnel-validation]
+    paths:
+      - 'studio/backend/cloudflare_tunnel.py'
+      - 'studio/backend/tests/secure_tunnel_e2e.py'
+      - '.github/workflows/secure-tunnel-windows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/cloudflare_tunnel.py'
+      - 'studio/backend/tests/secure_tunnel_e2e.py'
+      - '.github/workflows/secure-tunnel-windows.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  e2e:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Cloudflare quick-tunnel end-to-end
+        run: python -u studio/backend/tests/secure_tunnel_e2e.py
