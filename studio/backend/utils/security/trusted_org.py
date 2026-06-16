@@ -13,7 +13,7 @@ starts with ``unsloth/`` and would wrongly be treated as a first-party repo.
 ``is_trusted_org_repo`` hardens that: it rejects local paths outright, requires
 an ``org/repo`` shape whose namespace is a trusted org, and (when online)
 confirms via the Hub that the id actually resolves to a repo owned by that org.
-It fails CLOSED (returns False) on any uncertainty and never raises — a False
+It fails CLOSED (returns False) on any uncertainty and never raises - a False
 result simply means "do not silently auto-enable remote code; the user can still
 opt in via the explicit toggle".
 """

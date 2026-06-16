@@ -105,7 +105,7 @@ class TestTierFromVersion:
 
 
 # ---------------------------------------------------------------------------
-# _dynamic_tier_from_cfg — the core decision (sidecars patched out / absent)
+# _dynamic_tier_from_cfg - the core decision (sidecars patched out / absent)
 # ---------------------------------------------------------------------------
 
 
@@ -173,7 +173,7 @@ class TestDynamicTierFromCfg:
 
 
 # ---------------------------------------------------------------------------
-# get_transformers_tier — end to end via local config.json (no network)
+# get_transformers_tier - end to end via local config.json (no network)
 # ---------------------------------------------------------------------------
 
 
@@ -210,7 +210,7 @@ class TestGetTransformersTierDynamic:
 
     def test_curated_510_still_wins(self, tmp_path):
         # gemma4_unified is caught by the curated 510 check BEFORE the dynamic
-        # layer — confirm the curated decision is preserved.
+        # layer - confirm the curated decision is preserved.
         d = self._write_cfg(
             tmp_path,
             {
