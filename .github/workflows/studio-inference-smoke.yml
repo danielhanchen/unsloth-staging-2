@@ -772,6 +772,9 @@ jobs:
           kill "${STUDIO_PID}" 2>/dev/null || true
           sleep 2
           ss -tln | grep ":${STUDIO_PORT}" || true
+          # Capture backend + llama-server logs so a 500 has a server-side traceback.
+          mkdir -p logs/server-logs
+          cp -r ~/.unsloth/studio/logs/. logs/server-logs/ 2>/dev/null || true
 
       - name: Upload logs
         # Always upload so green runs are still reviewable.
@@ -784,6 +787,7 @@ jobs:
           path: |
             logs/studio.log
             logs/install.log
+            logs/server-logs/
           retention-days: 7
 
   # ─────────────────────────────────────────────────────────────────────
