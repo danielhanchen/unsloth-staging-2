@@ -260,19 +260,54 @@ def _handle_load(backend, config: dict, resp_queue: Any) -> None:
 
         # Auto-enable trust_remote_code only for NemotronH/Nano (config parsing
         # bugs require it). Must NOT match Llama-Nemotron (standard Llama arch).
+        from utils.security.trusted_org import is_trusted_org_repo
+
         _NEMOTRON_TRUST_SUBSTRINGS = ("nemotron_h", "nemotron-h", "nemotron-3-nano")
         trust_remote_code = config.get("trust_remote_code", False)
         if not trust_remote_code:
             model_name = config["model_name"]
             _mn_lower = model_name.lower()
-            if any(sub in _mn_lower for sub in _NEMOTRON_TRUST_SUBSTRINGS) and (
-                _mn_lower.startswith("unsloth/") or _mn_lower.startswith("nvidia/")
+            if (
+                any(sub in _mn_lower for sub in _NEMOTRON_TRUST_SUBSTRINGS)
+                and (_mn_lower.startswith("unsloth/") or _mn_lower.startswith("nvidia/"))
+                # Genuine first-party Hub repo only, not a local-path/spoof
+                # that starts with "unsloth/".
+                and is_trusted_org_repo(model_name)
             ):
                 trust_remote_code = True
                 logger.info(
                     "Auto-enabled trust_remote_code for Nemotron model: %s",
                     model_name,
                 )
+
+        # Consent gate: scan auto_map repo code before executing it; block
+        # CRITICAL/HIGH findings unless pinned-approved.
+        if trust_remote_code:
+            from utils.security import evaluate_remote_code_consent
+
+            _rc = evaluate_remote_code_consent(
+                config["model_name"],
+                hf_token = hf_token,
+                trust_remote_code = True,
+                approved_fingerprint = config.get("approved_remote_code_fingerprint"),
+            )
+            if _rc.blocked:
+                _send_response(
+                    resp_queue,
+                    {
+                        "type": "loaded",
+                        "success": False,
+                        "message": (
+                            f"Model '{config['model_name']}' ships custom code "
+                            f"flagged as {_rc.max_severity} by the security scan. "
+                            f"Review and approve it to proceed."
+                        ),
+                        "error_kind": "remote_code_blocked",
+                        "remote_code": _rc.response_payload(),
+                        "ts": time.time(),
+                    },
+                )
+                return
 
         # Heartbeat every 30s so the orchestrator knows we're alive during slow loads.
         xet_disabled = os.environ.get("HF_HUB_DISABLE_XET") == "1"

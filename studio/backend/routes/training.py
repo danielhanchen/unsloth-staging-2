@@ -253,13 +253,24 @@ async def start_training(
         }
 
         # Training page has no trust_remote_code toggle; as a safety net consult
-        # YAML model defaults directly so models that need it always get it.
+        # YAML model defaults directly so models that need it get it -- but only
+        # auto-enable for genuine first-party (unsloth/nvidia) Hub repos. A YAML
+        # default must never silently run remote code for a local path or a
+        # spoofed name that merely starts with "unsloth/".
         if not training_kwargs["trust_remote_code"]:
+            from utils.security.trusted_org import is_trusted_org_repo
+
             model_defaults = load_model_defaults(request.model_name)
             yaml_trust = model_defaults.get("training", {}).get("trust_remote_code", False)
-            if yaml_trust:
+            if yaml_trust and is_trusted_org_repo(request.model_name):
                 logger.info(f"YAML config sets trust_remote_code=True for {request.model_name}")
                 training_kwargs["trust_remote_code"] = True
+            elif yaml_trust:
+                logger.warning(
+                    "YAML sets trust_remote_code=True for %s but it is not a trusted "
+                    "first-party repo; leaving disabled (user can opt in explicitly).",
+                    request.model_name,
+                )
 
         # Free GPU memory: shut down any running inference/export subprocesses
         # before training (they'd compete for VRAM otherwise).

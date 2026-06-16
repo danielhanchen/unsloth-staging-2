@@ -1521,16 +1521,24 @@ async def get_model_config(
         except Exception:
             pass
 
-        # Fallback: try AutoConfig directly.
+        # Fallback: read raw config.json (declarative fields only). This is a
+        # metadata probe that runs on model selection, so it must never execute
+        # a model repo's auto_map Python. Reuses the same
+        # code-free reader as transformers-version detection.
         if max_position_embeddings is None:
             try:
-                from transformers import AutoConfig as _AutoConfig
+                from utils.transformers_version import _load_config_json
+                from types import SimpleNamespace
 
-                _trust = model_name.lower().startswith("unsloth/")
-                _ac = _AutoConfig.from_pretrained(
-                    model_name, trust_remote_code = _trust, token = hf_token
-                )
-                max_position_embeddings = _get_max_position_embeddings(_ac)
+                _cfg = _load_config_json(model_name)
+                if _cfg is not None:
+
+                    def _to_ns(d):
+                        if isinstance(d, dict):
+                            return SimpleNamespace(**{k: _to_ns(v) for k, v in d.items()})
+                        return d
+
+                    max_position_embeddings = _get_max_position_embeddings(_to_ns(_cfg))
             except Exception:
                 pass
 
