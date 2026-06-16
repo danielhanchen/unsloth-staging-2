@@ -2067,11 +2067,16 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
     # NemotronH needs trust_remote_code=True to work around config-parsing bugs.
     # Other 5.x models are native and don't need it (it bypasses the compiler,
     # disabling fused CE). Must NOT match Llama-Nemotron (standard Llama arch).
+    from utils.security.trusted_org import is_trusted_org_repo
+
     _NEMOTRON_TRUST_SUBSTRINGS = ("nemotron_h", "nemotron-h", "nemotron-3-nano")
     _lowered = model_name.lower()
     if (
         any(sub in _lowered for sub in _NEMOTRON_TRUST_SUBSTRINGS)
         and (_lowered.startswith("unsloth/") or _lowered.startswith("nvidia/"))
+        # Confirm a genuine first-party Hub repo, not a local path / spoofed
+        # name that merely starts with "unsloth/".
+        and is_trusted_org_repo(model_name)
         and not config.get("trust_remote_code", False)
     ):
         config["trust_remote_code"] = True
@@ -2079,6 +2084,34 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
             "Auto-enabled trust_remote_code for Nemotron model: %s",
             model_name,
         )
+
+    # ── 1a'. Consent gate: before running any model repo code, scan the
+    # auto_map Python and refuse code flagged CRITICAL/HIGH unless the user
+    # pinned approval of this exact code version.
+    if config.get("trust_remote_code", False):
+        from utils.security import evaluate_remote_code_consent
+
+        _rc = evaluate_remote_code_consent(
+            model_name,
+            hf_token = config.get("hf_token") or None,
+            trust_remote_code = True,
+            approved_fingerprint = config.get("approved_remote_code_fingerprint"),
+        )
+        if _rc.blocked:
+            event_queue.put(
+                {
+                    "type": "error",
+                    "error": (
+                        f"Model '{model_name}' ships custom code flagged as "
+                        f"{_rc.max_severity} by the security scan. Review it and "
+                        f"re-run with approval to proceed.\n\n{_rc.findings_summary}"
+                    ),
+                    "error_kind": "remote_code_blocked",
+                    "remote_code": _rc.response_payload(),
+                    "ts": time.time(),
+                }
+            )
+            return
 
     # ── 1b. Install fast-path kernel libraries for the chosen model.
     # 1) causal-conv1d ALWAYS runs eagerly via the substring path: some SSM

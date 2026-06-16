@@ -136,6 +136,227 @@ _VENV_T5_510_DIR = str(_studio_root() / ".venv_t5_510")
 _VENV_T5_DIR = _VENV_T5_550_DIR
 
 
+# ---------------------------------------------------------------------------
+# Dynamic registry-based tier detection (self-maintaining)
+#
+# The curated substring/architecture sets above are kept as the authoritative
+# fast path and fallback. On top of them sits a dynamic layer that asks each
+# transformers environment's own ``CONFIG_MAPPING_NAMES`` whether it recognizes
+# a model's ``model_type``. This lets brand-new architectures route correctly
+# without editing the hardcoded lists:
+#   * recognized by the in-process 4.57 registry  -> default tier
+#   * recognized only by a 5.x sidecar's registry -> that tier
+#   * defined as repo code (``auto_map``)         -> default (trust_remote_code)
+#   * unknown to 4.57 with a 5.x ``transformers_version`` hint -> nearest tier
+# The layer NEVER overrides a positive curated decision and never issues a new
+# network request (it reuses the config.json the curated checks already cached),
+# so existing behavior is preserved exactly.
+# ---------------------------------------------------------------------------
+
+# In-process transformers (default 4.57.x) model_type registry, built once.
+_MAIN_CONFIG_MODEL_TYPES: set[str] | None = None
+
+# In-memory cache of each sidecar venv's CONFIG_MAPPING enumeration, keyed on
+# the venv directory. Disk-backed by a per-venv JSON cache file.
+_sidecar_config_mapping_cache: dict[str, set[str] | None] = {}
+
+_TIER_VENV_DIRS: dict[str, str] = {
+    "510": _VENV_T5_510_DIR,
+    "550": _VENV_T5_550_DIR,
+    "530": _VENV_T5_530_DIR,
+}
+
+
+def _main_config_model_types() -> set[str]:
+    """Return the set of model_types the in-process transformers recognizes.
+
+    Reads ``CONFIG_MAPPING_NAMES`` from the installed (default 4.57.x)
+    transformers. Built once and cached; returns an empty set if transformers
+    cannot be imported, in which case the dynamic layer simply defers to the
+    curated lists.
+    """
+    global _MAIN_CONFIG_MODEL_TYPES
+    if _MAIN_CONFIG_MODEL_TYPES is None:
+        try:
+            from transformers.models.auto.configuration_auto import (
+                CONFIG_MAPPING_NAMES,
+            )
+
+            _MAIN_CONFIG_MODEL_TYPES = set(CONFIG_MAPPING_NAMES.keys())
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Could not read in-process CONFIG_MAPPING_NAMES: %s", exc)
+            _MAIN_CONFIG_MODEL_TYPES = set()
+    return _MAIN_CONFIG_MODEL_TYPES
+
+
+def _venv_transformers_version(venv_dir: str) -> str | None:
+    """Return the transformers version installed in *venv_dir* (via dist-info)."""
+    try:
+        for di in Path(venv_dir).glob("transformers-*.dist-info"):
+            metadata = di / "METADATA"
+            if not metadata.is_file():
+                continue
+            for line in metadata.read_text(errors = "replace").splitlines():
+                if line.startswith("Version:"):
+                    return line.split(":", 1)[1].strip()
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not read transformers version in %s: %s", venv_dir, exc)
+    return None
+
+
+def _subprocess_dump_config_mapping(venv_dir: str) -> set[str] | None:
+    """Enumerate ``CONFIG_MAPPING_NAMES`` of the transformers in *venv_dir*.
+
+    Spawns a short subprocess with *venv_dir* prepended to ``sys.path`` and
+    dumps the model_type keys as JSON. Returns None on any failure. Mocked in
+    tests so no real sidecar venv is required.
+    """
+    code = (
+        "import json, sys; "
+        "from transformers.models.auto.configuration_auto import CONFIG_MAPPING_NAMES; "
+        "sys.stdout.write(json.dumps(list(CONFIG_MAPPING_NAMES)))"
+    )
+    try:
+        env = child_env_without_native_path_secret()
+        pp = env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = venv_dir + (os.pathsep + pp if pp else "")
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            stdout = subprocess.PIPE,
+            stderr = subprocess.PIPE,
+            text = True,
+            timeout = 60,
+            env = env,
+            **_windows_hidden_subprocess_kwargs(),
+        )
+        if result.returncode != 0:
+            logger.debug(
+                "config-mapping dump failed for %s: %s", venv_dir, result.stderr.strip()
+            )
+            return None
+        return set(json.loads(result.stdout.strip()))
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("config-mapping subprocess error for %s: %s", venv_dir, exc)
+        return None
+
+
+def _enumerate_config_mapping(venv_dir: str) -> set[str] | None:
+    """Return the model_types recognized by the transformers in *venv_dir*.
+
+    Disk-cached in ``<venv_dir>/.unsloth_config_mapping_cache.json`` keyed on the
+    sidecar's transformers version (refreshed when the version changes). Returns
+    None if the venv is absent or enumeration fails, in which case the dynamic
+    router falls back to the curated lists.
+    """
+    if not venv_dir or not os.path.isdir(venv_dir):
+        return None
+    if venv_dir in _sidecar_config_mapping_cache:
+        return _sidecar_config_mapping_cache[venv_dir]
+
+    cur_ver = _venv_transformers_version(venv_dir)
+    cache_file = Path(venv_dir) / ".unsloth_config_mapping_cache.json"
+
+    # Reuse the disk cache if the recorded version still matches.
+    if cur_ver and cache_file.is_file():
+        try:
+            data = json.loads(cache_file.read_text())
+            if data.get("transformers_version") == cur_ver and isinstance(
+                data.get("model_types"), list
+            ):
+                result = set(data["model_types"])
+                _sidecar_config_mapping_cache[venv_dir] = result
+                return result
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Could not read config-mapping cache %s: %s", cache_file, exc)
+
+    types = _subprocess_dump_config_mapping(venv_dir)
+    if types is None:
+        _sidecar_config_mapping_cache[venv_dir] = None
+        return None
+
+    try:
+        cache_file.write_text(
+            json.dumps({"transformers_version": cur_ver, "model_types": sorted(types)})
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("Could not write config-mapping cache %s: %s", cache_file, exc)
+
+    _sidecar_config_mapping_cache[venv_dir] = types
+    return types
+
+
+def _tier_from_transformers_version(tv: str | None) -> str | None:
+    """Map a saved ``transformers_version`` hint to the nearest sidecar tier.
+
+    Returns the lowest 5.x tier whose version is >= the hinted version, or the
+    newest tier as a last resort. Returns None for missing / <5.x hints.
+    """
+    if not tv:
+        return None
+    try:
+        parts = tv.split(".")
+        major = int(parts[0])
+        minor = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    except Exception:
+        return None
+    if major < 5:
+        return None
+    if (major, minor) <= (5, 3):
+        return "530"
+    if (major, minor) <= (5, 5):
+        return "550"
+    return "510"
+
+
+def _dynamic_tier_from_cfg(cfg: dict | None) -> str | None:
+    """Dynamic, registry-driven tier for *cfg* (an already-loaded config.json).
+
+    Returns a tier string only when it can positively determine the model needs
+    a newer transformers than the curated lists matched; otherwise None (the
+    caller then falls back to ``"default"``). Never issues a network request.
+    """
+    if not cfg:
+        return None
+    main = _main_config_model_types()
+    if not main:
+        # Registry unavailable -> defer entirely to the curated lists.
+        return None
+
+    model_type = cfg.get("model_type")
+    if model_type and model_type in main:
+        # Recognized by the in-process 4.57 transformers -> default tier.
+        return None
+
+    # Not recognized by 4.57. Ask each sidecar's registry (newest first).
+    if model_type:
+        for tier in ("510", "550", "530"):
+            sidecar = _enumerate_config_mapping(_TIER_VENV_DIRS[tier])
+            if sidecar and model_type in sidecar:
+                logger.info(
+                    "Dynamic tier: model_type=%s recognized by %s sidecar",
+                    model_type,
+                    tier,
+                )
+                return tier
+
+    # Architecture defined as repo code -> trust_remote_code handles it on 4.57.
+    if "auto_map" in cfg:
+        return None
+
+    # Genuinely unknown to 4.57 and not repo code -> use the version hint.
+    tier = _tier_from_transformers_version(cfg.get("transformers_version"))
+    if tier is not None:
+        logger.info(
+            "Dynamic tier: model_type=%s unknown to 4.57, version hint -> %s",
+            model_type,
+            tier,
+        )
+        return tier
+
+    # No positive signal -> defer to default (unchanged behavior).
+    return None
+
+
 def activate_transformers_for_subprocess(model_name: str) -> None:
     """Activate the correct transformers version in a subprocess worker.
 
@@ -456,6 +677,9 @@ def get_transformers_tier(model_name: str) -> str:
             local_tc = Path(model_name) / "tokenizer_config.json"
             if local_tc.is_file() and _check_tokenizer_config_needs_v5(model_name):
                 return "530"
+            dynamic = _dynamic_tier_from_cfg(cfg)
+            if dynamic is not None:
+                return dynamic
             return "default"
 
     # --- Fast substring checks (no I/O) ------------------------------------
@@ -475,6 +699,13 @@ def get_transformers_tier(model_name: str) -> str:
         return "550"
     if _check_tokenizer_config_needs_v5(model_name):
         return "530"
+
+    # Dynamic registry fallback: reuse the config.json the checks above already
+    # fetched/cached (no new network) and route brand-new architectures that the
+    # curated lists don't yet cover.
+    dynamic = _dynamic_tier_from_cfg(_config_json_cache.get(model_name))
+    if dynamic is not None:
+        return dynamic
 
     return "default"
 
