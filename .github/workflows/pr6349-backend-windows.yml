@@ -1,0 +1,43 @@
+name: PR6349-backend windows-latest
+on:
+  push:
+    branches: [pr6349-backend-xos]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  pytest:
+    runs-on: windows-latest
+    timeout-minutes: 50
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install backend deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install 'numpy<3' pytest pytest-asyncio pytest-timeout httpx python-multipart
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.4,<2.11'
+          else
+            pip install 'torch>=2.4,<2.11'
+          fi
+          pip install 'transformers>=4.51,<5.5'
+      - name: Run gguf + hub download-state tests
+        shell: bash
+        working-directory: studio/backend
+        run: |
+          # hub/tests conftest stubs fastapi -> must run separately from tests/
+          python -m pytest hub/tests/test_model_services.py hub/tests/test_pr6349_download_state.py -q --tb=short
+          python -m pytest tests/test_cached_gguf_routes.py tests/test_gguf_completion_usage.py tests/test_gguf_metadata.py tests/test_gguf_reload_inheritance.py tests/test_gguf_route_cursor_reset.py tests/test_gguf_routing.py tests/test_offline_gguf_cache_fallback.py tests/test_export_absolute_paths.py -q --tb=short
