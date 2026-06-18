@@ -2806,10 +2806,12 @@ def _is_sizable_local_path(model: str) -> bool:
         candidate = _lexical(model)
     except (OSError, RuntimeError, ValueError):
         return False
-    if not any(candidate == r or candidate.startswith(r + os.sep) for r in roots):
-        return False
-    # Containment against a trusted root is proven; safe to touch the filesystem.
-    return os.path.exists(candidate)
+    for root in roots:
+        if candidate == root or candidate.startswith(root + os.sep):
+            # Containment against a trusted root is proven; only now is it safe
+            # to touch the filesystem.
+            return os.path.exists(candidate)
+    return False
 
 
 def _export_size_cached(
