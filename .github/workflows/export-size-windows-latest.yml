@@ -1,0 +1,36 @@
+name: "export-size windows-latest"
+on:
+  push:
+    branches: [pr-export-size-cross-os]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/export-size-windows-latest.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/export-size-windows-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  pytest:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      PYTHONPATH: studio/backend
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pytest studio/backend/tests/test_export_size_estimate.py -q
