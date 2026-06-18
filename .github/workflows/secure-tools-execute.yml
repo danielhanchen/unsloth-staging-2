@@ -1,0 +1,50 @@
+# Staging-only CI: prove server-side tools actually execute under the
+# --secure tool policy (PR #6403's new deterministic test). Throwaway; not
+# for upstream. The test runs the real executor (python/terminal) and mocks
+# only the web_search network boundary, so no model/GPU/network is needed.
+name: "secure-tools-execute ubuntu-latest"
+on:
+  push:
+    branches: [secure-tools-execute-ci]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/secure-tools-execute.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/secure-tools-execute.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      # Same dependency shape as studio-backend-ci.yml so imports resolve on a
+      # clean CPU runner.
+      - name: Install backend test dependencies (CPU only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' pytest pytest-asyncio httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.4,<2.11'
+          pip install 'transformers>=4.51,<5.5'
+      - name: Tools-execute test
+        working-directory: studio/backend
+        run: |
+          python -m pytest tests/test_secure_tools_execute.py -q --tb=short
