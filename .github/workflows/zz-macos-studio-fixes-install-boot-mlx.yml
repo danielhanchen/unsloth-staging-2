@@ -1,0 +1,136 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Real Apple Silicon (macos-14) install + boot. Two things at once:
+#  - Issue 1 (slow startup): time the boot to /api/health; the llama.cpp freshness
+#    probe now runs on a background thread, so startup should be fast and the
+#    "llama.cpp ..." WARNING (if any) appears AFTER "Application startup complete".
+#  - Issue 3 (Train/Export greyed out): install WITH torch+mlx (no --no-torch) and
+#    report /api/health chat_only + chat_only_reason. On Apple Silicon with MLX
+#    present this should be chat_only=false (Train/Export enabled). chat_only=true
+#    with reason "mlx_unavailable" means the MLX install regression reproduces.
+name: "macos-studio-fixes - install + boot + MLX (macos-14)"
+
+on:
+  push:
+    branches: [macos-studio-fixes-validation]
+    paths:
+      - 'studio/**'
+      - 'install.sh'
+      - '.github/workflows/zz-macos-studio-fixes-install-boot-mlx.yml'
+  pull_request:
+    branches: [macos-studio-fixes-base]
+    paths:
+      - 'studio/**'
+      - 'install.sh'
+      - '.github/workflows/zz-macos-studio-fixes-install-boot-mlx.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  install-boot-mlx:
+    name: Install + boot + MLX (macos-14)
+    runs-on: macos-14
+    timeout-minutes: 35
+    env:
+      STUDIO_PORT: '18987'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - name: Install Studio (--local, WITH torch + MLX)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          START=$(date +%s)
+          # NOTE: no --no-torch -> installs torch + unsloth + unsloth-zoo, which on
+          # Apple Silicon should pull mlx/mlx-lm/mlx-vlm (the Train/Export gate).
+          bash install.sh --local 2>&1 | tee logs/install.log
+          echo "INSTALL_SECONDS=$(( $(date +%s) - START ))" | tee -a logs/metrics.txt
+
+      - name: Report resolved versions + MLX imports (studio venv)
+        run: |
+          VENV_PY=$(ls "$HOME"/.unsloth/studio/.venv_t5*/bin/python 2>/dev/null | head -1 || true)
+          echo "studio venv python: ${VENV_PY:-<not found, falling back to runner python>}"
+          PYBIN="${VENV_PY:-python}"
+          "$PYBIN" - <<'PY' | tee -a logs/metrics.txt
+          import importlib.metadata as m
+          print("## Resolved versions")
+          for p in ["unsloth","unsloth-zoo","mlx","mlx-lm","mlx-vlm","transformers","torch"]:
+              try:
+                  print(f"{p}=={m.version(p)}")
+              except Exception:
+                  print(f"{p}: NOT INSTALLED")
+          print("## MLX imports (drive the CHAT_ONLY gate)")
+          for mod in ["mlx.core", "unsloth_zoo.mlx"]:
+              try:
+                  __import__(mod); print(f"import {mod}: OK")
+              except Exception as e:
+                  print(f"import {mod}: FAILED ({type(e).__name__}: {e})")
+          PY
+
+      - name: Boot Studio (API-only) and time startup
+        run: |
+          unsloth studio reset-password || true
+          mkdir -p logs
+          BOOT_START=$(date +%s)
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" > logs/studio.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 240); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json; then
+              jq -e '.status == "healthy"' /tmp/health.json && break
+            fi
+            sleep 1
+          done
+          echo "BOOT_TO_HEALTHY_SECONDS=$(( $(date +%s) - BOOT_START ))" | tee -a logs/metrics.txt
+          jq -e '.status == "healthy"' /tmp/health.json
+
+      - name: Report chat_only + chat_only_reason
+        run: |
+          {
+            echo "## /api/health (unauthenticated fields)"
+            jq '{chat_only, chat_only_reason}' /tmp/health.json
+          } | tee -a logs/metrics.txt
+
+      - name: Startup ordering (probe must be off the critical path)
+        if: always()
+        run: |
+          echo "## studio.log startup markers"
+          grep -nE "Waiting for application startup|Application startup complete|llama.cpp|MLX|chat-only|Hardware detected" logs/studio.log || true
+
+      - name: Print metrics
+        if: always()
+        run: cat logs/metrics.txt || true
+
+      - name: Stop Studio
+        if: always()
+        run: |
+          kill "${STUDIO_PID}" 2>/dev/null || true
+          sleep 2
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: mac-install-boot-mlx
+          path: |
+            logs/install.log
+            logs/studio.log
+            logs/metrics.txt
+          retention-days: 7
