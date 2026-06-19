@@ -516,9 +516,19 @@ def cmd_reload(args) -> int:
 
 
 def _reload_gguf(save_dir: Path, metrics: dict) -> int:
+    # llama-cli may live in a CWD-local checkout (older flow) or in the
+    # default install dir unsloth_zoo builds into (~/.unsloth/llama.cpp on
+    # macOS, where _install_llama_cpp_macos clones + cmake-builds it).
+    try:
+        from unsloth_zoo.llama_cpp import LLAMA_CPP_DEFAULT_DIR
+        default_dir = Path(LLAMA_CPP_DEFAULT_DIR)
+    except Exception:
+        default_dir = Path.home() / ".unsloth" / "llama.cpp"
     candidates = [
         Path("llama.cpp/llama-cli"),
         Path("llama.cpp/build/bin/llama-cli"),
+        default_dir / "llama-cli",
+        default_dir / "build" / "bin" / "llama-cli",
     ]
     llama_cli = next((c for c in candidates if c.exists()), None)
     if llama_cli is None:
