@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+#
+# Staging-only cross-OS validation for the #5854 fix (guard empty CUDA arch
+# detection in studio/setup.sh). _resolve_cuda_archs uses bash regex / arrays;
+# this exercises it on Linux (bash 5), macOS (bash 3.2) and Windows (git-bash),
+# plus a `bash -n` parse of the full setup.sh on each, so the helper and the
+# rewritten arch block stay portable. Pure shell, no GPU, sub-second.
+#
+# Not part of the upstream PR: the stock Backend CI already runs
+# tests/sh/test_resolve_cuda_archs.sh in its shell-test loop.
+
+name: validate-5854-cuda-arch
+
+on:
+  push:
+    branches: [studio-fix-empty-cuda-arch-5854-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: bash version
+        run: bash --version | head -1
+      - name: setup.sh parses
+        run: bash -n studio/setup.sh
+      - name: _resolve_cuda_archs unit tests
+        run: bash tests/sh/test_resolve_cuda_archs.sh
