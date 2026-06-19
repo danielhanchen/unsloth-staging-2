@@ -441,6 +441,13 @@ def test_ps_venv_probe_expands_tilde_for_custom_studio_home(ps):
         f"{ps.name}: the venv-internal probe must expand a leading ~ in the custom "
         "Studio home before seeding the venv root (mirroring the canonical resolver)"
     )
+    # The ~ expansion must be guarded on a non-empty USERPROFILE; otherwise
+    # Join-Path $env:USERPROFILE throws on a service/SYSTEM account with no profile,
+    # aborting the whole probe (and the install).
+    assert "IsNullOrWhiteSpace($env:USERPROFILE)" in block, (
+        f"{ps.name}: the ~ expansion must guard against an empty $env:USERPROFILE "
+        "before Join-Path (else it throws on a profile-less account)"
+    )
 
 
 def _ps_floor_map(text, prefix):
@@ -635,9 +642,9 @@ def test_install_sh_wsl_reroute_uses_pipefail():
     # pipefail is set in the exports prefix the reroute bash -lc runs; the wsl.exe
     # call must wire that prefix in (a failed curl is otherwise masked by sh exit 0).
     line = text[text.rfind("\n", 0, i) + 1 : text.find("\n", i)]
-    assert "$_rr_exports" in line, (
-        "install.sh WSL reroute `bash -lc` must run the pipefail exports prefix"
-    )
+    assert (
+        "$_rr_exports" in line
+    ), "install.sh WSL reroute `bash -lc` must run the pipefail exports prefix"
 
 
 def test_uninstall_sh_preserves_shared_icon_for_surviving_shortcut():
