@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+#
+# Staging-only validation for the #4383 fix (multimodal list content in
+# Studio inference text paths). Pure pytest, no GPU, no heavy deps: the
+# content_to_text helper has only a typing import and the test loads it by
+# file path, so it runs identically on Linux, macOS and Windows. This guards
+# that the coercion is cross-platform clean and that inference.py still
+# byte-compiles everywhere after the edits.
+#
+# Not part of the upstream PR: the stock Backend CI already runs
+# studio/backend/tests/test_message_content.py on PRs touching studio/**.
+
+name: validate-4383-list-content
+
+on:
+  push:
+    branches: [studio-fix-list-content-4383-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: validate (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: python -m pip install -U pip pytest
+      - name: content_to_text unit tests
+        run: python -m pytest studio/backend/tests/test_message_content.py -q
+      - name: inference.py byte-compiles
+        run: python -m py_compile studio/backend/core/inference/inference.py studio/backend/core/inference/message_content.py
+      - name: reproduce issue #4383 payload
+        run: >
+          python -c "import importlib.util, pathlib;
+          p = pathlib.Path('studio/backend/core/inference/message_content.py');
+          s = importlib.util.spec_from_file_location('mc', p);
+          m = importlib.util.module_from_spec(s); s.loader.exec_module(m);
+          v = m.content_to_text([{'type':'text','text':'Hello'},{'type':'image_url','image_url':{'url':'x'}}]);
+          assert v == 'Hello', v;
+          assert v.replace('Hello','Hi') == 'Hi';
+          print('OK', repr(v))"
