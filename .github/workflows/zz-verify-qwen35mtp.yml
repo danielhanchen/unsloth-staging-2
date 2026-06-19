@@ -1,0 +1,195 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# THROWAWAY verification workflow (staging only; NOT for upstream).
+# Confirms that with the VS 2026 setup.ps1 changes on this branch, Studio still:
+#   1. installs via install.ps1 --local --no-torch (which invokes studio/setup.ps1),
+#   2. uses the Windows llama.cpp PREBUILT (no source build),
+#   3. serves GGUF inference for unsloth/Qwen3.5-4B-MTP-GGUF UD-Q4_K_XL on a
+#      GPU-less windows-latest runner.
+# Mirrors job 1 (OpenAI/Anthropic) of studio-windows-inference-smoke.yml, model swapped.
+
+name: VERIFY Qwen3.5-4B-MTP Studio GGUF (throwaway)
+
+on:
+  push:
+    branches: [ci-qwen35mtp-verify]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  qwen35mtp-inference:
+    name: Qwen3.5-4B-MTP UD-Q4_K_XL inference (prebuilt llama.cpp)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      GGUF_REPO: unsloth/Qwen3.5-4B-MTP-GGUF
+      GGUF_VARIANT: UD-Q4_K_XL
+      GGUF_FILE: Qwen3.5-4B-UD-Q4_K_XL.gguf
+      STUDIO_PORT: '18888'
+      HF_HOME: ${{ github.workspace }}/hf-cache
+      PYTHONIOENCODING: utf-8
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      # Parse the edited installer + run the existing setup.ps1 unit tests.
+      - name: PowerShell installer unit tests
+        shell: pwsh
+        run: |
+          foreach ($f in @('install.ps1', 'studio/setup.ps1')) {
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $f).Path, [ref]$null, [ref]$errs)
+            if ($errs) { $errs | ForEach-Object { $_.ToString() }; exit 1 }
+            Write-Host "$f parsed with no errors"
+          }
+          if (Test-Path tests/studio/test_resolve_cuda_toolkit.ps1) { pwsh -NoProfile -File tests/studio/test_resolve_cuda_toolkit.ps1 }
+          if (Test-Path tests/studio/test_torch_flavor.ps1) { pwsh -NoProfile -File tests/studio/test_torch_flavor.ps1 }
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Prime HF_HOME with the GGUF
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -m pip install --upgrade huggingface_hub
+          mkdir -p hf-cache
+          bash .github/scripts/hf-download-with-retry.sh "$GGUF_REPO" "$GGUF_FILE"
+          bash .github/scripts/hf-download-with-retry.sh ggml-org/models tinyllamas/stories260K.gguf
+
+      - name: Pre-install Windows tweaks (npm 11 + Defender exclusions)
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          npm install -g 'npm@^11' 2>&1 | Out-Host
+          foreach ($p in @(
+            "$env:USERPROFILE\.unsloth",
+            "$env:USERPROFILE\AppData\Local\uv",
+            "$env:GITHUB_WORKSPACE\studio\frontend\node_modules",
+            "$env:GITHUB_WORKSPACE\studio\frontend\dist"
+          )) {
+            try { Add-MpPreference -ExclusionPath $p -ErrorAction Stop } catch { }
+          }
+
+      - name: Install Studio (--local, --no-torch)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          $ProgressPreference = 'SilentlyContinue'
+          & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
+
+      - name: Assert install.ps1 used the Windows llama.cpp prebuilt
+        run: |
+          LLAMA_DIR=~/.unsloth/llama.cpp
+          INFO="$LLAMA_DIR/UNSLOTH_PREBUILT_INFO.json"
+          BIN="$LLAMA_DIR/build/bin/Release/llama-server.exe"
+          if grep -q "falling back to source build" logs/install.log; then
+            echo "::error::install.ps1 fell back to source-build llama.cpp on Windows."; exit 1
+          fi
+          if [ ! -f "$INFO" ]; then echo "::error::no UNSLOTH_PREBUILT_INFO.json"; ls -la "$LLAMA_DIR" || true; exit 1; fi
+          if [ ! -f "$BIN" ]; then echo "::error::no llama-server.exe"; ls -la "$LLAMA_DIR/build/bin" || true; exit 1; fi
+          echo "Windows prebuilt llama.cpp in place:"; cat "$INFO"
+
+      - name: Add Studio shim to GITHUB_PATH
+        run: |
+          SHIM_DIR=~/.unsloth/studio/bin
+          [ -f "$SHIM_DIR/unsloth.exe" ] || { echo "::error::unsloth.exe shim missing"; exit 1; }
+          cygpath -w "$SHIM_DIR" >> "$GITHUB_PATH"
+
+      - name: Install OpenAI SDK
+        run: python -m pip install 'openai>=1.50'
+
+      - name: Reset auth + boot Studio (API-only)
+        run: |
+          unsloth studio reset-password
+          mkdir -p logs
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" > logs/studio.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for /api/health + login
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json; then
+              jq -e '.status == "healthy"' /tmp/health.json && break
+            fi
+            sleep 1
+          done
+          jq -e '.status == "healthy"' /tmp/health.json
+          PW=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
+          echo "::add-mask::$PW"
+          TOKEN=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
+            -H 'content-type: application/json' \
+            -d "{\"username\":\"unsloth\",\"password\":\"$PW\"}" | jq -r .access_token)
+          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "login failed"; exit 1; }
+          echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Load Qwen3.5-4B-MTP UD-Q4_K_XL GGUF
+        run: |
+          LOAD_OK=0
+          for attempt in 1 2 3; do
+            HTTP=$(curl -s -o /tmp/load.json -w '%{http_code}' \
+              -X POST "http://127.0.0.1:${STUDIO_PORT}/api/inference/load" \
+              -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+              --max-time 900 \
+              -d "{\"model_path\":\"$GGUF_REPO\",\"gguf_variant\":\"$GGUF_VARIANT\",\"is_lora\":false,\"max_seq_length\":2048}")
+            if [ "$HTTP" = "200" ]; then LOAD_OK=1; break; fi
+            echo "::warning::/api/inference/load attempt $attempt -> $HTTP"; cat /tmp/load.json || true; sleep 10
+          done
+          [ "$LOAD_OK" = "1" ] || { echo "::error::load failed 3 attempts"; exit 22; }
+          jq '{status, display_name, is_gguf, context_length}' /tmp/load.json
+
+      - name: GGUF chat completion via OpenAI SDK
+        env:
+          BASE_URL: http://127.0.0.1:18888
+        run: |
+          python - <<'PY'
+          import os
+          from openai import OpenAI
+          client = OpenAI(base_url=f"{os.environ['BASE_URL']}/v1", api_key=os.environ["TOKEN"])
+          resp = client.chat.completions.create(
+              model="default",
+              messages=[{"role": "user", "content": "What is the capital of France? Answer in one word."}],
+              temperature=0.0, max_tokens=32, seed=3407,
+              extra_body={"enable_thinking": False},
+          )
+          text = (resp.choices[0].message.content or "").strip()
+          print(f"[qwen3.5-4b-mtp] reply: {text!r}")
+          assert text, "empty completion"
+          assert "paris" in text.lower(), f"expected 'paris', got {text!r}"
+          print("[qwen3.5-4b-mtp] PASS - GGUF inference works on prebuilt llama.cpp")
+          PY
+
+      - name: Stop Studio
+        if: always()
+        shell: cmd
+        run: echo Stop Studio (no-op; runner reclaims STUDIO_PID=%STUDIO_PID% at job end)
+
+      - name: Upload logs
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: verify-qwen35mtp-log
+          path: |
+            logs/studio.log
+            logs/install.log
+          retention-days: 7
