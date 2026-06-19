@@ -555,10 +555,18 @@ def _reload_gguf(save_dir: Path, metrics: dict) -> int:
                 str(SEED),
                 "-no-cnv",
                 "--no-warmup",
+                # Force CPU: the freshly cmake-built Metal binary can stall on
+                # first-run shader init, and 24 tokens on a 270M model is
+                # sub-second on CPU anyway. This is a load+generate smoke.
+                "-ngl",
+                "0",
             ],
             capture_output = True,
             text = True,
             timeout = 300,
+            # Never inherit the runner's stdin: some llama-cli builds block
+            # reading it despite -no-cnv, which manifests as a 300s timeout.
+            stdin = subprocess.DEVNULL,
         )
 
     metrics["llama_cli_returncode"] = proc.returncode
