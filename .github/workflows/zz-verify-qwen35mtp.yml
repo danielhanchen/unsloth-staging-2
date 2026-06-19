@@ -125,7 +125,7 @@ jobs:
           UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" > logs/studio.log 2>&1 &
           echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
 
-      - name: Wait for /api/health + login
+      - name: Wait for /api/health + rotate bootstrap password + login
         run: |
           for i in $(seq 1 180); do
             if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json; then
@@ -134,11 +134,21 @@ jobs:
             sleep 1
           done
           jq -e '.status == "healthy"' /tmp/health.json
-          PW=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
-          echo "::add-mask::$PW"
+          # Studio requires the bootstrap password to be rotated before its
+          # token is accepted on other endpoints (otherwise 403 "Password
+          # change required"). Rotate, then log in with the new password.
+          OLD=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
+          NEW="CIVerify-$(python -c 'import secrets; print(secrets.token_urlsafe(12))')"
+          echo "::add-mask::$OLD"; echo "::add-mask::$NEW"
+          OLD_TOKEN=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
+            -H 'content-type: application/json' \
+            -d "{\"username\":\"unsloth\",\"password\":\"$OLD\"}" | jq -r .access_token)
+          curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/change-password" \
+            -H "Authorization: Bearer $OLD_TOKEN" -H 'content-type: application/json' \
+            -d "{\"current_password\":\"$OLD\",\"new_password\":\"$NEW\"}" > /dev/null
           TOKEN=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
             -H 'content-type: application/json' \
-            -d "{\"username\":\"unsloth\",\"password\":\"$PW\"}" | jq -r .access_token)
+            -d "{\"username\":\"unsloth\",\"password\":\"$NEW\"}" | jq -r .access_token)
           [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "login failed"; exit 1; }
           echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
