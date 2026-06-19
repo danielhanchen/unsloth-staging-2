@@ -51,7 +51,7 @@ jobs:
 
       - name: Force the broken state (remove mlx from the studio venv)
         run: |
-          VENV_PY=$(ls "$HOME"/.unsloth/studio/.venv_t5*/bin/python 2>/dev/null | head -1 || true)
+          VENV_PY=$(find "$HOME/.unsloth/studio" -maxdepth 3 -path '*/bin/python' 2>/dev/null | head -1)
           echo "VENV_PY=$VENV_PY" | tee -a "$GITHUB_ENV"
           test -n "$VENV_PY" || { echo "studio venv python not found"; exit 1; }
           "$VENV_PY" -m pip uninstall -y mlx mlx-lm mlx-vlm || true
