@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Ubuntu parity for the macOS Studio fixes pytest (fast, cheap signal).
+name: "macos-studio-fixes - pytest (ubuntu-latest)"
+
+on:
+  push:
+    branches: [macos-studio-fixes-validation]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/zz-macos-studio-fixes-pytest-ubuntu.yml'
+  pull_request:
+    branches: [macos-studio-fixes-base]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/zz-macos-studio-fixes-pytest-ubuntu.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: Backend pytest (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install backend test dependencies (CPU only)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' pytest pytest-asyncio httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.4,<2.11'
+          pip install 'transformers>=4.51,<5.5'
+
+      - name: Targeted backend tests
+        working-directory: studio/backend
+        run: |
+          python -m pytest -q --tb=short \
+            tests/test_startup_llama_probe_non_blocking.py \
+            tests/test_model_defaults_none_guard.py \
+            tests/test_chat_only_reason.py \
+            tests/test_mlx_repair.py \
+            tests/test_install_resolve_prebuilt.py \
+            tests/test_llama_cpp_freshness.py \
+            tests/test_llama_cpp_update.py \
+            tests/test_lifespan_shutdown.py

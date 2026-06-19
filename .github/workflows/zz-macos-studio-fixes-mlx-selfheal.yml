@@ -1,0 +1,105 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# End-to-end MLX self-heal on real Apple Silicon (macos-14). Forces the broken
+# state (uninstall mlx from the studio venv), boots Studio, and asserts the
+# background auto-repair reinstalls mlx and re-detection flips chat_only false,
+# i.e. Train/Export re-enable without a manual `unsloth studio update`.
+name: "macos-studio-fixes - MLX self-heal e2e (macos-14)"
+
+on:
+  push:
+    branches: [macos-studio-fixes-validation]
+    paths:
+      - 'studio/**'
+      - 'install.sh'
+      - '.github/workflows/zz-macos-studio-fixes-mlx-selfheal.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-self-heal:
+    name: MLX self-heal (macos-14)
+    runs-on: macos-14
+    timeout-minutes: 35
+    env:
+      STUDIO_PORT: '18993'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.13'
+
+      - name: Install Studio (--local, WITH torch + MLX)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local 2>&1 | tee logs/install.log
+
+      - name: Force the broken state (remove mlx from the studio venv)
+        run: |
+          VENV_PY=$(find "$HOME/.unsloth/studio" -maxdepth 3 -path '*/bin/python' 2>/dev/null | head -1)
+          echo "VENV_PY=$VENV_PY" | tee -a "$GITHUB_ENV"
+          test -n "$VENV_PY" || { echo "studio venv python not found"; exit 1; }
+          "$VENV_PY" -m pip uninstall -y mlx mlx-lm mlx-vlm || true
+          if "$VENV_PY" -c "import mlx.core" 2>/dev/null; then
+            echo "mlx still importable after uninstall (unexpected)"; exit 1
+          fi
+          echo "confirmed: import mlx.core fails (broken state set)"
+
+      - name: Boot Studio (auto-repair enabled by default)
+        run: |
+          unsloth studio reset-password || true
+          mkdir -p logs
+          # UNSLOTH_DISABLE_MLX_AUTOREPAIR intentionally unset (default = on).
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" > logs/studio.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 240); do
+            curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json && \
+              jq -e '.status == "healthy"' /tmp/health.json && break
+            sleep 1
+          done
+          echo "initial /api/health:"; jq '{chat_only, chat_only_reason}' /tmp/health.json
+
+      - name: Wait for self-heal (chat_only flips false)
+        run: |
+          ok=0
+          # mlx + mlx-lm + mlx-vlm reinstall over the network, then re-detect.
+          for i in $(seq 1 60); do
+            curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json || true
+            if jq -e '.chat_only == false' /tmp/health.json >/dev/null 2>&1; then
+              ok=1; break
+            fi
+            sleep 10
+          done
+          echo "final /api/health:"; jq '{chat_only, chat_only_reason}' /tmp/health.json
+          echo "self-heal log lines:"; grep -nE "MLX self-heal|mlx-autorepair|Train/Export" logs/studio.log || true
+          "$VENV_PY" -c "import mlx.core; print('import mlx.core OK after self-heal')"
+          test "$ok" = "1" || { echo "self-heal did not flip chat_only=false"; exit 1; }
+
+      - name: Stop Studio
+        if: always()
+        run: kill "${STUDIO_PID}" 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: mlx-self-heal
+          path: |
+            logs/install.log
+            logs/studio.log
+          retention-days: 7

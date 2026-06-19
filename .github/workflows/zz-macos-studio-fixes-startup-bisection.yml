@@ -1,0 +1,99 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Slow-startup regression bisection on real Apple Silicon (macos-14). Boots three
+# refs and times boot -> /api/health:
+#   - 5a6e94d4 = parent of #5528 (2026-05-18): BEFORE the inline llama.cpp startup
+#     probe existed -> fast boot (the "previous version had no slow startup").
+#   - 420799b6 = current upstream main (the buggy state): inline probe gates
+#     `Application startup complete`.
+#   - macos-studio-fixes-validation = this fix: probe deferred to a daemon thread.
+# Uses --no-torch (GGUF-only) since the startup probe is torch-independent and it
+# keeps installs fast.
+name: "macos-studio-fixes - startup bisection (macos-14)"
+
+on:
+  push:
+    branches: [macos-studio-fixes-validation]
+    paths:
+      - '.github/workflows/zz-macos-studio-fixes-startup-bisection.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  boot-timing:
+    name: "Boot timing @ ${{ matrix.label }}"
+    runs-on: macos-14
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ref: '5a6e94d422f8fdcd3813790b7ad2c3f8e69d1b63'
+            label: 'pre-5528 (no probe)'
+          - ref: '420799b61ef35d6cfd87c4f4b02c98152fdf6599'
+            label: 'main (inline probe)'
+          - ref: 'macos-studio-fixes-validation'
+            label: 'fix (deferred probe)'
+    env:
+      STUDIO_PORT: '18991'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+          ref: ${{ matrix.ref }}
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install Studio (--local --no-torch)
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Boot + time to /api/health
+        run: |
+          unsloth studio reset-password || true
+          mkdir -p logs
+          BOOT_START=$(date +%s)
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" > logs/studio.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 240); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json; then
+              jq -e '.status == "healthy"' /tmp/health.json && break
+            fi
+            sleep 1
+          done
+          echo "=== ${{ matrix.label }}: BOOT_TO_HEALTHY_SECONDS=$(( $(date +%s) - BOOT_START )) ===" | tee logs/boot_seconds.txt
+          jq -e '.status == "healthy"' /tmp/health.json
+
+      - name: Startup markers (probe placement)
+        if: always()
+        run: grep -nE "Waiting for application startup|Application startup complete|llama.cpp" logs/studio.log || true
+
+      - name: Stop Studio
+        if: always()
+        run: kill "${STUDIO_PID}" 2>/dev/null || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: startup-bisection-${{ strategy.job-index }}
+          path: |
+            logs/studio.log
+            logs/boot_seconds.txt
+          retention-days: 7

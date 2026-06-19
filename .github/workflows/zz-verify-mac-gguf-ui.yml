@@ -8,20 +8,11 @@
 # bundle, or the Mac llama.cpp prebuilt's HTTP layer behaving
 # differently from the Linux build).
 
-name: Mac Studio UI CI
+name: "verify-mac - GGUF load + inference + chat UI (macos-14)"
 
 on:
-  pull_request:
-    paths:
-      - 'studio/**'
-      - 'unsloth/**'
-      - 'unsloth_cli/**'
-      - 'install.sh'
-      - 'pyproject.toml'
-      - 'tests/studio/**'
-      - '.github/workflows/studio-mac-ui-smoke.yml'
   push:
-    branches: [main, pip]
+    branches: [macos-studio-fixes-validation]
   workflow_dispatch:
 
 concurrency:

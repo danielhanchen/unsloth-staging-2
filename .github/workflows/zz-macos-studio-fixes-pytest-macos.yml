@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Throwaway staging validation for the macOS Studio fixes (startup non-blocking
+# probe, obsolete macOS pin removal, chat_only_reason). Deterministic backend
+# pytest on a real Apple Silicon (macos-14) runner. Quote the name so a future
+# `#NNNN` in it is not parsed as a YAML comment.
+name: "macos-studio-fixes - pytest (macos-14)"
+
+on:
+  push:
+    branches: [macos-studio-fixes-validation]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/zz-macos-studio-fixes-pytest-macos.yml'
+  pull_request:
+    branches: [macos-studio-fixes-base]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/zz-macos-studio-fixes-pytest-macos.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: Backend pytest (macos-14)
+    runs-on: macos-14
+    timeout-minutes: 25
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      HF_HUB_OFFLINE: '1'
+      TRANSFORMERS_OFFLINE: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install backend test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' pytest pytest-asyncio httpx
+          # macOS arm64: default PyPI torch IS the cpu/mps build (no CUDA wheels).
+          pip install 'torch>=2.4,<2.11' 'transformers>=4.51,<5.5'
+
+      - name: Targeted backend tests
+        working-directory: studio/backend
+        # The new/extended tests for this change, plus the existing freshness /
+        # update / lifespan / install-resolve tests as regression guards.
+        run: |
+          python -m pytest -q --tb=short \
+            tests/test_startup_llama_probe_non_blocking.py \
+            tests/test_model_defaults_none_guard.py \
+            tests/test_chat_only_reason.py \
+            tests/test_mlx_repair.py \
+            tests/test_install_resolve_prebuilt.py \
+            tests/test_llama_cpp_freshness.py \
+            tests/test_llama_cpp_update.py \
+            tests/test_lifespan_shutdown.py

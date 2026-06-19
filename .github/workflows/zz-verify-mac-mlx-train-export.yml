@@ -54,24 +54,12 @@
 # git URL through PyPI metadata; the audit comment in security-audit.yml
 # documents this). No new package is introduced solely by MLX CI.
 
-name: MLX CI on Mac M1
+name: "verify-mac - MLX training + export (macos-14)"
 
 on:
-  pull_request:
-    paths:
-      - 'unsloth/__init__.py'
-      - 'unsloth/_gpu_init.py'
-      - 'studio/backend/utils/hardware/**'
-      - 'studio/backend/core/training/worker.py'
-      - 'studio/backend/core/inference/mlx_inference.py'
-      - 'tests/studio/test_hardware_dispatch_matrix.py'
-      - 'tests/studio/test_is_mlx_dispatch_gate.py'
-      - 'tests/studio/test_mlx_training_worker_behaviors.py'
-      - 'tests/studio/run_real_mlx_smoke.py'
-      - 'tests/conftest.py'
-      - '.github/workflows/mlx-ci.yml'
   push:
-    branches: [main, pip]
+    branches: [macos-studio-fixes-validation]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -167,8 +155,10 @@ jobs:
             'torch==2.10.0'
           # github.com occasionally 500s on the git fetch; retry the
           # zoo install so a single upstream blip does not fail CI.
+          # Pinned to the MLX GGUF-export import-fix branch to validate that
+          # save_pretrained_gguf no longer NameErrors on install_llama_cpp.
           for attempt in 1 2 3; do
-            if pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo"; then
+            if pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth_zoo@mlx-gguf-export-install-import"; then
               break
             fi
             if [ "$attempt" -eq 3 ]; then
