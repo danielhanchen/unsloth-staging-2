@@ -1,0 +1,38 @@
+name: "PR-6296 windows-latest"
+on:
+  push:
+    branches: [pr6296-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  installer-tests:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: python -m pip install pytest
+      - name: pytest amd-smi gate + installer follow-ups (Windows native)
+        run: python -m pytest tests/studio/install/test_pr5940_followups.py -q
+      - name: PowerShell parse install.ps1 / setup.ps1 / uninstall.ps1
+        shell: pwsh
+        run: |
+          foreach ($f in 'install.ps1','studio/setup.ps1','scripts/uninstall.ps1') {
+            $e = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$null, [ref]$e)
+            if ($e) { Write-Host "$f PARSE ERRORS:"; $e; exit 1 } else { Write-Host "$f OK" }
+          }
+      - name: PowerShell uninstall dual-install icon test
+        shell: pwsh
+        run: ./tests/studio/test_uninstall_dual_install_icon.ps1
+      - name: Windows-native Test-HipinfoIsVenvInternal (drive-root + casing, Fix C)
+        shell: pwsh
+        run: ./tests/studio/test_hipinfo_venv_windows.ps1

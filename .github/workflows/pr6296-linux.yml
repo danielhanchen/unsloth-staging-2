@@ -1,0 +1,30 @@
+name: "PR-6296 ubuntu-latest"
+on:
+  push:
+    branches: [pr6296-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  installer-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: python -m pip install pytest
+      - name: pytest amd-smi gate + installer follow-ups (Linux)
+        run: python -m pytest tests/studio/install/test_pr5940_followups.py -q
+      - name: bash Strix Halo WSL reroute test
+        run: bash tests/sh/test_strixhalo_wsl_reroute.sh
+      - name: bash uninstall shared-icon test
+        run: bash tests/sh/test_uninstall_shared_icon.sh
+      - name: bash syntax (install.sh, uninstall.sh)
+        run: bash -n install.sh && bash -n scripts/uninstall.sh
