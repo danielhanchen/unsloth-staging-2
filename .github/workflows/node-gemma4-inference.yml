@@ -1,8 +1,12 @@
 # End-to-end proof that the isolated-Node change does not regress a real Studio
 # install + GGUF inference. Forces the ISOLATED Node path (no system npm >= 11),
-# asserts setup used the isolated Node and built the frontend, then loads
-# unsloth/gemma-4-E2B-it-GGUF UD-Q4_K_XL and generates. Linux + macOS (Apple
-# Silicon) -- CPU/Metal, no GPU needed for GGUF.
+# asserts setup used the isolated Node and built the frontend, then loads a GGUF
+# and generates on Linux + macOS (CPU, no GPU).
+#
+# Uses a small TEXT GGUF (gemma-3-270m-it) so it loads on the GPU-less runners
+# (Studio gates vision models like gemma-4-E2B to a GPU/Metal -> "chat_only"
+# runners 403 on a vision load). gemma-4-E2B-it-GGUF UD-Q4_K_XL itself is
+# validated by studio-mac-inference-smoke's vision job on the Metal runner.
 name: node-gemma4-inference
 
 on:
@@ -19,7 +23,7 @@ permissions:
 
 jobs:
   infer:
-    name: isolated-node + gemma-4-E2B ${{ matrix.os }}
+    name: isolated-node + inference ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:
@@ -27,12 +31,11 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-14]
     env:
-      GGUF_REPO: unsloth/gemma-4-E2B-it-GGUF
-      GGUF_FILE: gemma-4-E2B-it-UD-Q4_K_XL.gguf
-      # gemma-4-E2B is multimodal: load via local file path with mmproj sibling
-      # auto-detected (matches studio-mac-inference-smoke's gemma-4-E2B job).
-      MMPROJ_FILE: mmproj-F16.gguf
+      GGUF_REPO: unsloth/gemma-3-270m-it-GGUF
+      GGUF_VARIANT: UD-Q4_K_XL
+      GGUF_FILE: gemma-3-270m-it-UD-Q4_K_XL.gguf
       STUDIO_PORT: '18888'
+      HF_HOME: ${{ github.workspace }}/hf-cache
     steps:
       - uses: actions/checkout@v4
         with:
@@ -56,19 +59,15 @@ jobs:
           python-version: '3.12'
 
       - name: Show system node/npm (should be < npm 11 -> isolated path)
-        run: |
-          echo "system node: $(node -v)  npm: $(npm -v)"
+        run: echo "system node: $(node -v)  npm: $(npm -v)"
 
-      - name: Prime GGUF + mmproj
+      - name: Prime HF_HOME with the GGUF
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           python -m pip install --upgrade huggingface_hub
-          mkdir -p gguf-cache
-          # Flat dir so the mmproj sits beside the gguf and is auto-detected.
-          bash .github/scripts/hf-download-with-retry.sh "$GGUF_REPO" "$GGUF_FILE" gguf-cache
-          bash .github/scripts/hf-download-with-retry.sh "$GGUF_REPO" "$MMPROJ_FILE" gguf-cache
-          ls -lh gguf-cache/
+          mkdir -p hf-cache
+          bash .github/scripts/hf-download-with-retry.sh "$GGUF_REPO" "$GGUF_FILE"
 
       - name: Install Studio (--local, --no-torch)
         env:
@@ -82,19 +81,16 @@ jobs:
       - name: Assert the ISOLATED Node path was used and frontend built
         run: |
           set -e
-          # 1) setup.sh logged the isolated path (not "(system)").
           if ! grep -Eq "isolated Node|\(isolated\)" logs/install.log; then
             echo "::error::install did not use the isolated Node path"
             grep -Ei "node|npm" logs/install.log | tail -40
             exit 1
           fi
-          # 2) the isolated Node tree exists with metadata + a >=24 node.
           NODE_DIR=~/.unsloth/node
           test -f "$NODE_DIR/UNSLOTH_NODE_PREBUILT_INFO.json"
           "$NODE_DIR/bin/node" -v | grep -Eq '^v(2[4-9]|[3-9][0-9])\.'
           NPM_MAJOR=$("$NODE_DIR/bin/node" "$NODE_DIR/lib/node_modules/npm/bin/npm-cli.js" -v | cut -d. -f1)
           [ "$NPM_MAJOR" -ge 11 ]
-          # 3) the frontend actually built with that Node.
           test -d studio/frontend/dist
           ls studio/frontend/dist/assets/*.js >/dev/null
           echo "isolated Node path confirmed; frontend dist built"
@@ -116,45 +112,35 @@ jobs:
           done
           echo "Studio did not become healthy"; tail -200 logs/studio.log; exit 1
 
-      - name: Load gemma-4-E2B-it UD-Q4_K_XL and generate
+      - name: Load the GGUF and generate
         run: |
           set -uo pipefail
-          ls -la ~/.unsloth/studio/auth/ || true
           PW=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
           echo "::add-mask::$PW"
-          [ -n "$PW" ] || { echo "::error::bootstrap password is empty"; tail -100 logs/studio.log; exit 1; }
+          [ -n "$PW" ] || { echo "::error::empty bootstrap password"; tail -100 logs/studio.log; exit 1; }
 
-          # Login (print HTTP code + body so any auth issue is visible).
           RESP=$(curl -s -w $'\n%{http_code}' -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
             -H 'content-type: application/json' -d "{\"username\":\"unsloth\",\"password\":\"$PW\"}")
           CODE=$(printf '%s' "$RESP" | tail -1); BODY=$(printf '%s' "$RESP" | sed '$d')
-          echo "login HTTP $CODE"
-          [ "$CODE" = "200" ] || { echo "::error::login failed: $BODY"; exit 1; }
+          echo "login HTTP $CODE"; [ "$CODE" = "200" ] || { echo "::error::login: $BODY"; exit 1; }
           TOKEN=$(printf '%s' "$BODY" | jq -r .access_token)
           [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "::error::no token"; exit 1; }
 
-          # Load via local file path (multimodal: mmproj sibling auto-detected;
-          # gguf_variant omitted as it expects a directory, not a file).
-          GGUF_PATH="$GITHUB_WORKSPACE/gguf-cache/${GGUF_FILE}"
-          ls -lh "$GGUF_PATH" "$GITHUB_WORKSPACE/gguf-cache/${MMPROJ_FILE}"
           RESP=$(curl -s -w $'\n%{http_code}' -X POST "http://127.0.0.1:${STUDIO_PORT}/api/inference/load" \
             -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' --max-time 900 \
-            -d "{\"model_path\":\"$GGUF_PATH\",\"is_lora\":false,\"max_seq_length\":2048}")
+            -d "{\"model_path\":\"$GGUF_REPO\",\"gguf_variant\":\"$GGUF_VARIANT\",\"is_lora\":false,\"max_seq_length\":2048}")
           CODE=$(printf '%s' "$RESP" | tail -1); BODY=$(printf '%s' "$RESP" | sed '$d')
-          echo "load HTTP $CODE"; printf '%s\n' "$BODY" | jq '{status, display_name, is_gguf, is_vision, context_length}' || printf '%s\n' "$BODY"
+          echo "load HTTP $CODE"; printf '%s\n' "$BODY" | jq '{status, display_name, is_gguf, context_length}' || printf '%s\n' "$BODY"
           [ "$CODE" = "200" ] || { echo "::error::load failed"; tail -120 logs/studio.log; exit 1; }
 
-          # Generate. Small non-zero temperature: gemma-4 quants degenerate to
-          # <unused5> padding at temp=0 on CPU/Metal (see mac inference smoke).
           RESP=$(curl -s -w $'\n%{http_code}' -X POST "http://127.0.0.1:${STUDIO_PORT}/v1/chat/completions" \
             -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' --max-time 300 \
-            -d '{"model":"default","messages":[{"role":"user","content":"In one short sentence, what is Unsloth?"}],"temperature":0.2,"seed":3407,"max_tokens":48}')
+            -d '{"model":"default","messages":[{"role":"user","content":"In one short sentence, what is Unsloth?"}],"temperature":0.0,"max_tokens":48}')
           CODE=$(printf '%s' "$RESP" | tail -1); BODY=$(printf '%s' "$RESP" | sed '$d')
-          echo "generate HTTP $CODE"
-          [ "$CODE" = "200" ] || { echo "::error::generate failed: $BODY"; exit 1; }
+          echo "generate HTTP $CODE"; [ "$CODE" = "200" ] || { echo "::error::generate: $BODY"; exit 1; }
           printf '%s\n' "$BODY" | jq -r '.choices[0].message.content'
           printf '%s\n' "$BODY" | jq -e '.choices[0].message.content | length > 0' >/dev/null
-          echo "gemma-4-E2B-it UD-Q4_K_XL inference OK on ${{ matrix.os }}"
+          echo "isolated-node Studio inference OK on ${{ matrix.os }}"
 
       - name: Upload logs
         if: always()
