@@ -1,0 +1,60 @@
+name: studio-install-windows
+
+on:
+  push:
+    branches: [studio-install-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  install-from-source:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Clone unsloth (main = latest/nightly source)
+        run: git clone --depth 1 https://github.com/unslothai/unsloth
+
+      - name: Developer install from source (.\install.ps1 --local)
+        run: |
+          cd unsloth
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          $env:UNSLOTH_STUDIO_HOME = Join-Path $PWD ".studio"
+          .\install.ps1 --local
+
+      - name: Launch Studio (loopback) and health-check
+        run: |
+          cd unsloth
+          $env:UNSLOTH_STUDIO_HOME = Join-Path $PWD ".studio"
+          $exe = Join-Path $env:UNSLOTH_STUDIO_HOME "unsloth_studio\Scripts\unsloth.exe"
+          Write-Host "launcher: $exe"
+          $proc = Start-Process -FilePath $exe -ArgumentList "studio","-p","8899" `
+            -RedirectStandardOutput studio.out.log -RedirectStandardError studio.err.log `
+            -PassThru -NoNewWindow
+          $ok = $false
+          for ($i = 0; $i -lt 150; $i++) {
+            try {
+              Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8899/api/health" -TimeoutSec 5 | Out-Null
+              $ok = $true; break
+            } catch { Start-Sleep -Seconds 4 }
+          }
+          Write-Host "----- studio.out.log (tail) -----"
+          if (Test-Path studio.out.log) { Get-Content studio.out.log -Tail 80 }
+          Write-Host "----- studio.err.log (tail) -----"
+          if (Test-Path studio.err.log) { Get-Content studio.err.log -Tail 80 }
+          if ($proc -and -not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
+          if ($ok) {
+            Write-Host "RESULT: STUDIO HEALTHY (windows)"
+          } else {
+            Write-Host "RESULT: STUDIO NOT HEALTHY (windows)"; exit 1
+          }
