@@ -59,7 +59,8 @@ jobs:
           python-version: '3.12'
 
       - name: Show system node/npm (should be < npm 11 -> isolated path)
-        run: echo "system node: $(node -v)  npm: $(npm -v)"
+        run: |
+          echo "system node: $(node -v)  npm: $(npm -v)"
 
       - name: Prime HF_HOME with the GGUF
         env:
