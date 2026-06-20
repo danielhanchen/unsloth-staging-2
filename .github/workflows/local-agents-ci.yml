@@ -24,11 +24,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # tools_mode: `default` = `unsloth run` as the docs say (server-side tools
+        # ON, the documented default); `disable` = `unsloth run --disable-tools`
+        # (passthrough, so the external agent's own tools reach it). The grid is a
+        # before/after: external coding agents need passthrough to run their tools.
+        tools_mode: [default, disable]
         agent: [pi, codex, claude-code]
         model:
           - { repo: "unsloth/Qwen3.5-2B-MTP-GGUF", variant: "UD-Q4_K_XL" }
           - { repo: "unsloth/gemma-4-E2B-it-GGUF", variant: "UD-Q4_K_XL" }
-    name: ${{ matrix.agent }} / ${{ matrix.model.repo }}
+    name: ${{ matrix.agent }} / ${{ matrix.model.repo }} / ${{ matrix.tools_mode }}
     env:
       STUDIO_PORT: "8888"
       TASK_PROMPT: "Create a short Python Fibonacci function in a file called fib.py. Keep it under 15 lines."
@@ -75,9 +80,14 @@ jobs:
           # `unsloth run --model <repo>:<variant>`. Fall back to `studio run`.
           SUB="run"
           unsloth run --help >/dev/null 2>&1 || SUB="studio run"
-          echo "Using subcommand: unsloth $SUB"
+          # default: server-side tools ON (docs default). disable: passthrough so
+          # the external agent's own tools reach llama-server and come back as
+          # structured tool_calls the agent executes in its own cwd.
+          EXTRA=""
+          if [ "${{ matrix.tools_mode }}" = "disable" ]; then EXTRA="--disable-tools"; fi
+          echo "Using subcommand: unsloth $SUB $EXTRA"
           nohup unsloth $SUB --model "${{ matrix.model.repo }}:${{ matrix.model.variant }}" \
-            -H 127.0.0.1 -p "$STUDIO_PORT" > "$HOME/studio.log" 2>&1 &
+            $EXTRA -H 127.0.0.1 -p "$STUDIO_PORT" > "$HOME/studio.log" 2>&1 &
           echo "$!" > "$HOME/studio.pid"
           # Phase 1: wait for the printed API key (server booted).
           KEY=""
