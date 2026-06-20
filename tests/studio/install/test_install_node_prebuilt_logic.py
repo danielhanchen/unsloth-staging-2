@@ -5,6 +5,7 @@
 import importlib.util
 import io
 import json
+import os
 import sys
 import tarfile
 import zipfile
@@ -165,6 +166,10 @@ def _add_symlink(tar: tarfile.TarFile, name: str, target: str):
     tar.addfile(info)
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Node ships a .zip (no symlinks) on Windows; the tar+symlink path is Unix-only",
+)
 def test_extract_tar_gz_with_npm_symlink(tmp_path: Path):
     # Mirrors the real Node tarball: bin/npm -> ../lib/node_modules/npm/bin/npm-cli.js
     archive = tmp_path / "node.tar.gz"
