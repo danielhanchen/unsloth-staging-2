@@ -1352,6 +1352,11 @@ class LlamaCppBackend:
         # to decide whether to wait for the VRAM reclaim to finish.
         self._last_kill_monotonic: float = 0.0
 
+        # Monotonic timestamp of the last generation activity, refreshed on load
+        # and on every streamed chunk. Drives the idle-TTL eviction loop so a
+        # genuinely idle model can be unloaded automatically.
+        self._last_activity: float = 0.0
+
         _reaped = self._kill_orphaned_servers()
         if _reaped:
             # Reaped VRAM frees lazily; arm the settle wait so the first load
@@ -1369,6 +1374,23 @@ class LlamaCppBackend:
     def is_active(self) -> bool:
         """True if a llama-server process exists (loading or loaded)."""
         return self._process is not None
+
+    def note_activity(self) -> None:
+        """Record that the loaded model was just used (drives idle-TTL eviction)."""
+        self._last_activity = time.monotonic()
+
+    @property
+    def last_activity_monotonic(self) -> float:
+        return self._last_activity
+
+    @property
+    def idle_seconds(self) -> Optional[float]:
+        """Seconds since the model was last used, or None when none is loaded."""
+        if not self.is_loaded:
+            return None
+        if not self._last_activity:
+            return 0.0
+        return max(0.0, time.monotonic() - self._last_activity)
 
     @property
     def base_url(self) -> str:
@@ -3600,6 +3622,7 @@ class LlamaCppBackend:
         healthy = self._wait_for_health(timeout = 600.0)
         if healthy:
             self._healthy = True
+            self.note_activity()
             self._gpu_offload_active = True
             if extra_args is not None:
                 self._extra_args = list(extra_args)
@@ -6082,6 +6105,7 @@ class LlamaCppBackend:
                         )
 
                 self._healthy = True
+                self.note_activity()
 
                 # Commit caller intent only after _healthy=True so a failed start
                 # can't poison the next inheritance check. None keeps prior, []
@@ -7693,6 +7717,7 @@ class LlamaCppBackend:
                         first_token_deadline = first_token_deadline,
                     ):
                         buffer += raw_chunk
+                        self.note_activity()
                         while "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
                             line = line.strip()
@@ -8715,6 +8740,7 @@ class LlamaCppBackend:
                         first_token_deadline = first_token_deadline,
                     ):
                         buffer += raw_chunk
+                        self.note_activity()
                         while "\n" in buffer:
                             line, buffer = buffer.split("\n", 1)
                             line = line.strip()
