@@ -1344,6 +1344,55 @@ class TestGgufVisionToolRouting:
 
         assert captured["kwargs"]["disable_parallel_tool_use"] is True
 
+    def test_default_policy_relays_client_tools(self, monkeypatch):
+        # Policy on (the `unsloth run` default). A request carrying the caller's
+        # own function tools must take the client passthrough, not the built-in
+        # agentic loop, so the agent receives tool calls to run itself.
+        import routes.inference as inf_mod
+        from state.tool_policy import set_tool_policy
+
+        class _ClientPathHit(Exception):
+            pass
+
+        def _plain(**kwargs):
+            raise AssertionError("plain GGUF path should not be used")
+
+        def _tools(**kwargs):
+            raise AssertionError("built-in tool loop should not run")
+            yield  # pragma: no cover
+
+        backend = SimpleNamespace(
+            is_loaded = True,
+            is_vision = False,
+            supports_tools = True,
+            model_identifier = "test-gguf",
+            context_length = 4096,
+            generate_chat_completion = _plain,
+            generate_chat_completion_with_tools = _tools,
+        )
+        monkeypatch.setattr(inf_mod, "get_llama_cpp_backend", lambda: backend)
+
+        async def _client_pt(*a, **k):
+            raise _ClientPathHit()
+
+        monkeypatch.setattr(inf_mod, "_openai_passthrough_non_streaming", _client_pt)
+        set_tool_policy(True)
+        try:
+            payload = ChatCompletionRequest(
+                model = "default",
+                messages = [{"role": "user", "content": "hi"}],
+                tools = [
+                    {"type": "function", "function": {"name": "write_file",
+                                                      "parameters": {"type": "object"}}},
+                ],
+            )
+            with pytest.raises(_ClientPathHit):
+                self._drive(
+                    openai_chat_completions(payload, request = self._Request(), current_subject = "t")
+                )
+        finally:
+            reset_tool_policy()
+
     def test_confirm_tool_calls_requires_streaming_for_gguf_tools(self, monkeypatch):
         import routes.inference as inf_mod
 

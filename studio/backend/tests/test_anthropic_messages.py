@@ -1715,3 +1715,48 @@ class TestAnthropicMessagesToolRouting:
 
         _drive(anthropic_messages(payload, request = None, current_subject = "t"))
         assert backend.calls[0][0] == "plain"
+
+    def test_default_policy_relays_client_tools(self, monkeypatch):
+        # `unsloth run` default leaves the policy on. A request carrying the
+        # caller's OWN function tool must be relayed client-side (passthrough),
+        # not swallowed by Studio's built-in agentic loop. Without this an
+        # external agent (Claude Code) never receives a tool_use to execute.
+        import routes.inference as inf_mod
+
+        class _ClientPathHit(Exception):
+            pass
+
+        backend = _mock_backend(monkeypatch)
+
+        async def _client_pt(*a, **k):
+            raise _ClientPathHit()
+
+        monkeypatch.setattr(inf_mod, "_anthropic_passthrough_non_streaming", _client_pt)
+        set_tool_policy(True)
+        payload = _basic_payload(
+            tools = [{"name": "write_file", "input_schema": {"type": "object"}}],
+        )
+
+        with pytest.raises(_ClientPathHit):
+            _drive(anthropic_messages(payload, request = None, current_subject = "t"))
+        assert backend.calls == []  # built-in tool loop NOT entered
+
+    def test_explicit_enable_tools_keeps_server_loop_over_client_tools(self, monkeypatch):
+        # enable_tools=true is an explicit opt-in to server-side execution; it
+        # still wins even when the caller also sent its own function tools.
+        import routes.inference as inf_mod
+
+        backend = _mock_backend(monkeypatch)
+
+        async def _client_pt(*a, **k):
+            raise AssertionError("client passthrough should not run")
+
+        monkeypatch.setattr(inf_mod, "_anthropic_passthrough_non_streaming", _client_pt)
+        set_tool_policy(True)
+        payload = _basic_payload(
+            enable_tools = True,
+            tools = [{"name": "write_file", "input_schema": {"type": "object"}}],
+        )
+
+        _drive(anthropic_messages(payload, request = None, current_subject = "t"))
+        assert backend.calls[0][0] == "tools"
