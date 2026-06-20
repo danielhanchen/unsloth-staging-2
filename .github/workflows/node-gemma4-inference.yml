@@ -116,20 +116,38 @@ jobs:
 
       - name: Load gemma-4-E2B-it UD-Q4_K_XL and generate
         run: |
-          set -e
-          TOKEN=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
-            -H 'content-type: application/json' \
-            -d "{\"username\":\"unsloth\",\"password\":\"$(cat ~/.unsloth/studio/auth/.bootstrap_password)\"}" | jq -r .access_token)
-          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]
-          curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/inference/load" \
+          set -uo pipefail
+          ls -la ~/.unsloth/studio/auth/ || true
+          PW=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
+          echo "::add-mask::$PW"
+          [ -n "$PW" ] || { echo "::error::bootstrap password is empty"; tail -100 logs/studio.log; exit 1; }
+
+          # Login (print HTTP code + body so any auth issue is visible).
+          RESP=$(curl -s -w $'\n%{http_code}' -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
+            -H 'content-type: application/json' -d "{\"username\":\"unsloth\",\"password\":\"$PW\"}")
+          CODE=$(printf '%s' "$RESP" | tail -1); BODY=$(printf '%s' "$RESP" | sed '$d')
+          echo "login HTTP $CODE"
+          [ "$CODE" = "200" ] || { echo "::error::login failed: $BODY"; exit 1; }
+          TOKEN=$(printf '%s' "$BODY" | jq -r .access_token)
+          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "::error::no token"; exit 1; }
+
+          # Load the GGUF.
+          RESP=$(curl -s -w $'\n%{http_code}' -X POST "http://127.0.0.1:${STUDIO_PORT}/api/inference/load" \
             -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' --max-time 900 \
-            -d "{\"model_path\":\"$GGUF_REPO\",\"gguf_variant\":\"$GGUF_VARIANT\",\"is_lora\":false,\"max_seq_length\":2048}" \
-            | jq '{status, display_name, is_gguf, context_length}'
-          OUT=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/v1/chat/completions" \
+            -d "{\"model_path\":\"$GGUF_REPO\",\"gguf_variant\":\"$GGUF_VARIANT\",\"is_lora\":false,\"max_seq_length\":2048}")
+          CODE=$(printf '%s' "$RESP" | tail -1); BODY=$(printf '%s' "$RESP" | sed '$d')
+          echo "load HTTP $CODE"; printf '%s\n' "$BODY" | jq '{status, display_name, is_gguf, context_length}' || printf '%s\n' "$BODY"
+          [ "$CODE" = "200" ] || { echo "::error::load failed"; tail -120 logs/studio.log; exit 1; }
+
+          # Generate.
+          RESP=$(curl -s -w $'\n%{http_code}' -X POST "http://127.0.0.1:${STUDIO_PORT}/v1/chat/completions" \
             -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' --max-time 300 \
             -d '{"model":"default","messages":[{"role":"user","content":"In one short sentence, what is Unsloth?"}],"temperature":0.0,"max_tokens":48}')
-          echo "$OUT" | jq -r '.choices[0].message.content'
-          echo "$OUT" | jq -e '.choices[0].message.content | length > 0' >/dev/null
+          CODE=$(printf '%s' "$RESP" | tail -1); BODY=$(printf '%s' "$RESP" | sed '$d')
+          echo "generate HTTP $CODE"
+          [ "$CODE" = "200" ] || { echo "::error::generate failed: $BODY"; exit 1; }
+          printf '%s\n' "$BODY" | jq -r '.choices[0].message.content'
+          printf '%s\n' "$BODY" | jq -e '.choices[0].message.content | length > 0' >/dev/null
           echo "gemma-4-E2B-it UD-Q4_K_XL inference OK on ${{ matrix.os }}"
 
       - name: Upload logs
