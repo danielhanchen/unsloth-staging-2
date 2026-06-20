@@ -4717,10 +4717,19 @@ async def openai_chat_completions(
     _tools_passthrough = llama_backend.supports_tools and (
         (payload.tools and len(payload.tools) > 0) or _has_tool_messages
     )
+    # Client-supplied tools must run client-side (Studio can't execute another
+    # agent's functions), so relay them even when the server-side tool policy is
+    # on, unless the request explicitly opted into server-side tools.
+    _client_tool_passthrough = _tools_passthrough and payload.enable_tools is not True
     if (
         using_gguf
-        and not _effective_enable_tools(payload)
-        and (_tools_passthrough or _has_response_format)
+        and (
+            _client_tool_passthrough
+            or (
+                not _effective_enable_tools(payload)
+                and (_tools_passthrough or _has_response_format)
+            )
+        )
     ):
         if _wants_multiple_choices(payload):
             raise _reject_unsupported_n("GGUF tool or response_format passthrough")
@@ -8074,14 +8083,18 @@ async def anthropic_messages(
     # when tools aren't explicitly disabled (CLI --disable-tools or per-request
     # enable_tools=false). Explicit False always wins.
     _enable = _effective_enable_tools(payload)
+    # A caller's own function tools must run client-side, so prefer passthrough
+    # even when the server-side tool policy is on, unless the request explicitly
+    # opted into server-side tools (enable_tools=true).
+    _client_fn_tools = len(openai_client_tools) > 0 and llama_backend.supports_tools
+    _client_first = _client_fn_tools and payload.enable_tools is not True
     server_tools = (
-        (_enable or (_enable is None and bool(requested_studio_tools)))
+        not _client_first
+        and (_enable or (_enable is None and bool(requested_studio_tools)))
         and llama_backend.supports_tools
         and not _has_image
     )
-    client_tools = (
-        not server_tools and len(openai_client_tools) > 0 and llama_backend.supports_tools
-    )
+    client_tools = not server_tools and _client_fn_tools
 
     # Anthropic tool_choice.disable_parallel_tool_use caps the response to a
     # single tool_use block. Computed here so BOTH the client-tool passthrough
