@@ -58,18 +58,21 @@ jobs:
           set -x +e
           VENV="$HOME/.unsloth/studio/unsloth_studio"
           "$VENV/bin/python" -m pip install --no-deps --force-reinstall "$GITHUB_WORKSPACE" 2>&1 | tail -25
-          # confirm the patched symbol is present in the installed package
-          INST=$("$VENV/bin/python" -c "import studio.backend.routes.inference as m; print(m.__file__)")
+          # confirm the patched symbols are in the INSTALLED package (locate the
+          # file directly; importing it fails because the backend uses top-level
+          # imports that only resolve with studio/backend on sys.path).
+          INST=$(find "$VENV" -path "*site-packages/studio/backend/routes/inference.py" 2>/dev/null | head -1)
           echo "installed inference.py: $INST"
-          if grep -q "_client_tool_passthrough" "$INST" && grep -q "_client_first" "$INST"; then
+          if [ -n "$INST" ] && grep -q "_client_tool_passthrough" "$INST" && grep -q "_client_first" "$INST"; then
             echo "OVERLAY OK: fix present in installed code"
           else
-            echo "OVERLAY FAILED: fix not present"; exit 1
+            echo "OVERLAY FAILED: fix not present"; ls -la "$(dirname "$INST")" 2>/dev/null; exit 1
           fi
 
       - name: Serve model + capture key/id
         run: |
           set -x +e
+          cd "$HOME"  # avoid the checkout's studio/ shadowing the installed pkg
           SUB="run"; unsloth run --help >/dev/null 2>&1 || SUB="studio run"
           EXTRA=""; if [ "${{ matrix.tools_mode }}" = "disable" ]; then EXTRA="--disable-tools"; fi
           nohup unsloth $SUB --model "${{ matrix.model.repo }}:${{ matrix.model.variant }}" \
