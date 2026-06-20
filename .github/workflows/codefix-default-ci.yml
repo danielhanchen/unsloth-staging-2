@@ -108,9 +108,16 @@ jobs:
           cat > "$HOME/.pi/agent/models.json" <<EOF
           {"providers":{"unsloth":{"baseUrl":"http://127.0.0.1:$STUDIO_PORT/v1","api":"openai-completions","apiKey":"$STUDIO_KEY","models":[{"id":"$MODEL_ID","input":["text"]}]}}}
           EOF
-          mkdir -p "$HOME/proj" && cd "$HOME/proj" && git init -q && rm -f fib.py
-          PI_OFFLINE=1 timeout 600 pi -p --provider unsloth --model "$MODEL_ID" "$TASK_PROMPT" 2>&1 | tee "$HOME/agent_out.log"
-          echo "PI EXIT: ${PIPESTATUS[0]}"
+          mkdir -p "$HOME/proj" && cd "$HOME/proj" && git init -q
+          # Retry the trivial task: tiny CPU models are nondeterministic and may
+          # emit a sloppy tool sequence (e.g. an empty file) on a given attempt.
+          for attempt in 1 2 3; do
+            rm -f fib.py
+            echo "=== PI attempt $attempt ==="
+            PI_OFFLINE=1 timeout 480 pi -p --provider unsloth --model "$MODEL_ID" "$TASK_PROMPT" 2>&1 | tee "$HOME/agent_out.log"
+            grep -qiE "def fib|fibonacci" fib.py 2>/dev/null && break
+          done
+          echo "PI done"
 
       # ---------------- Codex (responses path regression) ----------------
       - name: Codex - run
@@ -134,10 +141,17 @@ jobs:
           model_provider = "unsloth_api"
           model = "$MODEL_ID"
           EOF
-          cd "$HOME/proj" && git init -q && rm -f fib.py
-          timeout 480 codex exec --oss --profile unsloth_api --skip-git-repo-check \
-            --dangerously-bypass-approvals-and-sandbox "$TASK_PROMPT" 2>&1 | tee "$HOME/agent_out.log"
-          echo "CODEX EXIT: ${PIPESTATUS[0]}"
+          cd "$HOME/proj" && git init -q
+          # Retry: tiny CPU models sometimes emit a sloppy tool sequence (e.g.
+          # `touch fib.py` then narrate) on a given attempt.
+          for attempt in 1 2 3; do
+            rm -f fib.py
+            echo "=== CODEX attempt $attempt ==="
+            timeout 420 codex exec --oss --profile unsloth_api --skip-git-repo-check \
+              --dangerously-bypass-approvals-and-sandbox "$TASK_PROMPT" 2>&1 | tee "$HOME/agent_out.log"
+            grep -qiE "def fib|fibonacci" fib.py 2>/dev/null && break
+          done
+          echo "CODEX done"
 
       # ---------------- Claude Code (messages path) ----------------
       - name: Claude Code - probe + run
