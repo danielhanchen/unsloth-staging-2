@@ -5080,6 +5080,13 @@ async def openai_chat_completions(
                             _stream_finish = event.get("finish_reason")
                             continue
 
+                        if event["type"] == "reasoning_summary":
+                            # Backend-authoritative reasoning wall-clock; the
+                            # client uses this for the "Thought for N" label
+                            # since reasoning is flushed in one chunk.
+                            yield f"data: {json.dumps(event)}\n\n"
+                            continue
+
                         # "content" type -- cumulative text. Sanitize the full
                         # cumulative then diff against the last sanitized
                         # snapshot so cross-chunk XML tags are handled correctly.

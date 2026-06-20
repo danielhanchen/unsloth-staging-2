@@ -393,7 +393,10 @@ const ReasoningGroupImpl: ReasoningGroupComponent = ({
         <ReasoningTrigger
           className="min-w-0 flex-1"
           active={isReasoningStreaming}
-          duration={duration || persistedDuration}
+          // Prefer the adapter's authoritative wall-clock reasoning duration
+          // (metadata.custom.reasoningDuration); fall back to the local
+          // edge-timed value only when the persisted one is unavailable.
+          duration={persistedDuration || duration}
         />
         <div className="flex w-16 shrink-0 justify-end">
           {isOpen && !isReasoningStreaming && (

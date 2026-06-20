@@ -868,6 +868,16 @@ export async function* streamChatCompletions(
         separatorIndex = buffer.search(/\r?\n\r?\n/);
         continue;
       }
+      // Backend-authoritative reasoning duration (ms). Local GGUF buffers the
+      // <think> block and flushes it at once, so chunk-arrival timing can't
+      // measure thinking time; trust this value for the "Thought for N" label.
+      if ("type" in parsed && parsed.type === "reasoning_summary") {
+        yield {
+          _reasoningDurationMs: (parsed as { duration_ms?: number }).duration_ms,
+        } as unknown as OpenAIChatChunk;
+        separatorIndex = buffer.search(/\r?\n\r?\n/);
+        continue;
+      }
       yield parsed as OpenAIChatChunk;
       separatorIndex = buffer.search(/\r?\n\r?\n/);
     }
