@@ -44,130 +44,187 @@ jobs:
 
       - name: Install Unsloth Studio (guide step 1, released one-liner)
         run: |
-          set -x
-          curl -fsSL https://unsloth.ai/install.sh | sh 2>&1 | tee "$HOME/install.log" | tail -40
-          echo "$HOME/.unsloth/studio/bin" >> "$GITHUB_PATH"
-          ls -la "$HOME/.unsloth/studio/bin" || { echo "STUDIO INSTALL FAILED"; tail -120 "$HOME/install.log"; exit 1; }
+          set -x +e
+          curl -fsSL https://unsloth.ai/install.sh | sh 2>&1 | tee "$HOME/install.log" | tail -50
+          # The installer builds a venv at ~/.unsloth/studio/unsloth_studio and a
+          # launcher shortcut; locate the actual `unsloth` entrypoint robustly.
+          UNSLOTH_BIN=""
+          for c in "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth" \
+                   "$HOME/.local/bin/unsloth" \
+                   "$HOME/.unsloth/studio/bin/unsloth" \
+                   "$(command -v unsloth || true)"; do
+            if [ -n "$c" ] && [ -x "$c" ]; then UNSLOTH_BIN="$c"; break; fi
+          done
+          if [ -z "$UNSLOTH_BIN" ]; then
+            UNSLOTH_BIN="$(find "$HOME/.unsloth" "$HOME/.local/bin" -maxdepth 5 -name unsloth -type f 2>/dev/null | head -1)"
+          fi
+          if [ -z "$UNSLOTH_BIN" ] || [ ! -x "$UNSLOTH_BIN" ]; then
+            echo "STUDIO INSTALL FAILED: unsloth launcher not found"
+            ls -laR "$HOME/.unsloth" 2>/dev/null | head -80
+            tail -150 "$HOME/install.log"
+            exit 1
+          fi
+          echo "Found unsloth launcher: $UNSLOTH_BIN"
+          dirname "$UNSLOTH_BIN" >> "$GITHUB_PATH"
 
-      - name: Serve model + capture key/id (guide step 1, unsloth run)
+      - name: Serve model + capture key/id (unsloth run, headless equivalent of guide step 1)
         run: |
-          set -x
-          export PATH="$HOME/.unsloth/studio/bin:$PATH"
-          nohup unsloth run --model "${{ matrix.model.repo }}:${{ matrix.model.variant }}" \
+          set -x +e
+          # Guide documents `unsloth studio` (UI then load model in browser); the
+          # headless equivalent that loads a specific GGUF and serves the API is
+          # `unsloth run --model <repo>:<variant>`. Fall back to `studio run`.
+          SUB="run"
+          unsloth run --help >/dev/null 2>&1 || SUB="studio run"
+          echo "Using subcommand: unsloth $SUB"
+          nohup unsloth $SUB --model "${{ matrix.model.repo }}:${{ matrix.model.variant }}" \
             -H 127.0.0.1 -p "$STUDIO_PORT" > "$HOME/studio.log" 2>&1 &
           echo "$!" > "$HOME/studio.pid"
-          # wait for server up
-          for i in $(seq 1 90); do
-            grep -q "running on http://127.0.0.1:$STUDIO_PORT" "$HOME/studio.log" && break
+          # Phase 1: wait for the printed API key (server booted).
+          KEY=""
+          for i in $(seq 1 120); do
+            KEY=$(grep -oE "sk-unsloth-[A-Za-z0-9_-]+" "$HOME/studio.log" 2>/dev/null | head -1)
+            if [ -n "$KEY" ]; then break; fi
+            if ! kill -0 "$(cat "$HOME/studio.pid")" 2>/dev/null; then
+              echo "studio process exited early"; break
+            fi
             sleep 5
           done
-          tail -30 "$HOME/studio.log" || true
-          KEY=$(grep -oE "sk-unsloth-[a-f0-9]+" "$HOME/studio.log" | head -1)
-          [ -n "$KEY" ] || { echo "NO API KEY -- studio did not start"; tail -120 "$HOME/studio.log"; exit 1; }
+          tail -50 "$HOME/studio.log" 2>/dev/null
+          if [ -z "$KEY" ]; then
+            echo "NO API KEY -- studio did not start"; tail -200 "$HOME/studio.log" 2>/dev/null; exit 1
+          fi
           echo "STUDIO_KEY=$KEY" >> "$GITHUB_ENV"
-          # wait for model load
-          for i in $(seq 1 90); do
-            curl -s -m 5 "http://127.0.0.1:$STUDIO_PORT/v1/models" -H "Authorization: Bearer $KEY" | grep -q '"data"' && break
+          # Phase 2: wait for the model to load (GGUF download + CPU load).
+          MODEL_ID=""
+          for i in $(seq 1 150); do
+            MODEL_ID=$(curl -s -m 5 "http://127.0.0.1:$STUDIO_PORT/v1/models" \
+              -H "Authorization: Bearer $KEY" 2>/dev/null | jq -r '.data[0].id // empty' 2>/dev/null)
+            if [ -n "$MODEL_ID" ]; then break; fi
             sleep 5
           done
-          MODEL_ID=$(curl -s "http://127.0.0.1:$STUDIO_PORT/v1/models" -H "Authorization: Bearer $KEY" | jq -r '.data[0].id')
-          [ -n "$MODEL_ID" ] && [ "$MODEL_ID" != "null" ] || { echo "MODEL DID NOT LOAD"; tail -120 "$HOME/studio.log"; exit 1; }
+          if [ -z "$MODEL_ID" ]; then
+            echo "MODEL DID NOT LOAD"; tail -200 "$HOME/studio.log" 2>/dev/null; exit 1
+          fi
           echo "MODEL_ID=$MODEL_ID" >> "$GITHUB_ENV"
           echo "Resolved MODEL_ID=$MODEL_ID"
 
-      - name: Server-side API smoke (responses + messages)
+      - name: Server-side API smoke (responses stream + messages)
         run: |
+          set +e
           B="http://127.0.0.1:$STUDIO_PORT"; H="Authorization: Bearer $STUDIO_KEY"
           echo "### /v1/responses (stream) ###"
-          curl -s -m 60 -N "$B/v1/responses" -H "$H" -H "Content-Type: application/json" \
-            -d "{\"model\":\"$MODEL_ID\",\"input\":\"Say hello in 3 words.\",\"stream\":true}" | head -c 600 || true
+          curl -s -m 90 -N "$B/v1/responses" -H "$H" -H "Content-Type: application/json" \
+            -d "{\"model\":\"$MODEL_ID\",\"input\":\"Say hello in 3 words.\",\"stream\":true}" | head -c 800
           echo; echo "### /v1/messages ###"
-          curl -s -m 60 "$B/v1/messages" -H "$H" -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" \
-            -d "{\"model\":\"$MODEL_ID\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in 3 words.\"}]}" | head -c 600 || true
+          curl -s -m 90 "$B/v1/messages" -H "$H" -H "Content-Type: application/json" -H "anthropic-version: 2023-06-01" \
+            -d "{\"model\":\"$MODEL_ID\",\"max_tokens\":32,\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in 3 words.\"}]}" | head -c 800
           echo
 
       # ---------------- Pi ----------------
       - name: Pi - install + configure + run
         if: matrix.agent == 'pi'
         run: |
-          set -x
+          set -x +e
           npm install -g @mariozechner/pi-coding-agent >/dev/null 2>&1
           mkdir -p "$HOME/.pi/agent"
           cat > "$HOME/.pi/agent/models.json" <<EOF
           {"providers":{"unsloth":{"baseUrl":"http://127.0.0.1:$STUDIO_PORT/v1","api":"openai-completions","apiKey":"$STUDIO_KEY","models":[{"id":"$MODEL_ID","input":["text"]}]}}}
           EOF
           mkdir -p "$HOME/proj" && cd "$HOME/proj" && git init -q && rm -f fib.py
-          set +e
           PI_OFFLINE=1 timeout 600 pi -p --provider unsloth --model "$MODEL_ID" "$TASK_PROMPT" 2>&1 | tee "$HOME/agent_out.log"
           echo "PI EXIT: ${PIPESTATUS[0]}"
 
       # ---------------- Codex ----------------
-      - name: Codex - install + configure + run (guide steps 2-4)
+      - name: Codex - install + configure + run (guide steps 2-5)
         if: matrix.agent == 'codex'
         run: |
-          set -x
+          set -x +e
           npm install -g @openai/codex >/dev/null 2>&1
           codex --version
-          mkdir -p "$HOME/.codex"
-          cat > "$HOME/.codex/config.toml" <<EOF
-          oss_provider = "unsloth_api"
+          mkdir -p "$HOME/.codex" "$HOME/proj"
+          export UNSLOTH_STUDIO_AUTH_TOKEN="$STUDIO_KEY"
+          cd "$HOME/proj" && git init -q
 
-          [model_providers.unsloth_api]
-          name                  = "Unsloth Studio"
-          base_url              = "http://localhost:$STUDIO_PORT/v1"
-          env_key               = "UNSLOTH_STUDIO_AUTH_TOKEN"
-          wire_api              = "responses"
-          requires_openai_auth  = false
-          EOF
+          # Profile overlay file: `--profile NAME` overlays $CODEX_HOME/NAME.config.toml.
           cat > "$HOME/.codex/unsloth_api.config.toml" <<EOF
           model_provider = "unsloth_api"
           model = "$MODEL_ID"
           EOF
-          cat "$HOME/.codex/config.toml" "$HOME/.codex/unsloth_api.config.toml"
-          export UNSLOTH_STUDIO_AUTH_TOKEN="$STUDIO_KEY"
-          mkdir -p "$HOME/proj" && cd "$HOME/proj" && git init -q && rm -f fib.py
-          set +e
-          echo "=== ATTEMPT A: guide exact (codex exec --oss --profile unsloth_api) ==="
-          timeout 600 codex exec --oss --profile unsloth_api --skip-git-repo-check \
-            --dangerously-bypass-approvals-and-sandbox "$TASK_PROMPT" 2>&1 | tee "$HOME/agent_out.log"
-          echo "CODEX-A EXIT: ${PIPESTATUS[0]}"
-          if [ ! -f fib.py ]; then
-            echo "=== ATTEMPT B: profile only (no --oss) ==="
-            timeout 600 codex exec --profile unsloth_api --skip-git-repo-check \
+
+          # config.toml WITH oss_provider (guide-exact, used by attempt A / --oss).
+          write_cfg () { # $1 = with_oss | no_oss
+            {
+              if [ "$1" = "with_oss" ]; then echo 'oss_provider = "unsloth_api"'; echo; fi
+              echo '[model_providers.unsloth_api]'
+              echo 'name                  = "Unsloth Studio"'
+              echo "base_url              = \"http://localhost:$STUDIO_PORT/v1\""
+              echo 'env_key               = "UNSLOTH_STUDIO_AUTH_TOKEN"'
+              echo 'wire_api              = "responses"'
+              echo 'requires_openai_auth  = false'
+            } > "$HOME/.codex/config.toml"
+          }
+
+          run_codex () { # $1=label ; rest=codex args
+            local label="$1"; shift
+            rm -f "$HOME/proj/fib.py"
+            echo "===== CODEX ATTEMPT $label : codex exec $* ====="
+            cat "$HOME/.codex/config.toml"; echo "--- profile ---"; cat "$HOME/.codex/unsloth_api.config.toml"
+            timeout 480 codex exec "$@" --skip-git-repo-check \
               --dangerously-bypass-approvals-and-sandbox "$TASK_PROMPT" 2>&1 | tee -a "$HOME/agent_out.log"
-            echo "CODEX-B EXIT: ${PIPESTATUS[0]}"
+            echo "EXIT($label)=${PIPESTATUS[0]}"
+            if [ -f "$HOME/proj/fib.py" ]; then echo ">>> ATTEMPT $label CREATED fib.py"; return 0; fi
+            return 1
+          }
+
+          OK=1
+          write_cfg with_oss
+          run_codex "A_guide_oss_profile"   --oss --profile unsloth_api && OK=0
+          if [ "$OK" -ne 0 ]; then
+            write_cfg no_oss
+            run_codex "B_profile_only"        --profile unsloth_api && OK=0
           fi
+          if [ "$OK" -ne 0 ]; then
+            run_codex "C_explicit_overrides"  -c model_provider=unsloth_api -c model="$MODEL_ID" && OK=0
+          fi
+          echo "CODEX_RESULT_OK=$OK"
 
       # ---------------- Claude Code ----------------
-      - name: Claude Code - install + configure + run (guide steps 2-4)
+      - name: Claude Code - install + configure + run (guide steps 2-5)
         if: matrix.agent == 'claude-code'
         run: |
-          set -x
+          set -x +e
           npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash
           export PATH="$HOME/.local/bin:$PATH"
-          which claude || { echo "claude not on PATH"; ls -la "$HOME/.local/bin" || true; }
+          command -v claude || { echo "claude not on PATH"; ls -la "$HOME/.local/bin" 2>/dev/null; exit 1; }
+          claude --version
           mkdir -p "$HOME/.claude"
           cat > "$HOME/.claude/settings.json" <<EOF
-          {"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"0","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1","DISABLE_AUTOUPDATER":"1"}}
+          {"env":{"CLAUDE_CODE_ENABLE_TELEMETRY":"0","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":"1","CLAUDE_CODE_ATTRIBUTION_HEADER":"0","DISABLE_AUTOUPDATER":"1"}}
           EOF
           export ANTHROPIC_BASE_URL="http://localhost:$STUDIO_PORT"
           export ANTHROPIC_AUTH_TOKEN="$STUDIO_KEY"
           export ANTHROPIC_MODEL="$MODEL_ID"
+          export ANTHROPIC_SMALL_FAST_MODEL="$MODEL_ID"
           export CLAUDE_CODE_ATTRIBUTION_HEADER=0
           mkdir -p "$HOME/proj" && cd "$HOME/proj" && git init -q && rm -f fib.py
-          set +e
           timeout 600 claude -p "$TASK_PROMPT" --model "$MODEL_ID" --dangerously-skip-permissions 2>&1 | tee "$HOME/agent_out.log"
           echo "CLAUDE EXIT: ${PIPESTATUS[0]}"
 
       - name: Diagnostics (always)
         if: always()
         run: |
+          set +e
           echo "############ AGENT OUTPUT (tail) ############"
-          tail -80 "$HOME/agent_out.log" 2>/dev/null || echo "(no agent output)"
+          tail -120 "$HOME/agent_out.log" 2>/dev/null || echo "(no agent output)"
+          echo "############ integration signal ############"
+          if [ -f "$HOME/agent_out.log" ]; then
+            grep -iE "ECONNREFUSED|connection refused|401|403|unauthorized|404|not found|ollama|not running|timed out|invalid api key|x-api-key|model_not_found" \
+              "$HOME/agent_out.log" | head -20 || echo "(no obvious connection/auth errors)"
+          fi
           echo "############ fib.py ? ############"
           if [ -f "$HOME/proj/fib.py" ]; then echo "CREATED:"; cat "$HOME/proj/fib.py"; else echo "NOT created"; fi
           echo "############ STUDIO LOG (tail) ############"
-          tail -80 "$HOME/studio.log" 2>/dev/null || echo "(no studio log)"
+          tail -100 "$HOME/studio.log" 2>/dev/null || echo "(no studio log)"
 
       - name: Assert agent produced fib.py
         if: always()

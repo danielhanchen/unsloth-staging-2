@@ -1,0 +1,1 @@
+- Before/after proved `<think>` leak fixed; `tools` leak not live-reproduced. Pending: correct PR comment, stop 8757-8760.

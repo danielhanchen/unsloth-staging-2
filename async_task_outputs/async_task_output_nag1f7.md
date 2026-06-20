@@ -1,0 +1,8 @@
+- Decision: corrected prior PR comment because the passthrough claim was inaccurate; kept two committed fixes as valid.
+- Decision: posted follow-up because before/after testing proved PR fixes Studio generation-path leak, while direct `llama-server` already parses `<|tool_call>` and `<think>`.
+- Created `/mnt/disks/unslothai/ubuntu/workspace_74/temp/pr6476_comment_corrected.md`: corrected comment body.
+- Created `/mnt/disks/unslothai/ubuntu/workspace_74/temp/pr6476_followup.md`: before/after evidence + suggestion to delegate parsing to llama.cpp `/v1/chat/completions`.
+- Ran `gh api repos/unslothai/unsloth/issues/comments/4756827288 -X PATCH -F body=@temp/pr6476_comment_corrected.md --jq '.html_url'`; posted `https://github.com/unslothai/unsloth/pull/6476#issuecomment-4756827288`.
+- Ran follow-up post; created `https://github.com/unslothai/unsloth/pull/6476#issuecomment-4757592642`.
+- Teardown: initial kill exited `144`; retry `pkill -9 -f "/studio_pr6476/"` / `"/studio_main/"` partly exited `1`; resolved by precise kills and final verification.
+- Completed: ports `8757`, `8758`, `8759`, `8760` down; `workspace_74` Studio processes `0`; other-workspace llama servers `7` untouched.

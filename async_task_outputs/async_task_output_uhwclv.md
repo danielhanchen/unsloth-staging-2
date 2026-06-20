@@ -1,0 +1,3 @@
+- Decision: PR still needed for Studio raw generation paths; direct `llama-server` with `--jinja` already parses Gemma `<think>`/`<|tool_call>`.
+- Ran in `/mnt/disks/unslothai/ubuntu/workspace_74`: found ports `34617`,`58097`,`37747`,`41071`; direct HTTP 200 showed `tool_calls` + `reasoning_content`.
+- Pending: write PR comment; tear down 4 GPU servers.

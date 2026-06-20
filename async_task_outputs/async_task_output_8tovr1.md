@@ -1,0 +1,10 @@
+- User expanded testing scope: test `unsloth/Qwen3.6-27B-MTP-GGUF` and `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` using `UD-Q4_K_XL` with the same approach as prior tests.
+- Decision implied: run tests through `Unsloth Studio + Pi + use the staging repos and or ourselves` to determine whether these models are also broken.
+- User requested installing `Codex` on the staging repos only, not globally or outside the workspace.
+- User provided guide URL to validate: `https://unsloth.ai/docs/basics/codex`.
+- Goal: verify whether the Unsloth Codex guide works in practice for Codex.
+- Goal: identify incorrect or missing areas in the guide so the docs can be fixed.
+- Goal: support running local models via `llama-server` and connecting them into `Codex`.
+- Pending: perform the additional GGUF model tests.
+- Pending: install and test `Codex` only against the staging repos.
+- Pending: evaluate the guide at `https://unsloth.ai/docs/basics/codex` and report doc gaps or failures.
