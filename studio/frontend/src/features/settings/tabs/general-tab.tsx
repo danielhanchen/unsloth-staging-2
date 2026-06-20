@@ -35,6 +35,7 @@ import {
   updateUploadLimitSettings,
   type UploadLimitSettings,
 } from "../api/upload-limit";
+import { ChangePasswordDialog } from "../components/change-password-dialog";
 import { useSettingsDialogStore } from "../stores/settings-dialog-store";
 import { LOCALE_STORAGE_KEY, useT } from "@/i18n";
 import { useNavigate, useRouterState } from "@tanstack/react-router";
@@ -327,6 +328,12 @@ export function GeneralTab() {
               {showToken ? <EyeOff className="size-3.5" /> : <Eye className="size-3.5" />}
             </button>
           </div>
+        </SettingsRow>
+        <SettingsRow
+          label="Password"
+          description="Change the password for this Studio account."
+        >
+          <ChangePasswordDialog />
         </SettingsRow>
       </SettingsSection>
 
