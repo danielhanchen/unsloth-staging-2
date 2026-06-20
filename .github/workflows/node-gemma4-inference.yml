@@ -120,10 +120,24 @@ jobs:
           echo "::add-mask::$PW"
           [ -n "$PW" ] || { echo "::error::empty bootstrap password"; tail -100 logs/studio.log; exit 1; }
 
+          # Bootstrap login.
           RESP=$(curl -s -w $'\n%{http_code}' -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
             -H 'content-type: application/json' -d "{\"username\":\"unsloth\",\"password\":\"$PW\"}")
           CODE=$(printf '%s' "$RESP" | tail -1); BODY=$(printf '%s' "$RESP" | sed '$d')
           echo "login HTTP $CODE"; [ "$CODE" = "200" ] || { echo "::error::login: $BODY"; exit 1; }
+          BTOKEN=$(printf '%s' "$BODY" | jq -r .access_token)
+
+          # Rotate the bootstrap password -- privileged ops (model load) are gated
+          # behind a rotated credential, so the bootstrap token alone 403s.
+          NEW="CIRot-$(python -c 'import secrets; print(secrets.token_urlsafe(12))')"
+          echo "::add-mask::$NEW"
+          curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/change-password" \
+            -H "Authorization: Bearer $BTOKEN" -H 'content-type: application/json' \
+            -d "{\"current_password\":\"$PW\",\"new_password\":\"$NEW\"}" > /dev/null
+          RESP=$(curl -s -w $'\n%{http_code}' -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
+            -H 'content-type: application/json' -d "{\"username\":\"unsloth\",\"password\":\"$NEW\"}")
+          CODE=$(printf '%s' "$RESP" | tail -1); BODY=$(printf '%s' "$RESP" | sed '$d')
+          echo "re-login HTTP $CODE"; [ "$CODE" = "200" ] || { echo "::error::re-login: $BODY"; exit 1; }
           TOKEN=$(printf '%s' "$BODY" | jq -r .access_token)
           [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ] || { echo "::error::no token"; exit 1; }
 
