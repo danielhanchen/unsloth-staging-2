@@ -1,0 +1,82 @@
+# Edge cases for the isolated Node installer that the OS/scenario matrices don't
+# cover: a non-x64 architecture (arm64 Linux) and a network-down install (must
+# fail gracefully with a clear message + proper exit code, never crash or hang).
+name: node-edge
+
+on:
+  push:
+    branches: [pr-node-isolated-0620]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  arm64-linux:
+    name: isolated Node on arm64 Linux
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Real isolated install + assert (linux-arm64)
+        run: |
+          set -e
+          DIR="$RUNNER_TEMP/uns_node_arm"
+          python studio/install_node_prebuilt.py --install-dir "$DIR" --node-version lts
+          PYTHONPATH=studio python - "$DIR" <<'PY'
+          import importlib.util, sys
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location("inp", "studio/install_node_prebuilt.py")
+          m = importlib.util.module_from_spec(spec); sys.modules["inp"] = m; spec.loader.exec_module(m)
+          d = Path(sys.argv[1]); host = m.detect_host()
+          assert host.node_arch == "arm64", host.node_arch
+          nv = m.installed_node_version(d, host); npm = m.installed_npm_major(d, host)
+          print("arm64 node:", nv, "npm:", npm)
+          assert nv and int(nv.split(".")[0]) >= 24
+          assert npm is not None and npm >= 11
+          print("OK isolated Node on linux-arm64")
+          PY
+
+  offline-graceful:
+    name: offline install fails gracefully
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Block nodejs.org and assert a clean failure (no crash/hang)
+        run: |
+          set -uo pipefail
+          # Route nodejs.org to a dead address so every fetch fails fast.
+          echo "0.0.0.0 nodejs.org" | sudo tee -a /etc/hosts
+          DIR="$RUNNER_TEMP/uns_node_off"
+          set +e
+          OUT=$(python studio/install_node_prebuilt.py --install-dir "$DIR" --node-version lts 2>&1)
+          RC=$?
+          set -e
+          echo "exit=$RC"
+          printf '%s\n' "$OUT" | tail -20
+          # Must be a non-zero, controlled exit (1 = error, 2 = fallback) ...
+          [ "$RC" -ne 0 ] || { echo "::error::offline install unexpectedly succeeded"; exit 1; }
+          [ "$RC" -eq 1 ] || [ "$RC" -eq 2 ] || { echo "::error::unexpected exit code $RC"; exit 1; }
+          # ... with a graceful logged message and NO uncaught traceback.
+          printf '%s\n' "$OUT" | grep -q "\[node-prebuilt\]" || { echo "::error::no graceful log line"; exit 1; }
+          if printf '%s\n' "$OUT" | grep -q "Traceback (most recent call last)"; then
+            echo "::error::uncaught traceback on offline failure"; exit 1
+          fi
+          # And nothing half-installed left behind.
+          [ ! -e "$DIR/bin/node" ] || { echo "::error::partial install left a node binary"; exit 1; }
+          echo "OK offline: clean exit $RC, graceful message, no partial install"

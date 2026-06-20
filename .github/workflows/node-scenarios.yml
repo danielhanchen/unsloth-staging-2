@@ -1,0 +1,120 @@
+# Simulates the Node/npm conditions a real user machine can be in, and asserts
+# the installer's decision + behaviour for each. Drives the SAME pure function
+# (decide_node_source, sliced from studio/setup.sh) and the SAME isolated
+# installer (install_node_prebuilt.py) that a real `unsloth studio` install runs,
+# so each row is a faithful end-to-end check of one scenario without the heavy
+# full Studio build (covered separately by node-gemma4-inference + the smokes).
+#
+#   good_npm11  -> system   (a fine Node + npm >= 11 is reused read-only)
+#   old_npm10   -> bundled  (the Discord bug: fine Node, npm 10.x)
+#   no_node     -> bundled  (fresh machine, no Node at all)
+#   broken_node -> bundled  (node on PATH errors / returns garbage)
+#   broken_npm  -> bundled  (npm on PATH returns a non-version)
+#   skip_optout -> skip     (UNSLOTH_SKIP_NODE_INSTALL=1 + unsuitable Node)
+#   custom_home -> bundled  (isolated Node nests under a custom UNSLOTH_STUDIO_HOME)
+name: node-scenarios
+
+on:
+  push:
+    branches: [pr-node-isolated-0620]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scenario:
+    name: ${{ matrix.scenario }} -> ${{ matrix.expect }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { scenario: good_npm11,  expect: system }
+          - { scenario: old_npm10,   expect: bundled }
+          - { scenario: no_node,     expect: bundled }
+          - { scenario: broken_node, expect: bundled }
+          - { scenario: broken_npm,  expect: bundled }
+          - { scenario: skip_optout, expect: skip }
+          - { scenario: custom_home, expect: bundled }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'   # ships Node 22 + npm 10.x (below the bar by default)
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply scenario "${{ matrix.scenario }}"
+        run: |
+          set -e
+          case "${{ matrix.scenario }}" in
+            good_npm11)
+              npm install -g 'npm@^11'
+              echo "npm upgraded to $(npm -v)" ;;
+            old_npm10)
+              echo "leaving npm at $(npm -v) (10.x)" ;;
+            no_node)
+              for b in node npm npx; do
+                p="$(command -v $b 2>/dev/null || true)"
+                [ -n "$p" ] && sudo rm -f "$p" || true
+              done
+              hash -r
+              echo "node now: $(command -v node || echo absent)" ;;
+            broken_node)
+              mkdir -p "$HOME/brk"
+              printf '#!/bin/sh\nexit 1\n' > "$HOME/brk/node"; chmod +x "$HOME/brk/node"
+              echo "$HOME/brk" >> "$GITHUB_PATH" ;;
+            broken_npm)
+              mkdir -p "$HOME/brk"
+              printf '#!/bin/sh\necho not-a-version\n' > "$HOME/brk/npm"; chmod +x "$HOME/brk/npm"
+              echo "$HOME/brk" >> "$GITHUB_PATH" ;;
+            skip_optout)
+              echo "UNSLOTH_SKIP_NODE_INSTALL=1" >> "$GITHUB_ENV" ;;
+            custom_home)
+              echo "UNSLOTH_STUDIO_HOME=$RUNNER_TEMP/custom_home" >> "$GITHUB_ENV"
+              mkdir -p "$RUNNER_TEMP/custom_home" ;;
+          esac
+
+      - name: Decide + provision (mirrors setup.sh Node section) and assert
+        run: |
+          set -uo pipefail
+          sed -n '/^decide_node_source()/,/^}/p' studio/setup.sh > /tmp/dns.sh
+          . /tmp/dns.sh
+
+          SKIP="${UNSLOTH_SKIP_NODE_INSTALL:-0}"
+          NODE_PARENT="${UNSLOTH_STUDIO_HOME:-$HOME/.unsloth}"
+          NODE_DIR="$NODE_PARENT/node"
+          NV="$(node -v 2>/dev/null || true)"
+          PV="$(npm -v 2>/dev/null || true)"
+          echo "detected node='$NV' npm='$PV' skip='$SKIP' parent='$NODE_PARENT'"
+
+          DEC="$(decide_node_source "$NV" "$PV" "$SKIP")"
+          echo "decision=$DEC  expected=${{ matrix.expect }}"
+          [ "$DEC" = "${{ matrix.expect }}" ] || { echo "::error::decision $DEC != ${{ matrix.expect }}"; exit 1; }
+
+          case "$DEC" in
+            system)
+              [ ! -d "$NODE_DIR" ] || { echo "::error::isolated dir created on system fast-path"; exit 1; }
+              echo "OK system: reusing $(command -v node) $(node -v), npm $(npm -v); no download" ;;
+            bundled)
+              python studio/install_node_prebuilt.py --install-dir "$NODE_DIR"
+              test -f "$NODE_DIR/UNSLOTH_NODE_PREBUILT_INFO.json"
+              "$NODE_DIR/bin/node" -v | grep -Eq '^v(2[4-9]|[3-9][0-9])\.'
+              NPM_MAJOR=$("$NODE_DIR/bin/node" "$NODE_DIR/lib/node_modules/npm/bin/npm-cli.js" -v | cut -d. -f1)
+              [ "$NPM_MAJOR" -ge 11 ]
+              echo "OK bundled: isolated $("$NODE_DIR/bin/node" -v) npm ${NPM_MAJOR}.x at $NODE_DIR (system untouched)" ;;
+            skip)
+              [ ! -d "$NODE_DIR" ] || { echo "::error::isolated dir created on skip path"; exit 1; }
+              echo "OK skip: nothing installed, system Node/npm untouched" ;;
+          esac
