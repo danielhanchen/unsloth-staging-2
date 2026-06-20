@@ -129,17 +129,17 @@ jobs:
           path: hf-cache
           key: ${{ runner.os }}-hf-${{ env.GGUF_REPO }}-${{ env.GGUF_VARIANT }}-v2
 
-      - name: Pre-install Windows tweaks (npm 11 + Defender exclusions)
+      - name: Pre-install Windows tweaks (Defender exclusions)
         shell: pwsh
-        # See studio-windows-update-smoke.yml for the full rationale.
-        # tl;dr: setup.ps1 needs npm >=11 to skip a 35 s winget Node
-        # reinstall, and Defender's real-time scan dominates the
-        # frontend / uv-pip-extract steps.
+        # NOTE: we intentionally do NOT upgrade npm here. setup-node@22 ships
+        # npm 10.x (< 11), so setup.ps1 must pick the "bundled" path and install
+        # an isolated Node -- exactly the behaviour this run validates (the old
+        # destructive `winget install Node.js LTS` branch is gone). Defender's
+        # real-time scan still dominates the frontend / uv-pip-extract steps, so
+        # keep the exclusions.
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          Write-Host "npm version before upgrade: $(npm -v)"
-          npm install -g 'npm@^11' 2>&1 | Out-Host
-          Write-Host "npm version after upgrade: $(npm -v)"
+          Write-Host "system npm (left at 10.x to force the isolated path): $(npm -v)"
           # NOTE: do NOT pre-create these directories. See
           # studio-windows-update-smoke.yml for the full rationale --
           # creating an empty studio/frontend/dist trips setup.ps1's
@@ -172,6 +172,24 @@ jobs:
           # and validated" via Write-Host, and we grep for that.
           $ProgressPreference = 'SilentlyContinue'
           & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
+
+      - name: Assert the ISOLATED Node path was used (no winget, no system clobber)
+        run: |
+          set -e
+          if ! grep -Eq "isolated Node|\(isolated\)" logs/install.log; then
+            echo "::error::setup.ps1 did not use the isolated Node path"
+            grep -Ei "node|npm" logs/install.log | tail -40 || true
+            exit 1
+          fi
+          if grep -Eqi "winget install OpenJS.NodeJS|Please install Node.js >= 20" logs/install.log; then
+            echo "::error::setup.ps1 still hit the removed winget Node branch"
+            exit 1
+          fi
+          NODE_DIR=~/.unsloth/node
+          test -f "$NODE_DIR/UNSLOTH_NODE_PREBUILT_INFO.json"
+          test -f "$NODE_DIR/node.exe"
+          test -d studio/frontend/dist
+          echo "isolated Node path confirmed on Windows; frontend dist built"
 
       - name: Assert install.ps1 used the Windows llama.cpp prebuilt
         run: |
@@ -474,17 +492,17 @@ jobs:
           path: gguf-cache
           key: ${{ runner.os }}-gguf-${{ env.GGUF_REPO }}-${{ env.GGUF_FILE }}-v1
 
-      - name: Pre-install Windows tweaks (npm 11 + Defender exclusions)
+      - name: Pre-install Windows tweaks (Defender exclusions)
         shell: pwsh
-        # See studio-windows-update-smoke.yml for the full rationale.
-        # tl;dr: setup.ps1 needs npm >=11 to skip a 35 s winget Node
-        # reinstall, and Defender's real-time scan dominates the
-        # frontend / uv-pip-extract steps.
+        # NOTE: we intentionally do NOT upgrade npm here. setup-node@22 ships
+        # npm 10.x (< 11), so setup.ps1 must pick the "bundled" path and install
+        # an isolated Node -- exactly the behaviour this run validates (the old
+        # destructive `winget install Node.js LTS` branch is gone). Defender's
+        # real-time scan still dominates the frontend / uv-pip-extract steps, so
+        # keep the exclusions.
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          Write-Host "npm version before upgrade: $(npm -v)"
-          npm install -g 'npm@^11' 2>&1 | Out-Host
-          Write-Host "npm version after upgrade: $(npm -v)"
+          Write-Host "system npm (left at 10.x to force the isolated path): $(npm -v)"
           # NOTE: do NOT pre-create these directories. See
           # studio-windows-update-smoke.yml for the full rationale --
           # creating an empty studio/frontend/dist trips setup.ps1's
@@ -517,6 +535,24 @@ jobs:
           # and validated" via Write-Host, and we grep for that.
           $ProgressPreference = 'SilentlyContinue'
           & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
+
+      - name: Assert the ISOLATED Node path was used (no winget, no system clobber)
+        run: |
+          set -e
+          if ! grep -Eq "isolated Node|\(isolated\)" logs/install.log; then
+            echo "::error::setup.ps1 did not use the isolated Node path"
+            grep -Ei "node|npm" logs/install.log | tail -40 || true
+            exit 1
+          fi
+          if grep -Eqi "winget install OpenJS.NodeJS|Please install Node.js >= 20" logs/install.log; then
+            echo "::error::setup.ps1 still hit the removed winget Node branch"
+            exit 1
+          fi
+          NODE_DIR=~/.unsloth/node
+          test -f "$NODE_DIR/UNSLOTH_NODE_PREBUILT_INFO.json"
+          test -f "$NODE_DIR/node.exe"
+          test -d studio/frontend/dist
+          echo "isolated Node path confirmed on Windows; frontend dist built"
 
       - name: Assert install.ps1 used the Windows llama.cpp prebuilt
         run: |
@@ -906,17 +942,17 @@ jobs:
           path: hf-cache
           key: ${{ runner.os }}-hf-${{ env.GGUF_REPO }}-${{ env.GGUF_VARIANT }}-${{ env.MMPROJ_FILE }}-v2
 
-      - name: Pre-install Windows tweaks (npm 11 + Defender exclusions)
+      - name: Pre-install Windows tweaks (Defender exclusions)
         shell: pwsh
-        # See studio-windows-update-smoke.yml for the full rationale.
-        # tl;dr: setup.ps1 needs npm >=11 to skip a 35 s winget Node
-        # reinstall, and Defender's real-time scan dominates the
-        # frontend / uv-pip-extract steps.
+        # NOTE: we intentionally do NOT upgrade npm here. setup-node@22 ships
+        # npm 10.x (< 11), so setup.ps1 must pick the "bundled" path and install
+        # an isolated Node -- exactly the behaviour this run validates (the old
+        # destructive `winget install Node.js LTS` branch is gone). Defender's
+        # real-time scan still dominates the frontend / uv-pip-extract steps, so
+        # keep the exclusions.
         run: |
           $ProgressPreference = 'SilentlyContinue'
-          Write-Host "npm version before upgrade: $(npm -v)"
-          npm install -g 'npm@^11' 2>&1 | Out-Host
-          Write-Host "npm version after upgrade: $(npm -v)"
+          Write-Host "system npm (left at 10.x to force the isolated path): $(npm -v)"
           # NOTE: do NOT pre-create these directories. See
           # studio-windows-update-smoke.yml for the full rationale --
           # creating an empty studio/frontend/dist trips setup.ps1's
@@ -949,6 +985,24 @@ jobs:
           # and validated" via Write-Host, and we grep for that.
           $ProgressPreference = 'SilentlyContinue'
           & ./install.ps1 --local --no-torch *>&1 | Tee-Object -FilePath logs/install.log
+
+      - name: Assert the ISOLATED Node path was used (no winget, no system clobber)
+        run: |
+          set -e
+          if ! grep -Eq "isolated Node|\(isolated\)" logs/install.log; then
+            echo "::error::setup.ps1 did not use the isolated Node path"
+            grep -Ei "node|npm" logs/install.log | tail -40 || true
+            exit 1
+          fi
+          if grep -Eqi "winget install OpenJS.NodeJS|Please install Node.js >= 20" logs/install.log; then
+            echo "::error::setup.ps1 still hit the removed winget Node branch"
+            exit 1
+          fi
+          NODE_DIR=~/.unsloth/node
+          test -f "$NODE_DIR/UNSLOTH_NODE_PREBUILT_INFO.json"
+          test -f "$NODE_DIR/node.exe"
+          test -d studio/frontend/dist
+          echo "isolated Node path confirmed on Windows; frontend dist built"
 
       - name: Assert install.ps1 used the Windows llama.cpp prebuilt
         run: |

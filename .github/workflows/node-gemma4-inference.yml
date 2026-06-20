@@ -1,0 +1,141 @@
+# End-to-end proof that the isolated-Node change does not regress a real Studio
+# install + GGUF inference. Forces the ISOLATED Node path (no system npm >= 11),
+# asserts setup used the isolated Node and built the frontend, then loads
+# unsloth/gemma-4-E2B-it-GGUF UD-Q4_K_XL and generates. Linux + macOS (Apple
+# Silicon) -- CPU/Metal, no GPU needed for GGUF.
+name: node-gemma4-inference
+
+on:
+  push:
+    branches: [pr-node-isolated-0620]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  infer:
+    name: isolated-node + gemma-4-E2B ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    env:
+      GGUF_REPO: unsloth/gemma-4-E2B-it-GGUF
+      GGUF_VARIANT: UD-Q4_K_XL
+      GGUF_FILE: gemma-4-E2B-it-UD-Q4_K_XL.gguf
+      STUDIO_PORT: '18888'
+      HF_HOME: ${{ github.workspace }}/hf-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Linux deps for llama.cpp prebuilt
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev libssl-dev jq
+
+      # setup-node@22 lands Node 22 + npm 10.x -- intentionally below npm>=11, so
+      # setup decides "bundled" and provisions an isolated Node (the path we want
+      # to validate). We do NOT upgrade npm here.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Show system node/npm (should be < npm 11 -> isolated path)
+        run: |
+          echo "system node: $(node -v)  npm: $(npm -v)"
+
+      - name: Prime HF_HOME with the GGUF
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python -m pip install --upgrade huggingface_hub
+          mkdir -p hf-cache
+          # No LOCAL_DIR -> lands in HF_HOME cache so Studio's model_path=repo load finds it.
+          bash .github/scripts/hf-download-with-retry.sh "$GGUF_REPO" "$GGUF_FILE"
+          bash .github/scripts/hf-download-with-retry.sh ggml-org/models tinyllamas/stories260K.gguf || true
+
+      - name: Install Studio (--local, --no-torch)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          bash install.sh --local --no-torch 2>&1 | tee logs/install.log
+
+      - name: Assert the ISOLATED Node path was used and frontend built
+        run: |
+          set -e
+          # 1) setup.sh logged the isolated path (not "(system)").
+          if ! grep -Eq "isolated Node|\(isolated\)" logs/install.log; then
+            echo "::error::install did not use the isolated Node path"
+            grep -Ei "node|npm" logs/install.log | tail -40
+            exit 1
+          fi
+          # 2) the isolated Node tree exists with metadata + a >=24 node.
+          NODE_DIR=~/.unsloth/node
+          test -f "$NODE_DIR/UNSLOTH_NODE_PREBUILT_INFO.json"
+          "$NODE_DIR/bin/node" -v | grep -Eq '^v(2[4-9]|[3-9][0-9])\.'
+          NPM_MAJOR=$("$NODE_DIR/bin/node" "$NODE_DIR/lib/node_modules/npm/bin/npm-cli.js" -v | cut -d. -f1)
+          [ "$NPM_MAJOR" -ge 11 ]
+          # 3) the frontend actually built with that Node.
+          test -d studio/frontend/dist
+          ls studio/frontend/dist/assets/*.js >/dev/null
+          echo "isolated Node path confirmed; frontend dist built"
+
+      - name: Reset auth + boot Studio (API-only)
+        run: |
+          unsloth studio reset-password
+          mkdir -p logs
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" > logs/studio.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for /api/health
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > health.json; then
+              cat health.json; exit 0
+            fi
+            sleep 1
+          done
+          echo "Studio did not become healthy"; tail -200 logs/studio.log; exit 1
+
+      - name: Load gemma-4-E2B-it UD-Q4_K_XL and generate
+        run: |
+          set -e
+          TOKEN=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
+            -H 'content-type: application/json' \
+            -d "{\"username\":\"unsloth\",\"password\":\"$(cat ~/.unsloth/studio/auth/.bootstrap_password)\"}" | jq -r .access_token)
+          [ -n "$TOKEN" ] && [ "$TOKEN" != "null" ]
+          curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/inference/load" \
+            -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' --max-time 900 \
+            -d "{\"model_path\":\"$GGUF_REPO\",\"gguf_variant\":\"$GGUF_VARIANT\",\"is_lora\":false,\"max_seq_length\":2048}" \
+            | jq '{status, display_name, is_gguf, context_length}'
+          OUT=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/v1/chat/completions" \
+            -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' --max-time 300 \
+            -d '{"model":"default","messages":[{"role":"user","content":"In one short sentence, what is Unsloth?"}],"temperature":0.0,"max_tokens":48}')
+          echo "$OUT" | jq -r '.choices[0].message.content'
+          echo "$OUT" | jq -e '.choices[0].message.content | length > 0' >/dev/null
+          echo "gemma-4-E2B-it UD-Q4_K_XL inference OK on ${{ matrix.os }}"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gemma4-${{ matrix.os }}-logs
+          path: logs/
+          if-no-files-found: ignore
