@@ -1,9 +1,7 @@
 # Simulates the Node/npm conditions a real user machine can be in, and asserts
-# the installer's decision + behaviour for each. Drives the SAME pure function
-# (decide_node_source, sliced from studio/setup.sh) and the SAME isolated
-# installer (install_node_prebuilt.py) that a real `unsloth studio` install runs,
-# so each row is a faithful end-to-end check of one scenario without the heavy
-# full Studio build (covered separately by node-gemma4-inference + the smokes).
+# the installer's decision + behaviour for each, on Linux AND macOS (both use the
+# bash decide_node_source from studio/setup.sh). Windows is covered by the
+# sibling node-scenarios-windows.yml (PowerShell Get-NodeDecision).
 #
 #   good_npm11  -> system   (a fine Node + npm >= 11 is reused read-only)
 #   old_npm10   -> bundled  (the Discord bug: fine Node, npm 10.x)
@@ -28,20 +26,17 @@ permissions:
 
 jobs:
   scenario:
-    name: ${{ matrix.scenario }} -> ${{ matrix.expect }}
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }} / ${{ matrix.scenario }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 12
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { scenario: good_npm11,  expect: system }
-          - { scenario: old_npm10,   expect: bundled }
-          - { scenario: no_node,     expect: bundled }
-          - { scenario: broken_node, expect: bundled }
-          - { scenario: broken_npm,  expect: bundled }
-          - { scenario: skip_optout, expect: skip }
-          - { scenario: custom_home, expect: bundled }
+        os: [ubuntu-latest, macos-14]
+        scenario: [good_npm11, old_npm10, no_node, broken_node, broken_npm, skip_optout, custom_home]
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,10 +61,8 @@ jobs:
               echo "leaving npm at $(npm -v) (10.x)" ;;
             no_node)
               for b in node npm npx; do
-                p="$(command -v $b 2>/dev/null || true)"
-                [ -n "$p" ] && sudo rm -f "$p" || true
+                while p="$(command -v $b 2>/dev/null)"; do sudo rm -f "$p" 2>/dev/null || break; hash -r; done
               done
-              hash -r
               echo "node now: $(command -v node || echo absent)" ;;
             broken_node)
               mkdir -p "$HOME/brk"
@@ -89,8 +82,14 @@ jobs:
       - name: Decide + provision (mirrors setup.sh Node section) and assert
         run: |
           set -uo pipefail
-          sed -n '/^decide_node_source()/,/^}/p' studio/setup.sh > /tmp/dns.sh
-          . /tmp/dns.sh
+          case "${{ matrix.scenario }}" in
+            good_npm11) EXPECT=system ;;
+            skip_optout) EXPECT=skip ;;
+            *) EXPECT=bundled ;;
+          esac
+
+          sed -n '/^decide_node_source()/,/^}/p' studio/setup.sh > "$RUNNER_TEMP/dns.sh"
+          . "$RUNNER_TEMP/dns.sh"
 
           SKIP="${UNSLOTH_SKIP_NODE_INSTALL:-0}"
           NODE_PARENT="${UNSLOTH_STUDIO_HOME:-$HOME/.unsloth}"
@@ -100,8 +99,8 @@ jobs:
           echo "detected node='$NV' npm='$PV' skip='$SKIP' parent='$NODE_PARENT'"
 
           DEC="$(decide_node_source "$NV" "$PV" "$SKIP")"
-          echo "decision=$DEC  expected=${{ matrix.expect }}"
-          [ "$DEC" = "${{ matrix.expect }}" ] || { echo "::error::decision $DEC != ${{ matrix.expect }}"; exit 1; }
+          echo "decision=$DEC  expected=$EXPECT"
+          [ "$DEC" = "$EXPECT" ] || { echo "::error::decision $DEC != $EXPECT"; exit 1; }
 
           case "$DEC" in
             system)
