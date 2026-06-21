@@ -290,3 +290,43 @@ jobs:
           echo "exit=$RC"
           [ "$RC" -eq 3 ] || { echo "::error::expected BUSY exit 3, got $RC"; exit 1; }
           echo "OK concurrent install correctly returned BUSY (exit 3)"
+
+  runtime-node-resolver:
+    name: backend resolves the isolated Node at runtime
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install deps the resolver path needs
+        run: python -m pip install --quiet filelock structlog
+      - name: Install isolated Node, then assert the backend resolver finds it with no system Node
+        run: |
+          set -euo pipefail
+          export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/uns_home"
+          mkdir -p "$UNSLOTH_STUDIO_HOME"
+          # Isolated Node installs under <UNSLOTH_HOME>/node (the sibling layout
+          # the backend resolver derives via studio_root()).
+          python studio/install_node_prebuilt.py --install-dir "$UNSLOTH_STUDIO_HOME/node" --node-version lts
+          # The managed Node is NOT on PATH (by design). Scrub every system node
+          # from PATH, then assert resolve_node_executable() returns the managed
+          # binary and that it actually runs at the pinned major.
+          PYTHONPATH=studio/backend python - <<'PY'
+          import os, shutil, subprocess, importlib
+          from pathlib import Path
+          kept = [p for p in os.environ.get("PATH", "").split(os.pathsep) if p and not (Path(p) / "node").exists()]
+          os.environ["PATH"] = os.pathsep.join(kept)
+          assert shutil.which("node") is None, "system node still on PATH after scrub"
+          nr = importlib.import_module("utils.node_runtime")
+          nr.resolve_node_executable.cache_clear()
+          exe = nr.resolve_node_executable()
+          managed = str(nr.managed_node_binary())
+          assert exe == managed, f"resolver returned {exe!r}, expected managed {managed!r}"
+          out = subprocess.run([exe, "-v"], capture_output=True, text=True, check=True).stdout.strip()
+          assert int(out.lstrip("v").split(".")[0]) >= 24, f"managed node {out} < 24"
+          print(f"OK runtime resolver -> {exe} ({out}); no system Node present")
+          PY
