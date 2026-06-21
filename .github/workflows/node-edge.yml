@@ -55,7 +55,8 @@ jobs:
 
   darwin-x64:
     name: isolated Node on Intel macOS
-    runs-on: macos-13          # the Intel (x86_64) macOS runner
+    runs-on: macos-15-intel    # Intel (x86_64) macOS runner; the legacy macos-13
+                               # Intel pool is being retired and backlogs for ~1h
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
