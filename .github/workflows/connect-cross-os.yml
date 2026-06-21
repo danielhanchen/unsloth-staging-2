@@ -1,0 +1,58 @@
+# Cross-OS validation for the `unsloth connect` credential changes (PR #6479).
+# Throwaway staging workflow: runs the connect CLI credential suite and the
+# Studio identity-handshake crypto on Linux, Windows and macOS to confirm the
+# new code is portable (loopback detection, no-redirect urlopen, 0600 cache
+# writes, HMAC proof). Deliberately lean: connect.py / _inference.py keep every
+# heavy import function-local, so the tests need only pure-Python wheels.
+name: connect-cross-os
+
+on:
+  push:
+    branches: [connect-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  connect:
+    name: connect+identity (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install lean test deps
+        # Pure-Python wheels only (no torch / transformers / llama.cpp), so the
+        # install is fast and reliable on every OS. typer+rich+pydantic+pyyaml
+        # cover importing the unsloth_cli package; pyjwt+structlog cover the
+        # auth/storage import chain (real HMAC proof tests); fastapi+httpx build
+        # the identity TestClient.
+        run: >
+          python -m pip install --upgrade pip
+          typer pytest pyyaml rich pydantic pyjwt structlog fastapi httpx
+
+      - name: unsloth connect credential tests
+        run: python -m pytest unsloth_cli/tests/test_connect.py -v
+
+      - name: Studio identity handshake tests
+        working-directory: studio/backend
+        # Route tests self-skip without the full backend deps (see test file);
+        # the proof crypto + secret persistence run everywhere.
+        run: python -m pytest tests/test_identity.py -v
