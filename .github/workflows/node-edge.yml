@@ -1,6 +1,13 @@
 # Edge cases for the isolated Node installer that the OS/scenario matrices don't
-# cover: a non-x64 architecture (arm64 Linux) and a network-down install (must
-# fail gracefully with a clear message + proper exit code, never crash or hang).
+# cover. The scenario matrices prove the decision (system/bundled/skip) per
+# machine state; these prove the installer's own contract corners:
+#   arm64-linux       -> non-x64 arch resolves + installs (linux-arm64)
+#   darwin-x64        -> Intel macOS arch token + isolated install (darwin-x64)
+#   windows-arm64     -> Windows-on-ARM arch token + isolated install (win-arm64)
+#   offline-graceful  -> network down: clean non-zero exit, no crash/partial dir
+#   idempotent-rerun  -> a second run short-circuits ("already matches", no download)
+#   stale-repair      -> a corrupt isolated install self-heals on the next run
+#   concurrent-lock   -> a second concurrent install returns BUSY (exit 3)
 name: node-edge
 
 on:
@@ -46,6 +53,73 @@ jobs:
           print("OK isolated Node on linux-arm64")
           PY
 
+  darwin-x64:
+    name: isolated Node on Intel macOS
+    runs-on: macos-13          # the Intel (x86_64) macOS runner
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Real isolated install + assert (darwin-x64)
+        run: |
+          set -e
+          DIR="$RUNNER_TEMP/uns_node_darwin_x64"
+          python studio/install_node_prebuilt.py --install-dir "$DIR" --node-version lts
+          PYTHONPATH=studio python - "$DIR" <<'PY'
+          import importlib.util, sys
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location("inp", "studio/install_node_prebuilt.py")
+          m = importlib.util.module_from_spec(spec); sys.modules["inp"] = m; spec.loader.exec_module(m)
+          d = Path(sys.argv[1]); host = m.detect_host()
+          assert host.node_os == "darwin", host.node_os
+          assert host.node_arch == "x64", host.node_arch
+          nv = m.installed_node_version(d, host); npm = m.installed_npm_major(d, host)
+          print("darwin-x64 node:", nv, "npm:", npm)
+          assert nv and int(nv.split(".")[0]) >= 24
+          assert npm is not None and npm >= 11
+          print("OK isolated Node on darwin-x64")
+          PY
+
+  windows-arm64:
+    name: isolated Node on Windows arm64
+    runs-on: windows-11-arm    # GitHub-hosted Windows-on-ARM runner
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: arm64
+      - name: Real isolated install + assert (win-arm64)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Confirm we are driving a native arm64 Python so detect_host() sees ARM64.
+          $hostArch = (python -c "import platform; print(platform.machine())").Trim()
+          Write-Host "python machine = $hostArch"
+          $DIR = Join-Path $env:RUNNER_TEMP 'uns_node_winarm'
+          python studio/install_node_prebuilt.py --install-dir $DIR --node-version lts
+          if ($LASTEXITCODE -ne 0) { throw "installer exit $LASTEXITCODE" }
+          $nodeExe = Join-Path $DIR 'node.exe'
+          if (-not (Test-Path $nodeExe)) { throw "no isolated node.exe" }
+          if (-not (Test-Path (Join-Path $DIR 'UNSLOTH_NODE_PREBUILT_INFO.json'))) { throw "no metadata" }
+          $arch = (& $nodeExe -e "process.stdout.write(process.arch)")
+          if ($arch -ne 'arm64') { throw "isolated node arch '$arch' != arm64" }
+          $iv = (& $nodeExe -v)
+          if ([int]($iv -replace '^v','').Split('.')[0] -lt 24) { throw "isolated node $iv < 24" }
+          $npmCli = Join-Path $DIR 'node_modules\npm\bin\npm-cli.js'
+          $npmMajor = [int]((& $nodeExe $npmCli -v).Split('.')[0])
+          if ($npmMajor -lt 11) { throw "isolated npm $npmMajor < 11" }
+          Write-Host "OK isolated Node $iv arch=$arch npm ${npmMajor}.x on win-arm64 (system untouched)"
+
   offline-graceful:
     name: offline install fails gracefully
     runs-on: ubuntu-latest
@@ -80,3 +154,138 @@ jobs:
           # And nothing half-installed left behind.
           [ ! -e "$DIR/bin/node" ] || { echo "::error::partial install left a node binary"; exit 1; }
           echo "OK offline: clean exit $RC, graceful message, no partial install"
+
+  idempotent-rerun:
+    name: re-run short-circuits (already matches)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install once, then assert the second run skips the download
+        run: |
+          set -uo pipefail
+          DIR="$RUNNER_TEMP/uns_node_idem"
+          # First install: must download and succeed.
+          OUT1=$(python studio/install_node_prebuilt.py --install-dir "$DIR" --node-version lts 2>&1)
+          echo "$OUT1" | tail -5
+          [ -x "$DIR/bin/node" ] || { echo "::error::first install produced no node"; exit 1; }
+          V1=$("$DIR/bin/node" -v)
+          # Second install with the same args: must short-circuit, no download.
+          OUT2=$(python studio/install_node_prebuilt.py --install-dir "$DIR" --node-version lts 2>&1)
+          echo "$OUT2" | tail -5
+          printf '%s\n' "$OUT2" | grep -q "already matches" \
+            || { echo "::error::second run did not log 'already matches'"; exit 1; }
+          if printf '%s\n' "$OUT2" | grep -qi "downloading"; then
+            echo "::error::second run re-downloaded despite a matching install"; exit 1
+          fi
+          V2=$("$DIR/bin/node" -v)
+          [ "$V1" = "$V2" ] || { echo "::error::version changed across idempotent run ($V1 -> $V2)"; exit 1; }
+          echo "OK idempotent: $V1 reused, no re-download"
+
+  stale-repair:
+    name: corrupt install self-heals
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install, corrupt the node binary, assert the next run repairs it
+        run: |
+          set -uo pipefail
+          DIR="$RUNNER_TEMP/uns_node_stale"
+          python studio/install_node_prebuilt.py --install-dir "$DIR" --node-version lts
+          [ -x "$DIR/bin/node" ] || { echo "::error::initial install produced no node"; exit 1; }
+          # Corrupt the isolated install: replace the node binary with garbage.
+          # Unlink first (always succeeds, even if the just-run binary is briefly
+          # ETXTBSY), then write a fresh non-ELF file.
+          rm -f "$DIR/bin/node"
+          printf 'corrupt-not-a-node-binary\n' > "$DIR/bin/node"
+          # Confirm corruption via the installer's OWN predicate (subprocess-based,
+          # the same check the installer uses) -- not via bash, which would shell
+          # out to a non-ELF exec and mask the failure.
+          PYTHONPATH=studio python - "$DIR" <<'PY'
+          import importlib.util, sys
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location("inp", "studio/install_node_prebuilt.py")
+          m = importlib.util.module_from_spec(spec); sys.modules["inp"] = m; spec.loader.exec_module(m)
+          d = Path(sys.argv[1]); host = m.detect_host()
+          meta = m.load_metadata(d); ver = (meta or {}).get("version")
+          assert ver, "metadata missing after install"
+          assert not m.existing_install_matches(d, host, version = ver), "corrupt install still reported as matching"
+          print("confirmed corrupt: existing_install_matches=False for v" + ver)
+          PY
+          # Next run must NOT short-circuit; it must re-download and repair.
+          OUT=$(python studio/install_node_prebuilt.py --install-dir "$DIR" --node-version lts 2>&1)
+          printf '%s\n' "$OUT" | tail -8
+          if printf '%s\n' "$OUT" | grep -q "already matches"; then
+            echo "::error::corrupt install was wrongly treated as matching"; exit 1
+          fi
+          NV=$("$DIR/bin/node" -v) || { echo "::error::node still broken after repair"; exit 1; }
+          echo "$NV" | grep -Eq '^v(2[4-9]|[3-9][0-9])\.' || { echo "::error::repaired node $NV < 24"; exit 1; }
+          NPM_MAJOR=$("$DIR/bin/node" "$DIR/lib/node_modules/npm/bin/npm-cli.js" -v | cut -d. -f1)
+          [ "$NPM_MAJOR" -ge 11 ] || { echo "::error::repaired npm $NPM_MAJOR < 11"; exit 1; }
+          echo "OK stale-repair: corrupt install rebuilt to $NV npm ${NPM_MAJOR}.x"
+
+  concurrent-lock:
+    name: concurrent install yields BUSY (exit 3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install filelock (mirror the Studio runtime lock backend)
+        run: python -m pip install --quiet filelock
+      - name: Hold the install lock in another process and assert exit 3
+        run: |
+          set -uo pipefail
+          DIR="$RUNNER_TEMP/uns_node_lock"
+          mkdir -p "$DIR"
+          MARK="$RUNNER_TEMP/locked.flag"
+          rm -f "$MARK"
+          # Holder process: acquire the real install lock, signal, hold ~25s.
+          PYTHONPATH=studio python - "$DIR" "$MARK" <<'PY' &
+          import importlib.util, sys, time
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location("inp", "studio/install_node_prebuilt.py")
+          m = importlib.util.module_from_spec(spec); sys.modules["inp"] = m; spec.loader.exec_module(m)
+          d = Path(sys.argv[1]); mark = Path(sys.argv[2])
+          with m.install_lock(m.install_lock_path(d)):
+              mark.write_text("locked")
+              time.sleep(25)
+          PY
+          HOLDER=$!
+          # Wait until the holder actually owns the lock.
+          for i in $(seq 1 150); do [ -f "$MARK" ] && break; sleep 0.2; done
+          [ -f "$MARK" ] || { echo "::error::holder never acquired the lock"; kill "$HOLDER" 2>/dev/null; exit 1; }
+          # Second install, tiny lock timeout: must return BUSY (exit 3), not hang.
+          set +e
+          PYTHONPATH=studio python - "$DIR" <<'PY'
+          import importlib.util, sys
+          from pathlib import Path
+          spec = importlib.util.spec_from_file_location("inp", "studio/install_node_prebuilt.py")
+          m = importlib.util.module_from_spec(spec); sys.modules["inp"] = m; spec.loader.exec_module(m)
+          m.INSTALL_LOCK_TIMEOUT_SECONDS = 2     # don't wait the full 300s
+          rc = m.main(["--install-dir", sys.argv[1]])
+          print("second-install rc:", rc)
+          sys.exit(rc)
+          PY
+          RC=$?
+          set -e
+          kill "$HOLDER" 2>/dev/null || true
+          wait "$HOLDER" 2>/dev/null || true
+          echo "exit=$RC"
+          [ "$RC" -eq 3 ] || { echo "::error::expected BUSY exit 3, got $RC"; exit 1; }
+          echo "OK concurrent install correctly returned BUSY (exit 3)"
