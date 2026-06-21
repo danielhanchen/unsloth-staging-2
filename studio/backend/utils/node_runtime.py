@@ -63,6 +63,15 @@ def managed_node_dir() -> Path:
             is_legacy = resolved == legacy_studio
         return legacy_node if is_legacy else (resolved / "node")
     except (ImportError, OSError, ValueError):
+        # Degraded import environment (utils.paths unavailable): still honor an
+        # explicit STUDIO_HOME override, mirroring studio_root()'s priority,
+        # before falling back to the legacy default.
+        override = (os.environ.get("UNSLOTH_STUDIO_HOME") or os.environ.get("STUDIO_HOME") or "").strip()
+        if override:
+            try:
+                return Path(override).expanduser().resolve() / "node"
+            except (OSError, ValueError):
+                return Path(override).expanduser() / "node"
         return legacy_node
 
 

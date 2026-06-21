@@ -71,6 +71,29 @@ def test_managed_dir_uses_legacy_sibling_by_default(monkeypatch):
     assert nr.managed_node_dir() == Path.home() / ".unsloth" / "node"
 
 
+def _raise_oserror():
+    raise OSError("simulated degraded import environment")
+
+
+def test_managed_dir_fallback_honors_override(monkeypatch, tmp_path):
+    # If utils.paths cannot be loaded / studio_root() fails, the resolver must
+    # still honor an explicit STUDIO_HOME override (not silently use legacy).
+    import utils.paths.storage_roots as sr
+
+    monkeypatch.setattr(sr, "studio_root", _raise_oserror)
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path))
+    assert nr.managed_node_dir() == tmp_path / "node"
+
+
+def test_managed_dir_fallback_legacy_without_override(monkeypatch):
+    import utils.paths.storage_roots as sr
+
+    monkeypatch.setattr(sr, "studio_root", _raise_oserror)
+    monkeypatch.delenv("UNSLOTH_STUDIO_HOME", raising = False)
+    monkeypatch.delenv("STUDIO_HOME", raising = False)
+    assert nr.managed_node_dir() == Path.home() / ".unsloth" / "node"
+
+
 def test_resolve_prefers_adequate_system_node(monkeypatch):
     monkeypatch.setattr(nr.shutil, "which", lambda name: "/usr/bin/node" if name == "node" else None)
     monkeypatch.setattr(nr, "_node_version_ok", lambda exe: exe == "/usr/bin/node")
