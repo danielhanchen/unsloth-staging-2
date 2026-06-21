@@ -69,9 +69,14 @@ on:
       - 'tests/studio/test_mlx_training_worker_behaviors.py'
       - 'tests/studio/run_real_mlx_smoke.py'
       - 'tests/conftest.py'
+      # Regression check: confirm the isolated-Node installer change does not
+      # break the MLX training path on real Apple Silicon.
+      - 'studio/setup.sh'
+      - 'studio/install_node_prebuilt.py'
       - '.github/workflows/mlx-ci.yml'
   push:
     branches: [main, pip]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}

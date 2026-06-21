@@ -1,0 +1,135 @@
+# Windows counterpart of node-scenarios.yml: simulates each Node/npm condition on
+# windows-latest and drives the REAL PowerShell decision (Get-NodeDecision,
+# AST-extracted from studio/setup.ps1) + the isolated installer, asserting the
+# decision and that the system Node/npm are never mutated.
+name: node-scenarios-windows
+
+on:
+  push:
+    branches: [pr-node-isolated-0620]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  scenario:
+    name: windows / ${{ matrix.scenario }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: [good_npm11, old_npm10, no_node, broken_node, broken_npm, skip_optout, custom_home]
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'   # ships Node 22 + npm 10.x (below the bar by default)
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Apply scenario "${{ matrix.scenario }}"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scn = "${{ matrix.scenario }}"
+          $brk = Join-Path $env:RUNNER_TEMP 'brk'
+          switch ($scn) {
+            'good_npm11' {
+              npm install -g 'npm@^11' | Out-Null
+              Write-Host "npm upgraded to $(npm -v)"
+            }
+            'old_npm10' { Write-Host "leaving npm at $(npm -v) (10.x)" }
+            'no_node' {
+              # Drop every PATH entry that provides node/npm so the next step
+              # sees no Node (filter rather than delete -- avoids file locks).
+              $filtered = ($env:PATH -split ';' | Where-Object {
+                $_ -and ($_ -notmatch '(?i)nodejs') -and ($_ -notmatch '(?i)\\node\\')
+              }) -join ';'
+              "PATH=$filtered" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+              Write-Host "node dirs removed from PATH"
+            }
+            'broken_node' {
+              New-Item -ItemType Directory -Force -Path $brk | Out-Null
+              Set-Content -Path (Join-Path $brk 'node.cmd') -Value "@exit /b 1" -Encoding ascii
+              $brk | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            }
+            'broken_npm' {
+              New-Item -ItemType Directory -Force -Path $brk | Out-Null
+              Set-Content -Path (Join-Path $brk 'npm.cmd') -Value "@echo not-a-version" -Encoding ascii
+              $brk | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+            }
+            'skip_optout' {
+              "UNSLOTH_SKIP_NODE_INSTALL=1" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+            'custom_home' {
+              $h = Join-Path $env:RUNNER_TEMP 'custom_home'
+              New-Item -ItemType Directory -Force -Path $h | Out-Null
+              "UNSLOTH_STUDIO_HOME=$h" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+            }
+          }
+
+      - name: Decide (Get-NodeDecision) + provision and assert
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $scn = "${{ matrix.scenario }}"
+          $expect = switch ($scn) { 'good_npm11' {'system'} 'skip_optout' {'skip'} default {'bundled'} }
+
+          # AST-extract the real decision helper from setup.ps1.
+          $errs = $null
+          $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path 'studio/setup.ps1').Path, [ref]$null, [ref]$errs)
+          if ($errs) { throw "setup.ps1 parse errors" }
+          $fn = $ast.FindAll({ param($n)
+            $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Get-NodeDecision'
+          }, $true)
+          Invoke-Expression $fn[0].Extent.Text
+
+          $nv = ''; $pv = ''
+          if (Get-Command node -ErrorAction SilentlyContinue) { $nv = (node -v 2>$null) }
+          if (Get-Command npm  -ErrorAction SilentlyContinue) { $pv = (npm  -v 2>$null) }
+          $skip = "$env:UNSLOTH_SKIP_NODE_INSTALL"
+          Write-Host "detected node='$nv' npm='$pv' skip='$skip'"
+
+          $dec = Get-NodeDecision -NodeVersion "$nv" -NpmVersion "$pv" -SkipInstall "$skip"
+          Write-Host "decision=$dec expected=$expect"
+          if ($dec -ne $expect) { Write-Host "::error::decision $dec != $expect"; exit 1 }
+
+          $parent = if ($env:UNSLOTH_STUDIO_HOME) { $env:UNSLOTH_STUDIO_HOME } else { Join-Path $env:USERPROFILE '.unsloth' }
+          $nodeDir = Join-Path $parent 'node'
+
+          switch ($dec) {
+            'system' {
+              if (Test-Path $nodeDir) { Write-Host "::error::isolated dir created on system fast-path"; exit 1 }
+              Write-Host "OK system: reusing $((Get-Command node).Source) $(node -v), npm $(npm -v); no download"
+            }
+            'bundled' {
+              python studio/install_node_prebuilt.py --install-dir $nodeDir
+              if ($LASTEXITCODE -ne 0) { Write-Host "::error::installer exit $LASTEXITCODE"; exit 1 }
+              $nodeExe = Join-Path $nodeDir 'node.exe'
+              if (-not (Test-Path $nodeExe)) { Write-Host "::error::no isolated node.exe"; exit 1 }
+              if (-not (Test-Path (Join-Path $nodeDir 'UNSLOTH_NODE_PREBUILT_INFO.json'))) { throw "no metadata" }
+              $iv = (& $nodeExe -v)
+              if ([int]($iv -replace '^v','').Split('.')[0] -lt 24) { Write-Host "::error::isolated node $iv < 24"; exit 1 }
+              $npmCli = Join-Path $nodeDir 'node_modules\npm\bin\npm-cli.js'
+              $npmMajor = [int]((& $nodeExe $npmCli -v).Split('.')[0])
+              if ($npmMajor -lt 11) { Write-Host "::error::isolated npm $npmMajor < 11"; exit 1 }
+              Write-Host "OK bundled: isolated $iv npm ${npmMajor}.x at $nodeDir (system untouched)"
+            }
+            'skip' {
+              if (Test-Path $nodeDir) { Write-Host "::error::isolated dir created on skip path"; exit 1 }
+              Write-Host "OK skip: nothing installed, system Node/npm untouched"
+            }
+          }
