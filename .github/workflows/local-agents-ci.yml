@@ -295,10 +295,15 @@ jobs:
                   raw = self._body()
                   try: d = json.loads(raw)
                   except Exception: d = {}
-                  if self.path.endswith("/v1/messages"):
-                      s = d.get("system")
-                      t = "\n".join(x.get("text","") for x in s if isinstance(x, dict)) if isinstance(s, list) else (s or "")
-                      with open(CAP, "a") as f: f.write((t.splitlines()[0] if t else "(empty)") + "\n")
+                  # Record the system prompt on ANY request that carries one
+                  # (Claude Code preflights /v1/messages/count_tokens and posts the
+                  # real turn to /v1/messages?beta=true -- both include `system`).
+                  s = d.get("system")
+                  if s is not None:
+                      t = "\n".join(x.get("text","") for x in s if isinstance(x, dict)) if isinstance(s, list) else str(s)
+                      with open(CAP, "a") as f: f.write(f"===REQ {self.path}===\n{t}\n")
+                  path = self.path.split("?")[0]  # drop query string (?beta=true)
+                  if path.endswith("/v1/messages"):
                       body, ct = SSE, "text/event-stream"
                   else:
                       body, ct = b'{"input_tokens":1}', "application/json"
@@ -313,14 +318,15 @@ jobs:
           CAP="$CAP" PORT=9911 python3 "$B/mock.py" &
           MOCK=$!
           for i in $(seq 1 40); do curl -s -m 2 http://127.0.0.1:9911/v1/models | grep -q data && break; sleep 0.5; done
-          export CLAUDE_CONFIG_DIR="$B/cfg" ANTHROPIC_BASE_URL="http://127.0.0.1:9911" ANTHROPIC_AUTH_TOKEN=test ANTHROPIC_API_KEY="" DISABLE_AUTOUPDATER=1
+          export CLAUDE_CONFIG_DIR="$B/cfg" ANTHROPIC_BASE_URL="http://127.0.0.1:9911" ANTHROPIC_AUTH_TOKEN=test ANTHROPIC_API_KEY="" ANTHROPIC_MODEL=mock-model ANTHROPIC_SMALL_FAST_MODEL=mock-model DISABLE_AUTOUPDATER=1
           run_form () {  # $1=label; rest=claude args
             local label="$1"; shift
             : > "$CAP"
             ( cd "$B/proj" && timeout 90 claude -p "say hi" --model mock-model --dangerously-skip-permissions "$@" > "$B/out_$label.txt" 2>&1 )
-            local line; line=$(head -1 "$CAP" 2>/dev/null)
-            echo "[$label] first system line: ${line:-<none>}"
-            echo "$line" | grep -q "x-anthropic-billing-header" && echo "$label HAS_LINE" || echo "$label NO_LINE"
+            cp "$CAP" "$B/cap_$label.txt"
+            local cnt reqs; cnt=$(grep -c "x-anthropic-billing-header" "$CAP"); reqs=$(grep -c "===REQ" "$CAP")
+            echo "[$label] billing-header matches=$cnt across $reqs captured request(s); first system line: $(grep -v '===REQ' "$CAP" | head -1)"
+            if [ "${cnt:-0}" -gt 0 ]; then echo "$label HAS_LINE"; else echo "$label NO_LINE"; fi
           }
           rm -f "$CLAUDE_CONFIG_DIR/settings.json"; unset CLAUDE_CODE_ATTRIBUTION_HEADER
           A=$(run_form A_default); echo "$A"
@@ -332,6 +338,11 @@ jobs:
           rm -f "$CLAUDE_CONFIG_DIR/settings.json"
           D=$(run_form D_settings_inline --settings '{"env":{"CLAUDE_CODE_ATTRIBUTION_HEADER":"0"}}'); echo "$D"
           kill "$MOCK" 2>/dev/null
+          echo "===== diagnostics ====="
+          for L in A_default B_shell_env C_settings_file D_settings_inline; do
+            echo "--- claude stdout/stderr ($L) ---"; sed -n '1,15p' "$B/out_$L.txt"
+            echo "--- captured system head ($L) ---"; sed -n '1,4p' "$B/cap_$L.txt"
+          done
           echo "===== verdict ====="
           ok=1
           echo "$A" | grep -q "HAS_LINE" || { echo "FAIL: default should carry the attribution line"; ok=0; }
