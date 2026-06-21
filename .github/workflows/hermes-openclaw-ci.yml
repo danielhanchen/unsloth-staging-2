@@ -1,0 +1,193 @@
+name: "hermes-openclaw-ci ubuntu-latest"
+
+# Validates the Unsloth docs for driving local GGUF models with Hermes Agent
+# (NousResearch) and OpenClaw against a locally-served Unsloth Studio endpoint.
+# Studio is served with --disable-tools (passthrough) so each agent's own tools
+# are relayed. Hermes connects via the OpenAI-compatible /v1 endpoint; OpenClaw
+# connects via the Anthropic messages endpoint (api: anthropic-messages).
+# CPU-only runner, tiny model. Throwaway staging workflow: never merged.
+
+on:
+  push:
+    branches: [hermes-openclaw-validation]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  agent:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: [hermes, openclaw]
+        model:
+          - { repo: "unsloth/Qwen3.5-2B-MTP-GGUF", variant: "UD-Q4_K_XL" }
+    name: ${{ matrix.agent }} / ${{ matrix.model.repo }}
+    env:
+      STUDIO_PORT: "8888"
+      TASK_PROMPT: "What is 2+2? Reply with only the digit."
+    steps:
+      - name: System info
+        run: |
+          set -x
+          nproc; free -h; df -h / | tail -1
+          node --version; npm --version; python3 --version
+
+      - name: Use Node 24 (OpenClaw needs >=22.19)
+        if: matrix.agent == 'openclaw'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Install build deps
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake build-essential libcurl4-openssl-dev jq
+
+      - name: Install Unsloth Studio (released one-liner)
+        run: |
+          set -x +e
+          curl -fsSL https://unsloth.ai/install.sh | sh 2>&1 | tee "$HOME/install.log" | tail -50
+          UNSLOTH_BIN=""
+          for c in "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth" \
+                   "$HOME/.local/bin/unsloth" "$(command -v unsloth || true)"; do
+            if [ -n "$c" ] && [ -x "$c" ]; then UNSLOTH_BIN="$c"; break; fi
+          done
+          [ -n "$UNSLOTH_BIN" ] || UNSLOTH_BIN="$(find "$HOME/.unsloth" "$HOME/.local/bin" -maxdepth 5 -name unsloth -type f 2>/dev/null | head -1)"
+          [ -n "$UNSLOTH_BIN" ] && [ -x "$UNSLOTH_BIN" ] || { echo "STUDIO INSTALL FAILED"; tail -150 "$HOME/install.log"; exit 1; }
+          echo "$(dirname "$UNSLOTH_BIN")" >> "$GITHUB_PATH"
+
+      - name: Serve model with --disable-tools (passthrough) + capture key/id
+        run: |
+          set -x +e
+          cd "$HOME"
+          SUB="run"; unsloth run --help >/dev/null 2>&1 || SUB="studio run"
+          nohup unsloth $SUB --model "${{ matrix.model.repo }}:${{ matrix.model.variant }}" \
+            --disable-tools -H 127.0.0.1 -p "$STUDIO_PORT" > "$HOME/studio.log" 2>&1 &
+          echo "$!" > "$HOME/studio.pid"
+          KEY=""
+          for i in $(seq 1 120); do
+            KEY=$(grep -oE "sk-unsloth-[A-Za-z0-9_-]+" "$HOME/studio.log" 2>/dev/null | head -1)
+            [ -n "$KEY" ] && break
+            kill -0 "$(cat "$HOME/studio.pid")" 2>/dev/null || { echo "studio exited early"; break; }
+            sleep 5
+          done
+          tail -40 "$HOME/studio.log" 2>/dev/null
+          [ -n "$KEY" ] || { echo "NO API KEY"; tail -200 "$HOME/studio.log" 2>/dev/null; exit 1; }
+          echo "STUDIO_KEY=$KEY" >> "$GITHUB_ENV"
+          MODEL_ID=""
+          for i in $(seq 1 150); do
+            MODEL_ID=$(curl -s -m 5 "http://127.0.0.1:$STUDIO_PORT/v1/models" -H "Authorization: Bearer $KEY" 2>/dev/null | jq -r '.data[0].id // empty' 2>/dev/null)
+            [ -n "$MODEL_ID" ] && break
+            sleep 5
+          done
+          [ -n "$MODEL_ID" ] || { echo "MODEL DID NOT LOAD"; tail -200 "$HOME/studio.log" 2>/dev/null; exit 1; }
+          echo "MODEL_ID=$MODEL_ID" >> "$GITHUB_ENV"
+          echo "Resolved MODEL_ID=$MODEL_ID"
+
+      # ---------------- Hermes Agent ----------------
+      - name: Hermes - install + configure + run (guide config)
+        if: matrix.agent == 'hermes'
+        run: |
+          set -x +e
+          # Guide installer, headless: skip the interactive wizard and the
+          # browser/skills stages (not needed for a chat-completions connection).
+          curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh \
+            | bash -s -- --non-interactive --skip-setup --skip-browser --no-skills 2>&1 | tee "$HOME/hermes_install.log" | tail -50
+          export PATH="$HOME/.local/bin:$HOME/.hermes/bin:$HOME/.hermes/hermes-agent/venv/bin:$PATH"
+          HERMES_BIN="$(command -v hermes || true)"
+          [ -n "$HERMES_BIN" ] || HERMES_BIN="$(find "$HOME/.hermes" "$HOME/.local/bin" -maxdepth 5 -name hermes -type f 2>/dev/null | head -1)"
+          [ -n "$HERMES_BIN" ] || { echo "HERMES NOT INSTALLED"; tail -120 "$HOME/hermes_install.log"; exit 1; }
+          echo "hermes at: $HERMES_BIN"; "$HERMES_BIN" --version 2>&1 | head -3
+          # Configure per guide: Custom OpenAI-compatible endpoint -> model.provider=custom
+          mkdir -p "$HOME/.hermes"
+          cat > "$HOME/.hermes/config.yaml" <<EOF
+          model:
+            provider: custom
+            base_url: http://127.0.0.1:$STUDIO_PORT/v1
+            default: $MODEL_ID
+            api_key: $STUDIO_KEY
+          EOF
+          echo "=== config.yaml ==="; cat "$HOME/.hermes/config.yaml"
+          mkdir -p "$HOME/proj" && cd "$HOME/proj"
+          for attempt in 1 2 3; do
+            echo "=== HERMES attempt $attempt ==="
+            timeout 360 "$HERMES_BIN" --ignore-rules -z "$TASK_PROMPT" 2>&1 | tee "$HOME/agent_out.log"
+            grep -qE "(^|[^0-9])4([^0-9]|$)" "$HOME/agent_out.log" && break
+          done
+
+      # ---------------- OpenClaw ----------------
+      - name: OpenClaw - install + configure + run (guide config, corrected baseUrl)
+        if: matrix.agent == 'openclaw'
+        run: |
+          set -x +e
+          node --version
+          npm install -g openclaw@latest 2>&1 | tail -20
+          OC_BIN="$(command -v openclaw || true)"
+          [ -n "$OC_BIN" ] || { echo "OPENCLAW NOT INSTALLED"; exit 1; }
+          "$OC_BIN" --version 2>&1 | head -3
+          # api: anthropic-messages -> the Anthropic SDK appends /v1 itself, so the
+          # baseUrl must be the ORIGIN (no /v1), otherwise requests hit /v1/v1/messages.
+          mkdir -p "$HOME/.openclaw"
+          cat > "$HOME/.openclaw/openclaw.json" <<EOF
+          {
+            "models": {
+              "mode": "merge",
+              "providers": {
+                "unsloth": {
+                  "baseUrl": "http://127.0.0.1:$STUDIO_PORT",
+                  "apiKey": "$STUDIO_KEY",
+                  "api": "anthropic-messages",
+                  "authHeader": true,
+                  "models": [
+                    { "id": "$MODEL_ID", "name": "$MODEL_ID", "contextWindow": 8192, "maxTokens": 512 }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          echo "=== openclaw.json ==="; cat "$HOME/.openclaw/openclaw.json"
+          echo "=== openclaw doctor (config schema validity) ==="
+          "$OC_BIN" doctor 2>&1 | tail -30
+          # HTTP-level proof of the guide bug + fix: same Bearer auth OpenClaw uses.
+          B="http://127.0.0.1:$STUDIO_PORT"; H="Authorization: Bearer $STUDIO_KEY"; CT="content-type: application/json"
+          AV="anthropic-version: 2023-06-01"
+          BODY="{\"model\":\"$MODEL_ID\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}"
+          echo "buggy baseUrl .../v1 -> POST /v1/v1/messages:"
+          curl -s -o /dev/null -w "  HTTP %{http_code}\n" -m 30 "$B/v1/v1/messages" -H "$H" -H "$CT" -H "$AV" -d "$BODY"
+          echo "correct baseUrl ... -> POST /v1/messages:"
+          curl -s -o /dev/null -w "  HTTP %{http_code}\n" -m 60 "$B/v1/messages" -H "$H" -H "$CT" -H "$AV" -d "$BODY"
+          mkdir -p "$HOME/proj" && cd "$HOME/proj"
+          for attempt in 1 2 3; do
+            echo "=== OPENCLAW attempt $attempt ==="
+            timeout 360 "$OC_BIN" agent --local --agent main --model "unsloth/$MODEL_ID" \
+              --message "$TASK_PROMPT" 2>&1 | tee "$HOME/agent_out.log"
+            grep -qE "(^|[^0-9])4([^0-9]|$)" "$HOME/agent_out.log" && break
+          done
+
+      - name: Validate connection
+        run: |
+          set +e
+          AG="${{ matrix.agent }}"
+          echo "===== studio.log tail ====="; tail -30 "$HOME/studio.log" 2>/dev/null
+          echo "===== agent_out.log tail ====="; tail -40 "$HOME/agent_out.log" 2>/dev/null
+          OUT="$HOME/agent_out.log"
+          OK=1; REASON=""
+          # Primary signal: the model answered 2+2 through the agent (proves a full
+          # round trip to Studio and back).
+          if grep -qE "(^|[^0-9])4([^0-9]|$)" "$OUT" 2>/dev/null; then OK=0; REASON="agent got model answer (4)"; fi
+          # Hard connection-failure markers => fail regardless.
+          if grep -qiE "ECONNREFUSED|connection refused|could not connect|getaddrinfo|ENOTFOUND" "$OUT" 2>/dev/null; then
+            echo "CONNECTION ERROR in agent output"; OK=1
+          fi
+          if [ "$OK" -eq 0 ]; then
+            echo "RESULT: PASS ($AG) -- $REASON"
+          else
+            echo "RESULT: FAIL ($AG) -- no model answer; see diagnostics above"; exit 1
+          fi
