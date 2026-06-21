@@ -251,3 +251,91 @@ jobs:
           else
             echo "RESULT: FAIL ($AG / $REPO) -- see diagnostics"; exit 1
           fi
+
+  # Verifies the Claude Code KV-cache fix the docs recommend: that the
+  # per-request attribution line is present by default and removed by each of the
+  # three disable forms (shell env, settings.json, --settings inline). Isolated
+  # via a stdlib mock Anthropic endpoint; no model, no GPU.
+  attribution-forms:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install Claude Code
+        run: |
+          set -x +e
+          npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || curl -fsSL https://claude.ai/install.sh | bash
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"; claude --version
+
+      - name: Capture system prompt under each attribution form
+        run: |
+          set -x +e
+          export PATH="$HOME/.local/bin:$PATH"
+          B="$HOME/attr"; mkdir -p "$B/proj" "$B/cfg"
+          CAP="$B/cap.txt"
+          cat > "$B/mock.py" <<'PYEOF'
+          import json, os
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          CAP = os.environ["CAP"]
+          EV = [
+            ("message_start", {"type":"message_start","message":{"id":"m","type":"message","role":"assistant","model":"x","content":[],"stop_reason":None,"stop_sequence":None,"usage":{"input_tokens":1,"output_tokens":1}}}),
+            ("content_block_start", {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+            ("content_block_delta", {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}),
+            ("content_block_stop", {"type":"content_block_stop","index":0}),
+            ("message_delta", {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":None},"usage":{"output_tokens":1}}),
+            ("message_stop", {"type":"message_stop"}),
+          ]
+          SSE = "".join(f"event: {e}\ndata: {json.dumps(d)}\n\n" for e, d in EV).encode()
+          class H(BaseHTTPRequestHandler):
+              def log_message(self, *a): pass
+              def _body(self):
+                  n = int(self.headers.get("content-length", 0))
+                  return self.rfile.read(n) if n else b""
+              def do_POST(self):
+                  raw = self._body()
+                  try: d = json.loads(raw)
+                  except Exception: d = {}
+                  if self.path.endswith("/v1/messages"):
+                      s = d.get("system")
+                      t = "\n".join(x.get("text","") for x in s if isinstance(x, dict)) if isinstance(s, list) else (s or "")
+                      with open(CAP, "a") as f: f.write((t.splitlines()[0] if t else "(empty)") + "\n")
+                      body, ct = SSE, "text/event-stream"
+                  else:
+                      body, ct = b'{"input_tokens":1}', "application/json"
+                  self.send_response(200); self.send_header("content-type", ct)
+                  self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)
+              def do_GET(self):
+                  body = b'{"data":[{"id":"mock-model"}]}'
+                  self.send_response(200); self.send_header("content-type","application/json")
+                  self.send_header("content-length", str(len(body))); self.end_headers(); self.wfile.write(body)
+          HTTPServer(("127.0.0.1", int(os.environ["PORT"])), H).serve_forever()
+          PYEOF
+          CAP="$CAP" PORT=9911 python3 "$B/mock.py" &
+          MOCK=$!
+          for i in $(seq 1 40); do curl -s -m 2 http://127.0.0.1:9911/v1/models | grep -q data && break; sleep 0.5; done
+          export CLAUDE_CONFIG_DIR="$B/cfg" ANTHROPIC_BASE_URL="http://127.0.0.1:9911" ANTHROPIC_AUTH_TOKEN=test ANTHROPIC_API_KEY="" DISABLE_AUTOUPDATER=1
+          run_form () {  # $1=label; rest=claude args
+            local label="$1"; shift
+            : > "$CAP"
+            ( cd "$B/proj" && timeout 90 claude -p "say hi" --model mock-model --dangerously-skip-permissions "$@" > "$B/out_$label.txt" 2>&1 )
+            local line; line=$(head -1 "$CAP" 2>/dev/null)
+            echo "[$label] first system line: ${line:-<none>}"
+            echo "$line" | grep -q "x-anthropic-billing-header" && echo "$label HAS_LINE" || echo "$label NO_LINE"
+          }
+          rm -f "$CLAUDE_CONFIG_DIR/settings.json"; unset CLAUDE_CODE_ATTRIBUTION_HEADER
+          A=$(run_form A_default); echo "$A"
+          export CLAUDE_CODE_ATTRIBUTION_HEADER=0
+          Bres=$(run_form B_shell_env); echo "$Bres"
+          unset CLAUDE_CODE_ATTRIBUTION_HEADER
+          printf '%s' '{"env":{"CLAUDE_CODE_ATTRIBUTION_HEADER":"0"}}' > "$CLAUDE_CONFIG_DIR/settings.json"
+          C=$(run_form C_settings_file); echo "$C"
+          rm -f "$CLAUDE_CONFIG_DIR/settings.json"
+          D=$(run_form D_settings_inline --settings '{"env":{"CLAUDE_CODE_ATTRIBUTION_HEADER":"0"}}'); echo "$D"
+          kill "$MOCK" 2>/dev/null
+          echo "===== verdict ====="
+          ok=1
+          echo "$A" | grep -q "HAS_LINE" || { echo "FAIL: default should carry the attribution line"; ok=0; }
+          for r in "$Bres" "$C" "$D"; do
+            echo "$r" | grep -q "NO_LINE" || { echo "FAIL: $(echo "$r" | awk '{print $1}') should remove the attribution line"; ok=0; }
+          done
+          [ "$ok" -eq 1 ] && echo "RESULT: PASS (shell env, settings.json, and --settings inline all remove the attribution line; default keeps it)" || { echo "RESULT: FAIL"; exit 1; }
