@@ -1,0 +1,30 @@
+diff --git a/unsloth_zoo/mlx/loader.py b/unsloth_zoo/mlx/loader.py
+index 7c6f8532..845e2470 100644
+--- a/unsloth_zoo/mlx/loader.py
++++ b/unsloth_zoo/mlx/loader.py
+@@ -3471,6 +3471,25 @@ class FastMLXModel:
+                 True  — force text-only via mlx-lm
+                 False — force VLM via mlx-vlm
+         """
++        # mlx-lm cannot read bitsandbytes-packed (NF4) checkpoints: a *-bnb-4bit
++        # repo's safetensors carry hundreds of bnb-only tensors (.absmax,
++        # .quant_map, .nested_absmax, ...) that are not model parameters, so the
++        # load fails ("Received N parameters not in model"). unsloth publishes a
++        # full-precision base repo for each bnb-4bit repo, so remap to it and let
++        # MLX apply its own 4-bit affine quantization. This lets the ~47 migrated
++        # notebooks that hard-code an unsloth/*-bnb-4bit model_name run unchanged
++        # on Apple Silicon. CUDA is unaffected (this is the MLX loader).
++        if isinstance(model_name, str):
++            for _bnb_suffix in ("-unsloth-bnb-4bit", "-bnb-4bit"):
++                if model_name.endswith(_bnb_suffix):
++                    _bnb_base = model_name[: -len(_bnb_suffix)]
++                    print(
++                        f"Unsloth: mlx-lm cannot load bitsandbytes 4-bit weights; "
++                        f"loading base '{_bnb_base}' and applying MLX 4-bit "
++                        f"quantization instead of '{model_name}'."
++                    )
++                    model_name = _bnb_base
++                    break
+         if full_finetuning and (
+             load_in_4bit or load_in_8bit or load_in_fp8
+             or load_in_mxfp4 or load_in_nvfp4
