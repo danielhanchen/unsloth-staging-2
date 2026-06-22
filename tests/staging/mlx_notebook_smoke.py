@@ -28,17 +28,24 @@ HF_HUB = os.path.expanduser("~/.cache/huggingface/hub")
 # run on MLX". Vision is validated separately (heavy for the CI paravirtual GPU).
 _SMALL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
 NOTEBOOKS = [
-    ("nb/Gemma3_(270M).ipynb", None),                                   # plain SFT, FastModel, gemma3 arch (real)
-    ("nb/Qwen2.5_(7B)-Alpaca.ipynb", _SMALL),                          # plain Alpaca SFT
-    ("nb/Qwen2_(7B)-Alpaca.ipynb", _SMALL),                            # plain Alpaca SFT
-    ("nb/Mistral_v0.3_(7B)-Alpaca.ipynb", _SMALL),                     # plain SFT, Mistral family
-    ("nb/Gemma2_(9B)-Alpaca.ipynb", _SMALL),                           # plain SFT, gemma2 chat template
-    ("nb/Qwen3_(4B)-Instruct.ipynb", _SMALL),                          # plain SFT, qwen3 structure
-    ("nb/Phi_3.5_Mini-Conversational.ipynb", _SMALL),                  # conversational, get_chat_template
-    ("nb/Llama3.1_(8B)-Alpaca.ipynb", _SMALL),                        # classic Alpaca SFT (Llama 3.1)
+    ("nb/Gemma3_(270M).ipynb", None),                                  # plain SFT, FastModel, gemma3 (real model)
+    ("nb/Gemma2_(2B)-Alpaca.ipynb", _SMALL),                           # gemma2 chat template
+    ("nb/Gemma4_(E2B)-Text.ipynb", _SMALL),                            # gemma4 text
+    ("nb/Granite4.0_350M.ipynb", _SMALL),                              # IBM Granite structure
+    ("nb/Qwen2.5_(7B)-Alpaca.ipynb", _SMALL),                          # Alpaca SFT
+    ("nb/Qwen3_(4B)-Thinking.ipynb", _SMALL),                          # qwen3 reasoning
+    ("nb/Qwen3_(14B)-Alpaca.ipynb", _SMALL),                           # qwen3 alpaca
+    ("nb/CodeGemma_(7B)-Conversational.ipynb", _SMALL),                # codegemma conversational
+    ("nb/Llama3_(8B)-Conversational.ipynb", _SMALL),                   # llama3 conversational
+    ("nb/Llama3.2_(1B)-RAFT.ipynb", _SMALL),                           # RAFT structure
+    ("nb/Mistral_(7B)-Text_Completion.ipynb", _SMALL),                # text completion (LM collator)
+    ("nb/Mistral_v0.3_(7B)-CPT.ipynb", _SMALL),                        # continued pretraining
+    ("nb/Mistral_Nemo_(12B)-Alpaca.ipynb", _SMALL),                    # mistral nemo
+    ("nb/Phi_3_Medium-Conversational.ipynb", _SMALL),                  # phi-3 medium
     ("nb/Phi_4-Conversational.ipynb", _SMALL),                         # DataCollatorForSeq2Seq
     ("nb/Qwen2.5_Coder_(14B)-Conversational.ipynb", _SMALL),          # DataCollatorForSeq2Seq, coder
-    ("nb/Llama3.2_(1B_and_3B)-Conversational.ipynb", "mlx-community/Llama-3.2-1B-Instruct-4bit"),  # seq2seq, near-real
+    ("nb/LFM2.5_(1.2B)-Text_Completion.ipynb", _SMALL),                # LFM2 text completion
+    ("nb/Llama3.2_(1B_and_3B)-Conversational.ipynb", "mlx-community/Llama-3.2-1B-Instruct-4bit"),  # seq2seq near-real
     ("nb/TinyLlama_(1.1B)-Alpaca.ipynb", _SMALL),                      # packing=True -> soft fallback
 ]
 
