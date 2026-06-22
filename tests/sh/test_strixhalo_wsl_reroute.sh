@@ -1,11 +1,13 @@
 #!/bin/bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 # Unit tests for _maybe_reroute_strixhalo_to_2404() from install.sh.
 #
-# ROCm-on-WSL only targets Ubuntu 24.04: from a newer default distro (e.g. 26.04)
-# with a 24.04 distro present, re-run the install there and stop; otherwise leave
-# the distro alone and let CPU-fallback print the `wsl --install` hint. Tests that
-# decision matrix hermetically -- the function is extracted from install.sh, its
-# absolute paths rewritten to per-test fixtures, with a mock wsl.exe (no real WSL).
+# ROCm-on-WSL only targets Ubuntu 24.04: from a newer distro (e.g. 26.04) with a
+# 24.04 distro present, re-run the install there and stop; otherwise leave the distro
+# alone and let CPU-fallback print the `wsl --install` hint. Tested hermetically: the
+# function is extracted from install.sh, its absolute paths rewritten to per-test
+# fixtures, with a mock wsl.exe (no real WSL).
 #
 # Follows the extract-via-sed pattern of test_get_torch_index_url.sh.
 set -e
@@ -16,7 +18,7 @@ PASS=0
 FAIL=0
 
 # All fixtures/temp files live under one root removed on exit, so a set -e abort
-# (or a failed assertion that stops the script) can't leak dirs into $TMPDIR.
+# can't leak dirs into $TMPDIR.
 _TMP_ROOT=$(mktemp -d)
 trap 'rm -rf "$_TMP_ROOT"' EXIT
 
@@ -101,7 +103,9 @@ run_func() {
         UNSLOTH_WSL_REROUTE_CMD='echo __ROUTED__' \
         "$@" \
         bash -c ". '$_func'; _maybe_reroute_strixhalo_to_2404; echo SKIP_ROCM=\$UNSLOTH_SKIP_ROCM_WSL_SETUP; echo __NOROUTE__" 2>&1
+    _rc=$?
     rm -f "$_func"
+    return "$_rc"
 }
 
 echo "=== test_strixhalo_wsl_reroute ==="
@@ -173,20 +177,19 @@ _out=$(run_func "$_d" SKIP_TORCH=true)
 assert_contains "SKIP_TORCH=true -> no route"           "$_out" "__NOROUTE__"
 rm -rf "$_d"
 
-# 11) Loop-guard payload check: the reroute exec exports UNSLOTH_WSL_REROUTED=1
-#     into the child so the nested install short-circuits gate 7. Verify the
-#     export is part of the command handed to wsl.exe -d.
+# 11) Loop-guard payload: the reroute exports UNSLOTH_WSL_REROUTED=1 into the child
+#     (so the nested install short-circuits gate 7). Verify it reaches wsl.exe -d.
 _d=$(make_fixture 1 strix 0 26.04 1)
 _out=$(run_func "$_d" UNSLOTH_WSL_REROUTE_CMD='echo flag=[$UNSLOTH_WSL_REROUTED]')
 assert_contains "reroute exports loop-guard flag"       "$_out" "flag=[1]"
 rm -rf "$_d"
 
-# 12) Already on 22.04 -> NO route. AMD supports ROCm-on-WSL on both 24.04 and
-#     22.04 (Radeon/Ryzen docs), so a supported 22.04 distro must not be displaced.
+# 12) On Ubuntu 22.04 -> unsupported by the ROCm-on-WSL bootstrap (helper targets
+#     24.04 only), so with a 24.04 distro present reroute the GPU install there.
 _d=$(make_fixture 1 strix 0 22.04 1)
 _out=$(run_func "$_d")
-assert_contains "on 22.04 (AMD-supported) -> no route"  "$_out" "__NOROUTE__"
-assert_absent   "on 22.04 -> reroute not attempted"     "$_out" "__ROUTED__"
+assert_contains "22.04 + existing 24.04 -> routes"      "$_out" "__ROUTED__"
+assert_absent   "22.04 route stops current distro"      "$_out" "__NOROUTE__"
 rm -rf "$_d"
 
 # 13) --local install -> NO auto-reroute (a local checkout can't be replayed via
@@ -235,9 +238,10 @@ rm -rf "$_d"
 
 # 19) No wsl.exe on an unsupported distro -> can't reach a 24.04 target, so stay
 #     CPU-only AND set the skip guard (don't bootstrap ROCm into 26.04 etc.).
+#     Drop the stub AND pin PATH to coreutils so a real host wsl.exe can't leak in.
 _d=$(make_fixture 1 strix 0 26.04 1)
 rm -f "$_d/bin/wsl.exe"
-_out=$(run_func "$_d")
+_out=$(run_func "$_d" PATH="$_d/bin:/usr/bin:/bin")
 assert_contains "no wsl.exe -> no route"                          "$_out" "__NOROUTE__"
 assert_absent   "no wsl.exe -> not rerouted"                      "$_out" "__ROUTED__"
 assert_contains "no wsl.exe -> skip ROCm bootstrap"               "$_out" "SKIP_ROCM=1"
@@ -251,7 +255,7 @@ _out=$(run_func "$_d" UNSLOTH_ROCM_WSL_AUTO=1 \
 assert_contains "UNSLOTH_ROCM_WSL_AUTO forwarded to reroute"      "$_out" "auto=[1]"
 rm -rf "$_d"
 
-# 21) Both 24.04 and 22.04 installed -> prefer 24.04 (AMD's primary target).
+# 21) Both 24.04 and 22.04 installed -> target 24.04 (the only bootstrap-supported one).
 _d=$(make_fixture 1 strix 0 26.04 1)
 printf 'Ubuntu\nUbuntu-22.04\nUbuntu-24.04\n' > "$_d/distros"
 _out=$(run_func "$_d")
@@ -260,13 +264,14 @@ assert_contains "both present -> targets 24.04"                   "$_out" "-d Ub
 assert_absent   "both present -> does not target 22.04"           "$_out" "-d Ubuntu-22.04"
 rm -rf "$_d"
 
-# 22) Only 22.04 installed -> reroute to 22.04 (also AMD-supported), not CPU-only.
+# 22) Only 22.04 installed (no 24.04) -> no route. 22.04 isn't a bootstrap target,
+#     so stay CPU-only and skip the origin ROCm bootstrap.
 _d=$(make_fixture 1 strix 0 26.04 0)
 printf 'Ubuntu\nUbuntu-22.04\n' > "$_d/distros"
 _out=$(run_func "$_d")
-assert_contains "only 22.04 -> routes"                            "$_out" "__ROUTED__"
-assert_contains "only 22.04 -> targets 22.04"                     "$_out" "-d Ubuntu-22.04"
-assert_absent   "only 22.04 -> stops current distro"              "$_out" "__NOROUTE__"
+assert_contains "only 22.04 -> no route"                          "$_out" "__NOROUTE__"
+assert_absent   "only 22.04 -> not rerouted"                      "$_out" "__ROUTED__"
+assert_contains "only 22.04 -> skip ROCm bootstrap"               "$_out" "SKIP_ROCM=1"
 rm -rf "$_d"
 
 # 23) Neither 24.04 nor 22.04 present -> stay CPU-only and skip the ROCm bootstrap.
@@ -278,7 +283,7 @@ assert_contains "no supported target -> skip ROCm bootstrap"      "$_out" "SKIP_
 rm -rf "$_d"
 
 # 24) A custom distro that merely CONTAINS the name (Ubuntu-24.04-test) but has no
-#     exact Ubuntu-24.04/22.04 must NOT be picked (substring match would fail wsl -d).
+#     exact Ubuntu-24.04 must NOT be picked (substring match would fail wsl -d).
 _d=$(make_fixture 1 strix 0 26.04 0)
 printf 'Ubuntu\nUbuntu-24.04-test\n' > "$_d/distros"
 _out=$(run_func "$_d")
@@ -293,6 +298,24 @@ printf 'Ubuntu\nUbuntu-24.04-test\nUbuntu-24.04\n' > "$_d/distros"
 _out=$(run_func "$_d")
 assert_contains "exact + custom -> routes"                        "$_out" "__ROUTED__"
 assert_contains "exact + custom -> targets the exact 24.04"       "$_out" "-d Ubuntu-24.04 --"
+rm -rf "$_d"
+
+# 26) Tauri mode: a child exit 2 ([TAURI:NEED_SUDO]) must propagate so the desktop app
+#     drives elevation for the target distro, not get masked as a CPU fallback here.
+_d=$(make_fixture 1 strix 0 26.04 1)
+_rc=0
+_out=$(run_func "$_d" TAURI_MODE=true UNSLOTH_WSL_REROUTE_CMD='exit 2') || _rc=$?
+if [ "$_rc" = "2" ]; then echo "  PASS: tauri child exit 2 -> reroute propagates exit 2"; PASS=$((PASS+1)); else echo "  FAIL: tauri exit 2 not propagated (rc=$_rc)"; FAIL=$((FAIL+1)); fi
+assert_absent   "tauri exit 2 -> not a CPU fallback"              "$_out" "__NOROUTE__"
+rm -rf "$_d"
+
+# 27) Non-tauri mode: a child exit 2 is just a failure -> CPU fallback, not propagated.
+_d=$(make_fixture 1 strix 0 26.04 1)
+_rc=0
+_out=$(run_func "$_d" UNSLOTH_WSL_REROUTE_CMD='exit 2') || _rc=$?
+if [ "$_rc" = "0" ]; then echo "  PASS: non-tauri exit 2 -> not propagated"; PASS=$((PASS+1)); else echo "  FAIL: non-tauri exit 2 wrongly propagated (rc=$_rc)"; FAIL=$((FAIL+1)); fi
+assert_contains "non-tauri child fail -> CPU fallback"            "$_out" "__NOROUTE__"
+assert_contains "non-tauri child fail -> skip ROCm bootstrap"     "$_out" "SKIP_ROCM=1"
 rm -rf "$_d"
 
 echo ""

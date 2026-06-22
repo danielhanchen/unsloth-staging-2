@@ -1,10 +1,12 @@
 #!/usr/bin/env pwsh
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 # Unit test for _RemoveDataDirKeepingWslIcon in scripts/uninstall.ps1.
 #
 # A native uninstall must NOT delete the shared unsloth.ico while a WSL shortcut
 # still points at it (else that shortcut blanks). Extracts the helper via AST and
-# runs it on a temp data dir with a controlled ShortcutDirs list (no real Desktop
-# / Start Menu), covering the dual-install and native-only cases.
+# runs it on a temp data dir with a controlled ShortcutDirs list (dual-install vs
+# native-only), so no real Desktop / Start Menu is touched.
 #
 # Run: pwsh -NoProfile -File tests/studio/test_uninstall_dual_install_icon.ps1
 
