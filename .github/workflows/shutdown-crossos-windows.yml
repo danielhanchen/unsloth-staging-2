@@ -1,0 +1,48 @@
+name: shutdown-crossos windows
+on:
+  push:
+    branches: [pr6566-cross-os]
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - 'studio/backend/run.py'
+      - 'unsloth_cli/commands/studio.py'
+      - 'tests/test_shutdown_crossos.py'
+      - 'tests/test_studio_shutdown_thread_wait.py'
+      - '.github/workflows/shutdown-crossos-windows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - 'studio/backend/run.py'
+      - 'unsloth_cli/commands/studio.py'
+      - 'tests/test_shutdown_crossos.py'
+      - 'tests/test_studio_shutdown_thread_wait.py'
+      - '.github/workflows/shutdown-crossos-windows.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  shutdown-windows:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+      - name: Shell syntax of install.sh via Git Bash
+        shell: bash
+        run: bash -n install.sh
+      - name: py_compile changed files
+        run: python -m py_compile studio/backend/run.py unsloth_cli/commands/studio.py tests/test_studio_shutdown_thread_wait.py tests/test_shutdown_crossos.py
+      - name: pytest (AST + contract; pty behavioural auto-skips on Windows)
+        run: python -m pytest tests/test_studio_shutdown_thread_wait.py tests/test_shutdown_crossos.py -v

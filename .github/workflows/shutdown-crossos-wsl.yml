@@ -1,0 +1,53 @@
+name: shutdown-crossos wsl
+on:
+  push:
+    branches: [pr6566-cross-os]
+    paths:
+      - 'install.sh'
+      - 'studio/backend/run.py'
+      - 'unsloth_cli/commands/studio.py'
+      - 'tests/test_shutdown_crossos.py'
+      - 'tests/test_studio_shutdown_thread_wait.py'
+      - '.github/workflows/shutdown-crossos-wsl.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'install.sh'
+      - 'studio/backend/run.py'
+      - 'unsloth_cli/commands/studio.py'
+      - 'tests/test_shutdown_crossos.py'
+      - 'tests/test_studio_shutdown_thread_wait.py'
+      - '.github/workflows/shutdown-crossos-wsl.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  shutdown-wsl:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Set up WSL (Ubuntu) with python + pytest
+        uses: Vampire/setup-wsl@v3
+        with:
+          distribution: Ubuntu-22.04
+          additional-packages: python3 python3-pytest dash
+      - name: Sanity (where am I)
+        shell: wsl-bash {0}
+        run: |
+          pwd
+          ls -la install.sh tests/test_shutdown_crossos.py
+      - name: Shell syntax under WSL bash + dash
+        shell: wsl-bash {0}
+        run: |
+          bash -n install.sh
+          dash -n install.sh
+      - name: pytest (AST + behavioural) under WSL
+        shell: wsl-bash {0}
+        run: |
+          python3 -m pytest tests/test_studio_shutdown_thread_wait.py tests/test_shutdown_crossos.py -v
