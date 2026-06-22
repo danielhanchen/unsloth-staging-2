@@ -41,15 +41,19 @@ check(isinstance(vis, dict) and isinstance(vis.get("devices"), list),
       "get_backend_visible_gpu_info is dict with devices list")
 
 # 4) /api/system psutil reads work on this OS (the PR's new fields), guarded.
-def guarded(fn):
+def guarded(label, fn):
+    # Defer the attribute access INTO the try, mirroring the PR's
+    # `cpu_freq = psutil.cpu_freq()` inside try/except. On macOS arm64 some
+    # psutil builds omit cpu_freq entirely, so even the attribute lookup can
+    # raise AttributeError -- which the PR's `except Exception` catches.
     try: return fn()
     except Exception as e:
-        print("   (probe raised, handled):", type(e).__name__); return None
+        print(f"   ({label} probe handled): {type(e).__name__}"); return None
 mem = psutil.virtual_memory()
 check(mem.total > 0, "virtual_memory().total > 0")
-cpu_freq = guarded(psutil.cpu_freq)
-disk = guarded(lambda: psutil.disk_usage(os.path.abspath(os.sep)))
-boot = guarded(psutil.boot_time)
+cpu_freq = guarded("cpu_freq", lambda: psutil.cpu_freq())
+disk = guarded("disk", lambda: psutil.disk_usage(os.path.abspath(os.sep)))
+boot = guarded("boot_time", lambda: psutil.boot_time())
 check(psutil.cpu_count(logical=True) is not None, "cpu_count(logical) available")
 uptime = round(time.time() - boot) if boot else None
 print(f"   cpu_freq={'set' if cpu_freq else None} disk={'set' if disk else None} uptime={uptime}")
