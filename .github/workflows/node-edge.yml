@@ -322,7 +322,7 @@ jobs:
           os.environ["PATH"] = os.pathsep.join(kept)
           assert shutil.which("node") is None, "system node still on PATH after scrub"
           nr = importlib.import_module("utils.node_runtime")
-          nr.resolve_node_executable.cache_clear()
+          nr._reset_resolved_node()
           exe = nr.resolve_node_executable()
           managed = str(nr.managed_node_binary())
           assert exe == managed, f"resolver returned {exe!r}, expected managed {managed!r}"
