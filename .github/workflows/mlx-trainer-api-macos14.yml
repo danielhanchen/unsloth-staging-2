@@ -79,6 +79,9 @@ jobs:
       - name: MLX trainer-api real probes (+ tiny real LoRA training)
         run: python tests/staging/mlx_trainer_api_real_probes.py
 
+      - name: Real migrated notebook end-to-end on MLX (Gemma3-270M, FastModel)
+        run: python tests/staging/run_gemma3_270m_notebook_mlx.py
+
       - name: PR MLX public-trainer pytest suite (runs for real on MLX)
         working-directory: unsloth_src
         run: python -m pytest tests/python/test_mlx_public_trainer_api.py -v --tb=short -p no:cacheprovider
