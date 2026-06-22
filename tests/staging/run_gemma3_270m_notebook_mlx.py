@@ -138,7 +138,6 @@ trainer = train_on_responses_only(
 
 # Now let's print the masked out example - you should see only the answer is present:
 
-tokenizer.decode([tokenizer.pad_token_id if x == -100 else x for x in trainer.train_dataset[100]["labels"]]).replace(tokenizer.pad_token, " ")
 
 # @title Show current memory stats
 from unsloth import get_gpu_memory_stats
