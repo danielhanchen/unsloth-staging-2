@@ -58,7 +58,9 @@ jobs:
           # to the PR head (unsloth_src) under site-packages.
           rm -rf "$GITHUB_WORKSPACE/unsloth"
           # runtime deps the MLX training path needs (transformers arrives via mlx-lm).
-          pip install datasets sentencepiece protobuf 'pytest==9.0.3' pytest-timeout
+          # real trl so the TRL->MLX shim test exercises the "patch real trl in
+          # place" path (the config a notebook user who also has trl installed hits).
+          pip install datasets sentencepiece protobuf trl 'pytest==9.0.3' pytest-timeout
           python -c "import unsloth, unsloth_zoo; print('unsloth at', unsloth.__file__); print('zoo at', unsloth_zoo.__file__)"
 
       - name: Real Apple Silicon + real mlx sanity
