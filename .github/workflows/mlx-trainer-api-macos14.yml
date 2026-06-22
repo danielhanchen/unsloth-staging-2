@@ -47,6 +47,9 @@ jobs:
           # zoo PR head: [mlx] extra pulls real mlx / mlx-lm / mlx-vlm wheels.
           git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth-zoo zoo
           git -C zoo log --oneline -1
+          # Proposed fix: make patch_tokenizer fall back to .encode for mlx-lm
+          # TokenizerWrapper so get_chat_template works for mlx-community models.
+          git -C zoo apply "$GITHUB_WORKSPACE/tests/staging/tokenizer_wrapper_mlx.patch"
           pip install -e './zoo[mlx]'
           # unsloth PR head: public UnslothTrainer / UnslothTrainingArguments API.
           git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth unsloth_src

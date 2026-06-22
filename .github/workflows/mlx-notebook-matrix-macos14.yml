@@ -41,6 +41,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
           git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth-zoo zoo
+          git -C zoo apply "$GITHUB_WORKSPACE/tests/staging/tokenizer_wrapper_mlx.patch"
           pip install -e './zoo[mlx]'
           git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth unsloth_src
           git -C unsloth_src apply "$GITHUB_WORKSPACE/tests/staging/seq2seq_collator_mlx.patch"

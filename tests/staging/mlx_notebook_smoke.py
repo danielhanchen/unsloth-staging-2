@@ -59,6 +59,9 @@ def convert(nb_path, model_override):
             continue
         if any(m in src for m in DROP_CELL_MARKERS):
             continue
+        # drop Jupyter magic / shell cells (`!cmd`, `%magic`) - install/deploy/inference
+        if any(ln.strip().startswith(("!", "%")) for ln in src.splitlines()):
+            continue
         if "trainer.train_dataset[" in src and "decode" in src:
             continue
         cells.append(src)
