@@ -31,15 +31,15 @@ NOTEBOOKS = [
     ("nb/Gemma3_(270M).ipynb", None),                                  # plain SFT, FastModel, gemma3 (real model)
     ("nb/Gemma2_(2B)-Alpaca.ipynb", _SMALL),                           # gemma2 chat template
     ("nb/Gemma4_(E2B)-Text.ipynb", _SMALL),                            # gemma4 text
-    ("nb/Granite4.0_350M.ipynb", _SMALL),                              # IBM Granite structure
+    ("nb/Gemma2_(9B)-Alpaca.ipynb", _SMALL),                           # gemma2 9B alpaca
     ("nb/Qwen2.5_(7B)-Alpaca.ipynb", _SMALL),                          # Alpaca SFT
     ("nb/Qwen3_(4B)-Thinking.ipynb", _SMALL),                          # qwen3 reasoning
     ("nb/Qwen3_(14B)-Alpaca.ipynb", _SMALL),                           # qwen3 alpaca
-    ("nb/CodeGemma_(7B)-Conversational.ipynb", _SMALL),                # codegemma conversational
+    ("nb/CodeGemma_(7B)-Conversational.ipynb", _SMALL),                # chatml + map_eos_token=True (TokenizerWrapper.to_str fix)
     ("nb/Llama3_(8B)-Conversational.ipynb", _SMALL),                   # llama3 conversational
-    ("nb/Llama3.2_(1B)-RAFT.ipynb", _SMALL),                           # RAFT structure
+    ("nb/Llama3.1_(8B)-Alpaca.ipynb", _SMALL),                         # llama3.1 alpaca
     ("nb/Mistral_(7B)-Text_Completion.ipynb", _SMALL),                # text completion (LM collator)
-    ("nb/Mistral_v0.3_(7B)-CPT.ipynb", _SMALL),                        # continued pretraining
+    ("nb/Mistral_v0.3_(7B)-CPT.ipynb", _SMALL),                        # continued pretraining (embedding_learning_rate)
     ("nb/Mistral_Nemo_(12B)-Alpaca.ipynb", _SMALL),                    # mistral nemo
     ("nb/Phi_3_Medium-Conversational.ipynb", _SMALL),                  # phi-3 medium
     ("nb/Phi_4-Conversational.ipynb", _SMALL),                         # DataCollatorForSeq2Seq
@@ -52,6 +52,8 @@ NOTEBOOKS = [
 DROP_CELL_MARKERS = (
     "pip install", "subprocess", "for_inference", "model.generate", "TextStreamer",
     "save_pretrained", "push_to_hub", "from IPython", "display(", "GGUF", "llama.cpp",
+    # inference helpers defined in dropped generate cells but called in kept cells
+    "do_gemma_4_inference", ".generate(",
 )
 
 
@@ -89,8 +91,11 @@ def convert(nb_path, model_override):
         code = re.sub(r'model_name\s*=\s*["\'][^"\']+["\']', f'model_name = "{model_override}"', code)
     code = re.sub(r'max_steps\s*=\s*\d+', 'max_steps = 3', code)
     code = re.sub(r'max_seq_length\s*=\s*\d+', 'max_seq_length = 512', code)
-    code = re.sub(r'split\s*=\s*"train(\[[^"]*\])?"', 'split = "train[:48]"', code)
-    code = re.sub(r"split\s*=\s*'train(\[[^']*\])?'", "split = 'train[:48]'", code)
+    # Notebooks that split off a tiny fraction (e.g. CPT's train_size=0.01) need a
+    # bigger base slice so the resulting train set is non-empty after the split.
+    _slice = "train[:600]" if "train_test_split" in code else "train[:48]"
+    code = re.sub(r'split\s*=\s*"train(\[[^"]*\])?"', f'split = "{_slice}"', code)
+    code = re.sub(r"split\s*=\s*'train(\[[^']*\])?'", f"split = '{_slice}'", code)
     # ease the paravirtual Metal GPU
     code = re.sub(r'per_device_train_batch_size\s*=\s*\d+', 'per_device_train_batch_size = 1', code)
     code = re.sub(r'gradient_accumulation_steps\s*=\s*\d+', 'gradient_accumulation_steps = 2', code)

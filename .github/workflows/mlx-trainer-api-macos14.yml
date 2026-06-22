@@ -59,6 +59,10 @@ jobs:
           # run unchanged. MLXTrainer batches/masks/pads natively, so the collator
           # is redundant rather than unsupported.
           git -C unsloth_src apply "$GITHUB_WORKSPACE/tests/staging/seq2seq_collator_mlx.patch"
+          # Proposed fix: unwrap mlx-lm's TokenizerWrapper inside get_chat_template
+          # so the map_eos_token / chatml token-swap path (CodeGemma + ~18
+          # Conversational notebooks) works for mlx-community models.
+          git -C unsloth_src apply "$GITHUB_WORKSPACE/tests/staging/chat_template_tokenizerwrapper_mlx.patch"
           git -C unsloth_src --no-pager diff --stat
           pip install --no-deps -e ./unsloth_src
           # This staging repo is itself a fork of unsloth, so its repo-root
@@ -97,6 +101,10 @@ jobs:
       - name: Real Vision notebook on MLX (Qwen2-VL-2B, UnslothVisionDataCollator)
         continue-on-error: true   # vision is heavy for the CI paravirtual Metal GPU; report-only
         run: python tests/staging/run_vision_lite_mlx.py
+
+      - name: Pre-quantized bnb-4bit checkpoint load on MLX (TinyLlama; report-only)
+        continue-on-error: true   # 47 notebooks use unsloth/*-bnb-4bit names; probe whether they load
+        run: python tests/staging/bnb4bit_load_probe_mlx.py
 
       - name: PR MLX public-trainer pytest suite (runs for real on MLX)
         working-directory: unsloth_src

@@ -12,6 +12,8 @@ on:
     paths:
       - 'tests/staging/mlx_notebook_smoke.py'
       - 'tests/staging/seq2seq_collator_mlx.patch'
+      - 'tests/staging/chat_template_tokenizerwrapper_mlx.patch'
+      - 'tests/staging/tokenizer_wrapper_mlx.patch'
       - '.github/workflows/mlx-notebook-matrix-macos14.yml'
   workflow_dispatch:
 
@@ -45,6 +47,7 @@ jobs:
           pip install -e './zoo[mlx]'
           git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth unsloth_src
           git -C unsloth_src apply "$GITHUB_WORKSPACE/tests/staging/seq2seq_collator_mlx.patch"
+          git -C unsloth_src apply "$GITHUB_WORKSPACE/tests/staging/chat_template_tokenizerwrapper_mlx.patch"
           pip install --no-deps -e ./unsloth_src
           rm -rf "$GITHUB_WORKSPACE/unsloth"
           pip install datasets sentencepiece protobuf trl
