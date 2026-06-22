@@ -67,10 +67,7 @@ dataset[2]["text"]
 
 # We can also render the LaTeX in the browser directly!
 
-from IPython.display import display, Math, Latex
 
-latex = dataset[2]["text"]
-display(Math(latex))
 
 # To format the dataset, all vision finetuning tasks should be formatted as follows:
 # 

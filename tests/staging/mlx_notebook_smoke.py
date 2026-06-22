@@ -35,7 +35,7 @@ NOTEBOOKS = [
     ("nb/Gemma2_(9B)-Alpaca.ipynb", _SMALL),                           # plain SFT, gemma2 chat template
     ("nb/Qwen3_(4B)-Instruct.ipynb", _SMALL),                          # plain SFT, qwen3 structure
     ("nb/Phi_3.5_Mini-Conversational.ipynb", _SMALL),                  # conversational, get_chat_template
-    ("nb/Meta-Synthetic-Data-Llama3.1_(8B).ipynb", _SMALL),           # synthetic-data SFT
+    ("nb/Llama3.1_(8B)-Alpaca.ipynb", _SMALL),                        # classic Alpaca SFT (Llama 3.1)
     ("nb/Phi_4-Conversational.ipynb", _SMALL),                         # DataCollatorForSeq2Seq
     ("nb/Qwen2.5_Coder_(14B)-Conversational.ipynb", _SMALL),          # DataCollatorForSeq2Seq, coder
     ("nb/Llama3.2_(1B_and_3B)-Conversational.ipynb", "mlx-community/Llama-3.2-1B-Instruct-4bit"),  # seq2seq, near-real
