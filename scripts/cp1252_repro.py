@@ -19,6 +19,17 @@ import subprocess
 import sys
 import tempfile
 
+# This harness PRINTS the unicode payload as part of its diagnostics. On a native
+# cp1252 Windows console that print() would itself raise the very UnicodeEncodeError
+# we are demonstrating, killing the script before it can report results. Force the
+# harness's own stdout to utf-8 so only the OLD code paths under test exhibit the
+# bug, not the reporting around them.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
+
 # Arrow, em-dash, accent, CJK, check, astral-plane emoji. ``ā`` (U+0101) is
 # included because its UTF-8 bytes (0xC4 0x81) contain 0x81, which is UNDEFINED
 # in cp1252 -- so decoding those bytes as cp1252 raises UnicodeDecodeError
