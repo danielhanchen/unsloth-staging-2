@@ -972,31 +972,105 @@ async def get_system_info(current_subject: str = Depends(get_current_subject)):
     """
     import platform
     import psutil
-    from utils.hardware import get_device
+    import os
+    import time
+    import logging
+    from utils.hardware import get_device, get_backend_visible_gpu_info, get_visible_gpu_utilization
     from utils.hardware.hardware import _backend_label
 
+    # Logger used by the except blocks below
+    logger = logging.getLogger(__name__)
+
     visibility_info = get_backend_visible_gpu_info()
+    utilization_info = get_visible_gpu_utilization()
+
+    util_devices = {d.get("index"): d for d in utilization_info.get("devices", [])}
+    enriched_devices = []
+
+    for dev in visibility_info.get("devices", []):
+        idx = dev.get("index")
+        util = util_devices.get(idx, {})
+
+        total_vram = util.get("vram_total_gb") or dev.get("memory_total_gb") or 0
+        used_vram = util.get("vram_used_gb") or 0
+
+        enriched_dev = dict(dev)
+        enriched_dev["vram_used_gb"] = used_vram
+        enriched_dev["vram_free_gb"] = round(total_vram - used_vram, 2) if total_vram else 0
+        enriched_dev["vram_utilization_pct"] = util.get("vram_utilization_pct")
+        enriched_devices.append(enriched_dev)
+
     gpu_info = {
-        "available": visibility_info["available"],
-        "devices": visibility_info["devices"],
+        "available": visibility_info.get("available", False),
+        "devices": enriched_devices,
     }
 
-    # CPU & Memory
+    # CPU | Memory| Disk
     memory = psutil.virtual_memory()
+
+    try:
+        cpu_freq = psutil.cpu_freq()
+    except Exception as e:
+        logger.debug(f"Failed to get CPU frequency: {e}")
+        cpu_freq = None
+
+    try:
+        disk = psutil.disk_usage(os.path.abspath(os.sep))
+    except Exception as e:
+        logger.debug(f"Failed to get disk usage: {e}")
+        disk = None
+
+    try:
+        current_process = psutil.Process(os.getpid())
+    except Exception as e:
+        logger.debug(f"Failed to get current process: {e}")
+        current_process = None
+
+    try:
+        boot_time = psutil.boot_time()
+    except Exception as e:
+        logger.debug(f"Failed to get boot time: {e}")
+        boot_time = None
+
+    # Read versions from metadata so a 3s system poll never imports heavy ML
+    # libraries (and never 500s on their import-time failures).
+    from importlib.metadata import PackageNotFoundError, version as pkg_version
+
+    ml_packages = {}
+    for pkg in ("torch", "transformers"):
+        try:
+            ml_packages[pkg] = pkg_version(pkg)
+        except PackageNotFoundError:
+            pass
+        except Exception as e:
+            logger.debug(f"Failed to read {pkg} version: {e}")
 
     return {
         "platform": platform.platform(),
         "python_version": platform.python_version(),
-        # _backend_label so /api/system reports "rocm" (not "cuda") on AMD,
-        # matching /api/hardware and /api/gpu-visibility.
         "device_backend": _backend_label(get_device()),
-        "cpu_count": psutil.cpu_count(),
+        "uptime_seconds": round(time.time() - boot_time) if boot_time else None,
+        "cpu": {
+            "logical_count": psutil.cpu_count(logical = True),
+            "physical_count": psutil.cpu_count(logical = False),
+            "usage_percent": psutil.cpu_percent(interval = None),
+            "frequency_mhz": round(cpu_freq.current, 2) if cpu_freq else None,
+        },
         "memory": {
-            "total_gb": round(memory.total / 1e9, 2),
-            "available_gb": round(memory.available / 1e9, 2),
+            "total_gb": memory.total / 1024**3,
+            "available_gb": memory.available / 1024**3,
             "percent_used": memory.percent,
+            "process_used_mb": round(current_process.memory_info().rss / 1024**2)
+            if current_process
+            else 0,
+        },
+        "disk": {
+            "total_gb": round(disk.total / 1e9, 2) if disk else 0,
+            "free_gb": round(disk.free / 1e9, 2) if disk else 0,
+            "percent_used": disk.percent if disk else 0,
         },
         "gpu": gpu_info,
+        "ml_packages": ml_packages,
     }
 
 
