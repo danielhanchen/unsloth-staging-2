@@ -23,13 +23,23 @@ HF_HUB = os.path.expanduser("~/.cache/huggingface/hub")
 # (relative notebook path, model override or None). Overrides keep CI light by
 # using small pre-quantized MLX models; the dedicated per-notebook steps test the
 # notebooks' real models.
+# Text notebooks across diverse structures (chat templates, datasets, collators,
+# packing). Small overrides keep CI light; the point is "does the notebook code
+# run on MLX". Vision is validated separately (heavy for the CI paravirtual GPU).
+_SMALL = "mlx-community/Qwen2.5-0.5B-Instruct-4bit"
 NOTEBOOKS = [
-    ("nb/Gemma3_(270M).ipynb", None),                                              # plain SFT, FastModel
-    ("nb/Qwen2.5_(7B)-Alpaca.ipynb", "mlx-community/Qwen2.5-0.5B-Instruct-4bit"),  # plain Alpaca SFT
-    ("nb/Mistral_v0.3_(7B)-Alpaca.ipynb", "mlx-community/Qwen2.5-0.5B-Instruct-4bit"),  # plain SFT, Mistral family
-    ("nb/Phi_4-Conversational.ipynb", "mlx-community/Qwen2.5-0.5B-Instruct-4bit"), # DataCollatorForSeq2Seq
-    ("nb/TinyLlama_(1.1B)-Alpaca.ipynb", "mlx-community/TinyLlama-1.1B-Chat-v1.0-4bit"),  # packing=True
-    ("nb/Qwen2_VL_(7B)-Vision.ipynb", "mlx-community/Qwen2-VL-2B-Instruct-4bit"),  # vision / UnslothVisionDataCollator
+    ("nb/Gemma3_(270M).ipynb", None),                                   # plain SFT, FastModel, gemma3 arch (real)
+    ("nb/Qwen2.5_(7B)-Alpaca.ipynb", _SMALL),                          # plain Alpaca SFT
+    ("nb/Qwen2_(7B)-Alpaca.ipynb", _SMALL),                            # plain Alpaca SFT
+    ("nb/Mistral_v0.3_(7B)-Alpaca.ipynb", _SMALL),                     # plain SFT, Mistral family
+    ("nb/Gemma2_(9B)-Alpaca.ipynb", _SMALL),                           # plain SFT, gemma2 chat template
+    ("nb/Qwen3_(4B)-Instruct.ipynb", _SMALL),                          # plain SFT, qwen3 structure
+    ("nb/Phi_3.5_Mini-Conversational.ipynb", _SMALL),                  # conversational, get_chat_template
+    ("nb/Meta-Synthetic-Data-Llama3.1_(8B).ipynb", _SMALL),           # synthetic-data SFT
+    ("nb/Phi_4-Conversational.ipynb", _SMALL),                         # DataCollatorForSeq2Seq
+    ("nb/Qwen2.5_Coder_(14B)-Conversational.ipynb", _SMALL),          # DataCollatorForSeq2Seq, coder
+    ("nb/Llama3.2_(1B_and_3B)-Conversational.ipynb", "mlx-community/Llama-3.2-1B-Instruct-4bit"),  # seq2seq, near-real
+    ("nb/TinyLlama_(1.1B)-Alpaca.ipynb", _SMALL),                      # packing=True -> soft fallback
 ]
 
 DROP_CELL_MARKERS = (
@@ -106,11 +116,6 @@ def main():
             print("   " + line)
         print(f"RESULT {nb_rel}: {'PASS' if ok else 'FAIL'} {err}", flush=True)
         results.append((nb_rel, ok, err))
-        # free disk between heavy model downloads
-        if os.path.isdir(HF_HUB):
-            for d in os.listdir(HF_HUB):
-                if d.startswith("models--"):
-                    shutil.rmtree(os.path.join(HF_HUB, d), ignore_errors=True)
 
     print("\n==================== MLX NOTEBOOK MATRIX ====================", flush=True)
     for nb_rel, ok, err in results:
