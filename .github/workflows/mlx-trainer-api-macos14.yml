@@ -91,6 +91,10 @@ jobs:
       - name: Real DataCollatorForSeq2Seq notebook end-to-end on MLX (Llama-3.2-1B Conversational)
         run: python tests/staging/run_llama_seq2seq_notebook_mlx.py
 
+      - name: Real Vision notebook on MLX (Qwen2-VL-2B, UnslothVisionDataCollator)
+        continue-on-error: true   # vision is heavy for the CI paravirtual Metal GPU; report-only
+        run: python tests/staging/run_vision_lite_mlx.py
+
       - name: PR MLX public-trainer pytest suite (runs for real on MLX)
         working-directory: unsloth_src
         run: python -m pytest tests/python/test_mlx_public_trainer_api.py -v --tb=short -p no:cacheprovider
