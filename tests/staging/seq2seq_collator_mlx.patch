@@ -1,0 +1,77 @@
+diff --git a/unsloth/__init__.py b/unsloth/__init__.py
+index 6fcf07f52..78540bdce 100644
+--- a/unsloth/__init__.py
++++ b/unsloth/__init__.py
+@@ -720,6 +720,29 @@ if _IS_MLX:
+     )
+     _MLX_TRAINER_KWARGS = frozenset(_MLX_TRAINER_POSITIONAL_KWARGS)
+ 
++    def _is_mlx_native_text_collator(collator):
++        """Return whether a HF text collator is redundant (and safe to drop) on MLX.
++
++        MLXTrainer tokenizes `dataset_text_field`, applies the response mask, and
++        pads input_ids/labels natively, so standard HF pad/copy collators add
++        nothing on MLX. Recognizing them lets notebooks that pass
++        `DataCollatorForSeq2Seq` (and similar) run unchanged on Apple Silicon
++        instead of erroring. Matched by class name to avoid importing
++        transformers on the torch-free MLX import path.
++        """
++        for klass in type(collator).__mro__:
++            name = klass.__name__
++            if name in (
++                "DataCollatorForSeq2Seq",
++                "DataCollatorWithPadding",
++                "DefaultDataCollator",
++            ):
++                return True
++            if name == "DataCollatorForLanguageModeling":
++                # Plain causal padding is fine; MLM masking changes semantics.
++                return not bool(getattr(collator, "mlm", False))
++        return False
++
+     class UnslothTrainer(MLXTrainer):
+         """Backend-aware public trainer that routes supported SFT notebooks to MLX."""
+ 
+@@ -742,23 +765,30 @@ if _IS_MLX:
+ 
+             data_collator = kwargs.pop("data_collator", None)
+             if data_collator is not None:
+-                if not isinstance(data_collator, UnslothVisionDataCollator):
++                if isinstance(data_collator, UnslothVisionDataCollator):
++                    collator_processor = getattr(data_collator, "processor", None)
++                    if collator_processor is not None and (
++                        kwargs.get("processor", None) is None or processor_from_processing_class
++                    ):
++                        kwargs["processor"] = collator_processor
++                        if kwargs.get("tokenizer", None) is None:
++                            kwargs["tokenizer"] = getattr(
++                                collator_processor,
++                                "tokenizer",
++                                collator_processor,
++                            )
++                elif _is_mlx_native_text_collator(data_collator):
++                    # Redundant on MLX: MLXTrainer tokenizes dataset_text_field,
++                    # applies the response mask, and pads input_ids/labels
++                    # natively. Drop it so notebooks that pass
++                    # DataCollatorForSeq2Seq run unchanged on Apple Silicon.
++                    pass
++                else:
+                     raise NotImplementedError(
+                         "Unsloth MLX: custom data_collator is not supported by "
+                         "MLXTrainer. Pass the dataset directly or use the MLX "
+                         "trainer's native batching path."
+                     )
+-                collator_processor = getattr(data_collator, "processor", None)
+-                if collator_processor is not None and (
+-                    kwargs.get("processor", None) is None or processor_from_processing_class
+-                ):
+-                    kwargs["processor"] = collator_processor
+-                    if kwargs.get("tokenizer", None) is None:
+-                        kwargs["tokenizer"] = getattr(
+-                            collator_processor,
+-                            "tokenizer",
+-                            collator_processor,
+-                        )
+ 
+             trainer_kwargs, config_kwargs, ignored_kwargs = _split_mlx_trainer_kwargs(kwargs)
+             _raise_unsupported_mlx_trainer_kwargs(ignored_kwargs)

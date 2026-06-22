@@ -51,6 +51,12 @@ jobs:
           # unsloth PR head: public UnslothTrainer / UnslothTrainingArguments API.
           git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth unsloth_src
           git -C unsloth_src log --oneline -1
+          # Proposed fix: accept DataCollatorForSeq2Seq (and similar pad-only HF
+          # text collators) on MLX so the 14 Conversational/Phi-4/Coder notebooks
+          # run unchanged. MLXTrainer batches/masks/pads natively, so the collator
+          # is redundant rather than unsupported.
+          git -C unsloth_src apply "$GITHUB_WORKSPACE/tests/staging/seq2seq_collator_mlx.patch"
+          git -C unsloth_src --no-pager diff --stat
           pip install --no-deps -e ./unsloth_src
           # This staging repo is itself a fork of unsloth, so its repo-root
           # ./unsloth package would shadow the editable PR install when python
@@ -81,6 +87,9 @@ jobs:
 
       - name: Real migrated notebook end-to-end on MLX (Gemma3-270M, FastModel)
         run: python tests/staging/run_gemma3_270m_notebook_mlx.py
+
+      - name: Real DataCollatorForSeq2Seq notebook end-to-end on MLX (Llama-3.2-1B Conversational)
+        run: python tests/staging/run_llama_seq2seq_notebook_mlx.py
 
       - name: PR MLX public-trainer pytest suite (runs for real on MLX)
         working-directory: unsloth_src

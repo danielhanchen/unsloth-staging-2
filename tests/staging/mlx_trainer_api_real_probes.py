@@ -178,25 +178,38 @@ def real_training_probe():
         assert any(f.endswith((".safetensors", ".npz", ".json")) for f in saved), saved
         print(f"OK: real MLX LoRA training completed + adapter saved ({sorted(set(saved))[:8]})")
 
-        # Document the known gap: notebooks that pass a non-vision custom
-        # data_collator (e.g. DataCollatorForSeq2Seq, used by 14 migrated
-        # Conversational/Phi-4/Coder notebooks) currently raise on MLX. So those
-        # notebooks do NOT yet "just run on Mac" -- custom collator is deferred.
+        # With the seq2seq-collator patch, notebooks that pass
+        # DataCollatorForSeq2Seq (14 migrated Conversational/Phi-4/Coder
+        # notebooks) should be ACCEPTED on MLX (the collator is redundant -
+        # MLXTrainer batches/masks/pads natively), while a genuinely custom
+        # collator still raises.
         from transformers import DataCollatorForSeq2Seq
+
+        accepted = UnslothTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=dataset,
+            data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
+            args=UnslothTrainingArguments(
+                dataset_text_field="text", max_steps=1, output_dir=tmp,
+            ),
+        )
+        assert isinstance(accepted, UnslothTrainer)
+        print("OK: DataCollatorForSeq2Seq accepted on MLX (routed through native batching)")
+
+        class _WeirdCustomCollator:
+            def __call__(self, features):
+                return features
 
         try:
             UnslothTrainer(
-                model=model,
-                tokenizer=tokenizer,
-                train_dataset=dataset,
-                data_collator=DataCollatorForSeq2Seq(tokenizer=tokenizer),
-                args=UnslothTrainingArguments(
-                    dataset_text_field="text", max_steps=1, output_dir=tmp,
-                ),
+                model=model, tokenizer=tokenizer, train_dataset=dataset,
+                data_collator=_WeirdCustomCollator(),
+                args=UnslothTrainingArguments(dataset_text_field="text", max_steps=1, output_dir=tmp),
             )
-            raise SystemExit("UNEXPECTED: DataCollatorForSeq2Seq accepted on MLX")
-        except NotImplementedError as exc:
-            print(f"NOTE (known gap): DataCollatorForSeq2Seq rejected on MLX -> {str(exc)[:90]}")
+            raise SystemExit("UNEXPECTED: genuinely custom collator accepted on MLX")
+        except NotImplementedError:
+            print("OK: genuinely custom data_collator still rejected on MLX")
 
 
 real_training_probe()
