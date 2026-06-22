@@ -1,0 +1,74 @@
+# Staging-only CI for unslothai/unsloth PR #6548 (UTF-8 for _python_exec I/O).
+# Validates the Windows-specific fix on a real windows-latest runner, which the
+# upstream studio-backend-ci.yml never does (it runs the backend suite on
+# ubuntu-latest only). Throwaway branch; this PR is closed, never merged.
+name: "PR-6548 windows-latest"
+
+on:
+  push:
+    branches: [pr6548-cross-os]
+    paths:
+      - 'studio/backend/**'
+      - 'scripts/cp1252_repro.py'
+      - '.github/workflows/pr6548-windows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/**'
+      - 'scripts/cp1252_repro.py'
+      - '.github/workflows/pr6548-windows.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  utf8:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.12: keep the historical Windows default codec (cp1252). 3.15+
+          # would enable UTF-8 mode and mask the bug we are reproducing.
+          python-version: '3.12'
+
+      - name: Show OS default codec (expect cp1252 on Windows)
+        shell: bash
+        run: python -c "import locale,sys;print('platform',sys.platform,'preferred',locale.getpreferredencoding(False))"
+
+      # --- Proof 1: the bug class on native Windows cp1252 (stdlib only) ---
+      - name: Self-contained repro script (native Windows codec)
+        shell: bash
+        run: python scripts/cp1252_repro.py --native
+
+      - name: Self-contained repro test (old path crashes, new path round-trips)
+        shell: bash
+        working-directory: studio/backend
+        run: python -m pip install pytest && python -m pytest tests/test_old_behavior_repro.py -v
+
+      # --- Proof 2: the PR's real test against the patched _python_exec ---
+      - name: Install backend deps for the real PR test
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' pytest pytest-asyncio httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.4,<2.11'
+          pip install 'transformers>=4.51,<5.5'
+
+      - name: PR test - _python_exec round-trips non-ASCII (sandbox + bypass)
+        shell: bash
+        working-directory: studio/backend
+        run: python -m pytest tests/test_exec_utf8.py -v

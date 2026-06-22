@@ -1,0 +1,67 @@
+# Staging-only CI for unslothai/unsloth PR #6548 - ubuntu-latest CONTROL.
+# On a utf-8 host the three I/O changes are no-ops, so the PR test must still
+# pass and the repro's forced-cp1252 simulation must still demonstrate the bug.
+# Throwaway branch; this PR is closed, never merged.
+name: "PR-6548 ubuntu-latest"
+
+on:
+  push:
+    branches: [pr6548-cross-os]
+    paths:
+      - 'studio/backend/**'
+      - 'scripts/cp1252_repro.py'
+      - '.github/workflows/pr6548-ubuntu.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/**'
+      - 'scripts/cp1252_repro.py'
+      - '.github/workflows/pr6548-ubuntu.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  utf8:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Show OS default codec (utf-8 on Linux)
+        run: python -c "import locale,sys;print('platform',sys.platform,'preferred',locale.getpreferredencoding(False))"
+
+      # Forced-cp1252 simulation must still show the bug class on a utf-8 host.
+      - name: Self-contained repro script (forced cp1252 simulation)
+        run: python scripts/cp1252_repro.py
+
+      - name: Self-contained repro test (forced cp1252 simulation)
+        working-directory: studio/backend
+        run: python -m pip install pytest && python -m pytest tests/test_old_behavior_repro.py -v
+
+      - name: Install backend deps for the real PR test
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography \
+            pyyaml jinja2 mammoth unpdf requests \
+            'numpy<3' pytest pytest-asyncio httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.4,<2.11'
+          pip install 'transformers>=4.51,<5.5'
+
+      - name: PR test - _python_exec round-trips non-ASCII (no-op on utf-8 host)
+        working-directory: studio/backend
+        run: python -m pytest tests/test_exec_utf8.py -v
