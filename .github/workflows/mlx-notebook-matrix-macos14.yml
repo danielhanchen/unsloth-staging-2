@@ -50,7 +50,9 @@ jobs:
           git -C unsloth_src apply "$GITHUB_WORKSPACE/tests/staging/chat_template_tokenizerwrapper_mlx.patch"
           pip install --no-deps -e ./unsloth_src
           rm -rf "$GITHUB_WORKSPACE/unsloth"
-          pip install datasets sentencepiece protobuf trl
+          # peft: a real `pip install unsloth` pulls it; get_chat_template's
+          # map_eos path imports unsloth.tokenizer_utils which imports peft.
+          pip install datasets sentencepiece protobuf trl peft
 
       - name: Clone notebooks PR
         run: git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/notebooks nb_repo

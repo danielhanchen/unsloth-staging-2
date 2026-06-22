@@ -19,21 +19,39 @@ assert platform.system() == "Darwin" and platform.machine() == "arm64", platform
 MODEL = os.environ.get("BNB4BIT_PROBE_MODEL", "unsloth/tinyllama-bnb-4bit")
 
 
+def _try_load(FastLanguageModel, **kw):
+    label = ", ".join(f"{k}={v}" for k, v in kw.items())
+    print(f"\n... attempting from_pretrained({MODEL!r}, {label}) on MLX")
+    try:
+        model, tokenizer = FastLanguageModel.from_pretrained(
+            model_name=MODEL, max_seq_length=512, **kw
+        )
+        print(f"STRATEGY_OK: {label}")
+        return model, tokenizer
+    except Exception as exc:
+        print(f"STRATEGY_FAILED: {label} -> {type(exc).__name__}: {str(exc)[:160]}")
+        return None, None
+
+
 def main():
     import unsloth  # noqa: F401  (sets DEVICE_TYPE=mlx on import)
     from unsloth import FastLanguageModel
 
-    print(f"... attempting FastLanguageModel.from_pretrained({MODEL!r}, load_in_4bit=True) on MLX")
-    try:
-        model, tokenizer = FastLanguageModel.from_pretrained(
-            model_name=MODEL,
-            max_seq_length=512,
-            load_in_4bit=True,
-        )
-    except Exception as exc:
-        print("BNB4BIT_LOAD: FAILED at from_pretrained")
-        print(f"  {type(exc).__name__}: {exc}")
-        traceback.print_exc()
+    # Characterize how a stock *-bnb-4bit checkpoint can be loaded on MLX. The
+    # stock-notebook call is load_in_4bit=True; we also probe the loader's own
+    # suggested escape hatches so the report says exactly which (if any) works.
+    model = tokenizer = None
+    for kw in (
+        {"load_in_4bit": True},          # stock notebook default
+        {"force_requantize": True},      # loader-suggested: requantize bnb -> MLX affine
+        {"load_in_4bit": False},         # loader-suggested: load without extra quantization
+    ):
+        model, tokenizer = _try_load(FastLanguageModel, **kw)
+        if model is not None:
+            break
+
+    if model is None:
+        print("BNB4BIT_LOAD: FAILED (no load strategy worked)")
         return 0
 
     print("BNB4BIT_LOAD: from_pretrained OK")
