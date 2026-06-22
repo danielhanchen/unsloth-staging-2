@@ -53,6 +53,9 @@ def test_install_sh_traps_int_before_launch():
     i_launch = txt.find('"$VENV_DIR/bin/unsloth" studio -p 8888')
     assert i_trap != -1, "installer must trap INT so it waits for studio's shutdown"
     assert 0 < i_trap < i_launch, "trap must come before the studio launch"
+    # The launch must run in a subshell that resets INT, so the child does not
+    # inherit the ignored SIGINT and can still handle its own Ctrl+C.
+    assert "(trap - INT; exec " in txt, "studio launch must reset INT in a subshell"
 
 
 def test_run_py_join_is_bounded_and_forcequit():
@@ -60,6 +63,7 @@ def test_run_py_join_is_bounded_and_forcequit():
     assert "_SERVER_SHUTDOWN_JOIN_TIMEOUT" in txt, "join must be bounded by a timeout"
     assert "thread.join(timeout = timeout)" in txt, "wait helper must join with a timeout"
     assert "signal.SIG_DFL" in txt, "signal handler must restore SIG_DFL for force-quit"
+    assert "signal.SIGBREAK, signal.SIG_DFL" in txt, "SIGBREAK must be restored on Windows"
 
 
 # --------------------------------------------------------------------------- #
@@ -148,25 +152,29 @@ def test_install_prompt_decline_behaviour(answer, expect):
 
 @_posix_only
 def test_installer_trap_orders_shutdown(tmp_path):
-    """trap '' INT in a non-interactive parent shell must make it wait for the
-    studio child's graceful shutdown instead of dying first (prompt-after-logs)."""
+    """The real install.sh pattern (trap '' INT + subshell that resets INT) must:
+    (a) deliver Ctrl+C to the child even though it relies on the default SIGINT
+    (so it is not swallowed by an inherited SIG_IGN), and (b) keep the installer
+    shell waiting so the prompt returns only after the child's shutdown logs."""
     child = tmp_path / "child.py"
+    # NB: relies on the default SIGINT -> KeyboardInterrupt; does NOT re-register,
+    # so an inherited SIG_IGN would make it never see Ctrl+C.
     child.write_text(textwrap.dedent('''
-        import signal, time, sys
-        def h(s, f):
-            print("LOG1", flush=True); time.sleep(0.3); print("LOG2", flush=True)
-            print("done", flush=True); sys.exit(0)
-        signal.signal(signal.SIGINT, h)
+        import time
         print("CHILD_READY", flush=True)
-        while True: time.sleep(0.2)
+        try:
+            while True: time.sleep(0.2)
+        except KeyboardInterrupt:
+            print("LOG1", flush=True); time.sleep(0.3); print("LOG2", flush=True)
     '''))
     installer = tmp_path / "installer.sh"
-    installer.write_text(f'trap \'\' INT\n{sys.executable} {child} </dev/null\necho EXITED\n')
-    # interactive bash parent prints PROMPT after the pipeline returns
+    installer.write_text(
+        f"trap '' INT\n(trap - INT; exec {sys.executable} {child} </dev/null)\necho EXITED\n")
     text, _ = _drive_interactive(f"cat {installer} | sh")
-    p = text.find("INTERACTIVE_PROMPT>", text.find("CHILD_READY"))
     l2 = text.find("LOG2")
-    assert l2 != -1 and p != -1 and p > l2, f"prompt must come after LOG2\n{text}"
+    p = text.find("INTERACTIVE_PROMPT>", text.find("CHILD_READY"))
+    assert l2 != -1, f"child must receive Ctrl+C (not an inherited SIG_IGN)\n{text}"
+    assert p != -1 and p > l2, f"prompt must come after the child's shutdown logs\n{text}"
 
 
 _RUNPY_CHILD = '''
