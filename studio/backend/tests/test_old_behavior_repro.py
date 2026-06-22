@@ -66,33 +66,43 @@ def test_old_write_path_crashes():
 
 @pytest.mark.skipif(_SKIP_OLD, reason=_skip_reason)
 def test_old_read_path_crashes_or_garbles():
-    """OLD stdout read (text=True, OS default codec) crashes/garbles on cp1252.
+    """OLD stdout read (OS default codec) crashes/garbles; NEW (utf-8) round-trips.
 
     The source is written as utf-8 so the WRITE succeeds and we isolate the READ
     failure. The child gets PYTHONIOENCODING=utf-8 (the sandbox path always set
-    it), so it emits valid utf-8 bytes that the OS default decoder mishandles.
+    it), so it emits valid utf-8 bytes. We capture those bytes once and decode
+    them two ways. Reading raw bytes and decoding in the main thread is the
+    deterministic equivalent of the OLD ``Popen(text=True)`` path: on Windows the
+    text-mode decode happens in a background reader thread, so the crash would
+    surface there and ``communicate()`` would just return ``None`` -- the data is
+    still lost, but the failure is not catchable around ``communicate()``. The
+    byte-level decode below exercises the identical codec mismatch on every OS.
     """
     fd, path = tempfile.mkstemp(suffix=".py", prefix="src_", dir=tempfile.mkdtemp())
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(f"print({UNICODE!r})")
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
-    crashed = False
-    out = None
     try:
         proc = subprocess.Popen(
             [sys.executable, path],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, encoding=_OLD_CODEC, env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,  # binary mode
         )
-        out, _ = proc.communicate(timeout=30)
-    except UnicodeDecodeError:
-        crashed = True
+        raw, _ = proc.communicate(timeout=30)
     finally:
         if os.path.exists(path):
             os.unlink(path)
-    # Either a hard decode crash, or a successful read that does NOT round-trip
-    # (mojibake) -- both prove the OS default codec is wrong here.
-    assert crashed or (out is not None and UNICODE not in out), repr(out)
+
+    # OLD: decode child bytes with the OS default codec -> hard crash or mojibake.
+    old_failed = False
+    try:
+        decoded_old = raw.decode(_OLD_CODEC)
+        old_failed = UNICODE not in decoded_old   # decoded without raising == mojibake
+    except UnicodeDecodeError:
+        old_failed = True
+    assert old_failed, f"old codec {_OLD_CODEC!r} unexpectedly round-tripped"
+
+    # NEW: decode the same bytes with the PR's explicit utf-8 -> exact round-trip.
+    assert UNICODE in raw.decode("utf-8", errors="replace")
 
 
 @pytest.mark.parametrize("disable_sandbox_like", [False, True])

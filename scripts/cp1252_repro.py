@@ -61,34 +61,31 @@ def new_write(code: str, workdir: str):
     return path
 
 
-def old_read(path: str, codec: str) -> str:
-    """OLD: Popen(text=True) with no explicit encoding -> OS default decode.
+def _child_bytes(path: str) -> bytes:
+    """Run the child (PYTHONIOENCODING=utf-8 -> emits utf-8) and capture raw bytes.
 
-    The child is given PYTHONIOENCODING=utf-8 (the sandbox path always set it),
-    so it emits UTF-8 bytes; the parent then mis-decodes them as ``codec``.
+    Reading bytes and decoding in the main thread is deterministic on every OS.
+    OLD ``Popen(text=True)`` decoded in a background reader thread on Windows, so
+    a decode crash there would just lose the data and leave ``communicate()``
+    returning None -- the byte-level decode below shows the identical mismatch.
     """
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     proc = subprocess.Popen(
         [sys.executable, path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding=codec,
-        env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,  # binary mode
     )
-    out, _ = proc.communicate(timeout=30)
-    return out or ""
+    raw, _ = proc.communicate(timeout=30)
+    return raw or b""
+
+
+def old_read(path: str, codec: str) -> str:
+    """OLD: decode the child's utf-8 bytes with the OS default codec (may raise)."""
+    return _child_bytes(path).decode(codec)
 
 
 def new_read(path: str) -> str:
     """NEW: explicit utf-8 + errors=replace on the parent decode."""
-    env = dict(os.environ, PYTHONIOENCODING="utf-8")
-    proc = subprocess.Popen(
-        [sys.executable, path],
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, encoding="utf-8", errors="replace",
-        env=env,
-    )
-    out, _ = proc.communicate(timeout=30)
-    return out or ""
+    return _child_bytes(path).decode("utf-8", errors="replace")
 
 
 def main():
