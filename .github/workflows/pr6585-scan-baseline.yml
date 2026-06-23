@@ -1,0 +1,110 @@
+# Staging-only validation for unslothai/unsloth PR #6585.
+# Replicates the pip-scan-packages job from security-audit.yml (3 shards,
+# SCAN_ENFORCE=1) to confirm the refreshed scan_packages_baseline.json makes
+# all three shards exit 0. Throwaway branch; PR is closed, never merged.
+name: "PR-6585 scan-packages"
+on:
+  push:
+    branches: [pr6585-scan-baseline-ci]
+    paths:
+      - 'scripts/scan_packages.py'
+      - 'scripts/scan_packages_baseline.json'
+      - 'studio/backend/requirements/**'
+      - 'pyproject.toml'
+      - '.github/workflows/pr6585-scan-baseline.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  pip-scan-packages:
+    name: "pip scan-packages :: ${{ matrix.shard.id }}"
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - { id: hf-stack, files: 'unsloth-deps no-torch-runtime' }
+          - { id: studio,   files: 'studio overrides extras-no-deps' }
+          - { id: extras,   files: 'extras' }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install scan_packages.py runtime deps
+        run: python -m pip install --upgrade pip requests packaging
+
+      - name: Build filtered requirements set
+        # Mirrors security-audit.yml: pyproject extraction + git+ strip.
+        run: |
+          mkdir -p audit-reqs
+          python <<'PY' > audit-reqs/unsloth-deps.txt
+          import tomllib
+          with open("pyproject.toml", "rb") as f:
+              d = tomllib.load(f)
+          core = d["project"]["dependencies"]
+          extras = d["project"]["optional-dependencies"]["huggingfacenotorch"]
+          print("# Auto-generated from pyproject.toml.")
+          for spec in core + extras:
+              print(spec)
+          PY
+          for f in studio.txt extras.txt extras-no-deps.txt \
+                   no-torch-runtime.txt overrides.txt triton-kernels.txt; do
+            python <<PY > "audit-reqs/$f"
+          src = "studio/backend/requirements/$f"
+          with open(src) as fh:
+              for line in fh:
+                  stripped = line.strip()
+                  before_comment = stripped.split("#", 1)[0]
+                  if "git+" in before_comment:
+                      print(f"# [staging] skipped git+ spec: {stripped}")
+                      continue
+                  print(line.rstrip("\n"))
+          PY
+          done
+
+      - name: Scan declared + transitive Python deps
+        env:
+          SHARD_FILES: ${{ matrix.shard.files }}
+          SCAN_ENFORCE: "1"
+        run: |
+          set +e
+          LOG="logs-scan-packages-${{ matrix.shard.id }}.txt"
+          REQ_ARGS=()
+          for f in $SHARD_FILES; do
+            if grep -qE '^[^#[:space:]]' "audit-reqs/$f.txt"; then
+              echo "  + audit-reqs/$f.txt"
+              REQ_ARGS+=( -r "audit-reqs/$f.txt" )
+            else
+              echo "  - audit-reqs/$f.txt (empty after git+ filter, skipping)"
+            fi
+          done
+          rc=0
+          if [ ${#REQ_ARGS[@]} -eq 0 ]; then
+            echo "[staging] shard ${{ matrix.shard.id }}: no PyPI specs, nothing to scan" | tee "$LOG"
+          else
+            python scripts/scan_packages.py --with-deps "${REQ_ARGS[@]}" 2>&1 | tee "$LOG"
+            rc=${PIPESTATUS[0]}
+          fi
+          echo "scan_packages.py exit code: $rc (enforce=$SCAN_ENFORCE)"
+          if [ "$SCAN_ENFORCE" = "1" ]; then
+            exit "$rc"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: scan-packages-log-${{ matrix.shard.id }}
+          path: logs-scan-packages-${{ matrix.shard.id }}.txt
+          retention-days: 7
