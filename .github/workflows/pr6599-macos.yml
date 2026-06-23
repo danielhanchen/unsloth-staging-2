@@ -1,0 +1,52 @@
+name: "PR-6599 mlx-selfheal macos-14"
+
+on:
+  push:
+    branches: [pr6599-mlx-selfheal-macos]
+    paths:
+      - 'studio/backend/utils/mlx_repair.py'
+      - 'studio/backend/tests/test_mlx_repair.py'
+      - 'studio/backend/tests/mlx_selfheal_e2e_check.py'
+      - '.github/workflows/pr6599-macos.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/utils/mlx_repair.py'
+      - 'studio/backend/tests/test_mlx_repair.py'
+      - 'studio/backend/tests/mlx_selfheal_e2e_check.py'
+      - '.github/workflows/pr6599-macos.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-selfheal:
+    runs-on: macos-14          # Apple Silicon (arm64) -- required for the MLX self-heal gate
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install uv + module/test deps
+        run: python -m pip install --upgrade pip uv structlog packaging pytest transformers
+
+      - name: Show host (confirm Apple Silicon)
+        run: |
+          python -c "import platform; print('system', platform.system(), 'machine', platform.machine())"
+          uv --version
+
+      - name: Unit tests (hardening logic on real macOS)
+        run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_mlx_repair.py -q -p no:cacheprovider
+
+      - name: End-to-end self-heal (MLX missing -> wheels-only install, env sanitized)
+        run: PYTHONPATH=studio/backend python studio/backend/tests/mlx_selfheal_e2e_check.py
