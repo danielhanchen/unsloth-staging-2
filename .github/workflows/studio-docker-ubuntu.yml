@@ -22,8 +22,8 @@ concurrency:
 permissions:
   contents: read
 env:
-  IMAGE_BLOB: unsloth-blackwell-studio-test12.tar.gz
-  IMAGE_TAG: unsloth-blackwell:studio-test12
+  IMAGE_BLOB: unsloth-blackwell-studio-test13.tar.gz
+  IMAGE_TAG: unsloth-blackwell:studio-test13
   BASE: http://127.0.0.1:18000
 jobs:
   pull-boot-and-drive:
