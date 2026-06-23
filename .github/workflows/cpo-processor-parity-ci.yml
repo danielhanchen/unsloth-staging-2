@@ -1,0 +1,58 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Staging-only cross-OS guard for the CPO/ORPO processor tokenizer rewriters
+# (issue #4952). The fix is a compile-time string rewrite, so the tests are
+# pure pytest with no torch/GPU and run identically on Linux/macOS/Windows;
+# this matrix confirms that and keeps the cpo_trainer registration from
+# silently regressing. Sub-second per OS.
+
+name: CPO processor parity
+
+on:
+  pull_request:
+    paths:
+      - 'unsloth/models/rl_replacements.py'
+      - 'tests/python/test_cpo_processor_text_tokenizer.py'
+      - 'tests/python/test_orpo_processor_text_tokenizer.py'
+      - '.github/workflows/cpo-processor-parity-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'unsloth/models/rl_replacements.py'
+      - 'tests/python/test_cpo_processor_text_tokenizer.py'
+      - 'tests/python/test_orpo_processor_text_tokenizer.py'
+      - '.github/workflows/cpo-processor-parity-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    name: parity (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: python -m pip install -U pip pytest
+      - name: CPO/ORPO processor tokenizer tests
+        run: >-
+          python -m pytest
+          tests/python/test_cpo_processor_text_tokenizer.py
+          tests/python/test_orpo_processor_text_tokenizer.py
+          -q
