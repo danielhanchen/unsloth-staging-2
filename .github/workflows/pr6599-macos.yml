@@ -46,7 +46,12 @@ jobs:
           uv --version
 
       - name: Unit tests (hardening logic on real macOS)
-        run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_mlx_repair.py -q -p no:cacheprovider
+        # Deselect the one test that imports utils.hardware.hardware (pulls heavy
+        # backend deps unrelated to this change and not installed on a bare runner).
+        run: >-
+          PYTHONPATH=studio/backend python -m pytest
+          studio/backend/tests/test_mlx_repair.py -q -p no:cacheprovider
+          --deselect studio/backend/tests/test_mlx_repair.py::test_apple_silicon_missing_mlx_starts_repair_and_redetects
 
       - name: End-to-end self-heal (MLX missing -> wheels-only install, env sanitized)
         run: PYTHONPATH=studio/backend python studio/backend/tests/mlx_selfheal_e2e_check.py
