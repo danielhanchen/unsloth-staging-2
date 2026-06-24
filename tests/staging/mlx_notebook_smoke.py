@@ -100,6 +100,10 @@ def convert(nb_path, model_override):
             continue
         if s.startswith("tokenizer.decode(") or s.startswith("display("):
             continue
+        # drop calls to inference helpers (do_<model>_inference(...)) whose
+        # defining cell was dropped as a `.generate(`/inference cell above.
+        if re.match(r'^do_\w*inference\s*\(', s):
+            continue
         kept.append(line)
     code = "\n".join(kept)
 
