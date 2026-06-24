@@ -1,0 +1,31 @@
+name: PR-6534 ubuntu-latest
+on:
+  push:
+    branches: [pr6534-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install pytest + uv
+        run: python -m pip install --upgrade pip pytest uv
+      - name: uv version
+        run: uv --version
+      - name: PR unit tests (TestUvSafePath + existing)
+        run: python -m pytest tests/python/test_install_python_stack.py -v
+      - name: Cross-OS uv space-path repro (fix + UV_OVERRIDE gap)
+        run: python tests/python/_pr6534_cross_os_repro.py
