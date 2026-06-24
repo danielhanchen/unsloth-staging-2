@@ -38,7 +38,10 @@ def banner(t: str) -> None:
 
 
 def uv_dry_run(extra_args, env=None):
-    cmd = [UV, "pip", "install", "--dry-run", *extra_args]
+    # --python pins a target interpreter so uv does not require an active venv
+    # on the CI runner (otherwise the success cases hit "No virtual environment
+    # found", which is unrelated to the path being tested).
+    cmd = [UV, "pip", "install", "--dry-run", "--python", sys.executable, *extra_args]
     r = subprocess.run(cmd, capture_output=True, text=True, env=env)
     first = (r.stderr.strip().splitlines() or [""])[0]
     return r.returncode, first
