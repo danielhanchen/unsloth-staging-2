@@ -27,6 +27,39 @@ import urllib.error
 
 NEWPW = "UnslothVerify_2026!"
 
+# Inference-dependent checks (model load, chat, tool/MCP generation) run a tiny
+# GGUF on CPU. On a host that is also busy (e.g. a workstation running training
+# while this drives the container), that work slows down proportionally and the
+# fixed timeouts below would expire mid-generation and report a false FAIL even
+# though Studio is healthy. slow_factor() turns current host load into a
+# multiplier for those timeouts: ~1.0 on an idle CI runner (behaviour unchanged)
+# and larger when the run queue is many times the core count, so a loaded host
+# gets proportionally more time instead of a spurious failure. Capped so a
+# pathologically overloaded host still terminates.
+SLOW_CEIL = 6.0
+
+
+def slow_factor():
+    """Timeout multiplier for inference-dependent checks.
+
+    The larger of:
+      * an explicit UNSLOTH_BATTERY_SLOW override (for a host you know is busy,
+        e.g. running training alongside this -- useful where load average per
+        CPU under-reports contention on a many-core box), and
+      * the 1-minute load average per CPU (POSIX-only; Windows, which has no
+        os.getloadavg, contributes 1.0).
+    Clamped to [1.0, SLOW_CEIL] so an idle CI runner is unchanged and a
+    pathologically overloaded host still terminates."""
+    try:
+        env = float(os.environ.get("UNSLOTH_BATTERY_SLOW", "1") or "1")
+    except ValueError:
+        env = 1.0
+    try:
+        loadavg = os.getloadavg()[0] / (os.cpu_count() or 1)
+    except (AttributeError, OSError):
+        loadavg = 1.0
+    return max(1.0, min(SLOW_CEIL, max(env, loadavg)))
+
 
 def mask(v):
     if v:
@@ -57,8 +90,10 @@ def http_code(url, token=None, timeout=20):
         return 0
 
 
-def sse_tool_events(base, token, prompt, tools, timeout=480):
+def sse_tool_events(base, token, prompt, tools, timeout=None):
     """POST a streaming chat with tools; return (tool_args[], tool_results[])."""
+    if timeout is None:
+        timeout = int(480 * slow_factor())
     body = {
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 900, "temperature": 0.0,
@@ -144,9 +179,13 @@ def main():
         results[name] = {"ok": bool(ok), "required": required, "detail": str(detail)[:300]}
         print(f"[{'PASS' if ok else 'FAIL'}] {name}: {str(detail)[:160]}", flush=True)
 
+    print(f"[info] startup slow_factor={slow_factor():.2f} "
+          f"(loadavg1/{os.cpu_count()} cpus); inference timeouts scale by it",
+          flush=True)
+
     # 1) health
     ok = False
-    for _ in range(90):
+    for _ in range(int(90 * slow_factor())):
         if http_code(f"{base}/api/health") == 200:
             ok = True
             break
@@ -195,31 +234,36 @@ def main():
         record("auth", False, repr(e))
         return finish(results, args)
 
-    # 3) load model
+    # 3) load model. The first load downloads the GGUF and warms the server;
+    # under host contention both slow down, so the POST timeout and the
+    # readiness poll run on a load-scaled wall-clock deadline rather than a
+    # fixed iteration count (the previous 60x5s=300s cap was what false-FAILed
+    # on a busy host).
     try:
-        s, d = http("POST", f"{base}/api/inference/load", token=token, timeout=600,
+        sf = slow_factor()
+        s, d = http("POST", f"{base}/api/inference/load", token=token, timeout=int(600 * sf),
                     body={"model_path": args.model, "gguf_variant": args.gguf_variant,
                           "max_seq_length": 4096})
         status = d.get("status") if isinstance(d, dict) else d
         ready = str(status) in ("loaded", "already_loaded")
-        for _ in range(60):
-            if ready:
-                break
+        deadline = time.monotonic() + 300 * sf
+        while not ready and time.monotonic() < deadline:
             try:
-                _, p = http("GET", f"{base}/api/inference/load-progress", token=token, timeout=20)
+                _, p = http("GET", f"{base}/api/inference/load-progress", token=token,
+                            timeout=int(20 * sf))
                 if isinstance(p, dict) and p.get("phase") == "ready":
                     ready = True
                     break
             except Exception:
                 pass
             time.sleep(5)
-        record("model_load", ready, f"status={status}")
+        record("model_load", ready, f"status={status} slow={sf:.1f}")
     except Exception as e:
         record("model_load", False, repr(e))
 
     # 4) chat/completions
     try:
-        s, d = http("POST", f"{base}/v1/chat/completions", token=token, timeout=120,
+        s, d = http("POST", f"{base}/v1/chat/completions", token=token, timeout=int(120 * slow_factor()),
                     body={"messages": [{"role": "user", "content": "Reply with exactly: API_OK /no_think"}],
                           "max_tokens": 48, "temperature": 0.0, "stream": False})
         txt = d["choices"][0]["message"]["content"]
@@ -232,7 +276,7 @@ def main():
     # error-free, non-failed response (and note whether the sentinel appeared)
     # rather than requiring exact text from the model.
     try:
-        s, d = http("POST", f"{base}/v1/responses", token=token, timeout=120,
+        s, d = http("POST", f"{base}/v1/responses", token=token, timeout=int(120 * slow_factor()),
                     body={"model": args.model, "input": "Reply with exactly: RESPONSES_OK /no_think",
                           "max_output_tokens": 48, "stream": False})
         blob = json.dumps(d).lower()
@@ -315,7 +359,8 @@ def main():
                 "content": "Use the add_numbers tool to add 19 and 23, then report the sum. /no_think"}],
                 "max_tokens": 600, "temperature": 0.0,
                 "enable_tools": True, "enabled_tools": [], "mcp_enabled": True, "stream": True}
-        resp = http("POST", f"{base}/v1/chat/completions", token=token, body=body, timeout=180, stream=True)
+        resp = http("POST", f"{base}/v1/chat/completions", token=token, body=body,
+                    timeout=int(180 * slow_factor()), stream=True)
         names, mres = [], []
         for ln in resp:
             ln = ln.decode("utf-8", "replace").strip()
@@ -361,9 +406,9 @@ def main():
     # 11) optional MLX (safetensors) for macOS lane
     if args.mlx_model:
         try:
-            http("POST", f"{base}/api/inference/load", token=token, timeout=900,
+            http("POST", f"{base}/api/inference/load", token=token, timeout=int(900 * slow_factor()),
                  body={"model_path": args.mlx_model, "max_seq_length": 1024})
-            s, d = http("POST", f"{base}/v1/chat/completions", token=token, timeout=180,
+            s, d = http("POST", f"{base}/v1/chat/completions", token=token, timeout=int(180 * slow_factor()),
                         body={"model": args.mlx_model,
                               "messages": [{"role": "user", "content": "Reply with exactly: MLX_OK"}],
                               "max_tokens": 32, "temperature": 0.0, "stream": False})
@@ -395,7 +440,7 @@ def main():
             subprocess.run(["docker", "cp", probe, f"{args.container}:/tmp/nb_probe.sh"],
                            check=True, timeout=30)
             out = subprocess.run(["docker", "exec", args.container, "bash", "/tmp/nb_probe.sh"],
-                                 capture_output=True, text=True, timeout=300)
+                                 capture_output=True, text=True, timeout=int(300 * slow_factor()))
             line = ""
             for ln in (out.stdout + out.stderr).splitlines():
                 if ln.startswith("NBRESULT"):
