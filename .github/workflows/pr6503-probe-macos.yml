@@ -33,7 +33,7 @@ jobs:
 
       - name: Probe UV_OVERRIDE space truncation (issue #6503 install.sh root cause)
         run: |
-          set -u
+          set +e
           uv --version
 
           # The real overrides file shipped in the repo, placed under a path with
