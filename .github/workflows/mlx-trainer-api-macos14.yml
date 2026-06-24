@@ -45,29 +45,15 @@ jobs:
           # torch (cpu) kept importable for any guarded torch paths.
           pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
           # zoo PR head: [mlx] extra pulls real mlx / mlx-lm / mlx-vlm wheels.
+          # The TokenizerWrapper .encode, bnb-4bit name remap, seq2seq-collator,
+          # and get_chat_template unwrap fixes are now merged into the PR heads,
+          # so no patches are applied: this validates the branches as-is.
           git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth-zoo zoo
           git -C zoo log --oneline -1
-          # Proposed fix: make patch_tokenizer fall back to .encode for mlx-lm
-          # TokenizerWrapper so get_chat_template works for mlx-community models.
-          git -C zoo apply "$GITHUB_WORKSPACE/tests/staging/tokenizer_wrapper_mlx.patch"
-          # Proposed fix: remap unsloth/*-bnb-4bit model names to their full-precision
-          # base repo on MLX (mlx-lm cannot read bitsandbytes weights), so the ~47
-          # notebooks hard-coding a bnb-4bit name load + MLX-quantize unchanged.
-          git -C zoo apply "$GITHUB_WORKSPACE/tests/staging/bnb_name_remap_mlx.patch"
           pip install -e './zoo[mlx]'
           # unsloth PR head: public UnslothTrainer / UnslothTrainingArguments API.
           git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth unsloth_src
           git -C unsloth_src log --oneline -1
-          # Proposed fix: accept DataCollatorForSeq2Seq (and similar pad-only HF
-          # text collators) on MLX so the 14 Conversational/Phi-4/Coder notebooks
-          # run unchanged. MLXTrainer batches/masks/pads natively, so the collator
-          # is redundant rather than unsupported.
-          git -C unsloth_src apply "$GITHUB_WORKSPACE/tests/staging/seq2seq_collator_mlx.patch"
-          # Proposed fix: unwrap mlx-lm's TokenizerWrapper inside get_chat_template
-          # so the map_eos_token / chatml token-swap path (CodeGemma + ~18
-          # Conversational notebooks) works for mlx-community models.
-          git -C unsloth_src apply "$GITHUB_WORKSPACE/tests/staging/chat_template_tokenizerwrapper_mlx.patch"
-          git -C unsloth_src --no-pager diff --stat
           pip install --no-deps -e ./unsloth_src
           # This staging repo is itself a fork of unsloth, so its repo-root
           # ./unsloth package would shadow the editable PR install when python

@@ -47,6 +47,22 @@ NOTEBOOKS = [
     ("nb/LFM2.5_(1.2B)-Text_Completion.ipynb", _SMALL),                # LFM2 text completion
     ("nb/Llama3.2_(1B_and_3B)-Conversational.ipynb", "mlx-community/Llama-3.2-1B-Instruct-4bit"),  # seq2seq near-real
     ("nb/TinyLlama_(1.1B)-Alpaca.ipynb", _SMALL),                      # packing=True -> soft fallback
+    # Broader family / structure coverage. Model is overridden to a small MLX
+    # model; the point is that each notebook's code path runs on Apple Silicon.
+    ("nb/Qwen2_(7B)-Alpaca.ipynb", _SMALL),                            # qwen2 (pre-2.5) tokenizer
+    ("nb/Falcon_H1_(0.5B)-Alpaca.ipynb", _SMALL),                      # falcon-h1 hybrid arch
+    ("nb/Granite4.0_350M.ipynb", _SMALL),                              # ibm granite 4
+    ("nb/Phi_3.5_Mini-Conversational.ipynb", _SMALL),                  # phi-3.5 conversational
+    ("nb/Liquid_LFM2_(1.2B)-Conversational.ipynb", _SMALL),            # lfm2 conversational
+    ("nb/Mistral_Small_(22B)-Alpaca.ipynb", _SMALL),                   # mistral small
+    ("nb/Magistral_(24B)-Reasoning-Conversational.ipynb", _SMALL),     # reasoning conversational
+    ("nb/Gemma3_(4B).ipynb", _SMALL),                                  # gemma3 4B plain SFT
+    ("nb/Gemma3N_(4B)-Conversational.ipynb", _SMALL),                  # gemma3n arch
+    ("nb/Gemma4_(E4B)-Text.ipynb", _SMALL),                            # gemma4 E4B text
+    ("nb/Llama3.3_(70B)_A100-Conversational.ipynb", _SMALL),           # llama3.3 conversational
+    ("nb/ERNIE_4_5_21B_A3B_PT-Conversational.ipynb", _SMALL),          # ernie moe, continued pretrain
+    ("nb/TinyQwen3_MoE.ipynb", _SMALL),                                # qwen3 MoE structure
+    ("nb/GLM_Flash_A100(80GB).ipynb", _SMALL),                         # glm conversational
 ]
 
 DROP_CELL_MARKERS = (

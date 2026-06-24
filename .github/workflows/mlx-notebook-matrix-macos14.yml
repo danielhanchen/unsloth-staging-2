@@ -1,8 +1,8 @@
 # Broad MLX notebook coverage: convert many migrated notebooks and run each
 # end-to-end on a real macos-14 Apple Silicon runner, reporting a pass/fail
-# matrix. Installs the PR heads + the seq2seq-collator fix, clones the notebooks
-# PR, and runs tests/staging/mlx_notebook_smoke.py (report-only; one notebook
-# failing does not abort the rest).
+# matrix. Installs the PR heads as-is (all MLX fixes are now merged into the
+# branches), clones the notebooks PR, and runs tests/staging/mlx_notebook_smoke.py
+# (report-only; one notebook failing does not abort the rest).
 
 name: mlx-notebook-matrix macos-14
 
@@ -11,10 +11,6 @@ on:
     branches: [mlx-trainer-api-validation]
     paths:
       - 'tests/staging/mlx_notebook_smoke.py'
-      - 'tests/staging/seq2seq_collator_mlx.patch'
-      - 'tests/staging/chat_template_tokenizerwrapper_mlx.patch'
-      - 'tests/staging/tokenizer_wrapper_mlx.patch'
-      - 'tests/staging/bnb_name_remap_mlx.patch'
       - '.github/workflows/mlx-notebook-matrix-macos14.yml'
   workflow_dispatch:
 
@@ -29,7 +25,7 @@ jobs:
   notebook-matrix:
     name: mlx notebook matrix
     runs-on: macos-14
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
         with:
@@ -39,17 +35,18 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install PR heads (+ seq2seq fix) with real MLX wheels
+      - name: Install PR heads with real MLX wheels
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
+          # All MLX fixes (TokenizerWrapper .encode, bnb-4bit name remap,
+          # seq2seq collator, get_chat_template unwrap) are merged into the PR
+          # heads, so the branches install as-is with no patches.
           git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth-zoo zoo
-          git -C zoo apply "$GITHUB_WORKSPACE/tests/staging/tokenizer_wrapper_mlx.patch"
-          git -C zoo apply "$GITHUB_WORKSPACE/tests/staging/bnb_name_remap_mlx.patch"
+          git -C zoo log --oneline -1
           pip install -e './zoo[mlx]'
           git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth unsloth_src
-          git -C unsloth_src apply "$GITHUB_WORKSPACE/tests/staging/seq2seq_collator_mlx.patch"
-          git -C unsloth_src apply "$GITHUB_WORKSPACE/tests/staging/chat_template_tokenizerwrapper_mlx.patch"
+          git -C unsloth_src log --oneline -1
           pip install --no-deps -e ./unsloth_src
           rm -rf "$GITHUB_WORKSPACE/unsloth"
           # peft: a real `pip install unsloth` pulls it; get_chat_template's
