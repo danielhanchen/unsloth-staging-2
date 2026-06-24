@@ -49,8 +49,11 @@ jobs:
       - name: Install jupyterlab (provides jlpm + labextension builder)
         run: python -m pip install "jupyterlab>=4.5,<5"
 
+      # No yarn.lock is committed (the Docker labext-builder generates one at
+      # build time too), so allow Yarn Berry to create it. GitHub sets CI=true,
+      # which would otherwise force an immutable install and fail with YN0028.
       - name: jlpm install
-        run: jlpm install
+        run: jlpm install --no-immutable
 
       - name: jlpm build:prod
         run: jlpm build:prod
