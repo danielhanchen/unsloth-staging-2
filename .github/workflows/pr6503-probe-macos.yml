@@ -1,0 +1,94 @@
+name: pr6503-probe-macos
+
+on:
+  push:
+    branches: [ pr6503-probe ]
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        uv: ["0.10.9", "latest"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Environment
+        run: |
+          uname -a
+          sw_vers || true
+          python3 --version
+
+      - name: Install uv ${{ matrix.uv }}
+        run: |
+          set -eu
+          if [ "${{ matrix.uv }}" = "latest" ]; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+          else
+            curl -LsSf "https://astral.sh/uv/${{ matrix.uv }}/install.sh" | sh
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Run probe
+        run: |
+          set -u
+          uv --version
+
+          # Build a project tree under a path containing a space, mirroring
+          # /Users/me/Documents/Open Source/unsloth from issue #6503. The repo's
+          # pyproject.toml has dynamic = ["version"], which is what triggers uv's
+          # cwd discovery.
+          SPACED_ROOT="$RUNNER_TEMP/Open Source"
+          REPO="$SPACED_ROOT/unsloth"
+          mkdir -p "$REPO"
+          cp -R "$GITHUB_WORKSPACE/." "$REPO/"
+          case "$REPO" in *" "*) echo "spaced repo: $REPO" ;; *) echo "ERROR: REPO has no space: $REPO"; exit 1 ;; esac
+
+          # Space-free venv target (the real installer also uses an absolute
+          # space-free --python under ~/.unsloth/studio).
+          SAFE_DIR="$RUNNER_TEMP/safe_cwd"
+          mkdir -p "$SAFE_DIR"
+          uv venv "$RUNNER_TEMP/venv" --python python3
+          VENV_PY="$RUNNER_TEMP/venv/bin/python"
+
+          TORCH_ARGS="torch>=2.6,<2.11.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu"
+
+          run_case() {
+            # $1 = label, $2 = cwd, rest = uv args
+            _label="$1"; _cwd="$2"; shift 2
+            echo "----------------------------------------------------------------"
+            echo "CASE: $_label"
+            echo "cwd : $_cwd"
+            echo "cmd : uv pip install --python <venv> $*"
+            _out="$RUNNER_TEMP/out.txt"
+            ( cd "$_cwd" && uv pip install --python "$VENV_PY" "$@" ) >"$_out" 2>&1
+            _rc=$?
+            echo "rc  : $_rc"
+            if grep -q "File not found" "$_out"; then
+              echo "RESULT: SPACE_BUG_REPRODUCED ($_label)"
+              grep -m1 "File not found" "$_out"
+            elif [ "$_rc" -eq 0 ]; then
+              echo "RESULT: OK ($_label)"
+            else
+              echo "RESULT: OTHER_FAILURE rc=$_rc ($_label)"
+              tail -8 "$_out"
+            fi
+          }
+
+          # 1. Repro: torch step from the spaced cwd (the reported failure).
+          run_case "torch_from_spaced_cwd_dryrun" "$REPO" $TORCH_ARGS --dry-run
+          # 2. Fix: same torch command from a space-free cwd.
+          run_case "torch_from_safe_cwd_dryrun" "$SAFE_DIR" $TORCH_ARGS --dry-run
+          # 3. Cheap: tiny pkg from spaced cwd (isolates cwd discovery from torch).
+          run_case "idna_from_spaced_cwd_dryrun" "$REPO" idna --dry-run
+          # 4. Fix candidate: --no-config from the spaced cwd.
+          run_case "torch_spaced_cwd_no_config" "$REPO" --no-config $TORCH_ARGS --dry-run
+          # 5. Overlay: editable install of the spaced abs path, from a safe cwd.
+          run_case "editable_spaced_abspath_from_safe_cwd" "$SAFE_DIR" -e "$REPO" --no-deps --dry-run
+          # 6. Overlay from spaced cwd too (full --local reality).
+          run_case "editable_spaced_abspath_from_spaced_cwd" "$REPO" -e "$REPO" --no-deps --dry-run
+
+          echo "================================================================"
+          echo "PROBE COMPLETE (uv ${{ matrix.uv }})"
