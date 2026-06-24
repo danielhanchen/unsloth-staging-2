@@ -1,0 +1,100 @@
+# Build the FULL Unsloth Studio image (base + Studio + JupyterLab + the Unsloth
+# labextension + login/branding) for linux/amd64 on a fresh ubuntu-latest runner
+# with no GPU. This is the "re-check Studio" lane: it proves Dockerfile.studio
+# assembles from source -- including the Node labext-builder stage, the Studio
+# install, and the branding overlays -- and then inspects the built image's
+# contents (no GPU needed for the content checks).
+#
+# Disk: the base (~18.6 GB) + studio-unique layers (~6.4 GB) are tight on a
+# GH runner, so we reclaim aggressively first and build with plain BuildKit
+# (no buildx --load double-copy).
+
+name: docker-build-studio-amd64
+
+on:
+  push:
+    branches: [docker-blackwell-ci]
+    paths:
+      - 'docker/**'
+      - '.github/workflows/docker-build-studio-amd64.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docker/**'
+      - '.github/workflows/docker-build-studio-amd64.yml'
+
+concurrency:
+  group: docker-build-studio-amd64-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-studio:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - name: Build base image (amd64)
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            --progress=plain \
+            --build-arg CUDA_VERSION=12.8.1 \
+            --build-arg UBUNTU_VERSION=24.04 \
+            --build-arg PYTHON_VERSION=3.12 \
+            -t unsloth-blackwell:base-ci \
+            -f docker/Dockerfile docker/
+          df -h /
+
+      - name: Build studio image (amd64, FROM base-ci)
+        run: |
+          DOCKER_BUILDKIT=1 docker build \
+            --progress=plain \
+            --build-arg BASE_IMAGE=unsloth-blackwell:base-ci \
+            --build-arg UNSLOTH_STUDIO_REF=main \
+            -t unsloth-blackwell:studio-ci \
+            -f docker/Dockerfile.studio docker/
+          docker image ls unsloth-blackwell
+          df -h /
+
+      - name: Verify studio image contents
+        run: |
+          docker run --rm --entrypoint bash unsloth-blackwell:studio-ci -c '
+          set -e
+          JS="$(/opt/unsloth-venv/bin/python -c "import os,jupyter_server;print(os.path.dirname(jupyter_server.__file__))")"
+          fail=0
+          echo "-- labextension enabled --"
+          /opt/unsloth-venv/bin/jupyter labextension list 2>&1 | grep -q "unsloth-jupyterlab" \
+            && echo "  OK unsloth-jupyterlab present" || { echo "::error::labextension missing"; fail=1; }
+          echo "-- core Jupyter logo disabled --"
+          /opt/unsloth-venv/bin/jupyter labextension list 2>&1 | grep -q "application-extension:logo" \
+            && echo "  OK core logo disabled" || { echo "::error::core logo not disabled"; fail=1; }
+          echo "-- login.html branded --"
+          grep -q "unsloth-login-card" "$JS/templates/login.html" \
+            && echo "  OK login branded" || { echo "::error::login not branded"; fail=1; }
+          echo "-- favicon + logo swapped (not stock sizes) --"
+          test "$(stat -c %s "$JS/static/logo/logo.png")" != "5922" \
+            && echo "  OK logo swapped" || { echo "::error::logo still stock"; fail=1; }
+          echo "-- overrides defaults --"
+          /opt/unsloth-venv/bin/python - <<PY
+          import json, sys
+          d = json.load(open("/opt/unsloth-venv/share/jupyter/lab/settings/overrides.json"))
+          t = d["@jupyterlab/apputils-extension:themes"]
+          n = d.get("@jupyterlab/apputils-extension:notification", {})
+          ok = t.get("theme") == "Unsloth Dark" and str(n.get("fetchNews")) == "false"
+          print("  overrides theme/news:", t.get("theme"), n.get("fetchNews"))
+          sys.exit(0 if ok else 1)
+          PY
+          echo "-- sidecar log gate + widget strip in base helpers --"
+          grep -q "_logging_enabled()" /opt/unsloth-venv/lib/python3.12/site-packages/unsloth_nb_compat.py \
+            && echo "  OK sidecar gate" || { echo "::error::sidecar gate missing"; fail=1; }
+          grep -q "_WIDGET_VIEW_MIME" /opt/unsloth-nb/unsloth_nb_strip_colab.py \
+            && echo "  OK widget strip" || { echo "::error::widget strip missing"; fail=1; }
+          exit $fail
+          '

@@ -76,7 +76,6 @@ def check_imports() -> None:
     # smoke-tests both arches.
     try:
         import xformers
-
         print(f"xformers    {xformers.__version__}")
     except ImportError:
         print("xformers    (missing -- expected on arm64 [huggingface] extras)")
@@ -140,16 +139,12 @@ def check_tiny_train(cap: tuple[int, int]) -> None:
         "Q: Name a primary color.\nA:",
         "Q: Hello, who are you?\nA:",
     ] * 2
-    enc = tokenizer(
-        prompts, return_tensors = "pt", padding = True, truncation = True, max_length = 64
-    )
+    enc = tokenizer(prompts, return_tensors = "pt", padding = True, truncation = True, max_length = 64)
     enc = {k: v.cuda() for k, v in enc.items()}
     labels = enc["input_ids"].clone()
 
     model.train()
-    optim = torch.optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad], lr = 1e-4
-    )
+    optim = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr = 1e-4)
     for step in range(5):
         out = model(**enc, labels = labels)
         out.loss.backward()

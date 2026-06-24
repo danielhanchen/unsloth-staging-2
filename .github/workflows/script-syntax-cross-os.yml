@@ -114,3 +114,12 @@ jobs:
                   failed += 1
           sys.exit(failed)
           PY
+
+      # Functional (not just parse) check of the notebook/Studio helpers on
+      # every OS: Colab cell-magic hoist, README folder naming, Colab-intro +
+      # widget-output stripping, sidecar-log gating, plus the shipped JupyterLab
+      # overrides / labextension plugins / login branding assets. Pure stdlib,
+      # no Docker or GPU, so it runs identically on Linux, macOS and Windows.
+      - name: validate Studio/notebook features
+        shell: bash
+        run: python tests/validate_studio_features.py

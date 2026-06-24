@@ -25,22 +25,48 @@ if [[ -x /usr/local/cuda-13.0/bin/ptxas ]] && [[ -z "${TRITON_PTXAS_PATH:-}" ]];
     export TRITON_PTXAS_PATH=/usr/local/cuda-13.0/bin/ptxas
 fi
 
+# Make the unslothai/notebooks collection available under /workspace before the
+# user command runs (JupyterLab, unsloth-run, or a shell). Best-effort: it is
+# fully gated by UNSLOTH_SKIP_NOTEBOOK_SYNC and never blocks or fails the
+# container (see unsloth_sync_notebooks.sh).
+sync_notebooks() {
+    if [[ -x /usr/local/bin/unsloth-sync-notebooks ]]; then
+        /usr/local/bin/unsloth-sync-notebooks || true
+    fi
+}
+
 if [[ "${UNSLOTH_SKIP_GPU_CHECK:-0}" == "1" ]]; then
+    sync_notebooks
     exec "$@"
 fi
 
 err()  { printf "\033[1;31mERROR:\033[0m %s\n" "$*" >&2; }
 warn() { printf "\033[1;33mWARN:\033[0m %s\n"  "$*" >&2; }
 
-# --- Check 1: nvidia-smi present and can enumerate at least one GPU ---------
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-    err "nvidia-smi not found inside the container."
-    err "The CUDA runtime in this image is broken. Re-pull the image."
-    exit 1
+# CPU mode for hosts that cannot pass a GPU into a Linux container at all:
+# Docker Desktop on macOS (no Metal passthrough), Docker Desktop on Windows
+# without WSL2 GPU support, plain CPU Linux boxes, and CI runners. Training
+# needs an NVIDIA GPU, but Jupyter, GGUF tooling (the baked llama.cpp), and
+# Studio chat / Data Recipes all work on CPU. With UNSLOTH_ALLOW_CPU=1 a
+# missing GPU degrades to a warning instead of the hard pre-flight failure;
+# when a GPU IS visible the normal checks below still run so a broken GPU
+# setup is not silently ignored.
+if [[ "${UNSLOTH_ALLOW_CPU:-0}" == "1" ]]; then
+    if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L 2>/dev/null | grep -q '^GPU'; then
+        warn "UNSLOTH_ALLOW_CPU=1 and no GPU visible -- continuing on CPU."
+        warn "Training requires an NVIDIA GPU. CPU mode covers Jupyter, GGUF tooling and Studio chat."
+        sync_notebooks
+        exec "$@"
+    fi
 fi
 
-if ! nvidia-smi -L 2>/dev/null | grep -q '^GPU'; then
-    err "No GPU visible to nvidia-smi from inside the container."
+# --- Check 1: nvidia-smi present and can enumerate at least one GPU ---------
+# nvidia-smi is injected by nvidia-container-toolkit when the container is
+# started with a GPU request; it is NOT baked into the image. A missing
+# binary therefore means "no GPU was attached", the same failure class as
+# an empty -L listing, not a broken image.
+if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi -L 2>/dev/null | grep -q '^GPU'; then
+    err "No GPU visible inside the container."
     cat >&2 <<'MSG'
 
 Likely causes (in order of frequency):
@@ -64,7 +90,12 @@ Likely causes (in order of frequency):
        podman:     --device nvidia.com/gpu=all
        k8s:        nvidia.com/gpu resource request + GPU operator
 
-To bypass this check (e.g. offline tooling), set UNSLOTH_SKIP_GPU_CHECK=1.
+  5. This host has no NVIDIA GPU at all (Docker Desktop on macOS, Windows
+     without WSL2 GPU support, CPU-only Linux). Training needs a GPU, but
+     Jupyter, GGUF tooling and Studio chat work on CPU:
+       docker run -e UNSLOTH_ALLOW_CPU=1 ...
+
+To bypass this check entirely (e.g. offline tooling), set UNSLOTH_SKIP_GPU_CHECK=1.
 MSG
     exit 1
 fi
@@ -127,4 +158,5 @@ if major < 8:
     print("      Unsloth will fall back to fp16. Training works but is slightly slower.")
 PY
 
+sync_notebooks
 exec "$@"

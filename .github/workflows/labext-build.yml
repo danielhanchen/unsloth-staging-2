@@ -1,0 +1,89 @@
+# Build the Unsloth JupyterLab extension (the Studio image's notebook UI:
+# "Unsloth Dark" theme, Down/Up cell navigation, #@title forms, top-bar logo)
+# from its TypeScript source on a clean runner -- no Docker, no GPU.
+#
+# This is the cheap "does the Studio notebook UI still compile" gate: it runs
+# the same `jlpm install && jlpm build:prod` the Dockerfile.studio labext-builder
+# stage runs, then asserts the prebuilt labextension and all feature symbols are
+# present in the emitted bundle. Catches TS/type regressions and missing plugins
+# without paying for the full 25 GB studio image build.
+
+name: labext-build
+
+on:
+  push:
+    branches: [docker-blackwell-ci]
+    paths:
+      - 'docker/jupyter/unsloth_labext/**'
+      - '.github/workflows/labext-build.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'docker/jupyter/unsloth_labext/**'
+      - '.github/workflows/labext-build.yml'
+
+concurrency:
+  group: labext-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: docker/jupyter/unsloth_labext
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # jlpm + the `jupyter labextension build` command come from the
+      # jupyterlab Python package; version-match the source's ^4.5 peer range.
+      - name: Install jupyterlab (provides jlpm + labextension builder)
+        run: python -m pip install "jupyterlab>=4.5,<5"
+
+      - name: jlpm install
+        run: jlpm install
+
+      - name: jlpm build:prod
+        run: jlpm build:prod
+
+      - name: Assert prebuilt labextension + feature symbols present
+        shell: bash
+        run: |
+          set -e
+          OUT="unsloth-jupyterlab/labextension"
+          test -f "$OUT/package.json" || { echo "::error::no built package.json"; exit 1; }
+          test -d "$OUT/static"        || { echo "::error::no static dir"; exit 1; }
+          test -d "$OUT/themes"        || { echo "::error::no themes dir"; exit 1; }
+          fail=0
+          for sym in \
+              "unsloth-jupyterlab:theme" \
+              "unsloth-jupyterlab:cell-nav" \
+              "unsloth-jupyterlab:logo" \
+              "unsloth-jupyterlab:colab-title" \
+              "unsloth-title-bar" \
+              "ArrowDown" \
+              "jp-cell-prompt-width" \
+              "data:image/png;base64"; do
+              if grep -rqF "$sym" "$OUT"/static/*.js; then
+                  echo "  found: $sym"
+              else
+                  echo "::error::missing symbol in bundle: $sym"; fail=1
+              fi
+          done
+          # Monokai theme palette emitted into the theme CSS.
+          if grep -rqi "mirror-editor-keyword-color" "$OUT"/themes/*/index.css 2>/dev/null \
+             || grep -rqi "mirror-editor-keyword-color" "$OUT"/themes/unsloth-jupyterlab/*.css 2>/dev/null; then
+              echo "  found: Monokai token CSS"
+          else
+              echo "::error::theme CSS missing Monokai token colors"; fail=1
+          fi
+          exit $fail

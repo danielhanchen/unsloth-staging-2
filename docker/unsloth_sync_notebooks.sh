@@ -1,0 +1,251 @@
+#!/usr/bin/env bash
+# Populate and refresh /workspace/unsloth-notebooks from unslothai/notebooks.
+#
+# The image bakes a read-only template at /opt/unsloth-notebooks so the
+# notebooks are present in JupyterLab instantly and offline. On boot this script
+# copies the template into /workspace/unsloth-notebooks (first run only) and then
+# best-effort refreshes from GitHub when upstream has actually advanced.
+#
+# The user's edits ALWAYS win. We remember the content hash of every file we
+# wrote; on refresh a file whose current hash differs from what we last wrote is
+# treated as user-modified and is left untouched. So a refresh only updates files
+# the user has not changed and adds new ones -- it never clobbers an edited
+# notebook and never produces merge conflicts.
+#
+# Opt-out / tuning (all optional):
+#   UNSLOTH_SKIP_NOTEBOOK_SYNC=1      do nothing (no populate, no refresh)
+#   UNSLOTH_SKIP_NOTEBOOK_REFRESH=1   populate from the baked template only;
+#                                     never touch the network
+#   UNSLOTH_KEEP_DELETED_NOTEBOOKS=1  do not restore notebooks the user deleted
+#                                     (default: deleted files are healed back)
+#   UNSLOTH_NOTEBOOKS_DIR=<path>      target dir (default /workspace/unsloth-notebooks)
+#   UNSLOTH_NOTEBOOKS_REPO=<url>      source repo (default unslothai/notebooks)
+#   UNSLOTH_NOTEBOOK_FETCH_TIMEOUT=N  seconds for each network op (default 60)
+#   UNSLOTH_SKIP_NOTEBOOK_VIEW=1      do not build the categorized folder view
+#   UNSLOTH_NOTEBOOKS_VIEW_DIR=<path> categorized view dir
+#                                     (default "/workspace/Unsloth Notebooks")
+#   UNSLOTH_NB_GPU=amd|cuda           force AMD-* notebook visibility (default:
+#                                     autodetect; AMD-* shown only on AMD/HIP)
+#   UNSLOTH_KEEP_COLAB_INTRO=1        keep the Colab "Run all on Colab" sentence
+#                                     (default: strip it for the Docker image)
+set -u
+
+TEMPLATE="${UNSLOTH_NOTEBOOKS_TEMPLATE:-/opt/unsloth-notebooks}"
+DEST="${UNSLOTH_NOTEBOOKS_DIR:-/workspace/unsloth-notebooks}"
+REMOTE="${UNSLOTH_NOTEBOOKS_REPO:-https://github.com/unslothai/notebooks}"
+STATE="$DEST/.unsloth_sync_state"     # "sha256  relpath" of what we last wrote
+SYNCED="$DEST/.unsloth_sync_commit"   # upstream commit we last synced to
+TIMEOUT="${UNSLOTH_NOTEBOOK_FETCH_TIMEOUT:-60}"
+
+# Helper that compares the *content* (the middle, ignoring the auto-generated
+# install header / announcements / footer) of two notebooks. Used so a refresh
+# doesn't rewrite an untouched notebook when only that boilerplate moved
+# upstream. Resolved from an explicit override, then PATH, then a sibling file.
+PYBIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+SIG_HELPER="${UNSLOTH_NB_SIG_HELPER:-}"
+if [ -z "$SIG_HELPER" ]; then
+    if command -v unsloth-nb-content-sig >/dev/null 2>&1; then
+        SIG_HELPER="$(command -v unsloth-nb-content-sig)"
+    else
+        _self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)"
+        [ -n "$_self_dir" ] && [ -f "$_self_dir/unsloth_nb_content_sig.py" ] \
+            && SIG_HELPER="$_self_dir/unsloth_nb_content_sig.py"
+    fi
+fi
+
+# Same resolution (override -> PATH -> sibling file) for the categorized-view
+# builder and the Docker-only Colab-intro stripper.
+_self_dir="${_self_dir:-$(cd "$(dirname "$0")" 2>/dev/null && pwd)}"
+VIEW_HELPER="${UNSLOTH_NB_VIEW_HELPER:-}"
+if [ -z "$VIEW_HELPER" ]; then
+    if command -v unsloth-nb-view >/dev/null 2>&1; then
+        VIEW_HELPER="$(command -v unsloth-nb-view)"
+    elif [ -n "$_self_dir" ] && [ -f "$_self_dir/unsloth_nb_view.py" ]; then
+        VIEW_HELPER="$_self_dir/unsloth_nb_view.py"
+    fi
+fi
+STRIP_HELPER="${UNSLOTH_NB_STRIP_HELPER:-}"
+if [ -z "$STRIP_HELPER" ]; then
+    if command -v unsloth-nb-strip-colab >/dev/null 2>&1; then
+        STRIP_HELPER="$(command -v unsloth-nb-strip-colab)"
+    elif [ -n "$_self_dir" ] && [ -f "$_self_dir/unsloth_nb_strip_colab.py" ]; then
+        STRIP_HELPER="$_self_dir/unsloth_nb_strip_colab.py"
+    fi
+fi
+
+# True only when BOTH are .ipynb, the helper is usable, and it reports the
+# non-boilerplate middle is identical (so only the header/footer changed).
+# Any failure returns false, so the caller falls back to a normal refresh.
+middle_unchanged() {
+    case "$1" in *.ipynb) : ;; *) return 1 ;; esac
+    [ -n "$PYBIN" ] && [ -n "$SIG_HELPER" ] || return 1
+    [ "${UNSLOTH_NOTEBOOK_BODY_AWARE:-1}" = "1" ] || return 1
+    [ "$("$PYBIN" "$SIG_HELPER" "$1" "$2" 2>/dev/null)" = "SAME" ] || return 1
+    return 0
+}
+
+[ "${UNSLOTH_SKIP_NOTEBOOK_SYNC:-0}" = "1" ] && exit 0
+[ -d "$TEMPLATE" ] || exit 0
+mkdir -p "$DEST" 2>/dev/null || exit 0
+
+hash_of() { sha256sum "$1" 2>/dev/null | cut -d' ' -f1; }
+
+# --- categorized folder view + Docker-only Colab cleanups --------------------
+# AMD/HIP detection: AMD-*.ipynb are shown only on an AMD GPU. UNSLOTH_NB_GPU
+# forces it (amd|cuda); otherwise probe nvidia-smi then the ROCm tools.
+nb_gpu_is_amd() {
+    case "${UNSLOTH_NB_GPU:-}" in
+        amd|AMD|hip|HIP|rocm|ROCm|ROCM) return 0 ;;
+        cuda|CUDA|nvidia|NVIDIA|nv|NV) return 1 ;;
+    esac
+    if command -v nvidia-smi >/dev/null 2>&1 \
+       && nvidia-smi -L 2>/dev/null | grep -q '^GPU'; then
+        return 1
+    fi
+    if command -v rocm-smi >/dev/null 2>&1 || command -v rocminfo >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1   # default: treat as non-AMD (hide AMD-* notebooks)
+}
+
+# Rebuild the sibling symlink VIEW (categorized folders mirroring the README
+# headers) from scratch. Symlinks live OUTSIDE $DEST, so the sync state machine
+# (which walks `find -type f`, skipping symlinks) never sees them.
+build_categorized_view() {
+    [ "${UNSLOTH_SKIP_NOTEBOOK_VIEW:-0}" = "1" ] && return 0
+    [ -n "$PYBIN" ] && [ -n "$VIEW_HELPER" ] || return 0
+    [ -d "$DEST/nb" ] || return 0
+    _view="${UNSLOTH_NOTEBOOKS_VIEW_DIR:-/workspace/Unsloth Notebooks}"
+    if nb_gpu_is_amd; then
+        "$PYBIN" "$VIEW_HELPER" "$DEST" "$_view" --amd 2>/dev/null || true
+    else
+        "$PYBIN" "$VIEW_HELPER" "$DEST" "$_view" 2>/dev/null || true
+    fi
+}
+
+# Strip the Colab-only "Run all on Colab" sentence from notebooks WE own and the
+# user has not edited (STATE-aware), updating their recorded hashes in place.
+strip_colab_intros() {
+    [ "${UNSLOTH_KEEP_COLAB_INTRO:-0}" = "1" ] && return 0
+    [ -n "$PYBIN" ] && [ -n "$STRIP_HELPER" ] || return 0
+    [ -f "$STATE" ] || return 0
+    "$PYBIN" "$STRIP_HELPER" --state "$STATE" --dest "$DEST" 2>/dev/null || true
+}
+
+# Apply both on EVERY exit after the basic guards, so the view + cleanups also
+# run on the common "nothing to refresh" / offline paths. Both are idempotent.
+finalize() { strip_colab_intros; build_categorized_view; }
+trap finalize EXIT
+
+# Record "<hash>  <relpath>" for every file currently under DEST (skip metadata).
+record_state() {
+    : > "$STATE.tmp" 2>/dev/null || return 0
+    ( cd "$DEST" && find . -type f -print0 ) | while IFS= read -r -d '' rel; do
+        rel="${rel#./}"
+        case "$rel" in
+            .unsloth_sync_state|.unsloth_sync_commit) continue ;;
+        esac
+        printf '%s  %s\n' "$(hash_of "$DEST/$rel")" "$rel" >> "$STATE.tmp"
+    done
+    mv "$STATE.tmp" "$STATE" 2>/dev/null || rm -f "$STATE.tmp"
+}
+
+# 1) First-boot populate from the baked template (instant, works offline).
+if [ ! -f "$STATE" ]; then
+    ( cd "$TEMPLATE" && find . -type f -print0 ) | while IFS= read -r -d '' rel; do
+        rel="${rel#./}"
+        case "$rel" in .unsloth_template_commit) continue ;; esac
+        mkdir -p "$DEST/$(dirname "$rel")" 2>/dev/null || true
+        cp -a "$TEMPLATE/$rel" "$DEST/$rel" 2>/dev/null || true
+    done
+    record_state
+    cp -a "$TEMPLATE/.unsloth_template_commit" "$SYNCED" 2>/dev/null || true
+    echo "[unsloth-nb] notebooks ready at $DEST"
+fi
+
+# 1b) Every-boot OFFLINE restore of deleted notebooks. A file we previously wrote
+# that the user has since DELETED is restored from the baked template -- works
+# with no network and even when upstream has not advanced. Files that still exist
+# (edited or not) are never touched, so this cannot resurrect or clobber an edit;
+# the GitHub refresh below then bumps any restored file to the latest upstream.
+# The restored file's recorded hash is reset to the template's so the refresh
+# treats it as pristine (not as a user edit). Opt out with
+# UNSLOTH_KEEP_DELETED_NOTEBOOKS=1 (for users who prune notebooks on purpose).
+if [ -f "$STATE" ] && [ "${UNSLOTH_KEEP_DELETED_NOTEBOOKS:-0}" != "1" ]; then
+    restored=0
+    RS_TMP="$(mktemp)"
+    while IFS= read -r line; do
+        h="${line%%  *}"; rel="${line#*  }"
+        if [ -n "$rel" ] && [ "$rel" != "$line" ] \
+           && [ ! -e "$DEST/$rel" ] && [ -f "$TEMPLATE/$rel" ]; then
+            mkdir -p "$DEST/$(dirname "$rel")" 2>/dev/null || true
+            if cp -a "$TEMPLATE/$rel" "$DEST/$rel" 2>/dev/null; then
+                printf '%s  %s\n' "$(hash_of "$DEST/$rel")" "$rel" >> "$RS_TMP"
+                restored=$((restored + 1))
+                continue
+            fi
+        fi
+        printf '%s\n' "$line" >> "$RS_TMP"
+    done < "$STATE"
+    mv "$RS_TMP" "$STATE" 2>/dev/null || rm -f "$RS_TMP"
+    [ "$restored" -gt 0 ] \
+        && echo "[unsloth-nb] restored $restored deleted notebook(s) from the baked set"
+fi
+
+# 2) Best-effort GitHub refresh -- only when upstream has advanced. Edits win.
+[ "${UNSLOTH_SKIP_NOTEBOOK_REFRESH:-0}" = "1" ] && exit 0
+command -v git >/dev/null 2>&1 || exit 0
+command -v sha256sum >/dev/null 2>&1 || exit 0
+
+last="$(cat "$SYNCED" 2>/dev/null || true)"
+remote="$(timeout "$TIMEOUT" git ls-remote "$REMOTE" HEAD 2>/dev/null | cut -f1)"
+[ -z "$remote" ] && exit 0            # offline / unreachable -> keep what we have
+[ "$remote" = "$last" ] && exit 0     # nothing new since last sync -> done
+
+TMP="$(mktemp -d)"
+if ! timeout "$TIMEOUT" git clone -q --depth 1 "$REMOTE" "$TMP" 2>/dev/null; then
+    rm -rf "$TMP"; exit 0             # network died mid-way -> keep what we have
+fi
+
+declare -A LAST
+if [ -f "$STATE" ]; then
+    while read -r h p; do
+        [ -n "${p:-}" ] && LAST["$p"]="$h"
+    done < "$STATE"
+fi
+
+TMPSTATE="$(mktemp)"
+updated=0; kept=0; unchanged=0
+while IFS= read -r -d '' f; do
+    rel="${f#"$TMP"/}"
+    case "$rel" in .git|.git/*) continue ;; esac
+    dst="$DEST/$rel"
+    if [ -e "$dst" ]; then
+        rec="${LAST[$rel]:-}"
+        if [ -n "$rec" ] && [ "$(hash_of "$dst")" != "$rec" ]; then
+            # User changed this file since we wrote it -> keep theirs, keep marker.
+            printf '%s  %s\n' "$rec" "$rel" >> "$TMPSTATE"
+            kept=$((kept + 1))
+            continue
+        fi
+        if [ -n "$rec" ] && middle_unchanged "$dst" "$f"; then
+            # Untouched notebook whose only upstream change is the install
+            # header / announcements / footer. The tutorial body is identical,
+            # so don't churn the user's file -- keep it and its marker as-is.
+            printf '%s  %s\n' "$rec" "$rel" >> "$TMPSTATE"
+            unchanged=$((unchanged + 1))
+            continue
+        fi
+    fi
+    mkdir -p "$(dirname "$dst")" 2>/dev/null || true
+    if cp -a "$f" "$dst" 2>/dev/null; then
+        printf '%s  %s\n' "$(hash_of "$dst")" "$rel" >> "$TMPSTATE"
+        updated=$((updated + 1))
+    fi
+done < <(find "$TMP" -type f -print0)
+
+mv "$TMPSTATE" "$STATE" 2>/dev/null || rm -f "$TMPSTATE"
+echo "$remote" > "$SYNCED" 2>/dev/null || true
+rm -rf "$TMP"
+echo "[unsloth-nb] notebooks refreshed from GitHub: $updated updated, $kept kept (your edits), $unchanged kept (only header/footer changed upstream)"
+exit 0
