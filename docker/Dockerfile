@@ -285,8 +285,9 @@ RUN set -eux \
 #   omegaconf  TTS families + both NeMo-Gym RL notebooks' config objects
 #   einx  TTS codec tensor-rearrange (Llasa / Oute / Spark TTS)
 #   librosa  Whisper audio feature extraction (pairs with soundfile + torchcodec)
-#   decord  ERNIE-VL vision notebook video decode
 #   ftfy  Oute TTS text normalisation
+# decord (ERNIE-VL video decode) is installed separately below: it ships no
+# aarch64 wheel, so a hard install here would break the arm64 build.
 # librosa pulls numba/soxr/audioread; numba is already pinned >=0.65 (numpy 2.4
 # compatible) by the vLLM pass, so the resolve must NOT move torch/numpy/numba --
 # the assertion below fails the build loudly if it did.
@@ -294,8 +295,14 @@ RUN ${VENV}/bin/uv pip install \
         --python ${VENV}/bin/python \
         jupyterlab notebook ipywidgets matplotlib \
         soundfile evaluate jiwer tensorboard langid easydict protobuf \
-        omegaconf einx librosa decord ftfy \
+        omegaconf einx librosa ftfy \
  && ${VENV}/bin/python -c "import torch, numpy, numba; from packaging.version import Version; assert torch.__version__.startswith('2.10.0'), torch.__version__; assert Version(numpy.__version__) >= Version('2.3'), numpy.__version__; assert Version(numba.__version__) >= Version('0.65'), numba.__version__; print('notebook-deps pins OK:', torch.__version__, numpy.__version__, numba.__version__)"
+
+# decord (ERNIE-VL video decode) publishes wheels only for x86_64 / win_amd64,
+# so install it on its own and fail-soft: amd64 gets it; on arm64 the ERNIE-VL
+# video path is skipped rather than breaking the whole image build.
+RUN ${VENV}/bin/uv pip install --python ${VENV}/bin/python decord \
+ || echo ">> decord skipped (no matching wheel for ${TARGETARCH:-amd64}); ERNIE-VL video decode unavailable"
 
 # Audio decode out of the box: the TTS/STT notebooks feed datasets' Audio
 # features, which decode through torchcodec. Three traps, all defended:

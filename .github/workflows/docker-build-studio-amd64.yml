@@ -57,7 +57,7 @@ jobs:
           DOCKER_BUILDKIT=1 docker build \
             --progress=plain \
             --build-arg BASE_IMAGE=unsloth-blackwell:base-ci \
-            --build-arg UNSLOTH_STUDIO_REF=main \
+            --build-arg UNSLOTH_STUDIO_REF=docker-blackwell-build \
             -t unsloth-blackwell:studio-ci \
             -f docker/Dockerfile.studio docker/
           docker image ls unsloth-blackwell
