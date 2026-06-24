@@ -417,7 +417,52 @@ def main():
         except Exception as e:
             record("mlx_safetensors", False, repr(e))
 
-    # 12) notebook refresh (docker only): delete/edit/restore behavior in the
+    # 12) in-place updaters (docker only): the baked helpers that update Studio
+    # and the llama.cpp prebuilt without pulling a new image. Each degrades
+    # gracefully (non-required skip) on an image that predates the helper, and is
+    # required where the helper is present.
+    if args.mode == "docker":
+        def _has(path):
+            return subprocess.run(["docker", "exec", args.container, "test", "-x", path]).returncode == 0
+
+        # unsloth-studio-update --no-restart: exercises venv resolution, the
+        # --no-deps package update, and the post-update import smoke check, while
+        # leaving the running studio untouched mid-battery.
+        try:
+            if not _has("/usr/local/bin/unsloth-studio-update"):
+                record("studio_update", True, "skipped: no unsloth-studio-update (pre-helper image)",
+                       required=False)
+            else:
+                out = subprocess.run(
+                    ["docker", "exec", args.container, "unsloth-studio-update", "--no-restart"],
+                    capture_output=True, text=True, timeout=int(600 * slow_factor()))
+                blob = (out.stdout + out.stderr).strip()
+                last = blob.splitlines()[-1][:90] if blob else ""
+                record("studio_update", out.returncode == 0 and "[studio-update] done" in blob,
+                       f"rc={out.returncode} {last}")
+        except Exception as e:
+            record("studio_update", False, repr(e))
+
+        # unsloth-llama-update --check: redirect-based resolver (no API, no
+        # download) reporting installed vs latest llama.cpp prebuilt tag.
+        try:
+            if not _has("/usr/local/bin/unsloth-llama-update"):
+                record("llama_update", True, "skipped: no unsloth-llama-update (pre-helper image)",
+                       required=False)
+            else:
+                out = subprocess.run(
+                    ["docker", "exec", args.container, "unsloth-llama-update", "--check"],
+                    capture_output=True, text=True, timeout=int(90 * slow_factor()))
+                blob = out.stdout + out.stderr
+                tags = " ".join(ln.strip() for ln in blob.splitlines()
+                                if "installed:" in ln or "latest:" in ln)
+                record("llama_update",
+                       out.returncode == 0 and "installed:" in blob and "latest:" in blob,
+                       f"rc={out.returncode} {tags[:120]}")
+        except Exception as e:
+            record("llama_update", False, repr(e))
+
+    # 13) notebook refresh (docker only): delete/edit/restore behavior in the
     # real container. A probe deletes one baked notebook, edits another, runs the
     # boot-time sync, and reports whether the deleted one healed back, the edited
     # one was left intact, and a third stayed unchanged. Native lanes have no
