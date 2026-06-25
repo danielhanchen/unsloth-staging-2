@@ -8,6 +8,8 @@ import { Widget } from '@lumino/widgets';
 import { UNSLOTH_LOGO_DATA_URI } from './logo';
 import cellNavPlugin from './cellNav';
 import colabTitlePlugin from './colabTitle';
+import outputSelectPlugin from './outputSelect';
+import uiChromePlugin from './uiChrome';
 
 /**
  * The "Unsloth Dark" theme: JupyterLab Dark repainted with the Sublime/Colab
@@ -62,4 +64,11 @@ const logoPlugin: JupyterFrontEndPlugin<void> = {
   }
 };
 
-export default [themePlugin, cellNavPlugin, logoPlugin, colabTitlePlugin];
+export default [
+  themePlugin,
+  cellNavPlugin,
+  logoPlugin,
+  colabTitlePlugin,
+  outputSelectPlugin,
+  uiChromePlugin
+];

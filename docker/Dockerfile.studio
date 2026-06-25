@@ -206,12 +206,20 @@ COPY --from=labext-builder /opt/labext-src/unsloth-jupyterlab/labextension /opt/
 COPY jupyter/favicon.ico /tmp/unsloth-branding/favicon.ico
 COPY jupyter/logo.png /tmp/unsloth-branding/logo.png
 COPY jupyter/login.html /tmp/unsloth-branding/login.html
+COPY jupyter/install_sloth_stickers.py /tmp/unsloth-branding/install_sloth_stickers.py
 RUN JS="$(/opt/unsloth-venv/bin/python -c 'import os, jupyter_server; print(os.path.dirname(jupyter_server.__file__))')" \
  && for n in favicon.ico favicon-notebook.ico favicon-file.ico favicon-terminal.ico; do \
         cp /tmp/unsloth-branding/favicon.ico "${JS}/static/favicons/${n}"; \
     done \
  && cp /tmp/unsloth-branding/logo.png "${JS}/static/logo/logo.png" \
  && cp /tmp/unsloth-branding/login.html "${JS}/templates/login.html" \
+    # Copy the curated Studio sloth stickers the login page rotates through into
+    # jupyter_server's static dir (sloth/NN.png). Fail-soft: if the Studio
+    # public folder ever moves, login.html's onerror falls back to the logo.
+ && /opt/unsloth-venv/bin/python /tmp/unsloth-branding/install_sloth_stickers.py \
+        --src "${UNSLOTH_STUDIO_HOME}/src/studio/frontend/public/Sloth emojis" \
+        --dest "${JS}/static/sloth" \
+    || echo ">> sloth stickers not installed (login falls back to the Unsloth logo)" \
  && rm -rf /tmp/unsloth-branding \
  && /opt/unsloth-venv/bin/jupyter labextension disable @jupyterlab/application-extension:logo \
  && /opt/unsloth-venv/bin/jupyter labextension lock @jupyterlab/application-extension:logo

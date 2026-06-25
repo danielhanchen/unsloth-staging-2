@@ -155,29 +155,35 @@ def test_labext_and_branding() -> None:
             p = json.load(f)
         check("labext name unsloth-jupyterlab", p.get("name") == "unsloth-jupyterlab")
         check("labext themePath set", bool(p.get("jupyterlab", {}).get("themePath")))
-    index = os.path.join(LABEXT, "src", "index.ts")
-    src = ""
-    if os.path.isfile(index):
-        with open(index, encoding="utf-8") as f:
-            src = f.read()
+    # Concatenate every .ts module under src/ so plugins defined in their own
+    # files (cellNav, colabTitle, outputSelect, uiChrome) are all covered.
+    src_dir = os.path.join(LABEXT, "src")
+    all_src = ""
+    if os.path.isdir(src_dir):
+        for fn in sorted(os.listdir(src_dir)):
+            if fn.endswith(".ts"):
+                with open(os.path.join(src_dir, fn), encoding="utf-8") as f:
+                    all_src += f.read() + "\n"
     for plug in ["unsloth-jupyterlab:theme", "unsloth-jupyterlab:cell-nav",
-                 "unsloth-jupyterlab:logo", "unsloth-jupyterlab:colab-title"]:
-        # cell-nav/colab-title live in their own modules; grep the whole src tree.
-        found = plug in src
-        if not found:
-            for fn in ("cellNav.ts", "colabTitle.ts"):
-                fp = os.path.join(LABEXT, "src", fn)
-                if os.path.isfile(fp):
-                    with open(fp, encoding="utf-8") as f:
-                        if plug in f.read():
-                            found = True
-                            break
-        check(f"plugin present: {plug}", found)
+                 "unsloth-jupyterlab:logo", "unsloth-jupyterlab:colab-title",
+                 "unsloth-jupyterlab:output-select-all", "unsloth-jupyterlab:ui-chrome"]:
+        check(f"plugin present: {plug}", plug in all_src)
+    # The two newest plugins are also exported from index.ts (wired in).
+    index = os.path.join(src_dir, "index.ts")
+    index_src = open(index, encoding="utf-8").read() if os.path.isfile(index) else ""
+    check("outputSelect wired in index.ts", "outputSelectPlugin" in index_src)
+    check("uiChrome wired in index.ts", "uiChromePlugin" in index_src)
+    # uiChrome hides the right activity bar; CTRL+A output-select selects nodes.
+    check("right activity bar hidden", "jp-mod-right" in all_src and "display: none" in all_src)
+    check("ctrl+A output select", "selectNodeContents" in all_src)
     # branding assets
     login = os.path.join(JUPYTER, "login.html")
-    check("login.html branded", os.path.isfile(login) and "unsloth-login-card" in open(login, encoding="utf-8").read())
+    login_src = open(login, encoding="utf-8").read() if os.path.isfile(login) else ""
+    check("login.html branded", "unsloth-login-card" in login_src)
+    check("login.html uses sloth stickers", 'static_url("sloth/' in login_src or "static_url('sloth/" in login_src)
     check("favicon.ico present", os.path.isfile(os.path.join(JUPYTER, "favicon.ico")))
     check("logo.png present", os.path.isfile(os.path.join(JUPYTER, "logo.png")))
+    check("sloth sticker installer present", os.path.isfile(os.path.join(JUPYTER, "install_sloth_stickers.py")))
 
 
 def main() -> int:

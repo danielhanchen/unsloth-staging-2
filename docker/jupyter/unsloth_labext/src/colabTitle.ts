@@ -33,7 +33,7 @@ function injectStyle(): void {
 .unsloth-title-bar {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 8px;
   cursor: pointer;
   padding: 4px 8px;
   /* Indent past the cell collapser + prompt gutter so the title aligns with the
@@ -41,7 +41,10 @@ function injectStyle(): void {
   margin: 2px 0 2px var(--jp-cell-prompt-width, 64px);
   user-select: none;
   border-radius: 4px;
-  font-size: var(--jp-content-font-size1, 14px);
+  /* Heading-2-sized so a #@title form reads like a section heading (matches the
+     rendered-markdown h2 scale, --jp-content-font-size4); the caret inherits
+     this size so it grows too. */
+  font-size: var(--jp-content-font-size4, 1.728em);
   color: var(--jp-content-font-color1, inherit);
 }
 .unsloth-title-bar:hover {
@@ -50,14 +53,16 @@ function injectStyle(): void {
 .unsloth-title-caret {
   display: inline-block;
   width: 1em;
-  opacity: 0.7;
-  transition: transform 0.1s ease;
+  line-height: 1;
+  opacity: 0.8;
+  transition: transform 0.12s ease;
 }
 .unsloth-title-bar.unsloth-collapsed .unsloth-title-caret {
   transform: rotate(-90deg);
 }
 .unsloth-title-text {
-  font-weight: 600;
+  font-weight: 700;
+  line-height: 1.25;
 }
 .jp-Cell.unsloth-code-collapsed > .jp-Cell-inputWrapper {
   display: none;

@@ -72,9 +72,13 @@ jobs:
               "unsloth-jupyterlab:cell-nav" \
               "unsloth-jupyterlab:logo" \
               "unsloth-jupyterlab:colab-title" \
+              "unsloth-jupyterlab:output-select-all" \
+              "unsloth-jupyterlab:ui-chrome" \
               "unsloth-title-bar" \
               "ArrowDown" \
               "jp-cell-prompt-width" \
+              "jp-mod-right" \
+              "selectNodeContents" \
               "data:image/png;base64"; do
               if grep -rqF "$sym" "$OUT"/static/*.js; then
                   echo "  found: $sym"

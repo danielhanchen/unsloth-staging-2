@@ -31,6 +31,11 @@
     box-shadow: 0 10px 34px rgba(0, 0, 0, 0.45);
   }
   .unsloth-login-card img.logo { height: 72px; width: auto; margin-bottom: 14px; }
+  /* A random Unsloth Studio sloth sticker, shown like the Studio login screen. */
+  .unsloth-login-card img.sloth {
+    height: 104px; width: 104px; object-fit: contain;
+    margin: 2px auto 10px; display: block;
+  }
   .unsloth-login-card h1 { font-size: 22px; margin: 0 0 4px; font-weight: 700; }
   .unsloth-login-card p.sub { color: hsl(60, 8%, 64%); margin: 0 0 24px; font-size: 14px; }
   .unsloth-login-card label {
@@ -56,8 +61,19 @@
 {% endblock %}
 
 {% block site %}
+{# A different Unsloth Studio sloth sticker each visit (matches Studio's login).
+   The PNGs are copied into static/sloth/NN.png by the image build; if one is
+   missing the onerror handler falls back to the Unsloth logo so the page never
+   shows a broken image. #}
+{% set sloths = [
+  "01.png", "02.png", "03.png", "04.png", "05.png", "06.png", "07.png",
+  "08.png", "09.png", "10.png", "11.png", "12.png", "13.png", "14.png",
+  "15.png", "16.png", "17.png", "18.png", "19.png", "20.png"
+] %}
 <div class="unsloth-login-card">
-  <img class="logo" src='{{ static_url("logo/logo.png") }}' alt='Unsloth' />
+  <img class="sloth" src='{{ static_url("sloth/" ~ (sloths | random)) }}'
+       onerror="this.onerror=null;this.className='logo';this.src='{{ static_url('logo/logo.png') }}';"
+       alt='Unsloth' />
   <h1>Unsloth</h1>
   <p class="sub">Sign in to JupyterLab</p>
   {% if login_available %}

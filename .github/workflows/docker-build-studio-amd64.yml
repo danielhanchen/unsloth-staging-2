@@ -81,6 +81,14 @@ jobs:
           echo "-- favicon + logo swapped (not stock sizes) --"
           test "$(stat -c %s "$JS/static/logo/logo.png")" != "5922" \
             && echo "  OK logo swapped" || { echo "::error::logo still stock"; fail=1; }
+          echo "-- login sloth stickers installed --"
+          { test -f "$JS/static/sloth/01.png" && test -f "$JS/static/sloth/20.png" \
+            && grep -q "sloth/" "$JS/templates/login.html"; } \
+            && echo "  OK sloth stickers" || { echo "::error::sloth stickers missing"; fail=1; }
+          echo "-- right activity bar hidden + ctrl+A output-select in labext --"
+          LJS="$(ls /opt/unsloth-venv/share/jupyter/labextensions/unsloth-jupyterlab/static/*.js)"; \
+          grep -qF "jp-mod-right" $LJS && grep -qF "selectNodeContents" $LJS \
+            && echo "  OK ui-chrome + output-select" || { echo "::error::ui-chrome/output-select missing from labext"; fail=1; }
           echo "-- overrides defaults --"
           /opt/unsloth-venv/bin/python - <<PY
           import json, sys
