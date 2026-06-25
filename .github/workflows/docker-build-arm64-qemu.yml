@@ -45,8 +45,17 @@ jobs:
 
       - name: Reclaim disk
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
-                      /opt/hostedtoolcache/CodeQL "$AGENT_TOOLSDIRECTORY" || true
+          # Match docker-publish.yml's aggressive reclaim. QEMU builds the arm64
+          # image on an amd64 host, so headroom is usually larger than the native
+          # arm64 runner, but a cache-busting Dockerfile change makes the full
+          # rebuild heavy enough to warrant the same cleanup. || true: paths
+          # differ slightly across runner images.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+                      "$AGENT_TOOLSDIRECTORY" /usr/local/.ghcup /usr/share/swift \
+                      /usr/local/share/powershell /usr/local/lib/node_modules /usr/local/julia* \
+                      /opt/microsoft /usr/share/miniconda /opt/az /usr/local/share/boost \
+                      /usr/local/share/chromium || true
+          sudo docker image prune -af || true
           df -h /
 
       - uses: docker/setup-qemu-action@v3
