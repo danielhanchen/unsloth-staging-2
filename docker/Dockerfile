@@ -291,17 +291,22 @@ RUN set -eux \
 # librosa pulls numba/soxr/audioread; numba is already pinned >=0.65 (numpy 2.4
 # compatible) by the vLLM pass, so the resolve must NOT move torch/numpy/numba --
 # the assertion below fails the build loudly if it did.
+# Pinned (==) to the resolved, tested versions for reproducible rebuilds -- the
+# same convention as the cu128 core (torch/torchvision/torchaudio). Bump these
+# deliberately, not silently on the next build. Transitive deps of these are
+# captured by the full venv lockfile (docker/freeze.sh -> requirements.lock.txt).
 RUN ${VENV}/bin/uv pip install \
         --python ${VENV}/bin/python \
-        jupyterlab notebook ipywidgets matplotlib \
-        soundfile evaluate jiwer tensorboard langid easydict protobuf \
-        omegaconf einx librosa ftfy \
+        "jupyterlab==4.6.0" "notebook==7.6.0" "ipywidgets==8.1.8" "matplotlib==3.11.0" \
+        "soundfile==0.14.0" "evaluate==0.4.6" "jiwer==4.0.0" "tensorboard==2.20.0" \
+        "langid==1.1.6" "easydict==1.13" "protobuf==6.33.6" \
+        "omegaconf==2.3.1" "einx==0.4.3" "librosa==0.11.0" "ftfy==6.3.1" \
  && ${VENV}/bin/python -c "import torch, numpy, numba; from packaging.version import Version; assert torch.__version__.startswith('2.10.0'), torch.__version__; assert Version(numpy.__version__) >= Version('2.3'), numpy.__version__; assert Version(numba.__version__) >= Version('0.65'), numba.__version__; print('notebook-deps pins OK:', torch.__version__, numpy.__version__, numba.__version__)"
 
 # decord (ERNIE-VL video decode) publishes wheels only for x86_64 / win_amd64,
 # so install it on its own and fail-soft: amd64 gets it; on arm64 the ERNIE-VL
 # video path is skipped rather than breaking the whole image build.
-RUN ${VENV}/bin/uv pip install --python ${VENV}/bin/python decord \
+RUN ${VENV}/bin/uv pip install --python ${VENV}/bin/python "decord==0.6.0" \
  || echo ">> decord skipped (no matching wheel for ${TARGETARCH:-amd64}); ERNIE-VL video decode unavailable"
 
 # Audio decode out of the box: the TTS/STT notebooks feed datasets' Audio
