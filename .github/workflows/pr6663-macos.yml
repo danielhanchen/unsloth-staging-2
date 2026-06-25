@@ -1,0 +1,37 @@
+name: pr6663-macos
+on:
+  push:
+    branches: [pr6663-cross-os]
+    paths:
+      - 'studio/setup.sh'
+      - 'build.sh'
+      - 'tests/registry_logic_test.sh'
+      - '.github/workflows/pr6663-macos.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/setup.sh'
+      - 'build.sh'
+      - 'tests/registry_logic_test.sh'
+      - '.github/workflows/pr6663-macos.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  bash-logic:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: bash version (macOS ships bash 3.2 at /bin/bash)
+        run: bash --version | head -1
+      - name: registry logic test (bash)
+        run: bash tests/registry_logic_test.sh

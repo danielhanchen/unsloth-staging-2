@@ -1,0 +1,41 @@
+name: pr6663-windows
+on:
+  push:
+    branches: [pr6663-cross-os]
+    paths:
+      - 'studio/setup.ps1'
+      - 'tests/registry_logic_test.ps1'
+      - '.github/workflows/pr6663-windows.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/setup.ps1'
+      - 'tests/registry_logic_test.ps1'
+      - '.github/workflows/pr6663-windows.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  ps-logic:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: pwsh 7 logic test
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass -Force
+          ./tests/registry_logic_test.ps1
+      - name: Windows PowerShell 5.1 logic test
+        shell: powershell
+        run: |
+          Set-ExecutionPolicy -Scope Process Bypass -Force
+          .\tests\registry_logic_test.ps1
