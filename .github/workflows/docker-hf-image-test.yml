@@ -74,9 +74,19 @@ jobs:
 
       - name: Pull + load the published image (docker/hf_pull.sh)
         run: |
+          set -o pipefail
           mkdir -p "$ART"
-          # hf_pull.sh: hf download <repo> <blob> --repo-type=model + pigz -d | docker load
-          bash docker/hf_pull.sh "$HF_REPO" "$IMAGE_TARBALL" "$IMAGE_TAG" | tee "$ART/00_image_load.log"
+          # hf_pull.sh: hf download <repo> <blob> --repo-type=model + pigz -d | docker load.
+          # It loads the tarball under its baked tag (e.g. unsloth-blackwell:studio-allpr),
+          # so capture that from `docker load` output and re-tag to our stable IMAGE_TAG.
+          bash docker/hf_pull.sh "$HF_REPO" "$IMAGE_TARBALL" | tee "$ART/00_image_load.log"
+          LOADED=$(sed -n 's/^Loaded image: //p' "$ART/00_image_load.log" | head -1)
+          if [ -z "$LOADED" ]; then
+            LOADED=$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -v '<none>' | head -1)
+          fi
+          echo "loaded image ref: $LOADED" | tee -a "$ART/00_image_load.log"
+          [ -n "$LOADED" ] || { echo "could not determine loaded image tag"; exit 1; }
+          docker tag "$LOADED" "$IMAGE_TAG"
           docker image inspect "$IMAGE_TAG" --format 'loaded {{.Id}} size={{.Size}}' | tee -a "$ART/00_image_load.log"
           # reclaim the tarball space immediately
           rm -f "$RUNNER_TEMP"/*.tar.gz /tmp/*.tar.gz || true
