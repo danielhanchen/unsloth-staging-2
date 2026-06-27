@@ -1,0 +1,44 @@
+# Quoted/hyphenated name so the `#` in "PR #6613" is not parsed as a YAML
+# comment (which would blank the name and collide concurrency across OSes).
+name: PR-6613 session-scope ubuntu-latest
+on:
+  push:
+    branches: [pr6613-session-scope-cross-os]
+    paths:
+      - 'unsloth_cli/**'
+      - '.github/scripts/agent-guides-drive.sh'
+      - '.github/workflows/pr6613-ubuntu.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'unsloth_cli/**'
+      - '.github/scripts/agent-guides-drive.sh'
+      - '.github/workflows/pr6613-ubuntu.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  start-cli:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+      - name: Install minimal deps
+        run: python -m pip install typer rich pydantic pyyaml pytest pytest-timeout ruff
+      - name: Unit tests (unsloth start session config)
+        run: python -m pytest unsloth_cli/tests/test_start.py -q
+      - name: Ruff
+        run: ruff check unsloth_cli/commands/start.py unsloth_cli/tests/test_start.py
+      - name: Bash syntax check (agent-guides CI driver)
+        run: bash -n .github/scripts/agent-guides-drive.sh
+      - name: ShellCheck (agent-guides CI driver, informational)
+        continue-on-error: true
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          shellcheck -x .github/scripts/agent-guides-drive.sh

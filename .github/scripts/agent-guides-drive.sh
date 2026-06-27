@@ -6,11 +6,11 @@
 # Local Agent Guides CI. All failures from here are failure class (c)
 # "guide drift": the server preflight already passed and the agent CLI
 # already installed, so a failure here means the documented recipe in
-# unsloth_cli/commands/connect.py no longer produces a working flow.
+# unsloth_cli/commands/start.py no longer produces a working flow.
 #
-# Self-updating: for the 5 agents with a connect.py recipe we obtain the
-# exact env + command from `unsloth connect <agent> --no-launch` and run
-# THAT, so a recipe change is exercised automatically. Pi (no connect.py
+# Self-updating: for the 5 agents with a start.py recipe we obtain the
+# exact env + command from `unsloth start <agent> --no-launch` and run
+# THAT, so a recipe change is exercised automatically. Pi (no start.py
 # command at HEAD) is driven by a hand-written recipe.
 #
 # Every agent invocation is wrapped in `timeout` so a headless-TTY prompt
@@ -53,14 +53,14 @@ REDACTED_DIR="$REPO_ROOT/redacted-configs"
 WORKDIR_BASE="$REPO_ROOT/agent-workdir"
 CACHE_HELPER="$SCRIPT_DIR/assert-prompt-cache.sh"
 mkdir -p "$LOGS_DIR" "$REDACTED_DIR"
-CONNECT_REF="unsloth_cli/commands/connect.py"
+CONNECT_REF="unsloth_cli/commands/start.py"
 
 # Prefill-shrinking flags for Claude Code. The heavyweight agents send
 # multi-thousand-token system prompts + full tool schemas, which on a CPU-only
 # runner is minutes of prefill per model round-trip (~16 tok/s for a 4B model).
 # Replacing the ~5.7k default system prompt with a tiny one (--system-prompt-file)
 # and restricting tools cuts the prefill to a few hundred tokens so it completes
-# quickly on CPU. These only shape the request size; the connect.py recipe
+# quickly on CPU. These only shape the request size; the start.py recipe
 # (endpoint, auth, model) is still exercised end to end.
 #
 # The bulk of Claude Code's prompt is the built-in tool JSON schemas: measured
@@ -131,13 +131,13 @@ run_timed() {  # $1=outfile, rest=command
   return "$rc"
 }
 
-# ── Pi: no connect.py command at HEAD -> hand-written recipe ──────────────
+# ── Pi: no start.py command at HEAD -> hand-written recipe ──────────────
 write_pi_config() {
-  if unsloth connect pi --help >/dev/null 2>&1; then
+  if unsloth start pi --help >/dev/null 2>&1; then
     # Tripwire: once a real recipe exists, the hand-written config would mask any
     # drift in it, defeating the point of this CI. Fail hard so the cell is
-    # migrated to the self-updating `unsloth connect pi --no-launch` path.
-    guide_fail "connect.py now ships a 'pi' command -- migrate this CI cell to the 'unsloth connect pi --no-launch' path so the documented recipe is exercised (the hand-written Pi config no longer reflects it)"
+    # migrated to the self-updating `unsloth start pi --no-launch` path.
+    guide_fail "start.py now ships a 'pi' command -- migrate this CI cell to the 'unsloth start pi --no-launch' path so the documented recipe is exercised (the hand-written Pi config no longer reflects it)"
   fi
   mkdir -p "$HOME/.pi/agent"
   python3 - "$UNSLOTH_BASE_URL" "$UNSLOTH_API_KEY" "$UNSLOTH_MODEL_ID" <<'PY'
@@ -157,19 +157,29 @@ PY
   redact "$REDACTED_DIR/pi-models.json"
 }
 
-# ── 5-agent connect.py path: parse env + command from --no-launch ─────────
+# Read a value from an `export VAR=...` line in the connect --no-launch output.
+# `unsloth start` writes each agent's session config off the user's ~ and points
+# at it through a relocation env var (CODEX_HOME / OPENCODE_CONFIG /
+# OPENCLAW_CONFIG_PATH), so the contract checks read the path from here.
+raw_env() {  # $1 = var name -> value (one shlex-quote layer stripped)
+  local raw="$LOGS_DIR/connect-${AGENT}.txt"
+  local v; v="$(sed -n "s/^export $1=//p" "$raw" | tail -1)"
+  v="${v#\'}"; v="${v%\'}"; printf '%s' "$v"
+}
+
+# ── 5-agent start.py path: parse env + command from --no-launch ─────────
 # Populates globals CONNECT_ENV (export/unset lines) and CONNECT_CMD (the
-# launch command on the last printed line), and runs connect.py's config
-# writers as a side effect (it writes ~/.codex, ~/.claude, etc.).
+# launch command on the last printed line), and runs start.py's config
+# writers as a side effect (it writes each agent's relocated session config).
 parse_connect() {
   local raw="$LOGS_DIR/connect-${AGENT}.txt"
-  if ! unsloth connect "$AGENT" --no-launch --api-key "$UNSLOTH_API_KEY" > "$raw" 2>&1; then
+  if ! unsloth start "$AGENT" --no-launch --api-key "$UNSLOTH_API_KEY" > "$raw" 2>&1; then
     cat "$raw"
-    guide_fail "'unsloth connect ${AGENT} --no-launch' exited non-zero"
+    guide_fail "'unsloth start ${AGENT} --no-launch' exited non-zero"
   fi
   echo "[$AGENT] connect --no-launch printed:"; cat "$raw"
   CONNECT_ENV="$(grep -E '^(export |unset )' "$raw" || true)"
-  # The launch command is the last non-export, non-status line. connect.py
+  # The launch command is the last non-export, non-status line. start.py
   # prints "Studio <url> · model <id>" and "Updated ..." status lines first.
   CONNECT_CMD="$(grep -vE '^(export |unset |Studio |Updated |Disabled |Warning|Loading)' "$raw" \
     | grep -E '[^[:space:]]' | tail -1)"
@@ -177,45 +187,47 @@ parse_connect() {
   redact "$raw"
 }
 
-# Cross-check the documented contract knobs so silent connect.py changes
+# Cross-check the documented contract knobs so silent start.py changes
 # (env-var rename, wire_api flip, attribution setting drop) also fail/flag.
 crosscheck_contract() {
   local raw="$LOGS_DIR/connect-${AGENT}.txt"
+  local cfg
   case "$AGENT" in
     codex)
       grep -q 'UNSLOTH_STUDIO_AUTH_TOKEN' "$raw" \
-        || guide_fail "Codex env key is no longer UNSLOTH_STUDIO_AUTH_TOKEN (connect.py _CODEX_ENV_KEY)"
-      if [ -f "$HOME/.codex/config.toml" ]; then
-        grep -q 'wire_api = "responses"' "$HOME/.codex/config.toml" \
-          || guide_fail "Codex wire_api is no longer \"responses\" in ~/.codex/config.toml"
-        cp "$HOME/.codex/config.toml" "$REDACTED_DIR/codex-config.toml"
+        || guide_fail "Codex env key is no longer UNSLOTH_STUDIO_AUTH_TOKEN (start.py _CODEX_ENV_KEY)"
+      cfg="$(raw_env CODEX_HOME)/config.toml"
+      if [ -f "$cfg" ]; then
+        grep -q 'wire_api = "responses"' "$cfg" \
+          || guide_fail "Codex wire_api is no longer \"responses\" in \$CODEX_HOME/config.toml"
+        cp "$cfg" "$REDACTED_DIR/codex-config.toml"
       fi
       grep -q 'codex --oss --profile unsloth_api' "$raw" \
         || echo "::warning::Codex launch command changed from 'codex --oss --profile unsloth_api'"
       ;;
     claude)
       grep -q 'ANTHROPIC_AUTH_TOKEN' "$raw" \
-        || guide_fail "Claude no longer exports ANTHROPIC_AUTH_TOKEN (connect.py claude())"
-      if [ -f "$HOME/.claude/settings.json" ]; then
-        grep -q '"CLAUDE_CODE_ATTRIBUTION_HEADER"' "$HOME/.claude/settings.json" \
-          || echo "::warning::CLAUDE_CODE_ATTRIBUTION_HEADER not written to ~/.claude/settings.json (ensure_claude_attribution_header)"
-        cp "$HOME/.claude/settings.json" "$REDACTED_DIR/claude-settings.json"
-      fi
+        || guide_fail "Claude no longer exports ANTHROPIC_AUTH_TOKEN (start.py claude())"
+      grep -q 'CLAUDE_CODE_ATTRIBUTION_HEADER' "$raw" \
+        || echo "::warning::CLAUDE_CODE_ATTRIBUTION_HEADER no longer set for the session (start.py claude())"
       ;;
     hermes)
       grep -q 'UNSLOTH_API_KEY' "$raw" \
-        || guide_fail "Hermes env key is no longer UNSLOTH_API_KEY (connect.py _HERMES_ENV_KEY)"
-      [ -f "$HOME/.hermes/config.yaml" ] && cp "$HOME/.hermes/config.yaml" "$REDACTED_DIR/hermes-config.yaml"
+        || guide_fail "Hermes env key is no longer UNSLOTH_API_KEY (start.py _HERMES_ENV_KEY)"
+      cfg="$(raw_env HERMES_HOME)/config.yaml"
+      [ -f "$cfg" ] && cp "$cfg" "$REDACTED_DIR/hermes-config.yaml"
       ;;
     openclaw)
-      if [ -f "$HOME/.openclaw/openclaw.json" ]; then
-        grep -q '"openai-completions"' "$HOME/.openclaw/openclaw.json" \
+      cfg="$(raw_env OPENCLAW_CONFIG_PATH)"
+      if [ -n "$cfg" ] && [ -f "$cfg" ]; then
+        grep -q '"openai-completions"' "$cfg" \
           || echo "::warning::OpenClaw provider api is no longer 'openai-completions' (write_openclaw_config)"
-        cp "$HOME/.openclaw/openclaw.json" "$REDACTED_DIR/openclaw.json"
+        cp "$cfg" "$REDACTED_DIR/openclaw.json"
       fi
       ;;
     opencode)
-      [ -f "$HOME/.config/opencode/opencode.json" ] && cp "$HOME/.config/opencode/opencode.json" "$REDACTED_DIR/opencode.json"
+      cfg="$(raw_env OPENCODE_CONFIG)"
+      [ -n "$cfg" ] && [ -f "$cfg" ] && cp "$cfg" "$REDACTED_DIR/opencode.json"
       ;;
   esac
   redact "$REDACTED_DIR"/* 2>/dev/null || true
@@ -229,16 +241,19 @@ crosscheck_contract() {
 
 # Hermes: an explicit empty cli toolset disables all tools (and drops the
 # tool-gated guidance blocks), so -z sends ~300 tokens instead of thousands.
-# hermes ships a DEFAULT config.yaml that already has a populated
-# platform_toolsets, and `unsloth connect` merges into it, so we must override
-# cli (not just append). That needs a YAML parser, and the runner's bare
-# python3 has no PyYAML -- but the venv that ships `unsloth` does (connect.py
-# imports yaml), so run the patch with that interpreter.
+# Hermes enables its default cli toolset when the session config does not pin one,
+# so we must set platform_toolsets.cli explicitly to [] (not just append) to get
+# zero tools. That needs a YAML parser, and the runner's bare python3 has no
+# PyYAML -- but the venv that ships `unsloth` does (start.py imports yaml), so run
+# the patch with that interpreter. We patch the relocated $HERMES_HOME/config.yaml
+# that `unsloth start` printed, not the user's ~/.hermes.
 # (-z reads platform_toolsets.cli; --ignore-rules is a no-op under -z.)
 patch_hermes_tools() {  # $1 = none|default
+  local cfg; cfg="$(raw_env HERMES_HOME)/config.yaml"
+  [ -n "$cfg" ] || guide_fail "Hermes HERMES_HOME missing from connect output (start.py hermes())"
   # Find a python that can import yaml. The runner's bare python3 cannot, but the
   # interpreter in the `unsloth` console-script shebang provably can (it runs
-  # connect.py's write_hermes_config, which imports yaml). Try that first, then
+  # start.py's write_hermes_config, which imports yaml). Try that first, then
   # any python on PATH, then the venv sibling, picking the first with PyYAML.
   local cand py="" shebang
   shebang="$(head -1 "$(command -v unsloth)" 2>/dev/null | sed -n 's/^#![[:space:]]*//p' | awk '{print $1}')"
@@ -247,13 +262,13 @@ patch_hermes_tools() {  # $1 = none|default
     { [ -x "$cand" ] || command -v "$cand" >/dev/null 2>&1; } || continue
     if "$cand" -c 'import yaml' 2>/dev/null; then py="$cand"; break; fi
   done
-  [ -n "$py" ] || guide_fail "could not find a python with PyYAML to patch ~/.hermes/config.yaml"
-  echo "[hermes] patching config with $py"
-  "$py" - "$1" <<'PY'
+  [ -n "$py" ] || guide_fail "could not find a python with PyYAML to patch the hermes session config"
+  echo "[hermes] patching $cfg with $py"
+  "$py" - "$1" "$cfg" <<'PY'
 import os, sys
 import yaml
 mode = sys.argv[1]
-p = os.path.expanduser("~/.hermes/config.yaml")
+p = sys.argv[2]
 cfg = (yaml.safe_load(open(p)) or {}) if os.path.exists(p) else {}
 ts = cfg.get("platform_toolsets")
 if not isinstance(ts, dict):
@@ -274,10 +289,14 @@ PY
 # drop the auto-injected AGENTS.md/SOUL.md bootstrap (the bulk of the prompt) for
 # both modes. --agent must reference a defined agent, so write it before invoking.
 patch_openclaw_agent() {  # $1 = notools|tools
-  python3 - "$1" <<'PY'
+  # OpenClaw reads its config from the relocated OPENCLAW_CONFIG_PATH that
+  # `unsloth start` printed, so patch THAT file (not the user's ~/.openclaw).
+  local cfg; cfg="$(raw_env OPENCLAW_CONFIG_PATH)"
+  [ -n "$cfg" ] || guide_fail "OpenClaw OPENCLAW_CONFIG_PATH missing from connect output (start.py openclaw())"
+  python3 - "$1" "$cfg" <<'PY'
 import os, sys, json
 mode = sys.argv[1]
-p = os.path.expanduser("~/.openclaw/openclaw.json")
+p = sys.argv[2]
 cfg = json.load(open(p)) if os.path.exists(p) else {}
 agents = cfg.setdefault("agents", {})
 agents.setdefault("defaults", {})["skipBootstrap"] = True
@@ -293,20 +312,24 @@ print(f"[openclaw] agent ci tools = {agent.get('tools', 'default')}")
 PY
 }
 
-# Build an invoke script that applies connect.py's env then runs the launch
+# Build an invoke script that applies start.py's env then runs the launch
 # command (with extra args appended) under bash. We do NOT eval connect's env
 # into this shell; we write it into a one-shot script so the export/unset
-# semantics are exactly what connect.py printed. The script path is absolute
+# semantics are exactly what start.py printed. The script path is absolute
 # so it is valid even when the caller has cd'd into a scratch work dir.
 invoke_via_connect() {  # $1=outfile, rest=extra args appended to the command
   local out="$1"; shift
   local script="$LOGS_DIR/invoke-${AGENT}.sh"
   local real; real="$(mktemp)"
+  # CONNECT_ENV_EXTRA / CONNECT_CMD_OVERRIDE let a caller (attribution-ab) flip a
+  # session knob without editing the user's config; empty -> use what start.py emitted.
+  local cmd="${CONNECT_CMD_OVERRIDE:-$CONNECT_CMD}"
   {
     echo "set -uo pipefail"
     echo "$CONNECT_ENV"
+    [ -n "${CONNECT_ENV_EXTRA:-}" ] && echo "$CONNECT_ENV_EXTRA"
     # Append extra args (the prompt / flags) to the launch command verbatim.
-    printf '%s' "$CONNECT_CMD"
+    printf '%s' "$cmd"
     local a
     for a in "$@"; do printf ' %q' "$a"; done
     printf '\n'
@@ -318,7 +341,7 @@ invoke_via_connect() {  # $1=outfile, rest=extra args appended to the command
   # Writing the redacted copy up front keeps the key out of the artifact even if
   # the run times out (run_timed exits before returning here).
   cp "$real" "$script"; redact "$script"
-  echo "[$AGENT] invoking (timeout ${TIMEOUT}s): $CONNECT_CMD $*"
+  echo "[$AGENT] invoking (timeout ${TIMEOUT}s): $cmd $*"
   run_timed "$out" bash "$real"
   local rc=$?
   rm -f "$real"
@@ -338,7 +361,7 @@ case "$MODE" in
     else
       parse_connect
       crosscheck_contract
-      # claude/codex run in print mode via the flags connect.py emits
+      # claude/codex run in print mode via the flags start.py emits
       # (claude -p / codex exec). For agents whose default subcommand prints
       # to stdout we pass the prompt through ctx.args.
       case "$AGENT" in
@@ -371,7 +394,7 @@ case "$MODE" in
     T1='Create a file named hello.py in the current directory whose entire contents are a single line: print("Hello"). Do not run it.'
     T2='Run hello.py with python and show me the exact output.'
 
-    # The connect.py recipe writers + crosscheck must see the repo; run them
+    # The start.py recipe writers + crosscheck must see the repo; run them
     # from the repo root BEFORE cd-ing into the scratch work dir.
     if [ "$AGENT" != "pi" ]; then
       parse_connect
@@ -466,33 +489,32 @@ case "$MODE" in
     # right before the measured turn, so an earlier turn's reuse can't leak in.
     LLAMA_LOG_DIR="${UNSLOTH_LLAMA_LOG_DIR:-$HOME/.unsloth/studio/logs/llama-server}"
     export LLAMA_LOG_DIR
-    parse_connect          # writes ~/.claude/settings.json (header=0) + env
+    parse_connect          # prints session env + suppression flags (no ~/.claude write)
     crosscheck_contract
     PROMPT='Reply with exactly the single word: pong'
 
-    # Phase A: header DISABLED (=0, the documented setting) -> expect a HIT on
-    # the continued turn. connect.py's ensure_claude_attribution_header() set 0.
+    # Phase A: the suppression start.py ships (CLAUDE_CODE_ATTRIBUTION_HEADER=0 +
+    # --exclude-dynamic-system-prompt-sections + --settings overlay) -> expect a
+    # HIT on the continued turn, since the system-prompt prefix is stable.
     invoke_via_connect "$LOGS_DIR/claude-ab-hit-1.txt" -p "$PROMPT"        # turn 1 primes
     FROM_HIT="$(bash "$CACHE_HELPER" mark)"                                # offset before turn 2
     invoke_via_connect "$LOGS_DIR/claude-ab-hit-2.txt" -p --continue "$PROMPT again"
     CACHE_LOG_FROM="$FROM_HIT" bash "$CACHE_HELPER" log HIT
 
-    # Phase B: header ENABLED -> expect a MISS. The header prepends a
-    # per-request-changing attribution line to the system prompt, so the shared
-    # prefix changes every turn and the KV cache is invalidated (~90% slower);
-    # this is exactly what the guide flag prevents.
-    python3 - <<'PY'
-import json, os
-p = os.path.expanduser("~/.claude/settings.json")
-s = json.load(open(p)) if os.path.exists(p) else {}
-s.setdefault("env", {})["CLAUDE_CODE_ATTRIBUTION_HEADER"] = "1"
-json.dump(s, open(p, "w"), indent=2)
-PY
+    # Phase B: vanilla Claude with the header ENABLED -> expect a MISS. We flip
+    # the env var to 1 and strip the suppression flags from the launch command
+    # (without them the dynamic attribution line is included and changes every
+    # turn, so the shared prefix moves and the KV cache is invalidated, ~90%
+    # slower). This is session-only: nothing is written to ~/.claude.
+    CONNECT_ENV_EXTRA='export CLAUDE_CODE_ATTRIBUTION_HEADER=1'
+    CONNECT_CMD_OVERRIDE="$(printf '%s' "$CONNECT_CMD" \
+      | sed -E "s/ --exclude-dynamic-system-prompt-sections//; s/ --settings '[^']*'//")"
     invoke_via_connect "$LOGS_DIR/claude-ab-miss-1.txt" -p "$PROMPT"
     FROM_MISS="$(bash "$CACHE_HELPER" mark)"
     invoke_via_connect "$LOGS_DIR/claude-ab-miss-2.txt" -p --continue "$PROMPT again"
     CACHE_LOG_FROM="$FROM_MISS" bash "$CACHE_HELPER" log MISS
-    echo "[claude] attribution A/B OK (header=0 HIT, header=1 MISS)"
+    unset CONNECT_ENV_EXTRA CONNECT_CMD_OVERRIDE
+    echo "[claude] attribution A/B OK (suppressed HIT, header=1 MISS)"
     ;;
 
   *)

@@ -968,7 +968,9 @@ export const Thread: FC<{
             scrollToBottomOnThreadSwitch={false}
             className={cn(
               "aui-thread-viewport aui-stream-viewport relative flex min-h-0 min-w-0 flex-1 basis-0 flex-col overflow-x-auto overflow-y-auto scroll-smooth px-5",
-              hideComposer ? "pt-4" : "pt-[48px]",
+              hideComposer
+                ? "pt-4"
+                : "pt-[calc(var(--studio-content-top-inset,0px)+48px)]",
             )}
           >
             {!hideWelcome && (
@@ -3043,6 +3045,7 @@ const ComposerToolsMenu: FC<{ side?: "top" | "bottom" }> = ({
           type="button"
           aria-label="Tools and attachments"
           className="unsloth-composer-plus"
+          data-tour="chat-plus-menu"
         >
           <PlusIcon className="size-[22px] stroke-[1.75px]" />
         </button>
