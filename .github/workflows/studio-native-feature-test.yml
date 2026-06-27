@@ -1,0 +1,154 @@
+# Native Unsloth Studio feature test on the free Mac / Windows / arm-Linux
+# GitHub-hosted runners. The published Docker image is linux/amd64 and cannot run
+# on these hosted runners (macOS = no Docker/nested-virt; hosted Windows = no
+# Linux containers; arm64 = wrong arch), so these OSes are validated via the
+# NATIVE install (install.sh / install.ps1) -- the path real Mac/Windows/arm
+# users take, and what #6692 fixes. We install Studio, load gemma-4-E4B GGUF, and
+# exercise inference, chat, RAG, web search, the update button, the llama.cpp
+# prebuilt, and the Unsloth branding, capturing screenshots for the PRs.
+#
+# Notebook auto-update (e) is a Docker-image feature only -> N/A here.
+# Training is out of scope (CPU). #6692's torch-index resolution is proven
+# separately by the cross-OS unit tests + the staging install matrix; this run
+# uses --no-torch to keep it fast and focused on the user-visible features.
+name: studio-native-feature-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_repo:
+        default: unsloth/gemma-4-E4B-it-GGUF
+      gguf_variant:
+        default: UD-Q4_K_XL
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15-intel, macos-latest, windows-latest, windows-11-arm, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      MODEL_REPO: ${{ inputs.model_repo }}
+      GGUF_VARIANT: ${{ inputs.gguf_variant }}
+      STUDIO_PORT: "18900"
+      ART: artifacts/${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Studio natively (--local --no-torch)
+        run: |
+          mkdir -p logs "$ART"
+          set -o pipefail
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            pwsh -NoProfile -Command "& ./install.ps1 --local --no-torch" 2>&1 | tee "$ART/00_install.log"
+          else
+            bash install.sh --local --no-torch 2>&1 | tee "$ART/00_install.log"
+          fi
+
+      - name: Confirm the llama.cpp prebuilt installed (not source-built)
+        run: |
+          LLAMA_DIR=~/.unsloth/llama.cpp
+          {
+            echo "## llama.cpp prebuilt ($RUNNER_OS / ${{ matrix.runner }})"
+            cat "$LLAMA_DIR/UNSLOTH_PREBUILT_INFO.json" 2>/dev/null || echo "(no prebuilt info json)"
+            for b in "$LLAMA_DIR/llama-server" "$LLAMA_DIR/build/bin/llama-server" "$LLAMA_DIR/build/bin/Release/llama-server.exe"; do
+              [ -x "$b" ] && { "$b" --version 2>&1 | head -2; break; }
+            done
+          } | tee "$ART/01_llama_prebuilt.log"
+
+      - name: Install probe + capture deps
+        run: |
+          python -m pip install -U pip
+          python -m pip install "httpx>=0.27" "playwright>=1.45" pillow
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            python -m playwright install --with-deps chromium
+            sudo apt-get update && sudo apt-get install -y ffmpeg
+          elif [ "$RUNNER_OS" = "macOS" ]; then
+            python -m playwright install chromium
+            brew install ffmpeg || true
+          else
+            python -m playwright install chromium
+            choco install ffmpeg -y || true
+          fi
+
+      - name: Boot Studio (API-only)
+        run: |
+          unsloth studio reset-password || true
+          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" > logs/studio.log 2>&1 &
+          echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
+
+      - name: Wait for /api/health
+        run: |
+          for i in $(seq 1 180); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json 2>/dev/null; then
+              python -c "import json;d=json.load(open('/tmp/health.json'));assert d.get('status')=='healthy';print('healthy:',d)"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Studio not healthy in 180s"; tail -200 logs/studio.log; exit 1
+
+      - name: Feature probe (inference, chat, RAG, web search)
+        run: |
+          PW=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
+          echo "::add-mask::$PW"
+          python tests/docker/feature_probe.py \
+            --base-url "http://127.0.0.1:${STUDIO_PORT}" \
+            --password "$PW" \
+            --model-repo "$MODEL_REPO" --gguf-variant "$GGUF_VARIANT" \
+            --out-dir "$ART/probe" \
+            --label "Native ${{ matrix.runner }} (CPU)"
+
+      - name: Capture Studio chat (screenshots + video)
+        if: always()
+        run: |
+          PYTHONPATH=tests/docker python tests/docker/studio_chat_capture.py \
+            --auth-json "$ART/probe/auth.json" \
+            --out-dir "$ART/chat" \
+            --model-hint "gemma-4-E4B-it-GGUF (${GGUF_VARIANT})" || true
+
+      - name: Update button -- stage an OLD Studio then update
+        if: always()
+        continue-on-error: true
+        run: |
+          {
+            echo "## Studio update button (old -> latest), $RUNNER_OS"
+            python -m pip install --no-deps "unsloth==2026.5.5" 2>&1 | tail -2 || true
+            python -c "import importlib.metadata as m;print('staged unsloth', m.version('unsloth'))" || true
+            unsloth studio update 2>&1 | grep -iE "before:|after:|installed|updated|prebuilt|complete|up to date" | head -20 || true
+            python -c "import importlib.metadata as m;print('final unsloth', m.version('unsloth'))" || true
+          } | tee "$ART/05_update_button.log"
+
+      - name: Build GIF from the chat recording
+        if: always()
+        run: |
+          mkdir -p "$ART/gifs"
+          if command -v ffmpeg >/dev/null 2>&1 && [ -f "$ART/chat/video/studio_chat.webm" ]; then
+            bash tests/docker/make_gifs.sh "$ART/chat/video/studio_chat.webm" "$ART/gifs/studio_chat_${{ matrix.runner }}.gif" 10 900 0 || true
+          fi
+
+      - name: Collect studio log
+        if: always()
+        run: cp logs/studio.log "$ART/99_studio.log" 2>/dev/null || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: studio-native-feature-test-${{ matrix.runner }}
+          path: artifacts/
+          retention-days: 14

@@ -1,0 +1,185 @@
+# Validate the PUBLISHED Unsloth Blackwell Docker image (Hugging Face) end-to-end
+# in CPU mode on the free Linux x64 GitHub-hosted runners. Downloads the tarball
+# from danielhanchen/unsloth-blackwell-docker, `docker load`s it, boots it with
+# UNSLOTH_ALLOW_CPU=1 (hosted runners have no GPU), and exercises GGUF inference,
+# chat, RAG, web search, the Studio update button, notebook auto-update, the
+# llama.cpp prebuilt, and the Unsloth branding -- capturing screenshots + GIFs.
+#
+# Linux x64 only: the published image is linux/amd64, which only runs natively on
+# x64 Linux hosted runners (macOS = no Docker/nested-virt; hosted Windows = no
+# Linux containers; arm64 = wrong arch). Mac/Windows/arm are covered by the
+# native install in studio-native-feature-test.yml.
+name: docker-hf-image-test
+
+on:
+  workflow_dispatch:
+    inputs:
+      hf_repo:
+        description: HF repo holding the image tarballs
+        default: danielhanchen/unsloth-blackwell-docker
+      image_tarball:
+        description: studio image tarball name
+        default: unsloth-blackwell-studio.tar.gz
+      model_repo:
+        default: unsloth/gemma-4-E4B-it-GGUF
+      gguf_variant:
+        default: UD-Q4_K_XL
+      old_unsloth_version:
+        description: older unsloth version to stage for the update-button test
+        default: 2026.5.5
+
+permissions:
+  contents: read
+
+jobs:
+  docker-cpu:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04, ubuntu-22.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+      HF_REPO: ${{ inputs.hf_repo }}
+      IMAGE_TARBALL: ${{ inputs.image_tarball }}
+      MODEL_REPO: ${{ inputs.model_repo }}
+      GGUF_VARIANT: ${{ inputs.gguf_variant }}
+      OLD_UNSLOTH: ${{ inputs.old_unsloth_version }}
+      IMAGE_TAG: unsloth-blackwell:hf-studio
+      STUDIO_PORT: "18000"
+      JUPYTER_PORT: "18888"
+      ART: artifacts/${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+
+      - name: Free disk space (the studio image is large)
+        run: |
+          set -x
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost || true
+          sudo docker image prune -af || true
+          df -h /
+
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Install probe + capture deps
+        run: |
+          python -m pip install -U pip
+          python -m pip install "httpx>=0.27" "playwright>=1.45" pillow "huggingface_hub>=0.34"
+          python -m playwright install --with-deps chromium
+          sudo apt-get update && sudo apt-get install -y ffmpeg pigz
+
+      - name: Pull + load the published image (docker/hf_pull.sh)
+        run: |
+          mkdir -p "$ART"
+          # hf_pull.sh: hf download <repo> <blob> --repo-type=model + pigz -d | docker load
+          bash docker/hf_pull.sh "$HF_REPO" "$IMAGE_TARBALL" "$IMAGE_TAG" | tee "$ART/00_image_load.log"
+          docker image inspect "$IMAGE_TAG" --format 'loaded {{.Id}} size={{.Size}}' | tee -a "$ART/00_image_load.log"
+          # reclaim the tarball space immediately
+          rm -f "$RUNNER_TEMP"/*.tar.gz /tmp/*.tar.gz || true
+          df -h /
+
+      - name: Boot the image in CPU mode
+        id: boot
+        run: |
+          JPW="CI-$(python -c 'import secrets;print(secrets.token_urlsafe(12))')"
+          echo "::add-mask::$JPW"
+          echo "JPW=$JPW" >> "$GITHUB_ENV"
+          CID=$(docker run -d --name unsloth_ci \
+              -e UNSLOTH_ALLOW_CPU=1 \
+              -e JUPYTER_PASSWORD="$JPW" \
+              -p ${STUDIO_PORT}:8000 -p ${JUPYTER_PORT}:8888 \
+              "$IMAGE_TAG")
+          echo "CID=$CID" >> "$GITHUB_ENV"
+          echo "booted $CID"
+
+      - name: Wait for Studio + JupyterLab (CPU)
+        run: |
+          ok_s=0; ok_j=0
+          for i in $(seq 1 60); do
+            curl -fsS "http://localhost:${STUDIO_PORT}/api/health" >/dev/null 2>&1 && ok_s=1 || true
+            curl -fsS "http://localhost:${JUPYTER_PORT}/login"      >/dev/null 2>&1 && ok_j=1 || true
+            [ "$ok_s" = 1 ] && [ "$ok_j" = 1 ] && break
+            sleep 5
+          done
+          docker logs --tail 60 "$CID" | tee "$ART/01_boot.log" || true
+          [ "$ok_s" = 1 ] || { echo "Studio never healthy"; exit 1; }
+          [ "$ok_j" = 1 ] || { echo "Jupyter never responded"; exit 1; }
+          echo "Studio + Jupyter healthy (CPU mode)"
+
+      - name: Feature probe (inference, chat, RAG, web search)
+        run: |
+          PW=$(docker exec "$CID" cat /opt/unsloth-studio/auth/.bootstrap_password)
+          echo "::add-mask::$PW"
+          python tests/docker/feature_probe.py \
+            --base-url "http://localhost:${STUDIO_PORT}" \
+            --password "$PW" \
+            --model-repo "$MODEL_REPO" --gguf-variant "$GGUF_VARIANT" \
+            --out-dir "$ART/probe" \
+            --label "Docker ${{ matrix.runner }} (CPU)"
+
+      - name: Capture Studio chat (screenshots + video)
+        if: always()
+        run: |
+          PYTHONPATH=tests/docker python tests/docker/studio_chat_capture.py \
+            --auth-json "$ART/probe/auth.json" \
+            --out-dir "$ART/chat" \
+            --model-hint "gemma-4-E4B-it-GGUF (${GGUF_VARIANT})" || true
+
+      - name: Capture JupyterLab branding (login footer, About, splash)
+        if: always()
+        run: |
+          python tests/docker/branding_screenshots.py \
+            --base-url "http://localhost:${JUPYTER_PORT}" \
+            --password "$JPW" \
+            --out-dir "$ART/branding" || true
+
+      - name: In-container checks (branding, llama prebuilt, notebook auto-update)
+        if: always()
+        run: |
+          docker cp tests/docker/incontainer_checks.py "$CID":/tmp/incontainer_checks.py
+          docker exec "$CID" /opt/unsloth-venv/bin/python /tmp/incontainer_checks.py --out-dir /tmp/incontainer_out
+          docker cp "$CID":/tmp/incontainer_out "$ART/incontainer" || true
+
+      - name: Update button -- stage an OLD Studio then update to latest
+        if: always()
+        continue-on-error: true
+        run: |
+          {
+            echo "## Studio update button (old -> latest)"
+            echo "### staging unsloth==$OLD_UNSLOTH"
+            docker exec "$CID" /opt/unsloth-venv/bin/pip install --no-deps "unsloth==$OLD_UNSLOTH" 2>&1 | tail -3 || true
+            docker exec "$CID" /opt/unsloth-venv/bin/python -c "import importlib.metadata as m;print('staged unsloth', m.version('unsloth'))"
+            echo "### running unsloth-studio-update (latest)"
+            docker exec "$CID" unsloth-studio-update 2>&1 | grep -iE "before:|after:|installed|updated|complete" | head -20
+            docker exec "$CID" /opt/unsloth-venv/bin/python -c "import importlib.metadata as m;print('final unsloth', m.version('unsloth'))"
+          } | tee "$ART/05_update_button.log"
+
+      - name: Build GIFs from recordings
+        if: always()
+        run: |
+          mkdir -p "$ART/gifs"
+          [ -f "$ART/chat/video/studio_chat.webm" ] && \
+            bash tests/docker/make_gifs.sh "$ART/chat/video/studio_chat.webm" "$ART/gifs/studio_chat.gif" 12 960 0 || true
+          [ -f "$ART/branding/video/jupyter_splash.webm" ] && \
+            bash tests/docker/make_gifs.sh "$ART/branding/video/jupyter_splash.webm" "$ART/gifs/jupyter_splash.gif" 15 900 0 || true
+          ls -lhR "$ART/gifs" || true
+
+      - name: Container logs
+        if: always()
+        run: docker logs "$CID" > "$ART/99_docker.log" 2>&1 || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: docker-hf-image-test-${{ matrix.runner }}
+          path: artifacts/
+          retention-days: 14
+
+      - name: Teardown
+        if: always()
+        run: docker rm -f "$CID" || true
