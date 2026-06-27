@@ -85,22 +85,50 @@ jobs:
             choco install ffmpeg -y || true
           fi
 
+      - name: Resolve installed Studio venv + unsloth CLI
+        run: |
+          # install.sh / install.ps1 --local install into a dedicated venv under
+          # ~/.unsloth/studio. On Windows that Scripts dir is NOT on the Git Bash
+          # PATH, so a bare `unsloth` is "command not found" -- resolve the venv
+          # binaries explicitly and reuse them everywhere below.
+          BASE="$HOME/.unsloth/studio"
+          UNSLOTH_BIN=""; VENV_PY=""
+          for d in "$BASE/unsloth_studio" "$BASE/.venv" "$BASE"; do
+            for sub in bin Scripts; do
+              [ -x "$d/$sub/unsloth" ]     && UNSLOTH_BIN="$d/$sub/unsloth"
+              [ -x "$d/$sub/unsloth.exe" ] && UNSLOTH_BIN="$d/$sub/unsloth.exe"
+              [ -x "$d/$sub/python" ]      && VENV_PY="$d/$sub/python"
+              [ -x "$d/$sub/python.exe" ]  && VENV_PY="$d/$sub/python.exe"
+            done
+          done
+          if [ -z "$UNSLOTH_BIN" ] && command -v unsloth >/dev/null 2>&1; then
+            UNSLOTH_BIN="$(command -v unsloth)"
+          fi
+          if [ -z "$UNSLOTH_BIN" ]; then
+            echo "unsloth CLI not found after install; tree:"; find "$BASE" -maxdepth 3 -iname 'unsloth*' || true
+            exit 1
+          fi
+          echo "UNSLOTH_BIN=$UNSLOTH_BIN" >> "$GITHUB_ENV"
+          echo "VENV_PY=$VENV_PY" >> "$GITHUB_ENV"
+          echo "resolved unsloth=$UNSLOTH_BIN venv_py=$VENV_PY"
+          "$UNSLOTH_BIN" --version || true
+
       - name: Boot Studio (API-only)
         run: |
-          unsloth studio reset-password || true
-          UNSLOTH_API_ONLY=1 unsloth studio -H 127.0.0.1 -p "$STUDIO_PORT" > logs/studio.log 2>&1 &
+          "$UNSLOTH_BIN" studio reset-password || true
+          UNSLOTH_API_ONLY=1 "$UNSLOTH_BIN" studio -H 127.0.0.1 -p "$STUDIO_PORT" > logs/studio.log 2>&1 &
           echo "STUDIO_PID=$!" >> "$GITHUB_ENV"
 
       - name: Wait for /api/health
         run: |
-          for i in $(seq 1 180); do
-            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > /tmp/health.json 2>/dev/null; then
-              python -c "import json;d=json.load(open('/tmp/health.json'));assert d.get('status')=='healthy';print('healthy:',d)"
+          for i in $(seq 1 300); do
+            if curl -fs "http://127.0.0.1:${STUDIO_PORT}/api/health" > health.json 2>/dev/null; then
+              python -c "import json;d=json.load(open('health.json'));assert d.get('status')=='healthy';print('healthy:',d)"
               exit 0
             fi
             sleep 1
           done
-          echo "Studio not healthy in 180s"; tail -200 logs/studio.log; exit 1
+          echo "Studio not healthy in 300s"; tail -200 logs/studio.log; exit 1
 
       - name: Feature probe (inference, chat, RAG, web search)
         run: |
@@ -125,12 +153,13 @@ jobs:
         if: always()
         continue-on-error: true
         run: |
+          PY="${VENV_PY:-python}"
           {
             echo "## Studio update button (old -> latest), $RUNNER_OS"
-            python -m pip install --no-deps "unsloth==2026.5.5" 2>&1 | tail -2 || true
-            python -c "import importlib.metadata as m;print('staged unsloth', m.version('unsloth'))" || true
-            unsloth studio update 2>&1 | grep -iE "before:|after:|installed|updated|prebuilt|complete|up to date" | head -20 || true
-            python -c "import importlib.metadata as m;print('final unsloth', m.version('unsloth'))" || true
+            "$PY" -m pip install --no-deps "unsloth==2026.5.5" 2>&1 | tail -2 || true
+            "$PY" -c "import importlib.metadata as m;print('staged unsloth', m.version('unsloth'))" || true
+            "$UNSLOTH_BIN" studio update 2>&1 | grep -iE "before:|after:|installed|updated|prebuilt|complete|up to date" | head -20 || true
+            "$PY" -c "import importlib.metadata as m;print('final unsloth', m.version('unsloth'))" || true
           } | tee "$ART/05_update_button.log"
 
       - name: Build GIF from the chat recording

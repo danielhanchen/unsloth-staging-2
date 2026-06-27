@@ -121,24 +121,39 @@ class Probe:
             "PASS",
             f"{d.get('display_name')} is_gguf={d.get('is_gguf')} ctx={d.get('context_length')}",
         )
-        # chat turn
-        chat = self.client.post(
-            f"{self.base}/v1/chat/completions",
-            headers=self._h(),
-            json={
-                "model": "default",
-                "messages": [{"role": "user", "content": "In one short sentence, what is Unsloth?"}],
-                "max_tokens": 96,
-                "temperature": 0.2,
-            },
-            timeout=300.0,
-        )
-        if chat.status_code != 200:
-            self.record("chat", "FAIL", f"{chat.status_code}: {chat.text[:160]}")
-            return False
-        content = chat.json().get("choices", [{}])[0].get("message", {}).get("content", "")
-        if not content.strip():
-            self.record("chat", "FAIL", "empty completion")
+        # chat turn. CPU generation on the smallest hosted runners (3-core /
+        # 7 GB arm) is slow and can return an empty first completion, so retry
+        # once with a smaller request and a longer deadline before failing.
+        attempts = [
+            {"max_tokens": 96, "temperature": 0.2, "timeout": 300.0},
+            {"max_tokens": 32, "temperature": 0.0, "timeout": 480.0},
+        ]
+        content = ""
+        last = ""
+        for i, a in enumerate(attempts):
+            chat = self.client.post(
+                f"{self.base}/v1/chat/completions",
+                headers=self._h(),
+                json={
+                    "model": "default",
+                    "messages": [
+                        {"role": "user", "content": "In one short sentence, what is Unsloth?"}
+                    ],
+                    "max_tokens": a["max_tokens"],
+                    "temperature": a["temperature"],
+                },
+                timeout=a["timeout"],
+            )
+            if chat.status_code != 200:
+                last = f"{chat.status_code}: {chat.text[:160]}"
+                continue
+            msg = chat.json().get("choices", [{}])[0].get("message", {})
+            content = (msg.get("content") or msg.get("reasoning_content") or "").strip()
+            if content:
+                break
+            last = f"empty completion (attempt {i + 1})"
+        if not content:
+            self.record("chat", "FAIL", last or "empty completion")
             return False
         (self.out / "chat_reply.txt").write_text(content, encoding="utf-8")
         self.record("chat", "PASS", f"{len(content)} chars: {content[:80]!r}")
