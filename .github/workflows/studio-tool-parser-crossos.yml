@@ -1,0 +1,35 @@
+name: studio-tool-parser-crossos
+
+# Cross-OS check that the Studio safetensors tool-call fixes (objectify tool_call
+# arguments + native-template fallback) and the gemma-4 chat-template handling
+# work on Linux, macOS and Windows. Uses the dependency-light, importlib-based
+# test modules so no torch / transformers / web stack is needed.
+
+on:
+  push:
+    branches: [studio-tools-all-prs]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tool-parser-tests:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        python: ['3.11', '3.12']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install minimal deps
+        run: python -m pip install --upgrade pip pytest jinja2
+      - name: Run dependency-light tool-call + template tests
+        working-directory: studio/backend
+        run: >
+          python -m pytest -q
+          tests/test_tool_arg_objectify.py
+          tests/test_gemma4_chat_template_override.py
