@@ -38,7 +38,7 @@ exec(f"_TOOL_XML_RE = _re.compile({_m.group(1)})", _ns)
 _TOOL_XML_RE = _ns["_TOOL_XML_RE"]
 _helper = _re.search(
     r"def _strip_tool_xml_for_display\(text: str, \*, auto_heal_tool_calls: bool\) -> str:\n"
-    r"(?:    .+\n)+",
+    r"(?:(?: {4}.*)?\n)+",
     _src,
 )
 assert _helper, "could not extract _strip_tool_xml_for_display source"
@@ -165,6 +165,34 @@ def test_strips_tail_only_parameter_orphan_no_trailing_ws():
     cleaned = _TOOL_XML_RE.sub("", "Final answer.</parameter>")
     assert "</parameter>" not in cleaned
     assert "Final answer." in cleaned
+
+
+def test_strips_complete_bracket_tag_keeps_trailing_prose():
+    # A complete Mistral [TOOL_CALLS] call strips only its balanced JSON,
+    # leaving following prose intact.
+    cleaned = _TOOL_XML_RE.sub("", '[TOOL_CALLS]web_search{"q":"x"} and then prose')
+    assert "[TOOL_CALLS]" not in cleaned
+    assert "and then prose" in cleaned
+
+
+def test_strips_unclosed_bracket_tail():
+    # Close brace lost to EOS: the truncated tail is stripped up to the end
+    # instead of leaking the raw bracket marker to the UI.
+    cleaned = _TOOL_XML_RE.sub("", 'here [TOOL_CALLS]web_search{"query":"weather"')
+    assert "[TOOL_CALLS]" not in cleaned
+    assert cleaned.strip() == "here"
+
+
+def test_strips_unclosed_rehearsal_tail():
+    cleaned = _TOOL_XML_RE.sub("", 'text python[ARGS]{"code":"print(1)"')
+    assert "[ARGS]" not in cleaned
+    assert cleaned.strip() == "text"
+
+
+def test_strips_hyphenated_mcp_bracket_name():
+    cleaned = _TOOL_XML_RE.sub("", 'x [TOOL_CALLS]mcp__srv__list-issues{"q":"x"}')
+    assert "list-issues" not in cleaned
+    assert cleaned.strip() == "x"
 
 
 def test_preserves_mid_string_parameter_in_code_sample():
@@ -329,3 +357,23 @@ def test_strips_bare_kimi_call_without_section_wrapper():
     cleaned = _TOOL_XML_RE.sub("", text)
     assert "tool_call_begin" not in cleaned
     assert cleaned == "pre  post"
+
+
+# ── Two-level-nested bracket JSON (balanced-scan strip) ──────────
+
+
+def test_route_strip_two_level_nested_bracket_keeps_trailing_prose():
+    # A [TOOL_CALLS] call with two-level-nested JSON args must be removed whole
+    # so the trailing prose survives. A one-level regex either left the markup
+    # or let the catch-all eat everything to EOS.
+    text = 'before [TOOL_CALLS]search{"f":{"g":{"h":1}}} after'
+    cleaned = _strip_tool_xml_for_display(text, auto_heal_tool_calls = True)
+    assert cleaned == "before  after"
+    assert "[TOOL_CALLS]" not in cleaned
+
+
+def test_route_strip_two_level_nested_rehearsal_keeps_trailing_prose():
+    text = 'note python[ARGS]{"a":{"b":{"c":1}}} done'
+    cleaned = _strip_tool_xml_for_display(text, auto_heal_tool_calls = True)
+    assert cleaned == "note  done"
+    assert "[ARGS]" not in cleaned

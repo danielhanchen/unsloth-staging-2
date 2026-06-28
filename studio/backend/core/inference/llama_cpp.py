@@ -8229,7 +8229,11 @@ class LlamaCppBackend:
                                         if not stripped_buf:
                                             continue
 
-                                        # Check tool signal prefixes.
+                                        # Most signals start a tool call, so
+                                        # `startswith` fits; bracket tags like
+                                        # `[ARGS]` arrive mid-buffer
+                                        # (`web_search[ARGS]{...}`), so also do a
+                                        # substring check so BUFFERING catches them.
                                         is_prefix = False
                                         is_match = False
                                         for sig in _tool_xml_signals:
@@ -8238,6 +8242,9 @@ class LlamaCppBackend:
                                                 break
                                             if sig.startswith(stripped_buf):
                                                 is_prefix = True
+                                                break
+                                            if sig.startswith("[") and sig in stripped_buf:
+                                                is_match = True
                                                 break
 
                                         if is_match:

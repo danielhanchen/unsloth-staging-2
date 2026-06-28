@@ -1581,9 +1581,9 @@ def _apply_rag_nudge(nudge: str, tools: list[dict], *, rag_scope) -> str:
 
 # Strip leaked tool-call markup: every shared-parser format AND the four leak shapes
 # ``llama_cpp.py``'s speculative buffer splits across the visible/DRAIN boundary
-# (closed pair, orphan open to EOF, bare orphan close, tail-only ``</parameter>``).
-# Mistral ``[TOOL_CALLS]`` goes to the parser's balanced-brace helper -- a non-greedy
-# ``\{.*?\}`` here would truncate nested JSON at the first ``}``.
+# (closed pair, orphan open to EOF, bare orphan close, tail-only ``</parameter>``),
+# plus Mistral ``[TOOL_CALLS]name{json}`` / rehearsal ``name[ARGS]{json}``: a complete
+# call strips only its balanced JSON (one level), a truncated tail goes to ``\Z``.
 # Reuse the parser's DeepSeek opener alternation so the display strip covers every
 # opener the parser accepts (incl. the space / escaped-underscore spellings); a
 # signal we parse must never be left un-stripped.
@@ -1604,6 +1604,8 @@ _TOOL_XML_RE = _re.compile(
     r"|" + _DS_OPEN_SRC + r".*?(?:<｜tool▁calls▁end｜>|\Z)"
     r"|<\|tool_calls_section_begin\|>.*?(?:<\|tool_calls_section_end\|>|\Z)"
     r"|<\|tool_call_begin\|>.*?(?:<\|tool_call_end\|>|\Z)"
+    r"|\[TOOL_CALLS\][\w-]+\s*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|.*?\Z)"
+    r"|\b[\w-]+\[ARGS\]\s*(?:\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}|.*?\Z)"
     r"|</parameter>\s*\Z",
     _re.DOTALL,
 )
@@ -1621,7 +1623,12 @@ def _strip_tool_xml_for_display(text: str, *, auto_heal_tool_calls: bool) -> str
     """Apply route-level XML leak cleanup only when Auto-Heal is enabled."""
     if not auto_heal_tool_calls:
         return text
-    return _TOOL_XML_RE.sub("", text)
+    # Strip bracket-tag calls with the parser's balanced-brace scan first so a
+    # two-level-nested JSON arg is removed whole instead of the catch-all eating
+    # the trailing prose after it.
+    from core.tool_healing import _strip_bracket_tag_calls
+
+    return _TOOL_XML_RE.sub("", _strip_bracket_tag_calls(text))
 
 
 logger = get_logger(__name__)

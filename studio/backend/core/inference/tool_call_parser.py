@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+#
+# Bracket-tag, rehearsal, and thinking-block-strip logic adapted from forge
+# (https://github.com/antoinezambelli/forge), Copyright (c) 2025-2026
+# Antoine Zambelli, used under the MIT License.
 
 """
 Backend-neutral tool-call parser shared by GGUF, safetensors, and MLX, so the
@@ -40,6 +44,7 @@ TOOL_XML_SIGNALS = (
     '<function name="',
     "<|python_tag|>",
     "[TOOL_CALLS]",
+    "[ARGS]",
     "<|tool_call>",
     # DeepSeek R1 / V3 / V3.1 -- 5 opener variants llama.cpp keeps.
     "<｜tool▁calls▁begin｜>",
@@ -83,6 +88,8 @@ _TOOL_ALL_PATS = _TOOL_CLOSED_PATS + [
     re.compile(r'<function(?:=[\w.\-]+|\s+name="[\w.\-]+")>.*$', re.DOTALL),
     re.compile(r"<\|tool_call>.*$", re.DOTALL),
     re.compile(r"\[TOOL_CALLS\].*$", re.DOTALL),
+    # Bare rehearsal ``name[ARGS]`` truncated before its brace (no ``[TOOL_CALLS]``).
+    re.compile(r"[\w.\-]+\[ARGS\].*$", re.DOTALL),
     re.compile(r"<\|python_tag\|>.*$", re.DOTALL),
     # DeepSeek envelopes truncated mid-stream (any opener variant).
     re.compile(_DEEPSEEK_OPEN_RE_SRC + r".*$", re.DOTALL),
@@ -370,6 +377,9 @@ def strip_tool_markup(text: str, *, final: bool = False) -> str:
     """Strip tool-call markup. ``final=False`` keeps in-progress markup buffered;
     ``final=True`` also drops trailing unclosed runs and trims."""
     text = _strip_mistral_closed_calls(text)
+    # Balanced-brace strip for bracket-tag / rehearsal calls (any JSON nesting depth)
+    # that the one-level regex arms below cannot remove whole.
+    text = _tool_healing._strip_bracket_tag_calls(text)
     pats = _TOOL_ALL_PATS if final else _TOOL_CLOSED_PATS
     for pat in pats:
         text = pat.sub("", text)
@@ -399,6 +409,17 @@ def parse_tool_calls_from_text(
         _parse_kimi_tool_calls,
     ):
         calls = parser(content, id_offset = id_offset, allow_incomplete = allow_incomplete)
+        if calls:
+            return calls
+
+    # Mistral Small 3.2 ``[TOOL_CALLS]name[CALL_ID]<id>[ARGS]{json}``: only our parser
+    # skips ``[CALL_ID]``; tool_healing's rehearsal pattern would read the id digits as
+    # the name. Gate on the ``[CALL_ID]`` marker so XML-vs-bracket precedence (handled
+    # in tool_healing) is untouched for every other input.
+    if _MISTRAL_CALL_ID_MARKER in content:
+        calls = _parse_mistral_tool_calls(
+            content, id_offset = id_offset, allow_incomplete = allow_incomplete
+        )
         if calls:
             return calls
 

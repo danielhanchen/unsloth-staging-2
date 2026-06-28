@@ -115,6 +115,24 @@ class TestParser:
         assert result[0]["function"]["name"] == "python"
         assert "print('hi')" in result[0]["function"]["arguments"]
 
+    def test_xml_param_preserves_leading_indentation(self):
+        import json
+
+        # The chat template wraps the value in a single \n on each side; only
+        # that wrapping newline is trimmed, so significant indentation in a code
+        # argument survives (str.strip() used to destroy it).
+        text = (
+            "<function=python><parameter=code>\n"
+            "    indented = 1\n"
+            "    more\n"
+            "</parameter></function>"
+        )
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert json.loads(result[0]["function"]["arguments"]) == {
+            "code": "    indented = 1\n    more"
+        }
+
     def test_xml_unclosed(self):
         # Closing tags omitted; parser must still extract the value.
         text = "<function=terminal><parameter=command>ls -la"
@@ -185,6 +203,8 @@ class TestParser:
         assert has_tool_signal("blah <tool_call> x")
         assert has_tool_signal("blah <|tool_call>call:terminal")
         assert has_tool_signal("hi <function=foo>...")
+        assert has_tool_signal("ok [TOOL_CALLS]web_search{...")
+        assert has_tool_signal("fine python[ARGS]{...")
         assert not has_tool_signal("hello world")
 
     def test_render_html_start_detector_uses_first_tool(self):
@@ -229,6 +249,247 @@ class TestParser:
             )
             == "before "
         )
+
+    # Mistral [TOOL_CALLS] bracket-tag.
+
+    def test_mistral_bracket_basic(self):
+        # Devstral / Mistral-Small fallback when bypassing native FC.
+        text = '[TOOL_CALLS]web_search{"query":"weather"}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "web_search"
+        assert isinstance(result[0]["function"]["arguments"], str)
+        assert "weather" in result[0]["function"]["arguments"]
+
+    def test_rehearsal_inside_unclosed_think_is_ignored(self):
+        """Rehearsal-shaped markup inside an unclosed <think> block must
+        not be executed as a real tool call. Mid-stream the </think>
+        tag has not arrived yet, so the strip regex has to accept
+        end-of-string as a terminator. Regression for the Gemini
+        high-severity flag on this PR."""
+        text = (
+            "<think>I should call web_search[ARGS]" '{"query":"weather"} next to find the answer.'
+        )
+        result = parse_tool_calls_from_text(text)
+        # Inside an unclosed think block, parse_tool_calls_from_text
+        # must yield no calls.
+        assert result == []
+
+    def test_rehearsal_inside_unclosed_bracket_think_is_ignored(self):
+        text = "[THINK]planning to use python[ARGS]" '{"code":"print(1)"} but not yet.'
+        result = parse_tool_calls_from_text(text)
+        assert result == []
+
+    def test_rehearsal_after_closed_think_still_parsed(self):
+        text = "<think>planning</think>" 'python[ARGS]{"code":"print(1)"}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "python"
+
+    def test_mistral_bracket_with_whitespace(self):
+        # Optional whitespace (including newlines) is permitted between
+        # the name and the opening brace.
+        text = '[TOOL_CALLS]python  \n  {"code":"print(1)"}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "python"
+        assert "print(1)" in result[0]["function"]["arguments"]
+
+    def test_mistral_bracket_nested_json(self):
+        # Brace-balance scan must handle nested objects and braces
+        # inside string literals.
+        text = "[TOOL_CALLS]web_search" '{"query":"a {nested} brace","opts":{"limit":5}}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        import json as _json
+
+        args = _json.loads(result[0]["function"]["arguments"])
+        assert args["query"] == "a {nested} brace"
+        assert args["opts"] == {"limit": 5}
+
+    def test_mistral_bracket_with_prose(self):
+        # Bracket-tag preceded and followed by prose is still
+        # recognised.
+        text = (
+            "Sure, I will look that up.\n"
+            '[TOOL_CALLS]web_search{"query":"weather"}\n'
+            "Calling now."
+        )
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "web_search"
+
+    def test_mistral_bracket_bad_json_dropped(self):
+        text = "[TOOL_CALLS]web_search{not valid}"
+        result = parse_tool_calls_from_text(text)
+        # No usable tool call; callers fall back to text.
+        assert result == []
+
+    def test_mistral_bracket_object_with_array_value(self):
+        # Args must be a JSON object. The outer braces wrap a dict whose
+        # value is an array; this is accepted.
+        text = '[TOOL_CALLS]web_search{"opts":[1,2,3]}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "web_search"
+
+    # Rehearsal syntax name[ARGS]{json}.
+
+    def test_rehearsal_basic(self):
+        text = 'python[ARGS]{"code":"print(1)"}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "python"
+        assert "print(1)" in result[0]["function"]["arguments"]
+
+    def test_rehearsal_with_prose(self):
+        text = "I should call the python tool. Like this: " 'python[ARGS]{"code":"x = 1"}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "python"
+
+    def test_rehearsal_bad_json_dropped(self):
+        text = "python[ARGS]{not valid json}"
+        result = parse_tool_calls_from_text(text)
+        assert result == []
+
+    def test_mistral_bracket_hyphenated_mcp_name(self):
+        # MCP function names may contain dashes; the bracket parser must
+        # capture the whole name, not truncate at the first dash.
+        text = '[TOOL_CALLS]mcp__srv__list-issues{"q":"x"}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "mcp__srv__list-issues"
+
+    def test_rehearsal_hyphenated_mcp_name(self):
+        text = 'mcp__srv__list-issues[ARGS]{"q":"x"}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "mcp__srv__list-issues"
+
+    def test_streaming_strip_removes_partial_bracket_marker(self):
+        # A bracket tag streamed before its opening brace (split delta) must
+        # be stripped on the final pass instead of leaking the raw marker to
+        # the UI, the same way a bare <tool_call> open tag is stripped.
+        assert strip_tool_markup("answer [TOOL_CALLS]web_search", final = True) == "answer"
+        assert strip_tool_markup("text python[ARGS]", final = True) == "text"
+        # Non-final must keep the in-progress tag buffered (not yet stripped).
+        partial = "answer [TOOL_CALLS]web_search"
+        assert strip_tool_markup(partial, final = False) == partial
+
+    def test_strip_removes_two_level_nested_bracket_call_keeps_prose(self):
+        # A bracket call with two-level-nested JSON args must be removed whole
+        # (a one-level regex left the markup or, in final mode, ate the trailing
+        # prose). The balanced-brace scan handles any nesting depth.
+        text = 'before [TOOL_CALLS]search{"f":{"g":{"h":1}}} after'
+        assert strip_tool_markup(text, final = False) == "before  after"
+        assert strip_tool_markup(text, final = True) == "before  after"
+
+    # <think> pre-strip.
+
+    def test_think_block_stripped_before_xml(self):
+        # A model may emit reasoning in <think>...</think> then a real
+        # tool call. The think block must be stripped before pattern
+        # matching so the post-thinking call is recognised.
+        text = (
+            "<think>I will use web_search to find the weather.</think>"
+            '<tool_call>{"name":"web_search","arguments":{"query":"sf"}}</tool_call>'
+        )
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "web_search"
+
+    def test_think_block_stripped_before_bracket_tag(self):
+        text = (
+            "<think>Let me search for that.</think>\n" '[TOOL_CALLS]web_search{"query":"weather"}'
+        )
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "web_search"
+
+    def test_uppercase_think_tag_stripped(self):
+        # Some templates use [THINK]...[/THINK] instead of <think>.
+        text = "[THINK]planning my next call[/THINK]" '[TOOL_CALLS]python{"code":"print(1)"}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "python"
+
+    def test_think_block_hides_inner_tool_call(self):
+        # A tool call mentioned inside a think block is the model
+        # rehearsing, not an actual call. The <think> wrapper is
+        # stripped first, removing the inner markup.
+        text = (
+            "<think>I might call "
+            '<tool_call>{"name":"web_search","arguments":{}}</tool_call> '
+            "but I am not sure</think>\n"
+            "Let me just answer directly."
+        )
+        result = parse_tool_calls_from_text(text)
+        assert result == []
+
+    def test_think_literal_inside_real_tool_argument_is_preserved(self):
+        # A real tool call whose argument legitimately contains a <think> /
+        # [THINK] literal must NOT be corrupted (the think-strip used to delete
+        # those substrings from the argument body).
+        text = (
+            '<tool_call>{"name":"write","arguments":'
+            '{"text":"compare <think> and </think> tags"}}</tool_call>'
+        )
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert json.loads(result[0]["function"]["arguments"])["text"] == (
+            "compare <think> and </think> tags"
+        )
+
+    def test_bracket_tag_argument_with_think_literal_is_preserved(self):
+        text = '[TOOL_CALLS]search{"q":"explain [THINK] blocks"}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert json.loads(result[0]["function"]["arguments"])["q"] == "explain [THINK] blocks"
+
+    def test_real_call_after_think_with_rehearsal_inside(self):
+        # A rehearsed call inside <think> is skipped, but the real call after
+        # </think> is parsed -- without deleting the think text from content.
+        text = '<think>plan: search[ARGS]{"q":"x"}</think>search[ARGS]{"q":"real"}'
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert json.loads(result[0]["function"]["arguments"])["q"] == "real"
+
+    # XML takes precedence over bracket-tag.
+
+    def test_xml_wins_over_bracket(self):
+        # If a model emits BOTH forms in one message (it happens with
+        # Mistral fine-tunes that retain Qwen-style chat templates),
+        # the XML form is the canonical one and must win.
+        text = (
+            '<tool_call>{"name":"primary","arguments":{}}</tool_call>'
+            '[TOOL_CALLS]secondary{"k":"v"}'
+        )
+        result = parse_tool_calls_from_text(text)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "primary"
+
+    # Strip patterns include bracket-tag and rehearsal.
+
+    def test_strip_bracket_tag_closed(self):
+        text = 'before [TOOL_CALLS]web_search{"q":"hi"} after'
+        assert "[TOOL_CALLS]" not in strip_tool_markup(text)
+        assert "before" in strip_tool_markup(text)
+        assert "after" in strip_tool_markup(text)
+
+    def test_strip_rehearsal_closed(self):
+        text = 'prose python[ARGS]{"code":"x"} more prose'
+        cleaned = strip_tool_markup(text)
+        assert "[ARGS]" not in cleaned
+        assert "prose" in cleaned
+        assert "more prose" in cleaned
+
+    def test_strip_bracket_tag_unclosed_final(self):
+        text = 'before [TOOL_CALLS]web_search{"q":"part'
+        # Final-mode strip drops the trailing unclosed run.
+        cleaned = strip_tool_markup(text, final = True)
+        assert "TOOL_CALLS" not in cleaned
+        assert cleaned == "before"
 
 
 class TestParserMultiFormat:
