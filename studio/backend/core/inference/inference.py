@@ -35,6 +35,21 @@ from loggers import get_logger
 logger = get_logger(__name__)
 
 
+def _conversation_uses_tools(messages: list, tools: Optional[list]) -> bool:
+    """True if this turn involves tools: tool schemas are advertised, or the
+    conversation carries assistant tool_calls / role:tool result messages.
+    Used to decide whether a chat-template failure should retry with the
+    model's native tool-capable template before the tool-stripping fallback."""
+    if tools:
+        return True
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool" or message.get("tool_calls"):
+            return True
+    return False
+
+
 class HarmonyTextStreamer:
     """Streaming text decoder for the gpt-oss harmony channel protocol.
 
@@ -218,6 +233,7 @@ class InferenceBackend:
         enable_thinking,
         reasoning_effort,
         preserve_thinking,
+        require_emits_tools: bool = True,
     ) -> Optional[str]:
         """Render ``messages`` + ``tools`` with the model's NATIVE chat template.
 
@@ -230,8 +246,12 @@ class InferenceBackend:
 
         The native template is loaded straight from the repo (bypassing any
         override applied to the live tokenizer) and cached on ``model_info``.
-        Returns the rendered prompt only if the native template actually emits
-        the tools (render differs with vs without tools); otherwise ``None``.
+        With ``require_emits_tools`` (default), returns the rendered prompt only
+        if the native template actually emits the tools (render differs with vs
+        without tools); otherwise ``None``. Pass ``require_emits_tools=False`` to
+        get the native render unconditionally -- used when the override template
+        *threw* on a tool conversation (e.g. role:tool messages) and we just need
+        a tool-aware render instead of the tool-stripping manual fallback.
         """
         native_tpl = model_info.get("native_chat_template")
         if native_tpl is None:
@@ -263,6 +283,8 @@ class InferenceBackend:
                 reasoning_effort = reasoning_effort,
                 preserve_thinking = preserve_thinking,
             )
+            if not require_emits_tools:
+                return with_tools
             no_tools = self._apply_chat_template_for_generation(
                 tokenizer,
                 messages,
@@ -1082,8 +1104,40 @@ class InferenceBackend:
             logger.debug(f"Formatted prompt: {formatted_prompt[:200]}...")
         except Exception as e:
             logger.error(f"Error applying chat template: {e}")
-            # Fall back to manual formatting
-            formatted_prompt = self.format_chat_prompt(messages, system_prompt)
+            # An Unsloth override template (e.g. 'gemma-4') can throw on a tool
+            # conversation it doesn't support ("roles must alternate" on role:tool
+            # messages). The manual fallback below STRIPS tool_calls / role:tool
+            # messages, so the model never sees the tool result. When the turn
+            # involves tools, first retry with the model's NATIVE (tool-capable)
+            # template -- the same path the GGUF side uses via llama-server.
+            native_prompt = None
+            if _conversation_uses_tools(template_messages, tools):
+                try:
+                    native_prompt = self._render_with_native_template(
+                        model_info,
+                        template_messages,
+                        tools,
+                        enable_thinking,
+                        reasoning_effort,
+                        preserve_thinking,
+                        require_emits_tools = False,
+                    )
+                except Exception as native_exc:
+                    logger.warning(
+                        "Native-template fallback failed for '%s': %s",
+                        self.active_model_name,
+                        native_exc,
+                    )
+            if native_prompt:
+                logger.info(
+                    "Override template failed on a tool conversation for '%s'; "
+                    "used the model's native tool-capable template.",
+                    self.active_model_name,
+                )
+                formatted_prompt = native_prompt
+            else:
+                # Fall back to manual formatting
+                formatted_prompt = self.format_chat_prompt(messages, system_prompt)
 
         # Step 3: generate
         yield from self.generate_stream(
