@@ -77,6 +77,4 @@ jobs:
             tests/test_safetensors_tool_loop.py \
             tests/test_tool_loop_controller.py \
             tests/test_mlx_inference_backend.py \
-            --deselect 'tests/test_safetensors_tool_loop.py::test_render_with_native_template_returns_render_only_when_tools_emitted' \
-            --deselect 'tests/test_safetensors_tool_loop.py::test_render_with_native_template_does_not_mutate_shared_tokenizer' \
-            --deselect 'tests/test_safetensors_tool_loop.py::test_native_template_loads_from_base_model_for_lora'
+            -k 'not native_template'
