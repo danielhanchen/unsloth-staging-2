@@ -220,6 +220,8 @@ def _run(args: argparse.Namespace) -> dict[str, Any]:
             transformer_quant_fast_accum = {"auto": None, "on": True, "off": False}[
                 args.fp8_fast_accum
             ],
+            transformer_cache = args.transformer_cache,
+            transformer_cache_threshold = args.transformer_cache_threshold,
         )
         _wait_for_load(backend)
         _cuda_sync()
@@ -452,9 +454,10 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--speed-mode",
         default = None,
-        choices = ["off", "default", "max"],
-        help = "speed profile: off is bit-identical; default adds compile + "
-        "cudnn.benchmark (near-lossless); max also adds TF32 + fused QKV",
+        choices = ["off", "eager", "default", "max"],
+        help = "speed profile: off is bit-identical; eager adds channels_last + cudnn + "
+        "attention + the shared eager patches (NO compile); default also adds regional "
+        "compile (near-lossless); max also adds TF32 + fused QKV",
     )
     p.add_argument(
         "--text-encoder-quant",
@@ -469,6 +472,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help = "opt-in fast transformer: load the DENSE bf16 transformer and torchao-"
         "quantise it onto the low-precision tensor cores (faster than GGUF, higher "
         "VRAM). auto picks per GPU; falls back to GGUF if unsupported / no VRAM",
+    )
+    p.add_argument(
+        "--transformer-cache",
+        default = None,
+        choices = ["off", "fbcache"],
+        help = "opt-in step caching (First-Block-Cache) for many-step models",
+    )
+    p.add_argument(
+        "--transformer-cache-threshold",
+        type = float,
+        default = None,
+        help = "FBCache residual threshold (default auto by quant)",
     )
     p.add_argument(
         "--fp8-fast-accum",
