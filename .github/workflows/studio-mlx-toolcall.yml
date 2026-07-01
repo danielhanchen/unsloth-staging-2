@@ -7,6 +7,7 @@ on:
     paths:
       - 'studio/backend/**'
       - 'scripts/mlx_toolcall_proof.py'
+      - 'scripts/mlx_reasoning_proof.py'
       - '.github/workflows/studio-mlx-toolcall.yml'
   workflow_dispatch:
 
@@ -68,6 +69,13 @@ jobs:
           set -eux
           python scripts/mlx_toolcall_proof.py 2>&1 | tee mlx_proof.log
 
+      - name: MLX reasoning-block proof (prefilled <think> split, Qwen3)
+        env:
+          HF_HUB_DISABLE_TELEMETRY: '1'
+        run: |
+          set -eux
+          python scripts/mlx_reasoning_proof.py 2>&1 | tee mlx_reasoning.log
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -75,3 +83,4 @@ jobs:
           path: |
             pytest_mlx.log
             mlx_proof.log
+            mlx_reasoning.log
