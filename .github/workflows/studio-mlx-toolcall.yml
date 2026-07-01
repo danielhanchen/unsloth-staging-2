@@ -66,14 +66,15 @@ jobs:
         env:
           HF_HUB_DISABLE_TELEMETRY: '1'
         run: |
-          set -eux
+          # pipefail so a failing proof fails the step (tee would otherwise mask it).
+          set -euxo pipefail
           python scripts/mlx_toolcall_proof.py 2>&1 | tee mlx_proof.log
 
-      - name: MLX reasoning-block proof (prefilled <think> split, Qwen3)
+      - name: MLX reasoning-block proof (real Qwen3 MLX <think> split)
         env:
           HF_HUB_DISABLE_TELEMETRY: '1'
         run: |
-          set -eux
+          set -euxo pipefail
           python scripts/mlx_reasoning_proof.py 2>&1 | tee mlx_reasoning.log
 
       - uses: actions/upload-artifact@v4
