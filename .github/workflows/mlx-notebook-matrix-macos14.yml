@@ -1,0 +1,79 @@
+# Prove the MLX compatibility shims carry UNMIGRATED notebooks: clone
+# unslothai/notebooks@main (the original, un-edited notebooks that still use
+# `from trl import SFTTrainer` + `torch.cuda.*` + `import torch`), install the
+# unsloth/unsloth-zoo PR heads (shims) + real torch + mlx, and run each notebook
+# end-to-end on a real macos-14 Apple Silicon runner. If these pass with the same
+# code the migration (notebooks#294) would have rewritten, the migration is not
+# needed for MLX when torch is installed. Report-only matrix.
+
+name: mlx-notebook-matrix macos-14
+
+on:
+  push:
+    branches: [mlx-trainer-api-validation]
+    paths:
+      - 'tests/staging/mlx_notebook_smoke.py'
+      - '.github/workflows/mlx-notebook-matrix-macos14.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  notebook-matrix:
+    name: mlx notebook matrix
+    runs-on: macos-14
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PR heads with real MLX wheels
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
+          # All MLX fixes (TokenizerWrapper .encode, bnb-4bit name remap,
+          # seq2seq collator, get_chat_template unwrap) are merged into the PR
+          # heads, so the branches install as-is with no patches.
+          git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth-zoo zoo
+          git -C zoo log --oneline -1
+          pip install -e './zoo[mlx]'
+          git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth unsloth_src
+          git -C unsloth_src log --oneline -1
+          pip install --no-deps -e ./unsloth_src
+          rm -rf "$GITHUB_WORKSPACE/unsloth"
+          # peft: a real `pip install unsloth` pulls it; get_chat_template's
+          # map_eos path imports unsloth.tokenizer_utils which imports peft.
+          pip install datasets sentencepiece protobuf trl peft
+
+      - name: Clone UNMIGRATED notebooks (unslothai/notebooks@main)
+        run: |
+          git clone --depth 1 -b main https://github.com/unslothai/notebooks nb_repo
+          git -C nb_repo log --oneline -1
+
+      - name: Assert the notebooks are unmigrated (original trl/torch surface)
+        run: |
+          # Fail loudly if these are already migrated -- the whole point is that
+          # the shims run the ORIGINAL code, not UnslothTrainer/get_gpu_memory_stats.
+          n_trl=$(grep -rl "from trl import SFTTrainer" nb_repo/nb/*.ipynb | wc -l | tr -d ' ')
+          n_cuda=$(grep -rl "torch.cuda.max_memory_reserved" nb_repo/nb/*.ipynb | wc -l | tr -d ' ')
+          echo "notebooks with 'from trl import SFTTrainer': $n_trl"
+          echo "notebooks with 'torch.cuda.max_memory_reserved': $n_cuda"
+          if [ "$n_trl" -eq 0 ] || [ "$n_cuda" -eq 0 ]; then
+            echo "ERROR: notebooks look already-migrated (missing original trl/torch surface)"; exit 1
+          fi
+          echo "OK: notebooks use the original trl.SFTTrainer + torch.cuda surface"
+
+      - name: MLX notebook matrix (report-only)
+        env:
+          NB_DIR: ${{ github.workspace }}/nb_repo
+        run: python tests/staging/mlx_notebook_smoke.py

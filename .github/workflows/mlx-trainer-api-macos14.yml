@@ -1,0 +1,101 @@
+# Real Apple Silicon validation for the MLX public trainer-API PR series:
+#   unslothai/unsloth#6462 + unslothai/unsloth-zoo#790 (+ notebooks#294 consumer).
+# Installs REAL mlx / mlx-lm / mlx-vlm wheels and the PR head branches, then:
+#   1. asserts real Apple Silicon + real mlx (no simulation shim)
+#   2. import smoke of the public MLX trainer surface
+#   3. tests/staging/mlx_trainer_api_real_probes.py: public API + optimizer/
+#      warmup/kwarg normalization + a real tiny LoRA SFT through UnslothTrainer
+#   4. the PR's own MLX public-trainer pytest suite, which RUNS for real on MLX
+#      (it self-skips everywhere else in CI).
+
+name: mlx-trainer-api macos-14
+
+on:
+  push:
+    branches: [mlx-trainer-api-validation]
+    paths:
+      - 'tests/staging/**'
+      - '.github/workflows/mlx-trainer-api-macos14.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  real-mlx-training:
+    name: real mlx trainer-api
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install PR heads with real MLX wheels
+        run: |
+          python -m pip install --upgrade pip
+          # torch (cpu) kept importable for any guarded torch paths.
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
+          # zoo PR head: [mlx] extra pulls real mlx / mlx-lm / mlx-vlm wheels.
+          # The TokenizerWrapper .encode, bnb-4bit name remap, seq2seq-collator,
+          # and get_chat_template unwrap fixes are now merged into the PR heads,
+          # so no patches are applied: this validates the branches as-is.
+          git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth-zoo zoo
+          git -C zoo log --oneline -1
+          pip install -e './zoo[mlx]'
+          # unsloth PR head: public UnslothTrainer / UnslothTrainingArguments API.
+          git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/unsloth unsloth_src
+          git -C unsloth_src log --oneline -1
+          pip install --no-deps -e ./unsloth_src
+          # This staging repo is itself a fork of unsloth, so its repo-root
+          # ./unsloth package would shadow the editable PR install when python
+          # runs from the workspace root. Drop it so `import unsloth` resolves
+          # to the PR head (unsloth_src) under site-packages.
+          rm -rf "$GITHUB_WORKSPACE/unsloth"
+          # runtime deps the MLX training path needs (transformers arrives via mlx-lm).
+          # real trl so the TRL->MLX shim test exercises the "patch real trl in
+          # place" path (the config a notebook user who also has trl installed hits).
+          pip install datasets sentencepiece protobuf trl peft 'pytest==9.0.3' pytest-timeout
+          python -c "import unsloth, unsloth_zoo; print('unsloth at', unsloth.__file__); print('zoo at', unsloth_zoo.__file__)"
+
+      - name: Real Apple Silicon + real mlx sanity
+        run: |
+          python -c "
+          import platform
+          assert platform.system() == 'Darwin' and platform.machine() == 'arm64', platform.platform()
+          import mlx.core as mx
+          assert 'mlx_simulation' not in (getattr(mx, '__file__', '') or ''), mx.__file__
+          import unsloth
+          assert getattr(unsloth, 'DEVICE_TYPE', None) == 'mlx', unsloth.DEVICE_TYPE
+          from unsloth import UnslothTrainer, UnslothTrainingArguments, get_gpu_memory_stats, clear_gpu_memory
+          print('OK: real mlx', mx.__version__, '| unsloth DEVICE_TYPE=mlx')
+          "
+
+      - name: MLX trainer-api real probes (+ tiny real LoRA training)
+        run: python tests/staging/mlx_trainer_api_real_probes.py
+
+      - name: Real migrated notebook end-to-end on MLX (Gemma3-270M, FastModel)
+        run: python tests/staging/run_gemma3_270m_notebook_mlx.py
+
+      - name: Real DataCollatorForSeq2Seq notebook end-to-end on MLX (Llama-3.2-1B Conversational)
+        run: python tests/staging/run_llama_seq2seq_notebook_mlx.py
+
+      - name: Real Vision notebook on MLX (Qwen2-VL-2B, UnslothVisionDataCollator)
+        continue-on-error: true   # vision is heavy for the CI paravirtual Metal GPU; report-only
+        run: python tests/staging/run_vision_lite_mlx.py
+
+      - name: Pre-quantized bnb-4bit checkpoint load on MLX (TinyLlama; report-only)
+        continue-on-error: true   # 47 notebooks use unsloth/*-bnb-4bit names; probe whether they load
+        run: python tests/staging/bnb4bit_load_probe_mlx.py
+
+      - name: PR MLX public-trainer pytest suite (runs for real on MLX)
+        working-directory: unsloth_src
+        run: python -m pytest tests/python/test_mlx_public_trainer_api.py -v --tb=short -p no:cacheprovider
