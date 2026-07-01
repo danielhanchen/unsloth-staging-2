@@ -37,7 +37,10 @@ jobs:
           assert platform.machine() == "arm64", "runner is not Apple Silicon"
           PY
           python -m pip install --upgrade pip
-          python -m pip install "mlx>=0.18" "mlx-lm>=0.19" huggingface_hub
+          # mlx runtime + the studio-backend import-chain deps (structlog/starlette are
+          # pulled in by core.inference.__init__ -> orchestrator/loggers; torch is only
+          # imported inside functions in utils.hardware, so it is not needed here).
+          python -m pip install "mlx>=0.18" "mlx-lm>=0.19" huggingface_hub structlog starlette
           python - <<'PY'
           import importlib.metadata as md, mlx  # noqa: F401
           def _ver(p):
