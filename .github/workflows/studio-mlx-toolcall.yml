@@ -1,0 +1,72 @@
+# Quoted name: avoids YAML '#'/hyphen parsing pitfalls noted in the staging recipe.
+name: "Studio MLX tool-call e2e (macos-14)"
+
+on:
+  push:
+    branches: [studio-mlx-toolcall-e2e]
+    paths:
+      - 'studio/backend/**'
+      - 'scripts/mlx_toolcall_proof.py'
+      - '.github/workflows/studio-mlx-toolcall.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-toolcall:
+    runs-on: macos-14          # Apple Silicon -- required for MLX (Metal)
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Preflight (arch + MLX import)
+        run: |
+          set -eux
+          python - <<'PY'
+          import platform
+          print("system:", platform.system(), "machine:", platform.machine())
+          assert platform.machine() == "arm64", "runner is not Apple Silicon"
+          PY
+          python -m pip install --upgrade pip
+          python -m pip install "mlx>=0.18" "mlx-lm>=0.19" huggingface_hub
+          python - <<'PY'
+          import mlx, platform
+          from mlx_lm.version import __version__ as v
+          print("OK arm64 | mlx", getattr(mlx,"__version__","?"), "| mlx_lm", v)
+          PY
+
+      - name: Shared tool-call parser suites (arm64)
+        id: pytests
+        continue-on-error: true
+        run: |
+          set -eux
+          python -m pip install pytest pytest-asyncio jinja2
+          PYTHONPATH=studio/backend python -m pytest -q \
+            studio/backend/tests/test_tool_call_parser_strict.py \
+            studio/backend/tests/test_tool_xml_strip.py \
+            studio/backend/tests/test_tool_arg_objectify.py \
+            2>&1 | tee pytest_mlx.log
+
+      - name: MLX runtime tool-call proof (real MLX generation -> shared parser)
+        env:
+          HF_HUB_DISABLE_TELEMETRY: '1'
+        run: |
+          set -eux
+          python scripts/mlx_toolcall_proof.py 2>&1 | tee mlx_proof.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-mlx-toolcall-evidence
+          path: |
+            pytest_mlx.log
+            mlx_proof.log
