@@ -23,8 +23,11 @@ def main() -> int:
     import mlx.core as mx  # noqa: F401
     import mlx  # noqa: F401
     from mlx_lm import load, generate
-    from mlx_lm.version import __version__ as mlxlm_ver
-    print("mlx:", getattr(mlx, "__version__", "?"), "| mlx_lm:", mlxlm_ver, flush=True)
+    import importlib.metadata as _md
+    def _ver(p):
+        try: return _md.version(p)
+        except Exception: return "?"
+    print("mlx:", _ver("mlx"), "| mlx_lm:", _ver("mlx-lm"), flush=True)
 
     from core.inference.tool_call_parser import parse_tool_calls_from_text
 

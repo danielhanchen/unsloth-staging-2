@@ -39,9 +39,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install "mlx>=0.18" "mlx-lm>=0.19" huggingface_hub
           python - <<'PY'
-          import mlx, platform
-          from mlx_lm.version import __version__ as v
-          print("OK arm64 | mlx", getattr(mlx,"__version__","?"), "| mlx_lm", v)
+          import importlib.metadata as md, mlx  # noqa: F401
+          def _ver(p):
+              try: return md.version(p)
+              except Exception: return "?"
+          print("OK arm64 | mlx", _ver("mlx"), "| mlx_lm", _ver("mlx-lm"))
           PY
 
       - name: Shared tool-call parser suites (arm64)
