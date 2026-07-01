@@ -1,10 +1,16 @@
-"""Smoke-run many migrated Unsloth notebooks end-to-end on MLX and report a matrix.
+"""Smoke-run Unsloth notebooks end-to-end on MLX and report a matrix.
 
 Goal: prove "take a notebook (FastLanguageModel/FastVisionModel) and it just runs
-on Mac." Each notebook is converted cell-by-cell into a runnable script (pip /
-inference / save / display cells dropped), trimmed for the CI GPU (small model,
+on Mac." Runs whatever NB_DIR points at -- for the unmigrated proof this is
+unslothai/notebooks@main, whose cells still use `from trl import SFTTrainer`,
+`torch.cuda.*`, and `import torch`; the MLX shims must carry them unchanged.
+
+Each notebook is converted cell-by-cell into a runnable script (pip / inference /
+save / display cells dropped), trimmed for the CI GPU (small model,
 max_seq_length 512, 3 steps, tiny dataset slice), and executed in an isolated
-subprocess. One notebook failing does not abort the others; a matrix is printed.
+subprocess. Model + hyperparameters are overridden for speed, but the trainer,
+memory-stats, and import cells are left exactly as written. One notebook failing
+does not abort the others; notebooks absent from NB_DIR are SKIPPED, not failed.
 
 Env: NB_DIR points at a checkout of the notebooks repo.
 """
@@ -124,6 +130,8 @@ def convert(nb_path, model_override):
 
 def run_one(nb_rel, model_override):
     path = os.path.join(NB_DIR, nb_rel)
+    if not os.path.exists(path):
+        return None, "not-present-in-NB_DIR", ""  # SKIP, not a failure
     try:
         script = convert(path, model_override)
     except Exception as exc:  # conversion error
@@ -142,6 +150,10 @@ def run_one(nb_rel, model_override):
         return False, "TIMEOUT(1200s)", ""
 
 
+def _label(ok):
+    return "SKIP" if ok is None else ("PASS" if ok else "FAIL")
+
+
 def main():
     results = []
     for nb_rel, mo in NOTEBOOKS:
@@ -149,14 +161,17 @@ def main():
         ok, err, out = run_one(nb_rel, mo)
         for line in out.splitlines()[-8:]:
             print("   " + line)
-        print(f"RESULT {nb_rel}: {'PASS' if ok else 'FAIL'} {err}", flush=True)
+        print(f"RESULT {nb_rel}: {_label(ok)} {err}", flush=True)
         results.append((nb_rel, ok, err))
 
     print("\n==================== MLX NOTEBOOK MATRIX ====================", flush=True)
     for nb_rel, ok, err in results:
-        print(f"  {'PASS' if ok else 'FAIL'}  {nb_rel}  {('-> ' + err) if not ok else ''}")
-    npass = sum(1 for _, ok, _ in results if ok)
-    print(f"TOTAL: {npass}/{len(results)} notebooks ran end-to-end on MLX")
+        print(f"  {_label(ok)}  {nb_rel}  {('-> ' + err) if ok is not True else ''}")
+    npass = sum(1 for _, ok, _ in results if ok is True)
+    nfail = sum(1 for _, ok, _ in results if ok is False)
+    nskip = sum(1 for _, ok, _ in results if ok is None)
+    ran = npass + nfail
+    print(f"TOTAL: {npass}/{ran} present notebooks ran end-to-end on MLX ({nskip} skipped, not on main)")
     # report-only: always exit 0 so the full matrix is visible
     return 0
 

@@ -1,8 +1,10 @@
-# Broad MLX notebook coverage: convert many migrated notebooks and run each
-# end-to-end on a real macos-14 Apple Silicon runner, reporting a pass/fail
-# matrix. Installs the PR heads as-is (all MLX fixes are now merged into the
-# branches), clones the notebooks PR, and runs tests/staging/mlx_notebook_smoke.py
-# (report-only; one notebook failing does not abort the rest).
+# Prove the MLX compatibility shims carry UNMIGRATED notebooks: clone
+# unslothai/notebooks@main (the original, un-edited notebooks that still use
+# `from trl import SFTTrainer` + `torch.cuda.*` + `import torch`), install the
+# unsloth/unsloth-zoo PR heads (shims) + real torch + mlx, and run each notebook
+# end-to-end on a real macos-14 Apple Silicon runner. If these pass with the same
+# code the migration (notebooks#294) would have rewritten, the migration is not
+# needed for MLX when torch is installed. Report-only matrix.
 
 name: mlx-notebook-matrix macos-14
 
@@ -53,8 +55,23 @@ jobs:
           # map_eos path imports unsloth.tokenizer_utils which imports peft.
           pip install datasets sentencepiece protobuf trl peft
 
-      - name: Clone notebooks PR
-        run: git clone --depth 1 -b mlx/trainer-api https://github.com/Lyxot/notebooks nb_repo
+      - name: Clone UNMIGRATED notebooks (unslothai/notebooks@main)
+        run: |
+          git clone --depth 1 -b main https://github.com/unslothai/notebooks nb_repo
+          git -C nb_repo log --oneline -1
+
+      - name: Assert the notebooks are unmigrated (original trl/torch surface)
+        run: |
+          # Fail loudly if these are already migrated -- the whole point is that
+          # the shims run the ORIGINAL code, not UnslothTrainer/get_gpu_memory_stats.
+          n_trl=$(grep -rl "from trl import SFTTrainer" nb_repo/nb/*.ipynb | wc -l | tr -d ' ')
+          n_cuda=$(grep -rl "torch.cuda.max_memory_reserved" nb_repo/nb/*.ipynb | wc -l | tr -d ' ')
+          echo "notebooks with 'from trl import SFTTrainer': $n_trl"
+          echo "notebooks with 'torch.cuda.max_memory_reserved': $n_cuda"
+          if [ "$n_trl" -eq 0 ] || [ "$n_cuda" -eq 0 ]; then
+            echo "ERROR: notebooks look already-migrated (missing original trl/torch surface)"; exit 1
+          fi
+          echo "OK: notebooks use the original trl.SFTTrainer + torch.cuda surface"
 
       - name: MLX notebook matrix (report-only)
         env:
