@@ -1,0 +1,90 @@
+# Real Apple Silicon validation for unslothai/unsloth#6782 (Studio: apply
+# presence_penalty on the safetensors and MLX inference paths). The MLX logits
+# processor can only be reasoned about on the Linux/CUDA dev host, so this runs
+# the real mlx wheels on a macos-14 runner and:
+#   1. asserts real Apple Silicon + real mlx (no simulation shim)
+#   2. exercises the on-device scatter semantics of the presence-penalty
+#      processor (idempotent for duplicate ids => presence, not frequency)
+#   3. drives a tiny real MLX model through mlx_lm.stream_generate to confirm
+#      logits_processors reaches our processor and the penalty changes output
+# Staging-only CI; the branch and PR are throwaway.
+
+name: mlx-presence macos-14
+
+on:
+  push:
+    branches: [pr6782-mlx-crossos-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mlx-macos14:
+    name: real mlx presence-penalty
+    runs-on: macos-14
+    timeout-minutes: 25
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install real mlx / mlx-lm and the light backend deps
+        run: |
+          python -m pip install --upgrade pip
+          # mlx + mlx-lm are the only heavy pieces; structlog/starlette are what
+          # core.inference.mlx_inference pulls in via loggers (no torch needed).
+          pip install mlx mlx-lm 'pytest==9.0.3' structlog starlette
+
+      - name: Real Apple Silicon + real mlx sanity (no simulation shim)
+        run: |
+          python -c "
+          import platform
+          assert platform.system() == 'Darwin' and platform.machine() == 'arm64', platform.platform()
+          import mlx.core as mx
+          assert 'mlx_simulation' not in (getattr(mx, '__file__', '') or ''), mx.__file__
+          print('OK real mlx', mx.__version__)
+          "
+
+      - name: Presence-penalty scatter semantics on real mlx (no model)
+        working-directory: studio/backend
+        env:
+          MLX_CI_SKIP_MODEL: '1'
+        run: python -m pytest tests/test_mlx_ci.py -v --tb=short -p no:cacheprovider
+
+      - name: End-to-end through mlx_lm.stream_generate (tiny real MLX model)
+        working-directory: studio/backend
+        run: >
+          python -m pytest
+          tests/test_mlx_ci.py::test_stream_generate_threads_processor_and_changes_output
+          -v --tb=short -p no:cacheprovider
+
+  linux-skip-check:
+    name: linux self-skip (no mlx)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install pytest + light deps
+        run: pip install 'pytest==9.0.3' structlog starlette
+
+      - name: MLX test module imports and self-skips cleanly without mlx
+        working-directory: studio/backend
+        run: python -m pytest tests/test_mlx_ci.py -v -rs -p no:cacheprovider
