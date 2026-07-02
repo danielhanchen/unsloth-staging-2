@@ -10129,6 +10129,61 @@ async def _anthropic_plain_non_streaming(run_gen, message_id, model_name):
 # Client-side tool pass-through (Anthropic-native tools field)
 # =====================================================================
 
+# llama.cpp's grammar parser rejects bounded repetitions past this cap
+# ("number of repetitions exceeds sane defaults"). String length and array
+# item bounds in tool schemas compile into exactly such repetitions.
+_GRAMMAR_REPETITION_CAP = 65535
+_GRAMMAR_BOUND_KEYS = ("maxLength", "minLength", "maxItems", "minItems")
+_PATTERN_REPETITION_RE = _re.compile(r"\{\s*\d*\s*,\s*(\d+)\s*\}")
+
+
+def _soften_tool_schemas_for_grammar(tools):
+    """Copy of ``tools`` with grammar-hostile JSON Schema bounds removed.
+
+    llama-server compiles the declared tool schemas into one GBNF grammar; a
+    single oversized bound (e.g. Claude Code's Workflow tool declares
+    ``script.maxLength = 524288``) aborts the WHOLE request with a grammar
+    400, killing every tool call in the session. Dropping a bound above the
+    parser's repetition cap only loosens validation the agent re-checks on
+    its side, so the request compiles and every tool keeps working. Inputs
+    are never mutated; untouched tools are returned as-is.
+    """
+
+    def soften(node):
+        if isinstance(node, dict):
+            out = {}
+            for key, value in node.items():
+                if key in _GRAMMAR_BOUND_KEYS and isinstance(value, int):
+                    if value > _GRAMMAR_REPETITION_CAP:
+                        continue
+                elif key == "pattern" and isinstance(value, str):
+                    if any(
+                        int(n) > _GRAMMAR_REPETITION_CAP
+                        for n in _PATTERN_REPETITION_RE.findall(value)
+                    ):
+                        continue
+                out[key] = soften(value)
+            return out
+        if isinstance(node, list):
+            return [soften(item) for item in node]
+        return node
+
+    softened = []
+    for tool in tools or []:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        parameters = function.get("parameters") if isinstance(function, dict) else None
+        if not isinstance(parameters, dict):
+            softened.append(tool)
+            continue
+        new_parameters = soften(parameters)
+        if new_parameters == parameters:
+            softened.append(tool)
+        else:
+            new_tool = dict(tool)
+            new_tool["function"] = {**tool["function"], "parameters": new_parameters}
+            softened.append(new_tool)
+    return softened
+
 
 def _build_passthrough_payload(
     openai_messages,
@@ -10151,7 +10206,7 @@ def _build_passthrough_payload(
 ):
     body = {
         "messages": openai_messages,
-        "tools": openai_tools,
+        "tools": _soften_tool_schemas_for_grammar(openai_tools),
         "tool_choice": tool_choice,
         "temperature": temperature,
         "top_p": top_p,

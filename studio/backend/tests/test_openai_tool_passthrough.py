@@ -3163,3 +3163,76 @@ class TestGgufChatHistoryAlternation:
         roles = [m["role"] for m in rebuilt]
         assert roles == ["system", "user"]
         assert all(roles[i] != roles[i + 1] for i in range(len(roles) - 1)), roles
+
+
+class TestSoftenToolSchemasForGrammar:
+    """Grammar-hostile JSON Schema bounds are dropped before llama-server.
+
+    llama.cpp compiles string/array bounds into bounded repetitions and
+    rejects any bound past its cap; one oversized tool (Claude Code's
+    Workflow declares script.maxLength = 524288) would otherwise 400 the
+    whole request and kill every tool call in the session.
+    """
+
+    def _tool(self, parameters):
+        return {"type": "function", "function": {"name": "t", "parameters": parameters}}
+
+    def test_oversized_max_length_dropped_small_bounds_kept(self):
+        from routes.inference import _soften_tool_schemas_for_grammar
+
+        params = {
+            "type": "object",
+            "properties": {
+                "script": {"type": "string", "maxLength": 524288},
+                "summary": {"type": "string", "maxLength": 200},
+                "items": {"type": "array", "maxItems": 32},
+            },
+        }
+        (out,) = _soften_tool_schemas_for_grammar([self._tool(params)])
+        props = out["function"]["parameters"]["properties"]
+        assert "maxLength" not in props["script"]
+        assert props["summary"]["maxLength"] == 200
+        assert props["items"]["maxItems"] == 32
+
+    def test_numeric_bounds_untouched(self):
+        from routes.inference import _soften_tool_schemas_for_grammar
+
+        params = {
+            "type": "object",
+            "properties": {"n": {"type": "integer", "maximum": 9007199254740991}},
+        }
+        (out,) = _soften_tool_schemas_for_grammar([self._tool(params)])
+        assert out["function"]["parameters"]["properties"]["n"]["maximum"] == 9007199254740991
+
+    def test_pattern_with_huge_repetition_dropped_normal_kept(self):
+        from routes.inference import _soften_tool_schemas_for_grammar
+
+        params = {
+            "type": "object",
+            "properties": {
+                "big": {"type": "string", "pattern": "^x{1,100000}$"},
+                "id": {"type": "string", "pattern": "^wf_[a-z0-9-]{6,}$"},
+            },
+        }
+        (out,) = _soften_tool_schemas_for_grammar([self._tool(params)])
+        props = out["function"]["parameters"]["properties"]
+        assert "pattern" not in props["big"]
+        assert props["id"]["pattern"] == "^wf_[a-z0-9-]{6,}$"
+
+    def test_inputs_never_mutated_and_clean_tools_identical(self):
+        from routes.inference import _soften_tool_schemas_for_grammar
+
+        dirty = self._tool({"type": "object", "properties": {"s": {"maxLength": 100000}}})
+        clean = self._tool({"type": "object", "properties": {"s": {"maxLength": 10}}})
+        before = json.dumps([dirty, clean], sort_keys = True)
+        soft_dirty, soft_clean = _soften_tool_schemas_for_grammar([dirty, clean])
+        assert json.dumps([dirty, clean], sort_keys = True) == before
+        assert soft_clean is clean
+        assert "maxLength" not in soft_dirty["function"]["parameters"]["properties"]["s"]
+
+    def test_malformed_tools_pass_through(self):
+        from routes.inference import _soften_tool_schemas_for_grammar
+
+        weird = ["nonsense", {"function": "x"}, {"type": "function", "function": {}}]
+        assert _soften_tool_schemas_for_grammar(weird) == weird
+        assert _soften_tool_schemas_for_grammar(None) == []
