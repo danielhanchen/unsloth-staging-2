@@ -73,3 +73,22 @@ jobs:
           pip install "mlx-lm==0.31.2" mlx-vlm
       - name: Probe load + generate
         run: python tests/staging/mlx_load_probe.py
+
+  fix-constraint:
+    name: shipped fix (mlx-lm!=0.31.3, what install_python_stack.py now installs)
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install MLX stack with the shipped exclusion
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade mlx mlx-metal "mlx-lm!=0.31.3" mlx-vlm
+          python -c "import importlib.metadata as m; print('resolved mlx-lm', m.version('mlx-lm'))"
+      - name: Probe load + generate
+        run: python tests/staging/mlx_load_probe.py
