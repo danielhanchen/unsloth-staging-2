@@ -87,4 +87,8 @@ jobs:
 
       - name: MLX test module imports and self-skips cleanly without mlx
         working-directory: studio/backend
-        run: python -m pytest tests/test_mlx_ci.py -v -rs -p no:cacheprovider
+        run: |
+          python -m pytest tests/test_mlx_ci.py -v -rs -p no:cacheprovider || rc=$?
+          # exit 5 = "no tests collected" = the module self-skipped (no mlx here),
+          # which is exactly the expected Linux outcome.
+          test "${rc:-0}" -eq 0 -o "${rc:-0}" -eq 5
