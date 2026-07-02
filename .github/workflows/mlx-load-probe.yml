@@ -1,0 +1,75 @@
+# Reproduce the Studio MLX load failure on qwen3_5 / gemma4 (QK-norm archs) on a
+# real macos-14 Apple Silicon runner, and sweep mlx-lm / mlx-vlm versions to find
+# the build that loads AND generates coherently. Staging-only; PR is throwaway.
+
+name: mlx-load-probe macos-14
+
+on:
+  push:
+    branches: [mlx-qwen35-gemma4-load-probe]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  latest-pypi:
+    name: latest pypi (what Studio installs today)
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install MLX stack (latest PyPI, mirrors install_python_stack.py)
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade mlx mlx-metal mlx-lm mlx-vlm
+      - name: Probe load + generate
+        run: python tests/staging/mlx_load_probe.py
+
+  git-main:
+    name: git-main mlx-lm + mlx-vlm
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install MLX core + git-main mlx-lm / mlx-vlm
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade mlx mlx-metal
+          pip install "git+https://github.com/ml-explore/mlx-lm"
+          pip install --no-deps "git+https://github.com/Blaizzy/mlx-vlm"
+          pip install "git+https://github.com/Blaizzy/mlx-vlm" || true
+      - name: Probe load + generate
+        run: python tests/staging/mlx_load_probe.py
+
+  pinned-0312:
+    name: mlx-lm 0.31.2 pin (issue #1242 gemma4-good)
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      HF_HUB_DISABLE_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Install MLX stack pinned to mlx-lm==0.31.2
+        run: |
+          python -m pip install --upgrade pip
+          pip install "mlx-lm==0.31.2" mlx-vlm
+      - name: Probe load + generate
+        run: python tests/staging/mlx_load_probe.py
