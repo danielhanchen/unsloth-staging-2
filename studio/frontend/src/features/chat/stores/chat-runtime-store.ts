@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import type { RememberedLoadSettings } from "@/components/assistant-ui/model-selector/remembered-load-settings";
 import { cancelStagedModelDownload } from "@/features/hub";
 import { toast } from "@/lib/toast";
 import { create } from "zustand";
@@ -50,6 +51,8 @@ export const CHAT_RAG_TOP_K_KEY = "unsloth_chat_rag_top_k";
 export const CHAT_RAG_AUTOINJECT_KEY = "unsloth_chat_rag_autoinject";
 export const CHAT_RAG_AUTOINJECT_MIN_SCORE_KEY =
   "unsloth_chat_rag_autoinject_min_score";
+export const CHAT_RAG_OCR_KEY = "unsloth_chat_rag_ocr_scanned";
+export const CHAT_RAG_CAPTION_KEY = "unsloth_chat_rag_caption_figures";
 export const CHAT_SPECULATIVE_TYPE_KEY = "unsloth_chat_speculative_type";
 
 // Persist only the model-agnostic intents (auto/ngram/off). MTP modes
@@ -68,6 +71,12 @@ export const DEFAULT_RAG_TOP_K = 5;
 export type RagAutoInject = "auto" | "on" | "off";
 export const DEFAULT_RAG_AUTOINJECT: RagAutoInject = "auto";
 export const DEFAULT_RAG_AUTOINJECT_MIN_SCORE = 0.7;
+// OCR scanned/image-only PDF pages at ingest time. On by default; off skips the
+// extra vision pass (only matters when the loaded chat model has vision).
+export const DEFAULT_RAG_OCR = true;
+// Describe figures/charts in PDFs at ingest time so they become searchable. On by
+// default (no-op without a vision model); off skips the per-figure vision calls.
+export const DEFAULT_RAG_CAPTION = true;
 
 function loadRagSource(): RagSource {
   if (typeof window === "undefined") return DEFAULT_RAG_SOURCE;
@@ -591,6 +600,10 @@ type ChatRuntimeStore = {
   // autoInject = forced first-pass retrieval before answering.
   ragAutoInject: RagAutoInject;
   ragAutoInjectMinScore: number;
+  // OCR scanned/image-only PDF pages at ingest time (vision model required).
+  ragOcrScanned: boolean;
+  // Describe figures/charts at ingest time (vision model required).
+  ragCaptionFigures: boolean;
   /**
    * When on, local Studio tool calls pause for an explicit allow/deny in the
    * chat before they run.
@@ -756,6 +769,8 @@ type ChatRuntimeStore = {
   setRagTopK: (topK: number) => void;
   setRagAutoInject: (value: RagAutoInject) => void;
   setRagAutoInjectMinScore: (score: number) => void;
+  setRagOcrScanned: (enabled: boolean) => void;
+  setRagCaptionFigures: (enabled: boolean) => void;
   setToolStatus: (status: string | null) => void;
   setGeneratingStatus: (status: string | null) => void;
   setActiveDiffusionCanvas: (canvas: DiffusionCanvasFrame | null) => void;
@@ -770,6 +785,10 @@ type ChatRuntimeStore = {
    *  start each deferred-staging session clean so one staged pick's settings
    *  don't leak onto the next. */
   resetModelSettingsToLoaded: () => void;
+  /** Seed the editable load knobs from a model's remembered settings. Shared by
+   *  the settings sheet's restore effect and the "Load on selection" paths,
+   *  which skip the sheet but must still honor a saved config. */
+  applyRememberedLoadSettings: (settings: RememberedLoadSettings) => void;
   setTensorParallel: (value: boolean) => void;
   setLoadOnSelection: (value: boolean) => void;
   setExpandQuantizations: (value: boolean) => void;
@@ -778,9 +797,10 @@ type ChatRuntimeStore = {
   /** Stage a pick for a deferred load: revert knobs to the loaded baseline,
    *  record the selection, and open the settings sheet. */
   stageModel: (selection: PendingModelSelection) => void;
-  /** Abandon a staged pick without loading: revert the knobs to the loaded
-   *  baseline and clear the pending selection. */
-  abandonStagedModel: () => void;
+  /** Abandon a staged pick without loading: revert knobs to the loaded baseline
+   *  and clear the pending selection. Cancels its in-flight download too, unless
+   *  `keepDownload` is set (navigation keeps the transfer running, like Hub). */
+  abandonStagedModel: (opts?: { keepDownload?: boolean }) => void;
   setCustomContextLength: (v: number | null) => void;
   setChatTemplateOverride: (template: string | null) => void;
   setPendingAudio: (base64: string, name: string) => void;
@@ -831,6 +851,7 @@ const PERSISTED_INFERENCE_PARAM_KEYS = [
   "maxSeqLength",
   "maxTokens",
   "systemPrompt",
+  "systemVariables",
   "trustRemoteCode",
   "fastMode",
 ] as const satisfies readonly PersistedInferenceParamKey[];
@@ -1070,6 +1091,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
     DEFAULT_RAG_AUTOINJECT_MIN_SCORE,
     { min: 0, max: 1 },
   ),
+  ragOcrScanned: loadBool(CHAT_RAG_OCR_KEY, DEFAULT_RAG_OCR),
+  ragCaptionFigures: loadBool(CHAT_RAG_CAPTION_KEY, DEFAULT_RAG_CAPTION),
   toolStatus: null,
   generatingStatus: null,
   activeDiffusionCanvas: null,
@@ -1491,6 +1514,16 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       );
       return { ragAutoInjectMinScore };
     }),
+  setRagOcrScanned: (ragOcrScanned) =>
+    set(() => {
+      saveBool(CHAT_RAG_OCR_KEY, ragOcrScanned);
+      return { ragOcrScanned };
+    }),
+  setRagCaptionFigures: (ragCaptionFigures) =>
+    set(() => {
+      saveBool(CHAT_RAG_CAPTION_KEY, ragCaptionFigures);
+      return { ragCaptionFigures };
+    }),
   setToolStatus: (toolStatus) => set({ toolStatus }),
   setActiveDiffusionCanvas: (activeDiffusionCanvas) =>
     set({ activeDiffusionCanvas }),
@@ -1527,6 +1560,16 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   setSpecDraftNMax: (specDraftNMax) => set({ specDraftNMax }),
   setTensorParallel: (tensorParallel) => set({ tensorParallel }),
   resetModelSettingsToLoaded: () => set((s) => loadedBaselineSettings(s)),
+  applyRememberedLoadSettings: (settings) =>
+    // Coalesce every field: a blob persisted by an older/newer build can omit
+    // keys, and a raw spread would push `undefined` into fields typed non-null.
+    set({
+      customContextLength: settings.contextLength ?? null,
+      kvCacheDtype: settings.kvCacheDtype ?? null,
+      speculativeType: settings.speculativeType ?? "auto",
+      specDraftNMax: settings.specDraftNMax ?? null,
+      tensorParallel: settings.tensorParallel ?? false,
+    }),
   setLoadOnSelection: (loadOnSelection) => {
     saveBool(CHAT_LOAD_ON_SELECTION_KEY, loadOnSelection);
     set({ loadOnSelection });
@@ -1544,15 +1587,9 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
     // Refuse staging mid-load: post-load cleanup would silently drop the queued
     // pick. stageOrLoad toasts first for callers that can.
     if (get().modelLoading) return;
+    // Rebinding to a new pick keeps the prior pick's download running so the
+    // user can queue multiple downloads at once (Hub-style).
     set((s) => {
-      if (
-        s.pendingSelection &&
-        (s.pendingSelection.id !== selection.id ||
-          (s.pendingSelection.ggufVariant ?? null) !==
-            (selection.ggufVariant ?? null))
-      ) {
-        cancelStagedModelDownload(s.pendingSelection);
-      }
       return {
         ...loadedBaselineSettings(s),
         pendingSelection: selection,
@@ -1566,14 +1603,13 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       };
     });
   },
-  abandonStagedModel: () => {
+  abandonStagedModel: (opts) => {
     const { pendingSelection } = get();
     if (!pendingSelection) return;
-    // Cancel the staged pick's in-flight download so it doesn't keep running
-    // after the staging UI is gone. Centralized here so every abandon path
-    // (sheet close, thread switch, route exit, new chat) cancels it, including
-    // root-level callers that have no access to the useRepoDownload hook.
-    cancelStagedModelDownload(pendingSelection);
+    // Cancel the staged pick's in-flight download (centralized for every abandon
+    // path: sheet close, thread switch, route exit, new chat). `keepDownload`
+    // opts out so navigation leaves the transfer running, like a Hub download.
+    if (!opts?.keepDownload) cancelStagedModelDownload(pendingSelection);
     set((s) => ({ ...loadedBaselineSettings(s), pendingSelection: null }));
   },
   setCustomContextLength: (customContextLength) => set({ customContextLength }),

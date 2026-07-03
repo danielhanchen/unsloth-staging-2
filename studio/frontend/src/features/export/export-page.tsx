@@ -2,8 +2,8 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { SectionCard } from "@/components/section-card";
-import { RecentTrainingsSection } from "@/features/studio/recent-trainings-section";
 import { Button } from "@/components/ui/button";
+import { Switch } from "@/components/ui/switch";
 import {
   Combobox,
   ComboboxContent,
@@ -62,6 +62,9 @@ import {
   EXPORT_METHODS,
   type ExportMethod,
   GUIDE_STEPS,
+  MERGED_FORMATS,
+  type MergedFormat,
+  QUANT_OPTIONS,
   buildQuantSizeLabels,
   getEstimatedSize,
 } from "./constants";
@@ -76,16 +79,35 @@ import { exportTourSteps } from "./tour";
 const SEARCH_INPUT_REASONS = new Set(["input-change", "input-paste", "input-clear"]);
 
 type SourceTab = "local" | "checkpoint" | "hf";
+type SourceMode = "checkpoint" | "model";
+
+
+function safePathSegment(
+  value: string | null | undefined,
+  fallback = "model",
+  maxLength = 250,
+): string {
+  const safe = (value ?? "")
+    .replace(/[^a-zA-Z0-9._-]/g, "-")
+    .replace(/^[._-]+|[._-]+$/g, "")
+    .slice(0, maxLength)
+    .replace(/[._-]+$/g, "");
+  return safe || fallback;
+}
 
 function buildRelativeSaveDirectory(
   exportMethod: ExportMethod | null,
+  sourceMode: SourceMode,
   sourceBaseModelName: string,
   selectedModelIdx: string | null,
   checkpoint: string | null,
 ): string {
   if (exportMethod === "gguf") {
-    return `${(sourceBaseModelName.split("/").pop() ?? selectedModelIdx ?? "model")
-      .replace(/[^a-zA-Z0-9._-]/g, "-")}-GGUF`;
+    const rawName =
+      sourceMode === "checkpoint"
+        ? checkpoint ?? selectedModelIdx ?? sourceBaseModelName
+        : sourceBaseModelName;
+    return `${safePathSegment(rawName)}-GGUF`;
   }
   return `${selectedModelIdx ?? "model"}/${checkpoint}`;
 }
@@ -126,9 +148,7 @@ export function ExportPage() {
 
   const [selectedModelIdx, setSelectedModelIdx] = useState<string | null>(null);
   const [checkpoint, setCheckpoint] = useState<string | null>(null);
-  const [sourceMode, setSourceMode] = useState<"checkpoint" | "model">(
-    "checkpoint",
-  );
+  const [sourceMode, setSourceMode] = useState<SourceMode>("checkpoint");
   const [modelSource, setModelSource] = useState<"hf" | "local">("hf");
   const [modelInput, setModelInput] = useState("");
   const [selectedSourceModel, setSelectedSourceModel] = useState<string | null>(
@@ -155,6 +175,16 @@ export function ExportPage() {
       ? s.summary.quantLevels
       : [];
   });
+  // GGUF importance matrix (required for the IQ quants) and merged-export precision.
+  const [useImatrix, setUseImatrix] = useState(false);
+  const [mergedFormat, setMergedFormat] = useState<MergedFormat>("16-bit (FP16)");
+  // IQ quants are imatrix-only, so force it on when one is selected; otherwise we would submit
+  // an IQ quant with no imatrix and llama.cpp would reject it.
+  const requiresImatrix = quantLevels.some(
+    (q) => QUANT_OPTIONS.find((o) => o.value === q)?.imatrix,
+  );
+  const effectiveImatrix = useImatrix || requiresImatrix;
+
   // Whether the inline export panel is expanded. The panel also shows itself
   // whenever a run is active/terminal (see `panelActive`), so it survives
   // navigation even though this local flag resets on remount.
@@ -450,6 +480,7 @@ export function ExportPage() {
   const defaultSaveDirectory = useMemo(() => {
     const relative = buildRelativeSaveDirectory(
       exportMethod,
+      sourceMode,
       sourceBaseModelName,
       selectedModelIdx,
       checkpoint,
@@ -596,6 +627,8 @@ export function ExportPage() {
       exportMethod,
       isAdapter: adapterExport,
       quantLevels,
+      useImatrix: effectiveImatrix,
+      mergedFormat,
       saveDirectory,
       destination,
       repoId,
@@ -622,6 +655,8 @@ export function ExportPage() {
     exportMethod,
     isAdapter,
     quantLevels,
+    effectiveImatrix,
+    mergedFormat,
     destination,
     saveDirectory,
     hfUsername,
@@ -1149,12 +1184,54 @@ export function ExportPage() {
                 }
               />
 
+              {exportMethod === "merged" && isAdapter && (
+                <div className="space-y-2">
+                  <div className="text-sm font-medium">Precision</div>
+                  <div className="flex flex-wrap gap-2">
+                    {MERGED_FORMATS.map((f) => (
+                      <Button
+                        key={f.value}
+                        type="button"
+                        variant={mergedFormat === f.value ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setMergedFormat(f.value)}
+                        title={f.hint}
+                      >
+                        {f.label}
+                      </Button>
+                    ))}
+                  </div>
+                  <div className="text-xs text-muted-foreground">
+                    {MERGED_FORMATS.find((f) => f.value === mergedFormat)?.hint}
+                  </div>
+                </div>
+              )}
+
               {exportMethod === "gguf" && (
-                <QuantPicker
-                  value={quantLevels}
-                  onChange={setQuantLevels}
-                  sizes={quantSizeLabels}
-                />
+                <>
+                  <QuantPicker
+                    value={quantLevels}
+                    onChange={setQuantLevels}
+                    sizes={quantSizeLabels}
+                  />
+                  <div className="flex items-center justify-between gap-3 rounded-lg border p-3">
+                    <div className="space-y-0.5">
+                      <div className="text-sm font-medium">
+                        Importance matrix (imatrix)
+                      </div>
+                      <div className="text-xs text-muted-foreground">
+                        {requiresImatrix
+                          ? "Required for the selected IQ low-bit quant. Auto-downloads the upstream Unsloth imatrix for the base model."
+                          : "Improves quant quality and unlocks the IQ low-bit quants. Auto-downloads the upstream Unsloth imatrix for the base model."}
+                      </div>
+                    </div>
+                    <Switch
+                      checked={effectiveImatrix}
+                      onCheckedChange={setUseImatrix}
+                      disabled={requiresImatrix}
+                    />
+                  </div>
+                </>
               )}
               {estimatedSize && (
                 <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
@@ -1224,8 +1301,6 @@ export function ExportPage() {
             </>
           )}
         </SectionCard>
-
-        <RecentTrainingsSection />
       </main>
     </div>
   );

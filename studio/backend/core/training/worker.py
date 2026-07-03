@@ -44,6 +44,7 @@ if sys.platform.startswith("linux") and "HSA_ENABLE_DXG_DETECTION" not in os.env
 
 logger = get_logger(__name__)
 from utils.hardware import apply_gpu_ids
+from utils.training_runs import build_default_output_dir_name
 from utils.wheel_utils import (
     direct_wheel_url,
     flash_attn_wheel_url,
@@ -1049,7 +1050,7 @@ def _ensure_flash_attn_for_long_context(event_queue: Any, max_seq_length: int) -
         _send_status(event_queue, "Continuing without flash-attn")
 
 
-def _activate_transformers_version(model_name: str) -> None:
+def _activate_transformers_version(model_name: str, hf_token: str | None = None) -> None:
     """Activate the correct transformers version BEFORE any ML imports."""
     # Ensure backend is on path for utils imports
     backend_path = str(Path(__file__).resolve().parent.parent.parent)
@@ -1058,10 +1059,10 @@ def _activate_transformers_version(model_name: str) -> None:
 
     from utils.transformers_version import activate_transformers_for_subprocess
 
-    activate_transformers_for_subprocess(model_name)
+    activate_transformers_for_subprocess(model_name, hf_token)
 
 
-def _activate_transformers_version_or_warn(model_name: str) -> None:
+def _activate_transformers_version_or_warn(model_name: str, hf_token: str | None = None) -> None:
     """Activate the required transformers version for the MLX fast-path.
 
     Unlike the non-MLX path (which treats activation failure as fatal and
@@ -1072,7 +1073,7 @@ def _activate_transformers_version_or_warn(model_name: str) -> None:
     is visible, while keeping the fall-through behaviour.
     """
     try:
-        _activate_transformers_version(model_name)
+        _activate_transformers_version(model_name, hf_token)
     except Exception as exc:
         logger.warning(
             "Failed to activate transformers version for '%s' (MLX); "
@@ -1787,11 +1788,14 @@ def _run_mlx_training(event_queue, stop_queue, config):
 
     # ── 5. Build output dir ──
     # Resolve to ~/.unsloth/studio/outputs/ so the export page finds it
-    from utils.paths import resolve_output_dir, ensure_dir, default_run_dir_name
+    from utils.paths import resolve_output_dir, ensure_dir
 
     output_dir = config.get("output_dir", "")
     if not output_dir:
-        output_dir = f"{default_run_dir_name(model_name)}_{int(time.time())}"
+        output_dir = build_default_output_dir_name(
+            model_name,
+            config.get("project_name"),
+        )
     output_dir = str(resolve_output_dir(output_dir))
     ensure_dir(Path(output_dir))
 
@@ -2139,7 +2143,7 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
         # Must happen before any transformers/mlx-lm imports in _run_mlx_training.
         # Non-fatal: fall through with whatever version is installed, but log
         # the failure instead of swallowing it (issue #6103).
-        _activate_transformers_version_or_warn(model_name)
+        _activate_transformers_version_or_warn(model_name, config.get("hf_token") or None)
         try:
             _run_mlx_training(event_queue, stop_queue, config)
         except Exception as exc:
@@ -2155,7 +2159,7 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
 
     # ── 1. Activate correct transformers version BEFORE any ML imports ──
     try:
-        _activate_transformers_version(model_name)
+        _activate_transformers_version(model_name, config.get("hf_token") or None)
     except Exception as exc:
         event_queue.put(
             {
@@ -2801,6 +2805,7 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
             subset = config.get("subset"),
             train_split = config.get("train_split", "train"),
             eval_split = config.get("eval_split"),
+            dataset_streaming = config.get("dataset_streaming", False),
             eval_steps = config.get("eval_steps", 0.00),
             dataset_slice_start = config.get("dataset_slice_start"),
             dataset_slice_end = config.get("dataset_slice_end"),
@@ -3018,7 +3023,10 @@ def run_training_process(*, event_queue: Any, stop_queue: Any, config: dict) -> 
             resume_from_checkpoint
         )
         if not output_dir:
-            output_dir = f"{default_run_dir_name(model_name)}_{int(time.time())}"
+            output_dir = build_default_output_dir_name(
+                model_name,
+                config.get("project_name"),
+            )
         output_dir = str(resolve_output_dir(output_dir))
         ensure_dir(Path(output_dir))
 
@@ -3499,7 +3507,10 @@ def _run_embedding_training(event_queue: Any, stop_queue: Any, config: dict) -> 
         resume_from_checkpoint
     )
     if not output_dir:
-        output_dir = f"{default_run_dir_name(model_name)}_{int(time.time())}"
+        output_dir = build_default_output_dir_name(
+            model_name,
+            config.get("project_name"),
+        )
     output_dir = str(resolve_output_dir(output_dir))
 
     num_epochs = config.get("num_epochs", 2)
