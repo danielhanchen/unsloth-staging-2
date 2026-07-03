@@ -329,6 +329,19 @@ class TestNudgeHelpers:
         assert response_has_promotable_calls(self._resp("", undeclared), {"Bash"}) is False
         assert response_has_promotable_calls(self._resp("", declared), {"Bash"}) is True
 
+    def test_retry_with_mixed_structured_calls_is_not_an_improvement(self):
+        # ALL structured calls must be declared: the caller forwards the whole
+        # list (and a parallel cap could keep only the FIRST), so a mixed retry
+        # could still hand the client an undeclared tool.
+        mixed = [
+            {"id": "x", "type": "function", "function": {"name": "Nuke", "arguments": "{}"}},
+            {"id": "y", "type": "function", "function": {"name": "Bash", "arguments": "{}"}},
+        ]
+        assert response_has_promotable_calls(self._resp("", mixed), {"Bash"}) is False
+        assert (
+            response_has_promotable_calls(self._resp("", list(reversed(mixed))), {"Bash"}) is False
+        )
+
     @pytest.mark.parametrize(
         "data",
         [
@@ -762,6 +775,51 @@ class TestNudgeRetryAnthropic:
         asyncio.run(_run())
 
 
+class TestAnthropicPassthroughHealingText:
+    """Non-streaming Anthropic passthrough must relay unpromoted (undeclared)
+    text-form calls as text, matching the OpenAI passthrough contract. Once
+    heal_openai_message promotes the declared call it span-trims only that
+    markup and deliberately leaves the undeclared bytes in the content; the
+    legacy blanket _TOOL_XML_RE strip must not delete them.
+    """
+
+    async def _drive(self, monkeypatch, upstream):
+        import routes.inference as inf_mod
+        from routes.inference import _anthropic_passthrough_non_streaming
+
+        client = ScriptedClient([upstream])
+        monkeypatch.setattr(inf_mod, "nonstreaming_client", lambda: client)
+        response = await _anthropic_passthrough_non_streaming(
+            _llama_backend(),
+            [{"role": "user", "content": "hi"}],
+            [LOOKUP_TOOL],
+            0.7,
+            0.95,
+            None,
+            256,
+            "msg_test",
+            "gguf",
+        )
+        return json.loads(response.body)
+
+    def test_mixed_declared_and_undeclared_relays_undeclared_as_text(self, monkeypatch):
+        async def _run():
+            content = f"Running now. {LOOKUP_XML} then {XML_UNDECLARED} done."
+            data = await self._drive(monkeypatch, _upstream_message(content))
+            # Declared lookup call is promoted into a structured tool_use block.
+            (tool_use,) = [b for b in data["content"] if b["type"] == "tool_use"]
+            assert tool_use["name"] == "lookup"
+            # Undeclared Nuke call was not promoted; its markup must survive in a
+            # text block instead of being deleted by the legacy XML strip.
+            (text_block,) = [b for b in data["content"] if b["type"] == "text"]
+            assert XML_UNDECLARED in text_block["text"]
+            assert "Running now." in text_block["text"] and "done." in text_block["text"]
+            # The promoted lookup markup is gone from the visible text.
+            assert LOOKUP_XML not in text_block["text"]
+
+        asyncio.run(_run())
+
+
 class TestAnthropicEmitterHealing:
     def _events(
         self,
@@ -1024,6 +1082,25 @@ class TestAnthropicNonStreamingRoute:
             _, data = await self._drive(monkeypatch, [_upstream_message(xml)])
             assert data["stop_reason"] == "end_turn"
             assert not any(b["type"] == "tool_use" for b in data["content"])
+            # Healing preserves what it does not promote: the undeclared call
+            # reaches the client as text instead of being silently stripped.
+            (text_block,) = [b for b in data["content"] if b["type"] == "text"]
+            assert text_block["text"] == xml
+
+        asyncio.run(_run())
+
+    def test_mixed_undeclared_text_preserved_after_heal(self, monkeypatch):
+        async def _run():
+            # Declared call promoted to tool_use; the undeclared call's markup
+            # stays in the text block (the legacy strip must not run after a
+            # span-exact heal), matching the OpenAI passthrough.
+            rogue = '<tool_call>{"name":"rogue","arguments":{}}</tool_call>'
+            _, data = await self._drive(monkeypatch, [_upstream_message(f"{LOOKUP_XML} {rogue}")])
+            (tool_block,) = [b for b in data["content"] if b["type"] == "tool_use"]
+            assert tool_block["name"] == "lookup"
+            (text_block,) = [b for b in data["content"] if b["type"] == "text"]
+            assert rogue in text_block["text"]
+            assert data["stop_reason"] == "tool_use"
 
         asyncio.run(_run())
 
@@ -1115,9 +1192,7 @@ class TestOpenaiStreamingRoute:
                 'data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}',
                 "data: [DONE]",
             ]
-            chunks = await _drive_stream(
-                monkeypatch, _payload(parallel_tool_calls = False), lines
-            )
+            chunks = await _drive_stream(monkeypatch, _payload(parallel_tool_calls = False), lines)
             payloads = _stream_payloads(chunks)
             tool_deltas = [
                 tc
