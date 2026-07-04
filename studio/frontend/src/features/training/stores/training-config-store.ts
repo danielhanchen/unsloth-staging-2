@@ -1013,9 +1013,7 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
           s.datasetStreaming ??= false;
         }
         if (version < 12) {
-          s.contextLengthManuallySet =
-            typeof s.contextLength === "number" &&
-            s.contextLength !== DEFAULT_HYPERPARAMS.contextLength;
+          s.contextLengthManuallySet = false;
         }
         return s as unknown as TrainingConfigStore;
       },
