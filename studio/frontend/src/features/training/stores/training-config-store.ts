@@ -89,6 +89,7 @@ const initialState: TrainingConfigState = {
   isDatasetImage: null,
   isDatasetAudio: false,
   maxPositionEmbeddings: null,
+  contextLengthManuallySet: false,
   ...DEFAULT_HYPERPARAMS,
 };
 
@@ -105,11 +106,6 @@ let _trainOnCompletionsManuallySet = false;
 // Has the user manually edited the LR since the last model load? When false,
 // switching method auto-sets LR to 2e-4 (LoRA/QLoRA) or 2e-5 (full fine-tune).
 let _learningRateManuallySet = false;
-
-// Has the user explicitly set context length? When true, model-default patches
-// cannot overwrite the visible value. Unlike LR, this survives model loads so
-// a deliberate choice like 32768 keeps showing until the user resets defaults.
-let _contextLengthManuallySet = false;
 
 // Stash the YAML learning rate so setTrainingMethod can restore it when
 // switching back from full to adapter.
@@ -375,14 +371,15 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
             _learningRateManuallySet = false;
             _yamlLearningRate = undefined;
             const patch = mapBackendModelConfigToTrainingPatch(modelDetails.config);
-            const effectiveContextLength = _contextLengthManuallySet
+            const contextLengthManuallySet = get().contextLengthManuallySet;
+            const effectiveContextLength = contextLengthManuallySet
               ? get().contextLength
               : patch.contextLength ?? get().contextLength;
 
             // User explicitly set context length: discard the model default so
             // the visible value is preserved. autoSelectTrainingMethod will
             // receive the preserved visible value via the explicit fallback.
-            if (_contextLengthManuallySet) {
+            if (contextLengthManuallySet) {
               delete patch.contextLength;
             }
 
@@ -858,10 +855,8 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
           evalSteps: uploadedEvalFile ? 0.1 : 0,
         }),
         setEpochs: (epochs) => set({ epochs }),
-        setContextLength: (contextLength) => {
-          _contextLengthManuallySet = true;
-          set({ contextLength });
-        },
+        setContextLength: (contextLength) =>
+          set({ contextLength, contextLengthManuallySet: true }),
         setVisionImageSize: (visionImageSize) => set({ visionImageSize }),
         setLearningRate: (learningRate) => {
           _learningRateManuallySet = true;
@@ -932,7 +927,6 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
         reset: () => {
           _trainOnCompletionsManuallySet = false;
           _learningRateManuallySet = false;
-          _contextLengthManuallySet = false;
           _yamlLearningRate = undefined;
           clearCptDatasetFormatTracking();
           set(initialState);
@@ -940,8 +934,8 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
         resetToModelDefaults: () => {
           const { selectedModel } = get();
           if (!selectedModel) return;
-          _contextLengthManuallySet = false;
           set({
+            contextLengthManuallySet: false,
             modelDefaultsAppliedFor: null,
             visionImageSize: DEFAULT_HYPERPARAMS.visionImageSize,
           });
@@ -954,13 +948,18 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
           if (patch.learningRate !== undefined) {
             _learningRateManuallySet = false;
           }
-          set(patch);
+          set({
+            ...patch,
+            ...(patch.contextLength !== undefined
+              ? { contextLengthManuallySet: true }
+              : {}),
+          });
         },
       };
     },
     {
       name: "unsloth_training_config_v1",
-      version: 11,
+      version: 12,
       migrate: (persisted, version) => {
         const s = persisted as Record<string, unknown>;
         if (version < 2 && s.datasetSubset == null && s.datasetConfig != null) {
@@ -1012,6 +1011,11 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
           // streaming backfill when it was nested under v<10, so give it its
           // own version guard.
           s.datasetStreaming ??= false;
+        }
+        if (version < 12) {
+          s.contextLengthManuallySet =
+            typeof s.contextLength === "number" &&
+            s.contextLength !== DEFAULT_HYPERPARAMS.contextLength;
         }
         return s as unknown as TrainingConfigStore;
       },
