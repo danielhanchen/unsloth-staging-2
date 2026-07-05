@@ -1,0 +1,73 @@
+# Real Apple Silicon validation for unsloth-zoo#855 (MLX notebook inference compat).
+# Installs REAL mlx / mlx-lm wheels, unsloth-zoo from the PR head branch
+# (Lyxot/unsloth-zoo@fix/mlx-inference-notebook-compat) and unsloth from unslothai
+# main (the trainer-API #6462 is merged), then runs the notebook inference contract
+# probe end to end on real MLX:
+#   apply_chat_template(return_tensors="pt", return_dict=True) -> BatchEncoding
+#   model.generate(**inputs)                                   -> batched torch id tensor
+#   batch_decode(out[:, prompt_len:])                          -> generated text
+
+name: mlx-inference-notebook macos-14
+
+on:
+  push:
+    branches: [mlx-trainer-api-validation]
+    paths:
+      - 'tests/staging/mlx_inference_notebook_probe.py'
+      - '.github/workflows/mlx-inference-notebook-macos14.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  real-mlx-inference:
+    name: real mlx notebook inference
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install zoo#855 head + unsloth main with real MLX wheels
+        run: |
+          python -m pip install --upgrade pip
+          # torch (cpu) kept importable: #855 prefers a torch tensor generate output.
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
+          # zoo PR head under test: [mlx] extra pulls real mlx / mlx-lm / mlx-vlm wheels.
+          git clone --depth 1 -b fix/mlx-inference-notebook-compat https://github.com/Lyxot/unsloth-zoo zoo
+          git -C zoo log --oneline -1
+          pip install -e './zoo[mlx]'
+          # unsloth from unslothai main (public FastModel + MLX routing, #6462 merged).
+          git clone --depth 1 -b main https://github.com/unslothai/unsloth unsloth_src
+          git -C unsloth_src log --oneline -1
+          pip install --no-deps -e ./unsloth_src
+          # This staging repo is a fork of unsloth; drop its repo-root ./unsloth so
+          # `import unsloth` resolves to the editable PR install, not the checkout.
+          rm -rf "$GITHUB_WORKSPACE/unsloth"
+          pip install datasets sentencepiece protobuf trl peft
+          python -c "import unsloth, unsloth_zoo; print('unsloth at', unsloth.__file__); print('zoo at', unsloth_zoo.__file__)"
+
+      - name: Real Apple Silicon + real mlx sanity
+        run: |
+          python -c "
+          import platform
+          assert platform.system() == 'Darwin' and platform.machine() == 'arm64', platform.platform()
+          import mlx.core as mx
+          assert 'mlx_simulation' not in (getattr(mx, '__file__', '') or ''), mx.__file__
+          import unsloth
+          assert getattr(unsloth, 'DEVICE_TYPE', None) == 'mlx', unsloth.DEVICE_TYPE
+          print('OK: real mlx', mx.__version__, '| unsloth DEVICE_TYPE=mlx')
+          "
+
+      - name: MLX notebook inference contract probe (zoo#855)
+        run: python tests/staging/mlx_inference_notebook_probe.py
