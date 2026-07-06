@@ -42,7 +42,7 @@ jobs:
           git -C unsloth_src log --oneline -1
           pip install --no-deps -e ./unsloth_src
           rm -rf "$GITHUB_WORKSPACE/unsloth"
-          pip install datasets sentencepiece protobuf trl peft 'pytest==9.0.3' pytest-timeout python-multipart fastapi
+          pip install datasets sentencepiece protobuf trl peft 'pytest==9.0.3' pytest-timeout python-multipart fastapi structlog cryptography httpx typer uvicorn pyjwt
           python -c "import unsloth, unsloth_zoo; print('unsloth', unsloth.__file__); print('zoo', unsloth_zoo.__file__)"
       - name: Real Apple Silicon + real mlx sanity
         run: |
