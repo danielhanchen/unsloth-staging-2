@@ -29,7 +29,6 @@ import os
 from collections.abc import Mapping
 from typing import Any, Optional
 
-from core.inference.tool_call_parser import TOOL_XML_SIGNALS, has_tool_signal
 from core.inference.tool_loop_controller import coerce_tool_arguments
 from core.tool_healing import parse_tool_calls_from_text
 
@@ -44,7 +43,17 @@ def nudge_enabled(request_flag: Optional[bool]) -> bool:
     return _NUDGE_DEFAULT if request_flag is None else bool(request_flag)
 
 
-_MAX_SIGNAL_LEN = max(len(s) for s in TOOL_XML_SIGNALS)
+# Buffer only on signals the healer's parser can promote -- narrower than the loops'
+# TOOL_XML_SIGNALS: loop-only signals like the bare ``[ARGS]`` rehearsal marker (name-gated
+# in the loops) would hold legitimate prose until finalization without ever promoting.
+_HEAL_SIGNALS = ("<tool_call>", "<|tool_call>", "<function=", "[TOOL_CALLS]")
+
+
+def _has_heal_signal(text: str) -> bool:
+    return any(s in text for s in _HEAL_SIGNALS)
+
+
+_MAX_SIGNAL_LEN = max(len(s) for s in _HEAL_SIGNALS)
 # A suspected-but-unclosed tool block larger than this is declared a false
 # alarm and flushed, bounding memory on a model rambling XML-lookalike text.
 _MAX_HOLD_CHARS = 64 * 1024
@@ -198,7 +207,7 @@ def heal_openai_message_events(
     if not isinstance(msg, dict) or msg.get("tool_calls"):
         return None
     content = msg.get("content")
-    if not isinstance(content, str) or not has_tool_signal(content):
+    if not isinstance(content, str) or not _has_heal_signal(content):
         return None
     parsed, spans = parse_tool_calls_from_text(content, allow_incomplete = True, with_spans = True)
     tool_schemas = _tool_schemas_by_name(tools) if tools is not None else None
@@ -248,7 +257,7 @@ def heal_openai_message(
 
 def _earliest_signal(buffer: str) -> int:
     best = -1
-    for signal in TOOL_XML_SIGNALS:
+    for signal in _HEAL_SIGNALS:
         index = buffer.find(signal)
         if index >= 0 and (best < 0 or index < best):
             best = index
@@ -275,7 +284,7 @@ def _partial_signal_suffix(buffer: str) -> int:
     """Length of the longest buffer suffix that is a proper prefix of a signal."""
     for length in range(min(len(buffer), _MAX_SIGNAL_LEN - 1), 0, -1):
         tail = buffer[-length:]
-        if any(signal.startswith(tail) for signal in TOOL_XML_SIGNALS):
+        if any(signal.startswith(tail) for signal in _HEAL_SIGNALS):
             return length
     return 0
 
@@ -342,7 +351,11 @@ class StreamToolCallHealer:
                     return events
             # HOLD: handle the FIRST complete block per pass so events keep
             # document order (a later declared call must not overtake an
-            # earlier undeclared one flushing as text).
+            # earlier undeclared one flushing as text). A "block" may be one
+            # markup call OR a whole Mistral [TOOL_CALLS] array whose per-item
+            # spans are contiguous; the whole contiguous run is drained here so
+            # later calls in the same array are not stranded as text once the
+            # residue no longer begins with a signal.
             parsed, spans = parse_tool_calls_from_text(
                 self._buffer,
                 id_offset = self._id_offset,
@@ -363,26 +376,34 @@ class StreamToolCallHealer:
                     self._holding = False
                     continue
                 return events
-            start, end = spans[0]
-            promoted = _promote(
-                [parsed[0]],
-                self._allowed,
-                id_offset = self._id_offset,
-                tool_schemas = self._tool_schemas,
-            )
-            if promoted:
-                if start:
-                    events.append(("text", self._buffer[:start]))
-                events.append(("tool_call", promoted[0]))
-                self._id_offset += 1
-                # Drop exactly the promoted markup span; everything else
-                # (leading text, later blocks) stays and is rescanned.
-                self._buffer = self._buffer[end:]
-            else:
-                # Undeclared or unusable name: its markup is DATA, flush it
-                # (and anything before it) verbatim, then rescan the rest.
-                events.append(("text", self._buffer[:end]))
-                self._buffer = self._buffer[end:]
+            pos = 0
+            run_end = spans[0][1]
+            for order, (call, (start, end)) in enumerate(zip(parsed, spans)):
+                # Stop at the first gap (prose between blocks) or an incomplete
+                # trailing block: leave it for the next pass so it can re-hold
+                # and stream incrementally instead of flushing as text early.
+                if order and start != run_end:
+                    break
+                promoted = _promote(
+                    [call],
+                    self._allowed,
+                    id_offset = self._id_offset,
+                    tool_schemas = self._tool_schemas,
+                )
+                if promoted:
+                    # Flush any leading text, then drop the promoted markup span.
+                    if self._buffer[pos:start]:
+                        events.append(("text", self._buffer[pos:start]))
+                    events.append(("tool_call", promoted[0]))
+                    self._id_offset += 1
+                else:
+                    # Undeclared or unusable name: its markup is DATA, flush it
+                    # (and anything before it) verbatim.
+                    events.append(("text", self._buffer[pos:end]))
+                pos = end
+                run_end = end
+            # Everything past the drained run (later blocks) stays and is rescanned.
+            self._buffer = self._buffer[run_end:]
             self._holding = False
 
     def finalize(self) -> list:
@@ -508,7 +529,7 @@ def nudge_should_retry(
     if not message or message.get("tool_calls"):
         return False
     text = message.get("content")
-    if not isinstance(text, str) or not has_tool_signal(text):
+    if not isinstance(text, str) or not _has_heal_signal(text):
         return False
     return not _heal_would_promote(text, allowed_tools, tools)
 
