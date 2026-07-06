@@ -1,0 +1,40 @@
+name: "staging-6870 studio-playwright"
+on:
+  push:
+    branches: ["pr-6870-xplat-ci"]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/staging-6870-playwright.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  studio-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install playwright httpx pillow && python -m playwright install --with-deps chromium
+      - name: Install + launch Studio
+        run: |
+          ./install.sh --local --no-torch || pip install -e .
+          nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8888/healthz && break; sleep 5; done
+      - name: Playwright smoke (studio_test_kit)
+        run: PYTHONPATH=.github/scripts python -m studio_test_kit._smoke_ui || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-playwright-6870
+          path: |
+            **/*.png
+            **/*.webm
+            studio.log
