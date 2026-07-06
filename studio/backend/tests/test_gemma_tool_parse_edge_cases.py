@@ -21,7 +21,10 @@ _BACKEND_DIR = str(Path(__file__).resolve().parent.parent)
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-from core.inference.tool_call_parser import parse_tool_calls_from_text
+from core.inference.tool_call_parser import (
+    _gemma_parse_value,
+    parse_tool_calls_from_text,
+)
 
 
 def _args(call: dict) -> dict:
@@ -45,6 +48,17 @@ def test_normal_multi_key_arguments_still_split():
     assert _args(calls[0]) == {"a": 1, "b": "hello", "c": "x,y"}
 
 
+def test_empty_bare_value_becomes_empty_string_not_dropped():
+    # An empty bare value (``{query:}``) must serialise as ``""`` (``{"query":}`` is invalid JSON and dropped the call).
+    calls = parse_tool_calls_from_text("<|tool_call>call:search{query:,unit:celsius}<tool_call|>")
+    assert len(calls) == 1, calls
+    assert _args(calls[0]) == {"query": "", "unit": "celsius"}
+
+    only = parse_tool_calls_from_text("<|tool_call>call:get{q:}<tool_call|>")
+    assert len(only) == 1, only
+    assert _args(only[0]) == {"q": ""}
+
+
 def test_bare_value_with_timestamps_after_comma_is_kept():
     # A comma followed by digits-then-colon (a timestamp/ratio) is value text,
     # not a new key, so the whole query must be preserved as one argument.
@@ -53,6 +67,15 @@ def test_bare_value_with_timestamps_after_comma_is_kept():
     )
     assert len(calls) == 1, calls
     assert _args(calls[0]) == {"query": "meet at 10:00, 11:00 tomorrow", "priority": "high"}
+
+
+def test_wrapperless_bare_value_with_timestamps_after_comma_is_kept():
+    # The wrapper-less Gemma form (no <|tool_call> markers) goes through the
+    # _gemma_parse_stripped_body scanner and its _GEMMA_KEY_RE.
+    calls = parse_tool_calls_from_text("call:web_search{query:meet at 10:00, 11:00 tomorrow}")
+    assert len(calls) == 1, calls
+    assert calls[0]["function"]["name"] == "web_search"
+    assert _args(calls[0]) == {"query": "meet at 10:00, 11:00 tomorrow"}
 
 
 def test_marker_inside_json_argument_is_not_a_second_call():
@@ -159,3 +182,83 @@ def test_json_marker_inside_xml_parameter_is_not_a_second_call():
     )
     calls = parse_tool_calls_from_text(content)
     assert [c["function"]["name"] for c in calls] == ["python"], calls
+
+
+def test_wrapperless_nested_object_argument_is_parsed():
+    # skip_special_tokens stream: the <|tool_call> wrapper and <|"|> string markers were stripped,
+    # so a nested object arrives bare.
+    calls = parse_tool_calls_from_text("call:f{loc:{city:NYC},n:3}")
+    assert len(calls) == 1
+    assert _args(calls[0]) == {"loc": {"city": "NYC"}, "n": 3}
+
+
+def test_wrapperless_array_argument_is_parsed():
+    calls = parse_tool_calls_from_text("call:label{labels:[bug,ui],n:2}")
+    assert len(calls) == 1
+    assert _args(calls[0]) == {"labels": ["bug", "ui"], "n": 2}
+
+
+def test_wrapperless_deeply_nested_object_and_array_are_preserved():
+    # The single-pass parser must keep multi-level nesting (objects inside
+    # objects, arrays inside arrays) intact, not flatten or drop it.
+    calls = parse_tool_calls_from_text(
+        "call:f{loc:{city:NYC,geo:{lat:1,lng:2}},tags:[a,b,[c,d]],n:3}"
+    )
+    assert len(calls) == 1
+    assert _args(calls[0]) == {
+        "loc": {"city": "NYC", "geo": {"lat": 1, "lng": 2}},
+        "tags": ["a", "b", ["c", "d"]],
+        "n": 3,
+    }
+
+
+def test_gemma_parse_array_advances_on_stray_brace():
+    # Regression: a stray '}' / ']' / ',' where an array element is expected must
+    # not stall _gemma_parse_value at the same index (it looped forever before).
+    from core.inference.tool_call_parser import _gemma_parse_array
+
+    items, end, closed = _gemma_parse_array("[a,}]", 0)
+    assert end == 5 and closed is True  # consumed through the closing ']'
+    assert items[0] == "a"
+
+
+def test_gemma_parse_value_always_advances_on_stray_delimiter():
+    # A stray delimiter (`,`, `}`, `]`) at the primitive position consumes no
+    # characters. The parser must still advance the index by at least one, or a
+    # caller that loops on the returned index spins forever at 100% CPU (DoS).
+    for delim in (",", "}", "]"):
+        text = delim + "rest"
+        value, nxt, _explicit = _gemma_parse_value(text, 0)
+        assert nxt > 0, (delim, value, nxt)
+
+
+def test_malformed_gemma_array_does_not_hang():
+    # ``[},]`` puts a stray ``}`` at the primitive position inside a list body.
+    # On the buggy parser this hangs the server; guard with a wall-clock timeout
+    # so the regression fails loudly instead of blocking CI forever.
+    import threading
+
+    result: dict = {}
+
+    def _run():
+        result["calls"] = parse_tool_calls_from_text("<|tool_call>call:f{a:[},]}<tool_call|>")
+
+    t = threading.Thread(target = _run, daemon = True)
+    t.start()
+    t.join(timeout = 10.0)
+    assert not t.is_alive(), "parse_tool_calls_from_text hung on malformed array input"
+
+
+def test_malformed_gemma_mapping_value_does_not_hang():
+    # A stray ``}`` where a mapping value is expected must also terminate.
+    import threading
+
+    result: dict = {}
+
+    def _run():
+        result["calls"] = parse_tool_calls_from_text("<|tool_call>call:f{a:}},b:1}<tool_call|>")
+
+    t = threading.Thread(target = _run, daemon = True)
+    t.start()
+    t.join(timeout = 10.0)
+    assert not t.is_alive(), "parse_tool_calls_from_text hung on malformed mapping input"
