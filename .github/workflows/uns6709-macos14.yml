@@ -1,0 +1,59 @@
+# Real Apple Silicon MLX validation for unsloth#6709 cli mlx train.
+# Installs the PR branch(es) + real mlx/mlx-lm/mlx-vlm wheels (zoo [mlx] extra)
+# on macos-14 and runs the PR's own tests, so the real-Metal / mlx.launch /
+# real-Darwin cases skipped on Linux CI actually execute here.
+name: "mlx-pr uns6709 macos-14"
+
+on:
+  push:
+    branches: [mlx-pr-validation]
+    paths:
+      - '.github/workflows/uns6709-macos14.yml'
+      - 'tests/staging/**'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: unsloth#6709 cli mlx train
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install PR branch(es) + real MLX wheels
+        run: |
+          python -m pip install --upgrade pip
+          pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
+          git clone --depth 1 -b main https://github.com/unslothai/unsloth-zoo zoo
+          git -C zoo log --oneline -1
+          pip install -e './zoo[mlx]'
+          git clone --depth 1 -b feat/cli-mlx-backend-aware https://github.com/Lyxot/unsloth unsloth_src
+          git -C unsloth_src log --oneline -1
+          pip install --no-deps -e ./unsloth_src
+          rm -rf "$GITHUB_WORKSPACE/unsloth"
+          pip install datasets sentencepiece protobuf trl peft 'pytest==9.0.3' pytest-timeout python-multipart fastapi
+          python -c "import unsloth, unsloth_zoo; print('unsloth', unsloth.__file__); print('zoo', unsloth_zoo.__file__)"
+      - name: Real Apple Silicon + real mlx sanity
+        run: |
+          python -c "
+          import platform
+          assert platform.system()=='Darwin' and platform.machine()=='arm64', platform.platform()
+          import mlx.core as mx
+          assert 'mlx_simulation' not in (getattr(mx,'__file__','') or ''), mx.__file__
+          import unsloth
+          assert getattr(unsloth,'DEVICE_TYPE',None)=='mlx', unsloth.DEVICE_TYPE
+          print('OK real mlx', mx.__version__, '| DEVICE_TYPE=mlx')
+          "
+      - name: unsloth#6709 cli mlx train -- run PR tests on real MLX
+        run: cd unsloth_src && PYTHONPATH=$PWD:$PWD/studio/backend python -m pytest studio/backend/tests/test_training_preflight.py -q -p no:cacheprovider
