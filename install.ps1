@@ -61,7 +61,11 @@ function Install-UnslothStudio {
     function Get-TauriGpuBranch {
         param([string]$TorchIndexFamily)
         if ($SkipTorch) { return "no_torch" }
-        if ($TorchIndexFamily -like "cu*") { return "cuda" }
+        # Require digits after "cu" (cu118/cu128/...) so an odd mirror leaf like
+        # "custom"/"current" is not mis-branded CUDA. $TorchIndexFamily is already
+        # normalised by Get-TauriTorchIndexFamily today, but keep the guard narrow
+        # to match the ^cu[0-9] rule in setup.ps1 / install_python_stack.py.
+        if ($TorchIndexFamily -match '^cu[0-9]') { return "cuda" }
         if ($TorchIndexFamily -like "rocm*") { return "rocm" }
         if ($TorchIndexFamily -eq "cpu") { return "cpu" }
         return "unknown"
@@ -1979,6 +1983,30 @@ exit 0
         return "$baseUrl/cu126"
     }
 
+    # ── Torch-index marker ───────────────────────────────────────────────────
+    # After a successful torch install, record the exact wheel --index-url used at
+    # a stable per-venv path so a later `unsloth studio update` (setup.ps1 /
+    # install_python_stack.py) can detect a pin change by an EXACT string compare
+    # rather than the wheel version-tag heuristic. Path/format MUST match
+    # install.sh, studio/setup.ps1 and install_python_stack.py:
+    #   <VenvDir>\.unsloth-torch-index   (single line = the resolved index URL)
+    # install.ps1 only WRITES the marker; setup.ps1 reads it during stale detection.
+    function Write-TorchIndexMarker {
+        param([string]$VenvDir, [string]$IndexUrl)
+        if ([string]::IsNullOrWhiteSpace($VenvDir)) { return }
+        if ([string]::IsNullOrWhiteSpace($IndexUrl)) { return }
+        if (-not (Test-Path -LiteralPath $VenvDir -PathType Container)) { return }
+        $marker = Join-Path $VenvDir ".unsloth-torch-index"
+        $tmp = "$marker.$PID.tmp"
+        try {
+            # Single LF-terminated line, no BOM (parity with the sh/py writers).
+            [System.IO.File]::WriteAllText($tmp, ($IndexUrl.Trim() + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+            Move-Item -LiteralPath $tmp -Destination $marker -Force -ErrorAction Stop
+        } catch {
+            try { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } } catch {}
+        }
+    }
+
     # ── Torch flavor helpers (to repair a stale CPU / wrong-CUDA wheel) ──
     # torch.__version__ -> flavor tag (cuXXX / rocm / cpu); untagged wheel = cpu,
     # matching setup.ps1's stale-venv parse.
@@ -2113,17 +2141,29 @@ exit 0
         $_pinLeaf = ($TorchIndexUrl.TrimEnd('/') -split '/')[-1].ToLower()
         $_pinRocm211 = $false
         if ($_pinLeaf -match '^rocm(\d+)\.(\d+)') {
-            $_pinRocm211 = ([int]$Matches[1] -gt 7) -or ([int]$Matches[1] -eq 7 -and [int]$Matches[2] -ge 2)
+            # Only KNOWN-2.11 rocm indexes (rocm7.2) get the 2.11 floor; do not floor
+            # an unknown newer rocm speculatively (rocm7.3 does not exist). Matches
+            # install.sh's rocm7.2 KNOWN-2.11 leaf, setup.ps1's Test-RocmKnown211Version
+            # and _ROCM_KNOWN_TORCH211_VERSIONS in install_python_stack.py.
+            $_pinRocm211 = ([int]$Matches[1] -eq 7 -and [int]$Matches[2] -eq 2)
         }
-        if ($_pinLeaf -like 'gfx*' -or $_pinRocm211) {
+        # Only the gfx families the AMD arch map above pins to torch 2.11 need the
+        # floor here (gfx120X-all, gfx1151, gfx1150 -- the _grouped_mm bug arches).
+        # Other per-arch indexes (gfx110X-all, gfx90a, gfx908) publish <2.11 wheels
+        # and the automatic path leaves them bare, so an override to one of those
+        # must NOT force a 2.11 floor the normal path intentionally avoids (which
+        # would fail resolution or drag in mismatched companions).
+        $_pinGfx211 = @('gfx120x-all', 'gfx1151', 'gfx1150') -contains $_pinLeaf
+        if ($_pinGfx211 -or $_pinRocm211) {
             $ROCmIndexUrl = $TorchIndexUrl
             $ROCmTorchFloor = "torch>=2.11.0,<2.12.0"
             $PinnedRocmVisionSpec = "torchvision>=0.26.0,<0.27.0"
             $PinnedRocmAudioSpec = "torchaudio>=2.11.0,<2.12.0"
             substep "pinned ROCm index ($_pinLeaf) -- enforcing $ROCmTorchFloor" "Cyan"
-        } elseif ($_pinLeaf -like 'rocm*') {
-            # Older rocm (<=7.1) ships torch <2.11; route via the ROCm path with the
-            # default floor so the pinned family resolves its own wheels.
+        } elseif ($_pinLeaf -like 'gfx*' -or $_pinLeaf -like 'rocm*') {
+            # Other gfx per-arch indexes and older rocm (<=7.1) ship torch <2.11;
+            # route via the ROCm path with bare specs so the pinned family resolves
+            # its own wheels (matches the automatic path's bare floor for these).
             $ROCmIndexUrl = $TorchIndexUrl
         }
     }
@@ -2393,6 +2433,17 @@ exit 0
                 Write-Host "  [WARN] Re-run this installer, or reinstall the GPU build manually for your GPU." -ForegroundColor Yellow
             }
         }
+    }
+
+    # ── Record the resolved torch wheel index (marker) ──
+    # Torch is now resolved; write the exact --index-url used so setup.ps1 /
+    # install_python_stack.py can detect a later pin change by an EXACT string
+    # compare instead of the version-tag heuristic. Reflects the installed family:
+    # $ROCmIndexUrl when the ROCm path ran, else the CUDA/CPU/pinned $TorchIndexUrl.
+    # Skipped for --no-torch (nothing installed). Matches install.sh / setup.ps1.
+    if (-not $SkipTorch) {
+        $MarkerIndexUrl = if ($ROCmIndexUrl) { $ROCmIndexUrl } else { $TorchIndexUrl }
+        Write-TorchIndexMarker -VenvDir $VenvDir -IndexUrl $MarkerIndexUrl
     }
 
     # Overlay Tauri-bundled studio fixes that may be ahead of PyPI. Skipped

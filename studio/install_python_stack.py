@@ -74,6 +74,23 @@ _ROCM_TORCH_INDEX: dict[tuple[int, int], str] = {
     (6, 0): "rocm6.0",
 }
 
+# AMD per-arch index leaves that need the torch 2.11 floor (the torch._C._grouped_mm
+# null-ptr bug lives in the <2.11 wheels for these arches). Mirrors the gfx keys in
+# _WINDOWS_ROCM_TORCH_PKG_SPECS and the *FloorMap sets in install.ps1 / setup.ps1.
+# Other per-arch indexes (gfx110X-all, gfx90a, gfx908) publish <2.11 wheels and must
+# stay bare, so an override to one of them must NOT be forced onto the 2.11 line.
+_ROCM_GFX_TORCH211_LEAVES: frozenset[str] = frozenset({"gfx120x-all", "gfx1151", "gfx1150"})
+
+# The pytorch.org rocmX.Y indexes KNOWN to ship torch 2.11 (verified against
+# download.pytorch.org): rocm7.2 -> torch 2.11.0 is the ONLY stable 2.11 rocm
+# index today (rocm7.1 -> 2.10.0, rocm6.4 -> 2.9.1; rocm7.3 / torch 2.12 do NOT
+# exist as stable). Do NOT treat an unknown newer rocm (rocm7.3, rocm8.0, ...) as
+# 2.11 speculatively -- that is exactly the mismatch bug tracked in the review.
+# MUST match the rocm leaf in the KNOWN-2.11 case in install.sh / setup.ps1 /
+# install.ps1 (rocm7.2 there too). Bump alongside those when a new stable rocm
+# index publishes torch 2.11+. Stored as (major, minor) tuples for exact compares.
+_ROCM_KNOWN_TORCH211_VERSIONS: frozenset[tuple[int, int]] = frozenset({(7, 2)})
+
 # Per-tag pip specs; rocm7.2 ships torch 2.11.0 (older tags cap at 2.10.x).
 _ROCM_TORCH_PKG_SPECS: dict[str, tuple[str, str, str]] = {
     "rocm7.2": (
@@ -102,6 +119,127 @@ _WINDOWS_ROCM_TORCH_PKG_SPECS: dict[str, tuple[str, str, str]] = {
 _PYTORCH_WHL_BASE = (
     os.environ.get("UNSLOTH_PYTORCH_MIRROR") or "https://download.pytorch.org/whl"
 ).rstrip("/")
+
+# ── Torch-index marker ─────────────────────────────────────────────────────────
+# After a successful torch install/reinstall, record the exact wheel --index-url
+# used at a stable per-venv path. On `studio update`/repair the marker turns the
+# "did the pinned index change?" decision into an EXACT string compare instead of
+# inferring it from the wheel's +rocm/+cu version tag (which cannot encode the AMD
+# per-arch gfx family: two gfx 2.11 indexes both install +rocm7.13.0). This
+# dissolves the per-arch-switch (gfx1151 -> gfx120X-all) and custom-URL
+# (/simple, /current) cases the version-tag heuristics cannot see.
+#
+# The path/format MUST match install.sh, install.ps1 and setup.ps1:
+#   <venv_prefix>/.unsloth-torch-index   (single line = the resolved index URL)
+# Written atomically (temp file + os.replace). A missing/empty/corrupt marker is
+# treated as absent, so old venvs (and torch installed out-of-band) fall back to
+# the existing +rocm/version-tag heuristics -- backward compatibility is required.
+_TORCH_INDEX_MARKER_NAME = ".unsloth-torch-index"
+
+
+def _normalize_index_url(url: "str | None") -> "str | None":
+    """Canonicalise a wheel index URL for exact marker/pin comparison.
+
+    Trims surrounding whitespace, strips ALL trailing slashes, and lowercases only
+    the FINAL path segment (the wheel-family leaf: cu128 / cpu / rocm7.2 / gfx1151 /
+    gfx120X-all). The host part is left untouched (it may be case-sensitive on some
+    mirrors); the leaf is lowercased so the canonical gfx120X-all (capital X) and
+    AMD's lowercase pip leaf gfx120x-all compare equal. MUST match the same
+    normalization in install.sh / setup.ps1 / install.ps1. Returns None for an
+    empty/whitespace-only input. Pure function.
+    """
+    if url is None:
+        return None
+    url = url.strip()
+    if not url:
+        return None
+    url = url.rstrip("/")
+    if not url:
+        return None
+    head, sep, leaf = url.rpartition("/")
+    if sep:
+        return f"{head}/{leaf.lower()}"
+    return url.lower()
+
+
+def _torch_index_marker_path() -> Path:
+    """Path to the per-venv torch-index marker (see _TORCH_INDEX_MARKER_NAME).
+
+    Anchored at sys.prefix (the venv the installer targets via --python
+    sys.executable), so it matches install.sh's $VENV_DIR and the PowerShell
+    $VenvDir marker location.
+    """
+    return Path(sys.prefix) / _TORCH_INDEX_MARKER_NAME
+
+
+def _read_torch_index_marker() -> "str | None":
+    """Return the recorded torch --index-url from the marker, else None.
+
+    None when the marker is missing, empty, or unreadable (corrupt/permission) --
+    all treated as "no marker" so the caller falls back to the version-tag
+    heuristics. The stored URL is returned VERBATIM (not normalized); callers
+    normalize both sides before comparing.
+    """
+    try:
+        text = _torch_index_marker_path().read_text(encoding = "utf-8")
+    except (OSError, ValueError):
+        return None
+    line = text.strip()
+    return line or None
+
+
+def _write_torch_index_marker(index_url: "str | None") -> None:
+    """Record the resolved torch wheel --index-url at the per-venv marker path.
+
+    Best-effort and atomic (temp file in the same dir + os.replace). Never raises:
+    a marker write failure must not abort an otherwise-successful install (the
+    repair path then falls back to the heuristics, same as an old venv). A blank
+    index_url is ignored (nothing meaningful to record).
+    """
+    if not index_url or not index_url.strip():
+        return
+    marker = _torch_index_marker_path()
+    payload = index_url.strip() + "\n"
+    try:
+        marker.parent.mkdir(parents = True, exist_ok = True)
+        fd, tmp = tempfile.mkstemp(prefix = ".unsloth-torch-index.", dir = str(marker.parent))
+        try:
+            with os.fdopen(fd, "w", encoding = "utf-8") as fh:
+                fh.write(payload)
+            os.replace(tmp, str(marker))
+        except OSError:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+    except OSError:
+        # Non-fatal: fall back to writing directly, then give up silently.
+        try:
+            marker.write_text(payload, encoding = "utf-8")
+        except OSError:
+            pass
+
+
+def _marker_pin_mismatch(pin_url: str) -> "bool | None":
+    """Compare an explicit torch-index pin against the recorded marker.
+
+    Returns:
+      * True  -> the pin resolves to a DIFFERENT index than the marker records
+                 (exact compare after _normalize_index_url) -> reinstall needed.
+      * False -> the pin matches the marker exactly -> no reinstall (no loop).
+      * None  -> no usable marker (missing/empty/corrupt) -> the caller must fall
+                 back to the +rocm/version-tag heuristics (backward compatibility).
+
+    This is the EXACT signal the version-tag heuristics cannot provide: switching
+    one 2.11 gfx pin to another (gfx1151 -> gfx120X-all) changes the pinned URL but
+    not the installed +rocm7.13.0 wheel tag. Pure w.r.t. its arg (reads the marker).
+    """
+    marker = _read_torch_index_marker()
+    if marker is None:
+        return None
+    return _normalize_index_url(pin_url) != _normalize_index_url(marker)
+
 
 # CUDA torch repair specs (see _ensure_cuda_torch). torchvision/torchaudio are
 # pinned to the torch<2.11 family rather than left bare: the install uses an
@@ -1080,6 +1218,81 @@ def _explicit_rocm_torch_index_url() -> "str | None":
     return url if leaf.startswith(("rocm", "gfx")) else None
 
 
+def _rocm_pin_family_mismatch(pin_url: str, installed_ver: str) -> bool:
+    """True when an explicit ROCm pin names a different ROCm family than the
+    already-installed ROCm torch, so the pin needs a reinstall to be applied.
+
+    Mirrors setup.ps1's stale-venv ROCm comparison. The pin leaf classifies into
+    three cases, matching the install-spec path in _ensure_rocm_torch:
+      * rocmX.Y leaf -> compare the pinned rocm version to the installed one
+        exactly when both are readable; else fall back to the torch 2.11 line
+        (rocm>=7.2 serves 2.11, older rocm does not).
+      * gfx leaf in _ROCM_GFX_TORCH211_LEAVES (gfx120x-all/gfx1151/gfx1150) ->
+        the install path pulls AMD's per-arch wheel (tagged with a THREE-part
+        +rocmA.B.C local version, e.g. 2.11.0+rocm7.13.0). A generic pytorch.org
+        rocm wheel (two-part +rocmA.B, e.g. +rocm7.2) or any pre-2.11 build is a
+        mismatch even when both are torch 2.11 -- the user asked for the per-arch
+        index. An already-installed per-arch wheel (three-part tag) is NOT a
+        mismatch, so a satisfied gfx pin does not reinstall-loop.
+      * gfx leaf NOT in the 2.11 allowlist (gfx110X-all/gfx90a/gfx908) -> the
+        install path uses the default <2.11 specs, so a correct 2.10+rocm wheel
+        must NOT be flagged. Mismatch only when the installed torch is 2.11+.
+    A pin that resolves to the same family as what is installed is NOT a mismatch,
+    so a correct ROCm venv is never needlessly reinstalled. Pure function.
+    """
+    leaf = pin_url.rstrip("/").rsplit("/", 1)[-1].lower()
+    # Pinned ROCm version (from a rocmX.Y leaf).
+    _pin_rocm = re.match(r"^rocm(\d+)\.(\d+)", leaf)
+    _pin_ver = (int(_pin_rocm.group(1)), int(_pin_rocm.group(2))) if _pin_rocm else None
+    # Installed ROCm version (+rocmX.Y) and whether the installed wheel carries a
+    # THREE-part local version (+rocmA.B.C) -- the AMD per-arch signature that
+    # distinguishes a repo.amd.com/gfx* wheel from a two-part pytorch.org one.
+    _inst_rocm = re.search(r"\+rocm(\d+)\.(\d+)", installed_ver)
+    _inst_ver = (int(_inst_rocm.group(1)), int(_inst_rocm.group(2))) if _inst_rocm else None
+    _inst_is_perarch = re.search(r"\+rocm\d+\.\d+\.\d+", installed_ver) is not None
+    # A ROCm build MUST carry a +rocm local tag. An untagged CPU/CUDA wheel (no
+    # +rocm, e.g. "2.10.0" / "2.11.0") never satisfies a ROCm pin -- always a
+    # mismatch -- mirroring setup.ps1's Get-RocmPinStaleTags. (In practice
+    # _ensure_rocm_torch only calls this when has_hip_torch is True, but keep the
+    # pure function correct for any input so it stays in lockstep with the PS side.)
+    _inst_has_rocm = re.search(r"\+rocm", installed_ver) is not None
+    # Whether the installed torch RELEASE (before "+") is 2.11+.
+    _inst_rel = re.match(r"^(\d+)\.(\d+)", installed_ver)
+    _inst_is_211 = (
+        (int(_inst_rel.group(1)), int(_inst_rel.group(2))) >= (2, 11) if _inst_rel else False
+    )
+
+    if leaf.startswith("gfx"):
+        # gfx per-arch pin: only the _grouped_mm-bug arches (the 2.11 allowlist)
+        # pull the AMD per-arch wheel; other gfx leaves stay on the default
+        # <2.11 specs (see _ROCM_TORCH_PKG_SPECS selection below).
+        if leaf in _ROCM_GFX_TORCH211_LEAVES:
+            # Expect the AMD per-arch wheel (three-part +rocmA.B.C, torch 2.11+).
+            # A satisfied per-arch install is NOT a mismatch (no reinstall loop);
+            # a generic rocm wheel or any pre-2.11 build IS a mismatch even at 2.11.
+            return not (_inst_is_211 and _inst_is_perarch)
+        # Non-2.11 gfx leaf: install path uses default <2.11 specs, so a correct
+        # <2.11 wheel must stay. An untagged (no +rocm) wheel never satisfies the
+        # pin -> mismatch; otherwise mismatch only when the installed torch is 2.11+.
+        return (not _inst_has_rocm) or _inst_is_211
+
+    # rocmX.Y pin. Only the KNOWN-2.11 rocm indexes are treated as the 2.11 line;
+    # an unknown newer rocm (rocm7.3, rocm8.0, ...) is NOT floored speculatively
+    # (it does not exist yet). Aligns with install.sh / setup.ps1 / install.ps1.
+    _pin_is_211 = _pin_ver in _ROCM_KNOWN_TORCH211_VERSIONS if _pin_ver is not None else False
+    if _pin_ver is not None and _inst_ver is not None:
+        # Both ROCm versions readable: exact (major, minor) comparison. A generic
+        # rocm7.2 pin over the AMD per-arch (+rocm7.13.x) wheel compares (7, 2) vs
+        # (7, 13) -> mismatch, which correctly reinstalls the generic wheel the
+        # user pinned instead of leaving the per-arch one in place.
+        return _pin_ver != _inst_ver
+    # rocm pin with an unreadable installed version: compare on the torch 2.11 line,
+    # but an untagged (no +rocm) wheel never satisfies a rocmX.Y pin -> mismatch.
+    if not _inst_has_rocm:
+        return True
+    return _pin_is_211 != _inst_is_211
+
+
 def _explicit_cpu_torch_index_url() -> "str | None":
     """The pinned wheel index URL when it names the CPU family (leaf == cpu), else None.
 
@@ -1093,19 +1306,95 @@ def _explicit_cpu_torch_index_url() -> "str | None":
     return url if leaf == "cpu" else None
 
 
+def _is_cuda_family_leaf(leaf: str) -> bool:
+    """True only for a real CUDA wheel-family leaf: "cu" followed by digits
+    (cu118, cu126, cu128, cu130, ...).
+
+    A bare startswith("cu") wrongly matches arbitrary mirror leaves like "custom"
+    or "current", which would let _ensure_cuda_torch treat a generic mirror pin as
+    CUDA authority and force a CUDA reinstall over a CPU/ROCm venv on a non-NVIDIA
+    host -- exactly what _explicit_cuda_torch_index_url's contract forbids.
+    """
+    return re.match(r"^cu[0-9]", leaf) is not None
+
+
 def _explicit_cuda_torch_index_url() -> "str | None":
-    """The pinned wheel index URL when it names a CUDA family (leaf cu*), else None.
+    """The pinned wheel index URL when it names a CUDA family (leaf cuXXX), else None.
 
     Mirrors _explicit_rocm/cpu_torch_index_url so _ensure_cuda_torch only treats a
     *CUDA* pin as authority to override the NVIDIA-presence gate. An arbitrary
     mirror URL (or a ROCm/CPU pin) must not force a CUDA reinstall over a working
-    ROCm/CPU venv on a non-NVIDIA host.
+    ROCm/CPU venv on a non-NVIDIA host, so match cuXXX (cu + digits) narrowly
+    rather than any leaf starting with "cu" (which would catch custom/current).
     """
     url = _explicit_torch_index_url()
     if url is None:
         return None
     leaf = url.rstrip("/").rsplit("/", 1)[-1].lower()
-    return url if leaf.startswith("cu") else None
+    return url if _is_cuda_family_leaf(leaf) else None
+
+
+def _explicit_unknown_family_torch_index_url() -> "str | None":
+    """The pinned index URL when its leaf names NO known torch family, else None.
+
+    A "known" family leaf is rocm* / gfx* / cpu / cuXXX -- the ones the dedicated
+    _explicit_{rocm,cpu,cuda}_torch_index_url helpers already classify. Anything
+    else (a private PEP 503 mirror ending in /simple, /current, /custom, ...) is an
+    UNKNOWN family: the version-tag heuristics cannot infer whether it is stale, so
+    the marker drives the decision and, when it differs (or is absent), the URL is
+    reinstalled VERBATIM -- "URL wins verbatim". Matches the unknown-leaf branch in
+    install.sh / setup.ps1 / install.ps1.
+    """
+    url = _explicit_torch_index_url()
+    if url is None:
+        return None
+    leaf = url.rstrip("/").rsplit("/", 1)[-1].lower()
+    if leaf.startswith(("rocm", "gfx")) or leaf == "cpu" or _is_cuda_family_leaf(leaf):
+        return None
+    return url
+
+
+def _ensure_verbatim_torch_index() -> None:
+    """Reinstall torch/vision/audio VERBATIM from an explicit custom index pin.
+
+    Handles the "URL wins verbatim" case for an explicit UNSLOTH_TORCH_INDEX_URL
+    (or _FAMILY) whose leaf names no known family (e.g. a private mirror ending in
+    /simple or /current). The other _ensure_* helpers all return None for such a
+    pin (it is neither rocm/gfx nor cpu nor cuXXX), so without this the pin would be
+    silently ignored and the GPU-probed default index used instead.
+
+    Fires ONLY when the marker exists and records a DIFFERENT index than the pin
+    (or after this reinstalls, the marker is rewritten to match). With NO marker it
+    is a no-op: an old venv (or torch installed out-of-band) must not be blindly
+    force-reinstalled from an unverified custom index -- backward compatibility.
+    macOS/no-torch: skipped (no torch to repair). The install uses the pinned URL
+    exclusively (--index-url) with bare specs so it "wins verbatim".
+    """
+    if NO_TORCH or IS_MACOS:
+        return
+    pin = _explicit_unknown_family_torch_index_url()
+    if pin is None:
+        return
+    _mismatch = _marker_pin_mismatch(pin)
+    if _mismatch is not True:
+        # None -> no marker (fall back / do nothing); False -> already this index.
+        return
+    print(
+        f"   explicit torch index pin ({pin}) differs from the recorded index -- "
+        f"reinstalling torch verbatim from it"
+    )
+    pip_install(
+        "torch (pinned custom index)",
+        "--force-reinstall",
+        "--no-cache-dir",
+        "torch",
+        "torchvision",
+        "torchaudio",
+        "--index-url",
+        pin,
+        constrain = False,
+    )
+    _write_torch_index_marker(pin)
 
 
 def _ensure_cuda_torch() -> None:
@@ -1196,13 +1485,20 @@ def _ensure_cuda_torch() -> None:
     # with no CUDA pin, is deliberate and left alone.
     _pin = _explicit_torch_index_url()
     _pin_leaf = _pin.rstrip("/").rsplit("/", 1)[-1].lower() if _pin else ""
-    _pinned_cuda = _pin_leaf.startswith("cu")
+    _pinned_cuda = _is_cuda_family_leaf(_pin_leaf)
     if _marker == "hip":
         _why = "torch is a ROCm build on an NVIDIA host"
     elif _marker == "cpu" and _pinned_cuda:
         _why = "torch is a CPU build but an explicit CUDA index is pinned"
-    elif _marker == "cuda" and _pinned_cuda and _installed_cu and _installed_cu != _pin_leaf:
-        _why = f"torch is {_installed_cu} but the pinned CUDA index is {_pin_leaf}"
+    elif _marker == "cuda" and _pinned_cuda and _installed_cu != _pin_leaf:
+        # Mismatch when the installed cuXXX differs from the pin. An UNTAGGED cuda
+        # build (empty _installed_cu -- e.g. torch re-resolved from default PyPI
+        # into a CUDA wheel with no +cuXXX local tag) also counts: the family
+        # cannot be confirmed to match the pin, so reinstall to enforce it. The
+        # reinstall targets the pinned family, so an already-matching untagged
+        # build simply re-lands on the same family (idempotent).
+        _installed_desc = _installed_cu if _installed_cu else "an untagged CUDA build"
+        _why = f"torch is {_installed_desc} but the pinned CUDA index is {_pin_leaf}"
     else:
         return  # healthy CUDA torch matching the pin, or a deliberate CPU wheel
 
@@ -1224,6 +1520,7 @@ def _ensure_cuda_torch() -> None:
         index_url,
         constrain = False,
     )
+    _write_torch_index_marker(index_url)
 
 
 def _ensure_cpu_torch() -> None:
@@ -1294,6 +1591,7 @@ def _ensure_cpu_torch() -> None:
         pin,
         constrain = False,
     )
+    _write_torch_index_marker(pin)
 
 
 def _ensure_rocm_torch() -> None:
@@ -1408,6 +1706,7 @@ def _ensure_rocm_torch() -> None:
                     "later to retry ROCm."
                 )
                 return
+            _write_torch_index_marker(index_url)
         # ROCm torch is installed (or already was); flag it so later phases
         # do not overwrite it with the generic CPU torch wheel. BNB is a
         # separate dependency -- a BNB install failure must NOT roll back the
@@ -1458,9 +1757,16 @@ def _ensure_rocm_torch() -> None:
         # pins anyway) and any ver comparisons stay well-defined.
         ver = (0, 0)
 
-    # Probe whether torch already links against HIP (ROCm already working).
+    # Probe whether torch already links against HIP (ROCm already working), and
+    # capture the installed ROCm build tag so a pin mismatch can be detected.
     # Do NOT skip for CUDA-only builds: they are unusable on AMD-only hosts
     # (the NVIDIA check above already handled mixed AMD+NVIDIA setups).
+    # Emit ONE "<hip_marker>|<version>" line (mirrors _ensure_cuda_torch) so the
+    # parse is positional and robust: the HIP marker is the field before "|" (HIP
+    # version, "rocm" sentinel, or empty for CPU/CUDA torch), the installed wheel
+    # version (e.g. "2.10.0+rocm6.4") is the field after it. Do NOT filter empty
+    # LINES and take slot 0 -- for CPU/CUDA torch the marker field IS empty, and
+    # dropping it would shift the version into slot 0 and wrongly flag has_hip_torch.
     try:
         probe = subprocess.run(
             [
@@ -1470,10 +1776,11 @@ def _ensure_rocm_torch() -> None:
                     "import torch; "
                     "hip=getattr(torch.version,'hip','') or ''; "
                     "ver=getattr(torch,'__version__','').lower(); "
-                    # Print the HIP version when present (back-compat), else a
-                    # "rocm" sentinel when only torch.__version__ flags ROCm
-                    # (AMD SDK / Radeon wheels). Empty string = CPU/CUDA.
-                    "print(hip if hip else ('rocm' if 'rocm' in ver else ''))"
+                    # HIP version when present (back-compat), else a "rocm"
+                    # sentinel when only torch.__version__ flags ROCm (AMD SDK /
+                    # Radeon wheels). Empty marker before "|" = CPU/CUDA torch.
+                    "marker=hip if hip else ('rocm' if 'rocm' in ver else ''); "
+                    "print(marker + '|' + ver)"
                 ),
             ],
             stdout = subprocess.PIPE,
@@ -1482,11 +1789,46 @@ def _ensure_rocm_torch() -> None:
         )
     except (OSError, subprocess.TimeoutExpired):
         probe = None
-    has_hip_torch = (
-        probe is not None and probe.returncode == 0 and probe.stdout.decode().strip() != ""
+    # Take the last non-empty stdout line so stray sitecustomize / import-hook
+    # output cannot mask the marker; then split positionally on the FIRST "|" --
+    # the empty HIP-marker field for CPU/CUDA torch is preserved (has_hip_torch
+    # is driven by that field, not by "first non-empty line").
+    _marker_lines = (
+        [ln.strip() for ln in probe.stdout.decode(errors = "replace").splitlines() if ln.strip()]
+        if (probe is not None and probe.returncode == 0)
+        else []
     )
+    _hip_marker, _sep, _installed_torch_ver = (
+        _marker_lines[-1].partition("|") if _marker_lines else ("", "", "")
+    )
+    # A "|"-delimited marker line is required: without the separator the probe
+    # output is unrecognised (old torch, injected noise), so treat HIP as absent
+    # and fall through to a reinstall rather than trusting an ambiguous string.
+    has_hip_torch = bool(_sep) and _hip_marker != ""
 
-    rocm_torch_ready = has_hip_torch
+    # An explicit ROCm pin whose family differs from the already-installed ROCm
+    # torch must reinstall, mirroring _ensure_cuda_torch (installed cuXXX != pin).
+    # Without this, `studio update` with UNSLOTH_TORCH_INDEX_FAMILY=rocm7.2 (or a
+    # gfx* URL) on a venv that already carries an OLDER ROCm build (+rocm6.4 /
+    # +rocm7.1) short-circuits on has_hip_torch and never applies the override.
+    #
+    # Prefer the torch-index MARKER when present: an EXACT compare of the pinned
+    # index against the index the last install recorded. This is the ONLY signal
+    # that catches a per-arch switch between two 2.11 gfx indexes (gfx1151 ->
+    # gfx120X-all) -- both install a +rocm7.13.0 wheel, so the version-tag
+    # heuristic below sees no difference and would leave the old arch in place. A
+    # matching marker also guarantees a correctly-pinned venv does NOT reinstall
+    # (no loop). When there is NO marker (old venv, or torch installed out-of-band)
+    # fall back to the +rocm/version-tag heuristic -- backward compatibility.
+    _rocm_pin_mismatch = False
+    if has_hip_torch and _rocm_pin is not None:
+        _marker_verdict = _marker_pin_mismatch(_rocm_pin)
+        if _marker_verdict is None:
+            _rocm_pin_mismatch = _rocm_pin_family_mismatch(_rocm_pin, _installed_torch_ver)
+        else:
+            _rocm_pin_mismatch = _marker_verdict
+
+    rocm_torch_ready = has_hip_torch and not _rocm_pin_mismatch
 
     # Strix Halo / Strix Point (gfx1151 / gfx1150) segfault under ROCm 7.1
     # in torch._grouped_mm. AMD's per-gfx repo ships torch 2.11.0+rocm7.13.0
@@ -1560,8 +1902,12 @@ def _ensure_rocm_torch() -> None:
             index_url,
             constrain = False,
         )
+        _write_torch_index_marker(index_url)
         rocm_torch_ready = True
-    elif not has_hip_torch:
+    elif not has_hip_torch or _rocm_pin_mismatch:
+        # Reinstall when torch is not ROCm yet, OR when a ROCm build is present but
+        # its family differs from an explicit pin (_rocm_pin_mismatch -- the ROCm
+        # analogue of _ensure_cuda_torch's installed-cuXXX != pin reinstall).
         # Honour an explicit ROCm wheel-index pin verbatim instead of re-detecting
         # the host ROCm version; otherwise select the best wheel tag (newest ROCm
         # version <= installed). gfx*/rocm7.2 indexes serve torch 2.11+, so match
@@ -1580,13 +1926,20 @@ def _ensure_rocm_torch() -> None:
                 None,
             )
         if tag is None:
-            print(f"   No PyTorch wheel for ROCm {ver[0]}.{ver[1]} -- " f"skipping torch reinstall")
+            print(f"   No PyTorch wheel for ROCm {ver[0]}.{ver[1]} -- skipping torch reinstall")
         else:
             if _override_idx is None:
                 index_url = f"{_PYTORCH_WHL_BASE}/{tag}"
             print(f"   ROCm torch -- installing from {index_url}")
-            if tag.startswith("gfx"):
+            # Only the gfx arches with the _grouped_mm bug (gfx120X-all, gfx1151,
+            # gfx1150) need the torch 2.11 spec; other gfx per-arch indexes
+            # (gfx110X-all, gfx90a, gfx908) publish <2.11 wheels, so a pinned
+            # override to one of those stays on the default range. Matches the
+            # gfx floor gating in install.ps1 / setup.ps1.
+            if tag in _ROCM_GFX_TORCH211_LEAVES:
                 _torch_pkg, _vision_pkg, _audio_pkg = _ROCM_TORCH_PKG_SPECS["rocm7.2"]
+            elif tag.startswith("gfx"):
+                _torch_pkg, _vision_pkg, _audio_pkg = _ROCM_TORCH_PKG_SPECS["_default"]
             else:
                 _torch_pkg, _vision_pkg, _audio_pkg = _ROCM_TORCH_PKG_SPECS.get(
                     tag, _ROCM_TORCH_PKG_SPECS["_default"]
@@ -1602,6 +1955,7 @@ def _ensure_rocm_torch() -> None:
                 index_url,
                 constrain = False,
             )
+            _write_torch_index_marker(index_url)
             rocm_torch_ready = True
 
     # Install bitsandbytes only when torch links against ROCm. Prefers the
@@ -1699,7 +2053,12 @@ if not _TORCH_BACKEND:
         _TORCH_BACKEND = "rocm"
     elif _idx_leaf == "cpu":
         _TORCH_BACKEND = "cpu"
-    elif _idx_leaf.startswith("cu"):
+    elif _is_cuda_family_leaf(_idx_leaf):
+        # Require a digit after "cu" (^cu[0-9]) so a full-override URL ending in
+        # /current or /custom is NOT branded CUDA. A wrong "cuda" backend makes
+        # _ensure_rocm_torch() return early on AMD hosts and leaves a CPU/wrong
+        # torch unrepaired; falling through here keeps _TORCH_BACKEND="" so the
+        # helpers probe the GPU instead.
         _TORCH_BACKEND = "cuda"
 
 
@@ -2437,6 +2796,7 @@ def install_python_stack() -> int:
         _ensure_cuda_torch()
         _ensure_rocm_torch()
         _ensure_cpu_torch()
+        _ensure_verbatim_torch_index()
 
     # Windows + AMD GPU: warn if ROCm torch was not installed (wrong Python
     # version or unknown ROCm version).
@@ -2632,6 +2992,7 @@ def install_python_stack() -> int:
         _ensure_cuda_torch()
         _ensure_rocm_torch()
         _ensure_cpu_torch()
+        _ensure_verbatim_torch_index()
 
     # 14. Final check (silent; third-party conflicts are expected)
     subprocess.run(

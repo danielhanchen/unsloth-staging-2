@@ -425,6 +425,182 @@ function Get-TorchIndexLeaf {
     return ($Url.TrimEnd('/') -split '/')[-1].ToLowerInvariant()
 }
 
+# ── Torch-index marker ───────────────────────────────────────────────────────
+# After a successful torch install this records the exact wheel --index-url used
+# at a stable per-venv path so a later `unsloth studio update` can detect a pin
+# change by an EXACT string compare rather than the wheel version-tag heuristic
+# (which cannot encode the AMD per-arch gfx family). Path/format MUST match
+# install.sh, install.ps1 and install_python_stack.py:
+#   <VenvDir>\.unsloth-torch-index   (single line = the resolved index URL)
+$TorchIndexMarkerName = ".unsloth-torch-index"
+
+# Normalise a wheel index URL for exact marker/pin comparison: trim whitespace,
+# strip ALL trailing slashes, lowercase ONLY the final path segment (the leaf).
+# Mirrors _normalize_index_url in install.sh / install_python_stack.py / install.ps1.
+function Get-NormalizedIndexUrl {
+    param([string]$Url)
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $null }
+    $u = $Url.Trim().TrimEnd('/')
+    if ([string]::IsNullOrWhiteSpace($u)) { return $null }
+    $idx = $u.LastIndexOf('/')
+    if ($idx -lt 0) { return $u.ToLowerInvariant() }
+    $head = $u.Substring(0, $idx)
+    $leaf = $u.Substring($idx + 1).ToLowerInvariant()
+    return "$head/$leaf"
+}
+
+# Path to the per-venv torch-index marker.
+function Get-TorchIndexMarkerPath {
+    param([string]$VenvDir)
+    if ([string]::IsNullOrWhiteSpace($VenvDir)) { return $null }
+    return Join-Path $VenvDir $TorchIndexMarkerName
+}
+
+# Return the recorded torch --index-url from the marker, else $null (missing /
+# empty / unreadable -> "no marker", so the caller falls back to the heuristics).
+function Read-TorchIndexMarker {
+    param([string]$VenvDir)
+    $marker = Get-TorchIndexMarkerPath -VenvDir $VenvDir
+    if (-not $marker) { return $null }
+    if (-not (Test-Path -LiteralPath $marker -PathType Leaf)) { return $null }
+    try {
+        $line = (Get-Content -LiteralPath $marker -Raw -ErrorAction Stop).Trim()
+    } catch { return $null }
+    if ([string]::IsNullOrWhiteSpace($line)) { return $null }
+    return $line
+}
+
+# Record the resolved torch wheel --index-url at the marker path, atomically
+# (temp file + Move). Best-effort: a write failure never aborts the install. A
+# blank URL is ignored (nothing to record).
+function Write-TorchIndexMarker {
+    param([string]$VenvDir, [string]$IndexUrl)
+    if ([string]::IsNullOrWhiteSpace($VenvDir)) { return }
+    if ([string]::IsNullOrWhiteSpace($IndexUrl)) { return }
+    if (-not (Test-Path -LiteralPath $VenvDir -PathType Container)) { return }
+    $marker = Get-TorchIndexMarkerPath -VenvDir $VenvDir
+    $tmp = "$marker.$PID.tmp"
+    try {
+        # Write a single line, LF-terminated, no BOM (parity with the sh/py writers).
+        [System.IO.File]::WriteAllText($tmp, ($IndexUrl.Trim() + "`n"), (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $marker -Force -ErrorAction Stop
+    } catch {
+        try { if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue } } catch {}
+    }
+}
+
+# Compare an explicit torch-index pin against the recorded marker.
+#   $true  -> pin resolves to a DIFFERENT index than the marker -> reinstall.
+#   $false -> pin matches the marker exactly -> no reinstall (no loop).
+#   $null  -> no usable marker -> caller falls back to the version-tag heuristics.
+function Test-MarkerPinMismatch {
+    param([string]$VenvDir, [string]$PinUrl)
+    $marker = Read-TorchIndexMarker -VenvDir $VenvDir
+    if ($null -eq $marker) { return $null }
+    return (Get-NormalizedIndexUrl $PinUrl) -ne (Get-NormalizedIndexUrl $marker)
+}
+
+# The AMD per-arch index leaves that need the torch 2.11 floor (the _grouped_mm
+# null-ptr bug lives in the <2.11 wheels for these arches). MUST match the
+# $_pinGfx211 allowlist in the install-spec path below (and install.ps1 /
+# install_python_stack.py). Other per-arch leaves (gfx110X-all/gfx90a/gfx908)
+# publish <2.11 wheels and stay on default specs, so a pin to one of those must
+# NOT be judged stale against the 2.11 line.
+function Test-RocmGfx211Leaf {
+    param([string]$Leaf)
+    return @('gfx120x-all', 'gfx1151', 'gfx1150') -contains $Leaf
+}
+
+# The pytorch.org rocmX.Y versions KNOWN to ship torch 2.11 (verified against
+# download.pytorch.org): rocm7.2 is the ONLY stable 2.11 rocm index today. Do NOT
+# treat an unknown newer rocm (rocm7.3, rocm8.0, ...) as 2.11 speculatively -- it
+# does not exist yet, and that speculative floor is the mismatch bug being fixed.
+# MUST match _ROCM_KNOWN_TORCH211_VERSIONS (Python) and the rocm7.2 KNOWN-2.11 leaf
+# in install.sh / install.ps1. $Major / $Minor are integers.
+function Test-RocmKnown211Version {
+    param([int]$Major, [int]$Minor)
+    return ($Major -eq 7 -and $Minor -eq 2)
+}
+
+# True only for a real CUDA wheel-family leaf: "cu" followed by digits (cu118,
+# cu126, cu128, cu130, ...). Mirrors install_python_stack.py::_is_cuda_family_leaf.
+# A bare -like 'cu*' wrongly matches arbitrary mirror leaves like "custom" /
+# "current", which would set an expected tag no installed flavor can equal and
+# rebuild the venv on every run instead of trusting the unknown custom index.
+function Test-CudaFamilyLeaf {
+    param([string]$Leaf)
+    if ([string]::IsNullOrWhiteSpace($Leaf)) { return $false }
+    return $Leaf -match '^cu[0-9]'
+}
+
+# Stale-venv ROCm comparison for a pinned gfx*/rocm* index. Returns a hashtable
+# @{ Expected = <tag>; Installed = <tag> } so the caller rebuilds when they
+# differ. Mirrors install_python_stack.py::_rocm_pin_family_mismatch:
+#   * rocmX.Y pin  -> compare exact rocm versions when both readable, else the
+#     torch 2.11 line (rocm>=7.2 serves 2.11, older rocm does not).
+#   * gfx pin in the 2.11 allowlist -> expect AMD's per-arch wheel (three-part
+#     +rocmA.B.C local version). A generic (two-part +rocmA.B) or pre-2.11 wheel
+#     is stale; an already-installed per-arch wheel is NOT (no rebuild loop).
+#   * gfx pin NOT in the allowlist (gfx110X-all/gfx90a/gfx908) -> default <2.11
+#     specs, so a 2.10+rocm wheel is correct; only a 2.11+ build is stale.
+# A ROCm pin (gfx* or rocmX.Y) is satisfied ONLY by an installed wheel carrying a
+# +rocm local tag: an untagged CPU/CUDA wheel (e.g. 2.10.0 / 2.11.0) never
+# satisfies a ROCm pin, so it is reported stale and the pin is (re)applied.
+function Get-RocmPinStaleTags {
+    param([string]$PinLeaf, [string]$TorchVersion)
+    $_pinRocm = [regex]::Match($PinLeaf, '^rocm(\d+)\.(\d+)')
+    $_pinVer = if ($_pinRocm.Success) { "$($_pinRocm.Groups[1].Value).$($_pinRocm.Groups[2].Value)" } else { $null }
+    # Installed rocm version and whether the wheel is a per-arch (three-part) build.
+    $_instRocm = [regex]::Match($TorchVersion, '\+rocm(\d+)\.(\d+)')
+    $_instVer = if ($_instRocm.Success) { "$($_instRocm.Groups[1].Value).$($_instRocm.Groups[2].Value)" } else { $null }
+    $_instPerArch = [regex]::IsMatch($TorchVersion, '\+rocm\d+\.\d+\.\d+')
+    # A ROCm build MUST carry a +rocm local tag. Without it the wheel is a CPU/CUDA
+    # build that cannot satisfy any ROCm pin, regardless of its release line.
+    $_instHasRocm = [regex]::IsMatch($TorchVersion, '\+rocm')
+    $_instRel = [regex]::Match($TorchVersion, '^(\d+)\.(\d+)')
+    $_instIs211 = $false
+    if ($_instRel.Success) {
+        $_instIs211 = ([int]$_instRel.Groups[1].Value -gt 2) -or ([int]$_instRel.Groups[1].Value -eq 2 -and [int]$_instRel.Groups[2].Value -ge 11)
+    }
+
+    if ($PinLeaf -like 'gfx*') {
+        if (Test-RocmGfx211Leaf $PinLeaf) {
+            # Expect the AMD per-arch (three-part) 2.11 wheel. Satisfied only when
+            # BOTH a 2.11 release AND a three-part rocm tag are installed (the
+            # three-part tag already implies +rocm).
+            $installed = if ($_instIs211 -and $_instPerArch) { "rocm-perarch(torch>=2.11)" } else { "rocm-generic-or-old" }
+            return @{ Expected = "rocm-perarch(torch>=2.11)"; Installed = $installed }
+        }
+        # Non-2.11 gfx leaf: default <2.11 spec. An untagged (no +rocm) wheel never
+        # satisfies the pin -> stale. Otherwise stale only when the build is 2.11+.
+        $installed = if (-not $_instHasRocm) { "not-rocm" } elseif ($_instIs211) { "rocm(torch>=2.11)" } else { "rocm(torch<2.11)" }
+        return @{
+            Expected  = "rocm(torch<2.11)"
+            Installed = $installed
+        }
+    }
+
+    # rocmX.Y pin.
+    if ($_pinVer -and $_instVer) {
+        # Both rocm versions readable: exact comparison. A readable $_instVer already
+        # implies a +rocm tag, so no separate tag check is needed here.
+        return @{ Expected = "rocm$_pinVer"; Installed = "rocm$_instVer" }
+    }
+    $_pinNeeds211 = $false
+    if ($_pinRocm.Success) {
+        # Only the KNOWN-2.11 rocm indexes (rocm7.2) are on the 2.11 line; an unknown
+        # newer rocm is NOT floored speculatively. Matches _ROCM_KNOWN_TORCH211_VERSIONS.
+        $_pinNeeds211 = Test-RocmKnown211Version -Major ([int]$_pinRocm.Groups[1].Value) -Minor ([int]$_pinRocm.Groups[2].Value)
+    }
+    # Fallback (installed rocm version unreadable): compare on the 2.11 line, but an
+    # untagged (no +rocm) wheel never satisfies a rocmX.Y pin -> report it stale.
+    $installed = if (-not $_instHasRocm) { "not-rocm" } elseif ($_instIs211) { "rocm(torch>=2.11)" } else { "rocm(torch<2.11)" }
+    return @{
+        Expected  = if ($_pinNeeds211) { "rocm(torch>=2.11)" } else { "rocm(torch<2.11)" }
+        Installed = $installed
+    }
+}
+
 # VS generator -> MSBuild BuildCustomizations dir; toolset tracks the VS major
 # (18->v180, 17->v170), defaulting to v170 when unparseable.
 function Get-VcBuildCustomizationsDir {
@@ -2568,45 +2744,49 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
         $_expectedKnown = $true
         if ($_pinnedIdx) {
             $_pinLeaf = Get-TorchIndexLeaf $_pinnedIdx
+            # Torch-index marker: when the last install recorded an index, compare the
+            # pin against it EXACTLY. This is the only signal that catches a per-arch
+            # switch between two 2.11 gfx indexes (gfx1151 -> gfx120X-all -- both
+            # install a +rocm7.13.0 wheel, so the tag heuristic sees no difference) and
+            # a custom-URL change (/simple -> /current). $null = no usable marker ->
+            # fall back to the version-tag heuristic (old venv; backward compatible).
+            $_markerMismatch = Test-MarkerPinMismatch -VenvDir $VenvDir -PinUrl $_pinnedIdx
+            if ($null -ne $_markerMismatch) {
+                # Drive the rebuild decision purely off the marker compare.
+                $_expectedKnown = $true
+                if ($_markerMismatch) {
+                    $expectedTorchTag  = "pinned:$_pinnedIdx"
+                    $installedTorchTag = "marker-mismatch"
+                } else {
+                    $expectedTorchTag  = "pinned:$_pinnedIdx"
+                    $installedTorchTag = "pinned:$_pinnedIdx"
+                }
+            }
             # cu*/cpu leaves stay specific so a cu126-vs-cu128 mismatch rebuilds.
-            if ($_pinLeaf -like 'gfx*' -or $_pinLeaf -like 'rocm*') {
+            elseif ($_pinLeaf -like 'gfx*' -or $_pinLeaf -like 'rocm*') {
                 # Do NOT collapse a pinned ROCm/gfx leaf to a generic "rocm": that
                 # would match any installed +rocm wheel and mask a pin change from
                 # one ROCm family to another (e.g. rocm6.4 -> gfx1151, or rocm6.4
-                # -> rocm6.3), leaving the requested index unapplied. Compare what
-                # the wheel tag exposes -- the ROCm version (+rocmX.Y) and whether
-                # the index serves the torch 2.11 line (gfx* / rocm>=7.2 do; older
-                # rocm does not). gfx pins carry no rocm version in the leaf, so
-                # they compare on the 2.11 line only.
-                $_pinNeeds211 = $false
-                $_pinRocmVer = $null
-                if ($_pinLeaf -like 'gfx*') {
-                    $_pinNeeds211 = $true
-                } elseif ($_pinLeaf -match '^rocm(\d+)\.(\d+)') {
-                    $_pinRocmVer = "$($Matches[1]).$($Matches[2])"
-                    $_pinNeeds211 = ([int]$Matches[1] -gt 7) -or ([int]$Matches[1] -eq 7 -and [int]$Matches[2] -ge 2)
-                }
-                $_instRocmVer = $null
-                if ($torchVer -match '\+rocm(\d+)\.(\d+)') { $_instRocmVer = "$($Matches[1]).$($Matches[2])" }
-                $_instIs211 = $false
-                if ($torchVer -match '^(\d+)\.(\d+)') {
-                    $_instIs211 = ([int]$Matches[1] -gt 2) -or ([int]$Matches[1] -eq 2 -and [int]$Matches[2] -ge 11)
-                }
-                if ($_pinRocmVer -and $_instRocmVer) {
-                    # Both ROCm versions readable: compare them exactly.
-                    $expectedTorchTag = "rocm$_pinRocmVer"
-                    $installedTorchTag = "rocm$_instRocmVer"
-                } else {
-                    # gfx pin or unreadable version: compare on the torch 2.11 line.
-                    $expectedTorchTag  = if ($_pinNeeds211) { "rocm(torch>=2.11)" } else { "rocm(torch<2.11)" }
-                    $installedTorchTag = if ($_instIs211)   { "rocm(torch>=2.11)" } else { "rocm(torch<2.11)" }
-                }
-            } elseif ($_pinLeaf -like 'cu*' -or $_pinLeaf -eq 'cpu') {
+                # -> rocm6.3), leaving the requested index unapplied. Get-RocmPinStaleTags
+                # compares what the wheel tag exposes and uses the SAME 2.11 allowlist
+                # (Test-RocmGfx211Leaf) as the install-spec path, so a gfx110X-all /
+                # gfx90a / gfx908 pin on a valid <2.11 wheel is NOT judged stale, and a
+                # 2.11-allowlist gfx pin over a generic (two-part +rocm) wheel IS.
+                $_rocmTags = Get-RocmPinStaleTags -PinLeaf $_pinLeaf -TorchVersion $torchVer
+                $expectedTorchTag  = $_rocmTags.Expected
+                $installedTorchTag = $_rocmTags.Installed
+            } elseif ((Test-CudaFamilyLeaf $_pinLeaf) -or $_pinLeaf -eq 'cpu') {
+                # Require digits after "cu" (cu118/cu128/...) so a mirror leaf like
+                # /custom or /current is NOT treated as a CUDA flavor -- otherwise the
+                # expected tag would be an arbitrary word no installed flavor equals,
+                # rebuilding the venv every run. Such leaves fall through to the
+                # trust-unknown-index branch below.
                 $expectedTorchTag = $_pinLeaf
             } else {
                 # Custom index whose final segment is not a torch flavor (e.g. a
-                # PEP 503 mirror ending in /simple). We cannot infer the flavor, so
-                # trust the pinned URL and do not rebuild on a bogus tag comparison.
+                # PEP 503 mirror ending in /simple) and no marker to compare against.
+                # We cannot infer the flavor, so trust the pinned URL and do not
+                # rebuild on a bogus tag comparison.
                 $_expectedKnown = $false
                 $expectedTorchTag = $installedTorchTag
             }
@@ -2922,15 +3102,28 @@ if ($TorchIndexPinned -and -not $ROCmIndexUrl -and $PinnedTorchIndexUrl) {
     $_pinLeaf = Get-TorchIndexLeaf $PinnedTorchIndexUrl
     $_pinRocm211 = $false
     if ($_pinLeaf -match '^rocm(\d+)\.(\d+)') {
-        $_pinRocm211 = ([int]$Matches[1] -gt 7) -or ([int]$Matches[1] -eq 7 -and [int]$Matches[2] -ge 2)
+        # Only KNOWN-2.11 rocm indexes (rocm7.2) get the 2.11 floor; do not floor an
+        # unknown newer rocm speculatively. Matches install.sh's rocm7.2 KNOWN-2.11
+        # leaf and Test-RocmKnown211Version / _ROCM_KNOWN_TORCH211_VERSIONS.
+        $_pinRocm211 = Test-RocmKnown211Version -Major ([int]$Matches[1]) -Minor ([int]$Matches[2])
     }
-    if ($_pinLeaf -like 'gfx*' -or $_pinRocm211) {
+    # Only the gfx families the AMD arch map above pins to torch 2.11 need the
+    # floor here (gfx120X-all, gfx1151, gfx1150 -- the _grouped_mm bug arches).
+    # Other per-arch indexes (gfx110X-all, gfx90a, gfx908) publish <2.11 wheels
+    # and the automatic path leaves them bare, so an override to one of those
+    # must NOT force a 2.11 floor the normal path intentionally avoids. Reuse
+    # Test-RocmGfx211Leaf so this allowlist and the stale-venv check never diverge.
+    $_pinGfx211 = Test-RocmGfx211Leaf $_pinLeaf
+    if ($_pinGfx211 -or $_pinRocm211) {
         $ROCmIndexUrl   = $PinnedTorchIndexUrl
         $ROCmTorchSpec  = "torch>=2.11.0,<2.12.0"
         $ROCmVisionSpec = "torchvision>=0.26.0,<0.27.0"
         $ROCmAudioSpec  = "torchaudio>=2.11.0,<2.12.0"
         substep "pinned ROCm index ($_pinLeaf) -- enforcing $ROCmTorchSpec" "Cyan"
-    } elseif ($_pinLeaf -like 'rocm*') {
+    } elseif ($_pinLeaf -like 'gfx*' -or $_pinLeaf -like 'rocm*') {
+        # Other gfx per-arch indexes and older rocm (<=7.1) ship torch <2.11;
+        # route via the ROCm path with bare specs (matches the automatic path's
+        # bare floor for these arches).
         $ROCmIndexUrl   = $PinnedTorchIndexUrl
         $ROCmTorchSpec  = "torch"
         $ROCmVisionSpec = "torchvision"
@@ -3033,6 +3226,16 @@ if (-not $ROCmIndexUrl -and ($CuTag -eq "cpu" -or $ROCmCpuFallback)) {
         substep "Triton for Windows installed (enables torch.compile)"
     }
 }
+
+# ── Record the resolved torch wheel index (marker) ──
+# Torch was just installed; write the exact --index-url used so a later `unsloth
+# studio update` can detect a pin change by an EXACT string compare (see the
+# stale-venv check above) instead of the version-tag heuristic. Reflects the actual
+# installed family: $ROCmIndexUrl when the ROCm path ran, else $TorchInstallIndexUrl
+# (which is the pinned/CUDA/CPU index, or the CPU index after a ROCm fallback).
+# Path/format matches install.sh, install.ps1 and install_python_stack.py.
+$MarkerIndexUrl = if ($ROCmIndexUrl) { $ROCmIndexUrl } else { $TorchInstallIndexUrl }
+Write-TorchIndexMarker -VenvDir $VenvDir -IndexUrl $MarkerIndexUrl
 
 # No unsloth.exe rename needed. setup.ps1 runs *via* unsloth.exe, so renaming the
 # running launcher only ever failed (WinError 32) and printed a scary warning. It's

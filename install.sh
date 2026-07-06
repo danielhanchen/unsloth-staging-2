@@ -334,7 +334,11 @@ _tauri_gpu_branch() {
         return
     fi
     case "$_diag_family" in
-        cu*) echo "cuda" ;;
+        # Require a digit after cu (cu118/cu128/...) so an odd leaf like custom /
+        # current is not branded CUDA -- matches the ^cu[0-9] rule in setup.ps1 /
+        # install_python_stack.py. $_diag_family is already normalised by
+        # _tauri_torch_index_family, but keep the guard narrow for parity.
+        cu[0-9]*) echo "cuda" ;;
         rocm*)
             if [ "$_diag_radeon" = true ]; then
                 echo "rocm_radeon"
@@ -2190,9 +2194,13 @@ _torch_flavor_tag() {
 
 # Expected tag from the index leaf ($1): cuXXX / cpu / rocm (rocmX.Y and gfx* ->
 # rocm). Empty on an unknown leaf (odd mirror) so the repair safely no-ops.
+# Lowercase the leaf first so gfx120X-all (capital X) / any cased mirror leaf
+# still classifies, keeping the cuXXX tag comparison against _torch_flavor_tag
+# (which emits lowercase cuXXX) case-consistent.
 _expected_torch_flavor_tag() {
     _u="${1%/}"
     _leaf="${_u##*/}"
+    _leaf=$(printf '%s' "$_leaf" | tr '[:upper:]' '[:lower:]')
     case "$_leaf" in
         cu[0-9]*)   echo "$_leaf" ;;
         cpu)        echo "cpu" ;;
@@ -2206,13 +2214,70 @@ _expected_torch_flavor_tag() {
 # resolves (torch + every transitive dep) via --index-url -- the same URLs the
 # fresh-install paths above already use -- so a stale wheel is auto-repairable.
 # Unknown/odd-mirror leaves -> no, so we warn rather than risk a wrong reinstall.
+# Lowercase the leaf first so a cased leaf (e.g. gfx120X-all) is recognised.
 _torch_index_repairable() {
     _u="${1%/}"
     _leaf="${_u##*/}"
+    _leaf=$(printf '%s' "$_leaf" | tr '[:upper:]' '[:lower:]')
     case "$_leaf" in
         cu[0-9]*|rocm[0-9]*|gfx*) echo "yes" ;;
         *)                        echo "no" ;;
     esac
+}
+
+# ── Torch-index marker ───────────────────────────────────────────────────────
+# After a successful torch install this records the exact wheel --index-url used
+# at a stable per-venv path so `unsloth studio update` / setup.ps1 /
+# install_python_stack.py can make the "did the pinned index change?" decision by
+# an EXACT string compare instead of inferring it from the wheel version tag
+# (which cannot encode the AMD per-arch gfx family). The path and format MUST match
+# install_python_stack.py, setup.ps1 and install.ps1:
+#   <venv_dir>/.unsloth-torch-index   (single line = the resolved index URL)
+_TORCH_INDEX_MARKER_NAME=".unsloth-torch-index"
+
+# Normalise a wheel index URL for exact marker/pin comparison: trim whitespace,
+# strip ALL trailing slashes, lowercase ONLY the final path segment (the leaf).
+# Mirrors _normalize_index_url in install_python_stack.py / setup.ps1 / install.ps1.
+_normalize_index_url() {
+    _n_url="$1"
+    # Trim leading/trailing whitespace.
+    _n_url="${_n_url#"${_n_url%%[![:space:]]*}"}"; _n_url="${_n_url%"${_n_url##*[![:space:]]}"}"
+    [ -n "$_n_url" ] || { printf '%s' ""; return; }
+    # Strip all trailing slashes.
+    while [ "${_n_url%/}" != "$_n_url" ]; do _n_url="${_n_url%/}"; done
+    [ -n "$_n_url" ] || { printf '%s' ""; return; }
+    case "$_n_url" in
+        */*)
+            _n_head="${_n_url%/*}"
+            _n_leaf="${_n_url##*/}"
+            _n_leaf=$(printf '%s' "$_n_leaf" | tr '[:upper:]' '[:lower:]')
+            printf '%s/%s' "$_n_head" "$_n_leaf"
+            ;;
+        *)
+            printf '%s' "$_n_url" | tr '[:upper:]' '[:lower:]'
+            ;;
+    esac
+}
+
+# Write the resolved torch --index-url ($2) into the marker under venv dir ($1),
+# atomically (temp file + mv). Best-effort: a write failure never aborts the
+# install (the repair path then falls back to the version-tag heuristics). A blank
+# URL is ignored (nothing meaningful to record).
+_write_torch_index_marker() {
+    _wm_venv="$1"
+    _wm_url="$2"
+    [ -n "$_wm_venv" ] || return 0
+    [ -d "$_wm_venv" ] || return 0
+    _wm_url="${_wm_url#"${_wm_url%%[![:space:]]*}"}"; _wm_url="${_wm_url%"${_wm_url##*[![:space:]]}"}"
+    [ -n "$_wm_url" ] || return 0
+    _wm_marker="$_wm_venv/$_TORCH_INDEX_MARKER_NAME"
+    _wm_tmp="$_wm_marker.$$.tmp"
+    if printf '%s\n' "$_wm_url" > "$_wm_tmp" 2>/dev/null; then
+        mv -f "$_wm_tmp" "$_wm_marker" 2>/dev/null || rm -f "$_wm_tmp" 2>/dev/null || true
+    else
+        rm -f "$_wm_tmp" 2>/dev/null || true
+    fi
+    return 0
 }
 
 get_radeon_wheel_url() {
@@ -2461,8 +2526,18 @@ _maybe_bootstrap_rocm_wsl() {
 # sudo + large downloads after probing /dev/dxg) and the Radeon/Strix rerouting
 # below (which would re-probe the GPU and overwrite the pinned URL). A headless /
 # container / CI build must get exactly the index it asked for.
+# Trim leading/trailing whitespace before the -n check (parity with
+# get_torch_index_url): a whitespace-only override (e.g. from a CI template) is
+# treated as unset there and falls through to normal CPU/ROCm detection, so it
+# must NOT flip _torch_index_pinned true here -- otherwise the WSL bootstrap and
+# Radeon/Strix reroutes below are skipped while detection still picks the normal
+# index, silently disabling them.
 _torch_index_pinned=false
-if [ -n "${UNSLOTH_TORCH_INDEX_URL:-}" ] || [ -n "${UNSLOTH_TORCH_INDEX_FAMILY:-}" ]; then
+_ti_url_trim="${UNSLOTH_TORCH_INDEX_URL:-}"
+_ti_url_trim="${_ti_url_trim#"${_ti_url_trim%%[![:space:]]*}"}"; _ti_url_trim="${_ti_url_trim%"${_ti_url_trim##*[![:space:]]}"}"
+_ti_family_trim="${UNSLOTH_TORCH_INDEX_FAMILY:-}"
+_ti_family_trim="${_ti_family_trim#"${_ti_family_trim%%[![:space:]]*}"}"; _ti_family_trim="${_ti_family_trim%"${_ti_family_trim##*[![:space:]]}"}"
+if [ -n "$_ti_url_trim" ] || [ -n "$_ti_family_trim" ]; then
     _torch_index_pinned=true
 fi
 [ "$_torch_index_pinned" = true ] || _maybe_bootstrap_rocm_wsl || true
@@ -2476,29 +2551,49 @@ TORCH_INDEX_URL=$(get_torch_index_url)
 # whose base path happens to contain "rocm" or "gfx" must not mislabel a
 # cu*/cpu index as ROCm (radeon repo URLs end in rocm-rel-X.Y/, Strix
 # overrides in gfxNNNN/, so the trailing slash is stripped first).
+# Lowercase the leaf once here so every gfx*/rocm*/cu* allowlist below matches
+# regardless of case. The canonical AMD RDNA4 leaf is gfx120X-all (capital X,
+# from the arch maps in install_python_stack.py / install.ps1); without this a
+# pin to gfx120X-all would miss the lowercase gfx120x-all allowlist entries.
+# The allowlists stay lowercase; inputs are normalised to lowercase.
+# CUDA is branded only on a real cu[0-9]* leaf (^cu[0-9]) -- NOT a bare cu*/catch-
+# all -- so a full-override mirror leaf like /current or /custom does NOT commit a
+# CUDA backend. An unknown leaf leaves the backend var unset so the stack probes
+# the GPU instead of returning early in _ensure_rocm_torch on AMD hosts.
+# Matches _is_cuda_family_leaf (Python) / Test-CudaFamilyLeaf (PowerShell).
 _torch_index_leaf="${TORCH_INDEX_URL%/}"
 _torch_index_leaf="${_torch_index_leaf##*/}"
+_torch_index_leaf=$(printf '%s' "$_torch_index_leaf" | tr '[:upper:]' '[:lower:]')
 case "$_torch_index_leaf" in
     rocm*|gfx*) export UNSLOTH_TORCH_BACKEND="rocm" ;;
     cpu)        export UNSLOTH_TORCH_BACKEND="cpu"  ;;
-    *)          export UNSLOTH_TORCH_BACKEND="cuda" ;;
+    cu[0-9]*)   export UNSLOTH_TORCH_BACKEND="cuda" ;;
+    # Unknown leaf (odd mirror, e.g. /current, /custom): do NOT commit a backend.
+    # Unset so a stale inherited value can't leak and the stack probes the GPU.
+    *)          unset UNSLOTH_TORCH_BACKEND ;;
 esac
 
-# rocm7.2 and the AMD per-gfx indexes (repo.amd.com/.../gfxNNNN) ship torch
-# 2.11.0 -- adjust the constraint to allow it. This also covers a pinned full-URL
-# or family override (e.g. UNSLOTH_TORCH_INDEX_URL=.../gfx1151) that returns early
-# above and so never hits the Strix reroute that otherwise raises this constraint.
-# Pin the companions to the matching 2.11 range too: the per-gfx index publishes
-# torchvision/torchaudio independently and a bare name can resolve a 2.12-built
-# wheel (ABI mismatch). Matches setup.ps1's *FloorMap and _ROCM_TORCH_PKG_SPECS.
-# All other ROCm tags and CUDA stay within <2.11.0.
+# rocm7.2 and the AMD per-gfx indexes with the torch._C._grouped_mm bug on <2.11
+# (repo.amd.com/.../gfx120X-all, gfx1151, gfx1150) ship torch 2.11.0 -- raise the
+# constraint to allow it. This also covers a pinned full-URL or family override
+# (e.g. UNSLOTH_TORCH_INDEX_URL=.../gfx1151) that returns early above and so never
+# hits the Strix reroute that otherwise raises this constraint. Pin the companions
+# to the matching 2.11 range too: the per-gfx index publishes torchvision/torchaudio
+# independently and a bare name can resolve a 2.12-built wheel (ABI mismatch).
+# Matches setup.ps1's *FloorMap and _ROCM_GFX_TORCH211_LEAVES in install_python_stack.py.
+# Only these gfx families need the floor: the other per-arch indexes (gfx110X-all,
+# gfx90a, gfx908) publish <2.11 wheels, so a pinned override to one of those must NOT
+# be forced onto the 2.11 line (which would fail resolution / pull mismatched
+# companions). All other ROCm tags and CUDA stay within <2.11.0.
 # Match on the FINAL path segment ($_torch_index_leaf, computed above), NOT the
 # whole URL: a custom UNSLOTH_PYTORCH_MIRROR whose base path contains a "gfx" or
 # "rocm7.2" segment (e.g. https://mirror.local/gfx-cache) with a cu*/cpu family
 # must not be treated as an AMD per-arch index and pushed to the 2.11 line. This
 # mirrors the leaf-only backend classification just above.
+# _torch_index_leaf is already lowercased above, so the canonical gfx120X-all
+# (capital X, from the arch maps) pins here via the lowercase gfx120x-all entry.
 case "$_torch_index_leaf" in
-    rocm7.2|gfx*)
+    rocm7.2|gfx120x-all|gfx1151|gfx1150)
         TORCH_CONSTRAINT="torch>=2.11.0,<2.12.0"
         TORCHVISION_CONSTRAINT="torchvision>=0.26.0,<0.27.0"
         TORCHAUDIO_CONSTRAINT="torchaudio>=2.11.0,<2.12.0"
@@ -3058,6 +3153,15 @@ if [ "$SKIP_TORCH" = false ] && [ -n "${TORCH_INDEX_URL:-}" ]; then
             substep "[WARN]   uv pip install --python \"$_VENV_PY\" \"$TORCH_CONSTRAINT\" \"$TORCHVISION_CONSTRAINT\" \"$TORCHAUDIO_CONSTRAINT\" --index-url $TORCH_INDEX_URL --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio" "$C_WARN"
         fi
     fi
+fi
+
+# ── Record the resolved torch wheel index (marker) ──
+# Torch is now fully resolved; write the exact --index-url used so `unsloth studio
+# update` (install_python_stack.py / setup.ps1) can detect a later pin change by an
+# exact string compare rather than the version-tag heuristic. Only when torch was
+# actually installed from a resolved index (skip --no-torch / no-URL fallback).
+if [ "$SKIP_TORCH" = false ] && [ -n "${TORCH_INDEX_URL:-}" ]; then
+    _write_torch_index_marker "$VENV_DIR" "$TORCH_INDEX_URL"
 fi
 
 # ── Run studio setup ──
