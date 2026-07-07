@@ -1763,6 +1763,31 @@ async def _select_request_tools(
     return tools
 
 
+def _enables_code_execution_tool(tools: list[dict]) -> bool:
+    """True when a resolved tool list includes a local code-execution tool
+    (python/terminal). ``confirm_code_execution`` only gates those, so the
+    streaming requirement is scoped to requests that actually expose one."""
+    from core.inference.tools import CODE_EXECUTION_TOOL_NAMES
+    return any(
+        (t.get("function") or {}).get("name") in CODE_EXECUTION_TOOL_NAMES for t in (tools or [])
+    )
+
+
+def _payload_may_enable_code_execution(payload) -> bool:
+    """True when a request could resolve a local code-execution tool before the
+    tool list is built (used by the pre-switch guard). Mirrors
+    ``_select_request_tools``: built-ins are off unless the tool loop is enabled,
+    and an explicit ``enabled_tools`` filter must then list python/terminal
+    (MCP/client tools are never code execution)."""
+    from core.inference.tools import CODE_EXECUTION_TOOL_NAMES
+
+    if not _effective_enable_tools(payload):
+        return False
+    if payload.enabled_tools is not None:
+        return bool(set(payload.enabled_tools) & CODE_EXECUTION_TOOL_NAMES)
+    return True
+
+
 def _apply_rag_nudge(nudge: str, tools: list[dict], *, rag_scope) -> str:
     """Append the RAG grounding nudge to ``nudge`` when the knowledge-base tool
     is active (search_knowledge_base present and a retrieval scope is set). The
@@ -5673,6 +5698,29 @@ async def openai_chat_completions(
                     param = "confirm_tool_calls",
                 ),
             )
+        # Same for confirm_code_execution: an external provider runs code_execution
+        # server-side, so this local confirm gate cannot intercept it -- reject it
+        # rather than give the caller a false approval guarantee.
+        if (
+            payload.confirm_code_execution
+            and not payload.bypass_permissions
+            and (
+                payload.enable_tools is True
+                or bool(payload.enabled_tools)
+                or bool(payload.tools)
+                or bool(payload.openai_code_exec_container_id)
+                or bool(payload.anthropic_code_exec_container_id)
+            )
+        ):
+            raise HTTPException(
+                status_code = 400,
+                detail = openai_error_body(
+                    "confirm_code_execution is only supported for local streaming tools.",
+                    status = 400,
+                    code = "invalid_request_error",
+                    param = "confirm_code_execution",
+                ),
+            )
         if _wants_multiple_choices(payload):
             _raise_unsupported_n("external provider chat completions")
         return await _proxy_to_external_provider(payload, request, current_subject)
@@ -5747,6 +5795,27 @@ async def openai_chat_completions(
                     status = 400,
                     code = "invalid_request_error",
                     param = "confirm_tool_calls",
+                ),
+            )
+        # Same pre-switch guard for confirm_code_execution, but scoped to requests
+        # that could actually run a local code-execution tool: the gate only
+        # applies to python/terminal, so a non-code tool request (e.g. web_search)
+        # must not be rejected, and a code-execution one must not evict the
+        # resident model only to 400 after the swap.
+        if (
+            payload.confirm_code_execution
+            and not payload.bypass_permissions
+            and not payload.stream
+            and _payload_may_enable_code_execution(payload)
+        ):
+            raise HTTPException(
+                status_code = 400,
+                detail = openai_error_body(
+                    "confirm_code_execution requires stream=true when a "
+                    "code-execution tool (python/terminal) is enabled.",
+                    status = 400,
+                    code = "invalid_request_error",
+                    param = "confirm_code_execution",
                 ),
             )
         # Reject a malformed tool_choice forcing object before the switch: a
@@ -6221,6 +6290,22 @@ async def openai_chat_completions(
                         param = "confirm_tool_calls",
                     ),
                 )
+            if (
+                payload.confirm_code_execution
+                and not payload.bypass_permissions
+                and not payload.stream
+                and _enables_code_execution_tool(tools_to_use)
+            ):
+                raise _reject(
+                    400,
+                    openai_error_body(
+                        "confirm_code_execution requires stream=true when a "
+                        "code-execution tool (python/terminal) is enabled.",
+                        status = 400,
+                        code = "invalid_request_error",
+                        param = "confirm_code_execution",
+                    ),
+                )
             if _wants_multiple_choices(payload):
                 raise _reject_unsupported_n("GGUF tool chat completions")
             # ── Tool-use system prompt nudge ──────────────────────
@@ -6288,6 +6373,8 @@ async def openai_chat_completions(
                     # Bypass Permissions takes precedence over the confirm gate:
                     # never prompt while bypassing.
                     confirm_tool_calls = bool(payload.confirm_tool_calls)
+                    and not bool(payload.bypass_permissions),
+                    confirm_code_execution = bool(payload.confirm_code_execution)
                     and not bool(payload.bypass_permissions),
                     bypass_permissions = bool(payload.bypass_permissions),
                 )
@@ -6945,6 +7032,22 @@ async def openai_chat_completions(
                     param = "confirm_tool_calls",
                 ),
             )
+        if (
+            payload.confirm_code_execution
+            and not payload.bypass_permissions
+            and not payload.stream
+            and _enables_code_execution_tool(_sf_tools_to_use)
+        ):
+            raise _reject(
+                400,
+                openai_error_body(
+                    "confirm_code_execution requires stream=true when a "
+                    "code-execution tool (python/terminal) is enabled.",
+                    status = 400,
+                    code = "invalid_request_error",
+                    param = "confirm_code_execution",
+                ),
+            )
         _sf_nudge = _build_tool_action_nudge(
             tools = _sf_tools_to_use,
             model_name = model_name,
@@ -7013,6 +7116,8 @@ async def openai_chat_completions(
                 # Bypass Permissions takes precedence over the confirm gate:
                 # never prompt while bypassing.
                 confirm_tool_calls = bool(payload.confirm_tool_calls)
+                and not bool(payload.bypass_permissions),
+                confirm_code_execution = bool(payload.confirm_code_execution)
                 and not bool(payload.bypass_permissions),
                 bypass_permissions = bool(payload.bypass_permissions),
                 use_adapter = payload.use_adapter,
@@ -10328,6 +10433,21 @@ async def anthropic_messages(
                 status_code = 400,
                 detail = anthropic_error_body(
                     "confirm_tool_calls is not supported for Anthropic Messages server tools.",
+                    status = 400,
+                    err_type = "invalid_request_error",
+                ),
+            )
+        if bool(getattr(payload, "confirm_code_execution", False)) and not bool(
+            getattr(payload, "bypass_permissions", False)
+        ):
+            api_monitor.fail(
+                monitor_id,
+                "confirm_code_execution is not supported for Anthropic Messages server tools.",
+            )
+            raise HTTPException(
+                status_code = 400,
+                detail = anthropic_error_body(
+                    "confirm_code_execution is not supported for Anthropic Messages server tools.",
                     status = 400,
                     err_type = "invalid_request_error",
                 ),
