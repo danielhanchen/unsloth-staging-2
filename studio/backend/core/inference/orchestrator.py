@@ -815,6 +815,59 @@ class InferenceOrchestrator:
         self._stop_dispatcher()
         return True
 
+    def share_distributed_object(
+        self,
+        obj,
+        timeout: Optional[float] = 300.0,
+    ):
+        """Share a small object through the worker's MLX distributed group."""
+        if not self._ensure_subprocess_alive():
+            raise RuntimeError("Inference subprocess is not running")
+
+        self._wait_dispatcher_idle()
+        with self._mailbox_lock:
+            if self._mailboxes:
+                raise RuntimeError(
+                    "Cannot share distributed objects while compare requests are active"
+                )
+        request_id = str(uuid.uuid4())
+        cmd = {
+            "type": "share_object",
+            "request_id": request_id,
+            "object": obj,
+        }
+
+        with self._gen_lock:
+            self._send_cmd(cmd)
+            deadline = None if timeout is None else time.monotonic() + timeout
+            while deadline is None or time.monotonic() < deadline:
+                remaining = 1.0 if deadline is None else max(0.1, deadline - time.monotonic())
+                resp = self._read_resp(timeout = min(remaining, 1.0))
+                if resp is None:
+                    if not self._ensure_subprocess_alive():
+                        raise RuntimeError(self._subprocess_crash_message("sharing chat turn"))
+                    continue
+
+                rtype = resp.get("type", "")
+                rid = resp.get("request_id")
+                if rid and rid != request_id:
+                    logger.debug(
+                        "Skipping response for request_id=%s while sharing request_id=%s",
+                        rid,
+                        request_id,
+                    )
+                    continue
+                if rtype == "shared":
+                    return resp.get("object")
+                if rtype == "share_error":
+                    raise RuntimeError(resp.get("error", "Failed to share object"))
+                if rtype == "error":
+                    raise RuntimeError(resp.get("error", "Subprocess error"))
+                if rtype == "status":
+                    continue
+
+            raise RuntimeError("Timeout waiting for distributed object share")
+
     # ------------------------------------------------------------------
     # Public API — same interface as InferenceBackend
     # ------------------------------------------------------------------
@@ -830,6 +883,8 @@ class InferenceOrchestrator:
         approved_remote_code_fingerprint: Optional[str] = None,
         gpu_ids: Optional[list[int]] = None,
         subject: Optional[str] = None,
+        tensor_parallel: bool = False,
+        mlx_distributed: bool = False,
     ) -> bool:
         """Load a model for inference.
 
@@ -855,6 +910,11 @@ class InferenceOrchestrator:
                 "approved_remote_code_fingerprint": approved_remote_code_fingerprint,
                 "subject": subject,
                 "gpu_ids": gpu_ids,
+                "tensor_parallel": bool(tensor_parallel),
+                "mlx_distributed": bool(mlx_distributed),
+                "mlx_parallel_mode": ("tensor" if tensor_parallel else "pipeline")
+                if mlx_distributed
+                else None,
             }
             resolved_gpu_ids, gpu_selection = prepare_gpu_selection(
                 gpu_ids,
