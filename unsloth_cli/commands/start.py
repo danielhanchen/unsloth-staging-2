@@ -1123,6 +1123,13 @@ def write_opencode_config(
         return {}
     before = json.dumps(config, sort_keys = True)
     config.setdefault("$schema", "https://opencode.ai/config.json")
+    # Only clear "unsloth" from an existing disable list so the session provider can
+    # load. Never introduce disabled_providers here: this file is an OPENCODE_CONFIG
+    # overlay, and writing an empty list would re-enable providers the user disabled
+    # in their own global/project config.
+    disabled_providers = config.get("disabled_providers")
+    if isinstance(disabled_providers, list) and "unsloth" in disabled_providers:
+        config["disabled_providers"] = [p for p in disabled_providers if p != "unsloth"]
     model_entry = {"name": model["id"]}
     window = model.get("context_length") or model.get("max_context_length")
     if window:
@@ -1450,7 +1457,11 @@ def opencode(
         serve = serve,
         launch = launch,
     )
-    command = ["opencode", *ctx.args]
+    opencode_model = f"unsloth/{entry['id']}"
+    # Force the model only on a bare launch. --model is a global flag for the TUI, but
+    # a passthrough subcommand (serve/run/...) takes the model from the pinned config,
+    # so --model must not be inserted before it.
+    command = ["opencode", *ctx.args] if ctx.args else ["opencode", "--model", opencode_model]
     with _session_config("opencode", launch) as cfg:
         config_path = cfg / "opencode.json"
         # OPENCODE_CONFIG is an overlay (loaded between the user's global and project
@@ -1462,7 +1473,7 @@ def opencode(
         # outranks project config; the API key stays in the private file, never the env.
         # Only --yolo carries a permission here (its allow must win over a project config);
         # a non-yolo session returns no permission, so the project's own rules are honored.
-        inline_config: dict = {"model": f"unsloth/{entry['id']}"}
+        inline_config: dict = {"model": opencode_model}
         if session_permission:
             inline_config["permission"] = session_permission
         env = {

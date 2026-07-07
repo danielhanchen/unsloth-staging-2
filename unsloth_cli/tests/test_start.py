@@ -1384,6 +1384,9 @@ def test_write_opencode_config_fresh(tmp_path):
         MODEL["id"]: {"name": MODEL["id"], "limit": {"context": 131072, "output": 8192}}
     }
     assert config["model"] == f"unsloth/{MODEL['id']}"
+    # A fresh config gains no disabled_providers key, so the overlay can't re-enable a
+    # provider the user disabled elsewhere.
+    assert "disabled_providers" not in config
     # Compaction buffer scaled to ~10% of the window (compact near 90%).
     assert config["compaction"] == {"auto": True, "reserved": 131072 // 10}
 
@@ -1391,16 +1394,45 @@ def test_write_opencode_config_fresh(tmp_path):
 def test_write_opencode_config_preserves_and_idempotent(tmp_path):
     path = tmp_path / "opencode.json"
     path.write_text(
-        json.dumps({"theme": "tokyonight", "provider": {"anthropic": {"name": "Anthropic"}}})
+        json.dumps(
+            {
+                "theme": "tokyonight",
+                "disabled_providers": ["ollama", "unsloth"],
+                "provider": {"anthropic": {"name": "Anthropic"}},
+            }
+        )
     )
     start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path)
     config = json.loads(path.read_text())
     assert config["theme"] == "tokyonight"
+    assert config["disabled_providers"] == ["ollama"]
     assert config["provider"]["anthropic"]["name"] == "Anthropic"
     assert config["provider"]["unsloth"]["options"]["baseURL"] == f"{BASE}/v1"
     before = path.read_text()
     start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path)
     assert path.read_text() == before
+
+
+def test_write_opencode_config_keeps_foreign_disabled_providers(tmp_path):
+    # A user who disabled other providers (but not unsloth) must keep them disabled:
+    # the overlay must not rewrite disabled_providers, or those providers get silently
+    # re-enabled for the session.
+    path = tmp_path / "opencode.json"
+    path.write_text(json.dumps({"disabled_providers": ["openai", "gemini"]}))
+    start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path)
+    config = json.loads(path.read_text())
+    assert config["disabled_providers"] == ["openai", "gemini"]
+
+
+def test_opencode_passthrough_subcommand_omits_model_flag(fake_studio):
+    # A passthrough subcommand (e.g. `serve`) takes the model from the pinned config;
+    # inserting --model before it would break opencode's arg parsing.
+    result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch", "serve"])
+    assert result.exit_code == 0, result.output
+    command = _launch_command(result.output)
+    assert command[0] == "opencode"
+    assert command[1] == "serve"
+    assert "--model" not in command
 
 
 def test_connect_opencode_no_launch(fake_studio, tmp_path):
@@ -1410,9 +1442,22 @@ def test_connect_opencode_no_launch(fake_studio, tmp_path):
     config_path = tmp_path / "agents" / "opencode" / "opencode.json"
     # OPENCODE_CONFIG overlay points at the session file, not the user's global config.
     _assert_env_set(result.output, "OPENCODE_CONFIG", str(config_path))
+    content_line = next(
+        ln for ln in result.output.splitlines() if ln.startswith("export OPENCODE_CONFIG_CONTENT=")
+    )
+    inline_config = json.loads(
+        shlex.split(content_line.removeprefix("export OPENCODE_CONFIG_CONTENT="))[0]
+    )
     config = json.loads(config_path.read_text())
     assert config["provider"]["unsloth"]["options"]["apiKey"] == "sk-unsloth-feedfacefeedface"
     assert config["model"] == f"unsloth/{MODEL['id']}"
+    assert "disabled_providers" not in config
+    assert inline_config == {"model": f"unsloth/{MODEL['id']}"}
+    assert _launch_command(result.output)[:3] == [
+        "opencode",
+        "--model",
+        f"unsloth/{MODEL['id']}",
+    ]
     assert not any(c[1].endswith("/api/inference/status") for c in fake_studio)
 
 
