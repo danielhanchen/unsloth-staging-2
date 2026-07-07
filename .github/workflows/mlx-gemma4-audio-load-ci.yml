@@ -203,9 +203,10 @@ jobs:
           #    load_weights(strict=True) must raise the exact shape mismatch that
           #    produced the HTTP 500. lazy=True keeps it CPU-only (no GPU eval).
           neg = textwrap.dedent(f"""
+              from pathlib import Path
               from mlx_vlm.utils import load_model
               try:
-                  load_model({path!r}, lazy=True)
+                  load_model(Path({path!r}), lazy=True)
               except Exception as e:
                   msg = f"{{type(e).__name__}}: {{e}}"
                   print("NEG_RAISED:", msg[:300])
@@ -223,8 +224,9 @@ jobs:
           #    does for a gemma4 checkpoint, then load. load_weights(strict=True)
           #    now accepts the checkpoint; assert channel-last conv target shapes.
           L._ensure_audio_conv_sanitize("gemma4")
+          from pathlib import Path
           from mlx_vlm.utils import load_model
-          m = load_model(path, lazy=True)
+          m = load_model(Path(path), lazy=True)
           w0 = tuple(m.audio_tower.subsample_conv_projection.layer0.conv.weight.shape)
           w1 = tuple(m.audio_tower.subsample_conv_projection.layer1.conv.weight.shape)
           dw = tuple(m.audio_tower.layers[0].lconv1d.depthwise_conv1d.weight.shape)
