@@ -82,8 +82,14 @@ jobs:
           echo "Studio venv python: $VENV_PY"
           "$VENV_PY" -m pip install --index-url https://download.pytorch.org/whl/cpu \
             --extra-index-url https://pypi.org/simple 'torch==2.10.0'
+          # Two steps: the first resolves + installs the MLX deps (mlx-vlm, ...);
+          # the second force-reinstalls ONLY the unsloth_zoo code, because the
+          # PyPI unsloth_zoo from install.sh shares this branch's version string,
+          # so a plain `pip install pkg @ git+URL` is skipped as "already
+          # satisfied" and the fix never lands.
           for attempt in 1 2 3; do
-            if "$VENV_PY" -m pip install "$ZOO_SPEC"; then
+            if "$VENV_PY" -m pip install "$ZOO_SPEC" && \
+               "$VENV_PY" -m pip install --force-reinstall --no-deps "$ZOO_SPEC"; then
               break
             fi
             [ "$attempt" -eq 3 ] && { echo "::error::unsloth_zoo git install failed"; exit 1; }
