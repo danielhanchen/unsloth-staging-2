@@ -152,12 +152,18 @@ class Results:
 # --------------------------------------------------------------------------- #
 # Model load + GGUF confirmation
 # --------------------------------------------------------------------------- #
-def load_and_confirm_gguf(cli, gguf_path, label, res, require_load):
+def load_and_confirm_gguf(cli, gguf_path, label, res, require_load, max_seq_length):
     """Load the local ``gguf_path`` and confirm the active backend is GGUF
     (llama.cpp). Returns True on success. On load failure: raises SystemExit
     when ``require_load`` is set (hard gate), else records a WARN and returns
-    False so the matrix reports the model without failing the job."""
-    print(f"[gguf-tools] loading {label} from {gguf_path} ...", flush=True)
+    False so the matrix reports the model without failing the job.
+
+    ``max_seq_length`` sets llama.cpp's ``n_ctx``. Unlike the MLX backend,
+    llama.cpp hard-rejects a prompt exceeding ``n_ctx`` with an HTTP 400, and the
+    server-side tool loop injects a sizable tool/MCP schema system prompt, so a
+    too-small context makes tool axes WARN for a context reason rather than a
+    tool-calling one. Load with enough headroom for the tool prompt."""
+    print(f"[gguf-tools] loading {label} from {gguf_path} (n_ctx={max_seq_length}) ...", flush=True)
 
     def _fail(reason):
         if require_load:
@@ -171,7 +177,7 @@ def load_and_confirm_gguf(cli, gguf_path, label, res, require_load):
     try:
         status, data = cli.post(
             "/api/inference/load",
-            {"model_path": gguf_path, "is_lora": False, "max_seq_length": 2048},
+            {"model_path": gguf_path, "is_lora": False, "max_seq_length": max_seq_length},
             timeout=1800,
         )
         print(f"[gguf-tools] load returned status={status} {json.dumps(data)[:200]}", flush=True)
@@ -485,6 +491,9 @@ def main():
     ap.add_argument("--label", required=True, help="Human-readable model label for the matrix")
     ap.add_argument("--port", required=True, help="Studio port")
     ap.add_argument("--workdir", default=os.path.expanduser("~/mcp_fs"), help="MCP filesystem root")
+    ap.add_argument("--max-seq-length", type=int, default=8192,
+                    help="llama.cpp n_ctx to load with; must fit the server-side tool "
+                         "system prompt (~3.5k tokens with MCP enabled) or tool axes 400.")
     ap.add_argument("--require-core", action="store_true",
                     help="Fail (exit 1) if the code_exec axis does not PASS (core-tier models).")
     ap.add_argument("--require-load", action="store_true",
@@ -504,7 +513,7 @@ def main():
     # core-tier model (--require-core) or when we are verifying load
     # (--require-load). Otherwise a load failure is reported + skipped.
     require_load = args.require_core or args.require_load
-    if not load_and_confirm_gguf(cli, args.gguf_path, args.label, res, require_load):
+    if not load_and_confirm_gguf(cli, args.gguf_path, args.label, res, require_load, args.max_seq_length):
         res.summary()
         print("[gguf-tools] RESULT: OK (model not loadable, reported)", flush=True)
         return 0
