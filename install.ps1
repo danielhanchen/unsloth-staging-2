@@ -1491,10 +1491,6 @@ exit 0
         step "venv" "creating Python $($DetectedPython.Version) virtual environment"
         substep "$VenvDir"
         $venvExit = Invoke-InstallCommand { uv venv $VenvDir --python "$($DetectedPython.Path)" }
-        if ($venvExit -ne 0) {
-            Write-Host "[ERROR] Failed to create virtual environment (exit code $venvExit)" -ForegroundColor Red
-            return (Exit-InstallFailure "Failed to create virtual environment (exit code $venvExit)" $venvExit)
-        }
         # Trust neither uv's exit code nor a half-baked Scripts\python.exe.
         function Test-VenvPythonReady {
             param(
@@ -1524,8 +1520,17 @@ exit 0
                 $ErrorActionPreference = $prevEap
             }
         }
-        if (-not (Test-VenvPythonReady $VenvPython $VenvDir)) {
+
+        $needsVenvFallback = $false
+        if ($venvExit -ne 0) {
+            substep "uv venv failed; rebuilding with python -m venv..." "Yellow"
+            $needsVenvFallback = $true
+        } elseif (-not (Test-VenvPythonReady $VenvPython $VenvDir)) {
             substep "uv venv returned success but left an unusable venv; rebuilding with python -m venv..." "Yellow"
+            $needsVenvFallback = $true
+        }
+
+        if ($needsVenvFallback) {
             if (
                 $StudioRedirectMode -eq 'env' -and
                 $VenvDirExistedBeforeCreate -and
