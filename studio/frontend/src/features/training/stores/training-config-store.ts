@@ -397,19 +397,15 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
             }
 
             const isAudio = !!modelDetails.is_audio;
-            if (!trainOnCompletionsManuallySet) {
-              // Vision model + known image dataset: force trainOnCompletions off.
-              if (modelDetails.is_vision && get().isDatasetImage === true) {
-                patch.trainOnCompletions = false;
-              }
-              // Pure audio model -> always uncheck trainOnCompletions.
-              if (isAudio && !modelDetails.is_vision) {
-                patch.trainOnCompletions = false;
-              }
-              // Audio-capable vision model (e.g. gemma3n) + audio dataset -> uncheck.
-              if (isAudio && modelDetails.is_vision && get().isDatasetAudio) {
-                patch.trainOnCompletions = false;
-              }
+            // Modality compatibility wins over manual YAML-default guards.
+            if (modelDetails.is_vision && get().isDatasetImage === true) {
+              patch.trainOnCompletions = false;
+            }
+            if (isAudio && !modelDetails.is_vision) {
+              patch.trainOnCompletions = false;
+            }
+            if (isAudio && modelDetails.is_vision && get().isDatasetAudio) {
+              patch.trainOnCompletions = false;
             }
 
             // Use backend model_type when available, else infer from flags.
@@ -575,6 +571,7 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
             isLoadingModelDefaults: false,
             modelDefaultsError: null,
             modelDefaultsAppliedFor: null,
+            contextLengthManuallySet: false,
             trainOnCompletionsManuallySet: false,
             learningRateManuallySet: false,
           });
@@ -589,6 +586,7 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
             visionImageSize?: number | null;
             trustRemoteCode?: boolean;
             approvedRemoteCodeFingerprint?: string | null;
+            contextLengthManuallySet?: boolean;
             trainOnCompletionsManuallySet?: boolean;
             learningRateManuallySet?: boolean;
           } = {
@@ -602,6 +600,7 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
             // re-applied below, and a custom-code model re-opens the dialog before start.
             patch.trustRemoteCode = false;
             patch.approvedRemoteCodeFingerprint = null;
+            patch.contextLengthManuallySet = false;
             patch.trainOnCompletionsManuallySet = false;
             patch.learningRateManuallySet = false;
           }
@@ -619,6 +618,7 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
               isLoadingModelDefaults: false,
               modelDefaultsError: null,
               modelDefaultsAppliedFor: null,
+              contextLengthManuallySet: false,
               trainOnCompletionsManuallySet: false,
               learningRateManuallySet: false,
             });
@@ -1027,7 +1027,10 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
           s.datasetStreaming ??= false;
         }
         if (version < 12) {
-          s.contextLengthManuallySet = false;
+          s.contextLengthManuallySet =
+            typeof s.contextLength === "number" &&
+            Number.isFinite(s.contextLength) &&
+            s.contextLength !== DEFAULT_HYPERPARAMS.contextLength;
         }
         if (version < 13) {
           s.trainOnCompletionsManuallySet = false;
