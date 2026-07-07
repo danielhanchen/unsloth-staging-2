@@ -154,16 +154,17 @@ class Results:
 # --------------------------------------------------------------------------- #
 # Model load + MLX confirmation
 # --------------------------------------------------------------------------- #
-def load_and_confirm_mlx(cli, model, res, require_core):
+def load_and_confirm_mlx(cli, model, res, require_load):
     """Load ``model`` and confirm the active backend is MLX (non-GGUF on an
     Apple-Silicon host). Returns True on success. On load failure: raises
-    SystemExit for core-tier models (hard gate), else records a WARN and returns
-    False so the matrix reports "this quant does not load on MLX" without failing
-    (e.g. gemma-4-e2b's audio tower is not supported by the loader)."""
+    SystemExit when ``require_load`` is set (hard gate -- used for core-tier
+    models and for the gemma-4-e2b audio-conv load-fix verification), else
+    records a WARN and returns False so the matrix reports "this quant does not
+    load on MLX" without failing the job."""
     print(f"[mlx-tools] loading {model} ...", flush=True)
 
     def _fail(reason):
-        if require_core:
+        if require_load:
             raise SystemExit(f"[mlx-tools] FATAL {reason}")
         res.add("model_load", "WARN", f"not loadable on MLX (report-only): {reason}")
         return False
@@ -495,6 +496,10 @@ def main():
     ap.add_argument("--workdir", default=os.path.expanduser("~/mcp_fs"), help="MCP filesystem root")
     ap.add_argument("--require-core", action="store_true",
                     help="Fail (exit 1) if the code_exec axis does not PASS (core-tier models).")
+    ap.add_argument("--require-load", action="store_true",
+                    help="Fail (exit 1) if the model does not load on the MLX backend, "
+                         "without gating on the drift-prone tool axes (used to verify the "
+                         "gemma-4-e2b audio-conv load fix).")
     args = ap.parse_args()
 
     token = os.environ.get("API_KEY")
@@ -505,9 +510,11 @@ def main():
     cli = Client(f"http://127.0.0.1:{args.port}", token)
     res = Results(args.model)
 
-    # Hard gate (core models): model must load as MLX before any axis runs.
-    # Best-effort models that fail to load are reported and skipped.
-    if not load_and_confirm_mlx(cli, args.model, res, args.require_core):
+    # Hard gate: the model must load as MLX before any axis runs when it is a
+    # core-tier model (--require-core) or when we are explicitly verifying that
+    # it loads (--require-load). Otherwise a load failure is reported + skipped.
+    require_load = args.require_core or args.require_load
+    if not load_and_confirm_mlx(cli, args.model, res, require_load):
         res.summary()
         print("[mlx-tools] RESULT: OK (best-effort model not loadable, reported)", flush=True)
         return 0
