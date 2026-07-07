@@ -196,8 +196,7 @@ function streamingCompatiblePatch(
       : state.datasetStreaming;
 
   if (willStream && state.trainOnCompletions) {
-    patch.trainOnCompletions = false;
-    patch.trainOnCompletionsManuallySet = false;
+    Object.assign(patch, forceTrainOnCompletionsOffPatch());
   }
 
   if (willStream && !hasSeparateStreamingEvalSplit(state)) {
@@ -205,6 +204,16 @@ function streamingCompatiblePatch(
   }
 
   return patch;
+}
+
+export function forceTrainOnCompletionsOffPatch(): Pick<
+  TrainingConfigState,
+  "trainOnCompletions" | "trainOnCompletionsManuallySet"
+> {
+  return {
+    trainOnCompletions: false,
+    trainOnCompletionsManuallySet: false,
+  };
 }
 
 // streamingCompatiblePatch can silently flip streaming-coupled fields. Surface a
@@ -248,10 +257,7 @@ function getCptTrainingPatch(): TrainingMethodStatePatch {
     loraVariant: "rslora",
     targetModules: CPT_TARGET_MODULES,
     datasetFormat: "raw",
-    trainOnCompletions: false,
-    // CPT forces completions-only off; clear the guard so this override is not
-    // treated as a manual choice (and discarded) on the next same-model reload.
-    trainOnCompletionsManuallySet: false,
+    ...forceTrainOnCompletionsOffPatch(),
   };
 }
 
@@ -406,7 +412,7 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
               (isAudio && !modelDetails.is_vision) ||
               (isAudio && modelDetails.is_vision && get().isDatasetAudio);
             if (modalityForcesCompletionsOff) {
-              patch.trainOnCompletions = false;
+              Object.assign(patch, forceTrainOnCompletionsOffPatch());
             }
 
             // Use backend model_type when available, else infer from flags.
@@ -444,9 +450,6 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
             set({
               ...patch,
               ...cptOverrides,
-              ...(modalityForcesCompletionsOff
-                ? { trainOnCompletionsManuallySet: false }
-                : {}),
               modelType: inferredModelType,
               isVisionModel: modelDetails.is_vision,
               isEmbeddingModel: isEmbedding,
@@ -518,16 +521,13 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
             };
             const { isVisionModel, isAudioModel } = get();
             if (isVisionModel && isImage) {
-              updates.trainOnCompletions = false;
-              updates.trainOnCompletionsManuallySet = false;
+              Object.assign(updates, forceTrainOnCompletionsOffPatch());
             }
             if (isAudioModel && !isVisionModel) {
-              updates.trainOnCompletions = false;
-              updates.trainOnCompletionsManuallySet = false;
+              Object.assign(updates, forceTrainOnCompletionsOffPatch());
             }
             if (isAudioModel && isVisionModel && isAudio) {
-              updates.trainOnCompletions = false;
-              updates.trainOnCompletionsManuallySet = false;
+              Object.assign(updates, forceTrainOnCompletionsOffPatch());
             }
             set(updates);
           })
@@ -702,10 +702,7 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
               }
               return {
                 datasetFormat: "raw",
-                trainOnCompletions: false,
-                // Raw/CPT forces completions-only off; clear the guard so the
-                // override is not treated as a manual choice on model reloads.
-                trainOnCompletionsManuallySet: false,
+                ...forceTrainOnCompletionsOffPatch(),
               };
             }
 
@@ -714,7 +711,7 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
             return {
               datasetFormat,
               ...(isRawTextDatasetFormat(datasetFormat)
-                ? { trainOnCompletions: false, trainOnCompletionsManuallySet: false }
+                ? forceTrainOnCompletionsOffPatch()
                 : {}),
             };
           }),
@@ -820,8 +817,7 @@ export const useTrainingConfigStore = create<TrainingConfigStore>()(
 
           set({
             datasetStreaming: true,
-            trainOnCompletions: false,
-            trainOnCompletionsManuallySet: false,
+            ...forceTrainOnCompletionsOffPatch(),
             evalSteps: dropsEval ? 0 : state.evalSteps,
           });
 
