@@ -98,14 +98,18 @@ jobs:
           echo "VENV_PY=$VENV_PY" >> "$GITHUB_ENV"
 
       - name: Assert the MLX stack + the fix are active on this runner
+        # Run from a neutral cwd and import unsloth_zoo (never unsloth): the repo
+        # root has a local ./unsloth package that shadows the installed one and
+        # pulls datasets/pandas, which is unrelated to this MLX load check.
         run: |
+          cd "$RUNNER_TEMP"
           "$VENV_PY" - <<'PY'
-          import unsloth
-          assert unsloth._IS_MLX is True, f"_IS_MLX={unsloth._IS_MLX} (expected True on Apple Silicon with full MLX stack)"
-          # Confirm the fixed loader is the one installed (the guard function ships in this branch).
+          from unsloth_zoo.mlx.runtime import is_mlx_available
           from unsloth_zoo.mlx import loader as _l
+          assert is_mlx_available(), "mlx is not importable/usable in the Studio venv"
+          # Confirm the fixed loader is the one installed (the guard ships in this branch).
           assert hasattr(_l, "_ensure_audio_conv_sanitize"), "fixed loader (_ensure_audio_conv_sanitize) not present -- wrong unsloth-zoo installed"
-          print("OK: _IS_MLX True and audio-conv sanitize guard present")
+          print("OK: MLX available and audio-conv sanitize guard present")
           PY
 
       - name: Restore HF cache for ${{ matrix.model }}
@@ -179,9 +183,9 @@ jobs:
         env:
           MODEL: ${{ matrix.model }}
         run: |
+          cd "$RUNNER_TEMP"  # avoid the repo's local ./unsloth shadowing installed pkgs
           "$VENV_PY" - <<'PY'
           import inspect, os, subprocess, sys, textwrap
-          import unsloth  # noqa: F401  (sets _IS_MLX, installs MLX patches)
           import unsloth_zoo.mlx.loader as L
 
           model = os.environ["MODEL"]
@@ -240,11 +244,11 @@ jobs:
         env:
           MODEL: ${{ matrix.model }}
         run: |
+          cd "$RUNNER_TEMP"  # avoid the repo's local ./unsloth shadowing installed pkgs
           "$VENV_PY" - <<'PY'
           import os, subprocess, sys, textwrap
           model = os.environ["MODEL"]
           gen = textwrap.dedent(f"""
-              import unsloth  # noqa: F401
               import unsloth_zoo.mlx.loader as L
               L._ensure_audio_conv_sanitize("gemma4")
               from huggingface_hub import snapshot_download
