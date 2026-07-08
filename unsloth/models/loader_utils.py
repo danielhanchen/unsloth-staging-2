@@ -14,7 +14,10 @@
 
 from ..device_type import DEVICE_TYPE_TORCH
 import importlib
+import json
+import logging
 import os
+import shutil
 import torch
 import re
 import tempfile
@@ -35,6 +38,8 @@ from transformers import __version__ as transformers_version
 from unsloth.models._utils import TorchAOConfig
 from unsloth_zoo.utils import Version, get_quant_type
 import gc
+
+logger = logging.getLogger(__name__)
 
 transformers_version = Version(transformers_version)
 SUPPORTS_FOURBIT = transformers_version >= Version("4.37")
@@ -324,7 +329,12 @@ def _offline_quantize_to_fp8(
     new_model_name = os.path.join(temp_dir, cache_name)
     print(f"Unsloth: Quantizing '{model_name}' to fp8, using model_name='{new_model_name}' instead")
 
-    if not os.path.isdir(new_model_name):
+    has_safetensors_cache = os.path.isdir(new_model_name) and any(
+        filename.endswith(".safetensors") for filename in os.listdir(new_model_name)
+    )
+    needs_refresh = os.path.isdir(new_model_name) and not has_safetensors_cache
+
+    if not os.path.isdir(new_model_name) or needs_refresh:
         from ._utils import _apply_text_only_key_mapping
 
         qconfig = _get_torchao_fp8_config(fp8_mode)
@@ -335,18 +345,27 @@ def _offline_quantize_to_fp8(
             config = text_config
         auto_model = AutoModelForImageTextToText if is_vlm else AutoModelForCausalLM
         auto_processor = AutoProcessor if is_vlm else AutoTokenizer
+        # Regenerate into a staging dir and only replace an existing (bin-only) cache once the
+        # safetensors save has succeeded, so a failed re-quantization (offline / gated / removed
+        # source model) leaves the previous loadable cache intact rather than deleting it. #6749
+        staging_dir = new_model_name + ".fp8tmp"
+        if os.path.isdir(staging_dir):
+            shutil.rmtree(staging_dir)
         model = auto_model.from_pretrained(
             model_name,
             config = config,
             **load_kwargs,
         )
         tokenizer = auto_processor.from_pretrained(model_name)
-        model.save_pretrained(new_model_name, safe_serialization = False)
+        model.save_pretrained(staging_dir, safe_serialization = True)
         del model
         for _ in range(2):
             torch.cuda.empty_cache()
             gc.collect()
-        tokenizer.save_pretrained(new_model_name)
+        tokenizer.save_pretrained(staging_dir)
+        if os.path.isdir(new_model_name):
+            shutil.rmtree(new_model_name)
+        os.replace(staging_dir, new_model_name)
     return new_model_name
 
 
@@ -360,6 +379,495 @@ def _tag_model_with_fp8_torchao_config(model: torch.nn.Module, fp8_mode: str):
         )
     except:
         pass
+
+
+def _has_float8_dtype(dtype):
+    dtype_name = str(dtype)
+    return dtype_name.startswith("torch.float8_")
+
+
+def _is_real_fp8_owner(module):
+    if not isinstance(module, torch.nn.Module):
+        return False
+    if getattr(module, "quant_method", None) in ["fp8", "fbgemm_fp8"]:
+        return True
+
+    config = getattr(module, "quantization_config", None)
+    if isinstance(config, dict) and config.get("quant_method") in ["fp8", "fbgemm_fp8"]:
+        return True
+    if getattr(config, "quant_method", None) in ["fp8", "fbgemm_fp8"]:
+        return True
+
+    if getattr(module, "quant_method", None) is None and "fp8" in type(module).__name__.lower():
+        return True
+
+    weight = getattr(module, "weight", None)
+    if isinstance(weight, torch.Tensor):
+        if getattr(weight, "quant_method", None) in ["fp8", "fbgemm_fp8"]:
+            return True
+        if _has_float8_dtype(getattr(weight, "dtype", None)):
+            return True
+
+    for attr_name in ("gate_up_proj", "gate_proj", "up_proj", "down_proj"):
+        tensor = getattr(module, attr_name, None)
+        if not isinstance(tensor, torch.Tensor):
+            continue
+        if getattr(tensor, "quant_method", None) in ["fp8", "fbgemm_fp8"]:
+            return True
+        if _has_float8_dtype(getattr(tensor, "dtype", None)):
+            return True
+
+    try:
+        from unsloth.kernels.fp8 import FbgemmFp8Linear, FP8Linear
+    except Exception as exc:
+        logger.debug("Optional fp8 kernels not available: %s", exc)
+        FbgemmFp8Linear, FP8Linear = None, None
+    if FbgemmFp8Linear is not None and isinstance(module, FbgemmFp8Linear):
+        return True
+    if FP8Linear is not None and isinstance(module, FP8Linear):
+        return True
+
+    return False
+
+
+def _model_has_real_fp8_modules(model):
+    if not hasattr(model, "modules"):
+        return False
+    for module in model.modules():
+        if _is_real_fp8_owner(module):
+            return True
+    return False
+
+
+_FP8_SCALE_SUFFIXES = (
+    ("weight_scale_inv", ".scale"),
+    ("weight_scale", ".weight_scale"),
+    ("weight_scale_inv", ".weight_scale_inv"),
+    ("gate_proj_scale", ".gate_proj_scale"),
+    ("gate_proj_scale_inv", ".gate_proj_scale_inv"),
+    ("up_proj_scale", ".up_proj_scale"),
+    ("up_proj_scale_inv", ".up_proj_scale_inv"),
+    ("gate_up_proj_scale", ".gate_up_proj_scale"),
+    ("gate_up_proj_scale_inv", ".gate_up_proj_scale_inv"),
+    ("down_proj_scale", ".down_proj_scale"),
+    ("down_proj_scale_inv", ".down_proj_scale_inv"),
+    # Static-activation FP8 checkpoints carry activation scales the expert forward reads when
+    # activation_scheme == "static"; restore them too so a dropped placeholder is repaired. #6749
+    ("activation_scale", ".activation_scale"),
+    ("gate_proj_activation_scale", ".gate_proj_activation_scale"),
+    ("up_proj_activation_scale", ".up_proj_activation_scale"),
+    ("gate_up_proj_activation_scale", ".gate_up_proj_activation_scale"),
+    ("down_proj_activation_scale", ".down_proj_activation_scale"),
+)
+
+
+def _resolve_weight_scale_inv_candidates(module_name, named_modules):
+    if module_name in named_modules:
+        return module_name
+    suffix = f".{module_name}"
+    suffix_matches = [name for name in named_modules if name.endswith(suffix)]
+    if len(suffix_matches) == 1:
+        return suffix_matches[0]
+    return None
+
+
+def _variant_file_names(variant):
+    if variant:
+        return [
+            f"model.{variant}.safetensors",
+            f"pytorch_model.{variant}.safetensors",
+        ]
+    return [
+        "model.safetensors",
+        "pytorch_model.safetensors",
+    ]
+
+
+def _variant_index_names(variant):
+    if variant:
+        return [
+            f"model.safetensors.index.{variant}.json",
+            f"pytorch_model.safetensors.index.{variant}.json",
+        ]
+    return [
+        "model.safetensors.index.json",
+        "pytorch_model.safetensors.index.json",
+    ]
+
+
+def _resolve_fp8_scale_safetensors_files(
+    model_dir,
+    variant = None,
+    use_safetensors = None,
+):
+    if use_safetensors is False:
+        return []
+
+    for index_name in _variant_index_names(variant):
+        index_path = os.path.join(model_dir, index_name)
+        if not os.path.isfile(index_path):
+            continue
+        try:
+            with open(index_path, encoding = "utf-8") as fh:
+                weight_map = json.load(fh).get("weight_map", {})
+        except Exception:
+            continue
+        selected = []
+        for key, filename in weight_map.items():
+            if not any(key.endswith(suffix) for _, suffix in _FP8_SCALE_SUFFIXES):
+                continue
+            full_path = os.path.join(model_dir, filename)
+            if filename.endswith(".safetensors") and os.path.isfile(full_path):
+                selected.append(full_path)
+        return sorted(set(selected))
+
+    for filename in _variant_file_names(variant):
+        full_path = os.path.join(model_dir, filename)
+        if os.path.isfile(full_path):
+            return [full_path]
+
+    if variant is not None:
+        return []
+
+    safetensors_files = [
+        os.path.join(model_dir, filename)
+        for filename in os.listdir(model_dir)
+        if filename.endswith(".safetensors") and os.path.isfile(os.path.join(model_dir, filename))
+    ]
+    if len(safetensors_files) == 1:
+        return safetensors_files
+    return []
+
+
+def _fp8_scale_snapshot_allow_patterns(
+    subfolder = None,
+    variant = None,
+    use_safetensors = None,
+):
+    """First-pass patterns for the scale-restore snapshot: the index plus the single-file
+    default model/pytorch_model safetensors only, never the shard globs. Sharded scale shards
+    are then fetched by exact name from the index in a second pass (_fp8_scale_index_extra_patterns),
+    so a large sharded checkpoint is not fully re-downloaded and alternate variants/extras are
+    never pulled. #6749"""
+    if use_safetensors is False:
+        return []
+    if variant:
+        patterns = [
+            f"model.{variant}.safetensors",
+            f"pytorch_model.{variant}.safetensors",
+            f"model.safetensors.index.{variant}.json",
+            f"pytorch_model.safetensors.index.{variant}.json",
+        ]
+    else:
+        patterns = [
+            "model.safetensors",
+            "pytorch_model.safetensors",
+            "model.safetensors.index.json",
+            "pytorch_model.safetensors.index.json",
+        ]
+    if subfolder:
+        patterns = [f"{subfolder}/{pattern}" for pattern in patterns]
+    return patterns
+
+
+def _fp8_scale_index_extra_patterns(
+    model_dir,
+    subfolder = None,
+    variant = None,
+):
+    """Exact safetensors shard names the FP8 scale index maps scale tensors to. The first
+    snapshot pass fetches only the index, so this returns just the scale-bearing shards
+    (`_resolve_fp8_scale_safetensors_files` follows the index `weight_map` verbatim); the
+    second pass downloads only these, never every model shard or an alternate variant. #6749"""
+    scan_dir = os.path.join(model_dir, subfolder) if subfolder else model_dir
+    if not os.path.isdir(scan_dir):
+        return []
+    for index_name in _variant_index_names(variant):
+        index_path = os.path.join(scan_dir, index_name)
+        if not os.path.isfile(index_path):
+            continue
+        try:
+            with open(index_path, encoding = "utf-8") as fh:
+                weight_map = json.load(fh).get("weight_map", {})
+        except Exception:
+            return []
+        extras = []
+        for key, filename in weight_map.items():
+            if not any(key.endswith(suffix) for _, suffix in _FP8_SCALE_SUFFIXES):
+                continue
+            if isinstance(filename, str) and filename.endswith(".safetensors"):
+                extras.append(f"{subfolder}/{filename}" if subfolder else filename)
+        return sorted(set(extras))
+    return []
+
+
+def _find_fp8_scale_inv_tensors(
+    model_dir,
+    model_name,
+    revision = None,
+    token = None,
+    local_files_only = False,
+    subfolder = None,
+    variant = None,
+    use_safetensors = None,
+    cache_dir = None,
+    force_download = False,
+):
+    if not os.path.exists(model_dir):
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception:
+            return []
+
+        # Only the index + selected safetensor shards are needed; never the whole repo.
+        allow_patterns = _fp8_scale_snapshot_allow_patterns(
+            subfolder = subfolder,
+            variant = variant,
+            use_safetensors = use_safetensors,
+        )
+        if not allow_patterns:
+            # use_safetensors is False -> nothing to restore, so skip the download entirely.
+            return []
+
+        try:
+            model_dir = snapshot_download(
+                model_name,
+                revision = revision,
+                token = token,
+                local_files_only = local_files_only,
+                cache_dir = cache_dir,
+                force_download = force_download,
+                allow_patterns = allow_patterns,
+            )
+        except Exception:
+            return []
+
+        # Fetch any scale shards the index maps to names outside the default globs; the first
+        # pass covers standard names, so standard repos add nothing here.
+        extra_patterns = _fp8_scale_index_extra_patterns(model_dir, subfolder, variant)
+        missing = [
+            pattern
+            for pattern in extra_patterns
+            if not os.path.isfile(os.path.join(model_dir, pattern))
+        ]
+        if missing:
+            try:
+                model_dir = snapshot_download(
+                    model_name,
+                    revision = revision,
+                    token = token,
+                    local_files_only = local_files_only,
+                    cache_dir = cache_dir,
+                    force_download = force_download,
+                    allow_patterns = allow_patterns + missing,
+                )
+            except Exception:
+                pass
+
+    if not os.path.isdir(model_dir):
+        return []
+
+    if subfolder:
+        model_dir = os.path.join(model_dir, subfolder)
+        if not os.path.isdir(model_dir):
+            return []
+
+    try:
+        from safetensors.torch import safe_open
+    except Exception:
+        return []
+
+    module_scales = {}
+    for full_path in _resolve_fp8_scale_safetensors_files(
+        model_dir,
+        variant = variant,
+        use_safetensors = use_safetensors,
+    ):
+        try:
+            with safe_open(full_path, framework = "pt", device = "cpu") as f:
+                for key in f.keys():
+                    for attr_name, suffix in _FP8_SCALE_SUFFIXES:
+                        if not key.endswith(suffix):
+                            continue
+                        module_name = key[: -len(suffix)]
+                        module_scales[(module_name, attr_name)] = f.get_tensor(key)
+                        break
+        except Exception:
+            continue
+    return [
+        (module_name, attr_name, tensor)
+        for (module_name, attr_name), tensor in module_scales.items()
+    ]
+
+
+# Projections weightless FP8 experts keep in place of a top-level `weight`.
+_FP8_PROJECTION_ATTRS = ("gate_up_proj", "gate_proj", "up_proj", "down_proj")
+
+
+def _fp8_projection_device(module, attr_name):
+    """Device of the projection tensor a dropped-placeholder scale belongs to, else None.
+
+    Weightless FP8 experts store projections like `gate_up_proj`/`down_proj` instead of a
+    top-level `weight`, so a restored scale must land on the projection's device. The scanner
+    opens safetensors on CPU, so falling back to the checkpoint tensor's device would register
+    a CPU buffer next to CUDA projections and the expert forward would hit a device mismatch.
+    """
+    for suffix in ("_scale_inv", "_scale"):
+        if attr_name.endswith(suffix):
+            projection = getattr(module, attr_name[: -len(suffix)], None)
+            if isinstance(projection, torch.Tensor):
+                return projection.device
+            break
+    for proj_name in _FP8_PROJECTION_ATTRS:
+        projection = getattr(module, proj_name, None)
+        if isinstance(projection, torch.Tensor):
+            return projection.device
+    return None
+
+
+def _restore_missing_fp8_weight_scale_inv(
+    model: torch.nn.Module,
+    model_name: str,
+    token = None,
+    revision = None,
+    local_files_only = False,
+    subfolder = None,
+    variant = None,
+    use_safetensors = None,
+    cache_dir = None,
+    force_download = False,
+):
+    """Find checkpointed `.weight_scale_inv` tensors and restore missing runtime tensors on FP8 modules.
+
+    Returns a tuple of `(restored_count, skipped_count)`.
+    """
+    if not hasattr(model, "named_modules"):
+        return 0, 0
+
+    name_to_module = dict(model.named_modules())
+    scaled_tensors = _find_fp8_scale_inv_tensors(
+        model_dir = model_name,
+        model_name = model_name,
+        revision = revision,
+        token = token,
+        local_files_only = local_files_only,
+        subfolder = subfolder,
+        variant = variant,
+        use_safetensors = use_safetensors,
+        cache_dir = cache_dir,
+        force_download = force_download,
+    )
+    if len(scaled_tensors) == 0:
+        return 0, 0
+
+    restored = 0
+    skipped = 0
+    for module_name, attr_name, scale_tensor in scaled_tensors:
+        target_name = _resolve_weight_scale_inv_candidates(module_name, name_to_module)
+        if target_name is None:
+            skipped += 1
+            continue
+
+        module = name_to_module[target_name]
+        if not _is_real_fp8_owner(module) and not hasattr(module, attr_name):
+            skipped += 1
+            continue
+
+        weight = getattr(module, "weight", None)
+        reference = getattr(module, attr_name, None)
+        if not isinstance(reference, torch.Tensor) and attr_name == "weight_scale_inv":
+            reference = getattr(module, "weight_scale", None)
+        if (
+            not _is_real_fp8_owner(module)
+            and not isinstance(weight, torch.Tensor)
+            and not isinstance(reference, torch.Tensor)
+        ):
+            skipped += 1
+            continue
+        # Prefer a materialized device: a meta scale placeholder can sit next to an already
+        # loaded weight (device-map/low-memory), so fall back to the live weight/projection
+        # device rather than skipping on the placeholder's meta device. #6749
+        if isinstance(reference, torch.Tensor) and reference.device.type != "meta":
+            target_device = reference.device
+        elif isinstance(weight, torch.Tensor) and weight.device.type != "meta":
+            target_device = weight.device
+        elif isinstance(reference, torch.Tensor):
+            target_device = reference.device
+        elif isinstance(weight, torch.Tensor):
+            target_device = weight.device
+        else:
+            projection_device = _fp8_projection_device(module, attr_name)
+            target_device = (
+                projection_device if projection_device is not None else scale_tensor.device
+            )
+        if target_device.type == "meta":
+            skipped += 1
+            continue
+        if isinstance(weight, torch.Tensor) and weight.device.type == "meta":
+            skipped += 1
+            continue
+        target_shape = reference.shape if isinstance(reference, torch.Tensor) else None
+        if target_shape is not None and target_shape != scale_tensor.shape:
+            if reference.numel() != scale_tensor.numel():
+                skipped += 1
+                continue
+            scale_tensor = scale_tensor.reshape(target_shape)
+        if (
+            not isinstance(reference, torch.Tensor)
+            and isinstance(weight, torch.Tensor)
+            and scale_tensor.numel() != 1
+            and scale_tensor.ndim > 0
+            and weight.ndim > 0
+            and scale_tensor.shape[0] > weight.shape[0]
+            # Keep transposed/column-wise scales (shape[0] == weight.shape[1]) the FP8 kernel
+            # handles; reject only scales matching neither weight rows nor columns. #6749
+            and (weight.ndim < 2 or scale_tensor.shape[0] != weight.shape[1])
+        ):
+            skipped += 1
+            continue
+
+        restored_scale = scale_tensor.to(device = target_device)
+        if isinstance(reference, torch.Tensor):
+            try:
+                restored_scale = restored_scale.to(dtype = reference.dtype)
+            except Exception:
+                pass
+        elif (
+            isinstance(weight, torch.Tensor)
+            and weight.is_floating_point()
+            and not _has_float8_dtype(weight.dtype)
+        ):
+            # Floating (fp16/bf16) FP8 owner with no reference scale: mirror the weight dtype
+            # instead of the checkpoint fp32. Packed/int8 and real float8 keep checkpoint dtype. #6749
+            try:
+                restored_scale = restored_scale.to(dtype = weight.dtype)
+            except Exception:
+                pass
+        if attr_name in module._buffers:
+            module._buffers[attr_name] = restored_scale
+        elif attr_name in module._parameters:
+            # HF FP8 scales live in _parameters; keep them Parameters rather than demoting to a
+            # buffer, which would break tensor-parallel/optimizer/PEFT parameter inspection. #6749
+            existing = module._parameters[attr_name]
+            if isinstance(existing, torch.nn.Parameter) and existing.device.type != "meta":
+                # Update in place so runtime metadata (e.g. `block_size` fp8 dequant reads via
+                # getattr) survives; a fresh Parameter would drop it and force default geometry. #6749
+                with torch.no_grad():
+                    existing.data = restored_scale
+            else:
+                # A meta placeholder Parameter cannot take `.data = <materialized>` (torch rejects
+                # meta -> concrete set_data), so replace it to materialize the scale. #6749
+                module._parameters[attr_name] = torch.nn.Parameter(
+                    restored_scale,
+                    requires_grad = bool(getattr(existing, "requires_grad", False)),
+                )
+        else:
+            if hasattr(module, attr_name):
+                delattr(module, attr_name)
+            module.register_buffer(attr_name, restored_scale)
+        restored += 1
+
+    return restored, skipped
 
 
 def check_and_disable_bitsandbytes_loading(
