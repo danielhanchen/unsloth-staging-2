@@ -29,6 +29,11 @@ jobs:
       GGUF_REPO: unsloth/Qwen3.5-2B-MTP-GGUF
       GGUF_VARIANT: UD-Q4_K_XL
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # hf_transfer hard-errors on this Windows runner instead of stalling, so Studio's
+      # xet->HTTP stall fallback never triggers. Force plain HTTP (what Studio's own
+      # hf_download worker does) so the GGUF lands on disk and llama-server actually spawns.
+      HF_HUB_ENABLE_HF_TRANSFER: '0'
+      HF_HUB_DISABLE_XET: '1'
     steps:
       - uses: actions/checkout@v4
 
@@ -127,8 +132,13 @@ jobs:
           python - "$DBG" <<'PY'
           import json,sys,os,subprocess,shlex
           rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
-          # first non-embedder model spawn
-          row=rows[0]
+          print(f"captured {len(rows)} spawn(s)")
+          for i,r in enumerate(rows):
+              print(f"  [{i}] {' '.join(r['argv'])[:300]}")
+          # pick the main MODEL spawn (Studio may spawn a concurrent embedder first);
+          # prefer the row whose argv references the loaded GGUF, else the last spawn.
+          def is_model(r): return any('Qwen3.5' in a or a.endswith('.gguf') for a in r['argv'])
+          row=next((r for r in rows if is_model(r)), rows[-1])
           argv=row["argv"]; cwd=row["cwd"]; path=row["PATH"]
           print("CAPTURED argv:", " ".join(argv))
           print("CAPTURED cwd:", cwd)
