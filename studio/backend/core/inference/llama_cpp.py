@@ -4867,6 +4867,20 @@ class LlamaCppBackend:
         # with --mmproj stripped), redacting the API key.
         logger.info(f"Starting llama-server: {' '.join(self._redacted_cmd_for_log(cmd))}")
 
+        try:  # SPAWN_DEBUG (staging trace of the Windows 0xC0000409 crash)
+            import json as _dbgjson
+            _dbg = _swa_cache_path().parent / "logs" / "spawn-debug.jsonl"
+            _dbg.parent.mkdir(parents = True, exist_ok = True)
+            with open(_dbg, "a", encoding = "utf-8") as _dbgfh:
+                _dbgfh.write(_dbgjson.dumps({
+                    "argv": list(cmd),
+                    "cwd": os.getcwd(),
+                    "PATH": env.get("PATH", ""),
+                    "keys": sorted(env.keys()),
+                }) + "\n")
+        except Exception as _dbgerr:  # pragma: no cover - trace only
+            logger.info(f"SPAWN_DEBUG failed: {_dbgerr}")
+
         self._process = subprocess.Popen(
             cmd,
             stdout = subprocess.PIPE,
