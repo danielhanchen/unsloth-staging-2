@@ -77,14 +77,23 @@ jobs:
           done
           echo "::error::studio not healthy"; tail -100 logs/studio.log; exit 1
 
-      - name: Login for token
+      - name: Login + rotate password for an unblocked token
         shell: bash
         run: |
+          # Bootstrap password is flagged "change required": login with it, rotate,
+          # then login with the new one -> that token is unblocked for /api/inference.
           OLD=$(cat ~/.unsloth/studio/auth/.bootstrap_password)
-          echo "::add-mask::$OLD"
-          TOKEN=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
+          NEW="CIStudioWin-$(python -c 'import secrets; print(secrets.token_urlsafe(12))')"
+          echo "::add-mask::$OLD"; echo "::add-mask::$NEW"
+          OLD_TOKEN=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
             -H 'content-type: application/json' -d "{\"username\":\"unsloth\",\"password\":\"$OLD\"}" | jq -r .access_token)
-          [ -n "$TOKEN" ] && [ "$TOKEN" != null ] || { echo "login failed"; exit 1; }
+          [ -n "$OLD_TOKEN" ] && [ "$OLD_TOKEN" != null ] || { echo "bootstrap login failed"; exit 1; }
+          curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/change-password" \
+            -H "Authorization: Bearer $OLD_TOKEN" -H 'content-type: application/json' \
+            -d "{\"current_password\":\"$OLD\",\"new_password\":\"$NEW\"}" > /dev/null
+          TOKEN=$(curl -fs -X POST "http://127.0.0.1:${STUDIO_PORT}/api/auth/login" \
+            -H 'content-type: application/json' -d "{\"username\":\"unsloth\",\"password\":\"$NEW\"}" | jq -r .access_token)
+          [ -n "$TOKEN" ] && [ "$TOKEN" != null ] || { echo "post-rotation login failed"; exit 1; }
           echo "TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
       - name: Load Qwen3.5-2B-MTP UD-Q4_K_XL via Studio + chat 1+1
