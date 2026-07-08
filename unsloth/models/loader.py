@@ -39,7 +39,9 @@ from peft import PeftConfig, PeftModel
 from .loader_utils import (
     _exclude_rope_inv_freq_from_ddp,
     _get_fp8_mode_and_check_settings,
+    _model_has_real_fp8_modules,
     _offline_quantize_to_fp8,
+    _restore_missing_fp8_weight_scale_inv,
     _tag_model_with_fp8_torchao_config,
     get_model_name,
     prepare_device_map,
@@ -483,6 +485,7 @@ class FastLanguageModel(FastLlamaModel):
         # Find FP8, BnB 4bit, other mapped names
         old_model_name = model_name
         fp8_mode = None
+        restore_fp8_scales = False
         if not use_exact_model_name:
             new_model_name = get_model_name(
                 model_name,
@@ -501,13 +504,24 @@ class FastLanguageModel(FastLlamaModel):
                     load_in_16bit,
                 )
                 model_name = _offline_quantize_to_fp8(model_name, fp8_mode, text_only = text_only)
+                restore_fp8_scales = True
+                # The helper may fall back to a preserved bin-only cache when regeneration fails;
+                # only force safetensors when it actually produced one, else from_pretrained would
+                # look for absent safetensors in that bin cache. #6749
+                if any(name.endswith(".safetensors") for name in os.listdir(model_name)):
+                    kwargs["use_safetensors"] = True
             else:
                 assert new_model_name is not None
                 model_name = new_model_name
                 # If mapper resolved to a pre-quantized FP8 model, disable
                 # on-the-fly quantization to avoid double quantization
                 if load_in_fp8 != False and new_model_name != old_model_name:
+                    restore_fp8_scales = True
                     load_in_fp8 = False
+                    # Pre-quantized FP8 siblings are safetensors-only, so force safetensors like
+                    # the offline path above; otherwise a caller-supplied use_safetensors=False
+                    # makes from_pretrained look for absent .bin weights and fail. #6749
+                    kwargs["use_safetensors"] = True
 
         # Check if pre-quantized models are allowed
         # AMD Instinct GPUs need blocksize = 128 on bitsandbytes < 0.49.2 (our pre-quants use blocksize = 64)
@@ -522,6 +536,7 @@ class FastLanguageModel(FastLlamaModel):
             load_in_4bit = False
             load_in_8bit = False
             load_in_fp8 = False
+            restore_fp8_scales = False
             load_in_16bit = True
 
         if USE_MODELSCOPE and not os.path.exists(model_name):
@@ -909,7 +924,19 @@ class FastLanguageModel(FastLlamaModel):
                 elif isinstance(quantization_config, dict):
                     model.config.update({"quantization_config": quantization_config})
 
-        if load_in_fp8 != False:
+        if restore_fp8_scales or _model_has_real_fp8_modules(model):
+            _restored_count, _skipped_count = _restore_missing_fp8_weight_scale_inv(
+                model,
+                model_name,
+                token = token,
+                revision = revision if not is_peft else None,
+                local_files_only = local_files_only,
+                subfolder = kwargs.get("subfolder"),
+                variant = kwargs.get("variant"),
+                use_safetensors = kwargs.get("use_safetensors"),
+                cache_dir = kwargs.get("cache_dir"),
+                force_download = kwargs.get("force_download", False),
+            )
             _tag_model_with_fp8_torchao_config(model, fp8_mode)
 
         if is_peft:
@@ -1170,6 +1197,7 @@ class FastModel(FastBaseModel):
         # Find FP8, BnB 4bit, other mapped names
         old_model_name = model_name
         fp8_mode = None
+        restore_fp8_scales = False
         if not use_exact_model_name:
             new_model_name = get_model_name(
                 model_name, load_in_4bit = load_in_4bit, load_in_fp8 = load_in_fp8
@@ -1184,13 +1212,24 @@ class FastModel(FastBaseModel):
                     load_in_16bit,
                 )
                 model_name = _offline_quantize_to_fp8(model_name, fp8_mode, text_only = text_only)
+                restore_fp8_scales = True
+                # The helper may fall back to a preserved bin-only cache when regeneration fails;
+                # only force safetensors when it actually produced one, else from_pretrained would
+                # look for absent safetensors in that bin cache. #6749
+                if any(name.endswith(".safetensors") for name in os.listdir(model_name)):
+                    kwargs["use_safetensors"] = True
             else:
                 assert new_model_name is not None
                 model_name = new_model_name
                 # If mapper resolved to a pre-quantized FP8 model, disable
                 # on-the-fly quantization to avoid double quantization
                 if load_in_fp8 != False and new_model_name != old_model_name:
+                    restore_fp8_scales = True
                     load_in_fp8 = False
+                    # Pre-quantized FP8 siblings are safetensors-only, so force safetensors like
+                    # the offline path above; otherwise a caller-supplied use_safetensors=False
+                    # makes from_pretrained look for absent .bin weights and fail. #6749
+                    kwargs["use_safetensors"] = True
 
         # Check if pre-quantized models are allowed
         # AMD Instinct GPUs need blocksize = 128 on bitsandbytes < 0.49.2 (our pre-quants use blocksize = 64)
@@ -1205,6 +1244,7 @@ class FastModel(FastBaseModel):
             load_in_4bit = False
             load_in_8bit = False
             load_in_fp8 = False
+            restore_fp8_scales = False
             load_in_16bit = True
 
         # Check modelscope
@@ -1552,7 +1592,19 @@ class FastModel(FastBaseModel):
             # Check base model again for PEFT
             model_name = peft_config.base_model_name_or_path
             if not use_exact_model_name:
-                model_name = get_model_name(model_name, load_in_4bit)
+                # Use a separate local, not old_model_name, which still holds the adapter repo
+                # PeftModel.from_pretrained loads below; reusing it would attach the base. #6749
+                base_before_remap = model_name
+                model_name = get_model_name(
+                    model_name,
+                    load_in_4bit = load_in_4bit,
+                    load_in_fp8 = load_in_fp8,
+                )
+                if load_in_fp8 != False and model_name != base_before_remap:
+                    load_in_fp8 = False
+                    # Pre-quantized FP8 base siblings are safetensors-only; force safetensors so a
+                    # caller-supplied use_safetensors=False does not fail on absent .bin weights. #6749
+                    kwargs["use_safetensors"] = True
             # Check if pre-quantized models are allowed
             # AMD Instinct GPUs need blocksize = 128 on bitsandbytes < 0.49.2 (our pre-quants use blocksize = 64)
             if not ALLOW_PREQUANTIZED_MODELS and model_name.lower().endswith(
@@ -1819,7 +1871,19 @@ class FastModel(FastBaseModel):
                 elif isinstance(quantization_config, dict):
                     model.config.update({"quantization_config": quantization_config})
 
-        if load_in_fp8 != False:
+        if restore_fp8_scales or _model_has_real_fp8_modules(model):
+            _restored_count, _skipped_count = _restore_missing_fp8_weight_scale_inv(
+                model,
+                model_name,
+                token = token,
+                revision = revision if not is_peft else None,
+                local_files_only = local_files_only,
+                subfolder = kwargs.get("subfolder"),
+                variant = kwargs.get("variant"),
+                use_safetensors = kwargs.get("use_safetensors"),
+                cache_dir = kwargs.get("cache_dir"),
+                force_download = kwargs.get("force_download", False),
+            )
             _tag_model_with_fp8_torchao_config(model, fp8_mode)
 
         if is_peft:
