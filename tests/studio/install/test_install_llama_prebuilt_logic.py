@@ -5083,9 +5083,7 @@ def test_validate_quantize_require_launch_falls_back_when_sandbox_unavailable(
     )
 
 
-def test_validate_server_require_launch_falls_back_when_sandbox_unavailable(
-    monkeypatch, tmp_path
-):
+def test_validate_server_require_launch_falls_back_when_sandbox_unavailable(monkeypatch, tmp_path):
     server_path = tmp_path / "llama-server"
     server_path.write_text("")
     probe_path = tmp_path / "probe.gguf"
