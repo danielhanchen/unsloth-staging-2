@@ -5028,3 +5028,91 @@ def test_diffusion_visual_server_refuses_unapproved_release_asset(monkeypatch, t
     assert not target.exists()
     assert raw_calls == []
     assert verified_calls == []
+
+
+def _skip_validation_plan(purpose: str) -> ValidationLaunchPlan:
+    # Mirrors the plan build_validation_sandbox_plan returns on Linux when no usable
+    # sandbox adapter is available: action=skip with no server probe mode.
+    return ValidationLaunchPlan(
+        command = ["bin", "arg"],
+        env = {},
+        action = INSTALL_LLAMA_PREBUILT._VALIDATION_LAUNCH_SKIP,
+        purpose = purpose,
+        sandbox_kind = "linux_bwrap",
+        reason = "No Linux sandbox adapter was available; skip downloaded-binary validation",
+        payload_command = ["bin", "arg"],
+        payload_env = {},
+    )
+
+
+def test_validate_quantize_require_launch_falls_back_when_sandbox_unavailable(
+    monkeypatch, tmp_path
+):
+    # A hashless bundle sets require_launch=True; if the smoke launch cannot run (no sandbox)
+    # the bundle has neither a sha256 nor a functional check, so it must fall back, never skip.
+    quantize_path = tmp_path / "llama-quantize"
+    quantize_path.write_text("")
+    probe_path = tmp_path / "probe.gguf"
+    probe_path.write_text("")
+    out_path = tmp_path / "out.gguf"
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "binary_env", lambda *a, **k: {})
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT,
+        "build_validation_sandbox_plan",
+        lambda *a, **k: _skip_validation_plan(INSTALL_LLAMA_PREBUILT._VALIDATION_PURPOSE_QUANTIZE),
+    )
+
+    with pytest.raises(PrebuiltFallback, match = "llama-quantize validation unavailable"):
+        validate_quantize(
+            quantize_path,
+            probe_path,
+            out_path,
+            tmp_path,
+            linux_host(),
+            require_launch = True,
+        )
+
+    # Without require_launch (an approved, sha256-backed bundle) the same skip is tolerated.
+    validate_quantize(
+        quantize_path,
+        probe_path,
+        out_path,
+        tmp_path,
+        linux_host(),
+        require_launch = False,
+    )
+
+
+def test_validate_server_require_launch_falls_back_when_sandbox_unavailable(
+    monkeypatch, tmp_path
+):
+    server_path = tmp_path / "llama-server"
+    server_path.write_text("")
+    probe_path = tmp_path / "probe.gguf"
+    probe_path.write_text("")
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "binary_env", lambda *a, **k: {})
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "free_local_port", lambda: 7777)
+    monkeypatch.setattr(
+        INSTALL_LLAMA_PREBUILT,
+        "build_validation_sandbox_plan",
+        lambda *a, **k: _skip_validation_plan(INSTALL_LLAMA_PREBUILT._VALIDATION_PURPOSE_SERVER),
+    )
+
+    with pytest.raises(PrebuiltFallback, match = "llama-server validation unavailable"):
+        validate_server(
+            server_path,
+            probe_path,
+            linux_host(),
+            tmp_path,
+            install_kind = "linux-cuda",
+            require_launch = True,
+        )
+
+    validate_server(
+        server_path,
+        probe_path,
+        linux_host(),
+        tmp_path,
+        install_kind = "linux-cuda",
+        require_launch = False,
+    )
