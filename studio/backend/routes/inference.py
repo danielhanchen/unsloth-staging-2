@@ -1763,6 +1763,34 @@ async def _select_request_tools(
     return tools
 
 
+def _enables_code_execution_tool(tools: list[dict]) -> bool:
+    """True when a resolved tool list includes a local code-execution tool
+    (python/terminal). ``confirm_code_execution`` only gates those, so the
+    streaming requirement is scoped to requests that actually expose one."""
+    from core.inference.tools import CODE_EXECUTION_TOOL_NAMES
+    return any(
+        isinstance(t, dict)
+        and isinstance(t.get("function"), dict)
+        and t["function"].get("name") in CODE_EXECUTION_TOOL_NAMES
+        for t in (tools or [])
+    )
+
+
+def _payload_may_enable_code_execution(payload) -> bool:
+    """True when a request could resolve a local code-execution tool before the
+    tool list is built (used by the pre-switch guard). Mirrors
+    ``_select_request_tools``: built-ins are off unless the tool loop is enabled,
+    and an explicit ``enabled_tools`` filter must then list python/terminal
+    (MCP/client tools are never code execution)."""
+    from core.inference.tools import CODE_EXECUTION_TOOL_NAMES
+
+    if not _effective_enable_tools(payload):
+        return False
+    if payload.enabled_tools is not None:
+        return bool(set(payload.enabled_tools) & CODE_EXECUTION_TOOL_NAMES)
+    return True
+
+
 def _apply_rag_nudge(nudge: str, tools: list[dict], *, rag_scope) -> str:
     """Append the RAG grounding nudge to ``nudge`` when the knowledge-base tool
     is active (search_knowledge_base present and a retrieval scope is set). The
@@ -5673,6 +5701,9 @@ async def openai_chat_completions(
                     param = "confirm_tool_calls",
                 ),
             )
+        # confirm_code_execution guards only local python/terminal; an external
+        # provider runs any hosted code_execution in its own sandbox, so the flag
+        # simply does not apply here and is ignored (documented on the field).
         if _wants_multiple_choices(payload):
             _raise_unsupported_n("external provider chat completions")
         return await _proxy_to_external_provider(payload, request, current_subject)
@@ -5747,6 +5778,28 @@ async def openai_chat_completions(
                     status = 400,
                     code = "invalid_request_error",
                     param = "confirm_tool_calls",
+                ),
+            )
+        # Same pre-switch guard for confirm_code_execution, but scoped to requests
+        # that could actually run a local code-execution tool: the gate only
+        # applies to python/terminal, so a non-code tool request (e.g. web_search)
+        # must not be rejected, and a code-execution one must not evict the
+        # resident model only to 400 after the swap.
+        if (
+            payload.confirm_code_execution
+            and not payload.bypass_permissions
+            and not payload.stream
+            and payload.max_tool_calls_per_message != 0
+            and _payload_may_enable_code_execution(payload)
+        ):
+            raise HTTPException(
+                status_code = 400,
+                detail = openai_error_body(
+                    "confirm_code_execution requires stream=true when a "
+                    "code-execution tool (python/terminal) is enabled.",
+                    status = 400,
+                    code = "invalid_request_error",
+                    param = "confirm_code_execution",
                 ),
             )
         # Reject a malformed tool_choice forcing object before the switch: a
@@ -6221,6 +6274,23 @@ async def openai_chat_completions(
                         param = "confirm_tool_calls",
                     ),
                 )
+            if (
+                payload.confirm_code_execution
+                and not payload.bypass_permissions
+                and not payload.stream
+                and payload.max_tool_calls_per_message != 0
+                and _enables_code_execution_tool(tools_to_use)
+            ):
+                raise _reject(
+                    400,
+                    openai_error_body(
+                        "confirm_code_execution requires stream=true when a "
+                        "code-execution tool (python/terminal) is enabled.",
+                        status = 400,
+                        code = "invalid_request_error",
+                        param = "confirm_code_execution",
+                    ),
+                )
             if _wants_multiple_choices(payload):
                 raise _reject_unsupported_n("GGUF tool chat completions")
             # ── Tool-use system prompt nudge ──────────────────────
@@ -6288,6 +6358,8 @@ async def openai_chat_completions(
                     # Bypass Permissions takes precedence over the confirm gate:
                     # never prompt while bypassing.
                     confirm_tool_calls = bool(payload.confirm_tool_calls)
+                    and not bool(payload.bypass_permissions),
+                    confirm_code_execution = bool(payload.confirm_code_execution)
                     and not bool(payload.bypass_permissions),
                     bypass_permissions = bool(payload.bypass_permissions),
                 )
@@ -6945,6 +7017,22 @@ async def openai_chat_completions(
                     param = "confirm_tool_calls",
                 ),
             )
+        if (
+            payload.confirm_code_execution
+            and not payload.bypass_permissions
+            and not payload.stream
+            and _enables_code_execution_tool(_sf_tools_to_use)
+        ):
+            raise _reject(
+                400,
+                openai_error_body(
+                    "confirm_code_execution requires stream=true when a "
+                    "code-execution tool (python/terminal) is enabled.",
+                    status = 400,
+                    code = "invalid_request_error",
+                    param = "confirm_code_execution",
+                ),
+            )
         _sf_nudge = _build_tool_action_nudge(
             tools = _sf_tools_to_use,
             model_name = model_name,
@@ -7013,6 +7101,8 @@ async def openai_chat_completions(
                 # Bypass Permissions takes precedence over the confirm gate:
                 # never prompt while bypassing.
                 confirm_tool_calls = bool(payload.confirm_tool_calls)
+                and not bool(payload.bypass_permissions),
+                confirm_code_execution = bool(payload.confirm_code_execution)
                 and not bool(payload.bypass_permissions),
                 bypass_permissions = bool(payload.bypass_permissions),
                 use_adapter = payload.use_adapter,
@@ -10140,6 +10230,11 @@ async def anthropic_messages(
             ),
         )
 
+    # confirm_code_execution is handled below inside the server-tool branch (it is
+    # rejected when a local python/terminal tool is actually selected, mirroring
+    # confirm_tool_calls), so nothing to do pre-switch here: a non-code request is
+    # unaffected and a disabled request never enters that branch.
+
     # require_vision rejects a swap to a text-only target before it runs, so an
     # image request can't evict the resident vision model only to hit the vision
     # guard (_normalize_anthropic_openai_images) below after the load.
@@ -10339,6 +10434,36 @@ async def anthropic_messages(
             requested_studio_tools,
             payload.enabled_tools,
         )
+
+        # confirm_code_execution guards local python/terminal execution. On this
+        # path a Studio tool alias like {"type":"python"} maps to the local tool
+        # loop and runs code on this host -- but the Anthropic Messages SSE
+        # translation does not wire the confirmation prompt (which is why
+        # confirm_tool_calls is rejected above). Silently ignoring the flag would
+        # run python/terminal without the promised prompt, so reject it when a
+        # local code-execution tool is actually selected. A non-code selection
+        # (e.g. web_search) is unaffected, and bypass_permissions suppresses the
+        # gate. Gated on server_tools above, so a disabled request never reaches
+        # here.
+        if (
+            bool(getattr(payload, "confirm_code_execution", False))
+            and not bool(getattr(payload, "bypass_permissions", False))
+            and _enables_code_execution_tool(openai_tools)
+        ):
+            api_monitor.fail(
+                monitor_id,
+                "confirm_code_execution is not supported for Anthropic Messages server tools.",
+            )
+            raise HTTPException(
+                status_code = 400,
+                detail = anthropic_error_body(
+                    "confirm_code_execution is not supported for Anthropic Messages "
+                    "server tools; it only guards local python/terminal execution on "
+                    "the OpenAI-compatible endpoints (/v1/chat/completions).",
+                    status = 400,
+                    err_type = "invalid_request_error",
+                ),
+            )
 
         # Build tool-use system prompt nudge (same logic as /chat/completions)
         _nudge = _build_tool_action_nudge(
