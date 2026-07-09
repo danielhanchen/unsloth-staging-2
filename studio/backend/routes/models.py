@@ -28,6 +28,14 @@ class CachedModelRepo(BaseModel):
     repo_id: str
     size_bytes: int
     last_modified: Optional[float] = None
+    # "text-to-image" for cached diffusers image repos; response_model would silently
+    # drop the value the handler sets, letting image-only repos pass the chat picker's
+    # task gate.
+    task: Optional[str] = None
+    # True when the snapshot is incomplete (a cancelled/partial download left only some
+    # weights). The picker must not treat a partial base repo as a usable download, or an
+    # On Device click routes to a fresh multi-GB re-download instead of the complete GGUF.
+    partial: Optional[bool] = None
 
 
 class CachedModelsResponse(BaseModel):
@@ -905,6 +913,9 @@ async def list_local_models(
 
     try:
         models = collect_local_models(models_root)
+        # Tag each model with its task so the Images picker can filter to diffusion
+        # (GGUF by architecture; local diffusers checkpoints by pipeline / family).
+        models = [m.model_copy(update = {"task": _local_model_task(m)}) for m in models]
 
         return LocalModelListResponse(
             models_dir = str(models_root),
@@ -2070,6 +2081,73 @@ async def scan_loras(
         )
 
 
+@router.get("/diffusion-loras")
+async def scan_diffusion_loras(
+    family: Optional[str] = Query(
+        default = None, description = "Filter to LoRAs compatible with this diffusion family"
+    ),
+    current_subject: str = Depends(get_current_subject),
+):
+    """List diffusion image LoRA adapters for the Images workflow.
+
+    Merges the curated catalog with local files in ``<studio_home>/loras/diffusion``,
+    optionally filtered to the loaded model's family. Cheap: one directory scan, no network
+    (a hub adapter is only downloaded when actually selected for a generation). Distinct from
+    ``/loras`` above, which lists trained/exported TEXT adapters.
+    """
+    from core.inference import diffusion_lora
+
+    entries = diffusion_lora.list_loras(family = family)
+    return {
+        "loras": [
+            {
+                "id": e.id,
+                "display_name": e.display_name,
+                "source": e.source,
+                "format": e.fmt,
+                "families": list(e.families),
+                "size_bytes": e.size_bytes,
+                "weight_default": e.weight_default,
+            }
+            for e in entries
+        ],
+        "loras_dir": str(diffusion_lora.loras_dir()),
+    }
+
+
+@router.get("/diffusion-controlnets")
+async def scan_diffusion_controlnets(
+    family: Optional[str] = Query(
+        default = None, description = "Filter to ControlNets compatible with this diffusion family"
+    ),
+    current_subject: str = Depends(get_current_subject),
+):
+    """List diffusion ControlNet models for the Images workflow.
+
+    Merges the curated, family-tagged catalog with local model folders in
+    ``<studio_home>/controlnets/diffusion``, optionally filtered to the loaded model's family.
+    Cheap: one directory scan, no network (a hub model is only downloaded when selected).
+    """
+    from core.inference import diffusion_controlnet
+
+    entries = diffusion_controlnet.list_controlnets(family = family)
+    return {
+        "controlnets": [
+            {
+                "id": e.id,
+                "display_name": e.display_name,
+                "source": e.source,
+                "families": list(e.families),
+                "control_types": list(e.control_types),
+                "is_union": e.is_union,
+            }
+            for e in entries
+        ],
+        "control_types": list(diffusion_controlnet.CONTROL_TYPES),
+        "controlnets_dir": str(diffusion_controlnet.controlnets_dir()),
+    }
+
+
 def _is_path_under(path: Path, root: Path) -> bool:
     try:
         path.resolve().relative_to(root.resolve())
@@ -3070,6 +3148,186 @@ def _repo_gguf_last_modified(repo_info) -> float:
     return latest
 
 
+# GGUF general.architecture values that denote a diffusion (image) model;
+# everything else is treated as a text model. Lets the Images picker show only
+# image GGUFs in its On Device list.
+_DIFFUSION_GGUF_ARCHS = frozenset(
+    {
+        # ONLY the families the diffusion backend can actually assemble (see
+        # diffusion_families._FAMILIES). Other on-device diffusion archs (SD1/2/3,
+        # SDXL, PixArt, Lumina2, AuraFlow, Wan, HunyuanVideo, ...) would pass this
+        # Images-picker filter and then fail validate_load with a 400, so they are
+        # deliberately excluded until the backend supports them.
+        "flux",  # flux.1
+        "flux2",  # flux.2-klein
+        "qwen_image",  # qwen-image
+        "qwenimage",
+        "z_image",  # z-image
+        "zimage",
+    }
+)
+
+# Known diffusion / image-video GGUF archs the backend can NOT assemble yet. These
+# are the GGUF general.architecture values llama.cpp also has no architecture for,
+# kept in sync with core.inference.llama_cpp.LlamaCppBackend._DIFFUSION_ARCHES
+# (minus the loadable set above). Tagging them with a dedicated, non-loadable task
+# keeps them OUT of the chat picker -- loading one as a chat model dies with
+# "unknown model architecture" -- while also keeping them out of the Images picker
+# (the task is not an IMAGE_GEN_TASK), where they would 400 in validate_load.
+_UNSUPPORTED_DIFFUSION_GGUF_ARCHS = frozenset(
+    {
+        "sd1",
+        "sd3",
+        "sdxl",
+        "aura",
+        "hidream",
+        "cosmos",
+        "hyvid",
+        "lumina2",
+    }
+)
+
+# Video GGUF archs the video backend CAN load (LTX-2.x ships as "ltxv"; the Wan
+# community GGUFs as "wan"). Tagged text-to-video so they surface in the Video
+# picker (VIDEO_GEN_TASKS) and stay out of chat (NON_CHAT_TASKS).
+_VIDEO_GGUF_ARCHS = frozenset({"ltxv", "wan"})
+_VIDEO_GEN_TASK = "text-to-video"
+
+# Task tag for the archs above; mirrored by the frontend NON_CHAT_TASKS gate.
+_UNSUPPORTED_DIFFUSION_TASK = "image-diffusion-unsupported"
+
+
+def _gguf_architecture(path: str) -> Optional[str]:
+    """The GGUF ``general.architecture``, or None. Delegates to the shared,
+    bounds-checked header reader (cached by path/mtime/size)."""
+    from utils.models.gguf_metadata import read_gguf_general_metadata
+
+    arch = (read_gguf_general_metadata(path) or {}).get("general.architecture")
+    return arch.strip() if isinstance(arch, str) and arch.strip() else None
+
+
+def _arch_to_task(arch: Optional[str], name_hints: tuple[Optional[str], ...] = ()) -> Optional[str]:
+    if arch is None:
+        return None
+    a = arch.lower()
+    if a in _DIFFUSION_GGUF_ARCHS:
+        return "text-to-image"
+    if a in _VIDEO_GGUF_ARCHS:
+        # Advertise as loadable video only when a VideoFamily actually resolves. Some archs map
+        # straight from the arch (ltxv); others are ambiguous at the arch level -- bare "wan"
+        # covers both the single-DiT TI2V-5B (GGUF-loadable) and the dual-expert A14B MoE whose
+        # single file the loader refuses -- so when the bare arch does not resolve, fall back to
+        # the repo/file names like the loader's own detect_video_family does (each tried
+        # separately, since it matches on name segments not substrings), and surface only a
+        # non-MoE (loadable) match. Without a name we cannot disambiguate, so a bare-arch Wan
+        # GGUF (which the loader also cannot resolve) stays in the unsupported bucket rather than
+        # advertising a GGUF that would 400 on load.
+        from core.inference.video_families import detect_video_family
+
+        fam = detect_video_family("", override = a)
+        if fam is None:
+            for hint in name_hints:
+                if hint:
+                    fam = detect_video_family(hint)
+                    if fam is not None:
+                        break
+        if fam is not None and not getattr(fam, "is_moe", False):
+            return _VIDEO_GEN_TASK
+        return _UNSUPPORTED_DIFFUSION_TASK
+    # A diffusion arch the backend can't assemble: hide it from chat (it would die
+    # in llama.cpp) without surfacing it in Images (it would 400 in validate_load).
+    if a in _UNSUPPORTED_DIFFUSION_GGUF_ARCHS:
+        return _UNSUPPORTED_DIFFUSION_TASK
+    return "text-generation"
+
+
+def _repo_gguf_task(repo_info) -> Optional[str]:
+    """HF pipeline task of a cached GGUF repo, from its architecture:
+    'text-to-image' for a loadable diffusion arch, the non-loadable diffusion tag
+    for a recognized-but-unsupported image arch, else 'text-generation' (None if
+    unreadable)."""
+    repo_id = getattr(repo_info, "repo_id", None)
+    try:
+        for path in _iter_gguf_paths(Path(repo_info.repo_path)):
+            if _is_mmproj_filename(path.name):
+                continue
+            task = _arch_to_task(_gguf_architecture(str(path)), name_hints = (repo_id, path.name))
+            if task is not None:
+                return task
+    except Exception:
+        pass
+    return None
+
+
+def _local_model_task(model: "LocalModelInfo") -> Optional[str]:
+    """Classify a local model into an HF pipeline task so the Images picker can filter.
+
+    For a GGUF, read its architecture (the path may be the .gguf file itself or a folder
+    containing one). For a local non-GGUF image checkpoint (a diffusers pipeline dir or a
+    single-file safetensors), fall through to the diffusers detection so on-device image
+    models get the 'text-to-image' tag instead of being dropped as task=null; the load
+    path accepts these as a local pipeline."""
+    path = model.path
+    _id_hints = (model.model_id, model.display_name, model.id)
+    if model.model_format == "gguf":
+        try:
+            p = Path(path)
+            if p.suffix.lower() == ".gguf" and p.is_file():
+                return _arch_to_task(_gguf_architecture(str(p)), name_hints = _id_hints + (p.name,))
+            for f in _iter_gguf_paths(p):
+                if _is_mmproj_filename(f.name):
+                    continue
+                task = _arch_to_task(_gguf_architecture(str(f)), name_hints = _id_hints + (f.name,))
+                if task is not None:
+                    return task
+        except Exception:
+            pass
+        return None
+    if _local_is_diffusers(model):
+        # A local diffusers pipeline can be a VIDEO family (LTX / Wan / Hunyuan), not just an
+        # image one. Tag it text-to-video so it surfaces in the Video On-Device picker instead
+        # of the Images picker (where the image loader would reject it), mirroring the
+        # cached-repo _cached_repo_task. Gated on _local_is_diffusers, so only a real loadable
+        # pipeline dir (model_index.json) or a name-matched checkpoint reaches this check.
+        try:
+            from core.inference.video import _is_trusted_video_repo
+            from core.inference.video_families import detect_video_family
+            for needle in (model.model_id, model.display_name, Path(model.id).name):
+                if (
+                    needle
+                    and detect_video_family(needle) is not None
+                    and _is_trusted_video_repo(path)
+                ):
+                    return _VIDEO_GEN_TASK
+        except Exception:
+            pass
+        return "text-to-image"
+    return None
+
+
+def _local_is_diffusers(model: "LocalModelInfo") -> bool:
+    """True for a local diffusers image checkpoint, mirroring the cached-repo
+    ``_repo_is_diffusers`` heuristics: a full pipeline carries a top-level
+    ``model_index.json``, while single-file / safetensors image checkpoints ship none, so
+    fall back to the model id resolving to a known diffusion family (the same resolver the
+    Images backend loads from). Family detection uses the clean model id / name, not the
+    on-disk path, so a parent directory keyword can't spuriously match."""
+    try:
+        p = Path(model.path)
+        if p.is_dir() and (p / "model_index.json").is_file():
+            return True
+    except Exception:
+        pass
+    try:
+        from core.inference.diffusion_families import detect_family
+        for needle in (model.model_id, model.display_name, Path(model.id).name):
+            if needle and detect_family(needle) is not None:
+                return True
+    except Exception:
+        pass
+    return False
+
+
 @router.get("/cached-gguf")
 async def list_cached_gguf(current_subject: str = Depends(get_current_subject)):
     """List GGUF repos downloaded to HF cache, legacy Unsloth cache, and HF default cache."""
@@ -3097,6 +3355,7 @@ async def list_cached_gguf(current_subject: str = Depends(get_current_subject)):
                             "size_bytes": total_size,
                             "cache_path": str(repo_info.repo_path),
                             "has_vision": _repo_has_mmproj(repo_info),
+                            "task": _repo_gguf_task(repo_info),
                         }
                         # Keep the newest timestamp across duplicate caches;
                         # attach only when known so absent rows sort as oldest.
@@ -3119,6 +3378,70 @@ async def list_cached_gguf(current_subject: str = Depends(get_current_subject)):
     except Exception as e:
         logger.error(f"Error listing cached GGUF repos: {e}", exc_info = True)
         return {"cached": []}
+
+
+def _repo_is_diffusers(repo_info) -> bool:
+    """True for an image-diffusion repo, so the chat picker hides it (it renders
+    images, not chat) and the Images picker claims it — mirroring how cached
+    diffusion GGUFs are classified by arch.
+
+    Two signals: a full diffusers pipeline carries a top-level model_index.json,
+    while single-file / ComfyUI / ControlNet image checkpoints (e.g. an FP8
+    Qwen-Image or a z-image .safetensors) ship none. For those, fall back to the
+    repo id resolving to a known diffusion family — the same resolver the Images
+    backend loads from — so they don't surface as loadable chat models."""
+    try:
+        for rev in repo_info.revisions:
+            for f in rev.files:
+                if f.file_name == "model_index.json" or f.file_name.endswith("/model_index.json"):
+                    return True
+    except Exception:
+        pass
+    try:
+        from core.inference.diffusion_families import detect_family
+        if detect_family(getattr(repo_info, "repo_id", "") or "") is not None:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _cached_repo_partial(repo_id: str, repo_cache_dir: Optional[Path] = None) -> bool:
+    """Whether the cached model snapshot is incomplete (cancelled/partial download).
+    Reuses the hub inventory scan's snapshot-partial detector (cancel marker, legacy
+    .incomplete blob, manifest walk -- cheapest first). ``repo_cache_dir`` scopes all three
+    signals to the specific snapshot being listed: without it the scan spans every HF cache
+    root, so a stale .incomplete copy in one root would flag a complete copy in another as
+    partial and hide it from the picker (the sibling inventory paths all scope the same way).
+    Best-effort: a detection error reports not-partial so a scan glitch never hides a
+    genuinely usable repo."""
+    try:
+        from hub.utils.inventory_scan import is_snapshot_partial
+        return bool(is_snapshot_partial("model", repo_id, repo_cache_dir))
+    except Exception:  # noqa: BLE001 -- never fail the listing over a partial probe
+        return False
+
+
+def _cached_repo_task(repo_info) -> Optional[str]:
+    """Pipeline task for a cached non-GGUF repo: 'text-to-video' for repos the
+    video backend can load as full pipelines (its trust list / family detector),
+    else 'text-to-image' for diffusers image repos, else None (chat). Without the
+    video tag, cached Lightricks / Wan / Hunyuan pipelines never surfaced in the
+    Video picker's On Device list -- everything diffusers was blanket-tagged
+    text-to-image."""
+    repo_id = getattr(repo_info, "repo_id", "") or ""
+    try:
+        from core.inference.video import _is_trusted_video_repo
+        from core.inference.video_families import detect_video_family
+
+        # Both gates: a detected video family (so unsloth image repos don't
+        # match) AND the load path's own trust rule (so an untrusted video repo
+        # isn't advertised as loadable).
+        if detect_video_family(repo_id) is not None and _is_trusted_video_repo(repo_id):
+            return _VIDEO_GEN_TASK
+    except Exception:
+        pass
+    return "text-to-image" if _repo_is_diffusers(repo_info) else None
 
 
 @router.get("/cached-models", response_model = CachedModelsResponse)
@@ -3163,11 +3486,22 @@ async def list_cached_models(
                     )
                     key = repo_id.lower()
                     existing = seen_lower.get(key)
-                    if existing is None or total_size > existing["size_bytes"]:
+                    is_partial = _cached_repo_partial(repo_id, Path(repo_info.repo_path))
+                    # Prefer the most COMPLETE snapshot, then the largest. The picker drops partial
+                    # rows, so a partial copy in one cache root must not shadow a smaller COMPLETE
+                    # copy in another (that would make a usable model vanish from On Device).
+                    # Completeness wins outright; size only breaks ties among equal completeness.
+                    if existing is None or (not is_partial, total_size) > (
+                        not bool(existing.get("partial")),
+                        existing["size_bytes"],
+                    ):
                         row = {
                             "repo_id": repo_id,
                             "size_bytes": total_size,
+                            "task": _cached_repo_task(repo_info),
                         }
+                        if is_partial:
+                            row["partial"] = True
                         # Keep the newest timestamp across duplicate caches;
                         # attach only when known so absent rows sort as oldest.
                         lm = max(last_modified, (existing or {}).get("last_modified", 0.0))
@@ -3194,6 +3528,14 @@ async def list_cached_models(
         return {"cached": []}
 
 
+def _loaded_id_matches_repo(loaded_id: str, repo_id: str) -> bool:
+    """True when *loaded_id* is *repo_id* or a file within it; ``/``-boundary aware so a
+    loaded ``org/model-2512`` does not block deleting the sibling cached ``org/model``."""
+    rid = repo_id.lower()
+    lid = loaded_id.lower()
+    return lid == rid or lid.startswith(f"{rid}/")
+
+
 @router.delete("/delete-cached")
 async def delete_cached_model(
     repo_id: str = Body(...),
@@ -3215,7 +3557,7 @@ async def delete_cached_model(
         llama_backend = get_llama_cpp_backend()
         if llama_backend.is_loaded and llama_backend.model_identifier:
             loaded_id = llama_backend.model_identifier.lower()
-            if loaded_id == repo_id.lower() or loaded_id.startswith(repo_id.lower()):
+            if _loaded_id_matches_repo(loaded_id, repo_id):
                 raise HTTPException(
                     status_code = 400,
                     detail = "Unload the model before deleting",
@@ -3229,10 +3571,86 @@ async def delete_cached_model(
         inference_backend = get_inference_backend()
         if inference_backend.active_model_name:
             active = inference_backend.active_model_name.lower()
-            if active == repo_id.lower() or active.startswith(repo_id.lower()):
+            if _loaded_id_matches_repo(active, repo_id):
                 raise HTTPException(
                     status_code = 400,
                     detail = "Unload the model before deleting",
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    # Also refuse if the diffusion (Images) backend has this repo loaded; its
+    # delete guard is otherwise chat-only, so its GGUF could be removed from
+    # under a live pipeline. Repo-level match, like the chat guards above.
+    try:
+        # The ACTIVE engine (diffusers or native sd_cpp): on a native selection the
+        # diffusers singleton reports unloaded while sd-cli still generates from the
+        # cached GGUF, so checking it alone would let the files be deleted mid-use.
+        from core.inference.diffusion_engine_router import get_active_diffusion_engine
+
+        engine = get_active_diffusion_engine()
+        diffusion_status = engine.status()
+        if diffusion_status.get("loaded") and diffusion_status.get("repo_id"):
+            loaded_id = str(diffusion_status["repo_id"]).lower()
+            if _loaded_id_matches_repo(loaded_id, repo_id):
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "Unload the model before deleting",
+                )
+        # The native sd.cpp one-shot engine re-reads its companion VAE / text-encoder files
+        # from the HF cache on every generation, so deleting a companion repo (e.g.
+        # comfyanonymous/flux_text_encoders) while a native GGUF is loaded would brick the
+        # next generation. status().repo_id only covers the main GGUF, so also refuse the
+        # committed companion repos the loaded engine reads from disk.
+        for lid in getattr(engine, "loaded_repo_ids", tuple)():
+            if _loaded_id_matches_repo(str(lid).lower(), repo_id):
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "Unload the model before deleting",
+                )
+        # Also refuse while a background image load is DOWNLOADING this repo (or its
+        # companion base): status().loaded is still False in that window, but deleting
+        # would remove blobs from under the in-flight download/assembly.
+        loading_ids = getattr(engine, "loading_repo_ids", tuple)()
+        for lid in loading_ids:
+            lid = str(lid).lower()
+            if _loaded_id_matches_repo(lid, repo_id):
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "An Images model load is using this repo; wait for it to finish",
+                )
+    except HTTPException:
+        raise
+    except Exception:
+        pass
+
+    # And refuse if the Video backend has this repo loaded or is downloading it: cached non-GGUF
+    # video repos now surface in the Video On-Device picker with the normal delete action, but the
+    # guards above only cover chat + the Images engine, so without this a loaded/loading Wan / LTX /
+    # Hunyuan pipeline could have its HF snapshot removed from under it. Mirror the Images guard.
+    try:
+        from core.inference.video import get_video_backend
+
+        video_backend = get_video_backend()
+        video_status = video_backend.status()
+        if video_status.get("loaded") and video_status.get("repo_id"):
+            loaded_id = str(video_status["repo_id"]).lower()
+            if _loaded_id_matches_repo(loaded_id, repo_id):
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "Unload the model before deleting",
+                )
+        # Also refuse while a background VIDEO load is DOWNLOADING this repo (or its companion
+        # base): status().loaded is still False in that window, but deleting would remove blobs
+        # from under the in-flight download/assembly -- same as the Images guard above.
+        for lid in getattr(video_backend, "loading_repo_ids", tuple)():
+            lid = str(lid).lower()
+            if _loaded_id_matches_repo(lid, repo_id):
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "A Video model load is using this repo; wait for it to finish",
                 )
     except HTTPException:
         raise

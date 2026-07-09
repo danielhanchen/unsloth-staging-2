@@ -297,6 +297,7 @@ from routes import (
     rag_router,
     training_history_router,
     training_router,
+    video_router,
 )
 from routes.llama import router as llama_router
 from routes.preview import router as preview_router
@@ -726,8 +727,11 @@ from utils.upload_limits import (  # noqa: E402
 )
 
 _BODY_PROTECTED_PREFIXES = (
-    "/v1/chat/completions",
-    "/v1/completions",
+    # Blanket-protect the whole OpenAI-compatible /v1 surface, like /api/inference below: every
+    # /v1 POST route (chat/completions, completions, images/generations, audio, embeddings,
+    # responses, messages, ...) buffers a JSON body and none is a multipart-upload passthrough,
+    # so a single prefix caps them all -- an enumerated list silently left new routes uncapped.
+    "/v1",
     "/p/",
     "/api/inference",
     "/api/data-recipe",
@@ -742,16 +746,31 @@ _DATASET_UPLOAD_PASSTHROUGH_PREFIX = "/api/datasets/upload"
 _DATA_RECIPE_UNSTRUCTURED_UPLOAD_PASSTHROUGH_PREFIX = (
     "/api/data-recipe/seed/upload-unstructured-file"
 )
+# The diffusion dataset upload route (POST /api/train/diffusion/dataset) is a multipart
+# image upload under the protected /api/train prefix. Like /api/datasets/upload it enforces
+# its own get_upload_limit_bytes() cap, so it must bypass the default body cap here or the
+# middleware would 413 near-limit batches (and ignore a raised max_upload_size_mb) before the
+# handler runs. Matched as an EXACT path (not a prefix): its JSON sub-routes
+# (PUT .../{name}/caption/{filename}, POST .../import-example) live under the same prefix but
+# must keep the normal small-JSON cap, or a large caption/import body would be buffered and
+# parsed up to the far larger upload limit before the route-level length checks run.
+_DIFFUSION_DATASET_UPLOAD_PATH = "/api/train/diffusion/dataset"
 _BODY_UPLOAD_PASSTHROUGH_PREFIXES = (
     _DATASET_UPLOAD_PASSTHROUGH_PREFIX,
     _DATA_RECIPE_UNSTRUCTURED_UPLOAD_PASSTHROUGH_PREFIX,
 )
+# Passthrough routes matched by EXACT path (the multipart upload only), so sibling JSON
+# sub-routes under the same prefix are not swept into the generous upload cap.
+_BODY_UPLOAD_PASSTHROUGH_EXACT_PATHS = (_DIFFUSION_DATASET_UPLOAD_PATH,)
 
 
 def _get_upload_passthrough_request_max_bytes(path: str) -> int:
     if path.startswith(_DATA_RECIPE_UNSTRUCTURED_UPLOAD_PASSTHROUGH_PREFIX):
         return upload_request_limit_bytes(UNSTRUCTURED_RECIPE_UPLOAD_MAX_BYTES)
-    if path.startswith(_DATASET_UPLOAD_PASSTHROUGH_PREFIX):
+    if (
+        path.startswith(_DATASET_UPLOAD_PASSTHROUGH_PREFIX)
+        or path == _DIFFUSION_DATASET_UPLOAD_PATH
+    ):
         return upload_request_limit_bytes()
     return default_request_body_limit_bytes()
 
@@ -800,12 +819,21 @@ class MaxBodyMiddleware:
         protected_prefixes: tuple,
         upload_passthrough_prefixes: tuple = (),
         upload_passthrough_max_bytes_getter = None,
+        upload_passthrough_exact_paths: tuple = (),
     ):
         self.app = app
         self.max_bytes_getter = max_bytes_getter
         self.protected_prefixes = protected_prefixes
         self.upload_passthrough_prefixes = upload_passthrough_prefixes
         self.upload_passthrough_max_bytes_getter = upload_passthrough_max_bytes_getter
+        # Passthrough routes matched by exact path, not prefix: an upload route whose prefix
+        # also covers sibling JSON sub-routes that must keep the normal (small) body cap.
+        self.upload_passthrough_exact_paths = upload_passthrough_exact_paths
+
+    def _is_upload_passthrough(self, path: str) -> bool:
+        return path in self.upload_passthrough_exact_paths or any(
+            path.startswith(p) for p in self.upload_passthrough_prefixes
+        )
 
     def _upload_passthrough_max_bytes(self, path: str) -> int:
         if self.upload_passthrough_max_bytes_getter is None:
@@ -842,7 +870,7 @@ class MaxBodyMiddleware:
                     declared = None
                 break
 
-        if any(path.startswith(p) for p in self.upload_passthrough_prefixes):
+        if self._is_upload_passthrough(path):
             upload_max_bytes = self._upload_passthrough_max_bytes(path)
             if declared is None:
                 await _send_411(send)
@@ -899,6 +927,7 @@ app.add_middleware(
     protected_prefixes = _BODY_PROTECTED_PREFIXES,
     upload_passthrough_prefixes = _BODY_UPLOAD_PASSTHROUGH_PREFIXES,
     upload_passthrough_max_bytes_getter = _get_upload_passthrough_request_max_bytes,
+    upload_passthrough_exact_paths = _BODY_UPLOAD_PASSTHROUGH_EXACT_PATHS,
 )
 
 # Tracks in-flight inference requests for idle auto-unload; off -> passthrough.
@@ -944,6 +973,9 @@ app.include_router(inference_router, prefix = "/api/inference", tags = ["inferen
 # Studio-only inference endpoints (cancel, etc.) are NOT exposed on the /v1
 # OpenAI-compat prefix below.
 app.include_router(inference_studio_router, prefix = "/api/inference", tags = ["inference"])
+
+# Studio-only text-to-video endpoints; not exposed on the /v1 OpenAI-compat prefix.
+app.include_router(video_router, prefix = "/api/inference", tags = ["inference"])
 
 # OpenAI-compatible: mount the inference router at /v1 for external tools.
 app.include_router(inference_router, prefix = "/v1", tags = ["openai-compat"])

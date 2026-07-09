@@ -210,12 +210,41 @@ _custom_studio_roots | while IFS= read -r _custom_root; do
         continue
     fi
     _remove_path "$_custom_root"
+    # Native diffusion (stable-diffusion.cpp) for a custom/env-mode Studio installs beside
+    # the root at <parent>/stable-diffusion.cpp -- find_sd_cpp_binary resolves it from
+    # UNSLOTH_STUDIO_HOME.parent (sd_cpp_engine.py) -- so removing only the root leaves the
+    # build behind. Only remove a sibling Studio installed: <parent> is a user-chosen dir
+    # and "stable-diffusion.cpp" is exactly what `git clone` of leejet/stable-diffusion.cpp
+    # produces, so require our owner marker (written by install_sd_cpp_prebuilt) before rm,
+    # and keep any unowned checkout. A pre-marker Studio build is left behind, never a user
+    # file deleted. Guard the derived parent path the same way.
+    _custom_sd_cpp="$(dirname "$_custom_root")/stable-diffusion.cpp"
+    if _is_unsafe_root "$_custom_sd_cpp"; then
+        echo "  refusing to remove unsafe path: $_custom_sd_cpp" >&2
+    elif [ -e "$_custom_sd_cpp" ] && [ ! -f "$_custom_sd_cpp/.unsloth-studio-owned" ]; then
+        echo "  keeping sd.cpp without Studio owner marker: $_custom_sd_cpp" >&2
+    else
+        _remove_path "$_custom_sd_cpp"
+    fi
 done
 _remove_path "$HOME/.unsloth/studio"
 # Default-mode shared llama.cpp build + cache are siblings of studio (not removed
 # by deleting it). No-op in env/custom mode (they nest under the custom root) and
 # when absent. A user-set UNSLOTH_LLAMA_CPP_PATH is intentionally kept.
 _remove_path "$HOME/.unsloth/llama.cpp"
+# Default-mode native diffusion (stable-diffusion.cpp / sd-cli) build, a sibling of
+# studio like llama.cpp (install_sd_cpp_prebuilt.default_install_dir()). No-op in
+# env/custom mode and when absent. "stable-diffusion.cpp" is exactly what a `git clone` of
+# leejet/stable-diffusion.cpp produces, so a user may keep their own checkout (or point
+# UNSLOTH_SD_CPP_PATH) at this default path; require our owner marker (written by
+# install_sd_cpp_prebuilt) before rm, mirroring the custom-root guard above, so a user's own
+# checkout or a pre-marker Studio build is kept rather than deleted.
+_default_sd_cpp="$HOME/.unsloth/stable-diffusion.cpp"
+if [ -e "$_default_sd_cpp" ] && [ ! -f "$_default_sd_cpp/.unsloth-studio-owned" ]; then
+    echo "  keeping sd.cpp without Studio owner marker: $_default_sd_cpp" >&2
+else
+    _remove_path "$_default_sd_cpp"
+fi
 _remove_path "$HOME/.unsloth/.cache"
 # Isolated Node.js runtime (install_node_prebuilt.py), a sibling of studio in
 # default mode. No-op in env/custom mode (nested under the custom root) and absent.

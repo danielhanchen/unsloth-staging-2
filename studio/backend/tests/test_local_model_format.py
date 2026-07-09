@@ -115,3 +115,93 @@ def test_scan_models_dir_classifies_root_gguf_with_config(tmp_path):
 
     assert row.path == str(root)
     assert row.model_format == "gguf"
+
+
+# ── Images picker task tag for local (non-GGUF) diffusers models ──────────────
+from models.models import LocalModelInfo  # noqa: E402
+
+
+def _local(
+    path,
+    *,
+    model_format = None,
+    model_id = None,
+    display_name = "m",
+    id = "m",
+):
+    return LocalModelInfo(
+        id = id,
+        display_name = display_name,
+        path = str(path),
+        source = "models_dir",
+        model_id = model_id,
+        model_format = model_format,
+    )
+
+
+def test_local_task_tags_diffusers_pipeline_dir(tmp_path):
+    # A local diffusers pipeline (top-level model_index.json) is an image model even
+    # though its model_format is not "gguf": tag it so the Images picker keeps it.
+    d = tmp_path / "my-local-pipeline"
+    _touch(d / "model_index.json")
+    _touch(d / "unet" / "diffusion_pytorch_model.safetensors")
+    assert models_route._local_model_task(_local(d)) == "text-to-image"
+
+
+def test_local_task_tags_diffusers_by_family_id(tmp_path):
+    # A single-file / safetensors image checkpoint ships no model_index.json; fall back
+    # to the model id resolving to a known diffusion family.
+    d = tmp_path / "flux-checkpoint"
+    _touch(d / "flux1-dev.safetensors")
+    assert (
+        models_route._local_model_task(_local(d, model_id = "black-forest-labs/FLUX.1-dev"))
+        == "text-to-image"
+    )
+
+
+def test_local_task_none_for_plain_llm(tmp_path):
+    # A plain non-GGUF LLM checkpoint (no pipeline, no image family) stays untagged.
+    d = tmp_path / "llama"
+    _touch(d / "config.json")
+    _touch(d / "model.safetensors")
+    assert models_route._local_model_task(_local(d, model_id = "meta-llama/Llama-3.1-8B")) is None
+
+
+def test_local_task_tags_video_pipeline_dir(tmp_path):
+    # A local diffusers pipeline whose id resolves to a VIDEO family (LTX / Wan / Hunyuan)
+    # must be tagged text-to-video so it surfaces in the Video On-Device picker, mirroring the
+    # cached-repo path -- not text-to-image, where the image loader would reject it.
+    d = tmp_path / "wan-local"
+    _touch(d / "model_index.json")
+    _touch(d / "transformer" / "diffusion_pytorch_model.safetensors")
+    assert (
+        models_route._local_model_task(_local(d, model_id = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"))
+        == models_route._VIDEO_GEN_TASK
+    )
+
+
+def test_local_task_video_name_without_pipeline_not_surfaced(tmp_path):
+    # A dir whose name matches a video family but which is NOT a diffusers pipeline (no
+    # model_index.json) is not a loadable pipeline, so it must stay untagged -- never surfaced
+    # to the Video picker, so it can never trigger a pipeline load that evicts then fails.
+    d = tmp_path / "ltx-loose"
+    _touch(d / "ltx-2.safetensors")  # loose weights, no model_index.json
+    assert models_route._local_model_task(_local(d, model_id = "Lightricks/LTX-2")) is None
+
+
+def test_local_task_ignores_family_token_in_parent_path(tmp_path):
+    # model.id is the full on-disk path for a scanned On-Device model, and the family-token
+    # matcher treats any path segment as a hint. A family token in a PARENT dir (e.g.
+    # /models/qwen-image/misc) must NOT tag an unrelated single-file as text-to-image: that
+    # would surface it in the Images picker and evict the GPU owner before from_single_file
+    # fails on the unrelated weights. Detection is scoped to the leaf name, not the raw path.
+    d = tmp_path / "misc"
+    _touch(d / "unrelated.safetensors")  # one non-family single file, no model_index.json
+    m = _local(d, id = "/models/qwen-image/misc", display_name = "misc")
+    assert models_route._local_is_diffusers(m) is False
+    assert models_route._local_model_task(m) is None
+    # Regression guard: a leaf name that itself carries a family hint is still tagged.
+    d2 = tmp_path / "z-image-turbo"
+    _touch(d2 / "model.safetensors")
+    m2 = _local(d2, id = str(d2), display_name = "z-image-turbo")
+    assert models_route._local_is_diffusers(m2) is True
