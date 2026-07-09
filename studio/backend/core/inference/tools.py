@@ -12,6 +12,9 @@ import signal
 os.environ["UNSLOTH_IS_PRESENT"] = "1"
 
 import asyncio
+import base64
+import binascii
+import codecs
 import random
 import re
 import shlex
@@ -21,6 +24,7 @@ import sys
 import tempfile
 import threading
 import urllib.request
+import zlib
 
 from core.inference.mcp_client import (
     MCP_TOOL_PREFIX,
@@ -106,6 +110,7 @@ _BLOCKED_COMMANDS_COMMON = frozenset(
         "rsync",
         "eval",
         "source",
+        "ln",
     }
 )
 _BLOCKED_COMMANDS_WIN = frozenset(
@@ -1591,7 +1596,1190 @@ def _web_search(
         return f"Search failed: {e}"
 
 
-def _check_signal_escape_patterns(code: str):
+# ==========================================================================
+# Sandbox static-analysis hardening (feature-flagged; see UNSLOTH_STUDIO_SINK_ANALYZER)
+#
+# A pure, whitelist-only constant folder plus a filesystem-confinement path
+# resolver back the eval/exec payload recursion and the destructive-op gate.
+# Everything here recomputes pure transforms on *literals only* and never runs,
+# imports, or reflects on user code. All limits are bounded so the analyzer can
+# never be slower or crashier than the legacy syntactic checks; on any breach a
+# folder returns None (opaque) and the caller fails safe.
+# ==========================================================================
+
+# Folder bounds (Stage 1). Breaching any of these yields None ("un-foldable").
+_FOLD_DEPTH = 24
+_FOLD_MAXLEN = 65536
+_FOLD_OPS = 4000
+_FOLD_MAX_SEQ = 4096
+_FOLD_MAXINT = 1 << 64
+
+_UNKNOWN = object()  # sentinel: "not statically decidable"
+
+
+class _FoldState:
+    """Shared op counter + single-assignment const-prop environment."""
+
+    __slots__ = ("ops", "names")
+
+    def __init__(self, names = None):
+        self.ops = 0
+        self.names = names or {}
+
+
+def _fold_cap(value):
+    """Return value unless a str/bytes exceeds the size cap or an int the magnitude cap."""
+    if isinstance(value, (str, bytes, bytearray)) and len(value) > _FOLD_MAXLEN:
+        return None
+    if isinstance(value, int) and not isinstance(value, bool) and abs(value) > _FOLD_MAXINT:
+        return None
+    return value
+
+
+def _fold_apply_codec(name, data):
+    """Pure data transforms only (rot13/hex/base64/zlib/text codecs). Bounded zlib."""
+    name = name.lower().replace("-", "_")
+    try:
+        if name in ("rot_13", "rot13"):
+            text = data if isinstance(data, str) else data.decode("latin-1")
+            return codecs.decode(text, "rot_13")
+        if name == "hex":
+            return codecs.decode(data, "hex")
+        if name in ("base64", "base_64"):
+            return base64.b64decode(data if isinstance(data, (bytes, bytearray)) else data.encode())
+        if name == "zlib":
+            payload = data if isinstance(data, (bytes, bytearray)) else str(data).encode()
+            d = zlib.decompressobj()
+            out = d.decompress(payload, _FOLD_MAXLEN)
+            if d.unconsumed_tail:  # would exceed the cap -> refuse
+                return None
+            return out
+        if name in ("utf_8", "utf8", "latin_1", "latin1", "ascii"):
+            if isinstance(data, (bytes, bytearray)):
+                return data.decode(name)
+            return data.encode(name)
+    except Exception:
+        return None
+    return None  # bz2/lzma/gzip and unknowns: bomb-unsafe / opaque -> refuse
+
+
+_FOLD_PURE_BUILTINS = frozenset(
+    {"chr", "ord", "str", "int", "bytes", "bytearray", "hex", "oct", "bin", "bool", "float", "len"}
+)
+_FOLD_STR_METHODS = frozenset(
+    {
+        "join",
+        "replace",
+        "upper",
+        "lower",
+        "strip",
+        "lstrip",
+        "rstrip",
+        "swapcase",
+        "title",
+        "capitalize",
+        "format",
+        "zfill",
+        "ljust",
+        "rjust",
+        "center",
+        "encode",
+        "decode",
+    }
+)
+_FOLD_B64_FUNCS = frozenset(
+    {
+        "b64decode",
+        "b64encode",
+        "urlsafe_b64decode",
+        "standard_b64decode",
+        "b32decode",
+        "b16decode",
+        "a85decode",
+        "b85decode",
+    }
+)
+
+
+def _const_fold(
+    node,
+    env = None,
+    _state = None,
+    _depth = 0,
+):
+    """Fold an AST expression to a concrete str/bytes/int/list value, else None.
+
+    Whitelist-only and pure: it never executes user code, never imports, never
+    reflects. Only a fixed set of pure transforms over already-folded literals
+    (concat/repeat/join/format/slice/reverse, base64/hex/rot13/zlib decode, and
+    a handful of pure builtins/str methods) is supported; anything else returns
+    None. ``env`` maps single-assignment module-level names to their RHS nodes.
+    """
+    if _state is None:
+        _state = _FoldState(env)
+    _state.ops += 1
+    if node is None or _depth > _FOLD_DEPTH or _state.ops > _FOLD_OPS:
+        return None
+
+    if isinstance(node, ast.Constant):
+        v = node.value
+        if isinstance(v, (str, bytes, bytearray, int, float)) or v is None:
+            return _fold_cap(v)
+        return None
+
+    if isinstance(node, ast.Name):
+        rhs = _state.names.get(node.id)
+        if rhs is None:
+            return None
+        return _const_fold(rhs, None, _state, _depth + 1)
+
+    if isinstance(node, (ast.List, ast.Tuple)):
+        if len(node.elts) > _FOLD_MAX_SEQ:
+            return None
+        vals = []
+        for e in node.elts:
+            v = _const_fold(e, None, _state, _depth + 1)
+            if v is None and not (isinstance(e, ast.Constant) and e.value is None):
+                return None
+            vals.append(v)
+        return vals
+
+    if isinstance(node, ast.JoinedStr):
+        out = []
+        for part in node.values:
+            if isinstance(part, ast.Constant):
+                out.append(str(part.value))
+            elif isinstance(part, ast.FormattedValue):
+                v = _const_fold(part.value, None, _state, _depth + 1)
+                if v is None:
+                    return None
+                spec = ""
+                if part.format_spec is not None:
+                    spec = _const_fold(part.format_spec, None, _state, _depth + 1)
+                    if spec is None:
+                        return None
+                if part.conversion and part.conversion != -1:
+                    try:
+                        v = {114: repr, 115: str, 97: ascii}[part.conversion](v)
+                    except Exception:
+                        return None
+                try:
+                    out.append(format(v, spec if isinstance(spec, str) else ""))
+                except Exception:
+                    return None
+            else:
+                return None
+        return _fold_cap("".join(out))
+
+    if isinstance(node, ast.BinOp):
+        left = _const_fold(node.left, None, _state, _depth + 1)
+        right = _const_fold(node.right, None, _state, _depth + 1)
+        if left is None or right is None:
+            return None
+        op = node.op
+        try:
+            if isinstance(op, ast.Mult):
+                if isinstance(left, (str, bytes, bytearray)) and isinstance(right, int):
+                    if len(left) * max(right, 0) > _FOLD_MAXLEN:
+                        return None
+                if isinstance(right, (str, bytes, bytearray)) and isinstance(left, int):
+                    if len(right) * max(left, 0) > _FOLD_MAXLEN:
+                        return None
+                return _fold_cap(left * right)
+            if isinstance(op, ast.Add):
+                return _fold_cap(left + right)
+            if isinstance(op, ast.Mod):
+                return _fold_cap(left % right)
+            if isinstance(op, ast.Sub):
+                return _fold_cap(left - right)
+            if isinstance(op, ast.FloorDiv):
+                return _fold_cap(left // right)
+            if isinstance(op, ast.Div):
+                return _fold_cap(left / right)
+            if isinstance(op, ast.BitXor):
+                return _fold_cap(left ^ right)
+            if isinstance(op, ast.BitOr):
+                return _fold_cap(left | right)
+            if isinstance(op, ast.BitAnd):
+                return _fold_cap(left & right)
+            if isinstance(op, ast.LShift) and isinstance(right, int) and 0 <= right < 64:
+                return _fold_cap(left << right)
+            if isinstance(op, ast.RShift) and isinstance(right, int) and 0 <= right < 64:
+                return _fold_cap(left >> right)
+        except Exception:
+            return None
+        return None  # Pow and others: refuse (bignum DoS)
+
+    if isinstance(node, ast.UnaryOp):
+        v = _const_fold(node.operand, None, _state, _depth + 1)
+        if v is None:
+            return None
+        try:
+            return {
+                ast.USub: lambda x: -x,
+                ast.UAdd: lambda x: +x,
+                ast.Invert: lambda x: ~x,
+                ast.Not: lambda x: not x,
+            }[type(node.op)](v)
+        except Exception:
+            return None
+
+    if isinstance(node, ast.Subscript):
+        base = _const_fold(node.value, None, _state, _depth + 1)
+        if base is None or not isinstance(base, (str, bytes, bytearray, list, tuple)):
+            return None
+        sl = node.slice
+        try:
+            if isinstance(sl, ast.Slice):
+                lo = _const_fold(sl.lower, None, _state, _depth + 1) if sl.lower else None
+                hi = _const_fold(sl.upper, None, _state, _depth + 1) if sl.upper else None
+                st = _const_fold(sl.step, None, _state, _depth + 1) if sl.step else None
+                if (
+                    (sl.lower is not None and lo is None)
+                    or (sl.upper is not None and hi is None)
+                    or (sl.step is not None and st is None)
+                ):
+                    return None
+                return _fold_cap(base[lo:hi:st])
+            idx = _const_fold(sl, None, _state, _depth + 1)
+            if not isinstance(idx, int):
+                return None
+            return _fold_cap(base[idx])
+        except Exception:
+            return None
+
+    if isinstance(node, ast.Call):
+        return _fold_call(node, _state, _depth)
+
+    return None
+
+
+def _fold_call(node, _state, _depth):
+    """Fold a whitelisted pure builtin / method / decode call, else None."""
+    f = node.func
+    args = []
+    for a in node.args:
+        v = _const_fold(a, None, _state, _depth + 1)
+        if v is None and not (isinstance(a, ast.Constant) and a.value is None):
+            return None
+        args.append(v)
+
+    if isinstance(f, ast.Name):
+        name = f.id
+        if name not in _FOLD_PURE_BUILTINS:
+            return None
+        try:
+            if name == "chr":
+                if len(args) == 1 and isinstance(args[0], int) and 0 <= args[0] <= 0x10FFFF:
+                    return chr(args[0])
+                return None
+            if name == "ord":
+                if (
+                    len(args) == 1
+                    and isinstance(args[0], (str, bytes, bytearray))
+                    and len(args[0]) == 1
+                ):
+                    return ord(args[0])
+                return None
+            fn = {
+                "str": str,
+                "bytes": bytes,
+                "bytearray": bytearray,
+                "int": int,
+                "hex": hex,
+                "oct": oct,
+                "bin": bin,
+                "bool": bool,
+                "float": float,
+                "len": len,
+            }[name]
+            return _fold_cap(fn(*args))
+        except Exception:
+            return None
+
+    if isinstance(f, ast.Attribute):
+        attr = f.attr
+        owner = f.value
+        if isinstance(owner, ast.Name):
+            mod = owner.id
+            try:
+                if mod == "base64" and attr in _FOLD_B64_FUNCS and len(args) >= 1:
+                    return _fold_cap(getattr(base64, attr)(args[0]))
+                if (
+                    mod == "codecs"
+                    and attr in ("decode", "encode")
+                    and len(args) >= 2
+                    and isinstance(args[1], str)
+                ):
+                    return _fold_cap(_fold_apply_codec(args[1], args[0]))
+                if mod == "binascii" and attr in ("unhexlify", "a2b_hex") and len(args) >= 1:
+                    return _fold_cap(binascii.unhexlify(args[0]))
+                if (
+                    mod in ("bytes", "bytearray")
+                    and attr == "fromhex"
+                    and len(args) >= 1
+                    and isinstance(args[0], str)
+                ):
+                    return _fold_cap(bytes.fromhex(args[0]))
+            except Exception:
+                return None
+        recv = _const_fold(owner, None, _state, _depth + 1)
+        if isinstance(recv, (str, bytes, bytearray)) and attr in _FOLD_STR_METHODS:
+            try:
+                kwargs = {}
+                for kw in node.keywords:
+                    if kw.arg is None:
+                        return None
+                    kv = _const_fold(kw.value, None, _state, _depth + 1)
+                    if kv is None:
+                        return None
+                    kwargs[kw.arg] = kv
+                call_args = []
+                for a in args:
+                    call_args.append(
+                        list(a) if attr == "join" and isinstance(a, (list, tuple)) else a
+                    )
+                return _fold_cap(getattr(recv, attr)(*call_args, **kwargs))
+            except Exception:
+                return None
+    return None
+
+
+def _build_const_prop_env(tree):
+    """Names bound exactly once by a module-level ``name = <expr>`` (single Name
+    target), never re-assigned / aug-assigned / declared global-nonlocal / used as
+    a loop / comprehension / with / except target. Maps name -> RHS node.
+
+    Conservative: any ambiguity excludes the name. Only module-level statements are
+    considered so a name shadowed inside a def / loop is never folded.
+    """
+    assigned_once: dict[str, ast.expr] = {}
+    disqualified: set[str] = set()
+
+    def _disqualify_targets(target):
+        for n in ast.walk(target):
+            if isinstance(n, ast.Name):
+                disqualified.add(n.id)
+
+    # Module-level single assignments.
+    for stmt in getattr(tree, "body", []):
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            name = stmt.targets[0].id
+            if name in assigned_once or name in disqualified:
+                disqualified.add(name)
+                assigned_once.pop(name, None)
+            else:
+                assigned_once[name] = stmt.value
+        elif isinstance(stmt, ast.Assign):
+            for t in stmt.targets:
+                _disqualify_targets(t)
+        elif isinstance(stmt, (ast.AugAssign, ast.AnnAssign)):
+            if getattr(stmt, "target", None) is not None:
+                _disqualify_targets(stmt.target)
+
+    # Any name that is ALSO written anywhere else (loops, defs, walrus, aug, params,
+    # comprehension targets, with/except/for) is disqualified.
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, (ast.Store, ast.Del)):
+            nm = n.id
+            if nm in assigned_once:
+                # It is stored somewhere; allow only if that single store is the
+                # module-level assign we recorded (identity check below).
+                pass
+        if isinstance(n, (ast.AugAssign,)):
+            _disqualify_targets(n.target)
+        elif isinstance(n, ast.NamedExpr):
+            _disqualify_targets(n.target)
+        elif isinstance(n, (ast.For, ast.AsyncFor)):
+            _disqualify_targets(n.target)
+        elif isinstance(n, ast.comprehension):
+            _disqualify_targets(n.target)
+        elif isinstance(n, ast.withitem):
+            if n.optional_vars is not None:
+                _disqualify_targets(n.optional_vars)
+        elif isinstance(n, ast.ExceptHandler):
+            if n.name:
+                disqualified.add(n.name)
+        elif isinstance(n, (ast.Global, ast.Nonlocal)):
+            for nm in n.names:
+                disqualified.add(nm)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            disqualified.add(n.name)
+            args = getattr(n, "args", None)
+            if args is not None:
+                for a in list(args.args) + list(args.posonlyargs) + list(args.kwonlyargs):
+                    disqualified.add(a.arg)
+                for extra in (args.vararg, args.kwarg):
+                    if extra is not None:
+                        disqualified.add(extra.arg)
+
+    # Count how many module-level stores each recorded name really has; if more
+    # than one Store target references it anywhere, drop it.
+    store_counts: dict[str, int] = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+            store_counts[n.id] = store_counts.get(n.id, 0) + 1
+
+    env = {}
+    for name, rhs in assigned_once.items():
+        if name in disqualified:
+            continue
+        if store_counts.get(name, 0) != 1:
+            continue
+        env[name] = rhs
+    return env
+
+
+# --------------------------------------------------------------------------
+# Stage 2: eval / exec / compile recursive payload analysis.
+# --------------------------------------------------------------------------
+_MAX_UNWRAP_DEPTH = 5
+_MAX_INNER_SRC = 200 * 1024
+_MAX_INNER_PARSES = 25
+_MAX_TOTAL_INNER_CHARS = 2 * 1024 * 1024
+_MAX_BRACKET_DEPTH = 200
+_MAX_ANALYZER_NODES = 200_000
+
+_EXEC_BUILTINS = frozenset({"eval", "exec", "compile"})
+# Deserialization sinks that reconstruct/execute arbitrary objects from bytes.
+_CODE_DESERIALIZE_SINKS = frozenset(
+    {
+        "pickle.loads",
+        "marshal.loads",
+        "dill.loads",
+        "cloudpickle.loads",
+        "_pickle.loads",
+        "jsonpickle.decode",
+    }
+)
+# Attribute names of pure decode/decompress primitives used to hide a payload.
+_DECODE_ATTRS = frozenset(
+    {
+        "b64decode",
+        "b64encode",
+        "urlsafe_b64decode",
+        "standard_b64decode",
+        "b32decode",
+        "b16decode",
+        "a85decode",
+        "b85decode",
+        "decodebytes",
+        "fromhex",
+        "unhexlify",
+        "a2b_hex",
+        "a2b_base64",
+        "decompress",
+    }
+)
+_FETCH_FQ_PREFIXES = (
+    "requests.",
+    "urllib.",
+    "httpx.",
+    "socket.",
+    "aiohttp.",
+    "urllib3.",
+    "http.client.",
+)
+# Constant attribute names that, resolved off a sensitive module via getattr, still
+# reach shell / process / delete / dynamic-import / code-exec capabilities. A benign
+# constant attr (getpid, path, sep, getcwd, ...) is allowed; a dynamic attr blocks.
+_DANGEROUS_ATTR_NAMES = frozenset(
+    {
+        "system",
+        "popen",
+        "popen2",
+        "popen3",
+        "popen4",
+        "execl",
+        "execle",
+        "execlp",
+        "execlpe",
+        "execv",
+        "execve",
+        "execvp",
+        "execvpe",
+        "spawnl",
+        "spawnle",
+        "spawnlp",
+        "spawnlpe",
+        "spawnv",
+        "spawnve",
+        "spawnvp",
+        "spawnvpe",
+        "posix_spawn",
+        "posix_spawnp",
+        "startfile",
+        "fork",
+        "forkpty",
+        "remove",
+        "unlink",
+        "rmdir",
+        "removedirs",
+        "rename",
+        "renames",
+        "replace",
+        "truncate",
+        "chmod",
+        "lchmod",
+        "chown",
+        "lchown",
+        "chflags",
+        "mkdir",
+        "makedirs",
+        "mknod",
+        "symlink",
+        "link",
+        "chdir",
+        "chroot",
+        "import_module",
+        "__import__",
+        "reload",
+        "eval",
+        "exec",
+        "compile",
+        "run",
+        "call",
+        "check_call",
+        "check_output",
+        "Popen",
+        "getoutput",
+        "getstatusoutput",
+        "load_module",
+        "exec_module",
+        "loads",
+        "load",
+    }
+)
+
+
+class _AnalyzerBudget:
+    """Shared, bounded counters across one classification (incl. exec recursion)."""
+
+    __slots__ = ("inner_parses", "inner_chars", "nodes")
+
+    def __init__(self):
+        self.inner_parses = 0
+        self.inner_chars = 0
+        self.nodes = 0
+
+
+def _fq_attr_name(node):
+    """Return the dotted name for a Name/Attribute chain, else ''."""
+    parts = []
+    cur = node
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+        return ".".join(reversed(parts))
+    return ""
+
+
+def _bracket_depth(s):
+    """Linear max bracket-nesting scan; never invokes the C parser (DoS-safe)."""
+    depth = mx = 0
+    for ch in s:
+        if ch in "([{":
+            depth += 1
+            if depth > mx:
+                mx = depth
+        elif ch in ")]}":
+            depth = depth - 1 if depth > 0 else 0
+    return mx
+
+
+def _to_text(value):
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return value.decode("latin-1", "replace")
+    return value
+
+
+def _compile_mode(node, const_env):
+    """Recover a compile()'s literal mode= (3rd positional or keyword), else 'exec'."""
+    mode_node = None
+    if len(node.args) >= 3:
+        mode_node = node.args[2]
+    for kw in node.keywords or []:
+        if kw.arg == "mode":
+            mode_node = kw.value
+    if mode_node is not None:
+        v = _const_fold(mode_node, const_env)
+        if v in ("eval", "exec", "single"):
+            return "eval" if v == "eval" else "exec"
+    return "exec"
+
+
+def _build_exec_env(tree, const_env):
+    """Map single-assignment names to exec builtins (`e = exec`) and to a compiled
+    source (`c = compile("...")`) so a later call through the alias is unwrapped."""
+    store_counts: dict[str, int] = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+            store_counts[n.id] = store_counts.get(n.id, 0) + 1
+
+    exec_aliases: dict[str, str] = {}
+    compiled_env: dict[str, tuple] = {}
+    for stmt in getattr(tree, "body", []):
+        if not (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            continue
+        name = stmt.targets[0].id
+        if store_counts.get(name, 0) != 1:
+            continue
+        rhs = stmt.value
+        if isinstance(rhs, ast.Name) and rhs.id in _EXEC_BUILTINS:
+            exec_aliases[name] = rhs.id
+        elif (
+            isinstance(rhs, ast.Call)
+            and isinstance(rhs.func, ast.Name)
+            and rhs.func.id == "compile"
+            and rhs.args
+        ):
+            v = _const_fold(rhs.args[0], const_env)
+            if isinstance(v, (str, bytes, bytearray)):
+                compiled_env[name] = (_to_text(v), _compile_mode(rhs, const_env))
+    return exec_aliases, compiled_env
+
+
+def _payload_has_obfuscation_primitive(node):
+    """True when a (non-plain) exec/eval payload is assembled from decode / fetch /
+    runtime-assembly primitives -- the canonical loader shapes that are essentially
+    never benign inside a sandbox."""
+    if node is None or isinstance(node, (ast.Name, ast.Constant)):
+        return False
+    for sub in ast.walk(node):
+        if isinstance(sub, ast.Call):
+            fn = sub.func
+            fq = _fq_attr_name(fn)
+            attr = (
+                fn.attr
+                if isinstance(fn, ast.Attribute)
+                else (fn.id if isinstance(fn, ast.Name) else "")
+            )
+            if fq in _CODE_DESERIALIZE_SINKS:
+                return True
+            # A dynamic exec payload produced by another eval/exec/compile is a
+            # nested-dynamic-exec obfuscation (also fails closed on eval(eval(...))).
+            if isinstance(fn, ast.Name) and fn.id in _EXEC_BUILTINS:
+                return True
+            if attr in _DECODE_ATTRS or attr in ("decode", "translate"):
+                return True
+            if fq and any(fq.startswith(p) for p in _FETCH_FQ_PREFIXES):
+                return True
+            if attr == "join" and sub.args:
+                a0 = sub.args[0]
+                if isinstance(a0, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
+                    return True
+                if (
+                    isinstance(a0, ast.Call)
+                    and isinstance(a0.func, ast.Name)
+                    and a0.func.id in ("map", "filter")
+                ):
+                    return True
+            if isinstance(fn, ast.Name) and fn.id in ("bytes", "bytearray") and sub.args:
+                a0 = sub.args[0]
+                if isinstance(a0, (ast.GeneratorExp, ast.ListComp, ast.SetComp)):
+                    return True
+        elif isinstance(sub, ast.Attribute) and sub.attr in ("text", "content"):
+            if isinstance(sub.value, ast.Call):
+                return True
+        elif isinstance(sub, ast.Subscript) and isinstance(sub.slice, ast.Slice):
+            if sub.slice.step is not None and _const_fold(sub.slice.step) == -1:
+                return True
+        elif isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.Mult):
+            # Large string/bytes repetition assembles an oversized payload (parse
+            # bomb) that the folder refuses on size; fail closed.
+            for a, b in ((sub.left, sub.right), (sub.right, sub.left)):
+                sv = _const_fold(a)
+                nv = _const_fold(b)
+                if isinstance(sv, (str, bytes, bytearray)) and isinstance(nv, int) and nv >= 1024:
+                    return True
+    return False
+
+
+def _safe_parse_inner(src, mode, depth, budget):
+    """DoS-safe gateway to ast.parse on an attacker-influenced payload string.
+
+    Returns one of ("PARSED", tree|None), ("SYNTAX_BAD", None), ("BOUND_HIT", None).
+    A linear bracket-depth pre-scan rejects pathological nesting *before* the C
+    parser runs (defends the CPython C-stack overflow on deeply-nested input)."""
+    if depth >= _MAX_UNWRAP_DEPTH:
+        return ("BOUND_HIT", None)
+    if len(src) > _MAX_INNER_SRC:
+        return ("BOUND_HIT", None)
+    if budget.inner_parses >= _MAX_INNER_PARSES:
+        return ("BOUND_HIT", None)
+    if budget.inner_chars + len(src) > _MAX_TOTAL_INNER_CHARS:
+        return ("BOUND_HIT", None)
+    if _bracket_depth(src) > _MAX_BRACKET_DEPTH:
+        return ("BOUND_HIT", None)
+    budget.inner_parses += 1
+    budget.inner_chars += len(src)
+    try:
+        return ("PARSED", ast.parse(src, mode = mode))
+    except SyntaxError:
+        try:
+            ast.parse(src, mode = ("exec" if mode == "eval" else "eval"))
+            return ("PARSED", None)
+        except SyntaxError:
+            return ("SYNTAX_BAD", None)
+    except (RecursionError, MemoryError, ValueError):
+        return ("BOUND_HIT", None)
+
+
+def _first_unsafe_reason(info):
+    for key in (
+        "shell_escapes",
+        "dynamic_exec",
+        "network_calls",
+        "sensitive_file_reads",
+        "filesystem_violations",
+        "signal_tampering",
+        "exception_catching",
+    ):
+        for item in info.get(key, []) or []:
+            desc = item.get("description")
+            if desc:
+                return desc
+    return "unsafe operation"
+
+
+def _recover_exec_payload(node, func_id, const_env, exec_aliases, compiled_env):
+    """Recover a statically foldable source string for eval/exec/compile.
+
+    Returns ("RECOVERED", src, mode) / ("DYNAMIC", None, None) / ("NO_PAYLOAD", None, None).
+    """
+    if not node.args:
+        return ("NO_PAYLOAD", None, None)
+    arg0 = node.args[0]
+    base_mode = "eval" if func_id == "eval" else "exec"
+
+    # exec(compile("...", ...)) / eval(compile("...", "<s>", "eval"))
+    if (
+        isinstance(arg0, ast.Call)
+        and isinstance(arg0.func, ast.Name)
+        and arg0.func.id == "compile"
+        and arg0.args
+    ):
+        v = _const_fold(arg0.args[0], const_env)
+        if isinstance(v, (str, bytes, bytearray)):
+            return ("RECOVERED", _to_text(v), _compile_mode(arg0, const_env))
+        return ("DYNAMIC", None, None)
+
+    # c = compile("..."); exec(c)
+    if isinstance(arg0, ast.Name) and arg0.id in compiled_env:
+        csrc, cmode = compiled_env[arg0.id]
+        return ("RECOVERED", csrc, cmode)
+
+    v = _const_fold(arg0, const_env)
+    if isinstance(v, (str, bytes, bytearray)):
+        mode = _compile_mode(node, const_env) if func_id == "compile" else base_mode
+        return ("RECOVERED", _to_text(v), mode)
+    return ("DYNAMIC", None, None)
+
+
+# --------------------------------------------------------------------------
+# Stage 3: first-class filesystem confinement.
+#
+# A destructive/mutating op is allowed only when its path is PROVABLY inside the
+# session workdir (LOCAL). A read is blocked only when it PROVABLY escapes to a
+# sensitive or traversal target (ESCAPE_READ). Path resolution is a constant-fold
+# extended with os.path.join / pathlib join / f-string real-join + absolute-reset
+# semantics; anything host-controlled or dynamic collapses to UNKNOWN.
+# --------------------------------------------------------------------------
+_PATH_DEPTH_CAP = 24
+_PATHLIB_CTORS = frozenset(
+    {"Path", "PurePath", "PosixPath", "WindowsPath", "PurePosixPath", "PureWindowsPath"}
+)
+
+# Sensitive read targets: exact host-identity / credential files, credential dirs,
+# and the classic /proc self-inspection paths. Substring tokens are only consulted
+# for absolute or ~-rooted paths with no whitespace (avoids sentence false positives).
+_SANDBOX_SENSITIVE_EXACT = frozenset(
+    {"/etc/passwd", "/etc/shadow", "/etc/sudoers", "/etc/gshadow", "/etc/master.passwd"}
+)
+_SANDBOX_SENSITIVE_DIR_PARTS = (
+    "/etc/ssh/",
+    "/root/",
+    "/.ssh/",
+    "/.aws/",
+    "/.config/gcloud",
+    "/.kube/",
+    "/.docker/",
+)
+_SANDBOX_SENSITIVE_TOKENS = (
+    "id_rsa",
+    "id_ed25519",
+    ".pem",
+    ".netrc",
+    "credentials",
+    ".git-credentials",
+    "/.huggingface/token",
+    ".kube/config",
+)
+_SANDBOX_SENSITIVE_RE = re.compile(
+    r"^/proc/(?:self|\d+)/(?:environ|cmdline|maps|mem|task/\d+/environ)$"
+)
+
+
+def _is_sensitive_abs_path(s):
+    """Provably-sensitive absolute (or ~-rooted) path, whitespace-free."""
+    if not isinstance(s, str) or not s:
+        return False
+    norm = s.replace("\\", "/")
+    if any(ch.isspace() for ch in norm):
+        return False
+    if not (norm.startswith("/") or norm.startswith("~")):
+        return False
+    if norm in _SANDBOX_SENSITIVE_EXACT:
+        return True
+    if any(part in norm for part in _SANDBOX_SENSITIVE_DIR_PARTS):
+        return True
+    if _SANDBOX_SENSITIVE_RE.match(norm):
+        return True
+    low = norm.lower()
+    return any(tok in low for tok in _SANDBOX_SENSITIVE_TOKENS)
+
+
+def _classify_path_string(s):
+    """LOCAL for a safe-relative path; ESCAPE for absolute / drive / ~ / `..`."""
+    if isinstance(s, (bytes, bytearray)):
+        s = _to_text(s)
+    if not isinstance(s, str) or s == "":
+        return "ESCAPE"  # empty path is not provably local -> fail closed
+    norm = s.replace("\\", "/")
+    if s[0] in ("/", "\\", "~"):
+        return "ESCAPE"
+    if len(s) >= 2 and s[1] == ":":
+        return "ESCAPE"
+    if ".." in norm.split("/"):
+        return "ESCAPE"
+    return "LOCAL"
+
+
+def _is_pathlib_expr(node):
+    """Whether an expression is structurally a pathlib.Path (ctor / join / attr chain)."""
+    if isinstance(node, ast.Call):
+        f = node.func
+        if isinstance(f, ast.Name) and f.id in _PATHLIB_CTORS:
+            return True
+        if isinstance(f, ast.Attribute):
+            if f.attr in _PATHLIB_CTORS:
+                return True
+            if f.attr in (
+                "joinpath",
+                "with_name",
+                "with_suffix",
+                "absolute",
+                "resolve",
+                "expanduser",
+                "parent",
+            ) and _is_pathlib_expr(f.value):
+                return True
+        return False
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        return _is_pathlib_expr(node.left) or _is_pathlib_expr(node.right)
+    if isinstance(node, ast.Attribute):
+        return _is_pathlib_expr(node.value)
+    return False
+
+
+def _resolve_join(components, env, depth):
+    """Combine component verdicts with join + absolute-reset semantics."""
+    result = "LOCAL"
+    for c in components:
+        v = _resolve_path(c, env, depth + 1)
+        if v == "ESCAPE":
+            result = "ESCAPE"  # absolute reset or `..` -> outside
+        elif v == "UNKNOWN" and result != "ESCAPE":
+            result = "UNKNOWN"
+    return result
+
+
+def _resolve_path(
+    node,
+    env = None,
+    depth = 0,
+):
+    """Classify a path expression as LOCAL / ESCAPE / UNKNOWN (see Stage 3)."""
+    if node is None or depth > _PATH_DEPTH_CAP:
+        return "UNKNOWN"
+
+    v = _const_fold(node, env)
+    if isinstance(v, (str, bytes, bytearray)):
+        return _classify_path_string(v)
+
+    if isinstance(node, ast.Name):
+        rhs = (env or {}).get(node.id)
+        if rhs is not None:
+            return _resolve_path(rhs, env, depth + 1)
+        return "UNKNOWN"
+
+    if isinstance(node, ast.JoinedStr):
+        # Not all-const (else it folded above): an absolute literal prefix escapes;
+        # a relative prefix + dynamic hole cannot be proven local -> UNKNOWN.
+        prefix = ""
+        for part in node.values:
+            if isinstance(part, ast.Constant):
+                prefix += str(part.value)
+            else:
+                break
+        if prefix:
+            if prefix[0] in ("/", "\\", "~"):
+                return "ESCAPE"
+            if len(prefix) >= 2 and prefix[1] == ":":
+                return "ESCAPE"
+            if ".." in prefix.replace("\\", "/").split("/"):
+                return "ESCAPE"
+        return "UNKNOWN"
+
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, ast.Add):
+            left = _resolve_path(node.left, env, depth + 1)
+            return "ESCAPE" if left == "ESCAPE" else "UNKNOWN"
+        if isinstance(node.op, ast.Div):
+            return _resolve_join([node.left, node.right], env, depth)
+        return "UNKNOWN"
+
+    if isinstance(node, ast.Call):
+        return _resolve_path_call(node, env, depth)
+
+    return "UNKNOWN"
+
+
+def _resolve_path_call(node, env, depth):
+    f = node.func
+    attr = f.attr if isinstance(f, ast.Attribute) else (f.id if isinstance(f, ast.Name) else "")
+
+    # os.path.join(...) / posixpath.join(...)
+    if attr == "join" and isinstance(f, ast.Attribute):
+        owner_fq = _fq_attr_name(f.value)
+        if owner_fq.endswith("path") or owner_fq in ("op",):
+            return _resolve_join(node.args, env, depth)
+    if attr == "joinpath" and isinstance(f, ast.Attribute):
+        return _resolve_join([f.value, *node.args], env, depth)
+    # Host-controlled / absolute anchors are never provably local.
+    if attr in (
+        "expanduser",
+        "expandvars",
+        "abspath",
+        "realpath",
+        "getcwd",
+        "getcwdb",
+        "gettempdir",
+        "mkdtemp",
+        "home",
+        "cwd",
+    ):
+        return "UNKNOWN"
+    if attr == "normpath" and node.args:
+        v = _const_fold(node.args[0], env)
+        if isinstance(v, (str, bytes, bytearray)):
+            return _classify_path_string(os.path.normpath(_to_text(v)))
+        return "UNKNOWN"
+    # Path(...) / PurePath(...) constructors (bare or pathlib.Path).
+    if (isinstance(f, ast.Name) and f.id in _PATHLIB_CTORS) or (
+        isinstance(f, ast.Attribute) and f.attr in _PATHLIB_CTORS
+    ):
+        if len(node.args) == 1:
+            return _resolve_path(node.args[0], env, depth + 1)
+        if len(node.args) >= 2:
+            return _resolve_join(node.args, env, depth)
+        return "UNKNOWN"
+    return "UNKNOWN"
+
+
+# Mutating-op inventory (fully-qualified stdlib names).
+_FS_DELETE = frozenset(
+    {
+        "os.remove",
+        "os.unlink",
+        "os.rmdir",
+        "os.removedirs",
+        "shutil.rmtree",
+        "pathlib.Path.unlink",
+        "pathlib.Path.rmdir",
+    }
+)
+_FS_META = frozenset(
+    {"os.chmod", "os.lchmod", "os.chown", "os.lchown", "os.chflags", "os.truncate", "shutil.chown"}
+)
+_FS_MKDIR = frozenset({"os.mkdir", "os.makedirs", "os.mknod"})
+_FS_CHDIR = frozenset({"os.chdir", "os.fchdir"})
+_FS_SINGLE_MUTATE = _FS_DELETE | _FS_META | _FS_MKDIR | _FS_CHDIR
+_FS_RENAME = frozenset({"os.rename", "os.renames", "os.replace", "shutil.move"})
+_FS_COPY = frozenset(
+    {
+        "shutil.copy",
+        "shutil.copy2",
+        "shutil.copyfile",
+        "shutil.copytree",
+        "shutil.copymode",
+        "shutil.copystat",
+    }
+)
+_FS_SYMLINK = frozenset({"os.symlink", "os.link"})
+_FS_TEMPFILE = frozenset(
+    {
+        "tempfile.mkstemp",
+        "tempfile.mkdtemp",
+        "tempfile.NamedTemporaryFile",
+        "tempfile.TemporaryFile",
+        "tempfile.TemporaryDirectory",
+        "tempfile.SpooledTemporaryFile",
+    }
+)
+_FS_LIBWRITER_FQ = frozenset(
+    {
+        "numpy.save",
+        "numpy.savez",
+        "numpy.savez_compressed",
+        "numpy.savetxt",
+        "np.save",
+        "np.savez",
+        "np.savez_compressed",
+        "np.savetxt",
+        "torch.save",
+        "joblib.dump",
+        "cv2.imwrite",
+    }
+)
+# Method-name-keyed library writers (receiver is a df / array / image / figure).
+_FS_LIBWRITER_METHODS = frozenset(
+    {"to_csv", "to_parquet", "to_pickle", "to_json", "to_excel", "to_feather", "savefig", "imwrite"}
+)
+# pathlib mutating methods -> (needs_receiver_path, extra_arg_index_or_None, op).
+# unambiguous method names fire on any pathlib-looking receiver; the ambiguous
+# ones (rename/replace/mkdir/chmod) require the receiver to be a pathlib expr.
+_FS_PATHLIB_MUTATE = {
+    "write_text": None,
+    "write_bytes": None,
+    "unlink": None,
+    "rmdir": None,
+    "symlink_to": 0,
+    "hardlink_to": 0,
+    "touch": None,
+    "rename": 0,
+    "replace": 0,
+    "mkdir": None,
+    "chmod": None,
+}
+_FS_PATHLIB_READ = frozenset({"read_text", "read_bytes"})
+
+
+# --------------------------------------------------------------------------
+# Stage 4: pragmatic aliasing (single-assignment alias + inline literal container).
+# Catches `s = os.system; s('rm -rf /')` and `[os.system][0](...)` feeding the
+# existing shell-command denylist. Deliberately low-FP: only unambiguous single
+# assignments (a name stored exactly once) and inline literal containers, never a
+# flow-insensitive union (so `s = os.system; s = print; s('hi')` is NOT aliased).
+# --------------------------------------------------------------------------
+_SHELL_SINK_FUNCS = frozenset(
+    {
+        "os.system",
+        "os.popen",
+        "os.popen2",
+        "os.popen3",
+        "os.popen4",
+        "os.execl",
+        "os.execle",
+        "os.execlp",
+        "os.execlpe",
+        "os.execv",
+        "os.execve",
+        "os.execvp",
+        "os.execvpe",
+        "os.spawnl",
+        "os.spawnle",
+        "os.spawnlp",
+        "os.spawnlpe",
+        "os.spawnv",
+        "os.spawnve",
+        "os.spawnvp",
+        "os.spawnvpe",
+        "os.posix_spawn",
+        "os.posix_spawnp",
+        "subprocess.run",
+        "subprocess.call",
+        "subprocess.check_call",
+        "subprocess.check_output",
+        "subprocess.Popen",
+        "subprocess.getoutput",
+        "subprocess.getstatusoutput",
+    }
+)
+
+
+def _resolve_static_shell_sink(node, os_aliases, subprocess_aliases, from_aliases):
+    """Resolve an expression to a shell-sink fully-qualified name, else None."""
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        if node.value.id in os_aliases:
+            fq = f"os.{node.attr}"
+            if fq in _SHELL_SINK_FUNCS:
+                return fq
+        if node.value.id in subprocess_aliases:
+            fq = f"subprocess.{node.attr}"
+            if fq in _SHELL_SINK_FUNCS:
+                return fq
+    if isinstance(node, ast.Name):
+        return from_aliases.get(node.id)
+    return None
+
+
+def _build_shell_sink_aliases(tree):
+    """Single-assignment names (stored exactly once) bound to a resolved shell sink."""
+    os_aliases = {"os"}
+    subprocess_aliases = {"subprocess"}
+    from_aliases: dict[str, str] = {}
+    store_counts: dict[str, int] = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+            store_counts[n.id] = store_counts.get(n.id, 0) + 1
+        elif isinstance(n, ast.Import):
+            for a in n.names:
+                if a.name == "os":
+                    os_aliases.add(a.asname or "os")
+                elif a.name == "subprocess":
+                    subprocess_aliases.add(a.asname or "subprocess")
+        elif isinstance(n, ast.ImportFrom) and n.module in ("os", "subprocess"):
+            for a in n.names:
+                fq = f"{n.module}.{a.name}"
+                if fq in _SHELL_SINK_FUNCS:
+                    from_aliases[a.asname or a.name] = fq
+
+    aliases: dict[str, str] = {}
+    for stmt in getattr(tree, "body", []):
+        if not (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+        ):
+            continue
+        name = stmt.targets[0].id
+        if store_counts.get(name, 0) != 1:
+            continue  # ambiguous reassignment -> do not alias (avoids FPs)
+        fq = _resolve_static_shell_sink(stmt.value, os_aliases, subprocess_aliases, from_aliases)
+        if fq:
+            aliases[name] = fq
+    return aliases
+
+
+def _check_signal_escape_patterns(
+    code: str,
+    _depth: int = 0,
+    _budget = None,
+):
     """Check for patterns that could escape signal-based timeouts. Returns
     (safe: bool, details: dict). Vendored from unsloth_zoo.rl_environments to
     avoid importing unsloth_zoo (needs GPU drivers; fails on Apple Silicon)."""
@@ -1608,7 +2796,107 @@ def _check_signal_escape_patterns(code: str):
     signal_tampering = []
     exception_catching = []
     shell_escapes = []
+    dynamic_exec = []
+    filesystem_violations = []
     warnings = []
+
+    # Feature flag + shared budget for the recursive sink analyzer (Stages 2-4).
+    # Default on; UNSLOTH_STUDIO_SINK_ANALYZER=0 reverts to the legacy blanket
+    # eval/exec ban and disables filesystem-confinement + aliasing analysis.
+    _analyzer_on = os.environ.get("UNSLOTH_STUDIO_SINK_ANALYZER", "1") != "0"
+    if _budget is None:
+        _budget = _AnalyzerBudget()
+    if _analyzer_on:
+        try:
+            _const_env = _build_const_prop_env(tree)
+            _exec_aliases, _compiled_env = _build_exec_env(tree, _const_env)
+            _sink_aliases = _build_shell_sink_aliases(tree)
+        except Exception:  # pragma: no cover - defensive: never crashier than legacy
+            logger.warning("sandbox analyzer context build failed; legacy fallback", exc_info = True)
+            _analyzer_on = False
+            _const_env, _exec_aliases, _compiled_env = {}, {}, {}
+            _sink_aliases = {}
+    else:
+        _const_env, _exec_aliases, _compiled_env = {}, {}, {}
+        _sink_aliases = {}
+
+    def _analyze_exec_call(node, func_id):
+        """Stage 2 driver: recover + recurse a foldable payload, else dynamic policy."""
+        try:
+            kind, src, mode = _recover_exec_payload(
+                node, func_id, _const_env, _exec_aliases, _compiled_env
+            )
+            if kind == "NO_PAYLOAD":
+                return
+            if kind == "RECOVERED":
+                parsed_kind, _ = _safe_parse_inner(src, mode, _depth, _budget)
+                if parsed_kind == "PARSED":
+                    inner_safe, inner_info = _check_signal_escape_patterns(src, _depth + 1, _budget)
+                    if not inner_safe and not inner_info.get("error"):
+                        dynamic_exec.append(
+                            {
+                                "type": "dynamic_exec",
+                                "line": getattr(node, "lineno", -1),
+                                "description": (
+                                    f"{func_id}() payload reaches unsafe operation: "
+                                    f"{_first_unsafe_reason(inner_info)}"
+                                ),
+                            }
+                        )
+                    return
+                if parsed_kind == "BOUND_HIT":
+                    dynamic_exec.append(
+                        {
+                            "type": "dynamic_exec",
+                            "line": getattr(node, "lineno", -1),
+                            "description": (
+                                f"{func_id}() payload exceeds static-analysis bounds "
+                                "(oversized / too-deeply-nested / too-many-layers)"
+                            ),
+                        }
+                    )
+                    return
+                # SYNTAX_BAD on a fully RECOVERED literal: we hold the exact
+                # source and it simply is not valid Python for this sink's mode,
+                # so it raises SyntaxError at runtime (same mode as the static
+                # parse) -- harmless, not an ACE vector. Allow it; only truly
+                # opaque (non-recoverable) payloads fall to the dynamic policy.
+                return
+            payload = node.args[0] if node.args else None
+            if _payload_has_obfuscation_primitive(payload):
+                dynamic_exec.append(
+                    {
+                        "type": "dynamic_exec",
+                        "line": getattr(node, "lineno", -1),
+                        "description": (
+                            f"{func_id}() of a runtime-decoded / fetched / assembled payload"
+                        ),
+                    }
+                )
+            elif func_id != "compile":
+                # An opaque, non-recoverable payload for an executing sink (eval/exec/
+                # runpy) is a universal ACE bypass: it can synthesize any shell/network/
+                # filesystem escape at runtime, invisibly to every static check. Block it
+                # (compile() alone does not run, so it stays allowed -- the exec/eval of its
+                # result is caught at that call). ast.literal_eval / json.loads cover data.
+                dynamic_exec.append(
+                    {
+                        "type": "dynamic_exec",
+                        "line": getattr(node, "lineno", -1),
+                        "description": (
+                            f"{func_id}() of a non-literal payload cannot be statically "
+                            "verified (use ast.literal_eval / json.loads for data)"
+                        ),
+                    }
+                )
+        except Exception:  # pragma: no cover - fail closed, never crashier than legacy
+            dynamic_exec.append(
+                {
+                    "type": "dynamic_exec",
+                    "line": getattr(node, "lineno", -1),
+                    "description": f"dynamic code execution via {func_id}()",
+                }
+            )
 
     def _ast_name_matches(node, names):
         if isinstance(node, ast.Name):
@@ -1625,39 +2913,62 @@ def _check_signal_escape_patterns(code: str):
             return full_name in names
         return False
 
-    # Dangerous os/subprocess functions that can execute shell commands.
-    _SHELL_EXEC_FUNCS = frozenset(
+    # Dangerous os/subprocess functions that can execute shell commands
+    # (defined at module scope as _SHELL_SINK_FUNCS so Stage 4 alias resolution
+    # can share it).
+    _SHELL_EXEC_FUNCS = _SHELL_SINK_FUNCS
+
+    # Dynamic-execution / obfuscation primitives that defeat the static (name-based) checks
+    # above: they build or reach a dangerous callable at runtime, so a bare name match cannot
+    # see the payload. eval/exec/compile are direct code-execution builtins; __import__ /
+    # importlib load a module by (possibly computed) name; getattr/setattr on a sensitive
+    # module implement `getattr(os, 'sys'+'tem')(...)`.
+    _DYNAMIC_EXEC_BUILTINS = frozenset({"eval", "exec", "compile"})
+    _DYNAMIC_IMPORT_FUNCS = frozenset(
+        {"importlib.import_module", "importlib.reload", "importlib.__import__"}
+    )
+    # Dynamic import is a real workflow (e.g. importing huggingface_hub), so it is flagged only
+    # when the target is computed (non-literal name = obfuscation) or names a module that can
+    # reach code execution / shell / builtins. A benign literal (json, numpy, huggingface_hub)
+    # passes; the HF upload gate below still validates its call args separately.
+    _DANGEROUS_IMPORT_NAMES = frozenset(
         {
-            "os.system",
-            "os.popen",
-            "os.popen2",
-            "os.popen3",
-            "os.popen4",
-            "os.execl",
-            "os.execle",
-            "os.execlp",
-            "os.execlpe",
-            "os.execv",
-            "os.execve",
-            "os.execvp",
-            "os.execvpe",
-            "os.spawnl",
-            "os.spawnle",
-            "os.spawnlp",
-            "os.spawnlpe",
-            "os.spawnv",
-            "os.spawnve",
-            "os.spawnvp",
-            "os.spawnvpe",
-            "os.posix_spawn",
-            "os.posix_spawnp",
-            "subprocess.run",
-            "subprocess.call",
-            "subprocess.check_call",
-            "subprocess.check_output",
-            "subprocess.Popen",
-            "subprocess.getoutput",
-            "subprocess.getstatusoutput",
+            "os",
+            "subprocess",
+            "sys",
+            "builtins",
+            "importlib",
+            "ctypes",
+            "pty",
+            "socket",
+            "signal",
+            "resource",
+            "shutil",
+            "multiprocessing",
+            "runpy",
+            "code",
+            "codeop",
+            "pdb",
+            "mmap",
+            "fcntl",
+        }
+    )
+    # Attribute-name obfuscation via getattr/setattr is only flagged when aimed at a module
+    # that can execute code or reach builtins (keeps ordinary getattr(obj, "field") benign).
+    _DYNAMIC_ATTR_TARGETS = frozenset({"os", "subprocess", "sys", "builtins", "importlib"})
+    # Introspection "gadget" dunders used to walk from a harmless object to os/builtins
+    # (``().__class__.__bases__[0].__subclasses__()``). ``__class__`` / ``__dict__`` are
+    # intentionally excluded (too common); the chain still trips on the others.
+    _GADGET_DUNDERS = frozenset(
+        {
+            "__subclasses__",
+            "__bases__",
+            "__base__",
+            "__mro__",
+            "__globals__",
+            "__builtins__",
+            "__code__",
+            "__closure__",
         }
     )
 
@@ -1754,6 +3065,33 @@ def _check_signal_escape_patterns(code: str):
             self.generic_visit(node)
             self.loop_depth -= 1
 
+        def _resolve_container_sink(self, sub):
+            """Resolve an inline literal-container index callee to a shell sink fq.
+
+            Covers ``[os.system][0]``, ``(os.system,)[0]`` and ``{'k': os.system}['k']``.
+            """
+
+            def _elt(elt):
+                fq = _resolve_static_shell_sink(
+                    elt, self.os_aliases, self.subprocess_aliases, self.shell_exec_aliases
+                )
+                if fq:
+                    return fq
+                if isinstance(elt, ast.Name):
+                    return _sink_aliases.get(elt.id)
+                return None
+
+            container = sub.value
+            ci = _const_fold(sub.slice, _const_env)
+            if isinstance(container, (ast.List, ast.Tuple)) and isinstance(ci, int):
+                if -len(container.elts) <= ci < len(container.elts):
+                    return _elt(container.elts[ci])
+            if isinstance(container, ast.Dict) and ci is not None:
+                for k, v in zip(container.keys, container.values):
+                    if k is not None and _const_fold(k, _const_env) == ci:
+                        return _elt(v)
+            return None
+
         def visit_Call(self, node):
             func = node.func
             func_name = None
@@ -1815,6 +3153,12 @@ def _check_signal_escape_patterns(code: str):
             elif isinstance(func, ast.Name):
                 # from-import aliases: from os import system; system(...)
                 shell_func = self.shell_exec_aliases.get(func.id)
+                # Stage 4: single-assignment alias `s = os.system; s('rm -rf /')`.
+                if shell_func is None and _analyzer_on:
+                    shell_func = _sink_aliases.get(func.id)
+            elif _analyzer_on and isinstance(func, ast.Subscript):
+                # Stage 4: inline literal container index `[os.system][0](...)`.
+                shell_func = self._resolve_container_sink(func)
 
             if shell_func and shell_func in _SHELL_EXEC_FUNCS:
                 # Expand **kwargs dicts to inspect their keys.
@@ -1901,6 +3245,103 @@ def _check_signal_escape_patterns(code: str):
                                 }
                             )
 
+            # --- Dynamic execution / obfuscation primitives ---
+            # eval / exec / compile (bare builtin or a single-assignment alias).
+            exec_func_id = None
+            if isinstance(func, ast.Name):
+                if func.id in _DYNAMIC_EXEC_BUILTINS:
+                    exec_func_id = func.id
+                elif _analyzer_on and func.id in _exec_aliases:
+                    exec_func_id = _exec_aliases[func.id]
+
+            if exec_func_id is not None:
+                if _analyzer_on:
+                    # Stage 2: recover + recurse the payload instead of a blanket ban,
+                    # so eval("2+2") passes while obfuscated escapes still block.
+                    _analyze_exec_call(node, exec_func_id)
+                else:
+                    dynamic_exec.append(
+                        {
+                            "type": "dynamic_exec",
+                            "line": getattr(node, "lineno", -1),
+                            "description": f"dynamic code execution via {exec_func_id}()",
+                        }
+                    )
+            else:
+                dynamic_desc = None
+                is_dynamic_import = _ast_name_matches(func, _DYNAMIC_IMPORT_FUNCS) or (
+                    isinstance(func, ast.Name) and func.id in ("__import__", "import_module")
+                )
+                # Deserialization sinks reconstruct arbitrary objects/code from bytes.
+                if _analyzer_on and _fq_attr_name(func) in _CODE_DESERIALIZE_SINKS:
+                    dynamic_desc = (
+                        f"{_fq_attr_name(func)}() deserializes an unverifiable code payload"
+                    )
+                elif is_dynamic_import:
+                    # Computed module name (obfuscation) or a dangerous target is unsafe; a
+                    # benign literal import (huggingface_hub, json, ...) passes. With the
+                    # analyzer on, the name is constant-folded first so `__import__(
+                    # "hugging"+"face_hub")` resolves to a real module instead of blocking.
+                    if node.args:
+                        if _analyzer_on:
+                            folded = _const_fold(node.args[0], _const_env)
+                            mod = folded if isinstance(folded, str) else None
+                        else:
+                            mod = _extract_string_from_node(node.args[0])
+                    else:
+                        mod = None
+                    if mod is None or mod.split(".")[0] in _DANGEROUS_IMPORT_NAMES:
+                        dynamic_desc = "dynamic import of a computed or sensitive module name"
+                elif (
+                    isinstance(func, ast.Name)
+                    and func.id in ("getattr", "setattr")
+                    and node.args
+                    and _ast_name_matches(
+                        node.args[0],
+                        _DYNAMIC_ATTR_TARGETS | self.os_aliases | self.subprocess_aliases,
+                    )
+                ):
+                    # Stage 2 refinement: a benign constant attr (getattr(os, "getpid"))
+                    # is allowed; only a dynamic attr or a dangerous constant attr blocks.
+                    if _analyzer_on and len(node.args) >= 2:
+                        attr_val = _const_fold(node.args[1], _const_env)
+                        if isinstance(attr_val, str):
+                            if attr_val in _DANGEROUS_ATTR_NAMES:
+                                dynamic_desc = (
+                                    f"{func.id}() on a sensitive module "
+                                    "(attribute-name obfuscation)"
+                                )
+                        else:
+                            dynamic_desc = (
+                                f"{func.id}() on a sensitive module (attribute-name obfuscation)"
+                            )
+                    else:
+                        dynamic_desc = (
+                            f"{func.id}() on a sensitive module (attribute-name obfuscation)"
+                        )
+                if dynamic_desc:
+                    dynamic_exec.append(
+                        {
+                            "type": "dynamic_exec",
+                            "line": getattr(node, "lineno", -1),
+                            "description": dynamic_desc,
+                        }
+                    )
+
+            self.generic_visit(node)
+
+        def visit_Attribute(self, node):
+            # Introspection gadget dunders (``__subclasses__``, ``__globals__``, ...) are the
+            # standard way to walk from a benign object to os/builtins, bypassing the name-based
+            # checks. Flag the attribute access itself, then keep descending.
+            if node.attr in _GADGET_DUNDERS:
+                dynamic_exec.append(
+                    {
+                        "type": "dynamic_exec",
+                        "line": getattr(node, "lineno", -1),
+                        "description": f"introspection gadget attribute {node.attr}",
+                    }
+                )
             self.generic_visit(node)
 
         def visit_ExceptHandler(self, node):
@@ -2514,21 +3955,193 @@ def _check_signal_escape_patterns(code: str):
                         )
             self.generic_visit(node)
 
+    _fs_read_strict = os.environ.get("FS_READ_STRICT", "0") != "0"
+
+    def _fs_block(node, description):
+        filesystem_violations.append(
+            {
+                "type": "filesystem_violation",
+                "line": getattr(node, "lineno", -1),
+                "description": description,
+            }
+        )
+
+    def _fs_mutating(node, path_node, label):
+        verdict = _resolve_path(path_node, _const_env)
+        if verdict != "LOCAL":
+            reason = (
+                "escapes the session workdir"
+                if verdict == "ESCAPE"
+                else "cannot be proven to stay inside the session workdir"
+            )
+            _fs_block(
+                node, f"{label}: destination path {reason} (must be a sandbox-local relative path)"
+            )
+
+    def _fs_libwriter(node, path_node, label):
+        # Best-effort library writers block only on a PROVABLE escape; a dynamic
+        # (UNKNOWN) path is left to the runtime realpath backstop to avoid
+        # false-positiving on in-memory buffers.
+        if _resolve_path(path_node, _const_env) == "ESCAPE":
+            _fs_block(node, f"{label}: destination path escapes the session workdir")
+
+    def _fs_read(node, path_node, label):
+        v = _const_fold(path_node, _const_env)
+        s = _to_text(v) if isinstance(v, (str, bytes, bytearray)) else None
+        if s is not None:
+            norm = s.replace("\\", "/")
+            if s[:1] == "~" or ".." in norm.split("/"):
+                _fs_block(node, f"{label}: read escapes the session workdir via traversal")
+                return
+            if _is_sensitive_abs_path(norm):
+                _fs_block(node, f"{label}: reads a sensitive host identity / credential file")
+                return
+            return
+        if _fs_read_strict and _resolve_path(path_node, _const_env) != "LOCAL":
+            _fs_block(node, f"{label}: read path cannot be proven sandbox-local (FS_READ_STRICT)")
+
+    def _kw(node, name):
+        for kw in node.keywords or []:
+            if kw.arg == name:
+                return kw.value
+        return None
+
+    def _open_is_write(node):
+        mode_node = node.args[1] if len(node.args) >= 2 else _kw(node, "mode")
+        if mode_node is None:
+            return False, "r"
+        v = _const_fold(mode_node, _const_env)
+        if isinstance(v, str):
+            return any(c in v for c in "wax+"), v
+        return True, None  # dynamic mode -> treat as write (conservative)
+
+    class _FilesystemPolicyVisitor(ast.NodeVisitor):
+        def visit_Call(self, node):
+            fq = _fq_attr_name(node.func)
+            f = node.func
+            method = (
+                f.attr
+                if isinstance(f, ast.Attribute)
+                else (f.id if isinstance(f, ast.Name) else "")
+            )
+
+            # Callee-independent literal-sensitive-path scan (library loaders that
+            # internally open(): pandas.read_csv('/etc/shadow'), np.load('/etc/passwd')).
+            for arg in list(node.args) + [kw.value for kw in (node.keywords or [])]:
+                fv = _const_fold(arg, _const_env)
+                sv = _to_text(fv) if isinstance(fv, (str, bytes, bytearray)) else None
+                if sv is not None and _is_sensitive_abs_path(sv):
+                    _fs_block(node, f"{sv!r} is a sensitive host identity / credential file")
+                    break
+
+            # builtins/io open(): write mode -> mutating; read mode -> read policy.
+            is_open = (isinstance(f, ast.Name) and f.id == "open") or fq in ("io.open", "os.fdopen")
+            if is_open and fq != "os.fdopen" and node.args:
+                is_write, _mode = _open_is_write(node)
+                if is_write:
+                    _fs_mutating(node, node.args[0], "open(write)")
+                else:
+                    _fs_read(node, node.args[0], "open(read)")
+
+            # os.open(path, flags): write flags -> mutating; else read.
+            if fq == "os.open" and node.args:
+                flags = node.args[1] if len(node.args) >= 2 else None
+                flag_names = (
+                    {n.attr for n in ast.walk(flags) if isinstance(n, ast.Attribute)}
+                    if flags
+                    else set()
+                )
+                is_write = (
+                    flags is None
+                    or bool(flag_names & {"O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND"})
+                    or not flag_names
+                )
+                if is_write:
+                    _fs_mutating(node, node.args[0], "os.open(write)")
+                else:
+                    _fs_read(node, node.args[0], "os.open(read)")
+
+            if fq in _FS_SINGLE_MUTATE and node.args:
+                _fs_mutating(node, node.args[0], fq)
+            elif fq in _FS_RENAME and node.args:
+                # rename/move: both src (removed) and dst are mutating.
+                _fs_mutating(node, node.args[0], f"{fq} (source)")
+                if len(node.args) >= 2:
+                    _fs_mutating(node, node.args[1], f"{fq} (destination)")
+                else:
+                    dst = _kw(node, "dst")
+                    if dst is not None:
+                        _fs_mutating(node, dst, f"{fq} (destination)")
+            elif fq in _FS_COPY and node.args:
+                dst = node.args[1] if len(node.args) >= 2 else _kw(node, "dst")
+                if dst is not None:
+                    _fs_mutating(node, dst, f"{fq} (destination)")
+                _fs_read(node, node.args[0], f"{fq} (source)")
+            elif fq in _FS_SYMLINK and node.args:
+                # os.symlink(src=target, dst=linkpath) / os.link: check BOTH.
+                _fs_mutating(node, node.args[0], f"{fq} (target)")
+                if len(node.args) >= 2:
+                    _fs_mutating(node, node.args[1], f"{fq} (link path)")
+            elif fq in _FS_TEMPFILE:
+                d = _kw(node, "dir")
+                if d is not None and _resolve_path(d, _const_env) != "LOCAL":
+                    _fs_block(node, f"{fq}: dir= must be a sandbox-local relative path")
+            elif fq in _FS_LIBWRITER_FQ and node.args:
+                _fs_libwriter(node, node.args[0], fq)
+
+            # Method-keyed library writers (df.to_csv(path), img.save(path), ...).
+            if isinstance(f, ast.Attribute):
+                if method in _FS_LIBWRITER_METHODS and node.args:
+                    _fs_libwriter(node, node.args[0], method)
+                elif method == "save" and node.args and fq not in _FS_LIBWRITER_FQ:
+                    # PIL Image.save / model.save style: block only a provable escape.
+                    _fs_libwriter(node, node.args[0], method)
+
+            # pathlib mutating / reading methods on a Path-looking receiver. A plain
+            # variable receiver is left to the Stage 5 runtime realpath backstop so
+            # benign `p = Path("out.txt"); p.write_text(...)` is not over-blocked.
+            if (
+                isinstance(f, ast.Attribute)
+                and _is_pathlib_expr(f.value)
+                and (method in _FS_PATHLIB_MUTATE or method in _FS_PATHLIB_READ)
+            ):
+                recv = f.value
+                if method in _FS_PATHLIB_READ:
+                    _fs_read(node, recv, f"pathlib.Path.{method}")
+                else:
+                    _fs_mutating(node, recv, f"pathlib.Path.{method}")
+                    extra = _FS_PATHLIB_MUTATE.get(method)
+                    if extra is not None and len(node.args) > extra:
+                        _fs_mutating(node, node.args[extra], f"pathlib.Path.{method} (target)")
+
+            self.generic_visit(node)
+
     NetworkAndIoVisitor().visit(tree)
+
+    if _analyzer_on:
+        try:
+            _FilesystemPolicyVisitor().visit(tree)
+        except Exception:  # pragma: no cover - never crashier than legacy
+            logger.warning("sandbox filesystem analyzer failed; skipping", exc_info = True)
+            filesystem_violations.clear()
 
     is_safe = (
         len(signal_tampering) == 0
         and len(exception_catching) == 0
         and len(shell_escapes) == 0
+        and len(dynamic_exec) == 0
         and len(network_calls) == 0
         and len(sensitive_file_reads) == 0
+        and len(filesystem_violations) == 0
     )
     return is_safe, {
         "signal_tampering": signal_tampering,
         "exception_catching": exception_catching,
         "shell_escapes": shell_escapes,
+        "dynamic_exec": dynamic_exec,
         "network_calls": network_calls,
         "sensitive_file_reads": sensitive_file_reads,
+        "filesystem_violations": filesystem_violations,
         "warnings": warnings,
     }
 
@@ -2550,13 +4163,21 @@ def _check_code_safety(code: str) -> str | None:
         exception_reasons = [
             item.get("description", "") for item in info.get("exception_catching", [])
         ]
+        dynamic_reasons = [item.get("description", "") for item in info.get("dynamic_exec", [])]
         network_reasons = [item.get("description", "") for item in info.get("network_calls", [])]
         file_reasons = [
             item.get("description", "") for item in info.get("sensitive_file_reads", [])
         ]
+        fs_reasons = [item.get("description", "") for item in info.get("filesystem_violations", [])]
         all_reasons = [
             r
-            for r in reasons + shell_reasons + exception_reasons + network_reasons + file_reasons
+            for r in reasons
+            + shell_reasons
+            + exception_reasons
+            + dynamic_reasons
+            + network_reasons
+            + file_reasons
+            + fs_reasons
             if r
         ]
         if all_reasons:
@@ -2607,6 +4228,120 @@ def _truncate(text: str, limit: int = _MAX_OUTPUT_CHARS) -> str:
     return text
 
 
+# --------------------------------------------------------------------------
+# Stage 5: runtime realpath backstop injected into sandboxed Python.
+#
+# The static gate is prove-or-block; this child-side guard resolves the true
+# realpath (following symlinks) of every MUTATING file op and refuses it unless it
+# lands inside the session workdir. It covers what static analysis cannot prove
+# (dynamic paths, pre-existing symlinks, library writers that funnel through
+# builtins.open). Reads are left unpatched. It is skipped entirely under
+# disable_sandbox (Bypass Permissions).
+# --------------------------------------------------------------------------
+_SANDBOX_GUARD_SRC = r"""
+import os as _os, builtins as _bi, functools as _ft
+_WD = _os.path.realpath(__WORKDIR__)
+
+def _within(p):
+    try:
+        if isinstance(p, int):
+            return True
+        rp = _os.path.realpath(_os.fspath(p))
+    except Exception:
+        return False
+    return rp == _WD or rp.startswith(_WD + _os.sep)
+
+def _deny(p, what):
+    raise PermissionError(
+        "sandbox: %s outside the session workdir is not permitted: %r" % (what, p)
+    )
+
+_real_open = _bi.open
+@_ft.wraps(_real_open)
+def _guarded_open(file, mode="r", *a, **k):
+    m = mode if isinstance(mode, str) else "r"
+    if any(c in m for c in "wax+") and not _within(file):
+        _deny(file, "write")
+    return _real_open(file, mode, *a, **k)
+_bi.open = _guarded_open
+
+def _wrap1(mod, name, what):
+    orig = getattr(mod, name, None)
+    if orig is None:
+        return
+    @_ft.wraps(orig)
+    def w(path, *a, **k):
+        if not _within(path):
+            _deny(path, what)
+        return orig(path, *a, **k)
+    setattr(mod, name, w)
+
+for _n in ("remove", "unlink", "rmdir", "removedirs", "truncate", "chmod",
+           "chown", "mkdir", "makedirs"):
+    _wrap1(_os, _n, _n)
+
+def _wrap2(mod, name, both):
+    orig = getattr(mod, name, None)
+    if orig is None:
+        return
+    @_ft.wraps(orig)
+    def w(src, dst, *a, **k):
+        if both and not _within(src):
+            _deny(src, name + " source")
+        if not _within(dst):
+            _deny(dst, name + " destination")
+        return orig(src, dst, *a, **k)
+    setattr(mod, name, w)
+
+for _n in ("rename", "renames", "replace", "link", "symlink"):
+    _wrap2(_os, _n, True)
+
+try:
+    import shutil as _sh
+    _wrap1(_sh, "rmtree", "rmtree")
+    _wrap2(_sh, "move", True)
+    for _n in ("copy", "copy2", "copyfile", "copytree"):
+        _wrap2(_sh, _n, False)
+except Exception:
+    pass
+
+try:
+    import pathlib as _pl
+    def _wrapp(name, targ):
+        orig = getattr(_pl.Path, name, None)
+        if orig is None:
+            return
+        @_ft.wraps(orig)
+        def w(self, *a, **k):
+            if not _within(self):
+                _deny(str(self), "Path." + name)
+            if targ and a and not _within(a[0]):
+                _deny(str(a[0]), "Path." + name + " target")
+            return orig(self, *a, **k)
+        setattr(_pl.Path, name, w)
+    for _n in ("write_text", "write_bytes", "unlink", "mkdir", "rmdir", "chmod", "touch"):
+        _wrapp(_n, False)
+    for _n in ("rename", "replace", "symlink_to", "hardlink_to"):
+        _wrapp(_n, True)
+except Exception:
+    pass
+"""
+
+
+def _sandbox_runtime_prelude(workdir: str) -> str:
+    """One physical line that runs the realpath backstop before the user code.
+
+    The guard executes in its own namespace (helper names never leak into user
+    globals) while its monkeypatches persist on the os/shutil/pathlib/builtins
+    module objects. Emitting it on a single line keeps user traceback line numbers
+    shifted by exactly one."""
+    src = _SANDBOX_GUARD_SRC.replace("__WORKDIR__", repr(workdir))
+    return (
+        "exec(compile(%r, '<studio-sandbox-guard>', 'exec'), {'__builtins__': __builtins__})\n"
+        % src
+    )
+
+
 def _python_exec(
     code: str,
     cancel_event = None,
@@ -2652,8 +4387,11 @@ def _python_exec(
         fd, tmp_path = tempfile.mkstemp(suffix = ".py", prefix = "studio_exec_", dir = workdir)
         # utf-8 so non-ASCII in model-written code survives the OS default codec
         # (Windows cp1252 would otherwise raise UnicodeEncodeError).
+        # Sandboxed runs get the realpath backstop prepended (Stage 5); bypass
+        # runs execute the code verbatim.
+        file_body = code if disable_sandbox else (_sandbox_runtime_prelude(workdir) + code)
         with os.fdopen(fd, "w", encoding = "utf-8") as f:
-            f.write(code)
+            f.write(file_body)
 
         safe_env = _build_bypass_env(workdir) if disable_sandbox else _build_safe_env(workdir)
         if disable_sandbox:
