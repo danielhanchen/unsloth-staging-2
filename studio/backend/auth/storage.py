@@ -18,6 +18,11 @@ from utils.paths import auth_db_path, ensure_dir
 DB_PATH = auth_db_path()
 DEFAULT_ADMIN_USERNAME = "unsloth"
 
+# Single source for the password policy. The HTTP schema
+# (models/auth.py ChangePasswordRequest) and the terminal password-change
+# prompt both enforce this; keep the unsloth_cli mirror in sync.
+MIN_PASSWORD_LENGTH = 8
+
 # Plaintext bootstrap password file beside auth.db, deleted on first password
 # change so the credential never lingers on disk.
 _BOOTSTRAP_PW_PATH = DB_PATH.parent / ".bootstrap_password"
@@ -79,11 +84,26 @@ def _load_bootstrap_password() -> Optional[str]:
 
 
 def clear_bootstrap_password() -> None:
-    """Delete the persisted bootstrap password file (called after password change)."""
+    """Delete the persisted bootstrap password file (called after password change).
+
+    Best-effort: by the time this runs the new password hash is already
+    committed, so a locked/undeletable file (Windows AV, read-only auth dir)
+    must not surface as a failed password change. The stale file's plaintext no
+    longer matches any credential.
+    """
     global _bootstrap_password
     _bootstrap_password = None
     if _BOOTSTRAP_PW_PATH.is_file():
-        _BOOTSTRAP_PW_PATH.unlink(missing_ok = True)
+        try:
+            _BOOTSTRAP_PW_PATH.unlink(missing_ok = True)
+        except OSError as e:
+            import sys
+            print(
+                f"Warning: could not delete {_BOOTSTRAP_PW_PATH.name} ({e}); "
+                "the old bootstrap password is already invalid.",
+                file = sys.stderr,
+                flush = True,
+            )
 
 
 def _hash_token(token: str) -> str:
@@ -547,8 +567,19 @@ def ensure_default_admin() -> bool:
         return False
 
 
-def update_password(username: str, new_password: str) -> bool:
-    """Update password, clear first-login requirement, rotate JWT secret."""
+def update_password(
+    username: str,
+    new_password: str,
+    *,
+    revoke_refresh_tokens: bool = False,
+) -> bool:
+    """Update password, clear first-login requirement, rotate JWT secret.
+
+    With ``revoke_refresh_tokens`` the user's refresh tokens are deleted in the
+    SAME transaction: a pre-change refresh token must never outlive the
+    credential it was minted under (a separate follow-up delete can fail after
+    the password commit and leave a stale token that still mints access tokens).
+    """
     from .hashing import hash_password
 
     salt, pwd_hash = hash_password(new_password)
@@ -563,6 +594,8 @@ def update_password(username: str, new_password: str) -> bool:
             """,
             (salt, pwd_hash, jwt_secret, username),
         )
+        if revoke_refresh_tokens and cursor.rowcount > 0:
+            conn.execute("DELETE FROM refresh_tokens WHERE username = ?", (username,))
         conn.commit()
         if cursor.rowcount > 0:
             clear_bootstrap_password()
