@@ -3,6 +3,7 @@
 
 import importlib.util
 import hashlib
+import hmac
 import json
 import os
 import platform
@@ -20,6 +21,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 import typer
+
+from unsloth_cli.commands import _password_prompt
 
 studio_app = typer.Typer(help = "Unsloth Studio commands.")
 
@@ -627,6 +630,184 @@ def _create_desktop_secret_in_cli() -> str:
         conn.close()
 
 
+def _should_prompt_password_change(
+    *, cloudflare: Optional[bool], host: str, secure: bool, api_only: bool
+) -> bool:
+    """Whether this launch will expose Studio through the Cloudflare tunnel.
+
+    CLI mirror of run.py's _cloudflare_tunnel_should_start, minus the Colab
+    case (Colab launches never come through this CLI path). --secure implies
+    the tunnel; --cloudflare only tunnels non-api-only wildcard binds.
+    """
+    if secure:
+        return True
+    if cloudflare is not True:
+        return False
+    return host in ("0.0.0.0", "::") and not api_only
+
+
+def _prompt_streams_interactive() -> bool:
+    """The prompt needs a real terminal for input and for the masked echo."""
+    try:
+        return sys.stdin.isatty() and sys.stderr.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
+def _bootstrap_deadline_active() -> bool:
+    """Whether the backend's bootstrap shutdown deadline will arm.
+
+    Mirror of studio/backend/auth/bootstrap_timeout.py bootstrap_timeout_seconds:
+    unset/blank/malformed UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT falls back to the 1h
+    default (a typo must not remove protection); 0 or negative disables it.
+    """
+    raw = os.environ.get("UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT", "").strip()
+    if not raw:
+        return True
+    try:
+        return int(raw) > 0
+    except ValueError:
+        return True
+
+
+def _cli_update_password(conn: sqlite3.Connection, username: str, new_password: str) -> None:
+    """CLI mirror of backend update_password + change-password route effects.
+
+    One transaction: rehash, rotate the JWT secret (invalidates access tokens),
+    clear must_change_password, revoke refresh tokens (see the refresh-token
+    review finding on PR #6651), and drop the desktop secret. File cleanup
+    happens after commit: the old credential is already cryptographically
+    invalid, so a failed unlink must not roll the change back.
+    """
+    password_salt, password_hash = _hash_password(new_password)
+    with conn:
+        conn.execute(
+            """
+            UPDATE auth_user
+            SET password_salt = ?, password_hash = ?, jwt_secret = ?, must_change_password = 0
+            WHERE username = ?
+            """,
+            (password_salt, password_hash, secrets.token_urlsafe(64), username),
+        )
+        conn.execute("DELETE FROM refresh_tokens WHERE username = ?", (username,))
+        conn.execute(
+            "DELETE FROM app_secrets WHERE key IN (?, ?)",
+            (DESKTOP_SECRET_HASH_KEY, DESKTOP_SECRET_CREATED_AT_KEY),
+        )
+    for stale in (BOOTSTRAP_PASSWORD_FILE, DESKTOP_SECRET_FILE):
+        try:
+            (STUDIO_HOME / "auth" / stale).unlink(missing_ok = True)
+        except OSError:
+            typer.echo(
+                f"Warning: could not remove stale {stale} file; the credential "
+                "in it is no longer valid, but consider deleting it manually.",
+                err = True,
+            )
+
+
+def _enforce_password_change_before_exposure(
+    *, cloudflare: Optional[bool], host: str, secure: bool, api_only: bool
+) -> None:
+    """Force a terminal password change before the first public (tunnel) exposure.
+
+    When the launch will start the Cloudflare tunnel and the admin account
+    still has its auto-generated bootstrap password, ask for a new password in
+    the terminal (masked with '*', confirmed, re-prompting until valid) before
+    any server or tunnel exists. Committing here, in the parent, means the
+    password never crosses argv or the environment, and an older studio-venv
+    child sees the change immediately. Without a terminal, warn and fall back
+    to the backend's bootstrap shutdown timer (~1h, UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT).
+    """
+    if not _should_prompt_password_change(
+        cloudflare = cloudflare, host = host, secure = secure, api_only = api_only
+    ):
+        return
+    # Inspection failures (unwritable STUDIO_HOME, locked DB) must not kill the
+    # launch: the backend still enforces auth and its bootstrap shutdown timer.
+    # A failure AFTER the user typed a new password stays fatal, below.
+    try:
+        conn = _connect_auth_db()
+    except (OSError, sqlite3.Error) as exc:
+        typer.echo(
+            f"Warning: could not inspect the Studio auth database ({exc}); "
+            "skipping the pre-exposure password check.",
+            err = True,
+        )
+        return
+    try:
+        try:
+            _ensure_cli_default_admin(conn)
+            row = conn.execute(
+                "SELECT password_salt, password_hash, must_change_password "
+                "FROM auth_user WHERE username = ?",
+                (DEFAULT_ADMIN_USERNAME,),
+            ).fetchone()
+        except (OSError, sqlite3.Error) as exc:
+            typer.echo(
+                f"Warning: could not inspect the Studio auth database ({exc}); "
+                "skipping the pre-exposure password check.",
+                err = True,
+            )
+            return
+        if not row or not row[2]:
+            return
+        if not _prompt_streams_interactive():
+            # Only proceed headless when the backend's bootstrap shutdown
+            # deadline will actually protect the launch. It never arms for
+            # api-only serving, and UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT=0
+            # disables it (mirrors auth/bootstrap_timeout.py semantics:
+            # unset/malformed -> default 1h, <= 0 -> disabled).
+            if api_only or not _bootstrap_deadline_active():
+                typer.echo(
+                    "Error: refusing to publish Studio on a public Cloudflare "
+                    "URL: the default admin password was never changed, no "
+                    "terminal is attached to change it here, and the bootstrap "
+                    "shutdown deadline does not apply to this launch (api-only, "
+                    "or UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT=0). Change the "
+                    "password first (run `unsloth studio` locally and log in, "
+                    "or re-run with a terminal attached), then retry.",
+                    err = True,
+                )
+                raise typer.Exit(1)
+            typer.echo(
+                "Warning: Studio is being exposed publicly while the admin account "
+                "still uses its auto-generated bootstrap password. Change it promptly "
+                "(read it on this machine from "
+                f"{STUDIO_HOME / 'auth' / BOOTSTRAP_PASSWORD_FILE}); Studio shuts "
+                "down after ~1h if it stays unchanged (UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT).",
+                err = True,
+            )
+            return
+        password_salt, password_hash = row[0], row[1]
+
+        def _is_current_password(candidate: str) -> bool:
+            return hmac.compare_digest(
+                _pbkdf2_hex(candidate, password_salt.encode("utf-8")), password_hash
+            )
+
+        typer.echo(
+            "Studio is about to be exposed on a public Cloudflare URL, but the "
+            f"admin account ('{DEFAULT_ADMIN_USERNAME}') still uses its "
+            "auto-generated bootstrap password.\n"
+            "Set a new admin password now (input shows '*' per character).",
+            err = True,
+        )
+        try:
+            new_password = _password_prompt.prompt_new_password(_is_current_password)
+        except (KeyboardInterrupt, EOFError):
+            typer.echo(
+                "\nError: password change aborted; refusing to expose Studio "
+                "with the default admin password. Re-run and set a password, "
+                "or launch without --secure/--cloudflare.",
+                err = True,
+            )
+            raise typer.Exit(1)
+        _cli_update_password(conn, DEFAULT_ADMIN_USERNAME, new_password)
+        typer.echo("Admin password updated.", err = True)
+    finally:
+        conn.close()
+
+
 def _load_model_via_http(
     port: int,
     api_key: str,
@@ -713,13 +894,13 @@ def studio_default(
             f"defaults to {_PARALLEL_DEFAULT_RUN}."
         ),
     ),
-    cloudflare: bool = typer.Option(
-        True,
+    cloudflare: Optional[bool] = typer.Option(
+        None,
         "--cloudflare/--no-cloudflare",
-        help = "Auto-create a free Cloudflare HTTPS tunnel for non-api-only wildcard "
-        "binds (0.0.0.0 or ::), exposing Studio on a PUBLIC internet URL (default on). "
-        "Pass --no-cloudflare to disable that Cloudflare URL; it does not change a "
-        "public wildcard bind. --api-only keeps it off unless paired with --secure.",
+        help = "Expose Studio on a PUBLIC internet URL via a free Cloudflare HTTPS "
+        "tunnel, for non-api-only wildcard binds (0.0.0.0 or ::). Off by default; "
+        "pass --cloudflare to enable it (--secure implies it). --no-cloudflare forces "
+        "it off but does not change a raw wildcard bind.",
     ),
     secure: bool = typer.Option(
         False,
@@ -766,13 +947,14 @@ def studio_default(
                 err = True,
             )
             raise typer.Exit(2)
-        # Same for --no-cloudflare: it would not reach the subcommand.
-        if not cloudflare:
+        # Same for --cloudflare/--no-cloudflare: it would not reach the subcommand.
+        if cloudflare is not None:
+            _cf_flag = "--cloudflare" if cloudflare else "--no-cloudflare"
             typer.echo(
-                f"Error: --no-cloudflare on `unsloth studio` applies to the "
+                f"Error: {_cf_flag} on `unsloth studio` applies to the "
                 f"plain-server path only. For `unsloth studio "
                 f"{ctx.invoked_subcommand}`, put it after the subcommand: "
-                f"`unsloth studio {ctx.invoked_subcommand} --no-cloudflare ...`",
+                f"`unsloth studio {ctx.invoked_subcommand} {_cf_flag} ...`",
                 err = True,
             )
             raise typer.Exit(2)
@@ -821,7 +1003,7 @@ def studio_default(
 
     # --secure requires the tunnel; force a loopback bind.
     if secure:
-        if not cloudflare:
+        if cloudflare is False:
             typer.echo(
                 "Error: --secure requires the Cloudflare tunnel; do not combine it "
                 "with --no-cloudflare.",
@@ -834,6 +1016,12 @@ def studio_default(
     # default (plain-server path; the `run` subcommand has its own --verbose).
     if verbose:
         _enable_verbose_access_logs()
+
+    # Public (tunnel) exposure with the seeded default password: force a
+    # terminal password change first, before any re-exec or server exists.
+    _enforce_password_change_before_exposure(
+        cloudflare = cloudflare, host = host, secure = secure, api_only = api_only
+    )
 
     # Use the studio venv if it exists and we aren't already in it.
     studio_venv_dir = STUDIO_HOME / "unsloth_studio"
@@ -867,8 +1055,16 @@ def studio_default(
                 args.append("--silent")
             if api_only:
                 args.append("--api-only")
-            # Forward the explicit polarity (matches run.py's BooleanOptionalAction).
-            args.append("--cloudflare" if cloudflare else "--no-cloudflare")
+            # Forward the default polarity explicitly: _find_run_py can fall back to
+            # an older run.py under the studio venv (whose --cloudflare defaulted on),
+            # so an unset default must not let a mixed install silently re-enable the
+            # tunnel. --secure implies the tunnel, so forward nothing then
+            # (--no-cloudflare would contradict --secure). The common in-venv launch
+            # skips this re-exec and keeps the tri-state None -> "(default)" banner.
+            if cloudflare is True:
+                args.append("--cloudflare")
+            elif not secure:
+                args.append("--no-cloudflare")
             args.append("--secure" if secure else "--no-secure")
             # Forward an explicit tool policy; None -> run.py leaves it unset (tools on).
             if enable_tools is True:
@@ -1106,13 +1302,13 @@ def run(
             f"{_PARALLEL_DEFAULT_RUN} (pre-PR hardcoded value)."
         ),
     ),
-    cloudflare: bool = typer.Option(
-        True,
+    cloudflare: Optional[bool] = typer.Option(
+        None,
         "--cloudflare/--no-cloudflare",
-        help = "Auto-create a free Cloudflare HTTPS tunnel for non-api-only wildcard "
-        "binds (0.0.0.0 or ::), exposing Studio on a PUBLIC internet URL (default on). "
-        "Pass --no-cloudflare to disable that Cloudflare URL; it does not change a "
-        "public wildcard bind. --api-only keeps it off unless paired with --secure.",
+        help = "Expose Studio on a PUBLIC internet URL via a free Cloudflare HTTPS "
+        "tunnel, for non-api-only wildcard binds (0.0.0.0 or ::). Off by default; "
+        "pass --cloudflare to enable it (--secure implies it). --no-cloudflare forces "
+        "it off but does not change a raw wildcard bind.",
     ),
     secure: bool = typer.Option(
         False,
@@ -1207,7 +1403,7 @@ def run(
 
     # --secure requires the tunnel; force a loopback bind so the raw port is never public.
     if secure:
-        if not cloudflare:
+        if cloudflare is False:
             typer.echo(
                 "Error: --secure requires the Cloudflare tunnel; do not combine it "
                 "with --no-cloudflare.",
@@ -1226,6 +1422,12 @@ def run(
         flag = enable_tools,
         yes = yes,
         silent = silent,
+    )
+
+    # Public (tunnel) exposure with the seeded default password: force a
+    # terminal password change first, before any re-exec or server exists.
+    _enforce_password_change_before_exposure(
+        cloudflare = cloudflare, host = host, secure = secure, api_only = api_only
     )
 
     # 1. Re-exec into the studio venv (same pattern as studio_default).
@@ -1279,8 +1481,14 @@ def run(
         # Typer claims --parallel outside ctx.args; without this the
         # child reverts to its default and silently drops the value.
         args.extend(["--parallel", str(parallel)])
-        # Forward the explicit polarity (same rationale as --load-in-4bit above).
-        args.append("--cloudflare" if cloudflare else "--no-cloudflare")
+        # Always forward an explicit polarity: a mixed-version studio venv whose old
+        # default was --cloudflare-on must not silently re-enable the tunnel. --secure
+        # implies the tunnel, so forward nothing then and let --secure drive it
+        # (--no-cloudflare would contradict --secure).
+        if cloudflare is True:
+            args.append("--cloudflare")
+        elif not secure:
+            args.append("--no-cloudflare")
         args.append("--secure" if secure else "--no-secure")
         args.append("--tensor-parallel" if tensor_parallel else "--no-tensor-parallel")
         if verbose:
