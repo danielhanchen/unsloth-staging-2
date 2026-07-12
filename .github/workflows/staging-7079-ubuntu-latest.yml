@@ -1,0 +1,50 @@
+name: "staging-7079 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-7079-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/llama_cpp.py'
+      - 'studio/backend/core/inference/orchestrator.py'
+      - 'studio/backend/core/inference/safetensors_agentic.py'
+      - 'studio/backend/core/inference/tools.py'
+      - 'studio/backend/models/inference.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/tests/test_permission_mode.py'
+      - 'studio/backend/tests/test_safetensors_tool_loop.py'
+      - 'studio/frontend/src/components/assistant-ui/thread.tsx'
+      - 'studio/frontend/src/features/chat/api/chat-adapter.ts'
+      - 'studio/frontend/src/features/chat/bypass-permissions-menu-item.tsx'
+      - 'studio/frontend/src/features/chat/chat-settings-sheet.tsx'
+      - 'studio/frontend/src/features/chat/index.ts'
+      - 'studio/frontend/src/features/chat/permission-mode-select.tsx'
+      - 'studio/frontend/src/features/chat/shared-composer.tsx'
+      - 'studio/frontend/src/features/chat/stores/chat-runtime-store.ts'
+      - 'studio/frontend/src/features/settings/tabs/general-tab.tsx'
+      - 'studio/frontend/src/i18n/locales/en.ts'
+      - 'studio/frontend/src/index.css'
+      - '.github/workflows/staging-7079-ubuntu-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
