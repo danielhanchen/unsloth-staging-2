@@ -26,7 +26,6 @@ import {
 import { formatEta, formatRate } from "../utils/format-transfer";
 import {
   isLocalModelPath,
-  pendingSelectionMatches,
   readPersistedSpeculativeType,
   resolveToolsEnabledOnLoad,
   saveSpeculativeType,
@@ -49,7 +48,10 @@ import {
   isMultimodalResponse,
 } from "../types/api";
 import { isExternalModelId } from "../external-providers";
-import { cancelStagedModelDownload } from "@/features/hub";
+import {
+  applyPerModelConfigToRuntime,
+  type PerModelConfig,
+} from "@/features/model-picker";
 import type {
   ChatLoraSummary,
   ChatModelSummary,
@@ -74,9 +76,10 @@ export type SelectedModelInput = {
   isGguf?: boolean;
   throwOnError?: boolean;
   /** Keep the current speculative-decoding choice across the model switch
-   *  instead of resetting it to the standing preference. Set by the deferred
-   *  ("Load on selection") Load, where the user picked it for this model. */
+   *  instead of resetting it to the standing preference. */
   keepSpeculative?: boolean;
+  config?: PerModelConfig;
+  previousConfig?: PerModelConfig;
 };
 
 // Approved fingerprints by checkpoint, so a rollback after a failed switch can resend
@@ -415,27 +418,11 @@ export function useChatModelRuntime() {
         typeof selection === "string" ? false : selection.throwOnError ?? false;
       const keepSpeculative =
         typeof selection === "string" ? false : selection.keepSpeculative ?? false;
-      // Picking/loading any model abandons a staged (deferred) selection.
-      // Before the early-returns below so even a no-op re-select clears the
-      // stage.
-      const staged = useChatRuntimeStore.getState().pendingSelection;
-      if (staged) {
-        // Loading a DIFFERENT model abandons this stage. Loading the staged pick
-        // ITSELF keeps it so the sidebar can show its load settings (context, KV
-        // cache, …) during the load. Cleared on success below; on failure it's
-        // left staged so the user can retry (see onLoadPendingModel's catch).
-        const loadingStagedPick = pendingSelectionMatches(staged, {
-          id: modelId,
-          ggufVariant,
-          nativePathToken,
-        });
-        if (!loadingStagedPick) {
-          cancelStagedModelDownload(staged);
-          useChatRuntimeStore.getState().setPendingSelection(null);
-        }
-      }
       const currentVariant = useChatRuntimeStore.getState().activeGgufVariant;
       if (!forceReload && (!modelId || (params.checkpoint === modelId && (ggufVariant ?? null) === (currentVariant ?? null)))) {
+        if (typeof selection !== "string" && selection.previousConfig) {
+          applyPerModelConfigToRuntime(selection.previousConfig);
+        }
         return;
       }
       // A load is already in flight. If it's this exact pick (id + GGUF variant +
@@ -448,6 +435,9 @@ export function useChatModelRuntime() {
       // every entry point is covered, not just the staged Load button.
       const inFlightLoad = loadingModelRef.current;
       if (inFlightLoad) {
+        if (typeof selection !== "string" && selection.previousConfig) {
+          applyPerModelConfigToRuntime(selection.previousConfig);
+        }
         const loadingSamePick =
           inFlightLoad.id === modelId &&
           (inFlightLoad.ggufVariant ?? null) === (ggufVariant ?? null) &&
@@ -551,11 +541,7 @@ export function useChatModelRuntime() {
           const previousActiveNativePathToken =
             stateBeforeUnload.activeNativePathToken;
           // Snapshot the load settings at click time, before the awaits below
-          // (validation, the trust dialog, unload). For a staged Load these knobs
-          // stay editable and a sheet-close revert (abandonStagedModel) can fire
-          // mid-load; reading them live just before loadModel would let the load
-          // use post-click values. The model-switch speculative reset below
-          // updates this snapshot in lock-step so non-staged loads are unchanged.
+          // (validation, the trust dialog, unload).
           const loadChatTemplateOverride = stateBeforeUnload.chatTemplateOverride;
           const loadKvCacheDtype = stateBeforeUnload.kvCacheDtype;
           const loadCustomContextLength = stateBeforeUnload.customContextLength;
@@ -835,25 +821,6 @@ export function useChatModelRuntime() {
               } else {
                 recordLastLocalModelLoad({ id: modelId, kind: "model" });
               }
-            }
-            // A successful load owns the shared (pick-unscoped) settings fields,
-            // so any surviving stage is stale: the just-loaded pick itself, or a
-            // pick queued for a different model mid-load whose knobs this load
-            // overwrote. Drop it. Only a DIFFERENT pick's download needs
-            // cancelling; the loaded pick's is already consumed, and cancelling
-            // it inside its post-complete linger window would flicker its card.
-            const staleStage = useChatRuntimeStore.getState().pendingSelection;
-            if (staleStage) {
-              if (
-                !pendingSelectionMatches(staleStage, {
-                  id: modelId,
-                  ggufVariant,
-                  nativePathToken,
-                })
-              ) {
-                cancelStagedModelDownload(staleStage);
-              }
-              useChatRuntimeStore.getState().setPendingSelection(null);
             }
           } catch (error) {
             // Skip rollback if user cancelled -- model is already being unloaded.
@@ -1212,6 +1179,9 @@ export function useChatModelRuntime() {
           resetLoadingUi();
         }
       } catch (error) {
+        if (typeof selection !== "string" && selection.previousConfig) {
+          applyPerModelConfigToRuntime(selection.previousConfig);
+        }
         if (abortCtrl.signal.aborted) return; // User cancelled, nothing to report
         resetLoadingUi();
         const message =
