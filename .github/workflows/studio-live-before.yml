@@ -1,0 +1,60 @@
+name: "pr7080 studio-live BEFORE"
+on:
+  push:
+    branches: ["pr-7080-before-ui"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  studio-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/studiohome
+      HF_HOME: ${{ github.workspace }}/hfcache
+      UNSLOTH_STUDIO_ALLOW_STDIO_MCP: '1'
+      SIDE: BEFORE
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Playwright + Chromium
+        run: |
+          pip install playwright httpx pillow
+          python -m playwright install --with-deps chromium
+      - name: Install Studio (local)
+        run: bash install.sh --local --python 3.12
+      - name: Launch Studio + wait for healthz
+        run: |
+          BIN="$UNSLOTH_STUDIO_HOME/bin/unsloth"
+          [ -x "$BIN" ] || BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
+          setsid bash -c "$BIN studio -H 127.0.0.1 -p 8888 > studio.log 2>&1" &
+          for i in $(seq 1 120); do
+            P=$(grep -m1 -oE 'running on http://127.0.0.1:[0-9]+' studio.log | grep -oE '[0-9]+$' || true)
+            [ -n "$P" ] && curl -sf "http://127.0.0.1:$P/healthz" >/dev/null 2>&1 && break
+            sleep 5
+          done
+          grep -m1 -oE 'running on http://127.0.0.1:[0-9]+' studio.log
+      - name: Drive Studio UI (Playwright)
+        run: |
+          PORT=$(grep -m1 -oE 'running on http://127.0.0.1:[0-9]+' studio.log | grep -oE '[0-9]+$')
+          PORT=${PORT:-8888}
+          PW=$(cat "$UNSLOTH_STUDIO_HOME/auth/.bootstrap_password")
+          VENV_PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          CMD="$VENV_PY -u $GITHUB_WORKSPACE/.github/scripts/counter_mcp.py"
+          PYTHONPATH=.github/scripts python .github/scripts/pr7080_studio_demo.py \
+            --base-url "http://127.0.0.1:$PORT" --password "$PW" --side "$SIDE" \
+            --counter-cmd "$CMD" --out-dir "out/$SIDE"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-ui-BEFORE
+          path: |
+            out/**
+            studio.log
