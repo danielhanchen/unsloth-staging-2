@@ -28,13 +28,12 @@ jobs:
           ./install.sh --local --no-torch || pip install -e .
           nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:8888/healthz && break; sleep 5; done
-      - name: Playwright smoke (studio_test_kit)
-        run: PYTHONPATH=.github/scripts python -m studio_test_kit._smoke_ui || true
+      - name: Capture permission UI (composer pill, 4-level menu, Settings > Permissions)
+        run: PYTHONPATH=.github/scripts python .github/scripts/perm_ui_ci.py || true
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: studio-playwright-7079
+          name: perm-ui-7079
           path: |
-            **/*.png
-            **/*.webm
+            perm_ui_ci_shots/*.png
             studio.log
