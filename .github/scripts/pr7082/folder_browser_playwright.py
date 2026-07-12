@@ -22,14 +22,29 @@ import httpx
 from playwright.async_api import async_playwright
 
 USERNAME = "unsloth"
+NEW_PASSWORD = "Unsloth-Studio-CI-2026"  # >=8 chars; clears the must-change gate
 
 
 async def login(url: str, password: str) -> dict:
+    """Log in with the bootstrap password; if the account still requires a
+    password change, change it so the SPA stops redirecting to /change-password,
+    then return the post-change tokens."""
     async with httpx.AsyncClient(timeout=20) as c:
         r = await c.post(f"{url}/api/auth/login", json={"username": USERNAME, "password": password})
         r.raise_for_status()
         b = r.json()
-        return {"access": b["access_token"], "refresh": b.get("refresh_token", "")}
+        access = b["access_token"]
+        if b.get("must_change_password"):
+            r2 = await c.post(
+                f"{url}/api/auth/change-password",
+                headers={"Authorization": f"Bearer {access}"},
+                json={"current_password": password, "new_password": NEW_PASSWORD},
+            )
+            r2.raise_for_status()
+            b = r2.json()
+            access = b["access_token"]
+            print("changed bootstrap password to clear must-change gate")
+        return {"access": access, "refresh": b.get("refresh_token", "")}
 
 
 def seed_js(tok: dict) -> str:
