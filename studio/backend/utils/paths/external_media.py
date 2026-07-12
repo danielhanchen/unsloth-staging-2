@@ -132,6 +132,23 @@ def windows_drive_roots(drive_letters: Iterable[str] = string.ascii_uppercase) -
     empty drives never show as dead entries. Returns ``[]`` off Windows, so
     callers on Linux/macOS are unaffected.
     """
+    # STAGING-ONLY spoof: expose a fake drive tree ($UNSLOTH_SPOOF_DRIVES/<C:|D:|...>)
+    # as "drives" so the drive-hopping UI can be Playwright-driven on a Linux runner.
+    _spoof = os.environ.get("UNSLOTH_SPOOF_DRIVES")
+    if _spoof and os.path.isdir(_spoof):
+        roots: list[Path] = []
+        seen: set[str] = set()
+        for name in sorted(os.listdir(_spoof)):
+            p = os.path.join(_spoof, name)
+            if not os.path.isdir(p) or not os.access(p, os.R_OK):
+                continue
+            key = os.path.normcase(os.path.realpath(p))
+            if key in seen:
+                continue
+            seen.add(key)
+            roots.append(Path(p))
+        return roots
+
     if platform.system() != "Windows":
         return []
 

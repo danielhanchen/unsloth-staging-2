@@ -73,6 +73,9 @@ const CHAT_ONLY_ALLOWED = new Set([
   // Export stays reachable on chat-only hosts so the page can show its own grayed-out reason
   // instead of a silent redirect; it self-gates via export capability, so nothing runs.
   "/export",
+  // STAGING-ONLY throwaway route for the folder-browser Playwright driver; a
+  // CPU/no-torch CI host reports chat-only, which would otherwise 302 it to /chat.
+  "/fbtest",
 ]);
 
 function isChatOnlyAllowed(pathname: string): boolean {

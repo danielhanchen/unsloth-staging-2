@@ -45,9 +45,13 @@ def _extract_project_name_from_config_json(config_json: Optional[str]) -> Option
 
 def _denied_path_prefixes() -> list[str]:
     """Platform-aware denylist of system directories."""
+    # STAGING-ONLY spoof: extra denied prefixes (';'-separated; paths may contain
+    # ':' as in a fake C:) so a spoofed C:/Windows is blocked on a Linux runner.
+    _spoof = os.environ.get("UNSLOTH_SPOOF_DENIED")
+    extra = [p for p in _spoof.split(";") if p] if _spoof else []
     system = platform.system()
     if system == "Linux":
-        return ["/proc", "/sys", "/dev", "/etc", "/boot", "/run"]
+        return ["/proc", "/sys", "/dev", "/etc", "/boot", "/run"] + extra
     if system == "Darwin":
         # macOS realpath() resolves /etc -> /private/etc etc; include /private variants.
         return [

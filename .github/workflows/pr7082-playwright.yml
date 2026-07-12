@@ -1,0 +1,123 @@
+name: "PR-7082 Playwright folder-browser"
+on:
+  push:
+    branches: ["pr-7082-ci"]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/pr7082-playwright.yml'
+      - '.github/scripts/pr7082/**'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  drive-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build Studio frontend (includes /fbtest driver route)
+        working-directory: studio/frontend
+        run: |
+          npm ci
+          npm run build
+          test -f dist/index.html
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install Studio backend (no-torch) + Playwright
+        run: |
+          python -m pip install --upgrade pip wheel
+          # studio.txt WITH deps (fastapi/uvicorn/pyjwt/diceware/cryptography/...);
+          # no-torch-runtime.txt --no-deps backstops any lazy transformers import.
+          pip install -r studio/backend/requirements/studio.txt
+          pip install --no-deps -r studio/backend/requirements/no-torch-runtime.txt
+          pip install playwright
+          python -m playwright install --with-deps chromium
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Build spoofed drive tree (C:/D:/E:)
+        run: python .github/scripts/pr7082/build_spoof_tree.py "$RUNNER_TEMP/spoofdrives"
+
+      - name: Launch Studio with spoofed drives and drive the folder browser
+        env:
+          UNSLOTH_STUDIO_HOME: ${{ runner.temp }}/studiohome
+          UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT: "0"
+          NO_COLOR: "1"
+        run: |
+          set -o pipefail
+          mkdir -p out "$UNSLOTH_STUDIO_HOME"
+          echo "SPOOF_DRIVES=$UNSLOTH_SPOOF_DRIVES"
+          echo "SPOOF_DENIED=$UNSLOTH_SPOOF_DENIED"
+
+          # Launch the real backend (serves studio/frontend/dist) on loopback.
+          python -u studio/backend/run.py --host 127.0.0.1 --port 8888 --no-cloudflare \
+            > out/studio.log 2>&1 &
+          STUDIO_PID=$!
+
+          # Wait for readiness (or a crash).
+          up=""
+          for i in $(seq 1 150); do
+            if curl -sf -o /dev/null http://127.0.0.1:8888/; then up=1; break; fi
+            if ! kill -0 "$STUDIO_PID" 2>/dev/null; then
+              echo "::error::Studio process exited before serving"; break
+            fi
+            sleep 2
+          done
+          if [ -z "$up" ]; then
+            echo "===== studio.log ====="; cat out/studio.log || true
+            exit 1
+          fi
+          echo "Studio is up after ~$((i*2))s"
+
+          # Bootstrap admin password is written to $STUDIO_HOME/auth/.bootstrap_password.
+          PW_FILE="$(find "$UNSLOTH_STUDIO_HOME" -name .bootstrap_password 2>/dev/null | head -1)"
+          if [ -z "$PW_FILE" ] || [ ! -s "$PW_FILE" ]; then
+            echo "::error::bootstrap password file not found"
+            echo "===== studio.log ====="; cat out/studio.log || true
+            exit 1
+          fi
+          PW="$(cat "$PW_FILE")"
+          echo "bootstrap password loaded (len ${#PW})"
+
+          # Drive the UI.
+          python .github/scripts/pr7082/folder_browser_playwright.py \
+            --url http://127.0.0.1:8888 --password "$PW" --out out
+          RC=$?
+
+          # Build a GIF from the recording for the PR write-up.
+          if [ -f out/folder_browser.webm ]; then
+            ffmpeg -y -i out/folder_browser.webm -vf \
+              "fps=8,scale=960:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" \
+              out/folder_browser.gif || true
+          fi
+
+          echo "===== studio.log (tail) ====="; tail -60 out/studio.log || true
+          kill "$STUDIO_PID" 2>/dev/null || true
+          exit $RC
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr7082-folder-browser
+          path: |
+            out/*.png
+            out/*.webm
+            out/*.gif
+            out/studio.log
+            out/DIAG_*
+          if-no-files-found: warn
