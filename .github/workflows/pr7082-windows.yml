@@ -1,0 +1,33 @@
+name: "PR-7082 windows-latest"
+on:
+  push:
+    branches: ["pr-7082-ci"]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/pr7082-windows.yml'
+      - '.github/scripts/pr7082/**'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install pytest structlog starlette
+      - name: Cross-platform drive-root unit suite (real Windows semantics)
+        run: PYTHONPATH=studio/backend python -m pytest -q studio/backend/tests/test_windows_external_drive_paths.py
+      - name: Real drive discovery + system-denylist integration (GetLogicalDrives, real C:\Windows)
+        run: python .github/scripts/pr7082/win_drive_integration.py
