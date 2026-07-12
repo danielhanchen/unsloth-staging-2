@@ -2637,12 +2637,18 @@ esac
 # mirrors the leaf-only backend classification just above.
 # _torch_index_leaf is already lowercased above, so the canonical gfx120X-all
 # (capital X, from the arch maps) pins here via the lowercase gfx120x-all entry.
+# The CUDA indexes (cu12x/cu13x) now publish torch 2.11.x too, so widen the CUDA
+# ceiling to <2.12.0 to match the torch 2.11.0 base image and the
+# _CUDA_TORCH_PKG_SPEC repair spec in studio/install_python_stack.py; the >=2.4
+# floor is kept so an older CUDA index (e.g. cu118) that tops out below 2.11
+# still resolves.
 case "$_torch_index_leaf" in
     rocm7.2|gfx120x-all|gfx1151|gfx1150)
         TORCH_CONSTRAINT="torch>=2.11.0,<2.12.0"
         TORCHVISION_CONSTRAINT="torchvision>=0.26.0,<0.27.0"
         TORCHAUDIO_CONSTRAINT="torchaudio>=2.11.0,<2.12.0"
         ;;
+    cu[0-9]*) TORCH_CONSTRAINT="torch>=2.4,<2.12.0" ;;
 esac
 
 # Auto-detect GPU for AMD ROCm based
