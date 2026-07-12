@@ -273,10 +273,9 @@ except ValueError:
 
 
 def _is_tool_error(exc: BaseException) -> bool:
-    """A tool-level failure (the tool executed and errored) leaves the transport
-    alive, so the session is kept. fastmcp surfaces these as ToolError; anything
-    else raised by call_tool is a transport-level failure. This is the
-    version-safe signal (fastmcp 3.0.2 has no dead-transport probe)."""
+    """A tool-level failure (the tool ran and errored) leaves the transport alive,
+    so the session is kept; fastmcp raises ToolError for these. Anything else from
+    call_tool is transport-level. Version-safe (fastmcp 3.0.2 has no dead probe)."""
     try:
         from fastmcp.exceptions import ToolError
     except Exception:  # noqa: BLE001
@@ -286,10 +285,9 @@ def _is_tool_error(exc: BaseException) -> bool:
 
 def _transport_dead(session) -> bool:
     """Best-effort, version-adaptive liveness probe for a cached stdio client.
-    ``Client.is_connected()`` only reports that a session object exists, not that
-    the subprocess is alive, so it is never used for this. Returns True only when
-    we can positively tell the transport is gone; when unknown it returns False
-    and the call will surface a transport error (evicted, never replayed)."""
+    ``Client.is_connected()`` only checks a session object exists, not that the
+    subprocess is alive, so it is never used here. Returns True only when the
+    transport is positively gone; unknown returns False (the call surfaces it)."""
     client = getattr(session, "client", None)
     if client is None:
         return True
@@ -899,19 +897,18 @@ def _call_stdio_tool(
         discard_session = ephemeral
         retry = False
         try:
-            # We may have waited on the call lock while: an overlapping caller's
-            # timeout retired this session (R1), a server update/delete
-            # invalidated it (R2), or a reused subprocess died (R-crash). Re-check
-            # all three *before* dispatch so we never run on a retired/dead client
-            # or a stale config.
+            # We may have waited on the call lock while another caller's timeout
+            # retired this session, a server update/delete invalidated it, or a
+            # reused subprocess died. Re-check all three before dispatch so we
+            # never run on a retired/dead client or a stale config.
             if session.closed.is_set():
                 # Intentional close (server update/delete/shutdown): don't retry
                 # on the stale config.
                 discard_session = True
                 raise RuntimeError("MCP server was updated or removed during the call")
             elif session.defunct:
-                # A concurrent same-scope caller's timeout retired this session
-                # (R1); move to a fresh one instead of reusing the retired client.
+                # A concurrent same-scope caller's timeout retired this session;
+                # move to a fresh one instead of reusing the retired client.
                 discard_session = True
                 if attempt == 0:
                     retry = True
@@ -952,18 +949,17 @@ def _call_stdio_tool(
                 # _SessionClosed; don't mistake it for a crash.
                 discard_session = True
                 raise RuntimeError("MCP server was updated or removed during the call")
-            # A tool-level error (ToolError) leaves the transport alive -> keep the
-            # session so its state survives. Any other exception is transport-level
-            # (dead subprocess, broken pipe): evict so it can't poison the scope,
-            # but DO NOT replay -- the tool may already have run and replaying would
-            # double-execute. The next call opens a fresh session.
+            # ToolError leaves the transport alive -> keep the session so its state
+            # survives. Any other exception is transport-level (dead subprocess,
+            # broken pipe): evict so it can't poison the scope, but DO NOT replay
+            # (the tool may already have run); the next call opens a fresh session.
             if not _is_tool_error(exc):
                 discard_session = True
             raise
         finally:
             # Set defunct + remove from the cache BEFORE releasing the call lock,
-            # so a queued same-scope borrower observes the retirement and moves to
-            # a fresh session instead of reusing this one (R1).
+            # so a queued same-scope borrower observes the retirement and opens a
+            # fresh session instead of reusing this one.
             _release_stdio_session(session)
             if discard_session:
                 _drop_stdio_session(key, session)
