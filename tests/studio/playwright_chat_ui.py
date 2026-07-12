@@ -669,10 +669,21 @@ with sync_playwright() as p:
     last_assistant = page.locator('[data-role="assistant"]').last
     last_assistant.hover()
     page.wait_for_timeout(400)
-    regen_btn = page.get_by_role(
-        "button",
-        name = re.compile(r"(reload|regenerate)", re.I),
-    ).first
+    # Exclude disabled controls from the reload/regenerate match. The
+    # model-picker per-model-config feature adds a "Reload model" button
+    # (SidebarModelConfig / ModelConfigPage) that also matches
+    # /(reload|regenerate)/i, sorts first in the DOM, and is `disabled` at
+    # baseline -- a global `.first.click()` targets that disabled button and
+    # times out. Dropping disabled controls restores the original behaviour:
+    # the message-level Regenerate action (enabled) becomes `.first` again.
+    regen_btn = (
+        page.get_by_role(
+            "button",
+            name = re.compile(r"(reload|regenerate)", re.I),
+        )
+        .and_(page.locator("button:not([disabled])"))
+        .first
+    )
     if regen_btn.count() > 0:
         regen_btn.click()
         try:
