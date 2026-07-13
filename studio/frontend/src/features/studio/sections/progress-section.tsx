@@ -31,6 +31,7 @@ import type { TrainingViewData } from "@/features/training";
 import { useGpuUtilization } from "@/hooks";
 import type { GpuUtilization } from "@/hooks/use-gpu-utilization";
 import { cn } from "@/lib/utils";
+import type { TrainingRunConfigOverride } from "../lib/training-run-config";
 import {
   ChartAverageIcon,
   DashboardSpeed01Icon,
@@ -78,22 +79,27 @@ function configRow(
   return [label, value];
 }
 
+function resolveConfigValue<K extends keyof TrainingRunConfigOverride>(
+  configOverride: TrainingRunConfigOverride | undefined,
+  key: K,
+  fallback: Exclude<TrainingRunConfigOverride[K], undefined>,
+): Exclude<TrainingRunConfigOverride[K], undefined> {
+  if (
+    configOverride &&
+    Object.prototype.hasOwnProperty.call(configOverride, key)
+  ) {
+    const value = configOverride[key];
+    if (value !== undefined) {
+      return value as Exclude<TrainingRunConfigOverride[K], undefined>;
+    }
+  }
+  return fallback;
+}
+
 interface ProgressSectionProps {
   data: TrainingViewData;
   isHistorical?: boolean;
-  configOverride?: {
-    epochs?: number;
-    batchSize?: number;
-    learningRate?: string;
-    maxSteps?: number;
-    contextLength?: number;
-    warmupSteps?: number;
-    optimizerType?: string;
-    loraRank?: number;
-    loraAlpha?: number;
-    loraDropout?: number;
-    loraVariant?: string;
-  };
+  configOverride?: TrainingRunConfigOverride;
 }
 
 export function ProgressSection({
@@ -183,17 +189,51 @@ export function ProgressSection({
     ? data.currentGradNorm
     : (lastValue(data.gradNormHistory) ?? data.currentGradNorm);
 
-  const cfgEpochs = isHistorical ? configOverride?.epochs : config.epochs;
-  const cfgBatchSize = isHistorical ? configOverride?.batchSize : config.batchSize;
-  const cfgLearningRate = isHistorical ? configOverride?.learningRate : config.learningRate;
-  const cfgMaxSteps = isHistorical ? configOverride?.maxSteps : config.maxSteps;
-  const cfgContextLength = isHistorical ? configOverride?.contextLength : config.contextLength;
-  const cfgWarmupSteps = isHistorical ? configOverride?.warmupSteps : config.warmupSteps;
-  const cfgOptimizerType = isHistorical ? configOverride?.optimizerType : config.optimizerType;
-  const cfgLoraRank = isHistorical ? configOverride?.loraRank : config.loraRank;
-  const cfgLoraAlpha = isHistorical ? configOverride?.loraAlpha : config.loraAlpha;
-  const cfgLoraDropout = isHistorical ? configOverride?.loraDropout : config.loraDropout;
-  const cfgLoraVariant = isHistorical ? configOverride?.loraVariant : config.loraVariant;
+  const cfgEpochs = isHistorical
+    ? configOverride?.epochs
+    : resolveConfigValue(configOverride, "epochs", config.epochs);
+  const cfgBatchSize = isHistorical
+    ? configOverride?.batchSize
+    : resolveConfigValue(configOverride, "batchSize", config.batchSize);
+  const cfgLearningRate = isHistorical
+    ? configOverride?.learningRate
+    : resolveConfigValue(
+      configOverride,
+      "learningRate",
+      String(config.learningRate),
+    );
+  const cfgMaxSteps = isHistorical
+    ? configOverride?.maxSteps
+    : resolveConfigValue(configOverride, "maxSteps", config.maxSteps);
+  const cfgContextLength = isHistorical
+    ? configOverride?.contextLength
+    : resolveConfigValue(
+      configOverride,
+      "contextLength",
+      config.contextLength,
+    );
+  const cfgWarmupSteps = isHistorical
+    ? configOverride?.warmupSteps
+    : resolveConfigValue(configOverride, "warmupSteps", config.warmupSteps);
+  const cfgOptimizerType = isHistorical
+    ? configOverride?.optimizerType
+    : resolveConfigValue(
+      configOverride,
+      "optimizerType",
+      config.optimizerType,
+    );
+  const cfgLoraRank = isHistorical
+    ? configOverride?.loraRank
+    : resolveConfigValue(configOverride, "loraRank", config.loraRank);
+  const cfgLoraAlpha = isHistorical
+    ? configOverride?.loraAlpha
+    : resolveConfigValue(configOverride, "loraAlpha", config.loraAlpha);
+  const cfgLoraDropout = isHistorical
+    ? configOverride?.loraDropout
+    : resolveConfigValue(configOverride, "loraDropout", config.loraDropout);
+  const cfgLoraVariant = isHistorical
+    ? configOverride?.loraVariant
+    : resolveConfigValue(configOverride, "loraVariant", config.loraVariant);
 
   const optimizerLabel =
     OPTIMIZER_OPTIONS.find((o) => o.value === cfgOptimizerType)?.label ??
@@ -411,7 +451,7 @@ function LiveGpuPanel({
                   value={index}
                   className="bg-popover text-popover-foreground dark:bg-zinc-900 dark:text-zinc-100"
                 >
-                  GPU {device.visible_ordinal ?? index} - {device.backend} ({device.vram_total_gb ? `${Math.round(device.vram_total_gb)}GB` : "N/A"})
+                  GPU {device.visible_ordinal ?? index} - {device.backend} ({device.vram_total_gb ? `${Math.round(device.vram_total_gb)}GiB` : "N/A"})
                 </option>
               ))}
             </select>
@@ -446,7 +486,7 @@ function LiveGpuPanel({
           icon={<HugeiconsIcon icon={RamMemoryIcon} className="size-3.5" />}
           value={
             currentGpu.vram_used_gb != null && currentGpu.vram_total_gb != null
-              ? `${currentGpu.vram_used_gb} / ${currentGpu.vram_total_gb} GB`
+              ? `${currentGpu.vram_used_gb} / ${currentGpu.vram_total_gb} GiB`
               : "--"
           }
           pct={currentGpu.vram_utilization_pct ?? 0}

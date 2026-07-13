@@ -5,10 +5,19 @@ import { cn } from "@/lib/utils";
 import {
   useTrainingConfigStore,
   useTrainingRuntimeStore,
+  getTrainingRun,
+  TrainingRunRequestError,
 } from "@/features/training";
-import type { TrainingViewData } from "@/features/training";
-import type { ReactElement } from "react";
+import type {
+  TrainingViewData,
+  TrainingRunDetailResponse,
+} from "@/features/training";
+import { type ReactElement, useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
+import {
+  mapTrainingRunConfigOverride,
+  mapTrainingRunMethod,
+} from "./lib/training-run-config";
 import { ChartsSection } from "./sections/charts-section";
 import { ProgressSection } from "./sections/progress-section";
 import { TrainingStartOverlay } from "./training-start-overlay";
@@ -52,6 +61,56 @@ export function LiveTrainingView(): ReactElement {
     })),
   );
 
+  const [activeRunDetail, setActiveRunDetail] =
+    useState<TrainingRunDetailResponse | null>(null);
+
+  useEffect(() => {
+    if (!runtime.jobId) {
+      setActiveRunDetail(null);
+      return;
+    }
+    const jobId = runtime.jobId;
+    const controller = new AbortController();
+    let active = true;
+    let retryTimer: number | null = null;
+    const loadActiveRunDetail = () => {
+      void getTrainingRun(jobId, controller.signal)
+        .then((detail) => {
+          if (!active || controller.signal.aborted) return;
+          setActiveRunDetail(detail);
+        })
+        .catch((err: unknown) => {
+          if (!active || controller.signal.aborted) return;
+          const status =
+            err instanceof TrainingRunRequestError ? err.status : null;
+          const retryNotFound =
+            status === 404 && (runtime.isStarting || runtime.isTrainingRunning);
+          if (
+            typeof status === "number" &&
+            status < 500 &&
+            !retryNotFound
+          ) {
+            setActiveRunDetail(null);
+            return;
+          }
+          retryTimer = window.setTimeout(loadActiveRunDetail, 1000);
+        });
+    };
+    loadActiveRunDetail();
+    return () => {
+      active = false;
+      if (retryTimer !== null) {
+        window.clearTimeout(retryTimer);
+      }
+      controller.abort();
+    };
+  }, [runtime.isStarting, runtime.isTrainingRunning, runtime.jobId]);
+
+  const activeRunConfigOverride =
+    activeRunDetail?.run.id === runtime.jobId
+      ? mapTrainingRunConfigOverride(activeRunDetail)
+      : undefined;
+
   const activeProjectName =
     runtime.startProjectName !== null
       ? runtime.startProjectName.trim() || null
@@ -76,7 +135,10 @@ export function LiveTrainingView(): ReactElement {
     isTrainingRunning: runtime.isTrainingRunning,
     modelName: runtime.startModelName ?? config.selectedModel ?? "",
     projectName: activeProjectName,
-    trainingMethod: config.trainingMethod ?? "",
+    trainingMethod:
+      activeRunDetail?.run.id === runtime.jobId
+        ? mapTrainingRunMethod(activeRunDetail)
+        : config.trainingMethod ?? "",
     lossHistory: runtime.lossHistory,
     lrHistory: runtime.lrHistory,
     gradNormHistory: runtime.gradNormHistory,
@@ -105,7 +167,11 @@ export function LiveTrainingView(): ReactElement {
         )}
       >
         <div data-tour="studio-training-progress">
-          <ProgressSection key={runtime.jobId ?? "no-job"} data={viewData} />
+          <ProgressSection
+            key={runtime.jobId ?? "no-job"}
+            data={viewData}
+            configOverride={activeRunConfigOverride}
+          />
         </div>
         <ChartsSection
           currentStep={viewData.currentStep}
