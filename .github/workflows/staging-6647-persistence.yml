@@ -1,0 +1,120 @@
+name: "staging-6647 persistence"
+on:
+  push:
+    branches: ["pr-6647-persist-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  before-main:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      NEWPW: "Unsloth-Test-8192"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pip install "huggingface_hub[cli]" playwright httpx pillow && python -m playwright install --with-deps chromium
+      - name: Pre-cache tiny GGUF (UD-Q4_K_XL)
+        run: huggingface-cli download unsloth/gemma-3-270m-it-GGUF --include "*UD-Q4_K_XL*"
+      - name: Install + launch main Studio (:8901)
+        run: |
+          git clone --branch main --depth 1 https://github.com/unslothai/unsloth studio_src
+          cd studio_src
+          UNSLOTH_STUDIO_HOME="$PWD/../shome" bash install.sh --local --no-torch || pip install -e .
+          nohup env UNSLOTH_STUDIO_HOME="$PWD/../shome" "$PWD/../shome/bin/unsloth" studio -H 127.0.0.1 -p 8901 > "$PWD/../studio.log" 2>&1 &
+          for i in $(seq 1 120); do curl -sf http://127.0.0.1:8901/healthz && break; sleep 4; done
+      - name: Rotate bootstrap password
+        run: |
+          BOOT=$(cat shome/auth/.bootstrap_password)
+          TOK=$(curl -s -X POST http://127.0.0.1:8901/api/auth/login -H 'Content-Type: application/json' -d "{\"username\":\"unsloth\",\"password\":\"$BOOT\"}" | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+          curl -s -X POST http://127.0.0.1:8901/api/auth/change-password -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d "{\"current_password\":\"$BOOT\",\"new_password\":\"$NEWPW\"}" >/dev/null
+      - name: Run BEFORE driver (main)
+        run: PYTHONPATH=.github/scripts python -m studio_test_kit.examples.pr6647_before --base http://127.0.0.1:8901 --password "$NEWPW" --model unsloth/gemma-3-270m-it-GGUF --context 8192 --out out/before
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr6647-before
+          path: |
+            out/before
+            studio.log
+
+  after-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      NEWPW: "Unsloth-Test-8192"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pip install "huggingface_hub[cli]" playwright httpx pillow && python -m playwright install --with-deps chromium
+      - name: Pre-cache tiny GGUF (UD-Q4_K_XL)
+        run: huggingface-cli download unsloth/gemma-3-270m-it-GGUF --include "*UD-Q4_K_XL*"
+      - name: Install + launch PR Studio (:8902)
+        run: |
+          git clone --branch feat/model-picker-per-model-config --depth 1 https://github.com/Sneakr/unsloth studio_src
+          cd studio_src
+          UNSLOTH_STUDIO_HOME="$PWD/../shome" bash install.sh --local --no-torch || pip install -e .
+          nohup env UNSLOTH_STUDIO_HOME="$PWD/../shome" "$PWD/../shome/bin/unsloth" studio -H 127.0.0.1 -p 8902 > "$PWD/../studio.log" 2>&1 &
+          for i in $(seq 1 120); do curl -sf http://127.0.0.1:8902/healthz && break; sleep 4; done
+      - name: Rotate bootstrap password
+        run: |
+          BOOT=$(cat shome/auth/.bootstrap_password)
+          TOK=$(curl -s -X POST http://127.0.0.1:8902/api/auth/login -H 'Content-Type: application/json' -d "{\"username\":\"unsloth\",\"password\":\"$BOOT\"}" | python3 -c "import sys,json;print(json.load(sys.stdin)['access_token'])")
+          curl -s -X POST http://127.0.0.1:8902/api/auth/change-password -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' -d "{\"current_password\":\"$BOOT\",\"new_password\":\"$NEWPW\"}" >/dev/null
+      - name: Run AFTER driver (PR)
+        run: PYTHONPATH=.github/scripts python -m studio_test_kit.examples.pr6647_after --base http://127.0.0.1:8902 --password "$NEWPW" --model unsloth/gemma-3-270m-it-GGUF --context 8192 --studio-log studio.log --out out/after
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr6647-after
+          path: |
+            out/after
+            studio.log
+
+  compose:
+    runs-on: ubuntu-latest
+    needs: [before-main, after-pr]
+    if: always()
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: sudo apt-get update && sudo apt-get install -y ffmpeg && pip install pillow
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr6647-before
+          path: dl/before
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr6647-after
+          path: dl/after
+      - name: Compose side-by-side
+        run: PYTHONPATH=.github/scripts python -m studio_test_kit.examples.pr6647_compose --before dl/before/out/before --after dl/after/out/after --out out/compose
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr6647-compose
+          path: out/compose
