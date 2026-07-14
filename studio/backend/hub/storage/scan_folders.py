@@ -52,6 +52,25 @@ def _denied_path_prefixes() -> list[str]:
     return []
 
 
+def is_denied_system_path(path: str) -> bool:
+    """True if *path* is, or descends from, a denied system directory.
+
+    Mirrors the denylist add_scan_folder() enforces at registration so the
+    browser refuses /etc, /proc, C:\\Windows, etc. even when the allowlist holds
+    a broad root (a Windows drive root C:\\ or a legacy-registered / root). The
+    /run carve-out keeps Linux removable-media mounts browseable. Expects an
+    already-resolved (realpath) path so symlinks cannot escape into a denied subtree.
+    """
+    is_win = platform.system() == "Windows"
+    check = os.path.normcase(path) if is_win else path
+    for prefix in _denied_path_prefixes():
+        if check == prefix or check.startswith(prefix + os.sep):
+            if prefix == "/run" and is_linux_run_media_path(check):
+                continue
+            return True
+    return False
+
+
 def _contains_sensitive_path_component(path: str) -> bool:
     return _shared_contains_sensitive_path_component(path)
 
