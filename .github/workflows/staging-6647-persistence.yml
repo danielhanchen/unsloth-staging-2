@@ -27,7 +27,7 @@ jobs:
           node-version: "22"
       - run: pip install "huggingface_hub[cli]" playwright httpx pillow && python -m playwright install --with-deps chromium
       - name: Pre-cache tiny GGUF (UD-Q4_K_XL)
-        run: huggingface-cli download unsloth/gemma-3-270m-it-GGUF --include "*UD-Q4_K_XL*"
+        run: hf download unsloth/gemma-3-270m-it-GGUF --include "*UD-Q4_K_XL*"
       - name: Install + launch main Studio (:8901)
         run: |
           git clone --branch main --depth 1 https://github.com/unslothai/unsloth studio_src
@@ -67,7 +67,7 @@ jobs:
           node-version: "22"
       - run: pip install "huggingface_hub[cli]" playwright httpx pillow && python -m playwright install --with-deps chromium
       - name: Pre-cache tiny GGUF (UD-Q4_K_XL)
-        run: huggingface-cli download unsloth/gemma-3-270m-it-GGUF --include "*UD-Q4_K_XL*"
+        run: hf download unsloth/gemma-3-270m-it-GGUF --include "*UD-Q4_K_XL*"
       - name: Install + launch PR Studio (:8902)
         run: |
           git clone --branch feat/model-picker-per-model-config --depth 1 https://github.com/Sneakr/unsloth studio_src
