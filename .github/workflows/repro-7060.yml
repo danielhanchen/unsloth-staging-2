@@ -1,0 +1,82 @@
+name: repro-7060 backend
+
+# Cross-platform reproduction of the Studio GGUF "update available" loop (#7060)
+# and the related false-update/partial family (#7113, #7033). Drives the REAL
+# Studio update check across code states on Windows / macOS / Linux.
+
+on:
+  push:
+    paths:
+      - 'repro_7060/repro_7060.py'
+      - 'repro_7060/run_repro_7060_ci.py'
+      - '.github/workflows/repro-7060.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: repro-7060-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        target:
+          - name: qwen
+            repo: unsloth/Qwen3.5-2B-MTP-GGUF
+            quant: UD-Q4_K_XL
+            filename: Qwen3.5-2B-UD-Q4_K_XL.gguf
+          - name: gemma
+            repo: unsloth/gemma-4-E2B-it-qat-GGUF
+            quant: UD-Q2_K_XL
+            filename: gemma-4-E2B-it-qat-UD-Q2_K_XL.gguf
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    env:
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_COMPILE_DISABLE: '1'
+      HF_HUB_ENABLE_HF_TRANSFER: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - name: Checkout (full history for code-state worktrees)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Studio backend deps
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r studio/backend/requirements/studio.txt
+          python -m pip install gguf hf_transfer
+
+      - name: Run reproduction (${{ matrix.target.name }})
+        shell: bash
+        run: |
+          python repro_7060/run_repro_7060_ci.py \
+            --repo "${{ matrix.target.repo }}" \
+            --quant "${{ matrix.target.quant }}" \
+            --filename "${{ matrix.target.filename }}" \
+            --out "outputs/repro_7060_${{ matrix.target.name }}_${{ matrix.os }}.json"
+
+      - name: Show report
+        if: always()
+        shell: bash
+        run: |
+          echo "----- report -----"
+          cat outputs/repro_7060_${{ matrix.target.name }}_${{ matrix.os }}.json || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-7060-${{ matrix.target.name }}-${{ matrix.os }}
+          path: outputs/
+          if-no-files-found: warn

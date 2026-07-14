@@ -1,0 +1,95 @@
+name: repro-7060 playwright
+
+# Best-effort end-to-end GUI reproduction against a LIVE released Studio (2026.7.2,
+# the buggy build users run). continue-on-error throughout: the backend workflow's
+# JSON asserts are the source of truth; this captures the badge + loop visually.
+
+on:
+  push:
+    paths:
+      - 'repro_7060/gui_driver.py'
+      - 'repro_7060/repro_7060.py'
+      - '.github/workflows/repro-7060-playwright.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: repro-7060-pw-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  studio-live:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    continue-on-error: true
+    env:
+      REPRO_REPO: unsloth/Qwen3.5-2B-MTP-GGUF
+      REPRO_QUANT: UD-Q4_K_XL
+      STUDIO_URL: http://127.0.0.1:8888
+      REPRO_OUT: outputs
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_COMPILE_DISABLE: '1'
+      HF_HUB_ENABLE_HF_TRANSFER: '1'
+      HF_HOME: ${{ github.workspace }}/_hf
+      HF_HUB_CACHE: ${{ github.workspace }}/_hf/hub
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install released Studio (2026.7.2) + drivers
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          # The released wheel bundles studio/backend + the built frontend + the
+          # `unsloth studio` CLI. Fall back to a plain install if the extra is absent.
+          python -m pip install "unsloth[studio]==2026.7.2" \
+            || python -m pip install "unsloth==2026.7.2" fastapi uvicorn typer structlog "huggingface_hub==0.36.2"
+          python -m pip install playwright httpx pillow hf_transfer
+          python -m playwright install chromium
+
+      - name: Launch Studio (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "$HF_HOME"
+          nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
+          echo "launched pid $!"
+
+      - name: Launch Studio (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:HF_HOME | Out-Null
+          Start-Process -FilePath "unsloth" -ArgumentList "studio","-H","127.0.0.1","-p","8888" `
+            -RedirectStandardOutput studio.log -RedirectStandardError studio.err -NoNewWindow
+          Write-Host "launched studio"
+
+      - name: Drive reproduction + screenshots
+        shell: bash
+        run: |
+          python repro_7060/gui_driver.py || true
+
+      - name: Show Studio log tail
+        if: always()
+        shell: bash
+        run: |
+          echo "----- studio.log -----"; tail -n 60 studio.log 2>/dev/null || true
+          echo "----- studio.err -----"; tail -n 40 studio.err 2>/dev/null || true
+
+      - name: Upload GUI artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repro-7060-gui-${{ matrix.os }}
+          path: |
+            outputs/
+            studio.log
+            studio.err
+          if-no-files-found: warn
