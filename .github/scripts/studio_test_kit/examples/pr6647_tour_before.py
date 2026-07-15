@@ -43,11 +43,14 @@ async def _shot(page, out_dir, name, log, full_page=True):
 
 
 async def _scene_template_editor(page, out_dir, log):
-    """main: the inline 'Edit chat template' button opens a Dialog 'Edit Chat Template'."""
+    """main: the inline 'Edit chat template' button opens a Dialog 'Edit Chat Template'.
+    The button sits low in the long Run-settings sheet, so scroll it into view first."""
     try:
         btn = page.get_by_label(re.compile("Edit chat template", re.I)).first
-        await btn.wait_for(state="visible", timeout=4000)
-        await btn.click()
+        if await btn.count() == 0:
+            btn = page.get_by_role("button", name=re.compile("Chat Template|Edit template", re.I)).first
+        await btn.scroll_into_view_if_needed(timeout=5000)
+        await btn.click(timeout=5000)
         dlg = page.get_by_role("dialog").first
         await dlg.wait_for(state="visible", timeout=6000)
         await page.wait_for_timeout(600)
@@ -64,23 +67,23 @@ async def _scene_template_editor(page, out_dir, log):
 
 
 async def _scene_settings_chat(page, base, out_dir, log):
+    """Open the Settings DIALOG (the /settings route calls openDialog) and switch to
+    the Chat tab, then screenshot. On main this tab has a 'Load on selection' row."""
     try:
+        await page.goto(base + "/settings", wait_until="domcontentloaded", timeout=15000)
+        dlg = page.get_by_role("dialog").first
         try:
-            await page.goto(base + "/settings", wait_until="domcontentloaded", timeout=15000)
+            await dlg.wait_for(state="visible", timeout=8000)
         except Exception:
-            await page.get_by_role("button", name=re.compile("Settings", re.I)).first.click(timeout=5000)
-        await page.wait_for_timeout(800)
-        for name in ("Chat", "Chat settings"):
-            tab = page.get_by_role("tab", name=re.compile(rf"^{name}$", re.I)).first
-            try:
-                if await tab.is_visible():
-                    await tab.click(timeout=3000)
-                    break
-            except Exception:
-                pass
-        await page.wait_for_timeout(600)
+            log("  settings dialog did not open via /settings")
+        try:
+            chat_tab = dlg.get_by_role("button", name=re.compile(r"^Chat$", re.I)).first
+            await chat_tab.click(timeout=4000)
+            await page.wait_for_timeout(800)
+        except Exception as e:
+            log(f"  chat tab click: {e!r}")
         rows = await page.get_by_text(re.compile("Load on selection", re.I)).count()
-        await _shot(page, out_dir, "s5_settings_chat", log)
+        await _shot(page, out_dir, "s5_settings_chat", log, full_page=False)
         log(f"  settings 'Load on selection' rows found: {rows} (expect >=1 on main)")
         return rows
     except Exception as e:

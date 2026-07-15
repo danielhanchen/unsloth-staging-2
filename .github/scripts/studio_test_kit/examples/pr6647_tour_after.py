@@ -58,14 +58,18 @@ async def _scene_advanced(panel, sp, out_dir, log):
         log(f"  advanced toggle not found: {e!r}")
     tp_set = False
     try:
-        tp = panel.get_by_role("switch", name=re.compile("Tensor Parallel|Tensor Parallel", re.I)).first
-        await tp.wait_for(state="visible", timeout=3000)
-        await tp.click()
-        tp_set = True
-        await panel.page.wait_for_timeout(300)
+        # The Tensor Parallelism switch has no accessible name; it is the last
+        # switch in the panel (the named "Show advanced settings" one is separate).
+        switches = panel.get_by_role("switch")
+        n = await switches.count()
+        if n:
+            tp = switches.nth(n - 1)
+            await tp.click(timeout=3000)
+            tp_set = True
+            await panel.page.wait_for_timeout(300)
     except Exception as e:
         log(f"  tensor-parallel switch not toggled: {e!r}")
-    await _shot(sp, out_dir, "s3_advanced", log)
+    await _shot(sp, out_dir, "s3_advanced", log, full_page=False)
     return tp_set
 
 
@@ -116,26 +120,23 @@ async def _scene_sidebar(page, sp, out_dir, log):
 
 
 async def _scene_settings_chat(page, base, sp, out_dir, log):
-    """Best-effort: open Settings -> Chat and screenshot (proves 'Load on selection'
-    is gone on the PR). Navigation selector is uncertain, so try a few routes."""
+    """Open the Settings DIALOG (the /settings route calls openDialog) and switch to
+    the Chat tab, then screenshot. On the PR the 'Load on selection' row is gone."""
     try:
+        await page.goto(base + "/settings", wait_until="domcontentloaded", timeout=15000)
+        dlg = page.get_by_role("dialog").first
         try:
-            await page.goto(base + "/settings", wait_until="domcontentloaded", timeout=15000)
+            await dlg.wait_for(state="visible", timeout=8000)
         except Exception:
-            btn = page.get_by_role("button", name=re.compile("Settings", re.I)).first
-            await btn.click(timeout=5000)
-        await page.wait_for_timeout(800)
-        for name in ("Chat", "Chat settings"):
-            tab = page.get_by_role("tab", name=re.compile(rf"^{name}$", re.I)).first
-            try:
-                if await tab.is_visible():
-                    await tab.click(timeout=3000)
-                    break
-            except Exception:
-                pass
-        await page.wait_for_timeout(600)
+            log("  settings dialog did not open via /settings")
+        try:
+            chat_tab = dlg.get_by_role("button", name=re.compile(r"^Chat$", re.I)).first
+            await chat_tab.click(timeout=4000)
+            await page.wait_for_timeout(800)
+        except Exception as e:
+            log(f"  chat tab click: {e!r}")
         has_row = await page.get_by_text(re.compile("Load on selection", re.I)).count()
-        await _shot(sp, out_dir, "s5_settings_chat", log)
+        await _shot(sp, out_dir, "s5_settings_chat", log, full_page=False)
         log(f"  settings 'Load on selection' rows found: {has_row} (expect 0 on PR)")
         return has_row
     except Exception as e:
