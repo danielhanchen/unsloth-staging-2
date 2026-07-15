@@ -56,21 +56,11 @@ async def _scene_advanced(panel, sp, out_dir, log):
         await panel.page.wait_for_timeout(400)
     except Exception as e:
         log(f"  advanced toggle not found: {e!r}")
-    tp_set = False
-    try:
-        # The Tensor Parallelism switch has no accessible name; it is the last
-        # switch in the panel (the named "Show advanced settings" one is separate).
-        switches = panel.get_by_role("switch")
-        n = await switches.count()
-        if n:
-            tp = switches.nth(n - 1)
-            await tp.click(timeout=3000)
-            tp_set = True
-            await panel.page.wait_for_timeout(300)
-    except Exception as e:
-        log(f"  tensor-parallel switch not toggled: {e!r}")
+    # Do NOT toggle the Tensor Parallelism switch: it has no accessible name and
+    # a positional click risks hitting the "Show advanced settings" toggle and
+    # collapsing the panel. The expanded panel screenshot is the value here.
     await _shot(sp, out_dir, "s3_advanced", log, full_page=False)
-    return tp_set
+    return False
 
 
 async def _scene_template_editor(panel, sp, out_dir, log):

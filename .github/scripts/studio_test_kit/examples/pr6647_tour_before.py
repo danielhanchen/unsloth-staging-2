@@ -46,9 +46,11 @@ async def _scene_template_editor(page, out_dir, log):
     """main: the inline 'Edit chat template' button opens a Dialog 'Edit Chat Template'.
     The button sits low in the long Run-settings sheet, so scroll it into view first."""
     try:
-        btn = page.get_by_label(re.compile("Edit chat template", re.I)).first
+        # main opens the editor from a "Chat Template" text button or an
+        # aria-label="Edit chat template" icon button (both call openEditor).
+        btn = page.get_by_role("button", name=re.compile(r"^Chat Template$")).first
         if await btn.count() == 0:
-            btn = page.get_by_role("button", name=re.compile("Chat Template|Edit template", re.I)).first
+            btn = page.get_by_label(re.compile("Edit chat template", re.I)).first
         await btn.scroll_into_view_if_needed(timeout=5000)
         await btn.click(timeout=5000)
         dlg = page.get_by_role("dialog").first
