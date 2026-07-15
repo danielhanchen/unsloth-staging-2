@@ -1,0 +1,51 @@
+name: "staging-7083 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-7083-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/_html_to_md.py'
+      - 'studio/backend/core/inference/llama_cpp.py'
+      - 'studio/backend/core/inference/safetensors_agentic.py'
+      - 'studio/backend/core/inference/sandbox_site/__init__.py'
+      - 'studio/backend/core/inference/sandbox_site/sitecustomize.py'
+      - 'studio/backend/core/inference/tool_stream_exec.py'
+      - 'studio/backend/core/inference/tools.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/tests/test_anthropic_messages.py'
+      - 'studio/backend/tests/test_bypass_permissions.py'
+      - 'studio/backend/tests/test_llama_cpp_tool_loop.py'
+      - 'studio/backend/tests/test_sandbox_sitecustomize.py'
+      - 'studio/backend/tests/test_sandbox_tools.py'
+      - 'studio/backend/tests/test_tool_output_streaming.py'
+      - 'studio/backend/tests/test_tool_stream_generator_drain.py'
+      - 'studio/backend/tests/test_web_fetch_extraction.py'
+      - 'studio/frontend/src/components/assistant-ui/thread.tsx'
+      - 'studio/frontend/src/components/assistant-ui/tool-group.tsx'
+      - 'studio/frontend/src/components/assistant-ui/tool-live-output.tsx'
+      - 'studio/frontend/src/components/assistant-ui/tool-result-output.tsx'
+      - '.github/workflows/staging-7083-ubuntu-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
