@@ -1,0 +1,120 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+
+"use client";
+
+import { createContext, useContext } from "react";
+import type { ModelType } from "./types";
+
+/**
+ * Pane scoping for the transient tool-output store maps.
+ *
+ * Backend tool call ids from local GGUF models are only unique within one
+ * response ("call_0", "call_1", ...), and multiple chat panes can stream at
+ * the same time (compare mode mounts two runtimes side by side; the main
+ * chat view stays mounted, CSS-hidden, while off-route). Keying the shared
+ * `toolLiveOutput` / `toolFullOutput` maps by the bare backend id would let
+ * one pane's stdout bleed into another pane's card with the same id, so the
+ * keys are prefixed with the pane identity instead.
+ *
+ * The scope is derived from static props (`modelType` + `pairId`) that both
+ * the stream adapter and the rendering components receive from the same
+ * `ChatRuntimeProvider`, so the writer and the reader can never disagree.
+ * Within one pane at most one run streams at a time; stale same-id entries
+ * from earlier turns are cleared when a new `tool_start` reuses the id.
+ */
+export function toolPaneScope(modelType?: ModelType, pairId?: string): string {
+  return `${modelType ?? "base"}\u0000${pairId ?? ""}`;
+}
+
+export const ToolPaneScopeContext = createContext<string>(toolPaneScope());
+
+export function useToolPaneScope(): string {
+  return useContext(ToolPaneScopeContext);
+}
+
+/** Store key for the live/full tool output maps: pane scope + tool call id. */
+export function toolOutputKey(paneScope: string, toolCallId: string): string {
+  return `${paneScope}\u0000${toolCallId}`;
+}
+
+// Marker the backend appends to a model-visible result whose output was
+// truncated to protect the context window (see backend tools._truncate). It is
+// also where the result stops being a copy of the stream, so we use it to tell
+// "just truncated" (the stream is the same text, only longer) from "carries
+// failure/exit status the stream never produced".
+const TRUNCATION_FOOTER_MARKER = "\n\n... (truncated";
+
+/**
+ * Whether the accumulated live stdout carries more of the real output than the
+ * model-visible `result` and should be preserved for the finished card.
+ *
+ * True when the result was truncated (its footer marks stdout that never made
+ * it into the result), OR the stream is simply longer than the result. The
+ * truncation case must not fall back to a length comparison: a truncated
+ * result can be LONGER than the stream by byte count once its footer, an
+ * `Exit code N:`/timeout notice, or an `__IMAGES__` base64 blob is appended,
+ * even though the stream still holds more of the actual stdout than the
+ * truncated card text. It is also true when a short live stream is not
+ * represented in the result at all: a timed-out or cancelled tool returns
+ * only a status line ("Execution timed out after N seconds." / "Execution
+ * cancelled.") that never carries the partial stdout the stream captured, so
+ * a length-only comparison would drop the only diagnostic output the failed
+ * tool produced. Shared by the write site (whether to retain the stream) and
+ * the read site (whether to display it) so they never disagree.
+ */
+export function shouldPreserveFullOutput(full: string, result: string): boolean {
+  if (!full) {
+    return false;
+  }
+  if (result.includes(TRUNCATION_FOOTER_MARKER)) {
+    return true;
+  }
+  if (full.length > result.length) {
+    return true;
+  }
+  // The live stream is not longer than the result, but a timed-out or
+  // cancelled tool returns only a status line that never echoes the partial
+  // stdout the stream captured, so it would otherwise be cleared on tool_end
+  // and vanish from the finished card. Preserve it whenever its real content
+  // is absent from the result (trimmed so trailing-newline drift between the
+  // stream and result does not cause a spurious duplicate append).
+  const core = full.trim();
+  return core.length > 0 && !result.includes(core);
+}
+
+/**
+ * Pick what a finished python/terminal card shows.
+ *
+ * `full` is the accumulated live stdout, which can exceed the model-visible
+ * `result` (truncated to protect the context window), so we prefer the fuller
+ * stream. But the result can also carry failure/exit text that never reached
+ * stdout -- "Execution timed out after N seconds.", "Exit code N: ..." -- and
+ * a length-only preference would drop it, hiding WHY a long-running tool
+ * stopped. So: show the stream when the result is just a truncated prefix of
+ * it; otherwise append the result so its status survives (and the copy button
+ * copies both).
+ */
+export function preferFullToolOutput(full: string, result: string): string {
+  if (!shouldPreserveFullOutput(full, result)) {
+    return result;
+  }
+  const marker = result.indexOf(TRUNCATION_FOOTER_MARKER);
+  const core = marker === -1 ? result : result.slice(0, marker);
+  if (!core || full === result || full.startsWith(core)) {
+    return full;
+  }
+  // Failed executions prefix the result body with "Exit code N:\n" (added to
+  // the result only, never to the live stream). The truncated `core` therefore
+  // starts with that prefix while `full` does not, so `full.startsWith(core)`
+  // above fails and the plain append below would emit the ~16 KB stdout prefix
+  // twice (once from `full`, once from the still-prefixed `result`). Re-attach
+  // the exit prefix to the fuller stream instead and keep any missing-path hint,
+  // so the exit status survives without duplicating stdout.
+  const exitMatch = core.match(/^(Exit code -?\d+:\n)([\s\S]*)$/);
+  if (exitMatch && full.startsWith(exitMatch[2])) {
+    const hint = result.match(/\nHint:[\s\S]*$/)?.[0] ?? "";
+    return `${exitMatch[1]}${full}${hint}`;
+  }
+  return `${full.replace(/\s+$/, "")}\n\n${result}`;
+}

@@ -12,6 +12,10 @@ import {
 import { downloadImagePart } from "@/components/assistant-ui/image";
 import { MarkdownText } from "@/components/assistant-ui/markdown-text";
 import { MessageHtmlArtifacts } from "@/components/assistant-ui/message-html-artifacts";
+import {
+  MessageResponseDetailsSheet,
+  MessageResponseModelBadge,
+} from "@/components/assistant-ui/message-response-details-sheet";
 import { MessageTiming } from "@/components/assistant-ui/message-timing";
 import { Reasoning, ReasoningGroup } from "@/components/assistant-ui/reasoning";
 import { RagSourcesGroup } from "@/components/assistant-ui/rag-sources";
@@ -75,6 +79,7 @@ import { McpComposerButton } from "@/features/chat/mcp-composer-button";
 import { getExternalReasoningCapabilities } from "@/features/chat/provider-capabilities";
 import { useRagToolDisabled } from "@/features/chat/hooks/use-rag-tool-disabled";
 import { BypassPermissionsMenuItem } from "@/features/chat/bypass-permissions-menu-item";
+import { PermissionModeComposerPill } from "@/features/chat/permission-mode-select";
 import { useChatRuntimeStore } from "@/features/chat/stores/chat-runtime-store";
 import { useExternalProvidersStore } from "@/features/chat/stores/external-providers-store";
 import { PROMPT_QUEUE_STOP_EVENT } from "@/features/chat/utils/prompt-queue-boundary";
@@ -123,10 +128,10 @@ import {
   FileDatabaseIcon,
   Folder01Icon,
   FolderAddIcon,
+  HelpCircleIcon,
   Image03Icon,
   McpServerIcon,
   PencilRulerIcon,
-  ShieldBanIcon,
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { useNavigate } from "@tanstack/react-router";
@@ -1212,7 +1217,7 @@ const ThreadComposerDock: FC<{
       <div
         aria-hidden={true}
         className={cn(
-          "absolute inset-x-0 bottom-0 bg-gradient-to-t from-background from-[calc(100%_-_28px)] to-[rgb(from_var(--background)_r_g_b/0)]",
+          "thread-bottom-fade absolute inset-x-0 bottom-0 bg-gradient-to-t from-background from-[calc(100%_-_28px)] to-[rgb(from_var(--background)_r_g_b/0)]",
           queueVisible
             ? "h-32 backdrop-blur-[1px] [mask-image:linear-gradient(to_top,black_0%,black_58%,transparent_100%)]"
             : "top-[10px]",
@@ -1312,6 +1317,7 @@ const ThreadWelcome: FC<{
   const incognito = useChatRuntimeStore((s) => s.incognito);
   const displayName = useUserProfileStore((s) => s.displayName);
   const nickname = useUserProfileStore((s) => s.nickname);
+  const showGreetingSloth = useUserProfileStore((s) => s.showGreetingSloth);
   const [welcome, setWelcome] = useState<Welcome>(DEFAULT_WELCOME);
 
   useEffect(() => {
@@ -1328,10 +1334,12 @@ const ThreadWelcome: FC<{
         <div className="aui-thread-welcome-message flex w-full flex-col justify-center gap-9 px-4">
           {/* Center the greeting (sloth + title) over the composer. */}
           <div className="flex flex-row items-center justify-center gap-[15px]">
-            <MascotImg
-              src={currentEmojiSrc}
-              className="size-[44px] -translate-y-[2px]"
-            />
+            {showGreetingSloth && (
+              <MascotImg
+                src={currentEmojiSrc}
+                className="size-[44px] -translate-y-[2px]"
+              />
+            )}
             <h1 className="aui-thread-welcome-message-inner unsloth-welcome-title fade-in slide-in-from-bottom-1 animate-in text-3xl tracking-[-0.02em] duration-200">
               {incognito ? "Temporary chat" : welcome.text}
             </h1>
@@ -1420,11 +1428,14 @@ const Composer: FC<{
   const artifactsEnabled = useChatRuntimeStore((s) => s.artifactsEnabled);
   const mcpEnabledForChat = useChatRuntimeStore((s) => s.mcpEnabledForChat);
   const ragEnabled = useChatRuntimeStore((s) => s.ragEnabled);
+  const permissionMode = useChatRuntimeStore((s) => s.permissionMode);
   const bypassPermissions = useChatRuntimeStore((s) => s.bypassPermissions);
-  // More than 4 pills: collapse to icons only. Search and Code always show;
+  // More than 4 pills: collapse to icons only. Search and Code always show; the
+  // permission pill shows in every mode except "off" (it renders null there);
   // Images, RAG, Canvas and MCP are conditional.
   const pillsCompact =
     2 +
+      (permissionMode !== "off" ? 1 : 0) +
       (ragEnabled ? 1 : 0) +
       (supportsBuiltinImageGeneration ? 1 : 0) +
       (artifactsEnabled ? 1 : 0) +
@@ -1848,9 +1859,9 @@ const Composer: FC<{
           data-pill-compact={pillsCompact ? "true" : undefined}
         >
           <ComposerToolsMenu side={effectiveMenuSide} />
-          {/* Active-mode badge: always visible when bypass is on, even while
-              the pill row is collapsed (returns null when off). */}
-          <BypassPermissionsToggle />
+          {/* Permission-level pill: always visible, even while the pill row
+              is collapsed; opens the permission level dropdown. */}
+          <PermissionModeComposerPill side={effectiveMenuSide} />
           {composerExpanded ? (
             <>
               <WebSearchToggle />
@@ -2612,36 +2623,6 @@ const ArtifactsToggle: FC = () => {
   );
 };
 
-// Claude gold pill shown while Bypass permissions is on; click to turn it off.
-// Mirror of shared-composer's badge so both composers surface the state.
-const BypassPermissionsToggle: FC = () => {
-  const bypassPermissions = useChatRuntimeStore((s) => s.bypassPermissions);
-  const setBypassPermissions = useChatRuntimeStore(
-    (s) => s.setBypassPermissions,
-  );
-  if (!bypassPermissions) return null;
-  return (
-    <button
-      type="button"
-      onClick={() => setBypassPermissions(false)}
-      className="composer-pill-btn"
-      data-active="true"
-      data-variant="danger"
-      aria-label="Disable Bypass permissions"
-      title="Bypass permissions is on (no confirmation, no sandbox). Click to turn off."
-    >
-      <PillGlyph>
-        <HugeiconsIcon
-          icon={ShieldBanIcon}
-          strokeWidth={2}
-          className="size-[15px]"
-        />
-      </PillGlyph>
-      <span>Bypass permissions</span>
-    </button>
-  );
-};
-
 const ToolStatusDisplay: FC = () => {
   const toolStatus = useChatRuntimeStore((s) => s.toolStatus);
   const isThreadRunning = useAuiState(({ thread }) => thread.isRunning);
@@ -3278,7 +3259,7 @@ const PromptQueueStack: FC<{ queueThreadIds: string[] }> = ({
                         cancelEditing();
                       }
                     }}
-                    className="max-h-20 min-h-8 min-w-0 resize-none rounded-md border border-border/45 bg-transparent px-2 py-1.5 text-sm leading-5 text-foreground outline-none transition-colors focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/35"
+                    className="max-h-20 min-h-8 min-w-0 resize-none rounded-md border border-border/45 bg-transparent px-2 py-1.5 text-sm leading-5 text-foreground outline-none transition-colors focus-visible:border-ring"
                     aria-label={`Edit queued prompt ${visiblePosition}`}
                   />
                   <Button
@@ -3472,8 +3453,18 @@ const ComposerRightControls: FC<{
 const MessageError: FC = () => {
   return (
     <MessagePrimitive.Error>
-      <ErrorPrimitive.Root className="aui-message-error-root mt-2 rounded-md bg-destructive/10 p-3 text-destructive text-sm dark:bg-destructive/5 dark:text-red-200">
-        <ErrorPrimitive.Message className="aui-message-error-message line-clamp-2" />
+      <ErrorPrimitive.Root className="aui-message-error-root mt-2 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-md bg-destructive/10 p-3 text-destructive text-sm dark:bg-destructive/5 dark:text-red-200">
+        <ErrorPrimitive.Message className="aui-message-error-message line-clamp-2 min-w-0 flex-1" />
+        {/* Recovery path for interrupted/failed turns: regenerate in place. */}
+        <ActionBarPrimitive.Reload asChild={true}>
+          <button
+            type="button"
+            className="aui-message-error-retry inline-flex shrink-0 items-center gap-1.5 rounded-md border border-destructive/40 px-2.5 py-1 text-xs font-medium transition-colors hover:bg-destructive/15"
+          >
+            <RefreshCwIcon strokeWidth={1.75} className="size-3.5" />
+            Retry
+          </button>
+        </ActionBarPrimitive.Reload>
       </ErrorPrimitive.Root>
     </MessagePrimitive.Error>
   );
@@ -3564,6 +3555,9 @@ const AssistantMessage: FC = () => {
   const aui = useAui();
   const messageId = useAuiState(({ message }) => message.id);
   const messageContent = useAuiState(({ message }) => message.content);
+  const hasReasoningParts = useAuiState(({ message }) =>
+    message.parts.some((part) => part.type === "reasoning"),
+  );
   const incognito = useChatRuntimeStore((s) => s.incognito);
 
   // Use global store for editing state to ensure a single source of truth
@@ -3620,7 +3614,7 @@ const AssistantMessage: FC = () => {
 
   return (
     <MessagePrimitive.Root
-      className="aui-assistant-message-root relative mx-auto min-w-0 w-full max-w-(--thread-content-max-width) pt-0.5 pb-4 text-[15.5px] [font-weight:410] tracking-[0.01em] dark:tracking-[0.02em]"
+      className="group/assistant-message aui-assistant-message-root relative mx-auto min-w-0 w-full max-w-(--thread-content-max-width) pt-0.5 pb-4 text-[15.5px] [font-weight:410] tracking-[0.01em] dark:tracking-[0.02em]"
       data-role="assistant"
     >
       <div className="aui-assistant-message-content wrap-break-word min-w-0 text-[#0d0d0d] dark:text-foreground leading-relaxed">
@@ -3629,7 +3623,7 @@ const AssistantMessage: FC = () => {
             <textarea
               ref={textareaRef}
               defaultValue={extractTaggedText(messageContent)}
-              className="w-full p-3 rounded-xl bg-muted border border-border text-foreground focus:ring-2 focus:ring-primary outline-none overflow-y-auto resize-none font-mono text-sm max-h-[70vh]"
+              className="w-full p-3 rounded-xl bg-muted border border-border text-foreground focus:ring-1 focus:ring-ring outline-none overflow-y-auto resize-none font-mono text-sm max-h-[70vh]"
               autoFocus
               onInput={adjustHeight}
               onKeyDown={(e) => {
@@ -3649,6 +3643,11 @@ const AssistantMessage: FC = () => {
           </div>
         ) : (
           <>
+            {!hasReasoningParts ? (
+              <div className="pointer-events-none relative h-0 min-w-0">
+                <MessageResponseModelBadge className="absolute -top-6 left-0 max-w-[min(22rem,100%)]" />
+              </div>
+            ) : null}
             <GeneratingIndicator />
             <CancelledIndicator />
             <DiffusionCanvas />
@@ -3893,58 +3892,76 @@ const EditAssistantMessageButton: FC = () => {
 
 const AssistantActionBar: FC = () => {
   const { forkMessage, forkDisabled } = useForkMessageAction();
+  const [detailsOpen, setDetailsOpen] = useState(false);
 
   return (
-    <ActionBarPrimitive.Root
-      hideWhenRunning={true}
-      className="aui-assistant-action-bar-root col-start-3 row-start-2 flex items-center gap-1 text-chat-icon-fg [&_button:not([data-slot=message-timing-trigger])]:size-8 [&_button]:!rounded-full [&_button:hover]:bg-chat-icon-bg-hover [&_button:hover]:text-chat-icon-fg-hover"
-    >
-      <CopyButton />
-      <EditAssistantMessageButton />
-      <ActionBarPrimitive.Reload asChild={true}>
-        <TooltipIconButton tooltip="Refresh">
-          <RefreshCwIcon strokeWidth={1.75} className="size-icon" />
-        </TooltipIconButton>
-      </ActionBarPrimitive.Reload>
-      <ForkCountBadge />
-      <DeleteMessageButton />
-      <ActionBarMorePrimitive.Root>
-        <ActionBarMorePrimitive.Trigger asChild={true}>
-          <TooltipIconButton
-            tooltip="More"
-            className="data-[state=open]:bg-accent"
-          >
-            <MoreHorizontalIcon strokeWidth={1.75} className="size-icon" />
+    <>
+      <ActionBarPrimitive.Root
+        hideWhenRunning={true}
+        className="aui-assistant-action-bar-root col-start-3 row-start-2 flex items-center gap-1 text-chat-icon-fg [&_button:not([data-slot=message-timing-trigger])]:size-8 [&_button]:!rounded-full [&_button:hover]:bg-chat-icon-bg-hover [&_button:hover]:text-chat-icon-fg-hover"
+      >
+        <CopyButton />
+        <EditAssistantMessageButton />
+        <ActionBarPrimitive.Reload asChild={true}>
+          <TooltipIconButton tooltip="Refresh">
+            <RefreshCwIcon strokeWidth={1.75} className="size-icon" />
           </TooltipIconButton>
-        </ActionBarMorePrimitive.Trigger>
-        <ActionBarMorePrimitive.Content
-          side="bottom"
-          align="start"
-          onCloseAutoFocus={(e) => e.preventDefault()}
-          className="aui-action-bar-more-content z-50 min-w-32 overflow-hidden rounded-[21px] bg-popover px-[9px] py-2 text-popover-foreground shadow-[0_2px_8px_-2px_rgba(0,0,0,0.16)] dark:shadow-none"
-        >
-          <ActionBarMorePrimitive.Item
-            disabled={forkDisabled}
-            onSelect={() => void forkMessage()}
-            className="aui-action-bar-more-item flex cursor-pointer select-none items-center gap-2 rounded-[12px] px-3 py-2 text-sm outline-none hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50"
+        </ActionBarPrimitive.Reload>
+        <ForkCountBadge />
+        <DeleteMessageButton />
+        <ActionBarMorePrimitive.Root>
+          <ActionBarMorePrimitive.Trigger asChild={true}>
+            <TooltipIconButton
+              tooltip="More"
+              className="data-[state=open]:bg-accent"
+            >
+              <MoreHorizontalIcon strokeWidth={1.75} className="size-icon" />
+            </TooltipIconButton>
+          </ActionBarMorePrimitive.Trigger>
+          <ActionBarMorePrimitive.Content
+            side="bottom"
+            align="start"
+            onCloseAutoFocus={(e) => e.preventDefault()}
+            className="aui-action-bar-more-content z-50 min-w-32 overflow-hidden rounded-[21px] bg-popover px-[9px] py-2 text-popover-foreground shadow-[0_2px_8px_-2px_rgba(0,0,0,0.16)] dark:shadow-none"
           >
-            <GitBranchIcon strokeWidth={1.75} className="size-icon" />
-            Fork in new chat
-          </ActionBarMorePrimitive.Item>
-          <ActionBarPrimitive.ExportMarkdown asChild={true}>
-            <ActionBarMorePrimitive.Item className="aui-action-bar-more-item flex cursor-pointer select-none items-center gap-2 rounded-[12px] px-3 py-2 text-sm outline-none hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground">
+            <ActionBarMorePrimitive.Item
+              disabled={forkDisabled}
+              onSelect={() => void forkMessage()}
+              className="aui-action-bar-more-item flex cursor-pointer select-none items-center gap-2 rounded-[12px] px-3 py-2 text-sm outline-none hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50"
+            >
+              <GitBranchIcon strokeWidth={1.75} className="size-icon" />
+              Fork in new chat
+            </ActionBarMorePrimitive.Item>
+            <ActionBarPrimitive.ExportMarkdown asChild={true}>
+              <ActionBarMorePrimitive.Item className="aui-action-bar-more-item flex cursor-pointer select-none items-center gap-2 rounded-[12px] px-3 py-2 text-sm outline-none hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground">
+                <HugeiconsIcon
+                  icon={Download01Icon}
+                  strokeWidth={1.75}
+                  className="size-icon"
+                />
+                Export as markdown
+              </ActionBarMorePrimitive.Item>
+            </ActionBarPrimitive.ExportMarkdown>
+            <ActionBarMorePrimitive.Item
+              onSelect={() => setDetailsOpen(true)}
+              className="aui-action-bar-more-item flex cursor-pointer select-none items-center gap-2 rounded-[12px] px-3 py-2 text-sm outline-none hover:bg-accent hover:text-accent-foreground focus:bg-accent focus:text-accent-foreground"
+            >
               <HugeiconsIcon
-                icon={Download01Icon}
+                icon={HelpCircleIcon}
                 strokeWidth={1.75}
                 className="size-icon"
               />
-              Export as Markdown
+              See response details
             </ActionBarMorePrimitive.Item>
-          </ActionBarPrimitive.ExportMarkdown>
-        </ActionBarMorePrimitive.Content>
-      </ActionBarMorePrimitive.Root>
-      <MessageTiming side="top" className="h-8 px-2" />
-    </ActionBarPrimitive.Root>
+          </ActionBarMorePrimitive.Content>
+        </ActionBarMorePrimitive.Root>
+        <MessageTiming side="top" className="h-8 px-2" />
+      </ActionBarPrimitive.Root>
+      <MessageResponseDetailsSheet
+        open={detailsOpen}
+        onOpenChange={setDetailsOpen}
+      />
+    </>
   );
 };
 
@@ -3975,7 +3992,7 @@ const UserMessage: FC = () => {
       <UserMessageAudio />
 
       <div className="aui-user-message-content-wrapper flex max-w-[80%] min-w-0 flex-col items-end">
-        <div className="aui-user-message-content wrap-break-word w-fit rounded-[24px] bg-[#f5f5f5] px-4 py-2.5 text-[#0d0d0d] dark:text-foreground dark:bg-card">
+        <div className="aui-user-message-content wrap-break-word w-fit max-w-full rounded-[24px] bg-[#f5f5f5] px-4 py-2.5 text-[#0d0d0d] dark:text-foreground dark:bg-card">
           <MessagePrimitive.Parts />
         </div>
         <div className="mt-1 -mr-[var(--icon-btn-inset)] flex min-h-8 items-center">
