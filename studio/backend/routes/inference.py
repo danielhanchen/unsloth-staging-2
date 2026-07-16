@@ -4148,7 +4148,6 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # agree on the candidate set. GGUF now supports gpu_ids (#7164).
         if effective_gpu_ids is not None:
             from utils.hardware import resolve_requested_gpu_ids
-
             try:
                 effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
             except ValueError as exc:
@@ -4764,7 +4763,6 @@ async def validate_model(
         # Mirror /load: validate explicit GPU selection before the guard.
         if effective_gpu_ids is not None:
             from utils.hardware import resolve_requested_gpu_ids
-
             try:
                 effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
             except ValueError as exc:
