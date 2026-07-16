@@ -338,13 +338,16 @@ def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
 
         return _FakePopen(cmd, **kwargs)
 
-    with patch.object(
-        subprocess,
-        "Popen",
-        side_effect = _make_fake_popen,
-    ), patch(
-        "utils.hardware.get_parent_visible_gpu_ids",
-        return_value = [1],
+    with (
+        patch.object(
+            subprocess,
+            "Popen",
+            side_effect = _make_fake_popen,
+        ),
+        patch(
+            "utils.hardware.get_parent_visible_gpu_ids",
+            return_value = [1],
+        ),
     ):
         backend.load_model(
             gguf_path = str(gguf),

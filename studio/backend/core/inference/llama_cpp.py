@@ -6649,9 +6649,7 @@ class LlamaCppBackend:
                 # training guard excluded. Pin --fit to the requested set instead.
                 if use_fit and gpu_indices is None and gpu_ids is not None and gpus:
                     gpu_indices = sorted(idx for idx, _ in gpus)
-                    logger.info(
-                        f"Using --fit on explicitly requested GPUs: {gpu_indices}"
-                    )
+                    logger.info(f"Using --fit on explicitly requested GPUs: {gpu_indices}")
 
                 # Unified-memory APUs load weights into system RAM (under WSL the VM
                 # cap, not the ROCm-reported VRAM, is the real ceiling); refuse an
