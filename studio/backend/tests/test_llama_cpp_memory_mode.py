@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import struct
 import subprocess
 import sys
@@ -248,3 +249,125 @@ def test_gpu_ids_filter_raises_when_no_visible_match(tmp_path):
             model_identifier = "test",
             gpu_ids = [9],
         )
+
+
+def test_gpu_ids_preserved_on_fit_fallback(tmp_path):
+    """When _select_gpus falls back to --fit on, still pin CUDA_VISIBLE_DEVICES."""
+    gguf = tmp_path / "model.gguf"
+    _write_minimal_gguf(gguf)
+
+    backend = LlamaCppBackend()
+    backend._get_gpu_memory = lambda _binary = None: [
+        (0, 10000, 16000),
+        (1, 8000, 16000),
+        (2, 6000, 16000),
+    ]
+    backend._read_gguf_metadata = lambda _p: None
+    backend._can_estimate_kv = lambda: False
+    backend._get_gguf_size_bytes = lambda _p: 1024
+    backend._mmproj_vram_bytes = lambda _p: 0
+    backend._resolve_launch_mmproj_path = lambda **k: None
+    backend._apu_ram_shortfall_message = lambda *a, **k: None
+    backend._amd_apu_wants_unified_memory = lambda *a, **k: False
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    # Force a --fit on fallback.
+    backend._select_gpus = lambda *a, **k: (None, True)
+    backend._wait_for_health = lambda timeout: True
+    backend._detect_audio_type_strict = lambda: None
+    backend._apply_detected_audio = lambda _d: True
+
+    captured_envs = []
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                captured_envs.append(kwargs.get("env") or dict(os.environ))
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with patch.object(subprocess, "Popen", side_effect = _make_fake_popen):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = [1, 2],
+        )
+
+    assert captured_envs, "llama-server was not spawned"
+    assert captured_envs[-1]["CUDA_VISIBLE_DEVICES"] == "1,2"
+
+
+def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
+    """Physical gpu_ids are mapped to Vulkan0..N ordinals for --device pinning."""
+    gguf = tmp_path / "model.gguf"
+    _write_minimal_gguf(gguf)
+
+    backend = LlamaCppBackend()
+    backend._is_vulkan_backend = lambda _binary = None: True
+    # Vulkan reports one device at ordinal 0.
+    backend._get_gpu_memory = lambda _binary = None: [(0, 10000, 16000)]
+    backend._get_gpu_free_memory = lambda _binary = None: [(0, 10000)]
+    backend._read_gguf_metadata = lambda _p: None
+    backend._can_estimate_kv = lambda: False
+    backend._get_gguf_size_bytes = lambda _p: 1024
+    backend._mmproj_vram_bytes = lambda _p: 0
+    backend._resolve_launch_mmproj_path = lambda **k: None
+    backend._apu_ram_shortfall_message = lambda *a, **k: None
+    backend._amd_apu_wants_unified_memory = lambda *a, **k: False
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._select_gpus = lambda *a, **k: ([0], False)
+    backend._wait_for_health = lambda timeout: True
+    backend._detect_audio_type_strict = lambda: None
+    backend._apply_detected_audio = lambda _d: True
+
+    captured_cmds = []
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                captured_cmds.append(list(cmd))
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with patch.object(
+        subprocess,
+        "Popen",
+        side_effect = _make_fake_popen,
+    ), patch(
+        "utils.hardware.get_parent_visible_gpu_ids",
+        return_value = [1],
+    ):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = [1],
+        )
+
+    assert captured_cmds, "llama-server was not spawned"
+    cmd = captured_cmds[-1]
+    assert "--device" in cmd
+    assert cmd[cmd.index("--device") + 1] == "Vulkan0"
+
+
+def test_memory_mode_auto_matches_none_in_target_state():
+    """An explicit 'auto' request should not reload a load that omitted the field."""
+    backend = _loaded_backend(_memory_mode = None)
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["memory_mode"] = "auto"
+    assert backend._already_in_target_state(**kwargs) is True
+
+
+def test_memory_mode_pinned_does_not_match_none():
+    backend = _loaded_backend(_memory_mode = None)
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["memory_mode"] = "pinned"
+    assert backend._already_in_target_state(**kwargs) is False

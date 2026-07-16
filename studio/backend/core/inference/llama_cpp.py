@@ -5451,6 +5451,18 @@ class LlamaCppBackend:
         self._stdout_thread.start()
 
     @staticmethod
+    def _canonical_memory_mode(memory_mode: Optional[str]) -> Optional[str]:
+        """Normalize a memory_mode value so 'auto'/blank/None are equivalent.
+
+        Returns None for the default (memory-mapped) placement, or the lowercase
+        canonical name 'pinned' / 'resident' for explicit modes.
+        """
+        mode = (memory_mode or "").strip().lower()
+        if mode in ("", "auto"):
+            return None
+        return mode
+
+    @staticmethod
     def _memory_mode_flags(memory_mode: Optional[str]) -> List[str]:
         """Return the llama-server flags for a GGUF memory placement mode.
 
@@ -5458,7 +5470,7 @@ class LlamaCppBackend:
         - "resident" -> --no-mmap --mlock (load fully into RAM and lock).
         - otherwise  -> [] (llama.cpp default, memory-mapped file).
         """
-        mode = (memory_mode or "").strip().lower()
+        mode = LlamaCppBackend._canonical_memory_mode(memory_mode)
         if mode == "pinned":
             return ["--mlock"]
         if mode == "resident":
@@ -5832,6 +5844,21 @@ class LlamaCppBackend:
                     # before auto-selection / tensor/layer planning runs.
                     if gpu_ids is not None:
                         allowed = set(gpu_ids)
+                        if is_vulkan_backend:
+                            # Vulkan builds report compact ggml ordinals in
+                            # _gpu_mem, but the caller's gpu_ids are physical
+                            # CUDA IDs. Map physical IDs to their position in
+                            # the parent-visible order so they match Vulkan0..N.
+                            from utils.hardware import get_parent_visible_gpu_ids
+
+                            parent_visible = get_parent_visible_gpu_ids()
+                            try:
+                                vulkan_ids = [parent_visible.index(g) for g in gpu_ids]
+                            except ValueError:
+                                raise ValueError(
+                                    f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
+                                ) from None
+                            allowed = set(vulkan_ids)
                         _gpu_mem = [g for g in _gpu_mem if g[0] in allowed]
                         if not _gpu_mem:
                             raise ValueError(
@@ -6615,6 +6642,17 @@ class LlamaCppBackend:
                     tp_tensor_split = None
                     effective_ctx = requested_ctx  # fall back to original
 
+                # If the caller explicitly requested GPUs but the model doesn't fit
+                # at the requested context, _select_gpus falls back to --fit on with
+                # gpu_indices=None. That would leave CUDA_VISIBLE_DEVICES unset and
+                # let llama-server use every parent-visible GPU, including ones the
+                # training guard excluded. Pin --fit to the requested set instead.
+                if use_fit and gpu_indices is None and gpu_ids is not None and gpus:
+                    gpu_indices = sorted(idx for idx, _ in gpus)
+                    logger.info(
+                        f"Using --fit on explicitly requested GPUs: {gpu_indices}"
+                    )
+
                 # Unified-memory APUs load weights into system RAM (under WSL the VM
                 # cap, not the ROCm-reported VRAM, is the real ceiling); refuse an
                 # oversize load the OS would otherwise kill mid-flight. Base model
@@ -7371,7 +7409,7 @@ class LlamaCppBackend:
                     self._extra_args_source = (model_identifier, hf_variant)
                 self._requested_n_ctx = int(n_ctx)
                 self._gpu_ids = list(gpu_ids) if gpu_ids is not None else None
-                self._memory_mode = (memory_mode or "").strip().lower() or None
+                self._memory_mode = LlamaCppBackend._canonical_memory_mode(memory_mode)
                 # Commit the known-good snapshot + whether MTP+tensor is live, then
                 # watch this load for a mid-generation crash.
                 self._last_load_kwargs = _pending_load_kwargs
@@ -7861,7 +7899,9 @@ class LlamaCppBackend:
 
         if _norm_list(self._gpu_ids) != _norm_list(gpu_ids):
             return False
-        if _norm(self._memory_mode) != _norm(memory_mode):
+        if LlamaCppBackend._canonical_memory_mode(
+            self._memory_mode
+        ) != LlamaCppBackend._canonical_memory_mode(memory_mode):
             return False
 
         # extra_args=None means "no opinion" (inherit handled at the route

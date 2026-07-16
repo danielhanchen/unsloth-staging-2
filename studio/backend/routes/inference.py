@@ -3127,9 +3127,9 @@ def _request_matches_loaded_settings(
     _request_gpu_ids = request.gpu_ids if request.gpu_ids else None
     if (_request_gpu_ids or None) != (llama_backend.gpu_ids or None):
         return False
-    if _normalise_settings_str(request.gguf_memory_mode) != _normalise_settings_str(
-        llama_backend.memory_mode
-    ):
+    if LlamaCppBackend._canonical_memory_mode(
+        request.gguf_memory_mode
+    ) != LlamaCppBackend._canonical_memory_mode(llama_backend.memory_mode):
         return False
     # Reconcile a user --split-mode in extras into the effective tensor state.
     # When the request omits llama_extra_args ("inherit"), compare using the
