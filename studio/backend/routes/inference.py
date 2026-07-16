@@ -3125,7 +3125,7 @@ def _request_matches_loaded_settings(
         return False
     # GPU selection and memory mode are first-class fields; any change must reload.
     _request_gpu_ids = request.gpu_ids if request.gpu_ids else None
-    if (_request_gpu_ids or None) != (llama_backend.gpu_ids or None):
+    if _request_gpu_ids != llama_backend.gpu_ids:
         return False
     if _normalise_settings_str(request.gguf_memory_mode) != _normalise_settings_str(
         llama_backend.memory_mode
