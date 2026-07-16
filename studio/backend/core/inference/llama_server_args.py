@@ -191,7 +191,12 @@ _TENSOR_SPLIT_FLAGS: frozenset[str] = frozenset({"-ts", "--tensor-split"})
 _SPLIT_SHADOWING_FLAGS: frozenset[str] = _SPLIT_MODE_FLAGS | _TENSOR_SPLIT_FLAGS
 
 _SHADOWING_FLAGS: frozenset[str] = (
-    _CONTEXT_FLAGS | _CACHE_FLAGS | _SPEC_FLAGS | _TEMPLATE_FLAGS | _SPLIT_SHADOWING_FLAGS | _MEMORY_MODE_FLAGS
+    _CONTEXT_FLAGS
+    | _CACHE_FLAGS
+    | _SPEC_FLAGS
+    | _TEMPLATE_FLAGS
+    | _SPLIT_SHADOWING_FLAGS
+    | _MEMORY_MODE_FLAGS
 )
 
 # Shadowing flags that take no value -- strip the flag only, not the next token.
