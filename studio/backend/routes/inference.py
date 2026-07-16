@@ -3123,17 +3123,27 @@ def _request_matches_loaded_settings(
         llama_backend.cache_type_kv
     ):
         return False
+    # GPU selection and memory mode are first-class fields; any change must reload.
+    _request_gpu_ids = request.gpu_ids if request.gpu_ids else None
+    if (_request_gpu_ids or None) != (llama_backend.gpu_ids or None):
+        return False
+    if _normalise_settings_str(request.gguf_memory_mode) != _normalise_settings_str(
+        llama_backend.memory_mode
+    ):
+        return False
     # Reconcile a user --split-mode in extras into the effective tensor state.
     # When the request omits llama_extra_args ("inherit"), compare using the
     # stored extras stripped the way the reload strips them, so an extras-driven
     # tensor load isn't seen as a mismatch that needlessly reloads the server.
     backend_extra = list(llama_backend.extra_args) if llama_backend.extra_args else []
+    fields_set = getattr(request, "model_fields_set", set())
     effective_extra = (
         request.llama_extra_args
         if request.llama_extra_args is not None
         else strip_shadowing_flags(
             backend_extra,
             strip_split_mode = _should_strip_split_mode(request, backend_extra),
+            strip_memory_mode = "gguf_memory_mode" in fields_set,
         )
     )
     if not _tensor_parallel_matches_loaded(
@@ -3190,6 +3200,7 @@ def _request_matches_loaded_settings(
             and strip_shadowing_flags(
                 backend_extra,
                 strip_split_mode = _should_strip_split_mode(request, backend_extra),
+                strip_memory_mode = "gguf_memory_mode" in fields_set,
             )
             != backend_extra
         ):
@@ -4133,12 +4144,15 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # Normalize gpu_ids: empty list means auto-selection, same as None
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
 
-        # Reject GGUF + gpu_ids first so the guard can't mask it with a VRAM 409.
-        if config.is_gguf and effective_gpu_ids is not None:
-            raise HTTPException(
-                status_code = 400,
-                detail = "gpu_ids is not supported for GGUF models yet.",
-            )
+        # Validate explicit GPU selection up front so the loader and the guard
+        # agree on the candidate set. GGUF now supports gpu_ids (#7164).
+        if effective_gpu_ids is not None:
+            from utils.hardware import resolve_requested_gpu_ids
+
+            try:
+                effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
+            except ValueError as exc:
+                raise HTTPException(status_code = 400, detail = str(exc)) from exc
         if not config.is_gguf and _mlx_distributed_launch_detected():
             raise HTTPException(
                 status_code = 400,
@@ -4256,6 +4270,7 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                         strip_split_mode = _should_strip_split_mode(
                             request, llama_backend.extra_args
                         ),
+                        strip_memory_mode = "gguf_memory_mode" in fields_set,
                     )
                     try:
                         extra_llama_args = validate_extra_args(stripped)
@@ -4291,6 +4306,7 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 speculative_type = request.speculative_type,
                 spec_draft_n_max = request.spec_draft_n_max,
                 n_parallel = _n_parallel,
+                memory_mode = request.gguf_memory_mode,
             )
             if config.gguf_hf_repo:
                 # HF mode: download via huggingface_hub then start llama-server
@@ -4375,6 +4391,7 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 attempt_kwargs = {
                     **_common_load_kwargs,
                     "extra_args": attempt_extra_args,
+                    "gpu_ids": effective_gpu_ids,
                 }
                 return await asyncio.to_thread(
                     llama_backend.load_model,
@@ -4744,12 +4761,14 @@ async def validate_model(
         # Refuse early (before the frontend unloads to load this) if it can't fit
         # alongside training, using the same settings /load uses so they agree.
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
-        # Mirror /load: reject GGUF + gpu_ids before the guard so both return 400.
-        if config.is_gguf and effective_gpu_ids is not None:
-            raise HTTPException(
-                status_code = 400,
-                detail = "gpu_ids is not supported for GGUF models yet.",
-            )
+        # Mirror /load: validate explicit GPU selection before the guard.
+        if effective_gpu_ids is not None:
+            from utils.hardware import resolve_requested_gpu_ids
+
+            try:
+                effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
+            except ValueError as exc:
+                raise HTTPException(status_code = 400, detail = str(exc)) from exc
         effective_load_in_4bit = _effective_load_in_4bit(config, request.load_in_4bit)
 
         # Both checks cover the [adapter, base] set (matching the scan route and workers):

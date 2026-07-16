@@ -64,7 +64,17 @@ class LoadRequest(BaseModel):
     )
     gpu_ids: Optional[List[int]] = Field(
         None,
-        description = "Physical GPU indices to use, for example [0, 1]. Omit or pass [] to use automatic selection. Explicit gpu_ids are unsupported when the parent CUDA_VISIBLE_DEVICES uses UUID/MIG entries. Not supported for GGUF models.",
+        description = "Physical GPU indices to use, for example [0, 1]. Omit or pass [] to use automatic selection. Explicit gpu_ids are unsupported when the parent CUDA_VISIBLE_DEVICES uses UUID/MIG entries. Supported for both Hugging Face and GGUF models.",
+    )
+    gguf_memory_mode: Optional[Literal["auto", "pinned", "resident"]] = Field(
+        None,
+        description = (
+            "GGUF memory placement mode. 'auto' (default) lets llama.cpp use its "
+            "normal memory-mapped loading. 'pinned' locks the model in system RAM "
+            "with --mlock so the OS cannot page it out. 'resident' loads the full "
+            "model into RAM with --no-mmap and locks it with --mlock, avoiding any "
+            "file-backed mapping. Ignored for non-GGUF models."
+        ),
     )
     speculative_type: Optional[str] = Field(
         None,
@@ -133,6 +143,10 @@ class ValidateModelRequest(BaseModel):
     max_seq_length: int = Field(0, ge = 0, le = 1048576)
     load_in_4bit: bool = Field(True)
     gpu_ids: Optional[List[int]] = Field(None)
+    gguf_memory_mode: Optional[Literal["auto", "pinned", "resident"]] = Field(
+        None,
+        description = "Intended GGUF memory placement mode; mirrors /load so validate's sizing agrees with the follow-up load.",
+    )
     include_context_length: bool = Field(
         False,
         description = "Also read the native context length from the local GGUF header. "

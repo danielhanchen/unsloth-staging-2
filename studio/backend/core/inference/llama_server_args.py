@@ -175,6 +175,10 @@ _TEMPLATE_FLAGS: frozenset[str] = frozenset(
         "--no-jinja",
     }
 )
+# Memory placement mode shadows the GGUF memory_mode first-class field.
+# --mlock / --no-mmap are pass-through in explicit extras, but stripped on
+# inherit when the user changes the memory mode so the new setting wins.
+_MEMORY_MODE_FLAGS: frozenset[str] = frozenset({"--mlock", "--no-mmap"})
 # Multi-GPU split mode shadows the Tensor Parallelism toggle
 # (--split-mode tensor). Pass-through stays allowed so users keep the
 # row/none/layer modes the toggle doesn't expose, but it's stripped on
@@ -187,7 +191,7 @@ _TENSOR_SPLIT_FLAGS: frozenset[str] = frozenset({"-ts", "--tensor-split"})
 _SPLIT_SHADOWING_FLAGS: frozenset[str] = _SPLIT_MODE_FLAGS | _TENSOR_SPLIT_FLAGS
 
 _SHADOWING_FLAGS: frozenset[str] = (
-    _CONTEXT_FLAGS | _CACHE_FLAGS | _SPEC_FLAGS | _TEMPLATE_FLAGS | _SPLIT_SHADOWING_FLAGS
+    _CONTEXT_FLAGS | _CACHE_FLAGS | _SPEC_FLAGS | _TEMPLATE_FLAGS | _SPLIT_SHADOWING_FLAGS | _MEMORY_MODE_FLAGS
 )
 
 # Shadowing flags that take no value -- strip the flag only, not the next token.
@@ -424,13 +428,14 @@ def strip_shadowing_flags(
     strip_spec: bool = True,
     strip_template: bool = True,
     strip_split_mode: bool = True,
+    strip_memory_mode: bool = True,
 ) -> list[str]:
     """Strip flags that shadow first-class Studio settings.
 
     Used when inheriting a previous load's ``llama_extra_args`` so an
     inherited `-c 4096` can't override the current `max_seq_length`
-    (same for cache / spec / template / split-mode). Each ``strip_*``
-    toggle controls one group; the route only strips groups whose
+    (same for cache / spec / template / split-mode / memory_mode). Each
+    ``strip_*`` toggle controls one group; the route only strips groups whose
     first-class field the caller actually supplied.
     """
     shadowing: set[str] = set()
@@ -444,6 +449,8 @@ def strip_shadowing_flags(
         shadowing |= _TEMPLATE_FLAGS
     if strip_split_mode:
         shadowing |= _SPLIT_SHADOWING_FLAGS
+    if strip_memory_mode:
+        shadowing |= _MEMORY_MODE_FLAGS
 
     tokens = [str(a) for a in (args or [])]
     out: list[str] = []
@@ -480,4 +487,5 @@ def strip_split_mode_only(args: Optional[Iterable[str]]) -> Optional[list[str]]:
         strip_spec = False,
         strip_template = False,
         strip_split_mode = True,
+        strip_memory_mode = False,
     )

@@ -1628,6 +1628,10 @@ class LlamaCppBackend:
         self._requested_spec_mode: Optional[str] = None
         # User --spec-draft-n-max override (None = platform default).
         self._spec_draft_n_max: Optional[int] = None
+        # Explicit GPU selection for GGUF loads (None = auto-select).
+        self._gpu_ids: Optional[List[int]] = None
+        # GGUF memory placement mode (None = auto; pinned/resident map to --mlock/--no-mmap).
+        self._memory_mode: Optional[str] = None
         # KV-cache estimation fields (populated by _read_gguf_metadata)
         self._n_layers: Optional[int] = None
         self._n_kv_heads: Optional[int] = None
@@ -1784,6 +1788,17 @@ class LlamaCppBackend:
         ``None`` if no extras have ever been recorded. Used by the route
         to refuse cross-model inheritance (#5401)."""
         return self._extra_args_source
+
+    @property
+    def gpu_ids(self) -> Optional[List[int]]:
+        """Physical GPU indices the active GGUF load is pinned to, or None
+        when the loader auto-selected the GPUs."""
+        return self._gpu_ids
+
+    @property
+    def memory_mode(self) -> Optional[str]:
+        """GGUF memory placement mode of the active load (auto/pinned/resident)."""
+        return self._memory_mode
 
     @property
     def context_length(self) -> Optional[int]:
@@ -5435,6 +5450,21 @@ class LlamaCppBackend:
         )
         self._stdout_thread.start()
 
+    @staticmethod
+    def _memory_mode_flags(memory_mode: Optional[str]) -> List[str]:
+        """Return the llama-server flags for a GGUF memory placement mode.
+
+        - "pinned"   -> --mlock (lock mmap'd pages in RAM).
+        - "resident" -> --no-mmap --mlock (load fully into RAM and lock).
+        - otherwise  -> [] (llama.cpp default, memory-mapped file).
+        """
+        mode = (memory_mode or "").strip().lower()
+        if mode == "pinned":
+            return ["--mlock"]
+        if mode == "resident":
+            return ["--no-mmap", "--mlock"]
+        return []
+
     def load_model(
         self,
         *,
@@ -5461,6 +5491,10 @@ class LlamaCppBackend:
         n_gpu_layers: Optional[int] = None,  # caller compat, unused
         n_parallel: int = 1,
         extra_args: Optional[List[str]] = None,
+        # Explicit GPU selection for GGUF loads (physical indices). None = auto.
+        gpu_ids: Optional[List[int]] = None,
+        # GGUF memory placement mode: auto | pinned (--mlock) | resident (--no-mmap --mlock).
+        memory_mode: Optional[str] = None,
         # Route-level tensor->layer fallback retry: keep the layer split multi-GPU.
         preserve_multi_gpu_on_layer: bool = False,
     ) -> bool:
@@ -5493,6 +5527,8 @@ class LlamaCppBackend:
             "n_gpu_layers": n_gpu_layers,
             "n_parallel": n_parallel,
             "extra_args": list(extra_args) if extra_args is not None else None,
+            "gpu_ids": list(gpu_ids) if gpu_ids is not None else None,
+            "memory_mode": memory_mode,
             # Replayed by _respawn_if_dead so a downgraded model stays multi-GPU.
             "preserve_multi_gpu_on_layer": preserve_multi_gpu_on_layer,
         }
@@ -5518,6 +5554,8 @@ class LlamaCppBackend:
                 chat_template_override = chat_template_override,
                 extra_args = extra_args,
                 is_vision = is_vision,
+                gpu_ids = gpu_ids,
+                memory_mode = memory_mode,
                 preserve_multi_gpu_on_layer = preserve_multi_gpu_on_layer,
             ):
                 logger.info(
@@ -5731,6 +5769,7 @@ class LlamaCppBackend:
                             strip_spec = False,
                             strip_template = False,
                             strip_split_mode = False,
+                            strip_memory_mode = False,
                         )
                     # The launch keeps an inherited tensor-safe env cache type (the
                     # env cleanup only pops quantized ones), so re-adopt a heavier
@@ -5789,6 +5828,15 @@ class LlamaCppBackend:
                     # per-GPU headroom (correct when the GPU is already partly used).
                     # Pass binary so a Vulkan build probes ggml's Vulkan ordinals.
                     _gpu_mem = self._get_gpu_memory(binary)
+                    # Honor explicit GPU selection: restrict the candidate set
+                    # before auto-selection / tensor/layer planning runs.
+                    if gpu_ids is not None:
+                        allowed = set(gpu_ids)
+                        _gpu_mem = [g for g in _gpu_mem if g[0] in allowed]
+                        if not _gpu_mem:
+                            raise ValueError(
+                                f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
+                            )
                     gpus = [(idx, free) for idx, free, _t in _gpu_mem]
                     total_by_idx = {idx: total for idx, _f, total in _gpu_mem}
 
@@ -6551,6 +6599,16 @@ class LlamaCppBackend:
                         f"context: {effective_ctx}, "
                         f"GPUs free: {gpus}, selected: {gpu_indices}, fit: {use_fit}"
                     )
+                except ValueError as e:
+                    # User-supplied gpu_ids were invalid (e.g. non-existent GPU).
+                    # Do not silently fall back to --fit on a different GPU; surface
+                    # the validation error so the caller can fix the request.
+                    if gpu_ids is not None and "gpu_ids" in str(e).lower():
+                        raise
+                    logger.warning(f"GPU selection failed ({e}), using --fit on")
+                    gpu_indices, use_fit = None, True
+                    tp_tensor_split = None
+                    effective_ctx = requested_ctx  # fall back to original
                 except Exception as e:
                     logger.warning(f"GPU selection failed ({e}), using --fit on")
                     gpu_indices, use_fit = None, True
@@ -6602,6 +6660,10 @@ class LlamaCppBackend:
                     # Error out at n_ctx instead of silently rotating the KV cache; frontend catches it and points the user at "Context Length".
                     "--no-context-shift",
                 ]
+
+                # Memory placement mode: keep model resident so idle weights aren't
+                # paged out and re-faulted from disk (#7164).
+                cmd.extend(self._memory_mode_flags(memory_mode))
 
                 # Report a clean public model id (matching GET /v1/models) rather
                 # than the raw -m path in llama-server's own /v1/models and the
@@ -7308,6 +7370,8 @@ class LlamaCppBackend:
                     self._extra_args = list(extra_args)
                     self._extra_args_source = (model_identifier, hf_variant)
                 self._requested_n_ctx = int(n_ctx)
+                self._gpu_ids = list(gpu_ids) if gpu_ids is not None else None
+                self._memory_mode = (memory_mode or "").strip().lower() or None
                 # Commit the known-good snapshot + whether MTP+tensor is live, then
                 # watch this load for a mid-generation crash.
                 self._last_load_kwargs = _pending_load_kwargs
@@ -7683,6 +7747,8 @@ class LlamaCppBackend:
         tensor_parallel: bool = False,
         mtp_draft_path: Optional[str] = None,
         preserve_multi_gpu_on_layer: bool = False,
+        gpu_ids: Optional[List[int]] = None,
+        memory_mode: Optional[str] = None,
     ) -> bool:
         """True iff the live server already satisfies these load kwargs.
 
@@ -7786,6 +7852,18 @@ class LlamaCppBackend:
         ):
             return False
 
+        # GPU selection / memory mode are first-class fields; a change must
+        # trigger a reload so the new placement takes effect (#7164).
+        def _norm_list(value):
+            if value is None:
+                return None
+            return list(value) if len(value) > 0 else None
+
+        if _norm_list(self._gpu_ids) != _norm_list(gpu_ids):
+            return False
+        if _norm(self._memory_mode) != _norm(memory_mode):
+            return False
+
         # extra_args=None means "no opinion" (inherit handled at the route
         # layer); only an explicit list forces equality.
         if extra_args is not None:
@@ -7852,6 +7930,8 @@ class LlamaCppBackend:
             self._speculative_type = None
             self._requested_spec_mode = None
             self._spec_draft_n_max = None
+            self._gpu_ids = None
+            self._memory_mode = None
             self._n_layers = None
             self._n_kv_heads = None
             self._n_kv_heads_by_layer = None

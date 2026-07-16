@@ -93,6 +93,9 @@ validate_extra_args = _lsa.validate_extra_args
         ["-fit", "off"],
         ["--fit", "on"],
         ["--fit-ctx", "8192"],
+        # Memory placement flags (soft-managed; shadowed on inherit)
+        ["--mlock"],
+        ["--no-mmap", "--mlock"],
     ],
 )
 def test_pass_through_allowed(args):
@@ -303,6 +306,9 @@ def test_is_managed_flag_false_for_pass_through():
     assert is_managed_flag("--flash-attn") is False
     assert is_managed_flag("-ngl") is False
     assert is_managed_flag("--threads") is False
+    # Memory placement flags are pass-through (shadowed on inherit only).
+    assert is_managed_flag("--mlock") is False
+    assert is_managed_flag("--no-mmap") is False
 
 
 # ── strip_shadowing_flags ─────────────────────────────────────────────
@@ -794,6 +800,38 @@ def test_strip_split_mode_only_drops_tensor_split_too():
         ["--split-mode", "tensor", "--tensor-split", "1,1", "-c", "4096"]
     ) == ["-c", "4096"]
     assert strip_split_mode_only(["-sm=tensor", "-ts=3,1"]) == []
+
+
+# ── Memory mode shadowing (#7164) ───────────────────────────────────────────
+
+
+def test_strip_shadowing_flags_drops_memory_mode_when_requested():
+    out = strip_shadowing_flags(
+        ["--mlock", "--no-mmap", "--top-k", "20"],
+        strip_memory_mode = True,
+    )
+    assert out == ["--top-k", "20"]
+
+
+def test_strip_shadowing_flags_keeps_memory_mode_when_not_requested():
+    out = strip_shadowing_flags(
+        ["--mlock", "--no-mmap", "--top-k", "20"],
+        strip_memory_mode = False,
+    )
+    assert out == ["--mlock", "--no-mmap", "--top-k", "20"]
+
+
+def test_strip_shadowing_flags_defaults_strip_memory_mode():
+    # Default kwargs strip everything, including memory placement flags.
+    assert strip_shadowing_flags(["--mlock", "--no-mmap"]) == []
+
+
+def test_strip_split_mode_only_keeps_memory_mode():
+    # Tensor->layer downgrade must not strip the user's memory mode choice.
+    assert strip_split_mode_only(["--mlock", "--no-mmap", "-sm", "tensor"]) == [
+        "--mlock",
+        "--no-mmap",
+    ]
 
 
 def test_strip_shadowing_flags_keeps_model_draft_without_spec():

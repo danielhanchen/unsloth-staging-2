@@ -467,11 +467,47 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertEqual(captured[0]["load_in_4bit"], False)
         self.assertEqual(captured[0]["max_seq_length"], 4096)
 
-    def test_rejects_gguf_with_gpu_ids_before_guard(self):
-        # /validate must mirror /load's GGUF + gpu_ids 400, before the VRAM guard.
+    def test_gguf_with_gpu_ids_reaches_guard(self):
+        # /validate now accepts gpu_ids for GGUF (#7164); it should reach the guard.
         from models.inference import ValidateModelRequest
 
         request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [0])
+        cfg = SimpleNamespace(
+            identifier = "x.gguf",
+            display_name = "x",
+            is_gguf = True,
+            is_lora = False,
+            is_vision = False,
+            path = None,
+            base_model = None,
+        )
+        captured = []
+        with (
+            patch.object(
+                self.route,
+                "_resolve_model_identifier_for_request",
+                return_value = ("x.gguf", "x.gguf", False),
+            ),
+            patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+            patch.object(self.route, "load_inference_config", return_value = {}),
+            patch.object(
+                self.route,
+                "_requires_trust_remote_code_for_model",
+                return_value = False,
+            ),
+            _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+        ):
+            resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
+        # Guard was reached with the explicit GPU selection.
+        self.assertEqual(captured[0]["requested_gpu_ids"], [0])
+        self.assertTrue(resp.valid)
+        self.assertTrue(resp.is_gguf)
+
+    def test_gguf_with_invalid_gpu_ids_rejected_before_guard(self):
+        # Invalid gpu_ids for GGUF should still 400 before the VRAM guard.
+        from models.inference import ValidateModelRequest
+
+        request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [99])
         cfg = SimpleNamespace(
             identifier = "x.gguf",
             display_name = "x",
@@ -495,7 +531,7 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
             with self.assertRaises(HTTPException) as exc:
                 asyncio.run(self.route.validate_model(request, current_subject = "u"))
         self.assertEqual(exc.exception.status_code, 400)
-        self.assertIn("gpu_ids is not supported for GGUF", exc.exception.detail)
+        self.assertIn("gpu_ids", exc.exception.detail)
         self.assertEqual(captured, [])  # guard never reached
 
 
