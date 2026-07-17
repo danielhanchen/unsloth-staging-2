@@ -268,7 +268,11 @@ def test_new_run_gets_its_own_watchdog(monkeypatch):
         watched_job_id = None,
     ):
         started.append(target_proc)
-        release.wait(timeout = 5)
+        # Block until the test's finally releases us (always reached), so a superseded
+        # watchdog stays alive regardless of scheduler load: no timeout can expire mid
+        # assertion and fail the test. The thread is a daemon, so even a release missed
+        # on a pre-cleanup abort never blocks process exit.
+        release.wait()
 
     monkeypatch.setattr(b, "_stop_watchdog_loop", _blocked_watchdog)
 
