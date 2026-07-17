@@ -2718,6 +2718,64 @@ class LlamaCppBackend:
             return True
 
     @staticmethod
+    def _assert_gpu_ids_resolvable(
+        gpu_ids: Optional[list[int]], gpu_mem: list[tuple[int, int, int]], is_vulkan_backend: bool
+    ) -> None:
+        """Raise ValueError if the requested gpu_ids cannot be honored on this host.
+
+        Side-effect-free mirror of the resolvability checks in load_model's flag
+        builder, so Phase 0 can reject a bad selection (an out-of-range or duplicate
+        id such as gpu_ids=[99], or a GPU-less host) BEFORE Phase 1 kills the running
+        server (#7188). The route only verifies that *a* GPU backend exists on
+        non-CUDA hosts (the CUDA resolver is skipped for the Vulkan path), so without
+        this preflight an invalid id reached the flag builder and 400'd only after the
+        active model had already been torn down. Returns without raising for the valid
+        'real GPU, telemetry down' case, matching the flag builder's fall-through. Any
+        divergence is still caught later by that builder, which stays the backstop."""
+        if not gpu_ids:
+            return
+        allowed = set(gpu_ids)
+        if is_vulkan_backend:
+            from utils.hardware import get_parent_visible_gpu_ids
+
+            _requested = list(gpu_ids)
+            if len(set(_requested)) != len(_requested) or any(g < 0 for g in _requested):
+                raise ValueError(
+                    f"Invalid Vulkan gpu_ids {_requested}: IDs must be unique and non-negative."
+                )
+            parent_visible = get_parent_visible_gpu_ids()
+            if parent_visible:
+                try:
+                    allowed = {parent_visible.index(g) for g in gpu_ids}
+                except ValueError:
+                    raise ValueError(
+                        f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
+                    ) from None
+            else:
+                allowed = set(gpu_ids)
+        probe_listed_devices = bool(gpu_mem)
+        matched = [g for g in gpu_mem if g[0] in allowed]
+        if not matched and (is_vulkan_backend or probe_listed_devices):
+            raise ValueError(f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs")
+        if not matched and not is_vulkan_backend:
+            from utils.hardware import get_parent_visible_gpu_ids
+
+            parent_visible = get_parent_visible_gpu_ids()
+            if not parent_visible:
+                raise ValueError(
+                    f"Requested gpu_ids {list(gpu_ids)} but no GPU backend is available "
+                    "(no GPU telemetry and no visible GPU mask); omit gpu_ids to run on "
+                    "CPU."
+                )
+            _outside_mask = [g for g in gpu_ids if g not in parent_visible]
+            if _outside_mask:
+                raise ValueError(
+                    f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs "
+                    f"{parent_visible}"
+                )
+        # Valid (including the real-GPU / telemetry-down fall-through).
+
+    @staticmethod
     def _get_gpu_memory(binary: Optional[str] = None) -> list[tuple[int, int, int]]:
         """Query free AND total memory per GPU.
 
@@ -5685,6 +5743,20 @@ class LlamaCppBackend:
                 raise ValueError(
                     "Explicit gguf_memory_mode is not supported for diffusion "
                     "(DiffusionGemma) GGUF models."
+                )
+
+            # Validate explicit gpu_ids against the backend probe BEFORE Phase 1 tears
+            # down the running server. On non-CUDA hosts the route only confirmed that
+            # *a* GPU backend exists, so an out-of-range or duplicate id (e.g.
+            # gpu_ids=[99]) would otherwise reach the flag builder below and 400 only
+            # after _kill_process() had already unloaded the active model (#7188). The
+            # probe is read-only, so running it here has no side effects.
+            if gpu_ids is not None:
+                _preflight_binary = self._find_llama_server_binary()
+                self._assert_gpu_ids_resolvable(
+                    gpu_ids,
+                    self._get_gpu_memory(_preflight_binary),
+                    self._is_vulkan_backend(_preflight_binary),
                 )
 
             # ── Phase 1: kill old process (under lock, fast) ──────────

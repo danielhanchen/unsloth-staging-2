@@ -525,6 +525,55 @@ def test_populated_probe_nonmatching_gpu_ids_still_raises(tmp_path):
             )
 
 
+@pytest.mark.parametrize(
+    "bad_ids, match",
+    [
+        ([99], "do not match any visible GPUs"),  # out-of-range on a Vulkan host
+        ([0, 0], "unique and non-negative"),  # duplicate ids
+    ],
+)
+def test_invalid_gpu_ids_rejected_before_kill_process(tmp_path, bad_ids, match):
+    """A bad gpu_ids (a typo like [99], or a duplicate) must be rejected in Phase 0,
+    BEFORE Phase 1 calls _kill_process(). Otherwise the route's existence-only probe
+    lets it through and the running server is torn down before the load 400s (#7188)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [(0, 10000, 16000)], vulkan = True)
+    killed = []
+    backend._kill_process = lambda: killed.append(True)
+
+    with (
+        patch.object(subprocess, "Popen"),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
+    ):
+        with pytest.raises(ValueError, match = match):
+            backend.load_model(
+                gguf_path = str(gguf),
+                model_identifier = "test",
+                gpu_ids = bad_ids,
+            )
+
+    assert killed == [], f"active model was torn down before rejecting gpu_ids={bad_ids}"
+
+
+def test_valid_gpu_ids_reach_kill_process(tmp_path):
+    """The Phase 0 preflight must NOT over-reject a VALID selection: a good gpu_ids
+    still proceeds past Phase 1 (the running server is replaced as before)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [(0, 10000, 16000)], vulkan = True)
+    killed = []
+    backend._kill_process = lambda: killed.append(True)
+
+    with (
+        patch.object(subprocess, "Popen"),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
+    ):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = [0],
+        )
+
+    assert killed, "a valid gpu_ids must still proceed past Phase 1 (kill the old server)"
+
+
 def test_gpu_ids_preserved_on_fit_fallback(tmp_path):
     """When _select_gpus falls back to --fit on, still pin CUDA_VISIBLE_DEVICES."""
     gguf = tmp_path / "model.gguf"
