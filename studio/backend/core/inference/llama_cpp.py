@@ -5891,11 +5891,23 @@ class LlamaCppBackend:
                                     f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
                                 ) from None
                             allowed = set(vulkan_ids)
+                        probe_listed_devices = bool(_gpu_mem)
                         _gpu_mem = [g for g in _gpu_mem if g[0] in allowed]
-                        if not _gpu_mem:
+                        if not _gpu_mem and (is_vulkan_backend or probe_listed_devices):
+                            # The probe enumerated GPUs but none match the request
+                            # (id genuinely absent), or this is a Vulkan build where
+                            # we cannot map physical ids to ggml ordinals without the
+                            # probe -- either way the selection can't be honored.
                             raise ValueError(
                                 f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
                             )
+                        # An empty CUDA/ROCm probe (probe_listed_devices is False) means
+                        # telemetry is unavailable, not that the GPU is absent: e.g. a
+                        # CUDA/ROCm llama.cpp build on a host without nvidia-smi and a
+                        # CPU-only torch. The route already validated gpu_ids against the
+                        # parent-visible mask, and auto-selection loads here via --fit on,
+                        # so the explicit request must too. Fall through with an empty
+                        # candidate set; the --fit fallback below pins the validated mask.
                     gpus = [(idx, free) for idx, free, _t in _gpu_mem]
                     total_by_idx = {idx: total for idx, _f, total in _gpu_mem}
 
@@ -6679,9 +6691,20 @@ class LlamaCppBackend:
                 # gpu_indices=None. That would leave CUDA_VISIBLE_DEVICES unset and
                 # let llama-server use every parent-visible GPU, including ones the
                 # training guard excluded. Pin --fit to the requested set instead.
-                if use_fit and gpu_indices is None and gpu_ids is not None and gpus:
-                    gpu_indices = sorted(idx for idx, _ in gpus)
-                    logger.info(f"Using --fit on explicitly requested GPUs: {gpu_indices}")
+                if use_fit and gpu_indices is None and gpu_ids is not None:
+                    if gpus:
+                        gpu_indices = sorted(idx for idx, _ in gpus)
+                        logger.info(f"Using --fit on explicitly requested GPUs: {gpu_indices}")
+                    elif not is_vulkan_backend:
+                        # No telemetry probe was available (handled in the GPU-filter
+                        # step above), so there are no measured GPUs to sort. gpu_ids are
+                        # physical CUDA/ROCm ids, so pin --fit to them directly; otherwise
+                        # CUDA_VISIBLE_DEVICES stays unset and llama-server would spread
+                        # across every parent-visible GPU, ignoring the explicit request.
+                        gpu_indices = sorted(gpu_ids)
+                        logger.info(
+                            f"Using --fit on explicitly requested GPUs (no telemetry): {gpu_indices}"
+                        )
 
                 # Unified-memory APUs load weights into system RAM (under WSL the VM
                 # cap, not the ROCm-reported VRAM, is the real ceiling); refuse an

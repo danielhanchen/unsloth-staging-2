@@ -251,6 +251,107 @@ def test_gpu_ids_filter_raises_when_no_visible_match(tmp_path):
         )
 
 
+def _fit_fallback_backend(
+    tmp_path,
+    gpu_memory,
+    *,
+    vulkan = False,
+):
+    """Backend stubbed like the --fit-fallback test but with a configurable probe."""
+    gguf = tmp_path / "model.gguf"
+    _write_minimal_gguf(gguf)
+
+    backend = LlamaCppBackend()
+    backend._get_gpu_memory = lambda _binary = None: list(gpu_memory)
+    backend._read_gguf_metadata = lambda _p: None
+    backend._can_estimate_kv = lambda: False
+    backend._get_gguf_size_bytes = lambda _p: 1024
+    backend._mmproj_vram_bytes = lambda _p: 0
+    backend._resolve_launch_mmproj_path = lambda **k: None
+    backend._apu_ram_shortfall_message = lambda *a, **k: None
+    backend._amd_apu_wants_unified_memory = lambda *a, **k: False
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._is_vulkan_backend = lambda _binary = None: vulkan
+    backend._get_gpu_free_memory = lambda _binary = None: list(gpu_memory)
+    backend._wait_for_health = lambda timeout: True
+    backend._detect_audio_type_strict = lambda: None
+    backend._apply_detected_audio = lambda _d: True
+    return backend, gguf
+
+
+def test_empty_probe_preserves_explicit_gpu_ids(tmp_path):
+    """A CUDA/ROCm build whose telemetry probe returns nothing (no nvidia-smi +
+    CPU-only torch) must still honor a route-validated explicit gpu_ids rather than
+    raising: auto-selection loads here via --fit on, so the explicit request pins the
+    same GPU via CUDA_VISIBLE_DEVICES + --fit on instead of failing (#7164)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
+
+    captured = {}
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env") or dict(os.environ)
+                captured["cmd"] = list(cmd)
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with (
+        patch.object(subprocess, "Popen", side_effect = _make_fake_popen),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0, 1]),
+    ):
+        assert backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = [1],
+        )
+
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    cmd = captured["cmd"]
+    assert "--fit" in cmd and cmd[cmd.index("--fit") + 1] == "on"
+
+
+def test_empty_probe_still_rejects_vulkan_gpu_ids(tmp_path):
+    """A Vulkan build cannot map physical ids to ggml ordinals without a probe, so an
+    empty Vulkan probe must keep rejecting the selection (tracked as #7201) rather than
+    silently spreading the load across every device."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [], vulkan = True)
+
+    with (
+        patch.object(subprocess, "Popen"),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
+    ):
+        with pytest.raises(ValueError, match = "do not match any visible GPUs"):
+            backend.load_model(
+                gguf_path = str(gguf),
+                model_identifier = "test",
+                gpu_ids = [0],
+            )
+
+
+def test_populated_probe_nonmatching_gpu_ids_still_raises(tmp_path):
+    """When the probe DID enumerate GPUs but none match the request, the id is genuinely
+    absent and the load must still raise (the empty-probe relaxation must not swallow
+    a real 'no such GPU' error)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [(0, 10000, 16000)])
+
+    with (
+        patch.object(subprocess, "Popen"),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0]),
+    ):
+        with pytest.raises(ValueError, match = "do not match any visible GPUs"):
+            backend.load_model(
+                gguf_path = str(gguf),
+                model_identifier = "test",
+                gpu_ids = [9],
+            )
+
+
 def test_gpu_ids_preserved_on_fit_fallback(tmp_path):
     """When _select_gpus falls back to --fit on, still pin CUDA_VISIBLE_DEVICES."""
     gguf = tmp_path / "model.gguf"
@@ -518,7 +619,7 @@ def test_load_model_rejects_gpu_ids_for_diffusion_gguf(tmp_path):
 
     started = []
     b1 = _make_backend()
-    b1._start_diffusion_server = lambda **kw: (started.append(kw) or True)
+    b1._start_diffusion_server = lambda **kw: started.append(kw) or True
     with pytest.raises(ValueError, match = "gpu_ids"):
         b1.load_model(gguf_path = str(gguf), model_identifier = "d", gpu_ids = [1])
     assert started == []  # runner never launched
@@ -526,7 +627,7 @@ def test_load_model_rejects_gpu_ids_for_diffusion_gguf(tmp_path):
     # The same diffusion GGUF WITHOUT gpu_ids still reaches the runner.
     b2 = _make_backend()
     started2 = []
-    b2._start_diffusion_server = lambda **kw: (started2.append(kw) or True)
+    b2._start_diffusion_server = lambda **kw: started2.append(kw) or True
     assert b2.load_model(gguf_path = str(gguf), model_identifier = "d") is True
     assert len(started2) == 1
 
@@ -544,7 +645,7 @@ def test_load_model_rejects_explicit_memory_mode_for_diffusion_gguf(tmp_path, mo
     backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
     backend._is_vulkan_backend = lambda _binary = None: False
     started = []
-    backend._start_diffusion_server = lambda **kw: (started.append(kw) or True)
+    backend._start_diffusion_server = lambda **kw: started.append(kw) or True
 
     with pytest.raises(ValueError, match = "memory_mode"):
         backend.load_model(
