@@ -3124,8 +3124,12 @@ def _request_matches_loaded_settings(
     ):
         return False
     # GPU selection and memory mode are first-class fields; any change must reload.
-    _request_gpu_ids = request.gpu_ids if request.gpu_ids else None
-    if _request_gpu_ids != llama_backend.gpu_ids:
+    # Compare as a set (order-insensitive): Studio sorts gpu_ids before pinning, so
+    # [0,1] and [1,0] launch identically and must not trigger a needless reload / 409
+    # during training (#7188).
+    _request_gpu_ids = sorted(request.gpu_ids) if request.gpu_ids else None
+    _loaded_gpu_ids = sorted(llama_backend.gpu_ids) if llama_backend.gpu_ids else None
+    if _request_gpu_ids != _loaded_gpu_ids:
         return False
     if LlamaCppBackend._canonical_memory_mode(
         request.gguf_memory_mode
@@ -4012,6 +4016,59 @@ async def load_model(
         return await _load_model_impl(request, fastapi_request, current_subject)
 
 
+def _reject_diffusion_placement(
+    config, *, gpu_ids: Optional[List[int]], memory_mode: Optional[str]
+) -> None:
+    """Raise 400 if a DiffusionGemma GGUF was given gpu_ids or an explicit memory mode.
+
+    The diffusion runner is single-GPU (DG_GPU) and has no --mlock/--no-mmap plumbing,
+    so those options are unsupported. Called by BOTH /validate and /load, before either
+    tears down the active model, so the two endpoints agree and the frontend can't
+    validate a placement /load will reject after it has already unloaded (#7188). Local
+    GGUFs use the authoritative header; HF repos fall back to the repo name (the file
+    isn't downloaded yet).
+    """
+    _gguf_file = getattr(config, "gguf_file", None)
+    _gguf_hf_repo = getattr(config, "gguf_hf_repo", None)
+    if not config.is_gguf or not (_gguf_file or _gguf_hf_repo):
+        return
+    _is_diffusion = False
+    if _gguf_file:
+        from utils.models.gguf_metadata import is_diffusion_gguf
+        _is_diffusion = is_diffusion_gguf(_gguf_file)
+    elif _gguf_hf_repo:
+        # Match "diffusiongemma" (no separator before "gemma") as well as a
+        # standalone "diffusion" segment, so the canonical google/diffusiongemma-*
+        # repo is rejected up front instead of only after the header read that
+        # follows the unload (#7188).
+        _is_diffusion = bool(
+            _re.search(
+                r"(?:^|[\/\-_.])diffusion(?:gemma|[\/\-_.]|$)",
+                _gguf_hf_repo,
+                _re.IGNORECASE,
+            )
+        )
+    if not _is_diffusion:
+        return
+    if gpu_ids:
+        raise HTTPException(
+            status_code = 400,
+            detail = (
+                "gpu_ids selection is not supported for diffusion "
+                "(DiffusionGemma) GGUF models; they run on a single GPU "
+                "chosen by the DG_GPU environment variable."
+            ),
+        )
+    if LlamaCppBackend._canonical_memory_mode(memory_mode) is not None:
+        raise HTTPException(
+            status_code = 400,
+            detail = (
+                "Explicit gguf_memory_mode is not supported for diffusion "
+                "(DiffusionGemma) GGUF models."
+            ),
+        )
+
+
 async def _load_model_impl(request: LoadRequest, fastapi_request: Request, current_subject: str):
     from core.inference.llama_cpp import LlamaServerNotFoundError
 
@@ -4121,7 +4178,7 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     spec_draft_n_max = llama_backend.spec_draft_n_max,
                     tensor_parallel = llama_backend.tensor_parallel,
                     gpu_ids = llama_backend.gpu_ids,
-                    gguf_memory_mode = llama_backend.memory_mode,
+                    gguf_memory_mode = llama_backend.requested_memory_mode,
                 )
         else:
             if (
@@ -4186,43 +4243,10 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
             )
 
         # Reject unsupported placement options for DiffusionGemma before the route
-        # tears down any active model. For local GGUF files we inspect the header;
-        # for HF repos we check the repo name (the GGUF isn't downloaded yet).
-        if config.is_gguf and (config.gguf_file or config.gguf_hf_repo):
-            _is_diffusion = False
-            if config.gguf_file:
-                from utils.models.gguf_metadata import is_diffusion_gguf
-                _is_diffusion = is_diffusion_gguf(config.gguf_file)
-            elif config.gguf_hf_repo:
-                # Match "diffusiongemma" (no separator before "gemma") as well as a
-                # standalone "diffusion" segment, so the canonical google/diffusiongemma-*
-                # repo is rejected up front instead of only after the header read that
-                # follows the unload (#7188).
-                _is_diffusion = bool(
-                    _re.search(
-                        r"(?:^|[\/\-_.])diffusion(?:gemma|[\/\-_.]|$)",
-                        config.gguf_hf_repo,
-                        _re.IGNORECASE,
-                    )
-                )
-            if _is_diffusion:
-                if request.gpu_ids:
-                    raise HTTPException(
-                        status_code = 400,
-                        detail = (
-                            "gpu_ids selection is not supported for diffusion "
-                            "(DiffusionGemma) GGUF models; they run on a single GPU "
-                            "chosen by the DG_GPU environment variable."
-                        ),
-                    )
-                if LlamaCppBackend._canonical_memory_mode(request.gguf_memory_mode) is not None:
-                    raise HTTPException(
-                        status_code = 400,
-                        detail = (
-                            "Explicit gguf_memory_mode is not supported for diffusion "
-                            "(DiffusionGemma) GGUF models."
-                        ),
-                    )
+        # tears down any active model (shared with /validate so the two agree).
+        _reject_diffusion_placement(
+            config, gpu_ids = request.gpu_ids, memory_mode = request.gguf_memory_mode
+        )
 
         # Normalize gpu_ids: empty list means auto-selection, same as None
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
@@ -4239,25 +4263,21 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
-            elif get_device() == DeviceType.CPU:
-                # A Vulkan llama-server on a torch-less host reports CPU but can
-                # still enumerate devices; let the backend validate via its probe.
-                backend_binary = getattr(
-                    LlamaCppBackend, "_find_llama_server_binary", lambda: None
-                )()
-                if backend_binary and LlamaCppBackend._is_vulkan_backend(backend_binary):
-                    logger.info(
-                        "Vulkan GGUF backend detected; deferring gpu_ids validation "
-                        "to the backend's Vulkan probe."
-                    )
-                else:
-                    raise HTTPException(
-                        status_code = 400,
-                        detail = (
-                            "gpu_ids selection is not supported: no GPU backend "
-                            "detected on this host."
-                        ),
-                    )
+            elif get_device() == DeviceType.CPU and not await asyncio.to_thread(
+                get_llama_cpp_backend().has_gpu_backend
+            ):
+                # No CUDA namespace AND the GGUF backend probe (incl. Vulkan) finds no
+                # device -> genuinely GPU-less, so reject before any teardown. A
+                # torch-less Vulkan host also reports CPU but its probe is non-empty, so
+                # it falls through and the backend validates against the Vulkan probe
+                # instead of being wrongly rejected here (#7164/#7188).
+                raise HTTPException(
+                    status_code = 400,
+                    detail = (
+                        "gpu_ids selection is not supported: no GPU backend "
+                        "detected on this host."
+                    ),
+                )
         if not config.is_gguf and _mlx_distributed_launch_detected():
             raise HTTPException(
                 status_code = 400,
@@ -4583,7 +4603,7 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 spec_draft_n_max = llama_backend.spec_draft_n_max,
                 tensor_parallel = llama_backend.tensor_parallel,
                 gpu_ids = llama_backend.gpu_ids,
-                gguf_memory_mode = llama_backend.memory_mode,
+                gguf_memory_mode = llama_backend.requested_memory_mode,
             )
 
         # ── Standard path: load via Unsloth/transformers ──────────
@@ -4868,36 +4888,11 @@ async def validate_model(
                 detail = f"Invalid model identifier: {model_log_label}",
             )
 
-        # Mirror /load: reject unsupported placement options for DiffusionGemma
-        # before the frontend unloads the current model after validate succeeds.
-        if config.is_gguf and (config.gguf_file or config.gguf_hf_repo):
-            _is_diffusion = False
-            if config.gguf_file:
-                from utils.models.gguf_metadata import is_diffusion_gguf
-
-                _is_diffusion = is_diffusion_gguf(config.gguf_file)
-            elif config.gguf_hf_repo:
-                _is_diffusion = bool(
-                    _re.search(r'(?:^|[\/\-_.])diffusion(?:[\/\-_.]|$)', config.gguf_hf_repo, _re.IGNORECASE)
-                )
-            if _is_diffusion:
-                if request.gpu_ids:
-                    raise HTTPException(
-                        status_code = 400,
-                        detail = (
-                            "gpu_ids selection is not supported for diffusion "
-                            "(DiffusionGemma) GGUF models; they run on a single GPU "
-                            "chosen by the DG_GPU environment variable."
-                        ),
-                    )
-                if LlamaCppBackend._canonical_memory_mode(request.gguf_memory_mode) is not None:
-                    raise HTTPException(
-                        status_code = 400,
-                        detail = (
-                            "Explicit gguf_memory_mode is not supported for diffusion "
-                            "(DiffusionGemma) GGUF models."
-                        ),
-                    )
+        # Reject DiffusionGemma placement here too, matching /load, so a client can't
+        # validate a gpu_ids/memory_mode /load will reject after it has unloaded (#7188).
+        _reject_diffusion_placement(
+            config, gpu_ids = request.gpu_ids, memory_mode = request.gguf_memory_mode
+        )
 
         # Refuse early (before the frontend unloads to load this) if it can't fit
         # alongside training, using the same settings /load uses so they agree.
@@ -4912,23 +4907,19 @@ async def validate_model(
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
-            elif get_device() == DeviceType.CPU:
-                backend_binary = getattr(
-                    LlamaCppBackend, "_find_llama_server_binary", lambda: None
-                )()
-                if backend_binary and LlamaCppBackend._is_vulkan_backend(backend_binary):
-                    logger.info(
-                        "Vulkan GGUF backend detected; deferring gpu_ids validation "
-                        "to the backend's Vulkan probe."
-                    )
-                else:
-                    raise HTTPException(
-                        status_code = 400,
-                        detail = (
-                            "gpu_ids selection is not supported: no GPU backend "
-                            "detected on this host."
-                        ),
-                    )
+            elif get_device() == DeviceType.CPU and not await asyncio.to_thread(
+                get_llama_cpp_backend().has_gpu_backend
+            ):
+                # Mirror /load: reject only when genuinely GPU-less. A torch-less Vulkan
+                # host reports CPU but its probe is non-empty, so defer to the backend
+                # rather than reject before the frontend unloads (#7164/#7188).
+                raise HTTPException(
+                    status_code = 400,
+                    detail = (
+                        "gpu_ids selection is not supported: no GPU backend "
+                        "detected on this host."
+                    ),
+                )
         effective_load_in_4bit = _effective_load_in_4bit(config, request.load_in_4bit)
 
         # Both checks cover the [adapter, base] set (matching the scan route and workers):
@@ -5686,7 +5677,7 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
                 spec_draft_n_max = llama_backend.spec_draft_n_max,
                 tensor_parallel = llama_backend.tensor_parallel,
                 gpu_ids = llama_backend.gpu_ids,
-                gguf_memory_mode = llama_backend.memory_mode,
+                gguf_memory_mode = llama_backend.requested_memory_mode,
                 llama_cpp_supports_mtp = _supports_mtp,
                 spec_fallback_reason = llama_backend.spec_fallback_reason,
                 llama_cpp_prebuilt_stale = _stale,

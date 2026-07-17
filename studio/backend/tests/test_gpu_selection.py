@@ -912,6 +912,11 @@ class TestRouteErrors(unittest.TestCase):
             # Selection fields echoed back in the LoadResponse (#7164/#7210).
             gpu_ids = None
             memory_mode = None
+            requested_memory_mode = None
+
+            def has_gpu_backend(self):
+                # Route's non-CUDA gpu_ids guard probes this; a GPU is present here.
+                return True
 
             def __init__(self):
                 self.load_model_calls = []

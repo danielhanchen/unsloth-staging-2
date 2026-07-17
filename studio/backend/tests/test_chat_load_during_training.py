@@ -517,6 +517,11 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
             # host having GPU 0 visible (CI runs GPU-less; #7164 added an up-front
             # resolve_requested_gpu_ids validation before the guard is reached).
             patch("utils.hardware.resolve_requested_gpu_ids", return_value = [0]),
+            # On a non-CUDA host the guard probes for a GPU backend; a GPU is present.
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
+                return_value = True,
+            ),
             _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
         ):
             resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
@@ -564,11 +569,47 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertIn("gpu_ids", exc.exception.detail)
         self.assertEqual(captured, [])  # guard never reached
 
+    def test_validate_rejects_diffusion_placement_like_load(self):
+        # /validate must reject DiffusionGemma gpu_ids/memory_mode the same way /load
+        # does, so a client can't validate OK, unload its working model, and then get a
+        # 400 from /load (#7188). Uses the HF repo name (no file downloaded at validate).
+        from models.inference import ValidateModelRequest
+
+        request = ValidateModelRequest(model_path = "google/diffusiongemma-2b", gpu_ids = [0])
+        cfg = SimpleNamespace(
+            identifier = "google/diffusiongemma-2b",
+            display_name = "diffusiongemma",
+            is_gguf = True,
+            is_lora = False,
+            is_vision = False,
+            path = None,
+            base_model = None,
+            gguf_file = None,
+            gguf_hf_repo = "google/diffusiongemma-2b",
+        )
+        captured = []
+        with (
+            patch.object(
+                self.route,
+                "_resolve_model_identifier_for_request",
+                return_value = ("google/diffusiongemma-2b", "google/diffusiongemma-2b", False),
+            ),
+            patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+            patch.object(self.route, "load_inference_config", return_value = {}),
+            _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+        ):
+            with self.assertRaises(HTTPException) as exc:
+                asyncio.run(self.route.validate_model(request, current_subject = "u"))
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("diffusion", exc.exception.detail.lower())
+        self.assertEqual(captured, [])  # guard never reached (rejected before it)
+
     def test_gguf_invalid_gpu_ids_deferred_to_backend_on_non_cuda(self):
-        # On a non-CUDA host (Vulkan AMD / CPU / Mac), the CUDA-oriented resolver
-        # cannot see Vulkan-only GPUs, so #7164 skips it for GGUF and defers gpu_ids
-        # validation to the backend probe. The route must NOT 400 here: it reaches
-        # the guard with the raw selection instead of rejecting a valid Vulkan id.
+        # On a non-CUDA host WITH a GPU (torch-less Vulkan AMD, which get_device()
+        # reports as CPU), the CUDA-oriented resolver can't see the Vulkan GPU, so
+        # #7164 skips it and defers to the backend probe. has_gpu_backend() is True
+        # (a GPU exists), so the route must NOT 400: it reaches the guard with the raw
+        # selection instead of rejecting a valid Vulkan id.
         from models.inference import ValidateModelRequest
         from utils.hardware import DeviceType
 
@@ -597,12 +638,56 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
             patch.object(self.route, "load_inference_config", return_value = {}),
             patch("utils.hardware.get_device", return_value = DeviceType.CPU),
             patch("utils.hardware.resolve_requested_gpu_ids", side_effect = _must_not_resolve),
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
+                return_value = True,
+            ),
             _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
         ):
             resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
         # Reached the guard with the raw selection; backend probe validates later.
         self.assertEqual(captured[0]["requested_gpu_ids"], [1])
         self.assertTrue(resp.valid)
+
+    def test_gguf_gpu_ids_rejected_on_cpu_only_host_before_teardown(self):
+        # A genuinely GPU-less host (get_device()==CPU AND the backend probe finds no
+        # device, incl. Vulkan) must reject gpu_ids at the route, before any teardown,
+        # rather than pin a non-existent device (#7188). This is the case the Vulkan
+        # host above is deliberately distinguished from.
+        from models.inference import ValidateModelRequest
+        from utils.hardware import DeviceType
+
+        request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [0])
+        cfg = SimpleNamespace(
+            identifier = "x.gguf",
+            display_name = "x",
+            is_gguf = True,
+            is_lora = False,
+            is_vision = False,
+            path = None,
+            base_model = None,
+        )
+        captured = []
+        with (
+            patch.object(
+                self.route,
+                "_resolve_model_identifier_for_request",
+                return_value = ("x.gguf", "x.gguf", False),
+            ),
+            patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+            patch.object(self.route, "load_inference_config", return_value = {}),
+            patch("utils.hardware.get_device", return_value = DeviceType.CPU),
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
+                return_value = False,
+            ),
+            _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+        ):
+            with self.assertRaises(HTTPException) as exc:
+                asyncio.run(self.route.validate_model(request, current_subject = "u"))
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("no GPU backend", exc.exception.detail)
+        self.assertEqual(captured, [])  # rejected before the guard / any teardown
 
 
 # ── _estimate_gguf_required_gb (sizes the same weights the loader loads) ──────

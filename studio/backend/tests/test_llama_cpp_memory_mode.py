@@ -370,6 +370,61 @@ def test_empty_probe_still_rejects_vulkan_gpu_ids(tmp_path):
             )
 
 
+def test_torchless_vulkan_populated_probe_uses_identity_ordinals(tmp_path):
+    """A torch-less Vulkan host has no CUDA/HIP physical namespace (empty parent-visible
+    mask), so gpu_ids ARE the Vulkan ordinals: with a POPULATED probe the selection must
+    load (pinned via --device Vulkan<i>) instead of raising -- otherwise explicit GPU
+    selection is unreachable on exactly the AMD/Vulkan hosts #7164 targets (#7188)."""
+    backend, gguf = _fit_fallback_backend(
+        tmp_path, gpu_memory = [(0, 10000, 16000), (1, 8000, 16000)], vulkan = True
+    )
+    backend._select_gpus = lambda *a, **k: ([1], False)
+
+    captured = {}
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 321
+
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = list(cmd)
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with (
+        patch.object(subprocess, "Popen", side_effect = _make_fake_popen),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
+    ):
+        assert backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = [1],
+        )
+    cmd = captured["cmd"]
+    assert "--device" in cmd and cmd[cmd.index("--device") + 1] == "Vulkan1"
+
+
+def test_vulkan_rejects_duplicate_gpu_ids(tmp_path):
+    """The CUDA resolver's duplicate check is skipped for the Vulkan path, so the branch
+    must reject duplicates itself rather than let set() silently collapse them (#7188)."""
+    backend, gguf = _fit_fallback_backend(
+        tmp_path, gpu_memory = [(0, 10000, 16000), (1, 8000, 16000)], vulkan = True
+    )
+    with (
+        patch.object(subprocess, "Popen"),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
+    ):
+        with pytest.raises(ValueError, match = "unique and non-negative"):
+            backend.load_model(
+                gguf_path = str(gguf),
+                model_identifier = "test",
+                gpu_ids = [0, 0],
+            )
+
+
 def test_empty_probe_rejects_gpu_ids_without_gpu_backend(tmp_path):
     """A non-Vulkan build with an empty probe AND an empty parent-visible mask has no
     GPU backend at all (CPU / Metal build). The route now skips resolve_requested_gpu_ids
@@ -758,6 +813,41 @@ def test_load_response_and_status_round_trip_placement_fields():
     )
     assert status_resp.gpu_ids == [0, 1]
     assert status_resp.gguf_memory_mode == "pinned"
+
+
+@pytest.mark.parametrize(
+    "mode,expected_requested,expected_canonical",
+    [
+        ("auto", "auto", None),
+        ("AUTO", "auto", None),
+        ("pinned", "pinned", "pinned"),
+        (None, None, None),
+    ],
+)
+def test_requested_memory_mode_preserves_explicit_auto(
+    tmp_path, mode, expected_requested, expected_canonical
+):
+    """The response echoes requested_memory_mode, not the canonical placement. An explicit
+    "auto" must survive as "auto" (not collapse to null) so the UI can restore it and a
+    later reload re-runs the inherited-env scrub instead of letting LLAMA_ARG_MLOCK creep
+    back; canonical _memory_mode still maps "auto" -> None for placement (#7188)."""
+    gguf = tmp_path / "model.gguf"
+    _write_minimal_gguf(gguf)
+    backend = _mem_env_backend(gguf)
+
+    with patch.object(subprocess, "Popen"):
+        assert backend.load_model(gguf_path = str(gguf), model_identifier = "t", memory_mode = mode)
+    assert backend.requested_memory_mode == expected_requested
+    assert backend.memory_mode == expected_canonical
+
+
+def test_already_in_target_state_gpu_ids_order_insensitive():
+    """[0,1] and [1,0] are the same selection (Studio sorts before pinning), so a
+    reordered echo must dedupe instead of forcing a reload / training 409 (#7188)."""
+    backend = _loaded_backend(_gpu_ids = [0, 1])
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["gpu_ids"] = [1, 0]
+    assert backend._already_in_target_state(**kwargs) is True
 
 
 # ── inherited LLAMA_ARG_* mmap/mlock env is scrubbed when a mode is set ───────
