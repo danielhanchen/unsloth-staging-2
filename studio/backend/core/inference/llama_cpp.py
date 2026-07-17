@@ -1632,6 +1632,12 @@ class LlamaCppBackend:
         self._gpu_ids: Optional[List[int]] = None
         # GGUF memory placement mode (None = auto; pinned/resident map to --mlock/--no-mmap).
         self._memory_mode: Optional[str] = None
+        # The user's RAW requested mode ("auto"/"pinned"/"resident"/None), reported in
+        # the status/load response. _memory_mode canonicalizes "auto" -> None for
+        # placement, but the response must still echo an explicit "auto" so the UI can
+        # restore it and a later reload re-runs the inherited-env scrub instead of
+        # round-tripping "auto" -> null and letting LLAMA_ARG_MLOCK creep back (#7188).
+        self._requested_memory_mode: Optional[str] = None
         # True when the live child was launched with NO explicit memory_mode yet
         # inherited an operator LLAMA_ARG_MLOCK/NO_MMAP/MMAP env (not scrubbed).
         # Lets an explicit 'auto' reload force the scrub the dedup would otherwise
@@ -1804,6 +1810,13 @@ class LlamaCppBackend:
     def memory_mode(self) -> Optional[str]:
         """GGUF memory placement mode of the active load (auto/pinned/resident)."""
         return self._memory_mode
+
+    @property
+    def requested_memory_mode(self) -> Optional[str]:
+        """The user's raw requested memory mode for the status/load response echo:
+        "auto"/"pinned"/"resident", or None when no mode was supplied. Distinguishes
+        an explicit "auto" (which _memory_mode canonicalizes to None) from omitted."""
+        return self._requested_memory_mode
 
     @property
     def launched_with_inherited_mem_env(self) -> bool:
@@ -2689,6 +2702,19 @@ class LlamaCppBackend:
             except Exception:
                 return 0
         return int(rec_bytes * _APPLE_UNIFIED_MEMORY_FRACTION)
+
+    def has_gpu_backend(self) -> bool:
+        """True if a GPU probe finds any device: nvidia-smi/amd-smi (CUDA/ROCm) or a
+        Vulkan build's ggml device enumeration. Lets the route reject gpu_ids on a
+        genuinely GPU-less host BEFORE it tears down the active model, without falsely
+        rejecting a torch-less Vulkan host -- get_device() reports CPU there because
+        DeviceType has no Vulkan, so a plain get_device()==CPU check would break the
+        exact AMD/Vulkan hosts #7164 targets. On a probe failure, return True so the
+        caller defers to the load path rather than wrongly rejecting (#7188)."""
+        try:
+            return bool(self._get_gpu_memory(self._find_llama_server_binary()))
+        except Exception:
+            return True
 
     @staticmethod
     def _get_gpu_memory(binary: Optional[str] = None) -> list[tuple[int, int, int]]:
@@ -5785,6 +5811,7 @@ class LlamaCppBackend:
                         # unnecessary kill+restart of the healthy diffusion server).
                         self._gpu_ids = None
                         self._memory_mode = None
+                        self._requested_memory_mode = None
                         self._launched_with_inherited_mem_env = False
                     return started
 
@@ -5956,6 +5983,18 @@ class LlamaCppBackend:
                             # Vulkan host), use the supplied IDs directly as
                             # Vulkan ordinals.
                             from utils.hardware import get_parent_visible_gpu_ids
+
+                            # The CUDA resolver's value checks are skipped for this
+                            # path, so enforce them here: reject duplicates / negatives
+                            # that set() would otherwise silently collapse (#7188).
+                            _requested = list(gpu_ids)
+                            if len(set(_requested)) != len(_requested) or any(
+                                g < 0 for g in _requested
+                            ):
+                                raise ValueError(
+                                    f"Invalid Vulkan gpu_ids {_requested}: IDs must be "
+                                    "unique and non-negative."
+                                )
                             parent_visible = get_parent_visible_gpu_ids()
                             if parent_visible:
                                 try:
@@ -7614,6 +7653,10 @@ class LlamaCppBackend:
                 self._requested_n_ctx = int(n_ctx)
                 self._gpu_ids = list(gpu_ids) if gpu_ids is not None else None
                 self._memory_mode = LlamaCppBackend._canonical_memory_mode(memory_mode)
+                # Raw requested mode for the response echo ("auto"/"pinned"/"resident"/
+                # None) -- keeps an explicit "auto" distinguishable from omitted so it
+                # round-trips instead of collapsing to null (#7188).
+                self._requested_memory_mode = (memory_mode or "").strip().lower() or None
                 self._launched_with_inherited_mem_env = _child_inherited_mem_env
                 # Commit the known-good snapshot + whether MTP+tensor is live, then
                 # watch this load for a mid-generation crash.
@@ -8098,9 +8141,11 @@ class LlamaCppBackend:
         # GPU selection / memory mode are first-class fields; a change must
         # trigger a reload so the new placement takes effect (#7164).
         def _norm_list(value):
+            # Order-insensitive: Studio sorts gpu_ids before pinning, so [0,1] and
+            # [1,0] are the same selection and must not force a reload (#7188).
             if value is None:
                 return None
-            return list(value) if len(value) > 0 else None
+            return sorted(value) if len(value) > 0 else None
 
         if _norm_list(self._gpu_ids) != _norm_list(gpu_ids):
             return False
@@ -8184,6 +8229,7 @@ class LlamaCppBackend:
             self._spec_draft_n_max = None
             self._gpu_ids = None
             self._memory_mode = None
+            self._requested_memory_mode = None
             self._launched_with_inherited_mem_env = False
             self._n_layers = None
             self._n_kv_heads = None
