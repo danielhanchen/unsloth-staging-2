@@ -865,6 +865,7 @@ class TestRouteErrors(unittest.TestCase):
             gguf_hf_repo = None,
             gguf_file = "/tmp/test.gguf",
             gguf_mmproj_file = None,
+            gguf_mtp_file = None,
             gguf_variant = None,
             identifier = "unsloth/test.gguf",
             display_name = "unsloth/test.gguf",
@@ -875,8 +876,39 @@ class TestRouteErrors(unittest.TestCase):
         )
 
         class DummyLlamaBackend:
+            # Reload-dedup / load-path fields read by _load_model_impl.
             extra_args = None
             extra_args_source = None
+            is_loaded = False
+            load_cancelled = False
+            layer_preserves_tensor_intent = False
+            tensor_parallel = False
+            is_diffusion = False
+            cache_type_kv = None
+            is_vision = False
+            _is_vision = False
+            _is_audio = False
+            _has_audio_input = False
+            _audio_type = None
+            gguf_path = None
+            hf_variant = None
+            model_identifier = None
+            chat_template = None
+            context_length = None
+            max_context_length = None
+            native_context_length = None
+            requested_spec_mode = None
+            spec_draft_n_max = None
+            # Capability / advertised-id fields read while building the LoadResponse.
+            supports_tools = False
+            supports_reasoning = False
+            supports_preserve_thinking = False
+            reasoning_always_on = False
+            reasoning_style = "enable_thinking"
+            reasoning_effort_levels = []
+            _openai_advertised_id = None
+            _native_grant_backed = False
+            _native_display_label = None
 
             def __init__(self):
                 self.load_model_calls = []
@@ -884,6 +916,9 @@ class TestRouteErrors(unittest.TestCase):
             def load_model(self, **kwargs):
                 self.load_model_calls.append(kwargs)
                 return True
+
+            def unload_model(self, *args, **kwargs):
+                return None
 
         class DummyUnslothBackend:
             active_model_name = None
@@ -897,6 +932,10 @@ class TestRouteErrors(unittest.TestCase):
                 "ModelConfig",
                 SimpleNamespace(from_identifier = lambda **_kwargs: model_config),
             ),
+            # Deterministic GPU resolution so the test doesn't depend on the host
+            # having GPUs 0/1 visible (CI runs GPU-less; #7164 validates gpu_ids
+            # up-front via resolve_requested_gpu_ids).
+            patch("utils.hardware.resolve_requested_gpu_ids", return_value = [0, 1]),
             patch.object(
                 inference_route,
                 "_guard_chat_load_against_training",
@@ -1110,6 +1149,17 @@ class TestRouteErrors(unittest.TestCase):
                 inference_route,
                 "ModelConfig",
                 SimpleNamespace(from_identifier = lambda **_kwargs: model_config),
+            ),
+            # Simulate a UUID/MIG parent visibility at the resolver layer: #7164
+            # validates gpu_ids up-front, so the UUID/MIG rejection now surfaces
+            # from resolve_requested_gpu_ids rather than the backend load call.
+            patch(
+                "utils.hardware.resolve_requested_gpu_ids",
+                side_effect = ValueError(
+                    "Invalid gpu_ids [1]: explicit physical GPU IDs are unsupported "
+                    "when CUDA_VISIBLE_DEVICES uses UUID/MIG entries ('GPU-abcdef'). "
+                    "Omit gpu_ids to use the parent-visible devices."
+                ),
             ),
             patch.object(
                 inference_route,
