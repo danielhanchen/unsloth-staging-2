@@ -5680,6 +5680,17 @@ class LlamaCppBackend:
                         "(DiffusionGemma) GGUF models; they run on a single GPU "
                         "chosen by the DG_GPU environment variable."
                     )
+                # This early return also skips the command builder that maps
+                # memory_mode to --mlock/--no-mmap, and _start_diffusion_server
+                # takes no memory-mode argument, so pinned/resident would be
+                # silently ignored yet recorded as honored. Reject them (auto is
+                # the no-op default and is allowed).
+                if LlamaCppBackend._canonical_memory_mode(memory_mode) is not None:
+                    raise ValueError(
+                        "gguf_memory_mode is not supported for diffusion "
+                        "(DiffusionGemma) GGUF models; the diffusion runner does "
+                        "not use llama.cpp memory-placement flags."
+                    )
                 # Not a tensor/layer GGUF: clear any preserved-fallback flag from a
                 # prior load (this path skips the command builder that clears it).
                 self._layer_preserves_tensor_intent = False
@@ -5687,7 +5698,7 @@ class LlamaCppBackend:
                     if self._cancel_event.is_set():
                         logger.info("Load cancelled before diffusion server start")
                         return False
-                    return self._start_diffusion_server(
+                    started = self._start_diffusion_server(
                         model_path = model_path,
                         gguf_path = gguf_path,
                         hf_repo = hf_repo,
@@ -5696,6 +5707,15 @@ class LlamaCppBackend:
                         n_ctx = n_ctx,
                         extra_args = extra_args,
                     )
+                    if started:
+                        # The diffusion runner has no gpu_ids / memory placement;
+                        # clear any values a prior llama-server load left so the
+                        # reload-dedup checks reflect the runner's actual state
+                        # (a stale _gpu_ids/_memory_mode would otherwise force an
+                        # unnecessary kill+restart of the healthy diffusion server).
+                        self._gpu_ids = None
+                        self._memory_mode = None
+                    return started
 
             if not binary:
                 # distinguish a transiently locked binary (antivirus / in-flight

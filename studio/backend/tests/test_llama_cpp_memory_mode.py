@@ -529,3 +529,55 @@ def test_load_model_rejects_gpu_ids_for_diffusion_gguf(tmp_path):
     b2._start_diffusion_server = lambda **kw: (started2.append(kw) or True)
     assert b2.load_model(gguf_path = str(gguf), model_identifier = "d") is True
     assert len(started2) == 1
+
+
+@pytest.mark.parametrize("mode", ["pinned", "PINNED", "resident", "RESIDENT"])
+def test_load_model_rejects_explicit_memory_mode_for_diffusion_gguf(tmp_path, mode):
+    """The diffusion runner has no --mlock/--no-mmap plumbing, so an explicit
+    pinned/resident memory_mode would be silently dropped yet recorded as honored.
+    load_model must reject it (route -> 400) rather than mislead the user."""
+    gguf = tmp_path / "diffusion.gguf"
+    _write_minimal_gguf(gguf, arch = "diffusion-gemma")
+
+    backend = LlamaCppBackend()
+    backend._read_gguf_metadata = lambda _p: setattr(backend, "_is_diffusion", True)
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._is_vulkan_backend = lambda _binary = None: False
+    started = []
+    backend._start_diffusion_server = lambda **kw: (started.append(kw) or True)
+
+    with pytest.raises(ValueError, match = "memory_mode"):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "d",
+            memory_mode = mode,
+        )
+    assert started == []  # runner never launched
+
+
+@pytest.mark.parametrize("mode", [None, "auto", "AUTO", ""])
+def test_diffusion_load_allows_default_memory_mode_and_clears_stale_state(tmp_path, mode):
+    """auto/blank/None placement is the no-op default and is allowed for diffusion.
+    A successful diffusion load must also clear any _gpu_ids/_memory_mode left by a
+    prior llama-server load so reload-dedup reflects the runner's real (unset) state
+    and doesn't force a needless kill+restart of the healthy diffusion server."""
+    gguf = tmp_path / "diffusion.gguf"
+    _write_minimal_gguf(gguf, arch = "diffusion-gemma")
+
+    backend = LlamaCppBackend()
+    backend._read_gguf_metadata = lambda _p: setattr(backend, "_is_diffusion", True)
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._is_vulkan_backend = lambda _binary = None: False
+    backend._start_diffusion_server = lambda **kw: True
+
+    # Simulate leftover placement state from a previous llama-server GGUF load.
+    backend._gpu_ids = [0, 1]
+    backend._memory_mode = "resident"
+
+    assert backend.load_model(
+        gguf_path = str(gguf),
+        model_identifier = "d",
+        memory_mode = mode,
+    ) is True
+    assert backend._gpu_ids is None
+    assert backend._memory_mode is None

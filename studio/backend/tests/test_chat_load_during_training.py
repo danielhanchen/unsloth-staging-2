@@ -174,6 +174,10 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
             patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
             patch("utils.hardware.estimate_required_model_memory_gb", return_value = (estimate, {})),
             patch("utils.hardware.get_visible_gpu_utilization", return_value = {"devices": devices}),
+            # Deterministic GPU resolution so the guard doesn't depend on the host
+            # exposing the requested GPUs (CI is GPU-less; resolve_requested_gpu_ids
+            # would otherwise raise and mislabel the mode as "explicit").
+            patch("utils.hardware.resolve_requested_gpu_ids", side_effect = lambda ids: list(ids)),
             patch("utils.hardware.auto_select_gpu_ids") as auto_mock,
         ):
             ok, info = tv.can_load_chat_during_training(
