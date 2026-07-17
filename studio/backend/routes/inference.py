@@ -3206,7 +3206,41 @@ def _request_matches_loaded_settings(
         ):
             return False
     else:
-        if list(request.llama_extra_args) != backend_extra:
+        # Strip memory-placement flags from BOTH sides when the caller set a
+        # memory mode, mirroring how the reload strips explicit extras before
+        # storing them (load_model). Without this, an explicit request that
+        # repeats a --mlock/--mmap/--no-mmap already dropped by the loaded
+        # server misses this already-loaded fast path and, during active
+        # training, gets rejected by the coexistence guard even though the live
+        # placement already matches. Stripping backend_extra too is idempotent.
+        _strip_mem = "gguf_memory_mode" in fields_set
+        _request_extra = (
+            strip_shadowing_flags(
+                request.llama_extra_args,
+                strip_context = False,
+                strip_cache = False,
+                strip_spec = False,
+                strip_template = False,
+                strip_split_mode = False,
+                strip_memory_mode = True,
+            )
+            if _strip_mem
+            else list(request.llama_extra_args)
+        )
+        _backend_extra_cmp = (
+            strip_shadowing_flags(
+                backend_extra,
+                strip_context = False,
+                strip_cache = False,
+                strip_spec = False,
+                strip_template = False,
+                strip_split_mode = False,
+                strip_memory_mode = True,
+            )
+            if _strip_mem
+            else backend_extra
+        )
+        if _request_extra != _backend_extra_cmp:
             return False
     # A separate drafter (Gemma's root mtp-*.gguf) appearing or disappearing
     # next to the loaded weights changes the launch command (--model-draft),

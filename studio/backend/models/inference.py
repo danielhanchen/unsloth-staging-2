@@ -58,6 +58,17 @@ class LoadRequest(BaseModel):
             return None
         return value
 
+    @field_validator("gguf_memory_mode", mode = "before")
+    @classmethod
+    def normalize_blank_gguf_memory_mode(cls, value: Any) -> Any:
+        # A settings form may serialize the default placement as "" (or whitespace).
+        # The backend canonicalizes blank / "auto" / None identically, so accept a
+        # blank string at the boundary by mapping it to None instead of failing the
+        # Literal validation with a 422 before canonicalization can run (#7164).
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
+
     cache_type_kv: Optional[str] = Field(
         None,
         description = "KV cache data type for both K and V (e.g. 'f16', 'bf16', 'q8_0', 'q4_1', 'q5_1')",
@@ -147,6 +158,16 @@ class ValidateModelRequest(BaseModel):
         None,
         description = "Intended GGUF memory placement mode; mirrors /load so validate's sizing agrees with the follow-up load.",
     )
+
+    @field_validator("gguf_memory_mode", mode = "before")
+    @classmethod
+    def normalize_blank_gguf_memory_mode(cls, value: Any) -> Any:
+        # Mirror LoadRequest: accept a blank string (a form's serialized default)
+        # as None so validate and load agree, instead of a 422 (#7164).
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
+
     include_context_length: bool = Field(
         False,
         description = "Also read the native context length from the local GGUF header. "

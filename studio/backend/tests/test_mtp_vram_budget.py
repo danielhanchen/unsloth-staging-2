@@ -320,7 +320,7 @@ class TestFitContextWithMtp:
     def _fit_backend(self, kv_per_token = 325_000):
         b = _make_backend()
         b._can_estimate_kv = lambda: True
-        b._estimate_kv_cache_bytes = lambda n, _t = None, **_k: (0 if n <= 0 else n * kv_per_token)
+        b._estimate_kv_cache_bytes = lambda n, _t = None, **_k: 0 if n <= 0 else n * kv_per_token
         return b
 
     def test_overhead_fn_lowers_context(self):
@@ -347,19 +347,23 @@ class TestFitContextWithMtp:
             131072,
             avail_mib,
             model,
-            mtp_overhead_fn = lambda c: b._estimate_mtp_overhead_bytes(
-                c, draft_cache_type_k = "f16", draft_cache_type_v = "f16"
-            )
-            or 0,
+            mtp_overhead_fn = lambda c: (
+                b._estimate_mtp_overhead_bytes(
+                    c, draft_cache_type_k = "f16", draft_cache_type_v = "f16"
+                )
+                or 0
+            ),
         )
         q4 = b._fit_context_to_vram(
             131072,
             avail_mib,
             model,
-            mtp_overhead_fn = lambda c: b._estimate_mtp_overhead_bytes(
-                c, draft_cache_type_k = "q4_0", draft_cache_type_v = "q4_0"
-            )
-            or 0,
+            mtp_overhead_fn = lambda c: (
+                b._estimate_mtp_overhead_bytes(
+                    c, draft_cache_type_k = "q4_0", draft_cache_type_v = "q4_0"
+                )
+                or 0
+            ),
         )
         assert 0 < q4 == f16
 
@@ -843,6 +847,24 @@ class TestExtraArgsMtpDetection:
         # HF-only (hf_repo): local/native loads have no download to retry.
         assert "llama_backend.hf_repo" in body
 
+    def test_route_matcher_strips_memory_flags_from_explicit_extras(self):
+        # An explicit llama_extra_args that repeats a --mlock/--mmap/--no-mmap the
+        # loaded server already stripped (load_model drops them when a memory mode
+        # is set) must still match the already-loaded fast path -- otherwise a no-op
+        # re-Apply during training is needlessly reloaded and rejected by the
+        # coexistence guard (#7164). The explicit-extras comparison must strip
+        # memory flags on BOTH sides when gguf_memory_mode was supplied.
+        routes_src = (
+            Path(__file__).resolve().parent.parent / "routes" / "inference.py"
+        ).read_text()
+        start = routes_src.index("def _request_matches_loaded_settings")
+        end = routes_src.index("\ndef ", start + 1)
+        body = "".join(routes_src[start:end].split())
+        assert '_strip_mem="gguf_memory_mode"infields_set' in body
+        assert "_request_extra" in body and "_backend_extra_cmp" in body
+        # Both sides are stripped (strip_memory_mode=True) before comparison.
+        assert body.count("strip_memory_mode=True") >= 2
+
     def test_extra_args_main_cache_type_heavier_axis(self):
         # Asymmetric --cache-type-k/-v must budget the heavier axis (extras win
         # per axis at launch), not the last-wins single type that under-reserves.
@@ -990,7 +1012,7 @@ def test_qwen36_class_regression_picks_lower_ctx_with_mtp():
     strictly lower one once the MTP draft reserve is accounted for."""
     b = _make_backend()
     b._can_estimate_kv = lambda: True
-    b._estimate_kv_cache_bytes = lambda n, _t = None, **_k: (0 if n <= 0 else int(n * 66_000))
+    b._estimate_kv_cache_bytes = lambda n, _t = None, **_k: 0 if n <= 0 else int(n * 66_000)
     avail_mib = 24_000
     model = int(17.9 * GIB)  # UD-Q4_K_XL weights
     no_mtp = b._fit_context_to_vram(262144, avail_mib, model)
