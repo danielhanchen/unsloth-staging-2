@@ -2707,7 +2707,14 @@ class LlamaCppBackend:
         get_device() reports as CPU, the AMD/Vulkan case #7164 targets). On a probe
         failure return True so the caller defers to the load path (#7188)."""
         try:
-            return bool(self._get_gpu_memory(self._find_llama_server_binary()))
+            if self._get_gpu_memory(self._find_llama_server_binary()):
+                return True
+            # A real GPU with telemetry down still exposes a numeric parent-visible mask
+            # (CUDA/HIP_VISIBLE_DEVICES). assert_requested_gpu_ids_resolvable validates
+            # gpu_ids against that mask fallback, so treating an empty probe as "no
+            # backend" here would 400 a selection the resolver would have accepted (#7188).
+            from utils.hardware import get_parent_visible_gpu_ids
+            return bool(get_parent_visible_gpu_ids())
         except Exception:
             return True
 
@@ -2737,23 +2744,14 @@ class LlamaCppBackend:
             return
         allowed = set(gpu_ids)
         if is_vulkan_backend:
-            from utils.hardware import get_parent_visible_gpu_ids
-
+            # gpu_ids are Vulkan ordinals matched directly against the probe; never
+            # remap through the CUDA/HIP mask (Vulkan enumerates independently) (#7188).
             _requested = list(gpu_ids)
             if len(set(_requested)) != len(_requested) or any(g < 0 for g in _requested):
                 raise ValueError(
                     f"Invalid Vulkan gpu_ids {_requested}: IDs must be unique and non-negative."
                 )
-            parent_visible = get_parent_visible_gpu_ids()
-            if parent_visible:
-                try:
-                    allowed = {parent_visible.index(g) for g in gpu_ids}
-                except ValueError:
-                    raise ValueError(
-                        f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
-                    ) from None
-            else:
-                allowed = set(gpu_ids)
+            allowed = set(gpu_ids)
         probe_listed_devices = bool(gpu_mem)
         matched = [g for g in gpu_mem if g[0] in allowed]
         if not matched and (is_vulkan_backend or probe_listed_devices):
@@ -2775,6 +2773,22 @@ class LlamaCppBackend:
                     f"{parent_visible}"
                 )
         # Valid (incl. the real-GPU / telemetry-down fall-through).
+
+    @staticmethod
+    def _strip_device_extra_args(extra_args):
+        """Drop a user --device/-dev from extra_args so an explicit gpu_ids pin owns
+        placement. Used for the launched command AND the persisted extras, so a dropped
+        --device can't be resurrected on a later inheriting reload (#7188)."""
+        return strip_shadowing_flags(
+            extra_args,
+            strip_context = False,
+            strip_cache = False,
+            strip_spec = False,
+            strip_template = False,
+            strip_split_mode = False,
+            strip_memory_mode = False,
+            strip_device = True,
+        )
 
     @staticmethod
     def _get_gpu_memory(binary: Optional[str] = None) -> list[tuple[int, int, int]]:
@@ -6034,13 +6048,12 @@ class LlamaCppBackend:
                     if gpu_ids is not None:
                         allowed = set(gpu_ids)
                         if is_vulkan_backend:
-                            # Vulkan reports compact ggml ordinals but gpu_ids are physical
-                            # CUDA IDs; map them via the parent-visible order to match
-                            # Vulkan0..N (no CUDA mask -> use the IDs as ordinals directly).
-                            from utils.hardware import get_parent_visible_gpu_ids
-
-                            # The CUDA resolver's value checks are skipped here, so reject
-                            # duplicates / negatives that set() would collapse (#7188).
+                            # gpu_ids are Vulkan device ordinals, matched directly against the
+                            # Vulkan probe. Vulkan enumerates independently of
+                            # CUDA_VISIBLE_DEVICES (order comes from the Vulkan loader and can
+                            # even reverse the CUDA order), so never remap through the CUDA/HIP
+                            # parent mask -- that would pin the wrong device (#7188). The CUDA
+                            # resolver's checks are skipped here, so reject duplicates/negatives.
                             _requested = list(gpu_ids)
                             if len(set(_requested)) != len(_requested) or any(
                                 g < 0 for g in _requested
@@ -6049,17 +6062,7 @@ class LlamaCppBackend:
                                     f"Invalid Vulkan gpu_ids {_requested}: IDs must be "
                                     "unique and non-negative."
                                 )
-                            parent_visible = get_parent_visible_gpu_ids()
-                            if parent_visible:
-                                try:
-                                    vulkan_ids = [parent_visible.index(g) for g in gpu_ids]
-                                except ValueError:
-                                    raise ValueError(
-                                        f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
-                                    ) from None
-                                allowed = set(vulkan_ids)
-                            else:
-                                allowed = set(gpu_ids)
+                            allowed = set(gpu_ids)
                         probe_listed_devices = bool(_gpu_mem)
                         _gpu_mem = [g for g in _gpu_mem if g[0] in allowed]
                         if not _gpu_mem and (is_vulkan_backend or probe_listed_devices):
@@ -7186,16 +7189,7 @@ class LlamaCppBackend:
                         # never accounted for (#7188). On Vulkan the --device pin is the
                         # only pin (the guard-bypass fix); on CUDA/ROCm it keeps
                         # backend.gpu_ids honest. Other extras still pass through.
-                        _emit_extra_args = strip_shadowing_flags(
-                            extra_args,
-                            strip_context = False,
-                            strip_cache = False,
-                            strip_spec = False,
-                            strip_template = False,
-                            strip_split_mode = False,
-                            strip_memory_mode = False,
-                            strip_device = True,
-                        )
+                        _emit_extra_args = self._strip_device_extra_args(extra_args)
                         if _emit_extra_args != list(extra_args):
                             logger.info(
                                 "Dropped a user --device/-dev from extra args: explicit "
@@ -7687,7 +7681,14 @@ class LlamaCppBackend:
                 # clears, list sets. Source records hf_variant for the route's
                 # same_source check.
                 if extra_args is not None:
-                    self._extra_args = list(extra_args)
+                    # Persist the SAME device-stripped extras the command used when gpu_ids
+                    # owns placement, so a later same-model reload that inherits these (after
+                    # gpu_ids is cleared) can't resurrect the dropped --device (#7188).
+                    self._extra_args = (
+                        self._strip_device_extra_args(extra_args)
+                        if gpu_ids is not None
+                        else list(extra_args)
+                    )
                     self._extra_args_source = (model_identifier, hf_variant)
                 self._requested_n_ctx = int(n_ctx)
                 self._gpu_ids = list(gpu_ids) if gpu_ids is not None else None

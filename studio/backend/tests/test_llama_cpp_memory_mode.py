@@ -726,16 +726,20 @@ def test_memory_mode_strips_conflicting_extra_args(tmp_path, mode, user_flag, wi
         assert mmap_flags[-1] == winning
 
 
-def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
-    """Physical gpu_ids are mapped to Vulkan0..N ordinals for --device pinning."""
+def test_vulkan_gpu_ids_used_as_direct_ordinals_not_remapped(tmp_path):
+    """gpu_ids are Vulkan device ordinals matched directly against the Vulkan probe,
+    NEVER remapped through the CUDA/HIP parent mask. Vulkan enumerates independently of
+    CUDA_VISIBLE_DEVICES (its order can even reverse the CUDA order), so a remap would
+    pin the wrong device. A CUDA mask of [2, 3] must not shift the requested ordinal
+    (#7188)."""
     gguf = tmp_path / "model.gguf"
     _write_minimal_gguf(gguf)
 
     backend = LlamaCppBackend()
     backend._is_vulkan_backend = lambda _binary = None: True
-    # Vulkan reports one device at ordinal 0.
-    backend._get_gpu_memory = lambda _binary = None: [(0, 10000, 16000)]
-    backend._get_gpu_free_memory = lambda _binary = None: [(0, 10000)]
+    # Vulkan reports two devices at ordinals 0 and 1.
+    backend._get_gpu_memory = lambda _binary = None: [(0, 10000, 16000), (1, 9000, 16000)]
+    backend._get_gpu_free_memory = lambda _binary = None: [(0, 10000), (1, 9000)]
     backend._read_gguf_metadata = lambda _p: None
     backend._can_estimate_kv = lambda: False
     backend._get_gguf_size_bytes = lambda _p: 1024
@@ -744,7 +748,8 @@ def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
     backend._apu_ram_shortfall_message = lambda *a, **k: None
     backend._amd_apu_wants_unified_memory = lambda *a, **k: False
     backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
-    backend._select_gpus = lambda *a, **k: ([0], False)
+    # Select the single candidate that survives the gpu_ids filter (its Vulkan ordinal).
+    backend._select_gpus = lambda requested_total, gpus, **k: ([gpus[0][0]], False)
     backend._wait_for_health = lambda timeout: True
     backend._detect_audio_type_strict = lambda: None
     backend._apply_detected_audio = lambda _d: True
@@ -769,9 +774,10 @@ def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
             "Popen",
             side_effect = _make_fake_popen,
         ),
+        # A CUDA/HIP mask of [2, 3] must NOT remap the requested Vulkan ordinal.
         patch(
             "utils.hardware.get_parent_visible_gpu_ids",
-            return_value = [1],
+            return_value = [2, 3],
         ),
     ):
         backend.load_model(
@@ -783,7 +789,56 @@ def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
     assert captured_cmds, "llama-server was not spawned"
     cmd = captured_cmds[-1]
     assert "--device" in cmd
-    assert cmd[cmd.index("--device") + 1] == "Vulkan0"
+    # gpu_ids=[1] pins Vulkan ordinal 1 directly, not remapped to Vulkan0 via the mask.
+    assert cmd[cmd.index("--device") + 1] == "Vulkan1"
+
+
+def test_has_gpu_backend_accepts_parent_mask_when_probe_empty():
+    """A real GPU with telemetry down (empty probe) but a numeric parent-visible mask
+    must count as a backend, so /load does not 400 a selection assert_requested_gpu_ids_
+    resolvable would accept via the mask fallback. No probe AND no mask is GPU-less (#7188)."""
+    backend = LlamaCppBackend()
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._get_gpu_memory = lambda _binary = None: []  # telemetry unavailable
+    with patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0, 1]):
+        assert backend.has_gpu_backend() is True
+    with patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []):
+        assert backend.has_gpu_backend() is False
+
+
+def test_explicit_gpu_ids_strips_stored_device_extra_args(tmp_path):
+    """With explicit gpu_ids a user --device is dropped from BOTH the command and the
+    PERSISTED extras, so a later same-model reload that inherits these (after gpu_ids is
+    cleared) can't resurrect the dropped --device and override auto placement (#7188)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [(0, 10000, 16000)], vulkan = True)
+    backend._select_gpus = lambda requested_total, gpus, **k: ([gpus[0][0]], False)
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                pass
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with (
+        patch.object(subprocess, "Popen", side_effect = _make_fake_popen),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
+    ):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = [0],
+            extra_args = ["--device", "Vulkan3", "--top-k", "5"],
+        )
+
+    stored = backend._extra_args or []
+    assert "--device" not in stored and "Vulkan3" not in stored
+    assert "--top-k" in stored  # unrelated extras are preserved
 
 
 def test_memory_mode_auto_matches_none_in_target_state():
