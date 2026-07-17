@@ -5668,6 +5668,18 @@ class LlamaCppBackend:
             # Block-diffusion GGUFs (DiffusionGemma) cannot run on llama-server;
             # serve them with the diffusion runner (same OpenAI-compat interface).
             if self._is_diffusion:
+                # The diffusion runner is single-GPU: its visual server picks a
+                # device from DG_GPU (default 0) and never consumes gpu_ids. Honoring
+                # a gpu_ids load here would let the training-coexistence guard budget
+                # against the requested GPU while the runner still starts on GPU 0
+                # (silent wrong placement + guard bypass). Reject the combination;
+                # the route maps this ValueError to a 400.
+                if gpu_ids is not None:
+                    raise ValueError(
+                        "gpu_ids selection is not supported for diffusion "
+                        "(DiffusionGemma) GGUF models; they run on a single GPU "
+                        "chosen by the DG_GPU environment variable."
+                    )
                 # Not a tensor/layer GGUF: clear any preserved-fallback flag from a
                 # prior load (this path skips the command builder that clears it).
                 self._layer_preserves_tensor_intent = False
@@ -6649,9 +6661,7 @@ class LlamaCppBackend:
                 # training guard excluded. Pin --fit to the requested set instead.
                 if use_fit and gpu_indices is None and gpu_ids is not None and gpus:
                     gpu_indices = sorted(idx for idx, _ in gpus)
-                    logger.info(
-                        f"Using --fit on explicitly requested GPUs: {gpu_indices}"
-                    )
+                    logger.info(f"Using --fit on explicitly requested GPUs: {gpu_indices}")
 
                 # Unified-memory APUs load weights into system RAM (under WSL the VM
                 # cap, not the ROCm-reported VRAM, is the real ceiling); refuse an
@@ -6952,18 +6962,16 @@ class LlamaCppBackend:
                 if "--threads" not in cmd:
                     env.pop("LLAMA_ARG_THREADS", None)
 
-                # When a first-class memory_mode is supplied, clear inherited
-                # llama.cpp env vars so the default/auto case is not silently
-                # pinned/no-mmapped by the environment. Pinned/resident emit CLI
-                # flags that already win, but auto emits nothing and must not
-                # inherit stale mlock/mmap settings.
+                # Memory placement is a first-class field (auto/pinned/resident):
+                # Studio's --mlock/--no-mmap (or their absence for auto) must win.
+                # llama-server honors LLAMA_ARG_MLOCK/NO_MMAP/MMAP only where Studio
+                # emits no CLI flag for that param, so an inherited env could run an
+                # explicit 'auto' mlocked/no-mmap or silently turn 'pinned' into
+                # 'resident'. Scrub them when the caller supplied a mode (mirrors the
+                # LLAMA_ARG_THREADS / split / cache scrubs).
                 if memory_mode is not None:
-                    for _env_key in (
-                        "LLAMA_ARG_MLOCK",
-                        "LLAMA_ARG_MMAP",
-                        "LLAMA_ARG_NO_MMAP",
-                    ):
-                        env.pop(_env_key, None)
+                    for _mm_var in ("LLAMA_ARG_MLOCK", "LLAMA_ARG_NO_MMAP", "LLAMA_ARG_MMAP"):
+                        env.pop(_mm_var, None)
 
                 # Reconcile the inherited LLAMA_ARG_* env with Studio's final
                 # decision: stripping CLI extras on a tensor->layer downgrade

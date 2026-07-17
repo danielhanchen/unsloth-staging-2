@@ -844,3 +844,24 @@ def test_strip_shadowing_flags_keeps_model_draft_without_spec():
         strip_template = False,
     )
     assert out == ["--model-draft", "/custom/mtp.gguf"]
+
+
+def test_strip_shadowing_flags_drops_inverse_mmap_flag():
+    # An inherited --mmap must not survive to last-wins-override Studio's
+    # resident-mode --no-mmap (#7164).
+    out = strip_shadowing_flags(["--mmap"], strip_memory_mode = True)
+    assert out == []
+
+
+@pytest.mark.parametrize("flag", ["--mlock", "--no-mmap", "--mmap"])
+def test_strip_memory_mode_valueless_preserves_next_token(flag):
+    # The memory-mode flags take no value; stripping one must not consume the
+    # following token.
+    out = strip_shadowing_flags([flag, "--top-k", "40"], strip_memory_mode = True)
+    assert out == ["--top-k", "40"]
+
+
+def test_strip_memory_mode_kept_when_field_not_supplied():
+    # Pass-through preserved when the user didn't change gguf_memory_mode.
+    out = strip_shadowing_flags(["--mmap"], strip_memory_mode = False)
+    assert out == ["--mmap"]

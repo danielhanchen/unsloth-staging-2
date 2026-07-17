@@ -509,6 +509,10 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
                 "_requires_trust_remote_code_for_model",
                 return_value = False,
             ),
+            # Make GPU resolution deterministic so the test doesn't depend on the
+            # host having GPU 0 visible (CI runs GPU-less; #7164 added an up-front
+            # resolve_requested_gpu_ids validation before the guard is reached).
+            patch("utils.hardware.resolve_requested_gpu_ids", return_value = [0]),
             _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
         ):
             resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))

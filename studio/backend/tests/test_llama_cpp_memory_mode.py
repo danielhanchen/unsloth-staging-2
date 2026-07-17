@@ -396,13 +396,16 @@ def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
 
         return _FakePopen(cmd, **kwargs)
 
-    with patch.object(
-        subprocess,
-        "Popen",
-        side_effect = _make_fake_popen,
-    ), patch(
-        "utils.hardware.get_parent_visible_gpu_ids",
-        return_value = [1],
+    with (
+        patch.object(
+            subprocess,
+            "Popen",
+            side_effect = _make_fake_popen,
+        ),
+        patch(
+            "utils.hardware.get_parent_visible_gpu_ids",
+            return_value = [1],
+        ),
     ):
         backend.load_model(
             gguf_path = str(gguf),
@@ -429,3 +432,100 @@ def test_memory_mode_pinned_does_not_match_none():
     kwargs = _base_target_state_kwargs(backend)
     kwargs["memory_mode"] = "pinned"
     assert backend._already_in_target_state(**kwargs) is False
+
+
+# ── inherited LLAMA_ARG_* mmap/mlock env is scrubbed when a mode is set ───────
+
+
+def _mem_env_backend(gguf):
+    backend = LlamaCppBackend()
+    backend._get_gpu_memory = lambda _binary = None: [(0, 10000, 16000)]
+    backend._read_gguf_metadata = lambda _p: None
+    backend._can_estimate_kv = lambda: False
+    backend._get_gguf_size_bytes = lambda _p: 1024
+    backend._mmproj_vram_bytes = lambda _p: 0
+    backend._resolve_launch_mmproj_path = lambda **k: None
+    backend._apu_ram_shortfall_message = lambda *a, **k: None
+    backend._amd_apu_wants_unified_memory = lambda *a, **k: False
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._select_gpus = lambda *a, **k: ([0], False)
+    backend._wait_for_health = lambda timeout: True
+    backend._detect_audio_type_strict = lambda: None
+    backend._apply_detected_audio = lambda _d: True
+    return backend
+
+
+@pytest.mark.parametrize(
+    "mode,scrubbed",
+    [("auto", True), ("pinned", True), ("resident", True), (None, False)],
+)
+def test_memory_mode_scrubs_inherited_mmap_env(tmp_path, monkeypatch, mode, scrubbed):
+    """An explicit memory_mode strips inherited LLAMA_ARG_MLOCK/NO_MMAP/MMAP so
+    llama-server can't silently run a placement Studio did not select (#7164).
+    memory_mode=None (no opinion) leaves any operator env untouched."""
+    monkeypatch.setenv("LLAMA_ARG_MLOCK", "1")
+    monkeypatch.setenv("LLAMA_ARG_NO_MMAP", "1")
+    monkeypatch.setenv("LLAMA_ARG_MMAP", "true")
+
+    gguf = tmp_path / "model.gguf"
+    _write_minimal_gguf(gguf)
+    backend = _mem_env_backend(gguf)
+
+    captured_envs = []
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                captured_envs.append(kwargs.get("env") or {})
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with patch.object(subprocess, "Popen", side_effect = _make_fake_popen):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            memory_mode = mode,
+        )
+
+    assert captured_envs, "llama-server was not spawned"
+    env = captured_envs[-1]
+    for var in ("LLAMA_ARG_MLOCK", "LLAMA_ARG_NO_MMAP", "LLAMA_ARG_MMAP"):
+        assert (var not in env) == scrubbed
+
+
+# ── gpu_ids is rejected for diffusion GGUFs (single-GPU DG_GPU runner) ────────
+
+
+def test_load_model_rejects_gpu_ids_for_diffusion_gguf(tmp_path):
+    """Diffusion GGUFs serve via the single-GPU DG_GPU runner and ignore gpu_ids;
+    load_model must reject a gpu_ids selection (the route maps this ValueError to a
+    400) so the training guard's budget can't diverge from where the runner starts."""
+    gguf = tmp_path / "diffusion.gguf"
+    _write_minimal_gguf(gguf, arch = "diffusion-gemma")
+
+    def _make_backend():
+        b = LlamaCppBackend()
+        # Force diffusion routing without depending on the full metadata parser.
+        b._read_gguf_metadata = lambda _p: setattr(b, "_is_diffusion", True)
+        b._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+        b._is_vulkan_backend = lambda _binary = None: False
+        return b
+
+    started = []
+    b1 = _make_backend()
+    b1._start_diffusion_server = lambda **kw: (started.append(kw) or True)
+    with pytest.raises(ValueError, match = "gpu_ids"):
+        b1.load_model(gguf_path = str(gguf), model_identifier = "d", gpu_ids = [1])
+    assert started == []  # runner never launched
+
+    # The same diffusion GGUF WITHOUT gpu_ids still reaches the runner.
+    b2 = _make_backend()
+    started2 = []
+    b2._start_diffusion_server = lambda **kw: (started2.append(kw) or True)
+    assert b2.load_model(gguf_path = str(gguf), model_identifier = "d") is True
+    assert len(started2) == 1
