@@ -574,10 +574,13 @@ def test_diffusion_load_allows_default_memory_mode_and_clears_stale_state(tmp_pa
     backend._gpu_ids = [0, 1]
     backend._memory_mode = "resident"
 
-    assert backend.load_model(
-        gguf_path = str(gguf),
-        model_identifier = "d",
-        memory_mode = mode,
-    ) is True
+    assert (
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "d",
+            memory_mode = mode,
+        )
+        is True
+    )
     assert backend._gpu_ids is None
     assert backend._memory_mode is None
