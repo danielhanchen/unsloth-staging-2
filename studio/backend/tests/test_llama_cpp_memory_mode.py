@@ -19,12 +19,9 @@ if _BACKEND_DIR not in sys.path:
 
 
 def _install_stub_if_absent(name: str, build):
-    """Install a lightweight stub for ``name`` only when the real module is not
-    importable. Never shadow a real module: this test file was collected before
-    a real-httpx importer once installed an incomplete httpx stub via
-    sys.modules.setdefault, which then broke unrelated tests in a combined pytest
-    run (order-dependent failures). Preferring the real module keeps the stub as a
-    pure fallback for minimal environments without changing global import state."""
+    """Install a stub for ``name`` only when the real module isn't importable, so a
+    stub never shadows a real module and breaks unrelated tests in a combined pytest
+    run. The stub stays a pure fallback for minimal environments."""
     if name in sys.modules:
         return
     try:
@@ -316,10 +313,8 @@ def _fit_fallback_backend(
 
 
 def test_empty_probe_preserves_explicit_gpu_ids(tmp_path):
-    """A CUDA/ROCm build whose telemetry probe returns nothing (no nvidia-smi +
-    CPU-only torch) must still honor a route-validated explicit gpu_ids rather than
-    raising: auto-selection loads here via --fit on, so the explicit request pins the
-    same GPU via CUDA_VISIBLE_DEVICES + --fit on instead of failing (#7164)."""
+    """A CUDA/ROCm build with an empty probe must still honor a route-validated explicit
+    gpu_ids, pinning via CUDA_VISIBLE_DEVICES + --fit on instead of raising (#7164)."""
     backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
 
     captured = {}
@@ -371,10 +366,9 @@ def test_empty_probe_still_rejects_vulkan_gpu_ids(tmp_path):
 
 
 def test_torchless_vulkan_populated_probe_uses_identity_ordinals(tmp_path):
-    """A torch-less Vulkan host has no CUDA/HIP physical namespace (empty parent-visible
-    mask), so gpu_ids ARE the Vulkan ordinals: with a POPULATED probe the selection must
-    load (pinned via --device Vulkan<i>) instead of raising -- otherwise explicit GPU
-    selection is unreachable on exactly the AMD/Vulkan hosts #7164 targets (#7188)."""
+    """A torch-less Vulkan host has an empty parent-visible mask, so gpu_ids ARE the
+    Vulkan ordinals: with a populated probe the selection loads (pinned via --device
+    Vulkan<i>) instead of raising (#7188)."""
     backend, gguf = _fit_fallback_backend(
         tmp_path, gpu_memory = [(0, 10000, 16000), (1, 8000, 16000)], vulkan = True
     )
@@ -426,10 +420,9 @@ def test_vulkan_rejects_duplicate_gpu_ids(tmp_path):
 
 
 def test_empty_probe_rejects_gpu_ids_without_gpu_backend(tmp_path):
-    """A non-Vulkan build with an empty probe AND an empty parent-visible mask has no
-    GPU backend at all (CPU / Metal build). The route now skips resolve_requested_gpu_ids
-    for GGUF on non-CUDA hosts, so the backend must reject gpu_ids here rather than pin a
-    non-existent device and silently run on CPU while reporting backend.gpu_ids (#7188)."""
+    """A non-Vulkan build with an empty probe AND empty parent-visible mask has no GPU
+    backend, so the backend must reject gpu_ids rather than pin a non-existent device
+    and silently run on CPU (#7188)."""
     backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
 
     with (
@@ -463,9 +456,8 @@ def test_empty_probe_rejects_gpu_ids_outside_parent_mask(tmp_path):
 
 
 def test_vulkan_gpu_ids_strips_conflicting_user_device(tmp_path):
-    """On Vulkan the --device flag is the only device pin. When explicit gpu_ids is set,
-    a user --device in extras must be stripped so it can't last-wins-override Studio's pin
-    and offload to a GPU the training guard never budgeted (#7188). Studio's --device
+    """On Vulkan --device is the only pin. With explicit gpu_ids, a user --device in
+    extras must be stripped so it can't override Studio's pin (#7188). Studio's --device
     survives; unrelated extras pass through."""
     backend, gguf = _fit_fallback_backend(
         tmp_path, gpu_memory = [(0, 10000, 16000), (1, 8000, 16000)], vulkan = True
@@ -926,10 +918,9 @@ def _mem_env_backend(gguf):
 )
 def test_memory_mode_scrubs_inherited_mmap_env(tmp_path, monkeypatch, mode, scrubbed):
     """An explicit memory_mode strips inherited LLAMA_ARG_MLOCK/NO_MMAP/MMAP so
-    llama-server can't silently run a placement Studio did not select (#7164).
-    memory_mode=None (no opinion) leaves any operator env untouched for backwards
-    compatibility; the reload-dedup instead reloads a None-loaded-with-inherited-env
-    child when a later explicit 'auto' arrives (see the target-state tests below)."""
+    llama-server can't run a placement Studio didn't select (#7164). memory_mode=None
+    leaves operator env untouched (backwards compatible); the reload-dedup handles a
+    later explicit 'auto' (see the target-state tests below)."""
     monkeypatch.setenv("LLAMA_ARG_MLOCK", "1")
     monkeypatch.setenv("LLAMA_ARG_NO_MMAP", "1")
     monkeypatch.setenv("LLAMA_ARG_MMAP", "true")
@@ -1024,10 +1015,9 @@ def test_load_model_rejects_explicit_memory_mode_for_diffusion_gguf(tmp_path, mo
 
 @pytest.mark.parametrize("mode", [None, "auto", "AUTO", ""])
 def test_diffusion_load_allows_default_memory_mode_and_clears_stale_state(tmp_path, mode):
-    """auto/blank/None placement is the no-op default and is allowed for diffusion.
-    A successful diffusion load must also clear any _gpu_ids/_memory_mode left by a
-    prior llama-server load so reload-dedup reflects the runner's real (unset) state
-    and doesn't force a needless kill+restart of the healthy diffusion server."""
+    """auto/blank/None is the allowed no-op default for diffusion. A successful load
+    must also clear any _gpu_ids/_memory_mode left by a prior llama-server load so
+    reload-dedup doesn't force a needless kill+restart of the diffusion server."""
     gguf = tmp_path / "diffusion.gguf"
     _write_minimal_gguf(gguf, arch = "diffusion-gemma")
 
@@ -1071,10 +1061,9 @@ def test_is_likely_diffusion_model_name_matches_diffusiongemma(name, expected):
 
 
 def test_local_chat_gguf_in_diffusion_path_not_prekilled(tmp_path):
-    """A local chat GGUF whose path contains "diffusion" (e.g. /models/diffusion/x.gguf)
-    is NOT a diffusion model -- its header proves it. The Phase 0 name heuristic runs only
-    for HF loads, so an explicit gpu_ids on such a local chat GGUF must load normally
-    instead of being rejected on the path name before the header read (#7188)."""
+    """A local chat GGUF whose path contains "diffusion" is NOT a diffusion model (its
+    header proves it). The Phase 0 name heuristic runs only for HF loads, so explicit
+    gpu_ids on such a local GGUF must load normally, not be rejected on the path (#7188)."""
     backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [(0, 10000, 16000)])
     backend._select_gpus = lambda *a, **k: ([0], False)
 

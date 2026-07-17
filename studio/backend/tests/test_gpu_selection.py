@@ -919,8 +919,7 @@ class TestRouteErrors(unittest.TestCase):
                 return True
 
             def assert_requested_gpu_ids_resolvable(self, gpu_ids):
-                # Route validates the specific ids against the probe before the unload
-                # path; [0, 1] is resolvable here, so this is a no-op.
+                # [0, 1] is resolvable here, so this is a no-op.
                 return None
 
             def __init__(self):
@@ -945,9 +944,7 @@ class TestRouteErrors(unittest.TestCase):
                 "ModelConfig",
                 SimpleNamespace(from_identifier = lambda **_kwargs: model_config),
             ),
-            # Deterministic GPU resolution so the test doesn't depend on the host
-            # having GPUs 0/1 visible (CI runs GPU-less; #7164 validates gpu_ids
-            # up-front via resolve_requested_gpu_ids).
+            # Deterministic GPU resolution (CI runs GPU-less).
             patch("utils.hardware.resolve_requested_gpu_ids", return_value = [0, 1]),
             patch.object(
                 inference_route,
@@ -1163,9 +1160,8 @@ class TestRouteErrors(unittest.TestCase):
                 "ModelConfig",
                 SimpleNamespace(from_identifier = lambda **_kwargs: model_config),
             ),
-            # Simulate a UUID/MIG parent visibility at the resolver layer: #7164
-            # validates gpu_ids up-front, so the UUID/MIG rejection now surfaces
-            # from resolve_requested_gpu_ids rather than the backend load call.
+            # Simulate UUID/MIG parent visibility at the resolver layer: the rejection
+            # now surfaces from resolve_requested_gpu_ids, not the backend load call.
             patch(
                 "utils.hardware.resolve_requested_gpu_ids",
                 side_effect = ValueError(

@@ -3123,10 +3123,9 @@ def _request_matches_loaded_settings(
         llama_backend.cache_type_kv
     ):
         return False
-    # GPU selection and memory mode are first-class fields; any change must reload.
-    # Compare as a set (order-insensitive): Studio sorts gpu_ids before pinning, so
-    # [0,1] and [1,0] launch identically and must not trigger a needless reload / 409
-    # during training (#7188).
+    # gpu_ids and memory mode are first-class; any change must reload. Compare
+    # order-insensitively: Studio sorts gpu_ids, so [0,1] and [1,0] are identical and
+    # must not force a needless reload / 409 during training (#7188).
     _request_gpu_ids = sorted(request.gpu_ids) if request.gpu_ids else None
     _loaded_gpu_ids = sorted(llama_backend.gpu_ids) if llama_backend.gpu_ids else None
     if _request_gpu_ids != _loaded_gpu_ids:
@@ -3135,10 +3134,9 @@ def _request_matches_loaded_settings(
         request.gguf_memory_mode
     ) != LlamaCppBackend._canonical_memory_mode(llama_backend.memory_mode):
         return False
-    # An explicit memory_mode (incl. 'auto') over a child that inherited operator
-    # LLAMA_ARG_* placement flags must reload so the backend scrub runs; the
-    # canonical check above equates 'auto' with the omitted state and would leave
-    # the child mlocked/no-mmap (#7164).
+    # Explicit memory_mode (incl. 'auto') over a child with inherited LLAMA_ARG_*
+    # placement flags must reload so the scrub runs; the canonical check above treats
+    # 'auto' as omitted and would leave the child mlocked/no-mmap (#7164).
     if request.gguf_memory_mode is not None and llama_backend.launched_with_inherited_mem_env:
         return False
     # Reconcile a user --split-mode in extras into the effective tensor state.
@@ -3147,12 +3145,10 @@ def _request_matches_loaded_settings(
     # tensor load isn't seen as a mismatch that needlessly reloads the server.
     backend_extra = list(llama_backend.extra_args) if llama_backend.extra_args else []
     fields_set = getattr(request, "model_fields_set", set())
-    # Strip inherited --mlock/--no-mmap/--mmap only when the request carries a real
-    # memory mode. Pydantic marks the field "set" even for an explicit null (a client
-    # echoing the status/load response, which is null for a no-mode load), but null ==
-    # None == "no opinion": the backend is then called with memory_mode=None and leaves
-    # placement alone, so stripping here would needlessly reload and drop the user's
-    # pass-through memory flags. Gate on the value, not merely model_fields_set (#7188).
+    # Strip inherited --mlock/--no-mmap/--mmap only for a real memory mode. Pydantic
+    # marks the field "set" even for an explicit null, but null == None == "no opinion"
+    # (backend leaves placement alone), so stripping then would needlessly reload and
+    # drop pass-through flags. Gate on the value, not model_fields_set (#7188).
     _strip_mem = request.gguf_memory_mode is not None
     effective_extra = (
         request.llama_extra_args
@@ -3223,22 +3219,18 @@ def _request_matches_loaded_settings(
         ):
             return False
     else:
-        # Strip memory-placement flags from the REQUEST side only when the caller
-        # set a memory mode, mirroring how the reload strips explicit extras before
-        # storing them (load_model). Without this, an explicit request that repeats
-        # a --mlock/--mmap/--no-mmap already dropped by the loaded server misses this
-        # already-loaded fast path and, during active training, gets rejected by the
-        # coexistence guard even though the live placement already matches.
+        # Strip memory-placement flags from the REQUEST side only for a real memory
+        # mode (mirrors how the reload strips explicit extras before storing them),
+        # so an explicit request repeating a --mlock/--mmap/--no-mmap already dropped
+        # by the loaded server still hits this fast path instead of being rejected by
+        # the coexistence guard during training.
         #
-        # The backend side is NOT stripped: a server that loaded with no memory_mode
-        # keeps a pass-through --mlock/--no-mmap in its stored extras and is still
-        # mlocked. Stripping it here would make an explicit auto (which clears that
-        # placement on reload) compare equal and wrongly dedupe to the pinned server,
-        # leaving the old placement active. Keeping the flag makes the mismatch force
-        # a reload so the auto scrub runs (#7164). A server that loaded WITH a mode
-        # already had these flags stripped at load, so backend_extra carries none and
-        # the comparison is unaffected in that case. (_strip_mem is gated on a real
-        # memory-mode value above, so an explicit null does not trigger this strip.)
+        # The backend side is NOT stripped: a server loaded with no memory_mode keeps
+        # a pass-through --mlock/--no-mmap and is still mlocked. Stripping it here would
+        # let an explicit auto (which clears that placement on reload) dedupe to the
+        # pinned server and leave the old placement active; keeping it forces a reload
+        # so the auto scrub runs (#7164). A server loaded WITH a mode already had these
+        # stripped at load, so backend_extra carries none and is unaffected.
         _request_extra = (
             strip_shadowing_flags(
                 request.llama_extra_args,
@@ -4021,12 +4013,10 @@ def _reject_diffusion_placement(
 ) -> None:
     """Raise 400 if a DiffusionGemma GGUF was given gpu_ids or an explicit memory mode.
 
-    The diffusion runner is single-GPU (DG_GPU) and has no --mlock/--no-mmap plumbing,
-    so those options are unsupported. Called by BOTH /validate and /load, before either
-    tears down the active model, so the two endpoints agree and the frontend can't
-    validate a placement /load will reject after it has already unloaded (#7188). Local
-    GGUFs use the authoritative header; HF repos fall back to the repo name (the file
-    isn't downloaded yet).
+    The diffusion runner is single-GPU (DG_GPU) with no --mlock/--no-mmap plumbing.
+    Called by BOTH /validate and /load before either tears down the active model, so
+    they agree and a placement /load will reject isn't validated post-unload (#7188).
+    Local GGUFs use the header; HF repos fall back to the repo name (not downloaded yet).
     """
     _gguf_file = getattr(config, "gguf_file", None)
     _gguf_hf_repo = getattr(config, "gguf_hf_repo", None)
@@ -4037,10 +4027,8 @@ def _reject_diffusion_placement(
         from utils.models.gguf_metadata import is_diffusion_gguf
         _is_diffusion = is_diffusion_gguf(_gguf_file)
     elif _gguf_hf_repo:
-        # Match "diffusiongemma" (no separator before "gemma") as well as a
-        # standalone "diffusion" segment, so the canonical google/diffusiongemma-*
-        # repo is rejected up front instead of only after the header read that
-        # follows the unload (#7188).
+        # Match "diffusiongemma" (no separator) and a standalone "diffusion" segment
+        # so google/diffusiongemma-* is rejected up front, not post-unload (#7188).
         _is_diffusion = bool(
             _re.search(
                 r"(?:^|[\/\-_.])diffusion(?:gemma|[\/\-_.]|$)",
@@ -4242,8 +4230,7 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 detail = f"Invalid model identifier: {model_log_label}",
             )
 
-        # Reject unsupported placement options for DiffusionGemma before the route
-        # tears down any active model (shared with /validate so the two agree).
+        # Reject DiffusionGemma placement before any teardown (shared with /validate).
         _reject_diffusion_placement(
             config, gpu_ids = request.gpu_ids, memory_mode = request.gguf_memory_mode
         )
@@ -4251,11 +4238,10 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # Normalize gpu_ids: empty list means auto-selection, same as None
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
 
-        # Validate explicit GPU selection up front so the loader and the guard
-        # agree on the candidate set. GGUF now supports gpu_ids (#7164).
-        # On non-CUDA hosts the CUDA-oriented resolver sees an empty parent-visible
-        # set and would 400; skip it for GGUF and let the backend validate against
-        # its Vulkan probe / ordinal mapping instead.
+        # Validate explicit GPU selection up front so the loader and guard agree on
+        # the candidate set. GGUF now supports gpu_ids (#7164). On non-CUDA hosts the
+        # CUDA-oriented resolver sees an empty parent-visible set and would 400, so
+        # skip it for GGUF and let the backend validate against its Vulkan probe.
         if effective_gpu_ids is not None:
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
             if not config.is_gguf or get_device() == DeviceType.CUDA:
@@ -4264,14 +4250,11 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
             else:
-                # Non-CUDA GGUF host (CPU / MLX / XPU): the CUDA-oriented resolver can't
-                # enumerate the llama.cpp backend's devices, so gate on its probe. If the
-                # probe (incl. Vulkan) finds no selectable device -> reject before any
-                # teardown, so a request the backend can't honor doesn't unload the active
-                # model first (#7188). A torch-less Vulkan host reports CPU but its probe is
-                # non-empty, so it falls through; MLX/XPU builds whose non-Vulkan probe can't
-                # enumerate Metal/SYCL devices are rejected here rather than after unload
-                # (#7164/#7188).
+                # Non-CUDA GGUF host (CPU / MLX / XPU): the CUDA resolver can't enumerate
+                # llama.cpp's devices, so gate on its probe and reject before any teardown
+                # (#7188). A torch-less Vulkan host reports CPU but its probe is non-empty
+                # so it falls through; MLX/XPU builds that can't enumerate Metal/SYCL are
+                # rejected here rather than after unload (#7164/#7188).
                 _llama_backend = get_llama_cpp_backend()
                 if not await asyncio.to_thread(_llama_backend.has_gpu_backend):
                     raise HTTPException(
@@ -4281,10 +4264,8 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                             "detected on this host."
                         ),
                     )
-                # A backend exists, but validate the SPECIFIC ids (Vulkan ordinals /
-                # visible mask) against the probe too, so an out-of-range or duplicate id
-                # is rejected here rather than after the GGUF path unloads the active
-                # HF/GGUF model and load_model 400s (#7188).
+                # Backend exists: validate the SPECIFIC ids against the probe too, so an
+                # out-of-range/duplicate id is rejected here, not after the unload (#7188).
                 try:
                     await asyncio.to_thread(
                         _llama_backend.assert_requested_gpu_ids_resolvable,
@@ -4409,9 +4390,8 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                         strip_split_mode = _should_strip_split_mode(
                             request, llama_backend.extra_args
                         ),
-                        # Only strip inherited memory flags for a real mode value; an
-                        # explicit null (Pydantic still marks it "set") means "no
-                        # opinion", so preserve the pass-through placement (#7188).
+                        # Strip inherited memory flags only for a real mode; an explicit
+                        # null means "no opinion", so keep pass-through placement (#7188).
                         strip_memory_mode = request.gguf_memory_mode is not None,
                     )
                     try:
@@ -4902,8 +4882,7 @@ async def validate_model(
                 detail = f"Invalid model identifier: {model_log_label}",
             )
 
-        # Reject DiffusionGemma placement here too, matching /load, so a client can't
-        # validate a gpu_ids/memory_mode /load will reject after it has unloaded (#7188).
+        # Reject DiffusionGemma placement here too, matching /load (#7188).
         _reject_diffusion_placement(
             config, gpu_ids = request.gpu_ids, memory_mode = request.gguf_memory_mode
         )
@@ -4911,9 +4890,8 @@ async def validate_model(
         # Refuse early (before the frontend unloads to load this) if it can't fit
         # alongside training, using the same settings /load uses so they agree.
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
-        # Mirror /load: validate explicit GPU selection before the guard.
-        # Skip the CUDA-oriented resolver for GGUF on non-CUDA hosts; the backend
-        # validates against the Vulkan probe instead.
+        # Mirror /load: validate explicit GPU selection before the guard. Skip the
+        # CUDA resolver for GGUF on non-CUDA hosts; the backend uses the Vulkan probe.
         if effective_gpu_ids is not None:
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
             if not config.is_gguf or get_device() == DeviceType.CUDA:
@@ -4922,10 +4900,10 @@ async def validate_model(
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
             else:
-                # Mirror /load: gate on the llama.cpp probe for any non-CUDA GGUF host
-                # (CPU / MLX / XPU) so an unsupported selection is rejected before the
-                # frontend unloads to load this. A torch-less Vulkan host reports CPU but
-                # its probe is non-empty, so it falls through (#7164/#7188).
+                # Mirror /load: gate on the llama.cpp probe for a non-CUDA GGUF host so
+                # an unsupported selection is rejected before the frontend unloads. A
+                # torch-less Vulkan host reports CPU but its probe is non-empty, so it
+                # falls through (#7164/#7188).
                 _llama_backend = get_llama_cpp_backend()
                 if not await asyncio.to_thread(_llama_backend.has_gpu_backend):
                     raise HTTPException(
@@ -4935,10 +4913,8 @@ async def validate_model(
                             "detected on this host."
                         ),
                     )
-                # A backend exists, but validate the SPECIFIC ids against the probe too.
-                # The frontend validates first and then unloads before /load, so a bad
-                # Vulkan id (e.g. [99] or a duplicate) must be rejected here rather than
-                # after the unload, matching /load's preflight (#7188).
+                # Validate the SPECIFIC ids against the probe too, so a bad Vulkan id
+                # (e.g. [99] or a duplicate) is rejected here, not after unload (#7188).
                 try:
                     await asyncio.to_thread(
                         _llama_backend.assert_requested_gpu_ids_resolvable,

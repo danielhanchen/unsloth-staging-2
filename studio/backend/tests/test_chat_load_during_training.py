@@ -175,8 +175,7 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
             patch("utils.hardware.estimate_required_model_memory_gb", return_value = (estimate, {})),
             patch("utils.hardware.get_visible_gpu_utilization", return_value = {"devices": devices}),
             # Deterministic GPU resolution so the guard doesn't depend on the host
-            # exposing the requested GPUs (CI is GPU-less; resolve_requested_gpu_ids
-            # would otherwise raise and mislabel the mode as "explicit").
+            # exposing the requested GPUs (CI is GPU-less).
             patch("utils.hardware.resolve_requested_gpu_ids", side_effect = lambda ids: list(ids)),
             patch("utils.hardware.auto_select_gpu_ids") as auto_mock,
         ):
@@ -204,10 +203,8 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
         self.assertTrue(ok)
 
     def test_no_per_gpu_floor_for_gguf_with_explicit_gpu_ids(self):
-        # GPU 0 has plenty of free VRAM, GPU 1 is nearly full. With explicit
-        # gpu_ids the HF balanced floor would require each GPU to hold half the
-        # model and reject the load; GGUF self-placement should still allow it
-        # because llama.cpp can select GPU 0 alone.
+        # GPU 0 free, GPU 1 nearly full. The HF balanced floor would reject (each GPU
+        # holds half), but GGUF self-placement can pick GPU 0 alone.
         ok, info, _ = self._run(
             devices = _devices((0, 80, 10), (1, 80, 75)),
             required_override = 20.0,
@@ -513,17 +510,15 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
                 "_requires_trust_remote_code_for_model",
                 return_value = False,
             ),
-            # Make GPU resolution deterministic so the test doesn't depend on the
-            # host having GPU 0 visible (CI runs GPU-less; #7164 added an up-front
-            # resolve_requested_gpu_ids validation before the guard is reached).
+            # Deterministic GPU resolution (CI runs GPU-less).
             patch("utils.hardware.resolve_requested_gpu_ids", return_value = [0]),
-            # On a non-CUDA host the guard probes for a GPU backend; a GPU is present.
+            # Non-CUDA host: the guard probes for a GPU backend; one is present.
             patch(
                 "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
                 return_value = True,
             ),
-            # The route now also validates the specific ids against the probe before
-            # the guard; treat [0] as resolvable so the fall-through is exercised.
+            # Route validates the specific ids against the probe too; treat [0] as
+            # resolvable so the fall-through is exercised.
             patch(
                 "core.inference.llama_cpp.LlamaCppBackend.assert_requested_gpu_ids_resolvable",
                 return_value = None,
@@ -531,15 +526,13 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
             _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
         ):
             resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
-        # Guard was reached with the explicit GPU selection.
         self.assertEqual(captured[0]["requested_gpu_ids"], [0])
         self.assertTrue(resp.valid)
         self.assertTrue(resp.is_gguf)
 
     def test_gguf_with_invalid_gpu_ids_rejected_before_guard(self):
-        # On a CUDA/ROCm host, an invalid GGUF gpu_ids still 400s before the VRAM
-        # guard: the CUDA-oriented resolver runs and rejects it up front. Pin the
-        # device to CUDA so this contract holds regardless of the CI host's GPUs.
+        # On CUDA/ROCm an invalid GGUF gpu_ids 400s before the guard (the resolver
+        # rejects it). Pin the device to CUDA so this holds regardless of CI host.
         from models.inference import ValidateModelRequest
         from utils.hardware import DeviceType
 
@@ -576,9 +569,9 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertEqual(captured, [])  # guard never reached
 
     def test_validate_rejects_diffusion_placement_like_load(self):
-        # /validate must reject DiffusionGemma gpu_ids/memory_mode the same way /load
-        # does, so a client can't validate OK, unload its working model, and then get a
-        # 400 from /load (#7188). Uses the HF repo name (no file downloaded at validate).
+        # /validate must reject DiffusionGemma gpu_ids/memory_mode like /load, so a
+        # client can't validate OK, unload, then get a 400 from /load (#7188). Uses
+        # the HF repo name (no file downloaded at validate).
         from models.inference import ValidateModelRequest
 
         request = ValidateModelRequest(model_path = "google/diffusiongemma-2b", gpu_ids = [0])
@@ -611,11 +604,10 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertEqual(captured, [])  # guard never reached (rejected before it)
 
     def test_gguf_invalid_gpu_ids_deferred_to_backend_on_non_cuda(self):
-        # On a non-CUDA host WITH a GPU (torch-less Vulkan AMD, which get_device()
-        # reports as CPU), the CUDA-oriented resolver can't see the Vulkan GPU, so
-        # #7164 skips it and defers to the backend probe. has_gpu_backend() is True
-        # (a GPU exists), so the route must NOT 400: it reaches the guard with the raw
-        # selection instead of rejecting a valid Vulkan id.
+        # Non-CUDA host WITH a GPU (torch-less Vulkan AMD, reported as CPU): the CUDA
+        # resolver can't see the Vulkan GPU, so it's skipped and deferred to the probe.
+        # has_gpu_backend() is True, so the route must NOT 400: it reaches the guard
+        # with the raw selection.
         from models.inference import ValidateModelRequest
         from utils.hardware import DeviceType
 
@@ -648,8 +640,7 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
                 "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
                 return_value = True,
             ),
-            # Route validates the specific ids against the probe before the guard; a
-            # torch-less Vulkan id is resolvable, so this is a no-op here.
+            # A torch-less Vulkan id is resolvable, so this is a no-op.
             patch(
                 "core.inference.llama_cpp.LlamaCppBackend.assert_requested_gpu_ids_resolvable",
                 return_value = None,
@@ -657,15 +648,13 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
             _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
         ):
             resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
-        # Reached the guard with the raw selection; backend probe validated it first.
         self.assertEqual(captured[0]["requested_gpu_ids"], [1])
         self.assertTrue(resp.valid)
 
     def test_gguf_gpu_ids_rejected_on_cpu_only_host_before_teardown(self):
-        # A genuinely GPU-less host (get_device()==CPU AND the backend probe finds no
-        # device, incl. Vulkan) must reject gpu_ids at the route, before any teardown,
-        # rather than pin a non-existent device (#7188). This is the case the Vulkan
-        # host above is deliberately distinguished from.
+        # A genuinely GPU-less host (get_device()==CPU AND an empty backend probe)
+        # must reject gpu_ids at the route before any teardown, not pin a non-existent
+        # device (#7188). Distinguished from the Vulkan host above.
         from models.inference import ValidateModelRequest
         from utils.hardware import DeviceType
 
@@ -702,12 +691,10 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertEqual(captured, [])  # rejected before the guard / any teardown
 
     def test_gguf_gpu_ids_rejected_on_mlx_xpu_host_before_teardown(self):
-        # On MLX/XPU hosts get_device() is neither CUDA nor CPU, so gpu_ids used to
-        # skip BOTH the CUDA resolver and the has_gpu_backend() preflight and only got
-        # rejected by load_model() after the route had already unloaded the active
-        # model. The preflight is now probe-gated for any non-CUDA host, so an
-        # unsupported selection (empty non-Vulkan probe) is rejected before any
-        # teardown, while a non-empty probe (e.g. a real Metal/SYCL device) still falls
+        # On MLX/XPU (neither CUDA nor CPU) gpu_ids used to skip both the resolver and
+        # the has_gpu_backend() preflight and only be rejected by load_model() after
+        # unload. The preflight is now probe-gated for any non-CUDA host: an empty
+        # non-Vulkan probe is rejected before teardown, a non-empty probe still falls
         # through to the backend (#7188).
         from models.inference import ValidateModelRequest
         from utils.hardware import DeviceType
@@ -746,9 +733,8 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
                 self.assertEqual(captured, [])  # rejected before the guard / any teardown
 
     def test_gguf_gpu_ids_deferred_to_backend_on_mlx_xpu_with_probe(self):
-        # The MLX/XPU preflight must NOT over-reject: when the backend probe DOES find a
-        # device (has_gpu_backend() True, e.g. a real Metal/SYCL build), the route falls
-        # through and lets the backend validate the selection rather than 400ing (#7188).
+        # The MLX/XPU preflight must NOT over-reject: when the probe finds a device
+        # (e.g. a real Metal/SYCL build), the route defers to the backend (#7188).
         from models.inference import ValidateModelRequest
         from utils.hardware import DeviceType
         for dev in (DeviceType.MLX, DeviceType.XPU):
@@ -796,10 +782,9 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
                 self.assertTrue(resp.valid)
 
     def test_gguf_invalid_gpu_ids_rejected_at_route_before_unload(self):
-        # A GPU backend EXISTS (has_gpu_backend True) but the requested id is
-        # unresolvable (an out-of-range/duplicate Vulkan id). The route must reject via
-        # the resolvability preflight BEFORE reaching the guard / unloading the active
-        # model, rather than defer to load_model which 400s only after teardown (#7188).
+        # A GPU backend exists but the requested id is unresolvable (out-of-range
+        # Vulkan id). The resolvability preflight must reject it before the guard /
+        # unload, not defer to load_model which 400s only after teardown (#7188).
         from models.inference import ValidateModelRequest
         from utils.hardware import DeviceType
 

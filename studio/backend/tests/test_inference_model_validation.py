@@ -44,10 +44,9 @@ from models.inference import ValidateModelRequest  # noqa: E402
 
 @pytest.mark.parametrize("blank", ["", "   ", "\n\t"])
 def test_blank_gguf_memory_mode_normalizes_to_auto(blank):
-    # A settings form may serialize the default placement as "": map it to explicit
-    # "auto" (not None) so a default-selecting Apply is still an explicit memory-mode
-    # choice and the inherited-env scrub runs, rather than 422-ing on the Literal or
-    # silently inheriting operator LLAMA_ARG_MLOCK / NO_MMAP / MMAP (#7164).
+    # A form may serialize the default placement as ""; map it to explicit "auto" so
+    # it counts as an explicit choice and the scrub runs, rather than 422-ing or
+    # inheriting operator LLAMA_ARG_MLOCK/NO_MMAP/MMAP (#7164).
     assert _base_load_request(gguf_memory_mode = blank).gguf_memory_mode == "auto"
     assert (
         ValidateModelRequest.model_validate(
@@ -63,8 +62,7 @@ def test_valid_gguf_memory_mode_preserved(mode):
 
 
 def test_invalid_gguf_memory_mode_still_rejected():
-    # Non-blank typos must still fail Literal validation (the before-validator
-    # only rescues blank strings, not arbitrary values).
+    # Non-blank typos must still fail Literal validation (only blanks are rescued).
     with pytest.raises(ValidationError):
         _base_load_request(gguf_memory_mode = "resdent")
 
