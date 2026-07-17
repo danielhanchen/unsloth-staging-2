@@ -168,6 +168,7 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
         devices,
         required_override = None,
         estimate = None,
+        requested_gpu_ids = None,
     ):
         with (
             patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
@@ -180,7 +181,7 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
                 hf_token = None,
                 load_in_4bit = True,
                 max_seq_length = 0,
-                requested_gpu_ids = None,
+                requested_gpu_ids = requested_gpu_ids,
                 is_gguf = True,
                 required_override_gb = required_override,
             )
@@ -197,6 +198,19 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
         # places, so the per-GPU floor that would block HF doesn't apply -> allow.
         ok, _, _ = self._run(devices = _devices((0, 80, 35), (1, 80, 70)), required_override = 20.0)
         self.assertTrue(ok)
+
+    def test_no_per_gpu_floor_for_gguf_with_explicit_gpu_ids(self):
+        # GPU 0 has plenty of free VRAM, GPU 1 is nearly full. With explicit
+        # gpu_ids the HF balanced floor would require each GPU to hold half the
+        # model and reject the load; GGUF self-placement should still allow it
+        # because llama.cpp can select GPU 0 alone.
+        ok, info, _ = self._run(
+            devices = _devices((0, 80, 10), (1, 80, 75)),
+            required_override = 20.0,
+            requested_gpu_ids = [0, 1],
+        )
+        self.assertTrue(ok)
+        self.assertEqual(info["mode"], "gguf")
 
     def test_estimate_unavailable_refuses(self):
         # No override and the estimator can't size it -> default-deny.

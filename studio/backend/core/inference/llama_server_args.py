@@ -176,9 +176,9 @@ _TEMPLATE_FLAGS: frozenset[str] = frozenset(
     }
 )
 # Memory placement mode shadows the GGUF memory_mode first-class field.
-# --mlock / --no-mmap are pass-through in explicit extras, but stripped on
-# inherit when the user changes the memory mode so the new setting wins.
-_MEMORY_MODE_FLAGS: frozenset[str] = frozenset({"--mlock", "--no-mmap"})
+# --mlock / --no-mmap / --mmap are pass-through in explicit extras, but stripped
+# on inherit when the user changes the memory mode so the new setting wins.
+_MEMORY_MODE_FLAGS: frozenset[str] = frozenset({"--mlock", "--no-mmap", "--mmap"})
 # Multi-GPU split mode shadows the Tensor Parallelism toggle
 # (--split-mode tensor). Pass-through stays allowed so users keep the
 # row/none/layer modes the toggle doesn't expose, but it's stripped on

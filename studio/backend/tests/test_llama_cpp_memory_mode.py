@@ -301,6 +301,64 @@ def test_gpu_ids_preserved_on_fit_fallback(tmp_path):
     assert captured_envs[-1]["CUDA_VISIBLE_DEVICES"] == "1,2"
 
 
+def test_memory_mode_clears_inherited_mmap_env_vars(tmp_path):
+    """An explicit memory_mode must clear stale LLAMA_ARG_* env vars."""
+    gguf = tmp_path / "model.gguf"
+    _write_minimal_gguf(gguf)
+
+    backend = LlamaCppBackend()
+    backend._get_gpu_memory = lambda _binary = None: [(0, 10000, 16000)]
+    backend._read_gguf_metadata = lambda _p: None
+    backend._can_estimate_kv = lambda: False
+    backend._get_gguf_size_bytes = lambda _p: 1024
+    backend._mmproj_vram_bytes = lambda _p: 0
+    backend._resolve_launch_mmproj_path = lambda **k: None
+    backend._apu_ram_shortfall_message = lambda *a, **k: None
+    backend._amd_apu_wants_unified_memory = lambda *a, **k: False
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._select_gpus = lambda *a, **k: ([0], False)
+    backend._wait_for_health = lambda timeout: True
+    backend._detect_audio_type_strict = lambda: None
+    backend._apply_detected_audio = lambda _d: True
+
+    base_env = dict(os.environ)
+    base_env.update(
+        {
+            "LLAMA_ARG_MLOCK": "1",
+            "LLAMA_ARG_MMAP": "1",
+            "LLAMA_ARG_NO_MMAP": "1",
+        }
+    )
+    backend._llama_server_env_for_binary = lambda _binary: dict(base_env)
+
+    captured_envs = []
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                captured_envs.append(kwargs.get("env") or dict(os.environ))
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with patch.object(subprocess, "Popen", side_effect = _make_fake_popen):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            memory_mode = "auto",
+        )
+
+    assert captured_envs, "llama-server was not spawned"
+    env = captured_envs[-1]
+    assert "LLAMA_ARG_MLOCK" not in env
+    assert "LLAMA_ARG_MMAP" not in env
+    assert "LLAMA_ARG_NO_MMAP" not in env
+
+
 def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
     """Physical gpu_ids are mapped to Vulkan0..N ordinals for --device pinning."""
     gguf = tmp_path / "model.gguf"

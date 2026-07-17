@@ -266,7 +266,10 @@ def can_load_chat_during_training(
             except ValueError:
                 return True, {"mode": "explicit", "reason": "invalid_gpu_ids"}
             free_vals = [free_by_index.get(i, 0.0) for i in resolved]
-            mode = "explicit"
+            # GGUF self-places inside the requested candidate set; do not apply the
+            # HF device_map="balanced" per-GPU floor that would reject a load that
+            # llama.cpp could place on a single fitting GPU.
+            mode = "gguf" if is_gguf else "explicit"
         else:
             # GGUF: llama.cpp picks the GPU(s); any visible GPU is a candidate.
             free_vals = list(free_by_index.values())

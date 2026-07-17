@@ -6952,6 +6952,19 @@ class LlamaCppBackend:
                 if "--threads" not in cmd:
                     env.pop("LLAMA_ARG_THREADS", None)
 
+                # When a first-class memory_mode is supplied, clear inherited
+                # llama.cpp env vars so the default/auto case is not silently
+                # pinned/no-mmapped by the environment. Pinned/resident emit CLI
+                # flags that already win, but auto emits nothing and must not
+                # inherit stale mlock/mmap settings.
+                if memory_mode is not None:
+                    for _env_key in (
+                        "LLAMA_ARG_MLOCK",
+                        "LLAMA_ARG_MMAP",
+                        "LLAMA_ARG_NO_MMAP",
+                    ):
+                        env.pop(_env_key, None)
+
                 # Reconcile the inherited LLAMA_ARG_* env with Studio's final
                 # decision: stripping CLI extras on a tensor->layer downgrade
                 # can't remove env vars, so the child could run a mode/KV Studio

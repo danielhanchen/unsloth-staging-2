@@ -807,7 +807,7 @@ def test_strip_split_mode_only_drops_tensor_split_too():
 
 def test_strip_shadowing_flags_drops_memory_mode_when_requested():
     out = strip_shadowing_flags(
-        ["--mlock", "--no-mmap", "--top-k", "20"],
+        ["--mlock", "--no-mmap", "--mmap", "--top-k", "20"],
         strip_memory_mode = True,
     )
     assert out == ["--top-k", "20"]
@@ -815,22 +815,23 @@ def test_strip_shadowing_flags_drops_memory_mode_when_requested():
 
 def test_strip_shadowing_flags_keeps_memory_mode_when_not_requested():
     out = strip_shadowing_flags(
-        ["--mlock", "--no-mmap", "--top-k", "20"],
+        ["--mlock", "--no-mmap", "--mmap", "--top-k", "20"],
         strip_memory_mode = False,
     )
-    assert out == ["--mlock", "--no-mmap", "--top-k", "20"]
+    assert out == ["--mlock", "--no-mmap", "--mmap", "--top-k", "20"]
 
 
 def test_strip_shadowing_flags_defaults_strip_memory_mode():
     # Default kwargs strip everything, including memory placement flags.
-    assert strip_shadowing_flags(["--mlock", "--no-mmap"]) == []
+    assert strip_shadowing_flags(["--mlock", "--no-mmap", "--mmap"]) == []
 
 
 def test_strip_split_mode_only_keeps_memory_mode():
     # Tensor->layer downgrade must not strip the user's memory mode choice.
-    assert strip_split_mode_only(["--mlock", "--no-mmap", "-sm", "tensor"]) == [
+    assert strip_split_mode_only(["--mlock", "--no-mmap", "--mmap", "-sm", "tensor"]) == [
         "--mlock",
         "--no-mmap",
+        "--mmap",
     ]
 
 
