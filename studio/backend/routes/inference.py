@@ -4240,13 +4240,24 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
             elif get_device() == DeviceType.CPU:
-                raise HTTPException(
-                    status_code = 400,
-                    detail = (
-                        "gpu_ids selection is not supported: no GPU backend "
-                        "detected on this host."
-                    ),
-                )
+                # A Vulkan llama-server on a torch-less host reports CPU but can
+                # still enumerate devices; let the backend validate via its probe.
+                backend_binary = getattr(
+                    LlamaCppBackend, "_find_llama_server_binary", lambda: None
+                )()
+                if backend_binary and LlamaCppBackend._is_vulkan_backend(backend_binary):
+                    logger.info(
+                        "Vulkan GGUF backend detected; deferring gpu_ids validation "
+                        "to the backend's Vulkan probe."
+                    )
+                else:
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported: no GPU backend "
+                            "detected on this host."
+                        ),
+                    )
         if not config.is_gguf and _mlx_distributed_launch_detected():
             raise HTTPException(
                 status_code = 400,
@@ -4857,6 +4868,37 @@ async def validate_model(
                 detail = f"Invalid model identifier: {model_log_label}",
             )
 
+        # Mirror /load: reject unsupported placement options for DiffusionGemma
+        # before the frontend unloads the current model after validate succeeds.
+        if config.is_gguf and (config.gguf_file or config.gguf_hf_repo):
+            _is_diffusion = False
+            if config.gguf_file:
+                from utils.models.gguf_metadata import is_diffusion_gguf
+
+                _is_diffusion = is_diffusion_gguf(config.gguf_file)
+            elif config.gguf_hf_repo:
+                _is_diffusion = bool(
+                    _re.search(r'(?:^|[\/\-_.])diffusion(?:[\/\-_.]|$)', config.gguf_hf_repo, _re.IGNORECASE)
+                )
+            if _is_diffusion:
+                if request.gpu_ids:
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported for diffusion "
+                            "(DiffusionGemma) GGUF models; they run on a single GPU "
+                            "chosen by the DG_GPU environment variable."
+                        ),
+                    )
+                if LlamaCppBackend._canonical_memory_mode(request.gguf_memory_mode) is not None:
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "Explicit gguf_memory_mode is not supported for diffusion "
+                            "(DiffusionGemma) GGUF models."
+                        ),
+                    )
+
         # Refuse early (before the frontend unloads to load this) if it can't fit
         # alongside training, using the same settings /load uses so they agree.
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
@@ -4871,13 +4913,22 @@ async def validate_model(
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
             elif get_device() == DeviceType.CPU:
-                raise HTTPException(
-                    status_code = 400,
-                    detail = (
-                        "gpu_ids selection is not supported: no GPU backend "
-                        "detected on this host."
-                    ),
-                )
+                backend_binary = getattr(
+                    LlamaCppBackend, "_find_llama_server_binary", lambda: None
+                )()
+                if backend_binary and LlamaCppBackend._is_vulkan_backend(backend_binary):
+                    logger.info(
+                        "Vulkan GGUF backend detected; deferring gpu_ids validation "
+                        "to the backend's Vulkan probe."
+                    )
+                else:
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported: no GPU backend "
+                            "detected on this host."
+                        ),
+                    )
         effective_load_in_4bit = _effective_load_in_4bit(config, request.load_in_4bit)
 
         # Both checks cover the [adapter, base] set (matching the scan route and workers):
