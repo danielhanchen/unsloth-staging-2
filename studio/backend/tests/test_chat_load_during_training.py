@@ -522,6 +522,12 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
                 "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
                 return_value = True,
             ),
+            # The route now also validates the specific ids against the probe before
+            # the guard; treat [0] as resolvable so the fall-through is exercised.
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend.assert_requested_gpu_ids_resolvable",
+                return_value = None,
+            ),
             _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
         ):
             resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
@@ -642,10 +648,16 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
                 "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
                 return_value = True,
             ),
+            # Route validates the specific ids against the probe before the guard; a
+            # torch-less Vulkan id is resolvable, so this is a no-op here.
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend.assert_requested_gpu_ids_resolvable",
+                return_value = None,
+            ),
             _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
         ):
             resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
-        # Reached the guard with the raw selection; backend probe validates later.
+        # Reached the guard with the raw selection; backend probe validated it first.
         self.assertEqual(captured[0]["requested_gpu_ids"], [1])
         self.assertTrue(resp.valid)
 
@@ -773,11 +785,59 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
                         "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
                         return_value = True,
                     ),
+                    patch(
+                        "core.inference.llama_cpp.LlamaCppBackend.assert_requested_gpu_ids_resolvable",
+                        return_value = None,
+                    ),
                     _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
                 ):
                     resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
                 self.assertEqual(captured[0]["requested_gpu_ids"], [0])
                 self.assertTrue(resp.valid)
+
+    def test_gguf_invalid_gpu_ids_rejected_at_route_before_unload(self):
+        # A GPU backend EXISTS (has_gpu_backend True) but the requested id is
+        # unresolvable (an out-of-range/duplicate Vulkan id). The route must reject via
+        # the resolvability preflight BEFORE reaching the guard / unloading the active
+        # model, rather than defer to load_model which 400s only after teardown (#7188).
+        from models.inference import ValidateModelRequest
+        from utils.hardware import DeviceType
+
+        request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [99])
+        cfg = SimpleNamespace(
+            identifier = "x.gguf",
+            display_name = "x",
+            is_gguf = True,
+            is_lora = False,
+            is_vision = False,
+            path = None,
+            base_model = None,
+        )
+        captured = []
+        with (
+            patch.object(
+                self.route,
+                "_resolve_model_identifier_for_request",
+                return_value = ("x.gguf", "x.gguf", False),
+            ),
+            patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+            patch.object(self.route, "load_inference_config", return_value = {}),
+            patch("utils.hardware.get_device", return_value = DeviceType.CPU),
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
+                return_value = True,
+            ),
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend.assert_requested_gpu_ids_resolvable",
+                side_effect = ValueError("Requested gpu_ids [99] do not match any visible GPUs"),
+            ),
+            _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+        ):
+            with self.assertRaises(HTTPException) as exc:
+                asyncio.run(self.route.validate_model(request, current_subject = "u"))
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("do not match any visible GPUs", exc.exception.detail)
+        self.assertEqual(captured, [])  # rejected before the guard / any teardown
 
 
 # ── _estimate_gguf_required_gb (sizes the same weights the loader loads) ──────

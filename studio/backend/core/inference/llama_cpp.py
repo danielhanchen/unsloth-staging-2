@@ -2717,6 +2717,20 @@ class LlamaCppBackend:
         except Exception:
             return True
 
+    def assert_requested_gpu_ids_resolvable(self, gpu_ids: Optional[list[int]]) -> None:
+        """Raise ValueError if the requested gpu_ids can't be honored by the llama.cpp
+        backend on this host. Self-contained (finds the binary + probes) so the route
+        can reject a bad selection (an out-of-range or duplicate id) BEFORE it unloads
+        the active HF/GGUF model. On non-CUDA hosts the route otherwise only proved that
+        *a* backend exists, so a typo like gpu_ids=[99] tore the running model down and
+        400'd only afterwards, inside load_model (#7188)."""
+        if not gpu_ids:
+            return
+        binary = self._find_llama_server_binary()
+        self._assert_gpu_ids_resolvable(
+            gpu_ids, self._get_gpu_memory(binary), self._is_vulkan_backend(binary)
+        )
+
     @staticmethod
     def _assert_gpu_ids_resolvable(
         gpu_ids: Optional[list[int]], gpu_mem: list[tuple[int, int, int]], is_vulkan_backend: bool

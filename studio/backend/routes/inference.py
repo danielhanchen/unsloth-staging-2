@@ -4263,22 +4263,35 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
-            elif not await asyncio.to_thread(get_llama_cpp_backend().has_gpu_backend):
+            else:
                 # Non-CUDA GGUF host (CPU / MLX / XPU): the CUDA-oriented resolver can't
                 # enumerate the llama.cpp backend's devices, so gate on its probe. If the
                 # probe (incl. Vulkan) finds no selectable device -> reject before any
                 # teardown, so a request the backend can't honor doesn't unload the active
                 # model first (#7188). A torch-less Vulkan host reports CPU but its probe is
-                # non-empty, so it falls through and the backend validates against the Vulkan
-                # ordinal mapping; MLX/XPU builds whose non-Vulkan probe can't enumerate
-                # Metal/SYCL devices are rejected here rather than after unload (#7164/#7188).
-                raise HTTPException(
-                    status_code = 400,
-                    detail = (
-                        "gpu_ids selection is not supported: no GPU backend "
-                        "detected on this host."
-                    ),
-                )
+                # non-empty, so it falls through; MLX/XPU builds whose non-Vulkan probe can't
+                # enumerate Metal/SYCL devices are rejected here rather than after unload
+                # (#7164/#7188).
+                _llama_backend = get_llama_cpp_backend()
+                if not await asyncio.to_thread(_llama_backend.has_gpu_backend):
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported: no GPU backend "
+                            "detected on this host."
+                        ),
+                    )
+                # A backend exists, but validate the SPECIFIC ids (Vulkan ordinals /
+                # visible mask) against the probe too, so an out-of-range or duplicate id
+                # is rejected here rather than after the GGUF path unloads the active
+                # HF/GGUF model and load_model 400s (#7188).
+                try:
+                    await asyncio.to_thread(
+                        _llama_backend.assert_requested_gpu_ids_resolvable,
+                        effective_gpu_ids,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code = 400, detail = str(exc)) from exc
         if not config.is_gguf and _mlx_distributed_launch_detected():
             raise HTTPException(
                 status_code = 400,
@@ -4908,19 +4921,31 @@ async def validate_model(
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
-            elif not await asyncio.to_thread(get_llama_cpp_backend().has_gpu_backend):
+            else:
                 # Mirror /load: gate on the llama.cpp probe for any non-CUDA GGUF host
                 # (CPU / MLX / XPU) so an unsupported selection is rejected before the
                 # frontend unloads to load this. A torch-less Vulkan host reports CPU but
-                # its probe is non-empty, so it falls through and the backend validates
-                # against the Vulkan ordinal mapping (#7164/#7188).
-                raise HTTPException(
-                    status_code = 400,
-                    detail = (
-                        "gpu_ids selection is not supported: no GPU backend "
-                        "detected on this host."
-                    ),
-                )
+                # its probe is non-empty, so it falls through (#7164/#7188).
+                _llama_backend = get_llama_cpp_backend()
+                if not await asyncio.to_thread(_llama_backend.has_gpu_backend):
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported: no GPU backend "
+                            "detected on this host."
+                        ),
+                    )
+                # A backend exists, but validate the SPECIFIC ids against the probe too.
+                # The frontend validates first and then unloads before /load, so a bad
+                # Vulkan id (e.g. [99] or a duplicate) must be rejected here rather than
+                # after the unload, matching /load's preflight (#7188).
+                try:
+                    await asyncio.to_thread(
+                        _llama_backend.assert_requested_gpu_ids_resolvable,
+                        effective_gpu_ids,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code = 400, detail = str(exc)) from exc
         effective_load_in_4bit = _effective_load_in_4bit(config, request.load_in_4bit)
 
         # Both checks cover the [adapter, base] set (matching the scan route and workers):

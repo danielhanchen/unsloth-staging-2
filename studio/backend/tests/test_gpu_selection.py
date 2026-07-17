@@ -918,6 +918,11 @@ class TestRouteErrors(unittest.TestCase):
                 # Route's non-CUDA gpu_ids guard probes this; a GPU is present here.
                 return True
 
+            def assert_requested_gpu_ids_resolvable(self, gpu_ids):
+                # Route validates the specific ids against the probe before the unload
+                # path; [0, 1] is resolvable here, so this is a no-op.
+                return None
+
             def __init__(self):
                 self.load_model_calls = []
 
