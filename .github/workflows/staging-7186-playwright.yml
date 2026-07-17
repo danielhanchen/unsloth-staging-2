@@ -1,0 +1,39 @@
+# QUOTE the name so the leading "#7186" is not parsed as a YAML comment.
+name: "PR-7186 py314 playwright browsers"
+on:
+  push:
+    branches: [pr-7186-py314-ci]
+    paths:
+      - 'studio/backend/run.py'
+      - 'tests/pr7186/**'
+      - '.github/workflows/staging-7186-playwright.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  browsers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install deps
+        run: python -m pip install --upgrade pip anyio nest_asyncio fastapi uvicorn httpx starlette playwright
+      - name: Install browser engines (chromium=Chrome/Edge, firefox, webkit=Safari)
+        run: python -m playwright install --with-deps chromium firefox webkit
+      - name: Load gated Studio frontend in all three engines
+        run: python tests/pr7186/playwright_browsers.py --engines chromium,firefox,webkit --shot-dir pr7186_shots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr7186-browser-shots
+          path: pr7186_shots

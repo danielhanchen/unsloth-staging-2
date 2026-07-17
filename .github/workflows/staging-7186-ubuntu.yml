@@ -1,0 +1,38 @@
+# QUOTE the name so the leading "#7186" is not parsed as a YAML comment.
+name: "PR-7186 py314 ubuntu-latest"
+on:
+  push:
+    branches: [pr-7186-py314-ci]
+    paths:
+      - 'studio/backend/run.py'
+      - 'tests/pr7186/**'
+      - '.github/workflows/staging-7186-ubuntu.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install deps
+        run: python -m pip install --upgrade pip anyio nest_asyncio fastapi uvicorn httpx starlette
+      - name: Unit matrix A-E (real run.py gate)
+        env:
+          RUN_PY: studio/backend/run.py
+        run: python tests/pr7186/verify.py
+      - name: Studio boot repro - OLD unconditional nest_asyncio (bug reproduces = expected 500 on 3.14)
+        run: python tests/pr7186/studio_boot_repro.py --nest force
+      - name: Studio boot repro - PR gate (fix; all 200)
+        run: python tests/pr7186/studio_boot_repro.py --nest auto
