@@ -3131,6 +3131,12 @@ def _request_matches_loaded_settings(
         request.gguf_memory_mode
     ) != LlamaCppBackend._canonical_memory_mode(llama_backend.memory_mode):
         return False
+    # An explicit memory_mode (incl. 'auto') over a child that inherited operator
+    # LLAMA_ARG_* placement flags must reload so the backend scrub runs; the
+    # canonical check above equates 'auto' with the omitted state and would leave
+    # the child mlocked/no-mmap (#7164).
+    if request.gguf_memory_mode is not None and llama_backend.launched_with_inherited_mem_env:
+        return False
     # Reconcile a user --split-mode in extras into the effective tensor state.
     # When the request omits llama_extra_args ("inherit"), compare using the
     # stored extras stripped the way the reload strips them, so an extras-driven
@@ -3206,7 +3212,41 @@ def _request_matches_loaded_settings(
         ):
             return False
     else:
-        if list(request.llama_extra_args) != backend_extra:
+        # Strip memory-placement flags from BOTH sides when the caller set a
+        # memory mode, mirroring how the reload strips explicit extras before
+        # storing them (load_model). Without this, an explicit request that
+        # repeats a --mlock/--mmap/--no-mmap already dropped by the loaded
+        # server misses this already-loaded fast path and, during active
+        # training, gets rejected by the coexistence guard even though the live
+        # placement already matches. Stripping backend_extra too is idempotent.
+        _strip_mem = "gguf_memory_mode" in fields_set
+        _request_extra = (
+            strip_shadowing_flags(
+                request.llama_extra_args,
+                strip_context = False,
+                strip_cache = False,
+                strip_spec = False,
+                strip_template = False,
+                strip_split_mode = False,
+                strip_memory_mode = True,
+            )
+            if _strip_mem
+            else list(request.llama_extra_args)
+        )
+        _backend_extra_cmp = (
+            strip_shadowing_flags(
+                backend_extra,
+                strip_context = False,
+                strip_cache = False,
+                strip_spec = False,
+                strip_template = False,
+                strip_split_mode = False,
+                strip_memory_mode = True,
+            )
+            if _strip_mem
+            else backend_extra
+        )
+        if _request_extra != _backend_extra_cmp:
             return False
     # A separate drafter (Gemma's root mtp-*.gguf) appearing or disappearing
     # next to the loaded weights changes the launch command (--model-draft),

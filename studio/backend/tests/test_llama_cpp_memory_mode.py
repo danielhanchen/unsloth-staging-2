@@ -17,41 +17,71 @@ _BACKEND_DIR = str(Path(__file__).resolve().parent.parent)
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-_loggers_stub = _types.ModuleType("loggers")
-_loggers_stub.get_logger = lambda name: __import__("logging").getLogger(name)
-sys.modules.setdefault("loggers", _loggers_stub)
 
-_jwt_stub = _types.ModuleType("jwt")
-_jwt_stub.decode = lambda *a, **k: {}
-_jwt_stub.ExpiredSignatureError = type("ExpiredSignatureError", (Exception,), {})
-_jwt_stub.InvalidTokenError = type("InvalidTokenError", (Exception,), {})
-sys.modules.setdefault("jwt", _jwt_stub)
+def _install_stub_if_absent(name: str, build):
+    """Install a lightweight stub for ``name`` only when the real module is not
+    importable. Never shadow a real module: this test file was collected before
+    a real-httpx importer once installed an incomplete httpx stub via
+    sys.modules.setdefault, which then broke unrelated tests in a combined pytest
+    run (order-dependent failures). Preferring the real module keeps the stub as a
+    pure fallback for minimal environments without changing global import state."""
+    if name in sys.modules:
+        return
+    try:
+        __import__(name)
+        return
+    except Exception:
+        sys.modules[name] = build()
 
-_structlog_stub = _types.ModuleType("structlog")
-_structlog_stub.get_logger = lambda *a, **k: __import__("logging").getLogger("stub")
-sys.modules.setdefault("structlog", _structlog_stub)
 
-_httpx_stub = _types.ModuleType("httpx")
-for _exc_name in (
-    "ConnectError",
-    "TimeoutException",
-    "ReadTimeout",
-    "ReadError",
-    "RemoteProtocolError",
-    "CloseError",
-):
-    setattr(_httpx_stub, _exc_name, type(_exc_name, (Exception,), {}))
-_httpx_stub.Timeout = type("T", (), {"__init__": lambda s, *a, **k: None})
-_httpx_stub.Client = type(
-    "Client",
-    (),
-    {
-        "__init__": lambda self, **kw: None,
-        "__enter__": lambda self: self,
-        "__exit__": lambda self, *a: None,
-    },
-)
-sys.modules.setdefault("httpx", _httpx_stub)
+def _build_loggers_stub():
+    mod = _types.ModuleType("loggers")
+    mod.get_logger = lambda name: __import__("logging").getLogger(name)
+    return mod
+
+
+def _build_structlog_stub():
+    mod = _types.ModuleType("structlog")
+    mod.get_logger = lambda *a, **k: __import__("logging").getLogger("stub")
+    return mod
+
+
+def _build_httpx_stub():
+    mod = _types.ModuleType("httpx")
+    for _exc_name in (
+        "ConnectError",
+        "TimeoutException",
+        "ReadTimeout",
+        "ReadError",
+        "RemoteProtocolError",
+        "CloseError",
+    ):
+        setattr(mod, _exc_name, type(_exc_name, (Exception,), {}))
+    mod.Timeout = type("T", (), {"__init__": lambda s, *a, **k: None})
+    mod.Client = type(
+        "Client",
+        (),
+        {
+            "__init__": lambda self, **kw: None,
+            "__enter__": lambda self: self,
+            "__exit__": lambda self, *a: None,
+        },
+    )
+    return mod
+
+
+def _build_jwt_stub():
+    mod = _types.ModuleType("jwt")
+    mod.decode = lambda *a, **k: {}
+    mod.ExpiredSignatureError = type("ExpiredSignatureError", (Exception,), {})
+    mod.InvalidTokenError = type("InvalidTokenError", (Exception,), {})
+    return mod
+
+
+_install_stub_if_absent("loggers", _build_loggers_stub)
+_install_stub_if_absent("structlog", _build_structlog_stub)
+_install_stub_if_absent("httpx", _build_httpx_stub)
+_install_stub_if_absent("jwt", _build_jwt_stub)
 
 import pytest
 
@@ -257,6 +287,107 @@ def test_gpu_ids_filter_raises_when_no_visible_match(tmp_path):
         )
 
 
+def _fit_fallback_backend(
+    tmp_path,
+    gpu_memory,
+    *,
+    vulkan = False,
+):
+    """Backend stubbed like the --fit-fallback test but with a configurable probe."""
+    gguf = tmp_path / "model.gguf"
+    _write_minimal_gguf(gguf)
+
+    backend = LlamaCppBackend()
+    backend._get_gpu_memory = lambda _binary = None: list(gpu_memory)
+    backend._read_gguf_metadata = lambda _p: None
+    backend._can_estimate_kv = lambda: False
+    backend._get_gguf_size_bytes = lambda _p: 1024
+    backend._mmproj_vram_bytes = lambda _p: 0
+    backend._resolve_launch_mmproj_path = lambda **k: None
+    backend._apu_ram_shortfall_message = lambda *a, **k: None
+    backend._amd_apu_wants_unified_memory = lambda *a, **k: False
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._is_vulkan_backend = lambda _binary = None: vulkan
+    backend._get_gpu_free_memory = lambda _binary = None: list(gpu_memory)
+    backend._wait_for_health = lambda timeout: True
+    backend._detect_audio_type_strict = lambda: None
+    backend._apply_detected_audio = lambda _d: True
+    return backend, gguf
+
+
+def test_empty_probe_preserves_explicit_gpu_ids(tmp_path):
+    """A CUDA/ROCm build whose telemetry probe returns nothing (no nvidia-smi +
+    CPU-only torch) must still honor a route-validated explicit gpu_ids rather than
+    raising: auto-selection loads here via --fit on, so the explicit request pins the
+    same GPU via CUDA_VISIBLE_DEVICES + --fit on instead of failing (#7164)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
+
+    captured = {}
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                captured["env"] = kwargs.get("env") or dict(os.environ)
+                captured["cmd"] = list(cmd)
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with (
+        patch.object(subprocess, "Popen", side_effect = _make_fake_popen),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0, 1]),
+    ):
+        assert backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = [1],
+        )
+
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "1"
+    cmd = captured["cmd"]
+    assert "--fit" in cmd and cmd[cmd.index("--fit") + 1] == "on"
+
+
+def test_empty_probe_still_rejects_vulkan_gpu_ids(tmp_path):
+    """A Vulkan build cannot map physical ids to ggml ordinals without a probe, so an
+    empty Vulkan probe must keep rejecting the selection (tracked as #7201) rather than
+    silently spreading the load across every device."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [], vulkan = True)
+
+    with (
+        patch.object(subprocess, "Popen"),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
+    ):
+        with pytest.raises(ValueError, match = "do not match any visible GPUs"):
+            backend.load_model(
+                gguf_path = str(gguf),
+                model_identifier = "test",
+                gpu_ids = [0],
+            )
+
+
+def test_populated_probe_nonmatching_gpu_ids_still_raises(tmp_path):
+    """When the probe DID enumerate GPUs but none match the request, the id is genuinely
+    absent and the load must still raise (the empty-probe relaxation must not swallow
+    a real 'no such GPU' error)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [(0, 10000, 16000)])
+
+    with (
+        patch.object(subprocess, "Popen"),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0]),
+    ):
+        with pytest.raises(ValueError, match = "do not match any visible GPUs"):
+            backend.load_model(
+                gguf_path = str(gguf),
+                model_identifier = "test",
+                gpu_ids = [9],
+            )
+
+
 def test_gpu_ids_preserved_on_fit_fallback(tmp_path):
     """When _select_gpus falls back to --fit on, still pin CUDA_VISIBLE_DEVICES."""
     gguf = tmp_path / "model.gguf"
@@ -365,6 +496,58 @@ def test_memory_mode_clears_inherited_mmap_env_vars(tmp_path):
     assert "LLAMA_ARG_NO_MMAP" not in env
 
 
+@pytest.mark.parametrize(
+    "mode,user_flag,winning",
+    [
+        ("resident", "--mmap", "--no-mmap"),
+        ("pinned", "--no-mmap", None),
+        ("auto", "--mlock", None),
+    ],
+)
+def test_memory_mode_strips_conflicting_extra_args(tmp_path, mode, user_flag, winning):
+    """When a placement mode is applied, a conflicting --mmap/--no-mmap/--mlock left
+    in extra_args must be stripped so llama.cpp's last-wins parsing can't run a
+    placement that disagrees with the stored memory_mode (#7164). auto emits no
+    memory flag, so the user's --mlock is dropped rather than pinning the child."""
+    gguf = tmp_path / "model.gguf"
+    _write_minimal_gguf(gguf)
+    backend = _mem_env_backend(gguf)
+
+    captured_cmds = []
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                captured_cmds.append(list(cmd))
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with patch.object(subprocess, "Popen", side_effect = _make_fake_popen):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            memory_mode = mode,
+            extra_args = [user_flag],
+        )
+
+    assert captured_cmds, "llama-server was not spawned"
+    cmd = captured_cmds[-1]
+    # The caller's conflicting flag is gone.
+    assert user_flag not in cmd
+    # Only Studio's own memory flags (if any) remain, and the last mmap/no-mmap
+    # flag reflects Studio's mode, not the stripped user flag.
+    mmap_flags = [a for a in cmd if a in ("--mmap", "--no-mmap")]
+    if winning is None:
+        assert "--mmap" not in cmd  # user --mmap/--no-mmap fully stripped
+    else:
+        assert mmap_flags[-1] == winning
+
+
 def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
     """Physical gpu_ids are mapped to Vulkan0..N ordinals for --device pinning."""
     gguf = tmp_path / "model.gguf"
@@ -433,6 +616,35 @@ def test_memory_mode_auto_matches_none_in_target_state():
     assert backend._already_in_target_state(**kwargs) is True
 
 
+def test_explicit_auto_reloads_when_child_inherited_mem_env():
+    """When the live child was launched with no mode but inherited operator
+    LLAMA_ARG_* placement flags, an explicit 'auto' request must reload so the
+    scrub runs -- otherwise it dedups to already-loaded and stays mlocked (#7164)."""
+    backend = _loaded_backend(_memory_mode = None, _launched_with_inherited_mem_env = True)
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["memory_mode"] = "auto"
+    assert backend._already_in_target_state(**kwargs) is False
+
+
+def test_omitted_mode_does_not_reload_child_with_inherited_mem_env():
+    """A request that also omits the mode (memory_mode=None) does NOT reload the
+    inherited-env child: omitting keeps the operator env, so there's nothing to
+    scrub and no spurious reload (which would be rejected during training)."""
+    backend = _loaded_backend(_memory_mode = None, _launched_with_inherited_mem_env = True)
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["memory_mode"] = None
+    assert backend._already_in_target_state(**kwargs) is True
+
+
+def test_explicit_auto_matches_scrubbed_child():
+    """Once the child was launched clean (no inherited env), an explicit 'auto'
+    re-Apply dedups to already-loaded -- no needless reload."""
+    backend = _loaded_backend(_memory_mode = None, _launched_with_inherited_mem_env = False)
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["memory_mode"] = "auto"
+    assert backend._already_in_target_state(**kwargs) is True
+
+
 def test_memory_mode_pinned_does_not_match_none():
     backend = _loaded_backend(_memory_mode = None)
     kwargs = _base_target_state_kwargs(backend)
@@ -494,7 +706,9 @@ def _mem_env_backend(gguf):
 def test_memory_mode_scrubs_inherited_mmap_env(tmp_path, monkeypatch, mode, scrubbed):
     """An explicit memory_mode strips inherited LLAMA_ARG_MLOCK/NO_MMAP/MMAP so
     llama-server can't silently run a placement Studio did not select (#7164).
-    memory_mode=None (no opinion) leaves any operator env untouched."""
+    memory_mode=None (no opinion) leaves any operator env untouched for backwards
+    compatibility; the reload-dedup instead reloads a None-loaded-with-inherited-env
+    child when a later explicit 'auto' arrives (see the target-state tests below)."""
     monkeypatch.setenv("LLAMA_ARG_MLOCK", "1")
     monkeypatch.setenv("LLAMA_ARG_NO_MMAP", "1")
     monkeypatch.setenv("LLAMA_ARG_MMAP", "true")
@@ -550,7 +764,7 @@ def test_load_model_rejects_gpu_ids_for_diffusion_gguf(tmp_path):
 
     started = []
     b1 = _make_backend()
-    b1._start_diffusion_server = lambda **kw: (started.append(kw) or True)
+    b1._start_diffusion_server = lambda **kw: started.append(kw) or True
     with pytest.raises(ValueError, match = "gpu_ids"):
         b1.load_model(gguf_path = str(gguf), model_identifier = "d", gpu_ids = [1])
     assert started == []  # runner never launched
@@ -558,6 +772,61 @@ def test_load_model_rejects_gpu_ids_for_diffusion_gguf(tmp_path):
     # The same diffusion GGUF WITHOUT gpu_ids still reaches the runner.
     b2 = _make_backend()
     started2 = []
-    b2._start_diffusion_server = lambda **kw: (started2.append(kw) or True)
+    b2._start_diffusion_server = lambda **kw: started2.append(kw) or True
     assert b2.load_model(gguf_path = str(gguf), model_identifier = "d") is True
     assert len(started2) == 1
+
+
+@pytest.mark.parametrize("mode", ["pinned", "PINNED", "resident", "RESIDENT"])
+def test_load_model_rejects_explicit_memory_mode_for_diffusion_gguf(tmp_path, mode):
+    """The diffusion runner has no --mlock/--no-mmap plumbing, so an explicit
+    pinned/resident memory_mode would be silently dropped yet recorded as honored.
+    load_model must reject it (route -> 400) rather than mislead the user."""
+    gguf = tmp_path / "diffusion.gguf"
+    _write_minimal_gguf(gguf, arch = "diffusion-gemma")
+
+    backend = LlamaCppBackend()
+    backend._read_gguf_metadata = lambda _p: setattr(backend, "_is_diffusion", True)
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._is_vulkan_backend = lambda _binary = None: False
+    started = []
+    backend._start_diffusion_server = lambda **kw: started.append(kw) or True
+
+    with pytest.raises(ValueError, match = "memory_mode"):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "d",
+            memory_mode = mode,
+        )
+    assert started == []  # runner never launched
+
+
+@pytest.mark.parametrize("mode", [None, "auto", "AUTO", ""])
+def test_diffusion_load_allows_default_memory_mode_and_clears_stale_state(tmp_path, mode):
+    """auto/blank/None placement is the no-op default and is allowed for diffusion.
+    A successful diffusion load must also clear any _gpu_ids/_memory_mode left by a
+    prior llama-server load so reload-dedup reflects the runner's real (unset) state
+    and doesn't force a needless kill+restart of the healthy diffusion server."""
+    gguf = tmp_path / "diffusion.gguf"
+    _write_minimal_gguf(gguf, arch = "diffusion-gemma")
+
+    backend = LlamaCppBackend()
+    backend._read_gguf_metadata = lambda _p: setattr(backend, "_is_diffusion", True)
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._is_vulkan_backend = lambda _binary = None: False
+    backend._start_diffusion_server = lambda **kw: True
+
+    # Simulate leftover placement state from a previous llama-server GGUF load.
+    backend._gpu_ids = [0, 1]
+    backend._memory_mode = "resident"
+
+    assert (
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "d",
+            memory_mode = mode,
+        )
+        is True
+    )
+    assert backend._gpu_ids is None
+    assert backend._memory_mode is None

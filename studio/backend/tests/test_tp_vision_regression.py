@@ -505,7 +505,9 @@ def test_diffusion_load_clears_preserved_tensor_flag():
     src = inspect.getsource(LlamaCppBackend.load_model)
     diff = src.find("if self._is_diffusion:")
     assert diff != -1
-    start = src.find("return self._start_diffusion_server", diff)
+    # The diffusion path now captures the runner's result (started = ...) before
+    # returning it, so match the call itself rather than a bare `return`.
+    start = src.find("self._start_diffusion_server", diff)
     assert start != -1
     assert "self._layer_preserves_tensor_intent = False" in src[diff:start]
 

@@ -36,6 +36,38 @@ def test_nonblank_chat_template_override_is_preserved_verbatim():
     assert req.chat_template_override == template
 
 
+import pytest  # noqa: E402
+from pydantic import ValidationError  # noqa: E402
+
+from models.inference import ValidateModelRequest  # noqa: E402
+
+
+@pytest.mark.parametrize("blank", ["", "   ", "\n\t"])
+def test_blank_gguf_memory_mode_normalizes_to_none(blank):
+    # A settings form may serialize the default placement as "": the backend
+    # canonicalizes blank/auto/None identically, so the boundary must accept it
+    # (map to None) rather than 422 before canonicalization (#7164).
+    assert _base_load_request(gguf_memory_mode = blank).gguf_memory_mode is None
+    assert (
+        ValidateModelRequest.model_validate(
+            {"model_path": "x", "gguf_memory_mode": blank}
+        ).gguf_memory_mode
+        is None
+    )
+
+
+@pytest.mark.parametrize("mode", ["auto", "pinned", "resident"])
+def test_valid_gguf_memory_mode_preserved(mode):
+    assert _base_load_request(gguf_memory_mode = mode).gguf_memory_mode == mode
+
+
+def test_invalid_gguf_memory_mode_still_rejected():
+    # Non-blank typos must still fail Literal validation (the before-validator
+    # only rescues blank strings, not arbitrary values).
+    with pytest.raises(ValidationError):
+        _base_load_request(gguf_memory_mode = "resdent")
+
+
 # ---------- ChatCompletionRequest tool_call_id walkback ----------
 
 from models.inference import ChatCompletionRequest
