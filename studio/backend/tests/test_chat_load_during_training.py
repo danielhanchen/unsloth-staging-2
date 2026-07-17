@@ -169,6 +169,7 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
         required_override = None,
         estimate = None,
         requested_gpu_ids = None,
+        gpu_ids_are_vulkan_ordinals = False,
     ):
         with (
             patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
@@ -186,6 +187,7 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
                 max_seq_length = 0,
                 requested_gpu_ids = requested_gpu_ids,
                 is_gguf = True,
+                gpu_ids_are_vulkan_ordinals = gpu_ids_are_vulkan_ordinals,
                 required_override_gb = required_override,
             )
         return ok, info, auto_mock
@@ -218,6 +220,55 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
         ok, info, _ = self._run(devices = _devices((0, 80, 0)), required_override = None, estimate = None)
         self.assertFalse(ok)
         self.assertEqual(info["reason"], "estimate_unavailable")
+
+    def test_vulkan_build_budgets_least_free_gpu(self):
+        # A Vulkan GGUF build pins by Vulkan ordinal, which the guard can't map to the
+        # CUDA index space free VRAM is reported in. free [70, 60], needed 9.75: it fits
+        # even on the least-free card, so allow (mode reflects the Vulkan branch).
+        ok, info, _ = self._run(
+            devices = _devices((0, 80, 10), (1, 80, 20)),
+            required_override = 5.0,
+            requested_gpu_ids = [0],
+            gpu_ids_are_vulkan_ordinals = True,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(info["mode"], "gguf_vulkan")
+
+    def test_vulkan_build_rejected_when_worst_card_too_full(self):
+        # free [70, 3], needed 15.5. A Vulkan pin could land on the near-full card and
+        # OOM training, so the least-free check rejects even though the aggregate fits.
+        ok, info, _ = self._run(
+            devices = _devices((0, 80, 10), (1, 80, 77)),
+            required_override = 10.0,
+            requested_gpu_ids = [0],
+            gpu_ids_are_vulkan_ordinals = True,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(info["mode"], "gguf_vulkan")
+
+    def test_cuda_indexed_build_allows_same_layout(self):
+        # Contrast: the SAME VRAM layout for a non-Vulkan (CUDA-indexed) GGUF build
+        # resolves the ids and budgets the aggregate (usable 72.55 >= 15.5) -> allow.
+        # Confirms the Vulkan branch above is what tightens the wrong-card case.
+        ok, info, _ = self._run(
+            devices = _devices((0, 80, 10), (1, 80, 77)),
+            required_override = 10.0,
+            requested_gpu_ids = [0, 1],
+            gpu_ids_are_vulkan_ordinals = False,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(info["mode"], "gguf")
+
+    def test_vulkan_build_no_visible_gpus_refuses(self):
+        # Vulkan build with no visible GPUs -> nothing to budget -> default-deny.
+        ok, info, _ = self._run(
+            devices = [],
+            required_override = 5.0,
+            requested_gpu_ids = [0],
+            gpu_ids_are_vulkan_ordinals = True,
+        )
+        self.assertFalse(ok)
+        self.assertEqual(info["reason"], "no_visible_gpus")
 
 
 # ── can_load_chat_during_training: device-independent paths ──────────────────

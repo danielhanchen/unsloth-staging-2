@@ -3050,8 +3050,20 @@ class LlamaCppBackend:
             # Vulkan build with an empty probe: the ordinals can't be resolved.
             raise ValueError(f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs")
         else:
-            from utils.hardware import get_parent_visible_gpu_ids
+            from utils.hardware import DeviceType, get_device, get_parent_visible_gpu_ids
 
+            # The CUDA/HIP visibility mask only governs placement on a CUDA/ROCm build.
+            # A Metal/SYCL/CPU backend ignores the CUDA_VISIBLE_DEVICES the launcher sets
+            # (SYCL keys off ONEAPI_DEVICE_SELECTOR, Metal has no such env), so with an
+            # empty probe on a non-CUDA host the pin can't be honored: reject it rather
+            # than accept a selection the loader would silently drop onto the default
+            # device (#7188). ROCm reports CUDA here, so HIP hosts keep the mask path.
+            if get_device() != DeviceType.CUDA:
+                raise ValueError(
+                    f"Requested gpu_ids {list(gpu_ids)} but this backend does not support "
+                    "explicit GPU selection (no GPU probe on a non-CUDA device); omit "
+                    "gpu_ids to run on the default device."
+                )
             parent_visible = get_parent_visible_gpu_ids()
             if not parent_visible:
                 raise ValueError(
@@ -6364,8 +6376,22 @@ class LlamaCppBackend:
                             # parent-visible mask is a real GPU with no telemetry (fall
                             # through, --fit pins it below); an empty mask or an id outside
                             # it means no such GPU, so reject rather than run on CPU (#7188).
-                            from utils.hardware import get_parent_visible_gpu_ids
+                            from utils.hardware import (
+                                DeviceType,
+                                get_device,
+                                get_parent_visible_gpu_ids,
+                            )
 
+                            # The mask only steers a CUDA/ROCm build; a Metal/SYCL/CPU
+                            # backend ignores CUDA_VISIBLE_DEVICES, so an empty probe there
+                            # means the pin can't be honored -- reject it (#7188).
+                            if get_device() != DeviceType.CUDA:
+                                raise ValueError(
+                                    f"Requested gpu_ids {list(gpu_ids)} but this backend does "
+                                    "not support explicit GPU selection (no GPU probe on a "
+                                    "non-CUDA device); omit gpu_ids to run on the default "
+                                    "device."
+                                )
                             parent_visible = get_parent_visible_gpu_ids()
                             if not parent_visible:
                                 raise ValueError(

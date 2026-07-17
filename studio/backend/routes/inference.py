@@ -3953,6 +3953,17 @@ def _guard_chat_load_against_training(
         else None
     )
 
+    # A Vulkan GGUF build pins by Vulkan ordinal, which enumerates independently of the
+    # CUDA index space the guard budgets in; resolving those as CUDA physical IDs would
+    # size free VRAM on the wrong card. Flag it so the guard budgets conservatively,
+    # matching /load, which defers Vulkan ids to the backend probe (#7188).
+    gpu_ids_are_vulkan_ordinals = False
+    if is_gguf and requested_gpu_ids:
+        try:
+            gpu_ids_are_vulkan_ordinals = get_llama_cpp_backend().is_vulkan_build()
+        except Exception:
+            gpu_ids_are_vulkan_ordinals = False
+
     ok, info = can_load_chat_during_training(
         model_name = model_identifier,
         hf_token = hf_token,
@@ -3960,6 +3971,7 @@ def _guard_chat_load_against_training(
         max_seq_length = max_seq_length,
         requested_gpu_ids = requested_gpu_ids,
         is_gguf = is_gguf,
+        gpu_ids_are_vulkan_ordinals = gpu_ids_are_vulkan_ordinals,
         required_override_gb = required_override_gb,
     )
     if ok:

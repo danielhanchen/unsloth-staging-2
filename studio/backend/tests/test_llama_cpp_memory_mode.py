@@ -315,6 +315,8 @@ def _fit_fallback_backend(
 def test_empty_probe_preserves_explicit_gpu_ids(tmp_path):
     """A CUDA/ROCm build with an empty probe must still honor a route-validated explicit
     gpu_ids, pinning via CUDA_VISIBLE_DEVICES + --fit on instead of raising (#7164)."""
+    from utils.hardware import DeviceType
+
     backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
 
     captured = {}
@@ -334,6 +336,8 @@ def test_empty_probe_preserves_explicit_gpu_ids(tmp_path):
 
     with (
         patch.object(subprocess, "Popen", side_effect = _make_fake_popen),
+        # CUDA host with telemetry down: the mask fallback only applies on CUDA/ROCm.
+        patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
         patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0, 1]),
     ):
         assert backend.load_model(
@@ -423,10 +427,14 @@ def test_empty_probe_rejects_gpu_ids_without_gpu_backend(tmp_path):
     """A non-Vulkan build with an empty probe AND empty parent-visible mask has no GPU
     backend, so the backend must reject gpu_ids rather than pin a non-existent device
     and silently run on CPU (#7188)."""
+    from utils.hardware import DeviceType
+
     backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
 
     with (
         patch.object(subprocess, "Popen"),
+        # CUDA host (the mask governs placement) but no mask -> genuinely GPU-less.
+        patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
         patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
     ):
         with pytest.raises(ValueError, match = "no GPU backend"):
@@ -441,10 +449,14 @@ def test_empty_probe_rejects_gpu_ids_outside_parent_mask(tmp_path):
     """Empty non-Vulkan probe but a set parent-visible mask (real GPU, no telemetry):
     a request outside that mask is a genuine 'no such GPU', so it must still raise
     rather than pin an id the host can't offer (#7188)."""
+    from utils.hardware import DeviceType
+
     backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
 
     with (
         patch.object(subprocess, "Popen"),
+        # CUDA host with telemetry down: the mask [0, 1] is real, but 9 is outside it.
+        patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
         patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0, 1]),
     ):
         with pytest.raises(ValueError, match = "do not match any visible GPUs"):
@@ -816,6 +828,25 @@ def test_partial_gpu_ids_match_is_rejected():
             LlamaCppBackend._assert_gpu_ids_resolvable([0, 99], probe, is_vulkan)
         # A full match still passes.
         LlamaCppBackend._assert_gpu_ids_resolvable([0], probe, is_vulkan)
+
+
+def test_empty_non_cuda_probe_rejects_gpu_ids_even_with_stray_mask():
+    """On a Metal/SYCL/CPU (non-CUDA) backend the launcher's CUDA_VISIBLE_DEVICES is
+    ignored (SYCL keys off ONEAPI_DEVICE_SELECTOR, Metal off none), so an empty probe
+    with a stray parent-visible mask must NOT accept gpu_ids -- the pin would be silently
+    dropped onto the default device. A CUDA host with the same empty probe + mask is the
+    real telemetry-down case and still falls through (#7188)."""
+    from utils.hardware import DeviceType
+    with patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0]):
+        # A stray CUDA mask on a non-CUDA host must not be trusted to honor the pin.
+        for dev in (DeviceType.MLX, DeviceType.XPU, DeviceType.CPU):
+            with patch("utils.hardware.get_device", return_value = dev):
+                with pytest.raises(ValueError, match = "does not support explicit GPU selection"):
+                    LlamaCppBackend._assert_gpu_ids_resolvable([0], [], False)
+        # CUDA host (ROCm reports CUDA too): empty probe + valid mask is telemetry-down,
+        # so the selection is accepted for the loader to pin via CUDA_VISIBLE_DEVICES.
+        with patch("utils.hardware.get_device", return_value = DeviceType.CUDA):
+            LlamaCppBackend._assert_gpu_ids_resolvable([0], [], False)
 
 
 def test_explicit_gpu_ids_strips_stored_device_extra_args(tmp_path):

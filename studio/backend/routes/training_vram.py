@@ -196,6 +196,7 @@ def can_load_chat_during_training(
     max_seq_length: int,
     requested_gpu_ids: Optional[List[int]],
     is_gguf: bool = False,
+    gpu_ids_are_vulkan_ordinals: bool = False,
     required_override_gb: Optional[float] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Decide if a NEW chat model can load without OOMing active training (inverse
@@ -259,6 +260,23 @@ def can_load_chat_during_training(
             return False, {"mode": mode, "reason": "estimate_unavailable"}
 
         free_by_index = _free_vram_by_index(get_visible_gpu_utilization().get("devices", []))
+        if requested_gpu_ids and gpu_ids_are_vulkan_ordinals:
+            # A Vulkan GGUF build pins by Vulkan ordinal, which enumerates independently of
+            # the CUDA/nvidia-smi index space free_by_index uses (the loader deliberately
+            # skips resolve_requested_gpu_ids for it), so we can't tell which physical card
+            # the pin lands on. Require the model to fit on the least-free visible GPU so no
+            # ordinal->physical mapping can approve a load that then OOMs training (#7188).
+            free_vals = list(free_by_index.values())
+            if not free_vals:
+                return False, {"mode": "gguf_vulkan", "reason": "no_visible_gpus"}
+            needed_gb = required_gb * SAFETY_MARGIN + KEEP_FLOOR_GB
+            min_free_gb = min(free_vals)
+            return min_free_gb >= needed_gb, {
+                "mode": "gguf_vulkan",
+                "required_gb": round(required_gb, 3),
+                "needed_gb": round(needed_gb, 3),
+                "min_free_gb": round(min_free_gb, 3),
+            }
         if requested_gpu_ids:
             # Invalid ids -> load_model 400s first, so don't block; missing id = 0.
             try:
