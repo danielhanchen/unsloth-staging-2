@@ -862,7 +862,10 @@ class TestExtraArgsMtpDetection:
         start = routes_src.index("def _request_matches_loaded_settings")
         end = routes_src.index("\ndef ", start + 1)
         body = "".join(routes_src[start:end].split())
-        assert '_strip_mem="gguf_memory_mode"infields_set' in body
+        # Gated on the VALUE, not merely model_fields_set: an explicit null (which
+        # Pydantic marks "set") must not strip, so it dedupes as "no opinion" (#7188).
+        assert "_strip_mem=request.gguf_memory_modeisnotNone" in body
+        assert '"gguf_memory_mode"infields_set' not in body
         # The request side is stripped and compared against the UNstripped backend.
         assert "_request_extra" in body
         assert "if_request_extra!=backend_extra:" in body

@@ -714,6 +714,28 @@ def test_explicit_auto_reloads_over_passthrough_mlock_in_extras():
     assert inference_routes._request_matches_loaded_settings(req, backend) is False
 
 
+def test_explicit_null_memory_mode_dedupes_over_passthrough_mlock():
+    """An explicit gguf_memory_mode=null (a client echoing the status/load response
+    field, which is null for a no-mode load) is "no opinion", not a mode change. Pydantic
+    still marks the field set, but the dedup must gate the memory strip on the VALUE: with
+    null it must NOT strip the request's pass-through --mlock and force a reload that drops
+    the placement -- a status-hydrated Apply dedupes to the running server (#7188)."""
+    from models.inference import LoadRequest
+
+    inference_routes = _load_inference_routes_module()
+
+    req = LoadRequest(
+        model_path = "owner/repo",
+        gguf_memory_mode = None,
+        llama_extra_args = ["--mlock"],
+    )
+    # Pydantic marks an explicit null as set -- exactly why gating on model_fields_set
+    # alone (rather than the value) was wrong.
+    assert "gguf_memory_mode" in req.model_fields_set
+    backend = _mem_loaded_backend(memory_mode = None, extra_args = ["--mlock"])
+    assert inference_routes._request_matches_loaded_settings(req, backend) is True
+
+
 def test_explicit_pinned_dedupes_when_flags_already_applied():
     """A server that loaded WITH memory_mode="pinned" already had --mlock stripped from
     its stored extras (applied via the mode flags). A repeat pinned Apply that re-sends

@@ -3143,13 +3143,20 @@ def _request_matches_loaded_settings(
     # tensor load isn't seen as a mismatch that needlessly reloads the server.
     backend_extra = list(llama_backend.extra_args) if llama_backend.extra_args else []
     fields_set = getattr(request, "model_fields_set", set())
+    # Strip inherited --mlock/--no-mmap/--mmap only when the request carries a real
+    # memory mode. Pydantic marks the field "set" even for an explicit null (a client
+    # echoing the status/load response, which is null for a no-mode load), but null ==
+    # None == "no opinion": the backend is then called with memory_mode=None and leaves
+    # placement alone, so stripping here would needlessly reload and drop the user's
+    # pass-through memory flags. Gate on the value, not merely model_fields_set (#7188).
+    _strip_mem = request.gguf_memory_mode is not None
     effective_extra = (
         request.llama_extra_args
         if request.llama_extra_args is not None
         else strip_shadowing_flags(
             backend_extra,
             strip_split_mode = _should_strip_split_mode(request, backend_extra),
-            strip_memory_mode = "gguf_memory_mode" in fields_set,
+            strip_memory_mode = _strip_mem,
         )
     )
     if not _tensor_parallel_matches_loaded(
@@ -3206,7 +3213,7 @@ def _request_matches_loaded_settings(
             and strip_shadowing_flags(
                 backend_extra,
                 strip_split_mode = _should_strip_split_mode(request, backend_extra),
-                strip_memory_mode = "gguf_memory_mode" in fields_set,
+                strip_memory_mode = _strip_mem,
             )
             != backend_extra
         ):
@@ -3226,8 +3233,8 @@ def _request_matches_loaded_settings(
         # leaving the old placement active. Keeping the flag makes the mismatch force
         # a reload so the auto scrub runs (#7164). A server that loaded WITH a mode
         # already had these flags stripped at load, so backend_extra carries none and
-        # the comparison is unaffected in that case.
-        _strip_mem = "gguf_memory_mode" in fields_set
+        # the comparison is unaffected in that case. (_strip_mem is gated on a real
+        # memory-mode value above, so an explicit null does not trigger this strip.)
         _request_extra = (
             strip_shadowing_flags(
                 request.llama_extra_args,
@@ -4349,7 +4356,10 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                         strip_split_mode = _should_strip_split_mode(
                             request, llama_backend.extra_args
                         ),
-                        strip_memory_mode = "gguf_memory_mode" in fields_set,
+                        # Only strip inherited memory flags for a real mode value; an
+                        # explicit null (Pydantic still marks it "set") means "no
+                        # opinion", so preserve the pass-through placement (#7188).
+                        strip_memory_mode = request.gguf_memory_mode is not None,
                     )
                     try:
                         extra_llama_args = validate_extra_args(stripped)
