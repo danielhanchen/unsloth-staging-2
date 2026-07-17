@@ -4947,6 +4947,22 @@ class LlamaCppBackend:
         )
     )
 
+    # Pre-kill check for block-diffusion model names (e.g. google/diffusiongemma-*)
+    # whose GGUF header is only readable after download (#7188).
+    _LIKELY_DIFFUSION_RE = re.compile(
+        r"(?:^|[\/\-_.])diffusion(?:[\/\-_.]|$)", re.IGNORECASE
+    )
+
+    @staticmethod
+    def _is_likely_diffusion_model_name(*, model_identifier: str = "", hf_repo: str = "") -> bool:
+        """True if the model name / HF repo strongly suggests a block-diffusion
+        GGUF whose gpu_ids / memory_mode must be rejected before tearing down
+        the current server."""
+        for candidate in (model_identifier, hf_repo):
+            if LlamaCppBackend._LIKELY_DIFFUSION_RE.search(candidate):
+                return True
+        return False
+
     @staticmethod
     def _classify_llama_start_failure(
         output: str,
@@ -5590,6 +5606,24 @@ class LlamaCppBackend:
 
             self._cancel_event.clear()
 
+            # ── Phase 0: validate diffusion placement constraints before
+            # tearing down the old server. The GGUF header is only readable
+            # after a download, so for HF-mode loads we use the model name.
+            _likely_diff = self._is_likely_diffusion_model_name(
+                model_identifier = model_identifier, hf_repo = hf_repo
+            )
+            if _likely_diff and gpu_ids is not None:
+                raise ValueError(
+                    "gpu_ids selection is not supported for diffusion "
+                    "(DiffusionGemma) GGUF models; they run on a single GPU "
+                    "chosen by the DG_GPU environment variable."
+                )
+            if _likely_diff and self._canonical_memory_mode(memory_mode) is not None:
+                raise ValueError(
+                    "Explicit gguf_memory_mode is not supported for diffusion "
+                    "(DiffusionGemma) GGUF models."
+                )
+
             # ── Phase 1: kill old process (under lock, fast) ──────────
             with self._lock:
                 self._kill_process()
@@ -5679,6 +5713,11 @@ class LlamaCppBackend:
                         "gpu_ids selection is not supported for diffusion "
                         "(DiffusionGemma) GGUF models; they run on a single GPU "
                         "chosen by the DG_GPU environment variable."
+                    )
+                if LlamaCppBackend._canonical_memory_mode(memory_mode) is not None:
+                    raise ValueError(
+                        "Explicit memory_mode is not supported for diffusion "
+                        "(DiffusionGemma) GGUF models."
                     )
                 # Not a tensor/layer GGUF: clear any preserved-fallback flag from a
                 # prior load (this path skips the command builder that clears it).

@@ -347,6 +347,14 @@ class LoadResponse(BaseModel):
         False,
         description = "Whether tensor-parallel split (--split-mode tensor) is active.",
     )
+    gpu_ids: Optional[List[int]] = Field(
+        None,
+        description = "Physical GPU indices the active GGUF load is pinned to, or None for auto-selection. Only meaningful when is_gguf is True.",
+    )
+    gguf_memory_mode: Optional[Literal["auto", "pinned", "resident"]] = Field(
+        None,
+        description = "Active GGUF memory placement mode. Only meaningful when is_gguf is True.",
+    )
 
 
 class UnloadResponse(BaseModel):
@@ -474,6 +482,14 @@ class InferenceStatusResponse(BaseModel):
     tensor_parallel: bool = Field(
         False,
         description = "Whether tensor-parallel split (--split-mode tensor) is active.",
+    )
+    gpu_ids: Optional[List[int]] = Field(
+        None,
+        description = "Physical GPU indices the active GGUF load is pinned to, or None for auto-selection. Only meaningful when is_gguf is True.",
+    )
+    gguf_memory_mode: Optional[Literal["auto", "pinned", "resident"]] = Field(
+        None,
+        description = "Active GGUF memory placement mode. Only meaningful when is_gguf is True.",
     )
     llama_cpp_supports_mtp: bool = Field(
         True,

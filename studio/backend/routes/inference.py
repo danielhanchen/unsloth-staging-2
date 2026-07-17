@@ -4078,6 +4078,8 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     speculative_type = llama_backend.requested_spec_mode,
                     spec_draft_n_max = llama_backend.spec_draft_n_max,
                     tensor_parallel = llama_backend.tensor_parallel,
+                    gpu_ids = llama_backend.gpu_ids,
+                    gguf_memory_mode = llama_backend.memory_mode,
                 )
         else:
             if (
@@ -4141,17 +4143,54 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 detail = f"Invalid model identifier: {model_log_label}",
             )
 
+        # Reject unsupported placement options for DiffusionGemma before the route
+        # tears down any active model. For local GGUF files we inspect the header;
+        # for HF repos we check the repo name (the GGUF isn't downloaded yet).
+        if config.is_gguf and (config.gguf_file or config.gguf_hf_repo):
+            _is_diffusion = False
+            if config.gguf_file:
+                from utils.models.gguf_metadata import is_diffusion_gguf
+
+                _is_diffusion = is_diffusion_gguf(config.gguf_file)
+            elif config.gguf_hf_repo:
+                _is_diffusion = bool(
+                    _re.search(r'(?:^|[\/\-_.])diffusion(?:[\/\-_.]|$)', config.gguf_hf_repo, _re.IGNORECASE)
+                )
+            if _is_diffusion:
+                if request.gpu_ids:
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported for diffusion "
+                            "(DiffusionGemma) GGUF models; they run on a single GPU "
+                            "chosen by the DG_GPU environment variable."
+                        ),
+                    )
+                if LlamaCppBackend._canonical_memory_mode(request.gguf_memory_mode) is not None:
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "Explicit gguf_memory_mode is not supported for diffusion "
+                            "(DiffusionGemma) GGUF models."
+                        ),
+                    )
+
         # Normalize gpu_ids: empty list means auto-selection, same as None
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
 
         # Validate explicit GPU selection up front so the loader and the guard
         # agree on the candidate set. GGUF now supports gpu_ids (#7164).
+        # On non-CUDA hosts the CUDA-oriented resolver sees an empty parent-visible
+        # set and would 400; skip it for GGUF and let the backend validate against
+        # its Vulkan probe / ordinal mapping instead.
         if effective_gpu_ids is not None:
-            from utils.hardware import resolve_requested_gpu_ids
-            try:
-                effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
-            except ValueError as exc:
-                raise HTTPException(status_code = 400, detail = str(exc)) from exc
+            from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
+
+            if not config.is_gguf or get_device() == DeviceType.CUDA:
+                try:
+                    effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
+                except ValueError as exc:
+                    raise HTTPException(status_code = 400, detail = str(exc)) from exc
         if not config.is_gguf and _mlx_distributed_launch_detected():
             raise HTTPException(
                 status_code = 400,
@@ -4473,6 +4512,8 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 speculative_type = llama_backend.requested_spec_mode,
                 spec_draft_n_max = llama_backend.spec_draft_n_max,
                 tensor_parallel = llama_backend.tensor_parallel,
+                gpu_ids = llama_backend.gpu_ids,
+                gguf_memory_mode = llama_backend.memory_mode,
             )
 
         # ── Standard path: load via Unsloth/transformers ──────────
@@ -4761,12 +4802,16 @@ async def validate_model(
         # alongside training, using the same settings /load uses so they agree.
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
         # Mirror /load: validate explicit GPU selection before the guard.
+        # Skip the CUDA-oriented resolver for GGUF on non-CUDA hosts; the backend
+        # validates against the Vulkan probe instead.
         if effective_gpu_ids is not None:
-            from utils.hardware import resolve_requested_gpu_ids
-            try:
-                effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
-            except ValueError as exc:
-                raise HTTPException(status_code = 400, detail = str(exc)) from exc
+            from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
+
+            if not config.is_gguf or get_device() == DeviceType.CUDA:
+                try:
+                    effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
+                except ValueError as exc:
+                    raise HTTPException(status_code = 400, detail = str(exc)) from exc
         effective_load_in_4bit = _effective_load_in_4bit(config, request.load_in_4bit)
 
         # Both checks cover the [adapter, base] set (matching the scan route and workers):
@@ -5523,6 +5568,8 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
                 speculative_type = llama_backend.requested_spec_mode,
                 spec_draft_n_max = llama_backend.spec_draft_n_max,
                 tensor_parallel = llama_backend.tensor_parallel,
+                gpu_ids = llama_backend.gpu_ids,
+                gguf_memory_mode = llama_backend.memory_mode,
                 llama_cpp_supports_mtp = _supports_mtp,
                 spec_fallback_reason = llama_backend.spec_fallback_reason,
                 llama_cpp_prebuilt_stale = _stale,

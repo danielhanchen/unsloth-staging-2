@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable, Mapping
 
 from utils.models.gguf_metadata import (
+    is_diffusion_gguf,
     is_mmproj_by_metadata,
     pairing_score,
     read_gguf_context_length,
@@ -341,3 +342,38 @@ def test_mmproj_audio_capability_missing_or_non_gguf(tmp_path: Path):
     junk = tmp_path / "garbage.gguf"
     junk.write_bytes(b"not a gguf header at all")
     assert read_mmproj_audio_capability(str(junk)) is None
+
+
+# --- is_diffusion_gguf -------------------------------------------------------
+
+
+def test_diffusion_gguf_by_architecture(tmp_path: Path):
+    p = _write_synthetic_gguf(
+        tmp_path / "diffusion.gguf",
+        {"general.architecture": "diffusion_gemma"},
+    )
+    assert is_diffusion_gguf(str(p)) is True
+
+
+def test_diffusion_gguf_by_canvas_length(tmp_path: Path):
+    p = _write_synthetic_gguf(
+        tmp_path / "diffusion.gguf",
+        {"general.architecture": "llama"},
+        extra_uint32 = {"diffusion.canvas_length": 256},
+    )
+    assert is_diffusion_gguf(str(p)) is True
+
+
+def test_non_diffusion_gguf(tmp_path: Path):
+    p = _write_synthetic_gguf(
+        tmp_path / "llama.gguf",
+        {"general.architecture": "llama"},
+    )
+    assert is_diffusion_gguf(str(p)) is False
+
+
+def test_is_diffusion_gguf_missing_or_non_gguf(tmp_path: Path):
+    assert is_diffusion_gguf(str(tmp_path / "nope.gguf")) is False
+    junk = tmp_path / "garbage.gguf"
+    junk.write_bytes(b"not a gguf header at all")
+    assert is_diffusion_gguf(str(junk)) is False

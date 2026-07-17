@@ -36,8 +36,22 @@ _WANTED_GENERAL_KEYS: frozenset[str] = frozenset(
         "general.source.url",
         "general.source.repo_url",
         "general.source.huggingface.repository",
+        "diffusion.canvas_length",
     }
 )
+
+
+def is_diffusion_gguf(path: str) -> bool:
+    """Return True if the GGUF header identifies a block-diffusion model."""
+    meta = read_gguf_general_metadata(path)
+    if not meta:
+        return False
+    arch = (meta.get("general.architecture") or "").lower()
+    if arch.startswith("diffusion"):
+        return True
+    if "diffusion.canvas_length" in meta:
+        return True
+    return False
 
 
 # Cache failed parses too so a broken file is not retried each scan.
@@ -117,17 +131,31 @@ def _parse_gguf_header(path: str) -> Optional[Dict[str, str]]:
                         break
                     vtype = struct.unpack("<I", vt_bytes)[0]
 
-                    if vtype == 8 and key in _WANTED_GENERAL_KEYS:
-                        slen_bytes = f.read(8)
-                        if len(slen_bytes) < 8:
-                            break
-                        slen = struct.unpack("<Q", slen_bytes)[0]
-                        if slen > 1 << 22:  # 4 MB sanity bound
-                            break
-                        sbytes = f.read(slen)
-                        if len(sbytes) < slen:
-                            break
-                        out[key] = sbytes.decode("utf-8", "replace")
+                    if key in _WANTED_GENERAL_KEYS:
+                        if vtype == 8:  # string
+                            slen_bytes = f.read(8)
+                            if len(slen_bytes) < 8:
+                                break
+                            slen = struct.unpack("<Q", slen_bytes)[0]
+                            if slen > 1 << 22:  # 4 MB sanity bound
+                                break
+                            sbytes = f.read(slen)
+                            if len(sbytes) < slen:
+                                break
+                            out[key] = sbytes.decode("utf-8", "replace")
+                        elif vtype == 4:  # uint32
+                            vbytes = f.read(4)
+                            if len(vbytes) < 4:
+                                break
+                            out[key] = str(struct.unpack("<I", vbytes)[0])
+                        elif vtype == 10:  # uint64
+                            vbytes = f.read(8)
+                            if len(vbytes) < 8:
+                                break
+                            out[key] = str(struct.unpack("<Q", vbytes)[0])
+                        else:
+                            if not _skip_gguf_value(f, vtype):
+                                break
                     else:
                         if not _skip_gguf_value(f, vtype):
                             break

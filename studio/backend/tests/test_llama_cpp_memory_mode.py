@@ -21,6 +21,12 @@ _loggers_stub = _types.ModuleType("loggers")
 _loggers_stub.get_logger = lambda name: __import__("logging").getLogger(name)
 sys.modules.setdefault("loggers", _loggers_stub)
 
+_jwt_stub = _types.ModuleType("jwt")
+_jwt_stub.decode = lambda *a, **k: {}
+_jwt_stub.ExpiredSignatureError = type("ExpiredSignatureError", (Exception,), {})
+_jwt_stub.InvalidTokenError = type("InvalidTokenError", (Exception,), {})
+sys.modules.setdefault("jwt", _jwt_stub)
+
 _structlog_stub = _types.ModuleType("structlog")
 _structlog_stub.get_logger = lambda *a, **k: __import__("logging").getLogger("stub")
 sys.modules.setdefault("structlog", _structlog_stub)
@@ -432,6 +438,32 @@ def test_memory_mode_pinned_does_not_match_none():
     kwargs = _base_target_state_kwargs(backend)
     kwargs["memory_mode"] = "pinned"
     assert backend._already_in_target_state(**kwargs) is False
+
+
+def test_load_response_and_status_round_trip_placement_fields():
+    """gpu_ids and gguf_memory_mode are accepted by the response schemas so
+    status-hydrated requests can preserve explicit placement settings."""
+    from models.inference import InferenceStatusResponse, LoadResponse
+
+    load_resp = LoadResponse(
+        status = "loaded",
+        model = "m",
+        display_name = "m",
+        is_gguf = True,
+        inference = {},
+        gpu_ids = [0, 1],
+        gguf_memory_mode = "resident",
+    )
+    assert load_resp.gpu_ids == [0, 1]
+    assert load_resp.gguf_memory_mode == "resident"
+
+    status_resp = InferenceStatusResponse(
+        is_gguf = True,
+        gpu_ids = [0, 1],
+        gguf_memory_mode = "pinned",
+    )
+    assert status_resp.gpu_ids == [0, 1]
+    assert status_resp.gguf_memory_mode == "pinned"
 
 
 # ── inherited LLAMA_ARG_* mmap/mlock env is scrubbed when a mode is set ───────
