@@ -36,3 +36,7 @@ jobs:
         run: python tests/pr7186/studio_boot_repro.py --nest force
       - name: Studio boot repro - PR gate (fix; all 200)
         run: python tests/pr7186/studio_boot_repro.py --nest auto
+      - name: Notebook launch, pre-fix gate reproduces the bug on 3.14 (expected 500)
+        run: python tests/pr7186/notebook_314_sim.py --gate pr
+      - name: Notebook launch, shipped version-gate (fix; 200)
+        run: python tests/pr7186/notebook_314_sim.py --gate versioned

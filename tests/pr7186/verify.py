@@ -164,11 +164,13 @@ def _check_E():
     )
     src = open(run_py, encoding="utf-8").read()
 
-    # Grab the try/except-RuntimeError/else gate that guards nest_asyncio.apply().
-    # Capture the leading indentation of the `try:` line (it lives inside run_server,
-    # indented 4 spaces) so textwrap.dedent has a common prefix to strip.
+    # Grab the gate that guards nest_asyncio.apply() -- INCLUDING an optional
+    # `if sys.version_info ... :` wrapper so we test the shipped behavior faithfully.
+    # Capture the leading indentation (it lives inside run_server, indented 4 spaces)
+    # so textwrap.dedent has a common prefix to strip.
     m = re.search(
-        r"(^[ \t]*try:\s*\n[ \t]*asyncio\.get_running_loop\(\).*?nest_asyncio\.apply\(\))",
+        r"(^[ \t]*(?:if sys\.version_info[^\n]*:\s*\n)?[ \t]*try:\s*\n"
+        r"[ \t]*asyncio\.get_running_loop\(\).*?nest_asyncio\.apply\(\))",
         src, re.DOTALL | re.MULTILINE,
     )
     if not m:
@@ -188,7 +190,7 @@ def _check_E():
         saved = _sys.modules.get("nest_asyncio")
         _sys.modules["nest_asyncio"] = fake
         try:
-            exec(compile(gate, run_py, "exec"), {"asyncio": asyncio})
+            exec(compile(gate, run_py, "exec"), {"asyncio": asyncio, "sys": sys})
         finally:
             if saved is not None:
                 _sys.modules["nest_asyncio"] = saved
@@ -207,8 +209,12 @@ def _check_E():
 
     asyncio.run(inside())
 
-    ok = (applied_noloop == 0) and (box["applied"] == 1)
-    print(f"applied_without_loop={applied_noloop}  applied_with_loop={box['applied']}")
+    # With the version guard, a running loop applies nest_asyncio only on <=3.13;
+    # on 3.14+ it must be skipped even with a loop (notebook/embedded case).
+    expect_with_loop = 1 if sys.version_info < (3, 14) else 0
+    ok = (applied_noloop == 0) and (box["applied"] == expect_with_loop)
+    print(f"applied_without_loop={applied_noloop}  applied_with_loop={box['applied']}"
+          f"  (expected_with_loop={expect_with_loop})")
     print("RESULT=" + ("PASS" if ok else "FAIL"))
     return ok
 
