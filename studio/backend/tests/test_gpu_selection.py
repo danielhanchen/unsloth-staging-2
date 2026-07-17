@@ -909,6 +909,9 @@ class TestRouteErrors(unittest.TestCase):
             _openai_advertised_id = None
             _native_grant_backed = False
             _native_display_label = None
+            # Selection fields echoed back in the LoadResponse (#7164/#7210).
+            gpu_ids = None
+            memory_mode = None
 
             def __init__(self):
                 self.load_model_calls = []

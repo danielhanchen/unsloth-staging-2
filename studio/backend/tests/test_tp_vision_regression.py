@@ -671,6 +671,67 @@ def test_explicit_split_mode_layer_extras_reloads_after_multi_gpu_fallback():
     )
 
 
+def _mem_loaded_backend(
+    *,
+    memory_mode,
+    extra_args,
+    launched_with_inherited_mem_env = False,
+):
+    """A loaded GGUF backend in a given memory-placement state, for the route dedup."""
+    b = LlamaCppBackend()
+    b._model_identifier = "owner/repo"
+    b._requested_n_ctx = 0
+    b._cache_type_kv = None
+    b._tensor_parallel = False
+    b._layer_preserves_tensor_intent = False
+    b._extra_args = list(extra_args) if extra_args else None
+    b._requested_spec_mode = "auto"
+    b._chat_template_override = None
+    b._gguf_path = None
+    b._gpu_ids = None
+    b._memory_mode = memory_mode
+    b._launched_with_inherited_mem_env = launched_with_inherited_mem_env
+    return b
+
+
+def test_explicit_auto_reloads_over_passthrough_mlock_in_extras():
+    """A server that loaded with no memory_mode keeps a pass-through --mlock in its
+    stored extras and is still mlocked. An explicit gguf_memory_mode="auto" repeating
+    --mlock must NOT dedupe to it: stripping only the request side keeps the backend's
+    --mlock visible, so the matcher reloads to clear the placement "auto" asks for and
+    the backend scrub then runs (Codex #7164)."""
+    from models.inference import LoadRequest
+
+    inference_routes = _load_inference_routes_module()
+
+    req = LoadRequest(
+        model_path = "owner/repo",
+        gguf_memory_mode = "auto",
+        llama_extra_args = ["--mlock"],
+    )
+    assert "gguf_memory_mode" in req.model_fields_set
+    backend = _mem_loaded_backend(memory_mode = None, extra_args = ["--mlock"])
+    assert inference_routes._request_matches_loaded_settings(req, backend) is False
+
+
+def test_explicit_pinned_dedupes_when_flags_already_applied():
+    """A server that loaded WITH memory_mode="pinned" already had --mlock stripped from
+    its stored extras (applied via the mode flags). A repeat pinned Apply that re-sends
+    --mlock must still dedupe: the request-side strip makes it compare equal to the
+    empty backend extras, so a no-op re-Apply during training isn't churned (#7164)."""
+    from models.inference import LoadRequest
+
+    inference_routes = _load_inference_routes_module()
+
+    req = LoadRequest(
+        model_path = "owner/repo",
+        gguf_memory_mode = "pinned",
+        llama_extra_args = ["--mlock"],
+    )
+    backend = _mem_loaded_backend(memory_mode = "pinned", extra_args = None)
+    assert inference_routes._request_matches_loaded_settings(req, backend) is True
+
+
 def test_tensor_off_reload_requires_explicit_toggle():
     """An Apply that doesn't touch the toggle (e.g. a context change) isn't churned
     by the preserved-fallback reload -- the working server is kept (Codex #6659)."""

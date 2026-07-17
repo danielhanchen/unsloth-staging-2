@@ -6950,7 +6950,12 @@ class LlamaCppBackend:
                     extra_args = extra_args,
                     model_identifier = model_identifier,
                     model_path = model_path,
-                    gpus = bool(gpus),
+                    # GPU-backed iff the launch actually targets GPUs: a measured
+                    # probe (gpus) OR a resolved pin (gpu_indices). The no-telemetry
+                    # explicit-gpu_ids path pins via gpu_indices with an empty probe,
+                    # so keying off bool(gpus) alone would mistake it for a CPU launch
+                    # and pick the CPU spec-draft default (n=3 instead of n=2) (#7164).
+                    gpus = bool(gpus) or bool(gpu_indices),
                     binary = binary,
                     mtp_draft_path = launch_mtp_draft_path,
                 )

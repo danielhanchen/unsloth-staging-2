@@ -43,16 +43,17 @@ from models.inference import ValidateModelRequest  # noqa: E402
 
 
 @pytest.mark.parametrize("blank", ["", "   ", "\n\t"])
-def test_blank_gguf_memory_mode_normalizes_to_none(blank):
-    # A settings form may serialize the default placement as "": the backend
-    # canonicalizes blank/auto/None identically, so the boundary must accept it
-    # (map to None) rather than 422 before canonicalization (#7164).
-    assert _base_load_request(gguf_memory_mode = blank).gguf_memory_mode is None
+def test_blank_gguf_memory_mode_normalizes_to_auto(blank):
+    # A settings form may serialize the default placement as "": map it to explicit
+    # "auto" (not None) so a default-selecting Apply is still an explicit memory-mode
+    # choice and the inherited-env scrub runs, rather than 422-ing on the Literal or
+    # silently inheriting operator LLAMA_ARG_MLOCK / NO_MMAP / MMAP (#7164).
+    assert _base_load_request(gguf_memory_mode = blank).gguf_memory_mode == "auto"
     assert (
         ValidateModelRequest.model_validate(
             {"model_path": "x", "gguf_memory_mode": blank}
         ).gguf_memory_mode
-        is None
+        == "auto"
     )
 
 

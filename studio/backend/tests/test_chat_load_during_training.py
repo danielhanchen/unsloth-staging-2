@@ -526,8 +526,11 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertTrue(resp.is_gguf)
 
     def test_gguf_with_invalid_gpu_ids_rejected_before_guard(self):
-        # Invalid gpu_ids for GGUF should still 400 before the VRAM guard.
+        # On a CUDA/ROCm host, an invalid GGUF gpu_ids still 400s before the VRAM
+        # guard: the CUDA-oriented resolver runs and rejects it up front. Pin the
+        # device to CUDA so this contract holds regardless of the CI host's GPUs.
         from models.inference import ValidateModelRequest
+        from utils.hardware import DeviceType
 
         request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [99])
         cfg = SimpleNamespace(
@@ -548,6 +551,11 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
             ),
             patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
             patch.object(self.route, "load_inference_config", return_value = {}),
+            patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
+            patch(
+                "utils.hardware.resolve_requested_gpu_ids",
+                side_effect = ValueError("Invalid gpu_ids [99]"),
+            ),
             _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
         ):
             with self.assertRaises(HTTPException) as exc:
@@ -555,6 +563,46 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertEqual(exc.exception.status_code, 400)
         self.assertIn("gpu_ids", exc.exception.detail)
         self.assertEqual(captured, [])  # guard never reached
+
+    def test_gguf_invalid_gpu_ids_deferred_to_backend_on_non_cuda(self):
+        # On a non-CUDA host (Vulkan AMD / CPU / Mac), the CUDA-oriented resolver
+        # cannot see Vulkan-only GPUs, so #7164 skips it for GGUF and defers gpu_ids
+        # validation to the backend probe. The route must NOT 400 here: it reaches
+        # the guard with the raw selection instead of rejecting a valid Vulkan id.
+        from models.inference import ValidateModelRequest
+        from utils.hardware import DeviceType
+
+        request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [1])
+        cfg = SimpleNamespace(
+            identifier = "x.gguf",
+            display_name = "x",
+            is_gguf = True,
+            is_lora = False,
+            is_vision = False,
+            path = None,
+            base_model = None,
+        )
+        captured = []
+
+        def _must_not_resolve(_ids):
+            raise AssertionError("CUDA resolver must be skipped for GGUF on non-CUDA hosts")
+
+        with (
+            patch.object(
+                self.route,
+                "_resolve_model_identifier_for_request",
+                return_value = ("x.gguf", "x.gguf", False),
+            ),
+            patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+            patch.object(self.route, "load_inference_config", return_value = {}),
+            patch("utils.hardware.get_device", return_value = DeviceType.CPU),
+            patch("utils.hardware.resolve_requested_gpu_ids", side_effect = _must_not_resolve),
+            _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+        ):
+            resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
+        # Reached the guard with the raw selection; backend probe validates later.
+        self.assertEqual(captured[0]["requested_gpu_ids"], [1])
+        self.assertTrue(resp.valid)
 
 
 # ── _estimate_gguf_required_gb (sizes the same weights the loader loads) ──────
