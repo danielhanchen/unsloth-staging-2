@@ -17,35 +17,62 @@ _BACKEND_DIR = str(Path(__file__).resolve().parent.parent)
 if _BACKEND_DIR not in sys.path:
     sys.path.insert(0, _BACKEND_DIR)
 
-_loggers_stub = _types.ModuleType("loggers")
-_loggers_stub.get_logger = lambda name: __import__("logging").getLogger(name)
-sys.modules.setdefault("loggers", _loggers_stub)
 
-_structlog_stub = _types.ModuleType("structlog")
-_structlog_stub.get_logger = lambda *a, **k: __import__("logging").getLogger("stub")
-sys.modules.setdefault("structlog", _structlog_stub)
+def _install_stub_if_absent(name: str, build):
+    """Install a lightweight stub for ``name`` only when the real module is not
+    importable. Never shadow a real module: this test file was collected before
+    a real-httpx importer once installed an incomplete httpx stub via
+    sys.modules.setdefault, which then broke unrelated tests in a combined pytest
+    run (order-dependent failures). Preferring the real module keeps the stub as a
+    pure fallback for minimal environments without changing global import state."""
+    if name in sys.modules:
+        return
+    try:
+        __import__(name)
+        return
+    except Exception:
+        sys.modules[name] = build()
 
-_httpx_stub = _types.ModuleType("httpx")
-for _exc_name in (
-    "ConnectError",
-    "TimeoutException",
-    "ReadTimeout",
-    "ReadError",
-    "RemoteProtocolError",
-    "CloseError",
-):
-    setattr(_httpx_stub, _exc_name, type(_exc_name, (Exception,), {}))
-_httpx_stub.Timeout = type("T", (), {"__init__": lambda s, *a, **k: None})
-_httpx_stub.Client = type(
-    "Client",
-    (),
-    {
-        "__init__": lambda self, **kw: None,
-        "__enter__": lambda self: self,
-        "__exit__": lambda self, *a: None,
-    },
-)
-sys.modules.setdefault("httpx", _httpx_stub)
+
+def _build_loggers_stub():
+    mod = _types.ModuleType("loggers")
+    mod.get_logger = lambda name: __import__("logging").getLogger(name)
+    return mod
+
+
+def _build_structlog_stub():
+    mod = _types.ModuleType("structlog")
+    mod.get_logger = lambda *a, **k: __import__("logging").getLogger("stub")
+    return mod
+
+
+def _build_httpx_stub():
+    mod = _types.ModuleType("httpx")
+    for _exc_name in (
+        "ConnectError",
+        "TimeoutException",
+        "ReadTimeout",
+        "ReadError",
+        "RemoteProtocolError",
+        "CloseError",
+    ):
+        setattr(mod, _exc_name, type(_exc_name, (Exception,), {}))
+    mod.Timeout = type("T", (), {"__init__": lambda s, *a, **k: None})
+    mod.Client = type(
+        "Client",
+        (),
+        {
+            "__init__": lambda self, **kw: None,
+            "__enter__": lambda self: self,
+            "__exit__": lambda self, *a: None,
+        },
+    )
+    return mod
+
+
+_install_stub_if_absent("loggers", _build_loggers_stub)
+_install_stub_if_absent("structlog", _build_structlog_stub)
+_install_stub_if_absent("httpx", _build_httpx_stub)
 
 import pytest
 
@@ -458,6 +485,58 @@ def test_memory_mode_clears_inherited_mmap_env_vars(tmp_path):
     assert "LLAMA_ARG_MLOCK" not in env
     assert "LLAMA_ARG_MMAP" not in env
     assert "LLAMA_ARG_NO_MMAP" not in env
+
+
+@pytest.mark.parametrize(
+    "mode,user_flag,winning",
+    [
+        ("resident", "--mmap", "--no-mmap"),
+        ("pinned", "--no-mmap", None),
+        ("auto", "--mlock", None),
+    ],
+)
+def test_memory_mode_strips_conflicting_extra_args(tmp_path, mode, user_flag, winning):
+    """When a placement mode is applied, a conflicting --mmap/--no-mmap/--mlock left
+    in extra_args must be stripped so llama.cpp's last-wins parsing can't run a
+    placement that disagrees with the stored memory_mode (#7164). auto emits no
+    memory flag, so the user's --mlock is dropped rather than pinning the child."""
+    gguf = tmp_path / "model.gguf"
+    _write_minimal_gguf(gguf)
+    backend = _mem_env_backend(gguf)
+
+    captured_cmds = []
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                captured_cmds.append(list(cmd))
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with patch.object(subprocess, "Popen", side_effect = _make_fake_popen):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            memory_mode = mode,
+            extra_args = [user_flag],
+        )
+
+    assert captured_cmds, "llama-server was not spawned"
+    cmd = captured_cmds[-1]
+    # The caller's conflicting flag is gone.
+    assert user_flag not in cmd
+    # Only Studio's own memory flags (if any) remain, and the last mmap/no-mmap
+    # flag reflects Studio's mode, not the stripped user flag.
+    mmap_flags = [a for a in cmd if a in ("--mmap", "--no-mmap")]
+    if winning is None:
+        assert "--mmap" not in cmd  # user --mmap/--no-mmap fully stripped
+    else:
+        assert mmap_flags[-1] == winning
 
 
 def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):

@@ -5518,6 +5518,25 @@ class LlamaCppBackend:
 
         Returns True if the server started and the health check passed.
         """
+        # When a placement mode is applied, Studio's --mlock/--no-mmap (or their
+        # absence for auto) is authoritative, so strip any conflicting
+        # --mmap/--no-mmap/--mlock the caller left in extra_args. Without this,
+        # llama.cpp's last-wins parsing would let a user --mmap in extras run the
+        # child memory-mapped while Studio stored memory_mode='resident' (state
+        # lying about the actual placement). The route strips this too, but doing
+        # it here keeps the invariant for direct/internal load_model calls and is
+        # idempotent when already stripped. Left untouched when no mode is applied
+        # (memory_mode is None = no opinion, the user's flags are their choice).
+        if memory_mode is not None and extra_args:
+            extra_args = strip_shadowing_flags(
+                extra_args,
+                strip_context = False,
+                strip_cache = False,
+                strip_spec = False,
+                strip_template = False,
+                strip_split_mode = False,
+                strip_memory_mode = True,
+            )
         # Raw load inputs so the runtime MTP-crash reload can replay this model
         # without MTP. Committed to _last_load_kwargs only on a healthy load.
         _pending_load_kwargs = {
