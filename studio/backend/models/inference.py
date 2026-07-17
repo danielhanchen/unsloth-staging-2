@@ -80,11 +80,13 @@ class LoadRequest(BaseModel):
     gguf_memory_mode: Optional[Literal["auto", "pinned", "resident"]] = Field(
         None,
         description = (
-            "GGUF memory placement mode. 'auto' (default) lets llama.cpp use its "
-            "normal memory-mapped loading. 'pinned' locks the model in system RAM "
-            "with --mlock so the OS cannot page it out. 'resident' loads the full "
-            "model into RAM with --no-mmap and locks it with --mlock, avoiding any "
-            "file-backed mapping. Ignored for non-GGUF models."
+            "GGUF host-memory placement mode (llama.cpp --mlock/--no-mmap). These "
+            "control system RAM residency and file mapping on the host, NOT GPU VRAM "
+            "placement, so they do not by themselves keep offloaded weights pinned in "
+            "VRAM. 'auto' (default) uses llama.cpp's normal memory-mapped loading. "
+            "'pinned' adds --mlock so the OS cannot page the model's host pages out. "
+            "'resident' loads the full model into RAM with --no-mmap and locks it with "
+            "--mlock, avoiding any file-backed mapping. Ignored for non-GGUF models."
         ),
     )
     speculative_type: Optional[str] = Field(

@@ -607,6 +607,35 @@ def test_memory_mode_auto_matches_none_in_target_state():
     assert backend._already_in_target_state(**kwargs) is True
 
 
+def test_explicit_auto_reloads_when_child_inherited_mem_env():
+    """When the live child was launched with no mode but inherited operator
+    LLAMA_ARG_* placement flags, an explicit 'auto' request must reload so the
+    scrub runs -- otherwise it dedups to already-loaded and stays mlocked (#7164)."""
+    backend = _loaded_backend(_memory_mode = None, _launched_with_inherited_mem_env = True)
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["memory_mode"] = "auto"
+    assert backend._already_in_target_state(**kwargs) is False
+
+
+def test_omitted_mode_does_not_reload_child_with_inherited_mem_env():
+    """A request that also omits the mode (memory_mode=None) does NOT reload the
+    inherited-env child: omitting keeps the operator env, so there's nothing to
+    scrub and no spurious reload (which would be rejected during training)."""
+    backend = _loaded_backend(_memory_mode = None, _launched_with_inherited_mem_env = True)
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["memory_mode"] = None
+    assert backend._already_in_target_state(**kwargs) is True
+
+
+def test_explicit_auto_matches_scrubbed_child():
+    """Once the child was launched clean (no inherited env), an explicit 'auto'
+    re-Apply dedups to already-loaded -- no needless reload."""
+    backend = _loaded_backend(_memory_mode = None, _launched_with_inherited_mem_env = False)
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["memory_mode"] = "auto"
+    assert backend._already_in_target_state(**kwargs) is True
+
+
 def test_memory_mode_pinned_does_not_match_none():
     backend = _loaded_backend(_memory_mode = None)
     kwargs = _base_target_state_kwargs(backend)
@@ -637,14 +666,14 @@ def _mem_env_backend(gguf):
 
 @pytest.mark.parametrize(
     "mode,scrubbed",
-    [("auto", True), ("pinned", True), ("resident", True), (None, True)],
+    [("auto", True), ("pinned", True), ("resident", True), (None, False)],
 )
 def test_memory_mode_scrubs_inherited_mmap_env(tmp_path, monkeypatch, mode, scrubbed):
-    """Every GGUF launch strips inherited LLAMA_ARG_MLOCK/NO_MMAP/MMAP so
+    """An explicit memory_mode strips inherited LLAMA_ARG_MLOCK/NO_MMAP/MMAP so
     llama-server can't silently run a placement Studio did not select (#7164).
-    memory_mode=None canonicalizes to the same default placement as 'auto', so it
-    scrubs too: otherwise a None-loaded child could keep inherited mlock/no-mmap
-    that a later explicit 'auto' (deduped to None) could never clear."""
+    memory_mode=None (no opinion) leaves any operator env untouched for backwards
+    compatibility; the reload-dedup instead reloads a None-loaded-with-inherited-env
+    child when a later explicit 'auto' arrives (see the target-state tests below)."""
     monkeypatch.setenv("LLAMA_ARG_MLOCK", "1")
     monkeypatch.setenv("LLAMA_ARG_NO_MMAP", "1")
     monkeypatch.setenv("LLAMA_ARG_MMAP", "true")

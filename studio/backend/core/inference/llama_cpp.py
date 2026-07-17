@@ -1632,6 +1632,11 @@ class LlamaCppBackend:
         self._gpu_ids: Optional[List[int]] = None
         # GGUF memory placement mode (None = auto; pinned/resident map to --mlock/--no-mmap).
         self._memory_mode: Optional[str] = None
+        # True when the live child was launched with NO explicit memory_mode yet
+        # inherited an operator LLAMA_ARG_MLOCK/NO_MMAP/MMAP env (not scrubbed).
+        # Lets an explicit 'auto' reload force the scrub the dedup would otherwise
+        # skip (auto canonicalizes to None == the omitted state).
+        self._launched_with_inherited_mem_env: bool = False
         # KV-cache estimation fields (populated by _read_gguf_metadata)
         self._n_layers: Optional[int] = None
         self._n_kv_heads: Optional[int] = None
@@ -1799,6 +1804,12 @@ class LlamaCppBackend:
     def memory_mode(self) -> Optional[str]:
         """GGUF memory placement mode of the active load (auto/pinned/resident)."""
         return self._memory_mode
+
+    @property
+    def launched_with_inherited_mem_env(self) -> bool:
+        """True when the live child inherited operator LLAMA_ARG_MLOCK/NO_MMAP/MMAP
+        env because no memory_mode was applied; an explicit mode reload clears it."""
+        return self._launched_with_inherited_mem_env
 
     @property
     def context_length(self) -> Optional[int]:
@@ -5734,6 +5745,7 @@ class LlamaCppBackend:
                         # unnecessary kill+restart of the healthy diffusion server).
                         self._gpu_ids = None
                         self._memory_mode = None
+                        self._launched_with_inherited_mem_env = False
                     return started
 
             if not binary:
@@ -7035,19 +7047,21 @@ class LlamaCppBackend:
                 # llama-server honors LLAMA_ARG_MLOCK/NO_MMAP/MMAP only where Studio
                 # emits no CLI flag for that param, so an inherited env could run an
                 # explicit 'auto' mlocked/no-mmap or silently turn 'pinned' into
-                # 'resident'. Scrub on every GGUF launch, not just when a mode was
-                # named: Studio's field (default 'auto' = memory-mapped) is
-                # authoritative, and an omitted mode canonicalizes to the same
-                # placement as 'auto'. If only a named mode scrubbed, a child
-                # launched with memory_mode=None could keep inherited mlock/no-mmap
-                # flags that a later explicit 'auto' could never clear -- the
-                # reload-dedup canonicalizes auto and None together and would treat
-                # the request as already loaded. Always scrubbing makes that stale
-                # state unreachable (an operator who wants pinning uses
-                # memory_mode='pinned'). Mirrors the LLAMA_ARG_THREADS / split /
-                # cache scrubs.
-                for _mm_var in ("LLAMA_ARG_MLOCK", "LLAMA_ARG_NO_MMAP", "LLAMA_ARG_MMAP"):
-                    env.pop(_mm_var, None)
+                # 'resident'. Scrub them ONLY when the caller supplied a mode, so an
+                # operator who sets these env vars keeps the pre-PR inheritance when
+                # no mode is requested (backwards compatible with existing installs).
+                # Record whether the child is launched WITH inherited placement flags
+                # (mode omitted + env present); a later explicit 'auto' then reloads
+                # to clear them, since the reload-dedup canonicalizes 'auto' and None
+                # together and would otherwise report already-loaded and leave the
+                # child mlocked. Mirrors the LLAMA_ARG_THREADS / split / cache scrubs.
+                _mm_vars = ("LLAMA_ARG_MLOCK", "LLAMA_ARG_NO_MMAP", "LLAMA_ARG_MMAP")
+                if memory_mode is not None:
+                    for _mm_var in _mm_vars:
+                        env.pop(_mm_var, None)
+                    _child_inherited_mem_env = False
+                else:
+                    _child_inherited_mem_env = any(_v in env for _v in _mm_vars)
 
                 # Reconcile the inherited LLAMA_ARG_* env with Studio's final
                 # decision: stripping CLI extras on a tensor->layer downgrade
@@ -7507,6 +7521,7 @@ class LlamaCppBackend:
                 self._requested_n_ctx = int(n_ctx)
                 self._gpu_ids = list(gpu_ids) if gpu_ids is not None else None
                 self._memory_mode = LlamaCppBackend._canonical_memory_mode(memory_mode)
+                self._launched_with_inherited_mem_env = _child_inherited_mem_env
                 # Commit the known-good snapshot + whether MTP+tensor is live, then
                 # watch this load for a mid-generation crash.
                 self._last_load_kwargs = _pending_load_kwargs
@@ -8000,6 +8015,13 @@ class LlamaCppBackend:
             self._memory_mode
         ) != LlamaCppBackend._canonical_memory_mode(memory_mode):
             return False
+        # An explicit memory_mode (including 'auto', which canonicalizes to None)
+        # over a child still carrying inherited LLAMA_ARG_* placement flags must
+        # reload so the launch scrub can clear them: the canonical check above
+        # treats 'auto' and the omitted state as equal and would otherwise leave
+        # the child mlocked/no-mmap (#7164).
+        if memory_mode is not None and self._launched_with_inherited_mem_env:
+            return False
 
         # extra_args=None means "no opinion" (inherit handled at the route
         # layer); only an explicit list forces equality.
@@ -8069,6 +8091,7 @@ class LlamaCppBackend:
             self._spec_draft_n_max = None
             self._gpu_ids = None
             self._memory_mode = None
+            self._launched_with_inherited_mem_env = False
             self._n_layers = None
             self._n_kv_heads = None
             self._n_kv_heads_by_layer = None

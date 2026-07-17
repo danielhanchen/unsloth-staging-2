@@ -3131,6 +3131,12 @@ def _request_matches_loaded_settings(
         request.gguf_memory_mode
     ) != LlamaCppBackend._canonical_memory_mode(llama_backend.memory_mode):
         return False
+    # An explicit memory_mode (incl. 'auto') over a child that inherited operator
+    # LLAMA_ARG_* placement flags must reload so the backend scrub runs; the
+    # canonical check above equates 'auto' with the omitted state and would leave
+    # the child mlocked/no-mmap (#7164).
+    if request.gguf_memory_mode is not None and llama_backend.launched_with_inherited_mem_env:
+        return False
     # Reconcile a user --split-mode in extras into the effective tensor state.
     # When the request omits llama_extra_args ("inherit"), compare using the
     # stored extras stripped the way the reload strips them, so an extras-driven
