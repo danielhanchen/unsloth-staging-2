@@ -4190,11 +4190,14 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
             _is_diffusion = False
             if config.gguf_file:
                 from utils.models.gguf_metadata import is_diffusion_gguf
-
                 _is_diffusion = is_diffusion_gguf(config.gguf_file)
             elif config.gguf_hf_repo:
                 _is_diffusion = bool(
-                    _re.search(r'(?:^|[\/\-_.])diffusion(?:[\/\-_.]|$)', config.gguf_hf_repo, _re.IGNORECASE)
+                    _re.search(
+                        r"(?:^|[\/\-_.])diffusion(?:[\/\-_.]|$)",
+                        config.gguf_hf_repo,
+                        _re.IGNORECASE,
+                    )
                 )
             if _is_diffusion:
                 if request.gpu_ids:
@@ -4225,7 +4228,6 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # its Vulkan probe / ordinal mapping instead.
         if effective_gpu_ids is not None:
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
-
             if not config.is_gguf or get_device() == DeviceType.CUDA:
                 try:
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
@@ -4846,7 +4848,6 @@ async def validate_model(
         # validates against the Vulkan probe instead.
         if effective_gpu_ids is not None:
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
-
             if not config.is_gguf or get_device() == DeviceType.CUDA:
                 try:
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)

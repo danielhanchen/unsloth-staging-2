@@ -4960,9 +4960,7 @@ class LlamaCppBackend:
 
     # Pre-kill check for block-diffusion model names (e.g. google/diffusiongemma-*)
     # whose GGUF header is only readable after download (#7188).
-    _LIKELY_DIFFUSION_RE = re.compile(
-        r"(?:^|[\/\-_.])diffusion(?:[\/\-_.]|$)", re.IGNORECASE
-    )
+    _LIKELY_DIFFUSION_RE = re.compile(r"(?:^|[\/\-_.])diffusion(?:[\/\-_.]|$)", re.IGNORECASE)
 
     @staticmethod
     def _is_likely_diffusion_model_name(*, model_identifier: str = "", hf_repo: str = "") -> bool:
