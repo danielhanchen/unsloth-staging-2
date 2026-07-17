@@ -111,6 +111,9 @@ export async function loadModel(
       ...payload,
       native_path_lease: payload.nativePathLease ?? null,
       nativePathLease: undefined,
+      // Pass through explicit GGUF placement so status-hydrated Apply restores them.
+      gpu_ids: payload.gpu_ids ?? null,
+      gguf_memory_mode: payload.gguf_memory_mode ?? null,
     }),
   });
   return parseJsonOrThrow<LoadModelResponse>(response);
@@ -131,6 +134,8 @@ export async function validateModel(
       // follow-up /load and doesn't unload for a load /load would then reject.
       max_seq_length: payload.max_seq_length,
       load_in_4bit: payload.load_in_4bit,
+      gpu_ids: payload.gpu_ids ?? null,
+      gguf_memory_mode: payload.gguf_memory_mode ?? null,
     }),
   });
   return parseJsonOrThrow<ValidateModelResponse>(response);

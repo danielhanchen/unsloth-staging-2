@@ -4231,6 +4231,14 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
+            elif get_device() == DeviceType.CPU:
+                raise HTTPException(
+                    status_code = 400,
+                    detail = (
+                        "gpu_ids selection is not supported: no GPU backend "
+                        "detected on this host."
+                    ),
+                )
         if not config.is_gguf and _mlx_distributed_launch_detected():
             raise HTTPException(
                 status_code = 400,
@@ -4852,6 +4860,14 @@ async def validate_model(
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
+            elif get_device() == DeviceType.CPU:
+                raise HTTPException(
+                    status_code = 400,
+                    detail = (
+                        "gpu_ids selection is not supported: no GPU backend "
+                        "detected on this host."
+                    ),
+                )
         effective_load_in_4bit = _effective_load_in_4bit(config, request.load_in_4bit)
 
         # Both checks cover the [adapter, base] set (matching the scan route and workers):

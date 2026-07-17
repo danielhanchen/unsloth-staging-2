@@ -601,6 +601,8 @@ export function useChatModelRuntime() {
           const loadCustomContextLength = stateBeforeUnload.customContextLength;
           const loadGgufContextLength = stateBeforeUnload.ggufContextLength;
           const loadTensorParallel = stateBeforeUnload.tensorParallel;
+          const loadGpuIds = stateBeforeUnload.activeGpuIds;
+          const loadMemoryMode = stateBeforeUnload.activeMemoryMode;
           const loadActivePresetSource = stateBeforeUnload.activePresetSource;
           const loadActiveGgufVariant = stateBeforeUnload.activeGgufVariant;
           let loadSpeculativeType = stateBeforeUnload.speculativeType;
@@ -633,6 +635,8 @@ export function useChatModelRuntime() {
               load_in_4bit: true,
               is_lora: isLora,
               gguf_variant: ggufVariant ?? null,
+              gpu_ids: loadGpuIds ?? null,
+              gguf_memory_mode: loadMemoryMode ?? null,
             });
             // Upgrade consent runs before the security dialogs; Accept installs and the load continues.
             if (validation.requires_transformers_upgrade) {
@@ -737,6 +741,8 @@ export function useChatModelRuntime() {
               speculative_type: loadSpeculativeType,
               spec_draft_n_max: loadSpecDraftNMax,
               tensor_parallel: loadTensorParallel,
+              gpu_ids: loadGpuIds ?? null,
+              gguf_memory_mode: loadMemoryMode ?? null,
             });
 
             // If cancelled while loading, don't update UI to show
@@ -954,6 +960,8 @@ export function useChatModelRuntime() {
                   // Restore the previous model in the split mode it was running,
                   // not the default layer split.
                   tensor_parallel: stateBeforeUnload.loadedTensorParallel ?? false,
+                  gpu_ids: stateBeforeUnload.activeGpuIds ?? null,
+                  gguf_memory_mode: stateBeforeUnload.activeMemoryMode ?? null,
                 });
                 useChatRuntimeStore.setState({
                   activeNativePathToken: previousActiveNativePathToken ?? null,

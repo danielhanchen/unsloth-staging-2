@@ -65,6 +65,10 @@ export interface LoadModelRequest {
    * of by layer for GGUF models. Multi-GPU only; no effect on a single GPU.
    */
   tensor_parallel?: boolean | null;
+  /** Physical GPU indices to pin the GGUF load to, or null for auto-selection. */
+  gpu_ids?: number[] | null;
+  /** GGUF memory placement mode: auto (default), pinned (--mlock), or resident (--no-mmap --mlock). */
+  gguf_memory_mode?: "auto" | "pinned" | "resident" | null;
 }
 
 export interface ValidateModelResponse {
@@ -158,7 +162,11 @@ export interface LoadModelResponse {
   speculative_type?: string | null;
   spec_draft_n_max?: number | null;
   /** Whether tensor-parallel split (--split-mode tensor) is active. */
-  tensor_parallel?: boolean;
+  tensor_parallel?: boolean | null;
+  /** Physical GPU indices to pin the GGUF load to, or null for auto-selection. */
+  gpu_ids?: number[] | null;
+  /** GGUF memory placement mode: auto (default), pinned (--mlock), or resident (--no-mmap --mlock). */
+  gguf_memory_mode?: "auto" | "pinned" | "resident" | null;
 }
 
 export interface UnloadModelRequest {
@@ -203,6 +211,10 @@ export interface InferenceStatusResponse {
   spec_draft_n_max?: number | null;
   /** Whether tensor-parallel split (--split-mode tensor) is active. */
   tensor_parallel?: boolean;
+  /** Physical GPU indices the active GGUF load is pinned to. */
+  gpu_ids?: number[] | null;
+  /** Active GGUF memory placement mode. */
+  gguf_memory_mode?: "auto" | "pinned" | "resident" | null;
   /**
    * Why MTP was disabled on the loaded model despite being requested.
    * "binary_no_mtp" / "binary_outdated" -> updating llama.cpp would re-enable

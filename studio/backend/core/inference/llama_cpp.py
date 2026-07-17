@@ -5946,16 +5946,22 @@ class LlamaCppBackend:
                             # _gpu_mem, but the caller's gpu_ids are physical
                             # CUDA IDs. Map physical IDs to their position in
                             # the parent-visible order so they match Vulkan0..N.
+                            # When no CUDA parent mask is available (e.g. pure
+                            # Vulkan host), use the supplied IDs directly as
+                            # Vulkan ordinals.
                             from utils.hardware import get_parent_visible_gpu_ids
 
                             parent_visible = get_parent_visible_gpu_ids()
-                            try:
-                                vulkan_ids = [parent_visible.index(g) for g in gpu_ids]
-                            except ValueError:
-                                raise ValueError(
-                                    f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
-                                ) from None
-                            allowed = set(vulkan_ids)
+                            if parent_visible:
+                                try:
+                                    vulkan_ids = [parent_visible.index(g) for g in gpu_ids]
+                                except ValueError:
+                                    raise ValueError(
+                                        f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
+                                    ) from None
+                                allowed = set(vulkan_ids)
+                            else:
+                                allowed = set(gpu_ids)
                         probe_listed_devices = bool(_gpu_mem)
                         _gpu_mem = [g for g in _gpu_mem if g[0] in allowed]
                         if not _gpu_mem and (is_vulkan_backend or probe_listed_devices):

@@ -743,6 +743,10 @@ type ChatRuntimeStore = {
   tensorParallel: boolean;
   /** Backend-reported tensor-parallel state; null until first hydrated. */
   loadedTensorParallel: boolean | null;
+  /** Physical GPU indices the active GGUF load is pinned to (from /status). */
+  activeGpuIds: number[] | null;
+  /** Active GGUF memory placement mode (from /status). */
+  activeMemoryMode: "auto" | "pinned" | "resident" | null;
   /** Persisted: when false, picking a local model stages it as
    *  `pendingSelection` (and opens settings) instead of loading immediately,
    *  so load settings can be set before the single load. */
@@ -1213,6 +1217,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   loadedSpecDraftNMax: null,
   tensorParallel: false,
   loadedTensorParallel: null,
+  activeGpuIds: null,
+  activeMemoryMode: null,
   loadOnSelection: loadBool(CHAT_LOAD_ON_SELECTION_KEY, true),
   expandQuantizations: loadBool(CHAT_EXPAND_QUANTIZATIONS_KEY, false),
   showAllQuantizations: loadBool(CHAT_SHOW_ALL_QUANTIZATIONS_KEY, true),
@@ -1455,6 +1461,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       loadedSpecDraftNMax: null,
       tensorParallel: false,
       loadedTensorParallel: null,
+      activeGpuIds: null,
+      activeMemoryMode: null,
       loadedIsMultimodal: false,
       loadedIsDiffusion: false,
       customContextLength: null,
