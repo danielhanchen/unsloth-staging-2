@@ -4263,14 +4263,15 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
-            elif get_device() == DeviceType.CPU and not await asyncio.to_thread(
-                get_llama_cpp_backend().has_gpu_backend
-            ):
-                # No CUDA namespace AND the GGUF backend probe (incl. Vulkan) finds no
-                # device -> genuinely GPU-less, so reject before any teardown. A
-                # torch-less Vulkan host also reports CPU but its probe is non-empty, so
-                # it falls through and the backend validates against the Vulkan probe
-                # instead of being wrongly rejected here (#7164/#7188).
+            elif not await asyncio.to_thread(get_llama_cpp_backend().has_gpu_backend):
+                # Non-CUDA GGUF host (CPU / MLX / XPU): the CUDA-oriented resolver can't
+                # enumerate the llama.cpp backend's devices, so gate on its probe. If the
+                # probe (incl. Vulkan) finds no selectable device -> reject before any
+                # teardown, so a request the backend can't honor doesn't unload the active
+                # model first (#7188). A torch-less Vulkan host reports CPU but its probe is
+                # non-empty, so it falls through and the backend validates against the Vulkan
+                # ordinal mapping; MLX/XPU builds whose non-Vulkan probe can't enumerate
+                # Metal/SYCL devices are rejected here rather than after unload (#7164/#7188).
                 raise HTTPException(
                     status_code = 400,
                     detail = (
@@ -4907,12 +4908,12 @@ async def validate_model(
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
-            elif get_device() == DeviceType.CPU and not await asyncio.to_thread(
-                get_llama_cpp_backend().has_gpu_backend
-            ):
-                # Mirror /load: reject only when genuinely GPU-less. A torch-less Vulkan
-                # host reports CPU but its probe is non-empty, so defer to the backend
-                # rather than reject before the frontend unloads (#7164/#7188).
+            elif not await asyncio.to_thread(get_llama_cpp_backend().has_gpu_backend):
+                # Mirror /load: gate on the llama.cpp probe for any non-CUDA GGUF host
+                # (CPU / MLX / XPU) so an unsupported selection is rejected before the
+                # frontend unloads to load this. A torch-less Vulkan host reports CPU but
+                # its probe is non-empty, so it falls through and the backend validates
+                # against the Vulkan ordinal mapping (#7164/#7188).
                 raise HTTPException(
                     status_code = 400,
                     detail = (

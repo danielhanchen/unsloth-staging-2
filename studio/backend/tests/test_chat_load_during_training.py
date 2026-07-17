@@ -689,6 +689,96 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertIn("no GPU backend", exc.exception.detail)
         self.assertEqual(captured, [])  # rejected before the guard / any teardown
 
+    def test_gguf_gpu_ids_rejected_on_mlx_xpu_host_before_teardown(self):
+        # On MLX/XPU hosts get_device() is neither CUDA nor CPU, so gpu_ids used to
+        # skip BOTH the CUDA resolver and the has_gpu_backend() preflight and only got
+        # rejected by load_model() after the route had already unloaded the active
+        # model. The preflight is now probe-gated for any non-CUDA host, so an
+        # unsupported selection (empty non-Vulkan probe) is rejected before any
+        # teardown, while a non-empty probe (e.g. a real Metal/SYCL device) still falls
+        # through to the backend (#7188).
+        from models.inference import ValidateModelRequest
+        from utils.hardware import DeviceType
+        for dev in (DeviceType.MLX, DeviceType.XPU):
+            with self.subTest(device = dev):
+                request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [0])
+                cfg = SimpleNamespace(
+                    identifier = "x.gguf",
+                    display_name = "x",
+                    is_gguf = True,
+                    is_lora = False,
+                    is_vision = False,
+                    path = None,
+                    base_model = None,
+                )
+                captured = []
+                with (
+                    patch.object(
+                        self.route,
+                        "_resolve_model_identifier_for_request",
+                        return_value = ("x.gguf", "x.gguf", False),
+                    ),
+                    patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+                    patch.object(self.route, "load_inference_config", return_value = {}),
+                    patch("utils.hardware.get_device", return_value = dev),
+                    patch(
+                        "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
+                        return_value = False,
+                    ),
+                    _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+                ):
+                    with self.assertRaises(HTTPException) as exc:
+                        asyncio.run(self.route.validate_model(request, current_subject = "u"))
+                self.assertEqual(exc.exception.status_code, 400)
+                self.assertIn("no GPU backend", exc.exception.detail)
+                self.assertEqual(captured, [])  # rejected before the guard / any teardown
+
+    def test_gguf_gpu_ids_deferred_to_backend_on_mlx_xpu_with_probe(self):
+        # The MLX/XPU preflight must NOT over-reject: when the backend probe DOES find a
+        # device (has_gpu_backend() True, e.g. a real Metal/SYCL build), the route falls
+        # through and lets the backend validate the selection rather than 400ing (#7188).
+        from models.inference import ValidateModelRequest
+        from utils.hardware import DeviceType
+        for dev in (DeviceType.MLX, DeviceType.XPU):
+            with self.subTest(device = dev):
+                request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [0])
+                cfg = SimpleNamespace(
+                    identifier = "x.gguf",
+                    display_name = "x",
+                    is_gguf = True,
+                    is_lora = False,
+                    is_vision = False,
+                    path = None,
+                    base_model = None,
+                )
+                captured = []
+
+                def _must_not_resolve(_ids):
+                    raise AssertionError("CUDA resolver must be skipped for GGUF on non-CUDA hosts")
+
+                with (
+                    patch.object(
+                        self.route,
+                        "_resolve_model_identifier_for_request",
+                        return_value = ("x.gguf", "x.gguf", False),
+                    ),
+                    patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+                    patch.object(self.route, "load_inference_config", return_value = {}),
+                    patch("utils.hardware.get_device", return_value = dev),
+                    patch(
+                        "utils.hardware.resolve_requested_gpu_ids",
+                        side_effect = _must_not_resolve,
+                    ),
+                    patch(
+                        "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
+                        return_value = True,
+                    ),
+                    _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+                ):
+                    resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
+                self.assertEqual(captured[0]["requested_gpu_ids"], [0])
+                self.assertTrue(resp.valid)
+
 
 # ── _estimate_gguf_required_gb (sizes the same weights the loader loads) ──────
 
