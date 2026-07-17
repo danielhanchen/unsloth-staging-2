@@ -3231,6 +3231,10 @@ def _request_matches_loaded_settings(
         # pinned server and leave the old placement active; keeping it forces a reload
         # so the auto scrub runs (#7164). A server loaded WITH a mode already had these
         # stripped at load, so backend_extra carries none and is unaffected.
+        # Explicit gpu_ids make the backend drop a user --device from both the launched
+        # and stored extras, so strip it request-side too or an otherwise identical reload
+        # would miss this fast path and force a needless reload / training 409 (#7188).
+        _strip_dev = request.gpu_ids is not None
         _request_extra = (
             strip_shadowing_flags(
                 request.llama_extra_args,
@@ -3239,9 +3243,10 @@ def _request_matches_loaded_settings(
                 strip_spec = False,
                 strip_template = False,
                 strip_split_mode = False,
-                strip_memory_mode = True,
+                strip_memory_mode = _strip_mem,
+                strip_device = _strip_dev,
             )
-            if _strip_mem
+            if (_strip_mem or _strip_dev)
             else list(request.llama_extra_args)
         )
         if _request_extra != backend_extra:
@@ -4244,17 +4249,26 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # skip it for GGUF and let the backend validate against its Vulkan probe.
         if effective_gpu_ids is not None:
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
-            if not config.is_gguf or get_device() == DeviceType.CUDA:
+
+            # A Vulkan llama-server build treats gpu_ids as Vulkan ordinals (never remapped
+            # through CUDA_VISIBLE_DEVICES), so defer it to the backend probe even on a
+            # CUDA-visible host -- else the CUDA resolver would 400 a valid Vulkan id under
+            # a CUDA/HIP mask (#7188).
+            _gguf_vulkan_build = config.is_gguf and await asyncio.to_thread(
+                get_llama_cpp_backend().is_vulkan_build
+            )
+            if not config.is_gguf or (get_device() == DeviceType.CUDA and not _gguf_vulkan_build):
                 try:
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
             else:
-                # Non-CUDA GGUF host (CPU / MLX / XPU): the CUDA resolver can't enumerate
-                # llama.cpp's devices, so gate on its probe and reject before any teardown
-                # (#7188). A torch-less Vulkan host reports CPU but its probe is non-empty
-                # so it falls through; MLX/XPU builds that can't enumerate Metal/SYCL are
-                # rejected here rather than after unload (#7164/#7188).
+                # Non-CUDA GGUF host (CPU / MLX / XPU) or a Vulkan build on any host: the
+                # CUDA resolver can't enumerate llama.cpp's devices, so gate on its probe
+                # and reject before any teardown (#7188). A torch-less Vulkan host reports
+                # CPU but its probe is non-empty so it falls through; MLX/XPU builds that
+                # can't enumerate Metal/SYCL are rejected here rather than after unload
+                # (#7164/#7188).
                 _llama_backend = get_llama_cpp_backend()
                 if not await asyncio.to_thread(_llama_backend.has_gpu_backend):
                     raise HTTPException(
@@ -4894,16 +4908,22 @@ async def validate_model(
         # CUDA resolver for GGUF on non-CUDA hosts; the backend uses the Vulkan probe.
         if effective_gpu_ids is not None:
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
-            if not config.is_gguf or get_device() == DeviceType.CUDA:
+
+            # Mirror /load: a Vulkan build's gpu_ids are Vulkan ordinals, so defer to the
+            # backend probe even on a CUDA-visible host (#7188).
+            _gguf_vulkan_build = config.is_gguf and await asyncio.to_thread(
+                get_llama_cpp_backend().is_vulkan_build
+            )
+            if not config.is_gguf or (get_device() == DeviceType.CUDA and not _gguf_vulkan_build):
                 try:
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
             else:
-                # Mirror /load: gate on the llama.cpp probe for a non-CUDA GGUF host so
-                # an unsupported selection is rejected before the frontend unloads. A
-                # torch-less Vulkan host reports CPU but its probe is non-empty, so it
-                # falls through (#7164/#7188).
+                # Mirror /load: gate on the llama.cpp probe for a non-CUDA GGUF host (or a
+                # Vulkan build on any host) so an unsupported selection is rejected before
+                # the frontend unloads. A torch-less Vulkan host reports CPU but its probe
+                # is non-empty, so it falls through (#7164/#7188).
                 _llama_backend = get_llama_cpp_backend()
                 if not await asyncio.to_thread(_llama_backend.has_gpu_backend):
                     raise HTTPException(

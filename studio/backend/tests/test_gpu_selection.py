@@ -918,6 +918,10 @@ class TestRouteErrors(unittest.TestCase):
                 # Route's non-CUDA gpu_ids guard probes this; a GPU is present here.
                 return True
 
+            def is_vulkan_build(self):
+                # Not a Vulkan build, so a CUDA host uses the CUDA resolver path.
+                return False
+
             def assert_requested_gpu_ids_resolvable(self, gpu_ids):
                 # [0, 1] is resolvable here, so this is a no-op.
                 return None

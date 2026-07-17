@@ -2718,6 +2718,15 @@ class LlamaCppBackend:
         except Exception:
             return True
 
+    def is_vulkan_build(self) -> bool:
+        """True if the resolved llama-server binary is a Vulkan build. The route uses this
+        to defer gpu_ids to the backend (which treats them as Vulkan ordinals) instead of
+        the CUDA physical-ID resolver even on a CUDA-visible host (#7188)."""
+        try:
+            return self._is_vulkan_backend(self._find_llama_server_binary())
+        except Exception:
+            return False
+
     def assert_requested_gpu_ids_resolvable(self, gpu_ids: Optional[list[int]]) -> None:
         """Raise ValueError if the requested gpu_ids can't be honored by the llama.cpp
         backend. Self-contained (finds the binary + probes) so the route can reject a
@@ -2752,11 +2761,17 @@ class LlamaCppBackend:
                     f"Invalid Vulkan gpu_ids {_requested}: IDs must be unique and non-negative."
                 )
             allowed = set(gpu_ids)
-        probe_listed_devices = bool(gpu_mem)
         matched = [g for g in gpu_mem if g[0] in allowed]
-        if not matched and (is_vulkan_backend or probe_listed_devices):
+        if gpu_mem:
+            # Every requested id must be present, not just one: a partial match like
+            # [0, 99] against a probe of [0] must be rejected, not silently narrowed to
+            # [0] (which would place the model on fewer GPUs than asked) (#7188).
+            if len(matched) != len(allowed):
+                raise ValueError(f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs")
+        elif is_vulkan_backend:
+            # Vulkan build with an empty probe: the ordinals can't be resolved.
             raise ValueError(f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs")
-        if not matched and not is_vulkan_backend:
+        else:
             from utils.hardware import get_parent_visible_gpu_ids
 
             parent_visible = get_parent_visible_gpu_ids()
@@ -6065,13 +6080,19 @@ class LlamaCppBackend:
                             allowed = set(gpu_ids)
                         probe_listed_devices = bool(_gpu_mem)
                         _gpu_mem = [g for g in _gpu_mem if g[0] in allowed]
-                        if not _gpu_mem and (is_vulkan_backend or probe_listed_devices):
-                            # Probe enumerated GPUs but none match (id absent), or a
+                        if probe_listed_devices and len(_gpu_mem) != len(allowed):
+                            # Probe enumerated GPUs but not ALL requested ids match: reject
+                            # rather than silently narrow (e.g. [0, 99] -> [0]), which would
+                            # place the model on fewer GPUs than asked (#7188).
+                            raise ValueError(
+                                f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
+                            )
+                        if not _gpu_mem and is_vulkan_backend and not probe_listed_devices:
                             # Vulkan build with no probe to map ids -- can't honor it.
                             raise ValueError(
                                 f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
                             )
-                        if not _gpu_mem and not is_vulkan_backend:
+                        if not _gpu_mem and not is_vulkan_backend and not probe_listed_devices:
                             # Empty non-Vulkan probe: a real GPU with telemetry down, or
                             # no GPU backend at all. The route skips the CUDA resolver for
                             # GGUF on non-CUDA hosts, so validate the mask HERE: a non-empty

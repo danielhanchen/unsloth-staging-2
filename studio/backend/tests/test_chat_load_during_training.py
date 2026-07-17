@@ -824,6 +824,56 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertIn("do not match any visible GPUs", exc.exception.detail)
         self.assertEqual(captured, [])  # rejected before the guard / any teardown
 
+    def test_gguf_cuda_host_vulkan_build_defers_to_backend(self):
+        # On a CUDA-visible host running a Vulkan build, gpu_ids are Vulkan ordinals, so
+        # the route must skip the CUDA physical-ID resolver and defer to the backend probe
+        # rather than 400 a valid Vulkan id under a CUDA mask (#7188).
+        from models.inference import ValidateModelRequest
+        from utils.hardware import DeviceType
+
+        request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [0])
+        cfg = SimpleNamespace(
+            identifier = "x.gguf",
+            display_name = "x",
+            is_gguf = True,
+            is_lora = False,
+            is_vision = False,
+            path = None,
+            base_model = None,
+        )
+        captured = []
+
+        def _must_not_resolve(_ids):
+            raise AssertionError("CUDA resolver must be skipped for a Vulkan build")
+
+        with (
+            patch.object(
+                self.route,
+                "_resolve_model_identifier_for_request",
+                return_value = ("x.gguf", "x.gguf", False),
+            ),
+            patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+            patch.object(self.route, "load_inference_config", return_value = {}),
+            patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
+            patch("utils.hardware.resolve_requested_gpu_ids", side_effect = _must_not_resolve),
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend.is_vulkan_build",
+                return_value = True,
+            ),
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend.has_gpu_backend",
+                return_value = True,
+            ),
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend.assert_requested_gpu_ids_resolvable",
+                return_value = None,
+            ),
+            _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+        ):
+            resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
+        self.assertEqual(captured[0]["requested_gpu_ids"], [0])
+        self.assertTrue(resp.valid)
+
 
 # ── _estimate_gguf_required_gb (sizes the same weights the loader loads) ──────
 

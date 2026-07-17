@@ -750,6 +750,25 @@ def test_explicit_pinned_dedupes_when_flags_already_applied():
     assert inference_routes._request_matches_loaded_settings(req, backend) is True
 
 
+def test_explicit_gpu_ids_dedupes_when_device_already_stripped():
+    """A GGUF loaded with explicit gpu_ids had a user --device stripped from its stored
+    extras. A repeat identical request re-sending --device must still dedupe: the request-
+    side strip (gated on gpu_ids) compares equal to the stripped backend extras, so the
+    load hits the fast path instead of a needless reload / training 409 (#7188)."""
+    from models.inference import LoadRequest
+
+    inference_routes = _load_inference_routes_module()
+
+    req = LoadRequest(
+        model_path = "owner/repo",
+        gpu_ids = [0],
+        llama_extra_args = ["--device", "Vulkan3", "--top-k", "5"],
+    )
+    backend = _mem_loaded_backend(memory_mode = None, extra_args = ["--top-k", "5"])
+    backend._gpu_ids = [0]
+    assert inference_routes._request_matches_loaded_settings(req, backend) is True
+
+
 def test_tensor_off_reload_requires_explicit_toggle():
     """An Apply that doesn't touch the toggle (e.g. a context change) isn't churned
     by the preserved-fallback reload -- the working server is kept (Codex #6659)."""

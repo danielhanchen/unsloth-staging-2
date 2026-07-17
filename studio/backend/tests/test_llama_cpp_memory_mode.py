@@ -806,6 +806,18 @@ def test_has_gpu_backend_accepts_parent_mask_when_probe_empty():
         assert backend.has_gpu_backend() is False
 
 
+def test_partial_gpu_ids_match_is_rejected():
+    """A partial match such as [0, 99] against a probe of [0] must be rejected, not
+    silently narrowed to [0] (which would place the model on fewer GPUs than the caller
+    asked for). Every requested id must be present, not just one (#7188)."""
+    probe = [(0, 10000, 16000)]
+    for is_vulkan in (True, False):
+        with pytest.raises(ValueError, match = "do not match any visible GPUs"):
+            LlamaCppBackend._assert_gpu_ids_resolvable([0, 99], probe, is_vulkan)
+        # A full match still passes.
+        LlamaCppBackend._assert_gpu_ids_resolvable([0], probe, is_vulkan)
+
+
 def test_explicit_gpu_ids_strips_stored_device_extra_args(tmp_path):
     """With explicit gpu_ids a user --device is dropped from BOTH the command and the
     PERSISTED extras, so a later same-model reload that inherits these (after gpu_ids is
