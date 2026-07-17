@@ -4187,9 +4187,13 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 from utils.models.gguf_metadata import is_diffusion_gguf
                 _is_diffusion = is_diffusion_gguf(config.gguf_file)
             elif config.gguf_hf_repo:
+                # Match "diffusiongemma" (no separator before "gemma") as well as a
+                # standalone "diffusion" segment, so the canonical google/diffusiongemma-*
+                # repo is rejected up front instead of only after the header read that
+                # follows the unload (#7188).
                 _is_diffusion = bool(
                     _re.search(
-                        r"(?:^|[\/\-_.])diffusion(?:[\/\-_.]|$)",
+                        r"(?:^|[\/\-_.])diffusion(?:gemma|[\/\-_.]|$)",
                         config.gguf_hf_repo,
                         _re.IGNORECASE,
                     )
