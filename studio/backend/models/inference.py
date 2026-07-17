@@ -62,11 +62,13 @@ class LoadRequest(BaseModel):
     @classmethod
     def normalize_blank_gguf_memory_mode(cls, value: Any) -> Any:
         # A settings form may serialize the default placement as "" (or whitespace).
-        # The backend canonicalizes blank / "auto" / None identically, so accept a
-        # blank string at the boundary by mapping it to None instead of failing the
-        # Literal validation with a 422 before canonicalization can run (#7164).
+        # Map a blank string to explicit "auto" (not None) so a default-selecting
+        # Apply is still treated as an explicit memory-mode choice: the route/backend
+        # only scrub inherited LLAMA_ARG_MLOCK / NO_MMAP / MMAP when the value is not
+        # None, so blank -> None would let those operator env vars survive instead of
+        # clearing to the memory-mapped default the user just selected (#7164).
         if isinstance(value, str) and value.strip() == "":
-            return None
+            return "auto"
         return value
 
     cache_type_kv: Optional[str] = Field(
@@ -164,10 +166,11 @@ class ValidateModelRequest(BaseModel):
     @field_validator("gguf_memory_mode", mode = "before")
     @classmethod
     def normalize_blank_gguf_memory_mode(cls, value: Any) -> Any:
-        # Mirror LoadRequest: accept a blank string (a form's serialized default)
-        # as None so validate and load agree, instead of a 422 (#7164).
+        # Mirror LoadRequest: a blank string (a form's serialized default) maps to
+        # explicit "auto" so validate and load agree and the inherited-env scrub is
+        # not silently skipped, instead of failing Literal validation with a 422 (#7164).
         if isinstance(value, str) and value.strip() == "":
-            return None
+            return "auto"
         return value
 
     include_context_length: bool = Field(

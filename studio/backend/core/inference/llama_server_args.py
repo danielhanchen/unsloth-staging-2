@@ -191,6 +191,12 @@ _MEMORY_MODE_FLAGS: frozenset[str] = frozenset({"--mlock", "--no-mmap", "--mmap"
 _SPLIT_MODE_FLAGS: frozenset[str] = frozenset({"-sm", "--split-mode"})
 _TENSOR_SPLIT_FLAGS: frozenset[str] = frozenset({"-ts", "--tensor-split"})
 _SPLIT_SHADOWING_FLAGS: frozenset[str] = _SPLIT_MODE_FLAGS | _TENSOR_SPLIT_FLAGS
+# llama.cpp's explicit offload device list (--device Vulkan0,Vulkan1 / -dev ...).
+# Not a general shadow flag (users may pass --device when Studio auto-selects), so
+# it is opt-in: stripped only when the first-class gpu_ids field is set, so an extras
+# --device can't last-wins-override the gpu_ids pin and offload to a GPU the training
+# guard and backend.gpu_ids never accounted for (#7188).
+_DEVICE_FLAGS: frozenset[str] = frozenset({"--device", "-dev"})
 
 _SHADOWING_FLAGS: frozenset[str] = (
     _CONTEXT_FLAGS
@@ -438,6 +444,7 @@ def strip_shadowing_flags(
     strip_template: bool = True,
     strip_split_mode: bool = True,
     strip_memory_mode: bool = True,
+    strip_device: bool = False,
 ) -> list[str]:
     """Strip flags that shadow first-class Studio settings.
 
@@ -445,7 +452,9 @@ def strip_shadowing_flags(
     inherited `-c 4096` can't override the current `max_seq_length`
     (same for cache / spec / template / split-mode / memory_mode). Each
     ``strip_*`` toggle controls one group; the route only strips groups whose
-    first-class field the caller actually supplied.
+    first-class field the caller actually supplied. ``strip_device`` is off by
+    default (users may pass ``--device`` when Studio auto-selects) and is enabled
+    only when explicit gpu_ids make the device placement authoritative.
     """
     shadowing: set[str] = set()
     if strip_context:
@@ -460,6 +469,8 @@ def strip_shadowing_flags(
         shadowing |= _SPLIT_SHADOWING_FLAGS
     if strip_memory_mode:
         shadowing |= _MEMORY_MODE_FLAGS
+    if strip_device:
+        shadowing |= _DEVICE_FLAGS
 
     tokens = [str(a) for a in (args or [])]
     out: list[str] = []

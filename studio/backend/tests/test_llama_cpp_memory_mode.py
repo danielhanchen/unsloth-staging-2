@@ -370,6 +370,88 @@ def test_empty_probe_still_rejects_vulkan_gpu_ids(tmp_path):
             )
 
 
+def test_empty_probe_rejects_gpu_ids_without_gpu_backend(tmp_path):
+    """A non-Vulkan build with an empty probe AND an empty parent-visible mask has no
+    GPU backend at all (CPU / Metal build). The route now skips resolve_requested_gpu_ids
+    for GGUF on non-CUDA hosts, so the backend must reject gpu_ids here rather than pin a
+    non-existent device and silently run on CPU while reporting backend.gpu_ids (#7188)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
+
+    with (
+        patch.object(subprocess, "Popen"),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
+    ):
+        with pytest.raises(ValueError, match = "no GPU backend"):
+            backend.load_model(
+                gguf_path = str(gguf),
+                model_identifier = "test",
+                gpu_ids = [0],
+            )
+
+
+def test_empty_probe_rejects_gpu_ids_outside_parent_mask(tmp_path):
+    """Empty non-Vulkan probe but a set parent-visible mask (real GPU, no telemetry):
+    a request outside that mask is a genuine 'no such GPU', so it must still raise
+    rather than pin an id the host can't offer (#7188)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
+
+    with (
+        patch.object(subprocess, "Popen"),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0, 1]),
+    ):
+        with pytest.raises(ValueError, match = "do not match any visible GPUs"):
+            backend.load_model(
+                gguf_path = str(gguf),
+                model_identifier = "test",
+                gpu_ids = [9],
+            )
+
+
+def test_vulkan_gpu_ids_strips_conflicting_user_device(tmp_path):
+    """On Vulkan the --device flag is the only device pin. When explicit gpu_ids is set,
+    a user --device in extras must be stripped so it can't last-wins-override Studio's pin
+    and offload to a GPU the training guard never budgeted (#7188). Studio's --device
+    survives; unrelated extras pass through."""
+    backend, gguf = _fit_fallback_backend(
+        tmp_path, gpu_memory = [(0, 10000, 16000), (1, 8000, 16000)], vulkan = True
+    )
+    backend._select_gpus = lambda *a, **k: ([0], False)
+
+    captured = {}
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 999
+
+            def __init__(self, cmd, **kwargs):
+                captured["cmd"] = list(cmd)
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with (
+        patch.object(subprocess, "Popen", side_effect = _make_fake_popen),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0, 1]),
+    ):
+        assert backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = [0],
+            extra_args = ["--device", "Vulkan1", "--top-k", "5"],
+        )
+
+    cmd = captured["cmd"]
+    # Studio pinned Vulkan0 (gpu_indices=[0]); the user's Vulkan1 override is gone.
+    assert "Vulkan1" not in cmd
+    device_idxs = [i for i, tok in enumerate(cmd) if tok == "--device"]
+    assert len(device_idxs) == 1
+    assert cmd[device_idxs[0] + 1] == "Vulkan0"
+    # Unrelated user extras still pass through.
+    assert "--top-k" in cmd and cmd[cmd.index("--top-k") + 1] == "5"
+
+
 def test_populated_probe_nonmatching_gpu_ids_still_raises(tmp_path):
     """When the probe DID enumerate GPUs but none match the request, the id is genuinely
     absent and the load must still raise (the empty-probe relaxation must not swallow
@@ -830,3 +912,39 @@ def test_diffusion_load_allows_default_memory_mode_and_clears_stale_state(tmp_pa
     )
     assert backend._gpu_ids is None
     assert backend._memory_mode is None
+
+
+@pytest.mark.parametrize(
+    "name,expected",
+    [
+        ("google/diffusiongemma-27b-it", True),  # canonical form: no separator before "gemma"
+        ("google/diffusion-gemma-27b", True),  # separated form
+        ("DiffusionGemma-2B", True),
+        ("/models/diffusion/llama.gguf", True),  # standalone "diffusion" segment
+        ("owner/llama-3-8b", False),
+        ("my-diffusionfoo-model", False),  # "diffusion" run into unrelated text
+    ],
+)
+def test_is_likely_diffusion_model_name_matches_diffusiongemma(name, expected):
+    """The pre-kill heuristic must match the canonical google/diffusiongemma-* form
+    (no separator before "gemma"), not just a standalone "diffusion" segment (#7188)."""
+    assert LlamaCppBackend._is_likely_diffusion_model_name(model_identifier = name) == expected
+
+
+def test_local_chat_gguf_in_diffusion_path_not_prekilled(tmp_path):
+    """A local chat GGUF whose path contains "diffusion" (e.g. /models/diffusion/x.gguf)
+    is NOT a diffusion model -- its header proves it. The Phase 0 name heuristic runs only
+    for HF loads, so an explicit gpu_ids on such a local chat GGUF must load normally
+    instead of being rejected on the path name before the header read (#7188)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [(0, 10000, 16000)])
+    backend._select_gpus = lambda *a, **k: ([0], False)
+
+    with patch.object(subprocess, "Popen"):
+        assert (
+            backend.load_model(
+                gguf_path = str(gguf),
+                model_identifier = "/models/diffusion/chat.gguf",
+                gpu_ids = [0],
+            )
+            is True
+        )

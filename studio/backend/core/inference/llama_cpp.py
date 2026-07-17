@@ -4959,10 +4959,11 @@ class LlamaCppBackend:
     )
 
     # Pre-kill check for block-diffusion model names (e.g. google/diffusiongemma-*)
-    # whose GGUF header is only readable after download (#7188).
-    _LIKELY_DIFFUSION_RE = re.compile(
-        r"(?:^|[\/\-_.])diffusion(?:[\/\-_.]|$)", re.IGNORECASE
-    )
+    # whose GGUF header is only readable after download (#7188). "diffusion" may run
+    # straight into "gemma" (diffusiongemma, no separator), so match that suffix too;
+    # a standalone "diffusion" segment (separator/end on both sides) still matches,
+    # while "diffusionfoo" does not.
+    _LIKELY_DIFFUSION_RE = re.compile(r"(?:^|[\/\-_.])diffusion(?:gemma|[\/\-_.]|$)", re.IGNORECASE)
 
     @staticmethod
     def _is_likely_diffusion_model_name(*, model_identifier: str = "", hf_repo: str = "") -> bool:
@@ -5638,8 +5639,13 @@ class LlamaCppBackend:
 
             # ── Phase 0: validate diffusion placement constraints before
             # tearing down the old server. The GGUF header is only readable
-            # after a download, so for HF-mode loads we use the model name.
-            _likely_diff = self._is_likely_diffusion_model_name(
+            # after a download, so for HF-mode loads we fall back to the repo
+            # name. Local loads are NOT name-matched here: the route already ran
+            # the authoritative is_diffusion_gguf header check on the local file,
+            # and _read_gguf_metadata / self._is_diffusion below re-confirm it, so
+            # a chat GGUF that merely lives in a ".../diffusion/..." path is not
+            # misrejected (#7188).
+            _likely_diff = hf_repo is not None and self._is_likely_diffusion_model_name(
                 model_identifier = model_identifier, hf_repo = hf_repo
             )
             if _likely_diff and gpu_ids is not None:
@@ -5972,19 +5978,34 @@ class LlamaCppBackend:
                             raise ValueError(
                                 f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
                             )
-                        # An empty CUDA/ROCm probe (probe_listed_devices is False) means
-                        # telemetry is unavailable, not that the GPU is absent: e.g. a
-                        # CUDA/ROCm llama.cpp build on a host without nvidia-smi and a
-                        # CPU-only torch. This path is reached only after the route's
-                        # resolve_requested_gpu_ids() already accepted the ids, which
-                        # requires a non-empty parent-visible mask -- in practice a set
-                        # CUDA_VISIBLE_DEVICES (the common containerized / pinned-visibility
-                        # case). Auto-selection loads here via --fit on, so the explicit
-                        # request must too: fall through with an empty candidate set and let
-                        # the --fit fallback below pin the validated mask. (When the mask is
-                        # ALSO empty -- CUDA_VISIBLE_DEVICES unset and no telemetry -- the
-                        # route rejects upfront; supporting that needs route-side relaxation,
-                        # tracked with the Vulkan-only case in #7201.)
+                        if not _gpu_mem and not is_vulkan_backend:
+                            # Empty non-Vulkan probe: telemetry may be unavailable on a
+                            # real GPU, or there may be no GPU backend at all (CPU / Metal
+                            # build). The route now skips resolve_requested_gpu_ids() for
+                            # GGUF on non-CUDA hosts (it cannot see Vulkan-only GPUs), so
+                            # validate the mask HERE instead of pinning blindly: a non-empty
+                            # parent-visible mask (e.g. a set CUDA_VISIBLE_DEVICES on a build
+                            # without nvidia-smi) is a real GPU with no telemetry -- fall
+                            # through and let the --fit fallback below pin it; an empty mask,
+                            # or an id outside it, means no such GPU, so reject rather than
+                            # pin a non-existent device and silently run on CPU (#7188).
+                            from utils.hardware import get_parent_visible_gpu_ids
+
+                            parent_visible = get_parent_visible_gpu_ids()
+                            if not parent_visible:
+                                raise ValueError(
+                                    f"Requested gpu_ids {list(gpu_ids)} but no GPU backend is "
+                                    "available (no GPU telemetry and no visible GPU mask); "
+                                    "omit gpu_ids to run on CPU."
+                                )
+                            _outside_mask = [g for g in gpu_ids if g not in parent_visible]
+                            if _outside_mask:
+                                raise ValueError(
+                                    f"Requested gpu_ids {list(gpu_ids)} do not match any "
+                                    f"visible GPUs {parent_visible}"
+                                )
+                            # Real GPU, telemetry down: fall through with an empty candidate
+                            # set and let the --fit fallback below pin the validated mask.
                     gpus = [(idx, free) for idx, free, _t in _gpu_mem]
                     total_by_idx = {idx: total for idx, _f, total in _gpu_mem}
 
@@ -6958,7 +6979,12 @@ class LlamaCppBackend:
                     extra_args = extra_args,
                     model_identifier = model_identifier,
                     model_path = model_path,
-                    gpus = bool(gpus),
+                    # GPU-backed iff the launch actually targets GPUs: a measured
+                    # probe (gpus) OR a resolved pin (gpu_indices). The no-telemetry
+                    # explicit-gpu_ids path pins via gpu_indices with an empty probe,
+                    # so keying off bool(gpus) alone would mistake it for a CPU launch
+                    # and pick the CPU spec-draft default (n=3 instead of n=2) (#7164).
+                    gpus = bool(gpus) or bool(gpu_indices),
                     binary = binary,
                     mtp_draft_path = launch_mtp_draft_path,
                 )
@@ -7061,7 +7087,10 @@ class LlamaCppBackend:
 
                 # Vulkan pins via --device (a cmd arg, unlike the env-based
                 # CUDA/ROCm pin below), emitted BEFORE user extras so llama.cpp's
-                # last-wins parsing lets a user --device override Studio's pick.
+                # last-wins parsing lets a user --device override Studio's pick
+                # when Studio auto-selected. An explicit gpu_ids overrides that:
+                # its --device is stripped from the user extras below so nothing
+                # can redirect the launch off the budgeted GPUs.
                 if is_vulkan_backend and gpu_indices is not None:
                     cmd += LlamaCppBackend._vulkan_pin_args(gpu_indices)
 
@@ -7069,8 +7098,33 @@ class LlamaCppBackend:
                 # lets the user override Studio's auto-set flags. Already
                 # validated by the route via validate_extra_args().
                 if extra_args:
-                    cmd.extend(str(a) for a in extra_args)
-                    logger.info(f"Appending user extra args to llama-server: {list(extra_args)}")
+                    _emit_extra_args = list(extra_args)
+                    if gpu_ids is not None:
+                        # gpu_ids is authoritative for device placement: drop a user
+                        # --device/-dev so it cannot last-wins-override the pin and
+                        # offload to a GPU the training guard and backend.gpu_ids never
+                        # accounted for (#7188). On Vulkan the --device pin above is the
+                        # only pin, so this is the guard-bypass fix; on CUDA/ROCm it also
+                        # keeps backend.gpu_ids honest. Other extras still pass through.
+                        _emit_extra_args = strip_shadowing_flags(
+                            extra_args,
+                            strip_context = False,
+                            strip_cache = False,
+                            strip_spec = False,
+                            strip_template = False,
+                            strip_split_mode = False,
+                            strip_memory_mode = False,
+                            strip_device = True,
+                        )
+                        if _emit_extra_args != list(extra_args):
+                            logger.info(
+                                "Dropped a user --device/-dev from extra args: explicit "
+                                "gpu_ids owns device placement."
+                            )
+                    cmd.extend(str(a) for a in _emit_extra_args)
+                    logger.info(
+                        f"Appending user extra args to llama-server: {list(_emit_extra_args)}"
+                    )
 
                 logger.info(f"Starting llama-server: {' '.join(self._redacted_cmd_for_log(cmd))}")
 

@@ -3143,13 +3143,20 @@ def _request_matches_loaded_settings(
     # tensor load isn't seen as a mismatch that needlessly reloads the server.
     backend_extra = list(llama_backend.extra_args) if llama_backend.extra_args else []
     fields_set = getattr(request, "model_fields_set", set())
+    # Strip inherited --mlock/--no-mmap/--mmap only when the request carries a real
+    # memory mode. Pydantic marks the field "set" even for an explicit null (a client
+    # echoing the status/load response, which is null for a no-mode load), but null ==
+    # None == "no opinion": the backend is then called with memory_mode=None and leaves
+    # placement alone, so stripping here would needlessly reload and drop the user's
+    # pass-through memory flags. Gate on the value, not merely model_fields_set (#7188).
+    _strip_mem = request.gguf_memory_mode is not None
     effective_extra = (
         request.llama_extra_args
         if request.llama_extra_args is not None
         else strip_shadowing_flags(
             backend_extra,
             strip_split_mode = _should_strip_split_mode(request, backend_extra),
-            strip_memory_mode = "gguf_memory_mode" in fields_set,
+            strip_memory_mode = _strip_mem,
         )
     )
     if not _tensor_parallel_matches_loaded(
@@ -3206,20 +3213,28 @@ def _request_matches_loaded_settings(
             and strip_shadowing_flags(
                 backend_extra,
                 strip_split_mode = _should_strip_split_mode(request, backend_extra),
-                strip_memory_mode = "gguf_memory_mode" in fields_set,
+                strip_memory_mode = _strip_mem,
             )
             != backend_extra
         ):
             return False
     else:
-        # Strip memory-placement flags from BOTH sides when the caller set a
-        # memory mode, mirroring how the reload strips explicit extras before
-        # storing them (load_model). Without this, an explicit request that
-        # repeats a --mlock/--mmap/--no-mmap already dropped by the loaded
-        # server misses this already-loaded fast path and, during active
-        # training, gets rejected by the coexistence guard even though the live
-        # placement already matches. Stripping backend_extra too is idempotent.
-        _strip_mem = "gguf_memory_mode" in fields_set
+        # Strip memory-placement flags from the REQUEST side only when the caller
+        # set a memory mode, mirroring how the reload strips explicit extras before
+        # storing them (load_model). Without this, an explicit request that repeats
+        # a --mlock/--mmap/--no-mmap already dropped by the loaded server misses this
+        # already-loaded fast path and, during active training, gets rejected by the
+        # coexistence guard even though the live placement already matches.
+        #
+        # The backend side is NOT stripped: a server that loaded with no memory_mode
+        # keeps a pass-through --mlock/--no-mmap in its stored extras and is still
+        # mlocked. Stripping it here would make an explicit auto (which clears that
+        # placement on reload) compare equal and wrongly dedupe to the pinned server,
+        # leaving the old placement active. Keeping the flag makes the mismatch force
+        # a reload so the auto scrub runs (#7164). A server that loaded WITH a mode
+        # already had these flags stripped at load, so backend_extra carries none and
+        # the comparison is unaffected in that case. (_strip_mem is gated on a real
+        # memory-mode value above, so an explicit null does not trigger this strip.)
         _request_extra = (
             strip_shadowing_flags(
                 request.llama_extra_args,
@@ -3233,20 +3248,7 @@ def _request_matches_loaded_settings(
             if _strip_mem
             else list(request.llama_extra_args)
         )
-        _backend_extra_cmp = (
-            strip_shadowing_flags(
-                backend_extra,
-                strip_context = False,
-                strip_cache = False,
-                strip_spec = False,
-                strip_template = False,
-                strip_split_mode = False,
-                strip_memory_mode = True,
-            )
-            if _strip_mem
-            else backend_extra
-        )
-        if _request_extra != _backend_extra_cmp:
+        if _request_extra != backend_extra:
             return False
     # A separate drafter (Gemma's root mtp-*.gguf) appearing or disappearing
     # next to the loaded weights changes the launch command (--model-draft),
@@ -4190,11 +4192,18 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
             _is_diffusion = False
             if config.gguf_file:
                 from utils.models.gguf_metadata import is_diffusion_gguf
-
                 _is_diffusion = is_diffusion_gguf(config.gguf_file)
             elif config.gguf_hf_repo:
+                # Match "diffusiongemma" (no separator before "gemma") as well as a
+                # standalone "diffusion" segment, so the canonical google/diffusiongemma-*
+                # repo is rejected up front instead of only after the header read that
+                # follows the unload (#7188).
                 _is_diffusion = bool(
-                    _re.search(r'(?:^|[\/\-_.])diffusion(?:[\/\-_.]|$)', config.gguf_hf_repo, _re.IGNORECASE)
+                    _re.search(
+                        r"(?:^|[\/\-_.])diffusion(?:gemma|[\/\-_.]|$)",
+                        config.gguf_hf_repo,
+                        _re.IGNORECASE,
+                    )
                 )
             if _is_diffusion:
                 if request.gpu_ids:
@@ -4225,7 +4234,6 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # its Vulkan probe / ordinal mapping instead.
         if effective_gpu_ids is not None:
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
-
             if not config.is_gguf or get_device() == DeviceType.CUDA:
                 try:
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
@@ -4356,7 +4364,10 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                         strip_split_mode = _should_strip_split_mode(
                             request, llama_backend.extra_args
                         ),
-                        strip_memory_mode = "gguf_memory_mode" in fields_set,
+                        # Only strip inherited memory flags for a real mode value; an
+                        # explicit null (Pydantic still marks it "set") means "no
+                        # opinion", so preserve the pass-through placement (#7188).
+                        strip_memory_mode = request.gguf_memory_mode is not None,
                     )
                     try:
                         extra_llama_args = validate_extra_args(stripped)
@@ -4854,7 +4865,6 @@ async def validate_model(
         # validates against the Vulkan probe instead.
         if effective_gpu_ids is not None:
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
-
             if not config.is_gguf or get_device() == DeviceType.CUDA:
                 try:
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)

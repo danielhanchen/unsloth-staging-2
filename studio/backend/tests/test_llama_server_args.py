@@ -373,6 +373,36 @@ def test_strip_shadowing_flags_keeps_spec_when_spec_disabled():
     assert out == ["--spec-type", "ngram-mod", "--draft-min", "48", "--top-k", "20"]
 
 
+def test_strip_shadowing_flags_keeps_device_by_default():
+    # --device is pass-through by default (users may pin when Studio auto-selects).
+    out = strip_shadowing_flags(
+        ["--device", "Vulkan1", "--top-k", "20"],
+        strip_context = False,
+        strip_cache = False,
+        strip_spec = False,
+        strip_template = False,
+        strip_split_mode = False,
+        strip_memory_mode = False,
+    )
+    assert out == ["--device", "Vulkan1", "--top-k", "20"]
+
+
+def test_strip_shadowing_flags_drops_device_when_requested():
+    # strip_device drops --device/-dev + value when explicit gpu_ids owns placement.
+    for flag in ("--device", "-dev"):
+        out = strip_shadowing_flags(
+            [flag, "Vulkan1", "--top-k", "20"],
+            strip_context = False,
+            strip_cache = False,
+            strip_spec = False,
+            strip_template = False,
+            strip_split_mode = False,
+            strip_memory_mode = False,
+            strip_device = True,
+        )
+        assert out == ["--top-k", "20"], flag
+
+
 def test_strip_shadowing_flags_drops_mtp_flags_when_requested():
     # MTP / draft-mtp flags must drop when speculative_type re-applies.
     out = strip_shadowing_flags(
