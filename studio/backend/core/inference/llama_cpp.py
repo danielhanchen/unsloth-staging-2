@@ -5956,7 +5956,6 @@ class LlamaCppBackend:
                             # Vulkan host), use the supplied IDs directly as
                             # Vulkan ordinals.
                             from utils.hardware import get_parent_visible_gpu_ids
-
                             parent_visible = get_parent_visible_gpu_ids()
                             if parent_visible:
                                 try:
