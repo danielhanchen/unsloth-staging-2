@@ -558,12 +558,14 @@ def _mem_env_backend(gguf):
 
 @pytest.mark.parametrize(
     "mode,scrubbed",
-    [("auto", True), ("pinned", True), ("resident", True), (None, False)],
+    [("auto", True), ("pinned", True), ("resident", True), (None, True)],
 )
 def test_memory_mode_scrubs_inherited_mmap_env(tmp_path, monkeypatch, mode, scrubbed):
-    """An explicit memory_mode strips inherited LLAMA_ARG_MLOCK/NO_MMAP/MMAP so
+    """Every GGUF launch strips inherited LLAMA_ARG_MLOCK/NO_MMAP/MMAP so
     llama-server can't silently run a placement Studio did not select (#7164).
-    memory_mode=None (no opinion) leaves any operator env untouched."""
+    memory_mode=None canonicalizes to the same default placement as 'auto', so it
+    scrubs too: otherwise a None-loaded child could keep inherited mlock/no-mmap
+    that a later explicit 'auto' (deduped to None) could never clear."""
     monkeypatch.setenv("LLAMA_ARG_MLOCK", "1")
     monkeypatch.setenv("LLAMA_ARG_NO_MMAP", "1")
     monkeypatch.setenv("LLAMA_ARG_MMAP", "true")

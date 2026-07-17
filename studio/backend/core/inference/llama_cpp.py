@@ -5904,10 +5904,16 @@ class LlamaCppBackend:
                         # An empty CUDA/ROCm probe (probe_listed_devices is False) means
                         # telemetry is unavailable, not that the GPU is absent: e.g. a
                         # CUDA/ROCm llama.cpp build on a host without nvidia-smi and a
-                        # CPU-only torch. The route already validated gpu_ids against the
-                        # parent-visible mask, and auto-selection loads here via --fit on,
-                        # so the explicit request must too. Fall through with an empty
-                        # candidate set; the --fit fallback below pins the validated mask.
+                        # CPU-only torch. This path is reached only after the route's
+                        # resolve_requested_gpu_ids() already accepted the ids, which
+                        # requires a non-empty parent-visible mask -- in practice a set
+                        # CUDA_VISIBLE_DEVICES (the common containerized / pinned-visibility
+                        # case). Auto-selection loads here via --fit on, so the explicit
+                        # request must too: fall through with an empty candidate set and let
+                        # the --fit fallback below pin the validated mask. (When the mask is
+                        # ALSO empty -- CUDA_VISIBLE_DEVICES unset and no telemetry -- the
+                        # route rejects upfront; supporting that needs route-side relaxation,
+                        # tracked with the Vulkan-only case in #7201.)
                     gpus = [(idx, free) for idx, free, _t in _gpu_mem]
                     total_by_idx = {idx: total for idx, _f, total in _gpu_mem}
 
@@ -7010,11 +7016,19 @@ class LlamaCppBackend:
                 # llama-server honors LLAMA_ARG_MLOCK/NO_MMAP/MMAP only where Studio
                 # emits no CLI flag for that param, so an inherited env could run an
                 # explicit 'auto' mlocked/no-mmap or silently turn 'pinned' into
-                # 'resident'. Scrub them when the caller supplied a mode (mirrors the
-                # LLAMA_ARG_THREADS / split / cache scrubs).
-                if memory_mode is not None:
-                    for _mm_var in ("LLAMA_ARG_MLOCK", "LLAMA_ARG_NO_MMAP", "LLAMA_ARG_MMAP"):
-                        env.pop(_mm_var, None)
+                # 'resident'. Scrub on every GGUF launch, not just when a mode was
+                # named: Studio's field (default 'auto' = memory-mapped) is
+                # authoritative, and an omitted mode canonicalizes to the same
+                # placement as 'auto'. If only a named mode scrubbed, a child
+                # launched with memory_mode=None could keep inherited mlock/no-mmap
+                # flags that a later explicit 'auto' could never clear -- the
+                # reload-dedup canonicalizes auto and None together and would treat
+                # the request as already loaded. Always scrubbing makes that stale
+                # state unreachable (an operator who wants pinning uses
+                # memory_mode='pinned'). Mirrors the LLAMA_ARG_THREADS / split /
+                # cache scrubs.
+                for _mm_var in ("LLAMA_ARG_MLOCK", "LLAMA_ARG_NO_MMAP", "LLAMA_ARG_MMAP"):
+                    env.pop(_mm_var, None)
 
                 # Reconcile the inherited LLAMA_ARG_* env with Studio's final
                 # decision: stripping CLI extras on a tensor->layer downgrade
