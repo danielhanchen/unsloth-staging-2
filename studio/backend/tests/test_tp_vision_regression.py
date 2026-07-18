@@ -205,9 +205,9 @@ def test_tensor_split_abort_recorded_early_on_first_spawn():
     assert idx != -1, "load_model must record a (binary, model) tensor-split abort"
     guard = src[max(0, idx - 600) : idx]
     assert "self._tensor_parallel" in guard
-    assert "_should_record_tensor_split_abort" in guard, (
-        "record must be gated on the marker-plus-hard-crash decision helper"
-    )
+    assert (
+        "_should_record_tensor_split_abort" in guard
+    ), "record must be gated on the marker-plus-hard-crash decision helper"
     # Recorded before the flash-attn-off retry, not after the full ladder.
     fa_off = src.find("_with_flash_attn_off")
     assert 0 <= idx < fa_off, "recording must latch on the first spawn, before flash-off"
@@ -311,9 +311,9 @@ def test_tensor_abort_cache_invalidated_on_binary_mtime_change(tmp_path):
         # Simulate an in-place update bumping the binary's mtime.
         st = binp.stat()
         os.utime(p, (st.st_atime, st.st_mtime + 10))
-        assert LlamaCppBackend._tensor_split_aborts(p, "m") is False, (
-            "a binary swapped in place (new mtime) must be re-probed"
-        )
+        assert (
+            LlamaCppBackend._tensor_split_aborts(p, "m") is False
+        ), "a binary swapped in place (new mtime) must be re-probed"
         # A same-second replacement (sub-second mtime bump) must also re-probe:
         # second-resolution mtime would inherit the stale abort (reviewer.py P2).
         sec_ns = (binp.stat().st_mtime_ns // 1_000_000_000) * 1_000_000_000
@@ -321,9 +321,9 @@ def test_tensor_abort_cache_invalidated_on_binary_mtime_change(tmp_path):
         LlamaCppBackend._record_tensor_split_abort(p, "m")
         binp.write_text("v2")
         os.utime(p, ns = (sec_ns, sec_ns + 1))
-        assert LlamaCppBackend._tensor_split_aborts(p, "m") is False, (
-            "a same-second in-place swap (ns mtime bump) must be re-probed"
-        )
+        assert (
+            LlamaCppBackend._tensor_split_aborts(p, "m") is False
+        ), "a same-second in-place swap (ns mtime bump) must be re-probed"
     finally:
         for key in list(LlamaCppBackend._tensor_split_abort_keys):
             if key and key[0] == p:
@@ -354,9 +354,9 @@ def test_budget_downgrade_preserves_multi_gpu_intent():
     assert budget != -1
     block = src[budget : budget + 1000]
     assert "tensor_parallel = False" in block
-    assert "_layer_min_gpus = max(_layer_min_gpus, len(tp_gpus))" in block, (
-        "the budget downgrade must preserve multi-GPU intent like the vision gate"
-    )
+    assert (
+        "_layer_min_gpus = max(_layer_min_gpus, len(tp_gpus))" in block
+    ), "the budget downgrade must preserve multi-GPU intent like the vision gate"
 
 
 def test_compute_buffer_downgrade_preserves_multi_gpu_intent():
@@ -371,9 +371,9 @@ def test_compute_buffer_downgrade_preserves_multi_gpu_intent():
     assert nxt != -1
     block = src[gate:nxt]
     assert "tensor_parallel = False" in block
-    assert "_layer_min_gpus = max(_layer_min_gpus, len(gpus))" in block, (
-        "the compute-buffer downgrade must preserve multi-GPU intent like the others"
-    )
+    assert (
+        "_layer_min_gpus = max(_layer_min_gpus, len(gpus))" in block
+    ), "the compute-buffer downgrade must preserve multi-GPU intent like the others"
 
 
 def test_tensor_split_layer_min_gpus_bump_requires_tensor_request():
@@ -420,9 +420,9 @@ def test_auto_context_layer_loops_capped_to_usable_gpus():
     """The auto-context loops bypass _select_gpus, so they apply its cap: a card
     counts only if usable VRAM clears the per-device layer overhead (#6659)."""
     src = inspect.getsource(LlamaCppBackend.load_model)
-    assert "range(max(1, _layer_min_gpus), len(ranked) + 1)" not in src, (
-        "auto-context loops must cap _layer_min_gpus to usable GPUs, not use it raw"
-    )
+    assert (
+        "range(max(1, _layer_min_gpus), len(ranked) + 1)" not in src
+    ), "auto-context loops must cap _layer_min_gpus to usable GPUs, not use it raw"
     assert "_auto_min_gpus" in src
     assert "range(_auto_min_gpus, len(ranked) + 1)" in src
     # the eligibility threshold is the per-device layer overhead, not bare > 0
@@ -577,9 +577,9 @@ def test_fit_off_retry_skipped_on_split_axis_abort():
     assert retry != -1
     guard = src[max(0, retry - 1000) : retry]
     assert "_fit_retry_allowed" in guard and "_startup_crashed" in guard
-    assert "not _split_axis_crash" in guard, (
-        "the fit-off retry must be skipped when the crash is a split-axis abort"
-    )
+    assert (
+        "not _split_axis_crash" in guard
+    ), "the fit-off retry must be skipped when the crash is a split-axis abort"
 
 
 def test_is_abort_exit_recognizes_windows_crt_abort():
@@ -885,9 +885,9 @@ def test_layer_min_gpus_bound_before_gpu_selection_try():
     try_body = src.find("gguf_size = self._get_gguf_size_bytes")
     fit_except = src.find("GPU selection failed")
     use_after = src.find("self._layer_preserves_tensor_intent = _layer_min_gpus > 1")
-    assert -1 < init < try_body < fit_except < use_after, (
-        "the init must precede the try body, the except, and the command-builder use"
-    )
+    assert (
+        -1 < init < try_body < fit_except < use_after
+    ), "the init must precede the try body, the except, and the command-builder use"
 
 
 def test_already_in_target_state_reloads_on_tensor_off_after_fallback():
