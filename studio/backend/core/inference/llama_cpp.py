@@ -1808,7 +1808,9 @@ class LlamaCppBackend:
 
     @property
     def memory_mode(self) -> Optional[str]:
-        """GGUF memory placement mode of the active load (auto/pinned/resident)."""
+        """GGUF memory placement mode of the active load (auto/pinned/resident).
+        Auto is canonicalised to None for dedup; use requested_memory_mode for the
+        original user-requested value."""
         return self._memory_mode
 
     @property

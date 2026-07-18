@@ -4278,6 +4278,20 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                         "detected on this host."
                     ),
                 )
+        if (
+            config.is_gguf
+            and effective_gpu_ids is not None
+            and not await asyncio.to_thread(
+                get_llama_cpp_backend().has_gpu_backend
+            )
+        ):
+            raise HTTPException(
+                status_code = 400,
+                detail = (
+                    "gpu_ids selection requires a GPU-capable llama.cpp binary. "
+                    "The installed llama-server build does not report a GPU backend."
+                ),
+            )
         if not config.is_gguf and _mlx_distributed_launch_detected():
             raise HTTPException(
                 status_code = 400,
@@ -4920,6 +4934,20 @@ async def validate_model(
                         "detected on this host."
                     ),
                 )
+        if (
+            config.is_gguf
+            and effective_gpu_ids is not None
+            and not await asyncio.to_thread(
+                get_llama_cpp_backend().has_gpu_backend
+            )
+        ):
+            raise HTTPException(
+                status_code = 400,
+                detail = (
+                    "gpu_ids selection requires a GPU-capable llama.cpp binary. "
+                    "The installed llama-server build does not report a GPU backend."
+                ),
+            )
         effective_load_in_4bit = _effective_load_in_4bit(config, request.load_in_4bit)
 
         # Both checks cover the [adapter, base] set (matching the scan route and workers):

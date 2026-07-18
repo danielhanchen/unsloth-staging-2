@@ -239,22 +239,19 @@ export function applyActiveModelStatusToStore(
         tensorParallel: status.tensor_parallel,
         loadedTensorParallel: status.tensor_parallel,
       }),
+    // Sync GGUF placement fields whenever the backend reflects a different
+    // value than the store, not only on model change. This catches reloads
+    // from another tab/API where the same checkpoint was placed differently.
     ...(seedLoadParams &&
-      prevState.activeGpuIds === null && {
-        activeGpuIds: status.gpu_ids ?? null,
-      }),
+      (prevState.activeGpuIds !== (status.gpu_ids ?? null)
+        ? { activeGpuIds: status.gpu_ids ?? null }
+        : {}),
+    ),
     ...(seedLoadParams &&
-      prevState.activeMemoryMode === null && {
-        activeMemoryMode: status.gguf_memory_mode ?? null,
-      }),
-    // Overwrite stale GGUF placement when the backend model changed, even if
-    // the fields were already seeded for the prior model. A non-GGUF status
-    // carries null for these fields so they are cleared naturally.
-    ...(seedLoadParams &&
-      hydratingExistingModel && {
-        activeGpuIds: status.gpu_ids ?? null,
-        activeMemoryMode: status.gguf_memory_mode ?? null,
-      }),
+      (prevState.activeMemoryMode !== (status.gguf_memory_mode ?? null)
+        ? { activeMemoryMode: status.gguf_memory_mode ?? null }
+        : {}),
+    ),
     ...(status.chat_template_override !== undefined &&
       prevState.loadedChatTemplateOverride === null &&
       prevState.chatTemplateOverride === null && {
