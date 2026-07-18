@@ -2798,11 +2798,8 @@ class LlamaCppBackend:
             return f"ggml-{name}.dll" if sys.platform == "win32" else f"libggml-{name}.so"
 
         def _has_lib(name):
-            # Match the exact soname AND versioned variants (e.g. libggml-cuda.so.0),
-            # which distro-packaged / split-lib llama.cpp builds ship on Linux. An
-            # exact-only check would miss a versioned GPU lib and falsely flag a real
-            # GPU build as CPU-only (rejecting a valid gpu_ids pin), and would miss a
-            # versioned CPU lib and fail to recognize a genuine CPU-only build (#7188).
+            # Match the exact soname and versioned variants (e.g. libggml-cuda.so.0),
+            # as shipped by distro-packaged / split-lib llama.cpp builds (#7188).
             stem = _lib(name)
             try:
                 return any(
@@ -2815,8 +2812,7 @@ class LlamaCppBackend:
 
         if any(_has_lib(b) for b in ("vulkan", "cuda", "hip")):
             return False  # a GPU ggml backend is present -> the pin can be honored
-        # No GPU lib: only CPU-only when a CPU/base ggml lib is present, proving the
-        # split-lib layout is in use (not a static build) and GPU support is truly absent.
+        # No GPU lib: CPU-only only if a CPU/base ggml lib proves the split-lib layout (not a static build).
         return any(_has_lib(b) for b in ("cpu", "base"))
 
     @staticmethod
@@ -7631,17 +7627,10 @@ class LlamaCppBackend:
                         if _ct_raw and _ct_raw not in self._TENSOR_PARALLEL_KV_TYPES:
                             env.pop(_ct_var, None)
 
-                # An explicit gpu_ids pin owns device placement: Studio steers the
-                # child via CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES (CUDA/ROCm) or
-                # a --device Vulkan<i> flag (Vulkan). llama.cpp also honors
-                # LLAMA_ARG_DEVICE (the env form of --device), and on the CUDA/ROCm
-                # path Studio emits no --device flag, so an inherited LLAMA_ARG_DEVICE
-                # would win and could steer offload off the pinned cards (or to
-                # 'none' -> CPU) while /load reports a GPU-pinned success. Scrub it so
-                # the pin can't be overridden, mirroring _strip_device_extra_args on
-                # the CLI side and the split / tensor / memory env scrubs above. Only
-                # under an explicit pin: without gpu_ids the operator's
-                # LLAMA_ARG_DEVICE inheritance stays intact (pre-PR behavior).
+                # Under an explicit gpu_ids pin, scrub inherited LLAMA_ARG_DEVICE (env form
+                # of --device): on the CUDA/ROCm path Studio emits no --device flag, so it
+                # would otherwise override the pin and steer offload off the pinned cards
+                # (or to 'none' -> CPU). Without a pin, inheritance is left intact.
                 if gpu_ids is not None:
                     env.pop("LLAMA_ARG_DEVICE", None)
 

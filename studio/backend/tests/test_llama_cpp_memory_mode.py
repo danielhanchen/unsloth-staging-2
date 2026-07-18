@@ -961,17 +961,16 @@ def test_backend_lacks_gpu_lib_detection(tmp_path):
     with patch("core.inference.llama_cpp._llama_lib_dir", return_value = _lib_dir_with()):
         assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is False
 
-    # Versioned sonames (distro-packaged builds ship e.g. libggml-cuda.so.0) are matched
-    # too. A versioned GPU lib next to an unversioned CPU lib is a real GPU build -> False;
-    # an exact-only check would miss the versioned GPU lib and falsely reject the pin (#7188).
+    # Versioned sonames (e.g. libggml-cuda.so.0) are matched too: a versioned GPU lib
+    # next to an unversioned CPU lib is a real GPU build -> False (#7188).
     for gpu in ("cuda", "hip", "vulkan"):
         d = tmp_path / f"libsv_cpu_{gpu}"
         d.mkdir()
-        (d / f"{pre}ggml-cpu.{ext}").write_bytes(b"x")  # unversioned CPU lib
-        (d / f"{pre}ggml-{gpu}.{ext}.0").write_bytes(b"x")  # versioned GPU lib
+        (d / f"{pre}ggml-cpu.{ext}").write_bytes(b"x")
+        (d / f"{pre}ggml-{gpu}.{ext}.0").write_bytes(b"x")
         with patch("core.inference.llama_cpp._llama_lib_dir", return_value = d):
             assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is False
-    # A versioned CPU-only lib is still recognized as a CPU-only build -> True.
+    # A versioned CPU-only lib is still recognized as CPU-only -> True.
     d = tmp_path / "libsv_cpu_only"
     d.mkdir()
     (d / f"{pre}ggml-cpu.{ext}.0").write_bytes(b"x")
