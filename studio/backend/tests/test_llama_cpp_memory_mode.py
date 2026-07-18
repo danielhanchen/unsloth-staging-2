@@ -648,6 +648,62 @@ def test_gpu_ids_preserved_on_fit_fallback(tmp_path):
     assert captured_envs[-1]["CUDA_VISIBLE_DEVICES"] == "1,2"
 
 
+@pytest.mark.parametrize("gpu_ids,scrubbed", [([1, 2], True), (None, False)])
+def test_gpu_ids_scrubs_inherited_llama_arg_device(tmp_path, monkeypatch, gpu_ids, scrubbed):
+    """An explicit gpu_ids pin owns device placement, so an inherited LLAMA_ARG_DEVICE (the
+    env form of llama.cpp --device) is scrubbed from the child env -- otherwise it would
+    steer offload off the pinned cards (or to 'none' -> CPU) while /load reports a GPU-pinned
+    success. Without gpu_ids the operator's LLAMA_ARG_DEVICE inheritance is left intact,
+    mirroring the memory/split/tensor env scrubs (backwards compatible) (#7188)."""
+    monkeypatch.setenv("LLAMA_ARG_DEVICE", "CUDA3")
+
+    gguf = tmp_path / "model.gguf"
+    _write_minimal_gguf(gguf)
+
+    backend = LlamaCppBackend()
+    backend._get_gpu_memory = lambda _binary = None: [
+        (0, 10000, 16000),
+        (1, 8000, 16000),
+        (2, 6000, 16000),
+    ]
+    backend._read_gguf_metadata = lambda _p: None
+    backend._can_estimate_kv = lambda: False
+    backend._get_gguf_size_bytes = lambda _p: 1024
+    backend._mmproj_vram_bytes = lambda _p: 0
+    backend._resolve_launch_mmproj_path = lambda **k: None
+    backend._apu_ram_shortfall_message = lambda *a, **k: None
+    backend._amd_apu_wants_unified_memory = lambda *a, **k: False
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._select_gpus = lambda *a, **k: ((list(gpu_ids) if gpu_ids else [0]), False)
+    backend._wait_for_health = lambda timeout: True
+    backend._detect_audio_type_strict = lambda: None
+    backend._apply_detected_audio = lambda _d: True
+
+    captured_envs = []
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                captured_envs.append(kwargs.get("env") or dict(os.environ))
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with patch.object(subprocess, "Popen", side_effect = _make_fake_popen):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = gpu_ids,
+        )
+
+    assert captured_envs, "llama-server was not spawned"
+    assert ("LLAMA_ARG_DEVICE" not in captured_envs[-1]) == scrubbed
+
+
 def test_memory_mode_clears_inherited_mmap_env_vars(tmp_path):
     """An explicit memory_mode must clear stale LLAMA_ARG_* env vars."""
     gguf = tmp_path / "model.gguf"
@@ -904,6 +960,23 @@ def test_backend_lacks_gpu_lib_detection(tmp_path):
     # No ggml libs at all (static / unrecognized) -> False (never falsely reject).
     with patch("core.inference.llama_cpp._llama_lib_dir", return_value = _lib_dir_with()):
         assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is False
+
+    # Versioned sonames (distro-packaged builds ship e.g. libggml-cuda.so.0) are matched
+    # too. A versioned GPU lib next to an unversioned CPU lib is a real GPU build -> False;
+    # an exact-only check would miss the versioned GPU lib and falsely reject the pin (#7188).
+    for gpu in ("cuda", "hip", "vulkan"):
+        d = tmp_path / f"libsv_cpu_{gpu}"
+        d.mkdir()
+        (d / f"{pre}ggml-cpu.{ext}").write_bytes(b"x")  # unversioned CPU lib
+        (d / f"{pre}ggml-{gpu}.{ext}.0").write_bytes(b"x")  # versioned GPU lib
+        with patch("core.inference.llama_cpp._llama_lib_dir", return_value = d):
+            assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is False
+    # A versioned CPU-only lib is still recognized as a CPU-only build -> True.
+    d = tmp_path / "libsv_cpu_only"
+    d.mkdir()
+    (d / f"{pre}ggml-cpu.{ext}.0").write_bytes(b"x")
+    with patch("core.inference.llama_cpp._llama_lib_dir", return_value = d):
+        assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is True
 
 
 def test_empty_non_cuda_probe_rejects_gpu_ids_even_with_stray_mask():

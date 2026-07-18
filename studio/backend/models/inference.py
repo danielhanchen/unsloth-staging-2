@@ -371,7 +371,7 @@ class LoadResponse(BaseModel):
     )
     gpu_ids: Optional[List[int]] = Field(
         None,
-        description = "Physical GPU indices the active GGUF load is pinned to, or None for auto-selection. Only meaningful when is_gguf is True.",
+        description = "GPU indices the active GGUF load is pinned to, or None for auto-selection. Physical CUDA/ROCm indices on a CUDA/ROCm build; Vulkan device ordinals (ggml's --device Vulkan<i> space) on a Vulkan build, which can differ from the CUDA/PCI order. Only meaningful when is_gguf is True.",
     )
     gguf_memory_mode: Optional[Literal["auto", "pinned", "resident"]] = Field(
         None,
@@ -507,7 +507,7 @@ class InferenceStatusResponse(BaseModel):
     )
     gpu_ids: Optional[List[int]] = Field(
         None,
-        description = "Physical GPU indices the active GGUF load is pinned to, or None for auto-selection. Only meaningful when is_gguf is True.",
+        description = "GPU indices the active GGUF load is pinned to, or None for auto-selection. Physical CUDA/ROCm indices on a CUDA/ROCm build; Vulkan device ordinals (ggml's --device Vulkan<i> space) on a Vulkan build, which can differ from the CUDA/PCI order. Only meaningful when is_gguf is True.",
     )
     gguf_memory_mode: Optional[Literal["auto", "pinned", "resident"]] = Field(
         None,
