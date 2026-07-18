@@ -8562,7 +8562,18 @@ class LlamaCppBackend:
         # layer); only an explicit list forces equality.
         if extra_args is not None:
             current = list(self._extra_args) if self._extra_args is not None else []
-            if list(extra_args) != current:
+            # load_model stores device-stripped extras when gpu_ids owns placement
+            # (so an inherited reload can't resurrect --device), so strip the
+            # incoming extras the same way before comparing. gpu_ids already matched
+            # above, so both sides used the same strip; without this a duplicate
+            # /load carrying a user --device misses the dedupe and needlessly kills
+            # and restarts an already-correct server (#7188).
+            requested = (
+                self._strip_device_extra_args(extra_args)
+                if gpu_ids is not None
+                else list(extra_args)
+            )
+            if requested != current:
                 return False
         return True
 

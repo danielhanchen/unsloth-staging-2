@@ -5051,6 +5051,32 @@ async def validate_model(
         # Mirror /load: validate explicit GPU selection before the guard. Skip the
         # CUDA resolver for GGUF on non-CUDA hosts; the backend uses the Vulkan probe.
         if effective_gpu_ids is not None:
+            # Mirror /load's draft-device reject for the validate-then-unload flow: a
+            # same-model reload inherits the running server's stored extras, and a
+            # stored --spec-draft-device naming a real GPU would escape the new gpu_ids
+            # pin. ValidateModelRequest carries no llama_extra_args, so only the
+            # inherited backend extras are checkable here; reject before the client
+            # unloads its working model, not only at /load after teardown (#7188).
+            if config.is_gguf:
+                from core.inference.llama_cpp import _extra_args_draft_device_pin
+
+                _loaded_llama = get_llama_cpp_backend()
+                if (
+                    _loaded_llama.is_loaded
+                    and _loaded_llama.model_identifier
+                    and _loaded_llama.model_identifier.lower() == model_identifier.lower()
+                ):
+                    _draft_dev_pin = _extra_args_draft_device_pin(_loaded_llama.extra_args)
+                    if _draft_dev_pin is not None:
+                        raise HTTPException(
+                            status_code = 400,
+                            detail = (
+                                f"A draft-model device override ('{_draft_dev_pin}') cannot be "
+                                "combined with explicit gpu_ids: it would place the speculative "
+                                "drafter outside the pinned GPUs the training guard budgeted. "
+                                "Remove the draft-device flag to follow gpu_ids, or set it to cpu."
+                            ),
+                        )
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
 
             # Mirror /load: a Vulkan build's gpu_ids are Vulkan ordinals, so defer to the

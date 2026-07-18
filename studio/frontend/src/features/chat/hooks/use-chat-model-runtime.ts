@@ -605,9 +605,13 @@ export function useChatModelRuntime() {
           // the loaded model's status, with no staged picker for the model being loaded. On
           // a switch, reusing this snapshot would pin the new model to the prior model's
           // devices / memory mode, so drop it to auto (null); same-model Apply/reload keeps
-          // it. Finalized before the validate call below so validate and load agree.
+          // it. A GGUF quantization change within the same repo (same modelId, different
+          // activeGgufVariant) counts as a switch too, since the new quant may not fit the
+          // prior variant's GPUs. Finalized before the validate call so validate/load agree.
           const isModelSwitch =
-            Boolean(currentCheckpoint) && currentCheckpoint !== modelId;
+            Boolean(currentCheckpoint) &&
+            (currentCheckpoint !== modelId ||
+              (stateBeforeUnload.activeGgufVariant ?? null) !== (ggufVariant ?? null));
           const loadGpuIds = isModelSwitch
             ? null
             : stateBeforeUnload.activeGpuIds;

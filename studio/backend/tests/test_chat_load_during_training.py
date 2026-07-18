@@ -652,6 +652,49 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         # Rejected before the coexistence guard (and thus before any unload).
         self.assertEqual(captured, [])
 
+    def test_gguf_validate_rejects_inherited_draft_device_before_unload(self):
+        # Validate-then-unload flow: a same-model reload inherits the running
+        # server's stored --spec-draft-device, which would escape a new gpu_ids
+        # pin. /validate must 400 BEFORE the client unloads, mirroring /load.
+        from fastapi import HTTPException
+        from models.inference import ValidateModelRequest
+
+        request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [0])
+        cfg = SimpleNamespace(
+            identifier = "x.gguf",
+            display_name = "x",
+            is_gguf = True,
+            is_lora = False,
+            is_vision = False,
+            path = None,
+            base_model = None,
+        )
+        # Same model already loaded, carrying a draft-device pin in its extras.
+        loaded = SimpleNamespace(
+            is_loaded = True,
+            model_identifier = "x.gguf",
+            extra_args = ["--spec-draft-device", "CUDA1"],
+        )
+        captured = []
+        with (
+            patch.object(
+                self.route,
+                "_resolve_model_identifier_for_request",
+                return_value = ("x.gguf", "x.gguf", False),
+            ),
+            patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+            patch.object(self.route, "load_inference_config", return_value = {}),
+            patch.object(self.route, "_requires_trust_remote_code_for_model", return_value = False),
+            patch.object(self.route, "get_llama_cpp_backend", return_value = loaded),
+            _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(self.route.validate_model(request, current_subject = "u"))
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("draft-model device", ctx.exception.detail)
+        # Rejected before the coexistence guard (and thus before any unload).
+        self.assertEqual(captured, [])
+
     def test_gguf_with_invalid_gpu_ids_rejected_before_guard(self):
         # On CUDA/ROCm an invalid GGUF gpu_ids 400s before the guard (the resolver
         # rejects it). Pin the device to CUDA so this holds regardless of CI host.

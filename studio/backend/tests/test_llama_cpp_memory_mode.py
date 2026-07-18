@@ -213,6 +213,26 @@ def test_already_in_target_state_normalizes_empty_gpu_ids():
     assert backend._already_in_target_state(**kwargs) is True
 
 
+def test_already_in_target_state_strips_device_extras_under_gpu_ids():
+    # load_model stores device-stripped extras when gpu_ids owns placement, so a
+    # duplicate /load carrying a user --device must strip the same way before the
+    # dedupe compare, else it needlessly restarts an already-correct server (#7188).
+    backend = _loaded_backend(_gpu_ids = [0, 1], _extra_args = ["--flash-attn", "on"])
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["gpu_ids"] = [0, 1]
+    kwargs["extra_args"] = ["--flash-attn", "on", "--device", "CUDA0"]
+    assert backend._already_in_target_state(**kwargs) is True
+
+
+def test_already_in_target_state_keeps_device_extras_without_gpu_ids():
+    # Without gpu_ids, --device is not stripped, so a genuine extras change still reloads.
+    backend = _loaded_backend(_gpu_ids = None, _extra_args = ["--flash-attn", "on"])
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["gpu_ids"] = None
+    kwargs["extra_args"] = ["--flash-attn", "on", "--device", "CUDA0"]
+    assert backend._already_in_target_state(**kwargs) is False
+
+
 # ── GPU selection filtering ──────────────────────────────────────────────────
 
 
