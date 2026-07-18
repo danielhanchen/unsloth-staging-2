@@ -4337,7 +4337,24 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
             # #7188, so it changes no pre-existing pathway.
             if config.is_gguf:
                 from core.inference.llama_cpp import _extra_args_draft_device_pin
-                _draft_dev_pin = _extra_args_draft_device_pin(request.llama_extra_args)
+
+                # llama_extra_args=None means "inherit the running server's extras"
+                # on a same-model reload (llama_cpp keeps _extra_args when the request
+                # omits them), and draft-device flags survive that inherit, so check
+                # the effective extras: the request's when provided, else the loaded
+                # same-model backend's. A pin stored by a prior load must not escape a
+                # newly added gpu_ids just because the reload omitted extras. Gate on
+                # same model_identifier, since cross-model inheritance is refused (#5401).
+                _draft_extra = request.llama_extra_args
+                if _draft_extra is None:
+                    _loaded_llama = get_llama_cpp_backend()
+                    if (
+                        _loaded_llama.is_loaded
+                        and _loaded_llama.model_identifier
+                        and _loaded_llama.model_identifier.lower() == model_identifier.lower()
+                    ):
+                        _draft_extra = _loaded_llama.extra_args
+                _draft_dev_pin = _extra_args_draft_device_pin(_draft_extra)
                 if _draft_dev_pin is not None:
                     raise HTTPException(
                         status_code = 400,

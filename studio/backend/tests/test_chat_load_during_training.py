@@ -1255,6 +1255,69 @@ class TestLoadModelGuardIntegration(unittest.TestCase):
         inf._shutdown_subprocess.assert_not_called()
         llama.unload_model.assert_not_called()
 
+    def test_gguf_inherited_draft_device_rejected_under_gpu_ids(self):
+        # A same-model reload that omits llama_extra_args inherits the running
+        # server's stored extras, and a stored --spec-draft-device survives the
+        # inherit. Adding gpu_ids to that reload must still 400: the check runs
+        # against the effective (inherited) extras, not just the raw request (#7188).
+        import contextlib
+        from unittest.mock import MagicMock
+        from models.inference import LoadRequest
+
+        inf = SimpleNamespace(active_model_name = None)
+        inf.unload_model = MagicMock()
+        inf._shutdown_subprocess = MagicMock()
+        # Same model already loaded, with a draft-device pin in its stored extras.
+        llama = SimpleNamespace(
+            is_loaded = True,
+            model_identifier = "x.gguf",
+            hf_variant = None,
+            extra_args = ["--spec-draft-device", "CUDA1"],
+        )
+        llama.unload_model = MagicMock()
+        cfg = SimpleNamespace(
+            is_gguf = True,
+            is_lora = False,
+            is_vision = False,
+            path = None,
+            base_model = None,
+            identifier = "x.gguf",
+            display_name = "x",
+        )
+        # Reload the same checkpoint, omitting extras (inherit) but adding a pin.
+        request = LoadRequest(model_path = "x.gguf", gpu_ids = [0], max_seq_length = 4096)
+        captured = []
+        with (
+            patch("utils.transformers_version.latest_tier_active_for", return_value = False),
+            patch.object(self.route, "validate_extra_args", return_value = None),
+            patch.object(
+                self.route,
+                "_resolve_model_identifier_for_request",
+                return_value = ("x.gguf", "x.gguf", False),
+            ),
+            patch.object(self.route, "resolve_effective_chat_template_override", return_value = None),
+            patch.object(self.route, "_reject_diffusion_placement", return_value = None),
+            # Different gpu_ids -> not a settings match, so the already_loaded early
+            # return is skipped and the reload path (with my check) runs.
+            patch.object(self.route, "_request_matches_loaded_settings", return_value = False),
+            patch.object(self.route, "get_inference_backend", return_value = inf),
+            patch.object(self.route, "get_llama_cpp_backend", return_value = llama),
+            patch.object(self.route, "_hf_offline_if_dns_dead", lambda: contextlib.nullcontext()),
+            patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+            _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+        ):
+            with self.assertRaises(HTTPException) as exc:
+                asyncio.run(
+                    self.route.load_model(request, fastapi_request = MagicMock(), current_subject = "u")
+                )
+
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("draft-model device", exc.exception.detail)
+        # Rejected before the guard and the unload step.
+        self.assertEqual(captured, [])
+        inf.unload_model.assert_not_called()
+        llama.unload_model.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

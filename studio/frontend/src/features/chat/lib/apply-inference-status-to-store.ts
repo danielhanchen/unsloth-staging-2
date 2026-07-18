@@ -239,22 +239,17 @@ export function applyActiveModelStatusToStore(
         tensorParallel: status.tensor_parallel,
         loadedTensorParallel: status.tensor_parallel,
       }),
-    ...(seedLoadParams &&
-      prevState.activeGpuIds === null && {
-        activeGpuIds: status.gpu_ids ?? null,
-      }),
-    ...(seedLoadParams &&
-      prevState.activeMemoryMode === null && {
-        activeMemoryMode: status.gguf_memory_mode ?? null,
-      }),
-    // Overwrite stale GGUF placement when the backend model changed, even if
-    // the fields were already seeded for the prior model. A non-GGUF status
-    // carries null for these fields so they are cleared naturally.
-    ...(seedLoadParams &&
-      hydratingExistingModel && {
-        activeGpuIds: status.gpu_ids ?? null,
-        activeMemoryMode: status.gguf_memory_mode ?? null,
-      }),
+    // GGUF placement is backend-owned (there is no UI editor for it), so mirror
+    // the running server's reported gpu_ids / memory_mode from /status whenever we
+    // seed load params -- not only when the store value is null or the model
+    // identity changed. An external/API reload of the same checkpoint with
+    // different gpu_ids or memory mode would otherwise leave the old placement in
+    // the store, so the next Apply for that model would resend the stale pin. A
+    // non-GGUF status carries null for these fields, clearing them naturally.
+    ...(seedLoadParams && {
+      activeGpuIds: status.gpu_ids ?? null,
+      activeMemoryMode: status.gguf_memory_mode ?? null,
+    }),
     ...(status.chat_template_override !== undefined &&
       prevState.loadedChatTemplateOverride === null &&
       prevState.chatTemplateOverride === null && {
