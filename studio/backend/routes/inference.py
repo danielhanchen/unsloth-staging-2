@@ -5059,7 +5059,6 @@ async def validate_model(
             # unloads its working model, not only at /load after teardown (#7188).
             if config.is_gguf:
                 from core.inference.llama_cpp import _extra_args_draft_device_pin
-
                 _loaded_llama = get_llama_cpp_backend()
                 if (
                     _loaded_llama.is_loaded
