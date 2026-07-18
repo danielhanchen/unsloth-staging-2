@@ -4337,7 +4337,6 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
             # #7188, so it changes no pre-existing pathway.
             if config.is_gguf:
                 from core.inference.llama_cpp import _extra_args_draft_device_pin
-
                 _draft_dev_pin = _extra_args_draft_device_pin(request.llama_extra_args)
                 if _draft_dev_pin is not None:
                     raise HTTPException(
