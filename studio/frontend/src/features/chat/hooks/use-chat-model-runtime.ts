@@ -867,6 +867,15 @@ export function useChatModelRuntime() {
               loadedChatTemplateOverride: effectiveChatTemplateOverride,
               loadedIsMultimodal: isMultimodalResponse(loadResponse),
               loadedIsDiffusion: loadResponse.is_diffusion ?? false,
+              // Commit the placement the backend actually applied so the store
+              // stops reflecting the previous model's pin. Without this, after a
+              // model switch (which clears the snapshot to auto) the store would
+              // keep the prior model's activeGpuIds / activeMemoryMode until the
+              // next status hydration, so an immediate same-model Apply/reload
+              // could re-send the stale pin. Non-GGUF and auto loads report null
+              // here, matching a fresh placement state.
+              activeGpuIds: loadResponse.gpu_ids ?? null,
+              activeMemoryMode: loadResponse.gguf_memory_mode ?? null,
               activeNativePathToken: nativePathToken ?? null,
             });
             // Unlock attach menus for capabilities the catalog entry lacked.

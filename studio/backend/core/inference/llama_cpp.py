@@ -1615,6 +1615,34 @@ def _extra_args_draft_offloaded_to_cpu(
     return False
 
 
+def _extra_args_draft_device_pin(extra_args: Optional[Iterable[str]]) -> Optional[str]:
+    """Return the drafter's explicit device pin from user extras when it names a
+    real GPU device (not cpu/none), else None. Parses the same draft-device flags
+    as _extra_args_draft_offloaded_to_cpu (--spec-draft-device / -devd /
+    --device-draft), last-wins, inline (=) or next-token, comma-separated.
+
+    A separate MTP drafter normally follows the main -ngl / device selection, so
+    under an explicit gpu_ids pin it lands on the pinned cards the training guard
+    budgeted. A draft-device naming a different GPU escapes that pin and can place
+    the drafter on a card the guard never reserved (#7188). cpu/none is a
+    supported offload (keeps the drafter off the GPU entirely), so it does not
+    conflict and returns None."""
+    dev_flags = {"--spec-draft-device", "-devd", "--device-draft"}
+    args = [str(a) for a in extra_args] if extra_args else []
+    last_dev: Optional[str] = None
+    for i, raw in enumerate(args):
+        flag, eq, inline = raw.partition("=")
+        value = inline if eq else (args[i + 1] if i + 1 < len(args) else "")
+        if flag in dev_flags:
+            last_dev = value
+    if last_dev is None:
+        return None
+    devs = [d.strip() for d in last_dev.split(",") if d.strip()]
+    if not devs or all(d.lower() in ("cpu", "none") for d in devs):
+        return None
+    return last_dev
+
+
 def _extra_args_n_ubatch(
     extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
 ) -> Optional[int]:

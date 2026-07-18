@@ -1189,6 +1189,72 @@ class TestLoadModelGuardIntegration(unittest.TestCase):
         inf._shutdown_subprocess.assert_not_called()
         llama.unload_model.assert_not_called()
 
+    def test_gguf_draft_device_gpu_rejected_under_gpu_ids_before_unload(self):
+        # An explicit gpu_ids pin owns placement and the training guard budgets it.
+        # A draft-device override naming a real GPU (--spec-draft-device CUDA1) would
+        # place the separate drafter outside the pin, so /load must 400 BEFORE the
+        # unload step frees the resident model, not after teardown (#7188). cpu/none
+        # offload is allowed and is covered by the _extra_args_draft_device_pin unit
+        # test.
+        import contextlib
+        from unittest.mock import MagicMock
+        from models.inference import LoadRequest
+
+        inf = SimpleNamespace(active_model_name = None)
+        inf.unload_model = MagicMock()
+        inf._shutdown_subprocess = MagicMock()
+        llama = SimpleNamespace(is_loaded = False, model_identifier = None, hf_variant = None)
+        llama.unload_model = MagicMock()
+        cfg = SimpleNamespace(
+            is_gguf = True,
+            is_lora = False,
+            is_vision = False,
+            path = None,
+            base_model = None,
+            identifier = "x.gguf",
+            display_name = "x",
+        )
+        request = LoadRequest(
+            model_path = "x.gguf",
+            gpu_ids = [0],
+            llama_extra_args = ["--spec-draft-device", "CUDA1"],
+            max_seq_length = 4096,
+        )
+        captured = []
+        with (
+            patch("utils.transformers_version.latest_tier_active_for", return_value = False),
+            patch.object(
+                self.route,
+                "validate_extra_args",
+                return_value = ["--spec-draft-device", "CUDA1"],
+            ),
+            patch.object(
+                self.route,
+                "_resolve_model_identifier_for_request",
+                return_value = ("x.gguf", "x.gguf", False),
+            ),
+            patch.object(self.route, "resolve_effective_chat_template_override", return_value = None),
+            patch.object(self.route, "_reject_diffusion_placement", return_value = None),
+            patch.object(self.route, "get_inference_backend", return_value = inf),
+            patch.object(self.route, "get_llama_cpp_backend", return_value = llama),
+            patch.object(self.route, "_hf_offline_if_dns_dead", lambda: contextlib.nullcontext()),
+            patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+            # Guard would PASS, so a 400 is attributable to the draft-device check.
+            _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+        ):
+            with self.assertRaises(HTTPException) as exc:
+                asyncio.run(
+                    self.route.load_model(request, fastapi_request = MagicMock(), current_subject = "u")
+                )
+
+        self.assertEqual(exc.exception.status_code, 400)
+        self.assertIn("draft-model device", exc.exception.detail)
+        # Rejected before the guard and the unload step, so nothing is torn down.
+        self.assertEqual(captured, [])
+        inf.unload_model.assert_not_called()
+        inf._shutdown_subprocess.assert_not_called()
+        llama.unload_model.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

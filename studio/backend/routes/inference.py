@@ -4239,7 +4239,19 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     spec_draft_n_max = llama_backend.spec_draft_n_max,
                     tensor_parallel = llama_backend.tensor_parallel,
                     gpu_ids = llama_backend.gpu_ids,
-                    gguf_memory_mode = llama_backend.requested_memory_mode,
+                    # Echo the caller's explicit mode (incl. 'auto') so a client
+                    # that persists this response keeps its choice. The running
+                    # model may have been launched with the mode omitted
+                    # (requested_memory_mode=None) yet be canonically equal to an
+                    # explicit 'auto' request, and returning None there would drop
+                    # the explicit choice so a later reload skips the placement
+                    # env scrub. Falls back to the loaded value when the request
+                    # had no opinion (omitted / explicit null).
+                    gguf_memory_mode = (
+                        request.gguf_memory_mode
+                        if request.gguf_memory_mode is not None
+                        else llama_backend.requested_memory_mode
+                    ),
                 )
         else:
             if (
@@ -4316,6 +4328,27 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # CUDA-oriented resolver sees an empty parent-visible set and would 400, so
         # skip it for GGUF and let the backend validate against its Vulkan probe.
         if effective_gpu_ids is not None:
+            # A draft-model device override in extras (--spec-draft-device / -devd /
+            # --device-draft) naming a real GPU would place the separate MTP drafter
+            # outside the explicit gpu_ids the training guard budgeted, so it could
+            # OOM training on an unreserved card. Reject before teardown; dropping the
+            # flag makes the drafter follow the pin, or set it to cpu to offload it
+            # (cpu/none is allowed). Only fires with explicit gpu_ids, which is new in
+            # #7188, so it changes no pre-existing pathway.
+            if config.is_gguf:
+                from core.inference.llama_cpp import _extra_args_draft_device_pin
+
+                _draft_dev_pin = _extra_args_draft_device_pin(request.llama_extra_args)
+                if _draft_dev_pin is not None:
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            f"A draft-model device override ('{_draft_dev_pin}') cannot be "
+                            "combined with explicit gpu_ids: it would place the speculative "
+                            "drafter outside the pinned GPUs the training guard budgeted. "
+                            "Remove the draft-device flag to follow gpu_ids, or set it to cpu."
+                        ),
+                    )
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
 
             # A Vulkan llama-server build treats gpu_ids as Vulkan ordinals (never remapped
