@@ -874,11 +874,10 @@ class TestExtraArgsMtpDetection:
         assert "llama_backend.hf_repo" in body
 
     def test_route_matcher_strips_memory_flags_from_explicit_extras(self):
-        # An explicit request repeating a --mlock/--mmap/--no-mmap the loaded server
-        # already stripped must still hit the already-loaded fast path, so a no-op
-        # re-Apply during training isn't reloaded (#7164). Only the REQUEST side is
-        # stripped: the backend side keeps its flags so an explicit auto over a server
-        # that inherited --mlock still mismatches and reloads to clear that placement.
+        # A request repeating a --mlock/--mmap/--no-mmap the loaded server already stripped
+        # must still hit the fast path, so a no-op re-Apply during training isn't reloaded
+        # (#7164). Only the request side is stripped: the backend keeps its flags so an
+        # explicit auto over a server that inherited --mlock still reloads to clear it.
         routes_src = (
             Path(__file__).resolve().parent.parent / "routes" / "inference.py"
         ).read_text()
@@ -914,9 +913,9 @@ class TestExtraArgsMtpDetection:
         assert "_extra_args_main_cache_type_for_budget(extra_args)" in load
 
     def test_load_model_spec_default_keys_off_resolved_gpu_pin(self):
-        # The no-telemetry explicit-gpu_ids path pins via gpu_indices with an empty
-        # probe. The GPU (n=2) vs CPU (n=3) spec-draft default must key off the resolved
-        # pin, not the empty probe, else the pinned GPU launch gets the CPU default (#7164).
+        # The no-telemetry gpu_ids path pins via gpu_indices with an empty probe. The GPU
+        # (n=2) vs CPU (n=3) spec-draft default must key off the resolved pin, not the empty
+        # probe, else the pinned GPU launch gets the CPU default (#7164).
         load = "".join(inspect.getsource(LlamaCppBackend.load_model).split())
         assert "gpus=bool(gpus)orbool(gpu_indices)" in load
 

@@ -261,20 +261,18 @@ def can_load_chat_during_training(
 
         free_by_index = _free_vram_by_index(get_visible_gpu_utilization().get("devices", []))
         if requested_gpu_ids and gpu_ids_are_vulkan_ordinals:
-            # A Vulkan GGUF build pins by Vulkan ordinal, which enumerates independently of
-            # the CUDA/nvidia-smi index space free_by_index uses (the loader deliberately
-            # skips resolve_requested_gpu_ids for it), so we can't tell which physical card
-            # the pin lands on. Require the model to fit on the least-free visible GPU so no
+            # Vulkan ordinals enumerate independently of the CUDA index space free_by_index
+            # uses (the loader skips resolve_requested_gpu_ids for them), so the target
+            # physical card is unknown. Require a fit on the least-free visible GPU so no
             # ordinal->physical mapping can approve a load that then OOMs training (#7188).
             free_vals = list(free_by_index.values())
             if not free_vals:
                 return False, {"mode": "gguf_vulkan", "reason": "no_visible_gpus"}
             needed_gb = required_gb * SAFETY_MARGIN + KEEP_FLOOR_GB
-            # A multi-GPU Vulkan pin shards the model (~needed/N per device), so require
-            # each visible GPU to hold a single shard, not the whole model -- otherwise a
-            # valid sharded load is rejected whenever it doesn't fit on the least-free card.
-            # The ordinal->physical mapping is unknown, so min_free over all visible GPUs is
-            # the safe bound: if the least-free card holds a shard, any mapping does (#7188).
+            # A multi-GPU pin shards the model (~needed/N per device), so require each
+            # visible GPU to hold one shard, not the whole model. With the mapping unknown,
+            # min_free is the safe bound: if the least-free card holds a shard, any mapping
+            # does (#7188).
             per_gpu_needed_gb = needed_gb / len(requested_gpu_ids)
             min_free_gb = min(free_vals)
             return min_free_gb >= per_gpu_needed_gb, {
@@ -291,9 +289,8 @@ def can_load_chat_during_training(
             except ValueError:
                 return True, {"mode": "explicit", "reason": "invalid_gpu_ids"}
             free_vals = [free_by_index.get(i, 0.0) for i in resolved]
-            # GGUF self-places inside the requested candidate set; do not apply the
-            # HF device_map="balanced" per-GPU floor that would reject a load that
-            # llama.cpp could place on a single fitting GPU.
+            # GGUF self-places inside the candidate set; skip the HF balanced per-GPU
+            # floor that would reject a load llama.cpp could fit on a single GPU.
             mode = "gguf" if is_gguf else "explicit"
         else:
             # GGUF: llama.cpp picks the GPU(s); any visible GPU is a candidate.

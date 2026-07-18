@@ -601,14 +601,11 @@ export function useChatModelRuntime() {
           const loadCustomContextLength = stateBeforeUnload.customContextLength;
           const loadGgufContextLength = stateBeforeUnload.ggufContextLength;
           const loadTensorParallel = stateBeforeUnload.tensorParallel;
-          // GGUF placement (gpu_ids / memory_mode) is per-model: activeGpuIds
-          // only ever mirrors the currently-loaded model's backend status,
-          // there is no staged sidebar picker that pre-selects it for the
-          // model being loaded. On a switch to a different model, reusing this
-          // snapshot would silently pin the new model to the prior model's
-          // physical devices / memory mode, so drop it to auto (null);
-          // same-model Apply/reload keeps it. Finalized here, before the
-          // validate call below, so the validate and load requests agree.
+          // GGUF placement (gpu_ids / memory_mode) is per-model: activeGpuIds only mirrors
+          // the loaded model's status, with no staged picker for the model being loaded. On
+          // a switch, reusing this snapshot would pin the new model to the prior model's
+          // devices / memory mode, so drop it to auto (null); same-model Apply/reload keeps
+          // it. Finalized before the validate call below so validate and load agree.
           const isModelSwitch =
             Boolean(currentCheckpoint) && currentCheckpoint !== modelId;
           const loadGpuIds = isModelSwitch
@@ -867,13 +864,11 @@ export function useChatModelRuntime() {
               loadedChatTemplateOverride: effectiveChatTemplateOverride,
               loadedIsMultimodal: isMultimodalResponse(loadResponse),
               loadedIsDiffusion: loadResponse.is_diffusion ?? false,
-              // Commit the placement the backend actually applied so the store
-              // stops reflecting the previous model's pin. Without this, after a
-              // model switch (which clears the snapshot to auto) the store would
-              // keep the prior model's activeGpuIds / activeMemoryMode until the
-              // next status hydration, so an immediate same-model Apply/reload
-              // could re-send the stale pin. Non-GGUF and auto loads report null
-              // here, matching a fresh placement state.
+              // Commit the placement the backend applied so the store stops reflecting the
+              // previous model's pin. Otherwise, after a switch (snapshot cleared to auto)
+              // the store keeps the prior activeGpuIds / activeMemoryMode until the next
+              // status hydration, so an immediate same-model Apply could re-send the stale
+              // pin. Non-GGUF and auto loads report null here.
               activeGpuIds: loadResponse.gpu_ids ?? null,
               activeMemoryMode: loadResponse.gguf_memory_mode ?? null,
               activeNativePathToken: nativePathToken ?? null,

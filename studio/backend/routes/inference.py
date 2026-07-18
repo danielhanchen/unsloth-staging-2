@@ -3176,9 +3176,9 @@ def _request_matches_loaded_settings(
         llama_backend.cache_type_kv
     ):
         return False
-    # gpu_ids and memory mode are first-class; any change must reload. Compare
-    # order-insensitively: Studio sorts gpu_ids, so [0,1] and [1,0] are identical and
-    # must not force a needless reload / 409 during training (#7188).
+    # gpu_ids / memory mode are first-class; any change must reload. Compare
+    # order-insensitively: Studio sorts gpu_ids, so [0,1] == [1,0] and must not force a
+    # needless reload / 409 during training (#7188).
     _request_gpu_ids = sorted(request.gpu_ids) if request.gpu_ids else None
     _loaded_gpu_ids = sorted(llama_backend.gpu_ids) if llama_backend.gpu_ids else None
     if _request_gpu_ids != _loaded_gpu_ids:
@@ -3187,9 +3187,9 @@ def _request_matches_loaded_settings(
         request.gguf_memory_mode
     ) != LlamaCppBackend._canonical_memory_mode(llama_backend.memory_mode):
         return False
-    # Explicit memory_mode (incl. 'auto') over a child with inherited LLAMA_ARG_*
-    # placement flags must reload so the scrub runs; the canonical check above treats
-    # 'auto' as omitted and would leave the child mlocked/no-mmap (#7164).
+    # An explicit memory_mode (incl. 'auto') over a child with inherited LLAMA_ARG_* flags
+    # must reload so the scrub runs; the canonical check above treats 'auto' as omitted and
+    # would leave the child mlocked/no-mmap (#7164).
     if request.gguf_memory_mode is not None and llama_backend.launched_with_inherited_mem_env:
         return False
     # Reconcile a user --split-mode in extras into the effective tensor state.
@@ -3198,10 +3198,9 @@ def _request_matches_loaded_settings(
     # tensor load isn't seen as a mismatch that needlessly reloads the server.
     backend_extra = list(llama_backend.extra_args) if llama_backend.extra_args else []
     fields_set = getattr(request, "model_fields_set", set())
-    # Strip inherited --mlock/--no-mmap/--mmap only for a real memory mode. Pydantic
-    # marks the field "set" even for an explicit null, but null == None == "no opinion"
-    # (backend leaves placement alone), so stripping then would needlessly reload and
-    # drop pass-through flags. Gate on the value, not model_fields_set (#7188).
+    # Strip inherited --mlock/--no-mmap/--mmap only for a real memory mode. Pydantic marks
+    # the field "set" even for an explicit null, but null == "no opinion" (placement left
+    # alone), so stripping then would needlessly reload. Gate on the value (#7188).
     _strip_mem = request.gguf_memory_mode is not None
     effective_extra = (
         request.llama_extra_args
@@ -3272,23 +3271,20 @@ def _request_matches_loaded_settings(
         ):
             return False
     else:
-        # Strip memory-placement flags from the REQUEST side only for a real memory
-        # mode (mirrors how the reload strips explicit extras before storing them),
-        # so an explicit request repeating a --mlock/--mmap/--no-mmap already dropped
-        # by the loaded server still hits this fast path instead of being rejected by
-        # the coexistence guard during training.
+        # Strip memory-placement flags request-side only for a real mode (mirrors the
+        # reload's strip of explicit extras), so a request repeating a --mlock/--mmap/--no-mmap
+        # the loaded server already dropped still hits this fast path instead of the guard.
         #
-        # The backend side is NOT stripped: a server loaded with no memory_mode keeps
-        # a pass-through --mlock/--no-mmap and is still mlocked. Stripping it here would
-        # let an explicit auto (which clears that placement on reload) dedupe to the
-        # pinned server and leave the old placement active; keeping it forces a reload
-        # so the auto scrub runs (#7164). A server loaded WITH a mode already had these
-        # stripped at load, so backend_extra carries none and is unaffected.
-        # Explicit gpu_ids make the backend drop a user --device from both the launched
-        # and stored extras, so strip it request-side too or an otherwise identical reload
-        # would miss this fast path and force a needless reload / training 409 (#7188).
-        # Gate on an EFFECTIVE pin: the load path normalizes gpu_ids=[] to None (auto) and
-        # keeps its --device, so an empty list must NOT strip here or the two sides diverge.
+        # The backend side is NOT stripped: a server loaded with no memory_mode keeps a
+        # pass-through --mlock/--no-mmap and is still mlocked. Stripping it here would let an
+        # explicit auto dedupe to the pinned server and leave the old placement active;
+        # keeping it forces a reload so the auto scrub runs (#7164). A server loaded WITH a
+        # mode already had these stripped, so backend_extra carries none.
+        # Explicit gpu_ids drop a user --device from the launched and stored extras, so strip
+        # it request-side too or an identical reload would miss this fast path and force a
+        # needless reload / training 409 (#7188). Gate on an EFFECTIVE pin: the load path
+        # normalizes gpu_ids=[] to None and keeps its --device, so an empty list must NOT
+        # strip here or the two sides diverge.
         _strip_dev = bool(request.gpu_ids)
         _request_extra = (
             strip_shadowing_flags(
@@ -3955,10 +3951,9 @@ def _guard_chat_load_against_training(
         else None
     )
 
-    # A Vulkan GGUF build pins by Vulkan ordinal, which enumerates independently of the
-    # CUDA index space the guard budgets in; resolving those as CUDA physical IDs would
-    # size free VRAM on the wrong card. Flag it so the guard budgets conservatively,
-    # matching /load, which defers Vulkan ids to the backend probe (#7188).
+    # Vulkan ordinals enumerate independently of the CUDA index space the guard budgets in;
+    # resolving them as CUDA physical IDs would size free VRAM on the wrong card. Flag it so
+    # the guard budgets conservatively, matching /load's deferral to the probe (#7188).
     gpu_ids_are_vulkan_ordinals = False
     if is_gguf and requested_gpu_ids:
         try:
@@ -4239,14 +4234,11 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     spec_draft_n_max = llama_backend.spec_draft_n_max,
                     tensor_parallel = llama_backend.tensor_parallel,
                     gpu_ids = llama_backend.gpu_ids,
-                    # Echo the caller's explicit mode (incl. 'auto') so a client
-                    # that persists this response keeps its choice. The running
-                    # model may have been launched with the mode omitted
-                    # (requested_memory_mode=None) yet be canonically equal to an
-                    # explicit 'auto' request, and returning None there would drop
-                    # the explicit choice so a later reload skips the placement
-                    # env scrub. Falls back to the loaded value when the request
-                    # had no opinion (omitted / explicit null).
+                    # Echo the caller's explicit mode (incl. 'auto') so a client persisting
+                    # this response keeps its choice: a model launched with the mode omitted
+                    # is canonically equal to an explicit 'auto', and returning None would
+                    # drop the choice so a later reload skips the env scrub. Falls back to
+                    # the loaded value when the request had no opinion.
                     gguf_memory_mode = (
                         request.gguf_memory_mode
                         if request.gguf_memory_mode is not None
@@ -4323,28 +4315,24 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # Normalize gpu_ids: empty list means auto-selection, same as None
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
 
-        # Validate explicit GPU selection up front so the loader and guard agree on
-        # the candidate set. GGUF now supports gpu_ids (#7164). On non-CUDA hosts the
-        # CUDA-oriented resolver sees an empty parent-visible set and would 400, so
-        # skip it for GGUF and let the backend validate against its Vulkan probe.
+        # Validate gpu_ids up front so the loader and guard agree on the candidate set. GGUF
+        # now supports gpu_ids (#7164). On non-CUDA hosts the CUDA resolver sees an empty set
+        # and would 400, so skip it for GGUF and let the backend use its Vulkan probe.
         if effective_gpu_ids is not None:
-            # A draft-model device override in extras (--spec-draft-device / -devd /
-            # --device-draft) naming a real GPU would place the separate MTP drafter
-            # outside the explicit gpu_ids the training guard budgeted, so it could
-            # OOM training on an unreserved card. Reject before teardown; dropping the
-            # flag makes the drafter follow the pin, or set it to cpu to offload it
-            # (cpu/none is allowed). Only fires with explicit gpu_ids, which is new in
-            # #7188, so it changes no pre-existing pathway.
+            # A draft-device override in extras (--spec-draft-device / -devd / --device-draft)
+            # naming a real GPU would place the MTP drafter outside the budgeted gpu_ids and
+            # OOM training on an unreserved card. Reject before teardown; drop the flag to
+            # follow the pin, or set it to cpu to offload (cpu/none allowed). Only fires with
+            # explicit gpu_ids (new in #7188), so it changes no pre-existing pathway.
             if config.is_gguf:
                 from core.inference.llama_cpp import _extra_args_draft_device_pin
 
-                # llama_extra_args=None means "inherit the running server's extras"
-                # on a same-model reload (llama_cpp keeps _extra_args when the request
-                # omits them), and draft-device flags survive that inherit, so check
-                # the effective extras: the request's when provided, else the loaded
-                # same-model backend's. A pin stored by a prior load must not escape a
-                # newly added gpu_ids just because the reload omitted extras. Gate on
-                # same model_identifier, since cross-model inheritance is refused (#5401).
+                # llama_extra_args=None means "inherit the running server's extras" on a
+                # same-model reload, and draft-device flags survive that inherit, so check the
+                # effective extras: the request's when provided, else the loaded same-model
+                # backend's. A prior pin must not escape a newly added gpu_ids just because the
+                # reload omitted extras. Gate on same model_identifier (cross-model is refused,
+                # #5401).
                 _draft_extra = request.llama_extra_args
                 if _draft_extra is None:
                     _loaded_llama = get_llama_cpp_backend()
@@ -4367,10 +4355,9 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     )
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
 
-            # A Vulkan llama-server build treats gpu_ids as Vulkan ordinals (never remapped
-            # through CUDA_VISIBLE_DEVICES), so defer it to the backend probe even on a
-            # CUDA-visible host -- else the CUDA resolver would 400 a valid Vulkan id under
-            # a CUDA/HIP mask (#7188).
+            # A Vulkan build treats gpu_ids as Vulkan ordinals (never remapped through
+            # CUDA_VISIBLE_DEVICES), so defer to the backend probe even on a CUDA-visible host,
+            # else the CUDA resolver would 400 a valid Vulkan id under a CUDA/HIP mask (#7188).
             _gguf_vulkan_build = config.is_gguf and await asyncio.to_thread(
                 get_llama_cpp_backend().is_vulkan_build
             )
@@ -4379,10 +4366,9 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
-                # A CPU-only llama.cpp build ignores CUDA_VISIBLE_DEVICES, so a resolvable
-                # CUDA id still can't be honored. The CUDA resolver above can't see the
-                # build, so reject here (before the unload) instead of only in Phase 0 after
-                # teardown -- mirrors the non-CUDA branch's pre-unload guard (#7188).
+                # A CPU-only build ignores CUDA_VISIBLE_DEVICES, so a resolvable CUDA id still
+                # can't be honored. The CUDA resolver can't see the build, so reject here
+                # before the unload, not only in Phase 0 after teardown (#7188).
                 if config.is_gguf and await asyncio.to_thread(
                     get_llama_cpp_backend()._backend_lacks_gpu_lib
                 ):
@@ -4394,12 +4380,11 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                         ),
                     )
             else:
-                # Non-CUDA GGUF host (CPU / MLX / XPU) or a Vulkan build on any host: the
-                # CUDA resolver can't enumerate llama.cpp's devices, so gate on its probe
-                # and reject before any teardown (#7188). A torch-less Vulkan host reports
-                # CPU but its probe is non-empty so it falls through; MLX/XPU builds that
-                # can't enumerate Metal/SYCL are rejected here rather than after unload
-                # (#7164/#7188).
+                # Non-CUDA GGUF host (CPU / MLX / XPU) or a Vulkan build on any host: the CUDA
+                # resolver can't enumerate llama.cpp's devices, so gate on its probe and reject
+                # before teardown (#7188). A torch-less Vulkan host reports CPU but its probe is
+                # non-empty so it falls through; MLX/XPU builds that can't enumerate Metal/SYCL
+                # are rejected here rather than after unload (#7164/#7188).
                 _llama_backend = get_llama_cpp_backend()
                 if not await asyncio.to_thread(_llama_backend.has_gpu_backend):
                     raise HTTPException(
@@ -4409,8 +4394,8 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                             "detected on this host."
                         ),
                     )
-                # Backend exists: validate the SPECIFIC ids against the probe too, so an
-                # out-of-range/duplicate id is rejected here, not after the unload (#7188).
+                # Backend exists: validate the specific ids against the probe too, so a bad
+                # id is rejected here, not after the unload (#7188).
                 try:
                     await asyncio.to_thread(
                         _llama_backend.assert_requested_gpu_ids_resolvable,
@@ -5093,9 +5078,9 @@ async def validate_model(
                     )
             else:
                 # Mirror /load: gate on the llama.cpp probe for a non-CUDA GGUF host (or a
-                # Vulkan build on any host) so an unsupported selection is rejected before
-                # the frontend unloads. A torch-less Vulkan host reports CPU but its probe
-                # is non-empty, so it falls through (#7164/#7188).
+                # Vulkan build) so an unsupported selection is rejected before the unload. A
+                # torch-less Vulkan host reports CPU but its probe is non-empty, so it falls
+                # through (#7164/#7188).
                 _llama_backend = get_llama_cpp_backend()
                 if not await asyncio.to_thread(_llama_backend.has_gpu_backend):
                     raise HTTPException(

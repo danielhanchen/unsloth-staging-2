@@ -222,9 +222,8 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
         self.assertEqual(info["reason"], "estimate_unavailable")
 
     def test_vulkan_build_budgets_least_free_gpu(self):
-        # A Vulkan GGUF build pins by Vulkan ordinal, which the guard can't map to the
-        # CUDA index space free VRAM is reported in. free [70, 60], needed 9.75: it fits
-        # even on the least-free card, so allow (mode reflects the Vulkan branch).
+        # Vulkan ordinals can't map to the CUDA index space free VRAM is reported in.
+        # free [70, 60], needed 9.75: fits even the least-free card, so allow.
         ok, info, _ = self._run(
             devices = _devices((0, 80, 10), (1, 80, 20)),
             required_override = 5.0,
@@ -247,9 +246,8 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
         self.assertEqual(info["mode"], "gguf_vulkan")
 
     def test_cuda_indexed_build_allows_same_layout(self):
-        # Contrast: the SAME VRAM layout for a non-Vulkan (CUDA-indexed) GGUF build
-        # resolves the ids and budgets the aggregate (usable 72.55 >= 15.5) -> allow.
-        # Confirms the Vulkan branch above is what tightens the wrong-card case.
+        # Same VRAM layout, CUDA-indexed build: resolves ids and budgets the aggregate
+        # (usable 72.55 >= 15.5) -> allow. Confirms the Vulkan branch tightens the case.
         ok, info, _ = self._run(
             devices = _devices((0, 80, 10), (1, 80, 77)),
             required_override = 10.0,
@@ -609,9 +607,8 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertTrue(resp.is_gguf)
 
     def test_gguf_cpu_only_build_rejected_on_cuda_host_before_guard(self):
-        # On a CUDA host with a CPU-only llama.cpp build, the CUDA resolver accepts the id
-        # but the build can't honor the pin. /validate must 400 BEFORE the guard/unload,
-        # not let it pass and fail only in Phase 0 after teardown (#7188).
+        # CUDA host, CPU-only build: the resolver accepts the id but the build can't honor
+        # the pin. /validate must 400 before the guard/unload, not fail in Phase 0 (#7188).
         from fastapi import HTTPException
         from models.inference import ValidateModelRequest
         from utils.hardware import DeviceType
@@ -694,9 +691,8 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertEqual(captured, [])  # guard never reached
 
     def test_validate_rejects_diffusion_placement_like_load(self):
-        # /validate must reject DiffusionGemma gpu_ids/memory_mode like /load, so a
-        # client can't validate OK, unload, then get a 400 from /load (#7188). Uses
-        # the HF repo name (no file downloaded at validate).
+        # /validate must reject DiffusionGemma gpu_ids/memory_mode like /load, so a client
+        # can't validate OK, unload, then 400 at /load (#7188). Uses the HF repo name.
         from models.inference import ValidateModelRequest
 
         request = ValidateModelRequest(model_path = "google/diffusiongemma-2b", gpu_ids = [0])
@@ -729,10 +725,9 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertEqual(captured, [])  # guard never reached (rejected before it)
 
     def test_gguf_invalid_gpu_ids_deferred_to_backend_on_non_cuda(self):
-        # Non-CUDA host WITH a GPU (torch-less Vulkan AMD, reported as CPU): the CUDA
-        # resolver can't see the Vulkan GPU, so it's skipped and deferred to the probe.
-        # has_gpu_backend() is True, so the route must NOT 400: it reaches the guard
-        # with the raw selection.
+        # Non-CUDA host WITH a GPU (torch-less Vulkan AMD, reported as CPU): the resolver
+        # can't see it, so it's deferred to the probe. has_gpu_backend() is True, so the
+        # route must NOT 400: it reaches the guard with the raw selection.
         from models.inference import ValidateModelRequest
         from utils.hardware import DeviceType
 
@@ -816,11 +811,10 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertEqual(captured, [])  # rejected before the guard / any teardown
 
     def test_gguf_gpu_ids_rejected_on_mlx_xpu_host_before_teardown(self):
-        # On MLX/XPU (neither CUDA nor CPU) gpu_ids used to skip both the resolver and
-        # the has_gpu_backend() preflight and only be rejected by load_model() after
-        # unload. The preflight is now probe-gated for any non-CUDA host: an empty
-        # non-Vulkan probe is rejected before teardown, a non-empty probe still falls
-        # through to the backend (#7188).
+        # MLX/XPU (neither CUDA nor CPU) gpu_ids used to skip the resolver and preflight and
+        # only fail in load_model() after unload. The preflight is now probe-gated for any
+        # non-CUDA host: an empty non-Vulkan probe is rejected before teardown, a non-empty
+        # probe still falls through (#7188).
         from models.inference import ValidateModelRequest
         from utils.hardware import DeviceType
         for dev in (DeviceType.MLX, DeviceType.XPU):
@@ -950,9 +944,8 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertEqual(captured, [])  # rejected before the guard / any teardown
 
     def test_gguf_cuda_host_vulkan_build_defers_to_backend(self):
-        # On a CUDA-visible host running a Vulkan build, gpu_ids are Vulkan ordinals, so
-        # the route must skip the CUDA physical-ID resolver and defer to the backend probe
-        # rather than 400 a valid Vulkan id under a CUDA mask (#7188).
+        # CUDA-visible host, Vulkan build: gpu_ids are Vulkan ordinals, so the route skips
+        # the CUDA resolver and defers to the probe rather than 400 a valid id (#7188).
         from models.inference import ValidateModelRequest
         from utils.hardware import DeviceType
 
@@ -1190,12 +1183,10 @@ class TestLoadModelGuardIntegration(unittest.TestCase):
         llama.unload_model.assert_not_called()
 
     def test_gguf_draft_device_gpu_rejected_under_gpu_ids_before_unload(self):
-        # An explicit gpu_ids pin owns placement and the training guard budgets it.
-        # A draft-device override naming a real GPU (--spec-draft-device CUDA1) would
-        # place the separate drafter outside the pin, so /load must 400 BEFORE the
-        # unload step frees the resident model, not after teardown (#7188). cpu/none
-        # offload is allowed and is covered by the _extra_args_draft_device_pin unit
-        # test.
+        # A draft-device override naming a real GPU (--spec-draft-device CUDA1) would place
+        # the drafter outside the gpu_ids pin, so /load must 400 before the unload frees the
+        # model, not after teardown (#7188). cpu/none offload is covered by the
+        # _extra_args_draft_device_pin unit test.
         import contextlib
         from unittest.mock import MagicMock
         from models.inference import LoadRequest
@@ -1256,9 +1247,8 @@ class TestLoadModelGuardIntegration(unittest.TestCase):
         llama.unload_model.assert_not_called()
 
     def test_gguf_inherited_draft_device_rejected_under_gpu_ids(self):
-        # A same-model reload that omits llama_extra_args inherits the running
-        # server's stored extras, and a stored --spec-draft-device survives the
-        # inherit. Adding gpu_ids to that reload must still 400: the check runs
+        # A same-model reload omitting llama_extra_args inherits the stored extras, and a
+        # stored --spec-draft-device survives. Adding gpu_ids must still 400: the check runs
         # against the effective (inherited) extras, not just the raw request (#7188).
         import contextlib
         from unittest.mock import MagicMock

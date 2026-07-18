@@ -175,10 +175,8 @@ _TEMPLATE_FLAGS: frozenset[str] = frozenset(
         "--no-jinja",
     }
 )
-# Memory placement flags shadow the GGUF memory_mode field: pass-through in
-# explicit extras, stripped on inherit when the mode changes so the new setting
-# wins. --mmap is the inverse of --no-mmap and could otherwise override a resident
-# load's --no-mmap.
+# Shadow the GGUF memory_mode field: pass-through in explicit extras, stripped on
+# inherit when the mode changes. --mmap is the inverse of --no-mmap.
 _MEMORY_MODE_FLAGS: frozenset[str] = frozenset({"--mlock", "--no-mmap", "--mmap"})
 # Multi-GPU split mode shadows the Tensor Parallelism toggle
 # (--split-mode tensor). Pass-through stays allowed so users keep the
@@ -190,10 +188,9 @@ _MEMORY_MODE_FLAGS: frozenset[str] = frozenset({"--mlock", "--no-mmap", "--mmap"
 _SPLIT_MODE_FLAGS: frozenset[str] = frozenset({"-sm", "--split-mode"})
 _TENSOR_SPLIT_FLAGS: frozenset[str] = frozenset({"-ts", "--tensor-split"})
 _SPLIT_SHADOWING_FLAGS: frozenset[str] = _SPLIT_MODE_FLAGS | _TENSOR_SPLIT_FLAGS
-# llama.cpp's explicit offload device list (--device / -dev). Not a general shadow
-# flag (users may pass it when Studio auto-selects), so opt-in: stripped only when
-# gpu_ids is set, so it can't override the pin and offload to a GPU the training
-# guard never accounted for (#7188).
+# llama.cpp offload device list (--device / -dev). Opt-in (users may pass it under
+# auto-select): stripped only when gpu_ids is set, so it can't override the pin and
+# offload to a GPU the training guard never budgeted (#7188).
 _DEVICE_FLAGS: frozenset[str] = frozenset({"--device", "-dev"})
 
 _SHADOWING_FLAGS: frozenset[str] = (

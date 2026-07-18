@@ -1939,14 +1939,13 @@ class LlamaCppBackend:
         self._gpu_ids: Optional[List[int]] = None
         # GGUF memory placement mode (None = auto; pinned/resident map to --mlock/--no-mmap).
         self._memory_mode: Optional[str] = None
-        # User's RAW requested mode ("auto"/"pinned"/"resident"/None) for the response
-        # echo. _memory_mode canonicalizes "auto" -> None, but the response must echo
-        # an explicit "auto" so it round-trips instead of collapsing to null and letting
-        # LLAMA_ARG_MLOCK creep back on reload (#7188).
+        # Raw requested mode for the response echo. _memory_mode canonicalizes
+        # "auto" -> None, but the echo must keep an explicit "auto" so it round-trips
+        # instead of collapsing to null and letting LLAMA_ARG_MLOCK creep back (#7188).
         self._requested_memory_mode: Optional[str] = None
-        # True when the live child launched with NO explicit memory_mode but inherited
-        # an operator LLAMA_ARG_MLOCK/NO_MMAP/MMAP env (unscrubbed). Lets an explicit
-        # 'auto' reload force the scrub the dedup would otherwise skip.
+        # True when the child launched with no explicit memory_mode but inherited an
+        # LLAMA_ARG_MLOCK/NO_MMAP/MMAP env; lets an explicit 'auto' reload force the
+        # scrub the dedup would otherwise skip.
         self._launched_with_inherited_mem_env: bool = False
         # KV-cache estimation fields (populated by _read_gguf_metadata)
         self._n_layers: Optional[int] = None
@@ -2800,8 +2799,8 @@ class LlamaCppBackend:
 
         if any((lib_dir / _lib(b)).is_file() for b in ("vulkan", "cuda", "hip")):
             return False  # a GPU ggml backend is present -> the pin can be honored
-        # No GPU lib. Only call it CPU-only when a CPU/base ggml lib IS present, proving
-        # the split-lib layout is in use and GPU support is genuinely absent (not static).
+        # No GPU lib: only CPU-only when a CPU/base ggml lib is present, proving the
+        # split-lib layout is in use (not a static build) and GPU support is truly absent.
         return any((lib_dir / _lib(b)).is_file() for b in ("cpu", "base"))
 
     @staticmethod
@@ -3040,10 +3039,9 @@ class LlamaCppBackend:
         try:
             if self._get_gpu_memory(self._find_llama_server_binary()):
                 return True
-            # A real GPU with telemetry down still exposes a numeric parent-visible mask
-            # (CUDA/HIP_VISIBLE_DEVICES). assert_requested_gpu_ids_resolvable validates
-            # gpu_ids against that mask fallback, so treating an empty probe as "no
-            # backend" here would 400 a selection the resolver would have accepted (#7188).
+            # A telemetry-down GPU still exposes a parent-visible mask, which the resolver
+            # validates against; treating an empty probe as "no backend" here would 400 a
+            # selection the resolver would have accepted (#7188).
             from utils.hardware import get_parent_visible_gpu_ids
             return bool(get_parent_visible_gpu_ids())
         except Exception:
@@ -3088,30 +3086,27 @@ class LlamaCppBackend:
         'real GPU, telemetry down' fall-through. The flag builder stays the backstop."""
         if not gpu_ids:
             return
-        # A CPU-only llama.cpp build (no cuda/hip/vulkan ggml lib) ignores
-        # CUDA_VISIBLE_DEVICES, so it cannot honor an explicit pin: reject before teardown
-        # rather than report a GPU-pinned load that silently runs on CPU (#7188).
+        # A CPU-only build (no cuda/hip/vulkan ggml lib) ignores CUDA_VISIBLE_DEVICES, so
+        # it can't honor a pin: reject before teardown rather than run silently on CPU (#7188).
         if backend_lacks_gpu_lib:
             raise ValueError(
                 f"Requested gpu_ids {list(gpu_ids)} but the llama.cpp build has no GPU "
                 "backend (CPU-only build); it would ignore the pin and run on CPU. Omit "
                 "gpu_ids to run on CPU."
             )
-        # Duplicate or negative ids are invalid on every backend -- the CUDA resolver and
-        # the Vulkan branch already reject them, so enforce it here for the deferred GGUF
-        # path too. Otherwise a non-Vulkan probe collapses [0, 0] into {0} and pins a
-        # single GPU while still recording the duplicate request (#7188).
+        # Duplicate/negative ids are invalid on every backend; enforce it here for the
+        # deferred GGUF path too, else a non-Vulkan probe collapses [0, 0] into {0} and
+        # pins one GPU while recording the duplicate (#7188).
         _requested = list(gpu_ids)
         if len(set(_requested)) != len(_requested) or any(g < 0 for g in _requested):
             raise ValueError(f"Invalid gpu_ids {_requested}: IDs must be unique and non-negative.")
         allowed = set(gpu_ids)
-        # Vulkan ordinals are matched directly against the probe; never remap through the
-        # CUDA/HIP mask (Vulkan enumerates independently of CUDA_VISIBLE_DEVICES) (#7188).
+        # Vulkan ordinals match the probe directly; never remap through the CUDA/HIP mask
+        # (Vulkan enumerates independently of CUDA_VISIBLE_DEVICES) (#7188).
         matched = [g for g in gpu_mem if g[0] in allowed]
         if gpu_mem:
-            # Every requested id must be present, not just one: a partial match like
-            # [0, 99] against a probe of [0] must be rejected, not silently narrowed to
-            # [0] (which would place the model on fewer GPUs than asked) (#7188).
+            # Every requested id must match: a partial hit like [0, 99] against [0] must be
+            # rejected, not narrowed to [0] (which places on fewer GPUs than asked) (#7188).
             if len(matched) != len(allowed):
                 raise ValueError(f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs")
         elif is_vulkan_backend:
@@ -3120,12 +3115,10 @@ class LlamaCppBackend:
         else:
             from utils.hardware import DeviceType, get_device, get_parent_visible_gpu_ids
 
-            # The CUDA/HIP visibility mask only governs placement on a CUDA/ROCm build.
-            # A Metal/SYCL/CPU backend ignores the CUDA_VISIBLE_DEVICES the launcher sets
-            # (SYCL keys off ONEAPI_DEVICE_SELECTOR, Metal has no such env), so with an
-            # empty probe on a non-CUDA host the pin can't be honored: reject it rather
-            # than accept a selection the loader would silently drop onto the default
-            # device (#7188). ROCm reports CUDA here, so HIP hosts keep the mask path.
+            # The CUDA/HIP mask only governs placement on a CUDA/ROCm build. A Metal/SYCL/CPU
+            # backend ignores CUDA_VISIBLE_DEVICES, so an empty probe on a non-CUDA host means
+            # the pin can't be honored: reject rather than drop onto the default device
+            # (#7188). ROCm reports CUDA here, so HIP hosts keep the mask path.
             if get_device() != DeviceType.CUDA:
                 raise ValueError(
                     f"Requested gpu_ids {list(gpu_ids)} but this backend does not support "
@@ -5415,9 +5408,9 @@ class LlamaCppBackend:
         )
     )
 
-    # Pre-kill check for block-diffusion names (e.g. google/diffusiongemma-*) whose
-    # GGUF header is only readable post-download (#7188). Matches "diffusiongemma"
-    # (no separator) and a standalone "diffusion" segment, but not "diffusionfoo".
+    # Pre-kill check for block-diffusion names (e.g. google/diffusiongemma-*) whose GGUF
+    # header only reads post-download (#7188). Matches "diffusiongemma" and a standalone
+    # "diffusion" segment, but not "diffusionfoo".
     _LIKELY_DIFFUSION_RE = re.compile(r"(?:^|[\/\-_.])diffusion(?:gemma|[\/\-_.]|$)", re.IGNORECASE)
 
     @staticmethod
@@ -6001,12 +5994,11 @@ class LlamaCppBackend:
 
         Returns True if the server started and the health check passed.
         """
-        # When a mode is applied, Studio's --mlock/--no-mmap (or their absence for auto)
-        # is authoritative, so strip conflicting --mmap/--no-mmap/--mlock from extra_args;
-        # else llama.cpp's last-wins parsing could run the child memory-mapped while
-        # Studio stored memory_mode='resident'. The route strips this too; doing it here
-        # keeps the invariant for direct load_model calls (idempotent). No mode = no
-        # opinion, so the user's flags are left untouched.
+        # When a mode is set, Studio's --mlock/--no-mmap (or their absence for auto) wins,
+        # so strip conflicting --mmap/--no-mmap/--mlock from extra_args; else last-wins
+        # parsing could memory-map the child while Studio stored 'resident'. The route
+        # strips this too; repeating it here covers direct load_model calls (idempotent).
+        # No mode = no opinion, so user flags are left untouched.
         if memory_mode is not None and extra_args:
             extra_args = strip_shadowing_flags(
                 extra_args,
@@ -6089,12 +6081,11 @@ class LlamaCppBackend:
 
             self._cancel_event.clear()
 
-            # ── Phase 0: validate diffusion placement before tearing down the old
-            # server. The header is only readable post-download, so HF-mode loads fall
-            # back to the repo name. Local loads are NOT name-matched (the route already
-            # ran the authoritative header check, and _read_gguf_metadata re-confirms
-            # below), so a chat GGUF under a ".../diffusion/..." path isn't misrejected
-            # (#7188).
+            # ── Phase 0: validate diffusion placement before teardown. The header only
+            # reads post-download, so HF-mode loads fall back to the repo name. Local loads
+            # are NOT name-matched (the route already ran the header check and
+            # _read_gguf_metadata re-confirms below), so a chat GGUF under a
+            # ".../diffusion/..." path isn't misrejected (#7188).
             _likely_diff = hf_repo is not None and self._is_likely_diffusion_model_name(
                 model_identifier = model_identifier, hf_repo = hf_repo
             )
@@ -6110,11 +6101,10 @@ class LlamaCppBackend:
                     "(DiffusionGemma) GGUF models."
                 )
 
-            # Validate explicit gpu_ids against the probe BEFORE Phase 1 tears down the
-            # running server. On non-CUDA hosts the route only confirmed *a* backend
-            # exists, so an out-of-range/duplicate id (e.g. [99]) would otherwise reach
-            # the flag builder and 400 only after _kill_process() unloaded the active
-            # model (#7188). The probe is read-only.
+            # Validate gpu_ids against the probe BEFORE Phase 1 teardown. On non-CUDA hosts
+            # the route only confirmed *a* backend exists, so a bad id (e.g. [99]) would
+            # otherwise 400 in the flag builder only after _kill_process() unloaded the
+            # active model (#7188). The probe is read-only.
             if gpu_ids is not None:
                 _preflight_binary = self._find_llama_server_binary()
                 self._assert_gpu_ids_resolvable(
@@ -6204,19 +6194,18 @@ class LlamaCppBackend:
             # Block-diffusion GGUFs (DiffusionGemma) cannot run on llama-server;
             # serve them with the diffusion runner (same OpenAI-compat interface).
             if self._is_diffusion:
-                # The diffusion runner is single-GPU (DG_GPU, default 0) and never uses
-                # gpu_ids; honoring one would let the coexistence guard budget the
-                # requested GPU while the runner starts on GPU 0 (wrong placement + guard
-                # bypass). Reject it; the route maps this ValueError to a 400.
+                # The diffusion runner is single-GPU (DG_GPU) and ignores gpu_ids; honoring
+                # one would budget the requested GPU while the runner starts on GPU 0 (wrong
+                # placement + guard bypass). Reject; the route maps this to a 400.
                 if gpu_ids is not None:
                     raise ValueError(
                         "gpu_ids selection is not supported for diffusion "
                         "(DiffusionGemma) GGUF models; they run on a single GPU "
                         "chosen by the DG_GPU environment variable."
                     )
-                # This path skips the command builder that maps memory_mode to
-                # --mlock/--no-mmap, so pinned/resident would be silently ignored yet
-                # recorded as honored. Reject them (auto is the allowed no-op default).
+                # This path skips the command builder that maps memory_mode to flags, so
+                # pinned/resident would be ignored yet recorded as honored. Reject them
+                # (auto is the allowed no-op default).
                 if LlamaCppBackend._canonical_memory_mode(memory_mode) is not None:
                     raise ValueError(
                         "gguf_memory_mode is not supported for diffusion "
@@ -6240,9 +6229,9 @@ class LlamaCppBackend:
                         extra_args = extra_args,
                     )
                     if started:
-                        # Clear any gpu_ids / memory placement a prior llama-server load
-                        # left, so reload-dedup reflects the runner's actual state and
-                        # doesn't needlessly kill+restart the healthy diffusion server.
+                        # Clear gpu_ids / placement a prior llama-server load left, so
+                        # reload-dedup reflects the runner's state and doesn't needlessly
+                        # restart the healthy diffusion server.
                         self._gpu_ids = None
                         self._memory_mode = None
                         self._requested_memory_mode = None
@@ -6404,13 +6393,12 @@ class LlamaCppBackend:
                     # per-GPU headroom (correct when the GPU is already partly used).
                     # Pass binary so a Vulkan build probes ggml's Vulkan ordinals.
                     _gpu_mem = self._get_gpu_memory(binary)
-                    # Honor explicit GPU selection: restrict the candidate set before
-                    # auto-selection / tensor/layer planning runs.
+                    # Honor gpu_ids: restrict the candidate set before auto-selection /
+                    # tensor/layer planning.
                     if gpu_ids is not None:
-                        # Duplicate/negative ids are invalid on every backend (the CUDA
-                        # resolver and Vulkan branch both reject them); enforce it here so
-                        # the deferred non-Vulkan probe path can't collapse [0, 0] into {0}
-                        # and pin one GPU while recording the duplicate (#7188).
+                        # Duplicate/negative ids are invalid on every backend; enforce here
+                        # so the deferred non-Vulkan probe path can't collapse [0, 0] into
+                        # {0} and pin one GPU while recording the duplicate (#7188).
                         _requested = list(gpu_ids)
                         if len(set(_requested)) != len(_requested) or any(
                             g < 0 for g in _requested
@@ -6420,16 +6408,14 @@ class LlamaCppBackend:
                                 "unique and non-negative."
                             )
                         allowed = set(gpu_ids)
-                        # Vulkan ordinals are matched directly against the Vulkan probe:
-                        # Vulkan enumerates independently of CUDA_VISIBLE_DEVICES (order
-                        # comes from the Vulkan loader and can even reverse the CUDA order),
-                        # so never remap through the CUDA/HIP parent mask (#7188).
+                        # Vulkan ordinals match the Vulkan probe directly: Vulkan enumerates
+                        # independently of CUDA_VISIBLE_DEVICES (loader order can even reverse
+                        # CUDA order), so never remap through the CUDA/HIP mask (#7188).
                         probe_listed_devices = bool(_gpu_mem)
                         _gpu_mem = [g for g in _gpu_mem if g[0] in allowed]
                         if probe_listed_devices and len(_gpu_mem) != len(allowed):
-                            # Probe enumerated GPUs but not ALL requested ids match: reject
-                            # rather than silently narrow (e.g. [0, 99] -> [0]), which would
-                            # place the model on fewer GPUs than asked (#7188).
+                            # Probe listed GPUs but not all ids match: reject rather than
+                            # narrow (e.g. [0, 99] -> [0], fewer GPUs than asked) (#7188).
                             raise ValueError(
                                 f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
                             )
@@ -6439,21 +6425,20 @@ class LlamaCppBackend:
                                 f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
                             )
                         if not _gpu_mem and not is_vulkan_backend and not probe_listed_devices:
-                            # Empty non-Vulkan probe: a real GPU with telemetry down, or
-                            # no GPU backend at all. The route skips the CUDA resolver for
-                            # GGUF on non-CUDA hosts, so validate the mask HERE: a non-empty
-                            # parent-visible mask is a real GPU with no telemetry (fall
-                            # through, --fit pins it below); an empty mask or an id outside
-                            # it means no such GPU, so reject rather than run on CPU (#7188).
+                            # Empty non-Vulkan probe: a telemetry-down GPU or no backend.
+                            # The route skipped the CUDA resolver here, so validate the mask:
+                            # a non-empty parent-visible mask is a telemetry-down GPU (fall
+                            # through, --fit pins it below); an empty mask or an out-of-mask
+                            # id means no such GPU, so reject rather than run on CPU (#7188).
                             from utils.hardware import (
                                 DeviceType,
                                 get_device,
                                 get_parent_visible_gpu_ids,
                             )
 
-                            # The mask only steers a CUDA/ROCm build; a Metal/SYCL/CPU
-                            # backend ignores CUDA_VISIBLE_DEVICES, so an empty probe there
-                            # means the pin can't be honored -- reject it (#7188).
+                            # The mask only steers a CUDA/ROCm build; a Metal/SYCL/CPU backend
+                            # ignores CUDA_VISIBLE_DEVICES, so an empty probe there can't honor
+                            # the pin -- reject it (#7188).
                             if get_device() != DeviceType.CUDA:
                                 raise ValueError(
                                     f"Requested gpu_ids {list(gpu_ids)} but this backend does "
@@ -7253,18 +7238,17 @@ class LlamaCppBackend:
                     tp_tensor_split = None
                     effective_ctx = requested_ctx  # fall back to original
 
-                # If explicit GPUs were requested but the model doesn't fit, _select_gpus
-                # falls back to --fit with gpu_indices=None, leaving CUDA_VISIBLE_DEVICES
-                # unset so llama-server spreads across every parent-visible GPU (incl. ones
-                # the training guard excluded). Pin --fit to the requested set instead.
+                # When explicit GPUs don't fit, _select_gpus falls back to --fit with
+                # gpu_indices=None, leaving CUDA_VISIBLE_DEVICES unset so llama-server spreads
+                # across every parent-visible GPU (incl. guard-excluded ones). Pin --fit to
+                # the requested set instead.
                 if use_fit and gpu_indices is None and gpu_ids is not None:
                     if gpus:
                         gpu_indices = sorted(idx for idx, _ in gpus)
                         logger.info(f"Using --fit on explicitly requested GPUs: {gpu_indices}")
                     elif not is_vulkan_backend:
-                        # No telemetry probe (no measured GPUs to sort); gpu_ids are
-                        # physical CUDA/ROCm ids, so pin --fit to them directly, else
-                        # llama-server spreads across every parent-visible GPU.
+                        # No telemetry probe: gpu_ids are physical CUDA/ROCm ids, so pin
+                        # --fit to them directly, else llama-server spreads across all GPUs.
                         gpu_indices = sorted(gpu_ids)
                         logger.info(
                             f"Using --fit on explicitly requested GPUs (no telemetry): {gpu_indices}"
@@ -7316,8 +7300,8 @@ class LlamaCppBackend:
                     "--no-context-shift",
                 ]
 
-                # Memory placement mode: keep model resident so idle weights aren't
-                # paged out and re-faulted from disk (#7164).
+                # Memory placement: keep weights resident so idle weights aren't paged
+                # out and re-faulted from disk (#7164).
                 cmd.extend(self._memory_mode_flags(memory_mode))
 
                 # Report a clean public model id (matching GET /v1/models) rather
@@ -7445,10 +7429,10 @@ class LlamaCppBackend:
                     extra_args = extra_args,
                     model_identifier = model_identifier,
                     model_path = model_path,
-                    # GPU-backed iff the launch targets GPUs: a measured probe (gpus) OR
-                    # a resolved pin (gpu_indices). The no-telemetry explicit-gpu_ids path
-                    # pins via gpu_indices with an empty probe, so bool(gpus) alone would
-                    # mistake it for CPU and pick the CPU spec-draft default (#7164).
+                    # GPU-backed iff the launch targets GPUs: a measured probe (gpus) OR a
+                    # resolved pin (gpu_indices). The no-telemetry gpu_ids path pins via
+                    # gpu_indices with an empty probe, so bool(gpus) alone would read as CPU
+                    # and pick the CPU spec-draft default (#7164).
                     gpus = bool(gpus) or bool(gpu_indices),
                     binary = binary,
                     mtp_draft_path = launch_mtp_draft_path,
@@ -7566,10 +7550,9 @@ class LlamaCppBackend:
                     _emit_extra_args = list(extra_args)
                     if gpu_ids is not None:
                         # gpu_ids is authoritative: drop a user --device/-dev so it can't
-                        # last-wins-override the pin and offload to a GPU the training guard
-                        # never accounted for (#7188). On Vulkan the --device pin is the
-                        # only pin (the guard-bypass fix); on CUDA/ROCm it keeps
-                        # backend.gpu_ids honest. Other extras still pass through.
+                        # override the pin and offload to a guard-unaccounted GPU (#7188).
+                        # On Vulkan --device is the only pin; on CUDA/ROCm it keeps
+                        # backend.gpu_ids honest. Other extras pass through.
                         _emit_extra_args = self._strip_device_extra_args(extra_args)
                         if _emit_extra_args != list(extra_args):
                             logger.info(
@@ -7591,16 +7574,14 @@ class LlamaCppBackend:
                 if "--threads" not in cmd:
                     env.pop("LLAMA_ARG_THREADS", None)
 
-                # Memory placement is first-class: Studio's --mlock/--no-mmap (or their
-                # absence for auto) must win. llama-server honors LLAMA_ARG_MLOCK/NO_MMAP/
-                # MMAP only where Studio emits no CLI flag, so an inherited env could run
-                # an explicit 'auto' mlocked or turn 'pinned' into 'resident'. Scrub them
-                # ONLY when a mode is supplied, so an operator's env vars keep the pre-PR
-                # inheritance when no mode is requested (backwards compatible). Record
-                # whether the child launched WITH inherited placement flags so a later
-                # explicit 'auto' reloads to clear them (the dedup canonicalizes 'auto'
-                # and None together and would otherwise leave the child mlocked). Mirrors
-                # the LLAMA_ARG_THREADS / split / cache scrubs.
+                # Studio's --mlock/--no-mmap (or their absence for auto) must win. llama-server
+                # honors LLAMA_ARG_MLOCK/NO_MMAP/MMAP only where Studio emits no flag, so an
+                # inherited env could mlock an explicit 'auto' or turn 'pinned' into 'resident'.
+                # Scrub only when a mode is set, so operator env vars keep the pre-PR
+                # inheritance otherwise (backwards compatible). Record whether the child
+                # launched WITH inherited placement flags so a later explicit 'auto' reloads
+                # to clear them (the dedup treats 'auto' and None alike and would otherwise
+                # leave it mlocked). Mirrors the threads / split / cache scrubs.
                 _mm_vars = ("LLAMA_ARG_MLOCK", "LLAMA_ARG_NO_MMAP", "LLAMA_ARG_MMAP")
                 if memory_mode is not None:
                     for _mm_var in _mm_vars:
@@ -8062,9 +8043,9 @@ class LlamaCppBackend:
                 # clears, list sets. Source records hf_variant for the route's
                 # same_source check.
                 if extra_args is not None:
-                    # Persist the SAME device-stripped extras the command used when gpu_ids
-                    # owns placement, so a later same-model reload that inherits these (after
-                    # gpu_ids is cleared) can't resurrect the dropped --device (#7188).
+                    # Persist the same device-stripped extras the command used when gpu_ids
+                    # owns placement, so a later inheriting reload (after gpu_ids clears)
+                    # can't resurrect the dropped --device (#7188).
                     self._extra_args = (
                         self._strip_device_extra_args(extra_args)
                         if gpu_ids is not None
@@ -8571,10 +8552,9 @@ class LlamaCppBackend:
             self._memory_mode
         ) != LlamaCppBackend._canonical_memory_mode(memory_mode):
             return False
-        # Explicit memory_mode (incl. 'auto') over a child still carrying inherited
-        # LLAMA_ARG_* placement flags must reload so the scrub clears them; the
-        # canonical check above treats 'auto' as omitted and would otherwise leave
-        # the child mlocked/no-mmap (#7164).
+        # An explicit memory_mode (incl. 'auto') over a child carrying inherited LLAMA_ARG_*
+        # flags must reload so the scrub runs; the canonical check above treats 'auto' as
+        # omitted and would otherwise leave the child mlocked/no-mmap (#7164).
         if memory_mode is not None and self._launched_with_inherited_mem_env:
             return False
 

@@ -61,10 +61,9 @@ class LoadRequest(BaseModel):
     @field_validator("gguf_memory_mode", mode = "before")
     @classmethod
     def normalize_blank_gguf_memory_mode(cls, value: Any) -> Any:
-        # A form may serialize the default placement as "". Map blank to explicit
-        # "auto" (not None) so it counts as an explicit choice: the route/backend only
-        # scrub inherited LLAMA_ARG_MLOCK/NO_MMAP/MMAP when the value is not None, so
-        # blank -> None would let those operator env vars survive (#7164).
+        # Map a form's blank default to explicit "auto" (not None) so it counts as a
+        # choice: the scrub of inherited LLAMA_ARG_MLOCK/NO_MMAP/MMAP only runs when the
+        # value is not None, so blank -> None would let those env vars survive (#7164).
         if isinstance(value, str) and value.strip() == "":
             return "auto"
         return value
