@@ -601,8 +601,22 @@ export function useChatModelRuntime() {
           const loadCustomContextLength = stateBeforeUnload.customContextLength;
           const loadGgufContextLength = stateBeforeUnload.ggufContextLength;
           const loadTensorParallel = stateBeforeUnload.tensorParallel;
-          const loadGpuIds = stateBeforeUnload.activeGpuIds;
-          const loadMemoryMode = stateBeforeUnload.activeMemoryMode;
+          // GGUF placement (gpu_ids / memory_mode) is per-model: activeGpuIds
+          // only ever mirrors the currently-loaded model's backend status,
+          // there is no staged sidebar picker that pre-selects it for the
+          // model being loaded. On a switch to a different model, reusing this
+          // snapshot would silently pin the new model to the prior model's
+          // physical devices / memory mode, so drop it to auto (null);
+          // same-model Apply/reload keeps it. Finalized here, before the
+          // validate call below, so the validate and load requests agree.
+          const isModelSwitch =
+            Boolean(currentCheckpoint) && currentCheckpoint !== modelId;
+          const loadGpuIds = isModelSwitch
+            ? null
+            : stateBeforeUnload.activeGpuIds;
+          const loadMemoryMode = isModelSwitch
+            ? null
+            : stateBeforeUnload.activeMemoryMode;
           const loadActivePresetSource = stateBeforeUnload.activePresetSource;
           const loadActiveGgufVariant = stateBeforeUnload.activeGgufVariant;
           let loadSpeculativeType = stateBeforeUnload.speculativeType;
