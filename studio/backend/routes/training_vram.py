@@ -270,11 +270,18 @@ def can_load_chat_during_training(
             if not free_vals:
                 return False, {"mode": "gguf_vulkan", "reason": "no_visible_gpus"}
             needed_gb = required_gb * SAFETY_MARGIN + KEEP_FLOOR_GB
+            # A multi-GPU Vulkan pin shards the model (~needed/N per device), so require
+            # each visible GPU to hold a single shard, not the whole model -- otherwise a
+            # valid sharded load is rejected whenever it doesn't fit on the least-free card.
+            # The ordinal->physical mapping is unknown, so min_free over all visible GPUs is
+            # the safe bound: if the least-free card holds a shard, any mapping does (#7188).
+            per_gpu_needed_gb = needed_gb / len(requested_gpu_ids)
             min_free_gb = min(free_vals)
-            return min_free_gb >= needed_gb, {
+            return min_free_gb >= per_gpu_needed_gb, {
                 "mode": "gguf_vulkan",
                 "required_gb": round(required_gb, 3),
                 "needed_gb": round(needed_gb, 3),
+                "per_gpu_needed_gb": round(per_gpu_needed_gb, 3),
                 "min_free_gb": round(min_free_gb, 3),
             }
         if requested_gpu_ids:

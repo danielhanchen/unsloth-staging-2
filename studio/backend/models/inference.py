@@ -75,7 +75,7 @@ class LoadRequest(BaseModel):
     )
     gpu_ids: Optional[List[int]] = Field(
         None,
-        description = "Physical GPU indices to use, for example [0, 1]. Omit or pass [] to use automatic selection. Explicit gpu_ids are unsupported when the parent CUDA_VISIBLE_DEVICES uses UUID/MIG entries. Supported for both Hugging Face and GGUF models.",
+        description = "GPU indices to use, for example [0, 1]. Physical CUDA/ROCm indices for Hugging Face models and CUDA/ROCm GGUF builds; for a Vulkan GGUF build these are Vulkan device ordinals (ggml's --device Vulkan<i> space), which enumerate independently of CUDA_VISIBLE_DEVICES and can differ from the CUDA/PCI order. Omit or pass [] to use automatic selection. Explicit gpu_ids are unsupported when the parent CUDA_VISIBLE_DEVICES uses UUID/MIG entries. Supported for both Hugging Face and GGUF models.",
     )
     gguf_memory_mode: Optional[Literal["auto", "pinned", "resident"]] = Field(
         None,

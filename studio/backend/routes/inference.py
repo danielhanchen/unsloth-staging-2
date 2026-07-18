@@ -4330,6 +4330,20 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
+                # A CPU-only llama.cpp build ignores CUDA_VISIBLE_DEVICES, so a resolvable
+                # CUDA id still can't be honored. The CUDA resolver above can't see the
+                # build, so reject here (before the unload) instead of only in Phase 0 after
+                # teardown -- mirrors the non-CUDA branch's pre-unload guard (#7188).
+                if config.is_gguf and await asyncio.to_thread(
+                    get_llama_cpp_backend()._backend_lacks_gpu_lib
+                ):
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported: the llama.cpp build has no "
+                            "GPU backend (CPU-only build) and would run on CPU. Omit gpu_ids."
+                        ),
+                    )
             else:
                 # Non-CUDA GGUF host (CPU / MLX / XPU) or a Vulkan build on any host: the
                 # CUDA resolver can't enumerate llama.cpp's devices, so gate on its probe
@@ -5015,6 +5029,19 @@ async def validate_model(
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
+                # Mirror /load: a CPU-only llama.cpp build ignores CUDA_VISIBLE_DEVICES, so a
+                # resolvable CUDA id still can't be honored. Reject here so /validate fails
+                # before the frontend unloads, not only in Phase 0 after teardown (#7188).
+                if config.is_gguf and await asyncio.to_thread(
+                    get_llama_cpp_backend()._backend_lacks_gpu_lib
+                ):
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported: the llama.cpp build has no "
+                            "GPU backend (CPU-only build) and would run on CPU. Omit gpu_ids."
+                        ),
+                    )
             else:
                 # Mirror /load: gate on the llama.cpp probe for a non-CUDA GGUF host (or a
                 # Vulkan build on any host) so an unsupported selection is rejected before

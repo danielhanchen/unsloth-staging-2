@@ -922,6 +922,10 @@ class TestRouteErrors(unittest.TestCase):
                 # Not a Vulkan build, so a CUDA host uses the CUDA resolver path.
                 return False
 
+            def _backend_lacks_gpu_lib(self, binary = None):
+                # A GPU-capable build, so the CUDA-branch CPU-only guard is a no-op.
+                return False
+
             def assert_requested_gpu_ids_resolvable(self, gpu_ids):
                 # [0, 1] is resolvable here, so this is a no-op.
                 return None

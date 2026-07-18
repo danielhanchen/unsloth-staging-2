@@ -270,6 +270,27 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(info["reason"], "no_visible_gpus")
 
+    def test_vulkan_multi_gpu_shards_budget_per_device(self):
+        # free [70, 4], needed 6.3. A single-GPU Vulkan pin needs the whole 6.3 on the
+        # least-free card -> reject; a 2-GPU pin shards (~3.15/card) and fits the least-
+        # free card -> allow. Confirms the guard budgets per-shard, not whole-model (#7188).
+        ok_single, info_single, _ = self._run(
+            devices = _devices((0, 80, 10), (1, 80, 76)),
+            required_override = 2.0,
+            requested_gpu_ids = [0],
+            gpu_ids_are_vulkan_ordinals = True,
+        )
+        self.assertFalse(ok_single)
+        ok_multi, info_multi, _ = self._run(
+            devices = _devices((0, 80, 10), (1, 80, 76)),
+            required_override = 2.0,
+            requested_gpu_ids = [0, 1],
+            gpu_ids_are_vulkan_ordinals = True,
+        )
+        self.assertTrue(ok_multi)
+        self.assertEqual(info_multi["mode"], "gguf_vulkan")
+        self.assertEqual(info_multi["per_gpu_needed_gb"], round(6.3 / 2, 3))
+
 
 # ── can_load_chat_during_training: device-independent paths ──────────────────
 
@@ -574,12 +595,65 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
                 "core.inference.llama_cpp.LlamaCppBackend.assert_requested_gpu_ids_resolvable",
                 return_value = None,
             ),
+            # A GPU-capable build (the CI host ships a CPU-only llama-server), so the
+            # CUDA-branch CPU-only guard is a no-op and the load reaches the guard.
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend._backend_lacks_gpu_lib",
+                return_value = False,
+            ),
             _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
         ):
             resp = asyncio.run(self.route.validate_model(request, current_subject = "u"))
         self.assertEqual(captured[0]["requested_gpu_ids"], [0])
         self.assertTrue(resp.valid)
         self.assertTrue(resp.is_gguf)
+
+    def test_gguf_cpu_only_build_rejected_on_cuda_host_before_guard(self):
+        # On a CUDA host with a CPU-only llama.cpp build, the CUDA resolver accepts the id
+        # but the build can't honor the pin. /validate must 400 BEFORE the guard/unload,
+        # not let it pass and fail only in Phase 0 after teardown (#7188).
+        from fastapi import HTTPException
+        from models.inference import ValidateModelRequest
+        from utils.hardware import DeviceType
+
+        request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [0])
+        cfg = SimpleNamespace(
+            identifier = "x.gguf",
+            display_name = "x",
+            is_gguf = True,
+            is_lora = False,
+            is_vision = False,
+            path = None,
+            base_model = None,
+        )
+        captured = []
+        with (
+            patch.object(
+                self.route,
+                "_resolve_model_identifier_for_request",
+                return_value = ("x.gguf", "x.gguf", False),
+            ),
+            patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
+            patch.object(self.route, "load_inference_config", return_value = {}),
+            patch.object(self.route, "_requires_trust_remote_code_for_model", return_value = False),
+            patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
+            patch("utils.hardware.resolve_requested_gpu_ids", return_value = [0]),
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend.is_vulkan_build",
+                return_value = False,
+            ),
+            patch(
+                "core.inference.llama_cpp.LlamaCppBackend._backend_lacks_gpu_lib",
+                return_value = True,
+            ),
+            _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                asyncio.run(self.route.validate_model(request, current_subject = "u"))
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertIn("CPU-only build", ctx.exception.detail)
+        # Rejected before the coexistence guard (and thus before any unload).
+        self.assertEqual(captured, [])
 
     def test_gguf_with_invalid_gpu_ids_rejected_before_guard(self):
         # On CUDA/ROCm an invalid GGUF gpu_ids 400s before the guard (the resolver
