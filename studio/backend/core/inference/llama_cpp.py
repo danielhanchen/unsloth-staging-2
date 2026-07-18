@@ -2752,6 +2752,31 @@ class LlamaCppBackend:
         return True
 
     @staticmethod
+    def _backend_lacks_gpu_lib(binary: Optional[str] = None) -> bool:
+        """True only when the llama.cpp build clearly ships CPU-only ggml libs (a
+        ggml-cpu/base lib present but no cuda/hip/vulkan sibling), so an explicit gpu_ids
+        pin can't be honored: the child is steered only by CUDA_VISIBLE_DEVICES and a
+        CPU-only llama-server would ignore it and run on CPU while /load reports a
+        GPU-pinned success. Conservative -- an unrecognized layout (no lib dir, or no
+        ggml libs at all, e.g. a statically linked build) returns False so a valid custom
+        GPU build is never falsely rejected (#7188)."""
+        binary = binary or LlamaCppBackend._find_llama_server_binary()
+        if not binary:
+            return False
+        lib_dir = _llama_lib_dir(binary)
+        if not lib_dir or not lib_dir.is_dir():
+            return False
+
+        def _lib(name):
+            return f"ggml-{name}.dll" if sys.platform == "win32" else f"libggml-{name}.so"
+
+        if any((lib_dir / _lib(b)).is_file() for b in ("vulkan", "cuda", "hip")):
+            return False  # a GPU ggml backend is present -> the pin can be honored
+        # No GPU lib. Only call it CPU-only when a CPU/base ggml lib IS present, proving
+        # the split-lib layout is in use and GPU support is genuinely absent (not static).
+        return any((lib_dir / _lib(b)).is_file() for b in ("cpu", "base"))
+
+    @staticmethod
     def _resolve_visible_physical_ids() -> Optional[list[int]]:
         """Physical GPU ids behind the active visibility mask (HIP/ROCR/CUDA on
         ROCm, CUDA otherwise). None when no mask is set; empty list for an empty
@@ -3014,12 +3039,18 @@ class LlamaCppBackend:
             return
         binary = self._find_llama_server_binary()
         self._assert_gpu_ids_resolvable(
-            gpu_ids, self._get_gpu_memory(binary), self._is_vulkan_backend(binary)
+            gpu_ids,
+            self._get_gpu_memory(binary),
+            self._is_vulkan_backend(binary),
+            self._backend_lacks_gpu_lib(binary),
         )
 
     @staticmethod
     def _assert_gpu_ids_resolvable(
-        gpu_ids: Optional[list[int]], gpu_mem: list[tuple[int, int, int]], is_vulkan_backend: bool
+        gpu_ids: Optional[list[int]],
+        gpu_mem: list[tuple[int, int, int]],
+        is_vulkan_backend: bool,
+        backend_lacks_gpu_lib: bool = False,
     ) -> None:
         """Raise ValueError if the requested gpu_ids cannot be honored on this host.
 
@@ -3029,16 +3060,25 @@ class LlamaCppBackend:
         'real GPU, telemetry down' fall-through. The flag builder stays the backstop."""
         if not gpu_ids:
             return
+        # A CPU-only llama.cpp build (no cuda/hip/vulkan ggml lib) ignores
+        # CUDA_VISIBLE_DEVICES, so it cannot honor an explicit pin: reject before teardown
+        # rather than report a GPU-pinned load that silently runs on CPU (#7188).
+        if backend_lacks_gpu_lib:
+            raise ValueError(
+                f"Requested gpu_ids {list(gpu_ids)} but the llama.cpp build has no GPU "
+                "backend (CPU-only build); it would ignore the pin and run on CPU. Omit "
+                "gpu_ids to run on CPU."
+            )
+        # Duplicate or negative ids are invalid on every backend -- the CUDA resolver and
+        # the Vulkan branch already reject them, so enforce it here for the deferred GGUF
+        # path too. Otherwise a non-Vulkan probe collapses [0, 0] into {0} and pins a
+        # single GPU while still recording the duplicate request (#7188).
+        _requested = list(gpu_ids)
+        if len(set(_requested)) != len(_requested) or any(g < 0 for g in _requested):
+            raise ValueError(f"Invalid gpu_ids {_requested}: IDs must be unique and non-negative.")
         allowed = set(gpu_ids)
-        if is_vulkan_backend:
-            # gpu_ids are Vulkan ordinals matched directly against the probe; never
-            # remap through the CUDA/HIP mask (Vulkan enumerates independently) (#7188).
-            _requested = list(gpu_ids)
-            if len(set(_requested)) != len(_requested) or any(g < 0 for g in _requested):
-                raise ValueError(
-                    f"Invalid Vulkan gpu_ids {_requested}: IDs must be unique and non-negative."
-                )
-            allowed = set(gpu_ids)
+        # Vulkan ordinals are matched directly against the probe; never remap through the
+        # CUDA/HIP mask (Vulkan enumerates independently of CUDA_VISIBLE_DEVICES) (#7188).
         matched = [g for g in gpu_mem if g[0] in allowed]
         if gpu_mem:
             # Every requested id must be present, not just one: a partial match like
@@ -6053,6 +6093,7 @@ class LlamaCppBackend:
                     gpu_ids,
                     self._get_gpu_memory(_preflight_binary),
                     self._is_vulkan_backend(_preflight_binary),
+                    self._backend_lacks_gpu_lib(_preflight_binary),
                 )
 
             # ── Phase 1: kill old process (under lock, fast) ──────────
@@ -6338,23 +6379,23 @@ class LlamaCppBackend:
                     # Honor explicit GPU selection: restrict the candidate set before
                     # auto-selection / tensor/layer planning runs.
                     if gpu_ids is not None:
+                        # Duplicate/negative ids are invalid on every backend (the CUDA
+                        # resolver and Vulkan branch both reject them); enforce it here so
+                        # the deferred non-Vulkan probe path can't collapse [0, 0] into {0}
+                        # and pin one GPU while recording the duplicate (#7188).
+                        _requested = list(gpu_ids)
+                        if len(set(_requested)) != len(_requested) or any(
+                            g < 0 for g in _requested
+                        ):
+                            raise ValueError(
+                                f"Invalid gpu_ids {_requested}: IDs must be "
+                                "unique and non-negative."
+                            )
                         allowed = set(gpu_ids)
-                        if is_vulkan_backend:
-                            # gpu_ids are Vulkan device ordinals, matched directly against the
-                            # Vulkan probe. Vulkan enumerates independently of
-                            # CUDA_VISIBLE_DEVICES (order comes from the Vulkan loader and can
-                            # even reverse the CUDA order), so never remap through the CUDA/HIP
-                            # parent mask -- that would pin the wrong device (#7188). The CUDA
-                            # resolver's checks are skipped here, so reject duplicates/negatives.
-                            _requested = list(gpu_ids)
-                            if len(set(_requested)) != len(_requested) or any(
-                                g < 0 for g in _requested
-                            ):
-                                raise ValueError(
-                                    f"Invalid Vulkan gpu_ids {_requested}: IDs must be "
-                                    "unique and non-negative."
-                                )
-                            allowed = set(gpu_ids)
+                        # Vulkan ordinals are matched directly against the Vulkan probe:
+                        # Vulkan enumerates independently of CUDA_VISIBLE_DEVICES (order
+                        # comes from the Vulkan loader and can even reverse the CUDA order),
+                        # so never remap through the CUDA/HIP parent mask (#7188).
                         probe_listed_devices = bool(_gpu_mem)
                         _gpu_mem = [g for g in _gpu_mem if g[0] in allowed]
                         if probe_listed_devices and len(_gpu_mem) != len(allowed):

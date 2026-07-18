@@ -830,6 +830,62 @@ def test_partial_gpu_ids_match_is_rejected():
         LlamaCppBackend._assert_gpu_ids_resolvable([0], probe, is_vulkan)
 
 
+def test_duplicate_or_negative_gpu_ids_rejected_on_all_backends():
+    """Duplicate/negative ids are invalid on every backend, not just Vulkan: a non-Vulkan
+    populated probe must not collapse [0, 0] into {0} and pin one GPU while recording the
+    duplicate (a torch-less CUDA host defers here, skipping the CUDA resolver) (#7188)."""
+    probe = [(0, 10000, 16000), (1, 8000, 16000)]
+    for is_vulkan in (True, False):
+        for bad in ([0, 0], [-1], [0, -1]):
+            with pytest.raises(ValueError, match = "unique and non-negative"):
+                LlamaCppBackend._assert_gpu_ids_resolvable(bad, probe, is_vulkan)
+        # A valid unique selection still passes.
+        LlamaCppBackend._assert_gpu_ids_resolvable([0, 1], probe, is_vulkan)
+
+
+def test_cpu_only_build_rejects_gpu_ids():
+    """A CPU-only llama.cpp build ignores CUDA_VISIBLE_DEVICES, so an explicit pin can't be
+    honored: reject it before teardown even with a populated nvidia-smi probe on a CUDA host,
+    instead of reporting a GPU-pinned load that silently runs on CPU (#7188)."""
+    probe = [(0, 10000, 16000)]
+    with pytest.raises(ValueError, match = "CPU-only build"):
+        LlamaCppBackend._assert_gpu_ids_resolvable([0], probe, False, backend_lacks_gpu_lib = True)
+    # With a GPU backend lib present the same pin is accepted.
+    LlamaCppBackend._assert_gpu_ids_resolvable([0], probe, False, backend_lacks_gpu_lib = False)
+
+
+def test_backend_lacks_gpu_lib_detection(tmp_path):
+    """_backend_lacks_gpu_lib is True ONLY for a clear CPU-only split-lib layout (a
+    ggml-cpu/base lib with no gpu sibling); a gpu lib, or an unrecognized/static layout
+    with no ggml libs, returns False so a valid custom GPU build is never falsely rejected
+    (#7188)."""
+    ext = "dll" if sys.platform == "win32" else "so"
+    pre = "" if sys.platform == "win32" else "lib"
+
+    def _lib_dir_with(*names):
+        d = tmp_path / ("libs_" + ("_".join(names) or "empty"))
+        d.mkdir()
+        for nm in names:
+            (d / f"{pre}ggml-{nm}.{ext}").write_bytes(b"x")
+        return d
+
+    binary = str(tmp_path / "llama-server")
+    (tmp_path / "llama-server").write_bytes(b"x")
+
+    # CPU-only split layout -> True.
+    with patch("core.inference.llama_cpp._llama_lib_dir", return_value = _lib_dir_with("cpu")):
+        assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is True
+    # Any GPU ggml lib present -> False (pin can be honored).
+    for gpu in ("cuda", "hip", "vulkan"):
+        with patch(
+            "core.inference.llama_cpp._llama_lib_dir", return_value = _lib_dir_with("cpu", gpu)
+        ):
+            assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is False
+    # No ggml libs at all (static / unrecognized) -> False (never falsely reject).
+    with patch("core.inference.llama_cpp._llama_lib_dir", return_value = _lib_dir_with()):
+        assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is False
+
+
 def test_empty_non_cuda_probe_rejects_gpu_ids_even_with_stray_mask():
     """On a Metal/SYCL/CPU (non-CUDA) backend the launcher's CUDA_VISIBLE_DEVICES is
     ignored (SYCL keys off ONEAPI_DEVICE_SELECTOR, Metal off none), so an empty probe

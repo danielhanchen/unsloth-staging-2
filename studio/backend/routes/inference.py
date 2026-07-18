@@ -3287,7 +3287,9 @@ def _request_matches_loaded_settings(
         # Explicit gpu_ids make the backend drop a user --device from both the launched
         # and stored extras, so strip it request-side too or an otherwise identical reload
         # would miss this fast path and force a needless reload / training 409 (#7188).
-        _strip_dev = request.gpu_ids is not None
+        # Gate on an EFFECTIVE pin: the load path normalizes gpu_ids=[] to None (auto) and
+        # keeps its --device, so an empty list must NOT strip here or the two sides diverge.
+        _strip_dev = bool(request.gpu_ids)
         _request_extra = (
             strip_shadowing_flags(
                 request.llama_extra_args,
