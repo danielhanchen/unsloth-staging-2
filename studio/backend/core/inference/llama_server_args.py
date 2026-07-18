@@ -175,11 +175,8 @@ _TEMPLATE_FLAGS: frozenset[str] = frozenset(
         "--no-jinja",
     }
 )
-# Memory placement mode shadows the GGUF memory_mode first-class field.
-# --mlock / --no-mmap / --mmap are pass-through in explicit extras, but stripped
-# on inherit when the user changes the memory mode so the new setting wins.
-# --mmap is the inverse of --no-mmap; an inherited --mmap would otherwise
-# last-wins-override a resident load's --no-mmap and defeat the mode.
+# Shadow the GGUF memory_mode field: pass-through in explicit extras, stripped on
+# inherit when the mode changes. --mmap is the inverse of --no-mmap.
 _MEMORY_MODE_FLAGS: frozenset[str] = frozenset({"--mlock", "--no-mmap", "--mmap"})
 # Multi-GPU split mode shadows the Tensor Parallelism toggle
 # (--split-mode tensor). Pass-through stays allowed so users keep the
@@ -191,11 +188,9 @@ _MEMORY_MODE_FLAGS: frozenset[str] = frozenset({"--mlock", "--no-mmap", "--mmap"
 _SPLIT_MODE_FLAGS: frozenset[str] = frozenset({"-sm", "--split-mode"})
 _TENSOR_SPLIT_FLAGS: frozenset[str] = frozenset({"-ts", "--tensor-split"})
 _SPLIT_SHADOWING_FLAGS: frozenset[str] = _SPLIT_MODE_FLAGS | _TENSOR_SPLIT_FLAGS
-# llama.cpp's explicit offload device list (--device Vulkan0,Vulkan1 / -dev ...).
-# Not a general shadow flag (users may pass --device when Studio auto-selects), so
-# it is opt-in: stripped only when the first-class gpu_ids field is set, so an extras
-# --device can't last-wins-override the gpu_ids pin and offload to a GPU the training
-# guard and backend.gpu_ids never accounted for (#7188).
+# llama.cpp offload device list (--device / -dev). Opt-in (users may pass it under
+# auto-select): stripped only when gpu_ids is set, so it can't override the pin and
+# offload to a GPU the training guard never budgeted (#7188).
 _DEVICE_FLAGS: frozenset[str] = frozenset({"--device", "-dev"})
 
 _SHADOWING_FLAGS: frozenset[str] = (
@@ -450,11 +445,10 @@ def strip_shadowing_flags(
 
     Used when inheriting a previous load's ``llama_extra_args`` so an
     inherited `-c 4096` can't override the current `max_seq_length`
-    (same for cache / spec / template / split-mode / memory_mode). Each
-    ``strip_*`` toggle controls one group; the route only strips groups whose
-    first-class field the caller actually supplied. ``strip_device`` is off by
-    default (users may pass ``--device`` when Studio auto-selects) and is enabled
-    only when explicit gpu_ids make the device placement authoritative.
+    (same for cache / spec / template / split-mode / memory_mode). Each ``strip_*``
+    toggle controls one group; the route only strips groups whose first-class field
+    the caller supplied. ``strip_device`` is off by default (users may pass
+    ``--device`` when Studio auto-selects) and enabled only for explicit gpu_ids.
     """
     shadowing: set[str] = set()
     if strip_context:

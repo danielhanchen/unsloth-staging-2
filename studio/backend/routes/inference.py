@@ -20,6 +20,7 @@ from loggers import get_logger
 import asyncio
 import threading
 import weakref
+from contextlib import ExitStack
 
 
 import re as _re
@@ -28,6 +29,7 @@ import re as _re
 from utils.models import extract_model_size_b as _extract_model_size_b
 
 from utils.api_errors import openai_error_body, anthropic_error_body
+from core.inference.orchestrator import GenStreamError, GenStreamErrorRaised
 from core.inference.llama_admission import (
     LlamaAdmissionCancelled,
     LlamaAdmissionConfig,
@@ -210,6 +212,14 @@ def _friendly_error(exc: Exception) -> str:
     if template_msg:
         return f"An internal error occurred: {template_msg}"
     return "An internal error occurred"
+
+
+def _friendly_gen_stream_error(value) -> str:
+    """Return a client-safe message for typed local generation errors."""
+    text = str(value)
+    if getattr(value, "public", False):
+        return text
+    return safe_error_detail(RuntimeError(text), fallback = "An internal error occurred.")
 
 
 def _friendly_upstream_error(text: str) -> str:
@@ -998,6 +1008,7 @@ try:
     from core.inference.llama_server_args import (
         _effective_tensor_parallel,
         _tensor_parallel_matches_loaded,
+        extra_args_disable_mmproj,
         parse_split_mode_override,
         resolve_tensor_parallel,
         strip_shadowing_flags,
@@ -1035,6 +1046,7 @@ except ImportError:
     from core.inference.llama_server_args import (
         _effective_tensor_parallel,
         _tensor_parallel_matches_loaded,
+        extra_args_disable_mmproj,
         parse_split_mode_override,
         resolve_tensor_parallel,
         strip_shadowing_flags,
@@ -1915,16 +1927,57 @@ async def artifact_preview_frame(allow_network: bool = False):
 _BARE_JSON_NAME_MARKER_RE = _re.compile(r'\{\s*\\?"(?:name|function)\\?"\s*:')
 
 
-def _detect_safetensors_features(backend, chat_template: Optional[str]) -> dict:
+def _detect_safetensors_features(
+    backend,
+    chat_template: Optional[str],
+    tools = None,
+) -> dict:
     """Classify reasoning/tool capabilities via the GGUF classifier so flags
     match across backends. gpt-oss is overridden: Harmony routes reasoning and
     tools through tokenizer channels, not template markup."""
     model_id = getattr(backend, "active_model_name", None)
+    feature_template = chat_template
+    try:
+        from core.inference.chat_template_helpers import _selected_template_strings_from_value
+        selected_templates = _selected_template_strings_from_value(chat_template, tools)
+        if selected_templates:
+            feature_template = selected_templates[0]
+    except Exception:
+        logger.debug("safetensors_named_template_selection_failed", exc_info = True)
     flags = detect_reasoning_flags(
-        chat_template,
+        feature_template,
         model_identifier = model_id,
         log_source = "safetensors",
     )
+    if not flags.get("supports_reasoning"):
+        try:
+            from core.inference.chat_template_helpers import (
+                detect_reasoning_channel_markers_from_template,
+            )
+
+            templates = [chat_template]
+            models = getattr(backend, "models", None)
+            model_info = (
+                models.get(model_id, {})
+                if isinstance(models, dict) and model_id is not None
+                else {}
+            )
+            if isinstance(model_info, dict):
+                templates.extend(
+                    (
+                        model_info.get("native_chat_template"),
+                        (model_info.get("chat_template_info") or {}).get("template"),
+                    )
+                )
+            if any(
+                detect_reasoning_channel_markers_from_template(template, tools = tools) is not None
+                for template in templates
+            ):
+                flags["supports_reasoning"] = True
+                flags["reasoning_always_on"] = True
+                logger.info("safetensors: model always reasons (native channel markers)")
+        except Exception:
+            logger.debug("safetensors_native_reasoning_marker_check_failed", exc_info = True)
     # Markers any supported parser recognises (template advertises tools but
     # uses none -> drop the pill). Reuse the parser's own signal list so this
     # gate never drifts (a hand-maintained copy lost the DeepSeek variants);
@@ -1938,9 +1991,9 @@ def _detect_safetensors_features(backend, chat_template: Optional[str]) -> dict:
     )
     if (
         flags.get("supports_tools")
-        and chat_template
-        and not any(m in chat_template for m in _PARSER_MARKERS)
-        and not _BARE_JSON_NAME_MARKER_RE.search(chat_template)
+        and isinstance(feature_template, str)
+        and not any(m in feature_template for m in _PARSER_MARKERS)
+        and not _BARE_JSON_NAME_MARKER_RE.search(feature_template)
     ):
         logger.info(
             "safetensors: template advertises tools but uses an "
@@ -3123,10 +3176,9 @@ def _request_matches_loaded_settings(
         llama_backend.cache_type_kv
     ):
         return False
-    # GPU selection and memory mode are first-class fields; any change must reload.
-    # Compare as a set (order-insensitive): Studio sorts gpu_ids before pinning, so
-    # [0,1] and [1,0] launch identically and must not trigger a needless reload / 409
-    # during training (#7188).
+    # gpu_ids / memory mode are first-class; any change must reload. Compare
+    # order-insensitively: Studio sorts gpu_ids, so [0,1] == [1,0] and must not force a
+    # needless reload / 409 during training (#7188).
     _request_gpu_ids = sorted(request.gpu_ids) if request.gpu_ids else None
     _loaded_gpu_ids = sorted(llama_backend.gpu_ids) if llama_backend.gpu_ids else None
     if _request_gpu_ids != _loaded_gpu_ids:
@@ -3135,10 +3187,9 @@ def _request_matches_loaded_settings(
         request.gguf_memory_mode
     ) != LlamaCppBackend._canonical_memory_mode(llama_backend.memory_mode):
         return False
-    # An explicit memory_mode (incl. 'auto') over a child that inherited operator
-    # LLAMA_ARG_* placement flags must reload so the backend scrub runs; the
-    # canonical check above equates 'auto' with the omitted state and would leave
-    # the child mlocked/no-mmap (#7164).
+    # An explicit memory_mode (incl. 'auto') over a child with inherited LLAMA_ARG_* flags
+    # must reload so the scrub runs; the canonical check above treats 'auto' as omitted and
+    # would leave the child mlocked/no-mmap (#7164).
     if request.gguf_memory_mode is not None and llama_backend.launched_with_inherited_mem_env:
         return False
     # Reconcile a user --split-mode in extras into the effective tensor state.
@@ -3147,12 +3198,9 @@ def _request_matches_loaded_settings(
     # tensor load isn't seen as a mismatch that needlessly reloads the server.
     backend_extra = list(llama_backend.extra_args) if llama_backend.extra_args else []
     fields_set = getattr(request, "model_fields_set", set())
-    # Strip inherited --mlock/--no-mmap/--mmap only when the request carries a real
-    # memory mode. Pydantic marks the field "set" even for an explicit null (a client
-    # echoing the status/load response, which is null for a no-mode load), but null ==
-    # None == "no opinion": the backend is then called with memory_mode=None and leaves
-    # placement alone, so stripping here would needlessly reload and drop the user's
-    # pass-through memory flags. Gate on the value, not merely model_fields_set (#7188).
+    # Strip inherited --mlock/--no-mmap/--mmap only for a real memory mode. Pydantic marks
+    # the field "set" even for an explicit null, but null == "no opinion" (placement left
+    # alone), so stripping then would needlessly reload. Gate on the value (#7188).
     _strip_mem = request.gguf_memory_mode is not None
     effective_extra = (
         request.llama_extra_args
@@ -3223,22 +3271,21 @@ def _request_matches_loaded_settings(
         ):
             return False
     else:
-        # Strip memory-placement flags from the REQUEST side only when the caller
-        # set a memory mode, mirroring how the reload strips explicit extras before
-        # storing them (load_model). Without this, an explicit request that repeats
-        # a --mlock/--mmap/--no-mmap already dropped by the loaded server misses this
-        # already-loaded fast path and, during active training, gets rejected by the
-        # coexistence guard even though the live placement already matches.
+        # Strip memory-placement flags request-side only for a real mode (mirrors the
+        # reload's strip of explicit extras), so a request repeating a --mlock/--mmap/--no-mmap
+        # the loaded server already dropped still hits this fast path instead of the guard.
         #
-        # The backend side is NOT stripped: a server that loaded with no memory_mode
-        # keeps a pass-through --mlock/--no-mmap in its stored extras and is still
-        # mlocked. Stripping it here would make an explicit auto (which clears that
-        # placement on reload) compare equal and wrongly dedupe to the pinned server,
-        # leaving the old placement active. Keeping the flag makes the mismatch force
-        # a reload so the auto scrub runs (#7164). A server that loaded WITH a mode
-        # already had these flags stripped at load, so backend_extra carries none and
-        # the comparison is unaffected in that case. (_strip_mem is gated on a real
-        # memory-mode value above, so an explicit null does not trigger this strip.)
+        # The backend side is NOT stripped: a server loaded with no memory_mode keeps a
+        # pass-through --mlock/--no-mmap and is still mlocked. Stripping it here would let an
+        # explicit auto dedupe to the pinned server and leave the old placement active;
+        # keeping it forces a reload so the auto scrub runs (#7164). A server loaded WITH a
+        # mode already had these stripped, so backend_extra carries none.
+        # Explicit gpu_ids drop a user --device from the launched and stored extras, so strip
+        # it request-side too or an identical reload would miss this fast path and force a
+        # needless reload / training 409 (#7188). Gate on an EFFECTIVE pin: the load path
+        # normalizes gpu_ids=[] to None and keeps its --device, so an empty list must NOT
+        # strip here or the two sides diverge.
+        _strip_dev = bool(request.gpu_ids)
         _request_extra = (
             strip_shadowing_flags(
                 request.llama_extra_args,
@@ -3247,9 +3294,10 @@ def _request_matches_loaded_settings(
                 strip_spec = False,
                 strip_template = False,
                 strip_split_mode = False,
-                strip_memory_mode = True,
+                strip_memory_mode = _strip_mem,
+                strip_device = _strip_dev,
             )
-            if _strip_mem
+            if (_strip_mem or _strip_dev)
             else list(request.llama_extra_args)
         )
         if _request_extra != backend_extra:
@@ -3903,6 +3951,16 @@ def _guard_chat_load_against_training(
         else None
     )
 
+    # Vulkan ordinals enumerate independently of the CUDA index space the guard budgets in;
+    # resolving them as CUDA physical IDs would size free VRAM on the wrong card. Flag it so
+    # the guard budgets conservatively, matching /load's deferral to the probe (#7188).
+    gpu_ids_are_vulkan_ordinals = False
+    if is_gguf and requested_gpu_ids:
+        try:
+            gpu_ids_are_vulkan_ordinals = get_llama_cpp_backend().is_vulkan_build()
+        except Exception:
+            gpu_ids_are_vulkan_ordinals = False
+
     ok, info = can_load_chat_during_training(
         model_name = model_identifier,
         hf_token = hf_token,
@@ -3910,6 +3968,7 @@ def _guard_chat_load_against_training(
         max_seq_length = max_seq_length,
         requested_gpu_ids = requested_gpu_ids,
         is_gguf = is_gguf,
+        gpu_ids_are_vulkan_ordinals = gpu_ids_are_vulkan_ordinals,
         required_override_gb = required_override_gb,
     )
     if ok:
@@ -4021,12 +4080,10 @@ def _reject_diffusion_placement(
 ) -> None:
     """Raise 400 if a DiffusionGemma GGUF was given gpu_ids or an explicit memory mode.
 
-    The diffusion runner is single-GPU (DG_GPU) and has no --mlock/--no-mmap plumbing,
-    so those options are unsupported. Called by BOTH /validate and /load, before either
-    tears down the active model, so the two endpoints agree and the frontend can't
-    validate a placement /load will reject after it has already unloaded (#7188). Local
-    GGUFs use the authoritative header; HF repos fall back to the repo name (the file
-    isn't downloaded yet).
+    The diffusion runner is single-GPU (DG_GPU) with no --mlock/--no-mmap plumbing.
+    Called by BOTH /validate and /load before either tears down the active model, so
+    they agree and a placement /load will reject isn't validated post-unload (#7188).
+    Local GGUFs use the header; HF repos fall back to the repo name (not downloaded yet).
     """
     _gguf_file = getattr(config, "gguf_file", None)
     _gguf_hf_repo = getattr(config, "gguf_hf_repo", None)
@@ -4037,10 +4094,8 @@ def _reject_diffusion_placement(
         from utils.models.gguf_metadata import is_diffusion_gguf
         _is_diffusion = is_diffusion_gguf(_gguf_file)
     elif _gguf_hf_repo:
-        # Match "diffusiongemma" (no separator before "gemma") as well as a
-        # standalone "diffusion" segment, so the canonical google/diffusiongemma-*
-        # repo is rejected up front instead of only after the header read that
-        # follows the unload (#7188).
+        # Match "diffusiongemma" (no separator) and a standalone "diffusion" segment
+        # so google/diffusiongemma-* is rejected up front, not post-unload (#7188).
         _is_diffusion = bool(
             _re.search(
                 r"(?:^|[\/\-_.])diffusion(?:gemma|[\/\-_.]|$)",
@@ -4078,6 +4133,7 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
 
     native_grant_backed = False
     model_log_label = request.model_path
+    gguf_load_stack = ExitStack()
     try:
         # Validate user pass-through args up front so a managed-flag collision
         # returns 400 before any model work.
@@ -4178,7 +4234,16 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     spec_draft_n_max = llama_backend.spec_draft_n_max,
                     tensor_parallel = llama_backend.tensor_parallel,
                     gpu_ids = llama_backend.gpu_ids,
-                    gguf_memory_mode = llama_backend.requested_memory_mode,
+                    # Echo the caller's explicit mode (incl. 'auto') so a client persisting
+                    # this response keeps its choice: a model launched with the mode omitted
+                    # is canonically equal to an explicit 'auto', and returning None would
+                    # drop the choice so a later reload skips the env scrub. Falls back to
+                    # the loaded value when the request had no opinion.
+                    gguf_memory_mode = (
+                        request.gguf_memory_mode
+                        if request.gguf_memory_mode is not None
+                        else llama_backend.requested_memory_mode
+                    ),
                 )
         else:
             if (
@@ -4242,8 +4307,7 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 detail = f"Invalid model identifier: {model_log_label}",
             )
 
-        # Reject unsupported placement options for DiffusionGemma before the route
-        # tears down any active model (shared with /validate so the two agree).
+        # Reject DiffusionGemma placement before any teardown (shared with /validate).
         _reject_diffusion_placement(
             config, gpu_ids = request.gpu_ids, memory_mode = request.gguf_memory_mode
         )
@@ -4251,47 +4315,94 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # Normalize gpu_ids: empty list means auto-selection, same as None
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
 
-        # Validate explicit GPU selection up front so the loader and the guard
-        # agree on the candidate set. GGUF now supports gpu_ids (#7164).
-        # On non-CUDA hosts the CUDA-oriented resolver sees an empty parent-visible
-        # set and would 400; skip it for GGUF and let the backend validate against
-        # its Vulkan probe / ordinal mapping instead.
+        # Validate gpu_ids up front so the loader and guard agree on the candidate set. GGUF
+        # now supports gpu_ids (#7164). On non-CUDA hosts the CUDA resolver sees an empty set
+        # and would 400, so skip it for GGUF and let the backend use its Vulkan probe.
         if effective_gpu_ids is not None:
+            # A draft-device override in extras (--spec-draft-device / -devd / --device-draft)
+            # naming a real GPU would place the MTP drafter outside the budgeted gpu_ids and
+            # OOM training on an unreserved card. Reject before teardown; drop the flag to
+            # follow the pin, or set it to cpu to offload (cpu/none allowed). Only fires with
+            # explicit gpu_ids (new in #7188), so it changes no pre-existing pathway.
+            if config.is_gguf:
+                from core.inference.llama_cpp import _extra_args_draft_device_pin
+
+                # llama_extra_args=None means "inherit the running server's extras" on a
+                # same-model reload, and draft-device flags survive that inherit, so check the
+                # effective extras: the request's when provided, else the loaded same-model
+                # backend's. A prior pin must not escape a newly added gpu_ids just because the
+                # reload omitted extras. Gate on same model_identifier (cross-model is refused,
+                # #5401).
+                _draft_extra = request.llama_extra_args
+                if _draft_extra is None:
+                    _loaded_llama = get_llama_cpp_backend()
+                    if (
+                        _loaded_llama.is_loaded
+                        and _loaded_llama.model_identifier
+                        and _loaded_llama.model_identifier.lower() == model_identifier.lower()
+                    ):
+                        _draft_extra = _loaded_llama.extra_args
+                _draft_dev_pin = _extra_args_draft_device_pin(_draft_extra)
+                if _draft_dev_pin is not None:
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            f"A draft-model device override ('{_draft_dev_pin}') cannot be "
+                            "combined with explicit gpu_ids: it would place the speculative "
+                            "drafter outside the pinned GPUs the training guard budgeted. "
+                            "Remove the draft-device flag to follow gpu_ids, or set it to cpu."
+                        ),
+                    )
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
-            if not config.is_gguf or get_device() == DeviceType.CUDA:
+
+            # A Vulkan build treats gpu_ids as Vulkan ordinals (never remapped through
+            # CUDA_VISIBLE_DEVICES), so defer to the backend probe even on a CUDA-visible host,
+            # else the CUDA resolver would 400 a valid Vulkan id under a CUDA/HIP mask (#7188).
+            _gguf_vulkan_build = config.is_gguf and await asyncio.to_thread(
+                get_llama_cpp_backend().is_vulkan_build
+            )
+            if not config.is_gguf or (get_device() == DeviceType.CUDA and not _gguf_vulkan_build):
                 try:
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
-            elif get_device() == DeviceType.CPU and not await asyncio.to_thread(
-                get_llama_cpp_backend().has_gpu_backend
-            ):
-                # No CUDA namespace AND the GGUF backend probe (incl. Vulkan) finds no
-                # device -> genuinely GPU-less, so reject before any teardown. A
-                # torch-less Vulkan host also reports CPU but its probe is non-empty, so
-                # it falls through and the backend validates against the Vulkan probe
-                # instead of being wrongly rejected here (#7164/#7188).
-                raise HTTPException(
-                    status_code = 400,
-                    detail = (
-                        "gpu_ids selection is not supported: no GPU backend "
-                        "detected on this host."
-                    ),
-                )
-        if (
-            config.is_gguf
-            and effective_gpu_ids is not None
-            and not await asyncio.to_thread(
-                get_llama_cpp_backend().has_gpu_backend
-            )
-        ):
-            raise HTTPException(
-                status_code = 400,
-                detail = (
-                    "gpu_ids selection requires a GPU-capable llama.cpp binary. "
-                    "The installed llama-server build does not report a GPU backend."
-                ),
-            )
+                # A CPU-only build ignores CUDA_VISIBLE_DEVICES, so a resolvable CUDA id still
+                # can't be honored. The CUDA resolver can't see the build, so reject here
+                # before the unload, not only in Phase 0 after teardown (#7188).
+                if config.is_gguf and await asyncio.to_thread(
+                    get_llama_cpp_backend()._backend_lacks_gpu_lib
+                ):
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported: the llama.cpp build has no "
+                            "GPU backend (CPU-only build) and would run on CPU. Omit gpu_ids."
+                        ),
+                    )
+            else:
+                # Non-CUDA GGUF host (CPU / MLX / XPU) or a Vulkan build on any host: the CUDA
+                # resolver can't enumerate llama.cpp's devices, so gate on its probe and reject
+                # before teardown (#7188). A torch-less Vulkan host reports CPU but its probe is
+                # non-empty so it falls through; MLX/XPU builds that can't enumerate Metal/SYCL
+                # are rejected here rather than after unload (#7164/#7188).
+                _llama_backend = get_llama_cpp_backend()
+                if not await asyncio.to_thread(_llama_backend.has_gpu_backend):
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported: no GPU backend "
+                            "detected on this host."
+                        ),
+                    )
+                # Backend exists: validate the specific ids against the probe too, so a bad
+                # id is rejected here, not after the unload (#7188).
+                try:
+                    await asyncio.to_thread(
+                        _llama_backend.assert_requested_gpu_ids_resolvable,
+                        effective_gpu_ids,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code = 400, detail = str(exc)) from exc
         if not config.is_gguf and _mlx_distributed_launch_detected():
             raise HTTPException(
                 status_code = 400,
@@ -4340,15 +4451,9 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
             llama_backend = get_llama_cpp_backend()
             unsloth_backend = get_inference_backend()
 
-            # Unload any active Unsloth model to free VRAM (off the event loop:
-            # unload takes _gen_lock and can wait on an in-flight stream).
-            if unsloth_backend.active_model_name:
-                logger.info(
-                    f"Unloading Unsloth model '{unsloth_backend.active_model_name}' before loading GGUF"
-                )
-                await asyncio.to_thread(
-                    unsloth_backend.unload_model, unsloth_backend.active_model_name
-                )
+            if config.gguf_hf_repo:
+                from core.inference.llama_cpp import gguf_load_in_flight
+                gguf_load_stack.enter_context(gguf_load_in_flight(config.gguf_hf_repo))
 
             # Inherit llama_extra_args from the previous load when the request
             # omits the field (the chat-settings Apply path doesn't round-trip
@@ -4409,9 +4514,8 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                         strip_split_mode = _should_strip_split_mode(
                             request, llama_backend.extra_args
                         ),
-                        # Only strip inherited memory flags for a real mode value; an
-                        # explicit null (Pydantic still marks it "set") means "no
-                        # opinion", so preserve the pass-through placement (#7188).
+                        # Strip inherited memory flags only for a real mode; an explicit
+                        # null means "no opinion", so keep pass-through placement (#7188).
                         strip_memory_mode = request.gguf_memory_mode is not None,
                     )
                     try:
@@ -4431,6 +4535,38 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                                 "load (same model, shadow-stripped): %s",
                                 extra_llama_args,
                             )
+
+            # Block cache writes that would race the download manager. This runs
+            # after pass-through argument inheritance so a carried --no-mmproj
+            # changes the companion requirement exactly as it does for the load.
+            if config.gguf_hf_repo:
+                from core.inference.llama_cpp import _hub_download_blocks_gguf_load
+                if await asyncio.to_thread(
+                    _hub_download_blocks_gguf_load,
+                    config.gguf_hf_repo,
+                    config.gguf_variant,
+                    require_mmproj = bool(
+                        config.is_vision and not extra_args_disable_mmproj(extra_llama_args)
+                    ),
+                    hf_token = request.hf_token,
+                ):
+                    raise HTTPException(
+                        status_code = 409,
+                        detail = (
+                            f"'{model_log_label}' is currently being downloaded "
+                            "by the download manager. Wait for the download to "
+                            "finish (or cancel it), then load the model."
+                        ),
+                    )
+
+            # Unload any active Unsloth model only after every hub conflict check.
+            if unsloth_backend.active_model_name:
+                logger.info(
+                    f"Unloading Unsloth model '{unsloth_backend.active_model_name}' before loading GGUF"
+                )
+                await asyncio.to_thread(
+                    unsloth_backend.unload_model, unsloth_backend.active_model_name
+                )
 
             # Route to HF or local mode based on config. Run in a thread so the
             # event loop stays free for progress polling and other requests
@@ -4800,6 +4936,8 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         logger.error(f"Error loading model: {e}", exc_info = True)
         msg = _maybe_unsupported_message(redacted_msg)
         raise HTTPException(status_code = 500, detail = f"Failed to load model: {msg}")
+    finally:
+        gguf_load_stack.close()
 
 
 def _requires_trust_remote_code_for_model(
@@ -4902,8 +5040,7 @@ async def validate_model(
                 detail = f"Invalid model identifier: {model_log_label}",
             )
 
-        # Reject DiffusionGemma placement here too, matching /load, so a client can't
-        # validate a gpu_ids/memory_mode /load will reject after it has unloaded (#7188).
+        # Reject DiffusionGemma placement here too, matching /load (#7188).
         _reject_diffusion_placement(
             config, gpu_ids = request.gpu_ids, memory_mode = request.gguf_memory_mode
         )
@@ -4911,43 +5048,82 @@ async def validate_model(
         # Refuse early (before the frontend unloads to load this) if it can't fit
         # alongside training, using the same settings /load uses so they agree.
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
-        # Mirror /load: validate explicit GPU selection before the guard.
-        # Skip the CUDA-oriented resolver for GGUF on non-CUDA hosts; the backend
-        # validates against the Vulkan probe instead.
+        # Mirror /load: validate explicit GPU selection before the guard. Skip the
+        # CUDA resolver for GGUF on non-CUDA hosts; the backend uses the Vulkan probe.
         if effective_gpu_ids is not None:
+            # Mirror /load's draft-device reject for the validate-then-unload flow: a
+            # same-model reload inherits the running server's stored extras, and a
+            # stored --spec-draft-device naming a real GPU would escape the new gpu_ids
+            # pin. ValidateModelRequest carries no llama_extra_args, so only the
+            # inherited backend extras are checkable here; reject before the client
+            # unloads its working model, not only at /load after teardown (#7188).
+            if config.is_gguf:
+                from core.inference.llama_cpp import _extra_args_draft_device_pin
+                _loaded_llama = get_llama_cpp_backend()
+                if (
+                    _loaded_llama.is_loaded
+                    and _loaded_llama.model_identifier
+                    and _loaded_llama.model_identifier.lower() == model_identifier.lower()
+                ):
+                    _draft_dev_pin = _extra_args_draft_device_pin(_loaded_llama.extra_args)
+                    if _draft_dev_pin is not None:
+                        raise HTTPException(
+                            status_code = 400,
+                            detail = (
+                                f"A draft-model device override ('{_draft_dev_pin}') cannot be "
+                                "combined with explicit gpu_ids: it would place the speculative "
+                                "drafter outside the pinned GPUs the training guard budgeted. "
+                                "Remove the draft-device flag to follow gpu_ids, or set it to cpu."
+                            ),
+                        )
             from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
-            if not config.is_gguf or get_device() == DeviceType.CUDA:
+
+            # Mirror /load: a Vulkan build's gpu_ids are Vulkan ordinals, so defer to the
+            # backend probe even on a CUDA-visible host (#7188).
+            _gguf_vulkan_build = config.is_gguf and await asyncio.to_thread(
+                get_llama_cpp_backend().is_vulkan_build
+            )
+            if not config.is_gguf or (get_device() == DeviceType.CUDA and not _gguf_vulkan_build):
                 try:
                     effective_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
                 except ValueError as exc:
                     raise HTTPException(status_code = 400, detail = str(exc)) from exc
-            elif get_device() == DeviceType.CPU and not await asyncio.to_thread(
-                get_llama_cpp_backend().has_gpu_backend
-            ):
-                # Mirror /load: reject only when genuinely GPU-less. A torch-less Vulkan
-                # host reports CPU but its probe is non-empty, so defer to the backend
-                # rather than reject before the frontend unloads (#7164/#7188).
-                raise HTTPException(
-                    status_code = 400,
-                    detail = (
-                        "gpu_ids selection is not supported: no GPU backend "
-                        "detected on this host."
-                    ),
-                )
-        if (
-            config.is_gguf
-            and effective_gpu_ids is not None
-            and not await asyncio.to_thread(
-                get_llama_cpp_backend().has_gpu_backend
-            )
-        ):
-            raise HTTPException(
-                status_code = 400,
-                detail = (
-                    "gpu_ids selection requires a GPU-capable llama.cpp binary. "
-                    "The installed llama-server build does not report a GPU backend."
-                ),
-            )
+                # Mirror /load: a CPU-only llama.cpp build ignores CUDA_VISIBLE_DEVICES, so a
+                # resolvable CUDA id still can't be honored. Reject here so /validate fails
+                # before the frontend unloads, not only in Phase 0 after teardown (#7188).
+                if config.is_gguf and await asyncio.to_thread(
+                    get_llama_cpp_backend()._backend_lacks_gpu_lib
+                ):
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported: the llama.cpp build has no "
+                            "GPU backend (CPU-only build) and would run on CPU. Omit gpu_ids."
+                        ),
+                    )
+            else:
+                # Mirror /load: gate on the llama.cpp probe for a non-CUDA GGUF host (or a
+                # Vulkan build) so an unsupported selection is rejected before the unload. A
+                # torch-less Vulkan host reports CPU but its probe is non-empty, so it falls
+                # through (#7164/#7188).
+                _llama_backend = get_llama_cpp_backend()
+                if not await asyncio.to_thread(_llama_backend.has_gpu_backend):
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = (
+                            "gpu_ids selection is not supported: no GPU backend "
+                            "detected on this host."
+                        ),
+                    )
+                # Validate the SPECIFIC ids against the probe too, so a bad Vulkan id
+                # (e.g. [99] or a duplicate) is rejected here, not after unload (#7188).
+                try:
+                    await asyncio.to_thread(
+                        _llama_backend.assert_requested_gpu_ids_resolvable,
+                        effective_gpu_ids,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(status_code = 400, detail = str(exc)) from exc
         effective_load_in_4bit = _effective_load_in_4bit(config, request.load_in_4bit)
 
         # Both checks cover the [adapter, base] set (matching the scan route and workers):
@@ -5590,6 +5766,10 @@ async def generate_stream(
                 if chunk is _DONE:
                     completed = True
                     break
+                if isinstance(chunk, GenStreamError):
+                    yield f"data: {json.dumps({'error': _friendly_gen_stream_error(chunk)})}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
                 yield f"data: {json.dumps({'content': chunk})}\n\n"
             if completed:
                 yield "data: [DONE]\n\n"
@@ -5603,6 +5783,7 @@ async def generate_stream(
             backend.reset_generation_state()
             logger.error(f"Error during generation: {e}", exc_info = True)
             yield f"data: {json.dumps({'error': _friendly_error(e)})}\n\n"
+            yield "data: [DONE]\n\n"
         finally:
             await _stop_local_disconnect_cancel_watcher(disconnect_watcher)
             if not completed and not cancel_event.is_set():
@@ -7228,6 +7409,13 @@ async def openai_chat_completions(
                             chunk_text = await asyncio.to_thread(next, gen, _DONE)
                             if chunk_text is _DONE:
                                 break
+                            if isinstance(chunk_text, GenStreamError):
+                                _msg = _friendly_gen_stream_error(chunk_text)
+                                api_monitor.fail(monitor_id, _msg)
+                                yield _openai_stream_error_sse(
+                                    {"error": {"message": _msg, "type": "server_error"}}
+                                )
+                                return
                             if chunk_text:
                                 api_monitor.append_reply(monitor_id, chunk_text)
                                 yield _chat_content_chunk(
@@ -7243,8 +7431,11 @@ async def openai_chat_completions(
                         raise
                     except Exception as e:
                         logger.error(f"Error during audio input streaming: {e}", exc_info = True)
-                        api_monitor.fail(monitor_id, _friendly_error(e))
-                        yield f"data: {json.dumps({'error': {'message': _friendly_error(e), 'type': 'server_error'}})}\n\n"
+                        _msg = _friendly_error(e)
+                        api_monitor.fail(monitor_id, _msg)
+                        yield _openai_stream_error_sse(
+                            {"error": {"message": _msg, "type": "server_error"}}
+                        )
                     finally:
                         await _stop_local_disconnect_cancel_watcher(disconnect_watcher)
                         _tracker.__exit__(None, None, None)
@@ -7261,7 +7452,15 @@ async def openai_chat_completions(
                 )
             else:
                 try:
-                    full_text = "".join(audio_input_generate())
+                    full_text = ""
+                    for chunk_text in audio_input_generate():
+                        if isinstance(chunk_text, GenStreamError):
+                            _msg = _friendly_gen_stream_error(chunk_text)
+                            api_monitor.fail(monitor_id, _msg)
+                            raise HTTPException(status_code = 500, detail = _msg)
+                        full_text += chunk_text
+                except HTTPException:
+                    raise
                 except Exception as e:
                     api_monitor.fail(monitor_id, _friendly_error(e))
                     raise
@@ -8805,19 +9004,33 @@ async def openai_chat_completions(
     # Classify capability flags from the loaded template.
     _sf_model_info = backend.models.get(backend.active_model_name, {})
     _sf_tpl = (_sf_model_info.get("chat_template_info") or {}).get("template")
-    _sf_features = _detect_safetensors_features(backend, _sf_tpl)
-
-    # GGUF parity: enable_thinking templates prefill an unclosed <think>; split into
-    # reasoning_content deltas so the UI renders the block for safetensors and MLX.
-    _sf_parse_think = bool(
-        _sf_features.get("supports_reasoning") or _sf_features.get("reasoning_always_on")
+    # Named templates may expose native reasoning only in their ``tool_use``
+    # branch. Use a truthy placeholder for Studio-managed tools, whose concrete
+    # schemas are selected below, and the request schemas for client passthrough.
+    _sf_server_tool_intent = bool(
+        _effective_enable_tools(payload) or _explicit_studio_tool_loop_requested(payload)
     )
-    # Prefilled-open only for prefill styles with thinking on; gpt-oss uses the normal mode.
-    _sf_reasoning_prefilled = _sf_reasoning_prefill_mode(
-        _sf_features,
-        payload.enable_thinking,
-        _sf_tpl,
-        reasoning_effort = payload.reasoning_effort,
+    _sf_template_tools = payload.tools if payload.tool_choice != "none" else None
+    if not _sf_template_tools and _sf_server_tool_intent:
+        _sf_template_tools = ({},)
+
+    def _sf_response_protocol(tools = None):
+        features = _detect_safetensors_features(backend, _sf_tpl, tools = tools)
+        parse_think = bool(
+            features.get("supports_reasoning") or features.get("reasoning_always_on")
+        )
+        reasoning_prefilled = _sf_reasoning_prefill_mode(
+            features,
+            payload.enable_thinking,
+            _sf_tpl,
+            reasoning_effort = payload.reasoning_effort,
+        )
+        return features, parse_think, reasoning_prefilled
+
+    # GGUF parity: split canonical <think> output into reasoning_content. The
+    # selected template branch must match whether this request renders tools.
+    _sf_features, _sf_parse_think, _sf_reasoning_prefilled = _sf_response_protocol(
+        _sf_template_tools
     )
 
     def _new_sf_reasoning_extractor():
@@ -9026,6 +9239,18 @@ async def openai_chat_completions(
                     _sf_next_task = None
                     if event is _sf_tool_sentinel:
                         break
+                    if isinstance(event, GenStreamError):
+                        backend.reset_generation_state()
+                        _msg = _friendly_gen_stream_error(event)
+                        api_monitor.fail(monitor_id, _msg)
+                        yield _openai_stream_error_sse(
+                            {"error": {"message": _msg, "type": "server_error"}}
+                        )
+                        return
+                    if not isinstance(event, dict):
+                        raise RuntimeError(
+                            f"Invalid safetensors tool event: {type(event).__name__}"
+                        )
 
                     if event["type"] == "heartbeat":
                         # Tool-execution wrapper heartbeat -> SSE keepalive.
@@ -9113,6 +9338,11 @@ async def openai_chat_completions(
                 backend.reset_generation_state()
                 api_monitor.finish(monitor_id, "cancelled")
                 raise
+            except GenStreamErrorRaised as exc:
+                backend.reset_generation_state()
+                _msg = _friendly_gen_stream_error(exc)
+                api_monitor.fail(monitor_id, _msg)
+                yield _openai_stream_error_sse({"error": {"message": _msg, "type": "server_error"}})
             except Exception:
                 backend.reset_generation_state()
                 # Generic wire message; full trace stays in the log (CWE-209:
@@ -9162,6 +9392,15 @@ async def openai_chat_completions(
                 for event in gen:
                     if cancel_event.is_set():
                         break
+                    if isinstance(event, GenStreamError):
+                        raise HTTPException(
+                            status_code = 500,
+                            detail = _friendly_gen_stream_error(event),
+                        )
+                    if not isinstance(event, dict):
+                        raise RuntimeError(
+                            f"Invalid safetensors tool event: {type(event).__name__}"
+                        )
                     if event.get("type") == "content":
                         full_text = _strip_tool_xml_for_display(
                             event.get("text", ""),
@@ -9201,6 +9440,15 @@ async def openai_chat_completions(
             cancel_event.set()
             backend.reset_generation_state()
             api_monitor.finish(monitor_id, "cancelled")
+            raise
+        except GenStreamErrorRaised as exc:
+            backend.reset_generation_state()
+            _msg = _friendly_gen_stream_error(exc)
+            api_monitor.fail(monitor_id, _msg)
+            raise HTTPException(status_code = 500, detail = _msg)
+        except HTTPException as exc:
+            backend.reset_generation_state()
+            api_monitor.fail(monitor_id, str(exc.detail))
             raise
         except Exception:
             backend.reset_generation_state()
@@ -9288,6 +9536,12 @@ async def openai_chat_completions(
         else:
             gen_kwargs["tools"] = payload.tools
 
+    # The potential tool context above is needed before server/client routing is
+    # known. This standard path now has the exact schemas that will be rendered,
+    # so resolve reasoning parsing again to keep empty registries, forced-tool
+    # misses, and tool_choice="none" on the marker-free template branch.
+    _, _sf_parse_think, _sf_reasoning_prefilled = _sf_response_protocol(gen_kwargs.get("tools"))
+
     # Request-scoped usage/timings receptacle (filled at gen_done).
     stats_holder: dict = {}
 
@@ -9368,6 +9622,14 @@ async def openai_chat_completions(
                     _next_task = None
                     if cumulative is _DONE:
                         break
+                    if isinstance(cumulative, GenStreamError):
+                        backend.reset_generation_state()
+                        _msg = _friendly_gen_stream_error(cumulative)
+                        api_monitor.fail(monitor_id, _msg)
+                        yield _openai_stream_error_sse(
+                            {"error": {"message": _msg, "type": "server_error"}}
+                        )
+                        return
                     if await request.is_disconnected():
                         cancel_event.set()
                         backend.reset_generation_state()
@@ -9517,6 +9779,11 @@ async def openai_chat_completions(
         try:
             full_text = ""
             for token in generate():
+                if isinstance(token, GenStreamError):
+                    backend.reset_generation_state()
+                    _msg = _friendly_gen_stream_error(token)
+                    api_monitor.fail(monitor_id, _msg)
+                    raise HTTPException(status_code = 500, detail = _msg)
                 full_text = token
 
             # Split prefilled <think> reasoning (GGUF parity); also covers MLX via
@@ -9615,6 +9882,8 @@ async def openai_chat_completions(
             api_monitor.finish(monitor_id)
             return _model_json_response(response)
 
+        except HTTPException:
+            raise
         except Exception as e:
             backend.reset_generation_state()
             logger.error(f"Error during OpenAI completion: {e}", exc_info = True)

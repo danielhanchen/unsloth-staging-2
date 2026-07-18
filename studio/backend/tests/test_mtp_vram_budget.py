@@ -68,6 +68,7 @@ from core.inference.llama_cpp import (  # noqa: E402
     _CTX_FIT_VRAM_FRACTION,
     LlamaCppBackend,
     _extra_args_draft_cache_types,
+    _extra_args_draft_device_pin,
     _extra_args_draft_offloaded_to_cpu,
     _extra_args_mtp_draft_path,
     _extra_args_n_ubatch,
@@ -621,6 +622,31 @@ class TestExtraArgsMtpDetection:
     @pytest.mark.parametrize(
         "args,expected",
         [
+            # No draft-device flag -> no pin to reject.
+            (None, None),
+            ([], None),
+            (["-c", "4096"], None),
+            # cpu / none offload is a supported placement, not a GPU escape.
+            (["--spec-draft-device", "cpu"], None),
+            (["--spec-draft-device", "CPU,none"], None),
+            (["-devd", "none"], None),
+            # A real GPU device escapes the gpu_ids pin -> return the offending value.
+            (["--spec-draft-device", "CUDA1"], "CUDA1"),
+            (["--device-draft", "Vulkan2"], "Vulkan2"),
+            (["-devd", "CUDA0,CPU"], "CUDA0,CPU"),  # any GPU in the list conflicts
+            # inline flag=value form.
+            (["--spec-draft-device=Vulkan3"], "Vulkan3"),
+            # last-wins: only the final draft-device value counts.
+            (["--spec-draft-device", "CUDA1", "--spec-draft-device", "cpu"], None),
+            (["--spec-draft-device", "cpu", "--spec-draft-device", "CUDA1"], "CUDA1"),
+        ],
+    )
+    def test_draft_device_pin(self, args, expected):
+        assert _extra_args_draft_device_pin(args) == expected
+
+    @pytest.mark.parametrize(
+        "args,expected",
+        [
             (["--spec-draft-n-max", "4"], 4),
             (["--spec-draft-n-max=6"], 6),
             (["--spec-type", "draft-mtp", "--spec-draft-n-max", "3"], 3),
@@ -848,22 +874,18 @@ class TestExtraArgsMtpDetection:
         assert "llama_backend.hf_repo" in body
 
     def test_route_matcher_strips_memory_flags_from_explicit_extras(self):
-        # An explicit llama_extra_args that repeats a --mlock/--mmap/--no-mmap the
-        # loaded server already stripped (load_model drops them when a memory mode
-        # is set) must still match the already-loaded fast path -- otherwise a no-op
-        # re-Apply during training is needlessly reloaded and rejected by the
-        # coexistence guard (#7164). Only the REQUEST side is stripped: the backend
-        # side must keep any pass-through flag so an explicit auto over a server that
-        # inherited --mlock (memory_mode omitted) still mismatches and reloads to
-        # clear that placement, instead of wrongly deduping to the pinned server.
+        # A request repeating a --mlock/--mmap/--no-mmap the loaded server already stripped
+        # must still hit the fast path, so a no-op re-Apply during training isn't reloaded
+        # (#7164). Only the request side is stripped: the backend keeps its flags so an
+        # explicit auto over a server that inherited --mlock still reloads to clear it.
         routes_src = (
             Path(__file__).resolve().parent.parent / "routes" / "inference.py"
         ).read_text()
         start = routes_src.index("def _request_matches_loaded_settings")
         end = routes_src.index("\ndef ", start + 1)
         body = "".join(routes_src[start:end].split())
-        # Gated on the VALUE, not merely model_fields_set: an explicit null (which
-        # Pydantic marks "set") must not strip, so it dedupes as "no opinion" (#7188).
+        # Gated on the VALUE, not model_fields_set: an explicit null must not strip,
+        # so it dedupes as "no opinion" (#7188).
         assert "_strip_mem=request.gguf_memory_modeisnotNone" in body
         assert '"gguf_memory_mode"infields_set' not in body
         # The request side is stripped and compared against the UNstripped backend.
@@ -891,11 +913,9 @@ class TestExtraArgsMtpDetection:
         assert "_extra_args_main_cache_type_for_budget(extra_args)" in load
 
     def test_load_model_spec_default_keys_off_resolved_gpu_pin(self):
-        # The no-telemetry explicit-gpu_ids path pins the child via gpu_indices with
-        # an EMPTY probe (gpus stays []). The spec-draft default is GPU (n=2) vs CPU
-        # (n=3) based on whether the launch targets GPUs, so it must key off the
-        # resolved pin, not the empty probe -- else the pinned GPU launch gets the
-        # slower CPU default (n=3) in exactly the hosts this fallback enables (#7164).
+        # The no-telemetry gpu_ids path pins via gpu_indices with an empty probe. The GPU
+        # (n=2) vs CPU (n=3) spec-draft default must key off the resolved pin, not the empty
+        # probe, else the pinned GPU launch gets the CPU default (#7164).
         load = "".join(inspect.getsource(LlamaCppBackend.load_model).split())
         assert "gpus=bool(gpus)orbool(gpu_indices)" in load
 

@@ -9,6 +9,7 @@ OpenAI-compatible /v1/chat/completions endpoint.
 
 import atexit
 import contextlib
+import functools
 import json
 import os
 import re
@@ -82,6 +83,7 @@ from core.inference.tool_call_parser import (
 )
 from core.inference.tool_loop_controller import (
     ToolLoopController,
+    append_deferred_nudges,
     tool_event_provenance,
 )
 from state.tool_approvals import (
@@ -998,6 +1000,283 @@ def _cached_colocated_split_main(
     return None
 
 
+def _cached_variant_resolution(repo_id: str, hf_variant: str) -> tuple[Optional[str], list[str]]:
+    """Find a cached main GGUF and its shards for a variant."""
+    candidate = next(_cached_variant_candidates(repo_id, hf_variant), None)
+    if candidate is None:
+        return None, []
+    _, main, shards, _ = candidate
+    return main, shards
+
+
+def _cached_variant_candidates(
+    repo_id: str,
+    hf_variant: str,
+    *,
+    require_mmproj: bool = False,
+) -> Generator[tuple[str, str, list[str], Path], None, None]:
+    """Yield complete cached variant copies in snapshot preference order."""
+    try:
+        from utils.models.model_config import _iter_hf_cache_snapshots
+        for snap in _iter_hf_cache_snapshots(repo_id):
+            cached_files = _gguf_snapshot_files(snap)
+            matches = _gguf_files_for_variant(cached_files, hf_variant)
+            if not matches:
+                continue
+            main = matches[0]
+            shards = _gguf_extra_shards(matches, main)
+            split = _SHARD_FULL_RE.match(main)
+            if split:
+                numbers = {
+                    int(match.group(2))
+                    for path in [main, *shards]
+                    if (match := _SHARD_FULL_RE.match(path))
+                }
+                if numbers != set(range(1, int(split.group(3)) + 1)):
+                    continue
+            main_path = snap.joinpath(*main.replace("\\", "/").split("/"))
+            if not main_path.is_file() or not _snapshot_has_all_shards(
+                str(main_path), main, shards, {}
+            ):
+                continue
+            if require_mmproj and not _pick_mmproj(cached_files):
+                continue
+            yield str(main_path), main, shards, snap
+    except Exception as e:
+        logger.debug(f"Cache lookup for variant failed: {e}")
+
+
+def _cached_candidate_matches_revision_size(
+    repo_id: str, candidate: tuple[str, str, list[str], Path], hf_token: Optional[str]
+) -> bool:
+    """Check cached byte sizes against the snapshot's own Hub revision.
+
+    A snapshot pointer is normally published only after its blob is complete.
+    When the old revision is still queryable, also compare every weight file's
+    size so a manually truncated cache entry is not treated as reusable. If
+    metadata cannot be reached, retain the cache's normal offline semantics.
+    """
+    main_path, main, shards, snap = candidate
+    paths = [main, *shards]
+    try:
+        from huggingface_hub import get_paths_info
+        infos = list(
+            get_paths_info(
+                repo_id,
+                paths,
+                revision = snap.name,
+                token = hf_token,
+            )
+        )
+    except Exception as e:
+        logger.debug(
+            "Could not size-check cached GGUF %s at revision %s: %s",
+            repo_id,
+            snap.name,
+            e,
+        )
+        return True
+
+    if not infos:
+        # The Hub answers an unknown (e.g. force-pushed away) revision with an
+        # empty result, not an error; treat it like unreachable metadata.
+        return True
+    expected_sizes = {info.path: info.size for info in infos if info.size is not None}
+    if any(path not in expected_sizes for path in paths):
+        return False
+    try:
+        if os.path.getsize(main_path) < expected_sizes[main]:
+            return False
+    except OSError:
+        return False
+    return _snapshot_has_all_shards(main_path, main, shards, expected_sizes)
+
+
+def _cached_complete_candidate(
+    repo_id: str, gguf_filename: Optional[str], shards: list[str]
+) -> Optional[tuple[str, str, list[str], Path]]:
+    """Return one complete exact-filename cache candidate with snapshot context."""
+    if not gguf_filename:
+        return None
+    if shards:
+        main_path = _cached_colocated_split_main(repo_id, gguf_filename, shards, {})
+    else:
+        m = _SHARD_FULL_RE.match(gguf_filename)
+        if m and int(m.group(3)) > 1:
+            return None
+        main_path = _cached_hf_snapshot_file(repo_id, gguf_filename)
+    if main_path is None:
+        return None
+    snap = _snapshot_dir_of(main_path)
+    if snap is None:
+        return None
+    return main_path, gguf_filename, shards, snap
+
+
+def cached_gguf_for_load(
+    hf_repo: str,
+    hf_variant: Optional[str],
+    *,
+    require_mmproj: bool = False,
+    verify_sizes: bool = False,
+    hf_token: Optional[str] = None,
+) -> Optional[str]:
+    """Return a cached GGUF that can be loaded without downloading."""
+    if not hf_variant:
+        return None
+    hf_repo = _resolve_repo_id_casing(hf_repo)
+    for candidate in _cached_variant_candidates(
+        hf_repo,
+        hf_variant,
+        require_mmproj = require_mmproj,
+    ):
+        if verify_sizes and not _cached_candidate_matches_revision_size(
+            hf_repo, candidate, hf_token
+        ):
+            continue
+        return candidate[0]
+    return None
+
+
+def _snapshot_dir_of(path: str) -> Optional[Path]:
+    """Return the HF cache snapshot containing path, if any."""
+    try:
+        p = Path(os.path.abspath(path))
+    except OSError:
+        return None
+    for ancestor in p.parents:
+        if ancestor.parent.name == "snapshots":
+            return ancestor
+    return None
+
+
+def _companion_snapshot_sibling(
+    near_path: str, pick: Callable[[list[str]], Optional[str]]
+) -> Optional[str]:
+    """Find a companion in the same snapshot as near_path."""
+    snap = _snapshot_dir_of(near_path)
+    if snap is None:
+        return None
+    try:
+        sibling = pick(_gguf_snapshot_files(snap))
+    except Exception:
+        return None
+    if not sibling:
+        return None
+    candidate = snap / sibling
+    return str(candidate) if candidate.is_file() else None
+
+
+def _pick_mmproj(candidates: list[str]) -> Optional[str]:
+    mmproj_files = sorted(
+        f for f in candidates if f.lower().endswith(".gguf") and "mmproj" in Path(f).name.lower()
+    )
+    if not mmproj_files:
+        return None
+    return next((f for f in mmproj_files if f.lower().endswith("-f16.gguf")), mmproj_files[0])
+
+
+def _hub_download_in_flight(hf_repo: str) -> bool:
+    try:
+        from hub.utils.download_registry import get_models_registry
+        return bool(get_models_registry().active_job_refs(hf_repo))
+    except Exception:
+        return False
+
+
+def _hub_download_blocks_gguf_load(
+    hf_repo: str,
+    hf_variant: Optional[str],
+    *,
+    require_mmproj: bool = False,
+    hf_token: Optional[str] = None,
+) -> bool:
+    """Whether an active Hub job makes this GGUF load unsafe.
+
+    Same-variant jobs can reclaim the stale snapshot a load would reuse, so
+    they always block. Other jobs block only when this load lacks a complete
+    cached copy and would write to the shared cache itself.
+    """
+    try:
+        from hub.utils.download_registry import get_models_registry
+
+        registry = get_models_registry()
+        if not registry.active_job_refs(hf_repo):
+            return False
+        if registry.has_active_variant(hf_repo, hf_variant):
+            return True
+    except Exception:
+        return False
+    return (
+        cached_gguf_for_load(
+            hf_repo,
+            hf_variant,
+            require_mmproj = require_mmproj,
+            verify_sizes = True,
+            hf_token = hf_token,
+        )
+        is None
+    )
+
+
+# Active GGUF loads by normalized repo ID.
+_LOADS_IN_FLIGHT: dict[str, int] = {}
+_LOADS_IN_FLIGHT_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def gguf_load_in_flight(hf_repo: Optional[str]):
+    """Track an HF GGUF load until the context exits."""
+    key = (hf_repo or "").strip().lower()
+    if not key:
+        yield
+        return
+    with _LOADS_IN_FLIGHT_LOCK:
+        _LOADS_IN_FLIGHT[key] = _LOADS_IN_FLIGHT.get(key, 0) + 1
+    try:
+        yield
+    finally:
+        with _LOADS_IN_FLIGHT_LOCK:
+            remaining = _LOADS_IN_FLIGHT.get(key, 1) - 1
+            if remaining <= 0:
+                _LOADS_IN_FLIGHT.pop(key, None)
+            else:
+                _LOADS_IN_FLIGHT[key] = remaining
+
+
+def hf_gguf_load_in_flight(hf_repo: str) -> bool:
+    """Return whether a GGUF load is active for hf_repo."""
+    key = (hf_repo or "").strip().lower()
+    if not key:
+        return False
+    with _LOADS_IN_FLIGHT_LOCK:
+        return _LOADS_IN_FLIGHT.get(key, 0) > 0
+
+
+def _with_gguf_load_marker(load: Callable):
+    """Keep an HF repo marked for the full synchronous load call."""
+
+    @functools.wraps(load)
+    def wrapped(self, *args, **kwargs):
+        hf_repo = kwargs.get("hf_repo")
+        with gguf_load_in_flight(hf_repo):
+            if hf_repo and _hub_download_blocks_gguf_load(
+                hf_repo,
+                kwargs.get("hf_variant"),
+                require_mmproj = bool(
+                    kwargs.get("is_vision")
+                    and not extra_args_disable_mmproj(kwargs.get("extra_args"))
+                ),
+                hf_token = kwargs.get("hf_token"),
+            ):
+                raise RuntimeError(
+                    f"'{hf_repo}' is currently being downloaded by the download manager"
+                )
+            return load(self, *args, **kwargs)
+
+    return wrapped
+
+
 def _gguf_extra_shards(files: Iterable[str], first_shard: str) -> list[str]:
     m = _SHARD_FULL_RE.match(first_shard)
     if not m:
@@ -1336,6 +1615,34 @@ def _extra_args_draft_offloaded_to_cpu(
     return False
 
 
+def _extra_args_draft_device_pin(extra_args: Optional[Iterable[str]]) -> Optional[str]:
+    """Return the drafter's explicit device pin from user extras when it names a
+    real GPU device (not cpu/none), else None. Parses the same draft-device flags
+    as _extra_args_draft_offloaded_to_cpu (--spec-draft-device / -devd /
+    --device-draft), last-wins, inline (=) or next-token, comma-separated.
+
+    A separate MTP drafter normally follows the main -ngl / device selection, so
+    under an explicit gpu_ids pin it lands on the pinned cards the training guard
+    budgeted. A draft-device naming a different GPU escapes that pin and can place
+    the drafter on a card the guard never reserved (#7188). cpu/none is a
+    supported offload (keeps the drafter off the GPU entirely), so it does not
+    conflict and returns None."""
+    dev_flags = {"--spec-draft-device", "-devd", "--device-draft"}
+    args = [str(a) for a in extra_args] if extra_args else []
+    last_dev: Optional[str] = None
+    for i, raw in enumerate(args):
+        flag, eq, inline = raw.partition("=")
+        value = inline if eq else (args[i + 1] if i + 1 < len(args) else "")
+        if flag in dev_flags:
+            last_dev = value
+    if last_dev is None:
+        return None
+    devs = [d.strip() for d in last_dev.split(",") if d.strip()]
+    if not devs or all(d.lower() in ("cpu", "none") for d in devs):
+        return None
+    return last_dev
+
+
 def _extra_args_n_ubatch(
     extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
 ) -> Optional[int]:
@@ -1632,16 +1939,13 @@ class LlamaCppBackend:
         self._gpu_ids: Optional[List[int]] = None
         # GGUF memory placement mode (None = auto; pinned/resident map to --mlock/--no-mmap).
         self._memory_mode: Optional[str] = None
-        # The user's RAW requested mode ("auto"/"pinned"/"resident"/None), reported in
-        # the status/load response. _memory_mode canonicalizes "auto" -> None for
-        # placement, but the response must still echo an explicit "auto" so the UI can
-        # restore it and a later reload re-runs the inherited-env scrub instead of
-        # round-tripping "auto" -> null and letting LLAMA_ARG_MLOCK creep back (#7188).
+        # Raw requested mode for the response echo. _memory_mode canonicalizes
+        # "auto" -> None, but the echo must keep an explicit "auto" so it round-trips
+        # instead of collapsing to null and letting LLAMA_ARG_MLOCK creep back (#7188).
         self._requested_memory_mode: Optional[str] = None
-        # True when the live child was launched with NO explicit memory_mode yet
-        # inherited an operator LLAMA_ARG_MLOCK/NO_MMAP/MMAP env (not scrubbed).
-        # Lets an explicit 'auto' reload force the scrub the dedup would otherwise
-        # skip (auto canonicalizes to None == the omitted state).
+        # True when the child launched with no explicit memory_mode but inherited an
+        # LLAMA_ARG_MLOCK/NO_MMAP/MMAP env; lets an explicit 'auto' reload force the
+        # scrub the dedup would otherwise skip.
         self._launched_with_inherited_mem_env: bool = False
         # KV-cache estimation fields (populated by _read_gguf_metadata)
         self._n_layers: Optional[int] = None
@@ -1802,8 +2106,7 @@ class LlamaCppBackend:
 
     @property
     def gpu_ids(self) -> Optional[List[int]]:
-        """Physical GPU indices the active GGUF load is pinned to, or None
-        when the loader auto-selected the GPUs."""
+        """Physical GPU indices the active GGUF load is pinned to, or None if auto."""
         return self._gpu_ids
 
     @property
@@ -1815,15 +2118,14 @@ class LlamaCppBackend:
 
     @property
     def requested_memory_mode(self) -> Optional[str]:
-        """The user's raw requested memory mode for the status/load response echo:
-        "auto"/"pinned"/"resident", or None when no mode was supplied. Distinguishes
-        an explicit "auto" (which _memory_mode canonicalizes to None) from omitted."""
+        """User's raw requested memory mode for the response echo. Distinguishes an
+        explicit "auto" (which _memory_mode canonicalizes to None) from omitted."""
         return self._requested_memory_mode
 
     @property
     def launched_with_inherited_mem_env(self) -> bool:
-        """True when the live child inherited operator LLAMA_ARG_MLOCK/NO_MMAP/MMAP
-        env because no memory_mode was applied; an explicit mode reload clears it."""
+        """True when the live child inherited operator LLAMA_ARG_MLOCK/NO_MMAP/MMAP env
+        because no memory_mode was applied; an explicit mode reload clears it."""
         return self._launched_with_inherited_mem_env
 
     @property
@@ -2479,6 +2781,43 @@ class LlamaCppBackend:
         return True
 
     @staticmethod
+    def _backend_lacks_gpu_lib(binary: Optional[str] = None) -> bool:
+        """True only when the llama.cpp build clearly ships CPU-only ggml libs (a
+        ggml-cpu/base lib present but no cuda/hip/vulkan sibling), so an explicit gpu_ids
+        pin can't be honored: the child is steered only by CUDA_VISIBLE_DEVICES and a
+        CPU-only llama-server would ignore it and run on CPU while /load reports a
+        GPU-pinned success. Conservative -- an unrecognized layout (no lib dir, or no
+        ggml libs at all, e.g. a statically linked build) returns False so a valid custom
+        GPU build is never falsely rejected (#7188)."""
+        binary = binary or LlamaCppBackend._find_llama_server_binary()
+        if not binary:
+            return False
+        lib_dir = _llama_lib_dir(binary)
+        if not lib_dir or not lib_dir.is_dir():
+            return False
+
+        def _lib(name):
+            return f"ggml-{name}.dll" if sys.platform == "win32" else f"libggml-{name}.so"
+
+        def _has_lib(name):
+            # Match the exact soname and versioned variants (e.g. libggml-cuda.so.0),
+            # as shipped by distro-packaged / split-lib llama.cpp builds (#7188).
+            stem = _lib(name)
+            try:
+                return any(
+                    f.name == stem or f.name.startswith(stem + ".")
+                    for f in lib_dir.iterdir()
+                    if f.is_file()
+                )
+            except OSError:
+                return False
+
+        if any(_has_lib(b) for b in ("vulkan", "cuda", "hip")):
+            return False  # a GPU ggml backend is present -> the pin can be honored
+        # No GPU lib: CPU-only only if a CPU/base ggml lib proves the split-lib layout (not a static build).
+        return any(_has_lib(b) for b in ("cpu", "base"))
+
+    @staticmethod
     def _resolve_visible_physical_ids() -> Optional[list[int]]:
         """Physical GPU ids behind the active visibility mask (HIP/ROCR/CUDA on
         ROCm, CUDA otherwise). None when no mask is set; empty list for an empty
@@ -2707,16 +3046,129 @@ class LlamaCppBackend:
 
     def has_gpu_backend(self) -> bool:
         """True if a GPU probe finds any device: nvidia-smi/amd-smi (CUDA/ROCm) or a
-        Vulkan build's ggml device enumeration. Lets the route reject gpu_ids on a
-        genuinely GPU-less host BEFORE it tears down the active model, without falsely
-        rejecting a torch-less Vulkan host -- get_device() reports CPU there because
-        DeviceType has no Vulkan, so a plain get_device()==CPU check would break the
-        exact AMD/Vulkan hosts #7164 targets. On a probe failure, return True so the
-        caller defers to the load path rather than wrongly rejecting (#7188)."""
+        Vulkan build's ggml enumeration. Lets the route reject gpu_ids on a GPU-less
+        host before teardown without falsely rejecting a torch-less Vulkan host (which
+        get_device() reports as CPU, the AMD/Vulkan case #7164 targets). On a probe
+        failure return True so the caller defers to the load path (#7188)."""
         try:
-            return bool(self._get_gpu_memory(self._find_llama_server_binary()))
+            if self._get_gpu_memory(self._find_llama_server_binary()):
+                return True
+            # A telemetry-down GPU still exposes a parent-visible mask, which the resolver
+            # validates against; treating an empty probe as "no backend" here would 400 a
+            # selection the resolver would have accepted (#7188).
+            from utils.hardware import get_parent_visible_gpu_ids
+            return bool(get_parent_visible_gpu_ids())
         except Exception:
             return True
+
+    def is_vulkan_build(self) -> bool:
+        """True if the resolved llama-server binary is a Vulkan build. The route uses this
+        to defer gpu_ids to the backend (which treats them as Vulkan ordinals) instead of
+        the CUDA physical-ID resolver even on a CUDA-visible host (#7188)."""
+        try:
+            return self._is_vulkan_backend(self._find_llama_server_binary())
+        except Exception:
+            return False
+
+    def assert_requested_gpu_ids_resolvable(self, gpu_ids: Optional[list[int]]) -> None:
+        """Raise ValueError if the requested gpu_ids can't be honored by the llama.cpp
+        backend. Self-contained (finds the binary + probes) so the route can reject a
+        bad selection BEFORE it unloads the active model; otherwise on non-CUDA hosts a
+        typo like gpu_ids=[99] tore the model down and 400'd only in load_model (#7188)."""
+        if not gpu_ids:
+            return
+        binary = self._find_llama_server_binary()
+        self._assert_gpu_ids_resolvable(
+            gpu_ids,
+            self._get_gpu_memory(binary),
+            self._is_vulkan_backend(binary),
+            self._backend_lacks_gpu_lib(binary),
+        )
+
+    @staticmethod
+    def _assert_gpu_ids_resolvable(
+        gpu_ids: Optional[list[int]],
+        gpu_mem: list[tuple[int, int, int]],
+        is_vulkan_backend: bool,
+        backend_lacks_gpu_lib: bool = False,
+    ) -> None:
+        """Raise ValueError if the requested gpu_ids cannot be honored on this host.
+
+        Side-effect-free mirror of load_model's flag-builder checks, so Phase 0 can
+        reject a bad selection (out-of-range/duplicate id, or a GPU-less host) BEFORE
+        Phase 1 kills the running server (#7188). Returns without raising for the valid
+        'real GPU, telemetry down' fall-through. The flag builder stays the backstop."""
+        if not gpu_ids:
+            return
+        # A CPU-only build (no cuda/hip/vulkan ggml lib) ignores CUDA_VISIBLE_DEVICES, so
+        # it can't honor a pin: reject before teardown rather than run silently on CPU (#7188).
+        if backend_lacks_gpu_lib:
+            raise ValueError(
+                f"Requested gpu_ids {list(gpu_ids)} but the llama.cpp build has no GPU "
+                "backend (CPU-only build); it would ignore the pin and run on CPU. Omit "
+                "gpu_ids to run on CPU."
+            )
+        # Duplicate/negative ids are invalid on every backend; enforce it here for the
+        # deferred GGUF path too, else a non-Vulkan probe collapses [0, 0] into {0} and
+        # pins one GPU while recording the duplicate (#7188).
+        _requested = list(gpu_ids)
+        if len(set(_requested)) != len(_requested) or any(g < 0 for g in _requested):
+            raise ValueError(f"Invalid gpu_ids {_requested}: IDs must be unique and non-negative.")
+        allowed = set(gpu_ids)
+        # Vulkan ordinals match the probe directly; never remap through the CUDA/HIP mask
+        # (Vulkan enumerates independently of CUDA_VISIBLE_DEVICES) (#7188).
+        matched = [g for g in gpu_mem if g[0] in allowed]
+        if gpu_mem:
+            # Every requested id must match: a partial hit like [0, 99] against [0] must be
+            # rejected, not narrowed to [0] (which places on fewer GPUs than asked) (#7188).
+            if len(matched) != len(allowed):
+                raise ValueError(f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs")
+        elif is_vulkan_backend:
+            # Vulkan build with an empty probe: the ordinals can't be resolved.
+            raise ValueError(f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs")
+        else:
+            from utils.hardware import DeviceType, get_device, get_parent_visible_gpu_ids
+
+            # The CUDA/HIP mask only governs placement on a CUDA/ROCm build. A Metal/SYCL/CPU
+            # backend ignores CUDA_VISIBLE_DEVICES, so an empty probe on a non-CUDA host means
+            # the pin can't be honored: reject rather than drop onto the default device
+            # (#7188). ROCm reports CUDA here, so HIP hosts keep the mask path.
+            if get_device() != DeviceType.CUDA:
+                raise ValueError(
+                    f"Requested gpu_ids {list(gpu_ids)} but this backend does not support "
+                    "explicit GPU selection (no GPU probe on a non-CUDA device); omit "
+                    "gpu_ids to run on the default device."
+                )
+            parent_visible = get_parent_visible_gpu_ids()
+            if not parent_visible:
+                raise ValueError(
+                    f"Requested gpu_ids {list(gpu_ids)} but no GPU backend is available "
+                    "(no GPU telemetry and no visible GPU mask); omit gpu_ids to run on "
+                    "CPU."
+                )
+            _outside_mask = [g for g in gpu_ids if g not in parent_visible]
+            if _outside_mask:
+                raise ValueError(
+                    f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs "
+                    f"{parent_visible}"
+                )
+        # Valid (incl. the real-GPU / telemetry-down fall-through).
+
+    @staticmethod
+    def _strip_device_extra_args(extra_args):
+        """Drop a user --device/-dev from extra_args so an explicit gpu_ids pin owns
+        placement. Used for the launched command AND the persisted extras, so a dropped
+        --device can't be resurrected on a later inheriting reload (#7188)."""
+        return strip_shadowing_flags(
+            extra_args,
+            strip_context = False,
+            strip_cache = False,
+            strip_spec = False,
+            strip_template = False,
+            strip_split_mode = False,
+            strip_memory_mode = False,
+            strip_device = True,
+        )
 
     @staticmethod
     def _get_gpu_memory(binary: Optional[str] = None) -> list[tuple[int, int, int]]:
@@ -3859,13 +4311,13 @@ class LlamaCppBackend:
         hf_repo: str,
         free_bytes: int,
         hf_token: Optional[str] = None,
-    ) -> Optional[tuple[str, int]]:
+    ) -> Optional[tuple[str, int, list[str]]]:
         """Find the smallest GGUF variant (including all shards) that fits.
 
         Groups split shards by variant prefix and sums their sizes (e.g.
         UD-Q4_K_XL with 9 shards of 50 GB each = 450 GB total).
 
-        Returns (first_shard_filename, total_size_bytes) or None.
+        Returns (first_shard_filename, total_size_bytes, extra_shards) or None.
         """
         try:
             from huggingface_hub import get_paths_info, list_repo_files
@@ -3901,9 +4353,13 @@ class LlamaCppBackend:
 
             # Smallest that fits
             variant_sizes.sort(key = lambda x: x[1])
-            for first_file, total_size, _ in variant_sizes:
+            for first_file, total_size, shard_files in variant_sizes:
                 if total_size > 0 and total_size <= free_bytes:
-                    return first_file, total_size
+                    return (
+                        first_file,
+                        total_size,
+                        [path for path in sorted(shard_files) if path != first_file],
+                    )
 
             return None
         except Exception:
@@ -4499,42 +4955,52 @@ class LlamaCppBackend:
             except Exception as e:
                 logger.warning(f"Could not list repo files: {e}")
 
-            # Offline: resolve variant -> filename from the local HF cache.
-            # The heuristic below assumes filenames echo the repo name, which
-            # breaks for e.g. Qwen3.6-27B-MTP-GGUF (no "MTP" in file). Match
-            # against the rel path (not just basename) so subdir layouts like
-            # ``BF16/foo.gguf`` are findable.
+            # Fall back to the local cache when the repo listing is unavailable.
             if not gguf_filename:
-                try:
-                    from utils.models.model_config import _iter_hf_cache_snapshots
-                    for snap in _iter_hf_cache_snapshots(hf_repo):
-                        cached_files = _gguf_snapshot_files(snap)
-                        matches = _gguf_files_for_variant(cached_files, hf_variant)
-                        if not matches:
-                            continue
-                        gguf_filename = matches[0]
-                        gguf_extra_shards = _gguf_extra_shards(matches, gguf_filename)
-                        logger.info(
-                            "Resolved variant %s -> %s from local HF cache",
-                            hf_variant,
-                            gguf_filename,
-                        )
-                        break
-                except Exception as e:
-                    logger.debug(f"Offline cache lookup for variant failed: {e}")
+                cached_name, cached_shards = _cached_variant_resolution(hf_repo, hf_variant)
+                if cached_name:
+                    gguf_filename = cached_name
+                    gguf_extra_shards = cached_shards
+                    logger.info(
+                        "Resolved variant %s -> %s from local HF cache",
+                        hf_variant,
+                        gguf_filename,
+                    )
 
             if not gguf_filename:
                 repo_name = hf_repo.split("/")[-1].replace("-GGUF", "")
                 gguf_filename = f"{repo_name}-{hf_variant}.gguf"
 
+        # Prefer the existing model. Updates use force=True to fetch a new revision.
+        if not force:
+            if hf_variant:
+                # Resolve by variant so a newer revision's filename does not hide
+                # the complete older copy. Size-check against that older snapshot's
+                # own revision when its metadata remains available.
+                cached_main = cached_gguf_for_load(
+                    hf_repo,
+                    hf_variant,
+                    verify_sizes = True,
+                    hf_token = hf_token,
+                )
+            else:
+                candidate = _cached_complete_candidate(hf_repo, gguf_filename, gguf_extra_shards)
+                cached_main = (
+                    candidate[0]
+                    if candidate is not None
+                    and _cached_candidate_matches_revision_size(hf_repo, candidate, hf_token)
+                    else None
+                )
+            if cached_main is not None:
+                logger.info(f"Reusing cached GGUF: {cached_main}")
+                return cached_main
+
         # Check disk space; fall back to a smaller variant if needed
         all_gguf_files = [gguf_filename] + gguf_extra_shards
-        expected_sizes: dict[str, int] = {}
         try:
             from huggingface_hub import get_paths_info, try_to_load_from_cache
 
             path_infos = list(get_paths_info(hf_repo, all_gguf_files, token = hf_token))
-            expected_sizes = {p.path: p.size for p in path_infos if p.size}
             total_bytes = sum((p.size or 0) for p in path_infos)
 
             # Subtract bytes already in the HF cache so we only preflight
@@ -4543,25 +5009,10 @@ class LlamaCppBackend:
             # cold whenever free disk is below the full weight footprint,
             # even though nothing needs downloading.
             already_cached_bytes = 0
-            # Cross-snapshot / case-variant cache reuse is offline-only (see the download
-            # path below); online, hf_hub_download fetches the current revision and
-            # resumes partials, so an old snapshot must not be counted as cached here or
-            # the preflight would under-count the download and skip the disk fallback.
+            # Count only files that can resume this download.
             offline = _hf_env_offline()
-            # A split GGUF whose shards are not co-located in a single snapshot is
-            # refetched as a whole set later, so it must not be counted as cached here.
-            split_needs_refetch = False
-            if offline and not force and gguf_extra_shards:
-                # Scan all snapshots for one that holds the whole set co-located, so a
-                # newer snapshot with only the first shard does not mask an older
-                # complete one and needlessly trip the disk fallback.
-                if (
-                    _cached_colocated_split_main(
-                        hf_repo, gguf_filename, gguf_extra_shards, expected_sizes
-                    )
-                    is None
-                ):
-                    split_needs_refetch = True
+            # Offline split sets are reusable only when every shard shares a snapshot.
+            split_needs_refetch = bool(offline and not force and gguf_extra_shards)
             if not force and not split_needs_refetch:
                 for p in path_infos:
                     if not p.size:
@@ -4622,32 +5073,26 @@ class LlamaCppBackend:
                         hf_token,
                     )
                     if smaller:
-                        fallback_file, fallback_size = smaller
+                        fallback_file, fallback_size, fallback_shards = smaller
                         logger.info(
                             f"Selected variant too large ({total_gb:.1f} GB), "
                             f"falling back to {fallback_file} ({fallback_size / (1024**3):.1f} GB)"
                         )
                         gguf_filename = fallback_file
-                        _m = _SHARD_RE.match(gguf_filename)
-                        _prefix = _m.group(1) if _m else None
-                        if _prefix:
-                            prefix_lower = _prefix.lower()
-                            gguf_extra_shards = sorted(
-                                f
-                                for f in all_gguf_files
-                                if f.lower().startswith(prefix_lower)
-                                and f != gguf_filename
-                                and not _is_companion_gguf_path(f)
+                        gguf_extra_shards = fallback_shards
+
+                        # The selected fallback is a new load target. Apply the
+                        # same any-revision reuse policy before starting a fetch.
+                        fallback_candidate = _cached_complete_candidate(
+                            hf_repo, gguf_filename, gguf_extra_shards
+                        )
+                        if fallback_candidate is not None and (
+                            _cached_candidate_matches_revision_size(
+                                hf_repo, fallback_candidate, hf_token
                             )
-                        else:
-                            gguf_extra_shards = []
-                        # Record the fallback's size so the later cache-reuse probe can
-                        # size-verify it; only for a single-file fallback, since
-                        # _find_smallest_fitting_variant returns the whole-variant size
-                        # and using that as the first shard's expected size would reject
-                        # a valid cached first shard of a split fallback.
-                        if not gguf_extra_shards:
-                            expected_sizes[fallback_file] = fallback_size
+                        ):
+                            logger.info(f"Reusing cached fallback GGUF: {fallback_candidate[0]}")
+                            return fallback_candidate[0]
                     else:
                         raise RuntimeError(
                             f"Not enough disk space to download any variant. "
@@ -4667,45 +5112,25 @@ class LlamaCppBackend:
                 raise RuntimeError("Cancelled")
             dl_start = time.monotonic()
             # Xet primary, HTTP fallback on stall; per-file so finished shards stay cached.
-            local_path = None
-            # Reuse a cached copy from another snapshot / case-variant repo dir only when
-            # offline. Online, fall through to hf_hub_download so its revision/etag check
-            # fetches the current file (and resumes a partial) instead of serving a stale
-            # same-name blob from an older revision.
-            if not force and _hf_env_offline():
-                if gguf_extra_shards:
-                    # A split GGUF must load every shard from one snapshot; reuse only a
-                    # snapshot that holds the whole set co-located, scanning past a newer
-                    # snapshot that has just the first shard while an older one is complete.
-                    local_path = _cached_colocated_split_main(
-                        hf_repo, gguf_filename, gguf_extra_shards, expected_sizes
-                    )
-                else:
-                    local_path = _cached_hf_snapshot_file(
-                        hf_repo,
-                        gguf_filename,
-                        expected_size = expected_sizes.get(gguf_filename),
-                    )
-            if local_path is None:
-                local_path = hf_hub_download_with_xet_fallback(
+            local_path = hf_hub_download_with_xet_fallback(
+                hf_repo,
+                gguf_filename,
+                hf_token,
+                cancel_event = cancel_event,
+                on_status = lambda m: logger.info(m),
+                force_download = force,
+            )
+            for shard in gguf_extra_shards:
+                if cancel_event.is_set():
+                    raise RuntimeError("Cancelled")
+                logger.info(f"Resolving GGUF shard: {shard}")
+                hf_hub_download_with_xet_fallback(
                     hf_repo,
-                    gguf_filename,
+                    shard,
                     hf_token,
                     cancel_event = cancel_event,
-                    on_status = lambda m: logger.info(m),
                     force_download = force,
                 )
-                for shard in gguf_extra_shards:
-                    if cancel_event.is_set():
-                        raise RuntimeError("Cancelled")
-                    logger.info(f"Resolving GGUF shard: {shard}")
-                    hf_hub_download_with_xet_fallback(
-                        hf_repo,
-                        shard,
-                        hf_token,
-                        cancel_event = cancel_event,
-                        force_download = force,
-                    )
         except Exception as e:
             if isinstance(e, RuntimeError) and "Cancelled" in str(e):
                 raise
@@ -4728,10 +5153,12 @@ class LlamaCppBackend:
         pick: Callable[[list[str]], Optional[str]],
         label: str,
         cancel_event: Optional[threading.Event] = None,
+        near_path: Optional[str] = None,
     ) -> Optional[str]:
         """Resolve and fetch a companion GGUF (mmproj / MTP drafter) by name.
 
-        Tries the live repo file list, then the local HF cache snapshots
+        Prefers a companion co-located with ``near_path``'s cache snapshot,
+        then tries the live repo file list, then the local HF cache snapshots
         (offline, same fallback as _download_gguf), then hf_hub_download.
         Runs WITHOUT self._lock (like _download_gguf); honors _cancel_event so
         an /unload between the main download and here skips the fetch.
@@ -4739,6 +5166,17 @@ class LlamaCppBackend:
         """
         cancel_event = cancel_event if cancel_event is not None else self._cancel_event
         if cancel_event.is_set():
+            return None
+
+        # Keep companion files in the main GGUF's snapshot.
+        if near_path:
+            cached = _companion_snapshot_sibling(near_path, pick)
+            if cached:
+                logger.info("Reusing cached %s: %s", label, cached)
+                return cached
+
+        if _hub_download_in_flight(hf_repo):
+            logger.info("Skipping %s download while a hub download is active", label)
             return None
 
         target: Optional[str] = None
@@ -4813,26 +5251,15 @@ class LlamaCppBackend:
         hf_repo: str,
         hf_token: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
+        near_path: Optional[str] = None,
     ) -> Optional[str]:
         """Download the mmproj (vision projection) file from a GGUF repo.
 
         Prefers mmproj-F16.gguf, else any mmproj*.gguf. Returns the local
         path, or None if none exists. ``cancel_event`` overrides
-        ``self._cancel_event`` (defaults to it).
+        ``self._cancel_event`` (defaults to it). ``near_path`` prefers a
+        copy co-located with the main GGUF's cache snapshot.
         """
-
-        def _pick_mmproj(candidates: list[str]) -> Optional[str]:
-            mmproj_files = sorted(
-                f
-                for f in candidates
-                if f.lower().endswith(".gguf") and "mmproj" in Path(f).name.lower()
-            )
-            if not mmproj_files:
-                return None
-            for f in mmproj_files:
-                if f.lower().endswith("-f16.gguf"):
-                    return f
-            return mmproj_files[0]
 
         return self._download_companion_gguf(
             hf_repo = hf_repo,
@@ -4840,6 +5267,7 @@ class LlamaCppBackend:
             pick = _pick_mmproj,
             label = "mmproj",
             cancel_event = cancel_event,
+            near_path = near_path,
         )
 
     def _cached_repo_mtp_drafter(self, hf_repo: str) -> Optional[str]:
@@ -4870,6 +5298,7 @@ class LlamaCppBackend:
         *,
         hf_repo: str,
         hf_token: Optional[str] = None,
+        near_path: Optional[str] = None,
     ) -> Optional[str]:
         """Download the separate MTP drafter (speculative head) from a GGUF repo.
 
@@ -4880,16 +5309,6 @@ class LlamaCppBackend:
         higher-precision copies under ``MTP/`` are for explicit selection and
         are intentionally skipped. Returns the local path, or None.
         """
-
-        # Offline, reuse any drafter already on disk (a fresh copy can't be
-        # fetched). Online, _download_companion_gguf/hf_hub_download reuse the
-        # current cached file and refetch a changed one, so skip the probe here
-        # rather than pair new weights with a stale draft.
-        if _hf_env_offline():
-            cached = self._cached_repo_mtp_drafter(hf_repo)
-            if cached:
-                logger.info(f"Reusing cached MTP drafter (offline): {cached}")
-                return cached
 
         def _pick_mtp(candidates: list[str]) -> Optional[str]:
             # Root-level only: MTP/ subdir copies now share the mtp- prefix but
@@ -4903,11 +5322,28 @@ class LlamaCppBackend:
             )
             return mtp_files[0] if mtp_files else None
 
+        if near_path:
+            cached = _companion_snapshot_sibling(near_path, _pick_mtp)
+            if cached:
+                logger.info("Reusing cached MTP drafter: %s", cached)
+                return cached
+
+        # Offline, reuse any drafter already on disk (a fresh copy can't be
+        # fetched). Online, _download_companion_gguf/hf_hub_download reuse the
+        # current cached file and refetch a changed one, so skip the probe here
+        # rather than pair new weights with a stale draft.
+        if _hf_env_offline():
+            cached = self._cached_repo_mtp_drafter(hf_repo)
+            if cached:
+                logger.info(f"Reusing cached MTP drafter (offline): {cached}")
+                return cached
+
         return self._download_companion_gguf(
             hf_repo = hf_repo,
             hf_token = hf_token,
             pick = _pick_mtp,
             label = "MTP drafter",
+            near_path = near_path,
         )
 
     def _resolve_launch_mmproj_path(
@@ -4986,18 +5422,15 @@ class LlamaCppBackend:
         )
     )
 
-    # Pre-kill check for block-diffusion model names (e.g. google/diffusiongemma-*)
-    # whose GGUF header is only readable after download (#7188). "diffusion" may run
-    # straight into "gemma" (diffusiongemma, no separator), so match that suffix too;
-    # a standalone "diffusion" segment (separator/end on both sides) still matches,
-    # while "diffusionfoo" does not.
+    # Pre-kill check for block-diffusion names (e.g. google/diffusiongemma-*) whose GGUF
+    # header only reads post-download (#7188). Matches "diffusiongemma" and a standalone
+    # "diffusion" segment, but not "diffusionfoo".
     _LIKELY_DIFFUSION_RE = re.compile(r"(?:^|[\/\-_.])diffusion(?:gemma|[\/\-_.]|$)", re.IGNORECASE)
 
     @staticmethod
     def _is_likely_diffusion_model_name(*, model_identifier: str = "", hf_repo: str = "") -> bool:
-        """True if the model name / HF repo strongly suggests a block-diffusion
-        GGUF whose gpu_ids / memory_mode must be rejected before tearing down
-        the current server."""
+        """True if the name / HF repo suggests a block-diffusion GGUF whose gpu_ids /
+        memory_mode must be rejected before tearing down the current server."""
         for candidate in (model_identifier, hf_repo):
             if candidate and LlamaCppBackend._LIKELY_DIFFUSION_RE.search(candidate):
                 return True
@@ -5533,6 +5966,7 @@ class LlamaCppBackend:
             return ["--no-mmap", "--mlock"]
         return []
 
+    @_with_gguf_load_marker
     def load_model(
         self,
         *,
@@ -5574,15 +6008,11 @@ class LlamaCppBackend:
 
         Returns True if the server started and the health check passed.
         """
-        # When a placement mode is applied, Studio's --mlock/--no-mmap (or their
-        # absence for auto) is authoritative, so strip any conflicting
-        # --mmap/--no-mmap/--mlock the caller left in extra_args. Without this,
-        # llama.cpp's last-wins parsing would let a user --mmap in extras run the
-        # child memory-mapped while Studio stored memory_mode='resident' (state
-        # lying about the actual placement). The route strips this too, but doing
-        # it here keeps the invariant for direct/internal load_model calls and is
-        # idempotent when already stripped. Left untouched when no mode is applied
-        # (memory_mode is None = no opinion, the user's flags are their choice).
+        # When a mode is set, Studio's --mlock/--no-mmap (or their absence for auto) wins,
+        # so strip conflicting --mmap/--no-mmap/--mlock from extra_args; else last-wins
+        # parsing could memory-map the child while Studio stored 'resident'. The route
+        # strips this too; repeating it here covers direct load_model calls (idempotent).
+        # No mode = no opinion, so user flags are left untouched.
         if memory_mode is not None and extra_args:
             extra_args = strip_shadowing_flags(
                 extra_args,
@@ -5665,14 +6095,11 @@ class LlamaCppBackend:
 
             self._cancel_event.clear()
 
-            # ── Phase 0: validate diffusion placement constraints before
-            # tearing down the old server. The GGUF header is only readable
-            # after a download, so for HF-mode loads we fall back to the repo
-            # name. Local loads are NOT name-matched here: the route already ran
-            # the authoritative is_diffusion_gguf header check on the local file,
-            # and _read_gguf_metadata / self._is_diffusion below re-confirm it, so
-            # a chat GGUF that merely lives in a ".../diffusion/..." path is not
-            # misrejected (#7188).
+            # ── Phase 0: validate diffusion placement before teardown. The header only
+            # reads post-download, so HF-mode loads fall back to the repo name. Local loads
+            # are NOT name-matched (the route already ran the header check and
+            # _read_gguf_metadata re-confirms below), so a chat GGUF under a
+            # ".../diffusion/..." path isn't misrejected (#7188).
             _likely_diff = hf_repo is not None and self._is_likely_diffusion_model_name(
                 model_identifier = model_identifier, hf_repo = hf_repo
             )
@@ -5686,6 +6113,19 @@ class LlamaCppBackend:
                 raise ValueError(
                     "Explicit gguf_memory_mode is not supported for diffusion "
                     "(DiffusionGemma) GGUF models."
+                )
+
+            # Validate gpu_ids against the probe BEFORE Phase 1 teardown. On non-CUDA hosts
+            # the route only confirmed *a* backend exists, so a bad id (e.g. [99]) would
+            # otherwise 400 in the flag builder only after _kill_process() unloaded the
+            # active model (#7188). The probe is read-only.
+            if gpu_ids is not None:
+                _preflight_binary = self._find_llama_server_binary()
+                self._assert_gpu_ids_resolvable(
+                    gpu_ids,
+                    self._get_gpu_memory(_preflight_binary),
+                    self._is_vulkan_backend(_preflight_binary),
+                    self._backend_lacks_gpu_lib(_preflight_binary),
                 )
 
             # ── Phase 1: kill old process (under lock, fast) ──────────
@@ -5728,6 +6168,7 @@ class LlamaCppBackend:
                         mmproj_path = self._download_mmproj(
                             hf_repo = hf_repo,
                             hf_token = hf_token,
+                            near_path = model_path,
                         )
                     # Auto-download the separate MTP drafter (e.g. Gemma) when
                     # the requested spec mode can use it. Repos with the head
@@ -5745,6 +6186,7 @@ class LlamaCppBackend:
                         mtp_draft_path = self._download_mtp(
                             hf_repo = hf_repo,
                             hf_token = hf_token,
+                            near_path = model_path,
                         )
             elif gguf_path:
                 if not Path(gguf_path).is_file():
@@ -5766,23 +6208,18 @@ class LlamaCppBackend:
             # Block-diffusion GGUFs (DiffusionGemma) cannot run on llama-server;
             # serve them with the diffusion runner (same OpenAI-compat interface).
             if self._is_diffusion:
-                # The diffusion runner is single-GPU: its visual server picks a
-                # device from DG_GPU (default 0) and never consumes gpu_ids. Honoring
-                # a gpu_ids load here would let the training-coexistence guard budget
-                # against the requested GPU while the runner still starts on GPU 0
-                # (silent wrong placement + guard bypass). Reject the combination;
-                # the route maps this ValueError to a 400.
+                # The diffusion runner is single-GPU (DG_GPU) and ignores gpu_ids; honoring
+                # one would budget the requested GPU while the runner starts on GPU 0 (wrong
+                # placement + guard bypass). Reject; the route maps this to a 400.
                 if gpu_ids is not None:
                     raise ValueError(
                         "gpu_ids selection is not supported for diffusion "
                         "(DiffusionGemma) GGUF models; they run on a single GPU "
                         "chosen by the DG_GPU environment variable."
                     )
-                # This early return also skips the command builder that maps
-                # memory_mode to --mlock/--no-mmap, and _start_diffusion_server
-                # takes no memory-mode argument, so pinned/resident would be
-                # silently ignored yet recorded as honored. Reject them (auto is
-                # the no-op default and is allowed).
+                # This path skips the command builder that maps memory_mode to flags, so
+                # pinned/resident would be ignored yet recorded as honored. Reject them
+                # (auto is the allowed no-op default).
                 if LlamaCppBackend._canonical_memory_mode(memory_mode) is not None:
                     raise ValueError(
                         "gguf_memory_mode is not supported for diffusion "
@@ -5806,11 +6243,9 @@ class LlamaCppBackend:
                         extra_args = extra_args,
                     )
                     if started:
-                        # The diffusion runner has no gpu_ids / memory placement;
-                        # clear any values a prior llama-server load left so the
-                        # reload-dedup checks reflect the runner's actual state
-                        # (a stale _gpu_ids/_memory_mode would otherwise force an
-                        # unnecessary kill+restart of the healthy diffusion server).
+                        # Clear gpu_ids / placement a prior llama-server load left, so
+                        # reload-dedup reflects the runner's state and doesn't needlessly
+                        # restart the healthy diffusion server.
                         self._gpu_ids = None
                         self._memory_mode = None
                         self._requested_memory_mode = None
@@ -5972,65 +6407,59 @@ class LlamaCppBackend:
                     # per-GPU headroom (correct when the GPU is already partly used).
                     # Pass binary so a Vulkan build probes ggml's Vulkan ordinals.
                     _gpu_mem = self._get_gpu_memory(binary)
-                    # Honor explicit GPU selection: restrict the candidate set
-                    # before auto-selection / tensor/layer planning runs.
+                    # Honor gpu_ids: restrict the candidate set before auto-selection /
+                    # tensor/layer planning.
                     if gpu_ids is not None:
+                        # Duplicate/negative ids are invalid on every backend; enforce here
+                        # so the deferred non-Vulkan probe path can't collapse [0, 0] into
+                        # {0} and pin one GPU while recording the duplicate (#7188).
+                        _requested = list(gpu_ids)
+                        if len(set(_requested)) != len(_requested) or any(
+                            g < 0 for g in _requested
+                        ):
+                            raise ValueError(
+                                f"Invalid gpu_ids {_requested}: IDs must be "
+                                "unique and non-negative."
+                            )
                         allowed = set(gpu_ids)
-                        if is_vulkan_backend:
-                            # Vulkan builds report compact ggml ordinals in
-                            # _gpu_mem, but the caller's gpu_ids are physical
-                            # CUDA IDs. Map physical IDs to their position in
-                            # the parent-visible order so they match Vulkan0..N.
-                            # When no CUDA parent mask is available (e.g. pure
-                            # Vulkan host), use the supplied IDs directly as
-                            # Vulkan ordinals.
-                            from utils.hardware import get_parent_visible_gpu_ids
-
-                            # The CUDA resolver's value checks are skipped for this
-                            # path, so enforce them here: reject duplicates / negatives
-                            # that set() would otherwise silently collapse (#7188).
-                            _requested = list(gpu_ids)
-                            if len(set(_requested)) != len(_requested) or any(
-                                g < 0 for g in _requested
-                            ):
-                                raise ValueError(
-                                    f"Invalid Vulkan gpu_ids {_requested}: IDs must be "
-                                    "unique and non-negative."
-                                )
-                            parent_visible = get_parent_visible_gpu_ids()
-                            if parent_visible:
-                                try:
-                                    vulkan_ids = [parent_visible.index(g) for g in gpu_ids]
-                                except ValueError:
-                                    raise ValueError(
-                                        f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
-                                    ) from None
-                                allowed = set(vulkan_ids)
-                            else:
-                                allowed = set(gpu_ids)
+                        # Vulkan ordinals match the Vulkan probe directly: Vulkan enumerates
+                        # independently of CUDA_VISIBLE_DEVICES (loader order can even reverse
+                        # CUDA order), so never remap through the CUDA/HIP mask (#7188).
                         probe_listed_devices = bool(_gpu_mem)
                         _gpu_mem = [g for g in _gpu_mem if g[0] in allowed]
-                        if not _gpu_mem and (is_vulkan_backend or probe_listed_devices):
-                            # The probe enumerated GPUs but none match the request
-                            # (id genuinely absent), or this is a Vulkan build where
-                            # we cannot map physical ids to ggml ordinals without the
-                            # probe -- either way the selection can't be honored.
+                        if probe_listed_devices and len(_gpu_mem) != len(allowed):
+                            # Probe listed GPUs but not all ids match: reject rather than
+                            # narrow (e.g. [0, 99] -> [0], fewer GPUs than asked) (#7188).
                             raise ValueError(
                                 f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
                             )
-                        if not _gpu_mem and not is_vulkan_backend:
-                            # Empty non-Vulkan probe: telemetry may be unavailable on a
-                            # real GPU, or there may be no GPU backend at all (CPU / Metal
-                            # build). The route now skips resolve_requested_gpu_ids() for
-                            # GGUF on non-CUDA hosts (it cannot see Vulkan-only GPUs), so
-                            # validate the mask HERE instead of pinning blindly: a non-empty
-                            # parent-visible mask (e.g. a set CUDA_VISIBLE_DEVICES on a build
-                            # without nvidia-smi) is a real GPU with no telemetry -- fall
-                            # through and let the --fit fallback below pin it; an empty mask,
-                            # or an id outside it, means no such GPU, so reject rather than
-                            # pin a non-existent device and silently run on CPU (#7188).
-                            from utils.hardware import get_parent_visible_gpu_ids
+                        if not _gpu_mem and is_vulkan_backend and not probe_listed_devices:
+                            # Vulkan build with no probe to map ids -- can't honor it.
+                            raise ValueError(
+                                f"Requested gpu_ids {list(gpu_ids)} do not match any visible GPUs"
+                            )
+                        if not _gpu_mem and not is_vulkan_backend and not probe_listed_devices:
+                            # Empty non-Vulkan probe: a telemetry-down GPU or no backend.
+                            # The route skipped the CUDA resolver here, so validate the mask:
+                            # a non-empty parent-visible mask is a telemetry-down GPU (fall
+                            # through, --fit pins it below); an empty mask or an out-of-mask
+                            # id means no such GPU, so reject rather than run on CPU (#7188).
+                            from utils.hardware import (
+                                DeviceType,
+                                get_device,
+                                get_parent_visible_gpu_ids,
+                            )
 
+                            # The mask only steers a CUDA/ROCm build; a Metal/SYCL/CPU backend
+                            # ignores CUDA_VISIBLE_DEVICES, so an empty probe there can't honor
+                            # the pin -- reject it (#7188).
+                            if get_device() != DeviceType.CUDA:
+                                raise ValueError(
+                                    f"Requested gpu_ids {list(gpu_ids)} but this backend does "
+                                    "not support explicit GPU selection (no GPU probe on a "
+                                    "non-CUDA device); omit gpu_ids to run on the default "
+                                    "device."
+                                )
                             parent_visible = get_parent_visible_gpu_ids()
                             if not parent_visible:
                                 raise ValueError(
@@ -6044,8 +6473,8 @@ class LlamaCppBackend:
                                     f"Requested gpu_ids {list(gpu_ids)} do not match any "
                                     f"visible GPUs {parent_visible}"
                                 )
-                            # Real GPU, telemetry down: fall through with an empty candidate
-                            # set and let the --fit fallback below pin the validated mask.
+                            # Real GPU, telemetry down: fall through and let --fit below
+                            # pin the validated mask.
                     gpus = [(idx, free) for idx, free, _t in _gpu_mem]
                     total_by_idx = {idx: total for idx, _f, total in _gpu_mem}
 
@@ -6809,9 +7238,8 @@ class LlamaCppBackend:
                         f"GPUs free: {gpus}, selected: {gpu_indices}, fit: {use_fit}"
                     )
                 except ValueError as e:
-                    # User-supplied gpu_ids were invalid (e.g. non-existent GPU).
-                    # Do not silently fall back to --fit on a different GPU; surface
-                    # the validation error so the caller can fix the request.
+                    # Invalid user gpu_ids: surface the error instead of silently
+                    # falling back to --fit on a different GPU.
                     if gpu_ids is not None and "gpu_ids" in str(e).lower():
                         raise
                     logger.warning(f"GPU selection failed ({e}), using --fit on")
@@ -6824,21 +7252,17 @@ class LlamaCppBackend:
                     tp_tensor_split = None
                     effective_ctx = requested_ctx  # fall back to original
 
-                # If the caller explicitly requested GPUs but the model doesn't fit
-                # at the requested context, _select_gpus falls back to --fit on with
-                # gpu_indices=None. That would leave CUDA_VISIBLE_DEVICES unset and
-                # let llama-server use every parent-visible GPU, including ones the
-                # training guard excluded. Pin --fit to the requested set instead.
+                # When explicit GPUs don't fit, _select_gpus falls back to --fit with
+                # gpu_indices=None, leaving CUDA_VISIBLE_DEVICES unset so llama-server spreads
+                # across every parent-visible GPU (incl. guard-excluded ones). Pin --fit to
+                # the requested set instead.
                 if use_fit and gpu_indices is None and gpu_ids is not None:
                     if gpus:
                         gpu_indices = sorted(idx for idx, _ in gpus)
                         logger.info(f"Using --fit on explicitly requested GPUs: {gpu_indices}")
                     elif not is_vulkan_backend:
-                        # No telemetry probe was available (handled in the GPU-filter
-                        # step above), so there are no measured GPUs to sort. gpu_ids are
-                        # physical CUDA/ROCm ids, so pin --fit to them directly; otherwise
-                        # CUDA_VISIBLE_DEVICES stays unset and llama-server would spread
-                        # across every parent-visible GPU, ignoring the explicit request.
+                        # No telemetry probe: gpu_ids are physical CUDA/ROCm ids, so pin
+                        # --fit to them directly, else llama-server spreads across all GPUs.
                         gpu_indices = sorted(gpu_ids)
                         logger.info(
                             f"Using --fit on explicitly requested GPUs (no telemetry): {gpu_indices}"
@@ -6890,8 +7314,8 @@ class LlamaCppBackend:
                     "--no-context-shift",
                 ]
 
-                # Memory placement mode: keep model resident so idle weights aren't
-                # paged out and re-faulted from disk (#7164).
+                # Memory placement: keep weights resident so idle weights aren't paged
+                # out and re-faulted from disk (#7164).
                 cmd.extend(self._memory_mode_flags(memory_mode))
 
                 # Report a clean public model id (matching GET /v1/models) rather
@@ -7019,11 +7443,10 @@ class LlamaCppBackend:
                     extra_args = extra_args,
                     model_identifier = model_identifier,
                     model_path = model_path,
-                    # GPU-backed iff the launch actually targets GPUs: a measured
-                    # probe (gpus) OR a resolved pin (gpu_indices). The no-telemetry
-                    # explicit-gpu_ids path pins via gpu_indices with an empty probe,
-                    # so keying off bool(gpus) alone would mistake it for a CPU launch
-                    # and pick the CPU spec-draft default (n=3 instead of n=2) (#7164).
+                    # GPU-backed iff the launch targets GPUs: a measured probe (gpus) OR a
+                    # resolved pin (gpu_indices). The no-telemetry gpu_ids path pins via
+                    # gpu_indices with an empty probe, so bool(gpus) alone would read as CPU
+                    # and pick the CPU spec-draft default (#7164).
                     gpus = bool(gpus) or bool(gpu_indices),
                     binary = binary,
                     mtp_draft_path = launch_mtp_draft_path,
@@ -7140,22 +7563,11 @@ class LlamaCppBackend:
                 if extra_args:
                     _emit_extra_args = list(extra_args)
                     if gpu_ids is not None:
-                        # gpu_ids is authoritative for device placement: drop a user
-                        # --device/-dev so it cannot last-wins-override the pin and
-                        # offload to a GPU the training guard and backend.gpu_ids never
-                        # accounted for (#7188). On Vulkan the --device pin above is the
-                        # only pin, so this is the guard-bypass fix; on CUDA/ROCm it also
-                        # keeps backend.gpu_ids honest. Other extras still pass through.
-                        _emit_extra_args = strip_shadowing_flags(
-                            extra_args,
-                            strip_context = False,
-                            strip_cache = False,
-                            strip_spec = False,
-                            strip_template = False,
-                            strip_split_mode = False,
-                            strip_memory_mode = False,
-                            strip_device = True,
-                        )
+                        # gpu_ids is authoritative: drop a user --device/-dev so it can't
+                        # override the pin and offload to a guard-unaccounted GPU (#7188).
+                        # On Vulkan --device is the only pin; on CUDA/ROCm it keeps
+                        # backend.gpu_ids honest. Other extras pass through.
+                        _emit_extra_args = self._strip_device_extra_args(extra_args)
                         if _emit_extra_args != list(extra_args):
                             logger.info(
                                 "Dropped a user --device/-dev from extra args: explicit "
@@ -7176,19 +7588,14 @@ class LlamaCppBackend:
                 if "--threads" not in cmd:
                     env.pop("LLAMA_ARG_THREADS", None)
 
-                # Memory placement is a first-class field (auto/pinned/resident):
-                # Studio's --mlock/--no-mmap (or their absence for auto) must win.
-                # llama-server honors LLAMA_ARG_MLOCK/NO_MMAP/MMAP only where Studio
-                # emits no CLI flag for that param, so an inherited env could run an
-                # explicit 'auto' mlocked/no-mmap or silently turn 'pinned' into
-                # 'resident'. Scrub them ONLY when the caller supplied a mode, so an
-                # operator who sets these env vars keeps the pre-PR inheritance when
-                # no mode is requested (backwards compatible with existing installs).
-                # Record whether the child is launched WITH inherited placement flags
-                # (mode omitted + env present); a later explicit 'auto' then reloads
-                # to clear them, since the reload-dedup canonicalizes 'auto' and None
-                # together and would otherwise report already-loaded and leave the
-                # child mlocked. Mirrors the LLAMA_ARG_THREADS / split / cache scrubs.
+                # Studio's --mlock/--no-mmap (or their absence for auto) must win. llama-server
+                # honors LLAMA_ARG_MLOCK/NO_MMAP/MMAP only where Studio emits no flag, so an
+                # inherited env could mlock an explicit 'auto' or turn 'pinned' into 'resident'.
+                # Scrub only when a mode is set, so operator env vars keep the pre-PR
+                # inheritance otherwise (backwards compatible). Record whether the child
+                # launched WITH inherited placement flags so a later explicit 'auto' reloads
+                # to clear them (the dedup treats 'auto' and None alike and would otherwise
+                # leave it mlocked). Mirrors the threads / split / cache scrubs.
                 _mm_vars = ("LLAMA_ARG_MLOCK", "LLAMA_ARG_NO_MMAP", "LLAMA_ARG_MMAP")
                 if memory_mode is not None:
                     for _mm_var in _mm_vars:
@@ -7221,6 +7628,13 @@ class LlamaCppBackend:
                         _ct_raw = (env.get(_ct_var) or "").strip().lower()
                         if _ct_raw and _ct_raw not in self._TENSOR_PARALLEL_KV_TYPES:
                             env.pop(_ct_var, None)
+
+                # Under an explicit gpu_ids pin, scrub inherited LLAMA_ARG_DEVICE (env form
+                # of --device): on the CUDA/ROCm path Studio emits no --device flag, so it
+                # would otherwise override the pin and steer offload off the pinned cards
+                # (or to 'none' -> CPU). Without a pin, inheritance is left intact.
+                if gpu_ids is not None:
+                    env.pop("LLAMA_ARG_DEVICE", None)
 
                 # Windows + full offload: PASSIVE OMP + 2 threads stop
                 # spin-wait burning CPU. CPU/partial offload keeps default
@@ -7650,13 +8064,19 @@ class LlamaCppBackend:
                 # clears, list sets. Source records hf_variant for the route's
                 # same_source check.
                 if extra_args is not None:
-                    self._extra_args = list(extra_args)
+                    # Persist the same device-stripped extras the command used when gpu_ids
+                    # owns placement, so a later inheriting reload (after gpu_ids clears)
+                    # can't resurrect the dropped --device (#7188).
+                    self._extra_args = (
+                        self._strip_device_extra_args(extra_args)
+                        if gpu_ids is not None
+                        else list(extra_args)
+                    )
                     self._extra_args_source = (model_identifier, hf_variant)
                 self._requested_n_ctx = int(n_ctx)
                 self._gpu_ids = list(gpu_ids) if gpu_ids is not None else None
                 self._memory_mode = LlamaCppBackend._canonical_memory_mode(memory_mode)
-                # Raw requested mode for the response echo ("auto"/"pinned"/"resident"/
-                # None) -- keeps an explicit "auto" distinguishable from omitted so it
+                # Raw requested mode for the response echo, so an explicit "auto"
                 # round-trips instead of collapsing to null (#7188).
                 self._requested_memory_mode = (memory_mode or "").strip().lower() or None
                 self._launched_with_inherited_mem_env = _child_inherited_mem_env
@@ -8140,11 +8560,9 @@ class LlamaCppBackend:
         ):
             return False
 
-        # GPU selection / memory mode are first-class fields; a change must
-        # trigger a reload so the new placement takes effect (#7164).
+        # gpu_ids / memory mode are first-class; a change must reload (#7164).
         def _norm_list(value):
-            # Order-insensitive: Studio sorts gpu_ids before pinning, so [0,1] and
-            # [1,0] are the same selection and must not force a reload (#7188).
+            # Order-insensitive: [0,1] and [1,0] are the same selection (#7188).
             if value is None:
                 return None
             return sorted(value) if len(value) > 0 else None
@@ -8155,11 +8573,9 @@ class LlamaCppBackend:
             self._memory_mode
         ) != LlamaCppBackend._canonical_memory_mode(memory_mode):
             return False
-        # An explicit memory_mode (including 'auto', which canonicalizes to None)
-        # over a child still carrying inherited LLAMA_ARG_* placement flags must
-        # reload so the launch scrub can clear them: the canonical check above
-        # treats 'auto' and the omitted state as equal and would otherwise leave
-        # the child mlocked/no-mmap (#7164).
+        # An explicit memory_mode (incl. 'auto') over a child carrying inherited LLAMA_ARG_*
+        # flags must reload so the scrub runs; the canonical check above treats 'auto' as
+        # omitted and would otherwise leave the child mlocked/no-mmap (#7164).
         if memory_mode is not None and self._launched_with_inherited_mem_env:
             return False
 
@@ -8167,7 +8583,18 @@ class LlamaCppBackend:
         # layer); only an explicit list forces equality.
         if extra_args is not None:
             current = list(self._extra_args) if self._extra_args is not None else []
-            if list(extra_args) != current:
+            # load_model stores device-stripped extras when gpu_ids owns placement
+            # (so an inherited reload can't resurrect --device), so strip the
+            # incoming extras the same way before comparing. gpu_ids already matched
+            # above, so both sides used the same strip; without this a duplicate
+            # /load carrying a user --device misses the dedupe and needlessly kills
+            # and restarts an already-correct server (#7188).
+            requested = (
+                self._strip_device_extra_args(extra_args)
+                if gpu_ids is not None
+                else list(extra_args)
+            )
+            if requested != current:
                 return False
         return True
 
@@ -8612,6 +9039,11 @@ class LlamaCppBackend:
                         if not is_ours:
                             continue
 
+                        # A live parent means a running Studio (or the user's
+                        # shell) still owns it -- not an orphan.
+                        if LlamaCppBackend._pid_parent_is_alive(proc.info["pid"]):
+                            continue
+
                         proc.kill()
                         killed += 1
                         logger.info(
@@ -8662,6 +9094,9 @@ class LlamaCppBackend:
                         binary.is_relative_to(root) for root in resolved_roots
                     )
                     if not owned:
+                        continue
+
+                    if LlamaCppBackend._pid_parent_is_alive(pid):
                         continue
 
                     try:
@@ -10492,6 +10927,9 @@ class LlamaCppBackend:
 
                 assistant_msg: dict = {"role": "assistant", "content": content_text}
                 assistant_appended = False
+                # Collect no-op nudges and flush them after the batch, so a no-op
+                # doesn't abort it and drop the parallel calls that follow.
+                deferred_noop_msgs: list = []
 
                 # The text-path provisional card uses the parser's default id ("call_0");
                 # a Mistral-style call carries its own id and would open a duplicate. Reuse
@@ -10534,14 +10972,14 @@ class LlamaCppBackend:
                                 "provenance": decision.provenance,
                             }
                         completion = tool_controller.record_noop(decision)
-                        conversation.append(completion.model_message())
+                        deferred_noop_msgs.append(completion.model_message())
                         if _forced_tool_call_pending:
                             _forced_tool_call_pending = False
                         logger.info(
                             "Suppressed local GGUF tool call as internal no-op: "
                             f"action={decision.action} tool={decision.tool_name}"
                         )
-                        break
+                        continue
 
                     if not assistant_appended:
                         assistant_msg["tool_calls"] = [decision.as_assistant_tool_call()]
@@ -10659,6 +11097,8 @@ class LlamaCppBackend:
 
                     if _forced_tool_call_pending:
                         _forced_tool_call_pending = False
+
+                append_deferred_nudges(conversation, deferred_noop_msgs)
 
                 # Close provisional cards not resolved by execution/no-op handling.
                 for _pid, _pname in provisional_started_tool_calls.items():

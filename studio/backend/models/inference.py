@@ -61,12 +61,9 @@ class LoadRequest(BaseModel):
     @field_validator("gguf_memory_mode", mode = "before")
     @classmethod
     def normalize_blank_gguf_memory_mode(cls, value: Any) -> Any:
-        # A settings form may serialize the default placement as "" (or whitespace).
-        # Map a blank string to explicit "auto" (not None) so a default-selecting
-        # Apply is still treated as an explicit memory-mode choice: the route/backend
-        # only scrub inherited LLAMA_ARG_MLOCK / NO_MMAP / MMAP when the value is not
-        # None, so blank -> None would let those operator env vars survive instead of
-        # clearing to the memory-mapped default the user just selected (#7164).
+        # Map a form's blank default to explicit "auto" (not None) so it counts as a
+        # choice: the scrub of inherited LLAMA_ARG_MLOCK/NO_MMAP/MMAP only runs when the
+        # value is not None, so blank -> None would let those env vars survive (#7164).
         if isinstance(value, str) and value.strip() == "":
             return "auto"
         return value
@@ -77,7 +74,7 @@ class LoadRequest(BaseModel):
     )
     gpu_ids: Optional[List[int]] = Field(
         None,
-        description = "Physical GPU indices to use, for example [0, 1]. Omit or pass [] to use automatic selection. Explicit gpu_ids are unsupported when the parent CUDA_VISIBLE_DEVICES uses UUID/MIG entries. Supported for both Hugging Face and GGUF models.",
+        description = "GPU indices to use, for example [0, 1]. Physical CUDA/ROCm indices for Hugging Face models and CUDA/ROCm GGUF builds; for a Vulkan GGUF build these are Vulkan device ordinals (ggml's --device Vulkan<i> space), which enumerate independently of CUDA_VISIBLE_DEVICES and can differ from the CUDA/PCI order. Omit or pass [] to use automatic selection. Explicit gpu_ids are unsupported when the parent CUDA_VISIBLE_DEVICES uses UUID/MIG entries. Supported for both Hugging Face and GGUF models.",
     )
     gguf_memory_mode: Optional[Literal["auto", "pinned", "resident"]] = Field(
         None,
@@ -166,9 +163,8 @@ class ValidateModelRequest(BaseModel):
     @field_validator("gguf_memory_mode", mode = "before")
     @classmethod
     def normalize_blank_gguf_memory_mode(cls, value: Any) -> Any:
-        # Mirror LoadRequest: a blank string (a form's serialized default) maps to
-        # explicit "auto" so validate and load agree and the inherited-env scrub is
-        # not silently skipped, instead of failing Literal validation with a 422 (#7164).
+        # Mirror LoadRequest: blank maps to explicit "auto" so validate and load agree
+        # and the inherited-env scrub isn't skipped (and it avoids a 422) (#7164).
         if isinstance(value, str) and value.strip() == "":
             return "auto"
         return value
@@ -375,7 +371,7 @@ class LoadResponse(BaseModel):
     )
     gpu_ids: Optional[List[int]] = Field(
         None,
-        description = "Physical GPU indices the active GGUF load is pinned to, or None for auto-selection. Only meaningful when is_gguf is True.",
+        description = "GPU indices the active GGUF load is pinned to, or None for auto-selection. Physical CUDA/ROCm indices on a CUDA/ROCm build; Vulkan device ordinals (ggml's --device Vulkan<i> space) on a Vulkan build, which can differ from the CUDA/PCI order. Only meaningful when is_gguf is True.",
     )
     gguf_memory_mode: Optional[Literal["auto", "pinned", "resident"]] = Field(
         None,
@@ -511,7 +507,7 @@ class InferenceStatusResponse(BaseModel):
     )
     gpu_ids: Optional[List[int]] = Field(
         None,
-        description = "Physical GPU indices the active GGUF load is pinned to, or None for auto-selection. Only meaningful when is_gguf is True.",
+        description = "GPU indices the active GGUF load is pinned to, or None for auto-selection. Physical CUDA/ROCm indices on a CUDA/ROCm build; Vulkan device ordinals (ggml's --device Vulkan<i> space) on a Vulkan build, which can differ from the CUDA/PCI order. Only meaningful when is_gguf is True.",
     )
     gguf_memory_mode: Optional[Literal["auto", "pinned", "resident"]] = Field(
         None,

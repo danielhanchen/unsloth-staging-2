@@ -19,12 +19,9 @@ if _BACKEND_DIR not in sys.path:
 
 
 def _install_stub_if_absent(name: str, build):
-    """Install a lightweight stub for ``name`` only when the real module is not
-    importable. Never shadow a real module: this test file was collected before
-    a real-httpx importer once installed an incomplete httpx stub via
-    sys.modules.setdefault, which then broke unrelated tests in a combined pytest
-    run (order-dependent failures). Preferring the real module keeps the stub as a
-    pure fallback for minimal environments without changing global import state."""
+    """Install a stub for ``name`` only when the real module isn't importable, so a
+    stub never shadows a real module and breaks unrelated tests in a combined pytest
+    run. The stub stays a pure fallback for minimal environments."""
     if name in sys.modules:
         return
     try:
@@ -216,6 +213,26 @@ def test_already_in_target_state_normalizes_empty_gpu_ids():
     assert backend._already_in_target_state(**kwargs) is True
 
 
+def test_already_in_target_state_strips_device_extras_under_gpu_ids():
+    # load_model stores device-stripped extras when gpu_ids owns placement, so a
+    # duplicate /load carrying a user --device must strip the same way before the
+    # dedupe compare, else it needlessly restarts an already-correct server (#7188).
+    backend = _loaded_backend(_gpu_ids = [0, 1], _extra_args = ["--flash-attn", "on"])
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["gpu_ids"] = [0, 1]
+    kwargs["extra_args"] = ["--flash-attn", "on", "--device", "CUDA0"]
+    assert backend._already_in_target_state(**kwargs) is True
+
+
+def test_already_in_target_state_keeps_device_extras_without_gpu_ids():
+    # Without gpu_ids, --device is not stripped, so a genuine extras change still reloads.
+    backend = _loaded_backend(_gpu_ids = None, _extra_args = ["--flash-attn", "on"])
+    kwargs = _base_target_state_kwargs(backend)
+    kwargs["gpu_ids"] = None
+    kwargs["extra_args"] = ["--flash-attn", "on", "--device", "CUDA0"]
+    assert backend._already_in_target_state(**kwargs) is False
+
+
 # ── GPU selection filtering ──────────────────────────────────────────────────
 
 
@@ -316,10 +333,10 @@ def _fit_fallback_backend(
 
 
 def test_empty_probe_preserves_explicit_gpu_ids(tmp_path):
-    """A CUDA/ROCm build whose telemetry probe returns nothing (no nvidia-smi +
-    CPU-only torch) must still honor a route-validated explicit gpu_ids rather than
-    raising: auto-selection loads here via --fit on, so the explicit request pins the
-    same GPU via CUDA_VISIBLE_DEVICES + --fit on instead of failing (#7164)."""
+    """A CUDA/ROCm build with an empty probe must still honor a route-validated explicit
+    gpu_ids, pinning via CUDA_VISIBLE_DEVICES + --fit on instead of raising (#7164)."""
+    from utils.hardware import DeviceType
+
     backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
 
     captured = {}
@@ -339,6 +356,8 @@ def test_empty_probe_preserves_explicit_gpu_ids(tmp_path):
 
     with (
         patch.object(subprocess, "Popen", side_effect = _make_fake_popen),
+        # CUDA host with telemetry down: the mask fallback only applies on CUDA/ROCm.
+        patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
         patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0, 1]),
     ):
         assert backend.load_model(
@@ -371,10 +390,9 @@ def test_empty_probe_still_rejects_vulkan_gpu_ids(tmp_path):
 
 
 def test_torchless_vulkan_populated_probe_uses_identity_ordinals(tmp_path):
-    """A torch-less Vulkan host has no CUDA/HIP physical namespace (empty parent-visible
-    mask), so gpu_ids ARE the Vulkan ordinals: with a POPULATED probe the selection must
-    load (pinned via --device Vulkan<i>) instead of raising -- otherwise explicit GPU
-    selection is unreachable on exactly the AMD/Vulkan hosts #7164 targets (#7188)."""
+    """A torch-less Vulkan host has an empty parent-visible mask, so gpu_ids ARE the
+    Vulkan ordinals: with a populated probe the selection loads (pinned via --device
+    Vulkan<i>) instead of raising (#7188)."""
     backend, gguf = _fit_fallback_backend(
         tmp_path, gpu_memory = [(0, 10000, 16000), (1, 8000, 16000)], vulkan = True
     )
@@ -426,14 +444,17 @@ def test_vulkan_rejects_duplicate_gpu_ids(tmp_path):
 
 
 def test_empty_probe_rejects_gpu_ids_without_gpu_backend(tmp_path):
-    """A non-Vulkan build with an empty probe AND an empty parent-visible mask has no
-    GPU backend at all (CPU / Metal build). The route now skips resolve_requested_gpu_ids
-    for GGUF on non-CUDA hosts, so the backend must reject gpu_ids here rather than pin a
-    non-existent device and silently run on CPU while reporting backend.gpu_ids (#7188)."""
+    """A non-Vulkan build with an empty probe AND empty parent-visible mask has no GPU
+    backend, so the backend must reject gpu_ids rather than pin a non-existent device
+    and silently run on CPU (#7188)."""
+    from utils.hardware import DeviceType
+
     backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
 
     with (
         patch.object(subprocess, "Popen"),
+        # CUDA host (the mask governs placement) but no mask -> genuinely GPU-less.
+        patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
         patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
     ):
         with pytest.raises(ValueError, match = "no GPU backend"):
@@ -448,10 +469,14 @@ def test_empty_probe_rejects_gpu_ids_outside_parent_mask(tmp_path):
     """Empty non-Vulkan probe but a set parent-visible mask (real GPU, no telemetry):
     a request outside that mask is a genuine 'no such GPU', so it must still raise
     rather than pin an id the host can't offer (#7188)."""
+    from utils.hardware import DeviceType
+
     backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [])  # empty probe
 
     with (
         patch.object(subprocess, "Popen"),
+        # CUDA host with telemetry down: the mask [0, 1] is real, but 9 is outside it.
+        patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
         patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0, 1]),
     ):
         with pytest.raises(ValueError, match = "do not match any visible GPUs"):
@@ -463,9 +488,8 @@ def test_empty_probe_rejects_gpu_ids_outside_parent_mask(tmp_path):
 
 
 def test_vulkan_gpu_ids_strips_conflicting_user_device(tmp_path):
-    """On Vulkan the --device flag is the only device pin. When explicit gpu_ids is set,
-    a user --device in extras must be stripped so it can't last-wins-override Studio's pin
-    and offload to a GPU the training guard never budgeted (#7188). Studio's --device
+    """On Vulkan --device is the only pin. With explicit gpu_ids, a user --device in
+    extras must be stripped so it can't override Studio's pin (#7188). Studio's --device
     survives; unrelated extras pass through."""
     backend, gguf = _fit_fallback_backend(
         tmp_path, gpu_memory = [(0, 10000, 16000), (1, 8000, 16000)], vulkan = True
@@ -525,6 +549,55 @@ def test_populated_probe_nonmatching_gpu_ids_still_raises(tmp_path):
             )
 
 
+@pytest.mark.parametrize(
+    "bad_ids, match",
+    [
+        ([99], "do not match any visible GPUs"),  # out-of-range on a Vulkan host
+        ([0, 0], "unique and non-negative"),  # duplicate ids
+    ],
+)
+def test_invalid_gpu_ids_rejected_before_kill_process(tmp_path, bad_ids, match):
+    """A bad gpu_ids (a typo like [99], or a duplicate) must be rejected in Phase 0,
+    BEFORE Phase 1 calls _kill_process(). Otherwise the route's existence-only probe
+    lets it through and the running server is torn down before the load 400s (#7188)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [(0, 10000, 16000)], vulkan = True)
+    killed = []
+    backend._kill_process = lambda: killed.append(True)
+
+    with (
+        patch.object(subprocess, "Popen"),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
+    ):
+        with pytest.raises(ValueError, match = match):
+            backend.load_model(
+                gguf_path = str(gguf),
+                model_identifier = "test",
+                gpu_ids = bad_ids,
+            )
+
+    assert killed == [], f"active model was torn down before rejecting gpu_ids={bad_ids}"
+
+
+def test_valid_gpu_ids_reach_kill_process(tmp_path):
+    """The Phase 0 preflight must NOT over-reject a VALID selection: a good gpu_ids
+    still proceeds past Phase 1 (the running server is replaced as before)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [(0, 10000, 16000)], vulkan = True)
+    killed = []
+    backend._kill_process = lambda: killed.append(True)
+
+    with (
+        patch.object(subprocess, "Popen"),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
+    ):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = [0],
+        )
+
+    assert killed, "a valid gpu_ids must still proceed past Phase 1 (kill the old server)"
+
+
 def test_gpu_ids_preserved_on_fit_fallback(tmp_path):
     """When _select_gpus falls back to --fit on, still pin CUDA_VISIBLE_DEVICES."""
     gguf = tmp_path / "model.gguf"
@@ -573,6 +646,62 @@ def test_gpu_ids_preserved_on_fit_fallback(tmp_path):
 
     assert captured_envs, "llama-server was not spawned"
     assert captured_envs[-1]["CUDA_VISIBLE_DEVICES"] == "1,2"
+
+
+@pytest.mark.parametrize("gpu_ids,scrubbed", [([1, 2], True), (None, False)])
+def test_gpu_ids_scrubs_inherited_llama_arg_device(tmp_path, monkeypatch, gpu_ids, scrubbed):
+    """An explicit gpu_ids pin owns device placement, so an inherited LLAMA_ARG_DEVICE (the
+    env form of llama.cpp --device) is scrubbed from the child env -- otherwise it would
+    steer offload off the pinned cards (or to 'none' -> CPU) while /load reports a GPU-pinned
+    success. Without gpu_ids the operator's LLAMA_ARG_DEVICE inheritance is left intact,
+    mirroring the memory/split/tensor env scrubs (backwards compatible) (#7188)."""
+    monkeypatch.setenv("LLAMA_ARG_DEVICE", "CUDA3")
+
+    gguf = tmp_path / "model.gguf"
+    _write_minimal_gguf(gguf)
+
+    backend = LlamaCppBackend()
+    backend._get_gpu_memory = lambda _binary = None: [
+        (0, 10000, 16000),
+        (1, 8000, 16000),
+        (2, 6000, 16000),
+    ]
+    backend._read_gguf_metadata = lambda _p: None
+    backend._can_estimate_kv = lambda: False
+    backend._get_gguf_size_bytes = lambda _p: 1024
+    backend._mmproj_vram_bytes = lambda _p: 0
+    backend._resolve_launch_mmproj_path = lambda **k: None
+    backend._apu_ram_shortfall_message = lambda *a, **k: None
+    backend._amd_apu_wants_unified_memory = lambda *a, **k: False
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._select_gpus = lambda *a, **k: ((list(gpu_ids) if gpu_ids else [0]), False)
+    backend._wait_for_health = lambda timeout: True
+    backend._detect_audio_type_strict = lambda: None
+    backend._apply_detected_audio = lambda _d: True
+
+    captured_envs = []
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                captured_envs.append(kwargs.get("env") or dict(os.environ))
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with patch.object(subprocess, "Popen", side_effect = _make_fake_popen):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = gpu_ids,
+        )
+
+    assert captured_envs, "llama-server was not spawned"
+    assert ("LLAMA_ARG_DEVICE" not in captured_envs[-1]) == scrubbed
 
 
 def test_memory_mode_clears_inherited_mmap_env_vars(tmp_path):
@@ -685,16 +814,20 @@ def test_memory_mode_strips_conflicting_extra_args(tmp_path, mode, user_flag, wi
         assert mmap_flags[-1] == winning
 
 
-def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
-    """Physical gpu_ids are mapped to Vulkan0..N ordinals for --device pinning."""
+def test_vulkan_gpu_ids_used_as_direct_ordinals_not_remapped(tmp_path):
+    """gpu_ids are Vulkan device ordinals matched directly against the Vulkan probe,
+    NEVER remapped through the CUDA/HIP parent mask. Vulkan enumerates independently of
+    CUDA_VISIBLE_DEVICES (its order can even reverse the CUDA order), so a remap would
+    pin the wrong device. A CUDA mask of [2, 3] must not shift the requested ordinal
+    (#7188)."""
     gguf = tmp_path / "model.gguf"
     _write_minimal_gguf(gguf)
 
     backend = LlamaCppBackend()
     backend._is_vulkan_backend = lambda _binary = None: True
-    # Vulkan reports one device at ordinal 0.
-    backend._get_gpu_memory = lambda _binary = None: [(0, 10000, 16000)]
-    backend._get_gpu_free_memory = lambda _binary = None: [(0, 10000)]
+    # Vulkan reports two devices at ordinals 0 and 1.
+    backend._get_gpu_memory = lambda _binary = None: [(0, 10000, 16000), (1, 9000, 16000)]
+    backend._get_gpu_free_memory = lambda _binary = None: [(0, 10000), (1, 9000)]
     backend._read_gguf_metadata = lambda _p: None
     backend._can_estimate_kv = lambda: False
     backend._get_gguf_size_bytes = lambda _p: 1024
@@ -703,7 +836,8 @@ def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
     backend._apu_ram_shortfall_message = lambda *a, **k: None
     backend._amd_apu_wants_unified_memory = lambda *a, **k: False
     backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
-    backend._select_gpus = lambda *a, **k: ([0], False)
+    # Select the single candidate that survives the gpu_ids filter (its Vulkan ordinal).
+    backend._select_gpus = lambda requested_total, gpus, **k: ([gpus[0][0]], False)
     backend._wait_for_health = lambda timeout: True
     backend._detect_audio_type_strict = lambda: None
     backend._apply_detected_audio = lambda _d: True
@@ -728,9 +862,10 @@ def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
             "Popen",
             side_effect = _make_fake_popen,
         ),
+        # A CUDA/HIP mask of [2, 3] must NOT remap the requested Vulkan ordinal.
         patch(
             "utils.hardware.get_parent_visible_gpu_ids",
-            return_value = [1],
+            return_value = [2, 3],
         ),
     ):
         backend.load_model(
@@ -742,7 +877,159 @@ def test_vulkan_gpu_ids_translated_to_compact_ordinals(tmp_path):
     assert captured_cmds, "llama-server was not spawned"
     cmd = captured_cmds[-1]
     assert "--device" in cmd
-    assert cmd[cmd.index("--device") + 1] == "Vulkan0"
+    # gpu_ids=[1] pins Vulkan ordinal 1 directly, not remapped to Vulkan0 via the mask.
+    assert cmd[cmd.index("--device") + 1] == "Vulkan1"
+
+
+def test_has_gpu_backend_accepts_parent_mask_when_probe_empty():
+    """A real GPU with telemetry down (empty probe) but a numeric parent-visible mask
+    must count as a backend, so /load does not 400 a selection assert_requested_gpu_ids_
+    resolvable would accept via the mask fallback. No probe AND no mask is GPU-less (#7188)."""
+    backend = LlamaCppBackend()
+    backend._find_llama_server_binary = lambda include_denied = False: "/fake/llama-server"
+    backend._get_gpu_memory = lambda _binary = None: []  # telemetry unavailable
+    with patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0, 1]):
+        assert backend.has_gpu_backend() is True
+    with patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []):
+        assert backend.has_gpu_backend() is False
+
+
+def test_partial_gpu_ids_match_is_rejected():
+    """A partial match such as [0, 99] against a probe of [0] must be rejected, not
+    silently narrowed to [0] (which would place the model on fewer GPUs than the caller
+    asked for). Every requested id must be present, not just one (#7188)."""
+    probe = [(0, 10000, 16000)]
+    for is_vulkan in (True, False):
+        with pytest.raises(ValueError, match = "do not match any visible GPUs"):
+            LlamaCppBackend._assert_gpu_ids_resolvable([0, 99], probe, is_vulkan)
+        # A full match still passes.
+        LlamaCppBackend._assert_gpu_ids_resolvable([0], probe, is_vulkan)
+
+
+def test_duplicate_or_negative_gpu_ids_rejected_on_all_backends():
+    """Duplicate/negative ids are invalid on every backend, not just Vulkan: a non-Vulkan
+    populated probe must not collapse [0, 0] into {0} and pin one GPU while recording the
+    duplicate (a torch-less CUDA host defers here, skipping the CUDA resolver) (#7188)."""
+    probe = [(0, 10000, 16000), (1, 8000, 16000)]
+    for is_vulkan in (True, False):
+        for bad in ([0, 0], [-1], [0, -1]):
+            with pytest.raises(ValueError, match = "unique and non-negative"):
+                LlamaCppBackend._assert_gpu_ids_resolvable(bad, probe, is_vulkan)
+        # A valid unique selection still passes.
+        LlamaCppBackend._assert_gpu_ids_resolvable([0, 1], probe, is_vulkan)
+
+
+def test_cpu_only_build_rejects_gpu_ids():
+    """A CPU-only llama.cpp build ignores CUDA_VISIBLE_DEVICES, so an explicit pin can't be
+    honored: reject it before teardown even with a populated nvidia-smi probe on a CUDA host,
+    instead of reporting a GPU-pinned load that silently runs on CPU (#7188)."""
+    probe = [(0, 10000, 16000)]
+    with pytest.raises(ValueError, match = "CPU-only build"):
+        LlamaCppBackend._assert_gpu_ids_resolvable([0], probe, False, backend_lacks_gpu_lib = True)
+    # With a GPU backend lib present the same pin is accepted.
+    LlamaCppBackend._assert_gpu_ids_resolvable([0], probe, False, backend_lacks_gpu_lib = False)
+
+
+def test_backend_lacks_gpu_lib_detection(tmp_path):
+    """_backend_lacks_gpu_lib is True ONLY for a clear CPU-only split-lib layout (a
+    ggml-cpu/base lib with no gpu sibling); a gpu lib, or an unrecognized/static layout
+    with no ggml libs, returns False so a valid custom GPU build is never falsely rejected
+    (#7188)."""
+    ext = "dll" if sys.platform == "win32" else "so"
+    pre = "" if sys.platform == "win32" else "lib"
+
+    def _lib_dir_with(*names):
+        d = tmp_path / ("libs_" + ("_".join(names) or "empty"))
+        d.mkdir()
+        for nm in names:
+            (d / f"{pre}ggml-{nm}.{ext}").write_bytes(b"x")
+        return d
+
+    binary = str(tmp_path / "llama-server")
+    (tmp_path / "llama-server").write_bytes(b"x")
+
+    # CPU-only split layout -> True.
+    with patch("core.inference.llama_cpp._llama_lib_dir", return_value = _lib_dir_with("cpu")):
+        assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is True
+    # Any GPU ggml lib present -> False (pin can be honored).
+    for gpu in ("cuda", "hip", "vulkan"):
+        with patch(
+            "core.inference.llama_cpp._llama_lib_dir", return_value = _lib_dir_with("cpu", gpu)
+        ):
+            assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is False
+    # No ggml libs at all (static / unrecognized) -> False (never falsely reject).
+    with patch("core.inference.llama_cpp._llama_lib_dir", return_value = _lib_dir_with()):
+        assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is False
+
+    # Versioned sonames (e.g. libggml-cuda.so.0) are matched too: a versioned GPU lib
+    # next to an unversioned CPU lib is a real GPU build -> False (#7188).
+    for gpu in ("cuda", "hip", "vulkan"):
+        d = tmp_path / f"libsv_cpu_{gpu}"
+        d.mkdir()
+        (d / f"{pre}ggml-cpu.{ext}").write_bytes(b"x")
+        (d / f"{pre}ggml-{gpu}.{ext}.0").write_bytes(b"x")
+        with patch("core.inference.llama_cpp._llama_lib_dir", return_value = d):
+            assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is False
+    # A versioned CPU-only lib is still recognized as CPU-only -> True.
+    d = tmp_path / "libsv_cpu_only"
+    d.mkdir()
+    (d / f"{pre}ggml-cpu.{ext}.0").write_bytes(b"x")
+    with patch("core.inference.llama_cpp._llama_lib_dir", return_value = d):
+        assert LlamaCppBackend._backend_lacks_gpu_lib(binary) is True
+
+
+def test_empty_non_cuda_probe_rejects_gpu_ids_even_with_stray_mask():
+    """On a Metal/SYCL/CPU (non-CUDA) backend the launcher's CUDA_VISIBLE_DEVICES is
+    ignored (SYCL keys off ONEAPI_DEVICE_SELECTOR, Metal off none), so an empty probe
+    with a stray parent-visible mask must NOT accept gpu_ids -- the pin would be silently
+    dropped onto the default device. A CUDA host with the same empty probe + mask is the
+    real telemetry-down case and still falls through (#7188)."""
+    from utils.hardware import DeviceType
+    with patch("utils.hardware.get_parent_visible_gpu_ids", return_value = [0]):
+        # A stray CUDA mask on a non-CUDA host must not be trusted to honor the pin.
+        for dev in (DeviceType.MLX, DeviceType.XPU, DeviceType.CPU):
+            with patch("utils.hardware.get_device", return_value = dev):
+                with pytest.raises(ValueError, match = "does not support explicit GPU selection"):
+                    LlamaCppBackend._assert_gpu_ids_resolvable([0], [], False)
+        # CUDA host (ROCm reports CUDA too): empty probe + valid mask is telemetry-down,
+        # so the selection is accepted for the loader to pin via CUDA_VISIBLE_DEVICES.
+        with patch("utils.hardware.get_device", return_value = DeviceType.CUDA):
+            LlamaCppBackend._assert_gpu_ids_resolvable([0], [], False)
+
+
+def test_explicit_gpu_ids_strips_stored_device_extra_args(tmp_path):
+    """With explicit gpu_ids a user --device is dropped from BOTH the command and the
+    PERSISTED extras, so a later same-model reload that inherits these (after gpu_ids is
+    cleared) can't resurrect the dropped --device and override auto placement (#7188)."""
+    backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [(0, 10000, 16000)], vulkan = True)
+    backend._select_gpus = lambda requested_total, gpus, **k: ([gpus[0][0]], False)
+
+    def _make_fake_popen(cmd, **kwargs):
+        class _FakePopen:
+            pid = 12345
+
+            def __init__(self, cmd, **kwargs):
+                pass
+
+            def poll(self):
+                return None
+
+        return _FakePopen(cmd, **kwargs)
+
+    with (
+        patch.object(subprocess, "Popen", side_effect = _make_fake_popen),
+        patch("utils.hardware.get_parent_visible_gpu_ids", return_value = []),
+    ):
+        backend.load_model(
+            gguf_path = str(gguf),
+            model_identifier = "test",
+            gpu_ids = [0],
+            extra_args = ["--device", "Vulkan3", "--top-k", "5"],
+        )
+
+    stored = backend._extra_args or []
+    assert "--device" not in stored and "Vulkan3" not in stored
+    assert "--top-k" in stored  # unrelated extras are preserved
 
 
 def test_memory_mode_auto_matches_none_in_target_state():
@@ -877,10 +1164,9 @@ def _mem_env_backend(gguf):
 )
 def test_memory_mode_scrubs_inherited_mmap_env(tmp_path, monkeypatch, mode, scrubbed):
     """An explicit memory_mode strips inherited LLAMA_ARG_MLOCK/NO_MMAP/MMAP so
-    llama-server can't silently run a placement Studio did not select (#7164).
-    memory_mode=None (no opinion) leaves any operator env untouched for backwards
-    compatibility; the reload-dedup instead reloads a None-loaded-with-inherited-env
-    child when a later explicit 'auto' arrives (see the target-state tests below)."""
+    llama-server can't run a placement Studio didn't select (#7164). memory_mode=None
+    leaves operator env untouched (backwards compatible); the reload-dedup handles a
+    later explicit 'auto' (see the target-state tests below)."""
     monkeypatch.setenv("LLAMA_ARG_MLOCK", "1")
     monkeypatch.setenv("LLAMA_ARG_NO_MMAP", "1")
     monkeypatch.setenv("LLAMA_ARG_MMAP", "true")
@@ -975,10 +1261,9 @@ def test_load_model_rejects_explicit_memory_mode_for_diffusion_gguf(tmp_path, mo
 
 @pytest.mark.parametrize("mode", [None, "auto", "AUTO", ""])
 def test_diffusion_load_allows_default_memory_mode_and_clears_stale_state(tmp_path, mode):
-    """auto/blank/None placement is the no-op default and is allowed for diffusion.
-    A successful diffusion load must also clear any _gpu_ids/_memory_mode left by a
-    prior llama-server load so reload-dedup reflects the runner's real (unset) state
-    and doesn't force a needless kill+restart of the healthy diffusion server."""
+    """auto/blank/None is the allowed no-op default for diffusion. A successful load
+    must also clear any _gpu_ids/_memory_mode left by a prior llama-server load so
+    reload-dedup doesn't force a needless kill+restart of the diffusion server."""
     gguf = tmp_path / "diffusion.gguf"
     _write_minimal_gguf(gguf, arch = "diffusion-gemma")
 
@@ -1022,10 +1307,9 @@ def test_is_likely_diffusion_model_name_matches_diffusiongemma(name, expected):
 
 
 def test_local_chat_gguf_in_diffusion_path_not_prekilled(tmp_path):
-    """A local chat GGUF whose path contains "diffusion" (e.g. /models/diffusion/x.gguf)
-    is NOT a diffusion model -- its header proves it. The Phase 0 name heuristic runs only
-    for HF loads, so an explicit gpu_ids on such a local chat GGUF must load normally
-    instead of being rejected on the path name before the header read (#7188)."""
+    """A local chat GGUF whose path contains "diffusion" is NOT a diffusion model (its
+    header proves it). The Phase 0 name heuristic runs only for HF loads, so explicit
+    gpu_ids on such a local GGUF must load normally, not be rejected on the path (#7188)."""
     backend, gguf = _fit_fallback_backend(tmp_path, gpu_memory = [(0, 10000, 16000)])
     backend._select_gpus = lambda *a, **k: ([0], False)
 

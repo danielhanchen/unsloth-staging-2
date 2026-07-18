@@ -505,8 +505,8 @@ def test_diffusion_load_clears_preserved_tensor_flag():
     src = inspect.getsource(LlamaCppBackend.load_model)
     diff = src.find("if self._is_diffusion:")
     assert diff != -1
-    # The diffusion path now captures the runner's result (started = ...) before
-    # returning it, so match the call itself rather than a bare `return`.
+    # The diffusion path captures the runner's result before returning, so match
+    # the call itself rather than a bare `return`.
     start = src.find("self._start_diffusion_server", diff)
     assert start != -1
     assert "self._layer_preserves_tensor_intent = False" in src[diff:start]
@@ -695,11 +695,10 @@ def _mem_loaded_backend(
 
 
 def test_explicit_auto_reloads_over_passthrough_mlock_in_extras():
-    """A server that loaded with no memory_mode keeps a pass-through --mlock in its
-    stored extras and is still mlocked. An explicit gguf_memory_mode="auto" repeating
-    --mlock must NOT dedupe to it: stripping only the request side keeps the backend's
-    --mlock visible, so the matcher reloads to clear the placement "auto" asks for and
-    the backend scrub then runs (Codex #7164)."""
+    """A server loaded with no memory_mode keeps a pass-through --mlock and is still
+    mlocked. An explicit "auto" repeating --mlock must NOT dedupe: stripping only the
+    request side keeps the backend's --mlock visible, so the matcher reloads and the
+    scrub runs (Codex #7164)."""
     from models.inference import LoadRequest
 
     inference_routes = _load_inference_routes_module()
@@ -715,11 +714,10 @@ def test_explicit_auto_reloads_over_passthrough_mlock_in_extras():
 
 
 def test_explicit_null_memory_mode_dedupes_over_passthrough_mlock():
-    """An explicit gguf_memory_mode=null (a client echoing the status/load response
-    field, which is null for a no-mode load) is "no opinion", not a mode change. Pydantic
-    still marks the field set, but the dedup must gate the memory strip on the VALUE: with
-    null it must NOT strip the request's pass-through --mlock and force a reload that drops
-    the placement -- a status-hydrated Apply dedupes to the running server (#7188)."""
+    """An explicit gguf_memory_mode=null (a client echoing the status response) is "no
+    opinion", not a mode change. Pydantic marks it set, but the dedup gates the strip on
+    the VALUE: null must NOT strip the request's --mlock, so a status-hydrated Apply
+    dedupes to the running server (#7188)."""
     from models.inference import LoadRequest
 
     inference_routes = _load_inference_routes_module()
@@ -729,18 +727,16 @@ def test_explicit_null_memory_mode_dedupes_over_passthrough_mlock():
         gguf_memory_mode = None,
         llama_extra_args = ["--mlock"],
     )
-    # Pydantic marks an explicit null as set -- exactly why gating on model_fields_set
-    # alone (rather than the value) was wrong.
+    # Pydantic marks an explicit null as set -- why gating on model_fields_set was wrong.
     assert "gguf_memory_mode" in req.model_fields_set
     backend = _mem_loaded_backend(memory_mode = None, extra_args = ["--mlock"])
     assert inference_routes._request_matches_loaded_settings(req, backend) is True
 
 
 def test_explicit_pinned_dedupes_when_flags_already_applied():
-    """A server that loaded WITH memory_mode="pinned" already had --mlock stripped from
-    its stored extras (applied via the mode flags). A repeat pinned Apply that re-sends
-    --mlock must still dedupe: the request-side strip makes it compare equal to the
-    empty backend extras, so a no-op re-Apply during training isn't churned (#7164)."""
+    """A server loaded WITH memory_mode="pinned" already had --mlock stripped from its
+    extras. A repeat pinned Apply re-sending --mlock must still dedupe: the request-side
+    strip makes it compare equal to the empty backend extras (#7164)."""
     from models.inference import LoadRequest
 
     inference_routes = _load_inference_routes_module()
@@ -751,6 +747,46 @@ def test_explicit_pinned_dedupes_when_flags_already_applied():
         llama_extra_args = ["--mlock"],
     )
     backend = _mem_loaded_backend(memory_mode = "pinned", extra_args = None)
+    assert inference_routes._request_matches_loaded_settings(req, backend) is True
+
+
+def test_explicit_gpu_ids_dedupes_when_device_already_stripped():
+    """A GGUF loaded with explicit gpu_ids had a user --device stripped from its stored
+    extras. A repeat identical request re-sending --device must still dedupe: the request-
+    side strip (gated on gpu_ids) compares equal to the stripped backend extras, so the
+    load hits the fast path instead of a needless reload / training 409 (#7188)."""
+    from models.inference import LoadRequest
+
+    inference_routes = _load_inference_routes_module()
+
+    req = LoadRequest(
+        model_path = "owner/repo",
+        gpu_ids = [0],
+        llama_extra_args = ["--device", "Vulkan3", "--top-k", "5"],
+    )
+    backend = _mem_loaded_backend(memory_mode = None, extra_args = ["--top-k", "5"])
+    backend._gpu_ids = [0]
+    assert inference_routes._request_matches_loaded_settings(req, backend) is True
+
+
+def test_empty_gpu_ids_dedupes_without_stripping_device():
+    """gpu_ids=[] is documented as auto (same as omitting): the load path normalizes it to
+    None and keeps its --device, so the request-side strip must be gated on an EFFECTIVE pin.
+    An empty list re-sending --device must still dedupe against a server loaded with no pin
+    that kept its --device, not force a needless reload / training 409 (#7188)."""
+    from models.inference import LoadRequest
+
+    inference_routes = _load_inference_routes_module()
+
+    req = LoadRequest(
+        model_path = "owner/repo",
+        gpu_ids = [],
+        llama_extra_args = ["--device", "Vulkan3", "--top-k", "5"],
+    )
+    backend = _mem_loaded_backend(
+        memory_mode = None, extra_args = ["--device", "Vulkan3", "--top-k", "5"]
+    )
+    backend._gpu_ids = None
     assert inference_routes._request_matches_loaded_settings(req, backend) is True
 
 
