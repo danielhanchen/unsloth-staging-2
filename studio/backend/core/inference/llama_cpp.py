@@ -6097,7 +6097,6 @@ class LlamaCppBackend:
                     # can't strand the load on CPU (issue #7164).
                     if gpu_ids:
                         from core.inference.llama_residency import filter_selected_gpus
-
                         gpus = filter_selected_gpus(gpus, gpu_ids)
                     total_by_idx = {idx: total for idx, _f, total in _gpu_mem}
 
@@ -7142,9 +7141,7 @@ class LlamaCppBackend:
                 # user --mmap / --no-mlock still wins via llama.cpp last-wins parse.
                 from core.inference.llama_residency import build_residency_flags
 
-                cmd += build_residency_flags(
-                    keep_model_in_vram = keep_model_in_vram, mlock = mlock
-                )
+                cmd += build_residency_flags(keep_model_in_vram = keep_model_in_vram, mlock = mlock)
                 # Record resolved state for the keep-warm idle loop, load dedupe,
                 # and status readback.
                 self._keep_resident = bool(keep_model_in_vram)
@@ -7154,9 +7151,7 @@ class LlamaCppBackend:
                 # Vulkan pins via --device (a cmd arg), before user extras so a
                 # user --device wins. Fall back to raw ids when the fit did not
                 # narrow the set, so an explicit selection is still honored.
-                _vulkan_pin_ids = (
-                    gpu_indices if gpu_indices is not None else (gpu_ids or None)
-                )
+                _vulkan_pin_ids = gpu_indices if gpu_indices is not None else (gpu_ids or None)
                 if is_vulkan_backend and _vulkan_pin_ids is not None:
                     cmd += LlamaCppBackend._vulkan_pin_args(_vulkan_pin_ids)
 

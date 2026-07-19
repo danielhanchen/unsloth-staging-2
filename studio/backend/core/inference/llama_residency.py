@@ -13,11 +13,8 @@ from typing import Iterable, Optional
 
 # ── (1) keep-resident / RAM control flags ────────────────────────────────────
 
-def build_residency_flags(
-    *,
-    keep_model_in_vram: bool = False,
-    mlock: bool = False,
-) -> list[str]:
+
+def build_residency_flags(*, keep_model_in_vram: bool = False, mlock: bool = False) -> list[str]:
     """llama-server flags for the keep-resident / RAM options.
 
     keep_model_in_vram -> --no-mmap: stop memory-mapping the GGUF so under full
@@ -36,6 +33,7 @@ def build_residency_flags(
 
 # ── (2) per-GPU selection ────────────────────────────────────────────────────
 
+
 def _as_id_list(gpu_ids: Optional[Iterable[int]]) -> Optional[list[int]]:
     """Normalise a selection to list[int], or None. [] -> None (auto)."""
     if gpu_ids is None:
@@ -45,8 +43,7 @@ def _as_id_list(gpu_ids: Optional[Iterable[int]]) -> Optional[list[int]]:
 
 
 def filter_selected_gpus(
-    gpus: list[tuple[int, int]],
-    gpu_ids: Optional[Iterable[int]],
+    gpus: list[tuple[int, int]], gpu_ids: Optional[Iterable[int]]
 ) -> list[tuple[int, int]]:
     """Restrict the probed (index, free_mib) list to the user's selection.
 
@@ -63,8 +60,7 @@ def filter_selected_gpus(
 
 
 def resolve_pin_ids(
-    gpu_indices: Optional[Iterable[int]],
-    user_gpu_ids: Optional[Iterable[int]],
+    gpu_indices: Optional[Iterable[int]], user_gpu_ids: Optional[Iterable[int]]
 ) -> Optional[list[int]]:
     """Physical GPU ids to pin the child to: the fit-selected subset when the
     auto-fit ran, else the raw user selection so an explicit choice is honoured
@@ -77,10 +73,7 @@ def resolve_pin_ids(
 
 
 def resolve_gpu_pin(
-    pin_ids: Optional[Iterable[int]],
-    *,
-    is_rocm: bool,
-    is_vulkan: bool,
+    pin_ids: Optional[Iterable[int]], *, is_rocm: bool, is_vulkan: bool
 ) -> tuple[dict[str, str], list[str], list[str]]:
     """Map a physical GPU id list to the launch mechanism for the active backend.
 
@@ -108,12 +101,8 @@ def resolve_gpu_pin(
 
 # ── (1b) idle-unload suppression ─────────────────────────────────────────────
 
-def should_idle_unload(
-    *,
-    is_loaded: bool,
-    is_idle: bool,
-    keep_resident: bool,
-) -> bool:
+
+def should_idle_unload(*, is_loaded: bool, is_idle: bool, keep_resident: bool) -> bool:
     """Whether the idle keep-warm loop should unload this tick. A model loaded
     with keep_model_in_vram opts out of the TTL auto-unload for its session, so
     unload only when loaded, past the idle TTL, and not pinned resident.

@@ -292,7 +292,6 @@ async def idle_unload_loop(poll_seconds: float = 15.0) -> None:
                 # idle auto-unload for its whole session, so a global TTL can't tear
                 # down a model the user explicitly pinned resident.
                 from core.inference.llama_residency import should_idle_unload
-
                 if should_idle_unload(
                     is_loaded = backend.is_loaded,
                     is_idle = _is_idle(ttl),
