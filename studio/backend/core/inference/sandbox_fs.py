@@ -56,15 +56,31 @@ _SYSCALL_NRS = {
 
 _LANDLOCK_CREATE_RULESET_VERSION = 1
 _LANDLOCK_RULE_PATH_BENEATH = 1
-# Minimum Landlock ABI we enforce on. ABI 1 (Linux 5.13-5.18) predates
-# LANDLOCK_ACCESS_FS_REFER (added in ABI 2): with a ruleset enforced, ABI 1
-# unconditionally denies reparenting a file to a different directory, and it
-# cannot be granted back (REFER is the one right the kernel denies by default
-# even when not handled). That breaks legitimate in-workdir os.rename /
-# shutil.move across subdirectories of the session workdir -- both paths are
-# sandbox-owned yet the move fails. Rather than break those, fall back to the
-# pre-Landlock protections (command blocklist, rlimits, env scrubbing) on ABI 1.
-_MIN_ABI = 2
+# Minimum Landlock ABI we enforce on. We require ABI 3 (Linux 6.2+) so that both
+# LANDLOCK_ACCESS_FS_REFER (added in ABI 2) and LANDLOCK_ACCESS_FS_TRUNCATE
+# (added in ABI 3) can be handled by the ruleset. Below that floor the ruleset
+# would either break legitimate in-workdir moves or silently leak a write
+# primitive:
+#
+#   ABI 1 (Linux 5.13-5.18) predates FS_REFER: with a ruleset enforced it
+#   unconditionally denies reparenting a file to a different directory, and it
+#   cannot be granted back (REFER is the one right the kernel denies by default
+#   even when not handled). That breaks legitimate in-workdir os.rename /
+#   shutil.move across subdirectories of the session workdir -- both paths are
+#   sandbox-owned yet the move fails.
+#
+#   ABI 2 (Linux 5.19-6.1) predates FS_TRUNCATE: the kernel allows any access
+#   right a ruleset does not handle, and a ruleset created on ABI 2 cannot
+#   handle TRUNCATE. A sandboxed truncate(2)/ftruncate(2)/creat(2)/open(O_TRUNC)
+#   -- including a shell `> file` redirect or Python open(path, "w") -- could
+#   therefore zero out any same-UID-writable host file OUTSIDE the workdir,
+#   defeating the write confinement this module claims. A command blocklist
+#   cannot cover this (redirects and open() truncate implicitly), so the only
+#   sound fix is to require the ABI that can handle TRUNCATE.
+#
+# Rather than enforce a broken or leaky ruleset on those kernels, fall back to
+# the pre-Landlock protections (command blocklist, rlimits, env scrubbing).
+_MIN_ABI = 3
 _PR_SET_NO_NEW_PRIVS = 38
 # O_PATH opens a handle to the inode without read/exec permission, exactly what
 # landlock_add_rule wants for the parent_fd. Constant (not exported by os on all
@@ -238,9 +254,11 @@ def _availability() -> int:
 def landlock_available() -> bool:
     """True when Landlock FS confinement can be enforced on this host.
 
-    Requires ABI >= _MIN_ABI: ABI 1 lacks FS_REFER and would break legitimate
-    in-workdir cross-directory renames (see _MIN_ABI), so it degrades to the
-    other sandbox layers instead."""
+    Requires ABI >= _MIN_ABI (3): below that the ruleset would break legitimate
+    in-workdir cross-directory renames (ABI 1 lacks FS_REFER) or silently allow
+    out-of-workdir file truncation (ABI 2 cannot handle FS_TRUNCATE, and
+    unhandled rights are always allowed); see _MIN_ABI. On older kernels it
+    degrades to the other sandbox layers instead."""
     return _availability() >= _MIN_ABI
 
 
@@ -355,6 +373,17 @@ def _build_rules(workdir: str, handled: int) -> "list[tuple[str, int]]":
         os.path.dirname(sys.executable) if sys.executable else "",
     ):
         add(path, dir_ro)
+    # A virtualenv exported to the child via VIRTUAL_ENV. tools._build_safe_env
+    # prepends $VIRTUAL_ENV/bin to the child PATH even when VIRTUAL_ENV differs
+    # from the running interpreter's prefixes granted above (Studio launched with
+    # VIRTUAL_ENV pointing at a different env than sys.prefix). Without this grant
+    # a console script resolved from that PATH entry (pip, an installed package
+    # CLI) lacks FS_EXECUTE and fails with EACCES on an enforcing host. Grant the
+    # venv root read+execute like the other interpreter roots so its bin/ scripts
+    # and its lib/.../site-packages resolve; add() dedups when it coincides with a
+    # prefix already granted, and skips it when unset or nonexistent. Read-only:
+    # the sandbox never gets write to the shared venv.
+    add(os.environ.get("VIRTUAL_ENV", ""), dir_ro)
     # The sandbox's own sitecustomize shim dir (on the child PYTHONPATH); outside
     # the interpreter roots on a source checkout, so grant it or the path-remap
     # shim silently fails to import under confinement.

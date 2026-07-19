@@ -86,6 +86,16 @@ def _run_confined(
 
 @_needs_landlock
 class TestEnforcement:
+    @pytest.fixture(autouse = True)
+    def _neutralize_ambient_virtualenv(self, monkeypatch):
+        # build_sandbox_confiner grants the exported VIRTUAL_ENV read+execute (so
+        # console scripts resolve). On a dev host VIRTUAL_ENV can point at the
+        # workspace root, an ancestor of pytest's tmp_path, which would grant read
+        # of the test's out-of-workdir secrets and mask genuine confinement. These
+        # tests exercise system-path confinement, not the venv grant (unit-tested
+        # separately), so remove the ambient value for determinism.
+        monkeypatch.delenv("VIRTUAL_ENV", raising = False)
+
     def test_read_outside_workdir_is_denied(self, tmp_path):
         sandbox = tmp_path / "sandbox"
         sandbox.mkdir()
@@ -277,6 +287,12 @@ class TestEnforcement:
 
 @_needs_landlock
 class TestExecutorPaths:
+    @pytest.fixture(autouse = True)
+    def _neutralize_ambient_virtualenv(self, monkeypatch):
+        # See TestEnforcement._neutralize_ambient_virtualenv: keep the exported
+        # VIRTUAL_ENV grant from covering pytest's tmp_path on dev hosts.
+        monkeypatch.delenv("VIRTUAL_ENV", raising = False)
+
     def test_bash_exec_cannot_read_outside_but_works_inside(self, tmp_path, monkeypatch):
         from core.inference import tools
 
@@ -331,17 +347,35 @@ class TestGateAndFallback:
     def test_abi_1_falls_back_no_confinement(self, monkeypatch):
         # ABI 1 (Linux 5.13-5.18) predates FS_REFER and unconditionally denies
         # reparenting a file across directories, breaking legitimate in-workdir
-        # os.rename/shutil.move; so we require ABI >= 2 and degrade to the other
+        # os.rename/shutil.move; so we require ABI >= 3 and degrade to the other
         # layers on ABI 1 instead of enforcing a rename-breaking ruleset.
         monkeypatch.setattr(sandbox_fs, "_abi_cached", 1)
         assert landlock_available() is False
         assert fs_confinement_enabled() is False
         assert build_sandbox_confiner("/tmp") is None
 
-    def test_abi_2_enables_confinement(self, monkeypatch):
+    def test_abi_2_falls_back_no_confinement(self, monkeypatch):
+        # ABI 2 (Linux 5.19-6.1) predates FS_TRUNCATE. Unhandled Landlock rights
+        # are always allowed, so a ruleset built on ABI 2 cannot deny
+        # truncate(2)/ftruncate(2)/open(O_TRUNC): a sandboxed `> file` redirect or
+        # open(path, "w") could zero a same-UID-writable host file OUTSIDE the
+        # workdir, defeating the claimed write confinement. We require ABI >= 3
+        # (which can handle TRUNCATE) and fall back to the other layers on ABI 2
+        # rather than enforce a leaky ruleset.
         monkeypatch.setattr(sandbox_fs, "_abi_cached", 2)
+        assert landlock_available() is False
+        assert fs_confinement_enabled() is False
+        assert build_sandbox_confiner("/tmp") is None
+
+    def test_abi_3_enables_confinement(self, monkeypatch):
+        # ABI 3 (Linux 6.2+) is the first version that can handle FS_TRUNCATE, so
+        # it is the floor at which confinement is both complete and non-breaking.
+        monkeypatch.setattr(sandbox_fs, "_abi_cached", 3)
         assert landlock_available() is True
         assert fs_confinement_enabled() is True
+        # TRUNCATE is handled at the enforced floor, so it is denied outside the
+        # explicit read-write grants (the workdir / shm), closing the ABI 2 gap.
+        assert _fs_handled_mask(3) & sandbox_fs._FS_TRUNCATE
 
     def test_make_sandbox_preexec_none_confiner_is_unchanged(self):
         # The wiring in tools returns the plain preexec when confinement is off,
@@ -393,6 +427,37 @@ class TestMaskAndRules:
             assert not (rules[passwd] & (1 << 3))  # no READ_DIR on a file
             assert not (rules[passwd] & (1 << 1))  # read-only: no WRITE_FILE
             assert rules[passwd] & (1 << 2)  # READ_FILE granted
+
+    def test_build_rules_grants_exported_virtualenv_readexec(self, tmp_path, monkeypatch):
+        # tools._build_safe_env prepends $VIRTUAL_ENV/bin to the child PATH even
+        # when VIRTUAL_ENV differs from the running interpreter's prefix. That
+        # venv root must be granted read+execute, else a console script resolved
+        # from it (pip, an installed CLI) fails with EACCES on an enforcing host.
+        venv = tmp_path / "othervenv"
+        (venv / "bin").mkdir(parents = True)
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules(str(workdir), handled))
+        real = os.path.realpath(str(venv))
+        assert real in rules, sorted(rules)
+        assert rules[real] & (1 << 0)  # FS_EXECUTE (console scripts / interpreter)
+        assert rules[real] & (1 << 2)  # READ_FILE
+        assert rules[real] & (1 << 3)  # READ_DIR
+        assert not (rules[real] & (1 << 1))  # read-only: no WRITE_FILE
+        assert not (rules[real] & (1 << 14))  # read-only: no TRUNCATE
+
+    def test_build_rules_no_virtualenv_grant_when_unset(self, tmp_path, monkeypatch):
+        # With VIRTUAL_ENV unset, no extra venv rule is added (only the running
+        # interpreter's prefixes are granted).
+        monkeypatch.delenv("VIRTUAL_ENV", raising = False)
+        handled = _fs_handled_mask(5)
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        # Should not raise and should not key a rule on an empty path.
+        rules = dict(_build_rules(str(workdir), handled))
+        assert "" not in rules
 
     def test_build_rules_grants_sandbox_site_dir_readonly(self):
         # The sandbox sitecustomize shim dir is on the child PYTHONPATH: readable
