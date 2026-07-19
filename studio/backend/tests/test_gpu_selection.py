@@ -878,6 +878,8 @@ class TestRouteErrors(unittest.TestCase):
         # resolution as non-GGUF loads (rejecting only genuinely invalid ids with
         # the resolver's actionable message) rather than a blanket "not supported"
         # reject, so /validate can stay consistent with /load (#7239).
+        import utils.hardware.hardware as hardware_mod
+
         inference_route = _load_route_module(
             "inference_route_module_for_gguf_gpu_ids_test",
             "routes/inference.py",
@@ -907,7 +909,10 @@ class TestRouteErrors(unittest.TestCase):
                 "ModelConfig",
                 SimpleNamespace(from_identifier = lambda **_kwargs: model_config),
             ),
+            # Patch both the package re-export and the defining module so the stub
+            # fires no matter which import path the route uses.
             patch("utils.hardware.resolve_requested_gpu_ids", _fake_resolve),
+            patch.object(hardware_mod, "resolve_requested_gpu_ids", _fake_resolve),
             patch.object(
                 inference_route,
                 "_guard_chat_load_against_training",
@@ -933,6 +938,77 @@ class TestRouteErrors(unittest.TestCase):
         self.assertEqual(exc_info.exception.status_code, 400)
         self.assertIn("SENTINEL", exc_info.exception.detail)
         self.assertNotIn("not supported for GGUF", exc_info.exception.detail)
+
+    def test_inference_route_validates_gpu_ids_for_gguf(self):
+        # gpu_ids is now SUPPORTED for GGUF (the GPU picker), but still
+        # validated: a rejected pick surfaces as a clean 400, not the old
+        # "not supported for GGUF" rejection. Patch the validator so the test
+        # is deterministic regardless of the host's (or a prior test's) GPU env.
+        import utils.hardware.hardware as hardware_mod
+
+        inference_route = _load_route_module(
+            "inference_route_module_for_gguf_gpu_ids_test2",
+            "routes/inference.py",
+        )
+        request = LoadRequest(model_path = "unsloth/test.gguf", gpu_ids = [0, 1])
+        model_config = SimpleNamespace(
+            is_gguf = True,
+            is_lora = False,
+            gguf_hf_repo = None,
+            gguf_file = "/tmp/test.gguf",
+            gguf_mmproj_file = None,
+            gguf_variant = None,
+            identifier = "unsloth/test.gguf",
+            display_name = "unsloth/test.gguf",
+            is_vision = False,
+            is_audio = False,
+            audio_type = None,
+            has_audio_input = False,
+        )
+
+        with (
+            patch.object(
+                inference_route,
+                "ModelConfig",
+                SimpleNamespace(from_identifier = lambda **_kwargs: model_config),
+            ),
+            # Patch both the package re-export and the defining module so the stub
+            # fires no matter which import path the route uses.
+            patch(
+                "utils.hardware.resolve_requested_gpu_ids",
+                side_effect = ValueError("Invalid gpu_ids [0, 1]: rejected by test"),
+            ),
+            patch.object(
+                hardware_mod,
+                "resolve_requested_gpu_ids",
+                side_effect = ValueError("Invalid gpu_ids [0, 1]: rejected by test"),
+            ),
+            patch.object(
+                inference_route,
+                "_guard_chat_load_against_training",
+                return_value = None,
+            ),
+            patch.object(inference_route.asyncio, "to_thread", new = _inline_to_thread),
+            patch.object(inference_route, "_hf_offline_if_dns_dead", nullcontext),
+        ):
+            with self.assertRaises(HTTPException) as exc_info:
+                asyncio.run(
+                    inference_route._load_model_impl(
+                        request,
+                        SimpleNamespace(
+                            app = SimpleNamespace(
+                                state = SimpleNamespace(llama_parallel_slots = 1),
+                            ),
+                        ),
+                        current_subject = "test-user",
+                    )
+                )
+
+        # The validator's ValueError becomes a clean 400 (not the removed
+        # "not supported for GGUF" rejection).
+        self.assertEqual(exc_info.exception.status_code, 400)
+        self.assertIn("gpu_ids", exc_info.exception.detail.lower())
+        self.assertNotIn("not supported", exc_info.exception.detail.lower())
 
     def test_training_route_returns_400_for_invalid_gpu_ids(self):
         training_route = _load_route_module(

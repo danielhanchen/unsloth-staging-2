@@ -198,6 +198,7 @@ def can_load_chat_during_training(
     is_gguf: bool = False,
     is_vulkan: bool = False,
     required_override_gb: Optional[float] = None,
+    single_device_gpu: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Decide if a NEW chat model can load without OOMing active training (inverse
     of can_keep_chat_during_training: training is already resident, so size the
@@ -207,10 +208,11 @@ def can_load_chat_during_training(
     required_override_gb over the visible pool. A Vulkan GGUF selection picks by
     ggml Vulkan ordinal (a separate index space from CUDA physical ids), so its
     requested_gpu_ids must NOT be resolved against the CUDA parent-visible set;
-    size it against the full visible pool like GGUF self-placement instead, or a
-    valid ordinal outside the CUDA set would raise -> invalid_gpu_ids -> the OOM
-    check is bypassed. `load_in_4bit` must be effective (LoRA can flip 4-bit ->
-    16-bit). Non-CUDA allows the load; default-deny on any CUDA case it can't
+    size it against the busiest visible GPU instead, or a valid ordinal outside
+    the CUDA set would raise -> invalid_gpu_ids -> the OOM check is bypassed.
+    ``single_device_gpu`` is the exact physical device token selected by a
+    single-device runner. `load_in_4bit` must be effective (LoRA can flip 4-bit
+    -> 16-bit). Non-CUDA allows the load; default-deny on any CUDA case it can't
     size, so a load never OOMs training."""
     try:
         from utils.hardware import (
@@ -262,22 +264,39 @@ def can_load_chat_during_training(
             }
 
         # Explicit GPUs, or GGUF: size directly and check live free VRAM.
+        if single_device_gpu is not None:
+            mode = "single_device"
+        elif is_gguf:
+            mode = "gguf"
+        else:
+            mode = "explicit"
         required_gb = required_override_gb
         if required_gb is None:
             required_gb, _meta = estimate_required_model_memory_gb(model_name, **est_kwargs)
         if required_gb is None:
-            mode = "explicit" if requested_gpu_ids else "gguf"
             return False, {"mode": mode, "reason": "estimate_unavailable"}
 
         free_by_index = _free_vram_by_index(get_visible_gpu_utilization().get("devices", []))
-        if requested_gpu_ids and not vulkan_gguf:
-            # Invalid ids -> load_model 400s first, so don't block; missing id = 0.
+        if single_device_gpu is not None:
+            token = str(single_device_gpu).strip()
+            if not token:
+                # Empty token = a CPU-only single-device runner (e.g. a CPU
+                # diffusion GGUF): it uses no GPU VRAM, so it never threatens
+                # active training and can always load.
+                return True, {"mode": "single_device", "reason": "cpu_only"}
             try:
-                resolved = resolve_requested_gpu_ids(requested_gpu_ids)
-            except ValueError:
-                return True, {"mode": "explicit", "reason": "invalid_gpu_ids"}
-            free_vals = [free_by_index.get(i, 0.0) for i in resolved]
-            mode = "explicit"
+                selected_gpu = int(token)
+                if selected_gpu < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                # A non-numeric device token (e.g. a CUDA UUID / MIG handle)
+                # can't be mapped to a free-VRAM index, but the runner still
+                # drives ONE device. Size against the worst-case visible device
+                # (min free), never the aggregate pool, so a single-device load
+                # is never OK'd on capacity it can't use and OOMs training.
+                free_vals = [min(free_by_index.values())] if free_by_index else []
+            else:
+                free_vals = [free_by_index.get(selected_gpu, 0.0)]
         elif requested_gpu_ids and vulkan_gguf:
             # Explicit Vulkan ordinal: ggml Vulkan ordinals are a separate index
             # space from the CUDA/nvidia-smi index in free_by_index, so the pinned
@@ -286,12 +305,17 @@ def can_load_chat_during_training(
             # training-busy GPU using another GPU's free VRAM -> OOM. Size against the
             # busiest visible GPU: approve only if it fits even the most loaded card.
             free_vals = [min(free_by_index.values())] if free_by_index else []
-            mode = "gguf"
+        elif requested_gpu_ids:
+            # Invalid ids -> load_model 400s first, so don't block; missing id = 0.
+            try:
+                resolved = resolve_requested_gpu_ids(requested_gpu_ids)
+            except ValueError:
+                return True, {"mode": mode, "reason": "invalid_gpu_ids"}
+            free_vals = [free_by_index.get(i, 0.0) for i in resolved]
         else:
             # GGUF self-placement / auto Vulkan (no requested ids): llama.cpp picks
             # the GPU(s), so any visible GPU is a candidate -> size the whole pool.
             free_vals = list(free_by_index.values())
-            mode = "gguf"
 
         if not free_vals:
             return False, {"mode": mode, "reason": "no_visible_gpus"}
