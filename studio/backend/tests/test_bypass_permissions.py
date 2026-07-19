@@ -151,7 +151,9 @@ def test_python_sandboxed_composes_confiner_when_landlock_available(captured_pop
     # by identity, so the test above must pin the confiner to stay host-independent.
     calls = []
     monkeypatch.setattr(tools, "_sandbox_preexec", lambda: calls.append("base"))
-    monkeypatch.setattr(tools, "build_sandbox_confiner", lambda workdir: lambda: calls.append("confine"))
+    monkeypatch.setattr(
+        tools, "build_sandbox_confiner", lambda workdir: lambda: calls.append("confine")
+    )
     _python_exec("print(1)", None, 5, "t", disable_sandbox = False)
     preexec = captured_popen["kwargs"]["preexec_fn"]
     assert preexec is not tools._sandbox_preexec
