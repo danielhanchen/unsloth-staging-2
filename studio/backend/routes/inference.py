@@ -3194,6 +3194,16 @@ def _request_matches_loaded_settings(
             return False
         if _req_draft != _cur_draft:
             return False
+    elif (
+        "draft_model_path" in getattr(request, "model_fields_set", set())
+        and llama_backend.mtp_draft_path
+    ):
+        # An explicit clear (field present but empty) while a drafter is loaded must
+        # reload to re-resolve the drafter (drop it, or fall back to an auto sibling),
+        # else llama-server keeps the old drafter until an explicit unload. An omitted
+        # field (the common Apply / auto-switch reload path) keeps the current drafter,
+        # so those still dedupe (#7239).
+        return False
     # Compare requested n_ctx (not effective) so VRAM-cap doesn't mask an
     # Auto-vs-explicit slider flip.
     if request.max_seq_length != llama_backend.requested_n_ctx:
@@ -4260,6 +4270,15 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     "architectures)"
                 )
 
+        # Size an explicit user drafter (issue #7239) into the training guard: the
+        # local GGUF branch assigns it to the config only after this guard runs, so
+        # account for it here too or a load the guard permits could OOM the active
+        # training run with the extra --model-draft VRAM. Local GGUF only (the field
+        # is ignored for HF-repo and non-GGUF loads). A missing/typo path adds 0 to
+        # the estimate (it is size-checked on disk) and is rejected in the load branch.
+        if config.is_gguf and not config.gguf_hf_repo and request.draft_model_path:
+            config.gguf_mtp_file = request.draft_model_path
+
         # Refuse a load that would OOM active training, before the unload step below
         # frees the resident model. Off-loop: guard does sync nvidia-smi / HF work.
         await asyncio.to_thread(
@@ -4429,6 +4448,16 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 # companion check as an auto drafter so it can't escape the grant.
                 if request.draft_model_path:
                     config.gguf_mtp_file = request.draft_model_path
+                    # Non-native local loads skip the native companion check below,
+                    # so validate the explicit drafter here: load_model treats a
+                    # missing drafter as optional and drops it, which would silently
+                    # load without the requested draft on a typo. Surface a 400
+                    # instead of a silent no-op (#7239).
+                    if not native_grant_backed and not Path(request.draft_model_path).is_file():
+                        raise HTTPException(
+                            status_code = 400,
+                            detail = "Draft model path does not point to an existing GGUF file.",
+                        )
                 if native_grant_backed:
                     if config.gguf_mmproj_file:
                         _validate_native_gguf_companion(
@@ -4881,12 +4910,17 @@ async def validate_model(
         # Refuse early (before the frontend unloads to load this) if it can't fit
         # alongside training, using the same settings /load uses so they agree.
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
-        # Mirror /load: reject GGUF + gpu_ids before the guard so both return 400.
+        # Mirror /load: validate GGUF + gpu_ids the same way (resolve against the
+        # parent-visible set, Vulkan ordinals for a Vulkan build) so a preflight of
+        # the intended payload agrees with the follow-up load instead of rejecting a
+        # selection /load accepts (#7239).
         if config.is_gguf and effective_gpu_ids is not None:
-            raise HTTPException(
-                status_code = 400,
-                detail = "gpu_ids is not supported for GGUF models yet.",
-            )
+            from utils.hardware import resolve_requested_gpu_ids
+            _gguf_is_vulkan = LlamaCppBackend._is_vulkan_backend()
+            try:
+                resolve_requested_gpu_ids(effective_gpu_ids, is_vulkan = _gguf_is_vulkan)
+            except ValueError as exc:
+                raise HTTPException(status_code = 400, detail = str(exc))
         effective_load_in_4bit = _effective_load_in_4bit(config, request.load_in_4bit)
 
         # Both checks cover the [adapter, base] set (matching the scan route and workers):

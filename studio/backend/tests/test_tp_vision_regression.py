@@ -874,3 +874,46 @@ def test_residency_and_gpu_toggles_force_reload_at_route_level():
         )
         is False
     )
+
+
+def _loaded_gguf_backend_with_drafter() -> LlamaCppBackend:
+    """A loaded GGUF backend that launched with an explicit user drafter (#7239)."""
+    b = _loaded_gguf_backend()
+    b._mtp_draft_path = "/tmp/draft.gguf"
+    return b
+
+
+def test_draft_clear_forces_reload_when_drafter_loaded():
+    """Clearing draft_model_path on a model loaded WITH a drafter must reload so the
+    drafter is re-resolved (dropped or replaced by an auto sibling), else llama-server
+    keeps the old drafter until an explicit unload. An omitted field (the common Apply /
+    auto-switch reload path) still dedupes and keeps the drafter (Codex #7239)."""
+    from models.inference import LoadRequest
+
+    routes = _load_inference_routes_module()
+
+    # Explicit clear (field present but empty) while a drafter is loaded -> reload.
+    cleared_none = LoadRequest(model_path = "owner/model.gguf", draft_model_path = None)
+    assert "draft_model_path" in cleared_none.model_fields_set
+    assert (
+        routes._request_matches_loaded_settings(cleared_none, _loaded_gguf_backend_with_drafter())
+        is False
+    )
+    cleared_blank = LoadRequest(model_path = "owner/model.gguf", draft_model_path = "")
+    assert (
+        routes._request_matches_loaded_settings(cleared_blank, _loaded_gguf_backend_with_drafter())
+        is False
+    )
+
+    # Field omitted (never sent) -> dedupe, keep the current drafter.
+    omitted = LoadRequest(model_path = "owner/model.gguf")
+    assert "draft_model_path" not in omitted.model_fields_set
+    assert (
+        routes._request_matches_loaded_settings(omitted, _loaded_gguf_backend_with_drafter())
+        is True
+    )
+
+    # Explicit clear but no drafter loaded -> nothing to drop, still dedupe.
+    assert (
+        routes._request_matches_loaded_settings(cleared_none, _loaded_gguf_backend()) is True
+    )

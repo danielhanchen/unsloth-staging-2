@@ -873,7 +873,11 @@ class TestRouteErrors(unittest.TestCase):
 
         self.assertIn("only supported on CUDA devices", str(exc_info.exception))
 
-    def test_inference_route_rejects_gpu_ids_for_gguf(self):
+    def test_inference_route_resolves_gguf_gpu_ids(self):
+        # GGUF gpu_ids are now supported: /load routes them through the same
+        # resolution as non-GGUF loads (rejecting only genuinely invalid ids with
+        # the resolver's actionable message) rather than a blanket "not supported"
+        # reject, so /validate can stay consistent with /load (#7239).
         inference_route = _load_route_module(
             "inference_route_module_for_gguf_gpu_ids_test",
             "routes/inference.py",
@@ -894,12 +898,16 @@ class TestRouteErrors(unittest.TestCase):
             has_audio_input = False,
         )
 
+        def _fake_resolve(ids, is_vulkan = False):
+            raise ValueError("SENTINEL requested GPUs are outside the parent-visible set")
+
         with (
             patch.object(
                 inference_route,
                 "ModelConfig",
                 SimpleNamespace(from_identifier = lambda **_kwargs: model_config),
             ),
+            patch("utils.hardware.resolve_requested_gpu_ids", _fake_resolve),
             patch.object(
                 inference_route,
                 "_guard_chat_load_against_training",
@@ -921,8 +929,10 @@ class TestRouteErrors(unittest.TestCase):
                     )
                 )
 
+        # The selection was routed through resolution (not the old blanket reject).
         self.assertEqual(exc_info.exception.status_code, 400)
-        self.assertIn("GGUF", exc_info.exception.detail)
+        self.assertIn("SENTINEL", exc_info.exception.detail)
+        self.assertNotIn("not supported for GGUF", exc_info.exception.detail)
 
     def test_training_route_returns_400_for_invalid_gpu_ids(self):
         training_route = _load_route_module(

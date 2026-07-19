@@ -467,21 +467,20 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertEqual(captured[0]["load_in_4bit"], False)
         self.assertEqual(captured[0]["max_seq_length"], 4096)
 
-    def test_rejects_gguf_with_gpu_ids_before_guard(self):
-        # /validate must mirror /load's GGUF + gpu_ids 400, before the VRAM guard.
+    def _validate_gguf_gpu_ids(self, *, resolve, gpu_ids = (0,), captured = None):
         from models.inference import ValidateModelRequest
 
-        request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = [0])
+        request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = list(gpu_ids))
         cfg = SimpleNamespace(
             identifier = "x.gguf",
             display_name = "x",
             is_gguf = True,
             is_lora = False,
             is_vision = False,
+            gguf_file = None,
             path = None,
             base_model = None,
         )
-        captured = []
         with (
             patch.object(
                 self.route,
@@ -490,12 +489,35 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
             ),
             patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
             patch.object(self.route, "load_inference_config", return_value = {}),
+            patch("utils.hardware.resolve_requested_gpu_ids", resolve),
             _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
         ):
-            with self.assertRaises(HTTPException) as exc:
-                asyncio.run(self.route.validate_model(request, current_subject = "u"))
+            return asyncio.run(self.route.validate_model(request, current_subject = "u"))
+
+    def test_resolves_gguf_gpu_ids_before_guard(self):
+        # /validate must mirror /load: GGUF gpu_ids are resolved (not blanket-rejected)
+        # so a preflight of the intended payload agrees with the follow-up load (#7239).
+        captured = []
+        resp = self._validate_gguf_gpu_ids(
+            resolve = lambda ids, is_vulkan = False: list(ids), captured = captured
+        )
+        self.assertTrue(resp.valid)
+        self.assertEqual(len(captured), 1)  # a valid selection reaches the guard
+
+    def test_rejects_invalid_gguf_gpu_ids_with_resolver_message(self):
+        # An invalid selection surfaces the resolver's actionable 400 before the guard,
+        # not the old blanket "not supported for GGUF" reject (#7239).
+        def _bad_resolve(ids, is_vulkan = False):
+            raise ValueError("SENTINEL requested GPUs are outside the parent-visible set")
+
+        captured = []
+        with self.assertRaises(HTTPException) as exc:
+            self._validate_gguf_gpu_ids(
+                resolve = _bad_resolve, gpu_ids = (99,), captured = captured
+            )
         self.assertEqual(exc.exception.status_code, 400)
-        self.assertIn("gpu_ids is not supported for GGUF", exc.exception.detail)
+        self.assertIn("SENTINEL", exc.exception.detail)
+        self.assertNotIn("not supported for GGUF", exc.exception.detail)
         self.assertEqual(captured, [])  # guard never reached
 
 
