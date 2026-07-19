@@ -56,6 +56,15 @@ _SYSCALL_NRS = {
 
 _LANDLOCK_CREATE_RULESET_VERSION = 1
 _LANDLOCK_RULE_PATH_BENEATH = 1
+# Minimum Landlock ABI we enforce on. ABI 1 (Linux 5.13-5.18) predates
+# LANDLOCK_ACCESS_FS_REFER (added in ABI 2): with a ruleset enforced, ABI 1
+# unconditionally denies reparenting a file to a different directory, and it
+# cannot be granted back (REFER is the one right the kernel denies by default
+# even when not handled). That breaks legitimate in-workdir os.rename /
+# shutil.move across subdirectories of the session workdir -- both paths are
+# sandbox-owned yet the move fails. Rather than break those, fall back to the
+# pre-Landlock protections (command blocklist, rlimits, env scrubbing) on ABI 1.
+_MIN_ABI = 2
 _PR_SET_NO_NEW_PRIVS = 38
 # O_PATH opens a handle to the inode without read/exec permission, exactly what
 # landlock_add_rule wants for the parent_fd. Constant (not exported by os on all
@@ -140,18 +149,25 @@ def _ca_cert_paths() -> "list[str]":
     denials would otherwise block, breaking certificate verification. Grant just
     the CA store, read-only; it holds only public trust anchors, not host FS.
 
-    Derived from OpenSSL's own defaults so it stays correct per distro/build. The
-    child runs a scrubbed env, so it uses the compile-time openssl_* defaults;
-    the env-resolved cafile/capath are included too for builds that bake
-    SSL_CERT_* in. Resolved in the parent (in _build_rules); the child imports
-    nothing.
+    Derived from OpenSSL's own defaults so it stays correct per distro/build.
+    Only the compile-time openssl_cafile / openssl_capath are granted, never the
+    env-resolved cafile / capath: those reflect the PARENT's SSL_CERT_FILE /
+    SSL_CERT_DIR (ssl.get_default_verify_paths resolves cafile/capath from those
+    env vars, falling back to the compile-time defaults otherwise). The child
+    runs a scrubbed env (tools._build_safe_env does not forward SSL_CERT_*), so
+    it uses the compile-time defaults regardless; granting the parent's
+    env-pointed path would be useless to the child and could expose a private
+    file (e.g. SSL_CERT_FILE=/home/service/private.pem) to the sandbox. An
+    operator who wants a custom store readable in the sandbox uses the
+    _ALLOW_READ_ENV escape hatch. Resolved in the parent (in _build_rules); the
+    child imports nothing.
     """
     try:
         import ssl
         dvp = ssl.get_default_verify_paths()
     except Exception:  # pragma: no cover - ssl is present on supported hosts
         return []
-    return [p for p in (dvp.openssl_cafile, dvp.openssl_capath, dvp.cafile, dvp.capath) if p]
+    return [p for p in (dvp.openssl_cafile, dvp.openssl_capath) if p]
 
 
 def _load_libc():
@@ -220,8 +236,12 @@ def _availability() -> int:
 
 
 def landlock_available() -> bool:
-    """True when Landlock FS confinement can be enforced on this host."""
-    return _availability() > 0
+    """True when Landlock FS confinement can be enforced on this host.
+
+    Requires ABI >= _MIN_ABI: ABI 1 lacks FS_REFER and would break legitimate
+    in-workdir cross-directory renames (see _MIN_ABI), so it degrades to the
+    other sandbox layers instead."""
+    return _availability() >= _MIN_ABI
 
 
 def _gate() -> "bool | None":
@@ -417,7 +437,7 @@ def build_sandbox_confiner(workdir: str):
     if not fs_confinement_enabled():
         return None
     abi = _availability()
-    if abi <= 0:
+    if abi < _MIN_ABI:
         return None
     handled = _fs_handled_mask(abi)
     rules = _build_rules(workdir, handled)

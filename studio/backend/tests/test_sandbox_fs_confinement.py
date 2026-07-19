@@ -328,6 +328,21 @@ class TestGateAndFallback:
         assert fs_confinement_enabled() is False
         assert build_sandbox_confiner("/tmp") is None
 
+    def test_abi_1_falls_back_no_confinement(self, monkeypatch):
+        # ABI 1 (Linux 5.13-5.18) predates FS_REFER and unconditionally denies
+        # reparenting a file across directories, breaking legitimate in-workdir
+        # os.rename/shutil.move; so we require ABI >= 2 and degrade to the other
+        # layers on ABI 1 instead of enforcing a rename-breaking ruleset.
+        monkeypatch.setattr(sandbox_fs, "_abi_cached", 1)
+        assert landlock_available() is False
+        assert fs_confinement_enabled() is False
+        assert build_sandbox_confiner("/tmp") is None
+
+    def test_abi_2_enables_confinement(self, monkeypatch):
+        monkeypatch.setattr(sandbox_fs, "_abi_cached", 2)
+        assert landlock_available() is True
+        assert fs_confinement_enabled() is True
+
     def test_make_sandbox_preexec_none_confiner_is_unchanged(self):
         # The wiring in tools returns the plain preexec when confinement is off,
         # so the non-confined path stays byte-identical.
@@ -430,6 +445,40 @@ class TestMaskAndRules:
         for real in granted:
             assert rules[real] & (1 << 2)  # READ_FILE
             assert not (rules[real] & (1 << 1))  # read-only: no WRITE_FILE
+
+    def test_ca_paths_exclude_env_influenced_private_cafile(self, tmp_path, monkeypatch):
+        # ssl.get_default_verify_paths() resolves cafile/capath from the PARENT's
+        # SSL_CERT_FILE / SSL_CERT_DIR. The sandboxed child never receives those
+        # env vars (tools._build_safe_env drops them), so it uses the compile-time
+        # openssl_* defaults; granting the parent's env-pointed path is useless to
+        # the child and could leak a private file into the sandbox. Only the
+        # compile-time openssl_cafile/openssl_capath may be granted.
+        import ssl
+
+        workdir = tmp_path / "sbx"
+        workdir.mkdir()
+        private = tmp_path / "private.pem"  # a parent SSL_CERT_FILE, OUTSIDE workdir
+        private.write_text("PRIVATE_CA_9f")
+        public_cafile = tmp_path / "compile_default.pem"
+        public_cafile.write_text("PUBLIC_CA")
+        fake = ssl.DefaultVerifyPaths(
+            cafile = str(private),  # env-resolved (SSL_CERT_FILE) -> private
+            capath = None,
+            openssl_cafile_env = "SSL_CERT_FILE",
+            openssl_cafile = str(public_cafile),  # compile-time default
+            openssl_capath_env = "SSL_CERT_DIR",
+            openssl_capath = None,
+        )
+        monkeypatch.setattr(ssl, "get_default_verify_paths", lambda: fake)
+
+        paths = sandbox_fs._ca_cert_paths()
+        assert str(private) not in paths, paths
+        assert str(public_cafile) in paths, paths
+
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules(str(workdir), handled))
+        assert os.path.realpath(str(private)) not in rules
+        assert os.path.realpath(str(public_cafile)) in rules
 
     def test_build_rules_grants_resolv_conf_readonly(self):
         # Egress is direct (no netns/proxy), so glibc getaddrinfo reads

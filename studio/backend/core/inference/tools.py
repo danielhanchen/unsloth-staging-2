@@ -625,6 +625,13 @@ _AUTO_UNSAFE_PY_ATTRS = frozenset(
         "copytree",
         "chmod",
         "chown",
+        # lchown/lchmod act on the symlink itself, chflags/lchflags set BSD/macOS
+        # file flags: all mutate host metadata like chmod/chown, and Landlock does
+        # not mediate metadata changes, so they must ask in auto mode too.
+        "lchown",
+        "lchmod",
+        "chflags",
+        "lchflags",
         "system",
         "popen",
         "execv",
