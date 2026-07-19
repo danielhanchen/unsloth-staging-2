@@ -509,9 +509,7 @@ def test_omitted_draft_inherits_loaded_custom_drafter(tmp_path):
     # Explicit clear (field present, empty) -> do NOT inherit (the clear owns it).
     request_cleared = LoadRequest(model_path = "/local/model", draft_model_path = "")
     with patch.object(route, "get_llama_cpp_backend", return_value = llama):
-        assert (
-            route._resolve_inherited_draft_path(request_cleared, config, "/local/model") is None
-        )
+        assert route._resolve_inherited_draft_path(request_cleared, config, "/local/model") is None
 
     # A different loaded GGUF -> never leak the drafter across models.
     other = _local_gguf_config(gguf_file = str(tmp_path / "other.gguf"))
@@ -531,9 +529,7 @@ def test_omitted_draft_reload_threads_inherited_drafter(tmp_path):
     config = _local_gguf_config(gguf_file = str(gguf))
     request = LoadRequest(model_path = "/local/model")  # draft_model_path omitted
 
-    llama = SimpleNamespace(
-        gguf_path = str(gguf), mtp_draft_path = custom_draft, extra_args = []
-    )
+    llama = SimpleNamespace(gguf_path = str(gguf), mtp_draft_path = custom_draft, extra_args = [])
     captured = {}
 
     def _capture_guard(cfg, **kwargs):
@@ -591,16 +587,20 @@ def test_estimate_required_gb_forwards_include_mtp():
     sizer, so a remote drafter picked with the mode off does not inflate the VRAM
     estimate and 409 a load that fits without it (Codex #7239)."""
     route = _load_route_module("gguf_opts_regression_estimate_forward")
-    config = _local_gguf_config(
-        gguf_file = None, gguf_hf_repo = "org/repo", gguf_variant = "Q4_K_M"
-    )
+    config = _local_gguf_config(gguf_file = None, gguf_hf_repo = "org/repo", gguf_variant = "Q4_K_M")
 
     seen = {}
 
     def _fake_variants(repo, hf_token = None):
         return ([SimpleNamespace(quant = "Q4_K_M", size_bytes = 1_000_000_000)], False)
 
-    def _fake_companions(repo, *, hf_token, include_mmproj, include_mtp = True):
+    def _fake_companions(
+        repo,
+        *,
+        hf_token,
+        include_mmproj,
+        include_mtp = True,
+    ):
         seen["include_mtp"] = include_mtp
         return 200_000_000 if include_mtp else 0
 
@@ -654,8 +654,8 @@ def test_validate_off_mode_threads_drafter_and_skips_existence_check(tmp_path):
         resp = asyncio.run(route.validate_model(request, current_subject = "u"))
 
     assert resp.valid is True
-    assert captured["spec"] == "off"          # mode forwarded to the guard
-    assert captured["mtp"] == str(draft)       # drafter threaded into the estimate
+    assert captured["spec"] == "off"  # mode forwarded to the guard
+    assert captured["mtp"] == str(draft)  # drafter threaded into the estimate
 
 
 def test_validate_rejects_missing_draft_under_mtp():

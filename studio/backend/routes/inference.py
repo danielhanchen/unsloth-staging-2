@@ -3863,7 +3863,11 @@ def _effective_load_in_4bit(config: ModelConfig, requested: bool) -> bool:
 
 
 def _remote_gguf_companion_bytes(
-    repo: str, *, hf_token: Optional[str], include_mmproj: bool, include_mtp: bool = True
+    repo: str,
+    *,
+    hf_token: Optional[str],
+    include_mmproj: bool,
+    include_mtp: bool = True,
 ) -> int:
     """Bytes of MTP/mmproj companion GGUFs llama-server auto-downloads. 0 on error,
     so it can only add headroom, never refuse a load by itself.
@@ -4675,9 +4679,7 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 # it rather than dropping back to the auto sibling (the reload only
                 # sets gguf_mtp_file when draft_model_path is truthy, so without this
                 # the custom drafter is silently lost) (#7239).
-                _inherited_draft = _resolve_inherited_draft_path(
-                    request, config, model_identifier
-                )
+                _inherited_draft = _resolve_inherited_draft_path(request, config, model_identifier)
                 if _inherited_draft:
                     config.gguf_mtp_file = _inherited_draft
 
@@ -5425,9 +5427,7 @@ async def validate_model(
         # Local GGUF only; the field is ignored for HF-repo and non-GGUF loads (#7239).
         if is_gguf and not getattr(config, "gguf_hf_repo", None) and request.draft_model_path:
             config.gguf_mtp_file = request.draft_model_path
-            _val_extra_args = _resolve_inherited_extra_args(
-                request, config, model_identifier, None
-            )
+            _val_extra_args = _resolve_inherited_extra_args(request, config, model_identifier, None)
             _val_effective_mtp = (
                 _canonicalize_spec_mode(request.speculative_type) or "auto"
             ) not in ("off", "ngram", "ngram-simple") and not _extra_args_set_spec_type(
