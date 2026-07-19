@@ -255,6 +255,67 @@ def test_unload_model_resets_residency_fields(tmp_path):
     assert backend.gpu_ids is None
 
 
+# ── FIX 3 (#7239): an AUTO Vulkan pick is recorded as None, not an explicit pin ─
+
+
+def test_auto_vulkan_pick_not_recorded_as_explicit_pin(tmp_path):
+    """An auto Vulkan load (gpu_ids omitted) whose fitter narrows to Vulkan0 must
+    still PIN the child to that device (--device Vulkan0) yet record gpu_ids as
+    None, not [0]: an auto pick recorded as an explicit pin makes /status misreport
+    a user selection and the load dedupe compare an omitted None against [0] and
+    miss the already-loaded server. Mirrors the CUDA/ROCm ``elif gpu_ids`` branch
+    (Codex #7239)."""
+    backend = LlamaCppBackend()
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"\0" * 1024)
+
+    def _fake_metadata(self, path):
+        self._is_diffusion = False
+        self._context_length = 4096
+
+    captured = {}
+
+    def _capture_popen(cmd, *_a, **_k):
+        # The recording branch (self._gpu_ids) runs before any spawn, so capture the
+        # launched argv here; backend.gpu_ids is asserted from the outer scope.
+        captured["cmd"] = list(cmd)
+        raise RuntimeError("SPAWN_REACHED")
+
+    with (
+        mock.patch.object(
+            LlamaCppBackend,
+            "_find_llama_server_binary",
+            staticmethod(lambda **_k: "/fake/llama-server"),
+        ),
+        mock.patch.object(
+            LlamaCppBackend, "_is_vulkan_backend", staticmethod(lambda binary = None: True)
+        ),
+        mock.patch.object(LlamaCppBackend, "_read_gguf_metadata", _fake_metadata),
+        mock.patch.object(LlamaCppBackend, "_already_in_target_state", lambda self, **_k: False),
+        mock.patch.object(LlamaCppBackend, "_wait_for_vram_settle", lambda self, **_k: None),
+        mock.patch.object(LlamaCppBackend, "_find_free_port", staticmethod(lambda: 12345)),
+        mock.patch.object(LlamaCppBackend, "_kill_process", lambda self: None),
+        mock.patch.object(LlamaCppBackend, "_get_gguf_size_bytes", staticmethod(lambda p: 1024)),
+        mock.patch.object(
+            LlamaCppBackend,
+            "_get_gpu_memory",
+            staticmethod(lambda binary = None: [(0, 40000, 48000)]),
+        ),
+        # File-size-only auto path narrows to Vulkan0 (the fitter's real internals
+        # are irrelevant to the recording branch under test).
+        mock.patch.object(LlamaCppBackend, "_select_gpus", lambda self, *a, **k: ([0], False)),
+        mock.patch("core.inference.llama_cpp.subprocess.Popen", side_effect = _capture_popen),
+    ):
+        with pytest.raises(RuntimeError, match = "SPAWN_REACHED"):
+            backend.load_model(gguf_path = str(gguf), model_identifier = "m")  # gpu_ids omitted
+
+    # The child is still pinned to the auto-picked device ...
+    assert "--device" in captured["cmd"]
+    assert "Vulkan0" in captured["cmd"]
+    # ... but the RECORDED selection for /status + dedupe is None (auto), not [0].
+    assert backend.gpu_ids is None
+
+
 # ── FIX A: invalid Vulkan ordinal rejects BEFORE the Phase 1 kill ─────────────
 
 

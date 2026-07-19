@@ -7684,8 +7684,16 @@ class LlamaCppBackend:
                 # recorded set is identical to the request when no narrowing
                 # occurred. Keep auto selection (no gpu_ids) as None (#7239).
                 if is_vulkan_backend:
+                    # Only record an EXPLICIT Vulkan pin. An auto pick (no gpu_ids)
+                    # still narrows _vulkan_pin_ids to the fit-selected ordinals and
+                    # pins the child to them below, but recording that as gpu_ids
+                    # would misreport an explicit pin to /status and make the load
+                    # dedupe compare an omitted None against the auto-picked ids,
+                    # mirroring the CUDA/ROCm ``elif gpu_ids`` branch (#7239).
                     self._gpu_ids = (
-                        sorted(int(x) for x in _vulkan_pin_ids) if _vulkan_pin_ids else None
+                        sorted(int(x) for x in _vulkan_pin_ids)
+                        if (gpu_ids and _vulkan_pin_ids)
+                        else None
                     )
                 elif gpu_ids:
                     _effective_pin_ids = resolve_pin_ids(gpu_indices, gpu_ids)

@@ -239,6 +239,21 @@ class ValidateModelRequest(BaseModel):
         description = "Also read the native context length from the local GGUF header. "
         "Opt-in so the normal load preflight doesn't pay for a cache scan it doesn't need.",
     )
+    # Mirror the follow-up /load's speculative choices so the coexistence estimate
+    # sizes the drafter the same way. Without these, validate always canonicalizes
+    # to "auto" and counts an auto drafter, 409ing a load that fits with the drafter
+    # off (or under a user --spec-type), and never sees a typo'd explicit draft path
+    # that then 400s in /load after the frontend unloaded the working model (#7239).
+    speculative_type: Optional[str] = Field(
+        None,
+        description = "Intended speculative decoding mode for the follow-up load "
+        "(off/auto/mtp/mtp+ngram/ngram/ngram-simple). Sizes the drafter to match /load.",
+    )
+    draft_model_path: Optional[str] = Field(
+        None,
+        description = "Intended explicit MTP drafter GGUF path for the follow-up load. "
+        "Sized into the coexistence estimate and existence-checked exactly as /load does.",
+    )
 
 
 class TransformersUpgradeInfo(BaseModel):

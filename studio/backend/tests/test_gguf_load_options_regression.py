@@ -416,3 +416,272 @@ def test_validate_rejects_absent_vulkan_ordinal_like_load():
             )
         )
     assert resp.valid is True
+
+
+# ── FIX 5: an unused draft path (off / user --spec-type) must not 400 a load ──
+
+
+def test_load_disabled_spec_accepts_missing_draft_path():
+    """speculative_type="off" never emits --model-draft, so a stale/absent
+    draft_model_path must NOT 400 the load: the drafter would never launch. The
+    load reaches the real GGUF load (drafter still threaded through) instead of
+    the existence 400 (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_off_missing_draft")
+    request = LoadRequest(
+        model_path = "/local/model",
+        draft_model_path = "/tmp/does-not-exist-off-7239.gguf",
+        speculative_type = "off",
+    )
+    config = _local_gguf_config()
+
+    captured = {}
+
+    def _fail_load(**kwargs):
+        captured["mtp_draft_path"] = kwargs.get("mtp_draft_path")
+        raise RuntimeError("no llama-server in test")
+
+    with (
+        patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
+        patch.object(route, "_guard_chat_load_against_training", return_value = None),
+        patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+        patch.object(route, "_hf_offline_if_dns_dead", nullcontext),
+        patch.object(
+            route.get_llama_cpp_backend(), "load_model", side_effect = _fail_load, create = True
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(route._load_model_impl(request, _fastapi_request(), current_subject = "u"))
+
+    # No existence 400; the load proceeded (only the missing test server stops it).
+    assert "Draft model path" not in (exc.value.detail or "")
+    assert captured.get("mtp_draft_path") == "/tmp/does-not-exist-off-7239.gguf"
+
+
+def test_load_mtp_still_rejects_missing_draft_path():
+    """An explicit drafter under an effective-MTP mode (mtp) is still hard-400'd
+    when the path is absent, proving the Fix 5 gate only relaxes the modes that
+    never launch a drafter (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_mtp_missing_draft")
+    request = LoadRequest(
+        model_path = "/local/model",
+        draft_model_path = "/tmp/does-not-exist-mtp-7239.gguf",
+        speculative_type = "mtp",
+    )
+    config = _local_gguf_config()
+
+    with (
+        patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
+        patch.object(route, "_guard_chat_load_against_training", return_value = None),
+        patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+        patch.object(route, "_hf_offline_if_dns_dead", nullcontext),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(route._load_model_impl(request, _fastapi_request(), current_subject = "u"))
+
+    assert exc.value.status_code == 400
+    assert "Draft model path" in exc.value.detail
+
+
+# ── FIX 2: an omitted draft path inherits the live server's explicit drafter ──
+
+
+def test_omitted_draft_inherits_loaded_custom_drafter(tmp_path):
+    """A local GGUF serving an EXPLICIT custom drafter, reloaded by a request that
+    OMITS draft_model_path, must keep the drafter rather than drop it back to the
+    auto sibling. _resolve_inherited_draft_path returns the live drafter for the
+    omitted-field reload of the same local GGUF (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_inherit_draft")
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"gguf-stub")
+    custom_draft = "/custom/x.gguf"
+
+    llama = SimpleNamespace(gguf_path = str(gguf), mtp_draft_path = custom_draft)
+    config = _local_gguf_config(gguf_file = str(gguf))
+
+    # Omitted field -> inherit the live drafter.
+    request_omitted = LoadRequest(model_path = "/local/model")
+    with patch.object(route, "get_llama_cpp_backend", return_value = llama):
+        assert (
+            route._resolve_inherited_draft_path(request_omitted, config, "/local/model")
+            == custom_draft
+        )
+
+    # Explicit clear (field present, empty) -> do NOT inherit (the clear owns it).
+    request_cleared = LoadRequest(model_path = "/local/model", draft_model_path = "")
+    with patch.object(route, "get_llama_cpp_backend", return_value = llama):
+        assert (
+            route._resolve_inherited_draft_path(request_cleared, config, "/local/model") is None
+        )
+
+    # A different loaded GGUF -> never leak the drafter across models.
+    other = _local_gguf_config(gguf_file = str(tmp_path / "other.gguf"))
+    (tmp_path / "other.gguf").write_bytes(b"gguf-stub")
+    with patch.object(route, "get_llama_cpp_backend", return_value = llama):
+        assert route._resolve_inherited_draft_path(request_omitted, other, "/local/model") is None
+
+
+def test_omitted_draft_reload_threads_inherited_drafter(tmp_path):
+    """End to end: the omitted-field reload sizes the inherited drafter into the
+    config the training guard sees, so the reload preserves it instead of dropping
+    it (the old reload only set gguf_mtp_file for a truthy request field) (#7239)."""
+    route = _load_route_module("gguf_opts_regression_inherit_draft_e2e")
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"gguf-stub")
+    custom_draft = "/custom/x.gguf"
+    config = _local_gguf_config(gguf_file = str(gguf))
+    request = LoadRequest(model_path = "/local/model")  # draft_model_path omitted
+
+    llama = SimpleNamespace(
+        gguf_path = str(gguf), mtp_draft_path = custom_draft, extra_args = []
+    )
+    captured = {}
+
+    def _capture_guard(cfg, **kwargs):
+        captured["mtp"] = getattr(cfg, "gguf_mtp_file", None)
+        raise HTTPException(status_code = 409, detail = "stop-after-guard")
+
+    with (
+        patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
+        patch.object(route, "get_llama_cpp_backend", return_value = llama),
+        patch.object(
+            route, "get_inference_backend", return_value = SimpleNamespace(active_model_name = None)
+        ),
+        patch.object(route, "_guard_chat_load_against_training", _capture_guard),
+        patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+        patch.object(route, "_hf_offline_if_dns_dead", nullcontext),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(route._load_model_impl(request, _fastapi_request(), current_subject = "u"))
+
+    assert exc.value.status_code == 409
+    assert captured["mtp"] == custom_draft
+
+
+# ── FIX 4: a remote root mtp- companion is only counted when it will launch ──
+
+
+def test_remote_companion_bytes_gate_mtp():
+    """_remote_gguf_companion_bytes excludes the repo-root mtp- drafter when
+    include_mtp is False (the drafter will not be fetched under off/ngram/user
+    --spec-type) and includes it when True (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_remote_companion")
+
+    info = SimpleNamespace(
+        siblings = [
+            SimpleNamespace(rfilename = "model-Q4_K_M.gguf", size = 1000),
+            SimpleNamespace(rfilename = "mtp-model-Q4_K_M.gguf", size = 200),
+            SimpleNamespace(rfilename = "MTP/mtp-model.gguf", size = 500),  # subdir: ignored
+        ]
+    )
+
+    with patch("huggingface_hub.model_info", return_value = info):
+        with_mtp = route._remote_gguf_companion_bytes(
+            "org/repo", hf_token = None, include_mmproj = False, include_mtp = True
+        )
+        without_mtp = route._remote_gguf_companion_bytes(
+            "org/repo", hf_token = None, include_mmproj = False, include_mtp = False
+        )
+
+    assert with_mtp == 200  # only the repo-root mtp- sibling
+    assert without_mtp == 0
+
+
+def test_estimate_required_gb_forwards_include_mtp():
+    """_estimate_gguf_required_gb forwards include_mtp_draft to the remote companion
+    sizer, so a remote drafter picked with the mode off does not inflate the VRAM
+    estimate and 409 a load that fits without it (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_estimate_forward")
+    config = _local_gguf_config(
+        gguf_file = None, gguf_hf_repo = "org/repo", gguf_variant = "Q4_K_M"
+    )
+
+    seen = {}
+
+    def _fake_variants(repo, hf_token = None):
+        return ([SimpleNamespace(quant = "Q4_K_M", size_bytes = 1_000_000_000)], False)
+
+    def _fake_companions(repo, *, hf_token, include_mmproj, include_mtp = True):
+        seen["include_mtp"] = include_mtp
+        return 200_000_000 if include_mtp else 0
+
+    with (
+        patch("utils.models.model_config.list_gguf_variants", _fake_variants),
+        patch.object(route, "_remote_gguf_companion_bytes", _fake_companions),
+    ):
+        gb_off = route._estimate_gguf_required_gb(config, include_mtp_draft = False)
+        assert seen["include_mtp"] is False
+        gb_on = route._estimate_gguf_required_gb(config, include_mtp_draft = True)
+        assert seen["include_mtp"] is True
+
+    assert gb_on > gb_off  # the drafter's bytes are only counted when it will launch
+
+
+# ── FIX 1: /validate mirrors the follow-up load's draft/spec choices ──────────
+
+
+def test_validate_off_mode_threads_drafter_and_skips_existence_check(tmp_path):
+    """/validate now carries speculative_type + draft_model_path, so the training
+    guard sizes the drafter exactly as /load does and an unused drafter (mode off)
+    is not existence-checked. The guard sees the mode and the threaded drafter, and
+    an absent path under "off" does NOT 400 (matching /load) (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_validate_off")
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(b"gguf-stub")
+    request = ValidateModelRequest(
+        model_path = "unsloth/test",
+        draft_model_path = str(draft),
+        speculative_type = "off",
+    )
+    config = _local_gguf_config(identifier = "unsloth/test", gguf_file = str(tmp_path / "m.gguf"))
+
+    captured = {}
+
+    def _capture_guard(cfg, **kwargs):
+        captured["spec"] = kwargs.get("speculative_type")
+        captured["mtp"] = getattr(cfg, "gguf_mtp_file", None)
+        return None
+
+    with (
+        patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
+        patch.object(
+            route,
+            "get_llama_cpp_backend",
+            return_value = SimpleNamespace(extra_args = [], mtp_draft_path = None, gguf_path = None),
+        ),
+        patch.object(route, "_guard_chat_load_against_training", _capture_guard),
+        patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+    ):
+        resp = asyncio.run(route.validate_model(request, current_subject = "u"))
+
+    assert resp.valid is True
+    assert captured["spec"] == "off"          # mode forwarded to the guard
+    assert captured["mtp"] == str(draft)       # drafter threaded into the estimate
+
+
+def test_validate_rejects_missing_draft_under_mtp():
+    """A typo'd explicit draft_model_path under an effective-MTP mode must 400 in
+    /validate (not pass here then 400 in /load after the frontend unloaded the
+    working model) (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_validate_mtp_bad_draft")
+    request = ValidateModelRequest(
+        model_path = "unsloth/test",
+        draft_model_path = "/tmp/does-not-exist-validate-7239.gguf",
+        speculative_type = "mtp",
+    )
+    config = _local_gguf_config(identifier = "unsloth/test", gguf_file = "/tmp/m.gguf")
+
+    with (
+        patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
+        patch.object(
+            route,
+            "get_llama_cpp_backend",
+            return_value = SimpleNamespace(extra_args = [], mtp_draft_path = None, gguf_path = None),
+        ),
+        patch.object(route, "_guard_chat_load_against_training", return_value = None),
+        patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(route.validate_model(request, current_subject = "u"))
+
+    assert exc.value.status_code == 400
+    assert "Draft model path" in exc.value.detail

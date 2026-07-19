@@ -3863,10 +3863,16 @@ def _effective_load_in_4bit(config: ModelConfig, requested: bool) -> bool:
 
 
 def _remote_gguf_companion_bytes(
-    repo: str, *, hf_token: Optional[str], include_mmproj: bool
+    repo: str, *, hf_token: Optional[str], include_mmproj: bool, include_mtp: bool = True
 ) -> int:
     """Bytes of MTP/mmproj companion GGUFs llama-server auto-downloads. 0 on error,
-    so it can only add headroom, never refuse a load by itself."""
+    so it can only add headroom, never refuse a load by itself.
+
+    ``include_mtp`` gates the repo-root ``mtp-*.gguf`` drafter the same way the
+    local branch gates ``gguf_mtp_file``: the launch only fetches and loads it when
+    the effective speculative mode emits ``--model-draft``, so a remote drafter
+    picked with speculative_type off/ngram (or a user-owned --spec-type) must not
+    inflate the estimate and 409 a load that fits without it (#7239)."""
     try:
         from huggingface_hub import model_info
 
@@ -3880,7 +3886,7 @@ def _remote_gguf_companion_bytes(
             # Root-level mtp- only: -hf auto-fetches the repo-root drafter, not
             # the MTP/ subdir copies (which now share the mtp- prefix too).
             is_root_mtp = "/" not in name and base.startswith("mtp-")
-            if is_root_mtp or (include_mmproj and "mmproj" in base):
+            if (include_mtp and is_root_mtp) or (include_mmproj and "mmproj" in base):
                 total += getattr(sibling, "size", 0) or 0
         return total
     except Exception as e:
@@ -3963,7 +3969,10 @@ def _estimate_gguf_required_gb(
             if main_bytes is None:
                 return None
             companions = _remote_gguf_companion_bytes(
-                repo, hf_token = hf_token, include_mmproj = bool(has_vision)
+                repo,
+                hf_token = hf_token,
+                include_mmproj = bool(has_vision),
+                include_mtp = include_mtp_draft,
             )
             return (main_bytes + companions) / (1024**3)
         return None
@@ -4238,6 +4247,40 @@ def _resolve_inherited_extra_args(
                     extra_llama_args,
                 )
     return extra_llama_args
+
+
+def _resolve_inherited_draft_path(
+    request, config: ModelConfig, model_identifier: str
+) -> Optional[str]:
+    """Explicit MTP drafter to carry into a GGUF reload that OMITTED
+    draft_model_path. Mirrors _resolve_inherited_extra_args' omitted-field
+    inheritance: a settings-Apply / auto-switch reload of the SAME local GGUF does
+    not round-trip the drafter field, and the auto-sibling resolver would replace a
+    user's explicit custom drafter with the mtp-*.gguf sibling (or drop it). Inherit
+    the live server's drafter so the reload keeps it. An explicit set/clear (field
+    present) owns the drafter and is handled by the caller, so this only fires when
+    the field is omitted (#7239)."""
+    if "draft_model_path" in getattr(request, "model_fields_set", set()):
+        return None  # explicit set or clear owns the drafter
+    if not getattr(config, "is_gguf", False) or getattr(config, "gguf_hf_repo", None):
+        return None  # local GGUF only (HF-repo re-resolves its own sibling)
+    llama_backend = get_llama_cpp_backend()
+    stored = getattr(llama_backend, "mtp_draft_path", None)
+    if not stored:
+        return None
+    # Only inherit when the SAME local GGUF is already loaded, so the drafter can't
+    # leak across a model switch. Compare resolved paths (a snapshot symlink vs the
+    # resolved blob still compare equal).
+    loaded_gguf = getattr(llama_backend, "gguf_path", None)
+    current_gguf = getattr(config, "gguf_file", None)
+    if not loaded_gguf or not current_gguf:
+        return None
+    try:
+        if Path(loaded_gguf).resolve() != Path(current_gguf).resolve():
+            return None
+    except OSError:
+        return None
+    return stored
 
 
 def _model_json_response(model, status_code: int = 200) -> Response:
@@ -4623,8 +4666,20 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # training run with the extra --model-draft VRAM. Local GGUF only (the field
         # is ignored for HF-repo and non-GGUF loads). A missing/typo path adds 0 to
         # the estimate (it is size-checked on disk) and is rejected in the load branch.
-        if config.is_gguf and not config.gguf_hf_repo and request.draft_model_path:
-            config.gguf_mtp_file = request.draft_model_path
+        if config.is_gguf and not config.gguf_hf_repo:
+            if request.draft_model_path:
+                config.gguf_mtp_file = request.draft_model_path
+            else:
+                # Omitted field on a same-local-GGUF reload: inherit the live
+                # server's explicit drafter so an Apply / auto-switch reload keeps
+                # it rather than dropping back to the auto sibling (the reload only
+                # sets gguf_mtp_file when draft_model_path is truthy, so without this
+                # the custom drafter is silently lost) (#7239).
+                _inherited_draft = _resolve_inherited_draft_path(
+                    request, config, model_identifier
+                )
+                if _inherited_draft:
+                    config.gguf_mtp_file = _inherited_draft
 
         # Inherit the previous same-model load's pass-through extras when this
         # request omits the field (a settings-Apply reload doesn't round-trip
@@ -4735,14 +4790,33 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 # Explicit user-selected draft (MTP) GGUF (issue #7164) overrides
                 # the auto-detected sibling. Validated with the same native-path
                 # companion check as an auto drafter so it can't escape the grant.
+                # Whether the effective speculative mode will actually emit
+                # --model-draft for this drafter. _build_speculative_flags loads a
+                # separate drafter only for auto/mtp/mtp+ngram with no user
+                # --spec-type; off/ngram/ngram-simple and a user-owned --spec-type
+                # never launch it. Validating (or 400ing) an unused draft path would
+                # reject a load that runs fine without the drafter (#7239). Uses the
+                # same spec-canon / extras helpers the launch path uses so they agree.
+                _effective_mtp = (
+                    _canonicalize_spec_mode(request.speculative_type) or "auto"
+                ) not in ("off", "ngram", "ngram-simple") and not _extra_args_set_spec_type(
+                    extra_llama_args
+                )
                 if request.draft_model_path:
                     config.gguf_mtp_file = request.draft_model_path
                     # Non-native local loads skip the native companion check below,
                     # so validate the explicit drafter here: load_model treats a
                     # missing drafter as optional and drops it, which would silently
                     # load without the requested draft on a typo. Surface a 400
-                    # instead of a silent no-op (#7239).
-                    if not native_grant_backed and not Path(request.draft_model_path).is_file():
+                    # instead of a silent no-op (#7239). Only when the drafter will
+                    # actually launch -- a stale path under an off/ngram/user
+                    # --spec-type mode is never emitted, so it must not 400 a load
+                    # that would run without it.
+                    if (
+                        _effective_mtp
+                        and not native_grant_backed
+                        and not Path(request.draft_model_path).is_file()
+                    ):
                         raise HTTPException(
                             status_code = 400,
                             detail = "Draft model path does not point to an existing GGUF file.",
@@ -4762,7 +4836,11 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                                 config.gguf_mtp_file, config.gguf_file, "MTP drafter"
                             )
                         except HTTPException as exc:
-                            if request.draft_model_path:
+                            # A bad explicit drafter is a hard error only when it
+                            # will actually launch; under off/ngram/user --spec-type
+                            # it is never emitted, so drop it rather than 400 a load
+                            # that runs without it (#7239).
+                            if request.draft_model_path and _effective_mtp:
                                 raise
                             logger.warning("Dropping MTP drafter for native load: %s", exc.detail)
                             config.gguf_mtp_file = None
@@ -5339,6 +5417,31 @@ async def validate_model(
                 latest_tier_active_for, config.identifier, request.hf_token
             ):
                 effective_load_in_4bit = False
+        # Mirror /load's explicit-drafter handling so this preflight agrees with the
+        # follow-up load. Size the drafter into the config (the guard's own
+        # effective-MTP gate then counts it exactly as /load does) and reject a
+        # typo'd path with the same effective-MTP gating the load uses, so the typo
+        # surfaces here instead of after the frontend unloaded the working model.
+        # Local GGUF only; the field is ignored for HF-repo and non-GGUF loads (#7239).
+        if is_gguf and not getattr(config, "gguf_hf_repo", None) and request.draft_model_path:
+            config.gguf_mtp_file = request.draft_model_path
+            _val_extra_args = _resolve_inherited_extra_args(
+                request, config, model_identifier, None
+            )
+            _val_effective_mtp = (
+                _canonicalize_spec_mode(request.speculative_type) or "auto"
+            ) not in ("off", "ngram", "ngram-simple") and not _extra_args_set_spec_type(
+                _val_extra_args
+            )
+            if (
+                _val_effective_mtp
+                and not native_grant_backed
+                and not Path(request.draft_model_path).is_file()
+            ):
+                raise HTTPException(
+                    status_code = 400,
+                    detail = "Draft model path does not point to an existing GGUF file.",
+                )
         # A metadata-only probe just reads the GGUF header and allocates no VRAM,
         # so it must not be refused by the training guard. Real loads validate
         # without include_context_length and /load applies the guard again.
@@ -5364,10 +5467,11 @@ async def validate_model(
                     else 1
                 ),
                 gpu_memory_mode = request.gpu_memory_mode,
-                # ValidateModelRequest has no speculative_type (and no
-                # draft_model_path, so no explicit drafter reaches this path);
-                # default to auto, which keeps counting any auto-detected drafter.
-                speculative_type = getattr(request, "speculative_type", None),
+                # Mirror the follow-up /load: the request now carries the intended
+                # speculative mode (defaulting to auto when omitted, which keeps
+                # counting an auto-detected drafter) and any explicit drafter was
+                # sized into config.gguf_mtp_file above, so the estimate matches.
+                speculative_type = request.speculative_type,
             )
 
         # A selected GGUF loads via llama.cpp: auto_map Python and root pickle weights in a
