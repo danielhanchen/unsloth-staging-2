@@ -142,7 +142,6 @@ def _ca_cert_paths() -> "list[str]":
     """
     try:
         import ssl
-
         dvp = ssl.get_default_verify_paths()
     except Exception:  # pragma: no cover - ssl is present on supported hosts
         return []
