@@ -81,7 +81,9 @@ _DIR_RO = _FS_EXECUTE | _FS_READ_FILE | _FS_READ_DIR | _FS_IOCTL_DEV
 _FILE_RO = _FS_EXECUTE | _FS_READ_FILE | _FS_IOCTL_DEV
 _DEV_RW = _FS_READ_FILE | _FS_WRITE_FILE | _FS_IOCTL_DEV
 
-# System roots the interpreter and shell need read-only to run.
+# System roots the interpreter and shell need read-only to run. Not /opt: an
+# interpreter installed there is already covered by the sys.prefix / executable
+# dir grants below, and a blanket /opt would expose operator data placed there.
 _RO_SYSTEM_DIRS = (
     "/usr",
     "/lib",
@@ -90,7 +92,6 @@ _RO_SYSTEM_DIRS = (
     "/libx32",
     "/bin",
     "/sbin",
-    "/opt",
 )
 # Specific /etc files the dynamic loader / libc read. The rest of /etc, and
 # listing /etc, stay denied.
@@ -99,6 +100,11 @@ _RO_ETC_FILES = (
     "/etc/ld.so.preload",
     "/etc/localtime",
     "/etc/nsswitch.conf",
+    # Egress is direct (no netns/proxy), so glibc getaddrinfo reads resolv.conf
+    # to find the nameserver; without it allow-listed HTTPS by hostname fails.
+    # add() realpaths the systemd /run/systemd/resolve stub symlink. /etc/hosts
+    # stays denied on purpose.
+    "/etc/resolv.conf",
     "/etc/passwd",
     "/etc/group",
 )

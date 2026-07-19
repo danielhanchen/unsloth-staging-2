@@ -431,6 +431,28 @@ class TestMaskAndRules:
             assert rules[real] & (1 << 2)  # READ_FILE
             assert not (rules[real] & (1 << 1))  # read-only: no WRITE_FILE
 
+    def test_build_rules_grants_resolv_conf_readonly(self):
+        # Egress is direct (no netns/proxy), so glibc getaddrinfo reads
+        # /etc/resolv.conf for the nameserver; without it allow-listed HTTPS by
+        # hostname cannot resolve. Granted read-only (only nameserver IPs, not FS).
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules("/tmp", handled))
+        real = os.path.realpath("/etc/resolv.conf")
+        if not os.path.exists(real):  # absent on some non-Linux CI
+            pytest.skip("no /etc/resolv.conf on this host")
+        assert real in rules, sorted(rules)
+        assert rules[real] & (1 << 2)  # READ_FILE
+        assert not (rules[real] & (1 << 1))  # read-only: no WRITE_FILE
+        assert not (rules[real] & (1 << 3))  # no READ_DIR on a file
+
+    def test_build_rules_does_not_grant_opt_broadly(self, tmp_path):
+        # A blanket /opt grant is redundant (an /opt-installed interpreter is
+        # covered by the sys.prefix / executable-dir rules) and would expose
+        # operator data under /opt, so no rule is keyed on bare /opt.
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules(str(tmp_path), handled))
+        assert "/opt" not in rules
+
     def test_build_rules_never_grants_filesystem_root(self, monkeypatch):
         # A Python configured with --prefix=/ (or an interpreter at /python) makes
         # an interpreter root resolve to "/". A rule on "/" would grant read and
