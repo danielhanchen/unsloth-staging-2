@@ -649,6 +649,78 @@ def test_gpu_ids_reload_detection_collapses_diffusion_to_single_device():
     assert _target_state_gpu_ids(backend, None) is False
 
 
+def test_already_in_target_state_ignores_load_options_for_diffusion():
+    # #7239: _start_diffusion_server clears keep_resident/mlock and collapses a
+    # multi-GPU pick to its single lowest device. Reapplying the SAME request
+    # (keep_model_in_vram=true / mlock=true / gpu_ids=[0, 1]) must dedupe to the
+    # healthy runner rather than tear it down over options the runner cannot honor.
+    backend = _loaded_backend("auto")
+    backend._is_diffusion = True
+    backend._keep_resident = False  # cleared by the diffusion runner
+    backend._mlock = False
+    backend._gpu_ids = [0]  # collapsed from an earlier [0, 1] pick
+    assert (
+        backend._already_in_target_state(
+            gguf_path = None,
+            model_identifier = "owner/repo",
+            hf_variant = "Q4_K_M",
+            n_ctx = 8192,
+            cache_type_kv = None,
+            speculative_type = "auto",
+            chat_template_override = None,
+            extra_args = None,
+            is_vision = False,
+            gpu_ids = [0, 1],
+            keep_model_in_vram = True,
+            mlock = True,
+        )
+        is True
+    )
+
+
+def test_already_in_target_state_still_checks_load_options_for_chat():
+    # The chat path must STILL reload when residency/pin flips, so the diffusion
+    # skip does not loosen the non-diffusion guard.
+    backend = _loaded_backend("auto")
+    backend._is_diffusion = False
+    backend._keep_resident = False
+    backend._mlock = False
+    backend._gpu_ids = None
+    assert (
+        backend._already_in_target_state(
+            gguf_path = None,
+            model_identifier = "owner/repo",
+            hf_variant = "Q4_K_M",
+            n_ctx = 8192,
+            cache_type_kv = None,
+            speculative_type = "auto",
+            chat_template_override = None,
+            extra_args = None,
+            is_vision = False,
+            gpu_ids = None,
+            keep_model_in_vram = True,
+            mlock = False,
+        )
+        is False
+    )
+
+
+def test_route_matches_loaded_settings_skips_load_options_for_diffusion():
+    # #7239: the residency + raw GPU-pin dedupe checks must be gated on
+    # `not is_diffusion`, so a keep_model_in_vram / mlock / multi-GPU re-apply of a
+    # loaded diffusion model dedupes instead of tearing the runner down. The GPU
+    # pick is still compared (collapsed) in the diffusion-aware block below.
+    route_src = (Path(_BACKEND_DIR) / "routes" / "inference.py").read_text(encoding = "utf-8")
+    match_impl = route_src[route_src.index("def _request_matches_loaded_settings") :]
+    guard = match_impl.index("if not llama_backend.is_diffusion:")
+    keep = match_impl.index(
+        "bool(request.keep_model_in_vram) != bool(llama_backend.keep_resident)"
+    )
+    mlock = match_impl.index("bool(request.mlock) != bool(llama_backend.mlock)")
+    # The residency checks live under the diffusion guard.
+    assert guard < keep < mlock
+
+
 def test_start_diffusion_server_resets_tensor_parallel():
     # A prior tensor-parallel chat load leaves self._tensor_parallel True (load_model
     # phase 1 only kills the process, it skips the unload reset). Diffusion is never

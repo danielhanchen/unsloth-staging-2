@@ -3195,13 +3195,22 @@ def _request_matches_loaded_settings(
     # same model must reload rather than dedupe to the live server. Mirrors
     # LlamaCppBackend._already_in_target_state, which this route check gates
     # (an already_loaded return here never reaches that backend guard).
-    _req_gpu_ids = sorted(int(x) for x in request.gpu_ids) if request.gpu_ids else None
-    if _req_gpu_ids != (llama_backend.gpu_ids or None):
-        return False
-    if bool(request.keep_model_in_vram) != bool(llama_backend.keep_resident):
-        return False
-    if bool(request.mlock) != bool(llama_backend.mlock):
-        return False
+    #
+    # The diffusion runner does not support these load options: _start_diffusion_server
+    # clears keep_resident/mlock and collapses a multi-GPU pick to its single lowest
+    # device, so comparing the raw request against the recorded (cleared/collapsed)
+    # state would always mismatch and needlessly tear down a healthy runner. Skip the
+    # residency and raw-pin checks for diffusion; the GPU pick is still compared
+    # (collapsed the same way) in the diffusion-aware block below, mirroring
+    # LlamaCppBackend._already_in_target_state (#7239).
+    if not llama_backend.is_diffusion:
+        _req_gpu_ids = sorted(int(x) for x in request.gpu_ids) if request.gpu_ids else None
+        if _req_gpu_ids != (llama_backend.gpu_ids or None):
+            return False
+        if bool(request.keep_model_in_vram) != bool(llama_backend.keep_resident):
+            return False
+        if bool(request.mlock) != bool(llama_backend.mlock):
+            return False
     # An explicit user drafter overrides the auto-detected sibling, so a change
     # to it (or clearing it) must reload even when the auto-detected path matches.
     if request.draft_model_path:

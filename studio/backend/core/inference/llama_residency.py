@@ -31,6 +31,34 @@ def build_residency_flags(*, keep_model_in_vram: bool = False, mlock: bool = Fal
     return flags
 
 
+def derive_residency_state(
+    cmd: Iterable[str], *, keep_model_in_vram: bool = False, mlock: bool = False
+) -> tuple[bool, bool]:
+    """Return the (keep_resident, mlock) actually in effect for the FINAL argv.
+
+    Unsloth appends the user's llama_extra_args AFTER build_residency_flags, and
+    llama.cpp parses flags last-wins, so a user --mmap / --no-mlock in the extras
+    overrides Unsloth's --no-mmap / --mlock. Recording the requested booleans
+    would then misreport /status and let load dedupe treat an unlocked/unmapped
+    child as locked/resident. Scan the built command in order so the last
+    occurrence of each toggle pair wins, matching llama.cpp; fall back to the
+    requested boolean when neither flag of a pair is present.
+    """
+    keep_resident = bool(keep_model_in_vram)
+    mlock_state = bool(mlock)
+    for arg in cmd:
+        a = str(arg)
+        if a == "--no-mmap":
+            keep_resident = True
+        elif a == "--mmap":
+            keep_resident = False
+        elif a == "--mlock":
+            mlock_state = True
+        elif a == "--no-mlock":
+            mlock_state = False
+    return keep_resident, mlock_state
+
+
 # ── (2) per-GPU selection ────────────────────────────────────────────────────
 
 

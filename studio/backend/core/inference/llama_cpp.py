@@ -6418,10 +6418,18 @@ class LlamaCppBackend:
                         # try rather than fail-open onto a device the user didn't pick
                         # (which would silently pin Vulkan0 and misreport gpu_ids).
                         _wanted_ids = {int(x) for x in gpu_ids}
-                        if is_vulkan_backend and not any(g[0] in _wanted_ids for g in gpus):
+                        # Reject if ANY requested ordinal is absent from the probe,
+                        # not only when none match. [0, 99] against probed {0, 1}
+                        # partially matches (0) yet silently drops 99, breaking the
+                        # explicit-selection guarantee. Comparing the full requested
+                        # set against the probed set here (before filter_selected_gpus
+                        # narrows) still lets the fitter pick a subset of valid
+                        # ordinals later -- that is narrowing, not an absent ordinal.
+                        _probed_ordinals = {g[0] for g in gpus}
+                        if is_vulkan_backend and not _wanted_ids.issubset(_probed_ordinals):
                             _vulkan_explicit_unmatched = True
                             _vulkan_requested_ids = sorted(_wanted_ids)
-                            _vulkan_available_ordinals = sorted(g[0] for g in gpus)
+                            _vulkan_available_ordinals = sorted(_probed_ordinals)
                         gpus = filter_selected_gpus(gpus, gpu_ids)
                     total_by_idx = {idx: total for idx, _f, total in _gpu_mem}
                     # GPU picker: restrict every mode to the chosen devices, so
@@ -7609,7 +7617,7 @@ class LlamaCppBackend:
 
                 # Keep-resident / RAM flags (issue #7164), before user extras so a
                 # user --mmap / --no-mlock still wins via llama.cpp last-wins parse.
-                from core.inference.llama_residency import build_residency_flags
+                from core.inference.llama_residency import build_residency_flags, resolve_pin_ids
 
                 cmd += build_residency_flags(keep_model_in_vram = keep_model_in_vram, mlock = mlock)
 
@@ -7618,19 +7626,27 @@ class LlamaCppBackend:
                 # narrow the set, so an explicit selection is still honored.
                 _vulkan_pin_ids = gpu_indices if gpu_indices is not None else (gpu_ids or None)
 
-                # Record resolved state for the keep-warm idle loop, load dedupe,
-                # and status readback. On Vulkan the fit can narrow an explicit
-                # selection to the devices actually present, so record the ordinals
-                # actually pinned (_vulkan_pin_ids) rather than the raw request, or
-                # /status would echo an ordinal that was never pinned.
-                self._keep_resident = bool(keep_model_in_vram)
-                self._mlock = bool(mlock)
+                # Record the resolved GPU pin for the keep-warm idle loop, load
+                # dedupe, and status readback. Both backends can narrow an explicit
+                # selection to the devices the fit actually kept, so record the
+                # ordinals actually pinned (fit-narrowed gpu_indices, else the raw
+                # request via resolve_pin_ids) rather than the unfiltered request,
+                # or /status would echo an ordinal that was never pinned. On the
+                # non-Vulkan path gpu_indices is the CUDA/ROCm mask handed to the
+                # child, so an explicit [0, 1] narrowed to [0] records [0]; the
+                # recorded set is identical to the request when no narrowing
+                # occurred. Keep auto selection (no gpu_ids) as None (#7239).
                 if is_vulkan_backend:
                     self._gpu_ids = (
                         sorted(int(x) for x in _vulkan_pin_ids) if _vulkan_pin_ids else None
                     )
+                elif gpu_ids:
+                    _effective_pin_ids = resolve_pin_ids(gpu_indices, gpu_ids)
+                    self._gpu_ids = (
+                        sorted(int(x) for x in _effective_pin_ids) if _effective_pin_ids else None
+                    )
                 else:
-                    self._gpu_ids = sorted(int(x) for x in gpu_ids) if gpu_ids else None
+                    self._gpu_ids = None
 
                 if is_vulkan_backend and _vulkan_pin_ids is not None:
                     cmd += LlamaCppBackend._vulkan_pin_args(_vulkan_pin_ids)
@@ -7641,6 +7657,18 @@ class LlamaCppBackend:
                 if extra_args:
                     cmd.extend(str(a) for a in extra_args)
                     logger.info(f"Appending user extra args to llama-server: {list(extra_args)}")
+
+                # Derive residency state from the FINAL argv, not the requested
+                # booleans: user extras (appended above) are parsed last-wins by
+                # llama.cpp, so mlock=true + --no-mlock launches unlocked and
+                # keep_model_in_vram=true + --mmap launches mapped. Recording the
+                # request would misreport /status and let dedupe treat the child as
+                # locked/resident (and suppress idle unload). #7239.
+                from core.inference.llama_residency import derive_residency_state
+
+                self._keep_resident, self._mlock = derive_residency_state(
+                    cmd, keep_model_in_vram = keep_model_in_vram, mlock = mlock
+                )
 
                 logger.info(f"Starting llama-server: {' '.join(self._redacted_cmd_for_log(cmd))}")
 
@@ -8542,13 +8570,22 @@ class LlamaCppBackend:
         # Residency + explicit GPU pin (issue #7164): toggling any of these
         # changes the launch command / child env, so a duplicate /load that flips
         # one must reload rather than dedupe to the live server.
-        _req_gpu_ids = sorted(int(x) for x in gpu_ids) if gpu_ids else None
-        if _req_gpu_ids != (getattr(self, "_gpu_ids", None) or None):
-            return False
-        if bool(keep_model_in_vram) != bool(getattr(self, "_keep_resident", False)):
-            return False
-        if bool(mlock) != bool(getattr(self, "_mlock", False)):
-            return False
+        #
+        # The diffusion runner does not support these load options: it clears
+        # keep_resident/mlock and collapses a multi-GPU pick to its single lowest
+        # device, so comparing the raw request against the recorded (cleared/
+        # collapsed) state would always mismatch and needlessly restart a healthy
+        # runner. Skip the residency and raw-pin checks for diffusion; the GPU pick
+        # is still compared (collapsed the same way) in the diffusion-aware block
+        # below, mirroring routes/inference.py:_request_matches_loaded_settings (#7239).
+        if not self._is_diffusion:
+            _req_gpu_ids = sorted(int(x) for x in gpu_ids) if gpu_ids else None
+            if _req_gpu_ids != (getattr(self, "_gpu_ids", None) or None):
+                return False
+            if bool(keep_model_in_vram) != bool(getattr(self, "_keep_resident", False)):
+                return False
+            if bool(mlock) != bool(getattr(self, "_mlock", False)):
+                return False
         # Direct-file loads pass hf_variant=None while the backend stores an
         # extracted filename label; compare paths to keep the guard symmetric.
         if gguf_path is not None and self._gguf_path:

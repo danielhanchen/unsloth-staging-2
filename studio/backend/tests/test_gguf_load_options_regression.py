@@ -179,6 +179,14 @@ def _loaded_gguf_backend(**overrides):
         requested_spec_mode = None,
         spec_draft_n_max = None,
         tensor_parallel = False,
+        # GPU-memory knobs the already-loaded echo reads back (merged from main):
+        # a keep-in-VRAM load leaves these at their auto defaults.
+        gpu_memory_mode = "auto",
+        gpu_layers = -1,
+        n_cpu_moe = 0,
+        tensor_split = None,
+        n_layers = None,
+        n_moe_layers = 0,
         # The three fields under test: launched-with residency/mlock/GPU pin.
         keep_resident = True,
         mlock = True,

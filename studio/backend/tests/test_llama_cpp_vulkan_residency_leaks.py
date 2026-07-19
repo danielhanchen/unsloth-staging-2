@@ -82,6 +82,97 @@ def test_explicit_vulkan_ordinal_absent_from_probe_rejects(tmp_path):
     assert backend.gpu_ids != [3]
 
 
+def test_partially_unmatched_vulkan_ordinals_reject(tmp_path):
+    # Probe enumerates Vulkan0 and Vulkan1; the user pins [0, 99]. Ordinal 0
+    # matches (so the old "none match" guard passed), 99 is absent -> the load
+    # was launched on Vulkan0 while silently dropping 99, breaking the explicit
+    # selection. Any absent requested ordinal must now reject.
+    backend = LlamaCppBackend()
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"\0" * 1024)
+
+    def _fake_metadata(self, path):
+        self._is_diffusion = False
+        self._context_length = 4096
+
+    def _spawn_reached(*_a, **_k):
+        raise RuntimeError("SPAWN_REACHED: partially-unmatched Vulkan pin was not rejected")
+
+    with (
+        mock.patch.object(
+            LlamaCppBackend, "_find_llama_server_binary",
+            staticmethod(lambda **_k: "/fake/llama-server"),
+        ),
+        mock.patch.object(
+            LlamaCppBackend, "_is_vulkan_backend", staticmethod(lambda binary = None: True)
+        ),
+        mock.patch.object(LlamaCppBackend, "_read_gguf_metadata", _fake_metadata),
+        mock.patch.object(LlamaCppBackend, "_already_in_target_state", lambda self, **_k: False),
+        mock.patch.object(LlamaCppBackend, "_wait_for_vram_settle", lambda self, **_k: None),
+        mock.patch.object(LlamaCppBackend, "_find_free_port", staticmethod(lambda: 12345)),
+        mock.patch.object(LlamaCppBackend, "_kill_process", lambda self: None),
+        mock.patch.object(LlamaCppBackend, "_get_gguf_size_bytes", staticmethod(lambda p: 1024)),
+        # Vulkan0 and Vulkan1 present (idx, free_mib, total_mib).
+        mock.patch.object(
+            LlamaCppBackend, "_get_gpu_memory",
+            staticmethod(lambda binary = None: [(0, 40000, 48000), (1, 20000, 24000)]),
+        ),
+        mock.patch.object(LlamaCppBackend, "_start_llama_process", _spawn_reached),
+        mock.patch("core.inference.llama_cpp.subprocess.Popen", side_effect = _spawn_reached),
+    ):
+        with pytest.raises(ValueError, match = "not present"):
+            backend.load_model(
+                gguf_path = str(gguf), model_identifier = "m", gpu_ids = [0, 99]
+            )
+
+    # The partially-unpinnable selection was never recorded as the active pin.
+    assert backend.gpu_ids != [0, 99]
+
+
+def test_all_present_vulkan_ordinals_do_not_reject(tmp_path):
+    # A request where ALL ordinals are present must pass the absent-ordinal guard,
+    # even if the fitter later narrows the set -- that is narrowing of valid
+    # ordinals, not an absent ordinal. Reaching the spawn (SPAWN_REACHED) proves
+    # the guard did not falsely reject.
+    backend = LlamaCppBackend()
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"\0" * 1024)
+
+    def _fake_metadata(self, path):
+        self._is_diffusion = False
+        self._context_length = 4096
+
+    def _spawn_reached(*_a, **_k):
+        raise RuntimeError("SPAWN_REACHED")
+
+    with (
+        mock.patch.object(
+            LlamaCppBackend, "_find_llama_server_binary",
+            staticmethod(lambda **_k: "/fake/llama-server"),
+        ),
+        mock.patch.object(
+            LlamaCppBackend, "_is_vulkan_backend", staticmethod(lambda binary = None: True)
+        ),
+        mock.patch.object(LlamaCppBackend, "_read_gguf_metadata", _fake_metadata),
+        mock.patch.object(LlamaCppBackend, "_already_in_target_state", lambda self, **_k: False),
+        mock.patch.object(LlamaCppBackend, "_wait_for_vram_settle", lambda self, **_k: None),
+        mock.patch.object(LlamaCppBackend, "_find_free_port", staticmethod(lambda: 12345)),
+        mock.patch.object(LlamaCppBackend, "_kill_process", lambda self: None),
+        mock.patch.object(LlamaCppBackend, "_get_gguf_size_bytes", staticmethod(lambda p: 1024)),
+        mock.patch.object(
+            LlamaCppBackend, "_get_gpu_memory",
+            staticmethod(lambda binary = None: [(0, 40000, 48000), (1, 20000, 24000)]),
+        ),
+        mock.patch.object(LlamaCppBackend, "_start_llama_process", _spawn_reached),
+        mock.patch("core.inference.llama_cpp.subprocess.Popen", side_effect = _spawn_reached),
+    ):
+        # Not a ValueError("not present"): the guard let a fully-present [0, 1] pass.
+        with pytest.raises(RuntimeError, match = "SPAWN_REACHED"):
+            backend.load_model(
+                gguf_path = str(gguf), model_identifier = "m", gpu_ids = [0, 1]
+            )
+
+
 # ── FIX 3: diffusion path clears leaked residency; unload_model resets it ──────
 
 

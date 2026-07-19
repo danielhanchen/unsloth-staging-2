@@ -35,6 +35,48 @@ def test_residency_flags_both():
     ]
 
 
+# ── (1c) effective residency state after user flag overrides (#7239) ─────────
+
+
+def test_derive_residency_state_matches_request_without_extras():
+    # No user extras: the effective state equals the requested booleans.
+    cmd = ["llama-server", "-m", "/m.gguf"] + R.build_residency_flags(
+        keep_model_in_vram = True, mlock = True
+    )
+    assert R.derive_residency_state(cmd, keep_model_in_vram = True, mlock = True) == (True, True)
+
+
+def test_derive_residency_state_no_mlock_override_unlocks():
+    # mlock=true launched, but a user --no-mlock in extras wins (llama.cpp
+    # last-wins), so the recorded state must be unlocked -- not the request.
+    cmd = ["llama-server", "-m", "/m.gguf", "--mlock", "--no-mlock"]
+    assert R.derive_residency_state(cmd, keep_model_in_vram = False, mlock = True) == (
+        False,
+        False,
+    )
+
+
+def test_derive_residency_state_mmap_override_drops_keep_resident():
+    # keep_model_in_vram=true -> --no-mmap, but a user --mmap override maps the
+    # weights again, so keep_resident must be False (else idle unload is wrongly
+    # suppressed and /status misreports resident).
+    cmd = ["llama-server", "-m", "/m.gguf", "--no-mmap", "--mmap"]
+    assert R.derive_residency_state(cmd, keep_model_in_vram = True, mlock = False) == (
+        False,
+        False,
+    )
+
+
+def test_derive_residency_state_user_enables_via_extras():
+    # A user who did not tick the UI option but passes --mlock / --no-mmap in
+    # extras is correctly recorded as locked / resident.
+    cmd = ["llama-server", "-m", "/m.gguf", "--mlock", "--no-mmap"]
+    assert R.derive_residency_state(cmd, keep_model_in_vram = False, mlock = False) == (
+        True,
+        True,
+    )
+
+
 # ── (2) per-GPU selection: filter + pin-id resolution ────────────────────────
 
 
@@ -73,6 +115,23 @@ def test_resolve_pin_ids_falls_back_to_user_selection():
 def test_resolve_pin_ids_none_when_no_selection():
     assert R.resolve_pin_ids(None, None) is None
     assert R.resolve_pin_ids(None, []) is None
+
+
+def test_recorded_pin_matches_narrowed_multi_gpu_request():
+    # #7239: an explicit CUDA/ROCm [0, 1] narrowed by the fitter to [0] must be
+    # RECORDED as [0] (what llama-server is masked to), not the unfiltered [0, 1],
+    # or /load and /status report an ordinal the child never saw. load_model
+    # records sorted(resolve_pin_ids(gpu_indices, gpu_ids)) on the non-Vulkan path.
+    recorded = sorted(R.resolve_pin_ids([0], [0, 1]))
+    assert recorded == [0]
+
+
+def test_recorded_pin_unchanged_without_narrowing():
+    # No narrowing: gpu_indices equals the whole picked set, so the recorded pin
+    # is identical to the request (no behavior change).
+    assert sorted(R.resolve_pin_ids([0, 1], [0, 1])) == [0, 1]
+    # Fit could not size the model (gpu_indices None) -> the raw explicit pick.
+    assert sorted(R.resolve_pin_ids(None, [0, 1])) == [0, 1]
 
 
 # ── (2b) per-GPU selection: backend-specific pin mechanism ───────────────────
