@@ -130,6 +130,26 @@ class TestResolveRequestedGpuIds(_GpuCacheResetMixin, unittest.TestCase):
         ):
             self.assertEqual(resolve_requested_gpu_ids([]), [1, 3])
 
+    def test_vulkan_ordinals_bypass_cuda_parent_visible_validation(self):
+        # Vulkan build on a CPU-only torch host: no CUDA parent-visible set and a
+        # zero physical count, yet a valid Vulkan ordinal must not be rejected as
+        # a CUDA physical id (issue #7239).
+        with (
+            patch.dict(os.environ, {}, clear = True),
+            patch("utils.hardware.hardware.get_physical_gpu_count", return_value = 0),
+        ):
+            # As a CUDA physical id, [0] is outside the empty parent-visible set.
+            with self.assertRaises(ValueError):
+                resolve_requested_gpu_ids([0])
+            # As Vulkan ordinals, [0] and [0, 1] pass through unchanged.
+            self.assertEqual(resolve_requested_gpu_ids([0], is_vulkan = True), [0])
+            self.assertEqual(resolve_requested_gpu_ids([0, 1], is_vulkan = True), [0, 1])
+            # Malformed ordinals are still rejected.
+            with self.assertRaisesRegex(ValueError, "duplicate GPU IDs"):
+                resolve_requested_gpu_ids([0, 0], is_vulkan = True)
+            with self.assertRaisesRegex(ValueError, "non-negative"):
+                resolve_requested_gpu_ids([-1], is_vulkan = True)
+
     def test_apply_gpu_ids_only_updates_cuda_visible_devices(self):
         with patch.dict(
             os.environ,

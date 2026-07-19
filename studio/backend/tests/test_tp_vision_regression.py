@@ -803,3 +803,74 @@ def test_already_in_target_state_reloads_on_tensor_off_after_fallback():
     )
     # A genuine layer load (no preserved intent) -> dedupe, no churn.
     assert _backend(False)._already_in_target_state(**kwargs) is True
+
+
+def _loaded_gguf_backend() -> LlamaCppBackend:
+    """A cleanly loaded GGUF backend with default residency (no pin, no
+    keep-resident, no mlock) so a default LoadRequest dedupes and a toggled one
+    reloads (issue #7164)."""
+    b = LlamaCppBackend()
+    b._model_identifier = "owner/model.gguf"
+    b._requested_n_ctx = 0
+    b._cache_type_kv = None
+    b._tensor_parallel = False
+    b._layer_preserves_tensor_intent = False
+    b._extra_args = None
+    b._requested_spec_mode = "auto"
+    b._spec_draft_n_max = None
+    b._chat_template_override = None
+    b._gguf_path = None
+    b._hf_repo = None
+    b._spec_fallback_reason = None
+    b._mtp_draft_path = None
+    b._keep_resident = False
+    b._mlock = False
+    b._gpu_ids = None
+    return b
+
+
+def test_residency_and_gpu_toggles_force_reload_at_route_level():
+    """Route-level dedup must reload when keep_model_in_vram / mlock / gpu_ids /
+    draft_model_path change on an already-loaded model. Otherwise the /load returns
+    already_loaded before load_model runs and the new #7164 launch flags are
+    silently dropped (Codex #7239)."""
+    from models.inference import LoadRequest
+
+    routes = _load_inference_routes_module()
+
+    base = LoadRequest(model_path = "owner/model.gguf")
+    # Baseline: nothing changed -> dedupe to the live server.
+    assert routes._request_matches_loaded_settings(base, _loaded_gguf_backend()) is True
+
+    # keep_model_in_vram toggled on -> reload (do not dedupe).
+    assert (
+        routes._request_matches_loaded_settings(
+            LoadRequest(model_path = "owner/model.gguf", keep_model_in_vram = True),
+            _loaded_gguf_backend(),
+        )
+        is False
+    )
+    # mlock toggled on -> reload.
+    assert (
+        routes._request_matches_loaded_settings(
+            LoadRequest(model_path = "owner/model.gguf", mlock = True),
+            _loaded_gguf_backend(),
+        )
+        is False
+    )
+    # Explicit GPU pin added -> reload.
+    assert (
+        routes._request_matches_loaded_settings(
+            LoadRequest(model_path = "owner/model.gguf", gpu_ids = [0]),
+            _loaded_gguf_backend(),
+        )
+        is False
+    )
+    # Explicit user drafter added -> reload.
+    assert (
+        routes._request_matches_loaded_settings(
+            LoadRequest(model_path = "owner/model.gguf", draft_model_path = "/tmp/draft.gguf"),
+            _loaded_gguf_backend(),
+        )
+        is False
+    )

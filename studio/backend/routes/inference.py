@@ -3168,6 +3168,32 @@ def _request_matches_loaded_settings(
     gemma-4 override), so the dedup compares against what the backend actually
     holds rather than the raw request field. Defaults to the request field for
     callers that do not resolve a bundled override."""
+    # Residency + explicit GPU pin + user draft (issue #7164): toggling any of
+    # these changes the launch command / child env, so a settings change on the
+    # same model must reload rather than dedupe to the live server. Mirrors
+    # LlamaCppBackend._already_in_target_state, which this route check gates
+    # (an already_loaded return here never reaches that backend guard).
+    _req_gpu_ids = sorted(int(x) for x in request.gpu_ids) if request.gpu_ids else None
+    if _req_gpu_ids != (llama_backend.gpu_ids or None):
+        return False
+    if bool(request.keep_model_in_vram) != bool(llama_backend.keep_resident):
+        return False
+    if bool(request.mlock) != bool(llama_backend.mlock):
+        return False
+    # An explicit user drafter overrides the auto-detected sibling, so a change
+    # to it (or clearing it) must reload even when the auto-detected path matches.
+    if request.draft_model_path:
+        try:
+            _req_draft = Path(request.draft_model_path).resolve()
+            _cur_draft = (
+                Path(llama_backend.mtp_draft_path).resolve()
+                if llama_backend.mtp_draft_path
+                else None
+            )
+        except OSError:
+            return False
+        if _req_draft != _cur_draft:
+            return False
     # Compare requested n_ctx (not effective) so VRAM-cap doesn't mask an
     # Auto-vs-explicit slider flip.
     if request.max_seq_length != llama_backend.requested_n_ctx:
@@ -4193,8 +4219,15 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         gguf_gpu_ids: Optional[List[int]] = None
         if config.is_gguf and effective_gpu_ids is not None:
             from utils.hardware import resolve_requested_gpu_ids
+            # A Vulkan build selects by ggml Vulkan ordinal (--device VulkanN),
+            # a separate index space from CUDA physical ids that may be empty
+            # under a CPU-only torch; validate as ordinals so a valid Vulkan
+            # selection is not rejected against the CUDA parent-visible set (#7239).
+            _gguf_is_vulkan = LlamaCppBackend._is_vulkan_backend()
             try:
-                gguf_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
+                gguf_gpu_ids = resolve_requested_gpu_ids(
+                    effective_gpu_ids, is_vulkan = _gguf_is_vulkan
+                )
             except ValueError as exc:
                 raise HTTPException(status_code = 400, detail = str(exc))
         if not config.is_gguf and _mlx_distributed_launch_detected():
