@@ -114,6 +114,14 @@ _RW_DEV_FILES = (
 # multiprocessing.Pool, ProcessPoolExecutor and joblib parallelism.
 _RW_SHM = "/dev/shm"
 
+# The sandbox sitecustomize shim lives in this dir (core/inference/sandbox_site)
+# and is placed on every sandboxed child's PYTHONPATH by tools._build_safe_env.
+# When Studio runs from a source checkout it sits outside the interpreter roots,
+# so it must be granted read-only explicitly or Landlock silently blocks the
+# /mnt/data code-interpreter path-remap shim from importing. Derived from this
+# file's location (same dir as tools.py) so no import of tools is needed here.
+_SANDBOX_SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_site")
+
 
 def _load_libc():
     try:
@@ -267,7 +275,14 @@ def _build_rules(workdir: str, handled: int) -> "list[tuple[str, int]]":
     # Read-write: the session workdir (scratch, uploads, artifacts), shared-memory
     # tmpfs for multiprocessing, and operator-added writable paths.
     add(workdir, handled)
-    add(_RW_SHM, handled)
+    # /dev/shm: multiprocessing/shared_memory must create, read, write, truncate
+    # and remove named objects here, but never enumerate the mount. Every session
+    # runs as the same service UID, so granting READ_DIR would let one session
+    # list -- and hence discover the (otherwise unguessable) names of and read --
+    # other concurrent sessions' POSIX semaphores and shared-memory segments.
+    # Withholding only READ_DIR blocks that cross-session enumeration while
+    # leaving multiprocessing fully working.
+    add(_RW_SHM, handled & ~_FS_READ_DIR)
     for path in _extra_paths(_ALLOW_WRITE_ENV):
         add(path, handled)
 
@@ -282,6 +297,10 @@ def _build_rules(workdir: str, handled: int) -> "list[tuple[str, int]]":
         os.path.dirname(sys.executable) if sys.executable else "",
     ):
         add(path, dir_ro)
+    # The sandbox's own sitecustomize shim dir (on the child PYTHONPATH); outside
+    # the interpreter roots on a source checkout, so grant it or the path-remap
+    # shim silently fails to import under confinement.
+    add(_SANDBOX_SITE_DIR, dir_ro)
     for path in _extra_paths(_ALLOW_READ_ENV):
         add(path, dir_ro)
 

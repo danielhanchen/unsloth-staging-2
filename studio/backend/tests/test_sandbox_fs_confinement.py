@@ -32,6 +32,7 @@ if str(_BACKEND_ROOT) not in sys.path:
 
 from core.inference import sandbox_fs
 from core.inference.sandbox_fs import (
+    _SANDBOX_SITE_DIR,
     _build_rules,
     _fs_handled_mask,
     build_sandbox_confiner,
@@ -224,6 +225,52 @@ class TestEnforcement:
         )
         assert "POOL:[1, 4, 9, 16]" in r.stdout, (r.stdout, r.stderr)
 
+    def test_sandbox_site_dir_is_readable_under_confinement(self, tmp_path):
+        # The sitecustomize path-remap shim on the child PYTHONPATH must import;
+        # reading a file inside its dir has to succeed under the confiner, else the
+        # /mnt/data remap silently stops working for confined Python.
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        confiner = build_sandbox_confiner(str(sandbox))
+        shim = os.path.join(_SANDBOX_SITE_DIR, "sitecustomize.py")
+        r = _run_confined(
+            f"""
+            try:
+                open({shim!r}).read(); print("READ_OK")
+            except Exception as e:
+                print("DENIED:" + type(e).__name__)
+            """,
+            sandbox,
+            confiner,
+        )
+        assert "READ_OK" in r.stdout, (r.stdout, r.stderr)
+
+    def test_shm_enumeration_is_denied_but_shared_memory_works(self, tmp_path):
+        # /dev/shm is granted read/write/create (multiprocessing) but not READ_DIR:
+        # a session must not enumerate other same-UID sessions' POSIX objects while
+        # its own shared-memory create/read/write keeps working.
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        confiner = build_sandbox_confiner(str(sandbox))
+        r = _run_confined(
+            """
+            import os
+            from multiprocessing import shared_memory
+            try:
+                os.listdir("/dev/shm"); print("ENUM:ALLOWED")
+            except Exception as e:
+                print("ENUM:DENIED:" + type(e).__name__)
+            shm = shared_memory.SharedMemory(create = True, size = 8)
+            shm.buf[:3] = b"abc"
+            print("SHM:" + bytes(shm.buf[:3]).decode())
+            shm.close(); shm.unlink()
+            """,
+            sandbox,
+            confiner,
+        )
+        assert "ENUM:DENIED:PermissionError" in r.stdout, (r.stdout, r.stderr)
+        assert "SHM:abc" in r.stdout, (r.stdout, r.stderr)
+
 
 # ── Real executor paths stay confined and working ────────────────────────────
 
@@ -331,6 +378,28 @@ class TestMaskAndRules:
             assert not (rules[passwd] & (1 << 3))  # no READ_DIR on a file
             assert not (rules[passwd] & (1 << 1))  # read-only: no WRITE_FILE
             assert rules[passwd] & (1 << 2)  # READ_FILE granted
+
+    def test_build_rules_grants_sandbox_site_dir_readonly(self):
+        # The sandbox sitecustomize shim dir is on the child PYTHONPATH: readable
+        # (else the path-remap fails to import under confinement) but never writable.
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules("/tmp", handled))
+        site = os.path.realpath(_SANDBOX_SITE_DIR)
+        assert site in rules, sorted(rules)
+        assert rules[site] & (1 << 2)  # READ_FILE
+        assert rules[site] & (1 << 3)  # READ_DIR
+        assert not (rules[site] & (1 << 1))  # read-only: no WRITE_FILE
+
+    def test_build_rules_shm_is_readwrite_but_not_enumerable(self):
+        # /dev/shm is read/write/create for multiprocessing, but READ_DIR is
+        # withheld so a session cannot enumerate other same-UID sessions' objects.
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules("/tmp", handled))
+        shm = os.path.realpath(sandbox_fs._RW_SHM)
+        if shm in rules:  # /dev/shm present on Linux; skip the assert elsewhere
+            assert rules[shm] & (1 << 1)  # WRITE_FILE
+            assert rules[shm] & (1 << 2)  # READ_FILE
+            assert not (rules[shm] & (1 << 3))  # no READ_DIR (no enumeration)
 
     def test_build_rules_skips_nonexistent_paths(self, tmp_path, monkeypatch):
         handled = _fs_handled_mask(5)
