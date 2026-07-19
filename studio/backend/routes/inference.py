@@ -4187,12 +4187,17 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # Normalize gpu_ids: empty list means auto-selection, same as None
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
 
-        # Reject GGUF + gpu_ids first so the guard can't mask it with a VRAM 409.
+        # GGUF per-GPU selection (issue #7164): resolve the requested physical ids
+        # against the parent-visible set (rejects UUID/MIG masks with a 400) so
+        # load_model can pin llama-server to exactly these GPUs. None = auto.
+        gguf_gpu_ids: Optional[List[int]] = None
         if config.is_gguf and effective_gpu_ids is not None:
-            raise HTTPException(
-                status_code = 400,
-                detail = "gpu_ids is not supported for GGUF models yet.",
-            )
+            from utils.hardware import resolve_requested_gpu_ids
+
+            try:
+                gguf_gpu_ids = resolve_requested_gpu_ids(effective_gpu_ids)
+            except ValueError as exc:
+                raise HTTPException(status_code = 400, detail = str(exc))
         if not config.is_gguf and _mlx_distributed_launch_detected():
             raise HTTPException(
                 status_code = 400,
@@ -4371,6 +4376,11 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 speculative_type = request.speculative_type,
                 spec_draft_n_max = request.spec_draft_n_max,
                 n_parallel = _n_parallel,
+                # Issue #7164: explicit GPU pin + keep-resident (--no-mmap +
+                # idle-unload opt-out) + host page lock (--mlock).
+                gpu_ids = gguf_gpu_ids,
+                keep_model_in_vram = request.keep_model_in_vram,
+                mlock = request.mlock,
             )
             if config.gguf_hf_repo:
                 # HF mode: download via huggingface_hub then start llama-server
@@ -4381,6 +4391,11 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 )
             else:
                 # Local mode: llama-server loads via -m <path>
+                # Explicit user-selected draft (MTP) GGUF (issue #7164) overrides
+                # the auto-detected sibling. Validated with the same native-path
+                # companion check as an auto drafter so it can't escape the grant.
+                if request.draft_model_path:
+                    config.gguf_mtp_file = request.draft_model_path
                 if native_grant_backed:
                     if config.gguf_mmproj_file:
                         _validate_native_gguf_companion(
@@ -4388,12 +4403,16 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                         )
                     if config.gguf_mtp_file:
                         # The drafter is optional (unlike mmproj for a vision
-                        # model): drop it rather than fail the load.
+                        # model): drop it rather than fail the load. An explicit
+                        # user draft_model_path is a hard error instead, so a typo
+                        # is surfaced rather than silently ignored.
                         try:
                             _validate_native_gguf_companion(
                                 config.gguf_mtp_file, config.gguf_file, "MTP drafter"
                             )
                         except HTTPException as exc:
+                            if request.draft_model_path:
+                                raise
                             logger.warning("Dropping MTP drafter for native load: %s", exc.detail)
                             config.gguf_mtp_file = None
                 _source_load_kwargs = dict(
@@ -4537,6 +4556,9 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 speculative_type = llama_backend.requested_spec_mode,
                 spec_draft_n_max = llama_backend.spec_draft_n_max,
                 tensor_parallel = llama_backend.tensor_parallel,
+                keep_model_in_vram = llama_backend.keep_resident,
+                mlock = llama_backend.mlock,
+                gpu_ids = llama_backend.gpu_ids,
             )
 
         # ── Standard path: load via Unsloth/transformers ──────────
@@ -5593,6 +5615,9 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
                 speculative_type = llama_backend.requested_spec_mode,
                 spec_draft_n_max = llama_backend.spec_draft_n_max,
                 tensor_parallel = llama_backend.tensor_parallel,
+                keep_model_in_vram = llama_backend.keep_resident,
+                mlock = llama_backend.mlock,
+                gpu_ids = llama_backend.gpu_ids,
                 llama_cpp_supports_mtp = _supports_mtp,
                 spec_fallback_reason = llama_backend.spec_fallback_reason,
                 llama_cpp_prebuilt_stale = _stale,

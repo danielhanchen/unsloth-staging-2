@@ -64,7 +64,40 @@ class LoadRequest(BaseModel):
     )
     gpu_ids: Optional[List[int]] = Field(
         None,
-        description = "Physical GPU indices to use, for example [0, 1]. Omit or pass [] to use automatic selection. Explicit gpu_ids are unsupported when the parent CUDA_VISIBLE_DEVICES uses UUID/MIG entries. Not supported for GGUF models.",
+        description = "Physical GPU indices to use, for example [0, 1]. Omit or pass [] to use automatic selection. Explicit gpu_ids are unsupported when the parent CUDA_VISIBLE_DEVICES uses UUID/MIG entries. For GGUF models this pins llama-server to exactly these GPUs (CUDA_VISIBLE_DEVICES, plus HIP_VISIBLE_DEVICES on AMD ROCm, or --device Vulkan<i> on a Vulkan build).",
+    )
+    keep_model_in_vram: bool = Field(
+        False,
+        description = (
+            "Keep the model resident in VRAM (GGUF only). Passes llama.cpp "
+            "--no-mmap so the weights are not also memory-mapped into system RAM "
+            "(removes the redundant RAM copy under full GPU offload) and opts the "
+            "model out of the idle keep-warm auto-unload, so it stays loaded until "
+            "explicitly unloaded. Default off (unchanged behavior). Note: the "
+            "VRAM<->RAM paging some drivers do when the GPU idles is a GPU "
+            "power-management behavior (WDDM on Windows, amdgpu runpm/DPM on Linux) "
+            "and is not controllable via a llama.cpp flag."
+        ),
+    )
+    mlock: bool = Field(
+        False,
+        description = (
+            "Lock the model's host pages in RAM (GGUF only). Passes llama.cpp "
+            "--mlock (VirtualLock on Windows) so the OS never swaps the weights "
+            "out. Independent of keep_model_in_vram: it increases RAM residency "
+            "and can fail on tight-memory systems, so it is a separate opt-in. "
+            "Default off."
+        ),
+    )
+    draft_model_path: Optional[str] = Field(
+        None,
+        description = (
+            "Optional path to a separate draft (MTP / speculative) GGUF for a "
+            "local GGUF model that has no built-in MTP head. Wired to llama.cpp's "
+            "--model-draft; combine with speculative_type='mtp'. Ignored for "
+            "non-GGUF models. HF drafters can still be passed via llama_extra_args "
+            "(--spec-draft-hf)."
+        ),
     )
     speculative_type: Optional[str] = Field(
         None,
@@ -333,6 +366,18 @@ class LoadResponse(BaseModel):
         False,
         description = "Whether tensor-parallel split (--split-mode tensor) is active.",
     )
+    keep_model_in_vram: bool = Field(
+        False,
+        description = "Whether the model was loaded keep-resident (--no-mmap + idle-unload opt-out).",
+    )
+    mlock: bool = Field(
+        False,
+        description = "Whether host pages are locked in RAM (--mlock) for the active load.",
+    )
+    gpu_ids: Optional[List[int]] = Field(
+        None,
+        description = "Explicit physical GPU selection the GGUF was pinned to, or None (auto).",
+    )
 
 
 class UnloadResponse(BaseModel):
@@ -460,6 +505,18 @@ class InferenceStatusResponse(BaseModel):
     tensor_parallel: bool = Field(
         False,
         description = "Whether tensor-parallel split (--split-mode tensor) is active.",
+    )
+    keep_model_in_vram: bool = Field(
+        False,
+        description = "Whether the active model is loaded keep-resident (--no-mmap + idle-unload opt-out).",
+    )
+    mlock: bool = Field(
+        False,
+        description = "Whether host pages are locked in RAM (--mlock) for the active model.",
+    )
+    gpu_ids: Optional[List[int]] = Field(
+        None,
+        description = "Explicit physical GPU selection the active GGUF was pinned to, or None (auto).",
     )
     llama_cpp_supports_mtp: bool = Field(
         True,

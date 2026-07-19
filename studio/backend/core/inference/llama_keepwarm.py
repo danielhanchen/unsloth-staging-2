@@ -288,7 +288,16 @@ async def idle_unload_loop(poll_seconds: float = 15.0) -> None:
                     _note_activity()
                     _set_last_unloaded(None)  # a model is loaded; drop stale stash
             async with _unload_gate():
-                if backend.is_loaded and _is_idle(ttl):
+                # A model loaded with keep_model_in_vram (issue #7164) opts out of
+                # idle auto-unload for its whole session, so a global TTL can't tear
+                # down a model the user explicitly pinned resident.
+                from core.inference.llama_residency import should_idle_unload
+
+                if should_idle_unload(
+                    is_loaded = backend.is_loaded,
+                    is_idle = _is_idle(ttl),
+                    keep_resident = bool(getattr(backend, "keep_resident", False)),
+                ):
                     freed = _loaded_identity(backend)
                     await asyncio.to_thread(backend.unload_model)
                     _set_last_unloaded(freed)  # let an alias request reload it

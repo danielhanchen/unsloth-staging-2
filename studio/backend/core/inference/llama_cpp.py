@@ -1895,6 +1895,12 @@ class LlamaCppBackend:
         self._cache_type_kv: Optional[str] = None
         # Whether --split-mode tensor was applied on the active load.
         self._tensor_parallel: bool = False
+        # Keep-resident / explicit-GPU state for the active load (issue #7164).
+        # keep_resident opts the model out of idle auto-unload; mlock pins host
+        # pages; _gpu_ids is the user's explicit physical GPU selection (or None).
+        self._keep_resident: bool = False
+        self._mlock: bool = False
+        self._gpu_ids: Optional[list[int]] = None
         # Layer load kept multi-GPU only to honor a downgraded tensor request, so a
         # later explicit tensor-off reloads instead of deduping to it (#6659).
         self._layer_preserves_tensor_intent: bool = False
@@ -2328,6 +2334,22 @@ class LlamaCppBackend:
     def tensor_parallel(self) -> bool:
         """Whether --split-mode tensor is active on the loaded server."""
         return self._tensor_parallel
+
+    @property
+    def keep_resident(self) -> bool:
+        """Whether the active model was loaded keep_model_in_vram (issue #7164):
+        --no-mmap plus opt-out of the idle keep-warm auto-unload."""
+        return self._keep_resident
+
+    @property
+    def mlock(self) -> bool:
+        """Whether --mlock (pin host pages) is active on the loaded server."""
+        return self._mlock
+
+    @property
+    def gpu_ids(self) -> Optional[list[int]]:
+        """Explicit physical GPU selection for the active load, or None (auto)."""
+        return self._gpu_ids
 
     @property
     def layer_preserves_tensor_intent(self) -> bool:
@@ -5727,6 +5749,13 @@ class LlamaCppBackend:
         extra_args: Optional[List[str]] = None,
         # Route-level tensor->layer fallback retry: keep the layer split multi-GPU.
         preserve_multi_gpu_on_layer: bool = False,
+        # Explicit physical GPU selection (issue #7164). None/[] = auto-select
+        # (unchanged). When set, restricts llama-server to exactly these GPUs.
+        gpu_ids: Optional[List[int]] = None,
+        # Keep-resident options (issue #7164). keep_model_in_vram -> --no-mmap
+        # (drop the RAM mmap copy) + opt out of idle auto-unload; mlock -> --mlock.
+        keep_model_in_vram: bool = False,
+        mlock: bool = False,
     ) -> bool:
         """Start llama-server with a GGUF model.
 
@@ -5759,6 +5788,10 @@ class LlamaCppBackend:
             "extra_args": list(extra_args) if extra_args is not None else None,
             # Replayed by _respawn_if_dead so a downgraded model stays multi-GPU.
             "preserve_multi_gpu_on_layer": preserve_multi_gpu_on_layer,
+            # Replayed so an MTP-crash reload keeps the user's GPU pin + residency.
+            "gpu_ids": list(gpu_ids) if gpu_ids else None,
+            "keep_model_in_vram": keep_model_in_vram,
+            "mlock": mlock,
         }
         # Serialise the whole load so concurrent /load calls never leave two
         # llama-server processes alive (#5401 / #5161). Doesn't block /unload.
@@ -5783,6 +5816,9 @@ class LlamaCppBackend:
                 extra_args = extra_args,
                 is_vision = is_vision,
                 preserve_multi_gpu_on_layer = preserve_multi_gpu_on_layer,
+                gpu_ids = gpu_ids,
+                keep_model_in_vram = keep_model_in_vram,
+                mlock = mlock,
             ):
                 logger.info(
                     f"load_model: backend already in target state for "
@@ -6056,6 +6092,13 @@ class LlamaCppBackend:
                     # Pass binary so a Vulkan build probes ggml's Vulkan ordinals.
                     _gpu_mem = self._get_gpu_memory(binary)
                     gpus = [(idx, free) for idx, free, _t in _gpu_mem]
+                    # Restrict the fit (and thus the layer plan + pin env) to the
+                    # selected GPUs; fail-open if none match so a stale UI choice
+                    # can't strand the load on CPU (issue #7164).
+                    if gpu_ids:
+                        from core.inference.llama_residency import filter_selected_gpus
+
+                        gpus = filter_selected_gpus(gpus, gpu_ids)
                     total_by_idx = {idx: total for idx, _f, total in _gpu_mem}
 
                     def _gpu_usable(g, frac = _CTX_FIT_VRAM_FRACTION):
@@ -7095,11 +7138,27 @@ class LlamaCppBackend:
                             ", ".join(unsupported_cache_flags),
                         )
 
-                # Vulkan pins via --device (a cmd arg, unlike the env-based
-                # CUDA/ROCm pin below), emitted BEFORE user extras so llama.cpp's
-                # last-wins parsing lets a user --device override Unsloth's pick.
-                if is_vulkan_backend and gpu_indices is not None:
-                    cmd += LlamaCppBackend._vulkan_pin_args(gpu_indices)
+                # Keep-resident / RAM flags (issue #7164), before user extras so a
+                # user --mmap / --no-mlock still wins via llama.cpp last-wins parse.
+                from core.inference.llama_residency import build_residency_flags
+
+                cmd += build_residency_flags(
+                    keep_model_in_vram = keep_model_in_vram, mlock = mlock
+                )
+                # Record resolved state for the keep-warm idle loop, load dedupe,
+                # and status readback.
+                self._keep_resident = bool(keep_model_in_vram)
+                self._mlock = bool(mlock)
+                self._gpu_ids = sorted(int(x) for x in gpu_ids) if gpu_ids else None
+
+                # Vulkan pins via --device (a cmd arg), before user extras so a
+                # user --device wins. Fall back to raw ids when the fit did not
+                # narrow the set, so an explicit selection is still honored.
+                _vulkan_pin_ids = (
+                    gpu_indices if gpu_indices is not None else (gpu_ids or None)
+                )
+                if is_vulkan_backend and _vulkan_pin_ids is not None:
+                    cmd += LlamaCppBackend._vulkan_pin_args(_vulkan_pin_ids)
 
                 # User pass-through args go last so llama.cpp's last-wins parsing
                 # lets the user override Unsloth's auto-set flags. Already
@@ -7166,32 +7225,26 @@ class LlamaCppBackend:
                         f"Data-center GPU detected: applied DC llama.cpp env tuning (multi_gpu={multi_gpu})"
                     )
 
-                # Pin to selected GPU(s). On ROCm, narrowing only
-                # CUDA_VISIBLE_DEVICES leaves an AMD child seeing the full set, so
-                # set HIP_VISIBLE_DEVICES too. Vulkan is pinned via --device
-                # (above), not here.
-                if gpu_indices is not None and not is_vulkan_backend:
-                    pinned = ",".join(str(i) for i in gpu_indices)
-                    env["CUDA_VISIBLE_DEVICES"] = pinned
+                # Pin to selected GPU(s), fit-subset first then raw selection
+                # (issue #7164). resolve_gpu_pin sets CUDA_VISIBLE_DEVICES, and on
+                # ROCm also HIP_VISIBLE_DEVICES + clears ROCR_VISIBLE_DEVICES (double
+                # masking would re-index a non-zero pin out of range -> CPU fallback).
+                from core.inference.llama_residency import resolve_gpu_pin, resolve_pin_ids
+
+                _pin_ids = resolve_pin_ids(gpu_indices, gpu_ids)
+                if _pin_ids is not None and not is_vulkan_backend:
                     try:
                         import torch as _torch
-                        if getattr(_torch.version, "hip", None) is not None:
-                            env["HIP_VISIBLE_DEVICES"] = pinned
-                            # Do NOT also set ROCR_VISIBLE_DEVICES to the same
-                            # value. ROCR_VISIBLE_DEVICES filters at the HSA/ROCr
-                            # layer and HIP_VISIBLE_DEVICES at the HIP layer, so
-                            # setting both with the same physical indices applies
-                            # the mask twice: ROCR reduces the visible set and
-                            # re-indexes it from 0, then HIP indexes into the
-                            # already-reduced set. A single non-zero pin (e.g.
-                            # "1") then points out of range at the HIP layer, HIP
-                            # enumerates 0 devices, and llama.cpp falls back to
-                            # CPU ("ggml_cuda_init: no ROCm-capable device is
-                            # detected"). The HIP mask alone narrows correctly;
-                            # clear any inherited ROCR mask so it can't double up.
-                            env.pop("ROCR_VISIBLE_DEVICES", None)
+                        _child_is_rocm = getattr(_torch.version, "hip", None) is not None
                     except Exception as e:
-                        logger.debug("Failed to set ROCm visibility env vars for child: %s", e)
+                        logger.debug("Failed to probe ROCm for child visibility env: %s", e)
+                        _child_is_rocm = False
+                    _env_updates, _env_pop, _ = resolve_gpu_pin(
+                        _pin_ids, is_rocm = _child_is_rocm, is_vulkan = False
+                    )
+                    env.update(_env_updates)
+                    for _k in _env_pop:
+                        env.pop(_k, None)
 
                 # Captured before any text-only fallback strips it from cmd.
                 launched_with_mmproj = "--mmproj" in cmd
@@ -7949,6 +8002,9 @@ class LlamaCppBackend:
         tensor_parallel: bool = False,
         mtp_draft_path: Optional[str] = None,
         preserve_multi_gpu_on_layer: bool = False,
+        gpu_ids: Optional[List[int]] = None,
+        keep_model_in_vram: bool = False,
+        mlock: bool = False,
     ) -> bool:
         """True iff the live server already satisfies these load kwargs.
 
@@ -7959,6 +8015,16 @@ class LlamaCppBackend:
         if not self.is_loaded:
             return False
         if (self._model_identifier or "").lower() != (model_identifier or "").lower():
+            return False
+        # Residency + explicit GPU pin (issue #7164): toggling any of these
+        # changes the launch command / child env, so a duplicate /load that flips
+        # one must reload rather than dedupe to the live server.
+        _req_gpu_ids = sorted(int(x) for x in gpu_ids) if gpu_ids else None
+        if _req_gpu_ids != (getattr(self, "_gpu_ids", None) or None):
+            return False
+        if bool(keep_model_in_vram) != bool(getattr(self, "_keep_resident", False)):
+            return False
+        if bool(mlock) != bool(getattr(self, "_mlock", False)):
             return False
         # Direct-file loads pass hf_variant=None while the backend stores an
         # extracted filename label; compare paths to keep the guard symmetric.
