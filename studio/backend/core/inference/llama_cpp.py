@@ -4653,6 +4653,12 @@ class LlamaCppBackend:
         self._model_identifier = model_identifier
         self._cache_type_kv = None
         self._gpu_offload_active = True
+        # The diffusion shim ignores llama-server residency/GPU-pin flags, so clear
+        # any keep-in-VRAM/mlock/GPU state left by a prior chat load. Otherwise the
+        # runner would opt out of the idle TTL unload and /status would misreport.
+        self._keep_resident = False
+        self._mlock = False
+        self._gpu_ids = None
         if hf_variant:
             self._hf_variant = hf_variant
         elif gguf_path:
@@ -6080,6 +6086,12 @@ class LlamaCppBackend:
                 # Layer-fallback min GPUs; raised below on a tensor downgrade. Bound
                 # before the try so the --fit-on except path still has it (no UnboundLocal).
                 _layer_min_gpus = 1
+                # An explicit Vulkan ordinal absent from the ggml probe cannot be
+                # honored; flag it in the fit and reject after the try (raising inside
+                # would be swallowed into the --fit-on fallback). Bound before the try.
+                _vulkan_explicit_unmatched = False
+                _vulkan_requested_ids: list[int] = []
+                _vulkan_available_ordinals: list[int] = []
                 try:
                     gguf_size = self._get_gguf_size_bytes(model_path)
                     # Include GPU-loaded mmproj in the fit budget (#5825).
@@ -6097,6 +6109,16 @@ class LlamaCppBackend:
                     # can't strand the load on CPU (issue #7164).
                     if gpu_ids:
                         from core.inference.llama_residency import filter_selected_gpus
+                        # A Vulkan build indexes by ggml ordinal (not a CUDA id that
+                        # re-indexes under CUDA_VISIBLE_DEVICES). An explicit ordinal
+                        # absent from the probe can't be pinned, so reject after the
+                        # try rather than fail-open onto a device the user didn't pick
+                        # (which would silently pin Vulkan0 and misreport gpu_ids).
+                        _wanted_ids = {int(x) for x in gpu_ids}
+                        if is_vulkan_backend and not any(g[0] in _wanted_ids for g in gpus):
+                            _vulkan_explicit_unmatched = True
+                            _vulkan_requested_ids = sorted(_wanted_ids)
+                            _vulkan_available_ordinals = sorted(g[0] for g in gpus)
                         gpus = filter_selected_gpus(gpus, gpu_ids)
                     total_by_idx = {idx: total for idx, _f, total in _gpu_mem}
 
@@ -6865,6 +6887,15 @@ class LlamaCppBackend:
                     tp_tensor_split = None
                     effective_ctx = requested_ctx  # fall back to original
 
+                # An explicit Vulkan ordinal the probe never enumerated cannot be
+                # pinned; fail loudly (actionable 400) instead of fitting onto a
+                # device the user did not select and misreporting it in /status.
+                if _vulkan_explicit_unmatched:
+                    raise ValueError(
+                        f"Requested Vulkan GPU ordinal(s) {_vulkan_requested_ids} not "
+                        f"present. Available Vulkan devices: {_vulkan_available_ordinals}."
+                    )
+
                 # Unified-memory APUs load weights into system RAM (under WSL the VM
                 # cap, not the ROCm-reported VRAM, is the real ceiling); refuse an
                 # oversize load the OS would otherwise kill mid-flight. Base model
@@ -7142,16 +7173,26 @@ class LlamaCppBackend:
                 from core.inference.llama_residency import build_residency_flags
 
                 cmd += build_residency_flags(keep_model_in_vram = keep_model_in_vram, mlock = mlock)
-                # Record resolved state for the keep-warm idle loop, load dedupe,
-                # and status readback.
-                self._keep_resident = bool(keep_model_in_vram)
-                self._mlock = bool(mlock)
-                self._gpu_ids = sorted(int(x) for x in gpu_ids) if gpu_ids else None
 
                 # Vulkan pins via --device (a cmd arg), before user extras so a
                 # user --device wins. Fall back to raw ids when the fit did not
                 # narrow the set, so an explicit selection is still honored.
                 _vulkan_pin_ids = gpu_indices if gpu_indices is not None else (gpu_ids or None)
+
+                # Record resolved state for the keep-warm idle loop, load dedupe,
+                # and status readback. On Vulkan the fit can narrow an explicit
+                # selection to the devices actually present, so record the ordinals
+                # actually pinned (_vulkan_pin_ids) rather than the raw request, or
+                # /status would echo an ordinal that was never pinned.
+                self._keep_resident = bool(keep_model_in_vram)
+                self._mlock = bool(mlock)
+                if is_vulkan_backend:
+                    self._gpu_ids = (
+                        sorted(int(x) for x in _vulkan_pin_ids) if _vulkan_pin_ids else None
+                    )
+                else:
+                    self._gpu_ids = sorted(int(x) for x in gpu_ids) if gpu_ids else None
+
                 if is_vulkan_backend and _vulkan_pin_ids is not None:
                     cmd += LlamaCppBackend._vulkan_pin_args(_vulkan_pin_ids)
 
@@ -8174,6 +8215,11 @@ class LlamaCppBackend:
             self._supports_preserve_thinking = False
             self._supports_tools = False
             self._cache_type_kv = None
+            # Residency/GPU-pin state describes the active runner only; clear it so a
+            # keep-in-VRAM chat load never leaks into the next (or diffusion) runner.
+            self._keep_resident = False
+            self._mlock = False
+            self._gpu_ids = None
             self._tensor_parallel = False
             self._layer_preserves_tensor_intent = False
             self._speculative_type = None

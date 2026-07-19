@@ -259,6 +259,49 @@ class TestCanLoadVulkanGGUF(_GpuCacheResetMixin, unittest.TestCase):
         self.assertEqual(info["mode"], "gguf")
         resolve_mock.assert_not_called()
 
+    def test_explicit_ordinal_sizes_against_busiest_gpu_not_pool(self):
+        # CUDA training busy on GPU0 (2 GB free) with an idle GPU1 (60 GB free).
+        # /load pins exactly --device Vulkan<ordinal>, so an explicit ordinal must
+        # NOT be approved on GPU1's free VRAM (the pool sum would over-approve and
+        # then OOM training). Size against the busiest visible GPU: min(2,60)=2 <
+        # needed 15*1.15+4 = 21.25 -> block.
+        ok, info, resolve_mock = self._run(
+            devices = _devices((0, 80, 78), (1, 80, 20)),
+            required_override = 15.0,
+            gpu_ids = [0],
+        )
+        self.assertFalse(ok)
+        self.assertEqual(info["mode"], "gguf")
+        self.assertNotEqual(info.get("reason"), "invalid_gpu_ids")
+        resolve_mock.assert_not_called()  # ordinals never resolved against CUDA space
+
+    def test_auto_vulkan_no_requested_ids_uses_pool(self):
+        # Auto Vulkan (no requested ids): llama.cpp self-places, so the whole
+        # visible pool is a candidate. Pool 2 + 60*0.85 = 53 >= needed 21.25 -> allow.
+        with (
+            patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
+            patch(
+                "utils.hardware.get_visible_gpu_utilization",
+                return_value = {"devices": _devices((0, 80, 78), (1, 80, 20))},
+            ),
+            patch("utils.hardware.resolve_requested_gpu_ids") as resolve_mock,
+            patch("utils.hardware.auto_select_gpu_ids") as auto_mock,
+        ):
+            ok, info = tv.can_load_chat_during_training(
+                model_name = "unsloth/gemma-GGUF",
+                hf_token = None,
+                load_in_4bit = True,
+                max_seq_length = 0,
+                requested_gpu_ids = None,
+                is_gguf = True,
+                is_vulkan = True,
+                required_override_gb = 15.0,
+            )
+        self.assertTrue(ok)
+        self.assertEqual(info["mode"], "gguf")
+        auto_mock.assert_not_called()
+        resolve_mock.assert_not_called()
+
 
 # ── can_load_chat_during_training: device-independent paths ──────────────────
 

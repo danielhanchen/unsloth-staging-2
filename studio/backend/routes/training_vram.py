@@ -278,8 +278,17 @@ def can_load_chat_during_training(
                 return True, {"mode": "explicit", "reason": "invalid_gpu_ids"}
             free_vals = [free_by_index.get(i, 0.0) for i in resolved]
             mode = "explicit"
+        elif requested_gpu_ids and vulkan_gguf:
+            # Explicit Vulkan ordinal: ggml Vulkan ordinals are a separate index
+            # space from the CUDA/nvidia-smi index in free_by_index, so the pinned
+            # card cannot be mapped here. /load pins exactly --device Vulkan<ordinal>,
+            # so sizing against the whole pool would approve a card pinned onto a
+            # training-busy GPU using another GPU's free VRAM -> OOM. Size against the
+            # busiest visible GPU: approve only if it fits even the most loaded card.
+            free_vals = [min(free_by_index.values())] if free_by_index else []
+            mode = "gguf"
         else:
-            # GGUF self-placement (incl. Vulkan ordinal selection): llama.cpp picks
+            # GGUF self-placement / auto Vulkan (no requested ids): llama.cpp picks
             # the GPU(s), so any visible GPU is a candidate -> size the whole pool.
             free_vals = list(free_by_index.values())
             mode = "gguf"
