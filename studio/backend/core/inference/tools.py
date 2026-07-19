@@ -41,6 +41,7 @@ from core.inference.mcp_client import (
     record_probe_failure,
     stdio_mcp_enabled,
 )
+from core.inference.sandbox_fs import build_sandbox_confiner
 from storage import mcp_servers_db
 
 from loggers import get_logger
@@ -2798,6 +2799,24 @@ def _bypass_preexec():
         os.setsid()
     except OSError:
         pass
+
+
+def _make_sandbox_preexec(confiner):
+    """Compose _sandbox_preexec with an optional Landlock FS confiner.
+
+    _sandbox_preexec runs first (os.setsid, PR_SET_NO_NEW_PRIVS, rlimits); the
+    confiner then enforces the Landlock ruleset, which needs NO_NEW_PRIVS set.
+    Returns _sandbox_preexec unchanged when confinement is unavailable/disabled
+    (see core.inference.sandbox_fs), so the non-confined path is byte-identical.
+    """
+    if confiner is None:
+        return _sandbox_preexec
+
+    def _preexec():
+        _sandbox_preexec()
+        confiner()
+
+    return _preexec
 
 
 # Hardening the Unsloth parent is done once (PR_SET_DUMPABLE is process-global
@@ -5729,7 +5748,12 @@ def _python_exec(
             env = safe_env,
         )
         if sys.platform != "win32":
-            popen_kwargs["preexec_fn"] = _bypass_preexec if disable_sandbox else _sandbox_preexec
+            # Landlock FS confinement (non-bypass only) is applied in the child
+            # after _sandbox_preexec; None on unsupported/disabled platforms.
+            confiner = None if disable_sandbox else build_sandbox_confiner(workdir)
+            popen_kwargs["preexec_fn"] = (
+                _bypass_preexec if disable_sandbox else _make_sandbox_preexec(confiner)
+            )
         else:
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
@@ -5853,7 +5877,12 @@ def _bash_exec(
             env = safe_env,
         )
         if sys.platform != "win32":
-            popen_kwargs["preexec_fn"] = _bypass_preexec if disable_sandbox else _sandbox_preexec
+            # Landlock FS confinement (non-bypass only) is applied in the child
+            # after _sandbox_preexec; None on unsupported/disabled platforms.
+            confiner = None if disable_sandbox else build_sandbox_confiner(workdir)
+            popen_kwargs["preexec_fn"] = (
+                _bypass_preexec if disable_sandbox else _make_sandbox_preexec(confiner)
+            )
         else:
             popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 

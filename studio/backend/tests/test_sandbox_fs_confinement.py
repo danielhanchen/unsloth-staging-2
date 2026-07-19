@@ -1,0 +1,344 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+"""Landlock filesystem confinement for the code sandbox
+(core/inference/sandbox_fs.py).
+
+Enforcement tests spawn a real subprocess under the confiner (exactly as the
+python/terminal tools do in preexec_fn) and assert that:
+  - reads/writes OUTSIDE the sandbox workdir are denied,
+  - reads/writes INSIDE the workdir succeed,
+  - a normal computation runs and stdlib + a site-package import,
+  - an explicitly allowed path is readable,
+  - the real _bash_exec / _python_exec executor paths stay confined and working.
+They are skipped where Landlock is unavailable (non-Linux, kernel < 5.13, other
+arch). Gate, fallback, mask and rule-builder tests run everywhere.
+"""
+
+from __future__ import annotations
+
+import importlib
+import os
+import subprocess
+import sys
+import textwrap
+from pathlib import Path
+
+import pytest
+
+_BACKEND_ROOT = Path(__file__).resolve().parents[1]
+if str(_BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BACKEND_ROOT))
+
+from core.inference import sandbox_fs
+from core.inference.sandbox_fs import (
+    _build_rules,
+    _fs_handled_mask,
+    build_sandbox_confiner,
+    fs_confinement_enabled,
+    landlock_available,
+)
+
+_LANDLOCK = landlock_available()
+_needs_landlock = pytest.mark.skipif(
+    not _LANDLOCK, reason = "Landlock not available on this platform"
+)
+
+# A third-party package importable in the parent, so the site-package import test
+# is meaningful wherever it runs (numpy in the studio venv; else structlog/pytest,
+# both backend/test deps that live in site-packages).
+_SITE_PKG = next(
+    (
+        name
+        for name in ("numpy", "structlog", "yaml", "pytest")
+        if importlib.util.find_spec(name) is not None
+    ),
+    "pytest",
+)
+
+
+def _run_confined(code: str, workdir: Path, confiner, env_extra: dict | None = None):
+    """Run ``code`` in a subprocess under ``confiner`` (the production preexec
+    step) and return the CompletedProcess."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = ""  # keep the child from importing the test's own dir
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.run(
+        [sys.executable, "-u", "-c", textwrap.dedent(code)],
+        cwd = str(workdir),
+        preexec_fn = confiner,
+        capture_output = True,
+        text = True,
+        env = env,
+        timeout = 120,
+    )
+
+
+# ── Enforcement: deny outside, allow inside ──────────────────────────────────
+
+
+@_needs_landlock
+class TestEnforcement:
+    def test_read_outside_workdir_is_denied(self, tmp_path):
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        secret = tmp_path / "secret.txt"  # sibling, OUTSIDE the sandbox
+        secret.write_text("SENTINEL_OUTSIDE_9f3c")
+        confiner = build_sandbox_confiner(str(sandbox))
+        assert confiner is not None
+
+        r = _run_confined(
+            f"""
+            try:
+                data = open({str(secret)!r}).read()
+                print("READ:" + data)
+            except Exception as e:
+                print("DENIED:" + type(e).__name__)
+            """,
+            sandbox,
+            confiner,
+        )
+        assert "DENIED:PermissionError" in r.stdout, r.stdout
+        assert "SENTINEL_OUTSIDE_9f3c" not in r.stdout, r.stdout
+
+    def test_read_etc_hosts_is_denied(self, tmp_path):
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        confiner = build_sandbox_confiner(str(sandbox))
+        r = _run_confined(
+            """
+            try:
+                open("/etc/hosts").read(); print("READ")
+            except Exception as e:
+                print("DENIED:" + type(e).__name__)
+            """,
+            sandbox,
+            confiner,
+        )
+        assert "DENIED:PermissionError" in r.stdout, r.stdout
+
+    def test_write_outside_workdir_is_denied(self, tmp_path):
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        target = tmp_path / "escape.txt"  # sibling, OUTSIDE the sandbox
+        confiner = build_sandbox_confiner(str(sandbox))
+        r = _run_confined(
+            f"""
+            try:
+                open({str(target)!r}, "w").write("x"); print("WROTE")
+            except Exception as e:
+                print("DENIED:" + type(e).__name__)
+            """,
+            sandbox,
+            confiner,
+        )
+        assert "DENIED:PermissionError" in r.stdout, r.stdout
+        assert not target.exists()
+
+    def test_read_write_inside_workdir_succeeds(self, tmp_path):
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        confiner = build_sandbox_confiner(str(sandbox))
+        r = _run_confined(
+            """
+            import os
+            p = os.path.join(os.getcwd(), "artifact.txt")
+            open(p, "w").write("hello-scratch")
+            print("ROUNDTRIP:" + open(p).read())
+            """,
+            sandbox,
+            confiner,
+        )
+        assert "ROUNDTRIP:hello-scratch" in r.stdout, (r.stdout, r.stderr)
+        assert (sandbox / "artifact.txt").read_text() == "hello-scratch"
+
+    def test_normal_computation_and_imports_work(self, tmp_path):
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        confiner = build_sandbox_confiner(str(sandbox))
+        r = _run_confined(
+            f"""
+            import json, ssl, sqlite3, hashlib   # stdlib incl. C-extension modules
+            import {_SITE_PKG}                    # a real site-package
+            sieve = [True] * 30
+            sieve[0] = sieve[1] = False
+            for i in range(2, 30):
+                if sieve[i]:
+                    for j in range(i * i, 30, i):
+                        sieve[j] = False
+            print("PRIMES:" + json.dumps([i for i in range(30) if sieve[i]]))
+            print("IMPORT_OK")
+            """,
+            sandbox,
+            confiner,
+        )
+        assert "PRIMES:[2, 3, 5, 7, 11, 13, 17, 19, 23, 29]" in r.stdout, (
+            r.stdout,
+            r.stderr,
+        )
+        assert "IMPORT_OK" in r.stdout, (r.stdout, r.stderr)
+
+    def test_explicitly_allowed_path_is_readable(self, tmp_path, monkeypatch):
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        allowed = tmp_path / "allowed.txt"  # OUTSIDE the sandbox
+        allowed.write_text("ALLOWED_DATA_7b21")
+        denied = tmp_path / "denied.txt"  # OUTSIDE and not allow-listed
+        denied.write_text("DENIED_DATA_7b21")
+        monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_FS_ALLOW", str(allowed))
+        confiner = build_sandbox_confiner(str(sandbox))
+        r = _run_confined(
+            f"""
+            def probe(label, path):
+                try:
+                    print(label + ":" + open(path).read())
+                except Exception as e:
+                    print(label + ":DENIED:" + type(e).__name__)
+            probe("ALLOWED", {str(allowed)!r})
+            probe("DENIED", {str(denied)!r})
+            """,
+            sandbox,
+            confiner,
+        )
+        assert "ALLOWED:ALLOWED_DATA_7b21" in r.stdout, r.stdout
+        assert "DENIED:DENIED:PermissionError" in r.stdout, r.stdout
+
+    def test_multiprocessing_pool_still_works(self, tmp_path):
+        # /dev/shm must be granted or POSIX semaphores fail; guards that regression.
+        sandbox = tmp_path / "sandbox"
+        sandbox.mkdir()
+        confiner = build_sandbox_confiner(str(sandbox))
+        r = _run_confined(
+            """
+            import multiprocessing as mp
+            def sq(x): return x * x
+            if __name__ == "__main__":
+                with mp.Pool(2) as pool:
+                    print("POOL:" + str(pool.map(sq, [1, 2, 3, 4])))
+            """,
+            sandbox,
+            confiner,
+        )
+        assert "POOL:[1, 4, 9, 16]" in r.stdout, (r.stdout, r.stderr)
+
+
+# ── Real executor paths stay confined and working ────────────────────────────
+
+
+@_needs_landlock
+class TestExecutorPaths:
+    def test_bash_exec_cannot_read_outside_but_works_inside(self, tmp_path, monkeypatch):
+        from core.inference import tools
+
+        sandbox = tmp_path / "sbx"
+        sandbox.mkdir()
+        secret = tmp_path / "host_secret.txt"
+        secret.write_text("HOSTSECRET_5aa1")
+        monkeypatch.setattr(tools, "_get_workdir", lambda session_id = None: str(sandbox))
+
+        # cat is NOT in the blocklist, so only Landlock stops this host read.
+        denied = tools._bash_exec(f"cat {secret}", session_id = "s")
+        assert "HOSTSECRET_5aa1" not in denied, denied
+        assert "Permission denied" in denied, denied
+
+        # A write + read inside the workdir still works end to end.
+        ok = tools._bash_exec("echo inside-ok > note.txt && cat note.txt", session_id = "s")
+        assert "inside-ok" in ok, ok
+        assert (sandbox / "note.txt").read_text().strip() == "inside-ok"
+
+    def test_python_exec_benign_computation_runs(self, tmp_path, monkeypatch):
+        from core.inference import tools
+
+        sandbox = tmp_path / "sbx"
+        sandbox.mkdir()
+        monkeypatch.setattr(tools, "_get_workdir", lambda session_id = None: str(sandbox))
+        out = tools._python_exec(
+            "print(sum(i * i for i in range(1, 11)))", session_id = "s"
+        )
+        assert "385" in out, out
+
+
+# ── Gate + graceful fallback (run everywhere) ────────────────────────────────
+
+
+class TestGateAndFallback:
+    def test_gate_off_disables_confinement(self, monkeypatch):
+        monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_FS_CONFINE", "0")
+        assert fs_confinement_enabled() is False
+        assert build_sandbox_confiner("/nonexistent/workdir") is None
+
+    @pytest.mark.parametrize("value", ["off", "false", "no", "disable"])
+    def test_gate_off_synonyms(self, monkeypatch, value):
+        monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_FS_CONFINE", value)
+        assert fs_confinement_enabled() is False
+
+    def test_landlock_unavailable_falls_back_without_crash(self, monkeypatch):
+        # Simulate a host where Landlock is not present (old kernel / non-Linux /
+        # other arch): confiner is None, nothing raises.
+        monkeypatch.setattr(sandbox_fs, "_abi_cached", -1)
+        assert landlock_available() is False
+        assert fs_confinement_enabled() is False
+        assert build_sandbox_confiner("/tmp") is None
+
+    def test_make_sandbox_preexec_none_confiner_is_unchanged(self):
+        # The wiring in tools returns the plain preexec when confinement is off,
+        # so the non-confined path stays byte-identical.
+        from core.inference import tools
+
+        assert tools._make_sandbox_preexec(None) is tools._sandbox_preexec
+
+    def test_unavailable_logs_once(self, monkeypatch):
+        monkeypatch.setattr(sandbox_fs, "_abi_cached", -1)
+        monkeypatch.setattr(sandbox_fs, "_logged", False)
+        calls = []
+        monkeypatch.setattr(
+            sandbox_fs.logger, "info", lambda *a, **k: calls.append((a, k))
+        )
+        sandbox_fs._log_once()
+        sandbox_fs._log_once()
+        sandbox_fs._log_once()
+        assert len(calls) == 1, calls
+
+
+# ── ABI mask + rule builder units (run everywhere) ───────────────────────────
+
+
+class TestMaskAndRules:
+    def test_fs_handled_mask_is_monotonic_and_has_expected_bits(self):
+        masks = [_fs_handled_mask(a) for a in range(1, 8)]
+        for lo, hi in zip(masks, masks[1:]):
+            assert lo & hi == lo, "mask must only grow with ABI"
+        assert not (_fs_handled_mask(1) & (1 << 13))  # no REFER at ABI 1
+        assert _fs_handled_mask(2) & (1 << 13)  # REFER at ABI 2
+        assert _fs_handled_mask(3) & (1 << 14)  # TRUNCATE at ABI 3
+        assert _fs_handled_mask(5) & (1 << 15)  # IOCTL_DEV at ABI 5
+
+    def test_build_rules_grants_workdir_readwrite(self, tmp_path):
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules(str(tmp_path), handled))
+        real = os.path.realpath(str(tmp_path))
+        assert real in rules
+        # Workdir is granted every handled right (read + write + remove + ...).
+        assert rules[real] & (1 << 1)  # WRITE_FILE
+        assert rules[real] & (1 << 2)  # READ_FILE
+        assert rules[real] & (1 << 5)  # REMOVE_FILE
+
+    def test_build_rules_file_target_has_no_dir_only_bits(self, tmp_path):
+        # /etc/passwd is a file: its rule must not carry READ_DIR (dir-only),
+        # which the kernel would reject with EINVAL, silently dropping the rule.
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules(str(tmp_path), handled))
+        passwd = os.path.realpath("/etc/passwd")
+        if passwd in rules:  # present on Linux; skip the assert elsewhere
+            assert not (rules[passwd] & (1 << 3))  # no READ_DIR on a file
+            assert not (rules[passwd] & (1 << 1))  # read-only: no WRITE_FILE
+            assert rules[passwd] & (1 << 2)  # READ_FILE granted
+
+    def test_build_rules_skips_nonexistent_paths(self, tmp_path, monkeypatch):
+        handled = _fs_handled_mask(5)
+        monkeypatch.setenv(
+            "UNSLOTH_STUDIO_SANDBOX_FS_ALLOW", "/no/such/path/xyz_123"
+        )
+        rules = dict(_build_rules(str(tmp_path), handled))
+        assert not any("xyz_123" in p for p in rules)
