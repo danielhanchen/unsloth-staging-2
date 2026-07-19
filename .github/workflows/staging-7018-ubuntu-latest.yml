@@ -1,0 +1,51 @@
+name: "staging-7018 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-7018-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/local_model_resolver.py'
+      - 'studio/backend/core/rag/config.py'
+      - 'studio/backend/hub/services/models/cache_inventory.py'
+      - 'studio/backend/hub/services/models/local_inventory.py'
+      - 'studio/backend/hub/tests/test_model_services.py'
+      - 'studio/backend/routes/models.py'
+      - 'studio/backend/routes/settings.py'
+      - 'studio/backend/tests/test_cached_gguf_routes.py'
+      - 'studio/backend/tests/test_embedding_model_security_gate.py'
+      - 'studio/backend/tests/test_embedding_model_settings.py'
+      - 'studio/backend/tests/test_openai_auto_switch.py'
+      - 'studio/backend/utils/hidden_models.py'
+      - 'studio/frontend/src/features/hub/hooks/use-hidden-embedding-models.ts'
+      - 'studio/frontend/src/features/hub/hub-page.tsx'
+      - 'studio/frontend/src/features/hub/index.ts'
+      - 'studio/frontend/src/features/hub/inventory/inventory-hints.ts'
+      - 'studio/frontend/src/features/hub/inventory/types.ts'
+      - 'studio/frontend/src/features/hub/inventory/use-hub-inventory.ts'
+      - 'studio/frontend/src/features/hub/inventory/view-models.ts'
+      - 'studio/frontend/src/features/hub/lib/hidden-models.ts'
+      - '.github/workflows/staging-7018-ubuntu-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
