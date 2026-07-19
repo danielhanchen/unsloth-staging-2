@@ -4219,6 +4219,7 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         gguf_gpu_ids: Optional[List[int]] = None
         if config.is_gguf and effective_gpu_ids is not None:
             from utils.hardware import resolve_requested_gpu_ids
+
             # A Vulkan build selects by ggml Vulkan ordinal (--device VulkanN),
             # a separate index space from CUDA physical ids that may be empty
             # under a CPU-only torch; validate as ordinals so a valid Vulkan

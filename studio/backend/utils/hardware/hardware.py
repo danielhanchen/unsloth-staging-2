@@ -1234,9 +1234,7 @@ def resolve_requested_gpu_ids(
         # torch. The CUDA parent-visible / physical-count checks below therefore
         # do not apply; only reject malformed ordinals (issue #7239).
         if len(set(requested_ids)) != len(requested_ids):
-            raise ValueError(
-                f"Invalid gpu_ids {requested_ids}: duplicate GPU IDs are not allowed."
-            )
+            raise ValueError(f"Invalid gpu_ids {requested_ids}: duplicate GPU IDs are not allowed.")
         negative_ids = [gpu_id for gpu_id in requested_ids if gpu_id < 0]
         if negative_ids:
             raise ValueError(
