@@ -460,6 +460,27 @@ class TestMaskAndRules:
         # whole tree (secret.txt included).
         assert os.path.realpath(str(venv)) not in rules, sorted(rules)
 
+    def test_build_rules_grants_venv_pyvenv_cfg_read_only(self, tmp_path, monkeypatch):
+        # The interpreter reads $VIRTUAL_ENV/pyvenv.cfg during site init (site.venv())
+        # to set its prefix; on an external venv not under the runner's sys.prefix that
+        # file is otherwise ungranted, so a sandboxed venv python aborts startup with a
+        # PermissionError. It must be granted read-only (the venv ROOT dir stays
+        # ungranted, so the tree is not exposed).
+        venv = self._make_fake_venv(tmp_path / "othervenv")
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules(str(workdir), handled))
+
+        cfg = os.path.realpath(str(venv / "pyvenv.cfg"))
+        assert cfg in rules, sorted(rules)
+        assert rules[cfg] & (1 << 2)  # READ_FILE
+        assert not (rules[cfg] & (1 << 1))  # read-only: no WRITE_FILE
+        assert not (rules[cfg] & (1 << 14))  # read-only: no TRUNCATE
+        # Only the single config file is granted, never the venv root directory.
+        assert os.path.realpath(str(venv)) not in rules, sorted(rules)
+
     def test_build_rules_does_not_grant_non_venv_virtualenv(self, tmp_path, monkeypatch):
         # VIRTUAL_ENV pointing at a non-virtualenv (no pyvenv.cfg, no bin/python)
         # must grant NOTHING, else a workspace/repo root exported as VIRTUAL_ENV

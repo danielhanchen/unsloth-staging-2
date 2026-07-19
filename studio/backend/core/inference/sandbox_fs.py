@@ -170,6 +170,14 @@ def _venv_grant_paths(venv: str) -> "list[str]":
     if not any(os.path.exists(m) for m in markers):
         return []
     grants = [scripts]
+    # The interpreter reads $VIRTUAL_ENV/pyvenv.cfg during site init (site.venv())
+    # to establish its prefix; on an external venv not under the runner's sys.prefix
+    # that file is otherwise ungranted, so a sandboxed venv python aborts startup
+    # with a PermissionError. Grant the single read-only config file. _build_rules
+    # strips dir-only rights for a file target, so it lands FS_READ_FILE only.
+    cfg = os.path.join(real, "pyvenv.cfg")
+    if os.path.exists(cfg):
+        grants.append(cfg)
     # site-packages: POSIX lib/pythonX.Y/site-packages (+ lib64), Windows
     # Lib/site-packages. Glob matches the minor version without importing.
     for pattern in (
