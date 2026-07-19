@@ -32,7 +32,10 @@ def build_residency_flags(*, keep_model_in_vram: bool = False, mlock: bool = Fal
 
 
 def derive_residency_state(
-    cmd: Iterable[str], *, keep_model_in_vram: bool = False, mlock: bool = False
+    cmd: Iterable[str],
+    *,
+    keep_model_in_vram: bool = False,
+    mlock: bool = False,
 ) -> tuple[bool, bool]:
     """Return the (keep_resident, mlock) actually in effect for the FINAL argv.
 

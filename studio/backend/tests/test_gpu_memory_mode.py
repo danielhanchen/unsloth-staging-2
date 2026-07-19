@@ -713,9 +713,7 @@ def test_route_matches_loaded_settings_skips_load_options_for_diffusion():
     route_src = (Path(_BACKEND_DIR) / "routes" / "inference.py").read_text(encoding = "utf-8")
     match_impl = route_src[route_src.index("def _request_matches_loaded_settings") :]
     guard = match_impl.index("if not llama_backend.is_diffusion:")
-    keep = match_impl.index(
-        "bool(request.keep_model_in_vram) != bool(llama_backend.keep_resident)"
-    )
+    keep = match_impl.index("bool(request.keep_model_in_vram) != bool(llama_backend.keep_resident)")
     mlock = match_impl.index("bool(request.mlock) != bool(llama_backend.mlock)")
     # The residency checks live under the diffusion guard.
     assert guard < keep < mlock
