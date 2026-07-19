@@ -6196,10 +6196,17 @@ class LlamaCppBackend:
                 # visibility mask (CUDA_VISIBLE_DEVICES=<token> with
                 # CUDA_DEVICE_ORDER=PCI_BUS_ID), so a ggml Vulkan ordinal cannot be
                 # honored -- it would select the wrong physical GPU or none at all
-                # (crash / CPU fallback). The route rejects this up front when the
-                # GGUF is classifiable as diffusion pre-load (no kill); this catches
-                # the residual remote-uncached case whose arch is only known here,
-                # after the header read. Reject rather than silently mis-pin (#7239).
+                # (crash / CPU fallback). The route's metadata-authoritative
+                # classifier (_classify_diffusion_gguf) already rejects this up
+                # front for every LOCAL and cached-header GGUF, with no kill. This
+                # fallback covers only the residual it genuinely cannot classify
+                # pre-load: a REMOTE, uncached diffusion GGUF whose architecture is
+                # first known here, after the Phase 2 download that follows the
+                # Phase 1 kill. For that narrow case the kill has already happened,
+                # so this reject is service-loss; eliminating it would require
+                # downloading the header before the kill (a risky pre-download
+                # refactor deliberately not done, #7239). Reject rather than
+                # silently mis-pin the runner onto the wrong / no device.
                 if is_vulkan_backend and gpu_ids:
                     raise ValueError(
                         "GPU selection (gpu_ids) is not supported for a DiffusionGemma "

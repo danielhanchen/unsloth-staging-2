@@ -13,7 +13,7 @@
 
 import asyncio
 import importlib.util
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -273,3 +273,148 @@ def test_validate_surfaces_invalid_gguf_gpu_ids_from_resolution():
     assert exc.value.status_code == 400
     assert "SENTINEL" in exc.value.detail
     assert "not supported for GGUF" not in exc.value.detail
+
+
+def test_classify_diffusion_gguf_ignores_bare_diffusion_name(tmp_path):
+    """A GGUF whose name/path merely contains "diffusion" (but not the DiffusionGemma
+    runner token) with a LOCAL header that decodes an ordinary architecture must NOT be
+    classified as diffusion: the local header is authoritative, so the Vulkan gpu_ids
+    reject cannot falsely fire on a normal llama-server GGUF (Codex #7239). The name-only
+    hint stays scoped to the "diffusiongemma" family for a remote/uncached header."""
+    route = _load_route_module("gguf_opts_regression_classify_diffusion")
+
+    # LOCAL header authoritative: a real file whose probe decodes a non-diffusion arch.
+    local_gguf = tmp_path / "stable-diffusion-prompt-writer.gguf"
+    local_gguf.write_bytes(b"gguf-stub")
+    local_config = _local_gguf_config(
+        identifier = "/models/stable-diffusion/prompt-writer",
+        gguf_file = str(local_gguf),
+        gguf_hf_repo = None,
+        gguf_variant = None,
+    )
+
+    def _fake_read_meta(self, path):
+        # Same effect as the real probe on an ordinary GGUF: no diffusion flag, a
+        # successfully decoded architecture (which proves it is a normal model).
+        self._is_diffusion = False
+        self._architecture = "llama"
+
+    with patch.object(route.LlamaCppBackend, "_read_gguf_metadata", _fake_read_meta):
+        assert route._classify_diffusion_gguf(local_config) is False
+
+    # REMOTE/uncached + DiffusionGemma name token -> True (pre-download hint).
+    remote_dg = _local_gguf_config(
+        identifier = "unsloth/DiffusionGemma-4B-GGUF",
+        gguf_file = None,
+        gguf_hf_repo = None,
+        gguf_variant = None,
+    )
+    assert route._classify_diffusion_gguf(remote_dg) is True
+
+    # REMOTE/uncached + bare "diffusion" (not the runner family) -> None (stays guarded,
+    # NOT misclassified as normal, but also not falsely rejected as DiffusionGemma).
+    remote_bare = _local_gguf_config(
+        identifier = "org/stable-diffusion-prompts-GGUF",
+        gguf_file = None,
+        gguf_hf_repo = None,
+        gguf_variant = None,
+    )
+    assert route._classify_diffusion_gguf(remote_bare) is None
+
+
+def test_validate_rejects_diffusion_gguf_gpu_ids_on_vulkan():
+    """/validate must mirror /load's diffusion+Vulkan rejection: an explicit gpu_ids for a
+    diffusion GGUF on a Vulkan build is rejected (400) BEFORE the gpu-id resolution, so a
+    preflight cannot pass and let the frontend unload the working model before /load
+    returns the same 400 (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_validate_diffusion_vulkan")
+    request = ValidateModelRequest(model_path = "unsloth/test", gpu_ids = [0, 1])
+    config = _local_gguf_config(identifier = "unsloth/test", gguf_file = None)
+
+    seen = {}
+
+    def _fake_resolve(ids, is_vulkan = False):
+        seen["reached"] = True
+        return list(ids)
+
+    with (
+        patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
+        patch.object(route.LlamaCppBackend, "_is_vulkan_backend", lambda *a, **k: True),
+        patch.object(route, "_classify_diffusion_gguf", lambda config: True),
+        patch("utils.hardware.resolve_requested_gpu_ids", _fake_resolve),
+        patch.object(route, "_guard_chat_load_against_training", return_value = None),
+        patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(route.validate_model(request, current_subject = "u"))
+
+    assert exc.value.status_code == 400
+    assert "Vulkan" in exc.value.detail
+    assert "DiffusionGemma" in exc.value.detail
+    # The reject short-circuits before gpu-id resolution (as /load does).
+    assert "reached" not in seen
+
+
+def test_validate_rejects_absent_vulkan_ordinal_like_load():
+    """/validate must mirror /load's Vulkan-ordinal existence check: a requested ordinal
+    absent from the ggml-probed set is rejected (400 "not present") BEFORE the frontend
+    unloads the working model, and a present ordinal is NOT falsely rejected (Codex
+    #7239)."""
+    route = _load_route_module("gguf_opts_regression_validate_vulkan_ordinal")
+    config = _local_gguf_config(identifier = "unsloth/test", gguf_file = None)
+
+    # Only Vulkan ordinal 0 is present (free/total bytes are irrelevant to the check).
+    def _one_gpu(binary = None):
+        return [(0, 8 * 1024**3, 16 * 1024**3)]
+
+    def _common_patches():
+        return [
+            patch.object(
+                route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)
+            ),
+            patch.object(route.LlamaCppBackend, "_is_vulkan_backend", lambda *a, **k: True),
+            patch.object(route, "_classify_diffusion_gguf", lambda config: False),
+            patch.object(
+                route.LlamaCppBackend,
+                "_find_llama_server_binary",
+                lambda *a, **k: "/fake/llama-server",
+            ),
+            patch.object(route.LlamaCppBackend, "_get_gpu_memory", _one_gpu),
+            patch.object(route, "_guard_chat_load_against_training", return_value = None),
+            patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+        ]
+
+    # Absent ordinal [99] -> 400 "not present".
+    def _resolve_99(ids, is_vulkan = False):
+        return [99]
+
+    with ExitStack() as stack:
+        for cm in _common_patches():
+            stack.enter_context(cm)
+        stack.enter_context(patch("utils.hardware.resolve_requested_gpu_ids", _resolve_99))
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(
+                route.validate_model(
+                    ValidateModelRequest(model_path = "unsloth/test", gpu_ids = [99]),
+                    current_subject = "u",
+                )
+            )
+    assert exc.value.status_code == 400
+    assert "not present" in exc.value.detail
+
+    # Present ordinal [0] -> the ordinal check does NOT raise (a valid Vulkan pin is
+    # accepted, proving the guard does not falsely reject).
+    def _resolve_0(ids, is_vulkan = False):
+        return [0]
+
+    with ExitStack() as stack:
+        for cm in _common_patches():
+            stack.enter_context(cm)
+        stack.enter_context(patch("utils.hardware.resolve_requested_gpu_ids", _resolve_0))
+        resp = asyncio.run(
+            route.validate_model(
+                ValidateModelRequest(model_path = "unsloth/test", gpu_ids = [0]),
+                current_subject = "u",
+            )
+        )
+    assert resp.valid is True

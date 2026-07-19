@@ -3983,8 +3983,15 @@ def _classify_diffusion_gguf(config: ModelConfig) -> Optional[bool]:
     identity = " ".join(
         str(getattr(config, attr, "") or "") for attr in ("identifier", "gguf_hf_repo", "gguf_file")
     ).lower()
-    if "diffusion" in identity:
-        return True
+    # Name-only hint, used ONLY as a pre-download fallback. Restricted to the
+    # known DiffusionGemma runner family: a bare "diffusion" substring is common
+    # in ordinary text-model names/paths (e.g. a "stable-diffusion-prompt"
+    # generator, or any repo cloned under a ".../diffusion/..." directory), and
+    # treating those as diffusion falsely rejects a valid llama-server GGUF on a
+    # Vulkan build with gpu_ids (#7239). Normalize away non-alphanumerics so
+    # "DiffusionGemma", "diffusion-gemma" and "diffusion_gemma" all collapse to
+    # the "diffusiongemma" token. The local header below stays authoritative.
+    name_says_diffusion = "diffusiongemma" in _re.sub(r"[^a-z0-9]+", "", identity)
 
     try:
         main = getattr(config, "gguf_file", None)
@@ -3994,22 +4001,28 @@ def _classify_diffusion_gguf(config: ModelConfig) -> Optional[bool]:
             if repo and variant:
                 from hub.utils.gguf import resolve_local_gguf_path
                 main = resolve_local_gguf_path(repo, variant)
-        if not main or not Path(main).is_file():
-            return None
-
-        probe = LlamaCppBackend()
-        probe._read_gguf_metadata(str(main))
-        if probe.is_diffusion:
-            return True
-        # A successfully decoded architecture proves that this is a normal
-        # llama-server GGUF. No architecture means the lightweight probe could
-        # not establish the routing decision, so preserve the unknown state.
-        if getattr(probe, "_architecture", None):
-            return False
-        return None
+        if main and Path(main).is_file():
+            # The local GGUF header is authoritative: it is the same probe the
+            # loader uses, so the routing decision here matches the actual
+            # runner and cannot be fooled by a "diffusion"-flavored name/path.
+            probe = LlamaCppBackend()
+            probe._read_gguf_metadata(str(main))
+            if probe.is_diffusion:
+                return True
+            # A successfully decoded architecture proves that this is a normal
+            # llama-server GGUF, regardless of what its name suggests. No
+            # architecture means the lightweight probe could not establish the
+            # routing decision, so fall through to the name hint below.
+            if getattr(probe, "_architecture", None):
+                return False
     except Exception as e:
         logger.debug("Could not identify diffusion GGUF for training guard: %s", e)
-        return None
+
+    # Header not locally available (remote uncached) or inconclusive. Return
+    # True only for the DiffusionGemma runner family by name; otherwise None
+    # keeps an unknown remote GGUF guarded as potentially diffusion until its
+    # downloaded header proves otherwise (do not misclassify it as normal).
+    return True if name_says_diffusion else None
 
 
 def _guard_chat_load_against_training(
@@ -5212,10 +5225,59 @@ async def validate_model(
                     ),
                 )
             _gguf_is_vulkan = LlamaCppBackend._is_vulkan_backend()
+
+            # Mirror /load's diffusion+Vulkan rejection so this preflight agrees
+            # with the follow-up load instead of passing here and letting the
+            # frontend unload the working model before /load returns the same
+            # 400. The diffusion runner pins its visual-server child by CUDA
+            # physical index (CUDA_VISIBLE_DEVICES=<ordinal>), which has no
+            # defined mapping to ggml Vulkan ordinals, so an explicit pin cannot
+            # be honored (#7239). None (remote-uncached header) is not rejected
+            # here, matching /load, whose diffusion branch catches that residual.
+            if _gguf_is_vulkan and _classify_diffusion_gguf(config) is True:
+                raise HTTPException(
+                    status_code = 400,
+                    detail = (
+                        "GPU selection (gpu_ids) is not supported for a DiffusionGemma "
+                        "GGUF on a Vulkan llama.cpp build: the diffusion runner selects "
+                        "its device by CUDA physical index, which has no defined mapping "
+                        "to ggml Vulkan device ordinals. Omit gpu_ids to use the default "
+                        "device."
+                    ),
+                )
             try:
-                resolve_requested_gpu_ids(effective_gpu_ids, is_vulkan = _gguf_is_vulkan)
+                resolved_gpu_ids = resolve_requested_gpu_ids(
+                    effective_gpu_ids, is_vulkan = _gguf_is_vulkan
+                )
             except ValueError as exc:
                 raise HTTPException(status_code = 400, detail = str(exc)) from exc
+
+            # Mirror /load's Vulkan-ordinal existence check (load_model validates
+            # the requested ordinals are a subset of the ggml-probed set BEFORE
+            # the Phase 1 kill). Without this, a stale pin like [99] passes
+            # /validate, the frontend unloads the current model, and only then
+            # does /load reject the absent ordinal -- the exact asymmetric-fix
+            # bug this PR removes. CUDA ids are already range-checked above by
+            # resolve_requested_gpu_ids; Vulkan ordinals deliberately are not,
+            # so probe them here with the same issubset check /load uses (#7239).
+            if _gguf_is_vulkan and resolved_gpu_ids:
+                _binary = LlamaCppBackend._find_llama_server_binary()
+                if _binary:
+                    _probed = {
+                        g[0]
+                        for g in await asyncio.to_thread(
+                            LlamaCppBackend._get_gpu_memory, _binary
+                        )
+                    }
+                    _wanted = {int(x) for x in resolved_gpu_ids}
+                    if not _wanted.issubset(_probed):
+                        raise HTTPException(
+                            status_code = 400,
+                            detail = (
+                                f"Requested Vulkan GPU ordinal(s) {sorted(_wanted)} not "
+                                f"present. Available Vulkan devices: {sorted(_probed)}."
+                            ),
+                        )
         effective_load_in_4bit = _effective_load_in_4bit(config, request.load_in_4bit)
 
         # Both checks cover the [adapter, base] set (matching the scan route and workers):
