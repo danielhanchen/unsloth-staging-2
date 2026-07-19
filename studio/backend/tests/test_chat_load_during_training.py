@@ -654,6 +654,47 @@ class TestChatLoadGuardRoute(unittest.TestCase):
         gpu_arg.assert_called_once_with(None, cpu_only = False)
         self.assertEqual(captured[0]["single_device_gpu"], "3")
 
+    def _guard_capture_include_mtp(self, speculative_type):
+        """Run the guard on a GGUF config and return the include_mtp_draft kwarg
+        threaded into _estimate_gguf_required_gb."""
+        from unittest.mock import MagicMock
+
+        config = SimpleNamespace(is_gguf = True)
+        est = MagicMock(return_value = 5.0)
+        with (
+            patch.object(self.route, "_classify_diffusion_gguf", return_value = False),
+            patch.object(self.route, "_estimate_gguf_required_gb", est),
+            patch.object(self.route.LlamaCppBackend, "_is_vulkan_backend", return_value = False),
+            _stub_guard_deps(training_active = True, decision = (True, {})),
+        ):
+            self.route._guard_chat_load_against_training(
+                config,
+                model_identifier = "unsloth/Qwen3-4B-GGUF",
+                hf_token = None,
+                load_in_4bit = True,
+                max_seq_length = 0,
+                requested_gpu_ids = None,
+                gpu_memory_mode = "auto",
+                speculative_type = speculative_type,
+            )
+        return est.call_args.kwargs["include_mtp_draft"]
+
+    def test_guard_skips_draft_for_off_and_ngram(self):
+        # An explicit drafter selected with speculative_type off/ngram is never
+        # launched (--model-draft), so the guard must not size it in (#7239).
+        for mode in ("off", "ngram", "ngram-simple"):
+            self.assertFalse(
+                self._guard_capture_include_mtp(mode), f"{mode} should skip the drafter"
+            )
+
+    def test_guard_counts_draft_for_mtp(self):
+        # Genuine MTP (and auto, which engages a separate drafter): the draft file
+        # is launched, so it must still be counted.
+        for mode in ("mtp", "mtp+ngram", "auto", None):
+            self.assertTrue(
+                self._guard_capture_include_mtp(mode), f"{mode} should count the drafter"
+            )
+
     def test_refuses_with_headroom_number(self):
         info = {"required_gb": 30.0, "usable_gb": 6.0, "needed_gb": 39.0, "mode": "auto"}
         with self.assertRaises(HTTPException) as exc:
@@ -1057,6 +1098,43 @@ class TestEstimateGgufRequiredGb(unittest.TestCase):
             with patch.object(self.route, "_estimate_gguf_kv_gb", return_value = 2.0):
                 gb = self.route._estimate_gguf_required_gb(cfg, max_seq_length = 8192)
         self.assertAlmostEqual(gb, 1000 / (1024**3) + 2.0, places = 6)  # weights + KV
+
+    def test_mtp_draft_counted_by_default(self):
+        # Genuine MTP: the separate drafter file adds to the estimate.
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            (p / "model.gguf").write_bytes(b"x" * 1000)
+            (p / "drafter.gguf").write_bytes(b"y" * 500)
+            cfg = SimpleNamespace(
+                gguf_file = str(p / "model.gguf"),
+                gguf_mmproj_file = None,
+                gguf_mtp_file = str(p / "drafter.gguf"),
+                gguf_hf_repo = None,
+                gguf_variant = None,
+            )
+            with patch.object(self.route, "_estimate_gguf_kv_gb", return_value = 0.0):
+                gb = self.route._estimate_gguf_required_gb(cfg)
+        self.assertAlmostEqual(gb, 1500 / (1024**3), places = 9)  # weights + drafter
+
+    def test_mtp_draft_excluded_when_disabled(self):
+        # off/ngram: the launch never emits --model-draft, so the drafter file
+        # must not inflate the estimate (#7239).
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d)
+            (p / "model.gguf").write_bytes(b"x" * 1000)
+            (p / "drafter.gguf").write_bytes(b"y" * 500)
+            cfg = SimpleNamespace(
+                gguf_file = str(p / "model.gguf"),
+                gguf_mmproj_file = None,
+                gguf_mtp_file = str(p / "drafter.gguf"),
+                gguf_hf_repo = None,
+                gguf_variant = None,
+            )
+            with patch.object(self.route, "_estimate_gguf_kv_gb", return_value = 0.0):
+                gb = self.route._estimate_gguf_required_gb(cfg, include_mtp_draft = False)
+        self.assertAlmostEqual(gb, 1000 / (1024**3), places = 9)  # weights only, no drafter
 
     def test_kv_helper_graceful_on_non_gguf(self):
         import tempfile

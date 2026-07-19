@@ -3915,16 +3915,25 @@ def _estimate_gguf_required_gb(
     max_seq_length: int = 0,
     llama_extra_args: Optional[list[str]] = None,
     n_parallel: int = 1,
+    include_mtp_draft: bool = True,
 ) -> Optional[float]:
     """Approximate GGUF VRAM (GB): quantized weights + companions, plus the KV
     cache for local files (unreadable pre-download for remote). None when nothing
-    resolves so the caller default-denies."""
+    resolves so the caller default-denies.
+
+    ``include_mtp_draft`` gates the separate MTP drafter (``gguf_mtp_file``): the
+    launch only loads it when the effective speculative mode actually emits
+    ``--model-draft`` (MTP), so a draft picked with speculative_type off/ngram
+    must not inflate the estimate and 409 a load that would fit (#7239)."""
     try:
         total_bytes = 0
         main = getattr(config, "gguf_file", None)
         if main and Path(main).is_file():
             total_bytes += LlamaCppBackend._get_gguf_size_bytes(str(main))
-        for attr in ("gguf_mmproj_file", "gguf_mtp_file"):
+        attrs = ["gguf_mmproj_file"]
+        if include_mtp_draft:
+            attrs.append("gguf_mtp_file")
+        for attr in attrs:
             f = getattr(config, attr, None)
             if f and Path(f).is_file():
                 total_bytes += Path(f).stat().st_size
@@ -4005,6 +4014,7 @@ def _guard_chat_load_against_training(
     llama_extra_args: Optional[list[str]] = None,
     n_parallel: int = 1,
     gpu_memory_mode: Literal["auto", "manual"] = "auto",
+    speculative_type: Optional[str] = None,
 ) -> None:
     """Protect active training from automatically placed chat-model loads.
 
@@ -4041,6 +4051,20 @@ def _guard_chat_load_against_training(
             cpu_only = LlamaCppBackend._effective_gpu_count() == 0,
         )
 
+    # Only size a separate MTP drafter (gguf_mtp_file, set from an explicit
+    # draft_model_path) when the effective launch will actually emit
+    # --model-draft. _build_speculative_flags never loads it for off/ngram/
+    # ngram-simple, and suppresses its own emission entirely when the user owns
+    # --spec-type via extras, so counting the draft file in those cases would
+    # 409 a load that fits without it (#7239).
+    from core.inference.llama_cpp import _canonicalize_spec_mode, _extra_args_set_spec_type
+    _spec_mode = _canonicalize_spec_mode(speculative_type) or "auto"
+    include_mtp_draft = _spec_mode not in (
+        "off",
+        "ngram",
+        "ngram-simple",
+    ) and not _extra_args_set_spec_type(llama_extra_args)
+
     required_override_gb = (
         _estimate_gguf_required_gb(
             config,
@@ -4048,6 +4072,7 @@ def _guard_chat_load_against_training(
             max_seq_length = max_seq_length,
             llama_extra_args = llama_extra_args,
             n_parallel = n_parallel,
+            include_mtp_draft = include_mtp_draft,
         )
         if is_gguf
         else None
@@ -4583,6 +4608,7 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
             llama_extra_args = extra_llama_args,
             n_parallel = getattr(fastapi_request.app.state, "llama_parallel_slots", 1),
             gpu_memory_mode = request.gpu_memory_mode,
+            speculative_type = request.speculative_type,
         )
 
         # ── GGUF path: load via llama-server ──────────────────────
@@ -5247,6 +5273,10 @@ async def validate_model(
                     else 1
                 ),
                 gpu_memory_mode = request.gpu_memory_mode,
+                # ValidateModelRequest has no speculative_type (and no
+                # draft_model_path, so no explicit drafter reaches this path);
+                # default to auto, which keeps counting any auto-detected drafter.
+                speculative_type = getattr(request, "speculative_type", None),
             )
 
         # A selected GGUF loads via llama.cpp: auto_map Python and root pickle weights in a
