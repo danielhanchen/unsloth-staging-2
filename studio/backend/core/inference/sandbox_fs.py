@@ -123,6 +123,32 @@ _RW_SHM = "/dev/shm"
 _SANDBOX_SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_site")
 
 
+def _ca_cert_paths() -> "list[str]":
+    """System CA store (bundle file and hashed dir) the child's TLS stack reads
+    to verify HTTPS certificates.
+
+    Network egress to allow-listed hosts is a supported sandbox operation (the
+    preexec deliberately does not apply a network namespace), but OpenSSL's
+    default store commonly lives under a /usr symlink whose real path is in /etc
+    (e.g. /usr/lib/ssl/certs -> /etc/ssl/certs on Debian/Ubuntu), which the /etc
+    denials would otherwise block, breaking certificate verification. Grant just
+    the CA store, read-only; it holds only public trust anchors, not host FS.
+
+    Derived from OpenSSL's own defaults so it stays correct per distro/build. The
+    child runs a scrubbed env, so it uses the compile-time openssl_* defaults;
+    the env-resolved cafile/capath are included too for builds that bake
+    SSL_CERT_* in. Resolved in the parent (in _build_rules); the child imports
+    nothing.
+    """
+    try:
+        import ssl
+
+        dvp = ssl.get_default_verify_paths()
+    except Exception:  # pragma: no cover - ssl is present on supported hosts
+        return []
+    return [p for p in (dvp.openssl_cafile, dvp.openssl_capath, dvp.cafile, dvp.capath) if p]
+
+
 def _load_libc():
     try:
         name = ctypes.util.find_library("c")
@@ -268,6 +294,13 @@ def _build_rules(workdir: str, handled: int) -> "list[tuple[str, int]]":
             return
         if not os.path.exists(real):
             return
+        if real == os.sep:
+            # Never grant the filesystem root: a rule on "/" grants read and
+            # traversal of every descendant (/home, /etc, other sessions) and
+            # defeats the confinement. Reachable when an interpreter prefix or
+            # the sys.executable dir resolves to "/" (a Python built with
+            # --prefix=/, or an interpreter at /python).
+            return
         if not os.path.isdir(real):
             access &= file_valid
         rules[real] = rules.get(real, 0) | access
@@ -301,6 +334,10 @@ def _build_rules(workdir: str, handled: int) -> "list[tuple[str, int]]":
     # the interpreter roots on a source checkout, so grant it or the path-remap
     # shim silently fails to import under confinement.
     add(_SANDBOX_SITE_DIR, dir_ro)
+    # System CA store so HTTPS (git/pip/requests) can verify certificates; the
+    # store often realpath-resolves into /etc, which the /etc denials would block.
+    for path in _ca_cert_paths():
+        add(path, dir_ro)
     for path in _extra_paths(_ALLOW_READ_ENV):
         add(path, dir_ro)
 

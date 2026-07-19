@@ -406,3 +406,41 @@ class TestMaskAndRules:
         monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_FS_ALLOW", "/no/such/path/xyz_123")
         rules = dict(_build_rules(str(tmp_path), handled))
         assert not any("xyz_123" in p for p in rules)
+
+    def test_build_rules_grants_ca_store_readonly(self):
+        # HTTPS egress to allow-listed hosts is supported (git/pip/requests); the
+        # OpenSSL CA store commonly realpath-resolves into /etc (e.g.
+        # /usr/lib/ssl/certs -> /etc/ssl/certs), which the /etc denials would
+        # otherwise block, breaking TLS certificate verification. It must be
+        # granted read-only.
+        import ssl
+
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules("/tmp", handled))
+        dvp = ssl.get_default_verify_paths()
+        reals = {
+            os.path.realpath(p)
+            for p in (dvp.openssl_cafile, dvp.openssl_capath, dvp.cafile, dvp.capath)
+            if p and os.path.exists(p)
+        }
+        if not reals:  # no system CA store on this host (e.g. some non-Linux CI)
+            pytest.skip("no resolvable system CA store")
+        granted = reals & set(rules)
+        assert granted, (sorted(reals), sorted(rules))
+        for real in granted:
+            assert rules[real] & (1 << 2)  # READ_FILE
+            assert not (rules[real] & (1 << 1))  # read-only: no WRITE_FILE
+
+    def test_build_rules_never_grants_filesystem_root(self, monkeypatch):
+        # A Python configured with --prefix=/ (or an interpreter at /python) makes
+        # an interpreter root resolve to "/". A rule on "/" would grant read and
+        # traversal of the whole filesystem and defeat the confinement, so the
+        # root must be skipped.
+        import sys as _sys
+
+        handled = _fs_handled_mask(5)
+        for attr in ("prefix", "base_prefix", "exec_prefix", "base_exec_prefix"):
+            monkeypatch.setattr(_sys, attr, "/", raising = False)
+        monkeypatch.setattr(_sys, "executable", "/python", raising = False)
+        rules = dict(_build_rules("/tmp", handled))
+        assert os.sep not in rules, sorted(rules)
