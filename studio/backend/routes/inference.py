@@ -5265,9 +5265,7 @@ async def validate_model(
                 if _binary:
                     _probed = {
                         g[0]
-                        for g in await asyncio.to_thread(
-                            LlamaCppBackend._get_gpu_memory, _binary
-                        )
+                        for g in await asyncio.to_thread(LlamaCppBackend._get_gpu_memory, _binary)
                     }
                     _wanted = {int(x) for x in resolved_gpu_ids}
                     if not _wanted.issubset(_probed):

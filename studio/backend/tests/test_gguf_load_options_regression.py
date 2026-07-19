@@ -369,9 +369,7 @@ def test_validate_rejects_absent_vulkan_ordinal_like_load():
 
     def _common_patches():
         return [
-            patch.object(
-                route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)
-            ),
+            patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
             patch.object(route.LlamaCppBackend, "_is_vulkan_backend", lambda *a, **k: True),
             patch.object(route, "_classify_diffusion_gguf", lambda config: False),
             patch.object(
