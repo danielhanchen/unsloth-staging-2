@@ -146,9 +146,8 @@ def test_python_sandboxed_uses_sandbox_preexec_and_safe_env(captured_popen, monk
 
 @_POSIX_ONLY
 def test_python_sandboxed_composes_confiner_when_landlock_available(captured_popen, monkeypatch):
-    # When a confiner is built (Landlock available), the preexec is a closure that
-    # runs the base preexec then the confiner, in that order -- not _sandbox_preexec
-    # by identity, so the test above must pin the confiner to stay host-independent.
+    # When a confiner is built, the preexec is a closure running the base preexec
+    # then the confiner -- not _sandbox_preexec by identity.
     calls = []
     monkeypatch.setattr(tools, "_sandbox_preexec", lambda: calls.append("base"))
     monkeypatch.setattr(

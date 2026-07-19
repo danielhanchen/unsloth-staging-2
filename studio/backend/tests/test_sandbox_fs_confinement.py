@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Landlock filesystem confinement for the code sandbox
-(core/inference/sandbox_fs.py).
+"""Landlock filesystem confinement for the code sandbox (core/inference/sandbox_fs.py).
 
-Enforcement tests spawn a real subprocess under the confiner (exactly as the
-python/terminal tools do in preexec_fn) and assert that:
-  - reads/writes OUTSIDE the sandbox workdir are denied,
-  - reads/writes INSIDE the workdir succeed,
-  - a normal computation runs and stdlib + a site-package import,
-  - an explicitly allowed path is readable,
-  - the real _bash_exec / _python_exec executor paths stay confined and working.
-They are skipped where Landlock is unavailable (non-Linux, kernel < 5.13, other
-arch). Gate, fallback, mask and rule-builder tests run everywhere.
+Enforcement tests spawn a real subprocess under the confiner (as the
+python/terminal tools do in preexec_fn) and assert that reads/writes outside the
+workdir are denied, reads/writes inside succeed, normal computation + stdlib and
+site-package imports work, an allowed path is readable, and the real
+_bash_exec/_python_exec paths stay confined and working. They skip where Landlock
+is unavailable. Gate, fallback, mask and rule-builder tests run everywhere.
 """
 
 from __future__ import annotations
@@ -46,8 +42,7 @@ _needs_landlock = pytest.mark.skipif(
 )
 
 # A third-party package importable in the parent, so the site-package import test
-# is meaningful wherever it runs (numpy in the studio venv; else structlog/pytest,
-# both backend/test deps that live in site-packages).
+# is meaningful wherever it runs (numpy in the studio venv; else a backend dep).
 _SITE_PKG = next(
     (
         name
@@ -88,12 +83,11 @@ def _run_confined(
 class TestEnforcement:
     @pytest.fixture(autouse = True)
     def _neutralize_ambient_virtualenv(self, monkeypatch):
-        # build_sandbox_confiner grants the exported VIRTUAL_ENV read+execute (so
-        # console scripts resolve). On a dev host VIRTUAL_ENV can point at the
-        # workspace root, an ancestor of pytest's tmp_path, which would grant read
-        # of the test's out-of-workdir secrets and mask genuine confinement. These
-        # tests exercise system-path confinement, not the venv grant (unit-tested
-        # separately), so remove the ambient value for determinism.
+        # build_sandbox_confiner grants the exported VIRTUAL_ENV read+execute. On a
+        # dev host it can point at the workspace root, an ancestor of pytest's
+        # tmp_path, which would grant read of the test's out-of-workdir secrets and
+        # mask confinement. These tests exercise system-path confinement, not the
+        # venv grant (unit-tested separately), so drop the ambient value.
         monkeypatch.delenv("VIRTUAL_ENV", raising = False)
 
     def test_read_outside_workdir_is_denied(self, tmp_path):
@@ -236,9 +230,8 @@ class TestEnforcement:
         assert "POOL:[1, 4, 9, 16]" in r.stdout, (r.stdout, r.stderr)
 
     def test_sandbox_site_dir_is_readable_under_confinement(self, tmp_path):
-        # The sitecustomize path-remap shim on the child PYTHONPATH must import;
-        # reading a file inside its dir has to succeed under the confiner, else the
-        # /mnt/data remap silently stops working for confined Python.
+        # A file in the sitecustomize shim dir must be readable under the confiner,
+        # else the /mnt/data path-remap silently stops importing.
         sandbox = tmp_path / "sandbox"
         sandbox.mkdir()
         confiner = build_sandbox_confiner(str(sandbox))
@@ -256,8 +249,8 @@ class TestEnforcement:
         assert "READ_OK" in r.stdout, (r.stdout, r.stderr)
 
     def test_shm_enumeration_is_denied_but_shared_memory_works(self, tmp_path):
-        # /dev/shm is granted read/write/create (multiprocessing) but not READ_DIR:
-        # a session must not enumerate other same-UID sessions' POSIX objects while
+        # /dev/shm is read/write/create (multiprocessing) but not READ_DIR: a
+        # session must not enumerate other same-UID sessions' POSIX objects while
         # its own shared-memory create/read/write keeps working.
         sandbox = tmp_path / "sandbox"
         sandbox.mkdir()
@@ -289,8 +282,7 @@ class TestEnforcement:
 class TestExecutorPaths:
     @pytest.fixture(autouse = True)
     def _neutralize_ambient_virtualenv(self, monkeypatch):
-        # See TestEnforcement._neutralize_ambient_virtualenv: keep the exported
-        # VIRTUAL_ENV grant from covering pytest's tmp_path on dev hosts.
+        # See TestEnforcement._neutralize_ambient_virtualenv.
         monkeypatch.delenv("VIRTUAL_ENV", raising = False)
 
     def test_bash_exec_cannot_read_outside_but_works_inside(self, tmp_path, monkeypatch):
@@ -345,41 +337,34 @@ class TestGateAndFallback:
         assert build_sandbox_confiner("/tmp") is None
 
     def test_abi_1_falls_back_no_confinement(self, monkeypatch):
-        # ABI 1 (Linux 5.13-5.18) predates FS_REFER and unconditionally denies
-        # reparenting a file across directories, breaking legitimate in-workdir
-        # os.rename/shutil.move; so we require ABI >= 3 and degrade to the other
-        # layers on ABI 1 instead of enforcing a rename-breaking ruleset.
+        # ABI 1 lacks FS_REFER and denies cross-dir reparenting, breaking
+        # in-workdir os.rename/shutil.move; require ABI >= 3 and fall back here.
         monkeypatch.setattr(sandbox_fs, "_abi_cached", 1)
         assert landlock_available() is False
         assert fs_confinement_enabled() is False
         assert build_sandbox_confiner("/tmp") is None
 
     def test_abi_2_falls_back_no_confinement(self, monkeypatch):
-        # ABI 2 (Linux 5.19-6.1) predates FS_TRUNCATE. Unhandled Landlock rights
-        # are always allowed, so a ruleset built on ABI 2 cannot deny
-        # truncate(2)/ftruncate(2)/open(O_TRUNC): a sandboxed `> file` redirect or
-        # open(path, "w") could zero a same-UID-writable host file OUTSIDE the
-        # workdir, defeating the claimed write confinement. We require ABI >= 3
-        # (which can handle TRUNCATE) and fall back to the other layers on ABI 2
-        # rather than enforce a leaky ruleset.
+        # ABI 2 cannot handle FS_TRUNCATE, and unhandled rights are always allowed,
+        # so a sandboxed `> file` / open(path, "w") could zero a same-UID-writable
+        # host file OUTSIDE the workdir. Require ABI >= 3 and fall back here.
         monkeypatch.setattr(sandbox_fs, "_abi_cached", 2)
         assert landlock_available() is False
         assert fs_confinement_enabled() is False
         assert build_sandbox_confiner("/tmp") is None
 
     def test_abi_3_enables_confinement(self, monkeypatch):
-        # ABI 3 (Linux 6.2+) is the first version that can handle FS_TRUNCATE, so
-        # it is the floor at which confinement is both complete and non-breaking.
+        # ABI 3 (Linux 6.2+) is the first to handle FS_TRUNCATE: the floor where
+        # confinement is both complete and non-breaking.
         monkeypatch.setattr(sandbox_fs, "_abi_cached", 3)
         assert landlock_available() is True
         assert fs_confinement_enabled() is True
-        # TRUNCATE is handled at the enforced floor, so it is denied outside the
-        # explicit read-write grants (the workdir / shm), closing the ABI 2 gap.
+        # TRUNCATE handled, so denied outside the read-write grants, closing the
+        # ABI 2 gap.
         assert _fs_handled_mask(3) & sandbox_fs._FS_TRUNCATE
 
     def test_make_sandbox_preexec_none_confiner_is_unchanged(self):
-        # The wiring in tools returns the plain preexec when confinement is off,
-        # so the non-confined path stays byte-identical.
+        # Non-confined path stays byte-identical: plain preexec returned as-is.
         from core.inference import tools
         assert tools._make_sandbox_preexec(None) is tools._sandbox_preexec
 
@@ -430,18 +415,16 @@ class TestMaskAndRules:
 
     def test_build_rules_does_not_grant_etc_passwd(self, tmp_path):
         # /etc/passwd is deliberately NOT allow-listed: granting it would let a
-        # sandboxed `cat /etc/passwd` enumerate every host account, the exact
-        # host-user enumeration path this confinement is meant to close. The child
-        # runs fine without it (only libc identity lookups fail, and catchably).
+        # sandboxed `cat /etc/passwd` enumerate every host account. The child runs
+        # fine without it (only libc identity lookups fail, catchably).
         handled = _fs_handled_mask(5)
         rules = dict(_build_rules(str(tmp_path), handled))
         assert os.path.realpath("/etc/passwd") not in rules, sorted(rules)
 
     @staticmethod
     def _make_fake_venv(root: Path) -> Path:
-        # A minimal but valid virtualenv layout: pyvenv.cfg + bin/python +
-        # lib/python3.X/site-packages, exactly what _venv_grant_paths validates
-        # and grants.
+        # Minimal valid virtualenv: pyvenv.cfg + bin/python +
+        # lib/python3.X/site-packages, what _venv_grant_paths validates and grants.
         (root / "bin").mkdir(parents = True)
         (root / "pyvenv.cfg").write_text("home = /usr/bin\n")
         (root / "bin" / "python").write_text("#!/bin/sh\n")
@@ -451,10 +434,9 @@ class TestMaskAndRules:
     def test_build_rules_grants_only_venv_bin_and_site_packages_readexec(
         self, tmp_path, monkeypatch
     ):
-        # tools._build_safe_env prepends $VIRTUAL_ENV/bin to the child PATH even
-        # when VIRTUAL_ENV differs from the running interpreter's prefix. Only that
-        # scripts dir and the venv's site-packages are granted (read+execute), so
-        # console scripts resolve and imports load -- NOT the whole venv tree.
+        # Only the scripts dir and the venv's site-packages are granted
+        # (read+execute), so console scripts resolve and imports load -- NOT the
+        # whole venv tree.
         venv = self._make_fake_venv(tmp_path / "othervenv")
         secret = venv / "secret.txt"  # arbitrary file elsewhere in the tree
         secret.write_text("VENV_SECRET")
@@ -475,13 +457,13 @@ class TestMaskAndRules:
             assert not (rules[real] & (1 << 1))  # read-only: no WRITE_FILE
             assert not (rules[real] & (1 << 14))  # read-only: no TRUNCATE
         # The venv ROOT is NOT granted: a rule there would recursively expose the
-        # whole tree (secret.txt included) to the sandbox.
+        # whole tree (secret.txt included).
         assert os.path.realpath(str(venv)) not in rules, sorted(rules)
 
     def test_build_rules_does_not_grant_non_venv_virtualenv(self, tmp_path, monkeypatch):
-        # VIRTUAL_ENV pointing at a directory that is NOT a real virtualenv (no
-        # pyvenv.cfg, no bin/python) must grant NOTHING: otherwise a workspace /
-        # repo root exported as VIRTUAL_ENV would expose its source to the sandbox.
+        # VIRTUAL_ENV pointing at a non-virtualenv (no pyvenv.cfg, no bin/python)
+        # must grant NOTHING, else a workspace/repo root exported as VIRTUAL_ENV
+        # would expose its source to the sandbox.
         notvenv = tmp_path / "workspace_root"
         (notvenv / "src").mkdir(parents = True)
         (notvenv / "src" / "app.py").write_text("SECRET_SOURCE")
@@ -508,8 +490,8 @@ class TestMaskAndRules:
         assert "" not in rules
 
     def test_build_rules_grants_sandbox_site_dir_readonly(self):
-        # The sandbox sitecustomize shim dir is on the child PYTHONPATH: readable
-        # (else the path-remap fails to import under confinement) but never writable.
+        # The sitecustomize shim dir must be readable (else the path-remap fails to
+        # import) but never writable.
         handled = _fs_handled_mask(5)
         rules = dict(_build_rules("/tmp", handled))
         site = os.path.realpath(_SANDBOX_SITE_DIR)
@@ -536,11 +518,9 @@ class TestMaskAndRules:
         assert not any("xyz_123" in p for p in rules)
 
     def test_build_rules_grants_ca_store_readonly(self):
-        # HTTPS egress to allow-listed hosts is supported (git/pip/requests); the
-        # OpenSSL CA store commonly realpath-resolves into /etc (e.g.
-        # /usr/lib/ssl/certs -> /etc/ssl/certs), which the /etc denials would
-        # otherwise block, breaking TLS certificate verification. It must be
-        # granted read-only.
+        # The OpenSSL CA store commonly realpath-resolves into /etc (e.g.
+        # /usr/lib/ssl/certs -> /etc/ssl/certs), which the /etc denials would block,
+        # breaking TLS verification, so it must be granted read-only.
         import ssl
 
         handled = _fs_handled_mask(5)
@@ -561,11 +541,10 @@ class TestMaskAndRules:
 
     def test_ca_paths_exclude_env_influenced_private_cafile(self, tmp_path, monkeypatch):
         # ssl.get_default_verify_paths() resolves cafile/capath from the PARENT's
-        # SSL_CERT_FILE / SSL_CERT_DIR. The sandboxed child never receives those
-        # env vars (tools._build_safe_env drops them), so it uses the compile-time
-        # openssl_* defaults; granting the parent's env-pointed path is useless to
-        # the child and could leak a private file into the sandbox. Only the
-        # compile-time openssl_cafile/openssl_capath may be granted.
+        # SSL_CERT_FILE / SSL_CERT_DIR, which the scrubbed child never sees. So it
+        # uses the compile-time openssl_* defaults; granting the parent's env-pointed
+        # path is useless and could leak a private file. Only the compile-time
+        # openssl_cafile/openssl_capath may be granted.
         import ssl
 
         workdir = tmp_path / "sbx"
@@ -594,9 +573,9 @@ class TestMaskAndRules:
         assert os.path.realpath(str(public_cafile)) in rules
 
     def test_build_rules_grants_resolv_conf_readonly(self):
-        # Egress is direct (no netns/proxy), so glibc getaddrinfo reads
-        # /etc/resolv.conf for the nameserver; without it allow-listed HTTPS by
-        # hostname cannot resolve. Granted read-only (only nameserver IPs, not FS).
+        # Egress is direct, so glibc getaddrinfo reads /etc/resolv.conf for the
+        # nameserver; without it allow-listed HTTPS by hostname cannot resolve.
+        # Granted read-only.
         handled = _fs_handled_mask(5)
         rules = dict(_build_rules("/tmp", handled))
         real = os.path.realpath("/etc/resolv.conf")
@@ -608,18 +587,15 @@ class TestMaskAndRules:
         assert not (rules[real] & (1 << 3))  # no READ_DIR on a file
 
     def test_build_rules_does_not_grant_opt_broadly(self, tmp_path):
-        # A blanket /opt grant is redundant (an /opt-installed interpreter is
-        # covered by the sys.prefix / executable-dir rules) and would expose
-        # operator data under /opt, so no rule is keyed on bare /opt.
+        # A blanket /opt grant is redundant (an /opt interpreter is covered by the
+        # sys.prefix / executable-dir rules) and would expose operator data.
         handled = _fs_handled_mask(5)
         rules = dict(_build_rules(str(tmp_path), handled))
         assert "/opt" not in rules
 
     def test_build_rules_never_grants_filesystem_root(self, monkeypatch):
-        # A Python configured with --prefix=/ (or an interpreter at /python) makes
-        # an interpreter root resolve to "/". A rule on "/" would grant read and
-        # traversal of the whole filesystem and defeat the confinement, so the
-        # root must be skipped.
+        # An interpreter root resolving to "/" (Python built --prefix=/, or at
+        # /python): a rule on "/" would grant the whole filesystem, so skip it.
         import sys as _sys
 
         handled = _fs_handled_mask(5)

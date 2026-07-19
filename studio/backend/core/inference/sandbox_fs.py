@@ -3,30 +3,23 @@
 
 """Landlock filesystem confinement for the code sandbox (Linux 5.13+).
 
-Restricts the sandboxed python/terminal subprocess to its session working
-directory (read-write) plus the read-only system paths a process genuinely needs
-to run: the interpreter, stdlib, site-packages, the dynamic loader and shared
-libraries, and the core command binaries. Reads and writes to arbitrary host
-paths (/home, other users' files, most of /etc, /tmp outside the sandbox, /proc,
-/sys) are denied by the kernel.
+Confines the sandboxed python/terminal subprocess to its session workdir
+(read-write) plus the read-only system paths a process needs to run (interpreter,
+stdlib, site-packages, dynamic loader and shared libs, core command binaries).
+Reads and writes to arbitrary host paths (/home, other users' files, most of
+/etc, /tmp outside the sandbox, /proc, /sys) are denied by the kernel.
 
-This is defense-in-depth. The command blocklist, resource rlimits, credential-
-stripped environment, and the prompt isolation note in core/inference/tools.py
-all remain in force. Where Landlock is unavailable (non-Linux, kernel < 5.13, an
-unrecognised architecture, or the syscalls being blocked) the confiner is a no-op
-and the subprocess runs with the existing protections; a single log line records
-that FS confinement is unavailable on this platform.
+Defense-in-depth: the command blocklist, rlimits, credential-stripped env and
+the prompt isolation in core/inference/tools.py all remain in force. Where
+Landlock is unavailable (non-Linux, kernel < 5.13, unrecognised arch, or syscalls
+blocked) the confiner is a no-op logged once and the subprocess runs with the
+existing protections. Enforcement is Linux-only.
 
-Enforcement is Linux-only. macOS and Windows have no equivalent unprivileged
-mechanism here, so confinement degrades to the other layers.
-
-Landlock rules are inherited across execve and by descendants and cannot be
-relaxed afterwards, so they are applied in the subprocess preexec_fn (in the
-forked child, just before execve). preexec runs in a possibly multi-threaded
-server's child, so it must not import; every heavy step (ctypes handle, syscall
-numbers, resolved path list, packed ruleset attr) is done in the parent here, and
-the child does only pre-imported os/struct/ctypes/syscall calls, matching the
-existing _sandbox_preexec.
+Landlock rules are inherited across execve and cannot be relaxed afterwards, so
+they are applied in the subprocess preexec_fn (forked child, just before execve).
+preexec must not import, so every heavy step (ctypes handle, syscall numbers,
+resolved path list, packed ruleset attr) is done in the parent here; the child
+does only pre-imported os/struct/ctypes/syscall calls, matching _sandbox_preexec.
 """
 
 import ctypes
@@ -47,9 +40,8 @@ _GATE_ENV = "UNSLOTH_STUDIO_SANDBOX_FS_CONFINE"
 _ALLOW_READ_ENV = "UNSLOTH_STUDIO_SANDBOX_FS_ALLOW"
 _ALLOW_WRITE_ENV = "UNSLOTH_STUDIO_SANDBOX_FS_ALLOW_WRITE"
 
-# Landlock syscall numbers. Only issued on architectures where these are known to
-# be correct; on any other arch Landlock is treated as unavailable rather than
-# risk calling a different syscall by number.
+# Landlock syscall numbers, per arch. Unknown arch -> Landlock treated as
+# unavailable rather than risk calling the wrong syscall by number.
 _SYSCALL_NRS = {
     "x86_64": (444, 445, 446),
     "aarch64": (444, 445, 446),
@@ -57,35 +49,22 @@ _SYSCALL_NRS = {
 
 _LANDLOCK_CREATE_RULESET_VERSION = 1
 _LANDLOCK_RULE_PATH_BENEATH = 1
-# Minimum Landlock ABI we enforce on. We require ABI 3 (Linux 6.2+) so that both
-# LANDLOCK_ACCESS_FS_REFER (added in ABI 2) and LANDLOCK_ACCESS_FS_TRUNCATE
-# (added in ABI 3) can be handled by the ruleset. Below that floor the ruleset
-# would either break legitimate in-workdir moves or silently leak a write
-# primitive:
-#
-#   ABI 1 (Linux 5.13-5.18) predates FS_REFER: with a ruleset enforced it
-#   unconditionally denies reparenting a file to a different directory, and it
-#   cannot be granted back (REFER is the one right the kernel denies by default
-#   even when not handled). That breaks legitimate in-workdir os.rename /
-#   shutil.move across subdirectories of the session workdir -- both paths are
-#   sandbox-owned yet the move fails.
-#
-#   ABI 2 (Linux 5.19-6.1) predates FS_TRUNCATE: the kernel allows any access
-#   right a ruleset does not handle, and a ruleset created on ABI 2 cannot
-#   handle TRUNCATE. A sandboxed truncate(2)/ftruncate(2)/creat(2)/open(O_TRUNC)
-#   -- including a shell `> file` redirect or Python open(path, "w") -- could
-#   therefore zero out any same-UID-writable host file OUTSIDE the workdir,
-#   defeating the write confinement this module claims. A command blocklist
-#   cannot cover this (redirects and open() truncate implicitly), so the only
-#   sound fix is to require the ABI that can handle TRUNCATE.
-#
-# Rather than enforce a broken or leaky ruleset on those kernels, fall back to
-# the pre-Landlock protections (command blocklist, rlimits, env scrubbing).
+# Minimum Landlock ABI. We require ABI 3 (Linux 6.2+) so the ruleset can handle
+# both LANDLOCK_ACCESS_FS_REFER (ABI 2) and LANDLOCK_ACCESS_FS_TRUNCATE (ABI 3).
+# Below that floor the ruleset is broken or leaky:
+#   ABI 1 (5.13-5.18) lacks FS_REFER: an enforced ruleset unconditionally denies
+#   reparenting a file to another dir (the one right the kernel denies by default
+#   even when unhandled), breaking legitimate in-workdir os.rename/shutil.move.
+#   ABI 2 (5.19-6.1) cannot handle FS_TRUNCATE, and unhandled rights are always
+#   allowed: a sandboxed truncate/ftruncate/creat/open(O_TRUNC) -- a shell `>
+#   file` or open(path, "w") -- could zero any same-UID-writable host file
+#   OUTSIDE the workdir, defeating the write confinement. A blocklist cannot
+#   cover implicit truncation, so requiring the TRUNCATE-capable ABI is the fix.
+# Below the floor, fall back to the pre-Landlock protections.
 _MIN_ABI = 3
 _PR_SET_NO_NEW_PRIVS = 38
-# O_PATH opens a handle to the inode without read/exec permission, exactly what
-# landlock_add_rule wants for the parent_fd. Constant (not exported by os on all
-# builds), so define it rather than import.
+# O_PATH: inode handle without read/exec perm, as landlock_add_rule wants for
+# parent_fd. Not exported by os on all builds, so define the constant.
 _O_PATH = 0o10000000
 
 # Filesystem access-right bits (uapi/linux/landlock.h).
@@ -97,19 +76,19 @@ _FS_REFER = 1 << 13
 _FS_TRUNCATE = 1 << 14
 _FS_IOCTL_DEV = 1 << 15
 
-# Rights valid on a non-directory; adding a rule on a file with a directory-only
-# right (e.g. READ_DIR) is rejected with EINVAL, silently dropping the rule.
+# Rights valid on a non-directory; a dir-only right (e.g. READ_DIR) on a file is
+# rejected with EINVAL, silently dropping the rule.
 _FILE_VALID = _FS_EXECUTE | _FS_WRITE_FILE | _FS_READ_FILE | _FS_TRUNCATE | _FS_IOCTL_DEV
 
-# Read-only, read-write, and device grant masks (intersected with the handled set
+# Read-only, read-write and device grant masks (intersected with the handled set
 # per ABI before use).
 _DIR_RO = _FS_EXECUTE | _FS_READ_FILE | _FS_READ_DIR | _FS_IOCTL_DEV
 _FILE_RO = _FS_EXECUTE | _FS_READ_FILE | _FS_IOCTL_DEV
 _DEV_RW = _FS_READ_FILE | _FS_WRITE_FILE | _FS_IOCTL_DEV
 
-# System roots the interpreter and shell need read-only to run. Not /opt: an
-# interpreter installed there is already covered by the sys.prefix / executable
-# dir grants below, and a blanket /opt would expose operator data placed there.
+# System roots the interpreter and shell need read-only. Not /opt: an interpreter
+# there is already covered by the sys.prefix / executable-dir grants below, and a
+# blanket /opt would expose operator data placed there.
 _RO_SYSTEM_DIRS = (
     "/usr",
     "/lib",
@@ -127,18 +106,15 @@ _RO_ETC_FILES = (
     "/etc/localtime",
     "/etc/nsswitch.conf",
     # Egress is direct (no netns/proxy), so glibc getaddrinfo reads resolv.conf
-    # to find the nameserver; without it allow-listed HTTPS by hostname fails.
-    # add() realpaths the systemd /run/systemd/resolve stub symlink. /etc/hosts
-    # stays denied on purpose.
+    # for the nameserver; without it allow-listed HTTPS by hostname fails. add()
+    # realpaths the systemd stub symlink. /etc/hosts stays denied on purpose.
     "/etc/resolv.conf",
     "/etc/group",
-    # /etc/passwd is deliberately NOT granted: it is not needed for the child to
-    # function (python, the stdlib and pip all run without it; only libc identity
-    # lookups such as getpwuid()/getpass.getuser() fail, and they fail with a
-    # catchable KeyError/OSError rather than crashing). Granting it would let a
-    # sandboxed `cat /etc/passwd` enumerate every host account -- the exact
-    # host-user enumeration path this confinement is meant to close. An operator
-    # who genuinely needs it can allow-list it via UNSLOTH_STUDIO_SANDBOX_FS_ALLOW.
+    # /etc/passwd deliberately NOT granted: the child runs without it (only libc
+    # identity lookups like getpwuid()/getpass.getuser() fail, catchably).
+    # Granting it would let a sandboxed `cat /etc/passwd` enumerate every host
+    # account -- the enumeration path this confinement closes. Operators can
+    # allow-list it via UNSLOTH_STUDIO_SANDBOX_FS_ALLOW.
 )
 _RW_DEV_FILES = (
     "/dev/null",
@@ -152,34 +128,28 @@ _RW_DEV_FILES = (
 # multiprocessing.Pool, ProcessPoolExecutor and joblib parallelism.
 _RW_SHM = "/dev/shm"
 
-# The sandbox sitecustomize shim lives in this dir (core/inference/sandbox_site)
-# and is placed on every sandboxed child's PYTHONPATH by tools._build_safe_env.
-# When Studio runs from a source checkout it sits outside the interpreter roots,
-# so it must be granted read-only explicitly or Landlock silently blocks the
-# /mnt/data code-interpreter path-remap shim from importing. Derived from this
-# file's location (same dir as tools.py) so no import of tools is needed here.
+# The sandbox sitecustomize shim (core/inference/sandbox_site) is on every child's
+# PYTHONPATH via tools._build_safe_env. On a source checkout it sits outside the
+# interpreter roots, so it needs an explicit read-only grant or Landlock blocks the
+# /mnt/data path-remap shim from importing. Derived from this file's dir so no
+# import of tools is needed.
 _SANDBOX_SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_site")
 
 
 def _venv_grant_paths(venv: str) -> "list[str]":
-    """Read+execute paths a child-exported VIRTUAL_ENV genuinely needs, or [].
+    """Read+execute paths a child-exported VIRTUAL_ENV needs, or [].
 
-    tools._build_safe_env forwards the parent's VIRTUAL_ENV to the child and
-    prepends ``$VIRTUAL_ENV/bin`` (POSIX) / ``$VIRTUAL_ENV/Scripts`` (Windows) to
-    the child PATH. A console script resolved from there (pip, an installed CLI)
-    needs FS_EXECUTE on that scripts directory, and imports need the venv's
-    site-packages. Nothing else under the venv is required.
+    tools._build_safe_env forwards VIRTUAL_ENV and prepends ``$VIRTUAL_ENV/bin``
+    (POSIX) / ``Scripts`` (Windows) to the child PATH. A console script resolved
+    from there needs FS_EXECUTE on that scripts dir, and imports need the venv's
+    site-packages; nothing else under the venv is required.
 
-    We deliberately do NOT grant the whole VIRTUAL_ENV tree: when Studio is
-    launched with VIRTUAL_ENV pointing at a workspace / repo root (not a real
-    dedicated virtualenv), a recursive grant would expose that tree's source,
-    config and secrets to sandboxed model code -- a confinement breach. So the
-    grant is (a) gated on the path being a REAL virtualenv, validated by a
-    ``pyvenv.cfg`` at the root or a ``bin/python[3]`` (POSIX) /
-    ``Scripts/python.exe`` (Windows), and (b) limited to the scripts directory
-    and the ``site-packages`` roots. A non-venv VIRTUAL_ENV yields no grant.
-
-    Resolved in the parent (in _build_rules); the child imports nothing.
+    We deliberately do NOT grant the whole tree: a VIRTUAL_ENV pointing at a
+    workspace/repo root would then expose its source and secrets to sandboxed
+    code. So the grant is (a) gated on a REAL virtualenv (``pyvenv.cfg``, or
+    ``bin/python[3]`` / ``Scripts/python.exe``), and (b) limited to the scripts
+    dir and ``site-packages`` roots. A non-venv VIRTUAL_ENV yields no grant.
+    Resolved in the parent; the child imports nothing.
     """
     if not venv:
         return []
@@ -191,8 +161,7 @@ def _venv_grant_paths(venv: str) -> "list[str]":
         return []
     is_win = sys.platform == "win32"
     scripts = os.path.join(real, "Scripts" if is_win else "bin")
-    # Validate this is a dedicated virtualenv, not an arbitrary directory a
-    # misconfigured VIRTUAL_ENV happens to point at.
+    # Validate a dedicated virtualenv, not an arbitrary dir VIRTUAL_ENV points at.
     markers = [os.path.join(real, "pyvenv.cfg")]
     if is_win:
         markers.append(os.path.join(scripts, "python.exe"))
@@ -201,9 +170,8 @@ def _venv_grant_paths(venv: str) -> "list[str]":
     if not any(os.path.exists(m) for m in markers):
         return []
     grants = [scripts]
-    # site-packages: POSIX lib/pythonX.Y/site-packages (+ lib64 split), Windows
-    # Lib/site-packages. Glob so the interpreter minor version is matched without
-    # importing; nonexistent matches simply do not appear.
+    # site-packages: POSIX lib/pythonX.Y/site-packages (+ lib64), Windows
+    # Lib/site-packages. Glob matches the minor version without importing.
     for pattern in (
         os.path.join(real, "lib", "python*", "site-packages"),
         os.path.join(real, "lib64", "python*", "site-packages"),
@@ -214,28 +182,21 @@ def _venv_grant_paths(venv: str) -> "list[str]":
 
 
 def _ca_cert_paths() -> "list[str]":
-    """System CA store (bundle file and hashed dir) the child's TLS stack reads
-    to verify HTTPS certificates.
+    """System CA store (bundle + hashed dir) the child's TLS stack reads to verify
+    HTTPS certs, or [].
 
-    Network egress to allow-listed hosts is a supported sandbox operation (the
-    preexec deliberately does not apply a network namespace), but OpenSSL's
-    default store commonly lives under a /usr symlink whose real path is in /etc
-    (e.g. /usr/lib/ssl/certs -> /etc/ssl/certs on Debian/Ubuntu), which the /etc
-    denials would otherwise block, breaking certificate verification. Grant just
-    the CA store, read-only; it holds only public trust anchors, not host FS.
+    Egress to allow-listed hosts is supported (no network namespace). OpenSSL's
+    default store often lives under a /usr symlink whose real path is in /etc
+    (e.g. /usr/lib/ssl/certs -> /etc/ssl/certs), which the /etc denials would
+    block, breaking verification. Grant just the store, read-only; it holds only
+    public trust anchors.
 
-    Derived from OpenSSL's own defaults so it stays correct per distro/build.
-    Only the compile-time openssl_cafile / openssl_capath are granted, never the
-    env-resolved cafile / capath: those reflect the PARENT's SSL_CERT_FILE /
-    SSL_CERT_DIR (ssl.get_default_verify_paths resolves cafile/capath from those
-    env vars, falling back to the compile-time defaults otherwise). The child
-    runs a scrubbed env (tools._build_safe_env does not forward SSL_CERT_*), so
-    it uses the compile-time defaults regardless; granting the parent's
-    env-pointed path would be useless to the child and could expose a private
-    file (e.g. SSL_CERT_FILE=/home/service/private.pem) to the sandbox. An
-    operator who wants a custom store readable in the sandbox uses the
-    _ALLOW_READ_ENV escape hatch. Resolved in the parent (in _build_rules); the
-    child imports nothing.
+    Only the compile-time openssl_cafile/openssl_capath are granted, never the
+    env-resolved cafile/capath: those reflect the PARENT's SSL_CERT_FILE /
+    SSL_CERT_DIR, which the scrubbed child never sees, so granting them is useless
+    to the child and could leak a private file (e.g. SSL_CERT_FILE=.../private.pem)
+    into the sandbox. Operators use _ALLOW_READ_ENV for a custom store. Resolved
+    in the parent; the child imports nothing.
     """
     try:
         import ssl
@@ -311,13 +272,12 @@ def _availability() -> int:
 
 
 def landlock_available() -> bool:
-    """True when Landlock FS confinement can be enforced on this host.
+    """True when Landlock FS confinement can be enforced here.
 
-    Requires ABI >= _MIN_ABI (3): below that the ruleset would break legitimate
-    in-workdir cross-directory renames (ABI 1 lacks FS_REFER) or silently allow
-    out-of-workdir file truncation (ABI 2 cannot handle FS_TRUNCATE, and
-    unhandled rights are always allowed); see _MIN_ABI. On older kernels it
-    degrades to the other sandbox layers instead."""
+    Requires ABI >= _MIN_ABI (3): below that the ruleset breaks in-workdir renames
+    (ABI 1 lacks FS_REFER) or silently allows out-of-workdir truncation (ABI 2
+    cannot handle FS_TRUNCATE; unhandled rights are always allowed); see _MIN_ABI.
+    Older kernels degrade to the other sandbox layers."""
     return _availability() >= _MIN_ABI
 
 
@@ -398,10 +358,9 @@ def _build_rules(workdir: str, handled: int) -> "list[tuple[str, int]]":
             return
         if real == os.sep:
             # Never grant the filesystem root: a rule on "/" grants read and
-            # traversal of every descendant (/home, /etc, other sessions) and
-            # defeats the confinement. Reachable when an interpreter prefix or
-            # the sys.executable dir resolves to "/" (a Python built with
-            # --prefix=/, or an interpreter at /python).
+            # traversal of every descendant and defeats the confinement. Reachable
+            # when an interpreter prefix / sys.executable dir resolves to "/" (a
+            # Python built with --prefix=/, or an interpreter at /python).
             return
         if not os.path.isdir(real):
             access &= file_valid
@@ -410,13 +369,11 @@ def _build_rules(workdir: str, handled: int) -> "list[tuple[str, int]]":
     # Read-write: the session workdir (scratch, uploads, artifacts), shared-memory
     # tmpfs for multiprocessing, and operator-added writable paths.
     add(workdir, handled)
-    # /dev/shm: multiprocessing/shared_memory must create, read, write, truncate
-    # and remove named objects here, but never enumerate the mount. Every session
-    # runs as the same service UID, so granting READ_DIR would let one session
-    # list -- and hence discover the (otherwise unguessable) names of and read --
-    # other concurrent sessions' POSIX semaphores and shared-memory segments.
-    # Withholding only READ_DIR blocks that cross-session enumeration while
-    # leaving multiprocessing fully working.
+    # /dev/shm: multiprocessing/shared_memory create/read/write/truncate/remove
+    # named objects here but must not enumerate the mount. All sessions share the
+    # service UID, so READ_DIR would let one session list -- and thus discover the
+    # unguessable names of and read -- other sessions' semaphores/shm. Withholding
+    # only READ_DIR blocks that while multiprocessing keeps working.
     add(_RW_SHM, handled & ~_FS_READ_DIR)
     for path in _extra_paths(_ALLOW_WRITE_ENV):
         add(path, handled)
@@ -432,17 +389,13 @@ def _build_rules(workdir: str, handled: int) -> "list[tuple[str, int]]":
         os.path.dirname(sys.executable) if sys.executable else "",
     ):
         add(path, dir_ro)
-    # A virtualenv exported to the child via VIRTUAL_ENV. tools._build_safe_env
-    # prepends $VIRTUAL_ENV/bin to the child PATH even when VIRTUAL_ENV differs
-    # from the running interpreter's prefixes granted above (Studio launched with
-    # VIRTUAL_ENV pointing at a different env than sys.prefix). Without a grant a
-    # console script resolved from that PATH entry (pip, an installed package CLI)
-    # lacks FS_EXECUTE and fails with EACCES on an enforcing host. Grant only the
-    # scripts (bin/Scripts) dir and the site-packages roots the child actually
-    # needs, read-only, and ONLY when the path is a real dedicated virtualenv
-    # (_venv_grant_paths validates it) -- never the whole tree, so a VIRTUAL_ENV
-    # pointing at a workspace/repo root does not expose its source and secrets to
-    # the sandbox. add() dedups against any coinciding prefix grant.
+    # A virtualenv exported via VIRTUAL_ENV: tools._build_safe_env prepends
+    # $VIRTUAL_ENV/bin to the child PATH even when it differs from the prefixes
+    # granted above, so a console script resolved from there needs FS_EXECUTE.
+    # Grant only the scripts (bin/Scripts) dir and site-packages roots, read-only,
+    # and ONLY for a real dedicated virtualenv (_venv_grant_paths validates) --
+    # never the whole tree, so a VIRTUAL_ENV at a workspace/repo root does not leak
+    # its source. add() dedups against any coinciding prefix grant.
     for path in _venv_grant_paths(os.environ.get("VIRTUAL_ENV", "")):
         add(path, dir_ro)
     # The sandbox's own sitecustomize shim dir (on the child PYTHONPATH); outside
@@ -468,10 +421,10 @@ def _build_rules(workdir: str, handled: int) -> "list[tuple[str, int]]":
 def _make_apply(handled: int, rules: "list[tuple[str, int]]"):
     """Return the no-arg callable run in the child preexec to enforce the ruleset.
 
-    Only pre-imported operations run here (os/struct/ctypes/syscall). Any failure
-    is swallowed: confinement is defense-in-depth, and the child cannot log
-    without polluting the captured tool output, so a rare child-side failure
-    degrades to the other protections rather than crashing the tool.
+    Only pre-imported ops run here (os/struct/ctypes/syscall). Any failure is
+    swallowed: confinement is defense-in-depth and the child cannot log without
+    polluting captured tool output, so a rare failure degrades to the other
+    protections rather than crashing the tool.
     """
     nr_create, nr_add, nr_restrict = _NRS
     attr = ctypes.create_string_buffer(struct.pack("<Q", handled), 8)
@@ -503,8 +456,8 @@ def _make_apply(handled: int, rules: "list[tuple[str, int]]"):
                         )
                     finally:
                         os.close(pfd)
-                # restrict_self needs PR_SET_NO_NEW_PRIVS (already set by
-                # _sandbox_preexec, re-set here so the confiner is self-contained).
+                # restrict_self needs PR_SET_NO_NEW_PRIVS (set by _sandbox_preexec;
+                # re-set here so the confiner is self-contained).
                 _LIBC.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
                 _syscall(nr_restrict, ctypes.c_int(ruleset_fd), ctypes.c_uint32(0))
             finally:
