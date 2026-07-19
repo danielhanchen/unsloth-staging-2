@@ -57,7 +57,12 @@ _SITE_PKG = next(
 )
 
 
-def _run_confined(code: str, workdir: Path, confiner, env_extra: dict | None = None):
+def _run_confined(
+    code: str,
+    workdir: Path,
+    confiner,
+    env_extra: dict | None = None,
+):
     """Run ``code`` in a subprocess under ``confiner`` (the production preexec
     step) and return the CompletedProcess."""
     env = dict(os.environ)
@@ -173,10 +178,7 @@ class TestEnforcement:
             sandbox,
             confiner,
         )
-        assert "PRIMES:[2, 3, 5, 7, 11, 13, 17, 19, 23, 29]" in r.stdout, (
-            r.stdout,
-            r.stderr,
-        )
+        assert "PRIMES:[2, 3, 5, 7, 11, 13, 17, 19, 23, 29]" in r.stdout, (r.stdout, r.stderr)
         assert "IMPORT_OK" in r.stdout, (r.stdout, r.stderr)
 
     def test_explicitly_allowed_path_is_readable(self, tmp_path, monkeypatch):
@@ -253,9 +255,7 @@ class TestExecutorPaths:
         sandbox = tmp_path / "sbx"
         sandbox.mkdir()
         monkeypatch.setattr(tools, "_get_workdir", lambda session_id = None: str(sandbox))
-        out = tools._python_exec(
-            "print(sum(i * i for i in range(1, 11)))", session_id = "s"
-        )
+        out = tools._python_exec("print(sum(i * i for i in range(1, 11)))", session_id = "s")
         assert "385" in out, out
 
 
@@ -285,16 +285,13 @@ class TestGateAndFallback:
         # The wiring in tools returns the plain preexec when confinement is off,
         # so the non-confined path stays byte-identical.
         from core.inference import tools
-
         assert tools._make_sandbox_preexec(None) is tools._sandbox_preexec
 
     def test_unavailable_logs_once(self, monkeypatch):
         monkeypatch.setattr(sandbox_fs, "_abi_cached", -1)
         monkeypatch.setattr(sandbox_fs, "_logged", False)
         calls = []
-        monkeypatch.setattr(
-            sandbox_fs.logger, "info", lambda *a, **k: calls.append((a, k))
-        )
+        monkeypatch.setattr(sandbox_fs.logger, "info", lambda *a, **k: calls.append((a, k)))
         sandbox_fs._log_once()
         sandbox_fs._log_once()
         sandbox_fs._log_once()
@@ -337,8 +334,6 @@ class TestMaskAndRules:
 
     def test_build_rules_skips_nonexistent_paths(self, tmp_path, monkeypatch):
         handled = _fs_handled_mask(5)
-        monkeypatch.setenv(
-            "UNSLOTH_STUDIO_SANDBOX_FS_ALLOW", "/no/such/path/xyz_123"
-        )
+        monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_FS_ALLOW", "/no/such/path/xyz_123")
         rules = dict(_build_rules(str(tmp_path), handled))
         assert not any("xyz_123" in p for p in rules)

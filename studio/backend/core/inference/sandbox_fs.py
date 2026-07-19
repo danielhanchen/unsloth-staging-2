@@ -224,9 +224,7 @@ def _log_once() -> None:
         if _gate() is False:
             logger.info("Sandbox FS confinement disabled via %s", _GATE_ENV)
         elif landlock_available():
-            logger.info(
-                "Sandbox FS confinement active (Landlock ABI %s)", _availability()
-            )
+            logger.info("Sandbox FS confinement active (Landlock ABI %s)", _availability())
         else:
             logger.info(
                 "Sandbox FS confinement unavailable on this platform "
@@ -324,9 +322,7 @@ def _make_apply(handled: int, rules: "list[tuple[str, int]]"):
                     except OSError:
                         continue
                     try:
-                        rule = ctypes.create_string_buffer(
-                            struct.pack("<Qi", access, pfd), 12
-                        )
+                        rule = ctypes.create_string_buffer(struct.pack("<Qi", access, pfd), 12)
                         _syscall(
                             nr_add,
                             ctypes.c_int(ruleset_fd),
