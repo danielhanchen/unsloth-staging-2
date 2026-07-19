@@ -255,5 +255,152 @@ def test_unload_model_resets_residency_fields(tmp_path):
     assert backend.gpu_ids is None
 
 
+# ── FIX A: invalid Vulkan ordinal rejects BEFORE the Phase 1 kill ─────────────
+
+
+def test_invalid_vulkan_ordinal_rejects_before_kill(tmp_path):
+    # An invalid Vulkan pin used to be validated only after Phase 1 killed the live
+    # server, leaving nothing running (the CUDA path is range-checked at the route
+    # before any kill; Vulkan ordinals are not). The preflight must reject the
+    # absent ordinal ABOVE the kill, so a healthy running model is left untouched.
+    backend = LlamaCppBackend()
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"\0" * 1024)
+
+    kill_mock = mock.MagicMock()
+
+    def _fake_metadata(self, path):
+        self._is_diffusion = False
+        self._context_length = 4096
+
+    def _spawn_reached(*_a, **_k):
+        raise RuntimeError("SPAWN_REACHED: invalid Vulkan ordinal was not rejected pre-kill")
+
+    with (
+        mock.patch.object(
+            LlamaCppBackend,
+            "_find_llama_server_binary",
+            staticmethod(lambda **_k: "/fake/llama-server"),
+        ),
+        mock.patch.object(
+            LlamaCppBackend, "_is_vulkan_backend", staticmethod(lambda binary = None: True)
+        ),
+        mock.patch.object(LlamaCppBackend, "_read_gguf_metadata", _fake_metadata),
+        mock.patch.object(LlamaCppBackend, "_already_in_target_state", lambda self, **_k: False),
+        mock.patch.object(LlamaCppBackend, "_wait_for_vram_settle", lambda self, **_k: None),
+        mock.patch.object(LlamaCppBackend, "_find_free_port", staticmethod(lambda: 12345)),
+        # Record kills: the preflight must fire BEFORE _kill_process is invoked.
+        mock.patch.object(LlamaCppBackend, "_kill_process", kill_mock),
+        mock.patch.object(LlamaCppBackend, "_get_gguf_size_bytes", staticmethod(lambda p: 1024)),
+        # Only Vulkan0 present; the user pins the absent ordinal [99].
+        mock.patch.object(
+            LlamaCppBackend,
+            "_get_gpu_memory",
+            staticmethod(lambda binary = None: [(0, 40000, 48000)]),
+        ),
+        mock.patch.object(LlamaCppBackend, "_start_llama_process", _spawn_reached),
+        mock.patch("core.inference.llama_cpp.subprocess.Popen", side_effect = _spawn_reached),
+    ):
+        with pytest.raises(ValueError, match = "not present"):
+            backend.load_model(gguf_path = str(gguf), model_identifier = "m", gpu_ids = [99])
+
+    # The live process was NOT killed: the invalid pin never reached Phase 1.
+    kill_mock.assert_not_called()
+    # The raw, unpinnable ordinal was never recorded as the active selection.
+    assert backend.gpu_ids != [99]
+
+
+# ── FIX B: a Vulkan ggml ordinal must not feed the CUDA-mask diffusion runner ──
+
+
+def test_diffusion_on_vulkan_with_gpu_ids_rejects_before_spawn(tmp_path):
+    # A valid (present) Vulkan ordinal passes the Fix A preflight, so this isolates
+    # the diffusion-specific rejection: the diffusion runner pins its visual server
+    # by CUDA physical index, which cannot honor a ggml Vulkan ordinal. It must
+    # reject rather than silently launch the runner on the wrong / no device.
+    backend = LlamaCppBackend()
+    gguf = tmp_path / "diffusion.gguf"
+    gguf.write_bytes(b"\0" * 1024)
+
+    def _fake_metadata(self, path):
+        self._is_diffusion = True
+        self._context_length = 4096
+
+    def _diffusion_spawn_reached(self, **_k):
+        raise RuntimeError("DIFFUSION_SPAWN_REACHED: Vulkan ordinal fed to the CUDA-mask runner")
+
+    with (
+        mock.patch.object(
+            LlamaCppBackend,
+            "_find_llama_server_binary",
+            staticmethod(lambda **_k: "/fake/llama-server"),
+        ),
+        mock.patch.object(
+            LlamaCppBackend, "_is_vulkan_backend", staticmethod(lambda binary = None: True)
+        ),
+        mock.patch.object(LlamaCppBackend, "_read_gguf_metadata", _fake_metadata),
+        mock.patch.object(LlamaCppBackend, "_already_in_target_state", lambda self, **_k: False),
+        mock.patch.object(LlamaCppBackend, "_find_free_port", staticmethod(lambda: 12345)),
+        mock.patch.object(LlamaCppBackend, "_kill_process", lambda self: None),
+        # Vulkan0 is present, so the pin [0] survives the Fix A preflight.
+        mock.patch.object(
+            LlamaCppBackend,
+            "_get_gpu_memory",
+            staticmethod(lambda binary = None: [(0, 40000, 48000)]),
+        ),
+        mock.patch.object(LlamaCppBackend, "_start_diffusion_server", _diffusion_spawn_reached),
+    ):
+        with pytest.raises(ValueError, match = "not supported for a DiffusionGemma"):
+            backend.load_model(gguf_path = str(gguf), model_identifier = "diffusion-m", gpu_ids = [0])
+
+
+def test_non_diffusion_vulkan_valid_ordinal_still_proceeds(tmp_path):
+    # The #7239 feature: a valid Vulkan pin for the NORMAL llama-server path must
+    # NOT be falsely rejected by either fix. The load must reach Phase 1 (kill) and
+    # then the spawn, proving neither the preflight nor the diffusion guard fired.
+    backend = LlamaCppBackend()
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"\0" * 1024)
+
+    kill_mock = mock.MagicMock()
+
+    def _fake_metadata(self, path):
+        self._is_diffusion = False
+        self._context_length = 4096
+
+    def _spawn_reached(*_a, **_k):
+        raise RuntimeError("SPAWN_REACHED")
+
+    with (
+        mock.patch.object(
+            LlamaCppBackend,
+            "_find_llama_server_binary",
+            staticmethod(lambda **_k: "/fake/llama-server"),
+        ),
+        mock.patch.object(
+            LlamaCppBackend, "_is_vulkan_backend", staticmethod(lambda binary = None: True)
+        ),
+        mock.patch.object(LlamaCppBackend, "_read_gguf_metadata", _fake_metadata),
+        mock.patch.object(LlamaCppBackend, "_already_in_target_state", lambda self, **_k: False),
+        mock.patch.object(LlamaCppBackend, "_wait_for_vram_settle", lambda self, **_k: None),
+        mock.patch.object(LlamaCppBackend, "_find_free_port", staticmethod(lambda: 12345)),
+        mock.patch.object(LlamaCppBackend, "_kill_process", kill_mock),
+        mock.patch.object(LlamaCppBackend, "_get_gguf_size_bytes", staticmethod(lambda p: 1024)),
+        mock.patch.object(
+            LlamaCppBackend,
+            "_get_gpu_memory",
+            staticmethod(lambda binary = None: [(0, 40000, 48000), (1, 20000, 24000)]),
+        ),
+        mock.patch.object(LlamaCppBackend, "_start_llama_process", _spawn_reached),
+        mock.patch("core.inference.llama_cpp.subprocess.Popen", side_effect = _spawn_reached),
+    ):
+        # Reaching the spawn proves the valid Vulkan pin was accepted, not rejected.
+        with pytest.raises(RuntimeError, match = "SPAWN_REACHED"):
+            backend.load_model(gguf_path = str(gguf), model_identifier = "m", gpu_ids = [0, 1])
+
+    # The normal path DID reach Phase 1 (contrast: the invalid-ordinal test does not).
+    kill_mock.assert_called()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

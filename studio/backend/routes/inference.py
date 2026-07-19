@@ -4548,6 +4548,27 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
             # under a CPU-only torch; validate as ordinals so a valid Vulkan
             # selection is not rejected against the CUDA parent-visible set (#7239).
             _gguf_is_vulkan = LlamaCppBackend._is_vulkan_backend()
+
+            # A Vulkan build's gpu_ids are ggml Vulkan ordinals, but the diffusion
+            # runner (DiffusionGemma) pins its visual-server child by CUDA physical
+            # index (CUDA_VISIBLE_DEVICES=<ordinal>), a space with no defined mapping
+            # to Vulkan ordinals -- so a Vulkan pin would select the wrong physical
+            # GPU or none at all. Reject an explicit pin for a diffusion GGUF on a
+            # Vulkan build up front (before any load / kill). A valid Vulkan pin for
+            # the normal llama-server --device VulkanN path is still accepted (#7239).
+            # _classify_diffusion_gguf returns None when the header is not yet cached;
+            # that residual is caught on the diffusion branch inside load_model.
+            if _gguf_is_vulkan and _classify_diffusion_gguf(config) is True:
+                raise HTTPException(
+                    status_code = 400,
+                    detail = (
+                        "GPU selection (gpu_ids) is not supported for a DiffusionGemma "
+                        "GGUF on a Vulkan llama.cpp build: the diffusion runner selects "
+                        "its device by CUDA physical index, which has no defined mapping "
+                        "to ggml Vulkan device ordinals. Omit gpu_ids to use the default "
+                        "device."
+                    ),
+                )
             try:
                 gguf_gpu_ids = resolve_requested_gpu_ids(
                     effective_gpu_ids, is_vulkan = _gguf_is_vulkan

@@ -6088,14 +6088,38 @@ class LlamaCppBackend:
 
             self._cancel_event.clear()
 
-            # ── Phase 1: kill old process (under lock, fast) ──────────
-            with self._lock:
-                self._kill_process()
-
             # Resolve llama-server now but defer a not-found error: a block-diffusion
             # GGUF uses the diffusion runner, and its arch is only known after the header.
             binary = self._find_llama_server_binary()
             is_vulkan_backend = self._is_vulkan_backend(binary)
+
+            # ── Vulkan-ordinal preflight (BEFORE the Phase 1 kill) ────────
+            # An explicit Vulkan pin the ggml probe never enumerated cannot be
+            # honored. Validate it here, ABOVE the kill, so an invalid selection
+            # leaves the live model untouched: CUDA ids are already range-checked at
+            # the route before any kill, but Vulkan ordinals deliberately are not
+            # (routes/inference.py resolve_requested_gpu_ids(is_vulkan=True)), so a
+            # stale gpu_ids=[99] used to kill the healthy server and only then 400 on
+            # the absent ordinal, leaving nothing running -- an asymmetric
+            # service-loss regression (#7239). _get_gpu_memory depends only on the
+            # binary, not the Phase 2 download, so it is safe to probe now. This uses
+            # the exact issubset logic the later fit check (below) reuses, so the two
+            # agree. Deferred llama-server-not-found stays deferred (a block-diffusion
+            # GGUF may not need llama-server): only run when a Vulkan build was found
+            # and a pin was requested, never turning a deferred not-found into an
+            # early hard error for the diffusion path.
+            if is_vulkan_backend and gpu_ids and binary:
+                _pf_wanted = {int(x) for x in gpu_ids}
+                _pf_probed = {g[0] for g in self._get_gpu_memory(binary)}
+                if not _pf_wanted.issubset(_pf_probed):
+                    raise ValueError(
+                        f"Requested Vulkan GPU ordinal(s) {sorted(_pf_wanted)} not "
+                        f"present. Available Vulkan devices: {sorted(_pf_probed)}."
+                    )
+
+            # ── Phase 1: kill old process (under lock, fast) ──────────
+            with self._lock:
+                self._kill_process()
 
             # ── Phase 2: download (NO lock held, so cancel can proceed) ──
             # mtp_draft_path arrives set for local Gemma loads (detected
@@ -6168,6 +6192,22 @@ class LlamaCppBackend:
             # Block-diffusion GGUFs (DiffusionGemma) cannot run on llama-server;
             # serve them with the diffusion runner (same OpenAI-compat interface).
             if self._is_diffusion:
+                # The diffusion runner pins its visual-server child through a CUDA
+                # visibility mask (CUDA_VISIBLE_DEVICES=<token> with
+                # CUDA_DEVICE_ORDER=PCI_BUS_ID), so a ggml Vulkan ordinal cannot be
+                # honored -- it would select the wrong physical GPU or none at all
+                # (crash / CPU fallback). The route rejects this up front when the
+                # GGUF is classifiable as diffusion pre-load (no kill); this catches
+                # the residual remote-uncached case whose arch is only known here,
+                # after the header read. Reject rather than silently mis-pin (#7239).
+                if is_vulkan_backend and gpu_ids:
+                    raise ValueError(
+                        "GPU selection (gpu_ids) is not supported for a DiffusionGemma "
+                        "GGUF on a Vulkan llama.cpp build: the diffusion runner selects "
+                        "its device by CUDA physical index, which has no defined mapping "
+                        "to ggml Vulkan device ordinals. Omit gpu_ids to use the default "
+                        "device."
+                    )
                 # Not a tensor/layer GGUF: clear any preserved-fallback flag from a
                 # prior load (this path skips the command builder that clears it).
                 self._layer_preserves_tensor_intent = False
