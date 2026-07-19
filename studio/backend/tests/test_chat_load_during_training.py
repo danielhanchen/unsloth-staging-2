@@ -205,6 +205,61 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
         self.assertEqual(info["reason"], "estimate_unavailable")
 
 
+# ── can_load_chat_during_training: Vulkan GGUF (ordinal-space selection) ──────
+
+
+class TestCanLoadVulkanGGUF(_GpuCacheResetMixin, unittest.TestCase):
+    """A Vulkan GGUF selection picks by ggml Vulkan ordinal, a separate index space
+    from CUDA physical ids. Its requested_gpu_ids must NOT be resolved against the
+    CUDA parent-visible set (a valid ordinal outside it would raise -> invalid_gpu_ids
+    -> the OOM guard is bypassed with ok=True). Size against the visible pool instead."""
+
+    def _run(self, *, devices, required_override, gpu_ids):
+        # If resolve is consulted at all the Vulkan ordinal is (correctly, for the
+        # CUDA space) rejected -> proves the fix must bypass it.
+        def _resolve_cuda(ids, is_vulkan = False):
+            raise ValueError("requested GPUs are outside the parent-visible set")
+
+        with (
+            patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
+            patch("utils.hardware.get_visible_gpu_utilization", return_value = {"devices": devices}),
+            patch("utils.hardware.resolve_requested_gpu_ids", side_effect = _resolve_cuda) as resolve_mock,
+            patch("utils.hardware.auto_select_gpu_ids") as auto_mock,
+        ):
+            ok, info = tv.can_load_chat_during_training(
+                model_name = "unsloth/gemma-GGUF",
+                hf_token = None,
+                load_in_4bit = True,
+                max_seq_length = 0,
+                requested_gpu_ids = gpu_ids,
+                is_gguf = True,
+                is_vulkan = True,
+                required_override_gb = required_override,
+            )
+        auto_mock.assert_not_called()
+        return ok, info, resolve_mock
+
+    def test_blocks_when_pool_insufficient_not_invalid_gpu_ids_bypass(self):
+        # Vulkan ordinal [3] is outside the CUDA set; pool has 4 GB free, needs
+        # 10*1.15+4 = 15.5 -> block. Must NOT fall through the invalid_gpu_ids bypass.
+        ok, info, resolve_mock = self._run(
+            devices = _devices((0, 24, 20)), required_override = 10.0, gpu_ids = [3]
+        )
+        self.assertFalse(ok)
+        self.assertEqual(info["mode"], "gguf")
+        self.assertNotEqual(info.get("reason"), "invalid_gpu_ids")
+        resolve_mock.assert_not_called()  # ordinals never resolved against CUDA space
+
+    def test_allows_when_pool_fits(self):
+        # 70 GB free pool clears needed 15.5 -> allow, sized against the pool.
+        ok, info, resolve_mock = self._run(
+            devices = _devices((0, 80, 10)), required_override = 10.0, gpu_ids = [3]
+        )
+        self.assertTrue(ok)
+        self.assertEqual(info["mode"], "gguf")
+        resolve_mock.assert_not_called()
+
+
 # ── can_load_chat_during_training: device-independent paths ──────────────────
 
 
@@ -360,6 +415,26 @@ class TestChatLoadGuardRoute(unittest.TestCase):
             )
         self.assertEqual(captured[0]["is_gguf"], True)
         self.assertEqual(captured[0]["required_override_gb"], 12.5)
+
+    def test_gguf_vulkan_threads_is_vulkan_to_can_load(self):
+        # A Vulkan GGUF build must reach can_load with is_vulkan=True so ordinals
+        # are sized against the pool, not resolved against the CUDA set (#7239).
+        captured = []
+        config = SimpleNamespace(is_gguf = True)
+        with (
+            patch.object(self.route, "_estimate_gguf_required_gb", return_value = 12.5),
+            patch.object(self.route.LlamaCppBackend, "_is_vulkan_backend", return_value = True),
+        ):
+            self._guard(
+                config = config, captured = captured, training_active = True, decision = (True, {})
+            )
+        self.assertTrue(captured[0]["is_vulkan"])
+
+    def test_non_gguf_does_not_flag_vulkan(self):
+        # Non-GGUF loads never touch the Vulkan probe -> is_vulkan stays False.
+        captured = []
+        self._guard(captured = captured, training_active = True, decision = (True, {}))
+        self.assertFalse(captured[0]["is_vulkan"])
 
 
 class TestEffectiveLoadIn4bit(unittest.TestCase):

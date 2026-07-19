@@ -196,6 +196,7 @@ def can_load_chat_during_training(
     max_seq_length: int,
     requested_gpu_ids: Optional[List[int]],
     is_gguf: bool = False,
+    is_vulkan: bool = False,
     required_override_gb: Optional[float] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """Decide if a NEW chat model can load without OOMing active training (inverse
@@ -203,9 +204,14 @@ def can_load_chat_during_training(
     chat model against the free VRAM that remains). Sizes/places it the same way
     the loader will: HF auto reuses auto_select_gpu_ids; HF explicit requires an
     even-share per-GPU floor for device_map="balanced"; GGUF sizes from
-    required_override_gb over the visible pool. `load_in_4bit` must be effective
-    (LoRA can flip 4-bit -> 16-bit). Non-CUDA allows the load; default-deny on any
-    CUDA case it can't size, so a load never OOMs training."""
+    required_override_gb over the visible pool. A Vulkan GGUF selection picks by
+    ggml Vulkan ordinal (a separate index space from CUDA physical ids), so its
+    requested_gpu_ids must NOT be resolved against the CUDA parent-visible set;
+    size it against the full visible pool like GGUF self-placement instead, or a
+    valid ordinal outside the CUDA set would raise -> invalid_gpu_ids -> the OOM
+    check is bypassed. `load_in_4bit` must be effective (LoRA can flip 4-bit ->
+    16-bit). Non-CUDA allows the load; default-deny on any CUDA case it can't
+    size, so a load never OOMs training."""
     try:
         from utils.hardware import (
             DeviceType,
@@ -225,6 +231,11 @@ def can_load_chat_during_training(
             load_in_4bit = load_in_4bit,
             max_seq_length = max_seq_length or 2048,
         )
+
+        # A Vulkan GGUF selection uses ggml Vulkan ordinals, not CUDA physical ids;
+        # size it against the full visible pool (GGUF self-placement) rather than
+        # resolving ordinals against the CUDA parent-visible set.
+        vulkan_gguf = is_gguf and is_vulkan
 
         # HF auto: reuse the loader's selector; fits iff its pick clears the margin.
         if not requested_gpu_ids and not is_gguf:
@@ -259,7 +270,7 @@ def can_load_chat_during_training(
             return False, {"mode": mode, "reason": "estimate_unavailable"}
 
         free_by_index = _free_vram_by_index(get_visible_gpu_utilization().get("devices", []))
-        if requested_gpu_ids:
+        if requested_gpu_ids and not vulkan_gguf:
             # Invalid ids -> load_model 400s first, so don't block; missing id = 0.
             try:
                 resolved = resolve_requested_gpu_ids(requested_gpu_ids)
@@ -268,7 +279,8 @@ def can_load_chat_during_training(
             free_vals = [free_by_index.get(i, 0.0) for i in resolved]
             mode = "explicit"
         else:
-            # GGUF: llama.cpp picks the GPU(s); any visible GPU is a candidate.
+            # GGUF self-placement (incl. Vulkan ordinal selection): llama.cpp picks
+            # the GPU(s), so any visible GPU is a candidate -> size the whole pool.
             free_vals = list(free_by_index.values())
             mode = "gguf"
 

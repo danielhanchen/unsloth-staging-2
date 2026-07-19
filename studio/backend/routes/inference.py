@@ -3935,6 +3935,16 @@ def _guard_chat_load_against_training(
         else None
     )
 
+    # A Vulkan GGUF selection uses ggml Vulkan ordinals (a separate index space
+    # from CUDA physical ids); flag it so the guard sizes against the visible pool
+    # instead of resolving ordinals against the CUDA set (#7239). Never raise here.
+    is_vulkan = False
+    if is_gguf:
+        try:
+            is_vulkan = LlamaCppBackend._is_vulkan_backend()
+        except Exception as e:
+            logger.warning("Could not detect Vulkan backend for chat-load guard: %s", e)
+
     ok, info = can_load_chat_during_training(
         model_name = model_identifier,
         hf_token = hf_token,
@@ -3942,6 +3952,7 @@ def _guard_chat_load_against_training(
         max_seq_length = max_seq_length,
         requested_gpu_ids = requested_gpu_ids,
         is_gguf = is_gguf,
+        is_vulkan = is_vulkan,
         required_override_gb = required_override_gb,
     )
     if ok:
@@ -4157,6 +4168,12 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     speculative_type = llama_backend.requested_spec_mode,
                     spec_draft_n_max = llama_backend.spec_draft_n_max,
                     tensor_parallel = llama_backend.tensor_parallel,
+                    # Echo the live server's residency/mlock/GPU selection so the
+                    # dedupe response matches the success path (else Pydantic
+                    # defaults would report them as off) (#7239).
+                    keep_model_in_vram = llama_backend.keep_resident,
+                    mlock = llama_backend.mlock,
+                    gpu_ids = llama_backend.gpu_ids,
                 )
         else:
             if (

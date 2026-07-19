@@ -159,6 +159,70 @@ def test_load_accepts_existing_explicit_local_draft(tmp_path):
     assert captured.get("mtp_draft_path") == str(draft)
 
 
+def _loaded_gguf_backend(**overrides):
+    """A live llama.cpp backend already serving a GGUF, with every attribute the
+    already-loaded dedupe LoadResponse reads."""
+    base = dict(
+        is_loaded = True,
+        hf_variant = None,
+        model_identifier = "/tmp/model.gguf",
+        _audio_probed = True,
+        _is_vision = False,
+        is_diffusion = False,
+        _is_audio = False,
+        _audio_type = None,
+        _has_audio_input = False,
+        context_length = 4096,
+        max_context_length = 8192,
+        native_context_length = 8192,
+        supports_reasoning = False,
+        reasoning_style = "enable_thinking",
+        reasoning_effort_levels = [],
+        reasoning_always_on = False,
+        supports_preserve_thinking = False,
+        supports_tools = False,
+        chat_template = None,
+        requested_spec_mode = None,
+        spec_draft_n_max = None,
+        tensor_parallel = False,
+        # The three fields under test: launched-with residency/mlock/GPU pin.
+        keep_resident = True,
+        mlock = True,
+        gpu_ids = [0],
+    )
+    base.update(overrides)
+    return SimpleNamespace(**base)
+
+
+def test_already_loaded_gguf_echoes_active_load_options():
+    """An identical /load that dedupes to the live server must echo its actual
+    keep_model_in_vram / mlock / gpu_ids, not Pydantic defaults (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_dedupe_echo")
+    request = LoadRequest(
+        model_path = "/tmp/model.gguf",
+        keep_model_in_vram = True,
+        mlock = True,
+        gpu_ids = [0],
+    )
+    llama = _loaded_gguf_backend()
+
+    with (
+        patch.object(route, "get_llama_cpp_backend", return_value = llama),
+        patch.object(route, "get_inference_backend", return_value = SimpleNamespace(active_model_name = None)),
+        patch.object(route, "load_inference_config", return_value = {}),
+        patch.object(route, "resolve_effective_chat_template_override", return_value = None),
+        patch.object(route, "_request_matches_loaded_settings", return_value = True),
+    ):
+        resp = asyncio.run(
+            route._load_model_impl(request, _fastapi_request(), current_subject = "u")
+        )
+
+    assert resp.status == "already_loaded"
+    assert resp.keep_model_in_vram is True
+    assert resp.mlock is True
+    assert resp.gpu_ids == [0]
+
+
 def test_validate_accepts_gguf_gpu_ids_like_load():
     """/validate must route GGUF gpu_ids through the same resolution /load uses, not a
     blanket "not supported" reject, so a preflight of the intended payload agrees with
