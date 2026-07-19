@@ -61,10 +61,43 @@ def _safe_is_dir(path) -> bool:
 
 # Shared with the hub inventory scans; keep the private aliases so existing
 # importers (core.inference.local_model_resolver, tests) stay valid.
+# ``_HF_REPO_ID_RE`` is the Hub repo id shape ("owner/name", no leading
+# separator); anything else is treated as a local filesystem path.
 from utils.hidden_models import (
+    _HF_REPO_ID_RE,
     _safe_resolve,
     is_hidden_model as _is_hidden_model,
 )
+
+
+def hidden_model_matchers() -> tuple[list[str], list[str]]:
+    """Substring needles and exact resolved paths identifying infra models
+    (the RAG embedder and the llama.cpp install validation probe) that pickers
+    hide. Served by the ``/api/hub/hidden-models`` endpoint so the frontend can
+    extend its static needles with the user's configured embedder. A local-path
+    embedder is matched by exact resolved path only: a generic basename like
+    "model" must not substring-hide unrelated chat models."""
+    from core.rag import config as rag_config
+
+    needles = [
+        # The validation probe's repo (matches the cached repo id) and its exact
+        # filename (matches the on-disk path). The filename carries the .gguf so
+        # it does not hide unrelated repos like ``user/stories260K-finetune-GGUF``.
+        "ggml-org/models",
+        "stories260k.gguf",
+    ]
+    exact_paths: list[str] = []
+    for model in (
+        rag_config.effective_embedding_model(),
+        rag_config.effective_gguf_repo(),
+    ):
+        if _HF_REPO_ID_RE.match(model):
+            needles.append(model.split("/")[-1].lower())
+        else:
+            resolved = _safe_resolve(Path(model).expanduser())
+            if resolved:
+                exact_paths.append(resolved.lower())
+    return needles, exact_paths
 
 
 backend_path = Path(__file__).parent.parent.parent
@@ -1750,9 +1783,11 @@ def _get_model_size_bytes(model_name: str, hf_token: Optional[str] = None) -> Op
 async def get_model_config(
     model_name: str,
     hf_token: Optional[str] = Query(None),
+    header_hf_token: Optional[str] = Depends(get_hf_token),
     current_subject: str = Depends(get_current_subject),
 ):
     """Get configuration for a specific model (wraps load_model_defaults)."""
+    hf_token = _normalize_hf_token(header_hf_token) or _normalize_hf_token(hf_token)
     try:
         if not is_local_path(model_name):
             resolved = resolve_cached_repo_id_case(model_name)
@@ -2471,6 +2506,7 @@ async def get_lora_base_model(lora_path: str, current_subject: str = Depends(get
 async def check_vision_model(
     model_name: str,
     hf_token: Optional[str] = Query(None),
+    header_hf_token: Optional[str] = Depends(get_hf_token),
     current_subject: str = Depends(get_current_subject),
 ):
     """
@@ -2478,6 +2514,7 @@ async def check_vision_model(
 
     This endpoint wraps the backend is_vision_model function.
     """
+    hf_token = _normalize_hf_token(header_hf_token) or _normalize_hf_token(hf_token)
     try:
         logger.info(f"Checking if vision model: {model_name}")
         # Authenticate so a gated/private VLM classifies correctly (else 404 -> non-vision).
@@ -2503,6 +2540,7 @@ async def check_vision_model(
 async def check_embedding_model(
     model_name: str,
     hf_token: Optional[str] = Query(None),
+    header_hf_token: Optional[str] = Depends(get_hf_token),
     current_subject: str = Depends(get_current_subject),
 ):
     """
@@ -2510,6 +2548,7 @@ async def check_embedding_model(
 
     This endpoint wraps the backend is_embedding_model function.
     """
+    hf_token = _normalize_hf_token(header_hf_token) or _normalize_hf_token(hf_token)
     try:
         logger.info(f"Checking if embedding model: {model_name}")
         is_embedding = is_embedding_model(model_name, hf_token = hf_token)
