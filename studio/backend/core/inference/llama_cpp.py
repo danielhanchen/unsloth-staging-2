@@ -6411,6 +6411,7 @@ class LlamaCppBackend:
                     # can't strand the load on CPU (issue #7164).
                     if gpu_ids:
                         from core.inference.llama_residency import filter_selected_gpus
+
                         # A Vulkan build indexes by ggml ordinal (not a CUDA id that
                         # re-indexes under CUDA_VISIBLE_DEVICES). An explicit ordinal
                         # absent from the probe can't be pinned, so reject after the

@@ -309,7 +309,9 @@ class TestCanLoadVulkanGGUF(_GpuCacheResetMixin, unittest.TestCase):
         with (
             patch("utils.hardware.get_device", return_value = DeviceType.CUDA),
             patch("utils.hardware.get_visible_gpu_utilization", return_value = {"devices": devices}),
-            patch("utils.hardware.resolve_requested_gpu_ids", side_effect = _resolve_cuda) as resolve_mock,
+            patch(
+                "utils.hardware.resolve_requested_gpu_ids", side_effect = _resolve_cuda
+            ) as resolve_mock,
             patch("utils.hardware.auto_select_gpu_ids") as auto_mock,
         ):
             ok, info = tv.can_load_chat_during_training(
@@ -733,9 +735,7 @@ class TestChatLoadGuardRoute(unittest.TestCase):
             patch.object(self.route, "_estimate_gguf_required_gb", return_value = 12.5),
             patch.object(self.route.LlamaCppBackend, "_is_vulkan_backend", return_value = True),
         ):
-            self._guard(
-                config = config, captured = captured, training_active = True, decision = (True, {})
-            )
+            self._guard(config = config, captured = captured, training_active = True, decision = (True, {}))
         self.assertTrue(captured[0]["is_vulkan"])
 
     def test_non_gguf_does_not_flag_vulkan(self):
@@ -850,7 +850,13 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
         self.assertEqual(captured[0]["load_in_4bit"], False)
         self.assertEqual(captured[0]["max_seq_length"], 4096)
 
-    def _validate_gguf_gpu_ids(self, *, resolve, gpu_ids = (0,), captured = None):
+    def _validate_gguf_gpu_ids(
+        self,
+        *,
+        resolve,
+        gpu_ids = (0,),
+        captured = None,
+    ):
         from models.inference import ValidateModelRequest
 
         request = ValidateModelRequest(model_path = "x.gguf", gpu_ids = list(gpu_ids))
@@ -895,9 +901,7 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
 
         captured = []
         with self.assertRaises(HTTPException) as exc:
-            self._validate_gguf_gpu_ids(
-                resolve = _bad_resolve, gpu_ids = (99,), captured = captured
-            )
+            self._validate_gguf_gpu_ids(resolve = _bad_resolve, gpu_ids = (99,), captured = captured)
         self.assertEqual(exc.exception.status_code, 400)
         self.assertIn("SENTINEL", exc.exception.detail)
         self.assertNotIn("not supported for GGUF", exc.exception.detail)

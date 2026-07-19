@@ -925,6 +925,4 @@ def test_draft_clear_forces_reload_when_drafter_loaded():
     )
 
     # Explicit clear but no drafter loaded -> nothing to drop, still dedupe.
-    assert (
-        routes._request_matches_loaded_settings(cleared_none, _loaded_gguf_backend()) is True
-    )
+    assert routes._request_matches_loaded_settings(cleared_none, _loaded_gguf_backend()) is True

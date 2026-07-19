@@ -90,9 +90,7 @@ def test_load_sizes_explicit_draft_before_training_guard():
         patch.object(route, "_hf_offline_if_dns_dead", nullcontext),
     ):
         with pytest.raises(HTTPException) as exc:
-            asyncio.run(
-                route._load_model_impl(request, _fastapi_request(), current_subject = "u")
-            )
+            asyncio.run(route._load_model_impl(request, _fastapi_request(), current_subject = "u"))
 
     assert exc.value.status_code == 409
     assert captured["mtp"] == "/tmp/explicit-draft.gguf"
@@ -116,9 +114,7 @@ def test_load_rejects_missing_explicit_local_draft():
         patch.object(route, "_hf_offline_if_dns_dead", nullcontext),
     ):
         with pytest.raises(HTTPException) as exc:
-            asyncio.run(
-                route._load_model_impl(request, _fastapi_request(), current_subject = "u")
-            )
+            asyncio.run(route._load_model_impl(request, _fastapi_request(), current_subject = "u"))
 
     assert exc.value.status_code == 400
     assert "Draft model path" in exc.value.detail
@@ -150,9 +146,7 @@ def test_load_accepts_existing_explicit_local_draft(tmp_path):
         ),
     ):
         with pytest.raises(HTTPException) as exc:
-            asyncio.run(
-                route._load_model_impl(request, _fastapi_request(), current_subject = "u")
-            )
+            asyncio.run(route._load_model_impl(request, _fastapi_request(), current_subject = "u"))
 
     # Not the 400 existence error; the drafter path was passed through to the load.
     assert "Draft model path" not in (exc.value.detail or "")
@@ -208,14 +202,14 @@ def test_already_loaded_gguf_echoes_active_load_options():
 
     with (
         patch.object(route, "get_llama_cpp_backend", return_value = llama),
-        patch.object(route, "get_inference_backend", return_value = SimpleNamespace(active_model_name = None)),
+        patch.object(
+            route, "get_inference_backend", return_value = SimpleNamespace(active_model_name = None)
+        ),
         patch.object(route, "load_inference_config", return_value = {}),
         patch.object(route, "resolve_effective_chat_template_override", return_value = None),
         patch.object(route, "_request_matches_loaded_settings", return_value = True),
     ):
-        resp = asyncio.run(
-            route._load_model_impl(request, _fastapi_request(), current_subject = "u")
-        )
+        resp = asyncio.run(route._load_model_impl(request, _fastapi_request(), current_subject = "u"))
 
     assert resp.status == "already_loaded"
     assert resp.keep_model_in_vram is True

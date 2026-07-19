@@ -53,7 +53,8 @@ def test_explicit_vulkan_ordinal_absent_from_probe_rejects(tmp_path):
 
     with (
         mock.patch.object(
-            LlamaCppBackend, "_find_llama_server_binary",
+            LlamaCppBackend,
+            "_find_llama_server_binary",
             staticmethod(lambda **_k: "/fake/llama-server"),
         ),
         mock.patch.object(
@@ -67,16 +68,15 @@ def test_explicit_vulkan_ordinal_absent_from_probe_rejects(tmp_path):
         mock.patch.object(LlamaCppBackend, "_get_gguf_size_bytes", staticmethod(lambda p: 1024)),
         # Only Vulkan0 is present (idx, free_mib, total_mib).
         mock.patch.object(
-            LlamaCppBackend, "_get_gpu_memory",
+            LlamaCppBackend,
+            "_get_gpu_memory",
             staticmethod(lambda binary = None: [(0, 40000, 48000)]),
         ),
         mock.patch.object(LlamaCppBackend, "_start_llama_process", _spawn_reached),
         mock.patch("core.inference.llama_cpp.subprocess.Popen", side_effect = _spawn_reached),
     ):
         with pytest.raises(ValueError, match = "not present"):
-            backend.load_model(
-                gguf_path = str(gguf), model_identifier = "m", gpu_ids = [3]
-            )
+            backend.load_model(gguf_path = str(gguf), model_identifier = "m", gpu_ids = [3])
 
     # The raw, unpinnable ordinal was never recorded as the active selection.
     assert backend.gpu_ids != [3]
@@ -105,7 +105,8 @@ def _drive_diffusion(backend: LlamaCppBackend, tmp_path: Path) -> bool:
 
     with (
         mock.patch.object(
-            LlamaCppBackend, "_find_diffusion_assets",
+            LlamaCppBackend,
+            "_find_diffusion_assets",
             lambda self: (["python", "-m", "shim"], "/fake/visual-bin", None),
         ),
         mock.patch.object(LlamaCppBackend, "_kill_process", lambda self: None),

@@ -4058,6 +4058,7 @@ def _guard_chat_load_against_training(
     # --spec-type via extras, so counting the draft file in those cases would
     # 409 a load that fits without it (#7239).
     from core.inference.llama_cpp import _canonicalize_spec_mode, _extra_args_set_spec_type
+
     _spec_mode = _canonicalize_spec_mode(speculative_type) or "auto"
     include_mtp_draft = _spec_mode not in (
         "off",
