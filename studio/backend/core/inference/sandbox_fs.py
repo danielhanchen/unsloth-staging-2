@@ -31,6 +31,7 @@ existing _sandbox_preexec.
 
 import ctypes
 import ctypes.util
+import glob
 import os
 import platform
 import struct
@@ -130,8 +131,14 @@ _RO_ETC_FILES = (
     # add() realpaths the systemd /run/systemd/resolve stub symlink. /etc/hosts
     # stays denied on purpose.
     "/etc/resolv.conf",
-    "/etc/passwd",
     "/etc/group",
+    # /etc/passwd is deliberately NOT granted: it is not needed for the child to
+    # function (python, the stdlib and pip all run without it; only libc identity
+    # lookups such as getpwuid()/getpass.getuser() fail, and they fail with a
+    # catchable KeyError/OSError rather than crashing). Granting it would let a
+    # sandboxed `cat /etc/passwd` enumerate every host account -- the exact
+    # host-user enumeration path this confinement is meant to close. An operator
+    # who genuinely needs it can allow-list it via UNSLOTH_STUDIO_SANDBOX_FS_ALLOW.
 )
 _RW_DEV_FILES = (
     "/dev/null",
@@ -152,6 +159,58 @@ _RW_SHM = "/dev/shm"
 # /mnt/data code-interpreter path-remap shim from importing. Derived from this
 # file's location (same dir as tools.py) so no import of tools is needed here.
 _SANDBOX_SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_site")
+
+
+def _venv_grant_paths(venv: str) -> "list[str]":
+    """Read+execute paths a child-exported VIRTUAL_ENV genuinely needs, or [].
+
+    tools._build_safe_env forwards the parent's VIRTUAL_ENV to the child and
+    prepends ``$VIRTUAL_ENV/bin`` (POSIX) / ``$VIRTUAL_ENV/Scripts`` (Windows) to
+    the child PATH. A console script resolved from there (pip, an installed CLI)
+    needs FS_EXECUTE on that scripts directory, and imports need the venv's
+    site-packages. Nothing else under the venv is required.
+
+    We deliberately do NOT grant the whole VIRTUAL_ENV tree: when Studio is
+    launched with VIRTUAL_ENV pointing at a workspace / repo root (not a real
+    dedicated virtualenv), a recursive grant would expose that tree's source,
+    config and secrets to sandboxed model code -- a confinement breach. So the
+    grant is (a) gated on the path being a REAL virtualenv, validated by a
+    ``pyvenv.cfg`` at the root or a ``bin/python[3]`` (POSIX) /
+    ``Scripts/python.exe`` (Windows), and (b) limited to the scripts directory
+    and the ``site-packages`` roots. A non-venv VIRTUAL_ENV yields no grant.
+
+    Resolved in the parent (in _build_rules); the child imports nothing.
+    """
+    if not venv:
+        return []
+    try:
+        real = os.path.realpath(venv)
+    except OSError:
+        return []
+    if not os.path.isdir(real):
+        return []
+    is_win = sys.platform == "win32"
+    scripts = os.path.join(real, "Scripts" if is_win else "bin")
+    # Validate this is a dedicated virtualenv, not an arbitrary directory a
+    # misconfigured VIRTUAL_ENV happens to point at.
+    markers = [os.path.join(real, "pyvenv.cfg")]
+    if is_win:
+        markers.append(os.path.join(scripts, "python.exe"))
+    else:
+        markers += [os.path.join(scripts, "python"), os.path.join(scripts, "python3")]
+    if not any(os.path.exists(m) for m in markers):
+        return []
+    grants = [scripts]
+    # site-packages: POSIX lib/pythonX.Y/site-packages (+ lib64 split), Windows
+    # Lib/site-packages. Glob so the interpreter minor version is matched without
+    # importing; nonexistent matches simply do not appear.
+    for pattern in (
+        os.path.join(real, "lib", "python*", "site-packages"),
+        os.path.join(real, "lib64", "python*", "site-packages"),
+        os.path.join(real, "Lib", "site-packages"),
+    ):
+        grants.extend(glob.glob(pattern))
+    return grants
 
 
 def _ca_cert_paths() -> "list[str]":
@@ -376,14 +435,16 @@ def _build_rules(workdir: str, handled: int) -> "list[tuple[str, int]]":
     # A virtualenv exported to the child via VIRTUAL_ENV. tools._build_safe_env
     # prepends $VIRTUAL_ENV/bin to the child PATH even when VIRTUAL_ENV differs
     # from the running interpreter's prefixes granted above (Studio launched with
-    # VIRTUAL_ENV pointing at a different env than sys.prefix). Without this grant
-    # a console script resolved from that PATH entry (pip, an installed package
-    # CLI) lacks FS_EXECUTE and fails with EACCES on an enforcing host. Grant the
-    # venv root read+execute like the other interpreter roots so its bin/ scripts
-    # and its lib/.../site-packages resolve; add() dedups when it coincides with a
-    # prefix already granted, and skips it when unset or nonexistent. Read-only:
-    # the sandbox never gets write to the shared venv.
-    add(os.environ.get("VIRTUAL_ENV", ""), dir_ro)
+    # VIRTUAL_ENV pointing at a different env than sys.prefix). Without a grant a
+    # console script resolved from that PATH entry (pip, an installed package CLI)
+    # lacks FS_EXECUTE and fails with EACCES on an enforcing host. Grant only the
+    # scripts (bin/Scripts) dir and the site-packages roots the child actually
+    # needs, read-only, and ONLY when the path is a real dedicated virtualenv
+    # (_venv_grant_paths validates it) -- never the whole tree, so a VIRTUAL_ENV
+    # pointing at a workspace/repo root does not expose its source and secrets to
+    # the sandbox. add() dedups against any coinciding prefix grant.
+    for path in _venv_grant_paths(os.environ.get("VIRTUAL_ENV", "")):
+        add(path, dir_ro)
     # The sandbox's own sitecustomize shim dir (on the child PYTHONPATH); outside
     # the interpreter roots on a source checkout, so grant it or the path-remap
     # shim silently fails to import under confinement.

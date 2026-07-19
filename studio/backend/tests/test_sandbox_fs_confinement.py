@@ -418,35 +418,83 @@ class TestMaskAndRules:
         assert rules[real] & (1 << 5)  # REMOVE_FILE
 
     def test_build_rules_file_target_has_no_dir_only_bits(self, tmp_path):
-        # /etc/passwd is a file: its rule must not carry READ_DIR (dir-only),
+        # /etc/resolv.conf is a file: its rule must not carry READ_DIR (dir-only),
         # which the kernel would reject with EINVAL, silently dropping the rule.
         handled = _fs_handled_mask(5)
         rules = dict(_build_rules(str(tmp_path), handled))
-        passwd = os.path.realpath("/etc/passwd")
-        if passwd in rules:  # present on Linux; skip the assert elsewhere
-            assert not (rules[passwd] & (1 << 3))  # no READ_DIR on a file
-            assert not (rules[passwd] & (1 << 1))  # read-only: no WRITE_FILE
-            assert rules[passwd] & (1 << 2)  # READ_FILE granted
+        resolv = os.path.realpath("/etc/resolv.conf")
+        if resolv in rules:  # present on Linux; skip the assert elsewhere
+            assert not (rules[resolv] & (1 << 3))  # no READ_DIR on a file
+            assert not (rules[resolv] & (1 << 1))  # read-only: no WRITE_FILE
+            assert rules[resolv] & (1 << 2)  # READ_FILE granted
 
-    def test_build_rules_grants_exported_virtualenv_readexec(self, tmp_path, monkeypatch):
+    def test_build_rules_does_not_grant_etc_passwd(self, tmp_path):
+        # /etc/passwd is deliberately NOT allow-listed: granting it would let a
+        # sandboxed `cat /etc/passwd` enumerate every host account, the exact
+        # host-user enumeration path this confinement is meant to close. The child
+        # runs fine without it (only libc identity lookups fail, and catchably).
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules(str(tmp_path), handled))
+        assert os.path.realpath("/etc/passwd") not in rules, sorted(rules)
+
+    @staticmethod
+    def _make_fake_venv(root: Path) -> Path:
+        # A minimal but valid virtualenv layout: pyvenv.cfg + bin/python +
+        # lib/python3.X/site-packages, exactly what _venv_grant_paths validates
+        # and grants.
+        (root / "bin").mkdir(parents = True)
+        (root / "pyvenv.cfg").write_text("home = /usr/bin\n")
+        (root / "bin" / "python").write_text("#!/bin/sh\n")
+        (root / "lib" / "python3.11" / "site-packages").mkdir(parents = True)
+        return root
+
+    def test_build_rules_grants_only_venv_bin_and_site_packages_readexec(
+        self, tmp_path, monkeypatch
+    ):
         # tools._build_safe_env prepends $VIRTUAL_ENV/bin to the child PATH even
-        # when VIRTUAL_ENV differs from the running interpreter's prefix. That
-        # venv root must be granted read+execute, else a console script resolved
-        # from it (pip, an installed CLI) fails with EACCES on an enforcing host.
-        venv = tmp_path / "othervenv"
-        (venv / "bin").mkdir(parents = True)
+        # when VIRTUAL_ENV differs from the running interpreter's prefix. Only that
+        # scripts dir and the venv's site-packages are granted (read+execute), so
+        # console scripts resolve and imports load -- NOT the whole venv tree.
+        venv = self._make_fake_venv(tmp_path / "othervenv")
+        secret = venv / "secret.txt"  # arbitrary file elsewhere in the tree
+        secret.write_text("VENV_SECRET")
         workdir = tmp_path / "wd"
         workdir.mkdir()
         monkeypatch.setenv("VIRTUAL_ENV", str(venv))
         handled = _fs_handled_mask(5)
         rules = dict(_build_rules(str(workdir), handled))
-        real = os.path.realpath(str(venv))
-        assert real in rules, sorted(rules)
-        assert rules[real] & (1 << 0)  # FS_EXECUTE (console scripts / interpreter)
-        assert rules[real] & (1 << 2)  # READ_FILE
-        assert rules[real] & (1 << 3)  # READ_DIR
-        assert not (rules[real] & (1 << 1))  # read-only: no WRITE_FILE
-        assert not (rules[real] & (1 << 14))  # read-only: no TRUNCATE
+
+        bindir = os.path.realpath(str(venv / "bin"))
+        site = os.path.realpath(str(venv / "lib" / "python3.11" / "site-packages"))
+        assert bindir in rules, sorted(rules)
+        assert site in rules, sorted(rules)
+        for real in (bindir, site):
+            assert rules[real] & (1 << 0)  # FS_EXECUTE (console scripts / interpreter)
+            assert rules[real] & (1 << 2)  # READ_FILE
+            assert rules[real] & (1 << 3)  # READ_DIR
+            assert not (rules[real] & (1 << 1))  # read-only: no WRITE_FILE
+            assert not (rules[real] & (1 << 14))  # read-only: no TRUNCATE
+        # The venv ROOT is NOT granted: a rule there would recursively expose the
+        # whole tree (secret.txt included) to the sandbox.
+        assert os.path.realpath(str(venv)) not in rules, sorted(rules)
+
+    def test_build_rules_does_not_grant_non_venv_virtualenv(self, tmp_path, monkeypatch):
+        # VIRTUAL_ENV pointing at a directory that is NOT a real virtualenv (no
+        # pyvenv.cfg, no bin/python) must grant NOTHING: otherwise a workspace /
+        # repo root exported as VIRTUAL_ENV would expose its source to the sandbox.
+        notvenv = tmp_path / "workspace_root"
+        (notvenv / "src").mkdir(parents = True)
+        (notvenv / "src" / "app.py").write_text("SECRET_SOURCE")
+        (notvenv / ".env").write_text("API_KEY=secret")
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        monkeypatch.setenv("VIRTUAL_ENV", str(notvenv))
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules(str(workdir), handled))
+        real = os.path.realpath(str(notvenv))
+        assert real not in rules, sorted(rules)
+        # No descendant of the non-venv tree is granted either.
+        assert not any(p == real or p.startswith(real + os.sep) for p in rules), sorted(rules)
 
     def test_build_rules_no_virtualenv_grant_when_unset(self, tmp_path, monkeypatch):
         # With VIRTUAL_ENV unset, no extra venv rule is added (only the running
