@@ -5458,9 +5458,7 @@ async def validate_model(
             # this, validate sizes the smaller no-draft estimate and can approve; the
             # frontend then unloads the current model and /load inherits the drafter,
             # sizes the LARGER estimate and 409s after the model is already gone (#7239).
-            _inherited_draft = _resolve_inherited_draft_path(
-                request, config, model_identifier
-            )
+            _inherited_draft = _resolve_inherited_draft_path(request, config, model_identifier)
             if _inherited_draft:
                 config.gguf_mtp_file = _inherited_draft
         # A metadata-only probe just reads the GGUF header and allocates no VRAM,
