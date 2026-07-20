@@ -3211,9 +3211,16 @@ def _request_matches_loaded_settings(
         # dedupe rather than needlessly reload the healthy server (#7239).
         if _req_gpu_ids != (getattr(llama_backend, "requested_gpu_ids", None) or None):
             return False
-        if bool(request.keep_model_in_vram) != bool(llama_backend.keep_resident):
+        # Compare the RAW requested residency against the raw recorded pin, not the
+        # effective keep_resident / mlock (which /status echoes): a last-wins user
+        # --mmap / --no-mlock in the extras flips the effective state, so an identical
+        # re-request must still dedupe rather than needlessly reload the healthy server;
+        # consistent with the raw gpu-pin compare above (#7239).
+        if bool(request.keep_model_in_vram) != bool(
+            getattr(llama_backend, "requested_keep_resident", False)
+        ):
             return False
-        if bool(request.mlock) != bool(llama_backend.mlock):
+        if bool(request.mlock) != bool(getattr(llama_backend, "requested_mlock", False)):
             return False
     # An explicit user drafter overrides the auto-detected sibling, so a change
     # to it (or clearing it) must reload even when the auto-detected path matches.

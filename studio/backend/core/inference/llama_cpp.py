@@ -1914,6 +1914,13 @@ class LlamaCppBackend:
         # pages; _gpu_ids is the user's explicit physical GPU selection (or None).
         self._keep_resident: bool = False
         self._mlock: bool = False
+        # RAW requested keep_model_in_vram / mlock as sent by the caller. _keep_resident
+        # and _mlock record the EFFECTIVE state (a last-wins user --mmap / --no-mlock in
+        # the extras flips them), which /status echoes; dedupe compares these raw values
+        # so an identical re-request carrying a residency-negating extra still matches
+        # instead of needlessly reloading a healthy server, mirroring _requested_gpu_ids (#7239).
+        self._requested_keep_resident: bool = False
+        self._requested_mlock: bool = False
         # GPU memory strategy applied on the active load ("auto"/"manual").
         self._gpu_memory_mode: str = "auto"
         # Manual-mode load options (echoed back so the UI round-trips them).
@@ -2414,6 +2421,20 @@ class LlamaCppBackend:
         the raw request so load dedupe treats a narrowed-then-re-sent pick as a
         match rather than a needless reload (#7239)."""
         return self._requested_gpu_ids
+
+    @property
+    def requested_keep_resident(self) -> bool:
+        """RAW requested keep_model_in_vram (before a last-wins extra --mmap flipped
+        the effective state). keep_resident echoes the EFFECTIVE state for /status;
+        this echoes the raw request so load dedupe treats an identical re-request as a
+        match rather than a needless reload (#7239)."""
+        return self._requested_keep_resident
+
+    @property
+    def requested_mlock(self) -> bool:
+        """RAW requested mlock (before a last-wins extra --no-mlock flipped the
+        effective state); the mlock counterpart to requested_keep_resident (#7239)."""
+        return self._requested_mlock
 
     @property
     def n_layers(self) -> Optional[int]:
@@ -4880,6 +4901,8 @@ class LlamaCppBackend:
         # runner would opt out of the idle TTL unload and /status would misreport.
         self._keep_resident = False
         self._mlock = False
+        self._requested_keep_resident = False
+        self._requested_mlock = False
         # Diffusion doesn't use the llama.cpp GPU-memory knobs; reset them to
         # defaults (the picked device is still recorded below) so /load, /status
         # and reload dedup don't report a previous GGUF's manual settings.
@@ -7750,6 +7773,11 @@ class LlamaCppBackend:
                 self._keep_resident, self._mlock = derive_residency_state(
                     cmd, keep_model_in_vram = keep_model_in_vram, mlock = mlock
                 )
+                # Pin the raw request too: dedupe compares these (not the effective
+                # state above) so an identical re-request with a residency-negating
+                # extra dedupes instead of reloading, mirroring _requested_gpu_ids (#7239).
+                self._requested_keep_resident = bool(keep_model_in_vram)
+                self._requested_mlock = bool(mlock)
 
                 logger.info(f"Starting llama-server: {' '.join(self._redacted_cmd_for_log(cmd))}")
 
@@ -8666,9 +8694,12 @@ class LlamaCppBackend:
             # and re-sent as [0, 1] still dedupes (#7239).
             if _req_gpu_ids != (getattr(self, "_requested_gpu_ids", None) or None):
                 return False
-            if bool(keep_model_in_vram) != bool(getattr(self, "_keep_resident", False)):
+            # Compare the RAW requested residency, not the effective _keep_resident /
+            # _mlock (a last-wins user --mmap / --no-mlock flips those), so an identical
+            # re-request dedupes instead of reloading, mirroring the raw-pin above (#7239).
+            if bool(keep_model_in_vram) != bool(getattr(self, "_requested_keep_resident", False)):
                 return False
-            if bool(mlock) != bool(getattr(self, "_mlock", False)):
+            if bool(mlock) != bool(getattr(self, "_requested_mlock", False)):
                 return False
         # Direct-file loads pass hf_variant=None while the backend stores an
         # extracted filename label; compare paths to keep the guard symmetric.
@@ -8937,6 +8968,8 @@ class LlamaCppBackend:
             # keep-in-VRAM chat load never leaks into the next (or diffusion) runner.
             self._keep_resident = False
             self._mlock = False
+            self._requested_keep_resident = False
+            self._requested_mlock = False
             self._gpu_ids = None
             self._requested_gpu_ids = None
             self._tensor_parallel = False

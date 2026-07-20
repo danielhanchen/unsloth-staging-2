@@ -807,21 +807,34 @@ def test_validate_omitted_draft_not_inherited_across_models(tmp_path):
 # ── BUG A: dedupe compares the RAW requested GPU pin, not the fit-narrowed one ──
 
 
-def _pinned_backend(requested_gpu_ids, effective_gpu_ids):
+def _pinned_backend(
+    requested_gpu_ids,
+    effective_gpu_ids,
+    *,
+    requested_keep_resident = False,
+    keep_resident = False,
+    requested_mlock = False,
+    mlock = False,
+    extra_args = (),
+):
     """A live GGUF backend whose fit narrowed an explicit pin: requested_gpu_ids
     keeps the RAW request; gpu_ids echoes the EFFECTIVE (narrowed) pin for /status.
-    Every non-GPU field matches a default LoadRequest so only the pin decides the
-    dedupe (Codex #7239)."""
+    requested_keep_resident / requested_mlock likewise keep the RAW residency request
+    while keep_resident / mlock echo the EFFECTIVE state (a last-wins extra --mmap /
+    --no-mlock flips them). Every non-selected field matches a default LoadRequest so
+    only the pin under test decides the dedupe (Codex #7239)."""
     return SimpleNamespace(
         is_diffusion = False,
         gpu_ids = effective_gpu_ids,
         requested_gpu_ids = requested_gpu_ids,
-        keep_resident = False,
-        mlock = False,
+        keep_resident = keep_resident,
+        mlock = mlock,
+        requested_keep_resident = requested_keep_resident,
+        requested_mlock = requested_mlock,
         mtp_draft_path = None,
         requested_n_ctx = 0,
         cache_type_kv = None,
-        extra_args = [],
+        extra_args = list(extra_args),
         tensor_parallel = False,
         gpu_memory_mode = "auto",
         gpu_layers = -1,
@@ -876,5 +889,76 @@ def test_dedupe_matches_auto_none_vs_none():
     route = _load_route_module("gguf_opts_regression_dedupe_auto")
     backend = _pinned_backend(requested_gpu_ids = None, effective_gpu_ids = None)
     request = LoadRequest(model_path = "/tmp/model.gguf")  # gpu_ids omitted
+
+    assert route._request_matches_loaded_settings(request, backend) is True
+
+
+# ── dedupe compares the RAW requested residency, not the effective state a ──────
+# ── last-wins extra --mmap / --no-mlock flipped (same class as the GPU pin) ─────
+
+
+def test_dedupe_matches_residency_negated_by_extra_resent():
+    """keep_model_in_vram=true launched with a last-wins extra --mmap records the
+    EFFECTIVE keep_resident=False for /status while the RAW request is kept as
+    requested_keep_resident=True. The frontend re-sends the identical request; the
+    dedupe must compare RAW-vs-RAW (true == true) and MATCH so a healthy keep-in-VRAM
+    server is not needlessly torn down and reloaded, mirroring the GPU-pin case (#7239)."""
+    route = _load_route_module("gguf_opts_regression_dedupe_residency_match")
+    backend = _pinned_backend(
+        requested_gpu_ids = None,
+        effective_gpu_ids = None,
+        requested_keep_resident = True,
+        keep_resident = False,
+        extra_args = ["--mmap"],
+    )
+    request = LoadRequest(
+        model_path = "/tmp/model.gguf",
+        keep_model_in_vram = True,
+        llama_extra_args = ["--mmap"],
+    )
+
+    assert route._request_matches_loaded_settings(request, backend) is True
+    # /status still echoes the EFFECTIVE (extra-negated) residency, not the raw request.
+    assert backend.keep_resident is False
+
+
+def test_dedupe_reloads_on_residency_request_change():
+    """A real change to the residency request (keep_model_in_vram true -> false) must
+    still reload: raw false != raw true, so the user's new intent is honored even
+    though the effective keep_resident was already False from the prior --mmap."""
+    route = _load_route_module("gguf_opts_regression_dedupe_residency_change")
+    backend = _pinned_backend(
+        requested_gpu_ids = None,
+        effective_gpu_ids = None,
+        requested_keep_resident = True,
+        keep_resident = False,
+        extra_args = ["--mmap"],
+    )
+    request = LoadRequest(
+        model_path = "/tmp/model.gguf",
+        keep_model_in_vram = False,
+        llama_extra_args = ["--mmap"],
+    )
+
+    assert route._request_matches_loaded_settings(request, backend) is False
+
+
+def test_dedupe_matches_mlock_negated_by_extra_resent():
+    """mlock=true launched with a last-wins extra --no-mlock records the EFFECTIVE
+    mlock=False while keeping requested_mlock=True; an identical re-request dedupes
+    RAW-vs-RAW rather than reloading, the mlock counterpart of the above (#7239)."""
+    route = _load_route_module("gguf_opts_regression_dedupe_mlock_match")
+    backend = _pinned_backend(
+        requested_gpu_ids = None,
+        effective_gpu_ids = None,
+        requested_mlock = True,
+        mlock = False,
+        extra_args = ["--no-mlock"],
+    )
+    request = LoadRequest(
+        model_path = "/tmp/model.gguf",
+        mlock = True,
+        llama_extra_args = ["--no-mlock"],
+    )
 
     assert route._request_matches_loaded_settings(request, backend) is True
