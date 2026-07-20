@@ -728,9 +728,12 @@ class TestLoadHubDownloadExclusion:
         source = (Path(__file__).resolve().parent.parent / "routes" / "inference.py").read_text()
         gguf_branch = source[source.index("if config.is_gguf:") :]
 
+        # Inherited-extras resolution runs before the is_gguf branch (the coexistence
+        # guard needs the resolved extras), so this asserts the safety ordering the
+        # test is named for: the in-flight marker precedes the hub-download guard and
+        # the unload of the resident model.
         assert (
             gguf_branch.index("enter_context(gguf_load_in_flight")
-            < gguf_branch.index("if request.llama_extra_args is None")
             < gguf_branch.index("_hub_download_blocks_gguf_load")
             < gguf_branch.index("unsloth_backend.unload_model")
         )
