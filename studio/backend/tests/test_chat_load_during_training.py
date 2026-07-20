@@ -295,10 +295,10 @@ class TestCanLoadGGUF(_GpuCacheResetMixin, unittest.TestCase):
 
 
 class TestCanLoadVulkanGGUF(_GpuCacheResetMixin, unittest.TestCase):
-    """A Vulkan GGUF selection picks by ggml Vulkan ordinal, a separate index space
-    from CUDA physical ids. Its requested_gpu_ids must NOT be resolved against the
-    CUDA parent-visible set (a valid ordinal outside it would raise -> invalid_gpu_ids
-    -> the OOM guard is bypassed with ok=True). Size against the visible pool instead."""
+    """A Vulkan GGUF selection picks by ggml Vulkan ordinal (separate index space from
+    CUDA ids). Its requested_gpu_ids must NOT resolve against the CUDA set (a valid
+    ordinal outside it would raise -> invalid_gpu_ids -> bypass the OOM guard); size
+    against the visible pool instead."""
 
     def _run(self, *, devices, required_override, gpu_ids):
         # If resolve is consulted at all the Vulkan ordinal is (correctly, for the

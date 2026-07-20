@@ -3,13 +3,11 @@
 
 """Regression tests for two GGUF residency/GPU-pin correctness gaps (#7239):
 
-  * FIX 2: an explicit Vulkan ordinal absent from the ggml probe must NOT be
-    silently redirected to a different device (fail-open) and misreported; the
-    load rejects with an actionable error instead.
-  * FIX 3: the diffusion runner ignores llama-server residency flags, so a prior
-    keep-in-VRAM chat load must not leak keep_resident/mlock/gpu_ids into it
-    (else it opts out of the idle TTL unload and /status misreports); and
-    unload_model must reset those fields so they always describe the active runner.
+  * FIX 2: an explicit Vulkan ordinal absent from the ggml probe must reject with an
+    actionable error, not be silently redirected (fail-open) and misreported.
+  * FIX 3: the diffusion runner ignores residency flags, so a prior keep-in-VRAM chat
+    load must not leak keep_resident/mlock/gpu_ids into it; and unload_model must reset
+    those fields so they always describe the active runner.
 
 No GPU, network, or real subprocesses are used.
 """
@@ -34,9 +32,8 @@ from core.inference.llama_residency import should_idle_unload  # noqa: E402
 
 
 def test_explicit_vulkan_ordinal_absent_from_probe_rejects(tmp_path):
-    # Probe enumerates only Vulkan0; the user pins ordinal [3]. filter_selected_gpus
-    # fail-opens to the full list, so before the fix the fit picked Vulkan0, pinned
-    # --device Vulkan0, but recorded gpu_ids=[3] -> /status + /load misreport. The
+    # Probe enumerates only Vulkan0; the user pins [3]. filter_selected_gpus fail-opens,
+    # so before the fix the fit pinned Vulkan0 but recorded gpu_ids=[3] (misreport). The
     # load must instead reject with an actionable "not present" error.
     backend = LlamaCppBackend()
     gguf = tmp_path / "model.gguf"
@@ -259,12 +256,10 @@ def test_unload_model_resets_residency_fields(tmp_path):
 
 
 def test_auto_vulkan_pick_not_recorded_as_explicit_pin(tmp_path):
-    """An auto Vulkan load (gpu_ids omitted) whose fitter narrows to Vulkan0 must
-    still PIN the child to that device (--device Vulkan0) yet record gpu_ids as
-    None, not [0]: an auto pick recorded as an explicit pin makes /status misreport
-    a user selection and the load dedupe compare an omitted None against [0] and
-    miss the already-loaded server. Mirrors the CUDA/ROCm ``elif gpu_ids`` branch
-    (Codex #7239)."""
+    """An auto Vulkan load (gpu_ids omitted) whose fitter narrows to Vulkan0 must still
+    PIN the child (--device Vulkan0) yet record gpu_ids as None, not [0]: recording an
+    auto pick as an explicit pin misreports /status and makes dedupe miss the loaded
+    server. Mirrors the CUDA/ROCm ``elif gpu_ids`` branch (Codex #7239)."""
     backend = LlamaCppBackend()
     gguf = tmp_path / "model.gguf"
     gguf.write_bytes(b"\0" * 1024)
@@ -471,11 +466,9 @@ if __name__ == "__main__":
 
 
 def test_narrowed_explicit_pin_records_raw_and_effective(tmp_path):
-    """An explicit [0, 1] pin the fitter narrows to [0] must record BOTH: gpu_ids=[0]
-    (the effective pin /status echoes) and requested_gpu_ids=[0, 1] (the raw request
-    the load dedupe compares). Otherwise every re-Apply of the still-[0, 1] frontend
-    selection compares [0, 1] against the recorded [0] and needlessly reloads a
-    healthy server (Codex #7239)."""
+    """An explicit [0, 1] pin narrowed to [0] must record BOTH gpu_ids=[0] (effective,
+    for /status) and requested_gpu_ids=[0, 1] (raw, for dedupe). Otherwise a re-Apply of
+    the still-[0, 1] selection compares [0, 1] against [0] and needlessly reloads (#7239)."""
     backend = LlamaCppBackend()
     gguf = tmp_path / "model.gguf"
     gguf.write_bytes(b"\0" * 1024)
@@ -541,10 +534,9 @@ def _match_kwargs(**overrides):
 
 
 def test_already_in_target_state_dedupes_raw_requested_pin():
-    """_already_in_target_state (the backend mirror of the route dedupe) must compare
-    the RAW requested pin, not the fit-narrowed effective self._gpu_ids: a narrowed
-    [0, 1]->[0] re-sent as [0, 1] MATCHES; a [0]-only request does NOT; an auto None
-    load dedupes None-vs-None (Codex #7239)."""
+    """_already_in_target_state (backend mirror of the route dedupe) compares the RAW
+    requested pin, not the fit-narrowed self._gpu_ids: [0, 1]->[0] re-sent as [0, 1]
+    MATCHES; [0]-only does NOT; auto None dedupes None-vs-None (Codex #7239)."""
     backend = LlamaCppBackend()
     # Make the backend appear as a live, healthy server serving model "m" so the
     # dedupe reaches the pin comparison (is_loaded + model_identifier gates first).

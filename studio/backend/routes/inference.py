@@ -3190,32 +3190,21 @@ def _request_matches_loaded_settings(
     gemma-4 override), so the dedup compares against what the backend actually
     holds rather than the raw request field. Defaults to the request field for
     callers that do not resolve a bundled override."""
-    # Residency + explicit GPU pin + user draft (issue #7164): toggling any of
-    # these changes the launch command / child env, so a settings change on the
-    # same model must reload rather than dedupe to the live server. Mirrors
-    # LlamaCppBackend._already_in_target_state, which this route check gates
-    # (an already_loaded return here never reaches that backend guard).
-    #
-    # The diffusion runner does not support these load options: _start_diffusion_server
-    # clears keep_resident/mlock and collapses a multi-GPU pick to its single lowest
-    # device, so comparing the raw request against the recorded (cleared/collapsed)
-    # state would always mismatch and needlessly tear down a healthy runner. Skip the
-    # residency and raw-pin checks for diffusion; the GPU pick is still compared
-    # (collapsed the same way) in the diffusion-aware block below, mirroring
-    # LlamaCppBackend._already_in_target_state (#7239).
+    # Residency + explicit GPU pin + user draft (issue #7164): toggling any of these
+    # changes the launch command / child env, so a settings change on the same model
+    # must reload. Mirrors LlamaCppBackend._already_in_target_state (an already_loaded
+    # return here never reaches that backend guard). Diffusion does not support these
+    # (it clears keep_resident/mlock and collapses a multi-GPU pick), so raw-vs-recorded
+    # would always mismatch; skip them for diffusion (the GPU pick is still compared,
+    # collapsed, below) (#7239).
     if not llama_backend.is_diffusion:
         _req_gpu_ids = sorted(int(x) for x in request.gpu_ids) if request.gpu_ids else None
-        # Compare the RAW requested pin against the raw recorded pin, not the
-        # fit-narrowed effective gpu_ids (which /status echoes): a [0, 1] pick the
-        # fitter narrowed to [0] and the frontend re-sends as [0, 1] must still
-        # dedupe rather than needlessly reload the healthy server (#7239).
+        # Compare the RAW requested pin, not the fit-narrowed gpu_ids (/status echoes
+        # that): a [0, 1] narrowed to [0] and re-sent as [0, 1] must still dedupe (#7239).
         if _req_gpu_ids != (getattr(llama_backend, "requested_gpu_ids", None) or None):
             return False
-        # Compare the RAW requested residency against the raw recorded pin, not the
-        # effective keep_resident / mlock (which /status echoes): a last-wins user
-        # --mmap / --no-mlock in the extras flips the effective state, so an identical
-        # re-request must still dedupe rather than needlessly reload the healthy server;
-        # consistent with the raw gpu-pin compare above (#7239).
+        # Compare the RAW requested residency, not the effective keep_resident / mlock
+        # (a last-wins --mmap / --no-mlock flips it), so a re-request dedupes (#7239).
         if bool(request.keep_model_in_vram) != bool(
             getattr(llama_backend, "requested_keep_resident", False)
         ):
@@ -3241,10 +3230,8 @@ def _request_matches_loaded_settings(
         and llama_backend.mtp_draft_path
     ):
         # An explicit clear (field present but empty) while a drafter is loaded must
-        # reload to re-resolve the drafter (drop it, or fall back to an auto sibling),
-        # else llama-server keeps the old drafter until an explicit unload. An omitted
-        # field (the common Apply / auto-switch reload path) keeps the current drafter,
-        # so those still dedupe (#7239).
+        # reload to re-resolve it (drop it or fall back to an auto sibling). An omitted
+        # field (the common Apply reload path) keeps the drafter and still dedupes (#7239).
         return False
     # Compare requested n_ctx (not effective) so VRAM-cap doesn't mask an
     # Auto-vs-explicit slider flip.
@@ -3302,9 +3289,8 @@ def _request_matches_loaded_settings(
         if _req_gpu_ids != llama_backend.gpu_ids:
             return False
     else:
-        # Compare the raw requested pin against the raw recorded pin (not the
-        # fit-narrowed effective gpu_ids) so a narrowed-then-re-sent pick still
-        # dedupes; consistent with the non-diffusion block above (#7239).
+        # Compare the raw requested pin (not the fit-narrowed gpu_ids) so a
+        # narrowed-then-re-sent pick still dedupes; consistent with above (#7239).
         _req_gpu_ids = sorted(request.gpu_ids) if request.gpu_ids else None
         if _req_gpu_ids != (getattr(llama_backend, "requested_gpu_ids", None) or None):
             return False
@@ -3380,12 +3366,11 @@ def _request_matches_loaded_settings(
     # stored launch path may be a snapshot symlink while detect_mtp_file
     # returns the resolved blob.
     #
-    # Only the AUTO-detected sibling is re-checked here: an explicit (request or
-    # inherited) drafter is already governed by the explicit-path compare above, and
-    # detect_mtp_file returns the sibling (or None), so re-checking an explicit
-    # non-sibling drafter would mismatch and needlessly reload every repeat -- and turn
-    # a harmless re-Apply during training into a spurious 409. Skip it for an explicit
-    # request draft or an explicit stored drafter (#7239).
+    # Only the AUTO-detected sibling is re-checked: an explicit (request/inherited)
+    # drafter is governed by the explicit-path compare above, and detect_mtp_file
+    # returns the sibling (or None), so re-checking a non-sibling would mismatch,
+    # needlessly reload, and risk a spurious 409 during training. Skip it for an
+    # explicit request draft or explicit stored drafter (#7239).
     if (
         req_mode in ("auto", "mtp", "mtp+ngram")
         and llama_backend.gguf_path
@@ -3900,10 +3885,9 @@ def _remote_gguf_companion_bytes(
     """Bytes of MTP/mmproj companion GGUFs llama-server auto-downloads. 0 on error,
     so it can only add headroom, never refuse a load by itself.
 
-    ``include_mtp`` gates the repo-root ``mtp-*.gguf`` drafter the same way the
-    local branch gates ``gguf_mtp_file``: the launch only fetches and loads it when
-    the effective speculative mode emits ``--model-draft``, so a remote drafter
-    picked with speculative_type off/ngram (or a user-owned --spec-type) must not
+    ``include_mtp`` gates the repo-root ``mtp-*.gguf`` drafter (like the local branch
+    gates ``gguf_mtp_file``): only counted when the effective mode emits
+    ``--model-draft``, so a drafter picked with off/ngram or a user --spec-type doesn't
     inflate the estimate and 409 a load that fits without it (#7239)."""
     try:
         from huggingface_hub import model_info
@@ -3968,10 +3952,9 @@ def _estimate_gguf_required_gb(
     cache for local files (unreadable pre-download for remote). None when nothing
     resolves so the caller default-denies.
 
-    ``include_mtp_draft`` gates the separate MTP drafter (``gguf_mtp_file``): the
-    launch only loads it when the effective speculative mode actually emits
-    ``--model-draft`` (MTP), so a draft picked with speculative_type off/ngram
-    must not inflate the estimate and 409 a load that would fit (#7239)."""
+    ``include_mtp_draft`` gates the separate MTP drafter (``gguf_mtp_file``): only
+    counted when the effective mode emits ``--model-draft``, so a draft picked with
+    off/ngram doesn't inflate the estimate and 409 a load that would fit (#7239)."""
     try:
         total_bytes = 0
         main = getattr(config, "gguf_file", None)
@@ -4024,14 +4007,12 @@ def _classify_diffusion_gguf(config: ModelConfig) -> Optional[bool]:
     identity = " ".join(
         str(getattr(config, attr, "") or "") for attr in ("identifier", "gguf_hf_repo", "gguf_file")
     ).lower()
-    # Name-only hint, used ONLY as a pre-download fallback. Restricted to the
-    # known DiffusionGemma runner family: a bare "diffusion" substring is common
-    # in ordinary text-model names/paths (e.g. a "stable-diffusion-prompt"
-    # generator, or any repo cloned under a ".../diffusion/..." directory), and
-    # treating those as diffusion falsely rejects a valid llama-server GGUF on a
-    # Vulkan build with gpu_ids (#7239). Normalize away non-alphanumerics so
-    # "DiffusionGemma", "diffusion-gemma" and "diffusion_gemma" all collapse to
-    # the "diffusiongemma" token. The local header below stays authoritative.
+    # Name-only hint, used ONLY as a pre-download fallback, scoped to the
+    # DiffusionGemma runner family: a bare "diffusion" substring is common in
+    # ordinary text-model names/paths (e.g. "stable-diffusion-prompt"), and treating
+    # those as diffusion falsely rejects a valid Vulkan+gpu_ids GGUF (#7239). Normalize
+    # non-alphanumerics so "DiffusionGemma"/"diffusion-gemma" collapse to one token.
+    # The local header below stays authoritative.
     name_says_diffusion = "diffusiongemma" in _re.sub(r"[^a-z0-9]+", "", identity)
 
     try:
@@ -4043,26 +4024,22 @@ def _classify_diffusion_gguf(config: ModelConfig) -> Optional[bool]:
                 from hub.utils.gguf import resolve_local_gguf_path
                 main = resolve_local_gguf_path(repo, variant)
         if main and Path(main).is_file():
-            # The local GGUF header is authoritative: it is the same probe the
-            # loader uses, so the routing decision here matches the actual
-            # runner and cannot be fooled by a "diffusion"-flavored name/path.
+            # The local GGUF header is authoritative (same probe the loader uses), so
+            # it can't be fooled by a "diffusion"-flavored name/path.
             probe = LlamaCppBackend()
             probe._read_gguf_metadata(str(main))
             if probe.is_diffusion:
                 return True
-            # A successfully decoded architecture proves that this is a normal
-            # llama-server GGUF, regardless of what its name suggests. No
-            # architecture means the lightweight probe could not establish the
-            # routing decision, so fall through to the name hint below.
+            # A decoded architecture proves a normal llama-server GGUF; no architecture
+            # means the probe was inconclusive, so fall through to the name hint below.
             if getattr(probe, "_architecture", None):
                 return False
     except Exception as e:
         logger.debug("Could not identify diffusion GGUF for training guard: %s", e)
 
-    # Header not locally available (remote uncached) or inconclusive. Return
-    # True only for the DiffusionGemma runner family by name; otherwise None
-    # keeps an unknown remote GGUF guarded as potentially diffusion until its
-    # downloaded header proves otherwise (do not misclassify it as normal).
+    # Header unavailable (remote uncached) or inconclusive: True only for the
+    # DiffusionGemma name family; otherwise None keeps an unknown remote GGUF guarded
+    # as potentially diffusion until its header proves otherwise.
     return True if name_says_diffusion else None
 
 
@@ -4114,12 +4091,9 @@ def _guard_chat_load_against_training(
             cpu_only = LlamaCppBackend._effective_gpu_count() == 0,
         )
 
-    # Only size a separate MTP drafter (gguf_mtp_file, set from an explicit
-    # draft_model_path) when the effective launch will actually emit
-    # --model-draft. _build_speculative_flags never loads it for off/ngram/
-    # ngram-simple, and suppresses its own emission entirely when the user owns
-    # --spec-type via extras, so counting the draft file in those cases would
-    # 409 a load that fits without it (#7239).
+    # Only size the separate MTP drafter (gguf_mtp_file) when the launch will emit
+    # --model-draft: off/ngram/ngram-simple and a user-owned --spec-type never load
+    # it, so counting it then would 409 a load that fits without it (#7239).
     from core.inference.llama_cpp import _canonicalize_spec_mode, _extra_args_set_spec_type
 
     _spec_mode = _canonicalize_spec_mode(speculative_type) or "auto"
@@ -4142,9 +4116,9 @@ def _guard_chat_load_against_training(
         else None
     )
 
-    # A Vulkan GGUF selection uses ggml Vulkan ordinals (a separate index space
-    # from CUDA physical ids); flag it so the guard sizes against the visible pool
-    # instead of resolving ordinals against the CUDA set (#7239). Never raise here.
+    # A Vulkan GGUF selection uses ggml Vulkan ordinals (separate index space from
+    # CUDA ids); flag it so the guard sizes against the visible pool instead of
+    # resolving ordinals against the CUDA set (#7239). Never raise here.
     is_vulkan = False
     if is_gguf:
         try:
@@ -4284,14 +4258,12 @@ def _resolve_inherited_extra_args(
 def _resolve_inherited_draft_path(
     request, config: ModelConfig, model_identifier: str
 ) -> Optional[str]:
-    """Explicit MTP drafter to carry into a GGUF reload that OMITTED
-    draft_model_path. Mirrors _resolve_inherited_extra_args' omitted-field
-    inheritance: a settings-Apply / auto-switch reload of the SAME local GGUF does
-    not round-trip the drafter field, and the auto-sibling resolver would replace a
-    user's explicit custom drafter with the mtp-*.gguf sibling (or drop it). Inherit
-    the live server's drafter so the reload keeps it. An explicit set/clear (field
-    present) owns the drafter and is handled by the caller, so this only fires when
-    the field is omitted (#7239)."""
+    """Explicit MTP drafter to carry into a GGUF reload that OMITTED draft_model_path.
+    Like _resolve_inherited_extra_args: a settings-Apply reload of the SAME local GGUF
+    does not round-trip the drafter field, and the auto-sibling resolver would replace
+    a user's custom drafter with the mtp-*.gguf sibling. Inherit the live drafter so
+    the reload keeps it. An explicit set/clear is handled by the caller, so this only
+    fires when the field is omitted (#7239)."""
     if "draft_model_path" in getattr(request, "model_fields_set", set()):
         return None  # explicit set or clear owns the drafter
     if not getattr(config, "is_gguf", False) or getattr(config, "gguf_hf_repo", None):
@@ -4300,11 +4272,9 @@ def _resolve_inherited_draft_path(
     stored = getattr(llama_backend, "mtp_draft_path", None)
     if not stored:
         return None
-    # Only inherit an EXPLICIT drafter. An auto-detected sibling must NOT be pinned
-    # here: the reload dedupe deliberately re-detects the on-disk sibling (so a
-    # renamed/updated mtp-*.gguf is adopted), but re-pinning the stale sibling into
-    # the config would defeat that and load_model would then reclassify it explicit,
-    # permanently disabling the sibling re-check (#7239).
+    # Only inherit an EXPLICIT drafter: the reload deliberately re-detects the on-disk
+    # sibling, so re-pinning a stale auto sibling here would defeat that and let
+    # load_model reclassify it explicit, permanently disabling the re-check (#7239).
     if not getattr(llama_backend, "mtp_draft_explicit", False):
         return None
     # Only inherit when the SAME local GGUF is already loaded, so the drafter can't
@@ -4538,9 +4508,8 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     speculative_type = llama_backend.requested_spec_mode,
                     spec_draft_n_max = llama_backend.spec_draft_n_max,
                     tensor_parallel = llama_backend.tensor_parallel,
-                    # Echo the live server's residency/mlock/GPU selection so the
-                    # dedupe response matches the success path (else Pydantic
-                    # defaults would report them as off) (#7239).
+                    # Echo the live server's residency/mlock so the dedupe response
+                    # matches the success path (else Pydantic defaults them off) (#7239).
                     keep_model_in_vram = llama_backend.keep_resident,
                     mlock = llama_backend.mlock,
                     gpu_memory_mode = llama_backend.gpu_memory_mode,
@@ -4616,11 +4585,10 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # Normalize gpu_ids: empty list means auto-selection, same as None
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
 
-        # GGUF per-GPU selection (issue #7164 / #7239): validate the requested
-        # physical ids up front (before the training guard) so a bad pick is a
-        # clean 400, not masked by a VRAM 409. Rejects negative / out-of-range /
-        # duplicate ids and UUID/MIG parents, and resolves them so load_model can
-        # pin llama-server to exactly these GPUs. None = auto.
+        # GGUF per-GPU selection (issue #7164 / #7239): validate the requested ids up
+        # front (before the training guard) so a bad pick is a clean 400, not masked by
+        # a VRAM 409. Rejects negative / out-of-range / duplicate ids and UUID/MIG
+        # parents, and resolves them so load_model can pin exactly these GPUs. None = auto.
         gguf_gpu_ids: Optional[List[int]] = None
         if config.is_gguf and effective_gpu_ids is not None:
             from utils.hardware import DeviceType, get_device
@@ -4639,21 +4607,17 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     ),
                 )
 
-            # A Vulkan build selects by ggml Vulkan ordinal (--device VulkanN),
-            # a separate index space from CUDA physical ids that may be empty
-            # under a CPU-only torch; validate as ordinals so a valid Vulkan
-            # selection is not rejected against the CUDA parent-visible set (#7239).
+            # A Vulkan build selects by ggml Vulkan ordinal (--device VulkanN), a
+            # separate index space from CUDA ids that may be empty under CPU-only torch;
+            # validate as ordinals so a valid selection isn't rejected against the CUDA
+            # parent-visible set (#7239).
             _gguf_is_vulkan = LlamaCppBackend._is_vulkan_backend()
 
-            # A Vulkan build's gpu_ids are ggml Vulkan ordinals, but the diffusion
-            # runner (DiffusionGemma) pins its visual-server child by CUDA physical
-            # index (CUDA_VISIBLE_DEVICES=<ordinal>), a space with no defined mapping
-            # to Vulkan ordinals -- so a Vulkan pin would select the wrong physical
-            # GPU or none at all. Reject an explicit pin for a diffusion GGUF on a
-            # Vulkan build up front (before any load / kill). A valid Vulkan pin for
-            # the normal llama-server --device VulkanN path is still accepted (#7239).
-            # _classify_diffusion_gguf returns None when the header is not yet cached;
-            # that residual is caught on the diffusion branch inside load_model.
+            # The diffusion runner pins its child by CUDA physical index, which has no
+            # mapping to Vulkan ordinals, so reject an explicit pin for a diffusion GGUF
+            # on a Vulkan build up front (before any load / kill); the normal
+            # --device VulkanN path is still accepted. _classify_diffusion_gguf returns
+            # None for an uncached header, caught later on load_model's diffusion branch.
             if _gguf_is_vulkan and _classify_diffusion_gguf(config) is True:
                 raise HTTPException(
                     status_code = 400,
@@ -4700,21 +4664,18 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     "architectures)"
                 )
 
-        # Size an explicit user drafter (issue #7239) into the training guard: the
-        # local GGUF branch assigns it to the config only after this guard runs, so
-        # account for it here too or a load the guard permits could OOM the active
-        # training run with the extra --model-draft VRAM. Local GGUF only (the field
-        # is ignored for HF-repo and non-GGUF loads). A missing/typo path adds 0 to
-        # the estimate (it is size-checked on disk) and is rejected in the load branch.
+        # Size an explicit user drafter (issue #7239) into the training guard: the load
+        # branch assigns it to the config only after this guard runs, so account for it
+        # here too or a permitted load could OOM training with the extra --model-draft
+        # VRAM. Local GGUF only. A missing/typo path adds 0 (size-checked on disk) and
+        # is rejected in the load branch.
         if config.is_gguf and not config.gguf_hf_repo:
             if request.draft_model_path:
                 config.gguf_mtp_file = request.draft_model_path
             else:
-                # Omitted field on a same-local-GGUF reload: inherit the live
-                # server's explicit drafter so an Apply / auto-switch reload keeps
-                # it rather than dropping back to the auto sibling (the reload only
-                # sets gguf_mtp_file when draft_model_path is truthy, so without this
-                # the custom drafter is silently lost) (#7239).
+                # Omitted field on a same-local-GGUF reload: inherit the live explicit
+                # drafter so an Apply reload keeps it rather than dropping to the auto
+                # sibling (the reload only sets gguf_mtp_file for a truthy field) (#7239).
                 _inherited_draft = _resolve_inherited_draft_path(request, config, model_identifier)
                 if _inherited_draft:
                     config.gguf_mtp_file = _inherited_draft
@@ -4809,9 +4770,8 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 n_cpu_moe = request.n_cpu_moe,
                 tensor_split = request.tensor_split,
                 n_parallel = _n_parallel,
-                # Issue #7164: explicit GPU pin (resolved/validated ids) +
-                # keep-resident (--no-mmap + idle-unload opt-out) + host page
-                # lock (--mlock).
+                # Issue #7164: explicit GPU pin + keep-resident (--no-mmap +
+                # idle-unload opt-out) + host page lock (--mlock).
                 gpu_ids = gguf_gpu_ids,
                 keep_model_in_vram = request.keep_model_in_vram,
                 mlock = request.mlock,
@@ -4824,17 +4784,12 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                     hf_token = request.hf_token,
                 )
             else:
-                # Local mode: llama-server loads via -m <path>
-                # Explicit user-selected draft (MTP) GGUF (issue #7164) overrides
-                # the auto-detected sibling. Validated with the same native-path
-                # companion check as an auto drafter so it can't escape the grant.
-                # Whether the effective speculative mode will actually emit
-                # --model-draft for this drafter. _build_speculative_flags loads a
-                # separate drafter only for auto/mtp/mtp+ngram with no user
-                # --spec-type; off/ngram/ngram-simple and a user-owned --spec-type
-                # never launch it. Validating (or 400ing) an unused draft path would
-                # reject a load that runs fine without the drafter (#7239). Uses the
-                # same spec-canon / extras helpers the launch path uses so they agree.
+                # Local mode: llama-server loads via -m <path>. An explicit user draft
+                # (issue #7164) overrides the auto sibling.
+                # Whether the effective mode will emit --model-draft: only auto/mtp/
+                # mtp+ngram with no user --spec-type launch a drafter, so validating an
+                # unused draft path would reject a load that runs fine without it (#7239).
+                # Uses the same spec-canon / extras helpers the launch path uses.
                 _effective_mtp = (
                     _canonicalize_spec_mode(request.speculative_type) or "auto"
                 ) not in ("off", "ngram", "ngram-simple") and not _extra_args_set_spec_type(
@@ -4842,14 +4797,11 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                 )
                 if request.draft_model_path:
                     config.gguf_mtp_file = request.draft_model_path
-                    # Non-native local loads skip the native companion check below,
-                    # so validate the explicit drafter here: load_model treats a
-                    # missing drafter as optional and drops it, which would silently
-                    # load without the requested draft on a typo. Surface a 400
-                    # instead of a silent no-op (#7239). Only when the drafter will
-                    # actually launch -- a stale path under an off/ngram/user
-                    # --spec-type mode is never emitted, so it must not 400 a load
-                    # that would run without it.
+                    # Non-native local loads skip the native companion check below, so
+                    # validate the explicit drafter here (load_model would silently drop
+                    # a typo'd optional drafter): surface a 400 instead of a no-op. Only
+                    # when it will actually launch, so a stale path under off/ngram/user
+                    # --spec-type doesn't 400 a load that runs without it (#7239).
                     if (
                         _effective_mtp
                         and not native_grant_backed
@@ -4865,19 +4817,17 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
                             config.gguf_mmproj_file, config.gguf_file, "vision companion"
                         )
                     if config.gguf_mtp_file:
-                        # The drafter is optional (unlike mmproj for a vision
-                        # model): drop it rather than fail the load. An explicit
-                        # user draft_model_path is a hard error instead, so a typo
-                        # is surfaced rather than silently ignored.
+                        # The drafter is optional (unlike mmproj): drop it rather than
+                        # fail the load. An explicit user draft_model_path is a hard
+                        # error instead, so a typo is surfaced not silently ignored.
                         try:
                             _validate_native_gguf_companion(
                                 config.gguf_mtp_file, config.gguf_file, "MTP drafter"
                             )
                         except HTTPException as exc:
-                            # A bad explicit drafter is a hard error only when it
-                            # will actually launch; under off/ngram/user --spec-type
-                            # it is never emitted, so drop it rather than 400 a load
-                            # that runs without it (#7239).
+                            # A bad explicit drafter is a hard error only when it will
+                            # launch; under off/ngram/user --spec-type drop it rather
+                            # than 400 a load that runs without it (#7239).
                             if request.draft_model_path and _effective_mtp:
                                 raise
                             logger.warning("Dropping MTP drafter for native load: %s", exc.detail)
@@ -5323,12 +5273,10 @@ async def validate_model(
         # Apply the same training coexistence policy as /load before the frontend
         # unloads the current model.
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
-        # Mirror /load: validate GGUF + gpu_ids the same way (resolve against the
-        # parent-visible set, Vulkan ordinals for a Vulkan build) so a preflight of
-        # the intended payload agrees with the follow-up load instead of rejecting a
-        # selection /load accepts (#7239). XPU-host picks are rejected like /load
-        # (no defined mapping from the picker's torch-xpu ordinals to the
-        # launcher's device spaces).
+        # Mirror /load: validate GGUF + gpu_ids the same way (parent-visible set, or
+        # Vulkan ordinals for a Vulkan build) so a preflight agrees with the follow-up
+        # load instead of rejecting a selection /load accepts (#7239). XPU-host picks are
+        # rejected like /load (torch-xpu ordinals have no launcher device mapping).
         if config.is_gguf and effective_gpu_ids is not None:
             from utils.hardware import DeviceType, get_device
             from utils.hardware.hardware import resolve_requested_gpu_ids
@@ -5343,14 +5291,11 @@ async def validate_model(
                 )
             _gguf_is_vulkan = LlamaCppBackend._is_vulkan_backend()
 
-            # Mirror /load's diffusion+Vulkan rejection so this preflight agrees
-            # with the follow-up load instead of passing here and letting the
-            # frontend unload the working model before /load returns the same
-            # 400. The diffusion runner pins its visual-server child by CUDA
-            # physical index (CUDA_VISIBLE_DEVICES=<ordinal>), which has no
-            # defined mapping to ggml Vulkan ordinals, so an explicit pin cannot
-            # be honored (#7239). None (remote-uncached header) is not rejected
-            # here, matching /load, whose diffusion branch catches that residual.
+            # Mirror /load's diffusion+Vulkan rejection so this preflight agrees with
+            # the follow-up load instead of passing here and letting the frontend unload
+            # the working model before /load returns the same 400. The diffusion runner
+            # pins by CUDA physical index, unmapped to Vulkan ordinals (#7239). None
+            # (remote-uncached header) isn't rejected here, matching /load.
             if _gguf_is_vulkan and _classify_diffusion_gguf(config) is True:
                 raise HTTPException(
                     status_code = 400,
@@ -5369,14 +5314,11 @@ async def validate_model(
             except ValueError as exc:
                 raise HTTPException(status_code = 400, detail = str(exc)) from exc
 
-            # Mirror /load's Vulkan-ordinal existence check (load_model validates
-            # the requested ordinals are a subset of the ggml-probed set BEFORE
-            # the Phase 1 kill). Without this, a stale pin like [99] passes
-            # /validate, the frontend unloads the current model, and only then
-            # does /load reject the absent ordinal -- the exact asymmetric-fix
-            # bug this PR removes. CUDA ids are already range-checked above by
-            # resolve_requested_gpu_ids; Vulkan ordinals deliberately are not,
-            # so probe them here with the same issubset check /load uses (#7239).
+            # Mirror /load's Vulkan-ordinal existence check (subset of the ggml-probed
+            # set BEFORE the Phase 1 kill). Without it, a stale pin like [99] passes
+            # /validate, the frontend unloads the model, and only then does /load reject
+            # the absent ordinal -- the asymmetric-fix bug this PR removes. CUDA ids are
+            # range-checked above; Vulkan ordinals are not, so probe them here (#7239).
             if _gguf_is_vulkan and resolved_gpu_ids:
                 _binary = LlamaCppBackend._find_llama_server_binary()
                 if _binary:
@@ -5457,17 +5399,13 @@ async def validate_model(
             ):
                 effective_load_in_4bit = False
         # Mirror /load's explicit-drafter handling so this preflight agrees with the
-        # follow-up load. Size the drafter into the config (the guard's own
-        # effective-MTP gate then counts it exactly as /load does) and reject a
-        # typo'd path with the same effective-MTP gating the load uses, so the typo
-        # surfaces here instead of after the frontend unloaded the working model.
-        # Local GGUF only; the field is ignored for HF-repo and non-GGUF loads (#7239).
+        # follow-up load: size the drafter into the config and reject a typo'd path
+        # here (before the frontend unloads the working model). Local GGUF only (#7239).
         if is_gguf and not getattr(config, "gguf_hf_repo", None):
             # Effective-MTP gate computed once (matches /load): the drafter is only
-            # sized, existence-checked, and companion-validated when it will launch.
-            # Thread the request's own extras (like /load) so an explicit --spec-type
-            # in llama_extra_args suppresses the drafter here too; omitted (None) still
-            # inherits the previous same-model load's extras (#7239).
+            # sized/checked when it will launch. Thread the request's own extras so a
+            # user --spec-type suppresses the drafter; omitted (None) inherits the
+            # previous same-model load's extras (#7239).
             _val_extra_args = _resolve_inherited_extra_args(
                 request, config, model_identifier, getattr(request, "llama_extra_args", None)
             )
@@ -5492,19 +5430,15 @@ async def validate_model(
                     )
             else:
                 # draft_model_path OMITTED: mirror /load's inheritance of the active
-                # explicit drafter on a same-local-GGUF reload, so the guard's coexistence
-                # estimate sizes the SAME drafter the follow-up /load will run. Without
-                # this, validate sizes the smaller no-draft estimate and can approve; the
-                # frontend then unloads the current model and /load inherits the drafter,
-                # sizes the LARGER estimate and 409s after the model is already gone (#7239).
+                # explicit drafter on a same-local-GGUF reload, so the estimate sizes the
+                # SAME drafter /load will run. Otherwise validate approves the smaller
+                # no-draft estimate and /load 409s after the model is already gone (#7239).
                 _inherited_draft = _resolve_inherited_draft_path(request, config, model_identifier)
                 if _inherited_draft:
                     config.gguf_mtp_file = _inherited_draft
-            # Native-lease loads skip the plain existence check above; mirror /load's
-            # companion validation (same-directory containment) so a drafter outside the
-            # leased GGUF's folder or a typo surfaces here as a 400 instead of after the
-            # frontend unloaded the working model. An explicit path is a hard error; an
-            # inherited drafter is dropped rather than failing the preflight (#7239).
+            # Native-lease loads skip the plain existence check; mirror /load's companion
+            # containment check so a drafter outside the leased folder or a typo 400s here
+            # instead of after the unload. Explicit path = hard error; inherited = dropped.
             if native_grant_backed and config.gguf_mtp_file and _val_effective_mtp:
                 try:
                     _validate_native_gguf_companion(
@@ -5518,10 +5452,9 @@ async def validate_model(
         # so it must not be refused by the training guard. Real loads validate
         # without include_context_length and /load applies the guard again.
         if not request.include_context_length:
-            # Match /load's inherited llama.cpp extras and parallel slot count so
-            # validation cannot pass a smaller estimate than the subsequent load.
-            # Pass the request's own extras (like /load) so an explicit --spec-type
-            # off is honoured; omitted (None) inherits the previous load's extras.
+            # Match /load's inherited extras and parallel slot count so validation
+            # can't pass a smaller estimate than the load. Pass the request's own extras
+            # so a user --spec-type off is honoured; omitted (None) inherits (#7239).
             effective_extra_args = _resolve_inherited_extra_args(
                 request, config, model_identifier, getattr(request, "llama_extra_args", None)
             )
@@ -5541,10 +5474,9 @@ async def validate_model(
                     else 1
                 ),
                 gpu_memory_mode = request.gpu_memory_mode,
-                # Mirror the follow-up /load: the request now carries the intended
-                # speculative mode (defaulting to auto when omitted, which keeps
-                # counting an auto-detected drafter) and any explicit drafter was
-                # sized into config.gguf_mtp_file above, so the estimate matches.
+                # Mirror /load: the request carries the intended speculative mode
+                # (auto when omitted) and any explicit drafter was sized into
+                # config.gguf_mtp_file above, so the estimate matches.
                 speculative_type = request.speculative_type,
             )
 

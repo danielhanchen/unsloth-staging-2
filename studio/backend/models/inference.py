@@ -240,9 +240,8 @@ class ValidateModelRequest(BaseModel):
         "Opt-in so the normal load preflight doesn't pay for a cache scan it doesn't need.",
     )
     # Mirror the follow-up /load's speculative choices so the coexistence estimate
-    # sizes the drafter the same way. Without these, validate always canonicalizes
-    # to "auto" and counts an auto drafter, 409ing a load that fits with the drafter
-    # off (or under a user --spec-type), and never sees a typo'd explicit draft path
+    # sizes the drafter the same way. Without these, validate canonicalizes to "auto"
+    # and 409s a load that fits with the drafter off, or misses a typo'd draft path
     # that then 400s in /load after the frontend unloaded the working model (#7239).
     speculative_type: Optional[str] = Field(
         None,

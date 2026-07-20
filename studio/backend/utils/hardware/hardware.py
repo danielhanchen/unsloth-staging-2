@@ -1228,11 +1228,10 @@ def resolve_requested_gpu_ids(
         return [] if is_vulkan else parent_visible_ids
 
     if is_vulkan:
-        # A Vulkan llama.cpp build selects GPUs by ggml Vulkan ordinal
-        # (--device VulkanN), a separate index space from CUDA/ROCm physical
-        # ids that is enumerated independently and may be empty under a CPU-only
-        # torch. The CUDA parent-visible / physical-count checks below therefore
-        # do not apply; only reject malformed ordinals (issue #7239).
+        # A Vulkan build selects by ggml Vulkan ordinal (--device VulkanN), a separate
+        # index space from CUDA/ROCm ids that may be empty under CPU-only torch. The
+        # CUDA parent-visible / physical-count checks below do not apply; only reject
+        # malformed ordinals (issue #7239).
         if len(set(requested_ids)) != len(requested_ids):
             raise ValueError(f"Invalid gpu_ids {requested_ids}: duplicate GPU IDs are not allowed.")
         negative_ids = [gpu_id for gpu_id in requested_ids if gpu_id < 0]

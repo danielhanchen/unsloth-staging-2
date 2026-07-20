@@ -3,12 +3,11 @@
 
 """Route-level regression tests for the GGUF load options (issue #7164, Codex #7239):
 
-- an explicit draft (--model-draft) is sized into the training coexistence guard
-  before the load, so a load the guard permits cannot OOM active training;
-- an explicit local draft path is validated (404 -> 400) instead of silently
-  loading without the requested drafter;
-- /validate resolves GGUF gpu_ids the same way /load does, so a preflight of the
-  intended payload is not rejected for a selection /load accepts.
+- an explicit draft is sized into the training guard before the load, so a permitted
+  load cannot OOM active training;
+- an explicit local draft path is validated (400) instead of silently loading without it;
+- /validate resolves GGUF gpu_ids the same way /load does, so a preflight is not
+  rejected for a selection /load accepts.
 """
 
 import asyncio
@@ -276,11 +275,10 @@ def test_validate_surfaces_invalid_gguf_gpu_ids_from_resolution():
 
 
 def test_classify_diffusion_gguf_ignores_bare_diffusion_name(tmp_path):
-    """A GGUF whose name/path merely contains "diffusion" (but not the DiffusionGemma
-    runner token) with a LOCAL header that decodes an ordinary architecture must NOT be
-    classified as diffusion: the local header is authoritative, so the Vulkan gpu_ids
-    reject cannot falsely fire on a normal llama-server GGUF (Codex #7239). The name-only
-    hint stays scoped to the "diffusiongemma" family for a remote/uncached header."""
+    """A GGUF whose name merely contains "diffusion" (not the DiffusionGemma token) with
+    a LOCAL header decoding an ordinary architecture must NOT classify as diffusion: the
+    header is authoritative, so the Vulkan gpu_ids reject can't falsely fire. The name
+    hint stays scoped to "diffusiongemma" for a remote/uncached header (#7239)."""
     route = _load_route_module("gguf_opts_regression_classify_diffusion")
 
     # LOCAL header authoritative: a real file whose probe decodes a non-diffusion arch.
@@ -486,10 +484,9 @@ def test_load_mtp_still_rejects_missing_draft_path():
 
 
 def test_omitted_draft_inherits_loaded_custom_drafter(tmp_path):
-    """A local GGUF serving an EXPLICIT custom drafter, reloaded by a request that
-    OMITS draft_model_path, must keep the drafter rather than drop it back to the
-    auto sibling. _resolve_inherited_draft_path returns the live drafter for the
-    omitted-field reload of the same local GGUF (Codex #7239)."""
+    """A local GGUF serving an EXPLICIT custom drafter, reloaded by a request that OMITS
+    draft_model_path, must keep the drafter rather than drop to the auto sibling.
+    _resolve_inherited_draft_path returns the live drafter for that reload (#7239)."""
     route = _load_route_module("gguf_opts_regression_inherit_draft")
     gguf = tmp_path / "model.gguf"
     gguf.write_bytes(b"gguf-stub")
@@ -707,12 +704,10 @@ def test_validate_rejects_missing_draft_under_mtp():
 
 
 def test_validate_omitted_draft_inherits_active_drafter(tmp_path):
-    """/validate now mirrors /load's omitted-field inheritance: when a custom drafter
-    is live on the SAME local GGUF and the ValidateModelRequest OMITS draft_model_path,
-    the training guard must see the inherited drafter on the config so its estimate
-    matches the follow-up /load (which inherits the same drafter). Otherwise validate
-    sizes the smaller no-draft estimate, approves, the frontend unloads the model, and
-    /load then 409s after the model is already gone (Codex #7239)."""
+    """/validate mirrors /load's omitted-field inheritance: with a custom drafter live
+    on the SAME local GGUF and draft_model_path omitted, the guard must see the inherited
+    drafter so its estimate matches the follow-up /load. Otherwise validate approves the
+    smaller no-draft estimate and /load 409s after the model is already gone (#7239)."""
     route = _load_route_module("gguf_opts_regression_validate_inherit_omitted")
     gguf = tmp_path / "m.gguf"
     gguf.write_bytes(b"gguf-stub")
@@ -827,10 +822,9 @@ def test_validate_omitted_draft_not_inherited_across_models(tmp_path):
 
 
 def test_validate_native_lease_drafter_outside_dir_rejected(tmp_path):
-    """A native-lease load skips the plain existence check, so /validate must run the
-    same companion containment check /load does: an explicit MTP drafter living OUTSIDE
-    the leased GGUF's directory has to 400 here (before the frontend unloads the working
-    model), not slip through to a 400 in /load after the model is already gone (#7239)."""
+    """A native-lease load skips the plain existence check, so /validate must run /load's
+    companion containment check: an explicit MTP drafter OUTSIDE the leased GGUF's dir has
+    to 400 here, not slip through to a 400 in /load after the model is gone (#7239)."""
     route = _load_route_module("gguf_opts_regression_validate_native_companion")
     leased_dir = tmp_path / "leased"
     leased_dir.mkdir()
@@ -873,10 +867,9 @@ def test_validate_native_lease_drafter_outside_dir_rejected(tmp_path):
 
 
 def test_validate_threads_llama_extra_args_spec_off(tmp_path):
-    """ValidateModelRequest now carries llama_extra_args, so a user --spec-type off in
-    the extras suppresses the auto-detected sibling drafter in the coexistence estimate
-    exactly as /load does. Without the threaded field validate canonicalizes to auto,
-    sizes the sibling and can 409 a load that fits with the drafter off (#7239)."""
+    """ValidateModelRequest now carries llama_extra_args, so a user --spec-type off
+    suppresses the auto sibling in the estimate exactly as /load does. Without it validate
+    canonicalizes to auto, sizes the sibling and can 409 a load that fits without it (#7239)."""
     route = _load_route_module("gguf_opts_regression_validate_extra_args_spec")
     gguf = tmp_path / "m.gguf"
     gguf.write_bytes(b"gguf-stub")
@@ -932,12 +925,10 @@ def _pinned_backend(
     mtp_draft_explicit = False,
     gguf_path = None,
 ):
-    """A live GGUF backend whose fit narrowed an explicit pin: requested_gpu_ids
-    keeps the RAW request; gpu_ids echoes the EFFECTIVE (narrowed) pin for /status.
-    requested_keep_resident / requested_mlock likewise keep the RAW residency request
-    while keep_resident / mlock echo the EFFECTIVE state (a last-wins extra --mmap /
-    --no-mlock flips them). Every non-selected field matches a default LoadRequest so
-    only the pin under test decides the dedupe (Codex #7239)."""
+    """A live GGUF backend whose fit narrowed an explicit pin: requested_* keep the
+    RAW request while gpu_ids / keep_resident / mlock echo the EFFECTIVE state. Every
+    other field matches a default LoadRequest so only the pin under test decides the
+    dedupe (Codex #7239)."""
     return SimpleNamespace(
         is_diffusion = False,
         gpu_ids = effective_gpu_ids,
@@ -967,11 +958,9 @@ def _pinned_backend(
 
 
 def test_dedupe_matches_narrowed_pin_resent_raw():
-    """The fitter narrowed an explicit [0, 1] to [0] and recorded gpu_ids=[0] for
-    /status, but the RAW request [0, 1] is kept as requested_gpu_ids. The frontend
-    re-sends [0, 1] on the next Apply; the dedupe must compare RAW-vs-RAW ([0, 1] ==
-    [0, 1]) and MATCH so the healthy server is not needlessly killed and reloaded
-    (correctness point 3) (Codex #7239)."""
+    """The fitter narrowed [0, 1] to [0] (recorded as gpu_ids for /status) but kept the
+    RAW [0, 1] as requested_gpu_ids. A re-sent [0, 1] must dedupe RAW-vs-RAW and MATCH so
+    the healthy server is not needlessly reloaded (Codex #7239)."""
     route = _load_route_module("gguf_opts_regression_dedupe_narrowed")
     backend = _pinned_backend(requested_gpu_ids = [0, 1], effective_gpu_ids = [0])
     request = LoadRequest(model_path = "/tmp/model.gguf", gpu_ids = [0, 1])
@@ -1014,11 +1003,9 @@ def test_dedupe_matches_auto_none_vs_none():
 
 
 def test_dedupe_matches_residency_negated_by_extra_resent():
-    """keep_model_in_vram=true launched with a last-wins extra --mmap records the
-    EFFECTIVE keep_resident=False for /status while the RAW request is kept as
-    requested_keep_resident=True. The frontend re-sends the identical request; the
-    dedupe must compare RAW-vs-RAW (true == true) and MATCH so a healthy keep-in-VRAM
-    server is not needlessly torn down and reloaded, mirroring the GPU-pin case (#7239)."""
+    """keep_model_in_vram=true launched with a last-wins --mmap records the EFFECTIVE
+    keep_resident=False but keeps requested_keep_resident=True. An identical re-request
+    must dedupe RAW-vs-RAW and MATCH, mirroring the GPU-pin case (#7239)."""
     route = _load_route_module("gguf_opts_regression_dedupe_residency_match")
     backend = _pinned_backend(
         requested_gpu_ids = None,
@@ -1085,10 +1072,9 @@ def test_dedupe_matches_mlock_negated_by_extra_resent():
 
 
 def test_dedupe_skips_sibling_check_for_explicit_inherited_drafter(monkeypatch):
-    """A local GGUF loaded with an explicit drafter that is NOT the auto sibling
-    (mtp_draft_explicit=True) must dedupe an identical repeat that inherits the
-    drafter (draft omitted). Without the explicit gate, the sibling check compares
-    detect_mtp_file (the sibling, or None) against the explicit stored path, mismatches,
+    """A local GGUF with an explicit non-sibling drafter (mtp_draft_explicit=True) must
+    dedupe an identical repeat that inherits it (draft omitted). Without the explicit
+    gate the sibling check compares detect_mtp_file against the stored path, mismatches,
     and needlessly reloads / risks a spurious 409 during training (Codex #7239)."""
     route = _load_route_module("gguf_opts_regression_dedupe_explicit_draft")
     # If the gate is wrong and the sibling check runs, detect returns a non-matching

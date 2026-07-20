@@ -18,10 +18,9 @@ def build_residency_flags(*, keep_model_in_vram: bool = False, mlock: bool = Fal
     """llama-server flags for the keep-resident / RAM options.
 
     keep_model_in_vram -> --no-mmap: stop memory-mapping the GGUF so under full
-    offload the weights live in VRAM with no mapped RAM copy (the LM Studio-style
-    save-RAM behaviour; source of the reporter's ~18/38 GB RAM). mlock -> --mlock
-    pins host pages; a separate opt-in since it increases RAM residency. Both
-    default off, so an omitted pair yields [] and the launch command is unchanged.
+    offload the weights live in VRAM with no RAM copy (LM Studio-style save-RAM).
+    mlock -> --mlock pins host pages; a separate opt-in since it grows RAM residency.
+    Both default off, so an omitted pair yields [] (launch command unchanged).
     """
     flags: list[str] = []
     if keep_model_in_vram:
@@ -39,13 +38,10 @@ def derive_residency_state(
 ) -> tuple[bool, bool]:
     """Return the (keep_resident, mlock) actually in effect for the FINAL argv.
 
-    Unsloth appends the user's llama_extra_args AFTER build_residency_flags, and
-    llama.cpp parses flags last-wins, so a user --mmap / --no-mlock in the extras
-    overrides Unsloth's --no-mmap / --mlock. Recording the requested booleans
-    would then misreport /status and let load dedupe treat an unlocked/unmapped
-    child as locked/resident. Scan the built command in order so the last
-    occurrence of each toggle pair wins, matching llama.cpp; fall back to the
-    requested boolean when neither flag of a pair is present.
+    User llama_extra_args are appended AFTER build_residency_flags and llama.cpp
+    parses last-wins, so a user --mmap / --no-mlock overrides Unsloth's flag.
+    Scan the command in order so the last occurrence of each toggle pair wins;
+    fall back to the requested boolean when neither flag of a pair is present.
     """
     keep_resident = bool(keep_model_in_vram)
     mlock_state = bool(mlock)

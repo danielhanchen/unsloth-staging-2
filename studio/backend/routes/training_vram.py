@@ -205,11 +205,10 @@ def can_load_chat_during_training(
     chat model against the free VRAM that remains). Sizes/places it the same way
     the loader will: HF auto reuses auto_select_gpu_ids; HF explicit requires an
     even-share per-GPU floor for device_map="balanced"; GGUF sizes from
-    required_override_gb over the visible pool. A Vulkan GGUF selection picks by
-    ggml Vulkan ordinal (a separate index space from CUDA physical ids), so its
-    requested_gpu_ids must NOT be resolved against the CUDA parent-visible set;
-    size it against the busiest visible GPU instead, or a valid ordinal outside
-    the CUDA set would raise -> invalid_gpu_ids -> the OOM check is bypassed.
+    required_override_gb over the visible pool. A Vulkan GGUF selection picks by ggml
+    Vulkan ordinal (separate index space from CUDA ids), so its requested_gpu_ids is
+    NOT resolved against the CUDA set (which would raise -> invalid_gpu_ids -> bypass
+    the OOM check); size against the busiest visible GPU instead.
     ``single_device_gpu`` is the exact physical device token selected by a
     single-device runner. `load_in_4bit` must be effective (LoRA can flip 4-bit
     -> 16-bit). Non-CUDA allows the load; default-deny on any CUDA case it can't
@@ -298,12 +297,11 @@ def can_load_chat_during_training(
             else:
                 free_vals = [free_by_index.get(selected_gpu, 0.0)]
         elif requested_gpu_ids and vulkan_gguf:
-            # Explicit Vulkan ordinal: ggml Vulkan ordinals are a separate index
-            # space from the CUDA/nvidia-smi index in free_by_index, so the pinned
-            # card cannot be mapped here. /load pins exactly --device Vulkan<ordinal>,
-            # so sizing against the whole pool would approve a card pinned onto a
-            # training-busy GPU using another GPU's free VRAM -> OOM. Size against the
-            # busiest visible GPU: approve only if it fits even the most loaded card.
+            # Explicit Vulkan ordinal: ggml ordinals can't be mapped to the CUDA index
+            # in free_by_index, and /load pins exactly one --device, so sizing against
+            # the whole pool could approve a card pinned onto a training-busy GPU -> OOM.
+            # Size against the busiest visible GPU: approve only if it fits the most
+            # loaded card.
             free_vals = [min(free_by_index.values())] if free_by_index else []
         elif requested_gpu_ids:
             # Invalid ids -> load_model 400s first, so don't block; missing id = 0.
