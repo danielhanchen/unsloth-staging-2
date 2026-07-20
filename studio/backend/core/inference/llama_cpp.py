@@ -1877,6 +1877,12 @@ class LlamaCppBackend:
         # Separate MTP drafter launched with the current model; reload-dedup
         # key so a drafter that appears next to the weights forces a reload.
         self._mtp_draft_path: Optional[str] = None
+        # Whether _mtp_draft_path is an EXPLICIT (user/inherited) drafter rather
+        # than the auto-detected on-disk sibling. The route's sibling-appearance
+        # dedupe only applies to an auto sibling; an explicit drafter is governed by
+        # the explicit-path compare, so re-checking it against detect_mtp_file (which
+        # returns the sibling or None) would needlessly reload every repeat (#7239).
+        self._mtp_draft_explicit: bool = False
         # Why MTP was disabled on the last load that asked for it (auto on an
         # MTP model, or forced mtp / mtp+ngram), else None. Drives the "update
         # llama.cpp" hint in the UI. "binary_no_mtp" / "binary_outdated" ->
@@ -2085,6 +2091,13 @@ class LlamaCppBackend:
     @property
     def mtp_draft_path(self) -> Optional[str]:
         return self._mtp_draft_path
+
+    @property
+    def mtp_draft_explicit(self) -> bool:
+        """Whether the active drafter is an explicit user/inherited path rather than
+        the auto-detected on-disk sibling; the route dedupe skips the sibling-appearance
+        check for an explicit drafter so an identical repeat does not reload (#7239)."""
+        return self._mtp_draft_explicit
 
     @property
     def spec_fallback_reason(self) -> Optional[str]:
@@ -8017,6 +8030,22 @@ class LlamaCppBackend:
                 self._gguf_path = model_path
                 self._hf_repo = hf_repo
                 self._mtp_draft_path = launch_mtp_draft_path
+                # Classify the drafter as explicit vs the auto-detected sibling, using
+                # the same detect_mtp_file the route dedupe uses, so an explicit
+                # (or inherited) drafter that is not the on-disk sibling is not
+                # re-checked against the sibling and needlessly reloaded (#7239).
+                self._mtp_draft_explicit = False
+                if launch_mtp_draft_path and self._gguf_path:
+                    from utils.models.model_config import detect_mtp_file
+
+                    try:
+                        _auto_sibling = detect_mtp_file(self._gguf_path)
+                        self._mtp_draft_explicit = not _auto_sibling or (
+                            Path(launch_mtp_draft_path).resolve()
+                            != Path(_auto_sibling).resolve()
+                        )
+                    except OSError:
+                        self._mtp_draft_explicit = True
                 # For local GGUF files, extract variant from filename if absent
                 if hf_variant:
                     self._hf_variant = hf_variant
@@ -8938,6 +8967,7 @@ class LlamaCppBackend:
             self._gguf_path = None
             self._hf_repo = None
             self._mtp_draft_path = None
+            self._mtp_draft_explicit = False
             self._spec_fallback_reason = None
             self._last_load_kwargs = None
             self._mtp_runtime_fallback_active = False

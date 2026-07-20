@@ -816,6 +816,9 @@ def _pinned_backend(
     requested_mlock = False,
     mlock = False,
     extra_args = (),
+    mtp_draft_path = None,
+    mtp_draft_explicit = False,
+    gguf_path = None,
 ):
     """A live GGUF backend whose fit narrowed an explicit pin: requested_gpu_ids
     keeps the RAW request; gpu_ids echoes the EFFECTIVE (narrowed) pin for /status.
@@ -831,7 +834,8 @@ def _pinned_backend(
         mlock = mlock,
         requested_keep_resident = requested_keep_resident,
         requested_mlock = requested_mlock,
-        mtp_draft_path = None,
+        mtp_draft_path = mtp_draft_path,
+        mtp_draft_explicit = mtp_draft_explicit,
         requested_n_ctx = 0,
         cache_type_kv = None,
         extra_args = list(extra_args),
@@ -846,7 +850,7 @@ def _pinned_backend(
         spec_fallback_reason = None,
         spec_draft_n_max = None,
         chat_template_override = None,
-        gguf_path = None,
+        gguf_path = gguf_path,
     )
 
 
@@ -960,5 +964,82 @@ def test_dedupe_matches_mlock_negated_by_extra_resent():
         mlock = True,
         llama_extra_args = ["--no-mlock"],
     )
+
+    assert route._request_matches_loaded_settings(request, backend) is True
+
+
+# ── the sibling-appearance dedupe applies to the AUTO sibling only, not an ──────
+# ── explicit/inherited drafter (which the explicit-path compare governs) (#7239) ─
+
+
+def test_dedupe_skips_sibling_check_for_explicit_inherited_drafter(monkeypatch):
+    """A local GGUF loaded with an explicit drafter that is NOT the auto sibling
+    (mtp_draft_explicit=True) must dedupe an identical repeat that inherits the
+    drafter (draft omitted). Without the explicit gate, the sibling check compares
+    detect_mtp_file (the sibling, or None) against the explicit stored path, mismatches,
+    and needlessly reloads / risks a spurious 409 during training (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_dedupe_explicit_draft")
+    # If the gate is wrong and the sibling check runs, detect returns a non-matching
+    # sibling; the test still passes only because the explicit drafter is gated out.
+    monkeypatch.setattr(route, "detect_mtp_file", lambda *a, **k: None)
+    backend = _pinned_backend(
+        requested_gpu_ids = None,
+        effective_gpu_ids = None,
+        gguf_path = "/tmp/model.gguf",
+        mtp_draft_path = "/custom/my-draft.gguf",
+        mtp_draft_explicit = True,
+    )
+    request = LoadRequest(model_path = "/tmp/model.gguf")  # draft_model_path omitted (inherit)
+
+    assert route._request_matches_loaded_settings(request, backend) is True
+
+
+def test_dedupe_reloads_on_explicit_drafter_path_change():
+    """Changing the explicit drafter path still reloads via the explicit-path compare,
+    independent of the sibling gate (#7239)."""
+    route = _load_route_module("gguf_opts_regression_dedupe_explicit_draft_change")
+    backend = _pinned_backend(
+        requested_gpu_ids = None,
+        effective_gpu_ids = None,
+        gguf_path = "/tmp/model.gguf",
+        mtp_draft_path = "/custom/my-draft.gguf",
+        mtp_draft_explicit = True,
+    )
+    request = LoadRequest(
+        model_path = "/tmp/model.gguf", draft_model_path = "/custom/other-draft.gguf"
+    )
+
+    assert route._request_matches_loaded_settings(request, backend) is False
+
+
+def test_dedupe_still_rechecks_auto_sibling_on_change(monkeypatch):
+    """For an AUTO-detected sibling drafter (mtp_draft_explicit=False), the sibling
+    check must still run: a sibling that changed on disk forces a reload (#7239)."""
+    route = _load_route_module("gguf_opts_regression_dedupe_auto_sibling_changed")
+    monkeypatch.setattr(route, "detect_mtp_file", lambda *a, **k: "/models/new-sibling.gguf")
+    backend = _pinned_backend(
+        requested_gpu_ids = None,
+        effective_gpu_ids = None,
+        gguf_path = "/tmp/model.gguf",
+        mtp_draft_path = "/models/old-sibling.gguf",
+        mtp_draft_explicit = False,
+    )
+    request = LoadRequest(model_path = "/tmp/model.gguf")  # draft omitted
+
+    assert route._request_matches_loaded_settings(request, backend) is False
+
+
+def test_dedupe_matches_auto_sibling_unchanged(monkeypatch):
+    """An unchanged auto sibling still dedupes (the sibling check runs and matches)."""
+    route = _load_route_module("gguf_opts_regression_dedupe_auto_sibling_same")
+    monkeypatch.setattr(route, "detect_mtp_file", lambda *a, **k: "/models/sib.gguf")
+    backend = _pinned_backend(
+        requested_gpu_ids = None,
+        effective_gpu_ids = None,
+        gguf_path = "/tmp/model.gguf",
+        mtp_draft_path = "/models/sib.gguf",
+        mtp_draft_explicit = False,
+    )
+    request = LoadRequest(model_path = "/tmp/model.gguf")  # draft omitted
 
     assert route._request_matches_loaded_settings(request, backend) is True

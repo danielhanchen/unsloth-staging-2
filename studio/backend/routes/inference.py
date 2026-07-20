@@ -3379,7 +3379,19 @@ def _request_matches_loaded_settings(
     # comparison above short-circuits first. Resolve both sides since the
     # stored launch path may be a snapshot symlink while detect_mtp_file
     # returns the resolved blob.
-    if req_mode in ("auto", "mtp", "mtp+ngram") and llama_backend.gguf_path:
+    #
+    # Only the AUTO-detected sibling is re-checked here: an explicit (request or
+    # inherited) drafter is already governed by the explicit-path compare above, and
+    # detect_mtp_file returns the sibling (or None), so re-checking an explicit
+    # non-sibling drafter would mismatch and needlessly reload every repeat -- and turn
+    # a harmless re-Apply during training into a spurious 409. Skip it for an explicit
+    # request draft or an explicit stored drafter (#7239).
+    if (
+        req_mode in ("auto", "mtp", "mtp+ngram")
+        and llama_backend.gguf_path
+        and not request.draft_model_path
+        and not getattr(llama_backend, "mtp_draft_explicit", False)
+    ):
         effective_extras = (
             request.llama_extra_args
             if request.llama_extra_args is not None
