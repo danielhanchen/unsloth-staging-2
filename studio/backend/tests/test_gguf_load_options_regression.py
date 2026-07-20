@@ -904,9 +904,7 @@ def test_validate_threads_llama_extra_args_spec_off(tmp_path):
         patch.object(
             route,
             "get_llama_cpp_backend",
-            return_value = SimpleNamespace(
-                extra_args = [], mtp_draft_path = None, gguf_path = str(gguf)
-            ),
+            return_value = SimpleNamespace(extra_args = [], mtp_draft_path = None, gguf_path = str(gguf)),
         ),
         patch.object(route, "_guard_chat_load_against_training", _capture_guard),
         patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
