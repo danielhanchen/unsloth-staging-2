@@ -104,11 +104,11 @@ _RO_ETC_FILES = (
     # for the nameserver; without it allow-listed HTTPS by hostname fails. add()
     # realpaths the systemd stub symlink. /etc/hosts stays denied on purpose.
     "/etc/resolv.conf",
-    "/etc/group",
-    # /etc/passwd deliberately NOT granted: granting it would let a sandboxed
-    # `cat /etc/passwd` enumerate every host account -- the path this confinement
-    # closes. The child runs fine without it (only libc identity lookups like
-    # getpwuid()/getpass.getuser() fail, catchably). Allow-list via
+    # /etc/passwd and /etc/group deliberately NOT granted: granting them would let
+    # a sandboxed `cat` enumerate every host account and group membership -- the
+    # reconnaissance this confinement closes. Interpreter and shell startup do not
+    # read them (only explicit libc identity lookups like getpwuid()/getgrgid()/
+    # getpass.getuser() touch them, and fail catchably). Allow-list via
     # UNSLOTH_STUDIO_SANDBOX_FS_ALLOW if needed.
 )
 _RW_DEV_FILES = (
@@ -375,14 +375,26 @@ def _build_rules(workdir: str, handled: int) -> "list[tuple[str, int]]":
     # Read-only system dirs + interpreter/stdlib/site-packages roots.
     for path in _RO_SYSTEM_DIRS:
         add(path, dir_ro)
+    # System interpreter roots (base_prefix/base_exec_prefix, typically /usr) hold
+    # only system stdlib and libraries, so a full read-only grant is fine.
     for path in (
         sys.base_prefix,
-        sys.prefix,
         getattr(sys, "base_exec_prefix", sys.exec_prefix),
-        sys.exec_prefix,
         os.path.dirname(sys.executable) if sys.executable else "",
     ):
         add(path, dir_ro)
+    # sys.prefix / sys.exec_prefix are the venv ROOT when Studio runs from a
+    # virtualenv (its normal deployment). Granting the root wholesale would expose
+    # every file beneath the venv -- app source, .env, data placed at an in-place
+    # venv root -- to sandboxed commands, the same leak _venv_grant_paths refuses
+    # for VIRTUAL_ENV. Grant only the venv's bin + pyvenv.cfg + site-packages (the
+    # stdlib is served by base_prefix); a non-venv prefix equals base_prefix above
+    # and needs nothing more.
+    _base_real = os.path.realpath(sys.base_prefix)
+    for _prefix in (sys.prefix, sys.exec_prefix):
+        if _prefix and os.path.realpath(_prefix) != _base_real:
+            for path in _venv_grant_paths(_prefix):
+                add(path, dir_ro)
     # A virtualenv exported via VIRTUAL_ENV: tools._build_safe_env prepends
     # $VIRTUAL_ENV/bin to the child PATH, so a console script there needs
     # FS_EXECUTE. _venv_grant_paths validates a real dedicated virtualenv and

@@ -420,6 +420,32 @@ class TestMaskAndRules:
         rules = dict(_build_rules(str(tmp_path), handled))
         assert os.path.realpath("/etc/passwd") not in rules, sorted(rules)
 
+    def test_build_rules_does_not_grant_etc_group(self, tmp_path):
+        # /etc/group is withheld for the same reason as /etc/passwd: a sandboxed
+        # `cat /etc/group` would enumerate host groups and their membership.
+        # Interpreter/shell startup never read it (only explicit grp lookups do).
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules(str(tmp_path), handled))
+        assert os.path.realpath("/etc/group") not in rules, sorted(rules)
+
+    def test_build_rules_does_not_grant_interpreter_venv_root(self, tmp_path):
+        # When Studio runs from a virtualenv, sys.prefix is the venv ROOT. It must
+        # NOT be granted wholesale (that would expose everything under the venv to
+        # sandboxed commands); only the interpreter bin + site-packages are granted,
+        # mirroring the VIRTUAL_ENV narrowing.
+        if os.path.realpath(sys.prefix) == os.path.realpath(sys.base_prefix):
+            pytest.skip("interpreter is not running from a virtualenv")
+        handled = _fs_handled_mask(5)
+        rules = dict(_build_rules(str(tmp_path), handled))
+        venv_root = os.path.realpath(sys.prefix)
+        assert venv_root not in rules, sorted(rules)
+        # The bin dir is still granted so the child interpreter/console scripts resolve.
+        assert os.path.realpath(os.path.dirname(sys.executable)) in rules, sorted(rules)
+        # A site-packages under the venv is still granted so imports load.
+        assert any(
+            p.startswith(venv_root + os.sep) and p.endswith("site-packages") for p in rules
+        ), sorted(rules)
+
     @staticmethod
     def _make_fake_venv(root: Path) -> Path:
         # Minimal valid virtualenv: pyvenv.cfg + bin/python +
