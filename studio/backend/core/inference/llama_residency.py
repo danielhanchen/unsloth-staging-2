@@ -17,8 +17,10 @@ from typing import Iterable, Optional
 def build_residency_flags(*, keep_model_in_vram: bool = False, mlock: bool = False) -> list[str]:
     """llama-server flags for the keep-resident / RAM options.
 
-    keep_model_in_vram -> --no-mmap: stop memory-mapping the GGUF so under full
-    offload the weights live in VRAM with no RAM copy (LM Studio-style save-RAM).
+    keep_model_in_vram -> --no-mmap: don't memory-map the GGUF into system RAM,
+    so under full GPU offload the redundant RAM copy is removed (LM Studio-style
+    save-RAM). --no-mmap does not itself place or pin weights in VRAM (that follows
+    from full offload) nor stop the driver-level VRAM paging some GPUs do when idle.
     mlock -> --mlock pins host pages; a separate opt-in since it grows RAM residency.
     Both default off, so an omitted pair yields [] (launch command unchanged).
     """
