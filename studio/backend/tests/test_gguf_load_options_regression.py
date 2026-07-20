@@ -1005,9 +1005,7 @@ def test_dedupe_reloads_on_explicit_drafter_path_change():
         mtp_draft_path = "/custom/my-draft.gguf",
         mtp_draft_explicit = True,
     )
-    request = LoadRequest(
-        model_path = "/tmp/model.gguf", draft_model_path = "/custom/other-draft.gguf"
-    )
+    request = LoadRequest(model_path = "/tmp/model.gguf", draft_model_path = "/custom/other-draft.gguf")
 
     assert route._request_matches_loaded_settings(request, backend) is False
 

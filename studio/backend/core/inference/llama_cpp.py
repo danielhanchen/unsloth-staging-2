@@ -8037,12 +8037,10 @@ class LlamaCppBackend:
                 self._mtp_draft_explicit = False
                 if launch_mtp_draft_path and self._gguf_path:
                     from utils.models.model_config import detect_mtp_file
-
                     try:
                         _auto_sibling = detect_mtp_file(self._gguf_path)
                         self._mtp_draft_explicit = not _auto_sibling or (
-                            Path(launch_mtp_draft_path).resolve()
-                            != Path(_auto_sibling).resolve()
+                            Path(launch_mtp_draft_path).resolve() != Path(_auto_sibling).resolve()
                         )
                     except OSError:
                         self._mtp_draft_explicit = True
