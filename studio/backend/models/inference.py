@@ -254,6 +254,14 @@ class ValidateModelRequest(BaseModel):
         description = "Intended explicit MTP drafter GGUF path for the follow-up load. "
         "Sized into the coexistence estimate and existence-checked exactly as /load does.",
     )
+    llama_extra_args: Optional[List[str]] = Field(
+        None,
+        description = "Intended llama-server extra args for the follow-up load. Read only "
+        "for the coexistence estimate's effective-MTP gate (a user --spec-type there "
+        "means the drafter is not sized/launched), matching /load; not forwarded to any "
+        "server by validate. Without it, validate canonicalizes to auto and can 409 a "
+        "load that fits with the drafter off (#7239).",
+    )
 
 
 class TransformersUpgradeInfo(BaseModel):

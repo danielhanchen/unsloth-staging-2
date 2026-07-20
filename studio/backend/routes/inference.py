@@ -4300,6 +4300,13 @@ def _resolve_inherited_draft_path(
     stored = getattr(llama_backend, "mtp_draft_path", None)
     if not stored:
         return None
+    # Only inherit an EXPLICIT drafter. An auto-detected sibling must NOT be pinned
+    # here: the reload dedupe deliberately re-detects the on-disk sibling (so a
+    # renamed/updated mtp-*.gguf is adopted), but re-pinning the stale sibling into
+    # the config would defeat that and load_model would then reclassify it explicit,
+    # permanently disabling the sibling re-check (#7239).
+    if not getattr(llama_backend, "mtp_draft_explicit", False):
+        return None
     # Only inherit when the SAME local GGUF is already loaded, so the drafter can't
     # leak across a model switch. Compare resolved paths (a snapshot symlink vs the
     # resolved blob still compare equal).
@@ -5455,41 +5462,68 @@ async def validate_model(
         # typo'd path with the same effective-MTP gating the load uses, so the typo
         # surfaces here instead of after the frontend unloaded the working model.
         # Local GGUF only; the field is ignored for HF-repo and non-GGUF loads (#7239).
-        if is_gguf and not getattr(config, "gguf_hf_repo", None) and request.draft_model_path:
-            config.gguf_mtp_file = request.draft_model_path
-            _val_extra_args = _resolve_inherited_extra_args(request, config, model_identifier, None)
+        if is_gguf and not getattr(config, "gguf_hf_repo", None):
+            # Effective-MTP gate computed once (matches /load): the drafter is only
+            # sized, existence-checked, and companion-validated when it will launch.
+            # Thread the request's own extras (like /load) so an explicit --spec-type
+            # in llama_extra_args suppresses the drafter here too; omitted (None) still
+            # inherits the previous same-model load's extras (#7239).
+            _val_extra_args = _resolve_inherited_extra_args(
+                request, config, model_identifier, getattr(request, "llama_extra_args", None)
+            )
             _val_effective_mtp = (
                 _canonicalize_spec_mode(request.speculative_type) or "auto"
             ) not in ("off", "ngram", "ngram-simple") and not _extra_args_set_spec_type(
                 _val_extra_args
             )
-            if (
-                _val_effective_mtp
-                and not native_grant_backed
-                and not Path(request.draft_model_path).is_file()
-            ):
-                raise HTTPException(
-                    status_code = 400,
-                    detail = "Draft model path does not point to an existing GGUF file.",
-                )
-        elif is_gguf and not getattr(config, "gguf_hf_repo", None):
-            # draft_model_path OMITTED: mirror /load's inheritance of the active
-            # explicit drafter on a same-local-GGUF reload, so the guard's coexistence
-            # estimate sizes the SAME drafter the follow-up /load will run. Without
-            # this, validate sizes the smaller no-draft estimate and can approve; the
-            # frontend then unloads the current model and /load inherits the drafter,
-            # sizes the LARGER estimate and 409s after the model is already gone (#7239).
-            _inherited_draft = _resolve_inherited_draft_path(request, config, model_identifier)
-            if _inherited_draft:
-                config.gguf_mtp_file = _inherited_draft
+            if request.draft_model_path:
+                config.gguf_mtp_file = request.draft_model_path
+                # Reject a typo'd explicit path here (before the frontend unloads the
+                # working model), with the same effective-MTP gating /load uses. Native
+                # leases use the companion containment check below instead.
+                if (
+                    _val_effective_mtp
+                    and not native_grant_backed
+                    and not Path(request.draft_model_path).is_file()
+                ):
+                    raise HTTPException(
+                        status_code = 400,
+                        detail = "Draft model path does not point to an existing GGUF file.",
+                    )
+            else:
+                # draft_model_path OMITTED: mirror /load's inheritance of the active
+                # explicit drafter on a same-local-GGUF reload, so the guard's coexistence
+                # estimate sizes the SAME drafter the follow-up /load will run. Without
+                # this, validate sizes the smaller no-draft estimate and can approve; the
+                # frontend then unloads the current model and /load inherits the drafter,
+                # sizes the LARGER estimate and 409s after the model is already gone (#7239).
+                _inherited_draft = _resolve_inherited_draft_path(request, config, model_identifier)
+                if _inherited_draft:
+                    config.gguf_mtp_file = _inherited_draft
+            # Native-lease loads skip the plain existence check above; mirror /load's
+            # companion validation (same-directory containment) so a drafter outside the
+            # leased GGUF's folder or a typo surfaces here as a 400 instead of after the
+            # frontend unloaded the working model. An explicit path is a hard error; an
+            # inherited drafter is dropped rather than failing the preflight (#7239).
+            if native_grant_backed and config.gguf_mtp_file and _val_effective_mtp:
+                try:
+                    _validate_native_gguf_companion(
+                        config.gguf_mtp_file, config.gguf_file, "MTP drafter"
+                    )
+                except HTTPException:
+                    if request.draft_model_path:
+                        raise
+                    config.gguf_mtp_file = None
         # A metadata-only probe just reads the GGUF header and allocates no VRAM,
         # so it must not be refused by the training guard. Real loads validate
         # without include_context_length and /load applies the guard again.
         if not request.include_context_length:
             # Match /load's inherited llama.cpp extras and parallel slot count so
             # validation cannot pass a smaller estimate than the subsequent load.
+            # Pass the request's own extras (like /load) so an explicit --spec-type
+            # off is honoured; omitted (None) inherits the previous load's extras.
             effective_extra_args = _resolve_inherited_extra_args(
-                request, config, model_identifier, None
+                request, config, model_identifier, getattr(request, "llama_extra_args", None)
             )
             # Off-loop: guard does sync nvidia-smi / HF work.
             await asyncio.to_thread(

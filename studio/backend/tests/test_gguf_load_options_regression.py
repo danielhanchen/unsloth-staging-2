@@ -241,7 +241,7 @@ def test_validate_accepts_gguf_gpu_ids_like_load():
 
     with (
         patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
-        patch("utils.hardware.resolve_requested_gpu_ids", _fake_resolve),
+        patch("utils.hardware.hardware.resolve_requested_gpu_ids", _fake_resolve),
         patch.object(route, "_guard_chat_load_against_training", return_value = None),
         patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
     ):
@@ -263,7 +263,7 @@ def test_validate_surfaces_invalid_gguf_gpu_ids_from_resolution():
 
     with (
         patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
-        patch("utils.hardware.resolve_requested_gpu_ids", _fake_resolve),
+        patch("utils.hardware.hardware.resolve_requested_gpu_ids", _fake_resolve),
         patch.object(route, "_guard_chat_load_against_training", return_value = None),
         patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
     ):
@@ -341,7 +341,7 @@ def test_validate_rejects_diffusion_gguf_gpu_ids_on_vulkan():
         patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
         patch.object(route.LlamaCppBackend, "_is_vulkan_backend", lambda *a, **k: True),
         patch.object(route, "_classify_diffusion_gguf", lambda config: True),
-        patch("utils.hardware.resolve_requested_gpu_ids", _fake_resolve),
+        patch("utils.hardware.hardware.resolve_requested_gpu_ids", _fake_resolve),
         patch.object(route, "_guard_chat_load_against_training", return_value = None),
         patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
     ):
@@ -389,7 +389,7 @@ def test_validate_rejects_absent_vulkan_ordinal_like_load():
     with ExitStack() as stack:
         for cm in _common_patches():
             stack.enter_context(cm)
-        stack.enter_context(patch("utils.hardware.resolve_requested_gpu_ids", _resolve_99))
+        stack.enter_context(patch("utils.hardware.hardware.resolve_requested_gpu_ids", _resolve_99))
         with pytest.raises(HTTPException) as exc:
             asyncio.run(
                 route.validate_model(
@@ -408,7 +408,7 @@ def test_validate_rejects_absent_vulkan_ordinal_like_load():
     with ExitStack() as stack:
         for cm in _common_patches():
             stack.enter_context(cm)
-        stack.enter_context(patch("utils.hardware.resolve_requested_gpu_ids", _resolve_0))
+        stack.enter_context(patch("utils.hardware.hardware.resolve_requested_gpu_ids", _resolve_0))
         resp = asyncio.run(
             route.validate_model(
                 ValidateModelRequest(model_path = "unsloth/test", gpu_ids = [0]),
@@ -495,16 +495,27 @@ def test_omitted_draft_inherits_loaded_custom_drafter(tmp_path):
     gguf.write_bytes(b"gguf-stub")
     custom_draft = "/custom/x.gguf"
 
-    llama = SimpleNamespace(gguf_path = str(gguf), mtp_draft_path = custom_draft)
+    llama = SimpleNamespace(
+        gguf_path = str(gguf), mtp_draft_path = custom_draft, mtp_draft_explicit = True
+    )
     config = _local_gguf_config(gguf_file = str(gguf))
 
-    # Omitted field -> inherit the live drafter.
+    # Omitted field -> inherit the live EXPLICIT drafter.
     request_omitted = LoadRequest(model_path = "/local/model")
     with patch.object(route, "get_llama_cpp_backend", return_value = llama):
         assert (
             route._resolve_inherited_draft_path(request_omitted, config, "/local/model")
             == custom_draft
         )
+
+    # An AUTO-detected sibling (mtp_draft_explicit False) must NOT be inherited: the
+    # reload re-detects the on-disk sibling, so re-pinning the stale one would defeat
+    # that and permanently disable the sibling re-check (Codex #7239).
+    auto = SimpleNamespace(
+        gguf_path = str(gguf), mtp_draft_path = "/models/auto-sibling.gguf", mtp_draft_explicit = False
+    )
+    with patch.object(route, "get_llama_cpp_backend", return_value = auto):
+        assert route._resolve_inherited_draft_path(request_omitted, config, "/local/model") is None
 
     # Explicit clear (field present, empty) -> do NOT inherit (the clear owns it).
     request_cleared = LoadRequest(model_path = "/local/model", draft_model_path = "")
@@ -529,7 +540,12 @@ def test_omitted_draft_reload_threads_inherited_drafter(tmp_path):
     config = _local_gguf_config(gguf_file = str(gguf))
     request = LoadRequest(model_path = "/local/model")  # draft_model_path omitted
 
-    llama = SimpleNamespace(gguf_path = str(gguf), mtp_draft_path = custom_draft, extra_args = [])
+    llama = SimpleNamespace(
+        gguf_path = str(gguf),
+        mtp_draft_path = custom_draft,
+        mtp_draft_explicit = True,
+        extra_args = [],
+    )
     captured = {}
 
     def _capture_guard(cfg, **kwargs):
@@ -716,7 +732,10 @@ def test_validate_omitted_draft_inherits_active_drafter(tmp_path):
             route,
             "get_llama_cpp_backend",
             return_value = SimpleNamespace(
-                extra_args = [], mtp_draft_path = custom_draft, gguf_path = str(gguf)
+                extra_args = [],
+                mtp_draft_path = custom_draft,
+                mtp_draft_explicit = True,
+                gguf_path = str(gguf),
             ),
         ),
         patch.object(route, "_guard_chat_load_against_training", _capture_guard),
@@ -802,6 +821,101 @@ def test_validate_omitted_draft_not_inherited_across_models(tmp_path):
 
     assert resp.valid is True
     assert captured["mtp"] is None  # no drafter inherited across models
+
+
+# ── FIX 4: /validate runs the native-lease companion containment check ──────────
+
+
+def test_validate_native_lease_drafter_outside_dir_rejected(tmp_path):
+    """A native-lease load skips the plain existence check, so /validate must run the
+    same companion containment check /load does: an explicit MTP drafter living OUTSIDE
+    the leased GGUF's directory has to 400 here (before the frontend unloads the working
+    model), not slip through to a 400 in /load after the model is already gone (#7239)."""
+    route = _load_route_module("gguf_opts_regression_validate_native_companion")
+    leased_dir = tmp_path / "leased"
+    leased_dir.mkdir()
+    gguf = leased_dir / "m.gguf"
+    gguf.write_bytes(b"gguf-stub")
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    draft = outside_dir / "draft.gguf"  # a real file, but NOT next to the leased GGUF
+    draft.write_bytes(b"gguf-stub")
+    request = ValidateModelRequest(
+        model_path = str(gguf),
+        draft_model_path = str(draft),
+        speculative_type = "mtp",
+    )
+    config = _local_gguf_config(identifier = str(gguf), gguf_file = str(gguf))
+
+    with (
+        patch.object(
+            route,
+            "_resolve_model_identifier_for_request",
+            lambda request, operation = None: (str(gguf), str(gguf), True),  # native lease
+        ),
+        patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
+        patch.object(
+            route,
+            "get_llama_cpp_backend",
+            return_value = SimpleNamespace(extra_args = [], mtp_draft_path = None, gguf_path = None),
+        ),
+        patch.object(route, "_guard_chat_load_against_training", return_value = None),
+        patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+    ):
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(route.validate_model(request, current_subject = "u"))
+
+    assert exc.value.status_code == 400
+    assert "next to the selected GGUF" in exc.value.detail
+
+
+# ── FIX 5: /validate honours llama_extra_args in the effective-MTP gate ──────────
+
+
+def test_validate_threads_llama_extra_args_spec_off(tmp_path):
+    """ValidateModelRequest now carries llama_extra_args, so a user --spec-type off in
+    the extras suppresses the auto-detected sibling drafter in the coexistence estimate
+    exactly as /load does. Without the threaded field validate canonicalizes to auto,
+    sizes the sibling and can 409 a load that fits with the drafter off (#7239)."""
+    route = _load_route_module("gguf_opts_regression_validate_extra_args_spec")
+    gguf = tmp_path / "m.gguf"
+    gguf.write_bytes(b"gguf-stub")
+    sibling = tmp_path / "mtp-m.gguf"
+    sibling.write_bytes(b"gguf-stub")
+    request = ValidateModelRequest(
+        model_path = "unsloth/test",
+        speculative_type = "auto",
+        llama_extra_args = ["--spec-type", "off"],
+    )
+    # Auto-detected sibling already on the config (draft_model_path omitted).
+    config = _local_gguf_config(
+        identifier = "unsloth/test", gguf_file = str(gguf), gguf_mtp_file = str(sibling)
+    )
+
+    captured = {}
+
+    def _capture_guard(cfg, **kwargs):
+        captured["spec"] = kwargs.get("speculative_type")
+        captured["extra"] = kwargs.get("llama_extra_args")
+        return None
+
+    with (
+        patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
+        patch.object(
+            route,
+            "get_llama_cpp_backend",
+            return_value = SimpleNamespace(
+                extra_args = [], mtp_draft_path = None, gguf_path = str(gguf)
+            ),
+        ),
+        patch.object(route, "_guard_chat_load_against_training", _capture_guard),
+        patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+    ):
+        resp = asyncio.run(route.validate_model(request, current_subject = "u"))
+
+    assert resp.valid is True
+    assert captured["spec"] == "auto"
+    assert captured["extra"] == ["--spec-type", "off"]  # request extras threaded to the guard
 
 
 # ── BUG A: dedupe compares the RAW requested GPU pin, not the fit-narrowed one ──

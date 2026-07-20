@@ -878,7 +878,7 @@ class TestValidateRefusesDuringTraining(unittest.TestCase):
             ),
             patch.object(self.route.ModelConfig, "from_identifier", return_value = cfg),
             patch.object(self.route, "load_inference_config", return_value = {}),
-            patch("utils.hardware.resolve_requested_gpu_ids", resolve),
+            patch("utils.hardware.hardware.resolve_requested_gpu_ids", resolve),
             _stub_guard_deps(training_active = True, decision = (True, {}), captured = captured),
         ):
             return asyncio.run(self.route.validate_model(request, current_subject = "u"))
