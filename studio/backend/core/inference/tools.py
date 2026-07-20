@@ -625,9 +625,8 @@ _AUTO_UNSAFE_PY_ATTRS = frozenset(
         "copytree",
         "chmod",
         "chown",
-        # lchown/lchmod act on the symlink itself, chflags/lchflags set BSD/macOS
-        # file flags: all mutate host metadata Landlock does not mediate, so they
-        # must ask in auto mode too.
+        # Symlink/BSD-macOS metadata mutators Landlock does not mediate; must ask
+        # in auto mode too.
         "lchown",
         "lchmod",
         "chflags",
@@ -2812,9 +2811,9 @@ def _make_sandbox_preexec(confiner):
     """Compose _sandbox_preexec with an optional Landlock FS confiner.
 
     _sandbox_preexec runs first (os.setsid, PR_SET_NO_NEW_PRIVS, rlimits); the
-    confiner then enforces the Landlock ruleset, which needs NO_NEW_PRIVS set.
-    Returns _sandbox_preexec unchanged when confinement is unavailable/disabled
-    (see core.inference.sandbox_fs), so the non-confined path is byte-identical.
+    confiner then enforces the ruleset, which needs NO_NEW_PRIVS set. Returns
+    _sandbox_preexec unchanged when confinement is unavailable/disabled, so the
+    non-confined path is byte-identical.
     """
     if confiner is None:
         return _sandbox_preexec

@@ -580,8 +580,7 @@ def test_terminal_classifier(command, unsafe):
         ("import asyncio\nasyncio.sleep(1)", False),  # benign asyncio helper stays safe
         ("import os\nos.setxattr('f', 'user.x', b'v')", True),  # xattr write
         ("import os\nos.removexattr('f', 'user.x')", True),  # xattr remove
-        # Metadata mutators Landlock does not mediate; siblings of chmod/chown
-        # (act on the symlink itself / set BSD-macOS file flags) must ask too.
+        # Metadata mutators Landlock does not mediate; like chmod/chown, must ask.
         ("import os\nos.lchown('link', 0, 0)", True),  # symlink owner change
         ("import os\nos.lchmod('link', 0o600)", True),  # symlink mode change
         ("import os\nos.chflags('f', 0)", True),  # BSD/macOS file flags

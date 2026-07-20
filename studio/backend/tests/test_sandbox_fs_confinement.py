@@ -84,10 +84,9 @@ class TestEnforcement:
     @pytest.fixture(autouse = True)
     def _neutralize_ambient_virtualenv(self, monkeypatch):
         # build_sandbox_confiner grants the exported VIRTUAL_ENV read+execute. On a
-        # dev host it can point at the workspace root, an ancestor of pytest's
-        # tmp_path, which would grant read of the test's out-of-workdir secrets and
-        # mask confinement. These tests exercise system-path confinement, not the
-        # venv grant (unit-tested separately), so drop the ambient value.
+        # dev host it can point at the workspace root (an ancestor of tmp_path),
+        # masking confinement. These tests exercise system-path confinement, not
+        # the venv grant (unit-tested separately), so drop the ambient value.
         monkeypatch.delenv("VIRTUAL_ENV", raising = False)
 
     def test_read_outside_workdir_is_denied(self, tmp_path):
@@ -461,11 +460,9 @@ class TestMaskAndRules:
         assert os.path.realpath(str(venv)) not in rules, sorted(rules)
 
     def test_build_rules_grants_venv_pyvenv_cfg_read_only(self, tmp_path, monkeypatch):
-        # The interpreter reads $VIRTUAL_ENV/pyvenv.cfg during site init (site.venv())
-        # to set its prefix; on an external venv not under the runner's sys.prefix that
-        # file is otherwise ungranted, so a sandboxed venv python aborts startup with a
-        # PermissionError. It must be granted read-only (the venv ROOT dir stays
-        # ungranted, so the tree is not exposed).
+        # The interpreter reads $VIRTUAL_ENV/pyvenv.cfg during site init to set its
+        # prefix; on an external venv it is otherwise ungranted, so a sandboxed venv
+        # python aborts startup. Granted read-only (the venv ROOT stays ungranted).
         venv = self._make_fake_venv(tmp_path / "othervenv")
         workdir = tmp_path / "wd"
         workdir.mkdir()
@@ -539,9 +536,9 @@ class TestMaskAndRules:
         assert not any("xyz_123" in p for p in rules)
 
     def test_build_rules_grants_ca_store_readonly(self):
-        # The OpenSSL CA store commonly realpath-resolves into /etc (e.g.
+        # The OpenSSL CA store often realpath-resolves into /etc (e.g.
         # /usr/lib/ssl/certs -> /etc/ssl/certs), which the /etc denials would block,
-        # breaking TLS verification, so it must be granted read-only.
+        # so it must be granted read-only.
         import ssl
 
         handled = _fs_handled_mask(5)
@@ -561,11 +558,9 @@ class TestMaskAndRules:
             assert not (rules[real] & (1 << 1))  # read-only: no WRITE_FILE
 
     def test_ca_paths_exclude_env_influenced_private_cafile(self, tmp_path, monkeypatch):
-        # ssl.get_default_verify_paths() resolves cafile/capath from the PARENT's
-        # SSL_CERT_FILE / SSL_CERT_DIR, which the scrubbed child never sees. So it
-        # uses the compile-time openssl_* defaults; granting the parent's env-pointed
-        # path is useless and could leak a private file. Only the compile-time
-        # openssl_cafile/openssl_capath may be granted.
+        # cafile/capath resolve from the PARENT's SSL_CERT_FILE / SSL_CERT_DIR,
+        # which the scrubbed child never sees; granting them is useless and could
+        # leak a private file. Only the compile-time openssl_* defaults are granted.
         import ssl
 
         workdir = tmp_path / "sbx"
