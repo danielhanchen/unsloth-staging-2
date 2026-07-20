@@ -3205,7 +3205,11 @@ def _request_matches_loaded_settings(
     # LlamaCppBackend._already_in_target_state (#7239).
     if not llama_backend.is_diffusion:
         _req_gpu_ids = sorted(int(x) for x in request.gpu_ids) if request.gpu_ids else None
-        if _req_gpu_ids != (llama_backend.gpu_ids or None):
+        # Compare the RAW requested pin against the raw recorded pin, not the
+        # fit-narrowed effective gpu_ids (which /status echoes): a [0, 1] pick the
+        # fitter narrowed to [0] and the frontend re-sends as [0, 1] must still
+        # dedupe rather than needlessly reload the healthy server (#7239).
+        if _req_gpu_ids != (getattr(llama_backend, "requested_gpu_ids", None) or None):
             return False
         if bool(request.keep_model_in_vram) != bool(llama_backend.keep_resident):
             return False
@@ -3288,10 +3292,15 @@ def _request_matches_loaded_settings(
     # multi-GPU pick that resolves to the same device needlessly reloads.
     if llama_backend.is_diffusion:
         _req_gpu_ids = [sorted(request.gpu_ids)[0]] if request.gpu_ids else None
+        if _req_gpu_ids != llama_backend.gpu_ids:
+            return False
     else:
+        # Compare the raw requested pin against the raw recorded pin (not the
+        # fit-narrowed effective gpu_ids) so a narrowed-then-re-sent pick still
+        # dedupes; consistent with the non-diffusion block above (#7239).
         _req_gpu_ids = sorted(request.gpu_ids) if request.gpu_ids else None
-    if _req_gpu_ids != llama_backend.gpu_ids:
-        return False
+        if _req_gpu_ids != (getattr(llama_backend, "requested_gpu_ids", None) or None):
+            return False
     # Preserved tensor->layer fallback (both report tensor=off, so the check above
     # matches): if the user now explicitly drops tensor intent, reload so placement
     # re-selects instead of keeping the all-GPU mask (#6659). The effective check
@@ -5442,6 +5451,18 @@ async def validate_model(
                     status_code = 400,
                     detail = "Draft model path does not point to an existing GGUF file.",
                 )
+        elif is_gguf and not getattr(config, "gguf_hf_repo", None):
+            # draft_model_path OMITTED: mirror /load's inheritance of the active
+            # explicit drafter on a same-local-GGUF reload, so the guard's coexistence
+            # estimate sizes the SAME drafter the follow-up /load will run. Without
+            # this, validate sizes the smaller no-draft estimate and can approve; the
+            # frontend then unloads the current model and /load inherits the drafter,
+            # sizes the LARGER estimate and 409s after the model is already gone (#7239).
+            _inherited_draft = _resolve_inherited_draft_path(
+                request, config, model_identifier
+            )
+            if _inherited_draft:
+                config.gguf_mtp_file = _inherited_draft
         # A metadata-only probe just reads the GGUF header and allocates no VRAM,
         # so it must not be refused by the training guard. Real loads validate
         # without include_context_length and /load applies the guard again.

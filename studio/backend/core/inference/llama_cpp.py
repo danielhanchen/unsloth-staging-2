@@ -1925,6 +1925,11 @@ class LlamaCppBackend:
         self._tensor_split: Optional[List[float]] = None
         # User-picked physical GPU indices (None = automatic selection).
         self._gpu_ids: Optional[List[int]] = None
+        # RAW requested physical GPU pin as sent by the caller, before the fit
+        # narrowed it. self._gpu_ids records the EFFECTIVE (fit-narrowed) pin for
+        # /status; dedupe compares this raw value so a [0, 1] pick narrowed to [0]
+        # and re-sent as [0, 1] still matches instead of needlessly reloading (#7239).
+        self._requested_gpu_ids: Optional[List[int]] = None
         # Layer load kept multi-GPU only to honor a downgraded tensor request, so a
         # later explicit tensor-off reloads instead of deduping to it (#6659).
         self._layer_preserves_tensor_intent: bool = False
@@ -2400,6 +2405,15 @@ class LlamaCppBackend:
     def gpu_ids(self) -> Optional[List[int]]:
         """User-picked physical GPU indices, or None for automatic selection."""
         return self._gpu_ids
+
+    @property
+    def requested_gpu_ids(self) -> Optional[List[int]]:
+        """RAW requested GPU pin (before the fit narrowed it), or None for auto.
+
+        gpu_ids echoes the EFFECTIVE (fit-narrowed) pin for /status; this echoes
+        the raw request so load dedupe treats a narrowed-then-re-sent pick as a
+        match rather than a needless reload (#7239)."""
+        return self._requested_gpu_ids
 
     @property
     def n_layers(self) -> Optional[int]:
@@ -4885,6 +4899,10 @@ class LlamaCppBackend:
         # echoing a multi-GPU list would misreport placement in /status and let a
         # re-Apply dedup against GPUs the runner never used.
         self._gpu_ids = [sorted(gpu_ids)[0]] if gpu_ids else None
+        # Keep the raw-pin record in sync with the effective pin so a stale value
+        # from a prior chat load can't leak (diffusion dedupe still compares the
+        # collapsed effective pin, not this) (#7239).
+        self._requested_gpu_ids = sorted(int(x) for x in gpu_ids) if gpu_ids else None
         if hf_variant:
             self._hf_variant = hf_variant
         elif gguf_path:
@@ -7311,6 +7329,7 @@ class LlamaCppBackend:
                 # aborted, unpinnable ordinal never leaks into gpu_ids (#7239).
                 if _vulkan_explicit_unmatched:
                     self._gpu_ids = None
+                    self._requested_gpu_ids = None
                     raise ValueError(
                         f"Requested Vulkan GPU ordinal(s) {_vulkan_requested_ids} not "
                         f"present. Available Vulkan devices: {_vulkan_available_ordinals}."
@@ -7702,6 +7721,13 @@ class LlamaCppBackend:
                     )
                 else:
                     self._gpu_ids = None
+
+                # Also record the RAW requested pin (before the fit narrowed it),
+                # unconditionally for Vulkan, CUDA/ROCm, and auto (None). Load dedupe
+                # compares this raw value so an explicit [0, 1] narrowed to [0] and
+                # re-sent as [0, 1] still matches, while /status keeps echoing the
+                # effective self._gpu_ids (#7239).
+                self._requested_gpu_ids = sorted(int(x) for x in gpu_ids) if gpu_ids else None
 
                 if is_vulkan_backend and _vulkan_pin_ids is not None:
                     cmd += LlamaCppBackend._vulkan_pin_args(_vulkan_pin_ids)
@@ -8635,7 +8661,10 @@ class LlamaCppBackend:
         # below, mirroring routes/inference.py:_request_matches_loaded_settings (#7239).
         if not self._is_diffusion:
             _req_gpu_ids = sorted(int(x) for x in gpu_ids) if gpu_ids else None
-            if _req_gpu_ids != (getattr(self, "_gpu_ids", None) or None):
+            # Compare the RAW requested pin against the raw recorded pin, not the
+            # fit-narrowed effective self._gpu_ids, so a [0, 1] pick narrowed to [0]
+            # and re-sent as [0, 1] still dedupes (#7239).
+            if _req_gpu_ids != (getattr(self, "_requested_gpu_ids", None) or None):
                 return False
             if bool(keep_model_in_vram) != bool(getattr(self, "_keep_resident", False)):
                 return False
@@ -8711,10 +8740,16 @@ class LlamaCppBackend:
         # to the same device needlessly reloads.
         if self._is_diffusion:
             requested_gpu_pick = [sorted(gpu_ids)[0]] if gpu_ids else None
+            if (self._gpu_ids or None) != requested_gpu_pick:
+                return False
         else:
+            # Compare the raw requested pin against the raw recorded pin (not the
+            # fit-narrowed effective self._gpu_ids) so a narrowed-then-re-sent pick
+            # still dedupes; the non-diffusion block above already enforced this,
+            # so this stays consistent with it (#7239).
             requested_gpu_pick = sorted(gpu_ids) if gpu_ids else None
-        if (self._gpu_ids or None) != requested_gpu_pick:
-            return False
+            if (getattr(self, "_requested_gpu_ids", None) or None) != requested_gpu_pick:
+                return False
 
         # Compare on the canonical requested mode. With --spec-type in
         # extra_args the backend stores None; mirror that here.
@@ -8903,6 +8938,7 @@ class LlamaCppBackend:
             self._keep_resident = False
             self._mlock = False
             self._gpu_ids = None
+            self._requested_gpu_ids = None
             self._tensor_parallel = False
             self._gpu_memory_mode = "auto"
             self._gpu_layers = -1

@@ -685,3 +685,196 @@ def test_validate_rejects_missing_draft_under_mtp():
 
     assert exc.value.status_code == 400
     assert "Draft model path" in exc.value.detail
+
+
+# ── BUG B: /validate inherits the active drafter when draft_model_path is omitted ──
+
+
+def test_validate_omitted_draft_inherits_active_drafter(tmp_path):
+    """/validate now mirrors /load's omitted-field inheritance: when a custom drafter
+    is live on the SAME local GGUF and the ValidateModelRequest OMITS draft_model_path,
+    the training guard must see the inherited drafter on the config so its estimate
+    matches the follow-up /load (which inherits the same drafter). Otherwise validate
+    sizes the smaller no-draft estimate, approves, the frontend unloads the model, and
+    /load then 409s after the model is already gone (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_validate_inherit_omitted")
+    gguf = tmp_path / "m.gguf"
+    gguf.write_bytes(b"gguf-stub")
+    custom_draft = "/custom/x.gguf"
+    request = ValidateModelRequest(model_path = "unsloth/test")  # draft_model_path omitted
+    config = _local_gguf_config(identifier = "unsloth/test", gguf_file = str(gguf))
+
+    captured = {}
+
+    def _capture_guard(cfg, **kwargs):
+        captured["mtp"] = getattr(cfg, "gguf_mtp_file", None)
+        return None
+
+    with (
+        patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
+        patch.object(
+            route,
+            "get_llama_cpp_backend",
+            return_value = SimpleNamespace(
+                extra_args = [], mtp_draft_path = custom_draft, gguf_path = str(gguf)
+            ),
+        ),
+        patch.object(route, "_guard_chat_load_against_training", _capture_guard),
+        patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+    ):
+        resp = asyncio.run(route.validate_model(request, current_subject = "u"))
+
+    assert resp.valid is True
+    assert captured["mtp"] == custom_draft  # inherited drafter sized into the guard
+
+
+def test_validate_explicit_draft_unchanged_by_inherit(tmp_path):
+    """The explicit-path FIX-1 branch is unchanged: an explicit draft_model_path still
+    sizes exactly that path (never the live drafter) into the guard (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_validate_explicit_still")
+    gguf = tmp_path / "m.gguf"
+    gguf.write_bytes(b"gguf-stub")
+    draft = tmp_path / "draft.gguf"
+    draft.write_bytes(b"gguf-stub")
+    request = ValidateModelRequest(
+        model_path = "unsloth/test",
+        draft_model_path = str(draft),
+        speculative_type = "mtp",
+    )
+    config = _local_gguf_config(identifier = "unsloth/test", gguf_file = str(gguf))
+
+    captured = {}
+
+    def _capture_guard(cfg, **kwargs):
+        captured["mtp"] = getattr(cfg, "gguf_mtp_file", None)
+        return None
+
+    with (
+        patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
+        patch.object(
+            route,
+            "get_llama_cpp_backend",
+            # A different live drafter must NOT override the explicit request path.
+            return_value = SimpleNamespace(
+                extra_args = [], mtp_draft_path = "/custom/other.gguf", gguf_path = str(gguf)
+            ),
+        ),
+        patch.object(route, "_guard_chat_load_against_training", _capture_guard),
+        patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+    ):
+        resp = asyncio.run(route.validate_model(request, current_subject = "u"))
+
+    assert resp.valid is True
+    assert captured["mtp"] == str(draft)  # explicit path wins, no inheritance
+
+
+def test_validate_omitted_draft_not_inherited_across_models(tmp_path):
+    """A drafter live on a DIFFERENT local GGUF must not be inherited into a validate
+    of another GGUF: the guard sees no drafter (no cross-model leak) (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_validate_inherit_crossmodel")
+    gguf = tmp_path / "m.gguf"
+    gguf.write_bytes(b"gguf-stub")
+    other = tmp_path / "other.gguf"
+    other.write_bytes(b"gguf-stub")
+    request = ValidateModelRequest(model_path = "unsloth/test")  # draft_model_path omitted
+    config = _local_gguf_config(identifier = "unsloth/test", gguf_file = str(gguf))
+
+    captured = {}
+
+    def _capture_guard(cfg, **kwargs):
+        captured["mtp"] = getattr(cfg, "gguf_mtp_file", None)
+        return None
+
+    with (
+        patch.object(route, "ModelConfig", SimpleNamespace(from_identifier = lambda **_: config)),
+        patch.object(
+            route,
+            "get_llama_cpp_backend",
+            # Live drafter, but on a different GGUF than the one being validated.
+            return_value = SimpleNamespace(
+                extra_args = [], mtp_draft_path = "/custom/x.gguf", gguf_path = str(other)
+            ),
+        ),
+        patch.object(route, "_guard_chat_load_against_training", _capture_guard),
+        patch.object(route.asyncio, "to_thread", new = _inline_to_thread),
+    ):
+        resp = asyncio.run(route.validate_model(request, current_subject = "u"))
+
+    assert resp.valid is True
+    assert captured["mtp"] is None  # no drafter inherited across models
+
+
+# ── BUG A: dedupe compares the RAW requested GPU pin, not the fit-narrowed one ──
+
+
+def _pinned_backend(requested_gpu_ids, effective_gpu_ids):
+    """A live GGUF backend whose fit narrowed an explicit pin: requested_gpu_ids
+    keeps the RAW request; gpu_ids echoes the EFFECTIVE (narrowed) pin for /status.
+    Every non-GPU field matches a default LoadRequest so only the pin decides the
+    dedupe (Codex #7239)."""
+    return SimpleNamespace(
+        is_diffusion = False,
+        gpu_ids = effective_gpu_ids,
+        requested_gpu_ids = requested_gpu_ids,
+        keep_resident = False,
+        mlock = False,
+        mtp_draft_path = None,
+        requested_n_ctx = 0,
+        cache_type_kv = None,
+        extra_args = [],
+        tensor_parallel = False,
+        gpu_memory_mode = "auto",
+        gpu_layers = -1,
+        n_cpu_moe = 0,
+        tensor_split = None,
+        layer_preserves_tensor_intent = False,
+        requested_spec_mode = None,
+        hf_repo = None,
+        spec_fallback_reason = None,
+        spec_draft_n_max = None,
+        chat_template_override = None,
+        gguf_path = None,
+    )
+
+
+def test_dedupe_matches_narrowed_pin_resent_raw():
+    """The fitter narrowed an explicit [0, 1] to [0] and recorded gpu_ids=[0] for
+    /status, but the RAW request [0, 1] is kept as requested_gpu_ids. The frontend
+    re-sends [0, 1] on the next Apply; the dedupe must compare RAW-vs-RAW ([0, 1] ==
+    [0, 1]) and MATCH so the healthy server is not needlessly killed and reloaded
+    (correctness point 3) (Codex #7239)."""
+    route = _load_route_module("gguf_opts_regression_dedupe_narrowed")
+    backend = _pinned_backend(requested_gpu_ids = [0, 1], effective_gpu_ids = [0])
+    request = LoadRequest(model_path = "/tmp/model.gguf", gpu_ids = [0, 1])
+
+    assert route._request_matches_loaded_settings(request, backend) is True
+    # /status still echoes the EFFECTIVE (narrowed) pin, not the raw request.
+    assert backend.gpu_ids == [0]
+
+
+def test_dedupe_reloads_on_explicit_pin_change():
+    """An explicit CHANGE from [0, 1] to [0] must still reload: raw [0] != raw
+    [0, 1], so the user's new explicit pin is honored (correctness point 4)."""
+    route = _load_route_module("gguf_opts_regression_dedupe_change")
+    backend = _pinned_backend(requested_gpu_ids = [0, 1], effective_gpu_ids = [0])
+    request = LoadRequest(model_path = "/tmp/model.gguf", gpu_ids = [0])
+
+    assert route._request_matches_loaded_settings(request, backend) is False
+
+
+def test_dedupe_matches_non_narrowed_explicit_pin():
+    """A non-narrowed explicit [0, 1] -> [0, 1] still matches (correctness point 2)."""
+    route = _load_route_module("gguf_opts_regression_dedupe_nonnarrowed")
+    backend = _pinned_backend(requested_gpu_ids = [0, 1], effective_gpu_ids = [0, 1])
+    request = LoadRequest(model_path = "/tmp/model.gguf", gpu_ids = [0, 1])
+
+    assert route._request_matches_loaded_settings(request, backend) is True
+
+
+def test_dedupe_matches_auto_none_vs_none():
+    """An auto load (gpu_ids omitted) still dedupes None-vs-None (point 1)."""
+    route = _load_route_module("gguf_opts_regression_dedupe_auto")
+    backend = _pinned_backend(requested_gpu_ids = None, effective_gpu_ids = None)
+    request = LoadRequest(model_path = "/tmp/model.gguf")  # gpu_ids omitted
+
+    assert route._request_matches_loaded_settings(request, backend) is True

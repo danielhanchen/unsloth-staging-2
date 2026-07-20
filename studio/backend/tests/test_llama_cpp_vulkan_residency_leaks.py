@@ -465,3 +465,106 @@ def test_non_diffusion_vulkan_valid_ordinal_still_proceeds(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ── BUG A (#7239): the RAW requested pin is recorded and drives load dedupe ─────
+
+
+def test_narrowed_explicit_pin_records_raw_and_effective(tmp_path):
+    """An explicit [0, 1] pin the fitter narrows to [0] must record BOTH: gpu_ids=[0]
+    (the effective pin /status echoes) and requested_gpu_ids=[0, 1] (the raw request
+    the load dedupe compares). Otherwise every re-Apply of the still-[0, 1] frontend
+    selection compares [0, 1] against the recorded [0] and needlessly reloads a
+    healthy server (Codex #7239)."""
+    backend = LlamaCppBackend()
+    gguf = tmp_path / "model.gguf"
+    gguf.write_bytes(b"\0" * 1024)
+
+    def _fake_metadata(self, path):
+        self._is_diffusion = False
+        self._context_length = 4096
+
+    def _spawn_reached(*_a, **_k):
+        # The recording branch runs before any spawn; assert backend state after.
+        raise RuntimeError("SPAWN_REACHED")
+
+    with (
+        mock.patch.object(
+            LlamaCppBackend,
+            "_find_llama_server_binary",
+            staticmethod(lambda **_k: "/fake/llama-server"),
+        ),
+        mock.patch.object(
+            LlamaCppBackend, "_is_vulkan_backend", staticmethod(lambda binary = None: True)
+        ),
+        mock.patch.object(LlamaCppBackend, "_read_gguf_metadata", _fake_metadata),
+        mock.patch.object(LlamaCppBackend, "_already_in_target_state", lambda self, **_k: False),
+        mock.patch.object(LlamaCppBackend, "_wait_for_vram_settle", lambda self, **_k: None),
+        mock.patch.object(LlamaCppBackend, "_find_free_port", staticmethod(lambda: 12345)),
+        mock.patch.object(LlamaCppBackend, "_kill_process", lambda self: None),
+        mock.patch.object(LlamaCppBackend, "_get_gguf_size_bytes", staticmethod(lambda p: 1024)),
+        mock.patch.object(
+            LlamaCppBackend,
+            "_get_gpu_memory",
+            # Both ordinals present, so the explicit [0, 1] passes the absent-ordinal
+            # guard; the fitter (patched below) then narrows the valid set to [0].
+            staticmethod(lambda binary = None: [(0, 40000, 48000), (1, 20000, 24000)]),
+        ),
+        mock.patch.object(LlamaCppBackend, "_select_gpus", lambda self, *a, **k: ([0], False)),
+        mock.patch.object(LlamaCppBackend, "_start_llama_process", _spawn_reached),
+        mock.patch("core.inference.llama_cpp.subprocess.Popen", side_effect = _spawn_reached),
+    ):
+        with pytest.raises(RuntimeError, match = "SPAWN_REACHED"):
+            backend.load_model(gguf_path = str(gguf), model_identifier = "m", gpu_ids = [0, 1])
+
+    # /status echoes the effective (narrowed) pin ...
+    assert backend.gpu_ids == [0]
+    # ... while the raw request is preserved for the load dedupe.
+    assert backend.requested_gpu_ids == [0, 1]
+
+
+def _match_kwargs(**overrides):
+    """Non-GPU kwargs matching a fresh backend so only the pin decides the dedupe."""
+    base = dict(
+        model_identifier = "m",
+        hf_variant = None,
+        n_ctx = 0,
+        cache_type_kv = None,
+        speculative_type = None,
+        chat_template_override = None,
+        extra_args = None,
+        is_vision = False,
+        gguf_path = None,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_already_in_target_state_dedupes_raw_requested_pin():
+    """_already_in_target_state (the backend mirror of the route dedupe) must compare
+    the RAW requested pin, not the fit-narrowed effective self._gpu_ids: a narrowed
+    [0, 1]->[0] re-sent as [0, 1] MATCHES; a [0]-only request does NOT; an auto None
+    load dedupes None-vs-None (Codex #7239)."""
+    backend = LlamaCppBackend()
+    # Make the backend appear as a live, healthy server serving model "m" so the
+    # dedupe reaches the pin comparison (is_loaded + model_identifier gates first).
+    backend._process = mock.MagicMock()
+    backend._healthy = True
+    backend._model_identifier = "m"
+    backend._requested_spec_mode = "auto"  # matches an omitted speculative_type
+    backend._is_diffusion = False
+    # Narrowed explicit pin: raw [0, 1], effective [0].
+    backend._requested_gpu_ids = [0, 1]
+    backend._gpu_ids = [0]
+
+    # Re-sent raw [0, 1] dedupes (no reload) ...
+    assert backend._already_in_target_state(**_match_kwargs(gpu_ids = [0, 1])) is True
+    # ... a real change to [0] does not (raw [0] != raw [0, 1]) ...
+    assert backend._already_in_target_state(**_match_kwargs(gpu_ids = [0])) is False
+    # ... and /status still reports the effective pin.
+    assert backend.gpu_ids == [0]
+
+    # Auto load records None on both, and dedupes None-vs-None.
+    backend._requested_gpu_ids = None
+    backend._gpu_ids = None
+    assert backend._already_in_target_state(**_match_kwargs(gpu_ids = None)) is True
