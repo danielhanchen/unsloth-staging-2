@@ -4597,7 +4597,8 @@ async def _load_model_impl(request: LoadRequest, fastapi_request: Request, curre
         # pin llama-server to exactly these GPUs. None = auto.
         gguf_gpu_ids: Optional[List[int]] = None
         if config.is_gguf and effective_gpu_ids is not None:
-            from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
+            from utils.hardware import DeviceType, get_device
+            from utils.hardware.hardware import resolve_requested_gpu_ids
 
             # XPU hosts are rejected outright: the picker's indices are torch-xpu
             # ordinals neither applicator speaks (CUDA/HIP masks don't apply, and
@@ -5303,7 +5304,8 @@ async def validate_model(
         # (no defined mapping from the picker's torch-xpu ordinals to the
         # launcher's device spaces).
         if config.is_gguf and effective_gpu_ids is not None:
-            from utils.hardware import DeviceType, get_device, resolve_requested_gpu_ids
+            from utils.hardware import DeviceType, get_device
+            from utils.hardware.hardware import resolve_requested_gpu_ids
 
             if get_device() == DeviceType.XPU:
                 raise HTTPException(
