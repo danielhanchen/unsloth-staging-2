@@ -1,0 +1,109 @@
+name: macos14-metal-debug
+
+# Diagnostic only: root-cause the macOS 14 Metal empty-output regression of the
+# unslothai/llama.cpp prebuilt bundle b10069-mix-fb3d4ca with gemma-4-E2B-it
+# UD-Q4_K_XL. Runs the published bundle under several runtime toggles and
+# captures the full llama-server Metal init logs. Never touches any release.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle_url:
+        description: URL of the macOS arm64 bundle tar.gz to test
+        required: false
+        default: https://github.com/unslothai/llama.cpp/releases/download/b10069-mix-fb3d4ca/llama-b10069-mix-fb3d4ca-bin-macos-arm64.tar.gz
+      artifact_run:
+        description: "Optional: unslothai/llama.cpp run id to pull the bundle artifact from (overrides bundle_url)"
+        required: false
+        default: ""
+      artifact_name:
+        description: "Artifact name when artifact_run is set"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, full: 1 }
+          - { runner: macos-15, full: 0 }
+          - { runner: macos-26, full: 0 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      GEMMA_URL: https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-UD-Q4_K_XL.gguf
+      TINY_URL: https://huggingface.co/unsloth/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: System info
+        run: |
+          sw_vers
+          sysctl -n machdep.cpu.brand_string || true
+          system_profiler SPDisplaysDataType | grep -E "Chipset|Metal" || true
+      - name: Fetch bundle
+        run: |
+          mkdir -p work logs
+          if [ -n "${{ inputs.artifact_run }}" ]; then
+            gh run download "${{ inputs.artifact_run }}" -R unslothai/llama.cpp -n "${{ inputs.artifact_name }}" -D work/art
+            find work/art -name '*.tar.gz' -exec cp {} work/bundle.tar.gz \;
+          else
+            curl -fsSL --retry 5 -o work/bundle.tar.gz "${{ inputs.bundle_url }}"
+          fi
+          mkdir -p work/bundle && tar xzf work/bundle.tar.gz -C work/bundle
+          BIN=$(dirname "$(find work/bundle -name llama-server | head -1)")
+          echo "BIN=$PWD/$BIN" >> "$GITHUB_ENV"
+          ls "$BIN" | head -30
+      - name: Fetch models
+        run: |
+          curl -fsSL --retry 5 -o work/gemma.gguf "$GEMMA_URL"
+          curl -fsSL --retry 5 -o work/tiny.gguf "$TINY_URL"
+      - name: Run probes
+        run: |
+          attempt() { # attempt <name> <model> [server args...]
+            local name="$1" model="$2"; shift 2
+            echo "===== ATTEMPT $name ====="
+            "$BIN/llama-server" -m "work/$model" --host 127.0.0.1 --port 8091 \
+                -c 2048 --no-webui "$@" > "logs/$name.log" 2>&1 &
+            local pid=$!
+            local ok=""
+            for _ in $(seq 1 160); do
+              c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:8091/health || true)
+              [ "$c" = 200 ] && { ok=1; break; }
+              sleep 3
+            done
+            if [ -z "$ok" ]; then
+              echo "RESULT $name: SERVER_DID_NOT_START"
+            else
+              raw=$(curl -s --max-time 600 http://127.0.0.1:8091/v1/chat/completions -H 'Content-Type: application/json' \
+                -d '{"messages":[{"role":"user","content":"What is 2+2? Answer with just the number."}],"max_tokens":64,"temperature":0}')
+              out=$(echo "$raw" | python3 -c 'import json,sys;m=json.load(sys.stdin)["choices"][0]["message"];print(" ".join(((m.get("content") or "")+" "+(m.get("reasoning_content") or "")).split()))' 2>/dev/null || true)
+              echo "RESULT $name: output=[$out]"
+              echo "$raw" | head -c 800; echo
+            fi
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            echo "--- metal init lines ($name) ---"
+            grep -E "ggml_metal|has bfloat|has tensor|bfloat|residency|simdgroup|GPU family|error|warn" "logs/$name.log" | head -60 || true
+          }
+          attempt gemma-default gemma.gguf
+          if [ "${{ matrix.full }}" = "1" ]; then
+            GGML_METAL_BF16_DISABLE=1 attempt gemma-bf16-disable gemma.gguf
+            GGML_METAL_NO_RESIDENCY=1 attempt gemma-no-residency gemma.gguf
+            attempt gemma-cpu gemma.gguf -ngl 0
+            attempt tiny-default tiny.gguf
+          fi
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: metal-debug-logs-${{ matrix.runner }}
+          path: logs/
