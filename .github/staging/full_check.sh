@@ -158,11 +158,10 @@ fi
 
 # ---------------------------------------------------------------- gemma llama function
 echo "### gemma: CPU completion via llama-server"
-gemma_leg() {
-  local file="$1" url="https://huggingface.co/$GEMMA_REPO/resolve/main/$1"
-  fetch "$url" "$WORK/$file" 1800 || return 1
-  "$LLAMA_DIR/$BINSUB/llama-server$EXE" -m "$WORK/$file" --host 127.0.0.1 --port 8091 \
-      -c 2048 --no-webui > "$WORK/llama_server.log" 2>&1 &
+gemma_attempt() { # gemma_attempt <gguf-path> [extra llama-server args...]
+  local file="$1"; shift
+  "$LLAMA_DIR/$BINSUB/llama-server$EXE" -m "$file" --host 127.0.0.1 --port 8091 \
+      -c 2048 --no-webui "$@" > "$WORK/llama_server.log" 2>&1 &
   LPID=$!
   # /health returns 503 while the model is still loading; wait for a real 200.
   wait_http http://127.0.0.1:8091/health 160 200 || { kill "$LPID" 2>/dev/null; return 1; }
@@ -177,6 +176,18 @@ gemma_leg() {
   kill "$LPID" 2>/dev/null || true
   echo "gemma output: $out"
   [ -n "$out" ] && echo "$out" | grep -q "4"
+}
+gemma_leg() {
+  local file="$1" url="https://huggingface.co/$GEMMA_REPO/resolve/main/$1"
+  fetch "$url" "$WORK/$file" 1800 || return 1
+  gemma_attempt "$WORK/$file" && return 0
+  if [ "$OS" = macos ]; then
+    # macOS 14 Metal produces empty (degenerate) output for this model with the
+    # b10069 prebuilt; retry once on pure CPU to isolate the GPU path.
+    echo "retrying with -ngl 0 (CPU only) after empty/failed Metal attempt"
+    gemma_attempt "$WORK/$file" -ngl 0 && return 0
+  fi
+  return 1
 }
 FREE_GB=$(df -Pk "$WORK" | awk 'NR==2{print int($4/1048576)}')
 GEMMA_PICK="$GEMMA_FILE"
