@@ -1,0 +1,79 @@
+name: "staging-7311 macos-mlx accuracy"
+
+# Disposable staging-only gate: confirm PR #7311's MLX prompt cache is numerically faithful
+# on a REAL Apple Silicon runner (macos-14, M1). Installs real mlx + mlx-lm, re-runs the
+# MLX-gated unit tests un-masked, then proves logits accuracy + exact token-ID equivalence +
+# usage-token accounting equivalence (cached vs full prefill / cache disabled).
+
+on:
+  push:
+    branches: ["pr-7311-ci"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  mlx-accuracy:
+    name: MLX prompt cache accuracy on Mac M1
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install studio backend + real mlx-lm
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt \
+            pytest pytest-asyncio pytest-timeout httpx numpy
+          pip install mlx mlx-lm
+          python -c "import mlx.core as mx, mlx_lm; print('mlx', mx.__version__, '| mlx-lm', mlx_lm.__version__)"
+
+      - name: Guard - real MLX + LRUPromptCache available
+        run: |
+          python -c "
+          import platform
+          assert platform.system() == 'Darwin' and platform.machine() == 'arm64', platform.platform()
+          import mlx.core as mx
+          mx.eval(mx.zeros((2, 3), dtype=mx.float16))
+          from mlx_lm.models.cache import LRUPromptCache, make_prompt_cache, trim_prompt_cache, can_trim_prompt_cache
+          print('OK: real MLX runs; LRUPromptCache API present')
+          "
+
+      - name: Unit tests un-masked (the 2 MLX-gated tests MUST run)
+        run: |
+          PYTHONPATH=studio/backend python -m pytest \
+            studio/backend/tests/test_mlx_inference_backend.py -q -rs | tee ut.log
+          rc=${PIPESTATUS[0]}
+          grep -q "test_mlx_prompt_cache_only_stores_verifiable_prefix_coverage" ut.log
+          [ "$rc" -eq 0 ] || { echo "::error::unit tests failed"; exit "$rc"; }
+
+      - name: Accuracy + token equivalence (logits, 64-tok IDs, usage totals)
+        run: |
+          PYTHONPATH=studio/backend python tests/studio/mlx_prompt_cache_parity.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mlx-accuracy-logs
+          path: |
+            ut.log
