@@ -47,11 +47,15 @@ json_field() { # json_field <file> <key>
   "$PY" -c "import json,sys; print(json.load(open(sys.argv[1])).get(sys.argv[2],''))" "$1" "$2"
 }
 
-wait_http() { # wait_http <url> <tries>
-  local url="$1" tries="$2" code
+wait_http() { # wait_http <url> <tries> [want_code]  (want_code=any: any HTTP response)
+  local url="$1" tries="$2" want="${3:-any}" code
   for _ in $(seq 1 "$tries"); do
     code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$url" || true)
-    [ "$code" != "000" ] && return 0
+    if [ "$want" = any ]; then
+      [ "$code" != "000" ] && return 0
+    else
+      [ "$code" = "$want" ] && return 0
+    fi
     sleep 3
   done
   return 1
@@ -160,13 +164,15 @@ gemma_leg() {
   "$LLAMA_DIR/$BINSUB/llama-server$EXE" -m "$WORK/$file" --host 127.0.0.1 --port 8091 \
       -c 2048 --no-webui > "$WORK/llama_server.log" 2>&1 &
   LPID=$!
-  wait_http http://127.0.0.1:8091/health 120 || { kill "$LPID" 2>/dev/null; return 1; }
-  local out
+  # /health returns 503 while the model is still loading; wait for a real 200.
+  wait_http http://127.0.0.1:8091/health 160 200 || { kill "$LPID" 2>/dev/null; return 1; }
+  local raw out
   # /v1/chat/completions so the model's chat template is applied; a raw /completion
   # prompt makes the instruct model emit EOG immediately (empty output).
-  out=$(curl -s --max-time 600 http://127.0.0.1:8091/v1/chat/completions -H 'Content-Type: application/json' \
-        -d '{"messages":[{"role":"user","content":"What is 2+2? Answer with just the number."}],"max_tokens":32,"temperature":0}' \
-        | "$PY" -c 'import json,sys;print(" ".join((json.load(sys.stdin)["choices"][0]["message"]["content"] or "").split()))' || true)
+  raw=$(curl -s --max-time 600 http://127.0.0.1:8091/v1/chat/completions -H 'Content-Type: application/json' \
+        -d '{"messages":[{"role":"user","content":"What is 2+2? Answer with just the number."}],"max_tokens":32,"temperature":0}')
+  out=$(echo "$raw" | "$PY" -c 'import json,sys;print(" ".join((json.load(sys.stdin)["choices"][0]["message"]["content"] or "").split()))' 2>/dev/null || true)
+  [ -z "$out" ] && echo "chat response: $raw"
   kill "$LPID" 2>/dev/null || true
   echo "gemma output: $out"
   [ -n "$out" ] && echo "$out" | grep -q "4"
