@@ -136,6 +136,7 @@ def accounting_equivalence(model, tokenizer, name):
 
     on_u, on_t = usage_for(None)
     off_u, off_t = usage_for(0)
+    os.environ.pop("UNSLOTH_MLX_PROMPT_CACHE_BYTES", None)  # don't leak the disable into the next model
     print(f"      accounting: cache ON usage={on_u} (cache_n={on_t['cache_n']}) | "
           f"OFF usage={off_u} (cache_n={off_t['cache_n']})")
     assert on_t["cache_n"] > 0 and off_t["cache_n"] == 0, "cache on/off state not as expected"
@@ -145,6 +146,7 @@ def accounting_equivalence(model, tokenizer, name):
 
 def run_model(name):
     print(f"\n=== {name} ===")
+    os.environ.pop("UNSLOTH_MLX_PROMPT_CACHE_BYTES", None)  # start each model with the cache enabled
     model, tokenizer = load(name)
     backend = MLXInferenceBackend()
     backend._model, backend._tokenizer, backend._is_vlm = model, tokenizer, False
