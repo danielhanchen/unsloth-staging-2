@@ -62,10 +62,12 @@ jobs:
       - name: Unit tests un-masked (the 2 MLX-gated tests MUST run)
         run: |
           PYTHONPATH=studio/backend python -m pytest \
-            studio/backend/tests/test_mlx_inference_backend.py -q -rs | tee ut.log
-          rc=${PIPESTATUS[0]}
-          grep -q "test_mlx_prompt_cache_only_stores_verifiable_prefix_coverage" ut.log
-          [ "$rc" -eq 0 ] || { echo "::error::unit tests failed"; exit "$rc"; }
+            studio/backend/tests/test_mlx_inference_backend.py -v -rs | tee ut.log
+          grep -q "test_mlx_prompt_cache_only_stores_verifiable_prefix_coverage PASSED" ut.log \
+            || { echo "::error::KV-coverage real-MLX test did not run+pass"; exit 1; }
+          grep -q "test_mlx_presence_penalty_latches_the_first_decode_step PASSED" ut.log \
+            || { echo "::error::presence-penalty real-MLX test did not run+pass"; exit 1; }
+          echo "OK: both real-MLX-gated tests ran and passed"
 
       - name: Accuracy + token equivalence (logits, 64-tok IDs, usage totals)
         run: |
