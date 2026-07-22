@@ -1,0 +1,80 @@
+name: full-matrix-validation
+
+# Staging-only validation of PR unslothai/unsloth#7294 (studio-stt-prebuilt) across
+# every standard GitHub-hosted public runner. See .github/staging/full_check.sh for
+# the per-leg sub-checks. WSL2 cannot be nested on GitHub-hosted Windows runners;
+# the linux x64 legs approximate WSL2, and a best-effort WSL1 leg runs below.
+
+on:
+  push:
+    branches: [pr-7294-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: full-matrix-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-latest,        rocm_resolve: 1, rocm_full: 1 }
+          - { runner: ubuntu-slim,          rocm_resolve: 1 }
+          - { runner: ubuntu-22.04,         rocm_resolve: 1 }
+          - { runner: ubuntu-24.04,         rocm_resolve: 1 }
+          - { runner: ubuntu-26.04,         rocm_resolve: 1 }
+          - { runner: ubuntu-22.04-arm }
+          - { runner: ubuntu-24.04-arm }
+          - { runner: ubuntu-26.04-arm }
+          - { runner: windows-latest }
+          - { runner: windows-2022 }
+          - { runner: windows-2025 }
+          - { runner: windows-2025-vs2026 }
+          - { runner: windows-11-arm }
+          - { runner: windows-11-vs2026-arm }
+          - { runner: macos-latest }
+          - { runner: macos-14 }
+          - { runner: macos-15 }
+          - { runner: macos-26 }
+          - { runner: macos-15-intel,       gemma_optional: 1 }
+          - { runner: macos-26-intel,       gemma_optional: 1 }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      GEMMA_OPTIONAL: ${{ matrix.gemma_optional || 0 }}
+      DO_ROCM_RESOLVE: ${{ matrix.rocm_resolve || 0 }}
+      DO_ROCM_FULL: ${{ matrix.rocm_full || 0 }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Full validation (${{ matrix.runner }})
+        run: bash .github/staging/full_check.sh
+
+  # Best effort only: GitHub-hosted runners cannot nest WSL2, so this uses WSL1 via
+  # Vampire/setup-wsl. WSL2 behaviour is approximated by the native linux x64 legs.
+  wsl1-best-effort:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    continue-on-error: true
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Vampire/setup-wsl@v5
+        with:
+          distribution: Ubuntu-22.04
+          additional-packages: python3 curl ca-certificates ffmpeg
+      - name: Full validation inside WSL1
+        shell: wsl-bash {0}
+        run: |
+          cd "$(wslpath '${{ github.workspace }}')"
+          GEMMA_OPTIONAL=1 bash .github/staging/full_check.sh
