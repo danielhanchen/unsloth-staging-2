@@ -71,7 +71,6 @@ jobs:
         run: |
           curl -fsSL --retry 5 -o work/gemma.gguf "$GEMMA_URL"
           if [ "${{ matrix.full }}" = "1" ]; then
-            curl -fsSL --retry 5 -o work/tiny.gguf "$TINY_URL"
             curl -fsSL --retry 5 -o work/tinybf16.gguf "$TINYBF16_URL"
           fi
       - name: Run probes
@@ -102,14 +101,14 @@ jobs:
             echo "--- metal init lines ($name) ---"
             grep -E "ggml_metal|has bfloat|has tensor|bfloat|residency|simdgroup|GPU family|error|warn" "logs/$name.log" | head -60 || true
           }
-          attempt gemma-default gemma.gguf
+          attempt gemma-default gemma.gguf -lv 5
           if [ "${{ matrix.full }}" = "1" ]; then
-            GGML_METAL_BF16_DISABLE=1 attempt gemma-bf16-disable gemma.gguf
-            GGML_METAL_NO_RESIDENCY=1 attempt gemma-no-residency gemma.gguf
-            attempt gemma-cpu gemma.gguf -ngl 0
-            attempt tiny-default tiny.gguf
-            attempt tinybf16-default tinybf16.gguf
-            GGML_METAL_BF16_DISABLE=1 attempt tinybf16-bf16-disable tinybf16.gguf
+            GGML_METAL_BF16_DISABLE=1 attempt gemma-bf16-disable-verbose gemma.gguf -lv 5
+            GGML_METAL_SHARED_BUFFERS_DISABLE=1 attempt gemma-noshared gemma.gguf
+            attempt gemma-nommap gemma.gguf --no-mmap
+            attempt tinybf16-nommap tinybf16.gguf --no-mmap
+            GGML_METAL_BF16_DISABLE=1 attempt tinybf16-bf16-disable-nommap tinybf16.gguf --no-mmap
+            attempt tinybf16-cpu tinybf16.gguf -ngl 0
           fi
       - name: Upload logs
         if: always()
