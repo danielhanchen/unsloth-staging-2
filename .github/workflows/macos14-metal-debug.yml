@@ -6,6 +6,8 @@ name: macos14-metal-debug
 # captures the full llama-server Metal init logs. Never touches any release.
 
 on:
+  push:
+    branches: [macos14-metal-debug]
   workflow_dispatch:
     inputs:
       bundle_url:
@@ -56,7 +58,9 @@ jobs:
             gh run download "${{ inputs.artifact_run }}" -R unslothai/llama.cpp -n "${{ inputs.artifact_name }}" -D work/art
             find work/art -name '*.tar.gz' -exec cp {} work/bundle.tar.gz \;
           else
-            curl -fsSL --retry 5 -o work/bundle.tar.gz "${{ inputs.bundle_url }}"
+            URL="${{ inputs.bundle_url }}"
+            [ -n "$URL" ] || URL="https://github.com/unslothai/llama.cpp/releases/download/b10069-mix-fb3d4ca/llama-b10069-mix-fb3d4ca-bin-macos-arm64.tar.gz"
+            curl -fsSL --retry 5 -o work/bundle.tar.gz "$URL"
           fi
           mkdir -p work/bundle && tar xzf work/bundle.tar.gz -C work/bundle
           BIN=$(dirname "$(find work/bundle -name llama-server | head -1)")
