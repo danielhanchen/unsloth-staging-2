@@ -1,0 +1,90 @@
+name: "staging-7311 macos-mlx prompt-cache"
+
+# Disposable staging-only gate: confirm PR #7311's MLX prompt cache on a REAL Apple
+# Silicon runner (macos-14, M1, free for public repos), which the Linux/CUDA dev box
+# cannot do. Installs real mlx + mlx-lm, runs test_mlx_inference_backend.py UN-MASKED so
+# the two pytest.importorskip("mlx.core") tests actually execute, and drives two small
+# mlx-community 4-bit quants through the real cache path (reuse + output parity).
+
+on:
+  push:
+    branches: ["pr-7311-ci"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  mlx-prompt-cache:
+    name: MLX prompt cache on Mac M1
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install studio backend + real mlx-lm
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt \
+            pytest pytest-asyncio pytest-timeout httpx numpy
+          pip install mlx mlx-lm
+          echo "--- versions ---"
+          python -c "import mlx.core as mx, mlx_lm; print('mlx', mx.__version__, '| mlx-lm', mlx_lm.__version__)"
+          pip check || true
+
+      - name: Guard - real MLX + LRUPromptCache available
+        run: |
+          python -c "
+          import platform
+          assert platform.system() == 'Darwin' and platform.machine() == 'arm64', platform.platform()
+          import mlx.core as mx
+          a = mx.zeros((2, 3), dtype=mx.float16); mx.eval(a)
+          from mlx_lm.models.cache import LRUPromptCache, can_trim_prompt_cache, make_prompt_cache, trim_prompt_cache
+          print('OK: real MLX runs; LRUPromptCache API present')
+          "
+
+      - name: Unit tests un-masked (the 2 MLX-gated tests MUST run, not skip)
+        run: |
+          PYTHONPATH=studio/backend python -m pytest \
+            studio/backend/tests/test_mlx_inference_backend.py -v -rs | tee ut.log
+          rc=${PIPESTATUS[0]}
+          echo "--- assert the real-MLX-gated tests executed and passed ---"
+          grep -q "test_mlx_prompt_cache_only_stores_verifiable_prefix_coverage PASSED" ut.log \
+            || { echo "::error::_kv_prefix_coverage real-MLX test did not run+pass (skipped or failed)"; exit 1; }
+          grep -q "test_mlx_presence_penalty_latches_the_first_decode_step PASSED" ut.log \
+            || { echo "::error::presence-penalty real-MLX test did not run+pass (skipped or failed)"; exit 1; }
+          if grep -qE "test_mlx_.*SKIPPED" ut.log; then
+            echo "::warning::some MLX tests still skipped on a real Mac:"; grep -E "test_mlx_.*SKIPPED" ut.log || true
+          fi
+          echo "OK: both real-MLX-gated tests ran and passed"
+          [ "$rc" -eq 0 ] || { echo "::error::pytest reported failures"; exit "$rc"; }
+
+      - name: End-to-end prompt cache with mlx-community quants
+        run: |
+          PYTHONPATH=studio/backend python tests/studio/mlx_prompt_cache_e2e.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mlx-prompt-cache-logs
+          path: |
+            ut.log
