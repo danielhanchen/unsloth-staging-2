@@ -162,9 +162,11 @@ gemma_leg() {
   LPID=$!
   wait_http http://127.0.0.1:8091/health 120 || { kill "$LPID" 2>/dev/null; return 1; }
   local out
-  out=$(curl -s --max-time 600 http://127.0.0.1:8091/completion -H 'Content-Type: application/json' \
-        -d '{"prompt":"What is 2+2? Answer with just the number.","n_predict":16,"temperature":0}' \
-        | "$PY" -c 'import json,sys;print(" ".join(json.load(sys.stdin).get("content","").split()))' || true)
+  # /v1/chat/completions so the model's chat template is applied; a raw /completion
+  # prompt makes the instruct model emit EOG immediately (empty output).
+  out=$(curl -s --max-time 600 http://127.0.0.1:8091/v1/chat/completions -H 'Content-Type: application/json' \
+        -d '{"messages":[{"role":"user","content":"What is 2+2? Answer with just the number."}],"max_tokens":32,"temperature":0}' \
+        | "$PY" -c 'import json,sys;print(" ".join((json.load(sys.stdin)["choices"][0]["message"]["content"] or "").split()))' || true)
   kill "$LPID" 2>/dev/null || true
   echo "gemma output: $out"
   [ -n "$out" ] && echo "$out" | grep -q "4"
