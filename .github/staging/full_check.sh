@@ -19,6 +19,11 @@
 set -uo pipefail
 
 OLD_TAG="${OLD_LLAMA_TAG:-b10068-mix-fb3d4ca}"   # previous published tag before b10069-mix-fb3d4ca
+# Previous published whisper release. NOTE: no published slim whisper release pairs to the
+# older llama tag (v1.9.1-unsloth.2 and .3 both require b10069; v1.9.1-unsloth.1 is the
+# pre-slim fat format this PR drops), so the whisper update test pins .2 and updates to
+# the newest while paired to the same llama runtime.
+OLD_WHISPER_TAG="${OLD_WHISPER_TAG:-v1.9.1-unsloth.2}"
 GEMMA_REPO="unsloth/gemma-4-E2B-it-GGUF"
 GEMMA_FILE="gemma-4-E2B-it-UD-Q4_K_XL.gguf"      # 3.18 GB, verified via HF API
 GEMMA_FALLBACK_FILE="gemma-4-E2B-it-UD-IQ2_M.gguf"  # 2.29 GB smallest published quant (documented downgrade)
@@ -98,23 +103,45 @@ else
 fi
 
 # ---------------------------------------------------------------- whisper install + pairing
-echo "### whisper: slim install paired to llama $NEW_TAG"
+echo "### whisper: pinned older slim release $OLD_WHISPER_TAG paired to llama $NEW_TAG"
 WHISPER_OK=0
-if "$PY" studio/install_whisper_prebuilt.py --install-dir "$WHISPER_DIR" 2>&1 | tail -40; then
-  M="$WHISPER_DIR/UNSLOTH_WHISPER_PREBUILT_INFO.json"
+M="$WHISPER_DIR/UNSLOTH_WHISPER_PREBUILT_INFO.json"
+WBIN="$WHISPER_DIR/$BINSUB"
+if "$PY" studio/install_whisper_prebuilt.py --install-dir "$WHISPER_DIR" \
+      --published-release-tag "$OLD_WHISPER_TAG" 2>&1 | tail -40; then
   KIND=$(json_field "$M" install_kind || echo MISSING)
   PAIRED=$(json_field "$M" paired_llama_tag || echo MISSING)
-  WBIN="$WHISPER_DIR/$BINSUB"
+  WTAG=$(json_field "$M" release_tag || echo MISSING)
   GGML_COUNT=$(find "$WBIN" -maxdepth 1 \( -name 'libggml*' -o -name 'ggml*.dll' \) 2>/dev/null | wc -l)
-  if [ "$KIND" = "slim" ] && [ "$PAIRED" = "$NEW_TAG" ] && [ "$GGML_COUNT" -gt 0 ] \
+  if [ "$KIND" = "slim" ] && [ "$PAIRED" = "$NEW_TAG" ] && [ "$WTAG" = "$OLD_WHISPER_TAG" ] \
+     && [ "$GGML_COUNT" -gt 0 ] \
      && [ -x "$WBIN/whisper-server$EXE" -o -f "$WBIN/whisper-server$EXE" ]; then
-    record whisper-install PASS "install_kind=slim paired_llama_tag=$PAIRED ggml_objects=$GGML_COUNT"
+    record whisper-install PASS "pinned $OLD_WHISPER_TAG install_kind=slim paired_llama_tag=$PAIRED ggml_objects=$GGML_COUNT"
     WHISPER_OK=1
   else
-    record whisper-install FAIL "install_kind=$KIND paired=$PAIRED (want $NEW_TAG) ggml_objects=$GGML_COUNT"
+    record whisper-install FAIL "release_tag=$WTAG (want $OLD_WHISPER_TAG) install_kind=$KIND paired=$PAIRED (want $NEW_TAG) ggml_objects=$GGML_COUNT"
   fi
 else
-  record whisper-install FAIL "whisper install exited nonzero"
+  record whisper-install FAIL "pinned whisper install of $OLD_WHISPER_TAG exited nonzero"
+fi
+
+# ---------------------------------------------------------------- whisper update (unpinned re-run)
+echo "### whisper-update: unpinned re-run should advance past $OLD_WHISPER_TAG and stay paired"
+if [ "$WHISPER_OK" = "1" ] && "$PY" studio/install_whisper_prebuilt.py --install-dir "$WHISPER_DIR" 2>&1 | tail -40; then
+  KIND=$(json_field "$M" install_kind || echo MISSING)
+  PAIRED=$(json_field "$M" paired_llama_tag || echo MISSING)
+  WTAG=$(json_field "$M" release_tag || echo MISSING)
+  GGML_COUNT=$(find "$WBIN" -maxdepth 1 \( -name 'libggml*' -o -name 'ggml*.dll' \) 2>/dev/null | wc -l)
+  if [ "$KIND" = "slim" ] && [ "$PAIRED" = "$NEW_TAG" ] && [ -n "$WTAG" ] \
+     && [ "$WTAG" != "$OLD_WHISPER_TAG" ] && [ "$WTAG" != "MISSING" ] && [ "$GGML_COUNT" -gt 0 ]; then
+    record whisper-update PASS "marker advanced $OLD_WHISPER_TAG -> $WTAG, still slim + paired to $PAIRED"
+  else
+    WHISPER_OK=0
+    record whisper-update FAIL "release_tag=$WTAG install_kind=$KIND paired=$PAIRED ggml_objects=$GGML_COUNT"
+  fi
+else
+  WHISPER_OK=0
+  record whisper-update FAIL "unpinned whisper update exited nonzero (or install step failed)"
 fi
 
 # ---------------------------------------------------------------- whisper function
