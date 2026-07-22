@@ -170,8 +170,9 @@ gemma_leg() {
   # /v1/chat/completions so the model's chat template is applied; a raw /completion
   # prompt makes the instruct model emit EOG immediately (empty output).
   raw=$(curl -s --max-time 600 http://127.0.0.1:8091/v1/chat/completions -H 'Content-Type: application/json' \
-        -d '{"messages":[{"role":"user","content":"What is 2+2? Answer with just the number."}],"max_tokens":32,"temperature":0}')
-  out=$(echo "$raw" | "$PY" -c 'import json,sys;print(" ".join((json.load(sys.stdin)["choices"][0]["message"]["content"] or "").split()))' 2>/dev/null || true)
+        -d '{"messages":[{"role":"user","content":"What is 2+2? Answer with just the number."}],"max_tokens":256,"temperature":0}')
+  # Some legs route early tokens to reasoning_content; accept either channel.
+  out=$(echo "$raw" | "$PY" -c 'import json,sys;m=json.load(sys.stdin)["choices"][0]["message"];print(" ".join(((m.get("content") or "")+" "+(m.get("reasoning_content") or "")).split()))' 2>/dev/null || true)
   [ -z "$out" ] && echo "chat response: $raw"
   kill "$LPID" 2>/dev/null || true
   echo "gemma output: $out"
