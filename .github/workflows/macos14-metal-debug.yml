@@ -43,7 +43,8 @@ jobs:
     timeout-minutes: 45
     env:
       GEMMA_URL: https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-UD-Q4_K_XL.gguf
-      TINY_URL: https://huggingface.co/unsloth/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf
+      TINY_URL: https://huggingface.co/unsloth/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf
+      TINYBF16_URL: https://huggingface.co/unsloth/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-BF16.gguf
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: System info
@@ -69,7 +70,10 @@ jobs:
       - name: Fetch models
         run: |
           curl -fsSL --retry 5 -o work/gemma.gguf "$GEMMA_URL"
-          curl -fsSL --retry 5 -o work/tiny.gguf "$TINY_URL"
+          if [ "${{ matrix.full }}" = "1" ]; then
+            curl -fsSL --retry 5 -o work/tiny.gguf "$TINY_URL"
+            curl -fsSL --retry 5 -o work/tinybf16.gguf "$TINYBF16_URL"
+          fi
       - name: Run probes
         run: |
           attempt() { # attempt <name> <model> [server args...]
@@ -104,6 +108,8 @@ jobs:
             GGML_METAL_NO_RESIDENCY=1 attempt gemma-no-residency gemma.gguf
             attempt gemma-cpu gemma.gguf -ngl 0
             attempt tiny-default tiny.gguf
+            attempt tinybf16-default tinybf16.gguf
+            GGML_METAL_BF16_DISABLE=1 attempt tinybf16-bf16-disable tinybf16.gguf
           fi
       - name: Upload logs
         if: always()
