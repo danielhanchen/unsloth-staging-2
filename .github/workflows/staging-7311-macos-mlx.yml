@@ -82,6 +82,10 @@ jobs:
         run: |
           PYTHONPATH=studio/backend python tests/studio/mlx_prompt_cache_e2e.py
 
+      - name: Prefill speed benchmark (cache ON vs disabled)
+        run: |
+          PYTHONPATH=studio/backend python tests/studio/mlx_prompt_cache_bench.py
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
