@@ -18,6 +18,7 @@ import queue
 import random
 import re
 import shlex
+import shutil
 import ssl
 import subprocess
 import sys
@@ -328,6 +329,7 @@ def _find_blocked_commands(command: str) -> set[str]:
 # Directory holding the sandbox ``sitecustomize.py`` shim (code-interpreter
 # path remap); placed on the sandboxed child's PYTHONPATH in _build_safe_env.
 _SANDBOX_SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_site")
+
 # ── "Approve for me" (permission_mode="auto") safety detection ──────────────
 # Auto mode pauses only calls classified here as potentially unsafe. The sandbox
 # and hard blocks (blocklist, rlimits) still apply at run time; this gate only
@@ -2496,10 +2498,16 @@ def _build_safe_env(workdir: str) -> dict[str, str]:
 
     Whitelist-built from scratch (parent env NOT inherited): only PATH/HOME/
     TMPDIR/LANG/TERM/PYTHONIOENCODING/PYTHONPATH (+VIRTUAL_ENV or Windows
-    SystemRoot) reach the child; all credential vars (HF_TOKEN, AWS_*, etc.)
-    are absent. HOME points at the sandbox workdir so SDKs can't read the
+    SystemRoot and a minimal PATHEXT) reach the child; all credential vars
+    (HF_TOKEN, AWS_*, etc.) are absent. HOME points at the sandbox workdir so SDKs can't read the
     operator's cached creds. PYTHONPATH carries only the sandbox sitecustomize
     shim directory.
+
+    PATH starts with the Studio interpreter / venv and OS system dirs so
+    ``python``/``pip`` stay pinned. On Windows only, Git-for-Windows install
+    dirs from the host PATH are appended so bare ``git`` resolves (#7317).
+    User-writable host PATH entries (venv, ``node_modules/.bin``, etc.) are
+    never inherited — they could shadow auto-safe terminal commands.
     """
     # Start from the running interpreter's dir so 'python'/'pip' resolve to the
     # same environment the Unsloth server runs in.
@@ -2518,6 +2526,16 @@ def _build_safe_env(workdir: str) -> dict[str, str]:
         path_entries.extend([os.path.join(sysroot, "System32"), sysroot])
     else:
         path_entries.extend(["/usr/local/bin", "/usr/bin", "/bin"])
+
+    # Windows Git installs live outside System32; inherit only the dir of the
+    # git the HOST shell resolves (never a name-matched, possibly user-writable
+    # dir) so bare `git` resolves without weakening the sandbox PATH (#7317).
+    if sys.platform == "win32":
+        git_exe = shutil.which("git")
+        if git_exe:
+            git_dir = os.path.dirname(git_exe)
+            if os.path.isabs(git_dir):
+                path_entries.append(git_dir)
 
     # Deduplicate, preserving order.
     deduped = list(dict.fromkeys(p for p in path_entries if p))
@@ -2538,6 +2556,11 @@ def _build_safe_env(workdir: str) -> dict[str, str]:
     # Windows needs SystemRoot for Python/subprocess to work.
     if sys.platform == "win32":
         env["SystemRoot"] = os.environ.get("SystemRoot", r"C:\Windows")
+        # Restrict PATHEXT so cwd .BAT/.CMD cannot hijack bare names (#7317).
+        env["PATHEXT"] = ".EXE;.COM"
+        # cmd/CreateProcess search cwd before PATH for bare names; disable so
+        # a workdir rg.exe/git.exe cannot shadow auto-approved commands.
+        env["NoDefaultCurrentDirectoryInExePath"] = "1"
     return env
 
 
