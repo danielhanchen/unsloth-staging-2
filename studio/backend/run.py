@@ -1159,6 +1159,146 @@ def _stream_isatty(stream) -> bool:
         return False
 
 
+def _console_only_stream(stream):
+    """Return the real console stream behind a _TeeStream session-log wrapper.
+
+    run_server() calls _setup_server_disk_logging() early, which replaces
+    sys.stdout/stderr with _TeeStream so diagnostics are mirrored into a retained
+    logs/server/server-*.log. A one-time secret (the auto-generated admin
+    password) must reach the operator's console but MUST NOT land in that
+    persisted file (OWASP CWE-532: never write credentials to logs). Writing to
+    the underlying stream shows the banner on the console while bypassing the tee.
+
+    Unwraps RECURSIVELY: run_server() can run twice in one process (e.g. a local
+    run followed by a public one), and each call re-wraps the already-wrapped
+    sys.stdout/stderr, so the tees nest. Peeling one layer would return an inner
+    _TeeStream -- which forwards isatty() to the real console and so passes the
+    TTY check -- and the credential would be mirrored into the older run's
+    retained server-*.log. The depth bound keeps a pathological self-referential
+    wrapper from looping forever; a stream still wrapped after it is reported as
+    unusable (None) so the caller fails closed rather than tee a credential.
+    """
+    for _ in range(64):
+        if not isinstance(stream, _TeeStream):
+            return stream
+        stream = stream._stream
+    return None
+
+
+def _one_time_secret_stream():
+    """Return an interactive-terminal stream to surface a one-time secret, or None.
+
+    Prefers sys.stderr, then sys.stdout, unwrapping the _TeeStream session-log
+    wrapper (see _console_only_stream) so the secret bypasses the retained
+    logs/server/server-*.log (CWE-532: never write credentials to log files).
+
+    Requires the underlying stream to be a real TTY. A writable non-tty stream --
+    a `> file` shell redirect, nohup.out, a systemd-journald socket, a Docker
+    logging pipe -- is NOT an ephemeral console: writing the one-time credential
+    there PERSISTS the plaintext to a file/journal/pipe that log consumers can
+    read (CWE-532), which breaks the banner's "shown once, not written to disk"
+    promise. Only a TTY is a transient surface, so a non-tty stream is skipped and
+    the caller MUST fail closed (refuse to rotate the only recovery credential).
+
+    Returns None when neither stream is a usable TTY -- e.g. a Windows
+    pythonw/service wrapper (both None), a closed/non-writable inherited stream, or
+    a fully headless (nohup/systemd) launch whose stderr/stdout is redirected. The
+    caller then fails closed: print(file=None) would fall back to the tee'd
+    sys.stdout and persist the credential, and printing to a redirected stream
+    persists it just the same -- AFTER the seeded credential was already rotated --
+    so neither may be treated as usable. Mirrors the CLI's
+    _one_time_secret_console_stream tty/closed/writable preflight so the direct
+    `python run.py` path makes the same fail-closed decision before rotating.
+    """
+    for candidate in (sys.stderr, sys.stdout):
+        raw = _console_only_stream(candidate)
+        if raw is None:
+            continue
+        try:
+            if getattr(raw, "closed", False):
+                continue
+            if not callable(getattr(raw, "write", None)):
+                continue
+        except (AttributeError, ValueError):
+            continue
+        # A writable non-tty stream is a redirected file/journal/pipe that would
+        # persist the one-time credential (CWE-532); only a real terminal is an
+        # ephemeral surface. Skip it so the caller fails closed rather than leak.
+        if not _stream_isatty(raw):
+            continue
+        return raw
+    return None
+
+
+def _tunnel_binary_confirmed_unavailable() -> bool:
+    """True only if cloudflared is provably unavailable (absent from PATH and the
+    Unsloth cache AND a download attempt failed), so a --secure tunnel cannot start.
+
+    On --secure the bind is loopback, so the tunnel is the ONLY public exposure:
+    rotating the seeded recovery password before a public URL that never comes up
+    can lock out supervisor/nohup launches that do not preserve the one-time
+    stderr banner. Mirrors the CLI's _tunnel_binary_confirmed_unavailable so the
+    direct `python run.py --secure` path makes the same decision. Returns False on
+    ANY uncertainty: a possible credential leak outweighs a recoverable lockout, so
+    the caller keeps rotating unless the tunnel is provably dead.
+    """
+    try:
+        from cloudflare_tunnel import ensure_cloudflared
+        return ensure_cloudflared() is None
+    except Exception:
+        return False
+
+
+def _auto_generate_admin_password(admin_username: str) -> "Optional[str]":
+    """Generate a strong random admin password and commit it for a headless
+    public launch that supplied none.
+
+    Uses the existing ``update_password`` path, so it clears
+    ``must_change_password`` (no interactive prompt is then needed), rotates the
+    JWT secret, revokes refresh tokens, and deletes the on-disk bootstrap
+    password. The value is returned once for display; it is NEVER written to disk
+    or placed on argv.
+
+    The commit is a compare-and-set on ``must_change_password``: another Studio
+    process or tab sharing this auth DB can complete /change-password between the
+    gate's read and this write, and an unconditional update would overwrite the
+    password the user just chose. Returns None when that guard rejects the write,
+    so the caller shows nothing rather than a credential that never took effect.
+    """
+    import secrets as _secrets
+
+    from auth import storage as _auth_storage
+
+    generated = _secrets.token_urlsafe(24)
+    committed = _auth_storage.update_password(
+        admin_username,
+        generated,
+        revoke_refresh_tokens = True,
+        require_must_change = True,
+    )
+    return generated if committed else None
+
+
+def _print_auto_generated_credentials(username: str, password: str, *, out) -> None:
+    """Surface an auto-generated admin credential once, in the startup banner.
+
+    Printed to the given stream (stderr for CLI launches); never logged elsewhere
+    and never persisted. Colab prints its own copy into the notebook cell.
+    """
+    line = "=" * 70
+    print(
+        f"\n{line}\n"
+        "  Unsloth Studio admin login (auto-generated for this public launch)\n"
+        f"    Username: {username}\n"
+        f"    Password: {password}\n"
+        "  Save this now: it is shown once, not written to disk, and not in the\n"
+        "  process list. Rotate later with `unsloth studio reset-password`.\n"
+        f"{line}\n",
+        file = out,
+        flush = True,
+    )
+
+
 def _terminal_password_gate(
     *,
     tunnel_will_start: bool,
@@ -1195,10 +1335,6 @@ def _terminal_password_gate(
 
     from auth import hashing as _auth_hashing
     from auth import storage as _auth_storage
-    from auth.bootstrap_timeout import (
-        bootstrap_timeout_seconds,
-        should_arm_bootstrap_timeout,
-    )
     from auth.terminal_prompt import (
         prompt_for_password_change,
         should_prompt_password_change,
@@ -1217,46 +1353,55 @@ def _terminal_password_gate(
         stdin_isatty = _stream_isatty(sys.stdin),
         stderr_isatty = _stream_isatty(sys.stderr),
     ):
-        # No terminal: only proceed if the bootstrap deadline will arm; api-only
-        # and TIMEOUT=0 never arm it, leaving the default credential public.
-        deadline_arms = should_arm_bootstrap_timeout(
-            host = host,
-            secure = secure,
-            api_only = api_only,
-            frontend_served = frontend_served,
-            is_colab = is_colab,
-            requires_change = True,
-            timeout_seconds = bootstrap_timeout_seconds(),
-        )
-        if not deadline_arms:
+        # No terminal to run the interactive change and no password was supplied
+        # (--password / UNSLOTH_STUDIO_PASSWORD / stdin would have cleared
+        # must_change above). Rather than publish the default credential and lean
+        # on the bootstrap shutdown deadline, auto-generate a strong password,
+        # commit it (which clears must_change so the tunnel proceeds headlessly),
+        # and surface it once. This also protects the api-only / TIMEOUT=0 launches
+        # that the deadline never covered.
+        #
+        # Resolve the console stream BEFORE generating/committing the credential:
+        # the one-time password must reach an interactive terminal but never the
+        # tee'd session log NOR a redirected/persisted stream. With no usable TTY
+        # (stderr and stdout both absent, e.g. a Windows pythonw/service wrapper, OR
+        # a headless nohup/systemd launch whose stderr/stdout is redirected to a
+        # file/journal) surfacing the password would persist the plaintext to disk
+        # (CWE-532) -- print(file=None) would fall back to the tee'd sys.stdout, and
+        # a redirected stream retains it just the same -- so fail closed WITHOUT
+        # rotating the only recovery credential. A headless operator supplies
+        # --password / UNSLOTH_STUDIO_PASSWORD / stdin instead.
+        out = _one_time_secret_stream()
+        if out is None:
+            return False, False
+        # --secure exposes ONLY the loopback-bound tunnel; if cloudflared is
+        # provably unavailable no public URL comes up, so rotating the seeded
+        # recovery password here would only strip it behind a one-time banner a
+        # supervisor/nohup launch may drop, locking the operator out. Mirror the
+        # CLI: refuse and leave the existing credential intact for local recovery.
+        if secure and _tunnel_binary_confirmed_unavailable():
             print(
-                "Refusing to publish Unsloth on a public Cloudflare URL: the "
-                "default admin password was never changed, no terminal is "
-                "attached to change it here, and the bootstrap shutdown "
-                "deadline does not apply to this launch (api-only, or "
-                "UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT=0). Change the password "
-                "first (run `unsloth studio` locally and log in, or re-run "
-                "with a terminal attached), then retry.",
-                file = sys.stderr,
+                "Error: refusing to expose Unsloth: the Cloudflare tunnel binary "
+                "(cloudflared) is unavailable and could not be downloaded, so no "
+                "secure link can be published. Your admin password is unchanged.",
+                file = out,
                 flush = True,
             )
             return False, False
-        # The public page won't auto-fill the bootstrap credential (suppressed
-        # below) and the seeded file may already be gone, so point recovery at a
-        # terminal-attached run / reset-password instead of reading it from disk.
-        print(
-            "  WARNING: the default admin password is still active while "
-            "Unsloth is about to be published on a public Cloudflare URL, and "
-            "no terminal is attached to change it here. The public page will "
-            "NOT auto-fill the bootstrap credential. Set a new password by "
-            "running `unsloth studio` locally with a terminal attached, or "
-            "`unsloth studio reset-password`. Unsloth shuts down after the "
-            "bootstrap deadline (UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT, default 1h) "
-            "unless the password is changed.",
-            file = sys.stderr,
-            flush = True,
-        )
-        # Never serve the default credential in HTML over a public URL.
+        generated = _auto_generate_admin_password(_admin)
+        if generated is None:
+            # Lost the compare-and-set: a password was set elsewhere between the
+            # gate's read and the rotation, so ours was never written. The account
+            # is no longer on the default credential, so proceed without showing a
+            # password that would not authenticate.
+            return True, True
+        # Write the one-time credential to the raw console stream, NOT the
+        # _TeeStream that _setup_server_disk_logging() installed: the tee mirrors
+        # everything into a retained server-*.log, and this password must never be
+        # persisted (the banner itself promises it is not written to disk).
+        _print_auto_generated_credentials(_admin, generated, out = out)
+        # Password is no longer the default; still suppress any HTML injection of a
+        # stale bootstrap credential over the public URL.
         return True, True
 
     def _is_current_password(candidate: str) -> bool:
