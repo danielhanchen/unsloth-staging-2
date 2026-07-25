@@ -1797,11 +1797,13 @@ def run_server(
     return app
 
 
-# Mirror unsloth_cli/commands/studio.py's _PARALLEL_*. Default 1 is for direct
-# backend launches; `unsloth studio run` always passes its own value (4).
+# Mirror unsloth_cli/commands/studio.py's _PARALLEL_*. The Chat tab runs several
+# conversations at once, and the admission queue caps concurrent decodes at the
+# llama-server slot count, so a direct backend launch defaults to the same slot
+# count the CLI uses. A load too big for VRAM still degrades to fewer slots.
 _PARALLEL_MIN = 1
 _PARALLEL_MAX = 64
-_PARALLEL_DEFAULT_PLAIN = 1
+_PARALLEL_DEFAULT_PLAIN = 4
 
 
 def _build_arg_parser():

@@ -295,7 +295,12 @@ def _find_setup_script() -> Optional[Path]:
 _PARALLEL_MIN = 1
 _PARALLEL_MAX = 64
 _PARALLEL_DEFAULT_RUN = 4  # pre-PR hardcoded for `unsloth studio run`
-_PARALLEL_DEFAULT_PLAIN = 1  # pre-PR effective for plain `unsloth studio`
+# Studio's Chat tab runs several conversations at once (New Chat leaves the
+# previous one generating), and the admission queue caps concurrent decodes at
+# the llama-server slot count. At 1 slot every extra chat would queue behind the
+# first, so the plain server matches `unsloth studio run`. Loads that don't fit
+# in VRAM still fall back to fewer slots via _slots_that_fit_on_gpu().
+_PARALLEL_DEFAULT_PLAIN = 4
 
 
 def _resolve_secure(secure: bool, not_secure: bool) -> bool:

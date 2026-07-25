@@ -1,0 +1,90 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Runs the parallel-chats registry tests across all three platforms.
+#
+# Why: Studio's Chat tab now keeps several conversations streaming at once, and
+# a model load/unload has to know which chats it would interrupt. The registry
+# that tracks them is a plain dict guarded by a threading.Lock, with no
+# platform-specific primitives, so it is expected to behave identically on
+# Linux, macOS, Windows and WSL. This matrix keeps that expectation honest.
+# The tests import nothing beyond the stdlib and pytest, so no install step is
+# needed and the whole matrix finishes in seconds. The handful of cases that do
+# reach into routes.inference skip themselves when the inference stack is
+# absent; they run in full on studio-backend-ci.
+
+name: Studio parallel chats
+
+on:
+  pull_request:
+    paths:
+      - 'studio/backend/state/active_generations.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/models/inference.py'
+      - 'studio/backend/run.py'
+      - 'unsloth_cli/commands/studio.py'
+      - 'studio/backend/tests/test_active_generations.py'
+      - '.github/workflows/studio-parallel-chats-ci.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'studio/backend/state/active_generations.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/models/inference.py'
+      - 'studio/backend/run.py'
+      - 'unsloth_cli/commands/studio.py'
+      - 'studio/backend/tests/test_active_generations.py'
+      - '.github/workflows/studio-parallel-chats-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  parallel-chats:
+    name: parallel chats (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+      - run: python -m pip install -U pip pytest
+      - name: Active-generation registry tests
+        env:
+          UNSLOTH_NO_TORCH: '1'
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: >-
+          python -m pytest
+          studio/backend/tests/test_active_generations.py
+          -q -p no:cacheprovider
+      - name: Fail if the whole file skipped
+        shell: bash
+        env:
+          UNSLOTH_NO_TORCH: '1'
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: |
+          # A missing dependency must not turn this matrix into a green no-op:
+          # the registry cases have no optional imports and must always run.
+          python -m pytest studio/backend/tests/test_active_generations.py \
+            -q -p no:cacheprovider --collect-only > collected.txt
+          python - <<'PY'
+          import re, sys
+          text = open("collected.txt", encoding="utf-8").read()
+          m = re.search(r"(\d+) tests? collected", text)
+          count = int(m.group(1)) if m else 0
+          print(f"collected {count} tests")
+          sys.exit(0 if count >= 20 else 1)
+          PY
