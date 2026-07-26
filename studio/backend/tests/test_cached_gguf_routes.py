@@ -144,6 +144,7 @@ def test_list_cached_gguf_includes_non_suffix_repo_when_cache_contains_gguf(monk
             "size_bytes": 5_000,
             "cache_path": str(repo.repo_path),
             "has_vision": False,
+            "task": None,
         }
     ]
 
@@ -166,6 +167,7 @@ def test_list_cached_gguf_matches_extension_case_insensitively(monkeypatch, tmp_
             "size_bytes": 7_000,
             "cache_path": str(repo.repo_path),
             "has_vision": False,
+            "task": None,
         }
     ]
 
@@ -466,6 +468,7 @@ def test_list_cached_gguf_keeps_largest_duplicate_repo_across_scans(monkeypatch,
             "size_bytes": 6_000,
             "cache_path": str(larger.repo_path),
             "has_vision": False,
+            "task": None,
         }
     ]
 
@@ -496,6 +499,7 @@ def test_list_cached_gguf_dedupes_shared_blobs_across_revisions(monkeypatch, tmp
             "size_bytes": 5_000,
             "cache_path": str(repo.repo_path),
             "has_vision": False,
+            "task": None,
         }
     ]
 
@@ -519,6 +523,44 @@ def test_list_cached_models_skips_non_suffix_repo_when_gguf_files_exist(monkeypa
     result = asyncio.run(models_route.list_cached_models(current_subject = "test-user"))
 
     assert result["cached"] == []
+
+
+def test_list_cached_models_prefers_complete_over_larger_partial(monkeypatch, tmp_path):
+    # The same repo cached in two roots: a LARGER but PARTIAL copy must not shadow a SMALLER but
+    # COMPLETE one, or the picker (which drops partial rows) hides a usable model.
+    complete = _repo(
+        "Org/Dup",
+        [_file("model.safetensors", 10_000)],
+        tmp_path / "root_a" / "models--Org--Dup",
+    )
+    partial = _repo(
+        "Org/Dup",
+        [_file("model.safetensors", 15_000)],
+        tmp_path / "root_b" / "models--Org--Dup",
+    )
+
+    # The larger copy (root_b) is the partial one; the smaller (root_a) is complete.
+    monkeypatch.setattr(
+        models_route,
+        "_cached_repo_partial",
+        lambda repo_id, repo_cache_dir = None: "root_b" in str(repo_cache_dir),
+    )
+    monkeypatch.setattr(models_route, "_cached_repo_task", lambda repo_info: None)
+    # List the partial (larger) FIRST, so the old size-only rule would have picked it.
+    monkeypatch.setattr(
+        models_route,
+        "_all_hf_cache_scans",
+        lambda: [SimpleNamespace(repos = [partial, complete])],
+    )
+
+    result = asyncio.run(models_route.list_cached_models(current_subject = "test-user"))
+
+    assert len(result["cached"]) == 1
+    row = result["cached"][0]
+    assert row["repo_id"] == "Org/Dup"
+    # The COMPLETE (smaller) copy won.
+    assert row.get("partial") is not True
+    assert row["size_bytes"] == 10_000
 
 
 def test_list_cached_gguf_includes_mixed_repo_with_gguf_and_safetensors(monkeypatch, tmp_path):
@@ -546,6 +588,7 @@ def test_list_cached_gguf_includes_mixed_repo_with_gguf_and_safetensors(monkeypa
             "size_bytes": 5_000,
             "cache_path": str(mixed.repo_path),
             "has_vision": False,
+            "task": None,
         }
     ]
 
@@ -573,6 +616,7 @@ def test_list_cached_gguf_handles_none_size_on_disk(monkeypatch, tmp_path):
             "size_bytes": 5_000,
             "cache_path": str(partial.repo_path),
             "has_vision": False,
+            "task": None,
         }
     ]
 
@@ -609,6 +653,7 @@ def test_list_cached_gguf_skips_malformed_repo_without_wiping_response(monkeypat
             "size_bytes": 5_000,
             "cache_path": str(healthy.repo_path),
             "has_vision": False,
+            "task": None,
         }
     ]
 
@@ -656,7 +701,74 @@ def test_list_cached_models_includes_repo_with_only_mmproj_gguf(monkeypatch, tmp
 
     result = asyncio.run(models_route.list_cached_models(current_subject = "test-user"))
 
-    assert result["cached"] == [{"repo_id": "Org/MmprojAux", "size_bytes": 15_000}]
+    assert result["cached"] == [{"repo_id": "Org/MmprojAux", "size_bytes": 15_000, "task": None}]
+
+
+def test_list_cached_models_tags_diffusers_pipeline_as_text_to_image(monkeypatch, tmp_path):
+    """A cached diffusers pipeline repo (model_index.json present) is tagged
+    text-to-image so the chat picker hides it, while a plain checkpoint isn't."""
+    diffusion = _repo(
+        "Tongyi-MAI/Z-Image-Turbo",
+        [
+            _file("model_index.json", 1_000),
+            _file("text_encoder/model.safetensors", 9_000),
+            _file("transformer/diffusion_pytorch_model.safetensors", 9_000),
+        ],
+        tmp_path / "models--Tongyi-MAI--Z-Image-Turbo",
+    )
+    checkpoint = _repo(
+        "unsloth/Llama-3.2-1B-Instruct",
+        [_file("config.json", 1_000), _file("model.safetensors", 9_000)],
+        tmp_path / "models--unsloth--Llama-3.2-1B-Instruct",
+    )
+
+    monkeypatch.setattr(
+        models_route,
+        "_all_hf_cache_scans",
+        lambda: [SimpleNamespace(repos = [diffusion, checkpoint])],
+    )
+
+    result = asyncio.run(models_route.list_cached_models(current_subject = "test-user"))
+    by_repo = {c["repo_id"]: c["task"] for c in result["cached"]}
+    assert by_repo == {
+        "Tongyi-MAI/Z-Image-Turbo": "text-to-image",
+        "unsloth/Llama-3.2-1B-Instruct": None,
+    }
+
+
+def test_list_cached_models_marks_companion_only_pipeline_partial(monkeypatch, tmp_path):
+    """A companion-only prefetch (VAE / text-encoder / model_index.json but no transformer) carries
+    a root model_index.json yet is not a loadable pipeline, so it must be marked partial. A sibling
+    repo that DOES ship its transformer shards stays complete."""
+    companion_only = _repo(
+        "black-forest-labs/FLUX.1-dev",
+        [
+            _file("model_index.json", 1_000),
+            _file("vae/diffusion_pytorch_model.safetensors", 9_000),
+            _file("text_encoder/model.safetensors", 9_000),
+        ],
+        tmp_path / "models--black-forest-labs--FLUX.1-dev",
+    )
+    complete = _repo(
+        "Tongyi-MAI/Z-Image-Turbo",
+        [
+            _file("model_index.json", 1_000),
+            _file("text_encoder/model.safetensors", 9_000),
+            _file("transformer/diffusion_pytorch_model.safetensors", 9_000),
+        ],
+        tmp_path / "models--Tongyi-MAI--Z-Image-Turbo",
+    )
+
+    monkeypatch.setattr(
+        models_route,
+        "_all_hf_cache_scans",
+        lambda: [SimpleNamespace(repos = [companion_only, complete])],
+    )
+
+    result = asyncio.run(models_route.list_cached_models(current_subject = "test-user"))
+    by_repo = {c["repo_id"]: c for c in result["cached"]}
+    assert by_repo["black-forest-labs/FLUX.1-dev"].get("partial") is True
+    assert by_repo["Tongyi-MAI/Z-Image-Turbo"].get("partial") is None
 
 
 def test_list_cached_gguf_includes_vision_repo_with_main_gguf_and_mmproj(monkeypatch, tmp_path):
@@ -685,6 +797,7 @@ def test_list_cached_gguf_includes_vision_repo_with_main_gguf_and_mmproj(monkeyp
             "size_bytes": 5_000,
             "cache_path": str(vision_repo.repo_path),
             "has_vision": True,
+            "task": None,
         }
     ]
 
@@ -720,6 +833,7 @@ def test_all_hf_cache_scans_uses_shared_inventory(monkeypatch, tmp_path):
             "size_bytes": 5_000,
             "cache_path": str(tmp_path / "active"),
             "has_vision": False,
+            "task": None,
         }
     ]
 
@@ -1018,3 +1132,381 @@ def test_legacy_delete_delegates_to_shared_service(monkeypatch):
 
     assert result == {"status": "deleted", "repo_id": "org/repo"}
     assert calls == [("org/repo", None, "token", "/data/hf/hub")]
+
+
+def test_arch_to_task_hides_unsupported_diffusion_from_chat():
+    assert models_route._arch_to_task("flux") == "text-to-image"
+    assert models_route._arch_to_task("z_image") == "text-to-image"
+    assert models_route._arch_to_task("qwen_image") == "text-to-image"
+    assert models_route._arch_to_task("llama") == "text-generation"
+    assert models_route._arch_to_task(None) is None
+    # Known-but-unsupported diffusion archs get a task that is NEITHER chat nor a loadable image
+    # task, so the chat picker hides them and the Images picker leaves them out.
+    for arch in ("sdxl", "sd1", "sd3", "lumina2", "hidream", "cosmos", "hyvid"):
+        task = models_route._arch_to_task(arch)
+        assert task == models_route._UNSUPPORTED_DIFFUSION_TASK
+        assert task not in ("text-generation", "text-to-image")
+    # A video arch with a REGISTERED VideoFamily surfaces with the Video-picker task.
+    assert models_route._arch_to_task("ltxv") == models_route._VIDEO_GEN_TASK
+    assert models_route._arch_to_task("ltxv") not in ("text-generation", "text-to-image")
+    # A video arch that does not resolve from the bare arch alone ("wan" covers both the loadable
+    # TI2V-5B and the A14B MoE) stays unsupported when no name is available to disambiguate.
+    assert models_route._arch_to_task("wan") == models_route._UNSUPPORTED_DIFFUSION_TASK
+    assert models_route._arch_to_task("wan") not in ("text-generation", "text-to-image")
+    # With a repo/file name hint, the loadable TI2V-5B Wan GGUF resolves to the Video task while the
+    # A14B MoE stays unsupported, matching the loader's own name-aware detection.
+    assert (
+        models_route._arch_to_task("wan", ("QuantStack/Wan2.2-TI2V-5B-GGUF",))
+        == models_route._VIDEO_GEN_TASK
+    )
+    assert (
+        models_route._arch_to_task("wan", (None, "Wan2.2-TI2V-5B-Q4_K_M.gguf"))
+        == models_route._VIDEO_GEN_TASK
+    )
+    assert (
+        models_route._arch_to_task("wan", ("QuantStack/Wan2.2-T2V-A14B-GGUF",))
+        == models_route._UNSUPPORTED_DIFFUSION_TASK
+    )
+    # Drift guard: every diffusion arch llama.cpp rejects as a chat model must classify here as some
+    # non-chat task (image, video, or unsupported).
+    from core.inference.llama_cpp import LlamaCppBackend
+
+    classified = (
+        models_route._DIFFUSION_GGUF_ARCHS
+        | models_route._UNSUPPORTED_DIFFUSION_GGUF_ARCHS
+        | models_route._VIDEO_GGUF_ARCHS
+    )
+    missing = {a for a in LlamaCppBackend._DIFFUSION_ARCHES if a.lower() not in classified}
+    assert not missing, f"diffusion archs would still show in chat: {missing}"
+
+
+def _clear_chat_delete_guards(monkeypatch):
+    """Report chat + orchestrator idle so only the Images / Video guards can refuse a delete."""
+    import core.inference as core_inference
+    import routes.inference as routes_inference
+
+    monkeypatch.setattr(
+        routes_inference,
+        "get_llama_cpp_backend",
+        lambda: SimpleNamespace(
+            is_active = False,
+            is_loaded = False,
+            model_identifier = None,
+            hf_variant = None,
+        ),
+    )
+    monkeypatch.setattr(
+        core_inference,
+        "get_inference_backend",
+        lambda: SimpleNamespace(active_model_name = None),
+    )
+
+
+def _idle_video_backend():
+    return SimpleNamespace(
+        status = lambda: {"loaded": False, "repo_id": None},
+        loading_repo_ids = lambda: (),
+    )
+
+
+def _idle_diffusion_engine():
+    return SimpleNamespace(
+        status = lambda: {"loaded": False, "repo_id": None},
+        loaded_repo_ids = lambda: (),
+        loading_repo_ids = lambda: (),
+    )
+
+
+def test_delete_cached_refuses_diffusion_loaded_repo(monkeypatch):
+    # The cached-delete guard refuses deleting a repo the diffusion (Images) backend has loaded, so
+    # its GGUF can't be removed from under a live pipeline.
+    from fastapi import HTTPException
+    from hub.services.models import deletion
+    import core.inference.diffusion_engine_router as der
+    import core.inference.video as video_mod
+
+    _clear_chat_delete_guards(monkeypatch)
+    monkeypatch.setattr(
+        der,
+        "get_active_diffusion_engine",
+        lambda: SimpleNamespace(
+            status = lambda: {"loaded": True, "repo_id": "org/Z-Image-GGUF"},
+            loaded_repo_ids = lambda: (),
+            loading_repo_ids = lambda: (),
+        ),
+    )
+    monkeypatch.setattr(video_mod, "get_video_backend", _idle_video_backend)
+
+    try:
+        asyncio.run(deletion.delete_cached_model_response("org/Z-Image-GGUF"))
+        assert False, "expected HTTPException refusing the delete"
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "Unload the model before deleting" in e.detail
+
+
+def test_delete_cached_refuses_video_loaded_repo(monkeypatch):
+    # Same for the Video backend, which shares the On-Device GGUF delete UI with chat/Images.
+    from fastapi import HTTPException
+    from hub.services.models import deletion
+    import core.inference.diffusion_engine_router as der
+    import core.inference.video as video_mod
+
+    _clear_chat_delete_guards(monkeypatch)
+    monkeypatch.setattr(der, "get_active_diffusion_engine", _idle_diffusion_engine)
+    monkeypatch.setattr(
+        video_mod,
+        "get_video_backend",
+        lambda: SimpleNamespace(
+            status = lambda: {"loaded": True, "repo_id": "unsloth/LTX-2.3-GGUF"},
+            loading_repo_ids = lambda: (),
+        ),
+    )
+
+    try:
+        asyncio.run(deletion.delete_cached_model_response("unsloth/LTX-2.3-GGUF"))
+        assert False, "expected HTTPException refusing the delete"
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "Unload the model before deleting" in e.detail
+
+
+def test_delete_cached_refuses_loaded_native_companion_repo(monkeypatch):
+    # The native sd.cpp one-shot engine re-reads its companion VAE / text-encoder files every
+    # generation, so deleting a companion repo while a FLUX GGUF is loaded must be refused. The
+    # loaded repo_id does not match the companion, so the guard relies on loaded_repo_ids().
+    from fastapi import HTTPException
+    from hub.services.models import deletion
+    import core.inference.diffusion_engine_router as der
+    import core.inference.video as video_mod
+
+    _clear_chat_delete_guards(monkeypatch)
+    monkeypatch.setattr(
+        der,
+        "get_active_diffusion_engine",
+        lambda: SimpleNamespace(
+            status = lambda: {"loaded": True, "repo_id": "unsloth/FLUX.1-dev-GGUF"},
+            loaded_repo_ids = lambda: (
+                "unsloth/FLUX.1-dev-GGUF",
+                "black-forest-labs/FLUX.1-dev",
+                "comfyanonymous/flux_text_encoders",
+            ),
+            loading_repo_ids = lambda: (),
+        ),
+    )
+    monkeypatch.setattr(video_mod, "get_video_backend", _idle_video_backend)
+
+    try:
+        asyncio.run(deletion.delete_cached_model_response("comfyanonymous/flux_text_encoders"))
+        assert False, "expected HTTPException refusing the in-use companion delete"
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "Unload the model before deleting" in e.detail
+
+
+def test_delete_cached_refuses_repo_a_diffusion_load_is_downloading(monkeypatch):
+    # status().loaded is still False while a background Images load DOWNLOADS the repo, but deleting
+    # then would remove blobs from under it, so loading_repo_ids() must refuse.
+    from fastapi import HTTPException
+    from hub.services.models import deletion
+    import core.inference.diffusion_engine_router as der
+    import core.inference.video as video_mod
+
+    _clear_chat_delete_guards(monkeypatch)
+    monkeypatch.setattr(
+        der,
+        "get_active_diffusion_engine",
+        lambda: SimpleNamespace(
+            status = lambda: {"loaded": False, "repo_id": None},
+            loaded_repo_ids = lambda: (),
+            loading_repo_ids = lambda: ("unsloth/Qwen-Image-2512-GGUF",),
+        ),
+    )
+    monkeypatch.setattr(video_mod, "get_video_backend", _idle_video_backend)
+
+    try:
+        asyncio.run(deletion.delete_cached_model_response("unsloth/Qwen-Image-2512-GGUF"))
+        assert False, "expected HTTPException refusing the delete mid-download"
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "An Images model load is using this repo" in e.detail
+
+
+def test_delete_cached_allows_sibling_of_loaded_diffusion_repo(monkeypatch):
+    # A loaded Images repo must not block deleting a DIFFERENT cached repo that merely shares a name
+    # prefix (Qwen/Qwen-Image vs Qwen/Qwen-Image-2512). The guard is `/`-boundary aware.
+    from fastapi import HTTPException
+    from hub.services.models import deletion
+    import core.inference.diffusion_engine_router as der
+    import core.inference.video as video_mod
+
+    _clear_chat_delete_guards(monkeypatch)
+    monkeypatch.setattr(
+        der,
+        "get_active_diffusion_engine",
+        lambda: SimpleNamespace(
+            status = lambda: {"loaded": True, "repo_id": "Qwen/Qwen-Image-2512"},
+            loaded_repo_ids = lambda: (),
+            loading_repo_ids = lambda: (),
+        ),
+    )
+    monkeypatch.setattr(video_mod, "get_video_backend", _idle_video_backend)
+    # Stub the destructive stage: this test is about the guard boundary, not the cache walk.
+    monkeypatch.setattr(
+        deletion,
+        "_delete_cached_model_blocking",
+        lambda repo_id, variant, hf_token, cache_path = None: {
+            "status": "deleted",
+            "repo_id": repo_id,
+        },
+    )
+
+    # The sibling repo clears every guard and reaches the delete.
+    result = asyncio.run(deletion.delete_cached_model_response("Qwen/Qwen-Image"))
+    assert result == {"status": "deleted", "repo_id": "Qwen/Qwen-Image"}
+
+    # The loaded repo itself is still refused (exact match).
+    try:
+        asyncio.run(deletion.delete_cached_model_response("Qwen/Qwen-Image-2512"))
+        assert False, "expected HTTPException refusing delete of the loaded repo"
+    except HTTPException as e:
+        assert e.status_code == 400
+        assert "Unload the model before deleting" in e.detail
+
+
+def test_cached_repo_partial_scopes_probe_to_snapshot_dir(monkeypatch):
+    # The partial probe must be scoped to the snapshot row being listed: unscoped, a stale
+    # .incomplete copy in one cache root would flag a complete copy in another as partial and hide
+    # the usable model.
+    import hub.utils.inventory_scan as scan
+
+    calls = []
+
+    def _fake(
+        repo_type,
+        repo_id,
+        repo_cache_dir = None,
+    ):
+        calls.append((repo_type, repo_id, repo_cache_dir))
+        return False
+
+    monkeypatch.setattr(scan, "is_snapshot_partial", _fake)
+    snapshot_dir = Path("/root_a/models--Org--Repo/snapshots/abc")
+    assert models_route._cached_repo_partial("Org/Repo", snapshot_dir) is False
+    assert calls == [("model", "Org/Repo", snapshot_dir)]
+
+    monkeypatch.setattr(scan, "is_snapshot_partial", lambda *a, **k: True)
+    assert models_route._cached_repo_partial("Org/Repo", snapshot_dir) is True
+
+    # A probe error is swallowed (never hides a usable repo over a scan glitch).
+    def _boom(*a, **k):
+        raise RuntimeError("scan glitch")
+
+    monkeypatch.setattr(scan, "is_snapshot_partial", _boom)
+    assert models_route._cached_repo_partial("Org/Repo", snapshot_dir) is False
+
+
+def test_repo_has_pipeline_index_requires_root_model_index(tmp_path):
+    # Only a ROOT model_index.json makes a repo pipeline-loadable, so a nested subdir one must NOT
+    # clear the single_file flag. CachedFileInfo.file_name is the basename, so the helper scopes by
+    # snapshot path -- a name-only match would claim both.
+    snap = tmp_path / "snapshots" / "abc"
+    nested = SimpleNamespace(
+        file_name = "model_index.json",
+        file_path = snap / "prior" / "model_index.json",
+    )
+    repo_nested = SimpleNamespace(
+        repo_id = "unsloth/nested-index",
+        revisions = [SimpleNamespace(files = [nested], snapshot_path = snap)],
+    )
+    assert models_route._repo_has_pipeline_index(repo_nested) is False
+
+    root = SimpleNamespace(
+        file_name = "model_index.json",
+        file_path = snap / "model_index.json",
+    )
+    repo_root = SimpleNamespace(
+        repo_id = "unsloth/root-index",
+        revisions = [SimpleNamespace(files = [root], snapshot_path = snap)],
+    )
+    assert models_route._repo_has_pipeline_index(repo_root) is True
+
+
+def test_list_cached_models_flags_single_file_diffusion_repos(monkeypatch, tmp_path):
+    # A diffusion-tagged repo with NO top-level model_index.json is a single-file checkpoint, so it
+    # carries single_file=True; a full pipeline repo and a chat repo carry no flag.
+    single = _repo(
+        "unsloth/Qwen-Image-fp8-single",
+        [_file("qwen-image-fp8.safetensors", 10_000)],
+        tmp_path / "models--unsloth--Qwen-Image-fp8-single",
+    )
+    pipeline = _repo(
+        "unsloth/Qwen-Image-pipeline",
+        [_file("model_index.json", 10), _file("transformer/model.safetensors", 10_000)],
+        tmp_path / "models--unsloth--Qwen-Image-pipeline",
+    )
+    chat = _repo(
+        "Org/ChatRepo",
+        [_file("model.safetensors", 10_000)],
+        tmp_path / "models--Org--ChatRepo",
+    )
+
+    monkeypatch.setattr(
+        models_route,
+        "_cached_repo_task",
+        lambda repo_info: ("text-to-image" if "Qwen-Image" in repo_info.repo_id else None),
+    )
+    monkeypatch.setattr(
+        models_route,
+        "_all_hf_cache_scans",
+        lambda: [SimpleNamespace(repos = [single, pipeline, chat])],
+    )
+
+    result = asyncio.run(models_route.list_cached_models(current_subject = "test-user"))
+
+    rows = {r["repo_id"]: r for r in result["cached"]}
+    assert rows["unsloth/Qwen-Image-fp8-single"].get("single_file") is True
+    assert "single_file" not in rows["unsloth/Qwen-Image-pipeline"]
+    assert "single_file" not in rows["Org/ChatRepo"]
+
+
+def _pipeline_repo(repo_id: str, tmp_path: Path) -> SimpleNamespace:
+    return _repo(
+        repo_id,
+        [
+            _file("model_index.json", 1_000),
+            _file("transformer/diffusion_pytorch_model.safetensors", 5_000_000),
+        ],
+        tmp_path / f"models--{repo_id.replace('/', '--')}",
+    )
+
+
+def test_cached_repo_task_gates_an_image_pipeline_on_the_load_path_trust_rule(tmp_path):
+    """Every advertised row must be loadable. A cached community pipeline has a model_index.json
+    like any other, so tagging it text-to-image put a row in the Images picker that the loader's
+    trust check refuses -- the pick 400s. Gate the tag on the same rule."""
+    assert models_route._cached_repo_task(_pipeline_repo("unsloth/Qwen-Image", tmp_path)) == (
+        "text-to-image"
+    )
+    assert (
+        models_route._cached_repo_task(_pipeline_repo("someone/their-sdxl-mix", tmp_path)) is None
+    )
+
+
+def test_cached_repo_task_hides_an_untrusted_video_repo_instead_of_listing_it_under_images(
+    monkeypatch, tmp_path
+):
+    """A detected video pipeline that fails the video trust rule used to fall through to the image
+    fallback and show up in the Images picker, where it is just as unloadable."""
+    import core.inference.video as video_mod
+
+    repo = _pipeline_repo("someone/their-ltx-fork", tmp_path)
+    monkeypatch.setattr(
+        "core.inference.video_families.detect_video_family",
+        lambda repo_id: object(),
+    )
+    monkeypatch.setattr(video_mod, "_is_trusted_video_repo", lambda repo_id: False)
+    assert models_route._cached_repo_task(repo) is None
+
+    monkeypatch.setattr(video_mod, "_is_trusted_video_repo", lambda repo_id: True)
+    assert models_route._cached_repo_task(repo) == models_route._VIDEO_GEN_TASK

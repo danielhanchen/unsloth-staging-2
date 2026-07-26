@@ -9,6 +9,9 @@ export interface GpuInfo {
   available: boolean;
   name: string;
   memoryTotalGb: number;
+  /** Largest single device's VRAM. Image/video loads live on ONE device (no
+   * tensor split), so their fit math must use this, not the multi-GPU sum. */
+  maxDeviceMemoryGb: number;
   cpuCore: number;
   cpuThread: number;
   systemRamAvailableGb: number;
@@ -32,6 +35,7 @@ const DEFAULT_GPU: GpuInfo = {
   available: false,
   name: "Unknown",
   memoryTotalGb: 0,
+  maxDeviceMemoryGb: 0,
   cpuCore: 0,
   cpuThread: 0,
   systemRamAvailableGb: 0,
@@ -78,6 +82,7 @@ function toGpuInfo(data: SystemInfoResponse | null): GpuInfo {
     available: true,
     name: devices[0]?.name ?? "Unknown",
     memoryTotalGb: devices.reduce((sum, d) => sum + (d.memory_total_gb ?? 0), 0),
+    maxDeviceMemoryGb: devices.reduce((max, d) => Math.max(max, d.memory_total_gb ?? 0), 0),
   };
 }
 
