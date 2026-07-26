@@ -76,7 +76,10 @@ def routed():
     env = {**os.environ, "UNSLOTH_FORCE_GPU_PATH": "1"}
     proc = subprocess.run([sys.executable, "-c", code], capture_output = True, text = True, env = env)
     line = next((l for l in proc.stdout.splitlines() if l.startswith("RESULT ")), None)
-    assert line, f"child produced no result.\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    assert line, (
+        f"child produced no result (exit code {proc.returncode}).\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
     return json.loads(line[len("RESULT ") :])
 
 
