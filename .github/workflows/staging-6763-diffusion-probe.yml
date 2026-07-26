@@ -45,6 +45,14 @@ jobs:
           python -m pip install -e . || true
           python -m pip install playwright httpx
           python -m playwright install --with-deps chromium || python -m playwright install chromium
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build the web UI
+        run: |
+          cd studio/frontend
+          npm ci
+          npm run build
       - name: Launch Studio
         run: |
           mkdir -p artifacts
