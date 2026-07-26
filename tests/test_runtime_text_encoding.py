@@ -87,6 +87,13 @@ UNKNOWN_MODE = object()
 
 def _mode(call: ast.Call, positional_index: int):
     """The call's mode, or UNKNOWN_MODE when it is not a literal."""
+    # open(*args) / open(path, **kw) hide the mode, so it is unknown rather
+    # than absent. Falling through to the "r" default would flag a call that
+    # may resolve to binary, leaving no compliant way to write it.
+    if any(isinstance(a, ast.Starred) for a in call.args):
+        return UNKNOWN_MODE
+    if any(kw.arg is None for kw in call.keywords):
+        return UNKNOWN_MODE
     if len(call.args) > positional_index:
         node = call.args[positional_index]
         return node.value if isinstance(node, ast.Constant) else UNKNOWN_MODE
@@ -100,9 +107,13 @@ def _names_encoding(call: ast.Call) -> bool:
     """True only for an encoding that actually pins one.
 
     `encoding = None` and `encoding = "locale"` both re-select the platform
-    default, so the keyword being present is not enough.
+    default, so the keyword being present is not enough. A `**kwargs` splat may
+    carry an encoding we cannot see, so it counts as named rather than risking
+    a demand the contributor has no way to satisfy.
     """
     for kw in call.keywords:
+        if kw.arg is None:
+            return True
         if kw.arg != "encoding":
             continue
         if isinstance(kw.value, ast.Constant) and kw.value.value in (None, "locale"):
