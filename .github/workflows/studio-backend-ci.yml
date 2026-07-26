@@ -224,6 +224,10 @@ jobs:
             tests/studio/test_xpu_spoof_pipeline.py
 
       - name: Shell installer tests
+        # STAGING EXPERIMENT ONLY (not for upstream as-is): this step is ordered
+        # after a pytest step that currently always fails on main, so it never
+        # runs. if: always() proves whether the shell suite itself passes.
+        if: always()
         # Auto-discovered rather than allowlisted. The old hardcoded list had
         # silently fallen seven files behind tests/run_all.sh, including
         # test_strixhalo_wsl_reroute.sh -- the only shell coverage of the ROCm
