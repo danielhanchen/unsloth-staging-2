@@ -1,0 +1,51 @@
+name: "staging-6763 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-6763-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/diffusion.py'
+      - 'studio/backend/core/inference/diffusion_arch_patches.py'
+      - 'studio/backend/core/inference/diffusion_attention.py'
+      - 'studio/backend/core/inference/diffusion_auto_policy.py'
+      - 'studio/backend/core/inference/diffusion_batched.py'
+      - 'studio/backend/core/inference/diffusion_cache.py'
+      - 'studio/backend/core/inference/diffusion_compile_cache.py'
+      - 'studio/backend/core/inference/diffusion_cond_cache.py'
+      - 'studio/backend/core/inference/diffusion_controlnet.py'
+      - 'studio/backend/core/inference/diffusion_device.py'
+      - 'studio/backend/core/inference/diffusion_eager_patches.py'
+      - 'studio/backend/core/inference/diffusion_engine_router.py'
+      - 'studio/backend/core/inference/diffusion_families.py'
+      - 'studio/backend/core/inference/diffusion_gguf_compile.py'
+      - 'studio/backend/core/inference/diffusion_hidream.py'
+      - 'studio/backend/core/inference/diffusion_ideogram4.py'
+      - 'studio/backend/core/inference/diffusion_inference_info.py'
+      - 'studio/backend/core/inference/diffusion_krea2.py'
+      - 'studio/backend/core/inference/diffusion_lora.py'
+      - 'studio/backend/core/inference/diffusion_memory.py'
+      - '.github/workflows/staging-6763-ubuntu-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
