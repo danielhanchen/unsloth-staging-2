@@ -90,6 +90,7 @@ from utils.models.model_config import (
     _extract_quant_label,
     _iter_hf_cache_snapshots,
     _list_gguf_variants_from_hf_cache,
+    _pick_best_gguf,
     detect_gguf_model_remote,
     list_gguf_variants,
 )
@@ -997,6 +998,281 @@ class TestExtractQuantLabelSubdir:
     def test_deeper_nesting_picks_nearest_quant_dir(self):
         # Multiple matching parents: prefer the innermost (closest to the file).
         assert _extract_quant_label("models/MXFP4_MOE/foo.gguf") == "MXFP4_MOE"
+
+    def test_mtp_flavor_suffixes_are_distinct(self):
+        assert _extract_quant_label("Qwen3.6-40B-Deck-Opus-NEO-CODE-Q6_K-MTP.gguf") == "Q6_K-MTP"
+        assert (
+            _extract_quant_label("Qwen3.6-40B-Deck-Opus-NEO-CODE-Q6_K-PT-MTP.gguf") == "Q6_K-PT-MTP"
+        )
+
+    def test_mtp_suffix_from_parent_directory_segment(self):
+        assert _extract_quant_label("Q6_K-MTP/model.gguf") == "Q6_K-MTP"
+        assert _extract_quant_label("Q6_K-PT-MTP/model.gguf") == "Q6_K-PT-MTP"
+
+    def test_precision_infix_does_not_mask_real_quant(self):
+        assert _extract_quant_label("Foo-BF16-Q4_K_M.gguf") == "Q4_K_M"
+        assert _extract_quant_label("Foo-F16-Q8_0.gguf") == "Q8_0"
+
+    def test_variant_suffix_must_close_the_stem(self):
+        # Only a suffix that directly follows the quant and closes the stem is a flavor.
+        assert _extract_quant_label("m-Q6_K-MTP-v2.gguf") == "Q6_K"
+        assert _extract_quant_label("m-Q6_K-graft-MTP.gguf") == "Q6_K"
+        assert _extract_quant_label("m-Q6_K-MTPX.gguf") == "Q6_K"
+        assert _extract_quant_label("m-Q6_K-PT-PT-MTP.gguf") == "Q6_K"
+        assert _extract_quant_label("m-IQ4_XS-3.53bpw-v2.gguf") == "IQ4_XS"
+
+    def test_native_windows_path_matches_relative_path(self):
+        # llama_cpp derives hf_variant from the OS-native path it launched, so a
+        # parent folder's quant must not win over the one in the file's own name.
+        win = (
+            "N:\\AI Models\\Qwen\\Qwen3.6-40B-NEO-CODE-HERE-2T-OT-Q6_K"
+            "\\Qwen3.6-40B-NEO-CODE-Q6_K-MTP.gguf"
+        )
+        assert _extract_quant_label(win) == "Q6_K-MTP"
+        assert _extract_quant_label("C:\\models\\snap\\m-Q4_K_M.gguf") == "Q4_K_M"
+
+
+class TestSuffixedQuantDirWithRepeatedBasename:
+    """``Q6_K-MTP/model-Q6_K.gguf``: the basename settles the quant, so without
+    consulting the parent both MTP flavors collapse to one merged variant."""
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            ("Q6_K-MTP/model-Q6_K.gguf", "Q6_K-MTP"),
+            ("Q6_K-PT-MTP/model-Q6_K.gguf", "Q6_K-PT-MTP"),
+            ("IQ4_XS-3.53bpw/m-IQ4_XS.gguf", "IQ4_XS-3.53bpw"),
+            ("snap/Q6_K-MTP/model-Q6_K-00001-of-00003.gguf", "Q6_K-MTP"),
+            (r"C:\models\Q6_K-MTP\model-Q6_K.gguf", "Q6_K-MTP"),
+        ],
+    )
+    def test_parent_flavor_is_inherited(self, path, expected):
+        assert _extract_quant_label(path) == expected
+        from hub.utils.gguf import extract_quant_label as hub_extract
+        assert hub_extract(path.replace("\\", "/")) == expected
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            # Plain parent, or the basename already carrying its own flavor.
+            ("Q6_K/model-Q6_K.gguf", "Q6_K"),
+            ("Q6_K/model-Q6_K-MTP.gguf", "Q6_K-MTP"),
+            ("Q6_K-MTP/model-Q6_K-PT-MTP.gguf", "Q6_K-PT-MTP"),
+            # Parent names a different quant: the basename wins outright.
+            ("Q4_K_M-MTP/model-Q6_K.gguf", "Q6_K"),
+            # Near-miss parent suffixes stay ignored.
+            ("Q6_K-MTPX/model-Q6_K.gguf", "Q6_K"),
+            ("Q6_K-MTP-v2/model-Q6_K.gguf", "Q6_K"),
+        ],
+    )
+    def test_unrelated_parents_do_not_leak(self, path, expected):
+        assert _extract_quant_label(path) == expected
+
+
+class TestPreUpgradeVariantKeyStillLoads:
+    """Recipes saved before #7460 persisted the base quant, so ``Q6_K`` has to
+    keep finding a lone ``...-Q6_K-MTP.gguf`` after the label gained a flavor."""
+
+    @staticmethod
+    def _dir(tmp_path, names):
+        for name in names:
+            f = tmp_path / name
+            f.parent.mkdir(parents = True, exist_ok = True)
+            f.write_bytes(b"\0" * 1024)
+        return str(tmp_path)
+
+    def test_lone_flavor_resolves_from_the_old_key(self, tmp_path):
+        from utils.models.model_config import _find_local_gguf_by_variant
+
+        d = self._dir(tmp_path, ["model-Q6_K-MTP.gguf"])
+        assert _find_local_gguf_by_variant(d, "Q6_K") is not None
+        assert _find_local_gguf_by_variant(d, "Q6_K-MTP") is not None
+
+    def test_exact_match_still_wins_over_the_fallback(self, tmp_path):
+        from utils.models.model_config import _find_local_gguf_by_variant
+        d = self._dir(tmp_path, ["model-Q6_K.gguf", "model-Q6_K-MTP.gguf"])
+        assert _find_local_gguf_by_variant(d, "Q6_K").endswith("model-Q6_K.gguf")
+
+    def test_several_flavors_stay_ambiguous(self, tmp_path):
+        from utils.models.model_config import _find_local_gguf_by_variant
+        d = self._dir(tmp_path, ["model-Q6_K-MTP.gguf", "model-Q6_K-PT-MTP.gguf"])
+        assert _find_local_gguf_by_variant(d, "Q6_K") is None
+
+    def test_fallback_does_not_cross_base_quants(self, tmp_path):
+        from utils.models.model_config import _find_local_gguf_by_variant
+        d = self._dir(tmp_path, ["model-Q4_K_M-MTP.gguf"])
+        assert _find_local_gguf_by_variant(d, "Q6_K") is None
+
+    def test_sharded_lone_flavor_returns_the_first_shard(self, tmp_path):
+        from utils.models.model_config import _find_local_gguf_by_variant
+        d = self._dir(
+            tmp_path,
+            ["m-Q6_K-MTP-00002-of-00002.gguf", "m-Q6_K-MTP-00001-of-00002.gguf"],
+        )
+        assert _find_local_gguf_by_variant(d, "Q6_K").endswith("00001-of-00002.gguf")
+
+
+class TestInheritedFlavorDoesNotBreakOtherReaders:
+    """An inherited parent flavor changes the label every other reader keys on,
+    so endianness, deletion and the chat-template lookup all have to follow."""
+
+    @pytest.mark.parametrize(
+        "path,expected",
+        [
+            # The UD- prefix is part of the quant identity, so a parent naming a
+            # different base must not lend its flavor.
+            ("UD-Q4_K_XL-MTP/model-Q4_K_XL.gguf", "Q4_K_XL"),
+            ("Q4_K_XL-MTP/model-UD-Q4_K_XL.gguf", "UD-Q4_K_XL"),
+            ("UD-Q4_K_XL-MTP/model-UD-Q4_K_XL.gguf", "UD-Q4_K_XL-MTP"),
+            ("Q4_K_XL-MTP/model-Q4_K_XL.gguf", "Q4_K_XL-MTP"),
+        ],
+    )
+    def test_ud_prefix_is_part_of_the_quant_identity(self, path, expected):
+        from hub.utils.gguf import extract_quant_label as hub_extract
+        assert _extract_quant_label(path) == expected
+        assert hub_extract(path) == expected
+
+    @pytest.mark.parametrize(
+        "path,is_be",
+        [
+            ("Q6_K-MTP/model-Q6_K-be.gguf", True),
+            ("Q6_K/model-Q6_K-be.gguf", True),
+            ("model-Q6_K-be.gguf", True),
+            ("Q6_K-MTP/model-Q6_K.gguf", False),
+            ("IQ4_XS-3.53bpw/m-IQ4_XS-be.gguf", True),
+        ],
+    )
+    def test_big_endian_still_detected_under_an_inherited_flavor(self, path, is_be):
+        from core.inference.llama_cpp import _is_big_endian_gguf_path as llama_is_be
+        from hub.utils.gguf import is_big_endian_gguf_path as hub_is_be
+        from utils.models.model_config import _is_big_endian_gguf_path
+
+        label = _extract_quant_label(path)
+        assert _is_big_endian_gguf_path(path, label) is is_be
+        assert hub_is_be(path, label) is is_be
+        assert llama_is_be(path, label) is is_be
+
+    @pytest.mark.parametrize(
+        "relative,needle,matches",
+        [
+            ("model-Q6_K-MTP.gguf", "q6_k", True),
+            ("Q6_K-MTP/model.gguf", "q6_k", True),
+            ("m-IQ4_XS-3.53bpw.gguf", "iq4_xs", True),
+            ("model-Q6_K-MTP.gguf", "q6_k-mtp", True),
+            # -MTPX is not a flavor at all, so the file is a plain Q6_K.
+            ("model-Q6_K-MTPX.gguf", "q6_k", True),
+            # A different base quant never matches.
+            ("model-Q4_K_M-MTP.gguf", "q6_k", False),
+            ("model-Q6_K-MTP.gguf", "q4_k_m", False),
+        ],
+    )
+    def test_chat_template_lookup_accepts_legacy_keys(self, relative, needle, matches):
+        from picker.service import _variant_matches
+        assert _variant_matches(relative, needle) is matches
+
+
+class TestPreUpgradeVariantKeyResolvesFromCache:
+    """Same pre-#7460 compatibility gap as ``_find_local_gguf_by_variant``, but on
+    the HF-cache path that validation and diffusion classification read."""
+
+    @staticmethod
+    def _cached(monkeypatch, tmp_path, repo_id, names):
+        import hub.utils.gguf as hub_gguf
+        snap = _build_cache(tmp_path, repo_id, dict.fromkeys(names, 1024))
+        monkeypatch.setattr(hub_gguf, "iter_hf_cache_snapshots", lambda _repo_id, root = None: [snap])
+
+    @pytest.mark.parametrize(
+        "names,variant,expected",
+        [
+            (["model-Q6_K-MTP.gguf"], "Q6_K", "model-Q6_K-MTP.gguf"),
+            (["model-Q6_K-MTP.gguf"], "Q6_K-MTP", "model-Q6_K-MTP.gguf"),
+            (["Q6_K-MTP/model.gguf"], "Q6_K", "model.gguf"),
+            # Exact match still wins when the plain quant is also cached.
+            (["model-Q6_K.gguf", "model-Q6_K-MTP.gguf"], "Q6_K", "model-Q6_K.gguf"),
+        ],
+    )
+    def test_legacy_key_resolves_when_unambiguous(
+        self, monkeypatch, tmp_path, names, variant, expected
+    ):
+        from hub.utils.gguf import resolve_local_gguf_path
+
+        self._cached(monkeypatch, tmp_path, "org/legacy", names)
+        resolved = resolve_local_gguf_path("org/legacy", variant)
+        assert resolved is not None and Path(resolved).name == expected
+
+    @pytest.mark.parametrize(
+        "names,variant",
+        [
+            (["model-Q6_K-MTP.gguf", "model-Q6_K-PT-MTP.gguf"], "Q6_K"),
+            (["model-Q4_K_M-MTP.gguf"], "Q6_K"),
+        ],
+    )
+    def test_ambiguous_or_unrelated_still_returns_none(self, monkeypatch, tmp_path, names, variant):
+        from hub.utils.gguf import resolve_local_gguf_path
+        self._cached(monkeypatch, tmp_path, "org/ambiguous", names)
+        assert resolve_local_gguf_path("org/ambiguous", variant) is None
+
+
+class TestCompanionSearchRootSuffixedQuantDir:
+    """A suffixed quant dir is still a quant dir, so companions live one level up.
+
+    Without this the mmproj/MTP scan stays inside ``Q6_K-MTP/`` and the model
+    loads with no projector and no separate drafter.
+    """
+
+    @staticmethod
+    def _root(path):
+        from utils.models.model_config import _local_gguf_companion_search_root
+        return _local_gguf_companion_search_root(path, path)
+
+    @pytest.mark.parametrize(
+        "quant_dir",
+        ["Q6_K", "Q4_K_M", "UD-Q4_K_XL", "IQ4_XS", "BF16", "MXFP4_MOE", "TQ1_0", "Q8_0"],
+    )
+    def test_plain_quant_dirs_still_climb(self, quant_dir):
+        assert self._root(f"snap/{quant_dir}/model.gguf") == "snap"
+
+    @pytest.mark.parametrize(
+        "quant_dir",
+        ["Q6_K-MTP", "Q6_K-PT-MTP", "IQ4_XS-3.53bpw", "UD-Q4_K_XL-MTP", "BF16-4bpw"],
+    )
+    def test_suffixed_quant_dirs_climb_too(self, quant_dir):
+        assert self._root(f"snap/{quant_dir}/model.gguf") == "snap"
+
+    @pytest.mark.parametrize(
+        "other_dir",
+        ["Q6_K-MTPX", "Q6_K-MTP-v2", "Q6_K-junk", "Q6_K-bpw", "MTP", "my-model"],
+    )
+    def test_near_miss_dirs_do_not_climb(self, other_dir):
+        assert self._root(f"snap/{other_dir}/model.gguf") == f"snap/{other_dir}"
+
+
+def test_pick_best_gguf_prefers_real_quant_over_precision_infix():
+    assert _pick_best_gguf(["Foo-BF16-Q4_K_M.gguf", "Foo-Q8_0.gguf"]) == "Foo-BF16-Q4_K_M.gguf"
+
+
+def test_quant_label_matches_hub_extractor():
+    """Label drift between the hub picker and model_config makes a listed variant unloadable."""
+    from hub.utils.gguf import extract_quant_label as hub_extract_quant_label
+
+    names = [
+        "gemma-3-4b-it-Q4_K_M.gguf",
+        "model-UD-IQ1_S.gguf",
+        "Foo-BF16-Q4_K_M.gguf",
+        "m-Q6_K-MTP.gguf",
+        "m-Q6_K-PT-MTP.gguf",
+        "m-Q6_K-MTP-v2.gguf",
+        "m-Q6_K-MTPX.gguf",
+        "m-Q6_K-MTP-00001-of-00003.gguf",
+        "m-IQ4_XS-3.53bpw.gguf",
+        "m-IQ4_XS-3.53bpw-MTP.gguf",
+        "Q6_K-MTP/model.gguf",
+        "IQ4_XS-3.53bpw/model.gguf",
+        "BF16/model-00001-of-00002.gguf",
+        "N:\\models\\snap-Q6_K\\m-Q6_K-MTP.gguf",
+    ]
+    for name in names:
+        assert _extract_quant_label(name) == hub_extract_quant_label(name), name
 
 
 class TestDownloadMmprojOfflineCacheFallback:

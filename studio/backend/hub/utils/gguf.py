@@ -66,6 +66,11 @@ GGUF_QUANT_PREFERENCE = [
 ]
 
 _GGUF_SPLIT_SUFFIX_RE = re.compile(r"-\d{3,}-of-\d{3,}", re.IGNORECASE)
+# Suffixes that keep files sharing a base quant distinct (-Q6_K-MTP vs -Q6_K-PT-MTP).
+_POST_QUANT_VARIANT_SUFFIX_RE = re.compile(
+    r"-(?:(?:PT-)?MTP|[0-9]+(?:\.[0-9]+)?bpw)$",
+    re.IGNORECASE,
+)
 _GGUF_QUANT_RE = re.compile(
     r"(UD-)?"
     r"(MXFP[0-9]+(?:_[A-Z0-9]+)*"
@@ -116,7 +121,9 @@ def is_big_endian_gguf_path(path: str, quant: str = "") -> bool:
     normalized = path.replace("\\", "/")
     name = normalized.rsplit("/", 1)[-1]
     stem = name.rsplit(".", 1)[0].lower()
-    quant_key = quant.strip().lower()
+    # A flavor suffix can come from the parent dir, so match on the base quant
+    # or ``Q6_K-MTP/model-Q6_K-be.gguf`` reads as quant-in-parent-only.
+    quant_key = _POST_QUANT_VARIANT_SUFFIX_RE.sub("", quant).strip().lower()
     quant_index = stem.find(quant_key) if quant_key else -1
     parent = normalized.rsplit("/", 1)[0].lower() if "/" in normalized else ""
     quant_in_parent_only = (
@@ -177,18 +184,23 @@ def pick_best_gguf(filenames: list[str]) -> Optional[str]:
     ]
     if not gguf_files:
         return None
-    by_quant: dict[str, str] = {}
+    by_label: dict[str, str] = {}
     for name in gguf_files:
-        by_quant.setdefault(extract_quant_label(name).upper(), name)
+        label = extract_quant_label(name)
+        by_label.setdefault(label.upper(), name)
     for quant in GGUF_QUANT_PREFERENCE:
-        filename = by_quant.get(quant.upper())
-        if filename is not None:
-            return filename
+        pref = quant.upper()
+        exact = by_label.get(pref)
+        if exact is not None:
+            return exact
+        for label_upper, filename in by_label.items():
+            if _base_quant_for_preference(label_upper) == pref:
+                return filename
     return gguf_files[0]
 
 
 def _gguf_stem(filename: str) -> str:
-    basename = filename.rsplit("/", 1)[-1]
+    basename = filename.replace("\\", "/").rsplit("/", 1)[-1]
     return _GGUF_SPLIT_SUFFIX_RE.sub("", basename.rsplit(".", 1)[0]).strip()
 
 
@@ -206,19 +218,58 @@ def _select_quant_match(text: str) -> Optional[re.Match]:
     return fallback
 
 
+def _quant_with_disambiguating_suffix(stem: str, match: re.Match) -> str:
+    prefix = match.group(1) or ""
+    quant = f"{prefix}{match.group(2)}"
+    tail = stem[match.end() :]
+    suffix_match = _POST_QUANT_VARIANT_SUFFIX_RE.match(tail)
+    if suffix_match:
+        quant += suffix_match.group(0)
+    return quant
+
+
+def _base_quant_for_preference(label: str) -> str:
+    return _POST_QUANT_VARIANT_SUFFIX_RE.sub("", label).upper()
+
+
+def _full_base_label(match: re.Match) -> str:
+    """Quant identity including the ``UD-`` prefix, which distinguishes quants."""
+    return f"{match.group(1) or ''}{match.group(2)}".upper()
+
+
+def _parent_flavor_suffix(normalized: str, match: re.Match) -> str:
+    """Flavor suffix from the nearest quant-named parent dir, if it agrees.
+
+    ``Q6_K-MTP/model-Q6_K.gguf``: the basename settles the quant so the parent
+    is never inspected, and both MTP flavors would collapse to ``Q6_K``.
+    """
+    if "/" not in normalized:
+        return ""
+    for segment in reversed(normalized.rsplit("/", 1)[0].split("/")):
+        parent_match = _select_quant_match(segment)
+        if parent_match is None:
+            continue
+        if _full_base_label(parent_match) != _full_base_label(match):
+            return ""
+        suffix_match = _POST_QUANT_VARIANT_SUFFIX_RE.match(segment[parent_match.end() :])
+        return suffix_match.group(0) if suffix_match else ""
+    return ""
+
+
 def extract_quant_token(filename: str) -> Optional[str]:
-    stem = _gguf_stem(filename)
+    normalized = filename.replace("\\", "/")
+    stem = _gguf_stem(normalized)
     match = _select_quant_match(stem)
-    if not match and "/" in filename:
-        parents = filename.rsplit("/", 1)[0]
-        for segment in reversed(parents.split("/")):
+    if match:
+        label = _quant_with_disambiguating_suffix(stem, match)
+        if not _POST_QUANT_VARIANT_SUFFIX_RE.search(label):
+            label += _parent_flavor_suffix(normalized, match)
+        return label
+    if "/" in normalized:
+        for segment in reversed(normalized.rsplit("/", 1)[0].split("/")):
             parent_match = _select_quant_match(segment)
             if parent_match:
-                match = parent_match
-                break
-    if match:
-        prefix = match.group(1) or ""
-        return f"{prefix}{match.group(2)}"
+                return _quant_with_disambiguating_suffix(segment, parent_match)
     return None
 
 
@@ -428,11 +479,20 @@ def resolve_local_gguf_path(repo_id: str, gguf_variant: Optional[str]) -> Option
     triggers a download. Lets callers read header metadata before a load."""
     for snapshot in iter_hf_cache_snapshots(repo_id):
         variants, _ = list_local_gguf_variants(str(snapshot))
+        by_base: dict[str, GgufVariantInfo] = {}
         for variant in variants:
             if gguf_variant is None or variant.quant == gguf_variant:
                 candidate = snapshot / variant.filename
                 if candidate.is_file():
                     return str(candidate)
+            elif _base_quant_for_preference(variant.quant) == gguf_variant.upper():
+                by_base.setdefault(variant.quant.upper(), variant)
+        # Recipes saved before #7460 stored the base quant, so ``Q6_K`` must still
+        # find a lone cached ``...-Q6_K-MTP.gguf``. Ambiguous with several flavors.
+        if len(by_base) == 1:
+            candidate = snapshot / next(iter(by_base.values())).filename
+            if candidate.is_file():
+                return str(candidate)
     return None
 
 

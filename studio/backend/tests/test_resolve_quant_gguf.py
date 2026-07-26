@@ -97,3 +97,88 @@ def test_returns_none_when_quant_absent(tmp_path):
 
     assert path is None
     assert total == 0
+
+
+def test_delete_variant_matches_the_listed_label(tmp_path):
+    """``_delete_gguf_variant_files`` must key on the same label the listing shows.
+
+    Reading only ``path.name`` misses every subdir layout, so the displayed
+    variant 404s instead of deleting.
+    """
+    for names, variant in [
+        (["Q6_K-MTP/model-Q6_K.gguf"], "Q6_K-MTP"),
+        (["Q6_K/model.gguf"], "Q6_K"),
+        (["model-Q6_K.gguf"], "Q6_K"),
+        (["IQ4_XS-3.53bpw/m.gguf"], "IQ4_XS-3.53bpw"),
+    ]:
+        root = tmp_path / variant.replace(".", "_") / str(len(names))
+        for name in names:
+            _write(root / name, 16)
+        assert models_route._delete_gguf_variant_files(root, variant)[0] == 1
+
+
+def test_delete_variant_leaves_other_quants_alone(tmp_path):
+    root = tmp_path / "mixed"
+    _write(root / "Q6_K-MTP/model-Q6_K.gguf", 16)
+    _write(root / "Q6_K/model-Q6_K.gguf", 16)
+    _write(root / "model-Q4_K_M.gguf", 16)
+
+    assert models_route._delete_gguf_variant_files(root, "Q6_K-MTP")[0] == 1
+    assert (root / "Q6_K/model-Q6_K.gguf").exists()
+    assert (root / "model-Q4_K_M.gguf").exists()
+
+
+def _fake_cached_repo(root, rels):
+    """Minimal stand-in for a scanned HF cache repo (duck-typed via getattr)."""
+    import types
+
+    snapshot = root / "models--org--repo" / "snapshots" / ("a" * 40)
+    files = []
+    for rel in rels:
+        path = snapshot / rel
+        _write(path, 32)
+        files.append(
+            types.SimpleNamespace(file_name = path.name, file_path = str(path), blob_path = None)
+        )
+    return types.SimpleNamespace(
+        repo_path = str(root / "models--org--repo"),
+        revisions = [types.SimpleNamespace(files = files)],
+    )
+
+
+def _matches_variant(repo, variant):
+    from hub.services.models import deletion
+    from hub.services.models.common import _is_main_gguf_filename
+    from hub.utils.gguf import extract_quant_label
+
+    return deletion._repo_file_matches(
+        repo,
+        lambda name: _is_main_gguf_filename(name)
+        and extract_quant_label(name).lower() == variant.lower(),
+    )
+
+
+def test_cached_deletion_matches_the_listed_label(tmp_path):
+    """Cache deletion keys on ``file_name``, which is the basename, so a subdir
+    layout is read as the bare quant and the displayed variant matches nothing."""
+    for i, (rels, variant) in enumerate(
+        [
+            (["Q6_K-MTP/model-Q6_K.gguf"], "Q6_K-MTP"),
+            (["Q6_K/model.gguf"], "Q6_K"),
+            (["model-Q6_K.gguf"], "Q6_K"),
+            (["IQ4_XS-3.53bpw/m.gguf"], "IQ4_XS-3.53bpw"),
+        ]
+    ):
+        repo = _fake_cached_repo(tmp_path / str(i), rels)
+        assert len(_matches_variant(repo, variant)) == 1
+
+
+def test_cached_deletion_leaves_other_quants_alone(tmp_path):
+    repo = _fake_cached_repo(
+        tmp_path / "mixed",
+        ["Q6_K-MTP/model-Q6_K.gguf", "Q6_K/model-Q6_K.gguf", "model-Q4_K_M.gguf"],
+    )
+
+    matched = _matches_variant(repo, "Q6_K-MTP")
+
+    assert [name for _snap, _blob, name in matched] == ["Q6_K-MTP/model-Q6_K.gguf"]
