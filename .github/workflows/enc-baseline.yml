@@ -1,0 +1,45 @@
+name: "encoding BASELINE (unpatched main) - expected to fail on Windows"
+on:
+  push:
+    branches: ["enc-verify-baseline"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  baseline:
+    name: "${{ matrix.os }} baseline"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Report the platform default encoding
+        run: python -c "import sys,locale,platform; print('platform :', platform.platform()); print('getencoding :', locale.getencoding()); print('utf8_mode :', sys.flags.utf8_mode)"
+      - run: python -m pip install -q pytest pytest-asyncio pytest-timeout
+      # No fix applied. On a cp1252 Windows box these die at import.
+      - name: Collection on unpatched main
+        run: |
+          python -m pytest --collect-only -q -p no:cacheprovider \
+            tests/studio/test_cancel_atomicity.py \
+            tests/studio/test_cancel_id_wiring.py
+      - name: Backend tree collection on unpatched main
+        run: |
+          cd studio/backend
+          python -m pytest --collect-only -q -p no:cacheprovider tests/test_tool_xml_strip.py
