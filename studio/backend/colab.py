@@ -109,7 +109,13 @@ def _load_colab_login_credentials() -> "tuple[str, str] | None":
         lines = path.read_text(encoding = "utf-8").splitlines()
         if len(lines) >= 2 and lines[0] and lines[1]:
             return lines[0], lines[1]
-    except OSError as e:
+    # A cache written by an older build under a legacy codepage is undecodable
+    # here. Both fields are ASCII by construction today (the username is the
+    # literal DEFAULT_ADMIN_USERNAME, the password a diceware passphrase) and
+    # hosted Colab is Linux, so this is belt and braces -- but the alternative
+    # is an uncaught raise on a credentials path, and re-prompting is what the
+    # "no stored credentials" branch already does.
+    except (OSError, UnicodeDecodeError) as e:
         logger.info(f"Could not load Colab login credentials ({e}).")
     return None
 
