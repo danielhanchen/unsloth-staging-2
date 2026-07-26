@@ -132,9 +132,11 @@ async def main() -> int:
 
             await page.goto(f"{args.base}/images", wait_until="domcontentloaded", timeout=60_000)
             await page.wait_for_timeout(2500)
-            train_tab = page.get_by_role("button", name="Train").first
-            if await train_tab.count() > 0:
-                await train_tab.click()
+            # The Train tab is disabled on a GPU-less host, so a click may never land. That is
+            # the expected shape here, not a probe failure.
+            try:
+                train_tab = page.get_by_role("button", name="Train").last
+                await train_tab.click(timeout=8_000)
                 await page.wait_for_timeout(3000)
                 await page.screenshot(path=str(out / f"{sys.platform}_train.png"), full_page=True)
                 text = await page.inner_text("body")
@@ -142,6 +144,10 @@ async def main() -> int:
                     "has_dataset": "Dataset" in text,
                     "mentions_gpu_requirement": "GPU" in text,
                 }
+            except Exception as exc:  # noqa: BLE001
+                res["checks"]["train_tab"] = f"not clickable: {type(exc).__name__}"
+        except Exception as exc:  # noqa: BLE001 -- record and still write the report
+            res["ui_error"] = f"{type(exc).__name__}: {exc}"[:300]
         finally:
             await ctx.close()
             await browser.close()
