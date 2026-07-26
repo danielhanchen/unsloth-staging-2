@@ -1078,7 +1078,7 @@ def install_lock(lock_path: Path) -> Iterator[None]:
             except FileExistsError:
                 stale = False
                 try:
-                    raw = lock_path.read_text().strip()
+                    raw = lock_path.read_text(encoding = "utf-8").strip()
                 except FileNotFoundError:
                     # Lock vanished between our open and read -- retry
                     continue
@@ -2346,7 +2346,7 @@ def install_selected_prebuilt(
     if not server.is_file():
         raise PrebuiltFallback(f"post-install verification failed: {server} is missing")
     ops.log(
-        f"installed {ops.COMPONENT} {bundle.release_tag} " f"({selection.backend}) at {install_dir}"
+        f"installed {ops.COMPONENT} {bundle.release_tag} ({selection.backend}) at {install_dir}"
     )
     return 0
 

@@ -26,6 +26,15 @@ Binary handles are skipped: they have no encoding to name, and passing one is a
 ValueError. A non-constant mode is treated as unknown rather than assumed text,
 for the same reason -- demanding `encoding =` on a call that may resolve to "rb"
 would leave no compliant way to write it.
+
+Known limitation, deliberately not closed: `configparser.ConfigParser.read()`
+also takes an `encoding` and also defaults to the locale one, but it cannot be
+matched by name without resolving the receiver. `f.read(n)` on a binary handle,
+`resp.read(limit)` on an HTTP response and `handle.read(chunk)` are all spelled
+identically, and flagging those would be a false positive with no compliant fix
+-- the exact failure mode this guard is built to avoid. The one live
+`ConfigParser.read` in the tree (/etc/wsl.conf, hub/utils/paths.py) names its
+encoding; a future one has to be caught in review.
 """
 
 # `str | None` below is evaluated at import on Python 3.9 without this, and
@@ -37,16 +46,40 @@ from pathlib import Path
 
 
 REPO = Path(__file__).resolve().parent.parent
-# The three trees that ship to users. Test trees are covered by
-# test_source_read_encoding.py under a narrower import-time rule.
-ROOTS = (REPO / "unsloth", REPO / "studio" / "backend", REPO / "unsloth_cli")
+# Everything that ships to users. `studio/` covers the installer scripts as
+# well as the backend: install_python_stack.py reads /sys/class/kfd to decide
+# whether to pull ROCm wheels, which is the same detection path as
+# utils/hardware/hardware.py and deserves the same rule. Test trees are covered
+# by test_source_read_encoding.py under a narrower import-time rule.
+ROOTS = (REPO / "unsloth", REPO / "studio", REPO / "unsloth_cli")
+# The frontend tree is TypeScript; node_modules is vendored third-party code.
+SKIP_DIRS = {"frontend", "node_modules", "src-tauri", ".venv", "site-packages"}
 GUARDED_METHODS = {"read_text", "write_text"}
 # `<module>.open(...)` is somebody else's opener. fitz.open() takes filetype=,
 # tarfile.open() takes a compression mode; neither has an encoding to name.
 NOT_PATH_RECEIVERS = {
-    "bz2", "codecs", "cv2", "dbm", "fitz", "gzip", "h5py", "Image", "io", "json",
-    "lzma", "np", "numpy", "os", "pymupdf", "shelve", "socket", "sqlite3",
-    "tarfile", "wave", "webbrowser", "zipfile",
+    "bz2",
+    "codecs",
+    "cv2",
+    "dbm",
+    "fitz",
+    "gzip",
+    "h5py",
+    "Image",
+    "io",
+    "json",
+    "lzma",
+    "np",
+    "numpy",
+    "os",
+    "pymupdf",
+    "shelve",
+    "socket",
+    "sqlite3",
+    "tarfile",
+    "wave",
+    "webbrowser",
+    "zipfile",
 }
 # Distinct from None so that "no mode argument at all" still means text.
 UNKNOWN_MODE = object()
@@ -111,6 +144,8 @@ def _offender(call: ast.Call) -> str | None:
 
 def _is_test_path(path: Path) -> bool:
     parts = path.relative_to(REPO).parts
+    if SKIP_DIRS.intersection(parts):
+        return True
     if "tests" in parts or "test" in parts:
         return True
     return path.name.startswith("test_") or path.name.endswith("_test.py")
