@@ -1,0 +1,93 @@
+name: "encoding verification (real Windows / macOS / Linux)"
+on:
+  push:
+    branches: ["enc-verify-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  verify:
+    name: "${{ matrix.os }} / py${{ matrix.python }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        python: ['3.12']
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # What is this runner's actual default? A Windows runner configured for
+      # UTF-8 cannot reproduce the bug naturally, and the report has to say so
+      # rather than claim coverage it does not have.
+      - name: Report the platform default encoding
+        run: |
+          python -c "import sys,locale,platform; print('platform :', platform.platform()); print('getencoding :', locale.getencoding()); print('preferred :', locale.getpreferredencoding(False)); print('utf8_mode :', sys.flags.utf8_mode); print('stdout :', sys.stdout.encoding)"
+
+      - name: Install test deps
+        run: python -m pip install -q pytest pytest-asyncio pytest-timeout
+
+      # Both AST guards must hold on every OS. These need no third-party deps.
+      - name: Guard - import-time reads in the test trees (PR 7438)
+        run: python -m pytest tests/test_source_read_encoding.py -q -p no:cacheprovider
+
+      - name: Guard - shipping-code reads name an encoding
+        run: python -m pytest tests/test_runtime_text_encoding.py -q -p no:cacheprovider
+
+      # The bug itself. Under the runner's NATURAL default these modules must
+      # collect; on a cp1252 Windows box the pre-fix code died here at import.
+      - name: Collection - modules that used to die at import
+        run: |
+          python -m pytest --collect-only -q -p no:cacheprovider \
+            tests/studio/test_cancel_atomicity.py \
+            tests/studio/test_cancel_id_wiring.py
+
+      - name: Collection - backend tree module that reads routes/inference.py
+        run: |
+          cd studio/backend
+          python -m pytest --collect-only -q -p no:cacheprovider tests/test_tool_xml_strip.py
+
+      # Force cp1252 regardless of what the runner defaults to, so the check is
+      # meaningful even on a UTF-8 Windows image. This is the same shim used in
+      # the local matrix.
+      - name: Collection under a forced cp1252 default
+        run: |
+          cat > /tmp/cp1252_shim.py <<'PY'
+          import builtins, io, sys
+          _real = io.open
+          def shim(file, mode='r', buffering=-1, encoding=None, errors=None,
+                   newline=None, closefd=True, opener=None):
+              if 'b' not in mode and encoding in (None, 'locale'):
+                  encoding = 'cp1252'
+              return _real(file, mode, buffering, encoding, errors, newline, closefd, opener)
+          io.open = builtins.open = shim
+          import pytest
+          sys.exit(pytest.main(sys.argv[1:]))
+          PY
+          python /tmp/cp1252_shim.py --collect-only -q -p no:cacheprovider \
+            tests/studio/test_cancel_atomicity.py \
+            tests/studio/test_cancel_id_wiring.py
+
+      - name: Run the recovered tests
+        run: |
+          python -m pytest -q -p no:cacheprovider --tb=short \
+            tests/studio/test_cancel_atomicity.py \
+            tests/studio/test_cancel_id_wiring.py \
+            tests/test_source_read_encoding.py \
+            tests/test_runtime_text_encoding.py
