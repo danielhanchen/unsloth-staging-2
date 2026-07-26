@@ -770,6 +770,9 @@ class TrainingBackend:
         # True while a pump thread should be running; cleared on intended exits.
         # Left True after an abnormal death so _ensure_pump_alive spots a crash.
         self._pump_running: bool = False
+        # True from the start_training() guard passing until its spawn finishes; blocks a
+        # second concurrent start (routes call it from a worker thread, so starts can overlap).
+        self._start_in_progress: bool = False
         self._lock = threading.Lock()
         self._run_intent_lock = threading.RLock()
 
@@ -848,11 +851,39 @@ class TrainingBackend:
         still letting auto-selection place training against the freed memory.
         Hook failures never block the start.
         """
+        # Compare-and-set start guard: the route runs this method on a worker thread, so two
+        # overlapping /train/start requests can reach it concurrently. Without the flag both
+        # would pass the alive-check below (the proc is only assigned at the end) and
+        # double-spawn. Mirrors the diffusion training service's reserve().
         with self._lock:
+            if self._start_in_progress:
+                logger.warning("Training start already in progress")
+                return False
             if self._proc is not None and self._proc.is_alive():
                 logger.warning("Training subprocess already running")
                 return False
+            self._start_in_progress = True
+        try:
+            return self._start_training_impl(
+                job_id,
+                before_spawn = before_spawn,
+                resume_source_run_id = resume_source_run_id,
+                **kwargs,
+            )
+        finally:
+            with self._lock:
+                self._start_in_progress = False
 
+    # Named, not part of **kwargs: the body reads it directly, and it must not reach the
+    # worker config either (start_training's own signature keeps it out).
+    def _start_training_impl(
+        self,
+        job_id: str,
+        *,
+        before_spawn = None,
+        resume_source_run_id: Optional[str] = None,
+        **kwargs,
+    ) -> bool:
         # Join prior pump thread — refuse to start if it won't die
         if self._pump_thread is not None and self._pump_thread.is_alive():
             self._pump_thread.join(timeout = 5.0)
@@ -1543,6 +1574,13 @@ class TrainingBackend:
         # training invisibly behind a frozen UI. Cheap enough for per-second polls.
         self._ensure_pump_alive()
         with self._lock:
+            # A run reserved in start_training but not yet spawned (before_spawn frees residents,
+            # then GPU auto-selection, then proc.start()) is already active: the load/start guards
+            # read this to refuse a concurrent /images/load, /video/load, or /diffusion/start, so an
+            # idle reading here would let another pipeline race the reserved run for VRAM.
+            if self._start_in_progress:
+                return True
+
             if self._proc is not None and self._proc.is_alive():
                 return True
 

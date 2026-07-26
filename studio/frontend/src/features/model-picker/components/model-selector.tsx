@@ -34,12 +34,14 @@ import {
   useRef,
   useState,
 } from "react";
+import type { HfTaskFilter } from "@/features/hub/hooks/use-hub-model-search";
 import {
   type PerModelConfig,
   resolveInitialConfig,
 } from "../model-config/per-model-config";
 import { ModelConfigPage } from "./model-config-page";
 import { HubModelPicker, hasDownloadedModels } from "./model-selector/pickers";
+import type { CatalogGroup } from "./model-selector/model-catalog";
 import { PillTabs } from "./model-selector/pill-tabs";
 import {
   buildSourceTabs,
@@ -147,6 +149,15 @@ interface ModelSelectorProps {
   triggerDataTour?: string;
   contentDataTour?: string;
   showCloudIndicator?: boolean;
+  /** Restrict the Hub tab to a pipeline task (e.g. text-to-image). */
+  task?: HfTaskFilter;
+  /** Canonical model groups (Images / Video pages): collapses a model's
+   *  artifact repos into one row with a format second level and device-aware
+   *  routing. Undefined (chat) changes nothing. */
+  catalog?: CatalogGroup[];
+  /** Trigger text when nothing is loaded. Defaults to "Select model"; task pages name
+   *  what they pick so it reads as separate from the chat model. */
+  placeholder?: string;
 }
 
 function ModelSelectorTrigger({
@@ -158,6 +169,9 @@ function ModelSelectorTrigger({
   className,
   dataTour,
   onEject,
+  // Task pages name what they pick ("Select image model"), so it is clear the choice is
+  // separate from the chat model.
+  placeholder = "Select model",
 }: {
   currentModel?: ModelOption;
   isLoaded: boolean;
@@ -167,6 +181,7 @@ function ModelSelectorTrigger({
   className?: string;
   dataTour?: string;
   onEject?: () => void;
+  placeholder?: string;
 }) {
   return (
     <PopoverTrigger asChild={true}>
@@ -233,7 +248,7 @@ function ModelSelectorTrigger({
         ) : null}
         <span className="flex min-w-0 flex-1 items-baseline">
           <span className="min-w-0 flex flex-1 items-baseline truncate font-heading text-ui-16 font-medium leading-tight text-black dark:text-white">
-            {currentModel?.name ?? "Select model"}
+            {currentModel?.name ?? placeholder}
             {showCloudIndicator ? (
               <HugeiconsIcon
                 icon={CloudIcon}
@@ -330,6 +345,8 @@ function ModelSelectorContent({
   deleteDisabled,
   className,
   dataTour,
+  task,
+  catalog,
 }: {
   open: boolean;
   models: ModelOption[];
@@ -350,6 +367,8 @@ function ModelSelectorContent({
   deleteDisabled?: boolean;
   className?: string;
   dataTour?: string;
+  task?: HfTaskFilter;
+  catalog?: CatalogGroup[];
 }) {
   const hasSelection = Boolean(value);
   const chatOnly = usePlatformStore((s) => s.isChatOnly());
@@ -590,6 +609,8 @@ function ModelSelectorContent({
             onConfigure={openConfigPage}
             deleteDisabled={deleteDisabled}
             onEject={hasSelection && onEject ? onEject : undefined}
+            task={task}
+            catalog={catalog}
             section={effectiveHubSection}
             sectionToggle={
               <PillTabs
@@ -674,6 +695,9 @@ export function ModelSelector({
   triggerDataTour,
   contentDataTour,
   showCloudIndicator = false,
+  task,
+  catalog,
+  placeholder,
 }: ModelSelectorProps) {
   const [uncontrolledOpen, setUncontrolledOpen] = useState(false);
   const open = controlledOpen ?? uncontrolledOpen;
@@ -780,6 +804,7 @@ export function ModelSelector({
         className={className}
         dataTour={triggerDataTour}
         onEject={onEject ? handleEject : undefined}
+        placeholder={placeholder}
       />
       <ModelSelectorContent
         open={open}
@@ -796,11 +821,16 @@ export function ModelSelector({
         onEject={onEject ? handleEject : undefined}
         onFoldersChange={onFoldersChange}
         onPickLocalModel={onPickLocalModel ? handlePickLocalModel : undefined}
-        onBrowseHub={handleBrowseHub}
+        // The image tab (the only caller passing `task`) is a self-contained
+        // curated + on-device picker, so it omits the "Search Hub" button that
+        // navigates to the general Hub page.
+        onBrowseHub={task ? undefined : handleBrowseHub}
         onModelsChange={onModelsChange}
         deleteDisabled={deleteDisabled}
         className={contentClassName}
         dataTour={contentDataTour}
+        task={task}
+        catalog={catalog}
       />
     </Popover>
   );

@@ -51,6 +51,24 @@ def _denylist_inert(monkeypatch):
     monkeypatch.setattr(folder_browser, "is_denied_system_path", lambda _p: False)
 
 
+def _download_body(**over) -> SimpleNamespace:
+    """A download request with every field the route reads.
+
+    Built by hand rather than through the schema so these tests stay cheap, so it lists
+    the newer scoping fields too: leaving one off reads as AttributeError inside the
+    route, not as a missing default.
+    """
+    body = {
+        "repo_id": "Org/Model",
+        "gguf_variant": None,
+        "use_xet": False,
+        "scope_id": None,
+        "files": None,
+    }
+    body.update(over)
+    return SimpleNamespace(**body)
+
+
 def _repo(repo_id: str, files: list[SimpleNamespace], repo_path: Path):
     return SimpleNamespace(
         repo_id = repo_id,
@@ -3040,11 +3058,7 @@ def test_model_download_records_completed_baseline_for_new_gguf_variant(monkeypa
     monkeypatch.setattr(downloads, "_registry", registry)
     monkeypatch.setattr(downloads, "_spawn_download_worker", lambda *_args, **_kwargs: _Proc())
 
-    asyncio.run(
-        downloads.download_model_response(
-            SimpleNamespace(repo_id = "Org/Model", gguf_variant = "Q4_K_M", use_xet = False)
-        )
-    )
+    asyncio.run(downloads.download_model_response(_download_body(gguf_variant = "Q4_K_M")))
 
     assert registry.claim_kwargs["blob_hashes"] == frozenset({"mainhash"})
     assert registry.claim_kwargs["progress_blob_hashes"] == frozenset({"mainhash", "mmprojhash"})
@@ -3126,11 +3140,7 @@ def test_gguf_model_download_skips_completed_baseline_for_variant_resume_state(
     monkeypatch.setattr(downloads, "_registry", registry)
     monkeypatch.setattr(downloads, "_spawn_download_worker", lambda *_args, **_kwargs: _Proc())
 
-    asyncio.run(
-        downloads.download_model_response(
-            SimpleNamespace(repo_id = "Org/Model", gguf_variant = "Q4_K_M", use_xet = False)
-        )
-    )
+    asyncio.run(downloads.download_model_response(_download_body(gguf_variant = "Q4_K_M")))
 
     assert registry.claim_kwargs["completed_baseline_bytes"] == 0
 
@@ -3327,11 +3337,7 @@ def test_model_claim_register_cancel_uses_registry_marker_owner(monkeypatch):
         lambda proc, **_kwargs: killed.append(proc),
     )
 
-    result = asyncio.run(
-        downloads.download_model_response(
-            SimpleNamespace(repo_id = "Org/Model", gguf_variant = None, use_xet = False)
-        )
-    )
+    result = asyncio.run(downloads.download_model_response(_download_body()))
 
     assert result["state"] == "cancelled"
     assert killed
@@ -3443,11 +3449,7 @@ def test_model_download_watcher_invalidates_hf_cache_scan(monkeypatch):
 
     monkeypatch.setattr(downloads.asyncio, "to_thread", _inline_to_thread)
 
-    result = asyncio.run(
-        downloads.download_model_response(
-            SimpleNamespace(repo_id = "Org/Model", gguf_variant = None, use_xet = False)
-        )
-    )
+    result = asyncio.run(downloads.download_model_response(_download_body()))
 
     assert result["accepted"] is True
     assert invalidated == [True]
@@ -3512,20 +3514,8 @@ def test_two_concurrent_same_repo_variants_both_complete(monkeypatch, tmp_path):
 
     async def _run_both():
         return await asyncio.gather(
-            downloads.download_model_response(
-                SimpleNamespace(
-                    repo_id = "Org/Model",
-                    gguf_variant = "Q4_K_M",
-                    use_xet = False,
-                )
-            ),
-            downloads.download_model_response(
-                SimpleNamespace(
-                    repo_id = "Org/Model",
-                    gguf_variant = "Q8_0",
-                    use_xet = False,
-                )
-            ),
+            downloads.download_model_response(_download_body(gguf_variant = "Q4_K_M")),
+            downloads.download_model_response(_download_body(gguf_variant = "Q8_0")),
         )
 
     results = asyncio.run(_run_both())
