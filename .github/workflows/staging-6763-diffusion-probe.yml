@@ -49,24 +49,21 @@ jobs:
         run: |
           mkdir -p artifacts
           export UNSLOTH_STUDIO_HOME="$PWD/studio_home"
-          (python -m unsloth.studio_cli studio -H 127.0.0.1 -p 8888 > artifacts/studio.log 2>&1 &) || \
-          (unsloth studio -H 127.0.0.1 -p 8888 > artifacts/studio.log 2>&1 &)
+          export PYTHONPATH="$PWD/studio/backend"
+          # The backend directly, not the `unsloth studio` CLI: that path imports unsloth_zoo,
+          # which raises "cannot find any torch accelerator" on a GPU-less runner. Studio
+          # itself runs fine without one, which is the whole point of this probe.
+          (cd studio/backend && python run.py --host 127.0.0.1 --port 8888 \
+             --password "Probe-6763-pass" > ../../artifacts/studio.log 2>&1 &)
           for i in $(seq 1 90); do
-            if curl -sf http://127.0.0.1:8888/healthz > /dev/null; then echo "up after ${i}0s"; break; fi
+            if curl -sf http://127.0.0.1:8888/healthz > /dev/null; then echo "up after $((i * 5))s"; break; fi
             sleep 5
           done
-          curl -sf http://127.0.0.1:8888/healthz || (tail -50 artifacts/studio.log; exit 1)
+          curl -sf http://127.0.0.1:8888/healthz || (tail -80 artifacts/studio.log; exit 1)
       - name: Run the diffusion probe
         run: |
-          PASSWORD=$(python - <<'PY'
-          import re, pathlib
-          log = pathlib.Path("artifacts/studio.log").read_text(encoding="utf-8", errors="replace")
-          m = re.search(r"(?i)(?:bootstrap|initial|generated)\s*password\b[^\S\r\n]*[:=]?[^\S\r\n]*(\S+)", log)
-          print(m.group(1) if m else "")
-          PY
-          )
-          test -n "$PASSWORD" || (echo "no bootstrap password in the log"; tail -40 artifacts/studio.log; exit 1)
-          python .github/scripts/diffusion_probe.py --base http://127.0.0.1:8888 --password "$PASSWORD" --out artifacts
+          python .github/scripts/diffusion_probe.py --base http://127.0.0.1:8888 \
+            --password "Probe-6763-pass" --out artifacts
       - uses: actions/upload-artifact@v4
         if: always()
         with:
