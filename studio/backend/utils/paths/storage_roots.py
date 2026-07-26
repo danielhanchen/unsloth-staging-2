@@ -212,7 +212,7 @@ def lmstudio_model_dirs() -> list[Path]:
     settings_path = Path.home() / ".lmstudio" / "settings.json"
     if settings_path.is_file():
         try:
-            with open(settings_path) as f:
+            with open(settings_path, encoding = "utf-8") as f:
                 settings = json.load(f)
             downloads = settings.get("downloadsFolder", "")
             if downloads:
@@ -357,7 +357,7 @@ def _assert_contained(resolved: Path, root: Path) -> None:
         resolved_real.relative_to(root_real)
     except ValueError as exc:
         raise ValueError(
-            f"path escapes root: {resolved!s} -> {resolved_real!s} " f"is not under {root_real!s}"
+            f"path escapes root: {resolved!s} -> {resolved_real!s} is not under {root_real!s}"
         ) from exc
 
 

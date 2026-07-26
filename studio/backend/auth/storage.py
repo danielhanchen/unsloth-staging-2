@@ -42,9 +42,15 @@ def generate_bootstrap_password() -> str:
     if _bootstrap_password is not None:
         return _bootstrap_password
 
-    # Persisted from a previous run?
+    # Persisted from a previous run? An undecodable file means no usable
+    # persisted password, same as an empty one: fall through and mint a fresh
+    # passphrase rather than failing server startup, which has no enclosing
+    # try (lifespan in main.py, _terminal_password_gate in run.py).
     if _BOOTSTRAP_PW_PATH.is_file():
-        _bootstrap_password = _BOOTSTRAP_PW_PATH.read_text().strip()
+        try:
+            _bootstrap_password = _BOOTSTRAP_PW_PATH.read_text(encoding = "utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            _bootstrap_password = None
         if _bootstrap_password:
             return _bootstrap_password
 
@@ -57,7 +63,7 @@ def generate_bootstrap_password() -> str:
 
     # Persist so the same passphrase survives restarts until password change.
     ensure_dir(_BOOTSTRAP_PW_PATH.parent)
-    _BOOTSTRAP_PW_PATH.write_text(_bootstrap_password)
+    _BOOTSTRAP_PW_PATH.write_text(_bootstrap_password, encoding = "utf-8")
     try:
         os.chmod(_BOOTSTRAP_PW_PATH, 0o600)
     except OSError:
@@ -76,7 +82,10 @@ def _load_bootstrap_password() -> Optional[str]:
     global _bootstrap_password
     _bootstrap_password = None
     if _BOOTSTRAP_PW_PATH.is_file():
-        bootstrap_password = _BOOTSTRAP_PW_PATH.read_text().strip()
+        try:
+            bootstrap_password = _BOOTSTRAP_PW_PATH.read_text(encoding = "utf-8").strip()
+        except (OSError, UnicodeDecodeError):
+            bootstrap_password = ""
         if bootstrap_password:
             _bootstrap_password = bootstrap_password
     return _bootstrap_password
@@ -99,7 +108,7 @@ def clear_bootstrap_password() -> None:
             # stale plaintext can't be re-seeded by generate_bootstrap_password()
             # if a later reset-password deletes auth.db and re-validates it.
             try:
-                _BOOTSTRAP_PW_PATH.write_text("")
+                _BOOTSTRAP_PW_PATH.write_text("", encoding = "utf-8")
                 cleared = True
             except OSError:
                 cleared = False

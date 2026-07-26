@@ -98,9 +98,10 @@ def _json_rank_count_from_env(name: str) -> Optional[int]:
         if value.lstrip().startswith(("[", "{")):
             data = json.loads(value)
         else:
-            with open(value, "r") as f:
+            with open(value, "r", encoding = "utf-8") as f:
                 data = json.load(f)
-    except (OSError, json.JSONDecodeError):
+    # The path comes from an env var, so it can point at anything.
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
         return None
     if isinstance(data, list):
         return len(data)
@@ -158,7 +159,7 @@ def quiet_if_nonzero_mlx_rank():
     sys.stderr.flush()
     saved_stdout_fd = os.dup(1)
     saved_stderr_fd = os.dup(2)
-    with open(os.devnull, "w") as devnull:
+    with open(os.devnull, "w", encoding = "utf-8") as devnull:
         try:
             os.dup2(devnull.fileno(), 1)
             os.dup2(devnull.fileno(), 2)

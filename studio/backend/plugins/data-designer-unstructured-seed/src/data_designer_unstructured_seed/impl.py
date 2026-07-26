@@ -27,9 +27,11 @@ class UnstructuredSeedReader(SeedReader[UnstructuredSeedSource]):
             orig_name = path_obj.name
             if meta_path.exists():
                 try:
-                    meta = json_mod.loads(meta_path.read_text())
+                    meta = json_mod.loads(meta_path.read_text(encoding = "utf-8"))
                     orig_name = meta.get("original_filename", path_obj.name)
-                except (json_mod.JSONDecodeError, OSError):
+                # original_filename carries a user-uploaded name, so a sidecar
+                # written by an older build under a legacy codec is possible.
+                except (json_mod.JSONDecodeError, OSError, UnicodeDecodeError):
                     pass
             file_entries.append((path_obj, orig_name))
 
