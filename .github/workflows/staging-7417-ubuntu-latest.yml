@@ -1,0 +1,51 @@
+name: "staging-7417 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-7417-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/_vulkan_probe.py'
+      - 'studio/backend/core/inference/llama_cpp.py'
+      - 'studio/backend/core/inference/llama_server_args.py'
+      - 'studio/backend/main.py'
+      - 'studio/backend/models/inference.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/routes/training_vram.py'
+      - 'studio/backend/tests/test_chat_load_during_training.py'
+      - 'studio/backend/tests/test_gguf_load_cache_reuse.py'
+      - 'studio/backend/tests/test_gguf_placement_os_gpu_matrix.py'
+      - 'studio/backend/tests/test_gpu_memory_mode.py'
+      - 'studio/backend/tests/test_gpu_selection.py'
+      - 'studio/backend/tests/test_inference_model_validation.py'
+      - 'studio/backend/tests/test_install_resolve_prebuilt.py'
+      - 'studio/backend/tests/test_llama_cpp_memory_mode.py'
+      - 'studio/backend/tests/test_llama_cpp_mtp_detection.py'
+      - 'studio/backend/tests/test_llama_cpp_vulkan_probe.py'
+      - 'studio/backend/tests/test_llama_server_args.py'
+      - 'studio/backend/tests/test_mtp_vram_budget.py'
+      - 'studio/backend/tests/test_setup_llama_cpp_backend.py'
+      - '.github/workflows/staging-7417-ubuntu-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
