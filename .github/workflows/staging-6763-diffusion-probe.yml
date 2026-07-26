@@ -41,6 +41,7 @@ jobs:
           # pages and tell the user up front that the DiT families cannot train here.
           python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
           python -m pip install -r studio/backend/requirements/studio.txt
+          python -m pip install unsloth_zoo
           python -m pip install -e . || true
           python -m pip install playwright httpx
           python -m playwright install --with-deps chromium || python -m playwright install chromium
