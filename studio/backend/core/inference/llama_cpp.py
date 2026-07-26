@@ -561,7 +561,7 @@ def _load_swa_cache() -> dict:
                 _SWA_CACHE = json.load(f)
                 if not isinstance(_SWA_CACHE, dict):
                     _SWA_CACHE = {}
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
             _SWA_CACHE = {}
         return _SWA_CACHE
 
