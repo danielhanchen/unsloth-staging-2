@@ -4434,6 +4434,7 @@ async def _load_model_impl(
                     n_moe_layers = llama_backend.n_moe_layers,
                     gpu_ids = llama_backend.gpu_ids,
                     requested_gpu_ids = llama_backend.requested_gpu_ids,
+                    llama_extra_args = llama_backend.extra_args,
                 )
         else:
             if (
@@ -4806,6 +4807,7 @@ async def _load_model_impl(
                 n_moe_layers = llama_backend.n_moe_layers,
                 gpu_ids = llama_backend.gpu_ids,
                 requested_gpu_ids = llama_backend.requested_gpu_ids,
+                llama_extra_args = llama_backend.extra_args,
             )
 
         # ── Standard path: load via Unsloth/transformers ──────────
@@ -5096,6 +5098,15 @@ async def validate_model(
                 detail = f"Invalid model identifier: {model_log_label}",
             )
 
+        # Unconditional, like /load: gating on is_gguf would pass a preflight
+        # that /load then 400s on, after it already unloaded the active model.
+        if request.llama_extra_args is not None:
+            from core.inference.llama_server_args import validate_extra_args
+            try:
+                validate_extra_args(request.llama_extra_args)
+            except ValueError as exc:
+                raise HTTPException(status_code = 400, detail = str(exc)) from exc
+
         # Apply the same training coexistence policy as /load before the frontend
         # unloads the current model.
         effective_gpu_ids = request.gpu_ids if request.gpu_ids else None
@@ -5168,10 +5179,11 @@ async def validate_model(
         # training guard must not refuse it. Real loads omit include_context_length /
         # include_chat_template, and /load applies the guard again.
         if not (request.include_context_length or request.include_chat_template):
-            # Match /load's inherited llama.cpp extras and parallel slot count so
-            # validation cannot pass a smaller estimate than the subsequent load.
+            # Match /load's extras and parallel slots so validation cannot pass a
+            # smaller estimate than the load: the request's own extras when sent
+            # (their -c raises the KV estimate), else the inherited ones.
             effective_extra_args = _resolve_inherited_extra_args(
-                request, config, model_identifier, None
+                request, config, model_identifier, request.llama_extra_args
             )
             # Off-loop: guard does sync nvidia-smi / HF work.
             await asyncio.to_thread(
@@ -5930,6 +5942,7 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
                 n_layers = llama_backend.n_layers,
                 n_moe_layers = llama_backend.n_moe_layers,
                 gpu_ids = llama_backend.gpu_ids,
+                llama_extra_args = llama_backend.extra_args,
                 requested_gpu_ids = llama_backend.requested_gpu_ids,
                 llama_cpp_supports_mtp = _supports_mtp,
                 spec_fallback_reason = llama_backend.spec_fallback_reason,

@@ -2,7 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { getAuthToken } from "@/features/auth";
-import { resolveInitialConfig } from "@/features/model-picker";
+import { resolveInitialConfig, llamaExtraArgsForLoad } from "@/features/model-picker";
 import { projectHasSources } from "@/features/rag/api/rag-api";
 import { apiUrl } from "@/lib/api-base";
 import { parseParamCountB } from "@/lib/model-size";
@@ -1501,6 +1501,9 @@ async function autoLoadSmallestModel(): Promise<{
     // The safetensors fallback omits both fields and uses HF auto-placement.
     gpu_ids?: number[];
     gpu_memory_mode?: "auto" | "manual";
+    // The preflight must validate and size the KV budget against the same
+    // extras the load sends; omitting them makes it inherit the previous load's.
+    llama_extra_args?: string[];
   }): Promise<boolean> {
     const validation = await validateModel({
       ...payload,
@@ -1555,6 +1558,7 @@ async function autoLoadSmallestModel(): Promise<{
       config.gpuMemoryMode ?? currentStore.gpuMemoryMode;
     const effectiveGpuLayers = config.gpuLayers ?? GPU_LAYERS_AUTO;
     const effectiveNCpuMoe = config.nCpuMoe ?? 0;
+    const effectiveLlamaExtraArgs = llamaExtraArgsForLoad(config.llamaExtraArgs);
     if (config.selectedGpuIds != null) {
       // Warm the device cache first: on a cold cache the reconcile passes the
       // saved pick through unvalidated, and a stale cross-host pick then fails
@@ -1594,6 +1598,7 @@ async function autoLoadSmallestModel(): Promise<{
           ? {
               gpu_ids: effectiveGpuIds ?? undefined,
               gpu_memory_mode: effectiveGpuMemoryMode,
+              llama_extra_args: effectiveLlamaExtraArgs,
             }
           : {}),
       }))
@@ -1627,6 +1632,7 @@ async function autoLoadSmallestModel(): Promise<{
             gpu_layers: effectiveGpuLayers,
             n_cpu_moe: effectiveNCpuMoe,
             gpu_ids: effectiveGpuIds ?? undefined,
+            llama_extra_args: effectiveLlamaExtraArgs,
           }
         : {}),
     });
@@ -1696,6 +1702,11 @@ async function autoLoadSmallestModel(): Promise<{
         tensorParallel: loadResp.tensor_parallel ?? false,
         loadedTensorParallel: loadResp.tensor_parallel ?? false,
         ...loadedGpuMemoryFields(loadResp),
+        // What the server launched with, not what was asked for: manual GPU
+        // mode strips the offload group it owns. undefined = older backend.
+        llamaExtraArgs: loadResp.llama_extra_args ?? config.llamaExtraArgs ?? null,
+        loadedLlamaExtraArgs:
+          loadResp.llama_extra_args ?? config.llamaExtraArgs ?? null,
         loadedCustomContextLength: keepCustomCtx,
         defaultChatTemplate: loadResp.chat_template ?? null,
         chatTemplateOverride: effectiveChatTemplateOverride,
@@ -2002,6 +2013,12 @@ async function autoLoadSmallestModel(): Promise<{
         tensorParallel: loadResp.tensor_parallel ?? false,
         loadedTensorParallel: loadResp.tensor_parallel ?? false,
         ...loadedGpuMemoryFields(loadResp),
+        // This load sends no extra args, and the GPU helper only clears them for
+        // a non-GGUF response, so baseline both fields on the echo here. Else
+        // args staged for a model that never loaded stay on screen for Qwen and
+        // the next Reload sends them to it.
+        llamaExtraArgs: loadResp.llama_extra_args ?? null,
+        loadedLlamaExtraArgs: loadResp.llama_extra_args ?? null,
         // Drives the GPU Memory controls' diffusion gate; set alongside the
         // GPU fields on every load path so the gate can't read stale.
         loadedIsDiffusion: loadResp.is_diffusion ?? false,

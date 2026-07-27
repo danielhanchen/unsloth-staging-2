@@ -77,6 +77,8 @@ export interface LoadModelRequest {
   tensor_split?: number[] | null;
   /** Picked physical GPU indices (omit/empty = automatic). */
   gpu_ids?: number[];
+  /** Extra llama-server flags appended after Unsloth-managed args (GGUF-only). */
+  llama_extra_args?: string[];
 }
 
 export interface ValidateModelResponse {
@@ -197,6 +199,10 @@ export interface LoadModelResponse {
   gpu_ids?: number[] | null;
   /** User-requested GPU placement pool before fit-time narrowing. */
   requested_gpu_ids?: number[] | null;
+  /** Flags the load actually launched with, after manual GPU mode strips the
+   * offload group it owns. Baseline on this, not on the request, or the panel
+   * reports a stripped flag as active. */
+  llama_extra_args?: string[] | null;
 }
 
 export interface UnloadModelRequest {
@@ -253,6 +259,9 @@ export interface InferenceStatusResponse {
   requested_context_length?: number | null;
   /** Effective GPU placement after fit-time narrowing. */
   gpu_ids?: number[] | null;
+  /** Pass-through llama-server flags the active GGUF load ran with; re-seeds the
+   * args field on hydration so it can be read and cleared. Null for non-GGUF. */
+  llama_extra_args?: string[] | null;
   /** User-requested GPU placement pool before fit-time narrowing. */
   requested_gpu_ids?: number[] | null;
   n_layers?: number | null;

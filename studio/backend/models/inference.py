@@ -261,6 +261,13 @@ class ValidateModelRequest(BaseModel):
         "Opt-in and, like include_context_length, a metadata-only probe that skips the training "
         "guard. Only the leased file's own embedded template is read, never sibling sidecars.",
     )
+    llama_extra_args: Optional[List[str]] = Field(
+        None,
+        description = (
+            "Intended GGUF llama-server pass-through args for the follow-up load; "
+            "validated here so denied flags fail before /load unloads the active model."
+        ),
+    )
 
 
 class TransformersUpgradeInfo(BaseModel):
@@ -509,6 +516,15 @@ class LoadResponse(BaseModel):
             "or None for automatic selection."
         ),
     )
+    llama_extra_args: Optional[List[str]] = Field(
+        None,
+        description = (
+            "Pass-through llama-server flags the load actually launched with, after "
+            "manual GPU mode strips the offload group it owns. The UI baselines on this "
+            "rather than the request, so the panel never reports a stripped flag as "
+            "active. None for non-GGUF."
+        ),
+    )
 
 
 class UnloadResponse(BaseModel):
@@ -682,6 +698,14 @@ class InferenceStatusResponse(BaseModel):
         description = (
             "GPU placement pool requested by the user before fit-time narrowing, "
             "or None for automatic selection."
+        ),
+    )
+    llama_extra_args: Optional[List[str]] = Field(
+        None,
+        description = (
+            "Pass-through llama-server flags the active GGUF load was launched with. "
+            "Lets the UI re-seed (and so clear) the args field on hydration instead of "
+            "showing an empty box while the server still runs them. None for non-GGUF."
         ),
     )
     llama_cpp_supports_mtp: bool = Field(
