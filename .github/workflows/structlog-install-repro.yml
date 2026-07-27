@@ -1,0 +1,162 @@
+name: structlog-install-repro
+
+# Throwaway diagnostic workflow (staging repo only).
+# Reproduces two reported failures on Windows / macOS / Linux runners:
+#   1. `pip install unsloth` ships the `studio` package but not its runtime
+#      dependencies, so `unsloth export` dies on `No module named 'structlog'`.
+#   2. The desktop preflight probes (`unsloth -h`, `unsloth studio
+#      desktop-capabilities --json`) both succeed on that same venv, which is
+#      why an interrupted install is reported ManagedReady and the backend is
+#      launched into a crash.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  wheel-metadata:
+    name: wheel metadata (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: windows-x64 }
+          - { os: macos-14,       label: macos-arm64 }
+          - { os: macos-13,       label: macos-x64 }
+          - { os: ubuntu-latest,  label: linux-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Inspect the published unsloth wheel without installing it
+        shell: bash
+        run: |
+          set -x
+          python -m pip install --upgrade pip wheel >/dev/null
+          mkdir -p wheelhouse
+          python -m pip download unsloth --no-deps --dest wheelhouse
+          ls -l wheelhouse
+          python - <<'PY'
+          import glob, zipfile, sys
+          whl = glob.glob("wheelhouse/unsloth-*.whl")
+          if not whl:
+              sys.exit("no wheel downloaded")
+          whl = whl[0]
+          print("wheel:", whl)
+          with zipfile.ZipFile(whl) as z:
+              names = z.namelist()
+              meta = [n for n in names if n.endswith("METADATA")][0]
+              text = z.read(meta).decode("utf-8", "replace")
+          reqs = [l.split(":", 1)[1].strip() for l in text.splitlines()
+                  if l.startswith("Requires-Dist:")]
+          print("\n--- Requires-Dist (core, no extras) ---")
+          core = [r for r in reqs if "extra ==" not in r]
+          for r in core:
+              print(" ", r)
+          print("\n--- does the wheel declare the studio backend deps? ---")
+          for dep in ("structlog", "fastapi", "uvicorn", "diceware", "pyjwt"):
+              declared = any(dep in r.lower() for r in reqs)
+              print(f"  {dep:10s} declared_anywhere={declared}")
+          print("\n--- but does the wheel SHIP the studio backend code? ---")
+          for probe in ("studio/backend/run.py",
+                        "studio/backend/loggers/handlers.py",
+                        "studio/backend/core/export/orchestrator.py",
+                        "studio/backend/requirements/studio.txt"):
+              print(f"  {probe:52s} shipped={probe in names}")
+          PY
+
+  pypi-install-repro:
+    name: pip install unsloth (${{ matrix.label }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, label: windows-x64 }
+          - { os: macos-14,       label: macos-arm64 }
+          - { os: ubuntu-latest,  label: linux-x64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Create an isolated venv under UNSLOTH_STUDIO_HOME
+        shell: bash
+        run: |
+          set -x
+          STUDIO_HOME="$RUNNER_TEMP/unsloth_home"
+          mkdir -p "$STUDIO_HOME"
+          echo "UNSLOTH_STUDIO_HOME=$STUDIO_HOME" >> "$GITHUB_ENV"
+          uv venv --python 3.13 "$STUDIO_HOME/unsloth_studio"
+          if [ -d "$STUDIO_HOME/unsloth_studio/Scripts" ]; then
+            echo "VBIN=$STUDIO_HOME/unsloth_studio/Scripts" >> "$GITHUB_ENV"
+            echo "VEXE=.exe" >> "$GITHUB_ENV"
+          else
+            echo "VBIN=$STUDIO_HOME/unsloth_studio/bin" >> "$GITHUB_ENV"
+            echo "VEXE=" >> "$GITHUB_ENV"
+          fi
+
+      - name: uv pip install unsloth  (exactly what a user types)
+        shell: bash
+        run: |
+          uv pip install --python "$VBIN/python$VEXE" unsloth 2>&1 | tail -30
+
+      - name: Which studio runtime modules are importable?
+        shell: bash
+        run: |
+          "$VBIN/python$VEXE" - <<'PY'
+          import importlib.util
+          for name in ("typer","rich","pydantic","studio","unsloth_cli",
+                       "structlog","fastapi","uvicorn","diceware","jwt"):
+              try:
+                  spec = importlib.util.find_spec(name)
+              except Exception as exc:
+                  print(f"{name:12s} ERROR {type(exc).__name__}"); continue
+              print(f"{name:12s} {'PRESENT' if spec else 'MISSING'}")
+          PY
+
+      - name: DESKTOP PREFLIGHT PROBE 1 -- unsloth -h  (expect success)
+        shell: bash
+        run: |
+          "$VBIN/unsloth$VEXE" -h >/dev/null 2>&1
+          echo "probe1 exit=$?"
+
+      - name: DESKTOP PREFLIGHT PROBE 2 -- desktop-capabilities --json (expect success)
+        shell: bash
+        run: |
+          "$VBIN/unsloth$VEXE" studio desktop-capabilities --json
+          echo "probe2 exit=$?"
+
+      - name: Both probes pass, so the app would spawn the backend -- watch it crash
+        shell: bash
+        continue-on-error: true
+        run: |
+          "$VBIN/unsloth$VEXE" studio --api-only -H 127.0.0.1 -p 8899 2>&1 | tail -25
+          echo "backend exit=${PIPESTATUS[0]}"
+
+      - name: The other report -- unsloth export
+        shell: bash
+        continue-on-error: true
+        run: |
+          "$VBIN/unsloth$VEXE" export ./nonexistent_ckpt ./out 2>&1 | tail -25
+          echo "export exit=${PIPESTATUS[0]}"
+
+      - name: Enumerate the full missing-dependency chain
+        shell: bash
+        continue-on-error: true
+        run: |
+          for i in $(seq 1 15); do
+            missing=$("$VBIN/unsloth$VEXE" export ./nonexistent_ckpt ./out 2>&1 \
+                      | tr -d '\r' | grep -oE "No module named '[^']+'" | head -1 \
+                      | sed "s/No module named '//; s/'//")
+            if [ -z "$missing" ]; then
+              echo "round $i: no missing module left"
+              break
+            fi
+            echo "round $i: MISSING $missing"
+            uv pip install --python "$VBIN/python$VEXE" "$missing" >/dev/null 2>&1 \
+              || { echo "  could not install $missing"; break; }
+          done
