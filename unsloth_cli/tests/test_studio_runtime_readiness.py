@@ -1,0 +1,232 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+
+import importlib
+import json
+import sys
+from types import SimpleNamespace
+from pathlib import Path
+
+import pytest
+import typer
+
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+
+def _missing_structlog():
+    raise ModuleNotFoundError("No module named 'structlog'", name = "structlog")
+
+
+def test_desktop_runtime_check_reports_missing_dependency_as_json(monkeypatch, capsys):
+    studio = importlib.import_module("unsloth_cli.commands.studio")
+    monkeypatch.setattr(studio, "_load_run_module", _missing_structlog)
+
+    with pytest.raises(typer.Exit) as exited:
+        studio.desktop_runtime_check(_json_output = True)
+
+    assert exited.value.exit_code == 1
+    assert json.loads(capsys.readouterr().out) == {
+        "runtime_ready": False,
+        "reason": "missing_dependency",
+        "module": "structlog",
+    }
+
+
+def test_desktop_runtime_check_reports_success(monkeypatch, capsys):
+    studio = importlib.import_module("unsloth_cli.commands.studio")
+    monkeypatch.setattr(studio, "_load_run_module", lambda: object())
+    monkeypatch.setattr(studio, "_missing_studio_requirement", lambda _run_mod: None)
+
+    studio.desktop_runtime_check(_json_output = True)
+
+    assert json.loads(capsys.readouterr().out) == {"runtime_ready": True}
+
+
+def test_desktop_runtime_check_catches_later_startup_dependency(monkeypatch, capsys, tmp_path):
+    studio = importlib.import_module("unsloth_cli.commands.studio")
+    backend = tmp_path / "backend"
+    requirements = backend / "requirements"
+    requirements.mkdir(parents = True)
+    (requirements / "studio.txt").write_text(
+        "definitely-missing-studio-package\n",
+        encoding = "utf-8",
+    )
+    run_mod = SimpleNamespace(__file__ = str(backend / "run.py"))
+    monkeypatch.setattr(studio, "_load_run_module", lambda: run_mod)
+
+    with pytest.raises(typer.Exit):
+        studio.desktop_runtime_check(_json_output = True)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["module"] == "definitely-missing-studio-package"
+
+
+def test_desktop_runtime_check_ignores_pip_flag_lines(monkeypatch, capsys, tmp_path):
+    """An unparseable line must not fail the check: repair reinstalls the same
+    file, so the install would be declared broken forever."""
+    studio = importlib.import_module("unsloth_cli.commands.studio")
+    backend = tmp_path / "backend"
+    requirements = backend / "requirements"
+    requirements.mkdir(parents = True)
+    (requirements / "studio.txt").write_text(
+        "--extra-index-url https://example.invalid/simple\n-r base.txt\n",
+        encoding = "utf-8",
+    )
+    run_mod = SimpleNamespace(__file__ = str(backend / "run.py"))
+    monkeypatch.setattr(studio, "_load_run_module", lambda: run_mod)
+
+    studio.desktop_runtime_check(_json_output = True)
+
+    assert json.loads(capsys.readouterr().out) == {"runtime_ready": True}
+
+
+def test_desktop_runtime_check_accepts_a_prerelease_over_a_floor(monkeypatch, capsys, tmp_path):
+    studio = importlib.import_module("unsloth_cli.commands.studio")
+    backend = tmp_path / "backend"
+    requirements = backend / "requirements"
+    requirements.mkdir(parents = True)
+    (requirements / "studio.txt").write_text("example-package>=1.0\n", encoding = "utf-8")
+    run_mod = SimpleNamespace(__file__ = str(backend / "run.py"))
+    monkeypatch.setattr(studio, "_load_run_module", lambda: run_mod)
+    monkeypatch.setattr(
+        importlib.import_module("importlib.metadata"),
+        "distribution",
+        lambda _name: SimpleNamespace(version = "2.0.0b1", files = [], requires = None),
+    )
+
+    studio.desktop_runtime_check(_json_output = True)
+
+    assert json.loads(capsys.readouterr().out) == {"runtime_ready": True}
+
+
+def test_desktop_runtime_check_rejects_version_mismatch(monkeypatch, capsys, tmp_path):
+    studio = importlib.import_module("unsloth_cli.commands.studio")
+    backend = tmp_path / "backend"
+    requirements = backend / "requirements"
+    requirements.mkdir(parents = True)
+    (requirements / "studio.txt").write_text("example-package==2.0\n", encoding = "utf-8")
+    run_mod = SimpleNamespace(__file__ = str(backend / "run.py"))
+    monkeypatch.setattr(studio, "_load_run_module", lambda: run_mod)
+    monkeypatch.setattr(
+        importlib.import_module("importlib.metadata"),
+        "distribution",
+        lambda _name: SimpleNamespace(version = "1.0", files = [], requires = None),
+    )
+
+    with pytest.raises(typer.Exit):
+        studio.desktop_runtime_check(_json_output = True)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["module"] == "example-package"
+
+
+def test_desktop_runtime_check_rejects_metadata_without_an_unpacked_package(
+    monkeypatch, capsys, tmp_path
+):
+    """fastapi's wheel stores .dist-info/METADATA as its first archive entry, so
+    an interrupted unpack leaves a readable version for modules that never
+    landed. RECORD is written last, so its absence marks the unfinished unpack."""
+    studio = importlib.import_module("unsloth_cli.commands.studio")
+    backend = tmp_path / "backend"
+    requirements = backend / "requirements"
+    requirements.mkdir(parents = True)
+    (requirements / "studio.txt").write_text("fastapi\n", encoding = "utf-8")
+    run_mod = SimpleNamespace(__file__ = str(backend / "run.py"))
+    monkeypatch.setattr(studio, "_load_run_module", lambda: run_mod)
+    monkeypatch.setattr(
+        importlib.import_module("importlib.metadata"),
+        "distribution",
+        lambda _name: SimpleNamespace(version = "0.140.5", files = None, requires = None),
+    )
+
+    with pytest.raises(typer.Exit):
+        studio.desktop_runtime_check(_json_output = True)
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["reason"] == "missing_dependency"
+    assert payload["module"] == "fastapi"
+
+
+def _fake_distributions(monkeypatch, installed):
+    metadata = importlib.import_module("importlib.metadata")
+
+    def _distribution(name):
+        try:
+            version, requires = installed[name]
+        except KeyError:
+            raise metadata.PackageNotFoundError(name) from None
+        return SimpleNamespace(version = version, files = [], requires = requires)
+
+    monkeypatch.setattr(metadata, "distribution", _distribution)
+
+
+def test_desktop_runtime_check_rejects_a_missing_transitive_dependency(
+    monkeypatch, capsys, tmp_path
+):
+    """starlette reaches the venv only as a FastAPI dependency, and the backend
+    imports it from main.py, which run.py imports inside run_server. A
+    direct-only check calls the install ready and the server dies on start."""
+    studio = importlib.import_module("unsloth_cli.commands.studio")
+    backend = tmp_path / "backend"
+    requirements = backend / "requirements"
+    requirements.mkdir(parents = True)
+    (requirements / "studio.txt").write_text("fastapi>=0.115\n", encoding = "utf-8")
+    run_mod = SimpleNamespace(__file__ = str(backend / "run.py"))
+    monkeypatch.setattr(studio, "_load_run_module", lambda: run_mod)
+    _fake_distributions(monkeypatch, {"fastapi": ("0.140.5", ["starlette>=0.40"])})
+
+    with pytest.raises(typer.Exit):
+        studio.desktop_runtime_check(_json_output = True)
+
+    assert json.loads(capsys.readouterr().out)["module"] == "starlette"
+
+
+def test_desktop_runtime_check_ignores_optional_and_circular_dependencies(
+    monkeypatch, capsys, tmp_path
+):
+    """No extra is requested, so an extras-only dependency is not missing, and a
+    dependency cycle must terminate rather than walk forever."""
+    studio = importlib.import_module("unsloth_cli.commands.studio")
+    backend = tmp_path / "backend"
+    requirements = backend / "requirements"
+    requirements.mkdir(parents = True)
+    (requirements / "studio.txt").write_text("fastapi\n", encoding = "utf-8")
+    run_mod = SimpleNamespace(__file__ = str(backend / "run.py"))
+    monkeypatch.setattr(studio, "_load_run_module", lambda: run_mod)
+    _fake_distributions(
+        monkeypatch,
+        {
+            "fastapi": ("0.140.5", ['uvicorn; extra == "standard"', "starlette"]),
+            # Transitive bounds are not enforced: install_python_stack installs
+            # with --no-deps, so an unmet one can describe a working venv.
+            "starlette": ("0.1", ["fastapi>=99"]),
+        },
+    )
+
+    studio.desktop_runtime_check(_json_output = True)
+
+    assert json.loads(capsys.readouterr().out) == {"runtime_ready": True}
+
+
+def test_desktop_runtime_check_reports_a_rejected_setting_instead_of_exiting(monkeypatch, capsys):
+    """run.py raises SystemExit for values such as UNSLOTH_CPU_THREADS=invalid.
+    Escaping without a payload makes the desktop app reinstall over an
+    environment value no install can change."""
+    studio = importlib.import_module("unsloth_cli.commands.studio")
+
+    def _rejected_setting():
+        raise SystemExit("Error: Invalid UNSLOTH_CPU_THREADS value 'invalid'")
+
+    monkeypatch.setattr(studio, "_load_run_module", _rejected_setting)
+
+    with pytest.raises(typer.Exit) as exited:
+        studio.desktop_runtime_check(_json_output = True)
+
+    assert exited.value.exit_code == 1
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["runtime_ready"] is False
+    assert payload["reason"] == "backend_startup_failed"
+    assert "UNSLOTH_CPU_THREADS" in payload["error"]

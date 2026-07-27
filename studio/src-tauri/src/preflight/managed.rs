@@ -36,6 +36,13 @@ struct DesktopCapability {
     version: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct DesktopRuntimeCheck {
+    runtime_ready: bool,
+    reason: Option<String>,
+    module: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ManagedCapabilityCache {
     schema: u16,
@@ -264,9 +271,58 @@ fn write_cached_capability(fingerprint: &ManagedBinFingerprint, capability: &Des
 }
 
 async fn run_cli_probe(bin: &Path, args: &[&str]) -> bool {
-    let started = Instant::now();
     let mut cmd = Command::new(bin);
     cmd.args(args).stdout(Stdio::null()).stderr(Stdio::null());
+
+    #[cfg(target_os = "linux")]
+    if std::env::var_os("APPIMAGE").is_some() {
+        cmd.env_remove("LD_LIBRARY_PATH");
+        cmd.env_remove("PYTHONHOME");
+        cmd.env_remove("PYTHONPATH");
+    }
+
+    cmd.env_remove("UNSLOTH_STUDIO_HOME");
+    cmd.env_remove("STUDIO_HOME");
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(crate::process::CREATE_NO_WINDOW);
+    }
+
+    let Ok(mut child) = cmd.spawn() else {
+        return false;
+    };
+    match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(Ok(status)) => status.success(),
+        _ => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            false
+        }
+    }
+}
+
+/// A hung binary, kept out of the fallback below: an older CLI rejects the
+/// unknown command at once, so only a broken one reaches the timeout, and
+/// running two more probes on it would treble the wait before repair.
+const RUNTIME_PROBE_TIMEOUT: &str = "studio_runtime_probe_timeout";
+
+/// True when the CLI is older than `desktop-runtime-check` yet still launches.
+/// Such a CLI exits with a usage error and no JSON, which is indistinguishable
+/// from a crashed probe; `--help` resolves the command without running it, and
+/// the legacy launch probe keeps a genuinely unusable binary out of this path.
+async fn predates_runtime_check(bin: &Path) -> bool {
+    !run_cli_probe(bin, &["studio", "desktop-runtime-check", "--help"]).await
+        && run_cli_probe(bin, &["-h"]).await
+}
+
+async fn probe_cli_runtime(bin: &Path) -> Result<(), String> {
+    let started = Instant::now();
+    let mut cmd = Command::new(bin);
+    cmd.args(["studio", "desktop-runtime-check", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
 
     #[cfg(target_os = "linux")]
     if std::env::var_os("APPIMAGE").is_some() {
@@ -288,28 +344,70 @@ async fn run_cli_probe(bin: &Path, args: &[&str]) -> bool {
 
     let Ok(mut child) = cmd.spawn() else {
         info!(
-            "Managed preflight probe {:?} failed to spawn in {}ms",
-            args,
+            "Managed runtime probe failed to spawn in {}ms",
             started.elapsed().as_millis()
         );
-        return false;
+        return Err("studio_runtime_probe_failed".to_string());
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        return Err("studio_runtime_probe_failed".to_string());
     };
 
-    let ok = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
-        Ok(Ok(status)) => status.success(),
+    // Drain while waiting: the backend import this probe runs can print more than
+    // the pipe buffer holds, and waiting first deadlocks on it, timing out a
+    // healthy install into repair.
+    let reader = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        let _ = stdout.read_to_end(&mut buffer).await;
+        buffer
+    });
+
+    let status = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+        Ok(Ok(status)) => status,
         _ => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            false
+            reader.abort();
+            info!(
+                "Managed runtime probe timed out in {}ms",
+                started.elapsed().as_millis()
+            );
+            return Err(RUNTIME_PROBE_TIMEOUT.to_string());
         }
     };
+
+    let Ok(output) = reader.await else {
+        return Err("studio_runtime_probe_failed".to_string());
+    };
+    let payload = String::from_utf8_lossy(&output)
+        .lines()
+        .rev()
+        .find_map(|line| serde_json::from_str::<DesktopRuntimeCheck>(line).ok());
+    let result = match payload {
+        Some(payload) if status.success() && payload.runtime_ready => Ok(()),
+        Some(payload) => {
+            let reason = match payload.reason.as_deref() {
+                Some("missing_dependency") => {
+                    info!(
+                        "Managed runtime probe missing dependency module={}",
+                        payload.module.as_deref().unwrap_or("unknown")
+                    );
+                    "studio_runtime_missing_dependency"
+                }
+                Some("backend_import_failed") => "studio_runtime_import_failed",
+                Some("backend_startup_failed") => super::STUDIO_RUNTIME_STARTUP_FAILED,
+                _ => "studio_runtime_probe_failed",
+            };
+            Err(reason.to_string())
+        }
+        None => Err("studio_runtime_probe_failed".to_string()),
+    };
     info!(
-        "Managed preflight probe {:?} finished ok={} in {}ms",
-        args,
-        ok,
+        "Managed runtime probe finished ok={} in {}ms",
+        result.is_ok(),
         started.elapsed().as_millis()
     );
-    ok
+    result
 }
 
 async fn probe_cli_capability(bin: &Path) -> Option<DesktopCapability> {
@@ -348,11 +446,19 @@ async fn probe_cli_capability(bin: &Path) -> Option<DesktopCapability> {
         return None;
     };
 
+    // Same reason as the runtime probe above.
+    let reader = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        let _ = stdout.read_to_end(&mut buffer).await;
+        buffer
+    });
+
     match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
         Ok(Ok(status)) if status.success() => {}
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
+            reader.abort();
             info!(
                 "Managed desktop-capabilities probe timed out in {}ms",
                 started.elapsed().as_millis()
@@ -360,6 +466,7 @@ async fn probe_cli_capability(bin: &Path) -> Option<DesktopCapability> {
             return None;
         }
         _ => {
+            reader.abort();
             info!(
                 "Managed desktop-capabilities probe exited unsuccessfully in {}ms",
                 started.elapsed().as_millis()
@@ -368,10 +475,9 @@ async fn probe_cli_capability(bin: &Path) -> Option<DesktopCapability> {
         }
     }
 
-    let mut output = Vec::new();
-    if stdout.read_to_end(&mut output).await.is_err() {
+    let Ok(output) = reader.await else {
         return None;
-    }
+    };
 
     let capability = serde_json::from_slice::<DesktopCapability>(&output).ok();
     info!(
@@ -410,22 +516,25 @@ fn desktop_capability_ready(capability: &DesktopCapability) -> bool {
 
 pub(super) async fn probe_managed_bin(bin: PathBuf) -> ManagedProbe {
     let started = Instant::now();
-    // Always verify the managed CLI actually launches before trusting the cache.
-    // A matching capability fingerprint does not prove the binary can still run:
-    // its venv interpreter or a runtime dependency can be broken while the
-    // path/size/mtime/markers are unchanged, so the -h probe runs first and a
-    // non-launchable install is reported Stale for repair. The capability cache
-    // below still skips the heavier desktop-capabilities probe on a hit.
-    if !run_cli_probe(&bin, &["-h"]).await {
+    // Runtime readiness is intentionally uncached. A matching capability
+    // fingerprint only proves protocol compatibility, not that Studio's backend
+    // imports are complete after an interrupted dependency transaction.
+    if let Err(reason) = probe_cli_runtime(&bin).await {
+        // Every released CLI predates this subcommand, so a missing-command exit
+        // must not strand an install the launch probe still accepts.
+        if reason != "studio_runtime_probe_failed" || !predates_runtime_check(&bin).await {
+            info!(
+                "Managed preflight: runtime unusable for {:?} reason={} in {}ms",
+                bin,
+                reason,
+                started.elapsed().as_millis()
+            );
+            return ManagedProbe::Stale { bin, reason };
+        }
         info!(
-            "Managed preflight: cli unusable for {:?} in {}ms",
-            bin,
-            started.elapsed().as_millis()
+            "Managed preflight: cli predates the runtime probe for {:?}; using the launch probe",
+            bin
         );
-        return ManagedProbe::Stale {
-            bin,
-            reason: "cli_unusable".to_string(),
-        };
     }
 
     if let Some(fingerprint) = managed_bin_fingerprint(&bin) {
@@ -478,6 +587,16 @@ pub(super) async fn probe_managed_bin(bin: PathBuf) -> ManagedProbe {
 pub(super) async fn probe_managed_install() -> ManagedProbe {
     let started = Instant::now();
     let result = match crate::process::find_unsloth_binary() {
+        Some(bin) if crate::install::managed_install_in_progress() => {
+            info!(
+                "Managed preflight: interrupted desktop installation marker found for {:?}",
+                bin
+            );
+            ManagedProbe::Stale {
+                bin,
+                reason: "install_incomplete".to_string(),
+            }
+        }
         Some(bin) => probe_managed_bin(bin).await,
         None => ManagedProbe::Missing,
     };
@@ -491,4 +610,14 @@ pub(super) async fn probe_managed_install() -> ManagedProbe {
 
 pub async fn managed_install_ready() -> bool {
     matches!(probe_managed_install().await, ManagedProbe::Ready { .. })
+}
+
+/// Ready, or the reason it is not, so repair can tell an unrepairable cause
+/// apart from a stale install rather than reinstalling over both.
+pub async fn managed_install_state() -> Result<(), Option<String>> {
+    match probe_managed_install().await {
+        ManagedProbe::Ready { .. } => Ok(()),
+        ManagedProbe::Stale { reason, .. } => Err(Some(reason)),
+        _ => Err(None),
+    }
 }
