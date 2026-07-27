@@ -155,6 +155,8 @@ import {
 import { isDownloadCancelled } from "@/lib/native-files";
 import { toast } from "@/lib/toast";
 import { ShutdownDialog } from "@/components/shutdown-dialog";
+import { SidebarBulkSelectionBar } from "@/components/sidebar-bulk-selection-bar";
+import { useSidebarListSelection } from "@/hooks/use-sidebar-list-selection";
 import { translate, useT, type TranslationKey } from "@/i18n";
 
 const EMPHASIS_MARKER = "__UNSLOTH_I18N_EMPHASIS_MARKER__";
@@ -544,6 +546,23 @@ export function AppSidebar() {
   );
   const showTrainingRecents =
     !chatOnly && trainingRecentsRoute && runItems.length > 0;
+  const recentChatItemIds = useMemo(
+    () => recentChatItems.map((item) => item.id),
+    [recentChatItems],
+  );
+  const runItemIds = useMemo(() => runItems.map((run) => run.id), [runItems]);
+  const chatRecentsListRef = useRef<HTMLDivElement | null>(null);
+  const runRecentsListRef = useRef<HTMLDivElement | null>(null);
+  const chatRecentsSelection = useSidebarListSelection({
+    itemIds: recentChatItemIds,
+    scrollContainerRef: scrollRef,
+    listRootRef: chatRecentsListRef,
+  });
+  const runRecentsSelection = useSidebarListSelection({
+    itemIds: runItemIds,
+    scrollContainerRef: scrollRef,
+    listRootRef: runRecentsListRef,
+  });
   const activeJobId = useTrainingRuntimeStore((s) => s.jobId);
   const currentRunViewActive = useTrainingRuntimeStore((s) => s.currentRunViewActive);
   const selectedHistoryRunId = useTrainingRuntimeStore((s) => s.selectedHistoryRunId);
@@ -563,9 +582,9 @@ export function AppSidebar() {
   // clears even if a run finishes while the user is on another tab.
   useTrainingCompletionWatch();
 
-  // Recompute bottom-fade on mount and whenever list height can change
-  // (items load, sections toggle, route switch) - onScroll never fires for
-  // short, non-scrolling lists. Guarded setState below can't loop.
+  // Recompute bottom-fade on mount and whenever list height can change (items
+  // load, sections toggle, route switch, bulk bar mount/unmount) - onScroll
+  // never fires for short lists. Guarded setState below can't loop.
   useEffect(() => {
     const el = scrollRef.current;
     if (!el) return;
@@ -580,6 +599,8 @@ export function AppSidebar() {
     runsOpen,
     pinnedOpen,
     isStudioRoute,
+    chatRecentsSelection.selectedCount,
+    runRecentsSelection.selectedCount,
   ]);
 
   const chatDisabled = trainingInProgress;
@@ -626,14 +647,21 @@ export function AppSidebar() {
 
   // Shared chat delete: same error toast and pin cleanup whether or not the
   // confirm dialog is used.
-  async function deleteChatWithCleanup(item: SidebarItem) {
+  async function deleteChatWithCleanup(
+    item: SidebarItem,
+    options?: { silent?: boolean },
+  ): Promise<boolean> {
     try {
       await handleDeleteThread(item);
       unpinChat(item.id);
+      return true;
     } catch (err) {
-      toast.error(translate("shell.toast.failedToDeleteChat"), {
-        description: err instanceof Error ? err.message : undefined,
-      });
+      if (!options?.silent) {
+        toast.error(translate("shell.toast.failedToDeleteChat"), {
+          description: err instanceof Error ? err.message : undefined,
+        });
+      }
+      return false;
     }
   }
 
@@ -784,8 +812,10 @@ export function AppSidebar() {
 
   type DeleteTarget =
     | { kind: "chat"; item: SidebarItem }
+    | { kind: "chats-bulk"; items: SidebarItem[] }
     | { kind: "project"; project: ProjectRecord }
-    | { kind: "run"; run: TrainingRunSummary };
+    | { kind: "run"; run: TrainingRunSummary }
+    | { kind: "runs-bulk"; runs: TrainingRunSummary[]; skipped: number };
   const [confirmingDelete, setConfirmingDelete] =
     useState<DeleteTarget | null>(null);
   const [deleteProjectFiles, setDeleteProjectFiles] = useState(false);
@@ -798,6 +828,23 @@ export function AppSidebar() {
     setConfirmingDelete(null);
     // Reset so the next project delete never inherits this checkbox.
     setDeleteProjectFiles(false);
+    if (target.kind === "chats-bulk") {
+      // Guarded: this dialog already closed, so the bar stays live for the
+      // whole loop and a second confirm would delete the same rows again.
+      await chatRecentsSelection.runBulkAction(async () => {
+        let failed = 0;
+        for (const item of target.items) {
+          const ok = await deleteChatWithCleanup(item, { silent: true });
+          if (!ok) failed += 1;
+        }
+        if (failed === 0) {
+          chatRecentsSelection.clearSelection();
+        } else {
+          toast.error(translate("shell.toast.failedToDeleteSomeChats"));
+        }
+      });
+      return;
+    }
     if (target.kind === "chat") {
       await deleteChatWithCleanup(target.item);
       return;
@@ -829,6 +876,39 @@ export function AppSidebar() {
           description: err instanceof Error ? err.message : undefined,
         });
       }
+      return;
+    }
+    if (target.kind === "runs-bulk") {
+      await runRecentsSelection.runBulkAction(async () => {
+        // Re-check status: a run can start between opening and confirming.
+        const live = new Map(runItems.map((run) => [run.id, run]));
+        const deletable = target.runs.filter(
+          (run) => (live.get(run.id) ?? run).status !== "running",
+        );
+        const skipped = target.skipped + (target.runs.length - deletable.length);
+        let failed = 0;
+        for (const run of deletable) {
+          try {
+            await deleteTrainingRun(run.id);
+            if (selectedHistoryRunId === run.id) {
+              setSelectedHistoryRunId(null);
+            }
+            emitTrainingRunDeleted(run.id);
+          } catch {
+            failed += 1;
+          }
+        }
+        if (failed === 0) {
+          runRecentsSelection.clearSelection();
+        } else {
+          toast.error(translate("shell.toast.failedToDeleteSomeRuns"));
+        }
+        if (skipped > 0) {
+          toast.error(
+            t("shell.toast.skippedRunningRuns", { count: skipped }),
+          );
+        }
+      });
       return;
     }
     if (target.run.status === "running") {
@@ -890,6 +970,7 @@ export function AppSidebar() {
   function renderChatSidebarItem(
     item: SidebarItem,
     variant: "project" | "recent",
+    selectionIndex?: number,
   ) {
     const isPinned = pinnedIdSet.has(item.id);
     const itemClass =
@@ -919,10 +1000,14 @@ export function AppSidebar() {
             "group-hover/recent-item:pr-6 group-has-[.sidebar-row-action[data-state=open]]/recent-item:pr-6 [@media(pointer:coarse)]:pr-10",
     );
 
+    const isSelectableRecent =
+      variant === "recent" && selectionIndex != null;
+    const isSelected =
+      isSelectableRecent && chatRecentsSelection.isItemSelected(item.id);
+
     const isRenamingThis =
       renamingTarget?.kind === "chat" && renamingTarget.item.id === item.id;
 
-    // Inline rename edits the title in place as a rounded pill, no dialog.
     if (isRenamingThis) {
       return (
         <SidebarMenuItem key={item.id} className={itemClass}>
@@ -946,14 +1031,43 @@ export function AppSidebar() {
     }
 
     return (
-      <SidebarMenuItem key={item.id} className={itemClass}>
+      <SidebarMenuItem
+        key={item.id}
+        className={itemClass}
+        data-selection-index={isSelectableRecent ? selectionIndex : undefined}
+      >
         <SidebarMenuButton
           data-testid="recent-thread"
           data-thread-type={item.type}
           data-thread-id={item.id}
           isActive={activeThreadId === item.id}
-          className={buttonClass}
-          onClick={() => {
+          // Only while a selection is live: the tint alone tells a screen reader
+          // nothing, but a plain nav row must not read as an unpressed toggle.
+          aria-pressed={
+            isSelectableRecent && chatRecentsSelection.isSelectionActive
+              ? isSelected
+              : undefined
+          }
+          className={cn(
+            buttonClass,
+            isSelected && "bg-primary/10 hover:bg-primary/15",
+          )}
+          onPointerDown={
+            isSelectableRecent
+              ? (event) =>
+                  chatRecentsSelection.handleItemPointerDown(
+                    selectionIndex,
+                    event,
+                  )
+              : undefined
+          }
+          onClick={(event) => {
+            if (
+              isSelectableRecent &&
+              chatRecentsSelection.handleItemClick(selectionIndex, item.id, event)
+            ) {
+              return;
+            }
             navigate({
               to: "/chat",
               search:
@@ -1658,11 +1772,25 @@ export function AppSidebar() {
               </SidebarGroupLabel>
               <CollapsibleContent>
                 <SidebarGroupContent className="pl-1.5 pr-2">
-                  <SidebarMenu>
-                    {recentChatItems.map((item) =>
-                      renderChatSidebarItem(item, "recent"),
-                    )}
-                  </SidebarMenu>
+                  <div ref={chatRecentsListRef}>
+                    <SidebarMenu>
+                      {recentChatItems.map((item, index) =>
+                        renderChatSidebarItem(item, "recent", index),
+                      )}
+                    </SidebarMenu>
+                    <SidebarBulkSelectionBar
+                      count={chatRecentsSelection.selectedCount}
+                      busy={chatRecentsSelection.isBulkPending}
+                      onClear={chatRecentsSelection.clearSelection}
+                      onDelete={() => {
+                        const items = recentChatItems.filter((item) =>
+                          chatRecentsSelection.isItemSelected(item.id),
+                        );
+                        if (items.length === 0) return;
+                        setConfirmingDelete({ kind: "chats-bulk", items });
+                      }}
+                    />
+                  </div>
                   {/* "No chats yet" only when there is truly no history:
                       project-scoped and archived threads leave Recents empty
                       but still count as existing chats. */}
@@ -1690,8 +1818,9 @@ export function AppSidebar() {
             </SidebarGroupLabel>
             <CollapsibleContent>
               <SidebarGroupContent className="pl-1.5 pr-2">
-                <SidebarMenu>
-                  {runItems.map((run) => {
+                <div ref={runRecentsListRef}>
+                  <SidebarMenu>
+                    {runItems.map((run, index) => {
                     // Explicit selection wins. Otherwise highlight the active
                     // job only while the "Current Run" tab is the view, keeping
                     // the Configure tab unhighlighted even though activeJobId
@@ -1700,15 +1829,37 @@ export function AppSidebar() {
                       selectedHistoryRunId != null
                         ? run.id === selectedHistoryRunId
                         : currentRunViewActive && run.id === activeJobId;
+                    const isSelected = runRecentsSelection.isItemSelected(run.id);
                     return (
                       <SidebarMenuItem
                         key={run.id}
                         className="group/run-item relative"
+                        data-selection-index={index}
                       >
                         <SidebarMenuButton
                           isActive={isActiveRun}
-                          className="sidebar-nav-btn h-auto flex-col items-start gap-0.5 py-[5px] rounded-[14px] pl-3 pr-7 text-ui-14p5 tracking-nav font-medium"
-                          onClick={() => {
+                          aria-pressed={
+                            runRecentsSelection.isSelectionActive
+                              ? isSelected
+                              : undefined
+                          }
+                          className={cn(
+                            "sidebar-nav-btn h-auto flex-col items-start gap-0.5 py-[5px] rounded-[14px] pl-3 pr-7 text-ui-14p5 tracking-nav font-medium",
+                            isSelected && "bg-primary/10 hover:bg-primary/15",
+                          )}
+                          onPointerDown={(event) =>
+                            runRecentsSelection.handleItemPointerDown(index, event)
+                          }
+                          onClick={(event) => {
+                            if (
+                              runRecentsSelection.handleItemClick(
+                                index,
+                                run.id,
+                                event,
+                              )
+                            ) {
+                              return;
+                            }
                             setSelectedHistoryRunId(run.id);
                             // From Recipes/Export, jump to Train so the run's
                             // history opens (studio reacts to selectedHistoryRunId).
@@ -1773,7 +1924,34 @@ export function AppSidebar() {
                       </SidebarMenuItem>
                     );
                   })}
-                </SidebarMenu>
+                  </SidebarMenu>
+                  <SidebarBulkSelectionBar
+                    count={runRecentsSelection.selectedCount}
+                    busy={runRecentsSelection.isBulkPending}
+                    onClear={runRecentsSelection.clearSelection}
+                    onDelete={() => {
+                      // Drop running runs so the confirmed count is what gets deleted.
+                      const selected = runItems.filter((run) =>
+                        runRecentsSelection.isItemSelected(run.id),
+                      );
+                      const runs = selected.filter(
+                        (run) => run.status !== "running",
+                      );
+                      const skipped = selected.length - runs.length;
+                      if (runs.length === 0) {
+                        if (skipped > 0) {
+                          toast.error(
+                            t("shell.toast.skippedRunningRuns", {
+                              count: skipped,
+                            }),
+                          );
+                        }
+                        return;
+                      }
+                      setConfirmingDelete({ kind: "runs-bulk", runs, skipped });
+                    }}
+                  />
+                </div>
               </SidebarGroupContent>
             </CollapsibleContent>
           </SidebarGroup>
@@ -2036,19 +2214,31 @@ export function AppSidebar() {
       <DialogContent className="menu-flat-destructive corner-squircle dialog-soft-surface sm:max-w-md">
         <DialogHeader>
           <DialogTitle>
-            {confirmingDelete?.kind === "run"
+            {confirmingDelete?.kind === "runs-bulk"
+              ? t("shell.dialog.deleteRunsBulk.title")
+              : confirmingDelete?.kind === "run"
               ? t("shell.dialog.deleteRun.title")
+              : confirmingDelete?.kind === "chats-bulk"
+                ? t("shell.dialog.deleteChatsBulk.title")
               : confirmingDelete?.kind === "project"
                 ? "Delete project"
                 : t("shell.dialog.deleteChat.title")}
           </DialogTitle>
           <DialogDescription>
-            {confirmingDelete?.kind === "run" ? (
+            {confirmingDelete?.kind === "runs-bulk" ? (
+              t("shell.dialog.deleteRunsBulk.description", {
+                count: confirmingDelete.runs.length,
+              })
+            ) : confirmingDelete?.kind === "run" ? (
               renderEmphasizedTranslation(
                 t,
                 "shell.dialog.deleteRun.description",
                 getTrainingRunDisplayTitle(confirmingDelete.run),
               )
+            ) : confirmingDelete?.kind === "chats-bulk" ? (
+              t("shell.dialog.deleteChatsBulk.description", {
+                count: confirmingDelete.items.length,
+              })
             ) : confirmingDelete?.kind === "chat" ? (
               renderEmphasizedTranslation(
                 t,
