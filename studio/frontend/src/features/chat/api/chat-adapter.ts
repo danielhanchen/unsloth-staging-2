@@ -1842,11 +1842,14 @@ async function autoLoadSmallestModel(): Promise<{
       if (!loadId) continue;
       const isGguf = row.runtime?.trim().toLowerCase() === "llama_cpp";
       const repos = isGguf ? ggufRepos : modelRepos;
-      // A cached repo is also indexed here; trying it twice would burn two of
-      // the three load attempts on one model.
-      if (repos.some((repo) => (repo.load_id || repo.repo_id) === loadId)) {
-        continue;
-      }
+      // Both queues, not just this one: a cached repo is also indexed here, and
+      // a directory holding a .gguf next to .safetensors is classified as two
+      // rows sharing a path. Either way the same path would burn two of the
+      // three attempts, and the second is not even a different load, because
+      // from_identifier re-detects the GGUF whenever gguf_variant is null.
+      const alreadyQueued = (list: { repo_id: string; load_id?: string }[]) =>
+        list.some((repo) => (repo.load_id || repo.repo_id) === loadId);
+      if (alreadyQueued(ggufRepos) || alreadyQueued(modelRepos)) continue;
       // A local folder loads, and lists its variants, by path.
       const candidate = {
         repo_id: loadId,

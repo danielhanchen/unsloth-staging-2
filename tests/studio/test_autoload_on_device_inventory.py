@@ -333,3 +333,32 @@ def test_only_the_device_scan_failing_reports_an_unreadable_device():
     assert "inventoryUnavailable = true" in handler_body(
         "listOnDeviceInventory()\n        .then((response) => response.models)"
     )
+
+
+MIXED_GGUF_ROW = {
+    **GEMMA_ROW,
+    "id": "/mnt/ssd/models/mixed",
+    "load_id": "/mnt/ssd/models/mixed",
+    "path": "/mnt/ssd/models/mixed",
+    "runtime": "llama_cpp",
+}
+MIXED_SAFETENSORS_ROW = {**MIXED_GGUF_ROW, "model_format": "safetensors", "runtime": "transformers"}
+
+
+def test_a_mixed_weight_directory_is_queued_once():
+    """_classify_local_path emits a gguf row AND a safetensors row for a folder
+    holding both, sharing one path. Queuing both spends two of the three
+    attempts on one model, and the second is not even a different load:
+    from_identifier re-detects the GGUF when gguf_variant is null."""
+    src = _read(ADAPTER)
+    fold_in = src[
+        src.index("    for (const row of localModels) {") : src.index("    candidateCount =")
+    ]
+    queued = _run(
+        f"const localModels: any[] = {json.dumps([MIXED_GGUF_ROW, MIXED_SAFETENSORS_ROW])};\n"
+        "const ggufRepos: any[] = [];\nconst modelRepos: any[] = [];\n"
+        "const isAutoLoadableLocalRow = inventory.isAutoLoadableLocalRow;\n"
+        f"{fold_in}\n"
+        "console.log(JSON.stringify({ gguf: ggufRepos.length, model: modelRepos.length }));\n"
+    )
+    assert queued == {"gguf": 1, "model": 0}, queued
