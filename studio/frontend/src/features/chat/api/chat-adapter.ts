@@ -2,6 +2,10 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { getAuthToken } from "@/features/auth";
+import {
+  listLocalModels as listOnDeviceInventory,
+  type LocalModelInfo,
+} from "@/features/hub";
 import { resolveInitialConfig } from "@/features/model-picker";
 import { projectHasSources } from "@/features/rag/api/rag-api";
 import { apiUrl } from "@/lib/api-base";
@@ -81,6 +85,11 @@ import {
   recordLastLocalModelLoad,
   type LastLocalModelKind,
 } from "../utils/last-local-model-load";
+import {
+  describeAutoLoadFailure,
+  isAutoLoadableLocalRow,
+  type AutoLoadFailure,
+} from "../utils/auto-load-inventory";
 import { getImageInputUnavailableReason } from "../utils/image-input-support";
 import {
   hasClosedThinkTag,
@@ -97,6 +106,8 @@ import {
   streamChatCompletions,
   StreamInterruptedError,
   validateModel,
+  type CachedGgufRepo,
+  type CachedModelRepo,
 } from "./chat-api";
 import {
   createOpenAIContainer,
@@ -1464,9 +1475,17 @@ function isAutoLoadableGgufVariant(variant: GgufVariantDetail | null): boolean {
   return !hasBigEndianGgufMarker(filename, variant.quant);
 }
 
+/**
+ * Load a model for a Send that arrived with none selected. Sweeps only what is
+ * already on this device and never downloads from Hugging Face on its own: a
+ * background fetch is not something the user asked for (#7374). When nothing
+ * loads, the caller is handed the reason that actually held instead of a blanket
+ * "no downloaded models found".
+ */
 async function autoLoadSmallestModel(): Promise<{
   loaded: boolean;
   blockedByTrustRemoteCode: boolean;
+  failure?: AutoLoadFailure;
 }> {
   if (await tryAdoptServerActiveModel()) {
     return { loaded: true, blockedByTrustRemoteCode: false };
@@ -1487,7 +1506,38 @@ async function autoLoadSmallestModel(): Promise<{
   let blockedByTrustRemoteCode = false;
   let hadNonTrustFailure = false;
   let loadAttempts = 0;
+  // An inventory that failed to answer is unknown, not empty: reporting it as
+  // "nothing is downloaded" is what sent #7374 to the Hub for a model.
+  let inventoryUnavailable = false;
+  let candidateCount = 0;
+  let lastFailureReason: string | null = null;
   const skippedAutoLoadCandidates = new Set<string>();
+
+  function noteFailure(error: unknown): void {
+    hadNonTrustFailure = true;
+    if (error instanceof Error && error.message.trim()) {
+      lastFailureReason = error.message.trim();
+    }
+  }
+
+  function giveUp(): {
+    loaded: boolean;
+    blockedByTrustRemoteCode: boolean;
+    failure: AutoLoadFailure;
+  } {
+    toast.dismiss(toastId);
+    const blocked = blockedByTrustRemoteCode && !hadNonTrustFailure;
+    return {
+      loaded: false,
+      blockedByTrustRemoteCode: blocked,
+      failure: describeAutoLoadFailure({
+        candidateCount,
+        inventoryUnavailable,
+        blockedByTrustRemoteCode: blocked,
+        lastFailureReason,
+      }),
+    };
+  }
 
   async function canAutoLoad(payload: {
     model_path: string;
@@ -1743,10 +1793,48 @@ async function autoLoadSmallestModel(): Promise<{
     return true;
   }
   try {
-    const [ggufRepos, modelRepos] = await Promise.all([
-      listCachedGguf().catch(() => []),
-      listCachedModels().catch(() => []),
+    const unreadable =
+      <T,>(fallback: T) =>
+      (error: unknown): T => {
+        inventoryUnavailable = true;
+        noteFailure(error);
+        return fallback;
+      };
+    // The two cache lists only cover the managed HF caches, so a model in the
+    // models folder, an LM Studio dir or a registered scan folder was invisible
+    // here even though the picker listed it. The backend indexes all of them at
+    // GET /api/hub/local.
+    const [ggufRepos, modelRepos, localModels] = await Promise.all([
+      listCachedGguf().catch(unreadable<CachedGgufRepo[]>([])),
+      listCachedModels().catch(unreadable<CachedModelRepo[]>([])),
+      listOnDeviceInventory()
+        .then((response) => response.models)
+        .catch(unreadable<LocalModelInfo[]>([])),
     ]);
+    // Fold the on-device rows into the same two lists the loops below already
+    // walk. A row is a candidate on the capability the scanner computed while it
+    // stat-ed the directory, never on a guess about its filenames.
+    for (const row of localModels) {
+      if (!isAutoLoadableLocalRow(row)) continue;
+      const loadId = (row.load_id || row.id || row.path || "").trim();
+      if (!loadId) continue;
+      const isGguf = row.runtime?.trim().toLowerCase() === "llama_cpp";
+      const repos = isGguf ? ggufRepos : modelRepos;
+      // A cached repo is also indexed here; trying it twice would burn two of
+      // the three load attempts on one model.
+      if (repos.some((repo) => (repo.load_id || repo.repo_id) === loadId)) {
+        continue;
+      }
+      // A local folder loads, and lists its variants, by path.
+      const candidate = {
+        repo_id: loadId,
+        load_id: loadId,
+        size_bytes: row.size_bytes ?? 0,
+      };
+      if (isGguf) ggufRepos.push({ ...candidate, cache_path: row.path });
+      else modelRepos.push(candidate);
+    }
+    candidateCount = ggufRepos.length + modelRepos.length;
 
     if (lastLoaded) {
       if (lastLoaded.kind === "gguf") {
@@ -1861,8 +1949,8 @@ async function autoLoadSmallestModel(): Promise<{
               return { loaded: true, blockedByTrustRemoteCode: false };
             }
           }
-        } catch {
-          hadNonTrustFailure = true;
+        } catch (error) {
+          noteFailure(error);
           continue;
         }
       }
@@ -1895,144 +1983,22 @@ async function autoLoadSmallestModel(): Promise<{
           ) {
             return { loaded: true, blockedByTrustRemoteCode: false };
           }
-        } catch {
-          hadNonTrustFailure = true;
+        } catch (error) {
+          noteFailure(error);
           continue;
         }
       }
     }
 
-    // Cap also gates the default download, so total /api/inference/load
-    // budget across cached + fallback is MAX_AUTO_LOAD_ATTEMPTS, not +1.
-    if (loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS) {
-      toast.dismiss(toastId);
-      return {
-        loaded: false,
-        blockedByTrustRemoteCode:
-          blockedByTrustRemoteCode && !hadNonTrustFailure,
-      };
-    }
-
-    // No cached models — try downloading a small default GGUF.
-    toast("Downloading a small model…", {
-      id: toastId,
-      description:
-        "No downloaded models found. Fetching Qwen3.5-4B-MTP (UD-Q4_K_XL).",
-      duration: 30000,
-    });
-    try {
-      const rt = useChatRuntimeStore.getState();
-      if (
-        !(await canAutoLoad({
-          model_path: "unsloth/Qwen3.5-4B-MTP-GGUF",
-          max_seq_length: 0,
-          is_lora: false,
-          gguf_variant: "UD-Q4_K_XL",
-          // The same live-store GPU pick the load below sends (a fresh default
-          // model has no remembered settings to prefer).
-          gpu_ids: rt.selectedGpuIds ?? undefined,
-          gpu_memory_mode: rt.gpuMemoryMode,
-        }))
-      ) {
-        toast.dismiss(toastId);
-        return { loaded: false, blockedByTrustRemoteCode };
-      }
-      loadAttempts += 1;
-      const loadResp = await loadModel({
-        model_path: "unsloth/Qwen3.5-4B-MTP-GGUF",
-        hf_token: hfToken,
-        // Model default under both modes: Auto layers + no pin means
-        // resolveFitMaxSeqLength returns 0 for every mode (the canAutoLoad
-        // preflight above sends the same).
-        max_seq_length: 0,
-        load_in_4bit: true,
-        is_lora: false,
-        gguf_variant: "UD-Q4_K_XL",
-        trust_remote_code: trustRemoteCode,
-        speculative_type: specSettings.speculativeType,
-        spec_draft_n_max: specSettings.specDraftNMax,
-        // GPU Memory mode is a standing preference, so honor it on auto-load.
-        // The layer/MoE/split knobs and the context pin are per-model: the live
-        // store may hold edits drafted for a staged pick, and a fresh default
-        // model has no remembered settings, so those stay at their defaults like
-        // the cached-candidate path. The GPU pick deliberately differs (it's the
-        // picker's current on-screen selection, which the canAutoLoad preflight
-        // above already committed to).
-        gpu_memory_mode: rt.gpuMemoryMode,
-        gpu_layers: GPU_LAYERS_AUTO,
-        n_cpu_moe: 0,
-        gpu_ids: rt.selectedGpuIds ?? undefined,
-      });
-      saveSpeculativeType(specSettings.speculativeType);
-      persistGpuMemoryModeOnLoad(loadResp, rt.gpuMemoryMode);
-      useChatRuntimeStore
-        .getState()
-        .setCheckpoint("unsloth/Qwen3.5-4B-MTP-GGUF", "UD-Q4_K_XL");
-      const store = useChatRuntimeStore.getState();
-      store.setModelRequiresTrustRemoteCode(
-        loadResp.requires_trust_remote_code ?? false,
-      );
-      store.setParams({
-        ...store.params,
-        maxTokens: loadResp.context_length ?? 131072,
-      });
-      const defaultModel: ChatModelSummary = {
-        id: "unsloth/Qwen3.5-4B-MTP-GGUF",
-        name: loadResp.display_name ?? "Qwen3.5-4B-MTP-GGUF",
-        isVision: loadResp.is_vision ?? false,
-        isLora: false,
-        isGguf: true,
-      };
-      if (!store.models.some((m) => m.id === "unsloth/Qwen3.5-4B-MTP-GGUF")) {
-        store.setModels([...store.models, defaultModel]);
-      }
-      useChatRuntimeStore.setState({
-        ggufContextLength: loadResp.context_length ?? 131072,
-        ggufMaxContextLength:
-          loadResp.max_context_length ?? loadResp.context_length ?? 131072,
-        supportsReasoning: loadResp.supports_reasoning ?? false,
-        reasoningAlwaysOn: loadResp.reasoning_always_on ?? false,
-        reasoningEnabled: loadResp.supports_reasoning ?? false,
-        ...reasoningCapsFromLoad(loadResp),
-        supportsPreserveThinking: loadResp.supports_preserve_thinking ?? false,
-        supportsTools: loadResp.supports_tools ?? false,
-        ...resolveToolsEnabledOnLoad(loadResp.supports_tools ?? false),
-        kvCacheDtype: loadResp.cache_type_kv ?? null,
-        loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
-        tensorParallel: loadResp.tensor_parallel ?? false,
-        loadedTensorParallel: loadResp.tensor_parallel ?? false,
-        ...loadedGpuMemoryFields(loadResp),
-        // Drives the GPU Memory controls' diffusion gate; set alongside the
-        // GPU fields on every load path so the gate can't read stale.
-        loadedIsDiffusion: loadResp.is_diffusion ?? false,
-        defaultChatTemplate: loadResp.chat_template ?? null,
-        chatTemplateOverride: null,
-        loadedIsMultimodal: isMultimodalResponse(loadResp),
-        ...resolveLoadedSpeculativeSettings(loadResp),
-      });
-      recordLastLocalModelLoad({
-        id: "unsloth/Qwen3.5-4B-MTP-GGUF",
-        kind: "gguf",
-        ggufVariant: "UD-Q4_K_XL",
-      });
-      toast.success("Loaded Qwen3.5-4B-MTP (UD-Q4_K_XL)", { id: toastId });
-      return { loaded: true, blockedByTrustRemoteCode: false };
-    } catch {
-      toast.dismiss(toastId);
-      hadNonTrustFailure = true;
-      return {
-        loaded: false,
-        blockedByTrustRemoteCode:
-          blockedByTrustRemoteCode && !hadNonTrustFailure,
-      };
-    }
-  } catch {
-    toast.dismiss(toastId);
-    hadNonTrustFailure = true;
-    return {
-      loaded: false,
-      blockedByTrustRemoteCode: blockedByTrustRemoteCode && !hadNonTrustFailure,
-    };
+    // Nothing on this device loaded. Studio does not fetch a model from the Hub
+    // to cover for that: the user gets the real reason and picks (#7374).
+    return giveUp();
+  } catch (error) {
+    // An unexpected throw leaves the on-disk state unknown, so say that rather
+    // than claim the device is empty.
+    inventoryUnavailable = true;
+    noteFailure(error);
+    return giveUp();
   }
 }
 
@@ -2102,22 +2068,29 @@ export function createOpenAIStreamAdapter(
         // Prefer a model already loaded by the CLI/API before auto-loading.
         let loaded: boolean;
         let blockedByTrustRemoteCode: boolean;
+        let failure: AutoLoadFailure | undefined;
         try {
-          ({ loaded, blockedByTrustRemoteCode } =
+          ({ loaded, blockedByTrustRemoteCode, failure } =
             await autoLoadSmallestModel());
         } catch (error) {
           clearSelectedImageEditReference();
           throw error;
         }
         if (!loaded) {
+          // The sweep knows why it loaded nothing (device empty, inventory
+          // unreadable, or a model that failed to load), and that beats the
+          // generic line, which reads as "Studio saw nothing on disk".
           toast.error(
-            blockedByTrustRemoteCode
-              ? "This model needs custom code approval"
-              : "No model loaded",
+            failure?.title ??
+              (blockedByTrustRemoteCode
+                ? "This model needs custom code approval"
+                : "No model loaded"),
             {
-              description: blockedByTrustRemoteCode
-                ? "Select it from the top bar to review and approve its custom code, or pick another model."
-                : "Pick a model in the top bar, then retry.",
+              description:
+                failure?.description ??
+                (blockedByTrustRemoteCode
+                  ? "Select it from the top bar to review and approve its custom code, or pick another model."
+                  : "Pick a model in the top bar, then retry."),
             },
           );
           clearSelectedImageEditReference();
