@@ -1871,8 +1871,8 @@ async function autoLoadSmallestModel(): Promise<{
                 return { loaded: true, blockedByTrustRemoteCode: false };
               }
             }
-          } catch {
-            hadNonTrustFailure = true;
+          } catch (error) {
+            noteFailure(error);
             skippedAutoLoadCandidates.add(
               autoLoadCandidateKey("gguf", repo.repo_id, lastLoaded.ggufVariant),
             );
@@ -1899,8 +1899,8 @@ async function autoLoadSmallestModel(): Promise<{
             ) {
               return { loaded: true, blockedByTrustRemoteCode: false };
             }
-          } catch {
-            hadNonTrustFailure = true;
+          } catch (error) {
+            noteFailure(error);
             skippedAutoLoadCandidates.add(
               autoLoadCandidateKey("model", repo.repo_id),
             );
@@ -1920,6 +1920,27 @@ async function autoLoadSmallestModel(): Promise<{
       for (const repo of sorted) {
         if (loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS) break;
         try {
+          // A row the scanner resolved to one loose `.gguf` loads by that path
+          // with no variant, exactly as the picker loads it. Asking for its
+          // variants instead answers nothing, because the backend refuses to
+          // group GGUFs sitting in a folder that carries no model metadata, so
+          // routing it through the directory sweep would drop a chat-ready file.
+          if (repo.repo_id.toLowerCase().endsWith(".gguf")) {
+            if (hasBigEndianGgufMarker(repo.repo_id)) continue;
+            if (
+              await loadAutoLoadCandidate({
+                id: repo.repo_id,
+                loadId: repo.load_id,
+                kind: "gguf",
+                ggufVariant: null,
+                maxSeqLength: 0,
+                successLabel: `Loaded ${repo.repo_id}`,
+              })
+            ) {
+              return { loaded: true, blockedByTrustRemoteCode: false };
+            }
+            continue;
+          }
           const variants = await listGgufVariants(repo.repo_id, undefined, {
             preferLocalCache: true,
             localPath: repo.cache_path,

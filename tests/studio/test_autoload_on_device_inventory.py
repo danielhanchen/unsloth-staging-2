@@ -47,9 +47,9 @@ def _run(body: str):
     """Execute *body* against the real module and parse its last stdout line."""
     if shutil.which("node") is None:
         pytest.skip("node not available")
-    assert INVENTORY.exists(), (
-        "auto-load must decide candidates through features/chat/utils/auto-load-inventory.ts"
-    )
+    assert (
+        INVENTORY.exists()
+    ), "auto-load must decide candidates through features/chat/utils/auto-load-inventory.ts"
     probe = subprocess.run(
         ["node", "--experimental-strip-types", "--version"],
         capture_output = True,
@@ -124,6 +124,73 @@ def test_rows_the_scanner_will_not_vouch_for_are_never_auto_loaded():
     assert verdicts == {"partial": False, "unclassified": False, "adapter": False}
 
 
+# The same folder holding one loose ``.gguf`` instead of a model directory. The
+# scanner resolves the file itself, so the row is a direct-file row:
+# ``requires_variant`` is false and the quant is already read off the name.
+LOOSE_GGUF_ROW = {
+    **GEMMA_ROW,
+    "id": "/mnt/ssd/models/gemma-4-26B-A4B-it-Q4_K_M.gguf",
+    "load_id": "/mnt/ssd/models/gemma-4-26B-A4B-it-Q4_K_M.gguf",
+    "path": "/mnt/ssd/models/gemma-4-26B-A4B-it-Q4_K_M.gguf",
+    "format_variant": "Q4_K_M",
+    "capabilities": {"can_chat": True, "requires_variant": False},
+}
+
+
+def _sweep_calls(row: dict, variants: list) -> list:
+    """Run the real fold-in and GGUF sweep from ``chat-adapter.ts`` over one
+    ``GET /api/hub/local`` row, answering the variant lookup the way the backend
+    answers it for that row, and report the calls the sweep made."""
+    src = _read(ADAPTER)
+    fold_in = src[
+        src.index("    for (const row of localModels) {") : src.index("    candidateCount =")
+    ]
+    gguf_sweep = src[src.index("    // GGUF first:") : src.index("    // Fall back to safetensors")]
+    return _run(
+        f"const localModels: any[] = [{json.dumps(row)}];\n"
+        f"const BACKEND_VARIANTS: any = {json.dumps({'variants': variants})};\n"
+        "const ggufRepos: any[] = [];\nconst modelRepos: any[] = [];\n"
+        "const MAX_AUTO_LOAD_ATTEMPTS = 3;\nlet loadAttempts = 0;\n"
+        "const skippedAutoLoadCandidates = new Set<string>();\n"
+        "const isAutoLoadableLocalRow = inventory.isAutoLoadableLocalRow;\n"
+        "const autoLoadCandidateKey = (k: string, i: string, v?: string | null) =>"
+        ' `${k}:${i}:${v ?? ""}`;\n'
+        "const isAutoLoadableGgufVariant = (v: any) => !!v?.filename;\n"
+        "const hasBigEndianGgufMarker = (_f: string) => false;\n"
+        "const noteFailure = (_e: unknown) => {};\n"
+        "const calls: any[] = [];\n"
+        "const listGgufVariants = async (repoId: string) => {"
+        ' calls.push({ fn: "listGgufVariants", repoId }); return BACKEND_VARIANTS; };\n'
+        "const loadAutoLoadCandidate = async (c: any) => {"
+        ' calls.push({ fn: "loadAutoLoadCandidate", ...c }); return true; };\n'
+        "async function sweep(): Promise<any> {\n"
+        f"{fold_in}\n{gguf_sweep}\n"
+        "}\n"
+        "sweep().then(() => console.log(JSON.stringify(calls)));\n"
+    )
+
+
+def test_a_loose_gguf_file_loads_without_a_directory_variant_lookup():
+    """A ``.gguf`` dropped straight into the models dir, an LM Studio dir or a
+    Custom Folder is indexed as the file itself. ``_resolve_gguf_dir`` refuses to
+    group GGUFs in a folder carrying no model metadata, so the variant lookup
+    answers ``[]`` for that path: routing it through the directory sweep would
+    drop a chat-capable model. It loads by its own path, no variant, like the
+    picker loads it. A model folder keeps selecting its smallest variant."""
+    loose = _sweep_calls(LOOSE_GGUF_ROW, [])
+    assert [c["fn"] for c in loose] == ["loadAutoLoadCandidate"], loose
+    assert loose[0]["loadId"] == LOOSE_GGUF_ROW["path"]
+    assert loose[0]["kind"] == "gguf"
+    assert loose[0]["ggufVariant"] is None
+
+    folder = _sweep_calls(
+        GEMMA_ROW,
+        [{"filename": "Q4_K_M.gguf", "quant": "Q4_K_M", "size_bytes": 1, "downloaded": True}],
+    )
+    assert [c["fn"] for c in folder] == ["listGgufVariants", "loadAutoLoadCandidate"], folder
+    assert folder[1]["ggufVariant"] == "Q4_K_M"
+
+
 def test_failure_message_distinguishes_empty_unreadable_and_unloadable():
     """ "No downloaded models found" was printed for all three states, so a model
     that was found and then rejected read as a model Studio could not see. Each
@@ -173,3 +240,14 @@ def test_an_unreadable_inventory_is_not_reported_as_an_empty_device():
     assert "catch(() => [])" not in sweep
     assert "inventoryUnavailable = true" in sweep
     assert "describeAutoLoadFailure(" in sweep
+
+
+def test_a_failed_load_attempt_keeps_its_reason():
+    """Every failure in the sweep, including the remembered-model shortcut that
+    runs before the loops, must hand its error to the message. A bare `catch`
+    drops the backend's explanation -- an out-of-memory refusal, say -- and the
+    toast falls back to the generic "pick one yourself" line."""
+    sweep = _sweep().split("export function createOpenAIStreamAdapter")[0]
+    assert "} catch {" not in sweep
+    for handler in sweep.split("catch (error) {")[1:]:
+        assert "noteFailure(error);" in handler.split("}")[0]
