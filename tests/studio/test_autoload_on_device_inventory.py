@@ -31,6 +31,7 @@ FRONTEND = WORKDIR / "studio/frontend/src"
 INVENTORY = FRONTEND / "features/chat/utils/auto-load-inventory.ts"
 ADAPTER = FRONTEND / "features/chat/api/chat-adapter.ts"
 HUB_API = FRONTEND / "features/hub/inventory/api.ts"
+STORE = FRONTEND / "features/chat/stores/chat-runtime-store.ts"
 
 
 def _read(path: Path) -> str:
@@ -189,6 +190,64 @@ def test_a_loose_gguf_file_loads_without_a_directory_variant_lookup():
     )
     assert [c["fn"] for c in folder] == ["listGgufVariants", "loadAutoLoadCandidate"], folder
     assert folder[1]["ggufVariant"] == "Q4_K_M"
+
+
+def _slice(src: str, start: str, end: str) -> str:
+    begin = src.index(start)
+    return src[begin : src.index(end, begin)]
+
+
+def _restore_remembered_model(repos: list, remembered: str):
+    """Run the real remembered-model restore from ``chat-adapter.ts`` over
+    ``repos``, through the real identity helpers, and report what it loaded."""
+    adapter = _read(ADAPTER)
+    return _run(
+        # The real local-path predicate the identity helpers ask.
+        _slice(_read(STORE), "export function isLocalModelPath(", "\n}\n") + "\n}\n"
+        'type LastLocalModelKind = "gguf" | "model";\n'
+        # Whatever identity helpers the adapter defines, however it spells them.
+        + _slice(adapter, "type AutoLoadCandidate = {", "function hasBigEndianGgufMarker(")
+        + f"const modelRepos: any[] = {json.dumps(repos)};\n"
+        "const ggufRepos: any[] = [];\n"
+        f"const lastLoaded: any = {{ id: {json.dumps(remembered)},"
+        ' kind: "model", ggufVariant: null };\n'
+        "const loaded: any[] = [];\n"
+        "const store = { params: { maxSeqLength: 2048 } };\n"
+        "const toast: any = Object.assign(() => {},"
+        " { dismiss() {}, success() {}, error() {} });\n"
+        'const toastId = "t";\n'
+        "const skippedAutoLoadCandidates = new Set<string>();\n"
+        "const noteFailure = (_e: unknown) => {};\n"
+        "const listGgufVariants = async () => ({ variants: [] });\n"
+        "const isAutoLoadableGgufVariant = () => true;\n"
+        "const loadAutoLoadCandidate = async (c: any) => { loaded.push(c); return true; };\n"
+        "async function restore(): Promise<any> {\n"
+        + _slice(adapter, "    if (lastLoaded) {", "    // GGUF first:")
+        + "\n}\n"
+        "restore().then(() => console.log(JSON.stringify({\n"
+        "  loaded: loaded[0]?.loadId ?? null,\n"
+        '  keys: modelRepos.map((r: any) => autoLoadCandidateKey("model", r.repo_id)),\n'
+        "})));\n"
+    )
+
+
+def test_two_local_models_differing_only_in_case_are_two_identities():
+    """An on-device row is identified by its absolute path, and a case-sensitive
+    filesystem does not fold case. The remembered/skip identity folded it,
+    because it only ever held Hub repo ids before the inventory rows arrived, so
+    ``/models/Foo`` and ``/models/foo`` shared one: the restore loaded whichever
+    row came first, and a failure for one skipped the other."""
+    lower = {"repo_id": "/models/foo", "load_id": "/models/foo", "size_bytes": 10}
+    upper = {"repo_id": "/models/Foo", "load_id": "/models/Foo", "size_bytes": 20}
+    # The colliding row is listed first, so a folded identity restores it.
+    result = _restore_remembered_model([lower, upper], upper["repo_id"])
+    assert result["loaded"] == upper["repo_id"], result
+    assert len(set(result["keys"])) == 2, result["keys"]
+
+    # A Hub repo id still folds: the cache resolves its real case for us.
+    unsloth = {"repo_id": "unsloth/Qwen3-4B", "load_id": "unsloth/Qwen3-4B", "size_bytes": 10}
+    folded = _restore_remembered_model([unsloth], "unsloth/qwen3-4b")
+    assert folded["loaded"] == unsloth["repo_id"], folded
 
 
 def test_failure_message_distinguishes_empty_unreadable_and_unloadable():

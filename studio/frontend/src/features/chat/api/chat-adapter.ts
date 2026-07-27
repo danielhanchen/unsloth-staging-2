@@ -47,6 +47,7 @@ import {
   type PendingImageEditReference,
   type RagAutoInject,
   GPU_LAYERS_AUTO,
+  isLocalModelPath,
   loadedGpuMemoryFields,
   reconcilePersistedGpuIds,
   resolveLoadedSpeculativeSettings,
@@ -1423,20 +1424,33 @@ type AutoLoadCandidate = {
   successLabel: string;
 };
 
+/**
+ * The identity an auto-load candidate is remembered and skipped under.
+ *
+ * A Hub repo id folds case, because the cache resolves a repo's real case for
+ * us and `Unsloth/x` and `unsloth/x` are one repo. An on-device row's identity
+ * is its absolute path, and a case-sensitive filesystem does not fold: folding
+ * it here would let two different models share one identity, so the remembered
+ * one could restore as the other, and a failure for one could skip the other.
+ */
+function autoLoadCandidateId(id: string): string {
+  return isLocalModelPath(id) ? id : id.toLowerCase();
+}
+
 function autoLoadCandidateKey(
   kind: LastLocalModelKind,
   id: string,
   ggufVariant?: string | null,
 ): string {
-  return `${kind}:${id.toLowerCase()}:${(ggufVariant ?? "").toLowerCase()}`;
+  return `${kind}:${autoLoadCandidateId(id)}:${(ggufVariant ?? "").toLowerCase()}`;
 }
 
 function findCachedRepo<T extends { repo_id: string }>(
   repos: T[],
   id: string,
 ): T | undefined {
-  const normalized = id.toLowerCase();
-  return repos.find((repo) => repo.repo_id.toLowerCase() === normalized);
+  const normalized = autoLoadCandidateId(id);
+  return repos.find((repo) => autoLoadCandidateId(repo.repo_id) === normalized);
 }
 
 function hasBigEndianGgufMarker(filename: string, quant?: string | null): boolean {
