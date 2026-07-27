@@ -181,6 +181,44 @@ _COMMAND_PREFIXES = frozenset(
         "xargs",
     }
 )
+# Wrapper options whose VALUE is a separate token (env -u NAME, nice -n 5).
+# Without consuming the value it is mistaken for the wrapped command, so
+# `env -u FOO rm -rf x` reads as the command `FOO` and the real `rm` is missed.
+# Shared by both layers -- the auto gate and the always-on blocklist walk hop
+# the same wrappers, and only one of them used to consume their operands.
+_WRAPPER_VALUE_FLAGS_BY_CMD = {
+    # env -i/--ignore-environment is VALUELESS; only -u/--unset takes a name.
+    "env": frozenset({"-u", "--unset"}),
+    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "ionice": frozenset({"-c", "--class", "-n", "--classdata", "-p", "--pid"}),
+    "xargs": frozenset(
+        {"-I", "-L", "-P", "-d", "--delimiter", "-a", "--arg-file", "-n", "-s", "-E"}
+    ),
+    "chroot": frozenset({"--userspec", "--groups"}),
+    # setpriv <options> <program>: only the value-taking options consume a token.
+    "setpriv": frozenset(
+        {
+            "--reuid",
+            "--regid",
+            "--groups",
+            "--inh-caps",
+            "--ambient-caps",
+            "--bounding-set",
+            "--securebits",
+            "--pdeathsig",
+            "--selinux-label",
+            "--apparmor-profile",
+            "--landlock-access",
+            "--landlock-rule",
+        }
+    ),
+    # exec -a NAME runs cmd under NAME, so NAME is a value, not the command.
+    "exec": frozenset({"-a"}),
+    "setsid": frozenset(),
+    "nohup": frozenset(),
+}
 _ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Env-assignment prefixes that change command lookup or code loading, so
 # `LD_PRELOAD=x ls` / `PATH=. ls` run attacker code before the read-only
@@ -268,8 +306,81 @@ _AWK_SHELL_ESCAPE_RE = re.compile(
     r"\bsystem\s*\(|\|\s*&?\s*[\"']\s*(?:/\S*/)?(?:sh|bash|zsh|ksh|dash|cmd)\b|"
     r"\bENVIRON\s*\[|\bprintf\s*\|"
 )
+# sed shells out like awk: GNU's `e` runs the rest of its line through popen,
+# and the `s///e` flag runs the pattern space. Either hides a command (even a
+# hard-blocked one) inside a text-editing argument, so the program is screened
+# while ordinary editing (sed 's/a/b/g', sed -n '1,20p') stays unprompted. Both
+# are GNU extensions; busybox/toybox/BSD sed reject `e` outright.
+_SED_COMMANDS = frozenset({"sed", "gsed", "ssed"})
+# `s///` flags that may precede `e`. `w` is absent: it takes the rest of the
+# line as a filename, so the e in `s/a/b/w report.txt` is part of that name.
+_SED_SUBST_FLAGS = frozenset("0123456789gpiImMe")
+# sed short options that consume text, so the rest of their token belongs to
+# them and no later letter in the cluster is a flag: -e/-f take a script and
+# -l a line length (attached or as the next token), while -i's backup suffix
+# is ATTACHED ONLY. Reading the suffix as more flags hid the real script --
+# `-ifoo` looked like an attached `-f oo`, and `-l 5` ate the script as the
+# length operand.
+_SED_VALUE_FLAGS = "efl"
+_SED_ATTACHED_VALUE_FLAGS = "i"
+# A backslash in a sed text argument escapes the next character, newline
+# included, so it is stripped before the payload is read as a shell command.
+_SED_TEXT_ESCAPE_RE = re.compile(r"\\([\s\S])")
+# A plain parameter reference inside a sed program (`sed "$p" f`). Only the
+# bare `$NAME` / `${NAME}` forms: anything with an operator in it is a
+# transformation this scan does not model, and the program is then judged
+# UNREAD rather than assumed harmless (see _sed_program_unresolved).
+_PROGRAM_VAR_RE = re.compile(r"\$\{(\w+)\}|\$(\w+)")
+# An unbraced expansion bash performs: a name (`$p`), a positional (`$1`) or a
+# special parameter ($@ $* $# $? $- $$ $!). A `$` followed by anything else is
+# literal text bash leaves alone -- verified: `printf '%s' "$ d"` prints `$ d`
+# and `printf '%s' "s/x$/y/"` prints it unchanged -- which is what keeps sed's
+# last-line address (`sed "$ d" f`, `sed "s/x$/y/" f`) out of the scan.
+_UNBRACED_PARAM_RE = re.compile(r"\$(?:[A-Za-z_]\w*|[0-9]+|[@*#?$!-])")
+# Arithmetic expansion evaluates to an INTEGER whatever it holds, so it can
+# never spell a sed command letter: verified `x=e; echo $((x))` prints 0, and
+# `$((echo hi))` is an arithmetic syntax error rather than a command
+# substitution. Standing a digit in its place keeps an ordinary
+# `sed -n "1,$((n + 1))p" f` silent while stopping the expansion's own
+# punctuation from hiding the command behind it -- `sed "$((c+1))e rm -f victim"`
+# really runs rm, and the raw text reads `c` as an append-text command that
+# swallows the payload as its operand.
+_ARITHMETIC_VALUE = "0"
+# A sed script always sits among the leading options or as the first positional;
+# everything past that is input files. Bounding the walk keeps a command padded
+# with hundreds of `-exec sed` words linear, since each one would otherwise
+# rescan the whole token list. This is the FLOOR every invocation gets; a line
+# with few sed words shares out the budget below instead, because a flat cap is
+# padding an attacker controls (`sed -n ...x128 '1e rm -f victim'` pushed the
+# real script one token past 128 and the screen came back empty).
+_MAX_SED_ARG_SCAN = 128
+# Argument tokens the sed screen may walk across ONE command line, split over
+# the sed words on it. A lone sed therefore reads its whole argument list while
+# the total work stays linear in the command length.
+_SED_SCAN_BUDGET = 200_000
+# Wrappers may sit between `find -exec` and the command it runs; bounded so a
+# line padded with `-exec env -exec env ...` cannot make the scan quadratic.
+_MAX_EXEC_PREFIX_SCAN = 32
+# First window tried when balancing a `$(...)`, quadrupled until the span closes
+# (_substitution_span), so a line of many short substitutions stays linear.
+_SUBSTITUTION_SPAN_STEP = 64
+# Quote state (_shell_quote_states) of a backslash and the character behind it.
+# Distinct from the surrounding quoting because bash EXPANDS neither: `\$` is a
+# literal dollar inside double quotes just as it is outside, so the `$(` in
+# `sed "s/\$(CC)/gcc/" Makefile` opens no command substitution. Any non-empty
+# string works; the callers only test whether the state is one bash expands.
+_ESCAPED_CHAR_STATE = "\\"
 _WIN_CONDITIONAL_KEYWORDS = frozenset({"exist", "defined", "errorlevel", "not"})
 _FIND_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+# `-exec CMD ... +` and `-exec CMD ... ;` are COMPLETE find actions: the words
+# after the terminator are find's next predicate, not more arguments of CMD.
+# Reading past it turned a following `-exec grep -e safe {} +` into a sed
+# `-e` program flag, which threw away the real positional script and left the
+# screen empty (`find in -exec sed '1e rm -f victim' {} + -exec grep -e safe
+# {} +` blocked nothing). `;` is already a shell separator once shlex is in
+# posix mode; the escaped spelling survives verbatim in the non-posix (Windows)
+# lexer, so both are listed.
+_FIND_EXEC_TERMINATORS = frozenset({"+", ";", "\\;"})
 
 # `[` and `[[` are the test builtins, not patterns.
 _TEST_BUILTINS = frozenset({"[", "[[", "]", "]]"})
@@ -289,6 +400,429 @@ def _blocked_matching_glob(base: str) -> "set[str]":
     if not _is_unresolved_command_glob(base):
         return set()
     return {name for name in _BLOCKED_COMMANDS if fnmatch.fnmatchcase(name, base)}
+
+
+def _is_sed_command(base: str) -> bool:
+    """Whether a command word runs sed. The name match is exact, plus any
+    command-position GLOB that could expand to one: bash resolves `/usr/bin/s[e]d`
+    to sed after this scan, and an exact-only check let the script behind such a
+    spelling through unscreened. Fail closed -- reading a non-sed tool's
+    arguments as a sed program costs nothing, since a program with no `e`
+    command yields no payload (`/usr/bin/l[s] -la` stays silent)."""
+    if base in _SED_COMMANDS:
+        return True
+    return _is_unresolved_command_glob(base) and any(
+        fnmatch.fnmatchcase(name, base) for name in _SED_COMMANDS
+    )
+
+
+def _sed_short_flag(token: str) -> "tuple[str, str] | None":
+    """The first value-taking short option in a sed flag cluster, as
+    ``(letter, text glued after it)``. The scan stops there because everything
+    left in the token is that option's value: `-ifoo` is -i with backup suffix
+    "foo", not an attached -f. ``None`` for a long option or a plain cluster."""
+    if not token.startswith("-") or token.startswith("--"):
+        return None
+    for index, ch in enumerate(token[1:]):
+        if ch in _SED_VALUE_FLAGS or ch in _SED_ATTACHED_VALUE_FLAGS:
+            return ch, token[index + 2 :]
+    return None
+
+
+def _sed_long_flag(name: str) -> str:
+    """Which value-taking sed long option ``--name`` is: "e" for --expression,
+    "f" for --file, "l" for --line-length, "" for anything else. getopt allows
+    unambiguous abbreviations, so --e/--ex/--expr are all --expression and --fi
+    upwards is --file (--f alone is ambiguous with --follow-symlinks, which sed
+    rejects). --in-place is absent: its suffix is attached, never a token."""
+    if len(name) <= 2:
+        return ""
+    if "--expression".startswith(name):
+        return "e"
+    if len(name) > 3 and "--file".startswith(name):
+        return "f"
+    if "--line-length".startswith(name):
+        return "l"
+    return ""
+
+
+def _sed_disables_exec(name: str) -> bool:
+    """Whether the long option ``name`` puts sed in a mode that REFUSES to shell
+    out. --sandbox disables the e/r/w commands outright and --posix drops the
+    GNU extensions `e` belongs to; a script COMPILED under either aborts the run
+    (exit 1, nothing executed), so a payload inside it is inert and prompting on
+    it is a false alarm. WHICH scripts are compiled under it depends on where
+    the flag sits -- see _sed_invocation.
+
+    getopt abbreviations count, but only unambiguous ones: `--p` is --posix and
+    `--sa` is --sandbox, while `--s` is ambiguous (--silent/--separate/--sandbox)
+    and sed exits on it. A spelling carrying `=` is rejected too ("option does
+    not allow an argument"), so only the bare forms are read as the mode being
+    on -- the safe direction, since an unrecognised spelling merely asks.
+    """
+    if len(name) >= 4 and "--sandbox".startswith(name):
+        return True
+    return len(name) >= 3 and "--posix".startswith(name)
+
+
+def _sed_scan_limit(sed_words: int) -> int:
+    """How many argument tokens ONE sed invocation may walk looking for its
+    script. A lone sed gets the whole budget, so padding its options can no
+    longer push the script out of view, while a line packed with sed words falls
+    back to the per-invocation floor -- which is what keeps the total walk
+    linear, since `find . ` + `-exec sed ` repeated to 16KB otherwise rescans
+    the whole tail once per word (39s, against 3s at the floor)."""
+    if sed_words <= 1:
+        return _SED_SCAN_BUDGET
+    return max(_MAX_SED_ARG_SCAN, _SED_SCAN_BUDGET // sed_words)
+
+
+def _sed_invocation(
+    tokens: "list[str]",
+    start: int,
+    limit: int = _MAX_SED_ARG_SCAN,
+) -> "tuple[str, bool]":
+    """The sed invocation whose command word sits at ``start``, as
+    ``(program, scan_overflowed)``.
+
+    sed joins every -e/--expression value with NEWLINES into one program, so
+    `sed -e '1a\\' -e 'e rm -rf x'` appends a literal line instead of executing
+    it and the pieces must be judged together. With no -e (and no -f program
+    FILE, unreadable here) the FIRST positional is the script and the rest are
+    inputs, so `sed -e 's/a/b/' e` treats its input file `e` as data.
+
+    A script sed cannot run is left OUT of the program: --sandbox / --posix (see
+    _sed_disables_exec) make it abort at COMPILE time, and sed compiles each
+    -e/-f script as that option is parsed while the positional one waits for the
+    whole option list. So the flag suppresses exactly the scripts written AFTER
+    it. Verified on GNU sed 4.9 with a `touch MARKER` payload:
+        sed --sandbox -e '1e touch MARKER' input  -> no-exec  (flag first)
+        sed -e '1e touch MARKER' --sandbox input  -> EXECUTES (already compiled)
+        sed -e '1e touch MARKER' input --sandbox  -> EXECUTES
+        sed -f prog.sed --sandbox input           -> EXECUTES
+        sed --sandbox '1e touch MARKER' input     -> no-exec
+    Reading the flag as invocation-wide let every EXECUTES row above through
+    unscreened.
+
+    A flag written after the POSITIONAL script suppresses only because getopt
+    PERMUTES, and POSIXLY_CORRECT turns permutation off, so it is not read as
+    suppressing either:
+        sed '1e touch MARKER' input --sandbox                   -> no-exec
+        POSIXLY_CORRECT=1 sed '1e touch MARKER' input --sandbox -> EXECUTES
+    The variable can reach sed from outside the command being screened -- an
+    earlier `export POSIXLY_CORRECT=1;`, a `POSIXLY_CORRECT=1 bash -c '...'`
+    wrapper whose inner string is scanned on its own, or the ambient
+    environment (all three verified to EXECUTE) -- so no reading of the command
+    text can rule it out. The cost is a prompt on the inert
+    `sed '1e CMD' input --sandbox`, which only ever arises for a program that
+    already holds an `e`: an ordinary edit yields no payload wherever the flag
+    sits.
+
+    ``scan_overflowed`` says ``limit`` ran out with arguments still ahead, so
+    the program returned is at best a PREFIX of the real one and an empty result
+    proves nothing. Callers fail closed on it rather than read it as "only edits
+    text".
+
+    `--` is honoured: after it every word is an operand, so a `--sandbox` there
+    is an input FILENAME that leaves `e` live (verified: `sed -- '1e CMD' input
+    --sandbox` still runs CMD).
+
+    The walk ends at a shell separator OR at a `find -exec` terminator, since a
+    `+` / `;` closes that action and the next predicate's words are not sed's
+    (see _FIND_EXEC_TERMINATORS).
+    """
+    programs: "list[str]" = []
+    first_positional = ""
+    positional_disabled = False  # a mode flag preceded the positional script
+    has_program_flag = False
+    # A mode flag has been seen, so every script COMPILED after it is inert.
+    # Monotone by construction, which is what makes dropping those scripts safe
+    # for the `-e '1a\' -e 'e rm -rf x'` continuation shape: the live pieces are
+    # always a PREFIX, never a hole in the middle of one program.
+    exec_disabled = False
+    end_of_options = False  # `--` seen: no later word is an option
+    value_pending = ""  # "e", "f" or "l": the next token is that flag's value
+    hit_separator = False  # the invocation ended before the window ran out
+    window = tokens[start + 1 : start + 1 + limit]
+    for token in window:
+        if token in _SHELL_SEPARATORS or token in _FIND_EXEC_TERMINATORS:
+            hit_separator = True
+            break
+        if value_pending:
+            # The value is consumed either way; only a script sed still compiles
+            # goes into the program.
+            if value_pending == "e" and not exec_disabled:
+                programs.append(token)
+            value_pending = ""
+            continue
+        if not end_of_options and token == "--":
+            end_of_options = True
+            continue
+        if not end_of_options and token.startswith("--"):
+            name, sep, value = token.partition("=")
+            if not sep and _sed_disables_exec(name):
+                exec_disabled = True
+                continue
+            letter = _sed_long_flag(name)
+            if not letter:
+                continue
+            # -l only matters so its operand is not mistaken for the script.
+            has_program_flag = has_program_flag or letter in "ef"
+            if not sep:
+                value_pending = letter
+            elif letter == "e" and not exec_disabled:
+                programs.append(value)
+            continue
+        if not end_of_options and token.startswith("-"):
+            # A cluster glues the value on (-ne'1p') or takes the next (-ne '1p').
+            found = _sed_short_flag(token)
+            if found is None:
+                continue
+            letter, attached = found
+            if letter in _SED_ATTACHED_VALUE_FLAGS:
+                # -i's suffix is the rest of the token; it never takes the next
+                # one, so the script is still the positional ahead.
+                continue
+            has_program_flag = has_program_flag or letter in "ef"
+            if not attached:
+                value_pending = letter
+            elif letter == "e" and not exec_disabled:
+                programs.append(attached)
+            continue
+        if not first_positional:
+            first_positional = token
+            positional_disabled = exec_disabled
+    if not has_program_flag and first_positional and not positional_disabled:
+        programs.append(first_positional)
+    # Complete when a separator closed the invocation, or when the window
+    # already covered every remaining argument.
+    scan_overflowed = not hit_separator and len(tokens) > start + 1 + limit
+    return "\n".join(programs), scan_overflowed
+
+
+def _sed_text(text: str) -> str:
+    """Unescape one sed text argument the way read_text does: every backslash
+    drops away and the character behind it stays, so `e touch MARK\\ER` runs
+    MARKER and `e\\` + newline runs the next line as its own command."""
+    return _SED_TEXT_ESCAPE_RE.sub(r"\1", text).strip()
+
+
+def _sed_exec_payloads(program: str) -> "list[str]":
+    """Shell payloads a sed program executes, in order.
+
+    `e COMMAND` runs COMMAND. A bare `e` and the `s///e` flag run the pattern
+    space, which only exists at run time, so they yield an EMPTY payload:
+    executes, but nothing to screen. An empty list means it only edits text.
+
+    The walk skips every region where an `e` is data (regexes, replacements,
+    a/i/c text, r/w filenames, b/t labels, comments), keeping `:e;N;$!be;...`,
+    `sed 's/e/E/g'` and `sed 's/a/b/w report.txt'` out of the results.
+    """
+    payloads: "list[str]" = []
+    n = len(program)
+
+    def _end_of_line(pos: int) -> int:
+        end = program.find("\n", pos)
+        return n if end < 0 else end
+
+    def _end_of_text(pos: int) -> int:
+        # read_text, which collects `e`/`a`/`i`/`c` text: a backslash escapes
+        # the next character, so a line ending in one carries the text onto the
+        # NEXT line instead of stopping there.
+        while pos < n and program[pos] != "\n":
+            pos += 2 if program[pos] == "\\" else 1
+        return min(pos, n)
+
+    def _skip_bracket(pos: int) -> int:
+        # A bracket expression, where the delimiter is data (`s/[/]/x/` really
+        # substitutes a slash). A leading `]` is literal; [:class:] nests.
+        pos += 1
+        if pos < n and program[pos] == "^":
+            pos += 1
+        if pos < n and program[pos] == "]":
+            pos += 1
+        while pos < n and program[pos] != "]":
+            if program[pos] == "[" and pos + 1 < n and program[pos + 1] in ":.=":
+                end = program.find(program[pos + 1] + "]", pos + 2)
+                pos = n if end < 0 else end + 2
+                continue
+            pos += 1
+        return pos + 1
+
+    def _skip_section(pos: int, delim: str, brackets: bool) -> int:
+        # One delimited section of a regex / s/// / y///, through its closing
+        # delimiter. Brackets apply to regex halves only; elsewhere `[` is data.
+        while pos < n and program[pos] != delim:
+            if program[pos] == "\\":
+                pos += 2
+            elif brackets and program[pos] == "[":
+                pos = _skip_bracket(pos)
+            else:
+                pos += 1
+        return pos + 1
+
+    def _skip_address(pos: int) -> int:
+        # A line number (GNU's first~step included), `$`, /regex/ or \%regex%,
+        # each allowing I/M modifiers.
+        if pos < n and program[pos] == "$":
+            return pos + 1
+        if pos < n and program[pos].isdigit():
+            while pos < n and (program[pos].isdigit() or program[pos] == "~"):
+                pos += 1
+            return pos
+        if pos < n and program[pos] == "/":
+            pos = _skip_section(pos + 1, "/", brackets = True)
+        elif pos < n and program[pos] == "\\" and pos + 1 < n:
+            pos = _skip_section(pos + 2, program[pos + 1], brackets = True)
+        else:
+            return pos
+        while pos < n and program[pos] in "IM":
+            pos += 1
+        return pos
+
+    i = 0
+    while i < n:
+        if program[i] in " \t\n;{}":
+            # Separators and block braces carry no command.
+            i += 1
+            continue
+        if program[i] == "#":
+            i = _end_of_line(i)
+            continue
+        i = _skip_address(i)
+        if i < n and program[i] == ",":
+            i += 1
+            while i < n and program[i] in " \t":
+                i += 1
+            if i < n and program[i] in "+~":
+                # `addr,+N` / `addr,~N` end the range relative to the first match.
+                i += 1
+                while i < n and program[i].isdigit():
+                    i += 1
+            else:
+                i = _skip_address(i)
+        while i < n and program[i] in " \t!":
+            # `1!e cmd`: negation, the command word is still ahead.
+            i += 1
+        if i >= n:
+            break
+        cmd, i = program[i], i + 1
+        if cmd == "e":
+            # The payload ends at an UNESCAPED newline, so a `;` inside it is
+            # shell text and `e\` + newline hands the next line to the same
+            # shell (`1e\` / `rm -f victim` really runs rm).
+            end = _end_of_text(i)
+            payloads.append(_sed_text(program[i:end]))
+            i = end
+        elif cmd in "sy" and i < n:
+            delim, i = program[i], i + 1
+            i = _skip_section(i, delim, brackets = cmd == "s")
+            i = _skip_section(i, delim, brackets = False)
+            if cmd == "s":
+                executes = False
+                while i < n and program[i] in _SED_SUBST_FLAGS:
+                    executes = executes or program[i] == "e"
+                    i += 1
+                if executes:
+                    payloads.append("")
+                if i < n and program[i] == "w":
+                    i = _end_of_line(i)
+        elif cmd in "aic":
+            # Literal text; the `a\` + newline form continues on a trailing "\".
+            i = _end_of_text(i)
+        elif cmd in "rRwW":
+            i = _end_of_line(i)  # the filename runs to the end of the line
+        elif cmd in "btT:v":
+            # A label (or `v` version) ends at the next separator.
+            while i < n and program[i] not in ";\n}":
+                i += 1
+    return payloads
+
+
+def _assignment_values(tokens: "list[str]") -> "dict[str, str]":
+    """``NAME -> value`` for every `NAME=value` word in a token list.
+
+    shlex has already removed the quoting, so the value is the exact text bash
+    expands `$NAME` to -- spaces and NEWLINES included. That is what the
+    string-level _expand_shell_assignments cannot give: its value pattern stops
+    at the first space, so a quoted multi-word value never enters its map at
+    all. The FIRST binding wins, matching the usual `p=...; use "$p"` shape; a
+    variable reassigned before its use resolves to the earlier value.
+
+    A value that is not itself literal is NOT recorded, because resolving to it
+    would invent a program rather than read one. `p=$(printf '1e rm -f victim')`
+    is the case that matters: the lexer splits that word at the `(`, leaving the
+    binding `p` -> `$`, and substituting that bare `$` turned an unread program
+    into a plausible-looking literal that sailed past _sed_program_unresolved.
+    Dropping the binding leaves `$p` unresolved, which is the truth.
+    """
+    env: "dict[str, str]" = {}
+    for token in tokens:
+        if _ASSIGNMENT_RE.match(token):
+            name, _, value = token.partition("=")
+            if "$" in value or "`" in value:
+                continue
+            env.setdefault(name, value)
+    return env
+
+
+def _resolve_program_vars(program: str, env: "dict[str, str]") -> str:
+    """``program`` with each `$NAME` / `${NAME}` replaced by its assigned value.
+
+    A sed script held in a variable (`p='# note<newline>e CMD'; sed "$p" f`) is
+    only a program once the reference is resolved, and only in a pass that KEEPS
+    the quoted newline -- the blanket newline pass turns the whole value into one
+    long sed comment, which is genuinely inert there. An unassigned name is left
+    as written, so nothing is invented.
+    """
+    return _PROGRAM_VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), program)
+
+
+def _sed_program_variants(program: str, env: "dict[str, str]") -> "list[str]":
+    """The sed program as written, plus every form it still reduces to: the
+    variable-resolved one and the arithmetic-collapsed one. All are screened,
+    because any spelling can be the one holding the `e` -- the raw text carries
+    it in `sed "e $file"`, the resolved one in `sed "$p"` and the collapsed one
+    in `sed "$((c+1))e rm -f victim"`."""
+    if "$" not in program:
+        return [program]
+    variants = [program]
+    resolved = _resolve_program_vars(program, env)
+    if resolved != program:
+        variants.append(resolved)
+    for form in list(variants):
+        collapsed = _collapse_shell_arithmetic(form)
+        if collapsed not in variants:
+            variants.append(collapsed)
+    return variants
+
+
+def _sed_program_unresolved(variants: "list[str]", live: "set[str]") -> bool:
+    """Whether NO spelling of the sed program is one this scan actually READ,
+    because every one still holds an expansion bash would rewrite.
+
+    The program sed finally receives is knowable only when each expansion in it
+    reduces to text: `p='1,3p'; sed "$p" f` does, since the assignment is right
+    there, while `sed "${p#x }" f` does not. `${p#x}` is one of a large family
+    of parameter transformations (`${p%y}`, `${p/a/b}`, `${p:-z}`, `${p^^}`,
+    `${p:2}`, `${!p}`, `${#p}`, array subscripts...), and modelling them one at
+    a time is one more chance to be subtly wrong with each addition, so an
+    unread program is treated as UNKNOWN and the auto gate asks. That makes
+    every form this scan does not model safe by default instead of a way past
+    it (`p='x e rm -f victim'; sed "${p#x }" input` really runs rm).
+
+    Only expansions the shell RUNS count, and only where they land in the
+    PROGRAM, so ordinary work stays silent: one the program merely quotes
+    (`sed 's/$(x)/y/' f`, ``sed 's/`//g' NOTES.md``), an escaped one
+    (`sed "s/\\$(CC)/gcc/" Makefile`) and one in a FILE operand
+    (`sed -n '1,3p' $(ls)`) are all left running.
+    """
+    if not live:
+        return False
+    return not any(
+        all(found not in live for found in _shell_expansions(variant, quoted = False))
+        for variant in variants
+    )
 
 
 def _find_blocked_commands(command: str) -> set[str]:
@@ -328,10 +862,56 @@ def _find_blocked_commands(command: str) -> set[str]:
             base = stem
         return base
 
+    def _exec_child_index(start: int) -> int:
+        """Index of the command a `find -exec` actually runs, or -1.
+
+        The command prefixes forward to their target, so `-exec env sed ...`
+        runs sed and `-exec timeout 5 rm ...` runs rm. Only the token right
+        after the flag used to be read, which hid both the sed program and a
+        plain blocked name behind any wrapper. Wrapper flags, assignment
+        prefixes and duration operands are stepped over the same way the walk
+        above does, and the whole hop is bounded so `-exec env -exec env ...`
+        cannot turn this into a quadratic rescan.
+
+        A wrapper option whose value is a SEPARATE token consumes that token
+        too, otherwise the value is read as the command and the real one behind
+        it is never seen: `-exec env -u FOO sed '1e rm -f victim' {} +` came
+        back with `FOO` as the child, and `-exec stdbuf -o L sed ...` with `L`.
+        """
+        i, steps, wrapper = start, 0, ""
+        while i < len(tokens) and steps < _MAX_EXEC_PREFIX_SCAN:
+            token = tokens[i]
+            if token in _SHELL_SEPARATORS or token in _FIND_EXEC_TERMINATORS:
+                return -1
+            steps += 1
+            if wrapper and token in _WRAPPER_VALUE_FLAGS_BY_CMD.get(wrapper, frozenset()):
+                # `env -u NAME`, `stdbuf -o L`: the option and its operand, both
+                # consumed in ONE step -- the budget bounds the work done per
+                # -exec, and stepping over two tokens costs no more than one.
+                # An attached spelling (-uNAME, --unset=NAME) carries its own
+                # value and is skipped by the plain-option branch below.
+                i += 2
+                continue
+            if wrapper and (
+                token.startswith("-") or _ASSIGNMENT_RE.match(token) or token.lstrip("-").isdigit()
+            ):
+                # `env -i`, `env A=b`, `timeout 5`: the wrapper's own argument.
+                i += 1
+                continue
+            base = _token_basename(token)
+            if base in _COMMAND_PREFIXES:
+                wrapper = base
+                i += 1
+                continue
+            return i
+        return -1
+
     expect_command = True  # start of string is a command position
     prefix_pending = False  # last cmd-position token was a wrapper (env/time/xargs/...)
+    prefix_command = ""  # which wrapper that was, for its own value-taking options
     skip_operand = False  # consume a wrapper/conditional operand, not the command
-    for token in tokens:
+    sed_indexes: "list[int]" = []  # command-position sed words, for the `e` scan below
+    for token_index, token in enumerate(tokens):
         if skip_operand:
             # `exec -a NAME cmd` and `if exist FILE cmd` both put an operand
             # where the command word would otherwise be.
@@ -347,8 +927,20 @@ def _find_blocked_commands(command: str) -> set[str]:
         if token in _SHELL_SEPARATORS or (token in _SHELL_KEYWORDS_AS_SEP and expect_command):
             expect_command = True
             prefix_pending = False
+            prefix_command = ""
             continue
         if token.startswith("-"):
+            # A wrapper option whose value is a SEPARATE token precedes that
+            # value, not the wrapped command. Without consuming it the value is
+            # read as the command word and the real command behind it is never
+            # reached: `env -u PATH rm -rf x` and `xargs -I {} rm -rf build`
+            # both came back empty. An attached spelling (-uPATH, --unset=PATH)
+            # carries its own value and falls through to the plain-flag case.
+            if prefix_pending and token in _WRAPPER_VALUE_FLAGS_BY_CMD.get(
+                prefix_command, frozenset()
+            ):
+                skip_operand = True
+                continue
             # Flags belong to the active command, but keep expect_command while a
             # wrapper prefix awaits its command (`stdbuf -oL cmd`, `xargs -- cmd`).
             if not prefix_pending:
@@ -366,6 +958,8 @@ def _find_blocked_commands(command: str) -> set[str]:
         if prefix_pending and token.lstrip("-").isdigit():
             continue
         base = _token_basename(token)
+        if _is_sed_command(base):
+            sed_indexes.append(token_index)
         if base in _BLOCKED_COMMANDS:
             blocked.add(base)
         else:
@@ -374,9 +968,11 @@ def _find_blocked_commands(command: str) -> set[str]:
         # non-numeric token is the real command. sudo is also in _BLOCKED_COMMANDS.
         if base in _COMMAND_PREFIXES:
             prefix_pending = True
+            prefix_command = base
             continue
         expect_command = False
         prefix_pending = False
+        prefix_command = ""
 
     # `alias zap='rm -rf'` stores a command bash runs when the alias is invoked,
     # so the body is scanned as a command in its own right.
@@ -404,11 +1000,24 @@ def _find_blocked_commands(command: str) -> set[str]:
                 else:
                     blocked |= _blocked_matching_glob(attached_base)
         if tok in _FIND_EXEC_FLAGS and i + 1 < len(tokens):
-            base = _token_basename(tokens[i + 1])
-            if base in _BLOCKED_COMMANDS:
-                blocked.add(base)
-            else:
-                blocked |= _blocked_matching_glob(base)
+            # The word right after the flag AND the command it forwards to: a
+            # wrapper is a command in its own right (`-exec sudo ls`) as well as
+            # a step on the way to another one (`-exec env rm -rf x`), so
+            # dropping either half loses a real detection.
+            child = _exec_child_index(i + 1)
+            exec_words = [i + 1] if child in (-1, i + 1) else [i + 1, child]
+            for word in exec_words:
+                base = _token_basename(tokens[word])
+                if _is_sed_command(base):
+                    # find runs its -exec child directly, but the walk above only
+                    # reaches `find`, so a sed there never got its program
+                    # screened (`find . -exec sed '1e rm -f victim' {} +`, and
+                    # behind a wrapper `find . -exec env sed '1e ...' {} +`).
+                    sed_indexes.append(word)
+                if base in _BLOCKED_COMMANDS:
+                    blocked.add(base)
+                else:
+                    blocked |= _blocked_matching_glob(base)
 
     # Regex catches blocked words at command boundaries shlex misses: inside
     # $(rm -rf), <(rm), backtick chains, or "foo;rm". Anchored to command-position
@@ -451,6 +1060,33 @@ def _find_blocked_commands(command: str) -> set[str]:
             elif is_win_c and prev_base in _SHELLS_WIN:
                 blocked |= _find_blocked_commands(tokens[i + 1])
             break  # stop at first non-flag token
+
+    # sed's `e COMMAND` hands COMMAND to the shell, a real command position the
+    # scan above sees only as a text argument, so screen it like `bash -c`. The
+    # pattern-space forms yield an empty payload; the auto gate prompts on those.
+    sed_limit = _sed_scan_limit(len(sed_indexes))
+    # Built at most once per call, and only when some program actually names a
+    # variable, so a line packed with sed words stays linear.
+    sed_vars: "dict[str, str] | None" = None
+    for i in sed_indexes:
+        # A script --sandbox / --posix stops sed compiling is already left out of
+        # the program (_sed_invocation), so a name inside one is never blocked.
+        program, scan_overflowed = _sed_invocation(tokens, i, sed_limit)
+        if scan_overflowed:
+            # The script sits past the scan window, so an empty program here is
+            # only ignorance: block the sed itself rather than let an
+            # `e rm -rf ~` ride in behind enough padding options.
+            blocked.add(_token_basename(tokens[i]))
+            continue
+        if "$" in program and sed_vars is None:
+            # A program held in a variable (p='...e rm -f victim'; sed "$p" f)
+            # only shows its `e` once the reference is resolved. shlex kept the
+            # quoted value whole, newlines and all, so the binding is exact.
+            sed_vars = _assignment_values(tokens)
+        for variant in _sed_program_variants(program, sed_vars or {}):
+            for payload in _sed_exec_payloads(variant):
+                if payload:
+                    blocked |= _find_blocked_commands(payload)
 
     return blocked
 
@@ -3437,42 +4073,6 @@ _ARRAY_EXPANSION_RE = re.compile(r"\$\{\w+\[[@*]\]\}")
 # A wrapper's bare duration/count argument (timeout 5 rm, timeout 1.5s rm) that
 # precedes the real command, so it is not mistaken for the command itself.
 _WRAPPER_DURATION_RE = re.compile(r"\d+(?:\.\d+)?[smhd]?$")
-# Wrapper options whose VALUE is a separate token (env -u NAME, nice -n 5).
-# Without consuming the value it is mistaken for the wrapped command, so
-# `env -u FOO rm -rf x` reads as the command `FOO` and the real `rm` is missed.
-_WRAPPER_VALUE_FLAGS_BY_CMD = {
-    # env -i/--ignore-environment is VALUELESS; only -u/--unset takes a name.
-    "env": frozenset({"-u", "--unset"}),
-    "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
-    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
-    "nice": frozenset({"-n", "--adjustment"}),
-    "ionice": frozenset({"-c", "--class", "-n", "--classdata", "-p", "--pid"}),
-    "xargs": frozenset(
-        {"-I", "-L", "-P", "-d", "--delimiter", "-a", "--arg-file", "-n", "-s", "-E"}
-    ),
-    "chroot": frozenset({"--userspec", "--groups"}),
-    # setpriv <options> <program>: only the value-taking options consume a token.
-    "setpriv": frozenset(
-        {
-            "--reuid",
-            "--regid",
-            "--groups",
-            "--inh-caps",
-            "--ambient-caps",
-            "--bounding-set",
-            "--securebits",
-            "--pdeathsig",
-            "--selinux-label",
-            "--apparmor-profile",
-            "--landlock-access",
-            "--landlock-rule",
-        }
-    ),
-    # exec -a NAME runs cmd under NAME, so NAME is a value, not the command.
-    "exec": frozenset({"-a"}),
-    "setsid": frozenset(),
-    "nohup": frozenset(),
-}
 # Non-shell interpreters running an inline program (python -c, node -e, php -r):
 # the terminal path never screens that program the way the python tool does.
 # sh/bash -c are omitted, the hard-block already recurses into their payloads.
@@ -3588,6 +4188,232 @@ def _short_flag_arg(token: str, letters: str) -> "str | None":
         if ch in letters:
             return body[i + 1 :]
     return None
+
+
+def _shell_quote_states(command: str) -> "list[str]":
+    """The quote context of every character: ``""`` outside quoting, ``"'"``
+    (or ``"$'"`` for ANSI-C, which honours backslash escapes) inside single
+    quoting, ``'"'`` inside double quoting, and ``_ESCAPED_CHAR_STATE`` for a
+    backslash and the character it quotes. A quote mark itself reports the
+    context it opens from, so a character is text bash expands exactly when its
+    state is ``""`` or ``'"'``.
+
+    Tracked character by character rather than paired off with a regex, because
+    a regex matches the apostrophe in `echo "it's"` against the next quote,
+    inverting the state for everything after it.
+    """
+    states: "list[str]" = []
+    quote = ""
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        if quote in ("'", "$'"):
+            # A plain single quote protects even backslashes; ANSI-C does not,
+            # so `\'` there is a quote character rather than the end of the word.
+            if quote == "$'" and ch == "\\" and i + 1 < n:
+                states += [quote, quote]
+                i += 2
+                continue
+            states.append(quote)
+            if ch == "'":
+                quote = ""
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            # Reported under its OWN state rather than the surrounding one:
+            # marking `\$` as ordinary double-quoted text made `$(` there look
+            # like a live substitution, so an everyday `sed "s/\$(CC)/gcc/"
+            # Makefile` asked for confirmation while real bash hands sed a
+            # literal `$(CC)` and nothing runs (verified: it prints CC=cc).
+            states += [_ESCAPED_CHAR_STATE, _ESCAPED_CHAR_STATE]
+            i += 2
+            continue
+        states.append(quote)
+        if quote == '"':
+            # Only the closing quote ends it; an apostrophe here is text.
+            if ch == '"':
+                quote = ""
+        elif ch == "'":
+            quote = "$'" if i and command[i - 1] == "$" else "'"
+        elif ch == '"':
+            quote = '"'
+        i += 1
+    return states
+
+
+def _substitution_span(command: str, start: int) -> int:
+    """Index just past the `)` that closes the `$(` at ``start``.
+
+    The body of a substitution is a FRESH shell context -- bash re-parses it, so
+    quoting reopens inside even when the whole thing sits in double quotes --
+    and a paren the body QUOTES is text, not nesting. Counting it raised the
+    depth, the real `)` then never brought the depth back to zero, and the span
+    ran on past the end of the word: `sed "$(printf '(' >/dev/null; printf 'e
+    rm -f victim')" input` yielded a span with ` input` glued on, which no
+    longer matched the sed program it had to be found inside, so the generated
+    script went unnoticed.
+
+    _shell_quote_states is a left-to-right machine, so the states it reports for
+    a prefix are the ones it reports for the whole string; the window is grown
+    until the span closes, which keeps the cost a constant multiple of the
+    substitution's own length rather than a walk to the end of the line for
+    every one of them.
+    """
+    n = len(command)
+    width = _SUBSTITUTION_SPAN_STEP
+    while True:
+        stop = min(n, start + 1 + width)
+        body = command[start + 1 : stop]
+        depth = 0
+        for offset, state in enumerate(_shell_quote_states(body)):
+            if state:
+                continue  # quoted: data to the nested shell, not a delimiter
+            char = body[offset]
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return start + 2 + offset
+        if stop >= n:
+            return n
+        width *= 4
+
+
+def _arithmetic_span(command: str, start: int) -> int:
+    """Index just past the `))` / `]` closing the arithmetic expansion at
+    ``start`` -- `$((...))`, or the deprecated `$[...]` bash 5.2 still
+    evaluates (`echo $[1+2]` prints 3)."""
+    opener = command[start + 1]
+    closer = ")" if opener == "(" else "]"
+    depth, i, n = 0, start + 1, len(command)
+    while i < n:
+        if command[i] == opener:
+            depth += 1
+        elif command[i] == closer:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _brace_param_span(command: str, start: int) -> int:
+    """Index just past the `}` closing the `${` at ``start``. Braces nest
+    (`${a:-${b}}`) and a backslash quotes the one behind it."""
+    depth, i, n = 0, start + 1, len(command)
+    while i < n:
+        if command[i] == "\\":
+            i += 2
+            continue
+        if command[i] == "{":
+            depth += 1
+        elif command[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def _collapse_shell_arithmetic(program: str) -> str:
+    """``program`` with each arithmetic expansion replaced by a digit
+    (_ARITHMETIC_VALUE), which is a faithful stand-in because arithmetic always
+    evaluates to an integer.
+
+    Without it the expansion's own punctuation is read as sed source and hides
+    the command behind it: `sed "$((c+1))e rm -f victim"` runs rm for real
+    (`$((c+1))` is 1), while the raw text takes the `c` for an append-text
+    command and swallows the payload as its operand. An expansion holding a
+    COMMAND substitution is left alone, so the substitution stays visible to
+    _sed_program_unresolved rather than being collapsed out of sight.
+    """
+    out: "list[str]" = []
+    i, n = 0, len(program)
+    while i < n:
+        if program.startswith("$((", i) or program.startswith("$[", i):
+            end = _arithmetic_span(program, i)
+            if not _HAS_COMMAND_SUBST_RE.search(program[i:end]):
+                out.append(_ARITHMETIC_VALUE)
+                i = end
+                continue
+        out.append(program[i])
+        i += 1
+    return "".join(out)
+
+
+def _shell_expansions(command: str, quoted: bool = True) -> "list[str]":
+    """Every expansion bash performs, as the exact text each one occupies:
+    `$(...)`, backticks, `${...}` in ANY form and a bare `$NAME` / `$?`.
+
+    With ``quoted`` (the default) the text is a whole command line, so a
+    single-quoted or backslash-escaped expansion is literal and reported as
+    nothing -- ``sed 's/`//g' NOTES.md`` and `sed "s/\\$(CC)/gcc/" Makefile`
+    both yield an empty list. With ``quoted`` False the text is a token shlex
+    has already unquoted, where every character counts; comparing the two tells
+    an expansion the shell RUNS from one a sed program merely quotes.
+
+    ARITHMETIC is skipped: it evaluates to an integer, so it can spell no sed
+    command (_ARITHMETIC_VALUE). One holding a command substitution is stepped
+    INTO instead, so the substitution inside `sed "$(( $(cat n) ))p"` is still
+    reported.
+    """
+    found: "list[str]" = []
+    states = _shell_quote_states(command) if quoted else None
+    i, n = 0, len(command)
+    while i < n:
+        if states is not None and states[i] not in ("", '"'):
+            i += 1
+            continue
+        if command[i] == "`":
+            end = command.find("`", i + 1)
+            end = n if end < 0 else end + 1
+            found.append(command[i:end])
+            i = end
+            continue
+        if command.startswith("$((", i) or command.startswith("$[", i):
+            end = _arithmetic_span(command, i)
+            # Stepping over the `$` alone would report the arithmetic's own
+            # `(name)` as a substitution; stepping over the whole span would
+            # hide a `$(...)` nested inside it. Do each where it applies.
+            i = i + 2 if _HAS_COMMAND_SUBST_RE.search(command[i:end]) else end
+            continue
+        if command.startswith("$(", i):
+            end = _substitution_span(command, i)
+            found.append(command[i:end])
+            i = end
+            continue
+        if command.startswith("${", i):
+            end = _brace_param_span(command, i)
+            found.append(command[i:end])
+            i = end
+            continue
+        match = _UNBRACED_PARAM_RE.match(command, i)
+        if match:
+            found.append(match.group(0))
+            i = match.end()
+            continue
+        i += 1
+    return found
+
+
+def _separate_unquoted_newlines(text: str) -> str:
+    """``text`` with each UNQUOTED newline replaced by `;`, which shlex reads as
+    a command boundary. A newline inside quotes is DATA -- a sed comment ends at
+    one -- so it survives, unlike a blanket replacement. A BACKSLASH-escaped
+    newline is a line continuation bash deletes rather than a separator, so it
+    survives too; the blanket pass still supplies that boundary if one is
+    wanted, since it replaces every newline unconditionally."""
+    states = _shell_quote_states(text)
+    out = []
+    for i, ch in enumerate(text):
+        if ch in "\r\n" and states[i] == "":
+            # \r\n is one boundary, not two.
+            if not (ch == "\n" and i and text[i - 1] == "\r"):
+                out.append(";")
+        else:
+            out.append(ch)
+    return "".join(out)
 
 
 # git subcommands that discard or overwrite work: `clean` deletes untracked files,
@@ -3915,12 +4741,26 @@ def _terminal_is_high_risk(command: str, _depth: int = 0) -> bool:
         return True
     # Newlines separate commands in a shell but read as whitespace to shlex, and
     # ANSI-C quoting ($'rm') hides the real command name.
-    normalized = (
-        _decode_ansi_c(command, keep_one_word = True)
-        .replace("\r\n", ";")
-        .replace("\n", ";")
-        .replace("\r", ";")
+    decoded = _decode_ansi_c(command, keep_one_word = True)
+    normalized = decoded.replace("\r\n", ";").replace("\n", ";").replace("\r", ";")
+    # Identical to the blanket form unless a newline is actually present, so the
+    # usual single-line command never pays for the quote walk.
+    quoted_newlines_kept = (
+        _separate_unquoted_newlines(decoded) if "\n" in decoded or "\r" in decoded else normalized
     )
+    # Matched against a sed program below to tell an expansion the shell RUNS
+    # from one the program merely quotes. Held in both newline forms so the
+    # match works whichever pass produced the tokens.
+    live_expansions: "set[str]" = set()
+    if "$" in command or "`" in command:
+        live_expansions = {
+            form
+            for expansion in _shell_expansions(command)
+            for form in (
+                expansion,
+                expansion.replace("\r\n", ";").replace("\n", ";").replace("\r", ";"),
+            )
+        }
     # A verb hidden behind an assignment (c=rm; $c x) or a default parameter
     # (${c:-rm}) is expanded so the resolved token is scanned too.
     expanded = _expand_shell_assignments(_expand_param_defaults(normalized))
@@ -3944,7 +4784,15 @@ def _terminal_is_high_risk(command: str, _depth: int = 0) -> bool:
     # the check above misses it. A benign array print is untouched.
     if _ARRAY_EXPANSION_RE.search(command) and _VAR_EXECUTED_AS_COMMAND_RE.search(command):
         return True
-    for text in {normalized, expanded}:
+    # A newline inside a QUOTED argument is data, not a separator, and turning
+    # it into `;` rewrites that data: a sed comment ends at a real newline, so
+    # `sed '# note<newline>e CMD'` reads as one long comment once the newline is
+    # gone. So a pass that only separates the UNQUOTED ones is scanned too. It
+    # keeps every command boundary the blanket form has, so the token stream is
+    # the same and only quoted content differs: the pass adds detections without
+    # merging two commands into one segment. The set collapses to a single scan
+    # for the usual single-line command.
+    for text in {normalized, expanded, quoted_newlines_kept}:
         try:
             lexer = shlex.shlex(text, posix = True, punctuation_chars = ";&|()")
             lexer.whitespace_split = True
@@ -3959,6 +4807,14 @@ def _terminal_is_high_risk(command: str, _depth: int = 0) -> bool:
         find_like = any(
             os.path.basename(t.strip(";&|()`{}")).lower() in ("find", "fd") for t in tokens
         )
+        # Shared out over the sed words present, so a lone sed reads its whole
+        # argument list and a line packed with them stays linear (_sed_scan_limit).
+        sed_scan_limit = _sed_scan_limit(
+            sum(1 for t in tokens if os.path.basename(t.strip(";&|()`{}")).lower() in _SED_COMMANDS)
+        )
+        # Built at most once per pass, and only when a sed program actually
+        # names a variable, so a line packed with sed words stays linear.
+        sed_vars: "dict[str, str] | None" = None
         if find_like and any(t.split("=", 1)[0] in _HIGH_RISK_FIND_FLAGS for t in tokens):
             return True
         # GNU tar runs --checkpoint-action=exec=CMD at each checkpoint, hiding a
@@ -4327,6 +5183,35 @@ def _terminal_is_high_risk(command: str, _depth: int = 0) -> bool:
                     chdir_pending = True
                 if base in _AWK_COMMANDS:
                     awk_program_pending = True
+                if base in _SED_COMMANDS:
+                    # `e` / `s///e` shell out from inside the script, which may
+                    # ride on -e/--expression rather than the next positional.
+                    # A script --sandbox / --posix stops sed compiling is already
+                    # left out of the program (_sed_invocation), so a payload
+                    # inside one never reaches this screen.
+                    sed_program, sed_overflowed = _sed_invocation(tokens, _tok_idx, sed_scan_limit)
+                    if sed_overflowed:
+                        # The script was pushed past the scan window by padding
+                        # options, so "no payload found" only means "not looked
+                        # at": ask instead of falling through to safe.
+                        return True
+                    if "$" in sed_program and sed_vars is None:
+                        # A program held in a variable (p='# note<newline>e CMD';
+                        # sed "$p" f) is only a program once the reference is
+                        # resolved, and only THIS pass keeps the quoted newline
+                        # that ends the comment: the blanket one turns the whole
+                        # value into a single inert comment line.
+                        sed_vars = _assignment_values(tokens)
+                    sed_variants = _sed_program_variants(sed_program, sed_vars or {})
+                    if any(_sed_exec_payloads(variant) for variant in sed_variants):
+                        return True
+                    # A program the shell still has to build is not knowable
+                    # here -- sed splices the result straight into the program
+                    # text, where it can open `;e CMD` from any position -- so
+                    # an unread one asks rather than being assumed to only edit
+                    # text (_sed_program_unresolved).
+                    if _sed_program_unresolved(sed_variants, live_expansions):
+                        return True
             elif current_command == "git" and not git_subcommand:
                 # The first positional after `git` is its subcommand.
                 git_subcommand = base

@@ -637,6 +637,247 @@ class TestBashBlocklistPosition:
         # Recursion into the nested command string catches command-position curl.
         assert "curl" in self._find()("bash -c 'curl https://x'")
 
+    def test_sed_exec_payload_blocked(self):
+        # sed's `e COMMAND` hands COMMAND to the shell, so the payload is a real
+        # command position hiding inside the script argument.
+        assert "rm" in self._find()("sed -n '1e rm -rf victim' input")
+        assert "curl" in self._find()("sed -e '/x/e curl https://x' input")
+        assert "rm" in self._find()("sed -ne '$e rm -rf build' input")
+        assert "wget" in self._find()("sed '1,2e wget https://bad' input")
+
+    def test_sed_exec_payload_continues_past_backslash(self):
+        # An `e` payload whose line ends in a backslash carries onto the NEXT
+        # line, which reaches the same shell, so the scan must not stop at the
+        # newline. Quote splitting (r''m) hides the name from the raw-text
+        # fallback, leaving the parsed payload as the only place rm shows up.
+        assert "rm" in self._find()("sed -n '1e\\\nrm -f victim' f")
+        assert "rm" in self._find()("sed -n '1e\\\nr''m -f victim' f")
+        assert "rm" in self._find()("sed -n '1e touch a\\\nrm -f victim' f")
+        # A backslash before an ordinary character drops away: r\m runs rm.
+        assert "rm" in self._find()("sed 'e r\\m -f victim' f")
+
+    def test_sed_comment_ends_at_newline(self):
+        # A sed comment runs to a real newline, so an `e` on the line after one
+        # is a command; with a literal `;` it is still all comment.
+        assert "rm" in self._find()("sed '# harmless\ne rm -f victim' input")
+        assert "curl" in self._find()("sed 's/a/b/w out.txt\ne curl https://x' input")
+        assert self._find()("sed '# harmless;e rm -f victim' input") == set()
+
+    def test_sed_attached_i_suffix_does_not_hide_the_script(self):
+        # Everything glued to -i is the backup suffix, so `-ifoo` is not an
+        # attached -f and the script is still the positional ahead. -l and
+        # --line-length take an operand that is likewise not the script.
+        assert "rm" in self._find()("sed -ifoo '1e rm -f victim' input")
+        assert "rm" in self._find()("sed -itemp '1e rm -f victim' input")
+        assert "curl" in self._find()("sed -ni.bak '1e curl https://x' input")
+        assert "rm" in self._find()("sed -l 5 '1e rm -f victim' input")
+        assert "rm" in self._find()("sed --line-length 5 '1e rm -f victim' input")
+        assert self._find()("sed -ifoo 's/old/new/g' input") == set()
+        assert self._find()("sed -l 80 -n '1,20p' input") == set()
+
+    def test_sed_under_find_exec_blocked(self):
+        # find runs its -exec child directly, but the command-position walk only
+        # reaches `find`, so the nested sed needs its script read explicitly.
+        assert "rm" in self._find()("find . -exec sed '1e rm -f victim' {} +")
+        assert "curl" in self._find()("find . -execdir sed '1e curl https://x' {} \\;")
+        assert self._find()("find . -exec sed -n '1,3p' {} +") == set()
+
+    def test_sed_under_find_exec_wrapper_blocked(self):
+        # env/timeout/nice forward -exec to their target, so the sed behind one
+        # is the process find really runs. Only the token right after the flag
+        # used to be read, which hid the whole invocation from this scan.
+        assert "rm" in self._find()("find . -exec env sed '1e rm -f victim' {} +")
+        assert "rm" in self._find()("find . -exec timeout 5 sed '1e rm -f victim' {} +")
+        assert "rm" in self._find()("find . -exec nice sed '1e rm -f victim' {} +")
+        assert "rm" in self._find()("find . -exec env A=b sed '1e rm -f victim' {} +")
+        assert "curl" in self._find()("find . -execdir env sed '1e curl https://x' {} \\;")
+        # The same hop resolves the plain blocked-name check on that line, which
+        # a wrapper hid just as effectively.
+        assert "rm" in self._find()("find . -exec env rm -rf build {} +")
+        assert "curl" in self._find()("find . -exec timeout 5 curl https://x {} +")
+        assert "rm" in self._find()("find . -exec xargs rm -rf build {} +")
+        # A wrapper is a command in its own right as well as a step on the way
+        # to one, so hopping it must not drop its own blocked name.
+        assert "sudo" in self._find()("find . -exec sudo ls {} +")
+        assert self._find()("find . -exec sudo rm -rf x {} +") >= {"sudo", "rm"}
+        assert "su" in self._find()("find . -exec su root {} +")
+        assert self._find()("find . -exec env sed -n '1,3p' {} +") == set()
+        assert self._find()("find . -exec env sed -i.bak 's/a/b/' {} +") == set()
+
+    def test_sed_script_past_the_scan_window_fails_closed(self):
+        # A flat argument cap was padding the caller controls: 128 valid options
+        # pushed the real script one token out of view and the screen came back
+        # empty. A lone sed now reads its whole argument list...
+        assert "rm" in self._find()("sed " + "-n " * 128 + "'1e rm -f victim' input")
+        assert "rm" in self._find()("sed " + "-n " * 300 + "'1e rm -f victim' input")
+        assert "rm" in self._find()("sed " + "-n " * 128 + "-e '1e rm -f victim' input")
+        assert self._find()("sed " + "-n " * 300 + "'1,3p' input") == set()
+        # ...while a line packed with sed words keeps the per-invocation floor
+        # that holds the total walk linear. Running out of window there means the
+        # program was never read, so the sed itself is blocked rather than an
+        # empty result being taken as proof it only edits text.
+        assert "sed" in self._find()("find . " + "-exec sed " * 1000 + "-n " * 200)
+
+    def test_sed_sandbox_and_posix_modes_not_blocked(self):
+        # --sandbox disables e/r/w and --posix drops the GNU extension `e`
+        # belongs to: sed exits 1 without running anything, so blocking a name
+        # from inside the payload was a false alarm. Abbreviations included.
+        assert self._find()("sed --sandbox '1e rm -f victim' input") == set()
+        assert self._find()("sed --posix '1e rm -f victim' input") == set()
+        assert self._find()("sed --sa '1e rm -f victim' input") == set()
+        assert self._find()("sed --p '1e rm -f victim' input") == set()
+        assert self._find()("sed --sandbox -e '1e rm -f victim' input") == set()
+        assert self._find()("sed --sandbox --expression='1e rm -f victim' input") == set()
+        assert self._find()("sed --sandbox -- '1e rm -f victim' input") == set()
+        assert self._find()("sed -e '2d' --sandbox -e '1e rm -f victim' input") == set()
+
+    def test_sed_sandbox_only_covers_the_scripts_written_after_it(self):
+        # sed compiles each -e/-f script as that option is parsed, so a script
+        # already compiled runs whatever a later flag says. Verified on GNU sed
+        # 4.9: `sed -e '1e touch MARKER' --sandbox input` creates MARKER and
+        # exits 0. Treating the flag as invocation-wide unblocked all of these.
+        assert "rm" in self._find()("sed -e '1e rm -f victim' --sandbox input")
+        assert "rm" in self._find()("sed -e '1e rm -f victim' input --sandbox")
+        assert "rm" in self._find()("sed --expression='1e rm -f victim' --sandbox input")
+        assert "rm" in self._find()("sed -e '1e rm -f victim' --sandbox -e '2d' input")
+        # A flag after the POSITIONAL script suppresses only because getopt
+        # PERMUTES, which POSIXLY_CORRECT turns off -- verified:
+        # `POSIXLY_CORRECT=1 sed '1e touch MARKER' input --sandbox` creates
+        # MARKER, sed having taken --sandbox for an input file. That variable
+        # can reach sed from outside the text being screened, so a later flag
+        # never counts.
+        assert "rm" in self._find()("sed '1e rm -f victim' input --sandbox")
+        assert "rm" in self._find()("sed '1e rm -f victim' --sandbox input")
+        assert "rm" in self._find()("sed '1e rm -f victim' input --posix")
+        assert "rm" in self._find()("POSIXLY_CORRECT=1 sed '1e rm -f victim' input --sandbox")
+        # An ordinary edit yields no payload wherever the flag sits, so the
+        # stricter reading costs nothing outside programs that already exec.
+        assert self._find()("sed -n '1,3p' input --sandbox") == set()
+        assert self._find()("sed 's/a/b/g' input --posix") == set()
+        # `--` ends option parsing, so a --sandbox behind it is an input
+        # FILENAME: the mode never turns on and the payload runs for real.
+        assert "rm" in self._find()("sed -- '1e rm -f victim' input --sandbox")
+        assert "rm" in self._find()("sed '1e rm -f victim' -- input --sandbox")
+        assert "rm" in self._find()("sed -e '1e rm -f victim' -- input --sandbox")
+        # An ambiguous (--s) or `=`-carrying spelling is a usage error, not the
+        # mode, so it keeps blocking.
+        assert "rm" in self._find()("sed --s '1e rm -f victim' input")
+        assert "rm" in self._find()("sed --sandbox=1 '1e rm -f victim' input")
+
+    def test_sed_scan_stops_at_the_find_exec_terminator(self):
+        # `-exec CMD ... +` / `... ;` is a COMPLETE action, so the next
+        # predicate's words are not sed's. Running past the terminator read the
+        # following `-exec grep -e safe` as a sed `-e` program flag, which
+        # discarded the real positional script and left the screen empty.
+        assert "rm" in self._find()(
+            "find . -exec sed '1e rm -f victim' {} + -exec grep -e safe {} +"
+        )
+        assert "rm" in self._find()(
+            "find . -exec sed '1e rm -f victim' {} \\; -exec grep -e safe {} \\;"
+        )
+        assert "rm" in self._find()(
+            "find . -exec grep -e safe {} + -exec sed '1e rm -f victim' {} +"
+        )
+        assert "curl" in self._find()(
+            "find . -execdir sed '1e curl https://x' {} + -exec grep -e safe {} +"
+        )
+        assert self._find()("find . -exec sed -n '1,3p' {} + -exec grep -e safe {} +") == set()
+
+    def test_sed_behind_a_wrapper_option_with_an_operand(self):
+        # A wrapper option whose value is a SEPARATE token consumes that token,
+        # so the command behind it is the one find runs. Without consuming it
+        # `env -u FOO sed ...` reported FOO as the child and the script was
+        # never read.
+        assert "rm" in self._find()("find . -exec env -u FOO sed '1e rm -f victim' {} +")
+        assert "rm" in self._find()("find . -exec env --unset FOO sed '1e rm -f victim' {} +")
+        assert "rm" in self._find()("find . -exec stdbuf -o L sed '1e rm -f victim' {} +")
+        assert "rm" in self._find()("find . -exec nice -n 5 sed '1e rm -f victim' {} +")
+        assert "rm" in self._find()("find . -exec timeout -s KILL 5 sed '1e rm -f victim' {} +")
+        # An attached spelling carries its own value, so nothing extra is eaten.
+        assert "rm" in self._find()("find . -exec env -uFOO sed '1e rm -f victim' {} +")
+        assert "rm" in self._find()("find . -exec env --unset=FOO sed '1e rm -f victim' {} +")
+        assert self._find()("find . -exec env -u FOO sed -n '1,3p' {} +") == set()
+        assert self._find()("find . -exec stdbuf -o L sed -n '1,3p' {} +") == set()
+
+    def test_wrapper_option_operand_is_not_the_command(self):
+        # The same hop at TOP level, which had the same hole: the operand was
+        # read as the command word and the real one behind it was never
+        # reached. It also stops the operand being blamed for a name it only
+        # spells (`timeout -s KILL` runs no `kill`, `env -u kill` runs no kill).
+        assert "rm" in self._find()("env -u PATH rm -rf x")
+        assert "rm" in self._find()("env --unset PATH rm -rf x")
+        assert "rm" in self._find()("stdbuf -o L rm -rf x")
+        assert "rm" in self._find()("xargs -I {} rm -rf build")
+        assert "rm" in self._find()("timeout -s KILL 5 rm -rf x")
+        assert "curl" in self._find()("xargs -E rm curl https://x")
+        assert self._find()("env -u kill ls") == set()
+        assert self._find()("env -u FOO ls -la") == set()
+        # A real command-position kill is still caught.
+        assert "kill" in self._find()("timeout -s KILL 5 kill -9 1")
+
+    def test_sed_program_held_in_a_variable(self):
+        # shlex keeps a quoted value whole, newlines and all, so resolving the
+        # reference shows the program sed really receives. Only that view has
+        # the newline that ENDS the comment; with it flattened the whole value
+        # reads as one inert comment line.
+        assert "rm" in self._find()("p='# harmless\ne rm -f victim'; sed \"$p\" input")
+        assert "rm" in self._find()("p='# harmless\ne rm -f victim'; sed \"${p}\" input")
+        assert "rm" in self._find()('p=e; sed "$p rm -f victim" input')
+        assert "curl" in self._find()("prog='1e curl https://x'; sed \"$prog\" input")
+        assert self._find()("p='1,3p'; sed -n \"$p\" input") == set()
+        assert self._find()("p='s/old/new/g'; sed \"$p\" input") == set()
+        # An unassigned name is left as written rather than invented.
+        assert self._find()('sed "$undefined" input') == set()
+        # A value that is not itself literal is no resolution either: the lexer
+        # splits `p=$(...)` at the `(`, and the leftover binding `p` -> `$`
+        # substituted a bare `$` for the program, dressing an unread script up
+        # as a plausible literal. The blocklist has no name to report there, so
+        # it reports none -- the auto gate is what asks (see test_permission_mode).
+        assert self._find()("p=$(printf '1e rm -f victim'); sed \"$p\" input") == set()
+
+    def test_sed_program_built_by_a_parameter_transformation(self):
+        # `${p#x}` and its family are not modelled, so the program is UNREAD
+        # rather than harmless. The blocklist can only report a name it can see,
+        # and there is none here -- the auto gate carries these (verified on GNU
+        # sed 4.9: `p='x 1e touch MARKER'; sed "${p#x }" input` creates MARKER).
+        assert self._find()("p='x 1e rm -f victim'; sed \"${p#x }\" input") == set()
+        assert self._find()("p='1e rm -f victimZ'; sed \"${p%Z}\" input") == set()
+        assert self._find()("printf -v p '1e rm -f victim'; sed \"$p\" input") == set()
+
+    def test_sed_program_behind_an_arithmetic_expansion(self):
+        # Arithmetic evaluates to an integer, so a digit stands in for it and
+        # the expansion's own punctuation stops hiding the command behind it.
+        # Read raw, `$((c+1))e rm -f victim` takes the `c` for an append-text
+        # command that swallows the payload, while real sed runs rm.
+        assert "rm" in self._find()('sed "$((c+1))e rm -f victim" input')
+        assert "rm" in self._find()('sed "$[c+1]e rm -f victim" input')
+        assert "curl" in self._find()('sed "$((4/2))e curl https://x" input')
+        # Ordinary line maths still yields no payload.
+        assert self._find()('sed -n "1,$((n + 1))p" f') == set()
+
+    def test_sed_spelled_as_a_command_glob(self):
+        # Bash expands a command-position glob after this scan, so a pattern
+        # that could resolve to sed is screened as sed. The name check was
+        # exact, and the script behind `/usr/bin/s[e]d` was never read.
+        assert "rm" in self._find()("/usr/bin/s[e]d '1e rm -f victim' input")
+        assert "rm" in self._find()("/usr/bin/s*d '1e rm -f victim' input")
+        assert "curl" in self._find()("/usr/bin/se? '1e curl https://x' input")
+        assert "rm" in self._find()("find . -exec /usr/bin/s[e]d '1e rm -f victim' {} +")
+        # Reading a non-sed tool's arguments as a program costs nothing: with no
+        # `e` command there is no payload.
+        assert self._find()("/usr/bin/s[e]d -n '1,3p' input") == set()
+        assert self._find()("/bin/l[s] -la") == set()
+
+    def test_ordinary_sed_program_allowed(self):
+        # Plain stream editing runs nothing, and a mention of sed in argument
+        # position is text: only a command-position sed has its script read.
+        assert self._find()("sed 's/old/new/g' input") == set()
+        assert self._find()("sed -n '1,20p' input") == set()
+        assert self._find()("sed 's/rm/RM/g' input") == set()
+        assert self._find()("printf '%s' sed '1e rm -rf victim'") == set()
+        assert self._find()("sed 's/a/b/we out.txt' input") == set()
+        assert self._find()("sed -e '1a\\' -e 'e rm -rf x' input") == set()
+
     def test_subshell_command_blocked(self):
         assert "rm" in self._find()("echo $(rm -rf /tmp)")
 
