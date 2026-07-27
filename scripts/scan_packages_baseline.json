@@ -107,6 +107,14 @@
       "evidence_hash": "a7295004315e26a8f3c64fb837521e9fdd7268219bb43e000fb0236ab0259223"
     },
     {
+      "package": "fastapi",
+      "file": "fastapi/routing.py",
+      "check": "C2 polling/beaconing loop detected",
+      "severity": "CRITICAL",
+      "evidence": "L592:                                 while True: sha256:93dbe0852740ecd36d2045764d7d5f2527b862f67da62c49e13f244909daa721",
+      "evidence_hash": "47d14b7e1f0ba1147def0f0e2dec06f4d030488844e12fca591e4ccb1c9c77b6"
+    },
+    {
       "package": "fastmcp-slim",
       "file": "fastmcp/cli/apps_dev.py",
       "check": "Creates archive with sensitive data AND makes network calls",
@@ -201,6 +209,22 @@
       "severity": "CRITICAL",
       "evidence": "L298:     while True: sha256:6b8e5e569594caf7c4eca6137646dae471a7c3aae7294096cf876f30b5f90306",
       "evidence_hash": "c066cc27bce31ee7b6ce07411ee7a7d9ecfbf3aafc8848f6641fabfe522a7703"
+    },
+    {
+      "package": "huggingface-hub",
+      "file": "huggingface_hub/_sandbox.py",
+      "check": "Writes to /tmp and executes (staged dropper)",
+      "severity": "CRITICAL",
+      "evidence": "L84: d=/tmp/.sbx-server\nL85: if command -v wget >/dev/null 2>&1; then wget -q -O \"$d\" \"$SBX_SERVER_URL\"\nL86: elif command -v curl >/dev/null 2>&1; then curl -fsSL -o \"$d\" \"$SBX_SERVER_URL\"\nL87: else cp \"$SBX_SERVER_MOUNT/sbx-server\" \"$d\"; fi\nL88: chmod +x \"$d\"",
+      "evidence_hash": "4e8ce7444ac0d4a788dcaf389ae8e26dd0221a226938d764810181a593d53d36"
+    },
+    {
+      "package": "huggingface-hub",
+      "file": "huggingface_hub/hf_api.py",
+      "check": "C2 polling/beaconing loop detected",
+      "severity": "CRITICAL",
+      "evidence": "L4679:         while True: sha256:be2b77aa7e6e63dcfa792738297b74e7fce8c3363c7ffae0020ecabaafeeefe4",
+      "evidence_hash": "8f410907235b10bff2cbf347b93afe564ec9498661749b65dd33505e64f7b18f"
     },
     {
       "package": "ipython",
