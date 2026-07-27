@@ -48,12 +48,13 @@ def _run(body: str):
     if shutil.which("node") is None:
         pytest.skip("node not available")
     assert INVENTORY.exists(), (
-        "auto-load must decide candidates through "
-        "features/chat/utils/auto-load-inventory.ts"
+        "auto-load must decide candidates through features/chat/utils/auto-load-inventory.ts"
     )
     probe = subprocess.run(
         ["node", "--experimental-strip-types", "--version"],
-        capture_output = True, text = True, timeout = 10,
+        capture_output = True,
+        text = True,
+        timeout = 10,
     )
     if probe.returncode != 0:
         pytest.skip("node --experimental-strip-types not available")
@@ -63,7 +64,10 @@ def _run(body: str):
         )
         result = subprocess.run(
             ["node", "--experimental-strip-types", "--no-warnings", "run.mts"],
-            cwd = workdir, capture_output = True, text = True, timeout = 60,
+            cwd = workdir,
+            capture_output = True,
+            text = True,
+            timeout = 60,
             env = dict(os.environ, NODE_NO_WARNINGS = "1"),
         )
     assert result.returncode == 0, f"stderr: {result.stderr}\nstdout: {result.stdout}"
@@ -90,9 +94,12 @@ def test_a_model_in_a_custom_folder_is_auto_loadable():
     """#7374: a GGUF outside the HF caches (Custom Folder, models dir, LM Studio)
     is a candidate. Nothing is in the caches, which is the exact state that used
     to fall through to the unsolicited download."""
-    assert _run(
-        f"console.log(JSON.stringify(inventory.isAutoLoadableLocalRow({json.dumps(GEMMA_ROW)})));\n"
-    ) is True
+    assert (
+        _run(
+            f"console.log(JSON.stringify(inventory.isAutoLoadableLocalRow({json.dumps(GEMMA_ROW)})));\n"
+        )
+        is True
+    )
 
 
 def test_rows_the_scanner_will_not_vouch_for_are_never_auto_loaded():
@@ -103,7 +110,9 @@ def test_rows_the_scanner_will_not_vouch_for_are_never_auto_loaded():
     rows = {
         "partial": {**GEMMA_ROW, "partial": True},
         "unclassified": {
-            **GEMMA_ROW, "runtime": "unknown", "capabilities": {"can_chat": False},
+            **GEMMA_ROW,
+            "runtime": "unknown",
+            "capabilities": {"can_chat": False},
         },
         "adapter": {**GEMMA_ROW, "runtime": "adapter"},
     }
@@ -116,7 +125,7 @@ def test_rows_the_scanner_will_not_vouch_for_are_never_auto_loaded():
 
 
 def test_failure_message_distinguishes_empty_unreadable_and_unloadable():
-    """"No downloaded models found" was printed for all three states, so a model
+    """ "No downloaded models found" was printed for all three states, so a model
     that was found and then rejected read as a model Studio could not see. Each
     state now says what happened, and a load failure carries its real reason (an
     out-of-memory refusal, for instance) instead of being swallowed."""
