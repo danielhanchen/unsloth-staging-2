@@ -265,6 +265,18 @@ _AWK_SHELL_ESCAPE_RE = re.compile(
     r"\bsystem\s*\(|\|\s*&?\s*[\"']\s*(?:/\S*/)?(?:sh|bash|zsh|ksh|dash|cmd)\b|"
     r"\bENVIRON\s*\[|\bprintf\s*\|"
 )
+# sed has the same escape hatch as awk: GNU's `e` command hands the rest of its
+# line to the shell (through popen, so a full `sh -c`), and the `s///e` flag runs
+# whatever the substitution left in the pattern space. Either one hides a command
+# (a hard-blocked one included) inside what reads as an ordinary text-editing
+# argument. Screening the program keeps everyday editing (sed 's/a/b/g', sed -n
+# '1,20p') running unprompted. Both are GNU extensions, so only GNU sed and the
+# GNU-derived spellings are listed -- busybox/toybox/BSD sed reject `e` outright.
+_SED_COMMANDS = frozenset({"sed", "gsed", "ssed"})
+# `s///` flags that may sit in front of the `e` flag. `w` is deliberately absent:
+# it takes the rest of the line as a filename, so the e in `s/a/b/w report.txt`
+# is part of that name and must not be read as the execute flag.
+_SED_SUBST_FLAGS = frozenset("0123456789gpiImMe")
 _WIN_CONDITIONAL_KEYWORDS = frozenset({"exist", "defined", "errorlevel", "not"})
 _FIND_EXEC_FLAGS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 
@@ -286,6 +298,193 @@ def _blocked_matching_glob(base: str) -> "set[str]":
     if not _is_unresolved_command_glob(base):
         return set()
     return {name for name in _BLOCKED_COMMANDS if fnmatch.fnmatchcase(name, base)}
+
+
+def _sed_program(tokens: "list[str]", start: int) -> str:
+    """The sed script of the invocation whose command word sits at ``start``.
+
+    Every `-e` / `--expression` value is a piece of the script, and sed joins
+    them with NEWLINES into one program -- so `sed -e '1a\\' -e 'e rm -rf x'`
+    appends a literal line rather than executing it, and the pieces have to be
+    judged together. Without any of those (and without a `-f` program FILE,
+    whose contents this cannot see) the FIRST positional is the script and the
+    rest are input paths, so `sed -e 's/a/b/' e` reads its input file `e` as
+    data rather than as a bare `e` command.
+    """
+    programs: "list[str]" = []
+    first_positional = ""
+    has_program_flag = False
+    value_pending = ""  # "e" or "f": the next token is that flag's value
+    for token in tokens[start + 1 :]:
+        if token in _SHELL_SEPARATORS:
+            break
+        if value_pending:
+            if value_pending == "e":
+                programs.append(token)
+            value_pending = ""
+            continue
+        if token.startswith("--"):
+            name, sep, value = token.partition("=")
+            # getopt takes any unambiguous abbreviation, so --e/--ex/--expr all
+            # mean --expression (no other sed long option starts with e) and
+            # --fi upwards means --file (--f alone is ambiguous with
+            # --follow-symlinks, which sed rejects outright).
+            is_expression = len(name) > 2 and "--expression".startswith(name)
+            is_file = len(name) > 3 and "--file".startswith(name)
+            if is_expression or is_file:
+                has_program_flag = True
+                if not sep:
+                    value_pending = "e" if is_expression else "f"
+                elif is_expression:
+                    programs.append(value)
+            continue
+        if token.startswith("-"):
+            # A cluster carries the value glued on (`sed -ne'1p'`) or in the
+            # next token (`sed -ne '1p'`), so -n and -e arrive as one word.
+            attached = _short_flag_arg(token, "ef")
+            if attached is None:
+                continue
+            has_program_flag = True
+            letter = next(ch for ch in token[1:] if ch in "ef")
+            if not attached:
+                value_pending = letter
+            elif letter == "e":
+                programs.append(attached)
+            continue
+        if not first_positional:
+            first_positional = token
+    if not has_program_flag and first_positional:
+        programs.append(first_positional)
+    return "\n".join(programs)
+
+
+def _sed_exec_payloads(program: str) -> "list[str]":
+    """Shell payloads a sed program executes, in the order they appear.
+
+    `e COMMAND` runs COMMAND through the shell. A bare `e` and the `s///e` flag
+    run the pattern space instead, whose text only exists at run time, so those
+    are reported as an EMPTY payload -- present (the program executes) but not
+    screenable. An empty list means the program only edits text.
+
+    The walk steps over every part of a script where an `e` is data: address and
+    substitution regexes, replacements, a/i/c text, r/w filenames, b/t labels and
+    comments. That keeps the join-lines idiom `:e;N;$!be;s/\\n/ /g`, `sed 's/e/E/g'`
+    and `sed 's/a/b/w report.txt'` out of the results.
+    """
+    payloads: "list[str]" = []
+    n = len(program)
+
+    def _end_of_line(pos: int) -> int:
+        end = program.find("\n", pos)
+        return n if end < 0 else end
+
+    def _skip_bracket(pos: int) -> int:
+        # A POSIX bracket expression, inside which the delimiter is ordinary data
+        # (`s/[/]/x/` really does substitute a slash). A leading `]` is literal,
+        # and [:class:] / [.coll.] / [=equiv=] nest a bracket of their own.
+        pos += 1
+        if pos < n and program[pos] == "^":
+            pos += 1
+        if pos < n and program[pos] == "]":
+            pos += 1
+        while pos < n and program[pos] != "]":
+            if program[pos] == "[" and pos + 1 < n and program[pos + 1] in ":.=":
+                end = program.find(program[pos + 1] + "]", pos + 2)
+                pos = n if end < 0 else end + 2
+                continue
+            pos += 1
+        return pos + 1
+
+    def _skip_section(pos: int, delim: str, brackets: bool) -> int:
+        # One delimited section of an address regex or an s///y/// command, up to
+        # and including its closing delimiter. Bracket expressions only apply to
+        # the regex halves; in a replacement or a y/// list `[` is a literal.
+        while pos < n and program[pos] != delim:
+            if program[pos] == "\\":
+                pos += 2
+            elif brackets and program[pos] == "[":
+                pos = _skip_bracket(pos)
+            else:
+                pos += 1
+        return pos + 1
+
+    def _skip_address(pos: int) -> int:
+        # A line number (GNU's first~step form included), `$`, /regex/ or the
+        # \%regex% custom-delimiter form, each allowing I/M modifiers.
+        if pos < n and program[pos] == "$":
+            return pos + 1
+        if pos < n and program[pos].isdigit():
+            while pos < n and (program[pos].isdigit() or program[pos] == "~"):
+                pos += 1
+            return pos
+        if pos < n and program[pos] == "/":
+            pos = _skip_section(pos + 1, "/", brackets = True)
+        elif pos < n and program[pos] == "\\" and pos + 1 < n:
+            pos = _skip_section(pos + 2, program[pos + 1], brackets = True)
+        else:
+            return pos
+        while pos < n and program[pos] in "IM":
+            pos += 1
+        return pos
+
+    i = 0
+    while i < n:
+        if program[i] in " \t\n;{}":
+            # Separators and block braces carry no command of their own.
+            i += 1
+            continue
+        if program[i] == "#":
+            i = _end_of_line(i)
+            continue
+        i = _skip_address(i)
+        if i < n and program[i] == ",":
+            i += 1
+            while i < n and program[i] in " \t":
+                i += 1
+            if i < n and program[i] in "+~":
+                # `addr,+N` / `addr,~N` end the range relative to the first match.
+                i += 1
+                while i < n and program[i].isdigit():
+                    i += 1
+            else:
+                i = _skip_address(i)
+        while i < n and program[i] in " \t!":
+            # `1!e cmd` negates the address; the command word is still ahead.
+            i += 1
+        if i >= n:
+            break
+        cmd, i = program[i], i + 1
+        if cmd == "e":
+            # The payload ends at the NEWLINE, so a `;` after it belongs to the
+            # shell command rather than starting the next sed command.
+            end = _end_of_line(i)
+            payloads.append(program[i:end].strip())
+            i = end
+        elif cmd in "sy" and i < n:
+            delim, i = program[i], i + 1
+            i = _skip_section(i, delim, brackets = cmd == "s")
+            i = _skip_section(i, delim, brackets = False)
+            if cmd == "s":
+                executes = False
+                while i < n and program[i] in _SED_SUBST_FLAGS:
+                    executes = executes or program[i] == "e"
+                    i += 1
+                if executes:
+                    payloads.append("")
+                if i < n and program[i] == "w":
+                    i = _end_of_line(i)
+        elif cmd in "aic":
+            # Literal text: the classic `a\` + newline form continues for as
+            # long as each line ends in a backslash.
+            while i < n and program[i] != "\n":
+                i += 2 if program[i] == "\\" else 1
+        elif cmd in "rRwW":
+            i = _end_of_line(i)  # the filename runs to the end of the line
+        elif cmd in "btT:v":
+            # A label (or the `v` version request) ends at the next separator.
+            while i < n and program[i] not in ";\n}":
+                i += 1
+    return payloads
 
 
 def _find_blocked_commands(command: str) -> set[str]:
@@ -328,7 +527,8 @@ def _find_blocked_commands(command: str) -> set[str]:
     expect_command = True  # start of string is a command position
     prefix_pending = False  # last cmd-position token was a wrapper (env/time/xargs/...)
     skip_operand = False  # consume a wrapper/conditional operand, not the command
-    for token in tokens:
+    sed_indexes: "list[int]" = []  # command-position sed words, for the `e` scan below
+    for token_index, token in enumerate(tokens):
         if skip_operand:
             # `exec -a NAME cmd` and `if exist FILE cmd` both put an operand
             # where the command word would otherwise be.
@@ -363,6 +563,8 @@ def _find_blocked_commands(command: str) -> set[str]:
         if prefix_pending and token.lstrip("-").isdigit():
             continue
         base = _token_basename(token)
+        if base in _SED_COMMANDS:
+            sed_indexes.append(token_index)
         if base in _BLOCKED_COMMANDS:
             blocked.add(base)
         else:
@@ -448,6 +650,16 @@ def _find_blocked_commands(command: str) -> set[str]:
             elif is_win_c and prev_base in _SHELLS_WIN:
                 blocked |= _find_blocked_commands(tokens[i + 1])
             break  # stop at first non-flag token
+
+    # sed's `e COMMAND` hands COMMAND to the shell, which is a real command
+    # position inside what the scan above only sees as a text-editing argument.
+    # Screen it like a nested `bash -c` payload. The pattern-space forms (a bare
+    # `e`, `s///e`) yield an empty payload: nothing to read here, and the auto
+    # gate prompts on them instead.
+    for i in sed_indexes:
+        for payload in _sed_exec_payloads(_sed_program(tokens, i)):
+            if payload:
+                blocked |= _find_blocked_commands(payload)
 
     return blocked
 
@@ -4324,6 +4536,12 @@ def _terminal_is_high_risk(command: str, _depth: int = 0) -> bool:
                     chdir_pending = True
                 if base in _AWK_COMMANDS:
                     awk_program_pending = True
+                if base in _SED_COMMANDS and _sed_exec_payloads(_sed_program(tokens, _tok_idx)):
+                    # sed's `e` command and `s///e` flag shell out from inside the
+                    # script, the same escape hatch awk's system() offers. Judged
+                    # here rather than on the next positional because the script
+                    # may instead ride on -e/--expression (sed -n -e '1e rm x' f).
+                    return True
             elif current_command == "git" and not git_subcommand:
                 # The first positional after `git` is its subcommand.
                 git_subcommand = base
