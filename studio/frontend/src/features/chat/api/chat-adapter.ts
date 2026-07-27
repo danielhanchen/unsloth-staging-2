@@ -1527,11 +1527,15 @@ async function autoLoadSmallestModel(): Promise<{
   let lastFailureReason: string | null = null;
   const skippedAutoLoadCandidates = new Set<string>();
 
-  function noteFailure(error: unknown): void {
-    hadNonTrustFailure = true;
+  function noteDiagnostic(error: unknown): void {
     if (error instanceof Error && error.message.trim()) {
       lastFailureReason = error.message.trim();
     }
+  }
+
+  function noteFailure(error: unknown): void {
+    hadNonTrustFailure = true;
+    noteDiagnostic(error);
   }
 
   function giveUp(): {
@@ -1814,7 +1818,10 @@ async function autoLoadSmallestModel(): Promise<{
     const unreadable =
       <T,>(fallback: T) =>
       (error: unknown): T => {
-        noteFailure(error);
+        // Reason only, never hadNonTrustFailure: the device scan reconstructs
+        // these candidates, so a cache-list blip must not outrank a
+        // trust-remote-code block in giveUp()'s verdict.
+        noteDiagnostic(error);
         return fallback;
       };
     const deviceUnreadable = (error: unknown): LocalModelInfo[] => {
@@ -1856,7 +1863,12 @@ async function autoLoadSmallestModel(): Promise<{
         load_id: loadId,
         size_bytes: row.size_bytes ?? 0,
       };
-      if (isGguf) ggufRepos.push({ ...candidate, cache_path: row.path });
+      if (isGguf)
+        ggufRepos.push({
+          ...candidate,
+          cache_path: row.path,
+          capabilities: row.capabilities,
+        });
       else modelRepos.push(candidate);
     }
     candidateCount = ggufRepos.length + modelRepos.length;
@@ -1950,7 +1962,9 @@ async function autoLoadSmallestModel(): Promise<{
           // variants instead answers nothing, because the backend refuses to
           // group GGUFs sitting in a folder that carries no model metadata, so
           // routing it through the directory sweep would drop a chat-ready file.
-          if (repo.repo_id.toLowerCase().endsWith(".gguf")) {
+          // Keyed on what the scanner decided while it stat-ed the path: a repo
+          // id can legitimately end in ".gguf" without being a loose file.
+          if (repo.capabilities?.requires_variant === false) {
             if (hasBigEndianGgufMarker(repo.repo_id)) continue;
             if (
               await loadAutoLoadCandidate({

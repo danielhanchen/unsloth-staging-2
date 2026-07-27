@@ -40,6 +40,11 @@ def _read(path: Path) -> str:
     return path.read_text()
 
 
+def _no_comments(src: str) -> str:
+    """Drop // comments so a mention in prose is not read as code."""
+    return re.sub(r"//[^\n]*", "", src)
+
+
 def _sweep() -> str:
     """The body of ``autoLoadSmallestModel``, where the policy lives."""
     return _read(ADAPTER).split("async function autoLoadSmallestModel", 1)[1]
@@ -362,3 +367,46 @@ def test_a_mixed_weight_directory_is_queued_once():
         "console.log(JSON.stringify({ gguf: ggufRepos.length, model: modelRepos.length }));\n"
     )
     assert queued == {"gguf": 1, "model": 0}, queued
+
+
+# A cached HF repo whose id merely ends in ".gguf". It is a directory of
+# variants, so the scanner marks requires_variant true.
+GGUF_SUFFIXED_REPO_ROW = {
+    **GEMMA_ROW,
+    "id": "owner/model.gguf",
+    "load_id": "owner/model.gguf",
+    "path": "/hf/cache/models--owner--model.gguf",
+    "capabilities": {"can_chat": True, "requires_variant": True},
+}
+
+
+def test_a_repo_id_ending_in_gguf_still_uses_variant_selection():
+    """The direct-file branch keys on what the scanner decided, not on the
+    identifier: "owner/model.gguf" is a valid repo id, and loading it with a
+    null variant lets the backend pick a quant that may not be downloaded."""
+    calls = _sweep_calls(GGUF_SUFFIXED_REPO_ROW, [{"filename": "a.gguf", "downloaded": True}])
+    assert [c["fn"] for c in calls][0] == "listGgufVariants", calls
+
+
+def test_an_auxiliary_listing_failure_is_not_a_load_failure():
+    """A managed-cache blip must not set hadNonTrustFailure: the device scan
+    reconstructs those candidates, and giveUp() computes `blocked` as
+    blockedByTrustRemoteCode && !hadNonTrustFailure, so it would suppress the
+    custom-code approval message."""
+    sweep = _sweep().split("export function createOpenAIStreamAdapter")[0]
+
+    def handler_sets_load_failure(call: str) -> bool:
+        """Whether the catch handler wired to *call* marks a load failure."""
+        name = re.search(re.escape(call) + r"\s*\.catch\((\w+)", sweep).group(1)
+        body = _no_comments(sweep.split(f"const {name} =", 1)[1].split("\n    const ", 1)[0])
+        if "hadNonTrustFailure" in body:
+            return True
+        # Follow one level of indirection into whichever note* helper it calls.
+        note = re.search(r"(note\w+)\(error\)", body)
+        if not note:
+            return False
+        fn = sweep.split(f"function {note.group(1)}(", 1)[1].split("\n  function ", 1)[0]
+        return "hadNonTrustFailure" in _no_comments(fn)
+
+    assert not handler_sets_load_failure("listCachedGguf()")
+    assert not handler_sets_load_failure("listCachedModels()")
