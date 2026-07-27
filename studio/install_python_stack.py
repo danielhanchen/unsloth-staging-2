@@ -1162,6 +1162,11 @@ def _has_usable_nvidia_gpu() -> bool:
     timeout, driver initialisation race). If either probe confirms an
     NVIDIA GPU the function returns True so _has_rocm_gpu() is blocked.
 
+    On Windows nvidia-smi.exe is not always on PATH, so fall back to the two
+    fixed driver locations install.ps1 / setup.ps1 already probe. Without this
+    an AMD iGPU + NVIDIA dGPU host whose PATH misses nvidia-smi looks
+    NVIDIA-free here and gets routed to the ROCm wheels.
+
     CUDA_VISIBLE_DEVICES set to "" or "-1" hides every NVIDIA device (mixed
     AMD+NVIDIA hosts steering work to the AMD card); neither probe honours
     that env var, so check it first and report the GPU as not usable. Unset
@@ -1171,6 +1176,23 @@ def _has_usable_nvidia_gpu() -> bool:
     if cvd is not None and cvd.strip() in ("", "-1"):
         return False
     exe = shutil.which("nvidia-smi")
+    if not exe and IS_WINDOWS:
+        for _candidate in (
+            os.path.join(
+                os.environ.get("ProgramFiles", r"C:\Program Files"),
+                "NVIDIA Corporation",
+                "NVSMI",
+                "nvidia-smi.exe",
+            ),
+            os.path.join(
+                os.environ.get("SystemRoot", r"C:\Windows"),
+                "System32",
+                "nvidia-smi.exe",
+            ),
+        ):
+            if os.path.isfile(_candidate):
+                exe = _candidate
+                break
     if exe:
         try:
             result = subprocess.run(
