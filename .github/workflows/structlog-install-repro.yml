@@ -11,6 +11,8 @@ name: structlog-install-repro
 
 on:
   workflow_dispatch:
+  push:
+    branches: [structlog-install-repro]
 
 jobs:
   wheel-metadata:
