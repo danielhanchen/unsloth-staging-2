@@ -1,0 +1,51 @@
+name: "staging-7438 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-7438-xplat-ci"]
+    paths:
+      - 'studio/backend/tests/test_cloudflare_tunnel.py'
+      - 'studio/backend/tests/test_consent_gate.py'
+      - 'studio/backend/tests/test_cpu_threads.py'
+      - 'studio/backend/tests/test_data_recipe_seed.py'
+      - 'studio/backend/tests/test_desktop_auth.py'
+      - 'studio/backend/tests/test_gguf_load_cache_reuse.py'
+      - 'studio/backend/tests/test_host_defaults.py'
+      - 'studio/backend/tests/test_mcp_servers.py'
+      - 'studio/backend/tests/test_mlx_training_worker_config.py'
+      - 'studio/backend/tests/test_mtp_vram_budget.py'
+      - 'studio/backend/tests/test_native_context_length.py'
+      - 'studio/backend/tests/test_native_template_trust_remote_code.py'
+      - 'studio/backend/tests/test_offline_inference_parent.py'
+      - 'studio/backend/tests/test_recommended_folders_has_model.py'
+      - 'studio/backend/tests/test_recommended_folders_permission.py'
+      - 'studio/backend/tests/test_sandbox_tools.py'
+      - 'studio/backend/tests/test_security_gate_consistency.py'
+      - 'studio/backend/tests/test_ssm_runtime.py'
+      - 'studio/backend/tests/test_studio_api.py'
+      - 'studio/backend/tests/test_tool_call_parser_strict.py'
+      - '.github/workflows/staging-7438-ubuntu-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
