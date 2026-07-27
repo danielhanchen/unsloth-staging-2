@@ -1576,12 +1576,25 @@ _GPU_OFFLOAD_OVERRIDE_FLAGS = _LAYER_OFFLOAD_FLAGS
 _THREAD_OVERRIDE_FLAGS = frozenset({"-t", "--threads"})
 
 
+def _canonical_long_flag_name(name: str) -> str:
+    """``name`` with llama.cpp's long-option underscore folding applied.
+
+    common/arg.cpp runs ``std::replace(arg, '_', '-')`` on every ``--`` token
+    before matching, so ``--spec_type`` reaches ``--spec-type``. Every parser
+    reading pass-through extras must match the same way or Studio budgets VRAM,
+    picks a drafter and reports a launch mode the child resolves differently.
+    Shorts keep their exact spelling. Single source of truth for the module;
+    ``llama_server_args._flag_name`` mirrors it on the validation boundary.
+    """
+    return name.replace("_", "-") if name.startswith("--") else name
+
+
 def _extra_arg_flag_name(token: str) -> Optional[str]:
     if not token.startswith("-") or token in {"-", "--"}:
         return None
     if len(token) >= 2 and (token[1].isdigit() or token[1] == "."):
         return None
-    return token.split("=", 1)[0]
+    return _canonical_long_flag_name(token.split("=", 1)[0])
 
 
 def _extra_args_set_any_flag(extra_args: Optional[Iterable[str]], flags: Collection[str]) -> bool:
@@ -1606,6 +1619,7 @@ def _effective_spec_type(
     cli_value: Optional[str] = None
     for i, raw in enumerate(args):
         flag, eq, inline = raw.partition("=")
+        flag = _canonical_long_flag_name(flag)
         if flag == "--spec-default":
             cli_present = True
             cli_value = "default"
@@ -1650,6 +1664,7 @@ def _extra_args_spec_draft_n_max(extra_args: Optional[Iterable[str]]) -> Optiona
     found: Optional[int] = None
     for i, raw in enumerate(args):
         flag, eq, inline = raw.partition("=")
+        flag = _canonical_long_flag_name(flag)
         if flag not in ("--spec-draft-n-max", "--draft-max"):
             continue
         value = inline if eq else (args[i + 1] if i + 1 < len(args) else "")
@@ -1680,6 +1695,7 @@ def _extra_args_mtp_draft_path(
     found: Optional[str] = None
     for i, raw in enumerate(args):
         flag, eq, inline = raw.partition("=")
+        flag = _canonical_long_flag_name(flag)
         if flag not in flags:
             continue
         value = inline if eq else (args[i + 1] if i + 1 < len(args) else "")
@@ -1704,6 +1720,7 @@ def _extra_args_draft_cache_types(
     v_type: Optional[str] = None
     for i, raw in enumerate(args):
         flag, eq, inline = raw.partition("=")
+        flag = _canonical_long_flag_name(flag)
         if flag not in k_flags and flag not in v_flags:
             continue
         value = inline if eq else (args[i + 1] if i + 1 < len(args) else "")
@@ -1736,6 +1753,7 @@ def _extra_args_draft_offloaded_to_cpu(
     last_dev: Optional[str] = None
     for i, raw in enumerate(args):
         flag, eq, inline = raw.partition("=")
+        flag = _canonical_long_flag_name(flag)
         value = inline if eq else (args[i + 1] if i + 1 < len(args) else "")
         if flag in ngl_flags:
             last_ngl = value
@@ -1766,6 +1784,7 @@ def _extra_args_n_ubatch(
     found: Optional[int] = None
     for i, raw in enumerate(args):
         flag, eq, inline = raw.partition("=")
+        flag = _canonical_long_flag_name(flag)
         if flag not in ("--ubatch-size", "-ub"):
             continue
         value = inline if eq else (args[i + 1] if i + 1 < len(args) else "")
@@ -6168,18 +6187,10 @@ class LlamaCppBackend:
 
     @staticmethod
     def _canonical_long_flag(name: str) -> str:
-        """Return ``name`` with llama.cpp's long-option underscore normalization.
-
-        llama.cpp runs ``std::replace(arg.begin(), arg.end(), '_', '-')`` on any
-        argv token that starts with ``--`` before looking it up, so a legal
-        pass-through spelling like ``--cache_type_v`` parses as
-        ``--cache-type-v``. Mirror that here so managed-flag matching sees the
-        same canonical name. Short flags (``-ctv``) never carry underscores and
-        keep their exact spelling; pass only the flag name (no attached value).
-        """
-        if name.startswith("--"):
-            return name.replace("_", "-")
-        return name
+        """``name`` with llama.cpp's underscore folding (``--cache_type_v`` ->
+        ``--cache-type-v``); see ``_canonical_long_flag_name``. Pass only the
+        flag name, no attached value."""
+        return _canonical_long_flag_name(name)
 
     @staticmethod
     def _with_flash_attn_off(cmd: list[str]) -> Optional[list[str]]:
@@ -6195,24 +6206,39 @@ class LlamaCppBackend:
             nxt = out[i + 1] if i + 1 < len(out) else None
             return nxt if nxt in ("on", "auto", "off") else None
 
+        def flash_attn_parts(tok: str):
+            """(canonical flag, inline value or None), or (None, None).
+
+            Extras are appended after Unsloth's own ``--flash-attn on``, so
+            last-wins lets ``--flash_attn=on`` decide the effective value;
+            matching raw text left it untouched and the retry crashed again.
+            """
+            name, eq, inline = tok.partition("=")
+            canonical = _canonical_long_flag_name(name)
+            if canonical not in ("--flash-attn", "-fa"):
+                return None, None
+            return canonical, (inline if eq else None)
+
         effective = None
         for i, tok in enumerate(out):
-            if tok.startswith(("--flash-attn=", "-fa=")):
-                effective = tok.partition("=")[2]
-            elif tok in ("--flash-attn", "-fa"):
-                effective = explicit(i) or "on"
+            canonical, inline = flash_attn_parts(tok)
+            if canonical is None:
+                continue
+            effective = inline if inline is not None else (explicit(i) or "on")
         if effective not in ("on", "auto"):
             return None
         for i, tok in enumerate(out):
-            if tok.startswith(("--flash-attn=", "-fa=")):
-                flag, _, value = tok.partition("=")
-                if value in ("on", "auto"):
-                    out[i] = f"{flag}=off"
-            elif tok in ("--flash-attn", "-fa"):
-                if explicit(i) in ("on", "auto"):
-                    out[i + 1] = "off"
-                elif explicit(i) is None:  # bare flag (reads as on) -> explicit off
-                    out[i] = f"{tok}=off"
+            canonical, inline = flash_attn_parts(tok)
+            if canonical is None:
+                continue
+            if inline is not None:
+                if inline in ("on", "auto"):
+                    # In place, in the user's spelling: length must not change.
+                    out[i] = f"{tok.partition('=')[0]}=off"
+            elif explicit(i) in ("on", "auto"):
+                out[i + 1] = "off"
+            elif explicit(i) is None:  # bare flag (reads as on) -> explicit off
+                out[i] = f"{tok}=off"
 
         # A quantized V cache requires flash attention in llama.cpp: the init
         # aborts with "V cache quantization requires flash_attn". A quantized K
@@ -9269,6 +9295,7 @@ class LlamaCppBackend:
         args = [str(arg) for arg in cmd]
         for index, raw in enumerate(args):
             flag, equals, inline = raw.partition("=")
+            flag = _canonical_long_flag_name(flag)
             if flag not in main_flags and flag not in draft_flags:
                 continue
             value = inline if equals else (args[index + 1] if index + 1 < len(args) else "")
@@ -9917,6 +9944,7 @@ class LlamaCppBackend:
         files: list[str] = []
         for i, arg in enumerate(args):
             flag, sep, inline = arg.partition("=")
+            flag = _canonical_long_flag_name(flag)
             if flag not in self._SIDECAR_WEIGHT_FLAGS:
                 continue
             operand = inline if sep else (args[i + 1] if i + 1 < len(args) else "")
@@ -9946,7 +9974,7 @@ class LlamaCppBackend:
         # Caching off makes restores useless; last prompt-cache flag wins, env only when unset.
         last = None
         for arg in self._extra_args or ():
-            flag = arg.strip().split("=", 1)[0]
+            flag = _canonical_long_flag_name(arg.strip().split("=", 1)[0])
             if flag in ("--cache-prompt", "--no-cache-prompt"):
                 last = flag
         if last is not None:

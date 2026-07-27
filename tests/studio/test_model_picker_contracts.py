@@ -578,3 +578,167 @@ def test_legacy_migration_is_idempotent_and_non_destructive():
     # Layer 3: non-overwriting merge skips an existing (or default) key, so even a
     # forced re-run cannot duplicate or clobber a user's config.
     assert "if (isDefaultConfig(migrated) || Object.hasOwn(map, key)) {" in src
+
+
+def test_per_model_config_persists_llama_extra_args():
+    """Custom llama-server flags must round-trip through per-model config storage."""
+    src = _read("features/model-picker/model-config/per-model-config.ts")
+    assert "llamaExtraArgs" in src
+    assert '"llamaExtraArgs"' in src
+
+
+def test_gguf_load_paths_forward_llama_extra_args():
+    """GGUF /load requests must forward per-model llama_extra_args."""
+    for rel in (
+        "features/chat/api/chat-adapter.ts",
+        "features/chat/hooks/use-chat-model-runtime.ts",
+        "features/chat/shared-composer.tsx",
+    ):
+        src = _read(rel)
+        assert "llama_extra_args:" in src, rel
+        assert "llamaExtraArgsForLoad" in src, rel
+
+
+def test_model_config_page_exposes_custom_llama_server_args():
+    src = _read("features/model-picker/components/model-config-page.tsx")
+    assert "LlamaExtraArgsSetting" in src
+    assert "parseLlamaExtraArgsInput" in src
+    assert "text-[11px]" not in src
+
+
+def test_llama_extra_args_formatter_quotes_quote_chars():
+    """formatLlamaExtraArgs must re-quote tokens holding quote characters.
+
+    The field re-parses whatever was rendered, so a bare {"enable_thinking":false}
+    comes back as {enable_thinking:false} on the next blur, corrupting the flag.
+    """
+    src = _read("features/model-picker/model-config/llama-extra-args.ts")
+    assert "/[\\s\"']/.test(token)" in src
+
+
+def test_autoload_preflight_validates_the_args_it_loads():
+    """The cached-autoload /validate must send the extras its /load sends.
+
+    /validate sizes the training-guard VRAM estimate from the extras (a -c
+    raises the KV budget) and rejects managed flags, so omitting them lets the
+    preflight pass a different command than the load that then fails.
+    """
+    src = _read("features/chat/api/chat-adapter.ts")
+    start = src.index("await canAutoLoad({")
+    payload = src[start : src.index("}))", start)]
+    assert "llama_extra_args: effectiveLlamaExtraArgs" in payload
+
+
+def test_status_hydration_reseeds_llama_extra_args():
+    """A page refresh must recover the running server's args.
+
+    Without the reseed the field reads empty while the server still runs them,
+    and Reload omits llama_extra_args, which /load treats as "inherit".
+    """
+    src = _read("features/chat/lib/apply-inference-status-to-store.ts")
+    assert "llamaExtraArgs: status.llama_extra_args" in src
+    assert "loadedLlamaExtraArgs: status.llama_extra_args" in src
+    types_src = _read("features/chat/types/api.ts")
+    assert "llama_extra_args?: string[] | null;" in types_src
+
+
+def test_llama_extra_args_parser_keeps_non_escape_backslashes():
+    """A quoted Windows path must survive the field.
+
+    Only a quote or another backslash escapes, as in a shell: treating every
+    backslash as one turns "C:\\Program Files\\t.jinja" into
+    "C:Program Filest.jinja", on the very platform #7022 was reported from.
+    """
+    src = _read("features/model-picker/model-config/llama-extra-args.ts")
+    assert 'ch === "\\\\" && (next === quote || next === "\\\\")' in src
+    # Double quotes only. A shell keeps a single-quoted value verbatim, so the
+    # escape branch must not fire there (see the behavioural test in
+    # test_llama_extra_args_roundtrip.py).
+    assert 'quote === \'"\' && ch === "\\\\"' in src
+
+
+def test_same_click_commit_covers_the_custom_llama_args_field():
+    """The Custom llama-server Args field needs the same blur bridge.
+
+    It stages its draft only on blur, which commits via the parent update()
+    before the button's onClick runs, while handleRun's closure still holds the
+    pre-blur config. Without an imperative commit, typing flags and clicking Load
+    in one gesture launches the previous args while the panel shows the new ones.
+    """
+    page = _read("features/model-picker/components/model-config-page.tsx")
+    assert "const llamaExtraArgsInputRef = useRef<LlamaExtraArgsInputHandle>(null);" in page
+    assert "llamaExtraArgsInputRef.current?.commit()" in page
+    assert "ref={llamaExtraArgsInputRef}" in page
+    assert "llamaExtraArgsInputRef?: Ref<LlamaExtraArgsInputHandle>;" in page
+    # Gated on non-null like the numeric drafts, so an untouched field is a no-op.
+    assert "committedLlamaExtraArgs != null" in page
+    assert "pendingPatch.llamaExtraArgs = committedLlamaExtraArgs;" in page
+    # The handle mirrors NumericValueInputHandle, one-shot blur cache included.
+    assert "commit: () => string[] | null;" in page
+    assert "lastBlurCommittedRef" in page
+
+
+def test_load_paths_baseline_on_the_servers_effective_args():
+    """Every GGUF load path must baseline on what the server launched with.
+
+    /load strips the offload group from explicit extras when gpu_memory_mode is
+    manual, so seeding from the request advertises a dropped --cpu-moe as active
+    and baselines dirty tracking on a launch that never ran. Every sibling in
+    these setState calls (KV dtype, TP, spec type) already reads the response.
+    """
+    runtime = _read("features/chat/hooks/use-chat-model-runtime.ts")
+    assert "loadResponse.llama_extra_args !== undefined" in runtime
+    assert "loadedLlamaExtraArgs: loadedExtraArgs," in runtime
+    for rel, var in (
+        ("features/chat/api/chat-adapter.ts", "loadResp"),
+        ("features/chat/shared-composer.tsx", "resp"),
+    ):
+        src = _read(rel)
+        assert f"llamaExtraArgs: {var}.llama_extra_args ??" in src, rel
+        assert f"{var}.llama_extra_args ??" in src, rel
+    # An older backend (undefined) falls back to the request, not a blank field.
+    types_src = _read("features/chat/types/api.ts")
+    load_response = types_src.split("export interface LoadModelResponse")[1].split(
+        "export interface"
+    )[0]
+    assert "llama_extra_args?: string[] | null;" in load_response
+
+
+def test_applying_a_config_without_args_clears_them_explicitly():
+    """A config with no args must reach /load as [], not as an omitted field.
+
+    Reset stages DEFAULT_PER_MODEL_CONFIG, whose llamaExtraArgs is absent. Mapped
+    to null it collapses through llamaExtraArgsForLoad into an omitted field,
+    which /load reads as "inherit the previous same-model args" -- so Reset would
+    blank the input and relaunch the same flags. Every sibling field in this same
+    setState is already sent explicitly on the load that follows.
+    """
+    src = _read("features/model-picker/model-config/apply-per-model-config.ts")
+    assert "llamaExtraArgs: config.llamaExtraArgs ?? []," in src
+    assert "llamaExtraArgs: config.llamaExtraArgs ?? null," not in src
+    # The load path still distinguishes cleared ([]) from absent (undefined).
+    args_src = _read("features/model-picker/model-config/llama-extra-args.ts")
+    assert "if (args == null) {\n    return undefined;\n  }" in args_src
+    page = _read("features/model-picker/components/model-config-page.tsx")
+    assert "onClick={() => setConfig({ ...DEFAULT_PER_MODEL_CONFIG })}" in page
+
+
+def test_default_gguf_autoload_baselines_the_args_fields():
+    """The "download a small default GGUF" branch must reset both args fields.
+
+    loadedGpuMemoryFields only clears them on a non-GGUF response, and this
+    branch sends no llama_extra_args of its own, so args staged for a model that
+    never finished loading would stay in the store: the panel shows them for
+    Qwen and the next Reload sends them to it. Its siblings (KV dtype, TP, GPU
+    pick, chat template) are all re-baselined here already.
+    """
+    src = _read("features/chat/api/chat-adapter.ts")
+    branch = src.split('model_path: "unsloth/Qwen3.5-4B-MTP-GGUF"', 1)[1]
+    branch = branch.split("recordLastLocalModelLoad", 1)[0]
+    assert "llamaExtraArgs: loadResp.llama_extra_args ?? null," in branch
+    assert "loadedLlamaExtraArgs: loadResp.llama_extra_args ?? null," in branch
+    # The helper itself still only speaks for the non-GGUF case.
+    store = _read("features/chat/stores/chat-runtime-store.ts")
+    helper = store.split("export function loadedGpuMemoryFields", 1)[1]
+    helper = helper.split("export function hasGgufSource", 1)[0]
+    assert helper.count("llamaExtraArgs: null,") == 1

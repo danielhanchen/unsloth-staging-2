@@ -56,9 +56,9 @@ _DENYLIST_GROUPS: tuple[frozenset[str], ...] = (
     # llama.cpp binaries match.
     frozenset({"--webui", "--no-webui"}),
     frozenset({"--ui", "--no-ui"}),
-    frozenset({"--ui-config"}),
-    frozenset({"--ui-config-file"}),
-    frozenset({"--ui-mcp-proxy", "--no-ui-mcp-proxy"}),
+    frozenset({"--ui-config", "--webui-config"}),
+    frozenset({"--ui-config-file", "--webui-config-file"}),
+    frozenset({"--ui-mcp-proxy", "--no-ui-mcp-proxy", "--webui-mcp-proxy", "--no-webui-mcp-proxy"}),
     frozenset({"--models-dir"}),
     frozenset({"--models-preset"}),
     frozenset({"--models-max"}),
@@ -70,6 +70,10 @@ _DENYLIST_GROUPS: tuple[frozenset[str], ...] = (
     # llama-server's own built-in tools flag would silently stack on top of
     # Unsloth's --enable-tools / --disable-tools policy resolver.
     frozenset({"--tools"}),
+    # --agent sets server_tools={"all"} (exec_shell_command, write_file, ...) and
+    # ui_mcp_proxy=true: denying only --tools / --ui-mcp-proxy leaves the same
+    # switch one alias away.
+    frozenset({"-ag", "--agent", "-no-ag", "--no-agent"}),
     # Slot-state dir: Studio owns it for KV persistence across idle unload.
     frozenset({"--slot-save-path"}),
 )
@@ -83,6 +87,11 @@ def _flag_name(token: str) -> Optional[str]:
     Peels `--key=value` to `--key`, treats `-1`/`-0.5` as values (shorts
     always start with a letter), and normalises attached `-np8` / `-np-1` /
     `-np8x` to `-np`. Mirrors the CLI's `_expand_attached_np_short`.
+
+    Long flags also fold `_` to `-`, like llama.cpp's own
+    `std::replace(arg, '_', '-')` on `--` args (common/arg.cpp): `--api_key`
+    reaches `--api-key`, so a hyphen-only denylist would be one underscore
+    from a bypass. Shorts are left alone, as upstream.
     """
     token = token.strip()
     if not token.startswith("-") or token in {"-", "--"}:
@@ -90,6 +99,8 @@ def _flag_name(token: str) -> Optional[str]:
     if len(token) >= 2 and (token[1].isdigit() or token[1] == "."):
         return None
     name = token.split("=", 1)[0]
+    if name.startswith("--"):
+        name = name.replace("_", "-")
     if len(name) > 3 and name.startswith("-np"):
         suffix = name[3:]
         if suffix[0].isdigit() or (

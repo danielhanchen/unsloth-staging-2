@@ -2152,3 +2152,115 @@ def test_already_in_target_state_retries_after_hf_drafter_not_found():
     # Sanity: with no fallback reason the same request still dedupes (matches).
     ok = _mtp_backend(_model_identifier = "unsloth/gemma-4-E4B-it-GGUF", _gguf_path = None)
     assert ok._already_in_target_state(**_drafter_not_found_kwargs()) is True
+
+
+# ── Underscore aliases: llama.cpp folds `_` to `-` on every `--` arg ──
+#
+# common/arg.cpp runs std::replace(arg, '_', '-') before matching, verified on
+# llama-server b10107: `--spec_type BOGUS` reports `error while handling
+# argument "--spec-type"`, an unknown flag reports `invalid argument`. These
+# spellings pass validation, so the runtime parsers must resolve them the same
+# way or Studio budgets VRAM and reports a mode the child does not run.
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--gpu_layers", "0"],
+        ["--n_gpu_layers=0"],
+    ],
+)
+def test_offload_override_detects_underscore_aliases(extra_args):
+    assert _extra_args_set_any_flag(extra_args, _GPU_OFFLOAD_OVERRIDE_FLAGS) is True
+
+
+def test_spec_type_auto_emit_suppressed_by_underscore_alias():
+    # Missing this appends Unsloth's own --spec-type, and llama.cpp's last-wins
+    # parse then runs the user's mode against a budget sized for Unsloth's.
+    assert _extra_args_set_spec_type(["--spec_type", "draft-mtp"]) is True
+    assert _extra_args_set_spec_type(["--spec_default"]) is True
+
+
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--spec_type", "draft-mtp"],
+        ["--spec_type=draft-mtp"],
+    ],
+)
+def test_mtp_reserve_sees_underscore_spec_type(extra_args):
+    from core.inference.llama_cpp import _effective_spec_type, _extra_args_requests_mtp
+
+    assert _effective_spec_type(extra_args, {}) == "draft-mtp"
+    assert _extra_args_requests_mtp(extra_args, {}) is True
+    # A CLI flag beats the env, so an underscore override still turns MTP off.
+    assert (
+        _extra_args_requests_mtp(["--spec_type", "ngram"], {"LLAMA_ARG_SPEC_TYPE": "draft-mtp"})
+        is False
+    )
+
+
+def test_draft_sizing_parsers_see_underscore_aliases():
+    from core.inference.llama_cpp import (
+        _extra_args_draft_cache_types,
+        _extra_args_draft_offloaded_to_cpu,
+        _extra_args_mtp_draft_path,
+        _extra_args_n_ubatch,
+        _extra_args_requests_separate_draft,
+        _extra_args_spec_draft_n_max,
+    )
+
+    assert _extra_args_requests_separate_draft(["--spec_type", "draft-eagle3"], {}) is True
+    assert _extra_args_spec_draft_n_max(["--spec_draft_n_max", "7"]) == 7
+    assert _extra_args_mtp_draft_path(["--model_draft", "/d.gguf"], {}) == "/d.gguf"
+    assert _extra_args_draft_cache_types(["--spec_draft_type_k", "q8_0"], {}) == ("q8_0", None)
+    assert _extra_args_draft_offloaded_to_cpu(["--spec_draft_ngl", "0"], {}) is True
+    assert _extra_args_n_ubatch(["--ubatch_size", "256"], {}) == 256
+
+
+def test_gpu_device_pin_sees_underscore_aliases():
+    assert LlamaCppBackend._cmd_has_gpu_device_pin(["--device_draft", "CUDA0"], {}) is True
+    assert LlamaCppBackend._cmd_has_gpu_device_pin(["--device_draft", "cpu"], {}) is False
+
+
+def test_underscore_folding_is_long_flags_only():
+    # Upstream leaves shorts alone, and a value token is never a flag.
+    from core.inference.llama_cpp import _canonical_long_flag_name, _extra_arg_flag_name
+
+    assert _canonical_long_flag_name("-ngl") == "-ngl"
+    assert _canonical_long_flag_name("--gpu_layers") == "--gpu-layers"
+    assert _extra_arg_flag_name("-ngl") == "-ngl"
+    assert _extra_arg_flag_name("-1") is None
+    assert _extra_arg_flag_name("-0.5") is None
+    assert _extra_arg_flag_name("notaflag") is None
+    assert _extra_arg_flag_name("--") is None
+    # The class helper and the module helper must stay one implementation.
+    assert LlamaCppBackend._canonical_long_flag("--cache_type_v") == "--cache-type-v"
+
+
+def test_flash_attn_off_recovery_sees_underscore_aliases():
+    """The FA-off crash-recovery rung must beat an appended underscore alias.
+
+    Unsloth emits its own `--flash-attn on` and appends user extras after it, so
+    last-wins lets a pass-through `--flash_attn=on` decide the effective value.
+    Matching raw text left it untouched and the retry crashed like the first try.
+    """
+    studio = ["llama-server", "-m", "/m.gguf", "--flash-attn", "on", "--no-context-shift"]
+    for extra, expected_tail in (
+        (["--flash_attn=on"], ["--flash_attn=off"]),
+        (["--flash_attn"], ["--flash_attn=off"]),
+        (["--flash_attn", "on"], ["--flash_attn", "off"]),
+        (["--flash-attn=auto"], ["--flash-attn=off"]),
+    ):
+        cmd = studio + extra
+        retry = LlamaCppBackend._with_flash_attn_off(cmd)
+        assert retry is not None, extra
+        # Length preserved for downstream slices, Unsloth's flag flipped, the
+        # user's alias neutralised in its own spelling.
+        assert len(retry) == len(cmd), extra
+        assert retry[3:5] == ["--flash-attn", "off"], extra
+        assert retry[len(studio) :] == expected_tail, extra
+
+    # An effective value that is already off means there is nothing to retry.
+    assert LlamaCppBackend._with_flash_attn_off(studio + ["--flash_attn=off"]) is None
+    assert LlamaCppBackend._with_flash_attn_off(["llama-server", "-m", "/m.gguf"]) is None

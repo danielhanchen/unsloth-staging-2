@@ -170,6 +170,10 @@ def test_non_flag_token_passes_through():
         "--ui-config-file",
         "--ui-mcp-proxy",
         "--no-ui-mcp-proxy",
+        "--webui-config",
+        "--webui-config-file",
+        "--webui-mcp-proxy",
+        "--no-webui-mcp-proxy",
         "--models-dir",
         "--models-preset",
         "--models-max",
@@ -183,6 +187,11 @@ def test_non_flag_token_passes_through():
         "--reranking",
         # llama-server's own --tools clashes with Unsloth's tool policy.
         "--tools",
+        # --agent is shorthand for --tools all + --ui-mcp-proxy.
+        "-ag",
+        "--agent",
+        "-no-ag",
+        "--no-agent",
         # Slot-state dir: Studio owns it for KV persistence across idle unload.
         "--slot-save-path",
     ],
@@ -256,6 +265,28 @@ def test_denylist_rejects_np_with_digit_prefix_and_junk(attached):
     # expands, else HTTP /load could smuggle `-np8x` through.
     with pytest.raises(ValueError, match = "np"):
         validate_extra_args([attached])
+
+
+def test_agent_alias_is_managed_like_tools_and_mcp_proxy():
+    # common/arg.cpp: -ag/--agent sets server_tools={"all"} (exec_shell_command,
+    # write_file, ...) and ui_mcp_proxy=true -- the exact two options --tools and
+    # --ui-mcp-proxy are denied for, so denying only those is one alias away.
+    for flag in ("-ag", "--agent", "-no-ag", "--no-agent", "--agent=1", "--no_agent"):
+        assert is_managed_flag(flag) is True
+        with pytest.raises(ValueError):
+            validate_extra_args([flag])
+
+
+def test_legacy_webui_aliases_are_managed():
+    # Upstream renamed --webui-* to --ui-* but kept both spellings on the same
+    # option (common/arg.cpp), so denying only the new names is a bypass.
+    for flag in (
+        "--webui-config",
+        "--webui-config-file",
+        "--webui-mcp-proxy",
+        "--no-webui-mcp-proxy",
+    ):
+        assert is_managed_flag(flag) is True
 
 
 def test_denylist_rejects_short_form_when_long_is_denied():
@@ -862,3 +893,62 @@ def test_strip_shadowing_flags_keeps_model_draft_without_spec():
         strip_template = False,
     )
     assert out == ["--model-draft", "/custom/mtp.gguf"]
+
+
+# ── Underscore aliases (llama.cpp folds `_` to `-` on long flags) ─────
+
+
+@pytest.mark.parametrize(
+    "denied",
+    [
+        "--api_key",
+        "--api_key_file",
+        "--api_prefix",
+        "--ssl_key_file",
+        "--ssl_cert_file",
+        "--n_parallel",
+        "--model_url",
+        "--hf_repo",
+        "--hf_file",
+        "--hf_token",
+        "--docker_repo",
+        "--mmproj_url",
+        "--slot_save_path",
+        "--models_dir",
+        "--models_preset",
+        "--models_max",
+        "--models_autoload",
+        "--reuse_port",
+        "--no_webui",
+        "--no_ui",
+        "--ui_config_file",
+        "--ui_mcp_proxy",
+    ],
+)
+def test_denylist_rejects_underscore_aliases(denied):
+    # common/arg.cpp runs std::replace(arg, '_', '-') on every `--` arg, so
+    # `--api_key` reaches --api-key: a hyphen-only denylist would be one
+    # underscore from handing over auth, model identity and the port.
+    with pytest.raises(ValueError):
+        validate_extra_args([denied, "value"])
+    with pytest.raises(ValueError):
+        validate_extra_args([f"{denied}=value"])
+    assert is_managed_flag(denied) is True
+
+
+def test_underscore_normalisation_is_long_flags_only():
+    # Upstream leaves shorts alone: `-m` stays managed, no short gains an alias.
+    assert is_managed_flag("-m") is True
+    assert is_managed_flag("--no_mmap") is False
+    assert is_managed_flag("--cpu_moe") is False
+    assert validate_extra_args(["--cpu_moe", "--no_mmap"]) == ["--cpu_moe", "--no_mmap"]
+
+
+def test_shadow_parsers_see_underscore_spellings():
+    # The child honours `--ctx_size`; missing it sizes the KV budget for a
+    # different context than the server allocates.
+    assert parse_ctx_override(["--ctx_size", "8192"]) == 8192
+    assert parse_cache_override(["--cache_type_k", "q8_0"]) == "q8_0"
+    assert parse_split_mode_override(["--split_mode", "tensor"]) == "tensor"
+    assert extra_args_disable_mmproj(["--no_mmproj"]) is True
+    assert strip_shadowing_flags(["--ctx_size", "8192", "--top-k", "20"]) == ["--top-k", "20"]

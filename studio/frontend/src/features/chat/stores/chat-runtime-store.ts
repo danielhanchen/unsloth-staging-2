@@ -630,6 +630,8 @@ export function loadedGpuMemoryFields(resp: {
       loadedSplitRatio: null,
       ggufLayerCount: null,
       moeLayerCount: null,
+      llamaExtraArgs: null,
+      loadedLlamaExtraArgs: null,
     };
   }
   const mode = resp.gpu_memory_mode ?? "auto";
@@ -901,6 +903,9 @@ type ChatRuntimeStore = {
   /** Picked physical GPU indices (null = use all / automatic). */
   selectedGpuIds: number[] | null;
   loadedGpuIds: number[] | null;
+  /** Per-model llama-server pass-through flags (GGUF-only); null = none. */
+  llamaExtraArgs: string[] | null;
+  loadedLlamaExtraArgs: string[] | null;
   /** Persisted: expand every On Device GGUF repo's quantizations by default
    *  instead of waiting for a click. */
   expandQuantizations: boolean;
@@ -1354,6 +1359,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   moeLayerCount: null,
   selectedGpuIds: null,
   loadedGpuIds: null,
+  llamaExtraArgs: null,
+  loadedLlamaExtraArgs: null,
   expandQuantizations: loadBool(CHAT_EXPAND_QUANTIZATIONS_KEY, false),
   showAllQuantizations: loadBool(CHAT_SHOW_ALL_QUANTIZATIONS_KEY, true),
   fitOnDeviceOnly: loadBool(MODELS_FIT_ON_DEVICE_ONLY_KEY, false),
@@ -1608,6 +1615,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       moeLayerCount: null,
       selectedGpuIds: null,
       loadedGpuIds: null,
+      llamaExtraArgs: null,
+      loadedLlamaExtraArgs: null,
       loadedIsMultimodal: false,
       loadedIsDiffusion: false,
       customContextLength: null,

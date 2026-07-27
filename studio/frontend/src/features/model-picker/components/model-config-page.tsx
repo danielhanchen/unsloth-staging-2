@@ -27,8 +27,10 @@ import { HugeiconsIcon } from "@hugeicons/react";
 import {
   type ReactNode,
   type Ref,
+  forwardRef,
   useEffect,
   useId,
+  useImperativeHandle,
   useRef,
   useState,
 } from "react";
@@ -55,6 +57,10 @@ import {
   resolveInitialConfig,
   savePerModelConfig,
 } from "../model-config/per-model-config";
+import {
+  formatLlamaExtraArgs,
+  parseLlamaExtraArgsInput,
+} from "../model-config/llama-extra-args";
 import { ChatTemplateEditorDialog } from "./chat-template-editor-dialog";
 import type { ModelPickTarget } from "./model-selector/types";
 import {
@@ -92,7 +98,8 @@ function hasNonDefaultAdvanced(config: PerModelConfig): boolean {
     (config.gpuMemoryMode ?? "auto") !== "auto" ||
     (config.gpuLayers != null && config.gpuLayers >= 0) ||
     (config.nCpuMoe ?? 0) > 0 ||
-    config.selectedGpuIds != null
+    config.selectedGpuIds != null ||
+    (config.llamaExtraArgs?.length ?? 0) > 0
   );
 }
 
@@ -413,6 +420,97 @@ function GpuMemorySettings({
   );
 }
 
+export type LlamaExtraArgsInputHandle = {
+  /** Commit a focused/same-click draft; null when none is pending. */
+  commit: () => string[] | null;
+};
+
+const LlamaExtraArgsSetting = forwardRef<
+  LlamaExtraArgsInputHandle,
+  {
+    config: PerModelConfig;
+    update: (patch: Partial<PerModelConfig>) => void;
+  }
+>(function LlamaExtraArgsSetting({ config, update }, ref) {
+  const [draft, setDraft] = useState(() =>
+    formatLlamaExtraArgs(config.llamaExtraArgs),
+  );
+  const draftRef = useRef(draft);
+  const dirtyRef = useRef(false);
+  // Same-click Load: blur commits via update() before the button's onClick, but
+  // handleRun's closure still holds the pre-blur config. Keep the blur result
+  // for one commit(), dropped on any settled render, like NumericValueInput.
+  const lastBlurCommittedRef = useRef<string[] | null>(null);
+  useEffect(() => {
+    lastBlurCommittedRef.current = null;
+  });
+  useEffect(() => {
+    const next = formatLlamaExtraArgs(config.llamaExtraArgs);
+    setDraft(next);
+    draftRef.current = next;
+    dirtyRef.current = false;
+  }, [config.llamaExtraArgs]);
+  const commitDraft = (raw: string): string[] => {
+    const next = parseLlamaExtraArgsInput(raw);
+    const current = config.llamaExtraArgs;
+    const same =
+      (current?.length ?? 0) === next.length &&
+      (current ?? []).every((token, index) => token === next[index]);
+    if (!same) {
+      update({ llamaExtraArgs: next });
+    }
+    return next;
+  };
+  const commit = () => {
+    lastBlurCommittedRef.current = commitDraft(draftRef.current);
+    dirtyRef.current = false;
+  };
+  useImperativeHandle(ref, () => ({
+    commit: () => {
+      if (dirtyRef.current) {
+        const committed = commitDraft(draftRef.current);
+        dirtyRef.current = false;
+        lastBlurCommittedRef.current = null;
+        return committed;
+      }
+      const blurCommitted = lastBlurCommittedRef.current;
+      lastBlurCommittedRef.current = null;
+      return blurCommitted;
+    },
+  }));
+  return (
+    <div className="space-y-2">
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className={LABEL_CLASS_WRAP}>Custom llama-server Args</span>
+        <InfoHint>
+          Extra flags passed to llama-server after Unsloth&apos;s defaults.
+          Useful for large MoE models on consumer GPUs, e.g.{" "}
+          <code className="text-ui-11">--cpu-moe --no-mmap</code>. Unsloth-managed
+          flags (model path, port, parallel slots) are rejected.
+        </InfoHint>
+      </div>
+      <input
+        type="text"
+        value={draft}
+        onChange={(event) => {
+          setDraft(event.target.value);
+          draftRef.current = event.target.value;
+          dirtyRef.current = true;
+        }}
+        onBlur={commit}
+        onKeyDown={(event) => {
+          if (event.key === "Enter") {
+            event.currentTarget.blur();
+          }
+        }}
+        placeholder="--cpu-moe --no-mmap"
+        aria-label="Custom llama-server arguments"
+        className={`h-8 w-full min-w-0 ${CONTROL_SURFACE} px-3 py-0 text-ui-13 font-medium text-nav-fg outline-none focus-visible:ring-0`}
+      />
+    </div>
+  );
+});
+
 function GgufAdvancedSettings({
   config,
   update,
@@ -423,6 +521,7 @@ function GgufAdvancedSettings({
   moeLayerCount,
   gpuLayersInputRef,
   moeLayersInputRef,
+  llamaExtraArgsInputRef,
 }: {
   config: PerModelConfig;
   update: (patch: Partial<PerModelConfig>) => void;
@@ -433,6 +532,7 @@ function GgufAdvancedSettings({
   moeLayerCount: number | null;
   gpuLayersInputRef?: Ref<NumericValueInputHandle>;
   moeLayersInputRef?: Ref<NumericValueInputHandle>;
+  llamaExtraArgsInputRef?: Ref<LlamaExtraArgsInputHandle>;
 }) {
   return (
     <>
@@ -565,6 +665,12 @@ function GgufAdvancedSettings({
         moeLayersInputRef={moeLayersInputRef}
       />
 
+      <LlamaExtraArgsSetting
+        config={config}
+        update={update}
+        ref={llamaExtraArgsInputRef}
+      />
+
       <ChatTemplateSetting config={config} onEditTemplate={onEditTemplate} />
     </>
   );
@@ -629,6 +735,7 @@ export function ModelConfigPage({
   const maxSeqLengthInputRef = useRef<NumericValueInputHandle>(null);
   const gpuLayersInputRef = useRef<NumericValueInputHandle>(null);
   const moeLayersInputRef = useRef<NumericValueInputHandle>(null);
+  const llamaExtraArgsInputRef = useRef<LlamaExtraArgsInputHandle>(null);
   const nativePathToken =
     target.meta.nativePathToken ??
     (isActiveModel ? activeNativePathToken : null);
@@ -804,6 +911,9 @@ export function ModelConfigPage({
     const committedMoeLayers = target.isGguf
       ? moeLayersInputRef.current?.commit()
       : undefined;
+    const committedLlamaExtraArgs = target.isGguf
+      ? llamaExtraArgsInputRef.current?.commit()
+      : undefined;
 
     const pendingPatch: Partial<PerModelConfig> = {};
     if (committedContext != null) {
@@ -821,11 +931,15 @@ export function ModelConfigPage({
     if (committedMoeLayers != null) {
       pendingPatch.nCpuMoe = committedMoeLayers;
     }
+    if (committedLlamaExtraArgs != null) {
+      pendingPatch.llamaExtraArgs = committedLlamaExtraArgs;
+    }
     const hasPending =
       committedContext != null ||
       committedMaxSeqLength != null ||
       committedGpuLayers != null ||
-      committedMoeLayers != null;
+      committedMoeLayers != null ||
+      committedLlamaExtraArgs != null;
 
     const effectiveConfig = hasPending
       ? { ...config, ...pendingPatch }
@@ -991,6 +1105,7 @@ export function ModelConfigPage({
                 moeLayerCount={stagedDims?.moeLayerCount ?? null}
                 gpuLayersInputRef={gpuLayersInputRef}
                 moeLayersInputRef={moeLayersInputRef}
+                llamaExtraArgsInputRef={llamaExtraArgsInputRef}
               />
             )}
 
