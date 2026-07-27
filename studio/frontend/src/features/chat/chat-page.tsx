@@ -2120,6 +2120,10 @@ export function ChatPage({
       webFetchToolsEnabled: supportsBuiltinWebFetch
         ? (storedWebFetchToolsEnabled ?? false)
         : false,
+      // MCP persists in localStorage, so without this a Connection inherits a
+      // local model's opt-in and can invoke local MCP tools on its first turn.
+      // In-memory only: a reload restores the user's local-model preference.
+      ...(supportsLocalToolRuntime ? { mcpEnabledForChat: false } : {}),
     });
   }, [externalProvidersForChat, inferenceParams.checkpoint]);
   const canCompare = useMemo(() => {
@@ -2645,6 +2649,9 @@ export function ChatPage({
           webFetchToolsEnabled: supportsBuiltinWebFetch
             ? (storedWebFetchToolsEnabled ?? false)
             : false,
+          // See the mount-time block: MCP is persisted, so it must not carry a
+          // local model's opt-in into an OAI-compat Connection.
+          ...(supportsLocalToolRuntime ? { mcpEnabledForChat: false } : {}),
           ...(stillOnOpenRouterFree ? {} : { lastOpenRouterChosenModel: null }),
         });
         return;
