@@ -270,6 +270,36 @@ def _load_run_module():
     return _RUN_MODULE
 
 
+def _missing_studio_requirement(run_mod):
+    from importlib.metadata import PackageNotFoundError, distribution
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    requirements = Path(run_mod.__file__).with_name("requirements") / "studio.txt"
+    for line in requirements.read_text(encoding = "utf-8").splitlines():
+        line = line.partition("#")[0].strip()
+        # pip flags (-r, --extra-index-url) are not requirements. Skipping them
+        # matters: an unparseable line would report the install broken, and
+        # repair reinstalls the same file, so the failure would never clear.
+        if not line or line.startswith("-"):
+            continue
+        try:
+            requirement = Requirement(line)
+        except InvalidRequirement:
+            continue
+        if requirement.marker and not requirement.marker.evaluate():
+            continue
+        try:
+            installed = distribution(requirement.name)
+        except PackageNotFoundError:
+            return requirement.name
+        # prereleases=True: a prerelease satisfying a floor is not a broken install.
+        if requirement.specifier and not requirement.specifier.contains(
+            installed.version, prereleases = True
+        ):
+            return requirement.name
+    return None
+
+
 def _find_setup_script() -> Optional[Path]:
     """Find studio/setup.sh or studio/setup.ps1.
 
@@ -2824,6 +2854,42 @@ def desktop_capabilities(
 
     for key, value in payload.items():
         typer.echo(f"{key}: {value}")
+
+
+@studio_app.command("desktop-runtime-check", hidden = True)
+def desktop_runtime_check(
+    _json_output: bool = typer.Option(
+        False,
+        "--json",
+        help = "Emit machine-readable JSON.",
+    ),
+):
+    try:
+        run_mod = _load_run_module()
+        missing = _missing_studio_requirement(run_mod)
+        if missing:
+            raise ModuleNotFoundError(
+                f"No distribution named {missing!r}",
+                name = missing,
+            )
+    except ModuleNotFoundError as exc:
+        payload = {
+            "runtime_ready": False,
+            "reason": "missing_dependency",
+            "module": exc.name,
+        }
+    except Exception as exc:
+        payload = {
+            "runtime_ready": False,
+            "reason": "backend_import_failed",
+            "error_type": type(exc).__name__,
+        }
+    else:
+        payload = {"runtime_ready": True}
+
+    typer.echo(json.dumps(payload, sort_keys = True))
+    if not payload["runtime_ready"]:
+        raise typer.Exit(code = 1) from None
 
 
 @studio_app.command("provision-desktop-auth", hidden = True)

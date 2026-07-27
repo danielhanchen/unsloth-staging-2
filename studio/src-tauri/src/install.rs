@@ -7,6 +7,8 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
+const INSTALL_IN_PROGRESS_MARKER: &str = ".desktop-install-in-progress";
+
 // ── Types ──
 
 pub struct InstallProcess {
@@ -37,6 +39,67 @@ pub fn new_install_state() -> InstallState {
 }
 
 use crate::process::trim_line_endings;
+
+fn install_in_progress_marker_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    Ok(home
+        .join(".unsloth")
+        .join("studio")
+        .join(INSTALL_IN_PROGRESS_MARKER))
+}
+
+pub(crate) fn managed_install_in_progress() -> bool {
+    install_in_progress_marker_path()
+        .map(|path| path.is_file())
+        .unwrap_or(false)
+}
+
+fn create_install_in_progress_marker() -> Result<(), String> {
+    let path = install_in_progress_marker_path()?;
+    create_install_in_progress_marker_at(&path)
+}
+
+fn create_install_in_progress_marker_at(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Invalid install marker path: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(error) => Err(format!("Failed to create {}: {}", path.display(), error)),
+    }
+}
+
+fn clear_install_in_progress_marker() -> Result<(), String> {
+    let path = install_in_progress_marker_path()?;
+    clear_install_in_progress_marker_at(&path)
+}
+
+/// The marker means "a run started and never reported an outcome", so every
+/// terminal outcome clears it, failures included. The runtime probe is the
+/// backstop for a broken venv, whereas a marker left behind by a failed update
+/// pins a working install into a repair it may not be able to finish offline.
+/// Never fatal: losing the marker costs a fast path, not correctness.
+fn clear_install_marker_best_effort() {
+    if let Err(msg) = clear_install_in_progress_marker() {
+        warn!("[install] {}", msg);
+    }
+}
+
+fn clear_install_in_progress_marker_at(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to remove {}: {}", path.display(), error)),
+    }
+}
 
 // ── Script Resolution ──
 
@@ -443,6 +506,10 @@ fn run_install_with_event_mode(
         &format!("Using script: {}", script.display()),
     );
 
+    if let Err(msg) = create_install_in_progress_marker() {
+        warn!("[install] {}", msg);
+    }
+
     let (stdout, stderr) = match spawn_script(&script, &args, &state) {
         Ok(handles) => handles,
         Err(msg) => {
@@ -475,6 +542,7 @@ fn run_install_with_event_mode(
 
     match result {
         Ok((status, _)) if status.success() => {
+            clear_install_marker_best_effort();
             diagnostics::finish_attempt(
                 &diagnostics,
                 &attempt,
@@ -508,6 +576,7 @@ fn run_install_with_event_mode(
                 let _ = app.emit(event_mode.needs_elevation_event(), &packages);
                 Err("NEEDS_ELEVATION".to_string())
             } else {
+                clear_install_marker_best_effort();
                 let msg = format!("Installer exited with code {}", code);
                 diagnostics::finish_attempt(
                     &diagnostics,
@@ -530,6 +599,7 @@ fn run_install_with_event_mode(
             Err(msg)
         }
         Err(msg) => {
+            clear_install_marker_best_effort();
             diagnostics::finish_attempt(&diagnostics, &attempt, None, false, Some(msg.clone()));
             clear_current_attempt(&state);
             if event_mode.emit_terminal_events() {
@@ -569,6 +639,9 @@ pub fn record_pending_elevation_canceled(
     let Some(attempt) = attempt else {
         return false;
     };
+    // The elevation exit left the marker in place for the resumed run that is
+    // now not happening.
+    clear_install_marker_best_effort();
     diagnostics::finish_attempt(
         diagnostics,
         &attempt,
@@ -841,6 +914,9 @@ fn finish_elevation_failure(
     exit_status: Option<String>,
     message: String,
 ) {
+    // Terminal, like a cancelled prompt: the run the code 2 exit left the
+    // marker for is not happening.
+    clear_install_marker_best_effort();
     if let Some(attempt) = attempt {
         diagnostics::finish_attempt(
             diagnostics,
@@ -876,6 +952,30 @@ fn capped_output_text(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_marker_persists_until_explicit_success_cleanup() {
+        let directory = std::env::temp_dir().join(format!(
+            "unsloth-install-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let marker = directory.join(INSTALL_IN_PROGRESS_MARKER);
+
+        create_install_in_progress_marker_at(&marker).unwrap();
+        assert!(marker.is_file());
+
+        create_install_in_progress_marker_at(&marker).unwrap();
+        assert!(marker.is_file());
+
+        clear_install_in_progress_marker_at(&marker).unwrap();
+        assert!(!marker.exists());
+        clear_install_in_progress_marker_at(&marker).unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn elevated_output_cap_is_utf8_boundary_safe() {
