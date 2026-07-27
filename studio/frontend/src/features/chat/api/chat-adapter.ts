@@ -1807,13 +1807,21 @@ async function autoLoadSmallestModel(): Promise<{
     return true;
   }
   try {
+    // Only the comprehensive scan failing means the device list is unknown: it
+    // walks the HF caches too, so it reconstructs whatever the two cache
+    // endpoints would have returned. Claiming otherwise would let a cache-list
+    // blip outrank an empty device or a real load error in the final toast.
     const unreadable =
       <T,>(fallback: T) =>
       (error: unknown): T => {
-        inventoryUnavailable = true;
         noteFailure(error);
         return fallback;
       };
+    const deviceUnreadable = (error: unknown): LocalModelInfo[] => {
+      inventoryUnavailable = true;
+      noteFailure(error);
+      return [];
+    };
     // The two cache lists only cover the managed HF caches, so a model in the
     // models folder, an LM Studio dir or a registered scan folder was invisible
     // here even though the picker listed it. The backend indexes all of them at
@@ -1823,7 +1831,7 @@ async function autoLoadSmallestModel(): Promise<{
       listCachedModels().catch(unreadable<CachedModelRepo[]>([])),
       listOnDeviceInventory()
         .then((response) => response.models)
-        .catch(unreadable<LocalModelInfo[]>([])),
+        .catch(deviceUnreadable),
     ]);
     // Fold the on-device rows into the same two lists the loops below already
     // walk. A row is a candidate on the capability the scanner computed while it

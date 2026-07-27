@@ -18,6 +18,7 @@ never report an unreadable inventory as an empty device.
 from __future__ import annotations
 
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -310,3 +311,25 @@ def test_a_failed_load_attempt_keeps_its_reason():
     assert "} catch {" not in sweep
     for handler in sweep.split("catch (error) {")[1:]:
         assert "noteFailure(error);" in handler.split("}")[0]
+
+
+def test_only_the_device_scan_failing_reports_an_unreadable_device():
+    """A blip on either managed-cache endpoint must not be reported as "could
+    not read the on-device list". /api/hub/local scans the HF caches too, so
+    when it succeeds the device inventory is known. The outer catch still sets
+    the flag: an unexpected throw really does leave the state unknown."""
+    sweep = _sweep().split("export function createOpenAIStreamAdapter")[0]
+
+    def handler_body(call: str) -> str:
+        """The body of whichever catch handler is wired to *call*."""
+        name = re.search(re.escape(call) + r"\s*\.catch\((\w+)", sweep).group(1)
+        after = sweep.split(f"const {name} =", 1)[1]
+        # Stop at the next declaration at the same indent, so a later handler
+        # does not leak into this one's body.
+        return after.split("\n    const ", 1)[0]
+
+    assert "inventoryUnavailable" not in handler_body("listCachedGguf()")
+    assert "inventoryUnavailable" not in handler_body("listCachedModels()")
+    assert "inventoryUnavailable = true" in handler_body(
+        "listOnDeviceInventory()\n        .then((response) => response.models)"
+    )
