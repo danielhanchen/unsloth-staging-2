@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -28,6 +29,35 @@ FIRST_RUN_PASSWORD = "unsloth-ci-smoke-pw"
 from studio_test_kit.auth import login, seed_init_script  # noqa: E402
 from studio_test_kit.lifecycle import StudioInstall, launch_studio, stop_studio  # noqa: E402
 from studio_test_kit.ui import open_chat  # noqa: E402
+
+
+def password_unset(home: Path) -> bool:
+    """True when no admin password has been chosen yet.
+
+    Mirrors the CLI's own test, `must_change_password` on the admin row, rather
+    than guessing from a file: the bootstrap file is written at first launch, so
+    before one it is absent on a fresh install and present after, which is the
+    opposite of what it looks like. A missing DB or row is the fresh case; the
+    CLI creates both. Anything unreadable answers False, since supplying a
+    password that is already set refuses to start.
+    """
+    db = home / "auth" / "auth.db"
+    if not db.is_file():
+        return True
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    except sqlite3.Error:
+        return False
+    try:
+        row = conn.execute(
+            "SELECT must_change_password FROM auth_user WHERE username = ?",
+            ("unsloth",),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    finally:
+        conn.close()
+    return row is None or bool(row[0])
 
 
 async def complete_first_run(page, out: Path) -> bool:
@@ -133,10 +163,9 @@ def main() -> int:
     # account". Env var, not argv: the help text notes a literal value is visible in
     # the process list.
     #
-    # Only on a genuine first run. Setting it when one already exists is a hard
-    # error that refuses to start, and the auto-generated bootstrap file is exactly
-    # the "no password chosen yet" signal the CLI itself keys on.
-    first_run = (install.home / "auth" / ".bootstrap_password").is_file()
+    # Only on a genuine first run: setting a password that already exists is a
+    # hard error that refuses to start.
+    first_run = password_unset(install.home)
     launch_env = {"UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK": "1"}
     if first_run:
         launch_env["UNSLOTH_STUDIO_PASSWORD"] = FIRST_RUN_PASSWORD
@@ -162,6 +191,12 @@ def main() -> int:
         # kit recovered from the auth file or the log.
         password = FIRST_RUN_PASSWORD if first_run else install.bootstrap_password
         facts.update(asyncio.run(drive(base_url, out, password)))
+        # Having supplied the password and still been shown the setup form means
+        # the supplied one never took. That is how this read as passing while the
+        # flag under test did nothing, so make it fail instead.
+        if first_run and facts.get("first_run_setup"):
+            raise RuntimeError(
+                "supplied UNSLOTH_STUDIO_PASSWORD but Studio still asked for setup")
         print("[ui] chat page rendered and the composer accepted input")
     except Exception as exc:  # noqa: BLE001 - the report is the deliverable
         rc = 1

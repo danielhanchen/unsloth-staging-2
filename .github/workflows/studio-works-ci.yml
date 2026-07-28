@@ -95,9 +95,15 @@ jobs:
         id: bin
         shell: bash
         run: |
-          for c in "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth" \
-                   "$HOME/.unsloth/studio/bin/unsloth" \
-                   "$HOME/.unsloth/studio/unsloth_studio/Scripts/unsloth.exe"; do
+          # .exe variants first: Git Bash answers `-x foo` for a foo.exe, so a
+          # plain-name candidate matches on Windows and then hands the rest of
+          # the job a path only bash can see.
+          for c in "$HOME/.unsloth/studio/unsloth_studio/Scripts/unsloth.exe" \
+                   "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.exe" \
+                   "$HOME/.unsloth/studio/bin/unsloth.exe" \
+                   "$HOME/.unsloth/studio/Scripts/unsloth.exe" \
+                   "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth" \
+                   "$HOME/.unsloth/studio/bin/unsloth"; do
             [ -x "$c" ] && { echo "bin=$c" >> "$GITHUB_OUTPUT"; echo "found $c"; exit 0; }
           done
           echo "::error::no unsloth CLI after a successful install"
