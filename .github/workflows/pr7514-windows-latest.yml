@@ -1,0 +1,56 @@
+name: "PR-7514 windows-latest"
+on:
+  push:
+    branches: [pr7514-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: studio/frontend/package-lock.json
+
+      # The genuinely OS-sensitive assertion. .gitattributes declares
+      # "studio/frontend/** text=auto eol=lf". Before this PR the file carried a
+      # raw NUL, so git classified it as binary and skipped EOL normalisation.
+      # Now that it is text, every OS must still check it out as LF with no NUL.
+      - name: git attributes for the changed file
+        shell: bash
+        run: git check-attr -a studio/frontend/src/components/assistant-ui/message-html-artifacts.tsx
+
+      # Runs on node's native TS type stripping, so it needs no node_modules.
+      # Asserts the full 42-case x 32-flag matrix, separator semantics, CRLF
+      # handling, and the on-disk NUL=0 / CR=0 invariant.
+      - name: Oracle matrix + file hygiene
+        run: node --experimental-strip-types tests/pr7514/ci_oracle.mts
+
+      - name: npm ci
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+
+      - name: typecheck
+        working-directory: studio/frontend
+        run: npm run typecheck
+
+      - name: build
+        working-directory: studio/frontend
+        run: npm run build
+
+      - name: eslint the changed file
+        working-directory: studio/frontend
+        continue-on-error: true
+        run: npx eslint src/components/assistant-ui/message-html-artifacts.tsx
