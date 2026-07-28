@@ -111,6 +111,20 @@ if [ "$MODE" = "mask" ]; then
         note "WARN could not move CommandLineTools"
       fi
     fi
+    # Xcode.app must go too. With the select link removed AND CommandLineTools moved,
+    # `xcode-select -p` does not fail -- it falls through to whatever Xcode bundle the
+    # runner image ships (observed: /Applications/Xcode_16.4.app/Contents/Developer),
+    # which re-arms /usr/bin/git and /usr/bin/cc and silently un-cleans the machine.
+    # A rename is instant regardless of bundle size: same filesystem, no copy.
+    for app in /Applications/Xcode*.app; do
+      [ -d "$app" ] || continue
+      if sudo mv "$app" "${app}.masked" 2>/dev/null; then
+        note "moved $(basename "$app") aside"
+        echo "sudo mv '${app}.masked' '$app' 2>/dev/null || true" >> "$RESTORE"
+      else
+        note "WARN could not move $app"
+      fi
+    done
     for brewdir in /opt/homebrew /usr/local/Homebrew; do
       if [ -d "$brewdir" ]; then
         if sudo mv "$brewdir" "${brewdir}.masked" 2>/dev/null; then
