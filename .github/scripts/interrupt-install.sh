@@ -28,6 +28,18 @@ KILL_GRACE="${KILL_GRACE:-10}"
 mkdir -p "$(dirname "$LOG")"
 : > "$LOG"
 
+# Stand in for the desktop app, which creates this before spawning the installer and
+# clears it only on a terminal outcome (install.rs). We kill the installer directly
+# rather than driving the real app, so without this the marker #7490 relies on is
+# absent for a reason that has nothing to do with #7490. Written to both locations
+# because the Rust side hardcodes ~/.unsloth/studio while CI overrides
+# UNSLOTH_STUDIO_HOME. Deliberately never cleared: being killed is the whole point.
+for _marker_dir in "${UNSLOTH_STUDIO_HOME:-}" "$HOME/.unsloth/studio"; do
+  [ -n "$_marker_dir" ] || continue
+  mkdir -p "$_marker_dir" 2>/dev/null || continue
+  : > "$_marker_dir/.desktop-install-in-progress" 2>/dev/null || true
+done
+
 # Job control puts the child in its own process group, so $! is the pgid leader and
 # `kill -- -$!` reaches every descendant -- matching the Rust side.
 set -m
