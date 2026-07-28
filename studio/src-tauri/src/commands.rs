@@ -18,6 +18,20 @@ async fn managed_install_ready_after_repair() -> bool {
     crate::preflight::managed_install_ready().await
 }
 
+/// The update can install the newer CLI and only then reach a rejected
+/// environment value. No reinstall changes that, so report it instead.
+fn unrepairable_after_update(reason: Option<&str>) -> Option<String> {
+    match reason {
+        Some(crate::preflight::STUDIO_RUNTIME_STARTUP_FAILED) => Some(
+            "Unsloth is installed, but the backend refuses to start with the current \
+             environment settings (for example UNSLOTH_CPU_THREADS). Fix or unset them, \
+             then try again."
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 fn should_emit_repair_failed(msg: &str) -> bool {
     !msg.contains("NEEDS_ELEVATION")
 }
@@ -532,39 +546,37 @@ pub async fn start_managed_repair(
     let repair_group_id = install::take_pending_repair_group_for_resume(&install_state)
         .unwrap_or_else(|| diagnostics::begin_repair_group(&diagnostics_state));
 
-    let _ = app.emit("repair-progress", "Updating existing Unsloth install...");
-    let update_app = app.clone();
-    let update_state = update_state.inner().clone();
-    let update_diagnostics = diagnostics_state.clone();
-    let update_repair_group_id = repair_group_id.clone();
-    let update_result = tokio::task::spawn_blocking(move || {
-        update::run_backend_update_for_repair(
-            update_app,
-            update_state,
-            update_diagnostics,
-            update_repair_group_id,
-        )
-    })
-    .await
-    .map_err(|e| format!("Repair update task panicked: {e}"))?;
+    if install::managed_install_in_progress() {
+        info!("Interrupted installation detected; skipping incremental repair update");
+        let _ = app.emit(
+            "repair-progress",
+            "Previous installation was interrupted. Running bundled installer...",
+        );
+    } else {
+        let _ = app.emit("repair-progress", "Updating existing Unsloth install...");
+        let update_app = app.clone();
+        let update_state = update_state.inner().clone();
+        let update_diagnostics = diagnostics_state.clone();
+        let update_repair_group_id = repair_group_id.clone();
+        let update_result = tokio::task::spawn_blocking(move || {
+            update::run_backend_update_for_repair(
+                update_app,
+                update_state,
+                update_diagnostics,
+                update_repair_group_id,
+            )
+        })
+        .await
+        .map_err(|e| format!("Repair update task panicked: {e}"))?;
 
-    match update_result {
-        Ok(()) if managed_install_ready_after_repair().await => {
-            info!("Managed repair complete after update");
-            diagnostics::finish_repair_group(&diagnostics_state, &repair_group_id, "success", None);
-            let _ = app.emit("repair-complete", ());
-            return Ok(());
-        }
-        Ok(()) => {
-            warn!("Managed repair update finished, but preflight is still not ready; falling back to installer");
-            let _ = app.emit(
-                "repair-progress",
-                "Update finished, but Unsloth is still not ready. Running bundled installer...",
-            );
-        }
-        Err(msg) => {
-            if msg.to_ascii_lowercase().contains("already running") {
-                error!("Managed repair update conflict: {}", msg);
+        let post_update = if matches!(update_result, Ok(())) {
+            Some(crate::preflight::managed_install_state().await)
+        } else {
+            None
+        };
+        if let Some(Err(reason)) = post_update.as_ref() {
+            if let Some(msg) = unrepairable_after_update(reason.as_deref()) {
+                warn!("Managed repair stopping: {}", msg);
                 diagnostics::finish_repair_group(
                     &diagnostics_state,
                     &repair_group_id,
@@ -574,15 +586,49 @@ pub async fn start_managed_repair(
                 let _ = app.emit("repair-failed", &msg);
                 return Err(msg);
             }
+        }
 
-            warn!(
-                "Managed repair update failed, falling back to bundled installer: {}",
-                msg
-            );
-            let _ = app.emit(
-                "repair-progress",
-                "Update failed. Running bundled installer...",
-            );
+        match update_result {
+            Ok(()) if matches!(post_update, Some(Ok(()))) => {
+                info!("Managed repair complete after update");
+                diagnostics::finish_repair_group(
+                    &diagnostics_state,
+                    &repair_group_id,
+                    "success",
+                    None,
+                );
+                let _ = app.emit("repair-complete", ());
+                return Ok(());
+            }
+            Ok(()) => {
+                warn!("Managed repair update finished, but preflight is still not ready; falling back to installer");
+                let _ = app.emit(
+                    "repair-progress",
+                    "Update finished, but Unsloth is still not ready. Running bundled installer...",
+                );
+            }
+            Err(msg) => {
+                if msg.to_ascii_lowercase().contains("already running") {
+                    error!("Managed repair update conflict: {}", msg);
+                    diagnostics::finish_repair_group(
+                        &diagnostics_state,
+                        &repair_group_id,
+                        "failed",
+                        Some(msg.clone()),
+                    );
+                    let _ = app.emit("repair-failed", &msg);
+                    return Err(msg);
+                }
+
+                warn!(
+                    "Managed repair update failed, falling back to bundled installer: {}",
+                    msg
+                );
+                let _ = app.emit(
+                    "repair-progress",
+                    "Update failed. Running bundled installer...",
+                );
+            }
         }
     }
 
@@ -744,6 +790,19 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("Directory does not exist"));
     }
+    #[test]
+    fn rejected_settings_stop_repair_instead_of_reinstalling() {
+        // This arm is the one that would otherwise reinstall over a healthy tree.
+        let msg =
+            super::unrepairable_after_update(Some(crate::preflight::STUDIO_RUNTIME_STARTUP_FAILED))
+                .expect("a rejected setting must stop repair");
+        assert!(msg.contains("UNSLOTH_CPU_THREADS"));
+        assert!(
+            super::unrepairable_after_update(Some("studio_runtime_missing_dependency")).is_none()
+        );
+        assert!(super::unrepairable_after_update(None).is_none());
+    }
+
     #[test]
     fn repair_elevation_is_not_a_terminal_repair_failure() {
         assert!(!super::should_emit_repair_failed("NEEDS_ELEVATION"));
