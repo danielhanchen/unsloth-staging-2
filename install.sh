@@ -1982,25 +1982,62 @@ _maybe_reroute_strixhalo_to_2404 || true
 # Homebrew install). Linux keeps requiring them; its package manager has them.
 tauri_log "STEP" "Checking system dependencies"
 
-case "$OS" in
-    macos)
-        # Xcode Command Line Tools provide the C/C++ compiler and git.
-        if ! xcode-select -p >/dev/null 2>&1; then
-            echo ""
-            echo "==> Xcode Command Line Tools are required."
-            echo "    Installing (a system dialog will appear)..."
-            xcode-select --install </dev/null 2>/dev/null || true
-            echo "    After the installation completes, please re-run this script."
-            exit 1
-        fi
+# A working git, as opposed to a git that merely exists. On a Mac without the Xcode
+# Command Line Tools, /usr/bin/git IS present -- it is a stub that errors with
+# "invalid active developer path" and pops a GUI dialog. So `command -v git`
+# answers the wrong question here; only running it tells the truth.
+_has_working_git() {
+    command -v git >/dev/null 2>&1 || return 1
+    git --version >/dev/null 2>&1
+}
+
+# macOS system-dependency check. A function, not inline code, so tests/sh can extract
+# and exercise it the way tests/sh/test_mac_intel_compat.sh does -- the old inline
+# form was untestable, which is why this gate shipped broken.
+#
+# The consumer install needs NO developer toolchain: uv arrives as a prebuilt binary,
+# CPython comes from uv's managed python-build-standalone, llama.cpp and whisper.cpp
+# are prebuilt downloads, Node is a pinned nodejs.org archive, and triton is skipped
+# on macOS. Requiring Xcode CLT here therefore blocked every brand-new Mac for a
+# toolchain nothing downstream used. Only `--local` genuinely needs git, because it
+# installs unsloth-zoo from a git+https URL.
+_check_macos_deps() {
+    _clt_missing=false
+    xcode-select -p >/dev/null 2>&1 || _clt_missing=true
+
+    if [ "$STUDIO_LOCAL_INSTALL" = true ] && ! _has_working_git; then
+        # Developer install only: pip needs git for the unsloth-zoo git+https URL.
+        echo ""
+        step "deps" "git is required for --local installs" "$C_ERR"
+        substep "--local installs unsloth-zoo from git+https://github.com/unslothai/unsloth-zoo,"
+        substep "which needs a working git. Install the Xcode Command Line Tools:"
+        substep "  xcode-select --install"
+        substep "Then re-run this script. A normal (non---local) install needs no compiler"
+        substep "and no git -- it uses prebuilt binaries and wheels only."
+        tauri_log "NEED_XCODE_CLT" "git"
+        return 1
+    fi
+
+    if [ "$_clt_missing" = true ]; then
+        # Not fatal: nothing on the consumer path needs it. Say so plainly instead of
+        # firing a GUI dialog and exiting, which is what stranded clean Macs.
+        step "deps" "no Xcode Command Line Tools (not required)" "$C_WARN"
+        substep "Unsloth installs prebuilt binaries and wheels, so no compiler is needed."
+        substep "Install them only for a llama.cpp source build: xcode-select --install"
+    elif command -v cmake >/dev/null 2>&1; then
+        step "deps" "all system dependencies found"
+    else
         # cmake is only needed for a source build; the default prebuilt path
         # doesn't use it, so its absence is not fatal -- no Homebrew prerequisite.
-        if command -v cmake >/dev/null 2>&1; then
-            step "deps" "all system dependencies found"
-        else
-            step "deps" "using prebuilt llama.cpp (cmake not found)" "$C_WARN"
-            substep "Install cmake only if you want a source build: brew install cmake"
-        fi
+        step "deps" "using prebuilt llama.cpp (cmake not found)" "$C_WARN"
+        substep "Install cmake only if you want a source build: brew install cmake"
+    fi
+    return 0
+}
+
+case "$OS" in
+    macos)
+        _check_macos_deps || exit 1
         ;;
     linux|wsl)
         MISSING=""
