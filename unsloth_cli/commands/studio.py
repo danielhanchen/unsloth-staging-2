@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import csv
 import importlib.util
 import hashlib
 import hmac
@@ -18,7 +19,7 @@ import types
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import List, Literal, Optional
 import typer
 
@@ -268,6 +269,123 @@ def _load_run_module():
         raise
     _RUN_MODULE = module
     return _RUN_MODULE
+
+
+def _canonical_distribution_name(name: str) -> str:
+    """PEP 503 normalisation, so PyJWT / pyjwt / py_jwt compare equal."""
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def _studio_requirement_roots(run_mod):
+    """Requirements studio.txt names directly, markers already applied."""
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    requirements = Path(run_mod.__file__).with_name("requirements") / "studio.txt"
+    roots = []
+    for line in requirements.read_text(encoding = "utf-8").splitlines():
+        line = line.partition("#")[0].strip()
+        # pip flags (-r, --extra-index-url) are not requirements. Treating one
+        # as broken is permanent: repair reinstalls the same file.
+        if not line or line.startswith("-"):
+            continue
+        try:
+            requirement = Requirement(line)
+        except InvalidRequirement:
+            continue
+        if requirement.marker and not requirement.marker.evaluate():
+            continue
+        roots.append(requirement)
+    return roots
+
+
+def _recorded_files_missing(installed) -> bool:
+    """Whether RECORD lists files the venv no longer has.
+
+    An interrupted replace can recreate a package directory and stop part-way
+    through filling it, so the directory existing proves nothing. RECORD is read
+    directly because Distribution.files drops entries that no longer exist,
+    which is exactly the set this looks for. 6656 files across studio.txt's
+    closure cost 158ms, and __pycache__ is skipped: deleting it is not damage.
+    """
+    # egg-info has no RECORD, and its file lists say nothing about completeness.
+    record = installed.read_text("RECORD")
+    if record is None:
+        return False
+    for row in csv.reader(record.splitlines()):
+        if not row or not row[0]:
+            continue
+        parts = PurePosixPath(row[0]).parts
+        # .dist-info is the metadata itself; .data and ../ land outside the tree.
+        if parts[0] == ".." or parts[0].endswith((".dist-info", ".data")):
+            continue
+        if "__pycache__" in parts or parts[-1].endswith(".pyc"):
+            continue
+        if not installed.locate_file(row[0]).exists():
+            return True
+    return False
+
+
+def _missing_studio_requirement(run_mod):
+    """First requirement studio.txt needs that this venv cannot supply.
+
+    Walks dependencies too: starlette reaches the venv only via FastAPI and is
+    imported inside run_server, so a direct-only check calls a doomed install
+    ready. Metadata only, no imports, ~80ms on a full venv.
+    """
+    from importlib.metadata import PackageNotFoundError, distribution
+    from packaging.requirements import InvalidRequirement, Requirement
+
+    pending = []
+    seen = set()
+
+    def visit(requirement, is_root):
+        """Missing name, or None; queues the requirement's dependencies."""
+        try:
+            installed = distribution(requirement.name)
+        except PackageNotFoundError:
+            return requirement.name
+        # Metadata outlives the package: wheels store METADATA first, so a killed
+        # unpack leaves a version behind. RECORD is last, so its absence marks it.
+        if installed.files is None or _recorded_files_missing(installed):
+            return requirement.name
+        # Only studio.txt pins are enforced: install_python_stack uses --no-deps,
+        # so transitive bounds read unsatisfied in venvs that work. A prerelease
+        # satisfying a floor is not a broken install either.
+        if (
+            is_root
+            and requirement.specifier
+            and not requirement.specifier.contains(installed.version, prereleases = True)
+        ):
+            return requirement.name
+        for dependency in installed.requires or []:
+            try:
+                parsed = Requirement(dependency)
+            except InvalidRequirement:
+                continue
+            # No extra is requested, so extras-only dependencies do not apply.
+            if parsed.marker and not parsed.marker.evaluate({"extra": ""}):
+                continue
+            pending.append(parsed)
+        return None
+
+    # Roots are seen up front: reached as a dependency first, a root would never
+    # meet its own pin (datasets wants huggingface-hub<2, studio.txt ==0.36.2).
+    roots = _studio_requirement_roots(run_mod)
+    seen.update(_canonical_distribution_name(root.name) for root in roots)
+    for requirement in roots:
+        missing = visit(requirement, True)
+        if missing:
+            return missing
+    while pending:
+        requirement = pending.pop()
+        key = _canonical_distribution_name(requirement.name)
+        if key in seen:
+            continue
+        seen.add(key)
+        missing = visit(requirement, False)
+        if missing:
+            return missing
+    return None
 
 
 def _find_setup_script() -> Optional[Path]:
@@ -2824,6 +2942,51 @@ def desktop_capabilities(
 
     for key, value in payload.items():
         typer.echo(f"{key}: {value}")
+
+
+@studio_app.command("desktop-runtime-check", hidden = True)
+def desktop_runtime_check(
+    _json_output: bool = typer.Option(
+        False,
+        "--json",
+        help = "Emit machine-readable JSON.",
+    ),
+):
+    try:
+        run_mod = _load_run_module()
+        missing = _missing_studio_requirement(run_mod)
+        if missing:
+            raise ModuleNotFoundError(
+                f"No distribution named {missing!r}",
+                name = missing,
+            )
+    except ModuleNotFoundError as exc:
+        payload = {
+            "runtime_ready": False,
+            "reason": "missing_dependency",
+            "module": exc.name,
+        }
+    # SystemExit is not an Exception. run.py raises it for rejected settings like
+    # UNSLOTH_CPU_THREADS; escaping emits no payload, so the app reinstalls.
+    except SystemExit as exc:
+        payload = {
+            "runtime_ready": False,
+            "reason": "backend_startup_failed",
+            "error_type": "SystemExit",
+            "error": str(exc),
+        }
+    except Exception as exc:
+        payload = {
+            "runtime_ready": False,
+            "reason": "backend_import_failed",
+            "error_type": type(exc).__name__,
+        }
+    else:
+        payload = {"runtime_ready": True}
+
+    typer.echo(json.dumps(payload, sort_keys = True))
+    if not payload["runtime_ready"]:
+        raise typer.Exit(code = 1) from None
 
 
 @studio_app.command("provision-desktop-auth", hidden = True)

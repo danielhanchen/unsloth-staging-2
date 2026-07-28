@@ -265,7 +265,22 @@ impl BackendOwnerState {
         self.write()
     }
 
+    /// Only while the file is still ours. Cleanup after an exit can take seconds,
+    /// and a start in that window already wrote the next metadata to this path.
     pub(crate) fn remove(self) {
+        // Held across the check and the unlink: a start that lands between the
+        // two would otherwise have its file deleted by the backend it replaced.
+        let _guard = lock_metadata();
+        if let Ok(Some(on_disk)) = read_metadata(&self.path) {
+            if on_disk.token_sha256 != self.metadata.token_sha256 {
+                warn!(
+                    "Leaving desktop backend owner metadata at {}: a newer backend owns it",
+                    self.path.display()
+                );
+                return;
+            }
+        }
+        // Unreadable counts as ours, or it would outlive every backend.
         remove_metadata_file(&self.path);
     }
 
@@ -304,7 +319,16 @@ impl BackendOwnerState {
     }
 }
 
+/// Serializes activation against cleanup. Both run in this process, and the
+/// check in remove() only holds if no write can land inside it.
+static METADATA_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn lock_metadata() -> std::sync::MutexGuard<'static, ()> {
+    METADATA_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn write_metadata(path: &Path, metadata: &DesktopBackendMetadata) -> Result<(), String> {
+    let _guard = lock_metadata();
     let parent = path
         .parent()
         .ok_or_else(|| "desktop owner metadata path has no parent".to_string())?;
@@ -976,6 +1000,32 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("desktop_backend.json")
+    }
+
+    #[test]
+    fn a_replaced_owner_file_survives_the_previous_backend_cleanup() {
+        let path = temp_metadata_path("replaced-owner");
+        let exited = BackendOwnerState::from_metadata(path.clone(), metadata(1, Some(8888)));
+        let mut current = metadata(2, Some(8899));
+        current.token = "next-backend-token".to_string();
+        current.token_sha256 = token_sha256("next-backend-token");
+        write_metadata(&path, &current).unwrap();
+
+        exited.remove();
+
+        let left = read_metadata(&path).unwrap().unwrap();
+        assert_eq!(left.token_sha256, token_sha256("next-backend-token"));
+    }
+
+    #[test]
+    fn an_owner_still_holding_the_file_removes_it() {
+        let path = temp_metadata_path("own-owner");
+        let owner = BackendOwnerState::from_metadata(path.clone(), metadata(1, Some(8888)));
+        write_metadata(&path, &metadata(1, Some(8888))).unwrap();
+
+        owner.remove();
+
+        assert!(read_metadata(&path).unwrap().is_none());
     }
 
     fn closed_port() -> u16 {
