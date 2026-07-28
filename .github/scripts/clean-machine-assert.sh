@@ -74,15 +74,35 @@ for check in "$@"; do
       ;;
 
     nobuild)
+      # "Built an sdist" is NOT the same as "needed a compiler". Four packages on the
+      # macOS path are sdist-only PURE PYTHON projects that build fine with no
+      # toolchain (verified by resolving each against cp313/macos-arm64):
+      #   openai-whisper, argbind, randomname  -- no version ever ships a wheel
+      #   antlr4-python3-runtime==4.9.3        -- pinned below the 4.13.2 wheel
+      # Failing on those would be a false alarm, so the contract asserted here is
+      # "nothing that needs a COMPILER was built", with that allowlist subtracted.
+      # UNSLOTH_ALLOW_SDIST can extend it.
+      _allow="openai-whisper argbind randomname antlr4-python3-runtime ${UNSLOTH_ALLOW_SDIST:-}"
       if [ ! -f "$LOG" ]; then
         fail "nobuild requested but $LOG is missing"
       else
-        # uv/pip say "Building wheel for X" / "Running setup.py" only on an sdist.
-        if grep -qiE "building wheel for|running setup\.py|preparing metadata \(setup\.py\)|building editable for" "$LOG"; then
-          fail "install compiled from source (sdist fallback) -- wheels-only contract broken"
-          grep -iE "building wheel for|running setup\.py" "$LOG" | head -20
+        _built="$(grep -oiE "building wheel for [a-z0-9._-]+" "$LOG" 2>/dev/null \
+                  | sed -E 's/.* for //' | tr 'A-Z' 'a-z' | sort -u || true)"
+        _bad=""
+        for pkg in $_built; do
+          case " $_allow " in *" $pkg "*) continue ;; esac
+          _bad="$_bad $pkg"
+        done
+        if [ -n "$_bad" ]; then
+          fail "built from source:$_bad -- these must resolve to wheels on a clean machine"
         else
-          ok "no source build in $LOG"
+          [ -n "$_built" ] && say_built="$(echo "$_built" | tr '\n' ' ')" || say_built="none"
+          ok "no non-allowlisted source build (built: $say_built)"
+        fi
+        # Independent of package names: a compiler error means a toolchain was needed.
+        if grep -qiE "error: command '(cc|gcc|clang|cl)' failed|no such file or directory: 'cc'|clang: error|cargo: not found|error: linker \`cc\` not found" "$LOG"; then
+          fail "compiler invocation appears in the install log"
+          grep -iE "error: command '(cc|gcc|clang|cl)' failed|clang: error" "$LOG" | head -10
         fi
       fi
       ;;
