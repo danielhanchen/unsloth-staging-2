@@ -184,6 +184,44 @@ _BLOCK_TAGS = frozenset(
 _HEADING_TAGS = frozenset({"h1", "h2", "h3", "h4", "h5", "h6"})
 _INLINE_EMPHASIS = {"strong": "**", "b": "**", "em": "*", "i": "*"}
 
+# A <header> is furniture only when it is almost entirely links: site nav, or the
+# 278-language dropdown Wikipedia's Vector 2022 skin puts inside <main>. Article
+# headers carry a byline, date or standfirst, so they are kept. Measured on live
+# pages, link-list headers sit at 0.94-1.00 and content headers at 0.13-0.90.
+_HEADER_LINK_DENSITY = 0.93
+# Below this a header is too small to displace an article, and the ratio too
+# noisy to trust, so it is left alone. Live link-list headers start at 182
+# chars; the largest link-dense header that carries real content is 93.
+_HEADER_MIN_CHARS = 150
+
+
+class _HeaderFrame:
+    """Buffered ``<header>`` output plus the link tally used to judge it.
+
+    Buffering (like ``_bq_stack``) lets the decision happen at ``</header>``,
+    when the whole subtree has been seen. A header that no end tag ever closes
+    is emitted unchanged, which is what browsers render."""
+
+    __slots__ = ("depth", "parts", "heading_spans", "heading_start", "text_chars", "link_chars")
+
+    def __init__(self, depth: int):
+        self.depth = depth
+        self.parts: list[str] = []
+        # Index ranges into parts holding the headings, kept when the rest goes.
+        self.heading_spans: list[tuple[int, int]] = []
+        self.heading_start: int | None = None
+        self.text_chars: int = 0
+        self.link_chars: int = 0
+
+    def render(self) -> str:
+        """The buffer, or only its headings when the header is link furniture."""
+        if (
+            self.text_chars >= _HEADER_MIN_CHARS
+            and self.link_chars >= _HEADER_LINK_DENSITY * self.text_chars
+        ):
+            return "".join("".join(self.parts[start:end]) for start, end in self.heading_spans)
+        return "".join(self.parts)
+
 
 class _MarkdownRenderer(HTMLParser):
     """HTMLParser subclass that emits Markdown tokens into a list.
@@ -193,7 +231,11 @@ class _MarkdownRenderer(HTMLParser):
     how the readability-style main-content pass drops page furniture.
     """
 
-    def __init__(self, scope_tags: frozenset[str] | None = None):
+    def __init__(
+        self,
+        scope_tags: frozenset[str] | None = None,
+        strip_header: bool = False,
+    ):
         super().__init__(convert_charrefs = False)
         self._out: list[str] = []
         self._skip_depth: int = 0
@@ -213,10 +255,17 @@ class _MarkdownRenderer(HTMLParser):
         self._open_tags: list[str] = []
         self._hidden_marks: list[int] = []
 
+        # Open <header> buffers, innermost last. Empty unless strip_header.
+        self._strip_header = strip_header
+        self._header_stack: list[_HeaderFrame] = []
+
         # Link state
         self._link_href: str | None = None
         self._link_text_parts: list[str] = []
         self._in_link: bool = False
+        # Text under the open <a>, credited as link furniture only once </a>
+        # closes it: an <a> left open adopts body prose, which is not furniture.
+        self._link_header_chars: int = 0
 
         # List state
         self._list_stack: list[str] = []  # "ul" or "ol"
@@ -249,6 +298,8 @@ class _MarkdownRenderer(HTMLParser):
             self._pre_parts.append(text)
         elif self._bq_stack:
             self._bq_stack[-1].append(text)
+        elif self._header_stack:
+            self._header_stack[-1].parts.append(text)
         else:
             self._out.append(text)
 
@@ -297,6 +348,8 @@ class _MarkdownRenderer(HTMLParser):
         text = re.sub(r"\s+", " ", "".join(self._link_text_parts)).strip()
         href = self._link_href or ""
         self._in_link = False
+        # Recovery paths reach here without </a>, so drop the uncredited tally.
+        self._link_header_chars = 0
         if href and text:
             self._emit(f"[{text}]({href})")
         elif text:
@@ -330,6 +383,34 @@ class _MarkdownRenderer(HTMLParser):
             del self._open_tags[close_at:]
             while self._hidden_marks and self._hidden_marks[-1] >= close_at:
                 self._hidden_marks.pop()
+            self._close_header_frames(close_at)
+
+    def _close_header_frames(self, depth: int) -> None:
+        """Judge and emit every buffered header at or below *depth*.
+
+        Any end tag that pops the header off the stack bounds it as conclusively
+        as ``</header>`` does, so an ancestor close judges it the same way."""
+        while self._header_stack and self._header_stack[-1].depth >= depth:
+            frame = self._header_stack.pop()
+            if self._header_stack:
+                # Roll the tally outward so an enclosing header is judged whole.
+                self._header_stack[-1].text_chars += frame.text_chars
+                self._header_stack[-1].link_chars += frame.link_chars
+            self._emit(frame.render())
+
+    def _flush_header_frames(self) -> None:
+        """Emit every open header unchanged, abandoning the strip."""
+        while self._header_stack:
+            self._emit("".join(self._header_stack.pop().parts))
+
+    def _count_header_text(self, text: str) -> None:
+        """Tally visible text for the innermost header's link density."""
+        if not self._header_stack:
+            return
+        chars = len(text.strip())
+        self._header_stack[-1].text_chars += chars
+        if self._in_link:
+            self._link_header_chars += chars
 
     def _enter_tag(self, tag: str, attr_dict: dict) -> bool:
         """Track open/hidden/scope state; return True when the tag's content
@@ -339,10 +420,15 @@ class _MarkdownRenderer(HTMLParser):
             self._open_tags.append(tag)
             if _is_hidden_element(attr_dict):
                 self._hidden_marks.append(len(self._open_tags) - 1)
+            if self._strip_header and tag == "header" and not self._hidden_marks:
+                self._header_stack.append(_HeaderFrame(len(self._open_tags) - 1))
         elif _is_hidden_element(attr_dict):
             # Void elements never join the stack, so suppress a hidden one inline.
             return False
         if self._scope_tags is not None and tag in self._scope_tags:
+            # A scope element inside a header would strand its output in the
+            # buffer, so keep the header as-is and let scoping proceed normally.
+            self._flush_header_frames()
             if self._scope_depth == 0:
                 self._scope_seg_start = len(self._out)
             self._scope_depth += 1
@@ -355,6 +441,10 @@ class _MarkdownRenderer(HTMLParser):
     def _exit_tag(self, tag: str) -> bool:
         """Pop to the matching open tag; return True when the end tag should
         be rendered (False = it closed inside a hidden / out-of-scope region)."""
+        # A scope closing over an <a> the page left open would strand its text in
+        # the link buffer, so recover the link before the segment is recorded.
+        if self._in_link and self._scope_tags is not None and tag in self._scope_tags:
+            self._finish_link()
         suppressed = bool(self._hidden_marks) or (
             self._scope_tags is not None and self._scope_depth == 0
         )
@@ -365,6 +455,7 @@ class _MarkdownRenderer(HTMLParser):
                     del self._open_tags[i:]
                     while self._hidden_marks and self._hidden_marks[-1] >= i:
                         self._hidden_marks.pop()
+                    self._close_header_frames(i)
                     break
         if self._scope_tags is not None and tag in self._scope_tags and self._scope_depth > 0:
             self._scope_depth -= 1
@@ -396,6 +487,8 @@ class _MarkdownRenderer(HTMLParser):
             return
 
         if tag in _HEADING_TAGS:
+            if self._header_stack and self._header_stack[-1].heading_start is None:
+                self._header_stack[-1].heading_start = len(self._header_stack[-1].parts)
             level = int(tag[1])
             self._emit("\n\n" + "#" * level + " ")
 
@@ -403,6 +496,7 @@ class _MarkdownRenderer(HTMLParser):
             self._link_href = attr_dict.get("href")
             self._link_text_parts = []
             self._in_link = True
+            self._link_header_chars = 0
 
         elif tag in _INLINE_EMPHASIS:
             self._emit(_INLINE_EMPHASIS[tag])
@@ -489,8 +583,14 @@ class _MarkdownRenderer(HTMLParser):
 
         if tag in _HEADING_TAGS:
             self._emit("\n\n")
+            frame = self._header_stack[-1] if self._header_stack else None
+            if frame is not None and frame.heading_start is not None:
+                frame.heading_spans.append((frame.heading_start, len(frame.parts)))
+                frame.heading_start = None
 
         elif tag == "a":
+            if self._header_stack:
+                self._header_stack[-1].link_chars += self._link_header_chars
             self._finish_link()
 
         elif tag in _INLINE_EMPHASIS:
@@ -553,6 +653,7 @@ class _MarkdownRenderer(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._text_suppressed():
             return
+        self._count_header_text(data)
         if self._in_pre:
             self._pre_parts.append(data)
             return
@@ -570,12 +671,16 @@ class _MarkdownRenderer(HTMLParser):
     def handle_entityref(self, name: str) -> None:
         if self._text_suppressed():
             return
-        self._emit(html.unescape(f"&{name};"))
+        text = html.unescape(f"&{name};")
+        self._count_header_text(text)
+        self._emit(text)
 
     def handle_charref(self, name: str) -> None:
         if self._text_suppressed():
             return
-        self._emit(html.unescape(f"&#{name};"))
+        text = html.unescape(f"&#{name};")
+        self._count_header_text(text)
+        self._emit(text)
 
     # Flush pending buffers (handles truncated HTML from capped fetches)
     def flush_pending(self) -> None:
@@ -607,6 +712,10 @@ class _MarkdownRenderer(HTMLParser):
                 self._bq_stack[-1].append("\n\n" + prefixed + "\n\n")
             else:
                 self._out.append("\n\n" + prefixed + "\n\n")
+
+        # A <header> no end tag ever closed adopts the page body under HTML5
+        # parsing, so emit it unchanged rather than judging a whole article.
+        self._flush_header_frames()
 
         # A scope left open by truncated HTML never reached _exit_tag, so its output
         # never joined scope_segments and would score 0. Flush the still-open segment
@@ -714,13 +823,22 @@ def _strip_boilerplate_lines(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 
-def _render(source_html: str, scope_tags: frozenset[str] | None) -> str:
-    renderer = _MarkdownRenderer(scope_tags = scope_tags)
+def _new_renderer(
+    source_html: str, scope_tags: frozenset[str] | None, strip_header: bool
+) -> _MarkdownRenderer:
+    renderer = _MarkdownRenderer(scope_tags = scope_tags, strip_header = strip_header)
     renderer.feed(source_html)
     renderer.close()
     renderer.flush_pending()
-    raw = "".join(renderer._out)
-    return _cleanup(raw)
+    return renderer
+
+
+def _render(
+    source_html: str,
+    scope_tags: frozenset[str] | None,
+    strip_header: bool = False,
+) -> str:
+    return _cleanup("".join(_new_renderer(source_html, scope_tags, strip_header)._out))
 
 
 def _select_main_scope_render(source_html: str, tag: str) -> tuple[int, str]:
@@ -728,10 +846,7 @@ def _select_main_scope_render(source_html: str, tag: str) -> tuple[int, str]:
     subtree. Sizing candidates one at a time stops many tiny sibling cards from
     clearing the threshold together, and returning that one subtree keeps
     unrelated siblings (related cards, comment threads) out of the output."""
-    renderer = _MarkdownRenderer(scope_tags = frozenset({tag}))
-    renderer.feed(source_html)
-    renderer.close()
-    renderer.flush_pending()
+    renderer = _new_renderer(source_html, frozenset({tag}), strip_header = True)
     best_len = 0
     best_render = ""
     for seg in renderer.scope_segments:
@@ -756,8 +871,9 @@ def html_to_markdown(source_html: str, *, main_content: bool = False) -> str:
 
     ``main_content=True`` applies a readability-style heuristic for page
     fetches: prefer the ``<article>`` subtree (GitHub renders READMEs there),
-    then ``<main>``, falling back to the whole document, and strip known
-    boilerplate fragments from the result.
+    then ``<main>``, falling back to the whole document, reduce a link-only
+    ``<header>`` to the heading it carries, and strip known boilerplate
+    fragments from the result.
     """
     # Normalize line endings before parsing.
     source_html = source_html.replace("\r\n", "\n").replace("\r", "\n")
@@ -768,5 +884,5 @@ def html_to_markdown(source_html: str, *, main_content: bool = False) -> str:
             length, rendered = _select_main_scope_render(source_html, scope_tag)
             if length >= _MIN_MAIN_CONTENT_CHARS:
                 return rendered
-        return _strip_boilerplate_lines(_render(source_html, None))
+        return _strip_boilerplate_lines(_render(source_html, None, strip_header = True))
     return _render(source_html, None)
