@@ -111,13 +111,19 @@ jobs:
         shell: bash
         run: |
           python3 -m pip install --quiet --disable-pip-version-check playwright httpx pillow
-          python3 -m playwright install --with-deps chromium
+          # --with-deps shells out to apt, so it only works on Linux.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            python3 -m playwright install --with-deps chromium
+          else
+            python3 -m playwright install chromium
+          fi
 
       - name: Drive the real UI
         shell: bash
         run: |
           python3 .github/scripts/studio_ui_smoke.py \
-            --home "$HOME/.unsloth/studio" --port 8899 --out ui-smoke
+            --home "$HOME/.unsloth/studio" --bin "${{ steps.bin.outputs.bin }}" \
+            --port 8899 --out ui-smoke
 
       - name: Upload evidence
         if: always()

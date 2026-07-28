@@ -74,6 +74,9 @@ async def drive(base_url: str, out: Path, password: str | None) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--home", required=True, help="UNSLOTH_STUDIO_HOME of the install")
+    ap.add_argument("--bin", default=None,
+                    help="the located `unsloth` CLI; passed so this cannot disagree "
+                         "with the step that already found it")
     ap.add_argument("--port", type=int, default=8899)
     ap.add_argument("--out", default="ui-smoke")
     ap.add_argument("--healthz-timeout", type=int, default=300)
@@ -84,6 +87,12 @@ def main() -> int:
     log_path = out / "studio.log"
 
     install = StudioInstall(home=Path(args.home), repo=Path.cwd(), branch="ci")
+    if args.bin:
+        # launch_studio resolves the CLI from `home` by trying known venv layouts.
+        # Point `home` at the parent of bin/ so the first candidate hits, rather than
+        # relying on the kit's list matching whatever this install produced.
+        binp = Path(args.bin)
+        install.home = binp.parent.parent
     facts: dict[str, object] = {}
     rc = 0
     try:
