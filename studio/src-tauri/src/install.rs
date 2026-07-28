@@ -786,6 +786,20 @@ pub fn record_install_intentional_stop(state: &InstallState, diagnostics: &Diagn
 /// Stop a running install process gracefully.
 /// Unix: SIGTERM to process group -> wait up to 5s -> SIGKILL
 /// Windows: hidden taskkill /T /F to terminate the installer tree
+/// Whether an installer is running right now.
+///
+/// Quitting the app tears the installer down (see `cleanup_child_processes`), and if
+/// that lands mid dependency-pass it leaves a venv the backend cannot import from --
+/// the reported "ModuleNotFoundError: No module named 'structlog'" after a quit at the
+/// "studio deps" step. Callers use this to warn first instead of destroying an install
+/// the user spent minutes on without saying anything.
+pub fn is_install_running(state: &InstallState) -> bool {
+    state
+        .lock()
+        .map(|install| install.child.is_some())
+        .unwrap_or(false)
+}
+
 pub fn stop_install(state: &InstallState) -> Result<(), String> {
     let mut child = {
         let mut install = match state.lock() {
