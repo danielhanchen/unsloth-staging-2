@@ -26,6 +26,21 @@ $ErrorActionPreference = 'Continue'
 New-Item -ItemType Directory -Force -Path (Split-Path -Parent $LogPath) | Out-Null
 Set-Content -Path $LogPath -Value '' -Encoding utf8
 
+# Stand in for the desktop app, which creates this before spawning the installer and
+# clears it only on a terminal outcome (install.rs). We kill install.ps1 directly
+# rather than driving the real app, so without this the marker #7490 relies on is
+# absent for a reason that has nothing to do with #7490 -- which is exactly what the
+# Windows legs reported. Both locations because the Rust side hardcodes
+# ~/.unsloth/studio while CI overrides UNSLOTH_STUDIO_HOME. Never cleared: being
+# killed is the whole point.
+foreach ($dir in @($env:UNSLOTH_STUDIO_HOME, (Join-Path $HOME '.unsloth\studio'))) {
+  if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+  try {
+    New-Item -ItemType Directory -Force -Path $dir -ErrorAction Stop | Out-Null
+    Set-Content -Path (Join-Path $dir '.desktop-install-in-progress') -Value '' -ErrorAction Stop
+  } catch { Write-Host "[interrupt] could not seed install marker in ${dir}: $_" }
+}
+
 # Run the installer in its own pwsh so stdout can be redirected to the log while we poll.
 $argList = @('-NoProfile', '-NonInteractive', '-File', 'install.ps1')
 if ($InstallArgs) { $argList += $InstallArgs.Split(' ') }
