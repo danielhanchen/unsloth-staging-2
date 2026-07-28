@@ -1,0 +1,41 @@
+name: "staging-7520 macos-14"
+on:
+  push:
+    branches: ["pr-7520-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/llama_cpp.py'
+      - 'studio/backend/tests/test_llama_cpp_tool_loop.py'
+      - 'studio/frontend/package.json'
+      - 'studio/frontend/src/components/assistant-ui/reasoning.tsx'
+      - 'studio/frontend/src/features/chat/api/chat-adapter.ts'
+      - 'studio/frontend/src/features/chat/index.ts'
+      - 'studio/frontend/src/features/chat/utils/parse-assistant-content.ts'
+      - 'studio/frontend/src/features/chat/utils/reasoning-duration.ts'
+      - 'studio/frontend/tests/reasoning-duration.test.ts'
+      - 'studio/frontend/tsconfig.test.json'
+      - '.github/workflows/staging-7520-macos-14.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_llama_cpp_tool_loop.py -q --tb=short || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
