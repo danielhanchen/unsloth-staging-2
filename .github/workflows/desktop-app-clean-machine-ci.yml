@@ -93,7 +93,12 @@ jobs:
           ls -la dl
 
       - name: Strip the developer toolchain
-        if: ${{ inputs.strip_toolchain != false }}
+        # `inputs` exists only for workflow_dispatch. On pull_request and schedule
+        # it is empty, and GitHub coerces '' and false alike to 0, so `!= false`
+        # was false and this never ran: both automatic triggers were installing
+        # against a full toolchain and reporting it as a clean machine. `!= 'false'`
+        # is not the fix either, it strips on a dispatch that asked not to.
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.strip_toolchain }}
         run: |
           bash .github/scripts/clean-machine-env.sh mask --remove
           set -a; . ./clean-machine.env; set +a
@@ -288,7 +293,12 @@ jobs:
           ls -la dl
 
       - name: Strip developer tooling from PATH
-        if: ${{ inputs.strip_toolchain != false }}
+        # `inputs` exists only for workflow_dispatch. On pull_request and schedule
+        # it is empty, and GitHub coerces '' and false alike to 0, so `!= false`
+        # was false and this never ran: both automatic triggers were installing
+        # against a full toolchain and reporting it as a clean machine. `!= 'false'`
+        # is not the fix either, it strips on a dispatch that asked not to.
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.strip_toolchain }}
         shell: pwsh
         run: |
           $drop = @('hostedtoolcache\windows\Python', 'WindowsApps', '\Git\', 'CMake',
