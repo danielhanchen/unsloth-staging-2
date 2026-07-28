@@ -84,6 +84,41 @@ fn setup_custom_titlebar(app: &tauri::App) -> Result<(), Box<dyn std::error::Err
     Ok(())
 }
 
+/// Ask before quitting on top of a running install. Returns true to proceed.
+///
+/// Quitting calls `cleanup_child_processes`, which SIGTERMs the installer's process
+/// group. Landing mid dependency-pass leaves a venv whose CLI works but whose server
+/// stack is missing, and the next launch then dies on `import structlog` -- exactly the
+/// reported failure. That took the user three minutes of installing to reach and
+/// offered no warning, so ask.
+///
+/// Only reachable from the tray Quit item, i.e. a deliberate user action with a UI
+/// present. The RunEvent::Exit path (OS shutdown, SIGTERM) must never block on a dialog
+/// nobody can answer, so it is left alone.
+fn confirm_quit_during_install(app: &tauri::AppHandle) -> bool {
+    use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
+
+    let Some(install_state) = app.try_state::<install::InstallState>() else {
+        return true;
+    };
+    if !install::is_install_running(&install_state) {
+        return true;
+    }
+    app.dialog()
+        .message(
+            "Unsloth Studio is still installing. Quitting now stops it part-way and \
+             leaves the installation incomplete, so it will need to be repaired before \
+             it can start.",
+        )
+        .kind(MessageDialogKind::Warning)
+        .title("Installation in progress")
+        .buttons(MessageDialogButtons::OkCancelCustom(
+            "Quit anyway".to_string(),
+            "Keep installing".to_string(),
+        ))
+        .blocking_show()
+}
+
 fn cleanup_child_processes(app: &tauri::AppHandle) {
     let diagnostics_state = app
         .try_state::<diagnostics::DiagnosticsState>()
@@ -137,6 +172,9 @@ fn setup_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
                 // leaving the backend orphaned.
                 let app_handle = app.clone();
                 std::thread::spawn(move || {
+                    if !confirm_quit_during_install(&app_handle) {
+                        return;
+                    }
                     cleanup_child_processes(&app_handle);
                     app_handle.exit(0);
                 });
