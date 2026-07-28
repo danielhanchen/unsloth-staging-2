@@ -125,6 +125,22 @@ def main() -> int:
     log_path = out / "studio.log"
 
     install = StudioInstall(home=Path(args.home), repo=Path.cwd(), branch="ci")
+    facts: dict[str, object] = {}
+
+    # Set the admin password at launch instead of driving the setup form. The CLI
+    # honours UNSLOTH_STUDIO_PASSWORD on the same path as --password and applies it
+    # before the server binds, so /chat renders the app rather than "Setup your
+    # account". Env var, not argv: the help text notes a literal value is visible in
+    # the process list.
+    #
+    # Only on a genuine first run. Setting it when one already exists is a hard
+    # error that refuses to start, and the auto-generated bootstrap file is exactly
+    # the "no password chosen yet" signal the CLI itself keys on.
+    first_run = (install.home / "auth" / ".bootstrap_password").is_file()
+    launch_env = {"UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK": "1"}
+    if first_run:
+        launch_env["UNSLOTH_STUDIO_PASSWORD"] = FIRST_RUN_PASSWORD
+    facts["first_run"] = first_run
     # `home` is deliberately NOT derived from --bin. launch_studio uses it for two
     # different things: finding the CLI, and exporting UNSLOTH_STUDIO_HOME. Pointing
     # it at the venv makes the CLI print "Unsloth Studio not set up. Run install.sh
@@ -132,18 +148,20 @@ def main() -> int:
     if args.bin and not Path(args.bin).exists():
         print(f"::error::located CLI {args.bin} does not exist")
         return 1
-    facts: dict[str, object] = {}
     rc = 0
     try:
         t0 = time.time()
         launch_studio(install, port=args.port, log_path=log_path,
                       healthz_timeout_s=args.healthz_timeout,
-                      extra_env={"UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK": "1"})
+                      extra_env=launch_env)
         facts["t_healthz_s"] = install.t_healthz_s or round(time.time() - t0, 2)
         print(f"[ui] /healthz 200 after {facts['t_healthz_s']}s")
 
         base_url = f"http://127.0.0.1:{args.port}"
-        facts.update(asyncio.run(drive(base_url, out, install.bootstrap_password)))
+        # When we set it, that is the password; otherwise fall back to whatever the
+        # kit recovered from the auth file or the log.
+        password = FIRST_RUN_PASSWORD if first_run else install.bootstrap_password
+        facts.update(asyncio.run(drive(base_url, out, password)))
         print("[ui] chat page rendered and the composer accepted input")
     except Exception as exc:  # noqa: BLE001 - the report is the deliverable
         rc = 1
