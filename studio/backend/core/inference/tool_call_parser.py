@@ -166,15 +166,31 @@ RAG_SEARCH_CAP_NUDGE = (
 
 
 # ── Plan-without-action re-prompt (shared by the GGUF and safetensors loops) ──
+# Verbs naming work this turn. Narrow on purpose: "install"/"add"/"open" belong to
+# advice for the user, which must not be re-prompted.
+_ACTION_VERB = (
+    r"(?:search|check|look|find|fetch|get|call|use|run|query|invoke|analy[sz]e"
+    r"|review|inspect|read|gather|examine|retrieve|browse|consult|verify"
+    r"|confirm|compute|calculate|determine|identify|render)"
+)
 # Forward-looking intent: the model says what it *will* do, not a final answer.
 INTENT_SIGNAL = re.compile(
-    r"(?i)("
-    # Direct intent ("I'll", "Let me"); lookahead drops negated forms
-    # ("I will not") so a refusal does not re-prompt.
-    r"\b(i['\u2019](ll|m going to|m gonna)|i am (going to|gonna)|i will|i shall|let me|allow me)\b(?!\s+(?:not|never)\b)"
+    r"(?im)("
+    # Direct intent ("I'll"); lookahead drops negated forms ("I will not").
+    r"\b(i['\u2019](ll|m going to|m gonna)|i am (going to|gonna)|i will|i shall)\b(?!\s+(?:not|never)\b)"
     r"|"
-    # Step/plan framing: "First ...", "Step 1:", "Here's my plan"
-    r"\b(?:first\b|step \d+:?|here['\u2019]?s (?:my |the |a )?(?:plan|approach))"
+    # "let me know" hands control back rather than announcing an action.
+    r"\b(?:let me|allow me)\b(?!\s+(?:not|never|know)\b)"
+    r"|"
+    # Step/plan framing. "first" must open a sentence and be followed by a plan
+    # (pronoun, "my/our plan", or an action verb); otherwise it is prose ("The
+    # first line is blank.", "First place went to Alice") or advice to the user.
+    r"(?:^|[.!?]\s+)\s*(?:the\s+)?first\s+step\b"
+    r"|(?:^|[.!?]\s+)\s*first\s*[,:–—-]?\s+(?:my|our)\s+(?:plan|approach|step)\b"
+    r"|(?:^|[.!?]\s+)\s*first\s*[,:–—-]?\s+(?:i|we|let['’]?s|let us)\b"
+    r"|(?:^|[.!?]\s+)\s*first\s*[,:–—-]?\s+" + _ACTION_VERB + r"\b"
+    r"|"
+    r"\b(?:step \d+:?|here['\u2019]?s (?:my |the |a )?(?:plan|approach))"
     r"|"
     r"\b(?:now i|next i)\b"
     r")"
@@ -188,6 +204,54 @@ REPROMPT_MAX_CHARS = 2000
 def is_short_intent_without_action(text: str) -> bool:
     stripped = text.strip()
     return 0 < len(stripped) < REPROMPT_MAX_CHARS and INTENT_SIGNAL.search(stripped) is not None
+
+
+# Leading marks are kept unless they are quotes or brackets, so ".NET" survives;
+# stripping all non-word chars would collapse "C++" and "C#" to the same token.
+_REPEAT_TRAIL_PUNCT = ".,;:!?\"'`()[]{}<>‘’“”"
+_REPEAT_LEAD_PUNCT = "\"'`([{‘“"
+# Wording that can drift between two attempts without the attempt changing.
+# Articles stay out: "The Who" and "Who" are different search targets.
+_REPEAT_FILLER = frozenset({"now", "then", "just", "so", "ok", "okay", "please", "also", "again"})
+
+
+def _normalize_for_repeat(text: str) -> str:
+    words = []
+    for word in text.lower().split():
+        stripped = word.rstrip(_REPEAT_TRAIL_PUNCT).lstrip(_REPEAT_LEAD_PUNCT)
+        # Keep marks-only tokens: "value is 5" and "value is < 5" differ, and
+        # dropping the "<" threw the corrected attempt away.
+        words.append(stripped or word)
+    return " ".join(words)
+
+
+# A nudge that just gets the same answer back has not worked, so stop there.
+def is_reprompt_repeat(text: str, previous: str) -> bool:
+    if not previous:
+        return False
+    a, b = _normalize_for_repeat(text), _normalize_for_repeat(previous)
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    ta = [word for word in a.split() if word not in _REPEAT_FILLER]
+    tb = [word for word in b.split() if word not in _REPEAT_FILLER]
+    if len(ta) < 4 or len(tb) < 4:
+        return False  # too short for overlap to mean anything
+    # Ordered content-word sequence, not a similarity ratio: any ratio is length
+    # dependent (one corrected token in a 50-word plan still scored 0.98), and order
+    # matters since "cats not dogs" and "dogs not cats" share every word.
+    return ta == tb
+
+
+# Stricter sibling of ``is_reprompt_repeat``: exact equality, since this discards the
+# turn. An appended answer would clear the fuzzy bar, and deletions flip meaning
+# ("is not supported" -> "is supported").
+def is_reprompt_restatement(text: str, previous: str) -> bool:
+    if not previous:
+        return False
+    a, b = _normalize_for_repeat(text), _normalize_for_repeat(previous)
+    return bool(a) and a == b
 
 
 def reprompt_to_act_message(tool_hint: str) -> str:
