@@ -1,0 +1,215 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Proves an INTERRUPTED install can never masquerade as a healthy one.
+#
+# Reported failure: a user quits the desktop app while it is installing. The app kills
+# the installer process group (main.rs cleanup_child_processes -> install.rs:798-807),
+# which lands mid "studio deps" -- the step that installs
+# studio/backend/requirements/studio.txt, where structlog is declared. On relaunch,
+# preflight probes `unsloth -h` and `studio desktop-capabilities --json`; both succeed
+# because the CLI's own deps (typer/click/rich) are core, so the app reports
+# ManagedReady with can_auto_repair=false. The backend then dies on
+# `import structlog` and the user is permanently stuck on "Server stopped
+# unexpectedly".
+#
+# Nothing in CI covered this: no job has ever interrupted an install. This workflow
+# kills the installer at each interesting phase and asserts the result is either
+# genuinely healthy or explicitly repairable -- never silently ready.
+
+name: Interrupted install recovery
+
+on:
+  pull_request:
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - 'studio/setup.sh'
+      - 'studio/setup.ps1'
+      - 'studio/install_python_stack.py'
+      - 'studio/src-tauri/src/install.rs'
+      - 'studio/src-tauri/src/preflight.rs'
+      - 'studio/src-tauri/src/preflight/**'
+      - 'unsloth_cli/commands/studio.py'
+      - '.github/scripts/interrupt*-install*'
+      - '.github/scripts/interrupted-install-probe.sh'
+      - '.github/workflows/interrupted-install-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/.studio-home
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+
+jobs:
+  # ── macOS + Linux: kill at each phase ─────────────────────────────────────
+  interrupt:
+    name: ${{ matrix.os }} kill@${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The exact reported case: killed during the step that installs structlog.
+          - {os: macos-14, label: studio-deps, marker: 'studio deps', experimental: false}
+          # Coarse phases, earliest to latest -- each leaves a different partial venv.
+          - {os: macos-14, label: venv,        marker: '\[TAURI:STEP\] Creating virtual environment', experimental: false}
+          - {os: macos-14, label: torch,       marker: '\[TAURI:STEP\] Installing PyTorch',           experimental: false}
+          - {os: macos-14, label: unsloth,     marker: '\[TAURI:STEP\] Installing Unsloth',           experimental: false}
+          - {os: macos-14, label: setup,       marker: '\[TAURI:STEP\] Running Unsloth setup',        experimental: false}
+          # Other dependency-pass steps around the named one.
+          - {os: macos-14, label: pip-bootstrap,  marker: 'pip bootstrap',     experimental: false}
+          - {os: macos-14, label: base-packages, marker: 'base packages',     experimental: false}
+          - {os: macos-14, label: unsloth-extras, marker: 'unsloth extras',    experimental: true}
+          - {os: macos-14, label: data-designer,  marker: 'data designer deps', experimental: true}
+          # Linux: same teardown path, different package manager and process semantics.
+          - {os: ubuntu-latest, label: studio-deps, marker: 'studio deps', experimental: false}
+          - {os: ubuntu-latest, label: torch, marker: '\[TAURI:STEP\] Installing PyTorch', experimental: false}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends cmake git build-essential libcurl4-openssl-dev
+
+      - name: Install, interrupted at "${{ matrix.label }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KILL_AT_SECONDS: '1500'
+        run: |
+          bash .github/scripts/interrupt-install.sh \
+            '${{ matrix.marker }}' logs/install.log -- --tauri
+
+      - name: What state is the install in?
+        id: probe
+        run: |
+          BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
+          [ -x "$BIN" ] || BIN="$UNSLOTH_STUDIO_HOME/bin/unsloth"
+          if [ ! -x "$BIN" ]; then
+            # No CLI at all is a SAFE outcome: preflight reports NotInstalled and the
+            # app offers a normal install. Nothing to assert beyond that.
+            echo "verdict=NO_CLI" >> "$GITHUB_OUTPUT"
+            echo "[probe] no unsloth CLI installed -> preflight reports NotInstalled (safe)"
+            exit 0
+          fi
+          rc=0
+          PROBE_OUT_DIR=probe bash .github/scripts/interrupted-install-probe.sh "$BIN" 8899 || rc=$?
+          v="$(grep -E '^VERDICT=' probe/verdict.env | tail -1 | cut -d= -f2)"
+          echo "verdict=$v" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: A re-run must repair, not short-circuit
+        # Only meaningful when the install is broken but present. The bug's second half
+        # is that `install.sh` sees a "current" version and no-ops over a broken venv.
+        if: always() && steps.probe.outputs.verdict != 'NO_CLI' && steps.probe.outputs.verdict != 'HEALTHY'
+        run: |
+          set -o pipefail
+          rc=0
+          bash install.sh --tauri < /dev/null 2>&1 | tee logs/repair.log || rc=$?
+          echo "repair exit: $rc"
+          if grep -qiE "up to date|already current" logs/repair.log \
+             && ! grep -qiE "forcing dependency pass|incomplete|repair" logs/repair.log; then
+            echo "::error::re-run reported the venv up to date without repairing it"
+            exit 1
+          fi
+          BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
+          [ -x "$BIN" ] || BIN="$UNSLOTH_STUDIO_HOME/bin/unsloth"
+          PROBE_OUT_DIR=probe-after bash .github/scripts/interrupted-install-probe.sh "$BIN" 8901
+          v="$(grep -E '^VERDICT=' probe-after/verdict.env | tail -1 | cut -d= -f2)"
+          if [ "$v" != "HEALTHY" ]; then
+            echo "::error::after a full re-run the backend still does not boot (verdict=$v)"
+            exit 1
+          fi
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: interrupted-${{ matrix.os }}-${{ matrix.label }}
+          path: |
+            logs/
+            probe/
+            probe-after/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ── Windows: no process groups, so the kill path differs ──────────────────
+  interrupt-windows:
+    name: windows kill@${{ matrix.label }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: studio-deps, marker: 'studio deps'}
+          - {label: torch, marker: 'Installing PyTorch'}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install, interrupted at "${{ matrix.label }}"
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File .github/scripts/interrupt-install.ps1 `
+            -Marker '${{ matrix.marker }}' -LogPath logs/install.log `
+            -InstallArgs '-SkipTorch' -KillAtSeconds 1500
+
+      - name: What state is the install in?
+        shell: pwsh
+        run: |
+          $bin = Join-Path $env:UNSLOTH_STUDIO_HOME 'unsloth_studio\Scripts\unsloth.exe'
+          if (-not (Test-Path $bin)) {
+            Write-Host '[probe] no unsloth CLI -> preflight reports NotInstalled (safe)'
+            exit 0
+          }
+          # Same three questions the shell probe asks: do the two preflight probes pass,
+          # and does the backend actually boot? A yes/yes/no is the bug.
+          & $bin -h *> probe-cli-h.log; $cliH = ($LASTEXITCODE -eq 0)
+          & $bin studio desktop-capabilities --json *> probe-caps.json; $caps = ($LASTEXITCODE -eq 0)
+          $backendOk = $false
+          $p = Start-Process -FilePath $bin -ArgumentList 'studio','--api-only','-H','127.0.0.1','-p','8899' `
+                 -RedirectStandardOutput probe-backend.log -RedirectStandardError probe-backend.err `
+                 -PassThru -NoNewWindow
+          for ($i=0; $i -lt 60; $i++) {
+            if ($p.HasExited) { break }
+            try { Invoke-WebRequest -Uri 'http://127.0.0.1:8899/api/health' -TimeoutSec 3 -UseBasicParsing | Out-Null; $backendOk = $true; break } catch { }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          Write-Host "cli_h=$cliH caps=$caps backend=$backendOk"
+          $missing = (Select-String -Path probe-backend.log,probe-backend.err -Pattern "No module named '([^']+)'" -ErrorAction SilentlyContinue | Select-Object -First 1)
+          if ($missing) { Write-Host "backend import error: $($missing.Line.Trim())" }
+          if (-not $backendOk -and $cliH -and $caps) {
+            Write-Host '::error::Interrupted install reports READY but the backend cannot boot -- app would show ManagedReady with can_auto_repair=false'
+            exit 1
+          }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: interrupted-windows-${{ matrix.label }}
+          path: |
+            logs/
+            probe-*.log
+            probe-*.json
+            probe-*.err
+          retention-days: 7
+          if-no-files-found: warn
