@@ -106,8 +106,8 @@ jobs:
             exit 0
           fi
           rc=0
-          PROBE_OUT_DIR=probe bash .github/scripts/interrupted-install-probe.sh "$BIN" 8899 || rc=$?
-          v="$(grep -E '^VERDICT=' probe/verdict.env | tail -1 | cut -d= -f2)"
+          python3 .github/scripts/interrupted_install_probe.py "$BIN" --out probe || rc=$?
+          v="$(python3 -c "import json;print(json.load(open('probe/verdict.json'))['verdict'])")"
           echo "verdict=$v" >> "$GITHUB_OUTPUT"
           exit "$rc"
 
@@ -127,8 +127,8 @@ jobs:
           fi
           BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
           [ -x "$BIN" ] || BIN="$UNSLOTH_STUDIO_HOME/bin/unsloth"
-          PROBE_OUT_DIR=probe-after bash .github/scripts/interrupted-install-probe.sh "$BIN" 8901
-          v="$(grep -E '^VERDICT=' probe-after/verdict.env | tail -1 | cut -d= -f2)"
+          python3 .github/scripts/interrupted_install_probe.py "$BIN" --out probe-after || true
+          v="$(python3 -c "import json;print(json.load(open('probe-after/verdict.json'))['verdict'])")"
           if [ "$v" != "HEALTHY" ]; then
             echo "::error::after a full re-run the backend still does not boot (verdict=$v)"
             exit 1
@@ -179,27 +179,12 @@ jobs:
             Write-Host '[probe] no unsloth CLI -> preflight reports NotInstalled (safe)'
             exit 0
           }
-          # Same three questions the shell probe asks: do the two preflight probes pass,
-          # and does the backend actually boot? A yes/yes/no is the bug.
-          & $bin -h *> probe-cli-h.log; $cliH = ($LASTEXITCODE -eq 0)
-          & $bin studio desktop-capabilities --json *> probe-caps.json; $caps = ($LASTEXITCODE -eq 0)
-          $backendOk = $false
-          $p = Start-Process -FilePath $bin -ArgumentList 'studio','--api-only','-H','127.0.0.1','-p','8899' `
-                 -RedirectStandardOutput probe-backend.log -RedirectStandardError probe-backend.err `
-                 -PassThru -NoNewWindow
-          for ($i=0; $i -lt 60; $i++) {
-            if ($p.HasExited) { break }
-            try { Invoke-WebRequest -Uri 'http://127.0.0.1:8899/api/health' -TimeoutSec 3 -UseBasicParsing | Out-Null; $backendOk = $true; break } catch { }
-            Start-Sleep -Seconds 2
-          }
-          if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-          Write-Host "cli_h=$cliH caps=$caps backend=$backendOk"
-          $missing = (Select-String -Path probe-backend.log,probe-backend.err -Pattern "No module named '([^']+)'" -ErrorAction SilentlyContinue | Select-Object -First 1)
-          if ($missing) { Write-Host "backend import error: $($missing.Line.Trim())" }
-          if (-not $backendOk -and $cliH -and $caps) {
-            Write-Host '::error::Interrupted install reports READY but the backend cannot boot -- app would show ManagedReady with can_auto_repair=false'
-            exit 1
-          }
+          # The SAME probe the other platforms run. This step used to be a bespoke
+          # inline version that only checked `-h` and `desktop-capabilities`, so it
+          # could not observe studio_install_ok / verify-install /
+          # desktop-runtime-check -- it would have failed the very PRs that add them,
+          # no matter how well they worked.
+          python .github/scripts/interrupted_install_probe.py $bin --out probe
 
       - name: Upload logs
         if: always()
@@ -208,8 +193,6 @@ jobs:
           name: interrupted-windows-${{ matrix.label }}
           path: |
             logs/
-            probe-*.log
-            probe-*.json
-            probe-*.err
+            probe/
           retention-days: 7
           if-no-files-found: warn
