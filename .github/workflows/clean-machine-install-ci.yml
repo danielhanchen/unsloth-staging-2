@@ -332,6 +332,88 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
+  # ── WSL ───────────────────────────────────────────────────────────────────
+  # install.sh carries ~126 lines of WSL-specific logic (the `linux|wsl` dependency
+  # branch, UNSLOTH_WSL_REROUTED, the Strix Halo reroute to 24.04), and none of it
+  # had ever run in CI -- tests/sh/test_strixhalo_wsl_reroute.sh extracts functions
+  # and mocks the environment, which cannot catch anything about a real WSL.
+  #
+  # No third-party action: the official Ubuntu WSL rootfs plus `wsl --import` is
+  # deterministic, checksum-verifiable, and avoids adding a supply-chain dependency
+  # to a repo that audits its lockfiles.
+  wsl:
+    name: wsl ubuntu-24.04
+    runs-on: windows-latest
+    timeout-minutes: 50
+    continue-on-error: true
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Import a fresh Ubuntu 24.04 WSL distro
+        shell: pwsh
+        run: |
+          # WSL2 is present on windows-2022+ runner images; only a distro is missing.
+          wsl --set-default-version 2
+          $url = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/current/ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz'
+          $expected = '2a790896740b14d637dbdc583cce1ba081ac53b9e9cdb46dc09a2f73abbd9934'
+          New-Item -ItemType Directory -Force -Path wsl-dist, logs | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile wsl-dist/rootfs.tar.gz -UseBasicParsing -TimeoutSec 900
+          $actual = (Get-FileHash wsl-dist/rootfs.tar.gz -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) {
+            Write-Host "::error::rootfs checksum mismatch: got $actual"
+            exit 1
+          }
+          wsl --import unsloth-ci "$PWD/wsl-dist/instance" "$PWD/wsl-dist/rootfs.tar.gz" --version 2
+          wsl -d unsloth-ci -- uname -a
+          # A freshly imported rootfs is genuinely bare: no curl, no git, no compiler.
+          # That is the clean machine, not a simulation of one.
+          wsl -d unsloth-ci -- sh -c 'for t in curl wget git gcc cmake python3 sudo; do printf "%-8s %s\n" "$t" "$(command -v $t || echo ABSENT)"; done'
+
+      - name: Install inside WSL, piped exactly as documented
+        shell: pwsh
+        run: |
+          # Only ca-certificates + curl, because the advertised one-liner cannot even
+          # start without a transport. Everything else must come from the installer.
+          wsl -d unsloth-ci -u root -- sh -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl' 2>&1 | Tee-Object -FilePath logs/wsl-bootstrap.log
+          # Copy the script in rather than reaching across /mnt/c: a DrvFs path brings
+          # Windows file permissions and CRLF risk with it, and neither is what a real
+          # WSL user's install looks like.
+          $wslPath = (wsl -d unsloth-ci -- wslpath -a "$($env:GITHUB_WORKSPACE -replace '\\','/')/install.sh").Trim()
+          Write-Host "installer source in WSL: $wslPath"
+          wsl -d unsloth-ci -u root -- cp "$wslPath" /root/install.sh
+          # Feed it through a pipe: same shape as `curl ... | sh`, so an early exit
+          # still exposes the broken-pipe problem, but the script under test is this
+          # ref rather than whatever production currently serves.
+          wsl -d unsloth-ci -u root -- sh -c 'cd /root && cat install.sh | sh' 2>&1 | Tee-Object -FilePath logs/wsl-install.log
+          Write-Host "installer exit: $LASTEXITCODE"
+
+      - name: Did it detect WSL, and did it end up usable?
+        if: always()
+        shell: pwsh
+        run: |
+          # The platform line proves the wsl branch was taken rather than plain linux.
+          Select-String -Path logs/wsl-install.log -Pattern 'platform|\[TAURI:DIAG\]|wsl' -ErrorAction SilentlyContinue |
+            Select-Object -First 10
+          wsl -d unsloth-ci -u root -- sh -c 'test -x "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth" && "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth" --version || echo "no CLI installed"' 2>&1 |
+            Tee-Object -FilePath logs/wsl-verify.log
+
+      - name: Tear the distro down
+        if: always()
+        shell: pwsh
+        run: wsl --unregister unsloth-ci 2>&1 | Out-Null; exit 0
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: clean-wsl-ubuntu2404
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
+
   # ── Windows ───────────────────────────────────────────────────────────────
   windows:
     name: win ${{ matrix.os }} / winget=${{ matrix.winget }}
