@@ -158,7 +158,13 @@ jobs:
               ;;
             tauri)
               # Exactly how the desktop app invokes it: no tty, stdin closed.
-              bash install.sh --tauri $FLAGS < /dev/null 2>&1 | tee logs/install.log || rc=$?
+              # --tauri rejects a custom UNSLOTH_STUDIO_HOME outright (the desktop app
+              # still uses the legacy ~/.unsloth/studio root), so the workspace-scoped
+              # value every other leg relies on has to go here or the installer exits
+              # before it does any work. The runner is ephemeral, so the real home is
+              # as disposable as the override.
+              env -u UNSLOTH_STUDIO_HOME \
+                bash install.sh --tauri $FLAGS < /dev/null 2>&1 | tee logs/install.log || rc=$?
               ;;
           esac
           echo "install_rc=$rc" >> "$GITHUB_OUTPUT"
@@ -182,7 +188,14 @@ jobs:
         if: steps.install.outcome == 'success'
         run: |
           set -a; . ./clean-machine.env; set +a
-          STUDIO_HOME="$UNSLOTH_STUDIO_HOME" bash .github/scripts/assert-llama-loads.sh
+          # The tauri leg cannot honour UNSLOTH_STUDIO_HOME (see the Install step), so
+          # it installed into the legacy root and that is where to look.
+          if [ "${{ matrix.delivery }}" = "tauri" ]; then
+            HOME_DIR="$HOME/.unsloth/studio"
+          else
+            HOME_DIR="$UNSLOTH_STUDIO_HOME"
+          fi
+          STUDIO_HOME="$HOME_DIR" bash .github/scripts/assert-llama-loads.sh
 
       - name: Restore the runner
         if: always()

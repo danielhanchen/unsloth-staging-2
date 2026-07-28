@@ -59,9 +59,20 @@ for check in "$@"; do
         # UNSLOTH_ALLOW_TOOLS lets that leg allow-list it explicitly.
         allow="${UNSLOTH_ALLOW_TOOLS:-}"
         hits=""
-        while IFS=$'\t' read -r tool _rest; do
+        while IFS=$'\t' read -r tool rest; do
           [ -n "$tool" ] || continue
           case " $allow " in *" $tool "*) continue ;; esac
+          # `xcode-select -p` ASKS whether a toolchain is selected; it cannot build
+          # anything. The installer has to ask in order to tell the user whether a
+          # source build is available, and the whole point of the fix is that it then
+          # carries on without one. Treating the question as toolchain USE would fail
+          # the very leg that proves the toolchain was never used. `--install`, which
+          # pops the CLT installer, stays a hit.
+          if [ "$tool" = "xcode-select" ]; then
+            case "$rest" in
+              -p|--print-path|-v|--version|"") continue ;;
+            esac
+          fi
           hits="$hits $tool"
         done < "$TRACE"
         if [ -n "$hits" ]; then

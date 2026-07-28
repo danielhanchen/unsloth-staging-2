@@ -2054,45 +2054,79 @@ _check_macos_deps() {
     return 0
 }
 
+# Linux/WSL system-dependency check. Same split as macOS, and a function for the same
+# reason: tests/sh can extract it, the old inline form could not be reached.
+#
+# Only a download transport is genuinely required. cmake, gcc and the libcurl headers
+# exist solely for a llama.cpp SOURCE build, and the consumer path never does one --
+# unslothai/llama.cpp publishes linux-x64 and linux-arm64 prebuilts covering cpu,
+# cuda12, cuda13, rocm and vulkan. Requiring them turned every non-apt distro into a
+# hard exit 1 (the Fedora/Arch/openSUSE message below) for tooling nothing downstream
+# used, which is the same defect the macOS Xcode CLT gate had. git follows macOS too:
+# needed only for --local, which installs unsloth-zoo from a git+https URL.
+_check_linux_deps() {
+    _transport_missing=false
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        _transport_missing=true
+    fi
+
+    # Source-build-only tooling. Absence is a warning, never a stop.
+    _optional_missing=""
+    command -v cmake       >/dev/null 2>&1 || _optional_missing="$_optional_missing cmake"
+    command -v gcc         >/dev/null 2>&1 || _optional_missing="$_optional_missing build-essential"
+    command -v curl-config >/dev/null 2>&1 || _optional_missing="$_optional_missing libcurl4-openssl-dev"
+    # Parameter expansion, not `sed`: this gate runs before anything is installed, and
+    # on a minimal container image sed may not exist. A failed `$(... | sed ...)` yields
+    # the empty string, which would report "all system dependencies found" on a machine
+    # that has none of them.
+    _optional_missing="${_optional_missing# }"
+
+    if [ "$STUDIO_LOCAL_INSTALL" = true ] && ! _has_working_git; then
+        echo ""
+        step "deps" "git is required for --local installs" "$C_ERR"
+        substep "--local installs unsloth-zoo from git+https://github.com/unslothai/unsloth-zoo,"
+        substep "which needs git. Install it with your package manager, then re-run."
+        substep "A normal (non---local) install needs no git and no compiler."
+        return 1
+    fi
+
+    # The one genuinely fatal case: nothing can be downloaded. Try apt first, since
+    # that is the distro family we can drive unattended.
+    if [ "$_transport_missing" = true ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            echo ""
+            step "deps" "missing: curl" "$C_WARN"
+            substep "Needed to download uv, Python and the prebuilt inference engine."
+            _smart_apt_install curl
+            echo ""
+        else
+            echo ""
+            step "deps" "missing: curl (or wget)" "$C_ERR"
+            substep "Unsloth needs one of them to download uv, Python and the prebuilt"
+            substep "inference engine. Install one, then re-run setup:"
+            substep "  Fedora/RHEL: sudo dnf install curl"
+            substep "  Arch:        sudo pacman -S --needed curl"
+            substep "  openSUSE:    sudo zypper install curl"
+            return 1
+        fi
+    fi
+
+    if [ -n "$_optional_missing" ]; then
+        step "deps" "using prebuilt llama.cpp (missing: $_optional_missing)" "$C_WARN"
+        substep "Not required: Unsloth downloads a prebuilt inference engine."
+        substep "Install them only for a llama.cpp source build."
+    else
+        step "deps" "all system dependencies found"
+    fi
+    return 0
+}
+
 case "$OS" in
     macos)
         _check_macos_deps || exit 1
         ;;
     linux|wsl)
-        MISSING=""
-        command -v cmake >/dev/null 2>&1 || MISSING="$MISSING cmake"
-        command -v git   >/dev/null 2>&1 || MISSING="$MISSING git"
-        # curl or wget is needed for downloads; check both
-        if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-            MISSING="$MISSING curl"
-        fi
-        command -v gcc  >/dev/null 2>&1 || MISSING="$MISSING build-essential"
-        # libcurl dev headers for llama.cpp HTTPS support
-        command -v curl-config >/dev/null 2>&1 || MISSING="$MISSING libcurl4-openssl-dev"
-
-        MISSING=$(echo "$MISSING" | sed 's/^ *//')
-        if [ -n "$MISSING" ]; then
-            echo ""
-            step "deps" "missing: $MISSING" "$C_WARN"
-            substep "These are needed to build the GGUF inference engine."
-            if command -v apt-get >/dev/null 2>&1; then
-                _smart_apt_install $MISSING
-            else
-                echo "    Automatic system package installation is supported on apt-based"
-                echo "    Linux distributions (Ubuntu/Debian) only. Please install the"
-                echo "    missing dependencies with your package manager, then re-run setup:"
-                echo "    $MISSING"
-                echo ""
-                echo "    Examples:"
-                echo "      Fedora/RHEL: sudo dnf install cmake git gcc gcc-c++ make libcurl-devel"
-                echo "      Arch:       sudo pacman -S --needed cmake git base-devel curl"
-                echo "      openSUSE:   sudo zypper install cmake git gcc gcc-c++ make libcurl-devel"
-                exit 1
-            fi
-            echo ""
-        else
-            step "deps" "all system dependencies found"
-        fi
+        _check_linux_deps || exit 1
         ;;
 esac
 
