@@ -116,6 +116,10 @@ export function useTauriBackend() {
   const externalPollAbortedRef = useRef(false);
   const authFailureRef = useRef<string | null>(getTauriAuthFailure());
   const elevationResumeRef = useRef<"install" | "repair" | null>(null);
+  // One automatic repair per session for a backend that cannot import its own
+  // dependencies. Without this latch a repair that does not fix the import would
+  // crash -> repair -> crash forever.
+  const incompleteInstallRepairRef = useRef(false);
   const [tauriEventsReady, setTauriEventsReady] = useState(!isTauri);
 
   function setBackendStatus(nextStatus: BackendStatus) {
@@ -551,9 +555,28 @@ export function useTauriBackend() {
         setApiBase(e.payload);
       });
 
-      register<void>("server-crashed", () => {
+      // The payload was added so an incomplete install stops looking like a crash.
+      // Older backends emit no payload, hence the fallbacks.
+      register<
+        | { message?: string; incomplete_install?: boolean; missing_module?: string }
+        | undefined
+      >("server-crashed", (e) => {
         startingRef.current = false;
-        setBackendError("Server stopped unexpectedly");
+        const detail = e.payload;
+        if (detail?.incomplete_install && !incompleteInstallRepairRef.current) {
+          // A backend that cannot import its own dependencies was never a crash: an
+          // install was interrupted before it finished. Repair is the correct action,
+          // and preflight cannot reach this conclusion on its own -- its probes run
+          // the CLI, whose own deps survived. Only the failed import proves it.
+          //
+          // Repair once per session: if the repaired install still cannot import, a
+          // second attempt would loop, so fall through to the message instead.
+          incompleteInstallRepairRef.current = true;
+          setBackendError(detail.message || "Studio's installation is incomplete");
+          void startRepair();
+          return;
+        }
+        setBackendError(detail?.message || "Server stopped unexpectedly");
       });
 
       register<string>("server-log", (e) => {
