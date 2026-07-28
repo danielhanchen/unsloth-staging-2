@@ -1,0 +1,535 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Installs and launches the SHIPPED desktop app on a machine stripped of developer
+# tooling, on all three platforms.
+#
+# studio-tauri-smoke.yml compiles the Tauri crate and release-desktop.yml produces the
+# bundles, but neither puts a published artifact on a clean machine and checks that it
+# starts -- the gap the reported failures fell through: both came from the packaged app
+# running its bundled Contents/Resources/install.sh, which no CI job exercised.
+#
+# Hosted runners have no interactive desktop session, so "runs" means: the bundle
+# installs / mounts / extracts, the binary is present, of the right architecture, and
+# passes the gatekeeper checks a user would hit (macOS quarantine + codesign, Windows
+# installer exit), the process STAYS UP past its preflight (where an unhappy app dies),
+# and it writes tauri.log showing the preflight disposition -- the field that read
+# `ManagedReady` over an unbootable venv in the bug report. Linux gets the strongest
+# check: a real webview under Xvfb.
+
+name: Desktop app clean machine
+
+on:
+  # Also on PRs touching this job or the machine-stripping scripts: workflow_dispatch
+  # alone cannot validate a change to the job itself, because dispatch resolves the
+  # workflow from the DEFAULT branch, so a new or edited file on a feature branch can
+  # never be dispatched and would first run only after merging blind.
+  pull_request:
+    paths:
+      - '.github/workflows/desktop-app-clean-machine-ci.yml'
+      - '.github/scripts/clean-machine-env.sh'
+      - '.github/scripts/clean-machine-assert.sh'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag in the desktop release repo'
+        type: string
+        default: 'desktop-v0.1.50-beta'
+      release_repo:
+        description: 'owner/name hosting the desktop release'
+        type: string
+        default: ''
+      strip_toolchain:
+        description: 'Strip developer tooling before installing'
+        type: boolean
+        default: true
+  schedule:
+    # Nightly, so a broken published bundle is caught without anyone asking.
+    - cron: '17 5 * * *'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # release-desktop.yml publishes into github.repository, so a nightly aimed
+  # anywhere else goes green over a broken production bundle.
+  # unsloth-test/unsloth-test holds one frozen release, so the schedule was
+  # re-testing the same fixture forever.
+  REL_REPO: ${{ inputs.release_repo || github.repository }}
+  # Empty unless dispatched: a pinned tag is an immutable fixture, so a nightly
+  # against it could never catch a newly published broken bundle. Each download step
+  # resolves the newest desktop-v* release when this is empty.
+  REL_TAG: ${{ inputs.release_tag || '' }}
+  UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/.studio-home
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+
+jobs:
+  # ── macOS: .dmg, Apple Silicon ────────────────────────────────────────────
+  macos:
+    name: desktop macOS ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: macos-14, experimental: false}
+          - {os: macos-15, experimental: false}
+          - {os: macos-26, experimental: true}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download the shipped .dmg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dl logs
+          # Desktop releases are prereleases (never repo-wide "latest"), so the
+          # newest desktop-v* tag has to be resolved explicitly.
+          if [ -z "$REL_TAG" ]; then
+            REL_TAG="$(gh release list --repo "$REL_REPO" --limit 100 --exclude-drafts \
+              --json tagName,createdAt \
+              --jq '[.[] | select(.tagName | startswith("desktop-v"))]
+                    | sort_by(.createdAt) | reverse | .[0].tagName // empty')"
+            [ -n "$REL_TAG" ] || { echo "::error::no desktop-v* release in $REL_REPO"; exit 1; }
+            echo "resolved release tag: $REL_TAG"
+            echo "REL_TAG=$REL_TAG" >> "$GITHUB_ENV"
+          fi
+          gh release download "$REL_TAG" --repo "$REL_REPO" \
+            --pattern '*aarch64.dmg' --dir dl
+          ls -la dl
+
+      - name: Strip the developer toolchain
+        # `inputs` exists only for workflow_dispatch, so on pull_request and schedule
+        # `inputs.strip_toolchain` is '' -- and loose equality coerces both '' and
+        # false to 0, making `!= false` FALSE, so automatic runs would keep the hosted
+        # toolchain this workflow exists to remove. Gate on the event instead.
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.strip_toolchain }}
+        run: |
+          bash .github/scripts/clean-machine-env.sh mask --remove
+          set -a; . ./clean-machine.env; set +a
+          bash .github/scripts/clean-machine-assert.sh absent
+
+      - name: Mount and install
+        run: |
+          DMG="$(ls dl/*.dmg | head -1)"
+          # A real download is quarantined, and Gatekeeper treats that differently
+          # from a locally built bundle: a genuine failure mode.
+          xattr -w com.apple.quarantine \
+            "0081;$(printf %x $(date +%s));Safari;" "$DMG" 2>/dev/null || true
+          hdiutil attach "$DMG" -nobrowse -quiet -mountpoint /Volumes/UnslothCI
+          APP="$(ls -d /Volumes/UnslothCI/*.app | head -1)"
+          echo "app bundle: $APP"
+          cp -R "$APP" /Applications/
+          hdiutil detach /Volumes/UnslothCI -quiet
+          ls -la /Applications | grep -i unsloth
+
+      - name: Inspect the bundle (arch, signature, Gatekeeper)
+        run: |
+          APP="$(ls -d /Applications/*Unsloth*.app | head -1)"
+          BIN="$APP/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
+          file "$BIN"
+          # `lipo -archs` prints and exits 0 for a thin x86_64 binary, and `|| true`
+          # swallowed even that, so "the right architecture" was never asserted. lipo
+          # is an xcrun shim too, absent once the strip step moved CommandLineTools
+          # aside; /usr/bin/file is base system.
+          ARCHS="$(lipo -archs "$BIN" 2>/dev/null || true)"
+          [ -n "$ARCHS" ] || ARCHS="$(file -b "$BIN")"
+          echo "architectures: $ARCHS"
+          case "$ARCHS" in
+            *arm64*|*aarch64*) ;;
+            *) echo "::error::the aarch64 .dmg carries no arm64 binary ($ARCHS)"; exit 1 ;;
+          esac
+          # Report rather than gate: an unnotarised beta is expected to fail
+          # assessment, but a user WILL hit this, so it must be visible.
+          codesign -dv --verbose=2 "$APP" 2>&1 | head -20 || true
+          spctl -a -vvv -t install "$APP" 2>&1 | head -5 || \
+            echo "::warning::Gatekeeper assessment failed -- users see 'cannot be opened' unless notarised"
+          # The bundled installer is what actually failed for users. `::error::` is
+          # only an annotation and `echo` exits 0, so the old `|| echo` form let a
+          # bundle with no installer pass.
+          if [ -f "$APP/Contents/Resources/install.sh" ]; then
+            echo "bundled install.sh present"
+          else
+            echo "::error::no bundled install.sh in the app"
+            exit 1
+          fi
+
+      - name: Run the bundled installer, the path first launch takes
+        run: |
+          set -a; [ -f ./clean-machine.env ] && . ./clean-machine.env; set +a
+          set -o pipefail
+          APP="$(ls -d /Applications/*Unsloth*.app | head -1)"
+          # A headless runner never clicks Install: preflight sets `not_installed` and
+          # returns (studio/frontend/src/hooks/use-tauri-backend.ts:252-254) while
+          # startup-screen.tsx:388-389 waits for the button, so launching alone would
+          # sit on that screen for 90s and pass without ever running the bundled
+          # installer. Invoke it as studio/src-tauri/src/install.rs does: --tauri,
+          # stdin closed, no tty. --tauri rejects a custom studio home
+          # (install.sh:102-114), so drop the workspace-scoped override.
+          env -u UNSLOTH_STUDIO_HOME \
+            bash "$APP/Contents/Resources/install.sh" --tauri \
+            < /dev/null 2>&1 | tee logs/bundled-install.log
+          PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          [ -x "$PY" ] || { echo "::error::bundled installer left no venv at $PY"; exit 1; }
+          "$PY" -V
+          # install.rs passes only --tauri, so torch is part of first launch:
+          # asserting it stops the venv check passing a bundle whose only failure is
+          # the torch install.
+          "$PY" -c "import torch; print('torch', torch.__version__)"
+
+      - name: Launch and prove it stays up
+        run: |
+          set -a; [ -f ./clean-machine.env ] && . ./clean-machine.env; set +a
+          APP="$(ls -d /Applications/*Unsloth*.app | head -1)"
+          BIN="$APP/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
+          "$BIN" > logs/app-stdout.log 2>&1 &
+          APP_PID=$!
+          # 90s: long enough to clear preflight and start the bundled installer.
+          for i in $(seq 1 90); do
+            kill -0 "$APP_PID" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            echo "app still running after 90s (pid $APP_PID)"
+            kill -TERM "$APP_PID" 2>/dev/null || true
+          else
+            wait "$APP_PID" 2>/dev/null; rc=$?
+            echo "::error::desktop app exited early with rc=$rc"
+            tail -50 logs/app-stdout.log || true
+            exit 1
+          fi
+
+      - name: What did its own log say?
+        if: always()
+        run: |
+          for f in "$UNSLOTH_STUDIO_HOME/tauri.log" "$HOME/.unsloth/studio/tauri.log"; do
+            [ -f "$f" ] || continue
+            echo "=== $f ==="
+            cp "$f" logs/ 2>/dev/null || true
+            tail -60 "$f"
+            # The two fields the bug report turned on.
+            grep -E "disposition=|can_auto_repair=|Xcode Command Line|ModuleNotFoundError" "$f" || true
+            found=1
+            if grep -qE "desktop_preflight completed disposition=" "$f"; then disposition=1; fi
+          done
+          # Everything above is `|| true`, so this step could not fail while the
+          # header sells the tauri.log disposition as an acceptance criterion.
+          # setup_logging (src-tauri/src/main.rs:50-67) opens tauri.log unconditionally
+          # at process start, so no log at all means the binary never got that far.
+          [ "${found:-0}" = "1" ] || { echo "::error::the app wrote no tauri.log; it never reached setup_logging"; exit 1; }
+          # setup_logging opens tauri.log at process start, so its existence is implied
+          # by the launch step. The disposition line is the field the bug report turned
+          # on, so a process that hangs before preflight must not pass.
+          [ "${disposition:-0}" = "1" ] || { echo "::error::tauri.log records no desktop_preflight disposition; the app never completed preflight"; exit 1; }
+
+      - name: Restore the runner
+        if: always()
+        run: bash .clean-machine/restore.sh || true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: desktop-macos-${{ matrix.os }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ── Linux: .deb and .AppImage, with a real webview under Xvfb ────────────
+  linux:
+    name: desktop linux ${{ matrix.kind }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {kind: deb, experimental: false}
+          - {kind: appimage, experimental: false}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download the shipped bundle
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dl logs
+          # Desktop releases are prereleases (never repo-wide "latest"), so the
+          # newest desktop-v* tag has to be resolved explicitly.
+          if [ -z "$REL_TAG" ]; then
+            REL_TAG="$(gh release list --repo "$REL_REPO" --limit 100 --exclude-drafts \
+              --json tagName,createdAt \
+              --jq '[.[] | select(.tagName | startswith("desktop-v"))]
+                    | sort_by(.createdAt) | reverse | .[0].tagName // empty')"
+            [ -n "$REL_TAG" ] || { echo "::error::no desktop-v* release in $REL_REPO"; exit 1; }
+            echo "resolved release tag: $REL_TAG"
+            echo "REL_TAG=$REL_TAG" >> "$GITHUB_ENV"
+          fi
+          pat='*.deb'; [ "${{ matrix.kind }}" = "appimage" ] && pat='*.AppImage'
+          gh release download "$REL_TAG" --repo "$REL_REPO" --pattern "$pat" --dir dl
+          ls -la dl
+
+      - name: Install with NO dev tooling, only runtime libs
+        run: |
+          # Deliberately not build-essential/cmake/git: a user installing a .deb has
+          # none of that. WebKit + Xvfb are runtime requirements of the app, and apt
+          # pulls the .deb's declared deps -- if that list is wrong, this step catches
+          # it.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends xvfb
+          if [ "${{ matrix.kind }}" = "deb" ]; then
+            sudo apt-get install -y ./dl/*.deb || {
+              echo "::error::the .deb does not declare its runtime dependencies correctly"
+              exit 1
+            }
+            BIN="$(dpkg -L "$(dpkg-deb -f dl/*.deb Package)" | grep -E '/usr/bin/' | head -1)"
+          else
+            sudo apt-get install -y -qq --no-install-recommends libfuse2 \
+              libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 || true
+            chmod +x dl/*.AppImage
+            BIN="$(ls dl/*.AppImage | head -1)"
+          fi
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+          echo "binary: $BIN"
+
+      - name: Run the bundled installer, the path first launch takes
+        run: |
+          set -o pipefail
+          # The launch step below only proves the process stayed alive: on a fresh
+          # home preflight reports not_installed and the app sits on the install
+          # screen waiting for a click (use-tauri-backend.ts:252-254,
+          # startup-screen.tsx:388-389), so a bundle whose embedded install.sh is
+          # missing or broken passed both Linux rows. tauri.conf.json:56-59 ships
+          # install.sh as a bundle resource, so find it where the bundle put it and
+          # run it as install.rs does.
+          if [ "${{ matrix.kind }}" = "deb" ]; then
+            SH="$(dpkg -L "$(dpkg-deb -f dl/*.deb Package)" | grep -E '/install\.sh$' | head -1)"
+          else
+            # ls returns a bare filename here, and a command word with no slash is
+            # resolved through PATH, not the cwd, so this needs the ./ prefix.
+            (cd dl && "./$(ls *.AppImage | head -1)" --appimage-extract >/dev/null)
+            SH="$(find dl/squashfs-root -name install.sh -type f | head -1)"
+          fi
+          [ -n "$SH" ] && [ -f "$SH" ] || { echo "::error::the bundle ships no install.sh resource"; exit 1; }
+          echo "bundled installer: $SH"
+          # --tauri rejects a custom studio home (install.sh:102-114), so drop the
+          # workspace-scoped override, and close stdin as install.rs does.
+          env -u UNSLOTH_STUDIO_HOME \
+            bash "$SH" --tauri < /dev/null 2>&1 | tee logs/bundled-install.log
+          PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          [ -x "$PY" ] || { echo "::error::bundled installer left no venv at $PY"; exit 1; }
+          "$PY" -V
+          # install.rs passes only --tauri, so torch is part of first launch.
+          "$PY" -c "import torch; print('torch', torch.__version__)"
+
+      - name: Launch under Xvfb and prove it stays up
+        run: |
+          # Linux is the one platform where a hosted runner can give the app a real
+          # display, so this is the strongest "does the UI come up" check available
+          # without self-hosted hardware.
+          xvfb-run -a --server-args="-screen 0 1440x900x24" \
+            "$BIN" > logs/app-stdout.log 2>&1 &
+          APP_PID=$!
+          for i in $(seq 1 90); do
+            kill -0 "$APP_PID" 2>/dev/null || break
+            sleep 1
+          done
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            echo "app still running after 90s"
+            kill -TERM "$APP_PID" 2>/dev/null || true
+          else
+            wait "$APP_PID" 2>/dev/null; rc=$?
+            echo "::error::desktop app exited early with rc=$rc"
+            tail -60 logs/app-stdout.log || true
+            exit 1
+          fi
+
+      - name: What did its own log say?
+        if: always()
+        run: |
+          for f in "$UNSLOTH_STUDIO_HOME/tauri.log" "$HOME/.unsloth/studio/tauri.log"; do
+            [ -f "$f" ] || continue
+            echo "=== $f ==="; cp "$f" logs/ 2>/dev/null || true; tail -60 "$f"
+            grep -E "disposition=|can_auto_repair=|ModuleNotFoundError" "$f" || true
+            found=1
+            if grep -qE "desktop_preflight completed disposition=" "$f"; then disposition=1; fi
+          done
+          # Same acceptance criterion the macOS rows already enforce. Everything
+          # above is `|| true` and the loop skips a missing log outright, so
+          # without these two lines the step could not fail. setup_logging
+          # (src-tauri/src/main.rs:50-67) opens tauri.log unconditionally at
+          # process start, so no log at all means the binary never got that far,
+          # and the launch step only proves the process stayed alive: an app that
+          # hangs before preflight completes would otherwise pass both Linux rows.
+          [ "${found:-0}" = "1" ] || { echo "::error::the app wrote no tauri.log; it never reached setup_logging"; exit 1; }
+          [ "${disposition:-0}" = "1" ] || { echo "::error::tauri.log records no desktop_preflight disposition; the app never completed preflight"; exit 1; }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: desktop-linux-${{ matrix.kind }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ── Windows: NSIS setup.exe, silent install ──────────────────────────────
+  windows:
+    name: desktop windows
+    runs-on: windows-latest
+    # 60, not 45: this job now runs the bundled installer, and a full torch install
+    # on a Windows runner is the slowest of the three platforms.
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download the shipped installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dl logs
+          # Desktop releases are prereleases (never repo-wide "latest"), so the
+          # newest desktop-v* tag has to be resolved explicitly.
+          if [ -z "$REL_TAG" ]; then
+            REL_TAG="$(gh release list --repo "$REL_REPO" --limit 100 --exclude-drafts \
+              --json tagName,createdAt \
+              --jq '[.[] | select(.tagName | startswith("desktop-v"))]
+                    | sort_by(.createdAt) | reverse | .[0].tagName // empty')"
+            [ -n "$REL_TAG" ] || { echo "::error::no desktop-v* release in $REL_REPO"; exit 1; }
+            echo "resolved release tag: $REL_TAG"
+            echo "REL_TAG=$REL_TAG" >> "$GITHUB_ENV"
+          fi
+          gh release download "$REL_TAG" --repo "$REL_REPO" --pattern '*setup.exe' --dir dl
+          ls -la dl
+
+      - name: Strip developer tooling from PATH
+        # `inputs` exists only for workflow_dispatch, so on pull_request and schedule
+        # `inputs.strip_toolchain` is '' -- and loose equality coerces both '' and
+        # false to 0, making `!= false` FALSE, so automatic runs would keep the hosted
+        # toolchain this workflow exists to remove. Gate on the event instead.
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.strip_toolchain }}
+        shell: pwsh
+        run: |
+          $drop = @('hostedtoolcache\windows\Python', 'WindowsApps', '\Git\', 'CMake',
+                    'Microsoft Visual Studio', 'BuildTools', 'LLVM', 'MSYS', 'mingw')
+          $kept = ($env:PATH -split ';') | Where-Object {
+            $p = $_; $p -and -not ($drop | Where-Object { $p -like "*$_*" })
+          }
+          "PATH=$($kept -join ';')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem dl/*setup.exe | Select-Object -First 1).FullName
+          # /S is the NSIS silent switch: a user double-clicks, but an installer that
+          # cannot run unattended cannot be scripted or MDM-deployed either.
+          $p = Start-Process -FilePath $exe -ArgumentList '/S' -Wait -PassThru
+          Write-Host "installer exit: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { Write-Host "::error::silent install failed"; exit 1 }
+          $found = Get-ChildItem -Path "$env:LOCALAPPDATA","$env:ProgramFiles" -Recurse `
+                     -Filter '*Unsloth*.exe' -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+          if (-not $found) { Write-Host '::error::no installed executable found'; exit 1 }
+          Write-Host "installed: $($found.FullName)"
+          "APP_EXE=$($found.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Run the bundled installer, the path first launch takes
+        shell: pwsh
+        run: |
+          # The launch step below only proves the process stayed alive. On a fresh
+          # profile preflight reports not_installed and the app waits for the user to
+          # click Install (use-tauri-backend.ts:252-254, startup-screen.tsx:388-389),
+          # so this job passed on a bundle whose embedded install.ps1 was missing or
+          # broken -- the packaged-app failure the workflow exists to catch, and the
+          # one thing the macOS and Linux rows now check and Windows did not.
+          # tauri.conf.json:56-59 ships install.ps1 as a bundle resource, so find it
+          # where NSIS put it and invoke it as install.rs:326-341 does.
+          $root = Split-Path -Parent $env:APP_EXE
+          $ps1 = Get-ChildItem -Path $root -Recurse -Filter 'install.ps1' -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+          if (-not $ps1) {
+            Write-Host '::error::the bundle ships no install.ps1 resource'
+            exit 1
+          }
+          Write-Host "bundled installer: $($ps1.FullName)"
+          # --tauri rejects a custom studio home (install.ps1:189-215), so drop the
+          # workspace-scoped override the same way install.rs scrubs it (354-357).
+          Remove-Item Env:UNSLOTH_STUDIO_HOME -ErrorAction SilentlyContinue
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+              -File $ps1.FullName --tauri *>&1 | Tee-Object -FilePath logs/bundled-install.log
+          $rc = $LASTEXITCODE
+          Write-Host "bundled installer exit: $rc"
+          if ($rc -ne 0) {
+            Write-Host "::error::bundled installer exited $rc"
+            exit $rc
+          }
+          # The exit code alone is not enough: it is the venv the app then boots from.
+          $py = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          if (-not (Test-Path $py)) {
+            Write-Host "::error::bundled installer left no venv at $py"
+            exit 1
+          }
+          & $py -V
+          # install.rs passes only --tauri, so torch is part of first launch, and a
+          # venv that cannot import it is the unbootable environment from the report.
+          & $py -c "import torch; print('torch', torch.__version__)"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::error::the bundled install produced a venv with no working torch'
+            exit 1
+          }
+
+      - name: Launch and prove it stays up
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath $env:APP_EXE -PassThru `
+                 -RedirectStandardOutput logs/app-stdout.log `
+                 -RedirectStandardError logs/app-stderr.log
+          for ($i = 0; $i -lt 90; $i++) { if ($p.HasExited) { break }; Start-Sleep -Seconds 1 }
+          if ($p.HasExited) {
+            Write-Host "::error::desktop app exited early with rc=$($p.ExitCode)"
+            Get-Content logs/app-stdout.log, logs/app-stderr.log -Tail 40 -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Write-Host "app still running after 90s"
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+
+      - name: What did its own log say?
+        if: always()
+        shell: pwsh
+        run: |
+          foreach ($f in @("$env:UNSLOTH_STUDIO_HOME\tauri.log",
+                           "$env:USERPROFILE\.unsloth\studio\tauri.log")) {
+            if (Test-Path $f) {
+              Write-Host "=== $f ==="
+              Copy-Item $f logs/ -ErrorAction SilentlyContinue
+              Get-Content $f -Tail 60
+              Select-String -Path $f -Pattern 'disposition=|can_auto_repair=|ModuleNotFoundError' `
+                -ErrorAction SilentlyContinue
+            }
+          }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: desktop-windows
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
