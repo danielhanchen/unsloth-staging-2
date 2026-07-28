@@ -58,7 +58,7 @@ env:
 jobs:
   # ── macOS: the reported failure ────────────────────────────────────────────
   macos:
-    name: mac ${{ matrix.os }} / ${{ matrix.mode }} / ${{ matrix.delivery }}
+    name: mac ${{ matrix.os }} / ${{ matrix.mode }} / ${{ matrix.delivery }}${{ matrix.flags && format(' {0}', matrix.flags) || '' }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     continue-on-error: ${{ matrix.experimental }}
@@ -208,6 +208,11 @@ jobs:
     container: ${{ matrix.image }}
     timeout-minutes: 40
     continue-on-error: ${{ matrix.experimental }}
+    # Container jobs default to `sh -e`, which is dash: `set -o pipefail` is an
+    # "Illegal option" there and kills the step before the installer even starts.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:

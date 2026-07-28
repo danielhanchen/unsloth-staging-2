@@ -76,9 +76,12 @@ if [ "$MODE" = "mask" ]; then
   NEWPATH="$(scrub_path)"
   {
     echo "export PATH='$NEWPATH'"
-    # A nonexistent developer dir: xcrun/xcode-select must not silently resolve
-    # to a full Xcode.app that the runner happens to ship.
-    echo "export DEVELOPER_DIR='$WORK/no-developer-dir'"
+    # DEVELOPER_DIR must be UNSET, not pointed at a fake path: `xcode-select -p`
+    # honours DEVELOPER_DIR and prints it verbatim with exit 0, so setting it to a
+    # nonexistent dir makes the probe SUCCEED -- the exact opposite of a clean Mac,
+    # where DEVELOPER_DIR is unset and the missing /var/db/xcode_select_link is what
+    # makes `xcode-select -p` fail.
+    echo "unset DEVELOPER_DIR || true"
     echo "unset SDKROOT CC CXX CFLAGS CXXFLAGS LDFLAGS CMAKE_GENERATOR CMAKE_PREFIX_PATH || true"
     echo "export HOMEBREW_NO_AUTO_UPDATE=1"
     echo "export UNSLOTH_CLEAN_MACHINE=1"
