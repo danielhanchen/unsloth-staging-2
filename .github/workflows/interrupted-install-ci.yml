@@ -141,19 +141,22 @@ jobs:
           rc=0
           bash install.sh --tauri --local < /dev/null 2>&1 | tee logs/repair.log || rc=$?
           echo "repair exit: $rc"
-          if grep -qiE "up to date|already current" logs/repair.log \
-             && ! grep -qiE "forcing dependency pass|incomplete|repair" logs/repair.log; then
-            echo "::error::re-run reported the venv up to date without repairing it"
-            exit 1
-          fi
           BIN="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
           [ -x "$BIN" ] || BIN="$HOME/.unsloth/studio/bin/unsloth"
           python3 .github/scripts/interrupted_install_probe.py "$BIN" --out probe-after || true
           v="$(python3 -c "import json;print(json.load(open('probe-after/verdict.json'))['verdict'])")"
-          if [ "$v" != "HEALTHY" ]; then
-            echo "::error::after a full re-run the backend still does not boot (verdict=$v)"
-            exit 1
+          # A booting backend IS the repair, whatever the log narrated. Judging by
+          # log text instead failed a leg whose venv was fine: the only match was
+          # the frontend build printing "up to date".
+          if [ "$v" = "HEALTHY" ]; then
+            echo "re-run repaired the install (verdict=HEALTHY)"
+            exit 0
           fi
+          echo "::error::after a full re-run the backend still does not boot (verdict=$v)"
+          if grep -qiE "(venv|dependenc|python stack)[^|]*(up to date|already current)" logs/repair.log; then
+            echo "::error::and the re-run treated the venv as current instead of repairing it"
+          fi
+          exit 1
 
       - name: Upload logs
         if: always()
