@@ -87,12 +87,13 @@ def main() -> int:
     log_path = out / "studio.log"
 
     install = StudioInstall(home=Path(args.home), repo=Path.cwd(), branch="ci")
-    if args.bin:
-        # launch_studio resolves the CLI from `home` by trying known venv layouts.
-        # Point `home` at the parent of bin/ so the first candidate hits, rather than
-        # relying on the kit's list matching whatever this install produced.
-        binp = Path(args.bin)
-        install.home = binp.parent.parent
+    # `home` is deliberately NOT derived from --bin. launch_studio uses it for two
+    # different things: finding the CLI, and exporting UNSLOTH_STUDIO_HOME. Pointing
+    # it at the venv makes the CLI print "Unsloth Studio not set up. Run install.sh
+    # first." and never bind. --bin is only a cross-check that both steps agree.
+    if args.bin and not Path(args.bin).exists():
+        print(f"::error::located CLI {args.bin} does not exist")
+        return 1
     facts: dict[str, object] = {}
     rc = 0
     try:

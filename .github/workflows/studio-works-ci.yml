@@ -108,20 +108,28 @@ jobs:
         run: python3 .github/scripts/cli_smoke.py "${{ steps.bin.outputs.bin }}" --out cli-smoke
 
       - name: Playwright
+        id: pw
         shell: bash
         run: |
-          python3 -m pip install --quiet --disable-pip-version-check playwright httpx pillow
+          # Own venv: the macOS runner's system python3 is Homebrew-managed and
+          # refuses pip with "externally-managed-environment". Also keeps these
+          # test-only packages out of the Studio venv under test.
+          python3 -m venv .pwenv
+          PY=.pwenv/bin/python
+          [ -x "$PY" ] || PY=.pwenv/Scripts/python.exe
+          echo "py=$PY" >> "$GITHUB_OUTPUT"
+          "$PY" -m pip install --quiet --disable-pip-version-check playwright httpx pillow
           # --with-deps shells out to apt, so it only works on Linux.
           if [ "${{ runner.os }}" = "Linux" ]; then
-            python3 -m playwright install --with-deps chromium
+            "$PY" -m playwright install --with-deps chromium
           else
-            python3 -m playwright install chromium
+            "$PY" -m playwright install chromium
           fi
 
       - name: Drive the real UI
         shell: bash
         run: |
-          python3 .github/scripts/studio_ui_smoke.py \
+          "${{ steps.pw.outputs.py }}" .github/scripts/studio_ui_smoke.py \
             --home "$HOME/.unsloth/studio" --bin "${{ steps.bin.outputs.bin }}" \
             --port 8899 --out ui-smoke
 
