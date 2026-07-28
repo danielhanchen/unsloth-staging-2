@@ -2070,9 +2070,13 @@ _check_linux_deps() {
         _transport_missing=true
     fi
 
-    # Source-build-only tooling. Absence is a warning, never a stop.
+    # Not required to boot, but wanted when we can get them: git fetches the
+    # triton_kernels git+https requirement (a training speedup, skipped without it),
+    # the rest are for an optional llama.cpp source build. Auto-installed on apt,
+    # a warning everywhere else, never a stop.
     _optional_missing=""
     command -v cmake       >/dev/null 2>&1 || _optional_missing="$_optional_missing cmake"
+    _has_working_git                       || _optional_missing="$_optional_missing git"
     command -v gcc         >/dev/null 2>&1 || _optional_missing="$_optional_missing build-essential"
     command -v curl-config >/dev/null 2>&1 || _optional_missing="$_optional_missing libcurl4-openssl-dev"
     # Parameter expansion, not `sed`: this gate runs before anything is installed, and
@@ -2111,10 +2115,25 @@ _check_linux_deps() {
         fi
     fi
 
+    # Try apt for the optional set too. Nothing here is fatal, so a failure only
+    # costs the features named below, but on Debian/Ubuntu we can just get them.
+    if [ -n "$_optional_missing" ] && command -v apt-get >/dev/null 2>&1; then
+        step "deps" "installing optional build tools: $_optional_missing" "$C_DIM"
+        _smart_apt_install $_optional_missing || true
+        _optional_missing=""
+        command -v cmake       >/dev/null 2>&1 || _optional_missing="$_optional_missing cmake"
+        _has_working_git                       || _optional_missing="$_optional_missing git"
+        command -v gcc         >/dev/null 2>&1 || _optional_missing="$_optional_missing build-essential"
+        command -v curl-config >/dev/null 2>&1 || _optional_missing="$_optional_missing libcurl4-openssl-dev"
+        _optional_missing="${_optional_missing# }"
+    fi
+
     if [ -n "$_optional_missing" ]; then
         step "deps" "using prebuilt llama.cpp (missing: $_optional_missing)" "$C_WARN"
-        substep "Not required: Unsloth downloads a prebuilt inference engine."
-        substep "Install them only for a llama.cpp source build."
+        substep "Not required to run: Unsloth downloads a prebuilt inference engine."
+        case " $_optional_missing " in
+            *" git "*) substep "Without git the triton kernels training speedup is skipped." ;;
+        esac
     else
         step "deps" "all system dependencies found"
     fi
