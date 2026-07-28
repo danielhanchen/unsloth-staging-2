@@ -8,8 +8,8 @@ use crate::desktop_backend_owner::{
 };
 use backend::probe_existing_backends;
 use log::warn;
-pub use managed::managed_install_ready;
 use managed::probe_managed_install;
+pub use managed::{managed_install_ready, managed_install_state};
 use std::path::PathBuf;
 use types::{BackendProbe, ManagedProbe};
 pub use types::{DesktopPreflightDisposition, DesktopPreflightResult, ExternalBackendConflict};
@@ -25,8 +25,18 @@ use managed::probe_managed_bin;
 #[cfg(test)]
 use version::{backend_version_compatible, MIN_DESKTOP_BACKEND_VERSION};
 
+/// The managed backend refused to start on a value inherited from the
+/// environment rather than from the install.
+pub(crate) const STUDIO_RUNTIME_STARTUP_FAILED: &str = "studio_runtime_startup_failed";
+
 fn release_auto_repair() -> bool {
     !cfg!(debug_assertions)
+}
+
+/// Reinstalling cannot change a rejected environment value, so repairing over
+/// one only replaces a healthy install and fails the same way.
+fn stale_reason_is_repairable(reason: &str) -> bool {
+    reason != STUDIO_RUNTIME_STARTUP_FAILED
 }
 
 fn managed_bin_for_result(managed: &ManagedProbe) -> Option<PathBuf> {
@@ -62,9 +72,9 @@ fn choose_preflight(managed: ManagedProbe, backend: BackendProbe) -> DesktopPref
             },
             ManagedProbe::Stale { bin, reason } => DesktopPreflightResult {
                 disposition: DesktopPreflightDisposition::ManagedStale,
+                can_auto_repair: release_auto_repair() && stale_reason_is_repairable(&reason),
                 reason: Some(reason),
                 port: None,
-                can_auto_repair: release_auto_repair(),
                 managed_bin: Some(bin),
             },
             ManagedProbe::Missing => DesktopPreflightResult {
@@ -394,6 +404,39 @@ mod tests {
     }
 
     #[test]
+    fn rejected_backend_settings_do_not_auto_repair() {
+        assert!(!stale_reason_is_repairable(STUDIO_RUNTIME_STARTUP_FAILED));
+        for reason in [
+            "studio_runtime_missing_dependency",
+            "studio_runtime_import_failed",
+            "studio_runtime_check_unsupported",
+            "install_incomplete",
+            "desktop_backend_version_too_old",
+        ] {
+            assert!(stale_reason_is_repairable(reason), "{reason}");
+        }
+
+        let result = choose_preflight(
+            ManagedProbe::Stale {
+                bin: PathBuf::from("/managed/unsloth"),
+                reason: STUDIO_RUNTIME_STARTUP_FAILED.to_string(),
+            },
+            BackendProbe::Missing,
+        );
+
+        assert_eq!(
+            result.disposition,
+            DesktopPreflightDisposition::ManagedStale
+        );
+        assert_eq!(
+            result.reason.as_deref(),
+            Some(STUDIO_RUNTIME_STARTUP_FAILED)
+        );
+        // False in every build profile, unlike the other stale reasons.
+        assert!(!result.can_auto_repair);
+    }
+
+    #[test]
     fn external_conflict_blocks_managed_flow() {
         let result = choose_preflight(
             ManagedProbe::Ready {
@@ -567,16 +610,33 @@ mod tests {
             (
                 "cap-missing",
                 r#"#!/bin/sh
-if [ "$1" = "-h" ]; then exit 0; fi
+if [ "$1" = "studio" ] && [ "$2" = "desktop-runtime-check" ] && [ "$3" = "--json" ]; then
+  printf '{"runtime_ready":true}'
+  exit 0
+fi
 if [ "$1" = "studio" ] && [ "$2" = "provision-desktop-auth" ] && [ "$3" = "--help" ]; then exit 0; fi
 exit 1
 "#,
                 Some("desktop_capability_probe_failed"),
             ),
             (
+                "runtime-missing-dependency",
+                r#"#!/bin/sh
+if [ "$1" = "studio" ] && [ "$2" = "desktop-runtime-check" ] && [ "$3" = "--json" ]; then
+  printf '{"runtime_ready":false,"reason":"missing_dependency","module":"structlog"}'
+  exit 1
+fi
+exit 1
+"#,
+                Some("studio_runtime_missing_dependency"),
+            ),
+            (
                 "cap-true-helper-missing",
                 r#"#!/bin/sh
-if [ "$1" = "-h" ]; then exit 0; fi
+if [ "$1" = "studio" ] && [ "$2" = "desktop-runtime-check" ] && [ "$3" = "--json" ]; then
+  printf '{"runtime_ready":true}'
+  exit 0
+fi
 if [ "$1" = "studio" ] && [ "$2" = "desktop-capabilities" ] && [ "$3" = "--json" ]; then
   printf '{"desktop_protocol_version":1,"desktop_manageability_version":2,"supports_api_only":true,"supports_provision_desktop_auth":true,"supports_desktop_backend_ownership":true,"studio_install_ok":true,"version":"2026.5.3"}'
   exit 0
@@ -588,7 +648,10 @@ exit 1
             (
                 "cap-false-helper-ready",
                 r#"#!/bin/sh
-if [ "$1" = "-h" ]; then exit 0; fi
+if [ "$1" = "studio" ] && [ "$2" = "desktop-runtime-check" ] && [ "$3" = "--json" ]; then
+  printf '{"runtime_ready":true}'
+  exit 0
+fi
 if [ "$1" = "studio" ] && [ "$2" = "desktop-capabilities" ] && [ "$3" = "--json" ]; then
   printf '{"desktop_protocol_version":1,"desktop_manageability_version":2,"supports_api_only":true,"supports_provision_desktop_auth":false,"supports_desktop_backend_ownership":true,"desktop_auth_stale_reason":"cap_false","studio_install_ok":true,"version":"2026.5.3"}'
   exit 0
@@ -619,26 +682,147 @@ exit 1
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn managed_cli_capability_help_probe_runs_before_cache() {
+    async fn a_hung_cli_is_stale_without_running_the_legacy_fallback() {
+        // An older CLI rejects the unknown command at once, so only a broken one
+        // reaches the timeout, and two more 10s probes would treble the wait.
+        let _cache_guard = MANAGED_CAPABILITY_CACHE_TEST_LOCK.lock().await;
+        let _cache_home = ManagedCapabilityCacheHome::new("runtime-hang");
+        remove_managed_capability_cache();
+
+        let fake = fake_cli(
+            "runtime-hang",
+            r#"#!/bin/sh
+sleep 120
+"#,
+        );
+        let started = std::time::Instant::now();
+        let probe = probe_managed_bin(fake.bin.clone()).await;
+        assert!(
+            matches!(&probe, ManagedProbe::Stale { reason, .. } if reason == "studio_runtime_probe_timeout"),
+            "a hung CLI must be stale on the timeout, got {probe:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(20),
+            "the legacy fallback ran after the timeout, tripling the wait"
+        );
+        remove_managed_capability_cache();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_runtime_probe_survives_more_stdout_than_the_pipe_holds() {
+        // The probe imports the whole backend, so output can exceed the 64 KiB
+        // pipe buffer, and waiting before draining wedges the child mid-write.
+        // This CLI writes ~1 MiB before the payload, so the drain both keeps up
+        // and keeps only the tail, which still has to contain the payload.
+        let _cache_guard = MANAGED_CAPABILITY_CACHE_TEST_LOCK.lock().await;
+        let _cache_home = ManagedCapabilityCacheHome::new("runtime-noisy");
+        remove_managed_capability_cache();
+
+        let fake = fake_cli(
+            "runtime-noisy",
+            r#"#!/bin/sh
+if [ "$1" = "studio" ] && [ "$2" = "desktop-runtime-check" ] && [ "$3" = "--json" ]; then
+  awk 'BEGIN { while (i++ < 40000) print "import chatter on stdout" }'
+  printf '{"runtime_ready":true}\n'
+  exit 0
+fi
+if [ "$1" = "studio" ] && [ "$2" = "desktop-capabilities" ] && [ "$3" = "--json" ]; then
+  printf '{"desktop_protocol_version":1,"desktop_manageability_version":2,"supports_api_only":true,"supports_provision_desktop_auth":true,"supports_desktop_backend_ownership":true,"studio_install_ok":true,"version":"2026.5.3"}'
+  exit 0
+fi
+exit 1
+"#,
+        );
+
+        let started = std::time::Instant::now();
+        let probe = probe_managed_bin(fake.bin.clone()).await;
+        assert!(
+            matches!(probe, ManagedProbe::Ready { .. }),
+            "noisy but healthy CLI must probe Ready, got {probe:?}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(9),
+            "probe hit the 10s timeout instead of draining stdout"
+        );
+        remove_managed_capability_cache();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_cli_predating_the_runtime_check_is_stale_for_its_own_reason() {
+        // Every published CLI satisfies MIN_DESKTOP_BACKEND_VERSION but has no
+        // `desktop-runtime-check`, so click exits 2 with an empty stdout. It is
+        // what the interrupted installs shipped with, and -h passes without
+        // touching the backend, so keep it apart from a CLI that cannot answer.
+        let _cache_guard = MANAGED_CAPABILITY_CACHE_TEST_LOCK.lock().await;
+        let _cache_home = ManagedCapabilityCacheHome::new("runtime-check-absent");
+        remove_managed_capability_cache();
+
+        let old = fake_cli(
+            "runtime-check-absent",
+            r#"#!/bin/sh
+if [ "$1" = "studio" ] && [ "$2" = "desktop-runtime-check" ]; then
+  echo "Error: No such command 'desktop-runtime-check'." >&2
+  exit 2
+fi
+if [ "$1" = "-h" ]; then exit 0; fi
+if [ "$1" = "studio" ] && [ "$2" = "desktop-capabilities" ] && [ "$3" = "--json" ]; then
+  printf '{"desktop_protocol_version":1,"desktop_manageability_version":1,"supports_api_only":true,"supports_provision_desktop_auth":true,"supports_desktop_backend_ownership":true,"version":"2026.7.5"}'
+  exit 0
+fi
+exit 1
+"#,
+        );
+        let probe = probe_managed_bin(old.bin.clone()).await;
+        assert!(
+            matches!(&probe, ManagedProbe::Stale { reason, .. }
+                if reason == "studio_runtime_check_unsupported"),
+            "CLI without the runtime-check subcommand must be stale for it, got {probe:?}"
+        );
+
+        // And a CLI that cannot launch at all keeps the plain probe failure.
+        remove_managed_capability_cache();
+        let broken = fake_cli(
+            "runtime-check-unlaunchable",
+            r#"#!/bin/sh
+exit 2
+"#,
+        );
+        assert!(
+            matches!(
+                probe_managed_bin(broken.bin.clone()).await,
+                ManagedProbe::Stale { reason, .. } if reason == "studio_runtime_probe_failed"
+            ),
+            "an unlaunchable CLI must stay Stale"
+        );
+        remove_managed_capability_cache();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_runtime_probe_runs_before_capability_cache() {
         use std::fs;
 
         let _cache_guard = MANAGED_CAPABILITY_CACHE_TEST_LOCK.lock().await;
         let _cache_home = ManagedCapabilityCacheHome::new("cache-hit");
 
         remove_managed_capability_cache();
-        // `-h` always succeeds unless `modeh` exists; the desktop-capabilities
-        // probe always succeeds unless `modecap` exists. Toggling those lets us
-        // prove the ordering: -h runs on every probe (even a cache hit), while
-        // the heavier capability probe is skipped once the cache is warm.
+        // Runtime readiness runs on every probe; the capability probe is skipped
+        // once the cache is warm.
         let fake = fake_cli(
             "cap-cache-hit",
             r#"#!/bin/sh
 log="$0.calls"
-modeh="$0.modeh"
+moderuntime="$0.moderuntime"
 modecap="$0.modecap"
 printf '%s\n' "$*" >> "$log"
-if [ "$1" = "-h" ]; then
-  if [ -f "$modeh" ]; then exit 42; fi
+if [ "$1" = "studio" ] && [ "$2" = "desktop-runtime-check" ] && [ "$3" = "--json" ]; then
+  if [ -f "$moderuntime" ]; then
+    printf '{"runtime_ready":false,"reason":"missing_dependency","module":"structlog"}'
+    exit 42
+  fi
+  printf '{"runtime_ready":true}'
   exit 0
 fi
 if [ "$1" = "studio" ] && [ "$2" = "desktop-capabilities" ] && [ "$3" = "--json" ]; then
@@ -651,37 +835,42 @@ exit 1
         );
         let bin = fake.bin.clone();
         let calls = bin.with_extension("calls");
-        let modeh = bin.with_extension("modeh");
+        let moderuntime = bin.with_extension("moderuntime");
         let modecap = bin.with_extension("modecap");
 
-        // Cold probe: runs -h and the capability probe, then caches the result.
+        // Cold probe runs both checks, then caches the static capability.
         assert!(matches!(
             probe_managed_bin(bin.clone()).await,
             ManagedProbe::Ready { .. }
         ));
         let first_calls = fs::read_to_string(&calls).unwrap();
-        assert!(first_calls.contains("-h"));
+        assert!(first_calls.contains("studio desktop-runtime-check --json"));
         assert!(first_calls.contains("studio desktop-capabilities --json"));
 
-        // Cache hit: -h still runs, but the capability probe is skipped (breaking
-        // it via `modecap` proves it is not invoked).
+        // Cache hit still checks the runtime, but skips the capability probe.
         fs::write(&modecap, "broken").unwrap();
         fs::write(&calls, "").unwrap();
         assert!(matches!(
             probe_managed_bin(bin.clone()).await,
             ManagedProbe::Ready { .. }
         ));
-        assert_eq!(fs::read_to_string(&calls).unwrap(), "-h\n");
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "studio desktop-runtime-check --json\n"
+        );
 
-        // A non-launchable CLI is caught by the -h probe even with a warm cache:
-        // preflight reports Stale (for repair) and never trusts the cache.
-        fs::write(&modeh, "broken").unwrap();
+        // A broken runtime is caught even with a warm capability cache.
+        fs::write(&moderuntime, "broken").unwrap();
         fs::write(&calls, "").unwrap();
         assert!(matches!(
             probe_managed_bin(bin).await,
-            ManagedProbe::Stale { .. }
+            ManagedProbe::Stale { reason, .. }
+                if reason == "studio_runtime_missing_dependency"
         ));
-        assert_eq!(fs::read_to_string(&calls).unwrap(), "-h\n");
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "studio desktop-runtime-check --json\n"
+        );
 
         remove_managed_capability_cache();
     }
