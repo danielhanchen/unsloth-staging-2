@@ -22,9 +22,33 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+# Only ever used against a throwaway CI install on loopback.
+FIRST_RUN_PASSWORD = "unsloth-ci-smoke-pw"
+
 from studio_test_kit.auth import login, seed_init_script  # noqa: E402
 from studio_test_kit.lifecycle import StudioInstall, launch_studio, stop_studio  # noqa: E402
 from studio_test_kit.ui import open_chat  # noqa: E402
+
+
+async def complete_first_run(page, out: Path) -> bool:
+    """Set the initial password if Studio is asking for one. Returns True if it did.
+
+    Idempotent: on an install that is already set up this finds no fields and is a
+    no-op, so the same script covers first run and relaunch.
+    """
+    setup = page.get_by_text("Setup your account", exact=False)
+    if await setup.count() == 0:
+        return False
+    pw_fields = page.locator("input[type='password']")
+    if await pw_fields.count() < 2:
+        return False
+    await pw_fields.nth(0).fill(FIRST_RUN_PASSWORD)
+    await pw_fields.nth(1).fill(FIRST_RUN_PASSWORD)
+    await page.get_by_role("button", name="Change password").click()
+    await page.wait_for_timeout(2000)
+    await page.screenshot(path=str(out / "after-setup.png"), full_page=True)
+    print("[ui] completed the first-run account setup")
+    return True
 
 
 async def drive(base_url: str, out: Path, password: str | None) -> dict:
@@ -46,12 +70,26 @@ async def drive(base_url: str, out: Path, password: str | None) -> dict:
         facts["title"] = await page.title()
         await page.screenshot(path=str(out / "chat.png"), full_page=True)
 
+        # A brand new install lands on "Setup your account / Choose a new password"
+        # before anything else, which is exactly what a real first run shows. Without
+        # completing it there is no composer to find, so drive it.
+        facts["first_run_setup"] = await complete_first_run(page, out)
+        await page.wait_for_load_state("networkidle", timeout=30_000)
+
         # The composer is the one control every chat flow needs. Anything less
         # (a mounted div, a 200) can be true of a broken app.
         composer = page.locator(
             "textarea, [contenteditable='true'], [data-testid*='composer']"
         ).first
-        await composer.wait_for(state="visible", timeout=45_000)
+        try:
+            await composer.wait_for(state="visible", timeout=45_000)
+        except Exception:
+            # Screenshot whatever IS on screen: a bare locator timeout says nothing
+            # about why, and this is a headless CI run nobody can look at live.
+            await page.screenshot(path=str(out / "composer-missing.png"), full_page=True)
+            body = (await page.inner_text("body"))[:600]
+            print(f"::error::composer never appeared. Page text:\n{body}")
+            raise
         facts["composer_visible"] = True
         await composer.click()
         await composer.type("hello from CI", delay=10)
