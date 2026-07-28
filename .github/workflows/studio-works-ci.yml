@@ -1,0 +1,156 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Confirms Studio actually WORKS after a clean install, rather than merely installing.
+#
+# The reported failure is the reason this is separate from the install matrix: the
+# install reported success, `unsloth -h` answered, `desktop-capabilities` answered,
+# and the backend still could not import. Every signal short of running the thing
+# said healthy. So this job runs the thing:
+#
+#   1. every registered CLI subcommand, for real, checking exit codes
+#   2. Studio launched and polled to /healthz 200
+#   3. Chromium against /chat, requiring the composer to be visible AND to accept
+#      input, plus an in-page fetch of /api/health so a shell that mounted but
+#      cannot reach its own backend fails too
+#
+# studio_test_kit is vendored into .github/scripts by staging_ci.stage_local.
+
+name: Studio works
+
+on:
+  pull_request:
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - 'studio/**'
+      - 'unsloth_cli/**'
+      - '.github/scripts/cli_smoke.py'
+      - '.github/scripts/studio_ui_smoke.py'
+      - '.github/workflows/studio-works-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+
+jobs:
+  studio-works:
+    name: studio works / ${{ matrix.os }}${{ matrix.clean && ' / clean' || '' }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 75
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, clean: false, experimental: false}
+          - {os: macos-14,      clean: true,  experimental: false}
+          - {os: macos-14,      clean: false, experimental: false}
+          - {os: windows-latest, clean: false, experimental: true}
+
+    steps:
+      # checkout first: it needs a working git, which masking then takes away.
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends cmake git build-essential libcurl4-openssl-dev
+
+      - name: Simulate a clean machine
+        if: matrix.clean
+        run: bash .github/scripts/clean-machine-env.sh mask --remove
+
+      - name: Install Studio
+        id: install
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          mkdir -p logs
+          set -o pipefail
+          if [ "${{ matrix.clean }}" = "true" ]; then
+            set -a; . ./clean-machine.env; set +a
+          fi
+          # No --tauri: it refuses a custom root and this job wants the default
+          # install a user gets. --no-torch keeps the job inside its timeout; the
+          # CLI and UI paths under test are identical either way.
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            pwsh -NoProfile -File install.ps1 --no-torch 2>&1 | tee logs/install.log
+          else
+            bash install.sh --no-torch < /dev/null 2>&1 | tee logs/install.log
+          fi
+
+      - name: Locate the installed CLI
+        id: bin
+        shell: bash
+        run: |
+          # .exe variants first: Git Bash answers `-x foo` for a foo.exe, so a
+          # plain-name candidate matches on Windows and then hands the rest of
+          # the job a path only bash can see.
+          for c in "$HOME/.unsloth/studio/unsloth_studio/Scripts/unsloth.exe" \
+                   "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.exe" \
+                   "$HOME/.unsloth/studio/bin/unsloth.exe" \
+                   "$HOME/.unsloth/studio/Scripts/unsloth.exe" \
+                   "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth" \
+                   "$HOME/.unsloth/studio/bin/unsloth"; do
+            [ -x "$c" ] && { echo "bin=$c" >> "$GITHUB_OUTPUT"; echo "found $c"; exit 0; }
+          done
+          echo "::error::no unsloth CLI after a successful install"
+          exit 1
+
+      - name: Every CLI subcommand must run
+        shell: bash
+        run: python3 .github/scripts/cli_smoke.py "${{ steps.bin.outputs.bin }}" --out cli-smoke
+
+      - name: Playwright
+        id: pw
+        shell: bash
+        run: |
+          # Own venv: the macOS runner's system python3 is Homebrew-managed and
+          # refuses pip with "externally-managed-environment". Also keeps these
+          # test-only packages out of the Studio venv under test.
+          python3 -m venv .pwenv
+          PY=.pwenv/bin/python
+          [ -x "$PY" ] || PY=.pwenv/Scripts/python.exe
+          echo "py=$PY" >> "$GITHUB_OUTPUT"
+          "$PY" -m pip install --quiet --disable-pip-version-check playwright httpx pillow
+          # --with-deps shells out to apt, so it only works on Linux.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            "$PY" -m playwright install --with-deps chromium
+          else
+            "$PY" -m playwright install chromium
+          fi
+
+      - name: Drive the real UI
+        shell: bash
+        run: |
+          "${{ steps.pw.outputs.py }}" .github/scripts/studio_ui_smoke.py \
+            --home "$HOME/.unsloth/studio" --bin "${{ steps.bin.outputs.bin }}" \
+            --port 8899 --out ui-smoke
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: studio-works-${{ matrix.os }}-${{ matrix.clean && 'clean' || 'normal' }}
+          path: |
+            logs/
+            cli-smoke/
+            ui-smoke/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Restore the runner
+        if: always() && matrix.clean
+        run: bash .clean-machine/restore.sh || true

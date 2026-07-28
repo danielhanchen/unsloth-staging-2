@@ -19,6 +19,25 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 set -e
+# ── Why the whole installer lives in a function ──────────────────────────────
+# `curl -fsSL https://unsloth.ai/install.sh | sh` makes sh the READER of a pipe.
+# This file is ~150KB, far more than a pipe buffer holds, so when a top-level
+# `exit` fired partway through, sh died with thousands of lines still unread; the
+# write end then failed and curl appended "(56) Failure writing output to
+# destination" AFTER the installer's own message -- which reads to users like a
+# network error rather than the real diagnosis. There are 35 exits, 29 of them in
+# the first half, so every early failure looked like a broken download.
+#
+# Defining a function forces sh to parse all the way to the closing brace before
+# it runs anything, so the pipe is fully drained and no exit can strand the
+# writer. install.ps1 has always been shaped this way (Install-UnslothStudio at
+# the end of the file); this brings install.sh into line.
+#
+# Deliberately NOT reindented: shell ignores leading whitespace, and reflowing
+# 4000+ lines would bury the change. `exit` still exits the shell from inside a
+# function, so no control flow changes. Do not add `exec < /dev/null` here -- for
+# a piped shell that would close the script's own source.
+_unsloth_main() {
 
 # ── Output style (aligned with studio/setup.sh) ──
 RULE=""
@@ -1982,61 +2001,157 @@ _maybe_reroute_strixhalo_to_2404 || true
 # Homebrew install). Linux keeps requiring them; its package manager has them.
 tauri_log "STEP" "Checking system dependencies"
 
-case "$OS" in
-    macos)
-        # Xcode Command Line Tools provide the C/C++ compiler and git.
-        if ! xcode-select -p >/dev/null 2>&1; then
-            echo ""
-            echo "==> Xcode Command Line Tools are required."
-            echo "    Installing (a system dialog will appear)..."
-            xcode-select --install </dev/null 2>/dev/null || true
-            echo "    After the installation completes, please re-run this script."
-            exit 1
-        fi
+# A working git, as opposed to a git that merely exists. On a Mac without the Xcode
+# Command Line Tools, /usr/bin/git IS present -- it is a stub that errors with
+# "invalid active developer path" and pops a GUI dialog. So `command -v git`
+# answers the wrong question here; only running it tells the truth.
+_has_working_git() {
+    command -v git >/dev/null 2>&1 || return 1
+    git --version >/dev/null 2>&1
+}
+
+# macOS system-dependency check. A function, not inline code, so tests/sh can extract
+# and exercise it the way tests/sh/test_mac_intel_compat.sh does -- the old inline
+# form was untestable, which is why this gate shipped broken.
+#
+# The consumer install needs NO developer toolchain: uv arrives as a prebuilt binary,
+# CPython comes from uv's managed python-build-standalone, llama.cpp and whisper.cpp
+# are prebuilt downloads, Node is a pinned nodejs.org archive, and triton is skipped
+# on macOS. Requiring Xcode CLT here therefore blocked every brand-new Mac for a
+# toolchain nothing downstream used. Only `--local` genuinely needs git, because it
+# installs unsloth-zoo from a git+https URL.
+_check_macos_deps() {
+    _clt_missing=false
+    xcode-select -p >/dev/null 2>&1 || _clt_missing=true
+
+    if [ "$STUDIO_LOCAL_INSTALL" = true ] && ! _has_working_git; then
+        # Developer install only: pip needs git for the unsloth-zoo git+https URL.
+        echo ""
+        step "deps" "git is required for --local installs" "$C_ERR"
+        substep "--local installs unsloth-zoo from git+https://github.com/unslothai/unsloth-zoo,"
+        substep "which needs a working git. Install the Xcode Command Line Tools:"
+        substep "  xcode-select --install"
+        substep "Then re-run this script. A normal (non---local) install needs no compiler"
+        substep "and no git -- it uses prebuilt binaries and wheels only."
+        tauri_log "NEED_XCODE_CLT" "git"
+        return 1
+    fi
+
+    if [ "$_clt_missing" = true ]; then
+        # Not fatal: nothing on the consumer path needs it. Say so plainly instead of
+        # firing a GUI dialog and exiting, which is what stranded clean Macs.
+        step "deps" "no Xcode Command Line Tools (not required)" "$C_WARN"
+        substep "Unsloth installs prebuilt binaries and wheels, so no compiler is needed."
+        substep "Install them only for a llama.cpp source build: xcode-select --install"
+    elif command -v cmake >/dev/null 2>&1; then
+        step "deps" "all system dependencies found"
+    else
         # cmake is only needed for a source build; the default prebuilt path
         # doesn't use it, so its absence is not fatal -- no Homebrew prerequisite.
-        if command -v cmake >/dev/null 2>&1; then
-            step "deps" "all system dependencies found"
+        step "deps" "using prebuilt llama.cpp (cmake not found)" "$C_WARN"
+        substep "Install cmake only if you want a source build: brew install cmake"
+    fi
+    return 0
+}
+
+# Linux/WSL system-dependency check. Same split as macOS, and a function for the same
+# reason: tests/sh can extract it, the old inline form could not be reached.
+#
+# Only a download transport is genuinely required. cmake, gcc and the libcurl headers
+# exist solely for a llama.cpp SOURCE build, and the consumer path never does one --
+# unslothai/llama.cpp publishes linux-x64 and linux-arm64 prebuilts covering cpu,
+# cuda12, cuda13, rocm and vulkan. Requiring them turned every non-apt distro into a
+# hard exit 1 (the Fedora/Arch/openSUSE message below) for tooling nothing downstream
+# used, which is the same defect the macOS Xcode CLT gate had. git follows macOS too:
+# needed only for --local, which installs unsloth-zoo from a git+https URL.
+_check_linux_deps() {
+    _transport_missing=false
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+        _transport_missing=true
+    fi
+
+    # Not required to boot, but wanted when we can get them: git fetches the
+    # triton_kernels git+https requirement (a training speedup, skipped without it),
+    # the rest are for an optional llama.cpp source build. Auto-installed on apt,
+    # a warning everywhere else, never a stop.
+    _optional_missing=""
+    command -v cmake       >/dev/null 2>&1 || _optional_missing="$_optional_missing cmake"
+    _has_working_git                       || _optional_missing="$_optional_missing git"
+    command -v gcc         >/dev/null 2>&1 || _optional_missing="$_optional_missing build-essential"
+    command -v curl-config >/dev/null 2>&1 || _optional_missing="$_optional_missing libcurl4-openssl-dev"
+    # Parameter expansion, not `sed`: this gate runs before anything is installed, and
+    # on a minimal container image sed may not exist. A failed `$(... | sed ...)` yields
+    # the empty string, which would report "all system dependencies found" on a machine
+    # that has none of them.
+    _optional_missing="${_optional_missing# }"
+
+    if [ "$STUDIO_LOCAL_INSTALL" = true ] && ! _has_working_git; then
+        echo ""
+        step "deps" "git is required for --local installs" "$C_ERR"
+        substep "--local installs unsloth-zoo from git+https://github.com/unslothai/unsloth-zoo,"
+        substep "which needs git. Install it with your package manager, then re-run."
+        substep "A normal (non---local) install needs no git and no compiler."
+        return 1
+    fi
+
+    # The one genuinely fatal case: nothing can be downloaded. Try apt first, since
+    # that is the distro family we can drive unattended.
+    if [ "$_transport_missing" = true ]; then
+        if command -v apt-get >/dev/null 2>&1; then
+            echo ""
+            step "deps" "missing: curl" "$C_WARN"
+            substep "Needed to download uv, Python and the prebuilt inference engine."
+            _smart_apt_install curl
+            echo ""
         else
-            step "deps" "using prebuilt llama.cpp (cmake not found)" "$C_WARN"
-            substep "Install cmake only if you want a source build: brew install cmake"
+            echo ""
+            step "deps" "missing: curl (or wget)" "$C_ERR"
+            substep "Unsloth needs one of them to download uv, Python and the prebuilt"
+            substep "inference engine. Install one, then re-run setup:"
+            substep "  Fedora/RHEL: sudo dnf install curl"
+            substep "  Arch:        sudo pacman -S --needed curl"
+            substep "  openSUSE:    sudo zypper install curl"
+            return 1
         fi
+    fi
+
+    # Try apt for the optional set too. Nothing here is fatal, so a failure only
+    # costs the features named below, but on Debian/Ubuntu we can just get them.
+    if [ -n "$_optional_missing" ] && command -v apt-get >/dev/null 2>&1; then
+        step "deps" "installing optional build tools: $_optional_missing" "$C_DIM"
+        # Subshell: _smart_apt_install exits rather than returns, and `|| true`
+        # does not catch an exit, so a missing optional tool aborted the install
+        # this gate exists to let continue. Code 2 is still re-raised, it is the
+        # NEED_SUDO handshake install.rs answers with an elevation prompt.
+        _sai_rc=0
+        ( _smart_apt_install $_optional_missing ) || _sai_rc=$?
+        if [ "$_sai_rc" -eq 2 ]; then exit 2; fi
+        _optional_missing=""
+        command -v cmake       >/dev/null 2>&1 || _optional_missing="$_optional_missing cmake"
+        _has_working_git                       || _optional_missing="$_optional_missing git"
+        command -v gcc         >/dev/null 2>&1 || _optional_missing="$_optional_missing build-essential"
+        command -v curl-config >/dev/null 2>&1 || _optional_missing="$_optional_missing libcurl4-openssl-dev"
+        _optional_missing="${_optional_missing# }"
+    fi
+
+    if [ -n "$_optional_missing" ]; then
+        step "deps" "using prebuilt llama.cpp (missing: $_optional_missing)" "$C_WARN"
+        substep "Not required to run: Unsloth downloads a prebuilt inference engine."
+        case " $_optional_missing " in
+            *" git "*) substep "Without git the triton kernels training speedup is skipped." ;;
+        esac
+    else
+        step "deps" "all system dependencies found"
+    fi
+    return 0
+}
+
+case "$OS" in
+    macos)
+        _check_macos_deps || exit 1
         ;;
     linux|wsl)
-        MISSING=""
-        command -v cmake >/dev/null 2>&1 || MISSING="$MISSING cmake"
-        command -v git   >/dev/null 2>&1 || MISSING="$MISSING git"
-        # curl or wget is needed for downloads; check both
-        if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-            MISSING="$MISSING curl"
-        fi
-        command -v gcc  >/dev/null 2>&1 || MISSING="$MISSING build-essential"
-        # libcurl dev headers for llama.cpp HTTPS support
-        command -v curl-config >/dev/null 2>&1 || MISSING="$MISSING libcurl4-openssl-dev"
-
-        MISSING=$(echo "$MISSING" | sed 's/^ *//')
-        if [ -n "$MISSING" ]; then
-            echo ""
-            step "deps" "missing: $MISSING" "$C_WARN"
-            substep "These are needed to build the GGUF inference engine."
-            if command -v apt-get >/dev/null 2>&1; then
-                _smart_apt_install $MISSING
-            else
-                echo "    Automatic system package installation is supported on apt-based"
-                echo "    Linux distributions (Ubuntu/Debian) only. Please install the"
-                echo "    missing dependencies with your package manager, then re-run setup:"
-                echo "    $MISSING"
-                echo ""
-                echo "    Examples:"
-                echo "      Fedora/RHEL: sudo dnf install cmake git gcc gcc-c++ make libcurl-devel"
-                echo "      Arch:       sudo pacman -S --needed cmake git base-devel curl"
-                echo "      openSUSE:   sudo zypper install cmake git gcc gcc-c++ make libcurl-devel"
-                exit 1
-            fi
-            echo ""
-        else
-            step "deps" "all system dependencies found"
-        fi
+        _check_linux_deps || exit 1
         ;;
 esac
 
@@ -4341,3 +4456,8 @@ else
     substep "(add -H 0.0.0.0 --cloudflare for a public Cloudflare HTTPS link, or --secure to keep the raw port private; anyone with the API key can run code)"
     echo ""
 fi
+
+}
+
+# Every byte above is parsed before this line runs, which is the entire point.
+_unsloth_main "$@"
