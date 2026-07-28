@@ -23,6 +23,15 @@
 name: Desktop app clean machine
 
 on:
+  # Also on PRs that touch this job or the machine-stripping scripts. workflow_dispatch
+  # alone is not enough to validate a change to the job itself: dispatch resolves the
+  # workflow from the DEFAULT branch, so a new or edited file on a feature branch can
+  # never be dispatched, and the job would first run only after merging blind.
+  pull_request:
+    paths:
+      - '.github/workflows/desktop-app-clean-machine-ci.yml'
+      - '.github/scripts/clean-machine-env.sh'
+      - '.github/scripts/clean-machine-assert.sh'
   workflow_dispatch:
     inputs:
       release_tag:
