@@ -396,6 +396,62 @@ mod tests {
     use std::sync::mpsc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn logs(lines: &[&str]) -> VecDeque<String> {
+        lines.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn missing_module_is_read_from_the_captured_traceback() {
+        // Verbatim shape of the reported failure: an install interrupted during the
+        // "studio deps" step drops structlog, and the backend dies importing it.
+        let captured = logs(&[
+            "[stderr] │ ❱ 15 import structlog │",
+            "[stderr] ╰────────────────────────────────────────────╯",
+            "[stderr] ModuleNotFoundError: No module named 'structlog'",
+        ]);
+        assert_eq!(
+            missing_module_from_logs(&captured),
+            Some("structlog".to_string())
+        );
+    }
+
+    #[test]
+    fn a_healthy_crash_is_not_misreported_as_an_incomplete_install() {
+        // Only an import failure means "packages are missing". Anything else must keep
+        // the generic message, or every ordinary crash would send users to Repair.
+        let captured = logs(&[
+            "[stderr] Traceback (most recent call last):",
+            "[stderr] RuntimeError: address already in use",
+        ]);
+        assert_eq!(missing_module_from_logs(&captured), None);
+        assert_eq!(missing_module_from_logs(&logs(&[])), None);
+    }
+
+    #[test]
+    fn the_fatal_import_error_wins_over_earlier_ones() {
+        // A caught-and-handled ModuleNotFoundError can appear earlier in the log (e.g.
+        // an optional-dependency probe). The one that killed the process is the last,
+        // so the scan runs newest-first.
+        let captured = logs(&[
+            "[stderr] ModuleNotFoundError: No module named 'optional_thing'",
+            "[stderr] continuing without it",
+            "[stderr] ModuleNotFoundError: No module named 'starlette'",
+        ]);
+        assert_eq!(
+            missing_module_from_logs(&captured),
+            Some("starlette".to_string())
+        );
+    }
+
+    #[test]
+    fn dotted_module_paths_survive_intact() {
+        let captured = logs(&["ModuleNotFoundError: No module named 'studio.backend.run'"]);
+        assert_eq!(
+            missing_module_from_logs(&captured),
+            Some("studio.backend.run".to_string())
+        );
+    }
+
     fn temp_studio_dir(test_name: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -897,6 +953,47 @@ async fn validate_candidate_port(
 
 /// Read lines from a child process stream (stdout or stderr).
 /// For stdout, parse TAURI_PORT=(\d+) candidates for async validation.
+/// A backend that dies on `ModuleNotFoundError` is not a crash, it is an incomplete
+/// install -- so say so.
+///
+/// The reported case: the user quit the app during the dependency pass, which SIGTERMs
+/// the installer process group (`install::stop_install`). That landed in the "studio
+/// deps" step, so the venv kept the CLI's own dependencies (typer/click/rich) but lost
+/// the server stack. The preflight probes -- `unsloth -h` and `studio
+/// desktop-capabilities` -- therefore both PASSED, the app reported ManagedReady with
+/// can_auto_repair=false, and the backend then died with
+///
+///     ModuleNotFoundError: No module named 'structlog'
+///
+/// which the UI rendered as the flat, unactionable "Server stopped unexpectedly".
+///
+/// The evidence was already in hand: the app captures that stderr into `proc.logs`. It
+/// just never read it. Classifying it here converts a dead end into a Repair prompt,
+/// and does so independently of how the readiness probes are hardened -- a probe can
+/// only check what it thought to check, whereas a failed import is ground truth.
+fn missing_module_from_logs(logs: &VecDeque<String>) -> Option<String> {
+    // Scan newest-first: the fatal import error is the last thing printed.
+    let re = Regex::new(r"ModuleNotFoundError: No module named '([^']+)'").ok()?;
+    logs.iter().rev().find_map(|line| {
+        re.captures(line)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+    })
+}
+
+/// Payload for `server-crashed`. Previously the event carried no data, so the UI could
+/// not tell "the server fell over" from "this install never had the packages".
+#[derive(Clone, serde::Serialize)]
+pub struct BackendCrash {
+    /// Human-readable summary for the error banner.
+    pub message: String,
+    /// True when the backend could not import its own dependencies, i.e. the install is
+    /// incomplete and repairing it is the correct action.
+    pub incomplete_install: bool,
+    /// The first module Python could not find, when that is why it died.
+    pub missing_module: Option<String>,
+}
+
 /// When stdout closes and the stop was not intentional, emit server-crashed.
 fn read_output_stream<R: std::io::Read>(
     stream: R,
@@ -998,6 +1095,7 @@ fn read_output_stream<R: std::io::Read>(
     if !is_stderr {
         let mut exit_record: Option<(String, bool)> = None;
         let mut emit_crash = false;
+        let mut missing_module: Option<String> = None;
         if let Ok(mut proc) = state.lock() {
             if proc.generation != generation {
                 return;
@@ -1036,6 +1134,26 @@ fn read_output_stream<R: std::io::Read>(
                 emit_crash = !intentional;
             }
         }
+
+        // Classify AFTER releasing the lock, and poll briefly: the traceback arrives on
+        // STDERR while this is the STDOUT reader, so the two race. Once the process has
+        // exited its stderr pipe is at EOF, so the other thread drains within
+        // milliseconds -- but reading immediately would often miss it and report a bare
+        // "Server stopped unexpectedly" for what is really a broken install.
+        if emit_crash {
+            for attempt in 0..20 {
+                if let Ok(proc) = state.lock() {
+                    if proc.generation != generation {
+                        return;
+                    }
+                    missing_module = missing_module_from_logs(&proc.logs);
+                }
+                if missing_module.is_some() || attempt == 19 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
         if let Some((status, intentional)) = exit_record {
             diagnostics::record_backend_exit(
                 diagnostics_state,
@@ -1046,8 +1164,34 @@ fn read_output_stream<R: std::io::Read>(
             );
         }
         if emit_crash {
-            error!("Backend process stdout closed unexpectedly (crash detected)");
-            let _ = app.emit("server-crashed", ());
+            let payload = match &missing_module {
+                Some(module) => {
+                    error!(
+                        "Backend could not start: missing module '{}' -- the install is \
+                         incomplete (most likely an install that was interrupted part-way)",
+                        module
+                    );
+                    BackendCrash {
+                        message: format!(
+                            "Studio's installation is incomplete: Python could not find \
+                             '{module}'. This usually means an install was interrupted \
+                             before it finished. Repairing will reinstall the missing \
+                             packages."
+                        ),
+                        incomplete_install: true,
+                        missing_module: Some(module.clone()),
+                    }
+                }
+                None => {
+                    error!("Backend process stdout closed unexpectedly (crash detected)");
+                    BackendCrash {
+                        message: "Server stopped unexpectedly".to_string(),
+                        incomplete_install: false,
+                        missing_module: None,
+                    }
+                }
+            };
+            let _ = app.emit("server-crashed", payload);
         }
     }
 }

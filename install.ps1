@@ -2438,6 +2438,26 @@ exit 0
             }
         } else {
             Write-TauriLog "STEP" "Installing PyTorch"
+            # Windows on ARM has no PyTorch at all. Measured with uv against both
+            # download.pytorch.org/whl/cpu and PyPI for aarch64-pc-windows-msvc /
+            # cp313: torch, torchvision and torchaudio each resolve to nothing --
+            # wheels exist only for win_amd64 and the manylinux targets. Without
+            # this the installer burns three uv retries on an unsatisfiable
+            # resolution and then reports a bare "Failed to install PyTorch
+            # (exit code 1)", which reads like a network problem rather than a
+            # platform that upstream does not build for.
+            if ((Get-TauriDiagArch) -eq "arm64") {
+                Write-Host "[ERROR] PyTorch does not publish Windows ARM64 wheels" -ForegroundColor Red
+                substep "torch, torchvision and torchaudio ship win_amd64 and Linux"
+                substep "wheels only, so the training and GPU inference stack cannot"
+                substep "be installed on Windows on ARM. This is an upstream gap, not"
+                substep "a problem with this machine."
+                substep "GGUF chat and inference do work here (llama.cpp publishes a"
+                substep "windows-arm64 prebuilt). Re-run with --no-torch to install"
+                substep "that path:"
+                substep "  .\install.ps1 --no-torch"
+                return (Exit-InstallFailure "PyTorch has no Windows ARM64 wheels; re-run with --no-torch" 1)
+            }
             substep "installing PyTorch ($(Remove-IndexUrlCredentials $TorchIndexUrl))..."
             # Bound the companions to the capped torch on EVERY index, cu<digits>
             # families included: torchaudio 2.11 dropped its exact torch pin from
