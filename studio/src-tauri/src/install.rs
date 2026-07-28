@@ -8,6 +8,8 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
+const INSTALL_IN_PROGRESS_MARKER: &str = ".desktop-install-in-progress";
+
 // ── Types ──
 
 pub struct InstallProcess {
@@ -39,158 +41,82 @@ pub fn new_install_state() -> InstallState {
 
 use crate::process::trim_line_endings;
 
-const FAILURE_CONTEXT_LINES: usize = 8;
-const FAILURE_CONTEXT_LINE_BYTES: usize = 1_000;
-
-fn generic_failure_message(code: i32) -> String {
-    format!(
-        "Installation failed with exit code {}. Open the installer logs for details.",
-        code
-    )
+fn install_in_progress_marker_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    Ok(home
+        .join(".unsloth")
+        .join("studio")
+        .join(INSTALL_IN_PROGRESS_MARKER))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum InstallOutputStream {
-    Stdout,
-    Stderr,
+pub(crate) fn managed_install_in_progress() -> bool {
+    install_in_progress_marker_path()
+        .map(|path| path.is_file())
+        .unwrap_or(false)
 }
 
-struct InstallOutputLine {
-    stream: InstallOutputStream,
-    text: String,
+/// Whether this process created the marker rather than finding one an earlier
+/// interrupted install left. Clearing someone else's drops the only signal that
+/// its venv is half-written. Process-wide because the marker is one file.
+static MARKER_CREATED_HERE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn create_install_in_progress_marker() -> Result<(), String> {
+    let path = install_in_progress_marker_path()?;
+    let created = create_install_in_progress_marker_at(&path)?;
+    MARKER_CREATED_HERE.store(created, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
 }
 
-#[derive(Default)]
-struct InstallFailureContext {
-    explicit_error: Option<String>,
-    explicit_error_stream: Option<InstallOutputStream>,
-    default_error: Option<String>,
-    output_tail: VecDeque<InstallOutputLine>,
-}
-
-impl InstallFailureContext {
-    fn observe_stdout(&mut self, text: &str) -> bool {
-        if text.starts_with("[TAURI:ERROR_CLEAR] ") {
-            self.clear_failure(InstallOutputStream::Stdout);
-            return true;
-        }
-        if text.starts_with("[TAURI:OUTPUT_CLEAR] ") {
-            self.clear_stream(InstallOutputStream::Stdout);
-            return true;
-        }
-        if let Some(message) = text.strip_prefix("[TAURI:ERROR] ") {
-            let message = message.trim();
-            if !message.is_empty() {
-                self.explicit_error = Some(Self::bounded_line(message));
-                self.explicit_error_stream = Some(InstallOutputStream::Stdout);
-            }
-            return false;
-        }
-        if let Some(message) = text.strip_prefix("[TAURI:ERROR_OUTPUT] ") {
-            self.capture_output_error(InstallOutputStream::Stdout, message);
-            return true;
-        }
-        if let Some(message) = text.strip_prefix("[TAURI:ERROR_DEFAULT] ") {
-            let message = message.trim();
-            if !message.is_empty() {
-                self.default_error = Some(Self::bounded_line(message));
-            }
-            return true;
-        }
-        if !text.starts_with("[TAURI:") {
-            self.push_output(InstallOutputStream::Stdout, text);
-        }
-        false
-    }
-
-    fn observe_stderr(&mut self, text: &str) -> bool {
-        if text.starts_with("[TAURI:ERROR_CLEAR] ") {
-            self.clear_failure(InstallOutputStream::Stderr);
-            return true;
-        }
-        if text.starts_with("[TAURI:OUTPUT_CLEAR] ") {
-            self.clear_stream(InstallOutputStream::Stderr);
-            return true;
-        }
-        if let Some(message) = text.strip_prefix("[TAURI:ERROR_OUTPUT] ") {
-            self.capture_output_error(InstallOutputStream::Stderr, message);
-            return true;
-        }
-        self.push_output(InstallOutputStream::Stderr, text);
-        false
-    }
-
-    fn capture_output_error(&mut self, stream: InstallOutputStream, fallback: &str) {
-        let fallback = fallback.trim();
-        let detail = self
-            .output_tail
-            .iter()
-            .rev()
-            .find(|line| line.stream == stream)
-            .map(|line| line.text.as_str());
-        if let Some(error) = match (fallback.is_empty(), detail) {
-            (_, Some(detail)) if fallback == detail => Some(detail.to_owned()),
-            (false, Some(detail)) => Some(Self::bounded_line(&format!("{fallback}: {detail}"))),
-            (false, None) => Some(Self::bounded_line(fallback)),
-            (true, Some(detail)) => Some(detail.to_owned()),
-            (true, None) => None,
-        } {
-            self.explicit_error = Some(error);
-            self.explicit_error_stream = Some(stream);
-        }
-    }
-
-    fn clear_failure(&mut self, stream: InstallOutputStream) {
-        if self.explicit_error_stream == Some(stream) {
-            self.explicit_error = None;
-            self.explicit_error_stream = None;
-        }
-        if stream == InstallOutputStream::Stdout {
-            self.default_error = None;
-        }
-        self.clear_stream(stream);
-    }
-
-    fn clear_stream(&mut self, stream: InstallOutputStream) {
-        self.output_tail.retain(|line| line.stream != stream);
-    }
-
-    fn push_output(&mut self, stream: InstallOutputStream, text: &str) {
-        let text = text.trim();
-        if text.is_empty() {
-            return;
-        }
-        let text = Self::bounded_line(text);
-        self.output_tail
-            .push_back(InstallOutputLine { stream, text });
-        while self.output_tail.len() > FAILURE_CONTEXT_LINES {
-            self.output_tail.pop_front();
-        }
-    }
-
-    fn bounded_line(text: &str) -> String {
-        let mut text = diagnostics::redact_for_display(text);
-        let boundary =
-            diagnostics::valid_utf8_boundary(&text, text.len().min(FAILURE_CONTEXT_LINE_BYTES));
-        text.truncate(boundary);
-        text
-    }
-
-    fn message(&self, code: i32) -> String {
-        let detail = self
-            .explicit_error
-            .as_deref()
-            .or(self.default_error.as_deref())
-            .or_else(|| self.output_tail.back().map(|line| line.text.as_str()));
-        match detail {
-            Some(detail) => format!("Installation failed: {}", detail),
-            None => generic_failure_message(code),
-        }
+/// Clear only a marker this attempt created. Used where the venv was never
+/// touched: a failed spawn, and the elevation exits.
+fn clear_own_install_marker() {
+    if MARKER_CREATED_HERE.load(std::sync::atomic::Ordering::Relaxed) {
+        clear_install_marker_best_effort();
     }
 }
 
-fn is_elevation_request(code: i32, packages: &[String]) -> bool {
-    code == 2 && !packages.is_empty()
+/// Ok(true) when this call created the file, Ok(false) when one was there.
+fn create_install_in_progress_marker_at(path: &Path) -> Result<bool, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Invalid install marker path: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(format!("Failed to create {}: {}", path.display(), error)),
+    }
+}
+
+fn clear_install_in_progress_marker() -> Result<(), String> {
+    let path = install_in_progress_marker_path()?;
+    clear_install_in_progress_marker_at(&path)
+}
+
+/// Clear only where the script provably never touched the venv: it failed to
+/// spawn, or it asked for elevation, which install.sh decides (:1931) before it
+/// creates the venv (:2120). Later on any failure can leave pip part-way
+/// through, and the marker is the only signal. Never fatal: it costs a fast path.
+fn clear_install_marker_best_effort() {
+    if let Err(msg) = clear_install_in_progress_marker() {
+        warn!("[install] {}", msg);
+    }
+    MARKER_CREATED_HERE.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn clear_install_in_progress_marker_at(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to remove {}: {}", path.display(), error)),
+    }
 }
 
 // ── Script Resolution ──
@@ -284,6 +210,10 @@ fn emit_complete(app: &AppHandle) {
 
 // ── Spawn ──
 
+/// A start rejected because one is already running, kept apart from a real
+/// spawn failure so the loser of the race leaves the winner's marker alone.
+const INSTALL_ALREADY_RUNNING: &str = "Installation is already running.";
+
 /// Spawns the install script in a process group.
 /// Returns (stdout, stderr) handles for streaming.
 /// The GroupChild is stored in state so stop_install() can kill the entire tree.
@@ -300,7 +230,7 @@ fn spawn_script(
 > {
     let mut install = state.lock().map_err(|e| e.to_string())?;
     if install.child.is_some() {
-        return Err("Installation is already running.".to_string());
+        return Err(INSTALL_ALREADY_RUNNING.to_string());
     }
     install.intentional_stop = false;
     install.needed_packages.clear();
@@ -620,9 +550,19 @@ fn run_install_with_event_mode(
         &format!("Using script: {}", script.display()),
     );
 
+    if let Err(msg) = create_install_in_progress_marker() {
+        warn!("[install] {}", msg);
+    }
+
     let (stdout, stderr) = match spawn_script(&script, &args, &state) {
         Ok(handles) => handles,
         Err(msg) => {
+            // Nothing ran, so nothing is half-installed. Unless the marker is
+            // not ours: another installer owns it, or an earlier interrupted
+            // one left it, and either way its signal is not ours to drop.
+            if msg != INSTALL_ALREADY_RUNNING {
+                clear_own_install_marker();
+            }
             diagnostics::finish_attempt(
                 &diagnostics,
                 &attempt,
@@ -652,6 +592,7 @@ fn run_install_with_event_mode(
 
     match result {
         Ok((status, _)) if status.success() => {
+            clear_install_marker_best_effort();
             diagnostics::finish_attempt(
                 &diagnostics,
                 &attempt,
@@ -685,10 +626,8 @@ fn run_install_with_event_mode(
                 let _ = app.emit(event_mode.needs_elevation_event(), &packages);
                 Err("NEEDS_ELEVATION".to_string())
             } else {
-                let msg = failure_context
-                    .lock()
-                    .map(|context| context.message(code))
-                    .unwrap_or_else(|_| generic_failure_message(code));
+                // Keep the marker: the script ran, so pip may be part-way through.
+                let msg = format!("Installer exited with code {}", code);
                 diagnostics::finish_attempt(
                     &diagnostics,
                     &attempt,
@@ -710,6 +649,7 @@ fn run_install_with_event_mode(
             Err(msg)
         }
         Err(msg) => {
+            // Same: the wait failed but the script was already running.
             diagnostics::finish_attempt(&diagnostics, &attempt, None, false, Some(msg.clone()));
             clear_current_attempt(&state);
             if event_mode.emit_terminal_events() {
@@ -749,6 +689,8 @@ pub fn record_pending_elevation_canceled(
     let Some(attempt) = attempt else {
         return false;
     };
+    // The resumed run the elevation exit left the marker for is not happening.
+    clear_own_install_marker();
     diagnostics::finish_attempt(
         diagnostics,
         &attempt,
@@ -786,6 +728,20 @@ pub fn record_install_intentional_stop(state: &InstallState, diagnostics: &Diagn
 /// Stop a running install process gracefully.
 /// Unix: SIGTERM to process group -> wait up to 5s -> SIGKILL
 /// Windows: hidden taskkill /T /F to terminate the installer tree
+/// Whether an installer is running right now.
+///
+/// Quitting the app tears the installer down (see `cleanup_child_processes`), and if
+/// that lands mid dependency-pass it leaves a venv the backend cannot import from --
+/// the reported "ModuleNotFoundError: No module named 'structlog'" after a quit at the
+/// "studio deps" step. Callers use this to warn first instead of destroying an install
+/// the user spent minutes on without saying anything.
+pub fn is_install_running(state: &InstallState) -> bool {
+    state
+        .lock()
+        .map(|install| install.child.is_some())
+        .unwrap_or(false)
+}
+
 pub fn stop_install(state: &InstallState) -> Result<(), String> {
     let mut child = {
         let mut install = match state.lock() {
@@ -1021,6 +977,8 @@ fn finish_elevation_failure(
     exit_status: Option<String>,
     message: String,
 ) {
+    // Terminal, like a cancelled prompt: the resumed run is not happening.
+    clear_own_install_marker();
     if let Some(attempt) = attempt {
         diagnostics::finish_attempt(
             diagnostics,
@@ -1056,6 +1014,31 @@ fn capped_output_text(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_marker_persists_until_explicit_success_cleanup() {
+        let directory = std::env::temp_dir().join(format!(
+            "unsloth-install-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let marker = directory.join(INSTALL_IN_PROGRESS_MARKER);
+
+        assert!(create_install_in_progress_marker_at(&marker).unwrap());
+        assert!(marker.is_file());
+
+        // A second attempt finds the first one's marker and does not own it.
+        assert!(!create_install_in_progress_marker_at(&marker).unwrap());
+        assert!(marker.is_file());
+
+        clear_install_in_progress_marker_at(&marker).unwrap();
+        assert!(!marker.exists());
+        clear_install_in_progress_marker_at(&marker).unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn elevated_output_cap_is_utf8_boundary_safe() {
