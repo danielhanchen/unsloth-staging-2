@@ -103,8 +103,13 @@ else
     STUDIO_STAMPED_VERSION="$(python scripts/stamp_studio_release.py)"
 fi
 
-# 4. Build wheel/sdist
+# 4. Build wheel/sdist. The build backend snapshots CHANGELOG.md into the
+# studio package (see _changelog_build.py), so release notes still render
+# offline. CHANGELOG.md at the repo root stays the one file to edit.
 python -m build
+
+# Drop the snapshot so a source checkout never serves a stale copy.
+rm -f studio/CHANGELOG.md
 
 if [ "${1:-}" = "publish" ]; then
     python scripts/stamp_studio_release.py --verify-dist dist --expected "$STUDIO_STAMPED_VERSION"

@@ -213,7 +213,9 @@ function TauriUpdateLayer({
   }
 
   return (
-    <div className="pointer-events-none fixed bottom-4 right-4 z-[9998] flex w-[calc(100vw-2rem)] max-w-[400px] flex-col items-stretch gap-2">
+    // Capped like the browser stack: the download panel sits in here too, so
+    // the two together must still fit the window.
+    <div className="pointer-events-none fixed bottom-4 right-4 z-[9998] flex max-h-[calc(100dvh_-_2rem)] flex-col items-end gap-2">
       <UpdateBanner
         status={update.status}
         info={update.info}
@@ -222,6 +224,7 @@ function TauriUpdateLayer({
         isExternalServer={isExternalServer}
         updatePolicyMode={update.updatePolicyMode}
         manualReleaseUrl={update.manualReleaseUrl}
+        releasePageUrl={update.releasePageUrl}
         positioned={false}
         onInstall={update.installUpdate}
         onDismiss={update.dismiss}
@@ -379,8 +382,12 @@ function TauriWrapper({ children }: { children: ReactNode }) {
       <>
         {children}
         {/* One bottom-right stack so overlays never overlap; they stack with a
-            gap, download panel anchored at the corner with banners above. */}
-        <div className="pointer-events-none fixed bottom-4 right-4 z-[9998] flex w-[calc(100vw-2rem)] max-w-[400px] flex-col items-stretch gap-2">
+            gap, download panel anchored at the corner with banners above.
+            Each overlay owns its width: the update banner is wider so its
+            notes and buttons fit on one row. */}
+        {/* Capped to the viewport: with a long download list and expanded
+            release notes the stack would otherwise push its top off screen. */}
+        <div className="pointer-events-none fixed bottom-4 right-4 z-[9998] flex max-h-[calc(100dvh_-_2rem)] flex-col items-end gap-2">
           <WebUpdateBanner
             positioned={false}
             enabled={!WEB_UPDATE_HIDDEN_ROUTES.has(pathname)}
