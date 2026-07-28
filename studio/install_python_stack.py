@@ -2853,6 +2853,31 @@ def patch_package_file(package_name: str, relative_path: str, url: str) -> None:
 # -- Main install sequence ---------------------------------------------
 
 
+def _has_working_git() -> bool:
+    """Match install.sh's _has_working_git: on PATH *and* actually runnable.
+
+    A git that is present but broken (a bare xcrun shim, a masked toolchain) is
+    what install.sh already classifies as missing. Testing only shutil.which
+    disagreed with it, so the installer promised to skip the git+https triton
+    requirement and then tried to fetch it anyway.
+    """
+    exe = shutil.which("git")
+    if exe is None:
+        return False
+    try:
+        return (
+            subprocess.run(
+                [exe, "--version"],
+                stdout = subprocess.DEVNULL,
+                stderr = subprocess.DEVNULL,
+                timeout = 30,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def install_python_stack() -> int:
     global USE_UV, _STEP, _TOTAL
     _STEP = 0
@@ -3159,16 +3184,22 @@ def install_python_stack() -> int:
         )
 
     # 5. Triton kernels (no-deps, from source). Skip on Windows and macOS
-    #    (no support).
+    #    (no support), and on any machine without git: the requirement is a
+    #    git+https URL, so pip cannot fetch it. These are a training speedup, not
+    #    a boot requirement, so warn and continue rather than fail the install.
     if not IS_WINDOWS and not IS_MACOS:
-        _progress("triton kernels")
-        pip_install(
-            "Installing triton kernels",
-            "--no-deps",
-            "--no-cache-dir",
-            req = REQ_ROOT / "triton-kernels.txt",
-            constrain = False,
-        )
+        if not _has_working_git():
+            _progress("triton kernels (skipped, no git)")
+            _safe_print("   no working git -- skipping triton kernels (training speedup only)")
+        else:
+            _progress("triton kernels")
+            pip_install(
+                "Installing triton kernels",
+                "--no-deps",
+                "--no-cache-dir",
+                req = REQ_ROOT / "triton-kernels.txt",
+                constrain = False,
+            )
 
     if not IS_WINDOWS and not IS_MACOS and not NO_TORCH:
         _progress("flash-attn")
