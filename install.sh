@@ -4185,6 +4185,33 @@ if [ "$SKIP_TORCH" = false ] && [ -n "${TORCH_INDEX_URL:-}" ]; then
     fi
 fi
 
+# ── CI only: overlay a source checkout over the package just installed ──
+# Not a consumer knob: no flag, absent from --help, ignored unless
+# UNSLOTH_CI_SOURCE_OVERLAY names a directory holding a pyproject.toml.
+#
+# The clean-machine legs run THIS script from a branch, but it installs unsloth
+# from PyPI, the consumer path. Everything Python-side then comes out of the
+# released wheel (studio/setup.sh, setup.ps1, install_python_stack.py and every
+# requirements/constraints file they reach via Path(__file__)), so the workflow
+# meant to validate a branch could not. An editable overlay re-points
+# `import studio` at the working tree, and the importlib.resources lookup below
+# then finds the branch's setup.sh unchanged. NOT --local: that also installs
+# `unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo`, which genuinely
+# needs git, and git absence is what these legs prove. Editable + --no-deps
+# resolves nothing and clones nothing, so it survives git, cmake and the C/C++
+# compilers all being gone.
+if [ -n "${UNSLOTH_CI_SOURCE_OVERLAY:-}" ]; then
+    if [ ! -f "$UNSLOTH_CI_SOURCE_OVERLAY/pyproject.toml" ]; then
+        echo "[ERROR] UNSLOTH_CI_SOURCE_OVERLAY is set to '$UNSLOTH_CI_SOURCE_OVERLAY' but there is no pyproject.toml there." >&2
+        exit 1
+    fi
+    substep "CI: overlaying source checkout (editable, no deps): $UNSLOTH_CI_SOURCE_OVERLAY"
+    # Retry: the editable build downloads its pinned build backend from PyPI, so
+    # it carries the same transient-network risk as every other install step.
+    run_install_cmd_retry "overlay CI source checkout" uv pip install --python "$_VENV_PY" \
+        --no-deps -e "$UNSLOTH_CI_SOURCE_OVERLAY"
+fi
+
 # ── Run studio setup ──
 tauri_log "STEP" "Running Unsloth setup"
 # When --local, use the repo's own setup.sh directly.
