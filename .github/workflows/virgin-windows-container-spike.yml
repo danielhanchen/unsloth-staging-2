@@ -74,6 +74,10 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
+      - name: Ensure the Docker daemon is running
+        shell: pwsh
+        run: ./.github/scripts/ensure-docker-daemon.ps1
+
       - name: Docker engine facts
         shell: pwsh
         run: |
@@ -189,6 +193,10 @@ jobs:
         with:
           fetch-depth: 1
           persist-credentials: false
+
+      - name: Ensure the Docker daemon is running
+        shell: pwsh
+        run: ./.github/scripts/ensure-docker-daemon.ps1
 
       - name: Start the container
         shell: pwsh
