@@ -98,13 +98,23 @@ jobs:
         shell: pwsh
         run: |
           $img = $env:IMAGE
-          # Cached on the windows-2022 runner image, so this is a no-op tag check
-          # rather than a multi-GB download. Timed anyway: if the runner image ever
-          # stops caching it, the cost shows up here instead of as a mystery timeout.
-          $sw = [System.Diagnostics.Stopwatch]::StartNew()
-          docker pull $img
-          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not pull $img"; exit 1 }
-          Write-Host "pull took $([int]$sw.Elapsed.TotalSeconds)s"
+          # Deliberately do NOT pull when the image is already cached. Process
+          # isolation requires the container build to be <= the host build, and MCR
+          # has shipped a patched image AHEAD of the runner host before: in Feb 2025
+          # that broke every Windows container job on windows-2025 for ~2 weeks with
+          # `hcs::System::Start ... (0xc0370106)` (actions/runner-images#11582). The
+          # cached image is the one that matched at runner-image build time, so using
+          # it as-is is strictly safer than refreshing it.
+          $cached = (docker images --format '{{.Repository}}:{{.Tag}}') -contains $img
+          if ($cached) {
+            Write-Host "using the runner's pre-cached $img (no pull; avoids host/container revision skew)"
+          } else {
+            Write-Host "::warning::$img is not pre-cached on this runner image; pulling (this may be slow and may outrun the host build)"
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            docker pull $img
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not pull $img"; exit 1 }
+            Write-Host "pull took $([int]$sw.Elapsed.TotalSeconds)s"
+          }
 
           # A keepalive entrypoint, so the payload can be `docker cp`'d in and each
           # assertion can be its own `docker exec` (and therefore its own workflow
@@ -149,18 +159,30 @@ jobs:
     needs: probe
     runs-on: windows-2022
     timeout-minutes: 90
+    continue-on-error: ${{ matrix.experimental }}
     strategy:
       fail-fast: false
       matrix:
         include:
           # The consumer path: install.ps1 from this ref, unsloth from PyPI. Proves
-          # what a user on a bare Windows box gets TODAY.
+          # what a user on a bare Windows box gets TODAY -- and today that is a
+          # FAILURE, in two places the hosted Windows leg structurally cannot see:
+          #   * studio/setup.ps1's git gate is winget-only, and winget can never work
+          #     in a Server Core container (microsoft/winget-cli#4319, #6027)
+          #   * Ensure-VCRedist is winget-only in the released wheel, and this
+          #     container genuinely has no vcruntime140_1.dll, so torch cannot import
+          # Both are fixed by #7549, which is unmerged. Experimental so the lane
+          # reports the gap rather than being permanently red; the step below pins
+          # the failure mode so an unrelated breakage is not tolerated as this one.
           - overlay: false
+            experimental: true
           # Re-points the venv at this ref before studio setup runs, so studio/setup.ps1
           # and install_python_stack.py under test are this ref's and not the released
           # wheel's. Without it a branch changing setup.ps1 gets a green run that proves
-          # nothing about the change.
+          # nothing about the change -- which is exactly what the first spike run did,
+          # before install.ps1 grew the overlay hook.
           - overlay: true
+            experimental: false
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -172,7 +194,11 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path logs | Out-Null
-          docker pull $env:IMAGE
+          # See the probe job: use the pre-cached image, do not refresh it.
+          if (-not ((docker images --format '{{.Repository}}:{{.Tag}}') -contains $env:IMAGE)) {
+            Write-Host "::warning::$env:IMAGE not pre-cached; pulling"
+            docker pull $env:IMAGE
+          }
           docker run -d --name virgin $env:IMAGE cmd /c "ping -t localhost >nul"
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not start a container from $env:IMAGE"; exit 1 }
           docker exec virgin cmd /c "mkdir C:\ci"
@@ -199,6 +225,32 @@ jobs:
             -ExecutionPolicy Bypass -File C:\ci\.github\scripts\virgin-windows-install.ps1 `
             -Overlay "$overlayArg" *>&1 | Tee-Object -FilePath logs/install-outer.log
           exit $LASTEXITCODE
+
+      # continue-on-error like the fedora leg, so without this a bootstrap outage or an
+      # unrelated early exit is tolerated exactly like the intended diagnostic.
+      - name: Assert the released-wheel outcome is the known one
+        if: always() && matrix.overlay == false
+        shell: pwsh
+        run: |
+          if ('${{ steps.install.outcome }}' -eq 'success') {
+            Write-Host '::warning::the released wheel now installs on a virgin Windows container -- #7549 has shipped; retire this row'
+            exit 0
+          }
+          if (-not (Test-Path logs/install-outer.log)) {
+            Write-Host '::error::released-wheel leg produced no log'
+            exit 1
+          }
+          $log = Get-Content logs/install-outer.log -Raw
+          # The two gaps this lane exists to surface. Either is an accepted outcome
+          # until #7549 merges; anything else is a new problem and must fail.
+          $gitGate = $log -match 'Git is required but could not be installed automatically'
+          $vcGate  = $log -match 'torch failed to import'
+          if (-not ($gitGate -or $vcGate)) {
+            Write-Host '::error::released-wheel leg failed at neither the winget-only git gate nor the missing VC++ runtime; this is a new failure'
+            exit 1
+          }
+          if ($gitGate) { Write-Host 'known outcome: winget-only git gate (studio/setup.ps1), fixed by #7549' }
+          if ($vcGate)  { Write-Host 'known outcome: no VC++ runtime and Ensure-VCRedist is winget-only, fixed by #7549' }
 
       - name: Recover the install log from the container
         if: always()

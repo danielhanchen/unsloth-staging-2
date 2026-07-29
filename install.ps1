@@ -2769,6 +2769,34 @@ exit 0
         }
     }
 
+    # ── CI-only: put this ref's Python under test ──
+    # SPIKE NOTE: backported from #7551 so the virgin-container lane can test THIS
+    # ref rather than the released wheel. Without it the overlay leg silently
+    # degrades into a duplicate of the non-overlay leg, which is exactly what the
+    # first spike run did.
+    #
+    # This script runs from a branch, but it installs unsloth from PyPI -- the
+    # consumer path -- so everything Python-side (studio/setup.ps1,
+    # install_python_stack.py and every requirements/constraints file they reach
+    # via Path(__file__)) comes out of the released wheel. An editable overlay makes
+    # _PACKAGE_ROOT in unsloth_cli/commands/studio.py resolve to the working tree by
+    # PEP 660 __file__, so setup.ps1 comes from the branch unchanged. NOT --local:
+    # that also installs `unsloth-zoo @ git+https://...`, which genuinely needs git,
+    # and git absence is the whole point of this lane. Editable + --no-deps resolves
+    # nothing and clones nothing, so it survives git, cmake and MSVC all missing.
+    if ($env:UNSLOTH_CI_SOURCE_OVERLAY) {
+        $CiOverlayRoot = $env:UNSLOTH_CI_SOURCE_OVERLAY
+        if (-not (Test-Path -LiteralPath (Join-Path $CiOverlayRoot "pyproject.toml"))) {
+            Write-Host "[ERROR] UNSLOTH_CI_SOURCE_OVERLAY is set to '$CiOverlayRoot' but there is no pyproject.toml there." -ForegroundColor Red
+            return (Exit-InstallFailure "UNSLOTH_CI_SOURCE_OVERLAY has no pyproject.toml: $CiOverlayRoot")
+        }
+        substep "CI: overlaying source checkout (editable, no deps): $CiOverlayRoot"
+        & uv pip install --python $VenvPython --no-deps -e $CiOverlayRoot
+        if ($LASTEXITCODE -ne 0) {
+            return (Exit-InstallFailure "Failed to overlay the CI source checkout (exit code $LASTEXITCODE)" $LASTEXITCODE)
+        }
+    }
+
     # ── Run studio setup ──
     # setup.ps1 will handle installing Git, CMake, Visual Studio Build Tools,
     # CUDA Toolkit, and other dependencies automatically via winget. Node.js is
