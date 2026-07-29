@@ -1,0 +1,52 @@
+name: "staging-7579 studio-playwright"
+on:
+  push:
+    branches: ["pr-7579-xplat-ci"]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/staging-7579-playwright.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  studio-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install playwright httpx pillow && python -m playwright install --with-deps chromium
+      - name: Install + launch Studio
+        run: |
+          ./install.sh --local --no-torch || pip install -e .
+          nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8888/healthz && break; sleep 5; done
+      - name: Playwright smoke (studio_test_kit)
+        run: PYTHONPATH=.github/scripts python -m studio_test_kit._smoke_ui || true
+      - name: Drive the PR's Playwright script (playwright_chat_ui.py)
+        env:
+          NEW_PW: StagingCI-7579-Pw1!
+          NEW2_PW: StagingCI-7579-Pw2!
+        run: |
+          PWFILE=$(grep -oE 'password saved to: *\S+' studio.log | tail -1 | awk '{print $NF}')
+          [ -f "$PWFILE" ] || { echo "::error::no bootstrap password file in studio.log"; tail -40 studio.log; exit 1; }
+          BOOT=$(cat "$PWFILE")
+          BASE_URL=http://127.0.0.1:8888 \
+            STUDIO_PW="$BOOT" STUDIO_OLD_PW="$BOOT" \
+            STUDIO_NEW_PW="$NEW_PW" STUDIO_NEW2_PW="$NEW2_PW" \
+            STUDIO_UI_STRICT=1 PW_ART_DIR=logs/playwright_staging python tests/studio/playwright_chat_ui.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-playwright-7579
+          path: |
+            **/*.png
+            **/*.webm
+            studio.log
