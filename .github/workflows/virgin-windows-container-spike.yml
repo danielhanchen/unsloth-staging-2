@@ -224,6 +224,31 @@ jobs:
             *>&1 | Tee-Object -FilePath logs/virginity.log
           exit $LASTEXITCODE
 
+      # Runs AFTER the virginity assertion, so the assertion still proves what it says.
+      #
+      # A fresh Windows container ships an almost empty trusted-root store; Windows
+      # normally fills it on demand via automatic root update, which schannel triggers
+      # but OpenSSL does not. That is why the probe's Invoke-WebRequest calls (schannel)
+      # all succeeded while studio/install_node_prebuilt.py died with
+      #   [SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate
+      # on nodejs.org: it uses bare urllib.request.urlopen, so Python reads the empty
+      # Windows ROOT store. uv and pip were unaffected because they bundle certifi.
+      #
+      # Seeding the root store is NOT a toolchain and NOT a product workaround -- it
+      # restores what every real Windows desktop already has, so it makes the container
+      # MORE representative of a bare user machine, not less. The underlying fragility
+      # is reported separately; without this step the lane cannot see past it to
+      # whatever else is broken.
+      - name: Seed the container's trusted root CA store
+        shell: pwsh
+        run: |
+          docker exec virgin cmd /c "certutil -generateSSTFromWU C:\roots.sst && certutil -addstore -f Root C:\roots.sst" `
+            *>&1 | Select-Object -Last 15
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::error::could not seed the container root CA store; Python-side HTTPS will fail'
+            exit 1
+          }
+
       - name: Install into the virgin container
         id: install
         shell: pwsh
