@@ -1,0 +1,225 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# FEASIBILITY SPIKE: is a GENUINELY VIRGIN Windows reachable in GitHub Actions?
+#
+# clean-machine-install-ci.yml's Linux legs are genuinely clean -- they run in
+# `ubuntu:24.04` / `fedora:41` containers with no curl, git, gcc or cmake. Its macOS
+# and Windows legs only SIMULATE absence, because hosted runners are developer
+# machines: the Windows leg renames the toolcache Python directory on disk and
+# scrubs the Machine and User registry PATH. That is honest masking, but it is not a
+# virgin OS, and two things it structurally cannot test are:
+#   * the VC++ 2015-2022 runtime, which ships in the runner image's System32 and
+#     cannot be removed without breaking the runner. The workflow carries an explicit
+#     HONESTY NOTE that `import torch` passing there does NOT prove a no-winget
+#     machine has the runtime.
+#   * a Windows with no Microsoft Store / App Installer at all, rather than a winget
+#     that has been hidden from PATH.
+#
+# A Windows container answers both. Constraints that shaped this file:
+#   * `container:` and `services:` are Linux-only on the Actions runner
+#     (actions/runner#1402, #904) -- "Container operations are only supported on
+#     Linux runners". So the container is driven by the docker CLI from a normal
+#     `run:` step instead of by the job's `container:` key. That also means no
+#     actions/checkout inside the container; the payload goes in via `docker cp`.
+#   * servercore, not nanoserver: install.ps1 must run under Windows PowerShell 5.1,
+#     which is what a real Windows box ships. nanoserver has no PowerShell at all.
+#   * ltsc2022 on a windows-2022 host: Windows containers require the host and
+#     container build to match for process isolation. windows-2022 (build 10.0.20348)
+#     pairs with ltsc2022, and the runner image pre-caches BOTH
+#     mcr.microsoft.com/windows/servercore:ltsc2022 and nanoserver:ltsc2022, so there
+#     is no multi-GB cold pull.
+#
+# This is a spike. If it holds up it folds into clean-machine-install-ci.yml as an
+# extra job, not as a replacement for the masked legs: the masked legs test a real
+# desktop Windows with a real Store, and the container tests a real bare Windows.
+
+name: Virgin Windows container (spike)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Windows base image to run the install in'
+        type: choice
+        options:
+          - 'mcr.microsoft.com/windows/servercore:ltsc2022'
+          - 'mcr.microsoft.com/windows/nanoserver:ltsc2022'
+        default: 'mcr.microsoft.com/windows/servercore:ltsc2022'
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ${{ inputs.image || 'mcr.microsoft.com/windows/servercore:ltsc2022' }}
+
+jobs:
+  # ── Q1: does the runner even give us a Windows container engine? ──────────────
+  # Split out from the install so the feasibility verdict lands in ~5 minutes and
+  # survives an install leg that times out. A green `probe` alone answers the
+  # question this spike was opened to answer.
+  probe:
+    name: probe / windows container is virgin
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Docker engine facts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          # The decisive fact: the daemon must be serving WINDOWS containers. On the
+          # hosted windows-2022 image it is; a Linux-container daemon would make every
+          # mcr.microsoft.com/windows/* pull fail with a manifest/platform error.
+          docker version
+          Write-Host "OSType     : $(docker info --format '{{.OSType}}')"
+          Write-Host "Isolation  : $(docker info --format '{{.Isolation}}')"
+          Write-Host "ServerOs   : $(docker version --format '{{.Server.Os}}')"
+          $osType = (docker info --format '{{.OSType}}').Trim()
+          if ($osType -ne 'windows') {
+            Write-Host "::error::docker is serving '$osType' containers, not windows; this lane cannot run here"
+            exit 1
+          }
+          Write-Host ""
+          Write-Host "=== images already on the runner (no cold pull if ours is here) ==="
+          docker images --format '{{.Repository}}:{{.Tag}}  {{.Size}}'
+
+      - name: Start the container
+        shell: pwsh
+        run: |
+          $img = $env:IMAGE
+          # Cached on the windows-2022 runner image, so this is a no-op tag check
+          # rather than a multi-GB download. Timed anyway: if the runner image ever
+          # stops caching it, the cost shows up here instead of as a mystery timeout.
+          $sw = [System.Diagnostics.Stopwatch]::StartNew()
+          docker pull $img
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not pull $img"; exit 1 }
+          Write-Host "pull took $([int]$sw.Elapsed.TotalSeconds)s"
+
+          # A keepalive entrypoint, so the payload can be `docker cp`'d in and each
+          # assertion can be its own `docker exec` (and therefore its own workflow
+          # step with its own exit code) instead of one opaque `docker run`.
+          docker run -d --name virgin $img cmd /c "ping -t localhost >nul"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not start a container from $img"; exit 1 }
+          Write-Host "isolation in effect: $(docker inspect virgin --format '{{.HostConfig.Isolation}}')"
+
+          # No actions/checkout inside the container: it needs git, and a container
+          # with git preinstalled is not the clean machine under test.
+          docker exec virgin cmd /c "mkdir C:\ci"
+          docker cp "$env:GITHUB_WORKSPACE\." virgin:C:\ci
+          docker exec virgin cmd /c "dir C:\ci\install.ps1"
+
+      - name: Assert the container is genuinely virgin
+        id: virginity
+        shell: pwsh
+        run: |
+          docker exec virgin powershell.exe -NoLogo -NoProfile -NonInteractive `
+            -ExecutionPolicy Bypass -File C:\ci\.github\scripts\virgin-windows-probe.ps1 `
+            *>&1 | Tee-Object -FilePath logs/virginity.log
+          exit $LASTEXITCODE
+
+      - name: Tear down
+        if: always()
+        shell: pwsh
+        run: |
+          docker rm -f virgin 2>&1 | Out-Null
+          exit 0
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: virgin-win-probe
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ── Q2: does the install actually work there? ────────────────────────────────
+  install:
+    name: install / overlay=${{ matrix.overlay }}
+    needs: probe
+    runs-on: windows-2022
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The consumer path: install.ps1 from this ref, unsloth from PyPI. Proves
+          # what a user on a bare Windows box gets TODAY.
+          - overlay: false
+          # Re-points the venv at this ref before studio setup runs, so studio/setup.ps1
+          # and install_python_stack.py under test are this ref's and not the released
+          # wheel's. Without it a branch changing setup.ps1 gets a green run that proves
+          # nothing about the change.
+          - overlay: true
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Start the container
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          docker pull $env:IMAGE
+          docker run -d --name virgin $env:IMAGE cmd /c "ping -t localhost >nul"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not start a container from $env:IMAGE"; exit 1 }
+          docker exec virgin cmd /c "mkdir C:\ci"
+          docker cp "$env:GITHUB_WORKSPACE\." virgin:C:\ci
+          docker exec virgin cmd /c "mkdir C:\ci-out"
+
+      # Re-run here and not only in `probe`: these are different runners, and an
+      # install leg that skipped the check would be reporting on an environment it
+      # never verified.
+      - name: Assert the container is genuinely virgin
+        shell: pwsh
+        run: |
+          docker exec virgin powershell.exe -NoLogo -NoProfile -NonInteractive `
+            -ExecutionPolicy Bypass -File C:\ci\.github\scripts\virgin-windows-probe.ps1 `
+            *>&1 | Tee-Object -FilePath logs/virginity.log
+          exit $LASTEXITCODE
+
+      - name: Install into the virgin container
+        id: install
+        shell: pwsh
+        run: |
+          $overlayArg = if ('${{ matrix.overlay }}' -eq 'true') { 'C:\ci' } else { '' }
+          docker exec virgin powershell.exe -NoLogo -NoProfile -NonInteractive `
+            -ExecutionPolicy Bypass -File C:\ci\.github\scripts\virgin-windows-install.ps1 `
+            -Overlay "$overlayArg" *>&1 | Tee-Object -FilePath logs/install-outer.log
+          exit $LASTEXITCODE
+
+      - name: Recover the install log from the container
+        if: always()
+        shell: pwsh
+        run: |
+          docker cp virgin:C:\ci-out\install.log logs/install.log 2>&1 | Out-Null
+          if (Test-Path logs/install.log) { Write-Host "recovered $((Get-Item logs/install.log).Length) bytes" }
+          else { Write-Host "::warning::no install log inside the container" }
+          exit 0
+
+      - name: Tear down
+        if: always()
+        shell: pwsh
+        run: |
+          docker rm -f virgin 2>&1 | Out-Null
+          exit 0
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: virgin-win-install-overlay-${{ matrix.overlay }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
