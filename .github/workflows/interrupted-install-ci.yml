@@ -1,0 +1,368 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Proves an INTERRUPTED install can never masquerade as a healthy one.
+#
+# Reported failure: quitting the app mid-install kills the installer process group
+# (main.rs cleanup_child_processes -> install.rs:798-807) mid "studio deps", the step
+# installing studio/backend/requirements/studio.txt where structlog is declared. On
+# relaunch preflight probes `unsloth -h` and `studio desktop-capabilities --json`; both
+# succeed because the CLI's own deps (typer/click/rich) are core, so the app reports
+# ManagedReady with can_auto_repair=false while the backend dies on `import structlog`
+# and the user is stuck on "Server stopped unexpectedly".
+#
+# No CI job had ever interrupted an install. This one kills the installer at each phase
+# and asserts the result is genuinely healthy or explicitly repairable, never silently ready.
+
+name: Interrupted install recovery
+
+on:
+  pull_request:
+    paths:
+      - 'install.sh'
+      - 'install.ps1'
+      - 'studio/setup.sh'
+      - 'studio/setup.ps1'
+      - 'studio/install_python_stack.py'
+      - 'studio/src-tauri/src/install.rs'
+      - 'studio/src-tauri/src/preflight.rs'
+      - 'studio/src-tauri/src/preflight/**'
+      - 'unsloth_cli/commands/studio.py'
+      # Every leg installs the checkout with `--local`, so this file decides the console
+      # script and the core deps: `-h` and `desktop-capabilities` only survive a torn
+      # install because typer/click/rich are declared here, not in an extra. No other
+      # install workflow interrupts the installer.
+      - 'pyproject.toml'
+      # studio_install_ok and verify-install, the decisions the probe asserts on, live
+      # here, so an install_state() that accepts a missing manifest would merge unrun.
+      - 'unsloth_cli/_studio_deps.py'
+      - 'studio/install_manifest.py'
+      # The requirement files are the phases: studio.txt declares structlog, whose absence
+      # IS the reported false-ready bug, so moving a package between them changes what
+      # every interrupted state looks like.
+      - 'studio/backend/requirements/**'
+      # `interrupt*-install*` would match the .sh / .ps1 but NOT the underscored probe
+      # (`*` never matches `/`, and a literal `-install` follows), so list all three.
+      - '.github/scripts/interrupt-install.sh'
+      - '.github/scripts/interrupt-install.ps1'
+      - '.github/scripts/interrupted_install_probe.py'
+      - '.github/workflows/interrupted-install-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+
+jobs:
+  # ── macOS + Linux: kill at each phase ─────────────────────────────────────
+  interrupt:
+    name: ${{ matrix.os }} kill@${{ matrix.label }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `beat` is the delay between the marker and the signal, in seconds. It is 0
+          # everywhere except the three steps that provably run for minutes: every phase
+          # label prints BEFORE its work starts, so killing at detection is already inside
+          # the phase, while any beat longer than the phase lands the signal in the NEXT
+          # one. A flat 3s beat is what made 5 of the 12 legs of staging run 30419729244
+          # interrupt a later phase than their label claims.
+          #
+          # The exact reported case: killed during the sub-step that installs structlog.
+          - {os: macos-14, label: studio-deps, marker: 'studio deps', beat: 0, experimental: false}
+          # Coarse phases, earliest to latest -- each leaves a different partial venv.
+          # venv is experimental: the step takes ~0.1s (30419729244 logged 03:31:07.371 ->
+          # 07.478 between its line and "Installing PyTorch"), shorter than any log poll, so
+          # the kill usually lands in the next phase and the landing check FAILS it. It
+          # still probes the earliest torn state when it does land.
+          - {os: macos-14, label: venv,        marker: '\[TAURI:STEP\] Creating virtual environment', beat: 0, experimental: true}
+          - {os: macos-14, label: torch,       marker: '\[TAURI:STEP\] Installing PyTorch',           beat: 3, experimental: false}
+          - {os: macos-14, label: unsloth,     marker: '\[TAURI:STEP\] Installing Unsloth',           beat: 3, experimental: false}
+          - {os: macos-14, label: setup,       marker: '\[TAURI:STEP\] Running Unsloth setup',        beat: 3, experimental: false}
+          # Other dependency-pass sub-steps around the named one. pip-bootstrap is
+          # experimental for the same reason as venv: in 30419729244 it landed in "2/10
+          # unsloth extras", producing a log byte-identical to the unsloth-extras leg.
+          - {os: macos-14, label: pip-bootstrap,  marker: 'pip bootstrap',     beat: 0, experimental: true}
+          # No base-packages cell: --local sets skip_base, so install_python_stack returns
+          # before "base packages" ever prints -- that leg ran to completion, proving nothing.
+          - {os: macos-14, label: unsloth-extras, marker: 'unsloth extras',    beat: 0, experimental: true}
+          - {os: macos-14, label: data-designer,  marker: 'data designer deps', beat: 0, experimental: true}
+          # Linux: same teardown path, different package manager and process semantics.
+          - {os: ubuntu-latest, label: studio-deps, marker: 'studio deps', beat: 0, experimental: false}
+          - {os: ubuntu-latest, label: torch, marker: '\[TAURI:STEP\] Installing PyTorch', beat: 3, experimental: false}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Linux system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends cmake git build-essential libcurl4-openssl-dev
+
+      - name: Install, interrupted at "${{ matrix.label }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          KILL_AT_SECONDS: '1500'
+          KILL_AFTER_MARKER_SECONDS: '${{ matrix.beat }}'
+        run: |
+          # --local is load-bearing. Without it install.sh:3996 resolves
+          # `unsloth>=2026.7.5` from PyPI, so the venv gets the PUBLISHED CLI, every
+          # `verify-install` / `desktop-runtime-check` probe reports "absent" whatever the
+          # branch does, and the lane cannot observe the fix it tests. --local overlays the
+          # checkout editable (install.sh:3990) before the dep pass, so a kill at "studio
+          # deps" leaves the branch's CLI installed.
+          bash .github/scripts/interrupt-install.sh \
+            '${{ matrix.marker }}' logs/install.log -- --tauri --local
+
+      - name: The kill must have landed where it was aimed
+        run: |
+          . logs/interrupt.env
+          echo "reason=$interrupt_reason killed=$interrupt_killed exit=$installer_exit"
+          if [ "$interrupt_reason" != "marker-hit" ]; then
+            echo "::error::installer never reached '${{ matrix.marker }}' (reason=$interrupt_reason)."
+            echo "::error::This leg proves nothing. Without this check it passes via the"
+            echo "::error::NO_CLI 'safe' path, which is how a --tauri/UNSLOTH_STUDIO_HOME"
+            echo "::error::conflict once made all 11 POSIX legs vacuously green."
+            tail -30 logs/install.log || true
+            exit 1
+          fi
+          # reason alone is not proof: the installer can finish between the driver's
+          # post-delay liveness check and the signal, leaving reason=marker-hit over a
+          # COMPLETED install that probes HEALTHY and skips the re-run assertion below. The
+          # exit status separates them: SIGTERM takes install.sh's trap to 143
+          # (install.sh:716) and SIGKILL to 137, while only a completed install exits 0.
+          if [ "$installer_exit" = "0" ]; then
+            echo "::error::installer exited 0 -- it COMPLETED inside the kill window, so"
+            echo "::error::nothing was interrupted and this leg asserts nothing."
+            tail -30 logs/install.log || true
+            exit 1
+          fi
+          # ...and the signal must land in the phase this leg is NAMED for. Warning-only
+          # left staging run 30419729244 fully green with the venv leg's install.log
+          # byte-identical to the torch leg's, and both "studio deps" legs killed past
+          # structlog (their own probe artefacts report backend_ok=true), so the flagship
+          # cell never reproduced the bug it is named after.
+          if [ "$interrupt_phase_mismatch" = "true" ]; then
+            echo "::error::the kill landed in a LATER phase than '${{ matrix.marker }}', so this"
+            echo "::error::leg duplicates whichever leg owns that phase and its label lies."
+            tr '\r' '\n' < logs/install.log | grep -aE '^\[TAURI:STEP\]|\[[=-]+\] *[0-9]+/[0-9]+' || true
+            exit 1
+          fi
+
+      - name: What state is the install in?
+        id: probe
+        run: |
+          # --tauri refuses a custom UNSLOTH_STUDIO_HOME, so it installs here.
+          BIN="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
+          [ -x "$BIN" ] || BIN="$HOME/.unsloth/studio/bin/unsloth"
+          if [ ! -x "$BIN" ]; then
+            # No CLI at all is SAFE: preflight reports NotInstalled, the app reinstalls.
+            echo "verdict=NO_CLI" >> "$GITHUB_OUTPUT"
+            echo "[probe] no unsloth CLI installed -> preflight reports NotInstalled (safe)"
+            exit 0
+          fi
+          rc=0
+          python3 .github/scripts/interrupted_install_probe.py "$BIN" --out probe || rc=$?
+          v="$(python3 -c "import json;print(json.load(open('probe/verdict.json'))['verdict'])")"
+          echo "verdict=$v" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+      - name: A re-run must repair, not short-circuit
+        # NO_CLI included: a kill at venv or torch lands before "Installing Unsloth"
+        # (install.sh:2125 / :3667 / :3961), so those legs always take NO_CLI and skipping
+        # the re-run left three non-experimental legs asserting only that a marker
+        # appeared. The bug's second half is `install.sh` seeing a "current" version and
+        # no-opping over a broken venv. HEALTHY also needs the install reported complete,
+        # so the data-designer leg (killed before the manifest is written last,
+        # install_python_stack.py:3255) arrives here instead of skipping that assertion.
+        if: always() && steps.probe.outputs.verdict != 'HEALTHY'
+        run: |
+          set -o pipefail
+          rc=0
+          bash install.sh --tauri --local < /dev/null 2>&1 | tee logs/repair.log || rc=$?
+          echo "repair exit: $rc"
+          BIN="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
+          [ -x "$BIN" ] || BIN="$HOME/.unsloth/studio/bin/unsloth"
+          # No verdict.json when the bin is missing, so check here or json.load crashes.
+          if [ ! -x "$BIN" ]; then
+            echo "::error::after a full re-run there is still no unsloth CLI at $BIN"
+            tail -30 logs/repair.log || true
+            exit 1
+          fi
+          python3 .github/scripts/interrupted_install_probe.py "$BIN" --out probe-after || true
+          v="$(python3 -c "import json;print(json.load(open('probe-after/verdict.json'))['verdict'])")"
+          # A booting backend IS the repair, whatever the log narrated: judging by log
+          # text failed a leg whose venv was fine, matching only the frontend's "up to date".
+          if [ "$v" = "HEALTHY" ]; then
+            echo "re-run repaired the install (verdict=HEALTHY)"
+            exit 0
+          fi
+          echo "::error::after a full re-run the backend still does not boot (verdict=$v)"
+          if grep -qiE "(venv|dependenc|python stack)[^|]*(up to date|already current)" logs/repair.log; then
+            echo "::error::and the re-run treated the venv as current instead of repairing it"
+          fi
+          exit 1
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: interrupted-${{ matrix.os }}-${{ matrix.label }}
+          path: |
+            logs/
+            probe/
+            probe-after/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ── Windows: no process groups, so the kill path differs ──────────────────
+  interrupt-windows:
+    name: windows kill@${{ matrix.label }}
+    # No UNSLOTH_STUDIO_HOME here. The app scrubs it (install.rs:202, :356) and
+    # install.ps1:189-215 rejects a custom root under --tauri, so a workspace-scoped root
+    # forced these legs down the shell-install path: UNSLOTH_TAURI_MODE=0, frontend build
+    # on, different root resolution, no bundled-file overlay. Worse, "Installing PyTorch"
+    # is only printed by Write-TauriLog (install.ps1:2440), so the torch leg's marker could
+    # never appear. The runner is ephemeral, so the default root is safe to install into.
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # install.ps1:121 parses `--no-torch`; `-SkipTorch` matches no case there and is
+          # silently dropped. The torch leg must NOT skip torch or its marker never appears.
+          # `beat` as in the POSIX job: 0 for the sub-step, 3 for the minutes-long torch step.
+          - {label: studio-deps, marker: 'studio deps', beat: 0, installArgs: '--tauri --no-torch --local'}
+          - {label: torch, marker: 'Installing PyTorch', beat: 3, installArgs: '--tauri --local'}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install, interrupted at "${{ matrix.label }}"
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -File .github/scripts/interrupt-install.ps1 `
+            -Marker '${{ matrix.marker }}' -LogPath logs/install.log `
+            -InstallArgs '${{ matrix.installArgs }}' -KillAtSeconds 1500 `
+            -KillAfterMarkerSeconds ${{ matrix.beat }}
+
+      - name: The kill must have landed where it was aimed
+        shell: pwsh
+        run: |
+          $vals = @{}
+          foreach ($line in (Get-Content logs/interrupt.env)) {
+            $kv = $line -split '=', 2
+            if ($kv.Count -eq 2) { $vals[$kv[0]] = $kv[1] }
+          }
+          Write-Host "reason=$($vals['interrupt_reason']) killed=$($vals['interrupt_killed']) exit=$($vals['installer_exit'])"
+          if ($vals['interrupt_reason'] -ne 'marker-hit') {
+            Write-Host "::error::installer never reached '${{ matrix.marker }}' (reason=$($vals['interrupt_reason']))."
+            Write-Host '::error::This leg proves nothing: without this check it passes via the'
+            Write-Host '::error::probe NO_CLI safe path, exactly as the POSIX legs once did.'
+            Get-Content logs/install.log -Tail 30 -ErrorAction SilentlyContinue
+            exit 1
+          }
+          # Same guard as the POSIX leg: the installer can finish between the driver's
+          # post-delay HasExited check and Stop-Tree, leaving reason=marker-hit over a
+          # COMPLETED install that probes HEALTHY and skips the re-run assertion.
+          # Stop-Process -Force is non-zero, so only a completed install reports 0.
+          # 'running' too, not just 0: the driver reports that when the installer outlived
+          # Stop-Tree and WaitForExit, and a live installer writing into the venv under the
+          # probe is not an interrupted install either. Only a real non-zero code counts.
+          if ($vals['installer_exit'] -eq '0' -or $vals['installer_exit'] -notmatch '^-?\d+$') {
+            Write-Host "::error::installer exit=$($vals['installer_exit']) -- it completed or never"
+            Write-Host '::error::died inside the kill window, so this leg asserts nothing.'
+            Get-Content logs/install.log -Tail 30 -ErrorAction SilentlyContinue
+            exit 1
+          }
+          # Same landing check as the POSIX leg: a phase already over when the poll saw the
+          # marker means the kill hit a LATER phase, so the leg duplicates another one.
+          if ($vals['interrupt_phase_mismatch'] -eq 'true') {
+            Write-Host "::error::the kill landed in a LATER phase than '${{ matrix.marker }}', so this"
+            Write-Host '::error::leg duplicates whichever leg owns that phase and its label lies.'
+            ((Get-Content logs/install.log -Raw) -replace "`r", "`n") -split "`n" |
+              Where-Object { $_ -match '^\[TAURI:STEP\]' -or $_ -match '\[[=-]+\]\s*\d+/\d+\s' }
+            exit 1
+          }
+
+      - name: What state is the install in?
+        id: probe
+        shell: pwsh
+        run: |
+          # --tauri refuses a custom root, so this is where install.ps1:254-262 puts it.
+          $bin = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
+          if (-not (Test-Path $bin)) {
+            "verdict=NO_CLI" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            Write-Host '[probe] no unsloth CLI -> preflight reports NotInstalled (safe)'
+            exit 0
+          }
+          # The SAME probe the other platforms run. The bespoke inline version it replaced
+          # checked only `-h` and `desktop-capabilities`, so it could not observe
+          # studio_install_ok / verify-install / desktop-runtime-check and would have
+          # failed the very PRs that add them.
+          python .github/scripts/interrupted_install_probe.py $bin --out probe
+          $rc = $LASTEXITCODE
+          $v = (Get-Content probe/verdict.json -Raw | ConvertFrom-Json).verdict
+          "verdict=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          exit $rc
+
+      - name: A re-run must repair, not short-circuit
+        # Same assertion the POSIX legs make, NO_CLI included: without it a Windows leg
+        # proves only that the break was DETECTED, never that install.ps1's version fast
+        # path does not short-circuit over it, the half of the bug that strands the user.
+        if: always() && steps.probe.outputs.verdict != 'HEALTHY'
+        shell: pwsh
+        run: |
+          # powershell.exe with install.rs:325-339's flags, matching the interrupted run:
+          # the desktop repairs under Windows PowerShell 5.1, so a repair that only works
+          # under pwsh 7 would pass here and still strand the user.
+          powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden `
+            -ExecutionPolicy Bypass -File install.ps1 ${{ matrix.installArgs }} *>&1 |
+            Tee-Object -FilePath logs/repair.log
+          $bin = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
+          if (-not (Test-Path $bin)) {
+            Write-Host "::error::after a full re-run there is still no unsloth CLI at $bin"
+            Get-Content logs/repair.log -Tail 30 -ErrorAction SilentlyContinue
+            exit 1
+          }
+          python .github/scripts/interrupted_install_probe.py $bin --out probe-after
+          $v = (Get-Content probe-after/verdict.json -Raw | ConvertFrom-Json).verdict
+          # A booting backend IS the repair, whatever the log narrated: judging by log text
+          # failed a POSIX leg whose venv was fine, matching only the frontend's "up to date".
+          if ($v -eq 'HEALTHY') {
+            Write-Host 're-run repaired the install (verdict=HEALTHY)'
+            exit 0
+          }
+          Write-Host "::error::after a full re-run the backend still does not boot (verdict=$v)"
+          $log = Get-Content logs/repair.log -Raw -ErrorAction SilentlyContinue
+          if ($log -match '(?i)(venv|dependenc|python stack)[^|]*(up to date|already current)') {
+            Write-Host '::error::and the re-run treated the venv as current instead of repairing it'
+          }
+          exit 1
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: interrupted-windows-${{ matrix.label }}
+          path: |
+            logs/
+            probe/
+            probe-after/
+          retention-days: 7
+          if-no-files-found: warn
