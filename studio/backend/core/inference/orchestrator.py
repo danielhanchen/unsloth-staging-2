@@ -30,8 +30,19 @@ from typing import Any, Generator, Optional, Tuple, Union
 from utils.hardware import get_device, prepare_gpu_selection
 
 # Re-exported from the shared helper so GGUF, training, and inference share one
-# type; kept importable here for backwards compatibility.
-from utils.hf_xet_fallback import DownloadStallError
+# type; kept importable here for backwards compatibility. Resolved through PEP
+# 562, not a module-level import: the shim resolves the name by importing
+# unsloth_zoo, hence torch, and routes/inference.py imports this module at
+# startup purely for the two GenStream* classes below.
+DownloadStallError: type
+
+
+def __getattr__(name: str):
+    if name == "DownloadStallError":
+        from utils.hf_xet_fallback import DownloadStallError as _exc
+        return _exc
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 logger = get_logger(__name__)
 
@@ -440,6 +451,11 @@ class InferenceOrchestrator:
         message, so long-running operations (large downloads, slow loads)
         survive as long as the subprocess keeps reporting progress.
         """
+        # Local: resolving this name runs the shim's lazy unsloth_zoo load,
+        # which pulls torch. The shim caches the class it picked, so this site
+        # and the `except` in load_model() see the same object.
+        from utils.hf_xet_fallback import DownloadStallError
+
         deadline = time.monotonic() + timeout
 
         while time.monotonic() < deadline:
@@ -1117,6 +1133,9 @@ class InferenceOrchestrator:
         stale unsloth patches, torch.compile caches, or getsource failures).
         """
         from utils.transformers_version import needs_transformers_5
+
+        # Same lazy-shim reason as _wait_response(); see the note there.
+        from utils.hf_xet_fallback import DownloadStallError
 
         model_name = config.identifier
         self.loading_models.add(model_name)
@@ -2096,11 +2115,24 @@ class InferenceOrchestrator:
 
 # ========== GLOBAL INSTANCE ==========
 _inference_backend = None
+# Guards the lazy construction below. The first build runs hardware detection
+# (get_default_models -> hw.get_device()), which takes seconds on a cold start,
+# and the routes that need the backend during first paint call this getter from
+# executor threads -- so without the lock several of them observe None inside
+# that window and each build their own orchestrator. The last one to finish wins
+# the global and the rest are orphaned, taking any load started on them (their
+# own subprocess, loading_models and active_model_name are per-instance) out of
+# reach of every later status or generation call.
+_inference_backend_lock = threading.Lock()
 
 
 def get_inference_backend() -> InferenceOrchestrator:
     """Global inference backend instance (orchestrator)."""
     global _inference_backend
+    # Double-checked: the cheap read keeps the warm path lock-free, and the
+    # recheck under the lock is what actually decides who constructs.
     if _inference_backend is None:
-        _inference_backend = InferenceOrchestrator()
+        with _inference_backend_lock:
+            if _inference_backend is None:
+                _inference_backend = InferenceOrchestrator()
     return _inference_backend

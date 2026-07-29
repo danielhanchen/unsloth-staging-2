@@ -333,13 +333,14 @@ from routes.prompts import router as prompts_router
 from auth import storage
 from auth.authentication import get_current_subject
 from utils.hardware import (
-    detect_hardware,
+    start_background_detection,
     get_device,
     DeviceType,
     get_backend_visible_gpu_info,
 )
 import utils.hardware.hardware as _hw_module
 
+from utils.torch_warmup import join_background_warm, start_background_warm
 from utils.cache_cleanup import clear_unsloth_compiled_cache
 from utils.lifespan_shutdown import run_lifespan_shutdown
 from utils.native_path_leases import native_path_leases_supported
@@ -495,6 +496,39 @@ def _warm_rag_embedder() -> None:
         pass
 
 
+def _post_warm_background_work() -> None:
+    """Stack-dependent startup work, run after the coordinated warm.
+
+    Both of these import the ML stack, and both used to do it their own way
+    before the socket bound: the MLX check inline on the lifespan thread (so a
+    healthy Mac waited on mlx.core/mlx_lm/mlx_vlm before uvicorn could bind, and
+    the whole point of deferring torch was lost there), the RAG embedder on a
+    thread started early enough to race the warm for the GIL and the import
+    locks -- pulling sentence-transformers/transformers/torch outside the warm's
+    hardware-first ordering and its purge-on-failure handling.
+
+    Joining the warm first means the stack is imported once, in the intended
+    order, and these two then run against a warm module cache.
+    """
+    join_background_warm()
+
+    # Apple Silicon with MLX missing => Train/Export are greyed out (chat-only).
+    # Reinstall mlx by name on a background thread and re-detect, so a
+    # reinstall/update that dropped mlx self-heals. No-op elsewhere; opt out with
+    # UNSLOTH_DISABLE_MLX_AUTOREPAIR=1. The availability probe imports the MLX
+    # runtime, which is why this waits for the warm rather than running inline:
+    # it cannot be made metadata-only, since checking versions without importing
+    # is precisely what lets a version-satisfying but broken install go unrepaired.
+    try:
+        from utils.mlx_repair import start_mlx_autorepair_if_needed
+        start_mlx_autorepair_if_needed()
+    except Exception as _mlx_exc:
+        import structlog as _structlog
+        _structlog.get_logger(__name__).debug("mlx autorepair skipped: %s", _mlx_exc)
+
+    _warm_rag_embedder()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup: detect hardware, seed default admin if needed. Shutdown: clean up compiled cache."""
@@ -512,24 +546,16 @@ async def lifespan(app: FastAPI):
     if overlay_dir.is_dir():
         shutil.rmtree(overlay_dir, ignore_errors = True)
 
-    # Detect hardware first — sets the DEVICE global used everywhere.
-    detect_hardware()
+    # Hardware detection is NOT here any more. It imports torch, and uvicorn
+    # binds only once this lifespan returns, so it kept the login screen behind
+    # a ~1.4s torch import. It runs first on the warm thread started at the end
+    # of this function; endpoints reading DEVICE / CHAT_ONLY go through
+    # ensure_hardware_detected() and wait for that same detection instead of
+    # reading a half-set global.
 
-    _lifespan_log.info(
-        "lifespan hardware detection completed in %.1fms",
-        (_time.perf_counter() - _lifespan_started) * 1000,
-    )
-
-    # Apple Silicon with MLX missing => Train/Export are greyed out (chat-only).
-    # Reinstall mlx by name on a background thread (off the critical path) and
-    # re-detect, so a reinstall/update that dropped mlx self-heals. No-op
-    # elsewhere; opt out with UNSLOTH_DISABLE_MLX_AUTOREPAIR=1.
-    try:
-        from utils.mlx_repair import start_mlx_autorepair_if_needed
-        start_mlx_autorepair_if_needed()
-    except Exception as _mlx_exc:
-        import structlog as _structlog
-        _structlog.get_logger(__name__).debug("mlx autorepair skipped: %s", _mlx_exc)
+    # MLX autorepair is NOT here any more: its availability probe imports the MLX
+    # runtime, which on a healthy Mac kept the socket unbound for exactly the wait
+    # this startup path exists to remove. It runs in _post_warm_background_work.
 
     # Reap workers/runs orphaned by a previous crash before new work starts.
     try:
@@ -557,8 +583,9 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         _lifespan_log.warning("reconcile_orphaned_ingestion_jobs failed at startup: %s", exc)
 
+    # The RAG embedder warm moved to _post_warm_background_work: started here it
+    # raced the coordinated warm for the GIL and the import locks.
     _start_helper_precache_if_enabled()
-    threading.Thread(target = _warm_rag_embedder, daemon = True, name = "rag-embedder-warm").start()
 
     from core.research_runs import ResearchSupervisor
 
@@ -599,6 +626,13 @@ async def lifespan(app: FastAPI):
         app.state.bootstrap_password = (
             None if _suppress_bootstrap else storage.get_bootstrap_password()
         )
+
+    # Last, so it never contends with the work above for the GIL: torch (via
+    # hardware detection), transformers, datasets, unsloth_zoo -- everything
+    # `import main` used to pull in before the port could bind. The socket binds
+    # as soon as this returns, so the login screen is up while the stack loads.
+    start_background_warm()
+    threading.Thread(target = _post_warm_background_work, daemon = True, name = "post-warm").start()
 
     _lifespan_log.info(
         "lifespan startup completed in %.1fms",
@@ -1068,6 +1102,55 @@ install_api_error_handlers(app)
 
 # ============ Health and System Endpoints ============
 
+# /api/health has a hard deadline. studio/src-tauri/src/preflight/backend.rs
+# builds its probe client with a 2s timeout and calls backend_health() on the
+# ownerless-spawned path, which runs right after TAURI_PORT is emitted. A
+# timeout there is not a retry: probe_ownerless_spawned_backend() returns
+# Missing, choose_ownerless_spawned_preflight() falls through to
+# ExternalConflict/"desktop_owned_backend_starting", and use-tauri-backend.ts
+# turns that into setBackendError("The desktop-owned Unsloth backend is still
+# starting. Wait a moment, then try again.") -- a dead end the user has to
+# retry by hand.
+#
+# That was safe while the lifespan detected hardware inline, since TAURI_PORT
+# came after detection and health answered instantly. Detection is on the warm
+# thread now and TAURI_PORT is emitted before it finishes, so health must answer
+# within the budget whether or not detection is done.
+#
+# The budget is a target, not a guarantee: the wait polls on the event loop, and
+# a C-extension import holds the GIL for stretches in which the loop does not run
+# at all, so the reply lands late by however long the current stretch is. Setting
+# it to 1.5s measured a worst case of 1.742s here -- inside the 2s but with only
+# 0.26s to absorb a slower host. 1.0s buys that margin back for one extra
+# provisional reply; the next poll ~0.3s later already carries the real value.
+#
+# Nothing the launcher reads from health depends on detection: it reads
+# status/service, the protocol and manageability versions, the auth and
+# ownership bits, studio_root_id, desktop_owner and version. Only chat_only
+# does, and only the web UI reads that.
+_HEALTH_DETECT_BUDGET_S = 1.0
+
+
+async def _await_hardware_detection(budget: float) -> bool:
+    """Wait up to ``budget`` seconds for DEVICE to be set. True iff it is.
+
+    Polls on the event loop instead of awaiting ensure_hardware_detected() in a
+    thread: asyncio.wait_for cannot cancel a to_thread, so a timed-out call
+    leaves the executor slot held for the rest of the import, and a polled
+    endpoint would drain the pool. Detection itself runs on the warm thread, or
+    on the one start_background_detection() puts up when the warm is disabled.
+    """
+    if _hw_module.DEVICE is not None:
+        return True
+    start_background_detection()
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + budget
+    while _hw_module.DEVICE is None:
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.02)
+    return True
+
 
 @app.get("/api/liveness")
 async def liveness_check():
@@ -1095,6 +1178,12 @@ async def health_check(request: Request):
     backend and gate UI before a token exists. version / studio_version /
     device_type require a bearer since they fingerprint the host.
     """
+    # chat_only comes from hardware detection, which the warm thread may still
+    # be running. Wait for it rather than publish the pre-detection default and
+    # grey out Train/Export on a GPU host for a second -- but only up to a
+    # budget, because this endpoint has a hard deadline (see
+    # _HEALTH_DETECT_BUDGET_S).
+    detected = await _await_hardware_detection(_HEALTH_DETECT_BUDGET_S)
     base = {
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
@@ -1110,6 +1199,14 @@ async def health_check(request: Request):
         "native_path_leases_supported": native_path_leases_supported(),
         **({"desktop_owner": owner} if (owner := _desktop_owner()) else {}),
     }
+    if not detected:
+        # chat_only above is the pre-detection default, not a measurement. It is
+        # the conservative direction (Train/Export hidden, never wrongly
+        # offered), but a client that caches it should re-read instead. Additive
+        # field: every launcher and UI that predates it ignores it, which is the
+        # point -- the desktop probe only needs the capability bits, all of which
+        # are already correct here.
+        base["hardware_detecting"] = True
     auth = request.headers.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         return base
@@ -1129,18 +1226,29 @@ async def health_check(request: Request):
 
     platform_map = {"darwin": "mac", "win32": "windows", "linux": "linux"}
     device_type = platform_map.get(sys.platform, sys.platform)
-    return {
+    authed = {
         **base,
-        # Why chat_only is set. This fingerprints the host, so keep it authed.
-        "chat_only_reason": getattr(_hw_module, "CHAT_ONLY_REASON", None),
         "version": UNSLOTH_VERSION,
         "studio_version": STUDIO_VERSION,
-        "device_type": device_type,
         # API-screen fields (authed-only; they fingerprint how the host is exposed).
         "cloudflare_url": getattr(request.app.state, "cloudflare_url", None),
         "server_url": getattr(request.app.state, "server_url", None),
         "secure": bool(getattr(request.app.state, "secure", False)),
     }
+    if detected:
+        # Why chat_only is set. This fingerprints the host, so keep it authed.
+        authed["chat_only_reason"] = getattr(_hw_module, "CHAT_ONLY_REASON", None)
+        authed["device_type"] = device_type
+    # Otherwise leave both out. device_type does not come from detection, but the
+    # frontend uses its presence as "this response is authoritative"
+    # (config/env.ts sets fetched = data.device_type !== undefined), and a
+    # cached fetched=true stops every later non-forced fetchDeviceType() from
+    # re-reading. The sidebar's recovery poll only runs for
+    # chat_only_reason === "mlx_unavailable", which a provisional reply does not
+    # have, so a GPU host would stay chat-only -- Train hidden, /studio
+    # redirected to /chat -- for the rest of the SPA session. Omitting it keeps
+    # fetched false, and the next fetch carries the measured values.
+    return authed
 
 
 @app.get("/api/studio/install-source")
@@ -1417,7 +1525,10 @@ def get_system_info(current_subject: str = Depends(get_current_subject)):
 
 @app.get("/api/system/gpu-visibility")
 async def get_gpu_visibility(current_subject: str = Depends(get_current_subject)):
-    return get_backend_visible_gpu_info()
+    # Off-loop: reaches get_device(), which blocks on hardware detection while
+    # the warm is still importing torch. Inline it would stall every other
+    # request for that whole import.
+    return await asyncio.to_thread(get_backend_visible_gpu_info)
 
 
 @app.get("/api/system/hardware")

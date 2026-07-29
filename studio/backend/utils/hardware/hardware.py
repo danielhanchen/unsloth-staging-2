@@ -24,6 +24,7 @@ import platform
 import re
 import subprocess
 import sys
+import threading
 import types
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 import structlog
@@ -78,6 +79,48 @@ CHAT_ONLY: bool = True  # No CUDA GPU -> GGUF chat only (Mac, CPU-only, etc.)
 CHAT_ONLY_REASON: Optional[str] = None
 IS_ROCM: bool = False  # True when running on AMD ROCm (HIP) -- routes GPU monitoring to amd.py
 
+# Detection now has several callers at once: the startup warm thread, plus any
+# early request through get_device(). Without this lock two runs interleave on
+# the globals above -- detect_hardware() resets CHAT_ONLY/IS_ROCM at entry, so a
+# reader between the reset and the CUDA branch sees "chat only" on a GPU host.
+# Re-entrant: get_device() -> detect_hardware() nests on the same thread.
+_DETECT_LOCK = threading.RLock()
+
+# Drives start_background_detection(). Separate from _DETECT_LOCK because it is
+# only ever held for the bookkeeping below, never across the import.
+_DETECT_KICK_LOCK = threading.Lock()
+_DETECT_THREAD: Optional[threading.Thread] = None
+
+
+def start_background_detection() -> None:
+    """Run detection on a daemon thread if nothing is running it yet.
+
+    For callers that must answer inside a deadline and so cannot await
+    ensure_hardware_detected() -- /api/health, which the desktop launcher probes
+    with a 2s client timeout. They poll DEVICE against their own budget; this
+    guarantees something is filling it in even when the warm thread is disabled
+    (UNSLOTH_DISABLE_TORCH_WARM=1) or has already moved past its hardware stage.
+
+    At most one thread at a time, and none once DEVICE is set, so a route that
+    keeps returning "still detecting" cannot pile them up. Not the asyncio
+    executor: a to_thread that outlives its awaiter holds an executor slot, and a
+    polled endpoint would exhaust the pool during a slow import.
+    """
+    global _DETECT_THREAD
+    if DEVICE is not None:
+        return
+    with _DETECT_KICK_LOCK:
+        if DEVICE is not None:
+            return
+        if _DETECT_THREAD is not None and _DETECT_THREAD.is_alive():
+            return
+        _DETECT_THREAD = threading.Thread(
+            target = ensure_hardware_detected,
+            daemon = True,
+            name = "hardware-detect",
+        )
+        _DETECT_THREAD.start()
+
 
 def _backend_label(device: DeviceType) -> str:
     """Return the user-facing backend name for API responses.
@@ -99,11 +142,27 @@ def is_apple_silicon() -> bool:
 
 
 def _has_torch() -> bool:
-    """True if PyTorch is importable."""
+    """True if PyTorch is importable.
+
+    Any failure counts as "no torch", not just ImportError: a wheel whose CUDA
+    libs don't resolve raises OSError, which used to escape into
+    detect_hardware(). That mattered less when detection ran once in the
+    lifespan; ensure_hardware_detected() re-runs while DEVICE is None, so an
+    escaping error would make every request retry the import. Treat a broken
+    torch like an absent one and take the CPU path.
+    """
     try:
         import torch
         return True
-    except ImportError:
+    except Exception:
+        # A failure part-way through torch/__init__ leaves its submodules in
+        # sys.modules with the parent evicted, so the next importer
+        # (transformers, warm stage two) re-runs __init__ against those cache
+        # hits and gets a torch missing pieces. purge_partial_import() clears
+        # that, and declines once a compiled submodule is loaded -- re-importing
+        # one aborts the process. See the note there.
+        from utils.torch_warmup import purge_partial_import
+        purge_partial_import("torch")
         return False
 
 
@@ -185,13 +244,53 @@ def detect_hardware() -> DeviceType:
       4. MLX   (Apple Silicon via MLX framework)
       5. CPU   (fallback)
     """
+    with _DETECT_LOCK:
+        return _detect_hardware_locked()
+
+
+def ensure_hardware_detected() -> DeviceType:
+    """Detect once, from any thread. Use this rather than detect_hardware()
+    unless you want a forced re-detect: it collapses the startup warm thread and
+    an early request into one detection, and a caller arriving mid-detection
+    waits for it instead of starting a second.
+
+    Never raises. Detection used to run in the lifespan, where a failure killed
+    startup loudly; on the warm thread a raise is swallowed and leaves DEVICE
+    None, so every later request would retry the same failing import and
+    /api/health, which waits on this, would 500. Record CPU + chat-only with a
+    reason instead: the UI can explain the greyed-out Train/Export and the retry
+    never happens."""
+    global DEVICE, CHAT_ONLY, CHAT_ONLY_REASON
+    with _DETECT_LOCK:
+        if DEVICE is None:
+            try:
+                _detect_hardware_locked()
+            except BaseException as exc:  # noqa: BLE001 - degrade, never 500 the health check
+                logger.error("Hardware detection failed; falling back to CPU: %r", exc)
+                DEVICE = DeviceType.CPU
+                CHAT_ONLY = True
+                CHAT_ONLY_REASON = "detection_failed"
+        return DEVICE
+
+
+def _detect_hardware_locked() -> DeviceType:
+    """detect_hardware() body. Call only with _DETECT_LOCK held."""
     global DEVICE, CHAT_ONLY, CHAT_ONLY_REASON, IS_ROCM
     CHAT_ONLY = True  # reset -- only CUDA/ROCm/XPU/MLX sets it to False
     CHAT_ONLY_REASON = None
     IS_ROCM = False
 
+    # Probe torch once per pass. A failed probe is expensive (the import runs to
+    # wherever it breaks) and self-repairing purge is refused whenever a compiled
+    # submodule is already loaded, so a second probe re-runs torch/__init__
+    # against those same cache hits: same failure, same declined purge, twice the
+    # wall clock on the path that is already degrading to CPU. It can also
+    # disagree with itself -- a re-run against a half-populated cache need not
+    # fail the same way -- so both branches below must see one answer, not two.
+    torch_ok = _has_torch()
+
     # --- CUDA / ROCm / XPU: try PyTorch ---
-    if _has_torch():
+    if torch_ok:
         import torch
 
         # --- Explicit-XPU hint ---
@@ -255,7 +354,7 @@ def detect_hardware() -> DeviceType:
             return DEVICE
 
     # --- XPU: Intel GPU ---
-    if _has_torch():
+    if torch_ok:
         import torch
         if hasattr(torch, "xpu") and torch.xpu.is_available():
             DEVICE = DeviceType.XPU
@@ -308,10 +407,7 @@ def get_device() -> DeviceType:
     Return the detected device, auto-detecting if detect_hardware() hasn't run.
     Prefer calling detect_hardware() explicitly at startup.
     """
-    global DEVICE
-    if DEVICE is None:
-        detect_hardware()
-    return DEVICE
+    return ensure_hardware_detected()
 
 
 def export_capability() -> dict:

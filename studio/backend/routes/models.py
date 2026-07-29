@@ -1743,7 +1743,11 @@ def _looks_like_mlx_repo(model_id: str) -> bool:
 async def list_models(current_subject: str = Depends(get_current_subject)):
     """List available models: default plus currently loaded."""
     try:
-        inference_backend = get_inference_backend()
+        # Off-loop: constructing the orchestrator singleton reads the default
+        # model list, which calls get_device(). The frontend fetches this on
+        # load, so before the warm finishes an inline call would freeze the
+        # whole server for the length of the torch import.
+        inference_backend = await asyncio.to_thread(get_inference_backend)
 
         default_models = inference_backend.default_models
 
@@ -2103,7 +2107,7 @@ async def discard_remote_code_download(
     except Exception:
         pass
     try:
-        inference_backend = get_inference_backend()
+        inference_backend = await asyncio.to_thread(get_inference_backend)
         if inference_backend.active_model_name:
             if _loaded_id_matches_repo(inference_backend.active_model_name, model_name):
                 return {"deleted": False, "reason": "loaded"}
@@ -2443,7 +2447,7 @@ async def delete_finetuned_model(
         ) from e
 
     try:
-        inference_backend = get_inference_backend()
+        inference_backend = await asyncio.to_thread(get_inference_backend)
         loading_models = getattr(inference_backend, "loading_models", set())
         if any(
             _loading_model_matches_deleted_path(loading_model, target_path)

@@ -103,7 +103,10 @@ async def get_hardware_utilization(current_subject: str = Depends(get_current_su
     Polled by the frontend during training.
     """
     from utils.hardware import get_gpu_utilization
-    return get_gpu_utilization()
+
+    # Off-loop for the same reason as /hardware/visible below, plus the first
+    # call blocks on hardware detection while the warm is still importing torch.
+    return await asyncio.to_thread(get_gpu_utilization)
 
 
 @router.get("/hardware/visible")
@@ -240,7 +243,17 @@ async def start_training(
                     detail = "dataset_streaming is not supported for embedding training; the embedding loader needs the full dataset.",
                 )
             from utils.hardware import hardware as _hw
+            from utils.hardware import ensure_hardware_detected
 
+            # DEVICE is no longer set by the lifespan -- the warm thread fills it
+            # in a moment after the socket binds, so a start that lands in that
+            # window would read None, skip the MLX rejection, and hand a
+            # streaming dataset to the MLX loader (which materializes it whole).
+            # Force detection first. Off-loop because it imports torch: inline it
+            # would stall every other request for that whole import, which is the
+            # very stall the deferred startup exists to remove (same treatment as
+            # /api/health and /api/system/gpu-visibility).
+            await asyncio.to_thread(ensure_hardware_detected)
             if _hw.DEVICE == _hw.DeviceType.MLX:
                 raise HTTPException(
                     status_code = 400,
