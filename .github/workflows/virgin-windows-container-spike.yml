@@ -1,0 +1,310 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# FEASIBILITY SPIKE: is a GENUINELY VIRGIN Windows reachable in GitHub Actions?
+#
+# clean-machine-install-ci.yml's Linux legs are genuinely clean -- they run in
+# `ubuntu:24.04` / `fedora:41` containers with no curl, git, gcc or cmake. Its macOS
+# and Windows legs only SIMULATE absence, because hosted runners are developer
+# machines: the Windows leg renames the toolcache Python directory on disk and
+# scrubs the Machine and User registry PATH. That is honest masking, but it is not a
+# virgin OS, and two things it structurally cannot test are:
+#   * the VC++ 2015-2022 runtime, which ships in the runner image's System32 and
+#     cannot be removed without breaking the runner. The workflow carries an explicit
+#     HONESTY NOTE that `import torch` passing there does NOT prove a no-winget
+#     machine has the runtime.
+#   * a Windows with no Microsoft Store / App Installer at all, rather than a winget
+#     that has been hidden from PATH.
+#
+# A Windows container answers both. Constraints that shaped this file:
+#   * `container:` and `services:` are Linux-only on the Actions runner
+#     (actions/runner#1402, #904) -- "Container operations are only supported on
+#     Linux runners". So the container is driven by the docker CLI from a normal
+#     `run:` step instead of by the job's `container:` key. That also means no
+#     actions/checkout inside the container; the payload goes in via `docker cp`.
+#   * servercore, not nanoserver: install.ps1 must run under Windows PowerShell 5.1,
+#     which is what a real Windows box ships. nanoserver has no PowerShell at all.
+#   * ltsc2022 on a windows-2022 host: Windows containers require the host and
+#     container build to match for process isolation. windows-2022 (build 10.0.20348)
+#     pairs with ltsc2022, and the runner image pre-caches BOTH
+#     mcr.microsoft.com/windows/servercore:ltsc2022 and nanoserver:ltsc2022, so there
+#     is no multi-GB cold pull.
+#
+# This is a spike. If it holds up it folds into clean-machine-install-ci.yml as an
+# extra job, not as a replacement for the masked legs: the masked legs test a real
+# desktop Windows with a real Store, and the container tests a real bare Windows.
+
+name: Virgin Windows container (spike)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Windows base image to run the install in'
+        type: choice
+        options:
+          - 'mcr.microsoft.com/windows/servercore:ltsc2022'
+          - 'mcr.microsoft.com/windows/nanoserver:ltsc2022'
+        default: 'mcr.microsoft.com/windows/servercore:ltsc2022'
+  push:
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ${{ inputs.image || 'mcr.microsoft.com/windows/servercore:ltsc2022' }}
+
+jobs:
+  # ── Q1: does the runner even give us a Windows container engine? ──────────────
+  # Split out from the install so the feasibility verdict lands in ~5 minutes and
+  # survives an install leg that times out. A green `probe` alone answers the
+  # question this spike was opened to answer.
+  probe:
+    name: probe / windows container is virgin
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Ensure the Docker daemon is running
+        shell: pwsh
+        run: ./.github/scripts/ensure-docker-daemon.ps1
+
+      - name: Docker engine facts
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          # The decisive fact: the daemon must be serving WINDOWS containers. On the
+          # hosted windows-2022 image it is; a Linux-container daemon would make every
+          # mcr.microsoft.com/windows/* pull fail with a manifest/platform error.
+          docker version
+          Write-Host "OSType     : $(docker info --format '{{.OSType}}')"
+          Write-Host "Isolation  : $(docker info --format '{{.Isolation}}')"
+          Write-Host "ServerOs   : $(docker version --format '{{.Server.Os}}')"
+          $osType = (docker info --format '{{.OSType}}').Trim()
+          if ($osType -ne 'windows') {
+            Write-Host "::error::docker is serving '$osType' containers, not windows; this lane cannot run here"
+            exit 1
+          }
+          Write-Host ""
+          Write-Host "=== images already on the runner (no cold pull if ours is here) ==="
+          docker images --format '{{.Repository}}:{{.Tag}}  {{.Size}}'
+
+      - name: Start the container
+        shell: pwsh
+        run: |
+          $img = $env:IMAGE
+          # Deliberately do NOT pull when the image is already cached. Process
+          # isolation requires the container build to be <= the host build, and MCR
+          # has shipped a patched image AHEAD of the runner host before: in Feb 2025
+          # that broke every Windows container job on windows-2025 for ~2 weeks with
+          # `hcs::System::Start ... (0xc0370106)` (actions/runner-images#11582). The
+          # cached image is the one that matched at runner-image build time, so using
+          # it as-is is strictly safer than refreshing it.
+          $cached = (docker images --format '{{.Repository}}:{{.Tag}}') -contains $img
+          if ($cached) {
+            Write-Host "using the runner's pre-cached $img (no pull; avoids host/container revision skew)"
+          } else {
+            Write-Host "::warning::$img is not pre-cached on this runner image; pulling (this may be slow and may outrun the host build)"
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            docker pull $img
+            if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not pull $img"; exit 1 }
+            Write-Host "pull took $([int]$sw.Elapsed.TotalSeconds)s"
+          }
+
+          # A keepalive entrypoint, so the payload can be `docker cp`'d in and each
+          # assertion can be its own `docker exec` (and therefore its own workflow
+          # step with its own exit code) instead of one opaque `docker run`.
+          docker run -d --name virgin $img cmd /c "ping -t localhost >nul"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not start a container from $img"; exit 1 }
+          Write-Host "isolation in effect: $(docker inspect virgin --format '{{.HostConfig.Isolation}}')"
+
+          # No actions/checkout inside the container: it needs git, and a container
+          # with git preinstalled is not the clean machine under test.
+          docker exec virgin cmd /c "mkdir C:\ci"
+          docker cp "$env:GITHUB_WORKSPACE\." virgin:C:\ci
+          docker exec virgin cmd /c "dir C:\ci\install.ps1"
+
+      - name: Assert the container is genuinely virgin
+        id: virginity
+        shell: pwsh
+        run: |
+          docker exec virgin powershell.exe -NoLogo -NoProfile -NonInteractive `
+            -ExecutionPolicy Bypass -File C:\ci\.github\scripts\virgin-windows-probe.ps1 `
+            *>&1 | Tee-Object -FilePath logs/virginity.log
+          exit $LASTEXITCODE
+
+      - name: Tear down
+        if: always()
+        shell: pwsh
+        run: |
+          docker rm -f virgin 2>&1 | Out-Null
+          exit 0
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: virgin-win-probe
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
+
+  # ── Q2: does the install actually work there? ────────────────────────────────
+  install:
+    name: install / overlay=${{ matrix.overlay }}
+    needs: probe
+    runs-on: windows-2022
+    timeout-minutes: 90
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The consumer path: install.ps1 from this ref, unsloth from PyPI. Proves
+          # what a user on a bare Windows box gets TODAY -- and today that is a
+          # FAILURE, in two places the hosted Windows leg structurally cannot see:
+          #   * studio/setup.ps1's git gate is winget-only, and winget can never work
+          #     in a Server Core container (microsoft/winget-cli#4319, #6027)
+          #   * Ensure-VCRedist is winget-only in the released wheel, and this
+          #     container genuinely has no vcruntime140_1.dll, so torch cannot import
+          # Both are fixed by #7549, which is unmerged. Experimental so the lane
+          # reports the gap rather than being permanently red; the step below pins
+          # the failure mode so an unrelated breakage is not tolerated as this one.
+          - overlay: false
+            experimental: true
+          # Re-points the venv at this ref before studio setup runs, so studio/setup.ps1
+          # and install_python_stack.py under test are this ref's and not the released
+          # wheel's. Without it a branch changing setup.ps1 gets a green run that proves
+          # nothing about the change -- which is exactly what the first spike run did,
+          # before install.ps1 grew the overlay hook.
+          - overlay: true
+            experimental: false
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Ensure the Docker daemon is running
+        shell: pwsh
+        run: ./.github/scripts/ensure-docker-daemon.ps1
+
+      - name: Start the container
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          # See the probe job: use the pre-cached image, do not refresh it.
+          if (-not ((docker images --format '{{.Repository}}:{{.Tag}}') -contains $env:IMAGE)) {
+            Write-Host "::warning::$env:IMAGE not pre-cached; pulling"
+            docker pull $env:IMAGE
+          }
+          docker run -d --name virgin $env:IMAGE cmd /c "ping -t localhost >nul"
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not start a container from $env:IMAGE"; exit 1 }
+          docker exec virgin cmd /c "mkdir C:\ci"
+          docker cp "$env:GITHUB_WORKSPACE\." virgin:C:\ci
+          docker exec virgin cmd /c "mkdir C:\ci-out"
+
+      # Re-run here and not only in `probe`: these are different runners, and an
+      # install leg that skipped the check would be reporting on an environment it
+      # never verified.
+      - name: Assert the container is genuinely virgin
+        shell: pwsh
+        run: |
+          docker exec virgin powershell.exe -NoLogo -NoProfile -NonInteractive `
+            -ExecutionPolicy Bypass -File C:\ci\.github\scripts\virgin-windows-probe.ps1 `
+            *>&1 | Tee-Object -FilePath logs/virginity.log
+          exit $LASTEXITCODE
+
+      # Runs AFTER the virginity assertion, so the assertion still proves what it says.
+      #
+      # A fresh Windows container ships an almost empty trusted-root store; Windows
+      # normally fills it on demand via automatic root update, which schannel triggers
+      # but OpenSSL does not. That is why the probe's Invoke-WebRequest calls (schannel)
+      # all succeeded while studio/install_node_prebuilt.py died with
+      #   [SSL: CERTIFICATE_VERIFY_FAILED] unable to get local issuer certificate
+      # on nodejs.org: it uses bare urllib.request.urlopen, so Python reads the empty
+      # Windows ROOT store. uv and pip were unaffected because they bundle certifi.
+      #
+      # Seeding the root store is NOT a toolchain and NOT a product workaround -- it
+      # restores what every real Windows desktop already has, so it makes the container
+      # MORE representative of a bare user machine, not less. The underlying fragility
+      # is reported separately; without this step the lane cannot see past it to
+      # whatever else is broken.
+      - name: Seed the container's trusted root CA store
+        shell: pwsh
+        run: |
+          docker exec virgin cmd /c "certutil -generateSSTFromWU C:\roots.sst && certutil -addstore -f Root C:\roots.sst" `
+            *>&1 | Select-Object -Last 15
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::error::could not seed the container root CA store; Python-side HTTPS will fail'
+            exit 1
+          }
+
+      - name: Install into the virgin container
+        id: install
+        shell: pwsh
+        run: |
+          $overlayArg = if ('${{ matrix.overlay }}' -eq 'true') { 'C:\ci' } else { '' }
+          docker exec virgin powershell.exe -NoLogo -NoProfile -NonInteractive `
+            -ExecutionPolicy Bypass -File C:\ci\.github\scripts\virgin-windows-install.ps1 `
+            -Overlay "$overlayArg" *>&1 | Tee-Object -FilePath logs/install-outer.log
+          exit $LASTEXITCODE
+
+      # continue-on-error like the fedora leg, so without this a bootstrap outage or an
+      # unrelated early exit is tolerated exactly like the intended diagnostic.
+      - name: Assert the released-wheel outcome is the known one
+        if: always() && matrix.overlay == false
+        shell: pwsh
+        run: |
+          if ('${{ steps.install.outcome }}' -eq 'success') {
+            Write-Host '::warning::the released wheel now installs on a virgin Windows container -- #7549 has shipped; retire this row'
+            exit 0
+          }
+          if (-not (Test-Path logs/install-outer.log)) {
+            Write-Host '::error::released-wheel leg produced no log'
+            exit 1
+          }
+          $log = Get-Content logs/install-outer.log -Raw
+          # The two gaps this lane exists to surface. Either is an accepted outcome
+          # until #7549 merges; anything else is a new problem and must fail.
+          $gitGate = $log -match 'Git is required but could not be installed automatically'
+          $vcGate  = $log -match 'torch failed to import'
+          if (-not ($gitGate -or $vcGate)) {
+            Write-Host '::error::released-wheel leg failed at neither the winget-only git gate nor the missing VC++ runtime; this is a new failure'
+            exit 1
+          }
+          if ($gitGate) { Write-Host 'known outcome: winget-only git gate (studio/setup.ps1), fixed by #7549' }
+          if ($vcGate)  { Write-Host 'known outcome: no VC++ runtime and Ensure-VCRedist is winget-only, fixed by #7549' }
+
+      - name: Recover the install log from the container
+        if: always()
+        shell: pwsh
+        run: |
+          docker cp virgin:C:\ci-out\install.log logs/install.log 2>&1 | Out-Null
+          if (Test-Path logs/install.log) { Write-Host "recovered $((Get-Item logs/install.log).Length) bytes" }
+          else { Write-Host "::warning::no install log inside the container" }
+          exit 0
+
+      - name: Tear down
+        if: always()
+        shell: pwsh
+        run: |
+          docker rm -f virgin 2>&1 | Out-Null
+          exit 0
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: virgin-win-install-overlay-${{ matrix.overlay }}
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
