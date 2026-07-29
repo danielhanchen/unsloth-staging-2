@@ -26,6 +26,19 @@ from typer.testing import CliRunner
 
 import unsloth_cli.commands.start as start
 
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def plain(text: str) -> str:
+    """CliRunner output without styling.
+
+    typer renders option errors through rich, which styles the option name itself, so
+    `"--flag" in output` breaks whenever rich emits colour. It does on GitHub Actions,
+    which it treats as a terminal, but not on a plain local run.
+    """
+    return _ANSI.sub("", text)
+
 BASE = "http://127.0.0.1:8888"
 MODEL = {"id": "unsloth/gemma-4-26B-A4B-it-GGUF", "context_length": 131072}
 
@@ -2673,7 +2686,7 @@ def test_start_rejects_invalid_gpu_memory_mode(fake_studio):
         ["claude", "--no-launch", "--gpu-memory-mode", "invalid"],
     )
     assert result.exit_code != 0
-    assert "Invalid value for '--gpu-memory-mode'" in result.output
+    assert "Invalid value for '--gpu-memory-mode'" in plain(result.output)
 
 
 def test_connect_model_variant_suffix_loads_split_repo(fake_studio):
@@ -5576,7 +5589,7 @@ def test_hermes_resume_oneshot_rejects_usage_file(monkeypatch, usage_arg):
         argv.append("usage.json")
     result = CliRunner().invoke(start.start_app, argv)
     assert result.exit_code == 2
-    assert "cannot resume a one-shot session with --usage-file" in result.output
+    assert "cannot resume a one-shot session with --usage-file" in plain(result.output)
 
 
 def test_native_resume_flag_passes_through_unchanged(fake_studio, monkeypatch):

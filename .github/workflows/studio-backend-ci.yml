@@ -182,6 +182,8 @@ jobs:
         #   (torchcodec, full transformers/peft/bnb pins) those tests need.
         # State-sensitive hardware-spoofing files run in isolation in the
         # next step because they mutate hardware.py module globals.
+        # unsloth_cli/tests: the CLI suite. No workflow ran it, so cross-platform and
+        #   CI-only breakage in `unsloth start` reached review unnoticed.
         # -m: honour markers from tests/python/conftest.py (`server` =
         #   needs studio venv, `e2e` = needs network).
         # --deselect:
@@ -193,7 +195,7 @@ jobs:
         #     transformers it resolves to. Tracked separately; this is a
         #     real bug in the no-torch install path, not a CI issue.
         run: |
-          python -m pytest tests/ -q --tb=short \
+          python -m pytest tests/ unsloth_cli/tests -q --tb=short \
             --ignore=tests/qlora \
             --ignore=tests/saving \
             --ignore=tests/utils \
