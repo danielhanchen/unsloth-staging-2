@@ -1,0 +1,61 @@
+name: Pester check (staging only)
+
+on:
+  push:
+    branches:
+      - pr-7188-ci
+  workflow_dispatch:
+
+jobs:
+  pester:
+    name: setup.ps1 unit tests (staging replica)
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Pester v5
+        shell: pwsh
+        run: |
+          if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) {
+            Register-PSRepository -Default -ErrorAction SilentlyContinue
+          }
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          Import-Module Pester -MinimumVersion 5.5.0
+          Get-Module Pester | Select-Object Name, Version | Format-Table
+
+      - name: Run Pester suite
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $testDir = Join-Path $env:GITHUB_WORKSPACE 'tests/studio_setup_ps1'
+          if (-not (Test-Path $testDir)) {
+              Write-Error "Test directory not found: $testDir"
+              exit 1
+          }
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path                = $testDir
+          $cfg.Run.Exit                = $true
+          $cfg.Run.Throw               = $true
+          $cfg.Output.Verbosity        = 'Detailed'
+          Invoke-Pester -Configuration $cfg
+
+      - name: VC++ round-trip function extraction (staging replica)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . (Join-Path $env:GITHUB_WORKSPACE 'tests/studio_setup_ps1/Get-FunctionSource.ps1')
+          $setup = Join-Path $env:GITHUB_WORKSPACE 'studio/setup.ps1'
+          $script:StudioVtOk = $false
+          $script:UnslothVerbose = $false
+          foreach ($fn in @('Get-StudioAnsi', 'Write-StudioStdoutMirror', 'step', 'substep',
+                            'Invoke-SetupCommand', 'Refresh-Environment', 'Get-HostMachineArch',
+                            'Test-VCRedistInstalled', 'Ensure-VCRedist')) {
+              $src = Get-FunctionSource -Path $setup -Name $fn
+              if (-not $src) { throw "Function '$fn' not found in setup.ps1" }
+              . ([scriptblock]::Create($src))
+          }
+          Write-Host "Test-VCRedistInstalled returned: $(Test-VCRedistInstalled)"
