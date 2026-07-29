@@ -21,6 +21,9 @@ export type UpdateStatus =
 export interface UpdateInfo {
   version: string;
   currentVersion: string;
+  // Backend release this desktop build pins. The app version is SemVer, but
+  // CHANGELOG.md is keyed by this one, so notes look it up.
+  pypiVersion?: string;
   body?: string;
   date?: string;
 }
@@ -42,8 +45,15 @@ interface DesktopUpdatePolicy {
 interface ManualUpdateInfo {
   version: string;
   currentVersion: string;
+  pypiVersion?: string | null;
   body?: string;
   date?: string;
+}
+
+/** `pypi_version` from latest.json, which the updater passes through raw. */
+function rawPypiVersion(raw: Record<string, unknown>): string | undefined {
+  const value = raw.pypi_version;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 export interface RetainedUpdateFailure {
@@ -162,6 +172,7 @@ export function useTauriUpdate(isExternalServer = false) {
       setInfo({
         version: manualUpdate.version,
         currentVersion: manualUpdate.currentVersion,
+        pypiVersion: manualUpdate.pypiVersion ?? undefined,
         body: manualUpdate.body,
         date: manualUpdate.date,
       });
@@ -197,6 +208,7 @@ export function useTauriUpdate(isExternalServer = false) {
           setInfo({
             version: update.version,
             currentVersion: update.currentVersion,
+            pypiVersion: rawPypiVersion(update.rawJson),
             body: update.body,
             date: update.date,
           });
@@ -384,10 +396,13 @@ export function useTauriUpdate(isExternalServer = false) {
     });
   }
 
+  // Install target for Linux packages that cannot self-update.
   const manualReleaseUrl =
     updatePolicy.mode === "manual_linux_package" && info
       ? manualReleasePageUrl(updatePolicy, info.version)
       : null;
+  // Release page for the offered version, on every platform, for the notes link.
+  const releasePageUrl = info ? manualReleasePageUrl(updatePolicy, info.version) : null;
 
   return {
     status,
@@ -401,6 +416,7 @@ export function useTauriUpdate(isExternalServer = false) {
     isExternalServer,
     updatePolicyMode: updatePolicy.mode,
     manualReleaseUrl,
+    releasePageUrl,
     installUpdate,
     retryUpdate,
     skipAndRestart,
