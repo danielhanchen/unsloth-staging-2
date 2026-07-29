@@ -1,0 +1,40 @@
+name: "PR-7604 frontend windows-latest"
+on:
+  push:
+    branches: [pr7604-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  frontend:
+    name: "studio/frontend on windows-latest"
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: studio/frontend/package-lock.json
+      - name: Toolchain
+        run: node --version && npm --version
+      - name: Install
+        run: npm ci --no-fund --no-audit
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Unit tests
+        run: npm test
+      - name: Build
+        run: npm run build
+      - name: Working tree clean
+        run: git status --porcelain
