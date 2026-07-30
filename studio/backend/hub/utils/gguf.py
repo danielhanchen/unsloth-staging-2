@@ -254,7 +254,11 @@ def _env_offline() -> bool:
 
 
 def iter_hf_cache_snapshots(repo_id: str, root: Optional[Path] = None):
-    from hub.utils.hf_cache_state import iter_active_repo_cache_dirs, iter_repo_cache_dirs
+    from hub.utils.hf_cache_state import (
+        iter_active_repo_cache_dirs,
+        iter_repo_cache_dirs,
+        snapshot_selection_key,
+    )
 
     snapshots: list[Path] = []
     repo_dirs = (
@@ -271,13 +275,8 @@ def iter_hf_cache_snapshots(repo_id: str, root: Optional[Path] = None):
         except OSError:
             continue
 
-    def _mtime(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return 0.0
-
-    snapshots.sort(key = _mtime, reverse = True)
+    # Same key the inventory row selects with, so both name one snapshot.
+    snapshots.sort(key = snapshot_selection_key, reverse = True)
     yield from snapshots
 
 
@@ -316,16 +315,30 @@ def list_empty_gguf_variant_dirs(repo_id: str, root: Optional[Path] = None) -> s
 def list_gguf_variants_from_hf_cache(
     repo_id: str, root: Optional[Path] = None
 ) -> Optional[tuple[list[GgufVariantInfo], bool]]:
+    # Local import: inventory_scan imports this module.
+    from hub.utils.inventory_scan import complete_snapshot_variants
+
     snapshots = (
         iter_hf_cache_snapshots(repo_id, root = root)
         if root is not None
         else iter_hf_cache_snapshots(repo_id)
     )
+    # A local load reads one snapshot dir, so pick the same one the inventory
+    # row does: newest snapshot holding a whole quant, offering only its
+    # completed subset. has_vision travels with that snapshot (never OR-ed
+    # across the walk). If no snapshot is complete, the first non-empty wins.
+    fallback: Optional[tuple[list[GgufVariantInfo], bool]] = None
     for snapshot in snapshots:
         variants, has_vision = list_local_gguf_variants(str(snapshot))
-        if variants or has_vision:
-            return variants, has_vision
-    return None
+        if variants:
+            complete = complete_snapshot_variants(str(snapshot))
+            # Unlabelled quants cannot be judged, so keep them.
+            usable = [v for v in variants if not v.quant or v.quant in complete]
+            if usable:
+                return usable, has_vision
+        if fallback is None and (variants or has_vision):
+            fallback = (variants, has_vision)
+    return fallback
 
 
 def list_partial_gguf_variants_from_state(
