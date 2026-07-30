@@ -84,6 +84,21 @@ def make_kill_on_close_job() -> int | None:
     """Create a KILL_ON_JOB_CLOSE job and put THIS process in it, so the backend we
     spawn next inherits it exactly as the app's children do."""
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    # ctypes defaults every restype to c_int, which truncates a 64-bit HANDLE on Win64.
+    # Without these the job handle and the GetCurrentProcess pseudo-handle both arrive
+    # mangled and AssignProcessToJobObject fails with 6 (ERROR_INVALID_HANDLE) -- which
+    # looks exactly like "this runner forbids nesting" and is not.
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel32.GetCurrentProcess.argtypes = []
+    kernel32.SetInformationJobObject.restype = wintypes.BOOL
+    kernel32.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+
     job = kernel32.CreateJobObjectW(None, None)
     if not job:
         print(f"::warning::CreateJobObjectW failed: {ctypes.get_last_error()}", flush=True)
@@ -97,12 +112,12 @@ def make_kill_on_close_job() -> int | None:
         print(f"::warning::SetInformationJobObject failed: {ctypes.get_last_error()}", flush=True)
         return None
     if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
-        # Already in a job that disallows nesting -- common under CI agents.
-        print(
-            f"::warning::AssignProcessToJobObject failed: {ctypes.get_last_error()} "
-            f"(this runner may already place us in a job that forbids nesting)",
-            flush=True,
-        )
+        code = ctypes.get_last_error()
+        meaning = {
+            5: "ERROR_ACCESS_DENIED -- genuinely already in a job that forbids nesting",
+            6: "ERROR_INVALID_HANDLE -- a handle was mangled; that is a bug in this probe",
+        }.get(code, "unexpected")
+        print(f"::warning::AssignProcessToJobObject failed: {code} ({meaning})", flush=True)
         return None
     return job
 
