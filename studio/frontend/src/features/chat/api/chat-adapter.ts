@@ -1266,6 +1266,198 @@ export function findLatestUserAudioBase64(
   return pendingAudio ?? undefined;
 }
 
+// The Canvas instructions createOpenAIStreamAdapter appends to the outbound system
+// prompt. Named so the token recount below prices the same text the request carries.
+export const CANVAS_TOOL_INSTRUCTION =
+  "When the user asks for an HTML, CSS, or JavaScript canvas, call render_html once with one complete self-contained HTML document in the code argument. Embed CSS and JavaScript inside the document. After render_html succeeds, do not call it again in the same response unless the user asks for changes. Future user requests for new canvases may call render_html once.";
+export const CANVAS_FALLBACK_INSTRUCTION =
+  "When the user asks for an HTML, CSS, or JavaScript canvas, return one complete self-contained fenced html code block. Embed CSS and JavaScript inside the document. Do not emit tool-call syntax.";
+
+/**
+ * The OpenAI-form messages a completion would send for `messages`, for the token
+ * recount that fills the context usage bar. Mirrors the prune + system-prompt half of
+ * createOpenAIStreamAdapter; the tool catalog is priced server-side from the flags
+ * buildLocalTokenCountExtras sends, since `unsloth run --enable-tools` can inject
+ * schemas the client cannot see.
+ */
+export async function buildOutboundMessagesForTokenCount(
+  messages: RunMessages,
+  threadId: string | undefined,
+): Promise<OpenAIChatMessage[]> {
+  const survivingMessages: RunMessage[] = [];
+  for (const message of messages) {
+    if (isAnthropicRefusalMessage(message)) {
+      const last = survivingMessages.at(-1);
+      if (last && last.role === "user") survivingMessages.pop();
+      continue;
+    }
+    survivingMessages.push(message);
+  }
+
+  const outboundMessages = survivingMessages
+    .flatMap(toOpenAIMessages)
+    .filter((message): message is NonNullable<typeof message> =>
+      Boolean(message),
+    );
+
+  const { params, artifactsEnabled, supportsTools } =
+    useChatRuntimeStore.getState();
+  const safeSystemPrompt =
+    typeof params.systemPrompt === "string"
+      ? resolveSystemPromptVariables(
+          params.systemPrompt,
+          typeof params.systemVariables === "string"
+            ? params.systemVariables
+            : "",
+        )
+      : "";
+  const projectInstructions = await resolveProjectInstructions(threadId);
+  const combinedSystemPrompt = [
+    projectInstructions
+      ? `<project_instructions>\n${projectInstructions}\n</project_instructions>`
+      : "",
+    safeSystemPrompt.trim(),
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  if (combinedSystemPrompt) {
+    outboundMessages.unshift({
+      role: "system",
+      content: combinedSystemPrompt,
+    });
+  }
+
+  // Canvas appends one of these to the system prompt on every request, tool schema or
+  // not, so a count without it reads low by that instruction and can say a chat fits
+  // when the next completion would not. The adapter's image gate is never the reason
+  // render_html is off here: the count route refuses messages carrying an image.
+  const canvasInstruction = artifactsEnabled
+    ? supportsTools
+      ? CANVAS_TOOL_INSTRUCTION
+      : CANVAS_FALLBACK_INSTRUCTION
+    : "";
+  if (canvasInstruction) {
+    const first = outboundMessages[0];
+    if (first && first.role === "system" && typeof first.content === "string") {
+      outboundMessages[0] = {
+        ...first,
+        content: `${first.content}\n\n${canvasInstruction}`,
+      };
+    } else {
+      outboundMessages.unshift({ role: "system", content: canvasInstruction });
+    }
+  }
+
+  return outboundMessages as OpenAIChatMessage[];
+}
+
+/**
+ * The reasoning fields a completion would send. The backend turns these into
+ * llama-server `chat_template_kwargs`, and llama-server only falls back to the
+ * load-time `--chat-template-kwargs` for keys a request omits -- so a count that sends
+ * none of them renders the template in whatever mode the model was LOADED in. Templates
+ * that prefill a thinking block, or that drop past reasoning unless preserve_thinking is
+ * set, then report a different prompt size from the next completion.
+ */
+export function buildLocalTokenCountReasoning(): Record<string, unknown> {
+  const {
+    supportsReasoning,
+    reasoningStyle,
+    reasoningEnabled,
+    reasoningEffort,
+    reasoningEffortLevels,
+    supportsPreserveThinking,
+    preserveThinking,
+  } = useChatRuntimeStore.getState();
+  // Same clamp the request build applies, so a level the loaded template does not offer
+  // is not sent (the backend would drop it and count against the template default).
+  const localReasoningEffort = clampReasoningEffortToLevels(
+    reasoningEffort,
+    reasoningEffortLevels,
+  );
+  return {
+    // enable_thinking, never the Anthropic-style `thinking` block the request may use:
+    // ChatCompletionRequest normalizes that shape into enable_thinking anyway, and this
+    // route models the normalized field directly.
+    ...(supportsReasoning
+      ? reasoningStyle === "enable_thinking_effort"
+        ? reasoningEnabled
+          ? { enable_thinking: true, reasoning_effort: localReasoningEffort }
+          : { enable_thinking: false }
+        : reasoningStyle === "reasoning_effort"
+          ? reasoningEnabled
+            ? { reasoning_effort: localReasoningEffort }
+            : {}
+          : { enable_thinking: reasoningEnabled }
+      : {}),
+    ...(supportsPreserveThinking
+      ? { preserve_thinking: preserveThinking }
+      : {}),
+  };
+}
+
+/**
+ * The tool flags a completion would send, so the count includes the tool schemas and
+ * the action nudge. Same gates the adapter applies before it turns tools on; the
+ * render_html image gate is left to the server, which sees the rendered prompt.
+ */
+export async function buildLocalTokenCountExtras(
+  threadId: string | undefined,
+): Promise<Record<string, unknown>> {
+  const {
+    supportsTools,
+    toolsEnabled,
+    codeToolsEnabled,
+    artifactsEnabled,
+    mcpEnabledForChat,
+    ragEnabled,
+    ragSource,
+  } = useChatRuntimeStore.getState();
+  if (!supportsTools) return {};
+
+  const ragProjectId = await resolveProjectId(threadId);
+  const projectRagEnabled = ragProjectId
+    ? await projectHasSources(ragProjectId)
+    : false;
+  const ragOn = ragEnabled || projectRagEnabled;
+  if (
+    !toolsEnabled &&
+    !codeToolsEnabled &&
+    !artifactsEnabled &&
+    !mcpEnabledForChat &&
+    !ragOn
+  ) {
+    return {};
+  }
+
+  return {
+    enable_tools: true,
+    enabled_tools: [
+      ...(ragOn ? ["search_knowledge_base"] : []),
+      ...(toolsEnabled ? ["web_search"] : []),
+      ...(codeToolsEnabled ? ["python", "terminal"] : []),
+      ...(artifactsEnabled ? ["render_html"] : []),
+    ],
+    mcp_enabled: mcpEnabledForChat,
+    // Only its truthiness is read server-side, to keep search_knowledge_base in the
+    // catalog and its grounding nudge in the prompt; no retrieval runs for a count.
+    ...(ragOn
+      ? {
+          rag_scope:
+            ragEnabled && ragSource.type === "kb"
+              ? { kb_id: ragSource.kbId }
+              : {
+                  ...(ragEnabled && threadId ? { thread_id: threadId } : {}),
+                  ...(projectRagEnabled && ragProjectId
+                    ? { project_id: ragProjectId }
+                    : {}),
+                },
+        }
+      : {}),
+  };
+}
+
+
 async function resolveUseAdapter(
   threadId: string | undefined,
   options: OpenAIStreamAdapterOptions = {},
@@ -2755,8 +2947,8 @@ export function createOpenAIStreamAdapter(
       );
       const artifactInstruction = artifactsEnabled
         ? renderHtmlToolEnabledForThisTurn
-          ? "When the user asks for an HTML, CSS, or JavaScript canvas, call render_html once with one complete self-contained HTML document in the code argument. Embed CSS and JavaScript inside the document. After render_html succeeds, do not call it again in the same response unless the user asks for changes. Future user requests for new canvases may call render_html once."
-          : "When the user asks for an HTML, CSS, or JavaScript canvas, return one complete self-contained fenced html code block. Embed CSS and JavaScript inside the document. Do not emit tool-call syntax."
+          ? CANVAS_TOOL_INSTRUCTION
+          : CANVAS_FALLBACK_INSTRUCTION
         : null;
       const effectiveDisabledToolGuard =
         disabledToolGuard && artifactsEnabled
