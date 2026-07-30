@@ -135,7 +135,7 @@ jobs:
           # on a hosted runner either dies on the compositor or paints nothing.
           export WEBKIT_DISABLE_DMABUF_RENDERER=1
           export WEBKIT_DISABLE_COMPOSITING_MODE=1
-          nohup xvfb-run -n 99 --server-args="-screen 0 1440x900x24" \
+          nohup xvfb-run -n 99 -f "$PWD/.xvfb-auth" --server-args="-screen 0 1440x900x24" \
             "$BIN" > logs/app-stdout.log 2>&1 &
           APP_PID=$!
           echo "APP_PID=$APP_PID" >> "$GITHUB_ENV"
@@ -175,7 +175,9 @@ jobs:
           # The release notes warn the AppImage "can show a blank window on some
           # Tauri/WebKitGTK + Wayland/Mesa stacks". Nothing else in this job can see
           # that: the process is alive, the backend is healthy, the logs are clean.
-          xwd -root -display :99 -out artifacts/screen.xwd
+          # xvfb-run exports XAUTHORITY to its child only, so this step has to be
+          # pointed at the same cookie or xwd reports "unable to open display".
+          XAUTHORITY="$PWD/.xvfb-auth" xwd -root -display :99 -out artifacts/screen.xwd
           python3 tests/studio/xwd_not_blank.py artifacts/screen.xwd
 
       - name: Serve an API with `unsloth run`
