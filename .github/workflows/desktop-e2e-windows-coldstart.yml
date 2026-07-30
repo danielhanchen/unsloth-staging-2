@@ -380,6 +380,24 @@ jobs:
               --log logs/gui-parent-backend.log
           exit 0
 
+      - name: D10 -- the injected Tauri env, and the job object
+        # The last two differences I can reproduce from outside the app. Everything
+        # mechanical about process creation is already ruled out, so if neither of these
+        # hangs it either, the next step is instrumentation inside the app rather than
+        # another guess from outside.
+        if: always()
+        shell: pwsh
+        run: |
+          $py  = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          $uns = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
+          & $py tests/studio/win_env_job_probe.py `
+              --exe $uns `
+              --first-port 8940 `
+              --wait 240 `
+              --log-dir logs/env-job-probe `
+              --report artifacts/env-job-probe.json
+          exit 0
+
       - name: Collect the backend's own session logs
         if: always()
         shell: pwsh
