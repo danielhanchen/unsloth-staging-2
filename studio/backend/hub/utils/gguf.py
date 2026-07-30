@@ -254,7 +254,11 @@ def _env_offline() -> bool:
 
 
 def iter_hf_cache_snapshots(repo_id: str, root: Optional[Path] = None):
-    from hub.utils.hf_cache_state import iter_active_repo_cache_dirs, iter_repo_cache_dirs
+    from hub.utils.hf_cache_state import (
+        iter_active_repo_cache_dirs,
+        iter_repo_cache_dirs,
+        snapshot_selection_key,
+    )
 
     snapshots: list[Path] = []
     repo_dirs = (
@@ -271,13 +275,8 @@ def iter_hf_cache_snapshots(repo_id: str, root: Optional[Path] = None):
         except OSError:
             continue
 
-    def _mtime(path: Path) -> float:
-        try:
-            return path.stat().st_mtime
-        except OSError:
-            return 0.0
-
-    snapshots.sort(key = _mtime, reverse = True)
+    # Same key the inventory row selects with, so both name one snapshot.
+    snapshots.sort(key = snapshot_selection_key, reverse = True)
     yield from snapshots
 
 
@@ -315,17 +314,34 @@ def list_empty_gguf_variant_dirs(repo_id: str, root: Optional[Path] = None) -> s
 
 def list_gguf_variants_from_hf_cache(
     repo_id: str, root: Optional[Path] = None
-) -> Optional[tuple[list[GgufVariantInfo], bool]]:
+) -> Optional[tuple[list[GgufVariantInfo], bool, set]]:
+    """``(variants, has_vision, complete)`` for the snapshot a load would read.
+
+    Everything in that snapshot is listed, so a torn download stays visible to resume or delete;
+    *complete* is the subset whose shards are all present, so the caller marks the rest partial
+    rather than ready, as the snapshot-path form of this call does.
+    """
+    # Local import: inventory_scan imports this module.
+    from hub.utils.inventory_scan import complete_snapshot_variants
+
     snapshots = (
         iter_hf_cache_snapshots(repo_id, root = root)
         if root is not None
         else iter_hf_cache_snapshots(repo_id)
     )
+    # A local load reads one snapshot dir, so pick the same one the inventory row does: the newest
+    # holding a whole quant, else the first non-empty. has_vision travels with it, never OR-ed.
+    fallback: Optional[tuple[list[GgufVariantInfo], bool, set]] = None
     for snapshot in snapshots:
         variants, has_vision = list_local_gguf_variants(str(snapshot))
-        if variants or has_vision:
-            return variants, has_vision
-    return None
+        complete = complete_snapshot_variants(str(snapshot)) if variants else set()
+        if variants:
+            # Selection only: an unlabelled quant cannot be judged, so it counts as usable.
+            if any(not v.quant or v.quant in complete for v in variants):
+                return variants, has_vision, complete
+        if fallback is None and (variants or has_vision):
+            fallback = (variants, has_vision, complete)
+    return fallback
 
 
 def list_partial_gguf_variants_from_state(
@@ -436,6 +452,14 @@ def resolve_local_gguf_path(repo_id: str, gguf_variant: Optional[str]) -> Option
     return None
 
 
+def _ready_cached_variants(cached: tuple) -> tuple[list[GgufVariantInfo], bool, None]:
+    """Cache result for a caller with nowhere to put readiness: drop the quants short a shard, but
+    keep the whole list when none is complete so the folder still shows up to manage."""
+    variants, has_vision, complete = cached
+    whole = [v for v in variants if not v.quant or v.quant in complete]
+    return whole or variants, has_vision, None
+
+
 def list_gguf_variants(
     repo_id: str, hf_token: Optional[str] = None
 ) -> tuple[list[GgufVariantInfo], bool, Optional[list]]:
@@ -444,7 +468,7 @@ def list_gguf_variants(
     if _env_offline():
         cached = list_gguf_variants_from_hf_cache(repo_id)
         if cached is not None:
-            return (*cached, None)
+            return _ready_cached_variants(cached)
 
     try:
         info = HfApi(token = hf_token).model_info(
@@ -467,7 +491,7 @@ def list_gguf_variants(
                 repo_id,
                 exc.__class__.__name__,
             )
-            return (*cached, None)
+            return _ready_cached_variants(cached)
         raise
 
     variants: list[GgufVariantInfo] = []
@@ -529,7 +553,12 @@ def list_local_gguf_variants(directory: str) -> tuple[list[GgufVariantInfo], boo
 
     for file in sorted(iter_gguf_files(root, recursive = True)):
         if is_mmproj_filename(file.name):
-            has_vision = True
+            # An interrupted download leaves the name with nothing behind it, and a projector
+            # llama.cpp cannot open is not vision support.
+            try:
+                has_vision = has_vision or file.stat().st_size > 0
+            except OSError:
+                pass
             continue
         try:
             size = file.stat().st_size
