@@ -1,0 +1,86 @@
+name: "staging-7473 studio-playwright"
+on:
+  push:
+    branches: ["pr-7473-xplat-ci"]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/staging-7473-playwright.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  studio-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install playwright httpx pillow && python -m playwright install --with-deps chromium
+      - name: Install + launch Studio
+        run: |
+          ./install.sh --local --no-torch || pip install -e .
+          nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8888/healthz && break; sleep 5; done
+      - name: Playwright smoke (studio_test_kit)
+        # Non-gating by design, but point it at the collected dir so a run without
+        # --pw-script still leaves something to look at.
+        run: |
+          mkdir -p logs/playwright_smoke
+          PW_ART_DIR=logs/playwright_smoke PYTHONPATH=.github/scripts             python -m studio_test_kit._smoke_ui || true
+      - name: Drive the PR's Playwright script (playwright_model_config.py)
+        env:
+          NEW_PW: StagingCI-7473-Pw1!
+          PW_SCRIPT: tests/studio/playwright_model_config.py
+        run: |
+          set -euo pipefail
+          [ -f "$PW_SCRIPT" ] || { echo "::error::no such Playwright driver: $PW_SCRIPT"; exit 1; }
+          # Which handoff does this driver support?
+          ATTACH_VAR=""
+          if grep -q 'STUDIO_LOGIN_PW' "$PW_SCRIPT"; then ATTACH_VAR=STUDIO_LOGIN_PW
+          elif grep -q 'STUDIO_PW' "$PW_SCRIPT"; then ATTACH_VAR=STUDIO_PW
+          fi
+          export BASE_URL=http://127.0.0.1:8888
+          export PW_ART_DIR=logs/playwright_staging
+          export STUDIO_UI_STRICT=1
+          if [ -n "$ATTACH_VAR" ]; then
+            PWFILE=$(grep -oE 'password saved to: *\S+' studio.log | tail -1 | awk '{print $NF}')
+            [ -f "$PWFILE" ] || { echo "::error::no bootstrap password file in studio.log"; tail -40 studio.log; exit 1; }
+            export BOOT=$(cat "$PWFILE")
+            python - <<'EOF'
+          import json, os, urllib.request
+          B, boot, new = "http://127.0.0.1:8888", os.environ["BOOT"], os.environ["NEW_PW"]
+          def post(path, body, tok=None):
+              req = urllib.request.Request(B + path, json.dumps(body).encode(),
+                                           {"Content-Type": "application/json"})
+              if tok: req.add_header("Authorization", "Bearer " + tok)
+              return json.load(urllib.request.urlopen(req, timeout=30))
+          tok = post("/api/auth/login", {"username": "unsloth", "password": boot})["access_token"]
+          post("/api/auth/change-password", {"current_password": boot, "new_password": new}, tok)
+          print("password rotated")
+          EOF
+            echo "attaching via $ATTACH_VAR"
+            export "$ATTACH_VAR=$NEW_PW" STUDIO_LOGIN_USER=unsloth
+          else
+            # Bootstrap state is required: the driver drives the form itself.
+            echo "leaving bootstrap password in place; driver performs the change"
+            export STUDIO_NEW_PW="$NEW_PW"
+          fi
+          python "$PW_SCRIPT"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-playwright-7473
+          # Scoped to where the drivers write. A bare `**/*.png` sweeps the repo's own
+          # assets and node_modules instead, so the artifact looks full while carrying no
+          # screenshot of the change under review.
+          path: |
+            logs/playwright*/**
+            studio.log
+          if-no-files-found: warn
