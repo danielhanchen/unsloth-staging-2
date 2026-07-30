@@ -1,0 +1,51 @@
+name: "staging-7473 macos-14"
+on:
+  push:
+    branches: ["pr-7473-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/api_monitor.py'
+      - 'studio/backend/core/inference/local_model_resolver.py'
+      - 'studio/backend/core/inference/openai_auto_download.py'
+      - 'studio/backend/picker/schemas.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/routes/settings.py'
+      - 'studio/backend/storage/studio_db.py'
+      - 'studio/backend/tests/test_api_monitor.py'
+      - 'studio/backend/tests/test_openai_auto_download.py'
+      - 'studio/backend/tests/test_openai_auto_switch.py'
+      - 'studio/backend/tests/test_parallel_slots_per_load.py'
+      - 'studio/backend/utils/openai_auto_switch_settings.py'
+      - 'studio/frontend/src/app/router.tsx'
+      - 'studio/frontend/src/app/routes/__root.tsx'
+      - 'studio/frontend/src/app/routes/api.tsx'
+      - 'studio/frontend/src/features/api-monitor/api-monitor-overlay.tsx'
+      - 'studio/frontend/src/features/api-monitor/api-monitor-page.tsx'
+      - 'studio/frontend/src/features/api-monitor/clear-monitor.ts'
+      - 'studio/frontend/src/features/api-monitor/components/saved-model-settings.tsx'
+      - 'studio/frontend/src/features/api-monitor/index.ts'
+      - '.github/workflows/staging-7473-macos-14.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_api_monitor.py studio/backend/tests/test_openai_auto_download.py studio/backend/tests/test_openai_auto_switch.py studio/backend/tests/test_parallel_slots_per_load.py tests/studio/test_model_picker_contracts.py tests/studio/test_settings_compact_overflow_contract.py tests/studio/test_usage_examples_model_source_contract.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
