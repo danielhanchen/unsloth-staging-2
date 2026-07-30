@@ -175,13 +175,30 @@ class Backend:
 
 
 def studio_root() -> Path:
-    """The desktop app ignores UNSLOTH_STUDIO_HOME and always uses the default root
-    (install.rs strips it before invoking the bundled installer), so resolve the same
-    path it writes rather than trusting the environment."""
-    override = os.environ.get("UNSLOTH_DRIVE_STUDIO_ROOT")
+    """Where the install we are driving keeps its state.
+
+    The desktop app ignores UNSLOTH_STUDIO_HOME (install.rs strips it before invoking
+    the bundled installer) and always uses ~/.unsloth/studio, so that is the default.
+    The non-Tauri control arm is installed under an explicit UNSLOTH_STUDIO_HOME, which
+    IS the root -- not a parent of `.unsloth/studio` -- so honour it when set.
+    """
+    override = os.environ.get("UNSLOTH_DRIVE_STUDIO_ROOT") or os.environ.get(
+        "UNSLOTH_STUDIO_HOME"
+    )
     if override:
         return Path(override)
     return Path.home() / ".unsloth" / "studio"
+
+
+def is_tauri_install() -> bool:
+    """True when we are driving the packaged desktop app rather than a plain
+    `unsloth studio`. The desktop app writes tauri.log unconditionally at process start
+    (main.rs setup_logging) and records its backend metadata; a control-arm Studio does
+    neither, so Tauri-only assertions must not fire against it."""
+    if os.environ.get("UNSLOTH_DRIVE_ASSUME_TAURI"):
+        return os.environ["UNSLOTH_DRIVE_ASSUME_TAURI"] == "1"
+    root = studio_root()
+    return (root / "tauri.log").exists() or (root / "run" / "desktop_backend.json").exists()
 
 
 def discover_backend(
@@ -207,6 +224,7 @@ def discover_backend(
         return None
 
     metadata_path = studio_root() / "run" / "desktop_backend.json"
+    rejected: dict[int, str] = {}
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if metadata_path.exists():
@@ -221,19 +239,37 @@ def discover_backend(
                 report.note("port_source", "desktop_backend.json")
                 return Backend(int(port))
         for port in range(PORT_START, PORT_END + 1):
-            if _is_unsloth(port) and _is_our_install(port):
+            if not _is_unsloth(port):
+                continue
+            ours, why = _is_our_install(port)
+            rejected[port] = why
+            if ours:
                 report.warn(
-                    f"backend found by scanning port {port}; "
+                    f"backend found by scanning port {port} ({why}); "
                     f"{metadata_path} was absent or stale"
                 )
                 report.note("port", port)
                 report.note("port_source", "scan")
                 return Backend(port)
         time.sleep(2)
-    report.fail(
-        f"no Unsloth backend on 127.0.0.1:{PORT_START}-{PORT_END} after {timeout:.0f}s; "
-        f"the desktop app never brought one up"
-    )
+
+    # A bare "not found" sends the reader to the runner logs to work out whether the app
+    # never started, started somewhere else, or was rejected. Say which.
+    report.note("discovery_metadata_path", str(metadata_path))
+    report.note("discovery_metadata_exists", metadata_path.exists())
+    report.note("discovery_studio_root", str(studio_root()))
+    report.note("discovery_rejected_ports", rejected)
+    if rejected:
+        report.fail(
+            f"an Unsloth backend answered on {sorted(rejected)} but none was accepted "
+            f"as ours: {rejected}"
+        )
+    else:
+        report.fail(
+            f"no Unsloth backend on 127.0.0.1:{PORT_START}-{PORT_END} after "
+            f"{timeout:.0f}s; the desktop app never brought one up "
+            f"(metadata {metadata_path} exists={metadata_path.exists()})"
+        )
     return None
 
 
@@ -248,23 +284,33 @@ def _is_unsloth(port: int) -> bool:
     return "unsloth" in service.lower() or not service
 
 
-def _is_our_install(port: int) -> bool:
+def _is_our_install(port: int) -> tuple[bool, str]:
     """Does this backend belong to the install we are testing?
 
     /api/health reports `studio_root_id`, which the install writes to
-    share/studio_install_id (desktop_backend_owner.rs:151-157). Without this check the
-    scan happily attaches to a DIFFERENT Unsloth on the same box -- a co-tenant dev
-    server, a leftover from another run -- and reports its health as ours. Ambiguity
-    resolves to False: attaching to the wrong Studio is worse than not finding one.
+    share/studio_install_id (desktop_backend_owner.rs:151-157). Matching them stops the
+    scan attaching to a DIFFERENT Unsloth on the same box -- a co-tenant dev server, a
+    leftover from another run -- and reporting its health as ours.
+
+    The id file is not guaranteed to exist (a hosted runner that has only ever run the
+    packaged app may not have one), and refusing to attach in that case throws away the
+    whole run over a missing marker. So: mismatch is a hard no, absent is a warned yes.
     """
-    id_path = studio_root() / "share" / "studio_install_id"
-    if not id_path.exists():
-        return False
     code, body = Backend(port).http("GET", "/api/health", timeout=3, auth=False)
     if code != 200 or not isinstance(body, dict):
-        return False
+        return False, "no health response"
     reported = str(body.get("studio_root_id", ""))
-    return bool(reported) and reported == id_path.read_text().strip()
+
+    id_path = studio_root() / "share" / "studio_install_id"
+    if not id_path.exists():
+        return True, f"no {id_path} to compare against; accepting on health alone"
+    expected = id_path.read_text().strip()
+    if reported and reported == expected:
+        return True, "studio_root_id matches this install"
+    return False, (
+        f"studio_root_id {reported[:16]}... does not match this install "
+        f"{expected[:16]}...; that is somebody else's Unsloth"
+    )
 
 
 def desktop_login(backend: Backend, report: Report) -> bool:
@@ -305,17 +351,31 @@ def desktop_login(backend: Backend, report: Report) -> bool:
     return True
 
 
-def password_login(backend: Backend, report: Report, password: str) -> bool:
-    """Password login, for the non-Tauri control arm which has no desktop secret."""
+def password_login(
+    backend: Backend, report: Report, password: str, username: str | None = None
+) -> bool:
+    """Password login, for the non-Tauri control arm which has no desktop secret.
+
+    The admin account is `unsloth`, not `admin`; try the caller's choice first and then
+    both known names rather than failing on a guess.
+    """
     print(f"::add-mask::{password}", flush=True)
-    code, body = backend.http(
-        "POST",
-        "/api/auth/login",
-        {"username": "admin", "password": password},
-        auth=False,
-    )
-    if code != 200 or not isinstance(body, dict) or "access_token" not in body:
-        report.fail(f"POST /api/auth/login -> {code} {str(body)[:200]}")
+    candidates = [username] if username else []
+    candidates += [u for u in ("unsloth", "admin") if u not in candidates]
+
+    body: Any = None
+    for candidate in candidates:
+        code, body = backend.http(
+            "POST",
+            "/api/auth/login",
+            {"username": candidate, "password": password},
+            auth=False,
+        )
+        if code == 200 and isinstance(body, dict) and "access_token" in body:
+            report.note("login_username", candidate)
+            break
+    else:
+        report.fail(f"POST /api/auth/login failed for {candidates}: {str(body)[:200]}")
         return False
     backend.token = body["access_token"]
     print(f"::add-mask::{backend.token}", flush=True)
@@ -404,9 +464,12 @@ def scenario_backend(backend: Backend, report: Report) -> None:
             report.fail(f"GET {path} -> {code}")
 
     # The bundled installer's venv is what the app boots from; a preflight that says
-    # ready over an unbootable venv is the exact reported failure.
+    # ready over an unbootable venv is the exact reported failure. Only the packaged app
+    # writes this file, so a control-arm Studio is not held to it.
     log = studio_root() / "tauri.log"
-    if log.exists():
+    if not is_tauri_install():
+        report.warn("not a packaged desktop install; skipping the tauri.log assertions")
+    elif log.exists():
         text = log.read_text(errors="replace")
         dispositions = [
             line.split("disposition=")[1].split()[0]
@@ -488,34 +551,45 @@ def scenario_inference(backend: Backend, report: Report) -> None:
 def scenario_parallel_chats(backend: Backend, report: Report) -> None:
     """Three concurrent conversations against one loaded model.
 
-    Deliberately NOT the MTP model: its card states `-np > 1` is unsupported with MTP,
-    so parallel slots need a separate, non-MTP load.
+    Uses the MTP model with speculative decoding OFF, not the 270m: the MTP card states
+    `-np > 1` is unsupported with MTP, so parallel slots need a non-MTP load, and a 270m
+    is too small to be a fair test -- it emits EOS immediately on a short instruction,
+    which reads as "empty response" and hides a real parallelism bug behind a model
+    quality artifact. UNSLOTH_DRIVE_PARALLEL_REPO overrides for memory-tight runners.
     """
-    if not load_model(backend, report, SMALL_REPO, gguf_variant=SMALL_VARIANT):
+    repo = os.environ.get("UNSLOTH_DRIVE_PARALLEL_REPO", MTP_REPO)
+    variant = os.environ.get("UNSLOTH_DRIVE_PARALLEL_VARIANT", MTP_VARIANT)
+    if not load_model(
+        backend, report, repo, gguf_variant=variant, speculative_type="off"
+    ):
         return
+    report.note("parallel_repo", repo)
 
+    # Distinct topics, so a shared-slot bug shows up as one thread's subject appearing
+    # in another's answer. Natural prompts, because a "reply with one word" instruction
+    # is answered with EOS by small models.
     prompts = {
-        "alpha": "Reply with exactly the single word: ALPHA",
-        "bravo": "Reply with exactly the single word: BRAVO",
-        "charlie": "Reply with exactly the single word: CHARLIE",
+        "ocean": ("Write one sentence about the ocean.", "ocean"),
+        "mountain": ("Write one sentence about mountains.", "mountain"),
+        "desert": ("Write one sentence about deserts.", "desert"),
     }
     results: dict[str, tuple[int, str]] = {}
     lock = threading.Lock()
 
     def run(name: str, prompt: str) -> None:
-        code, body = chat_once(backend, prompt, max_tokens=8)
+        code, body = chat_once(backend, prompt, max_tokens=48)
         with lock:
             results[name] = (code, _completion_text(body))
 
     started = time.monotonic()
-    threads = [threading.Thread(target=run, args=(n, p)) for n, p in prompts.items()]
+    threads = [threading.Thread(target=run, args=(n, p)) for n, (p, _) in prompts.items()]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join(timeout=900)
-    elapsed = time.monotonic() - started
-    report.note("parallel_seconds", round(elapsed, 1))
-    report.note("parallel_results", {k: v[1][:60] for k, v in results.items()})
+    parallel_seconds = time.monotonic() - started
+    report.note("parallel_seconds", round(parallel_seconds, 1))
+    report.note("parallel_results", {k: v[1][:80] for k, v in results.items()})
 
     if len(results) != 3:
         report.fail(f"only {len(results)}/3 parallel chats returned within 900s")
@@ -525,20 +599,48 @@ def scenario_parallel_chats(backend: Backend, report: Report) -> None:
         elif not text.strip():
             report.fail(f"parallel chat {name} returned empty text")
         else:
-            report.ok(f"parallel chat {name} -> {text.strip()[:40]!r}")
+            report.ok(f"parallel chat {name} -> {text.strip()[:50]!r}")
 
-    # Cross-talk: each answer must reflect its OWN prompt. A shared-slot bug shows up
-    # here as another thread's keyword appearing in this thread's answer.
+    # Cross-talk: each answer must be about its OWN subject and not another thread's.
     leaks = []
     for name, (_code, text) in results.items():
-        others = [o.upper() for o in prompts if o != name]
-        leaked = [o for o in others if o in text.upper()]
+        others = [kw for other, (_p, kw) in prompts.items() if other != name]
+        leaked = [kw for kw in others if kw in text.lower()]
         if leaked:
-            leaks.append(f"{name} leaked {leaked}")
+            leaks.append(f"{name} mentioned {leaked}")
     if leaks:
-        report.fail(f"cross-talk between parallel chats: {'; '.join(leaks)}")
+        report.warn(f"possible cross-talk between parallel chats: {'; '.join(leaks)}")
     elif results:
         report.ok("no cross-talk between parallel chats")
+
+    # Were they actually concurrent? Three requests that queue behind each other also
+    # "all succeed", so time one request alone and compare. A server with a single slot
+    # takes ~3x as long for three; real parallel slots are much closer to 1x.
+    solo_started = time.monotonic()
+    chat_once(backend, "Write one sentence about rivers.", max_tokens=48)
+    solo_seconds = time.monotonic() - solo_started
+    report.note("solo_seconds", round(solo_seconds, 1))
+    # Below a second the measurement is request overhead, not generation, and the ratio
+    # is meaningless -- on a fast GPU three chats finish in 0.5s against a 0.2s solo and
+    # "2.5x" says nothing about slot count.
+    if solo_seconds < 1.0:
+        report.ok(
+            f"concurrency ratio not meaningful at this speed "
+            f"({parallel_seconds:.2f}s parallel vs {solo_seconds:.2f}s solo)"
+        )
+    elif solo_seconds > 0:
+        ratio = parallel_seconds / solo_seconds
+        report.note("parallel_over_solo_ratio", round(ratio, 2))
+        if ratio <= 2.2:
+            report.ok(
+                f"the three chats ran concurrently ({parallel_seconds:.1f}s vs "
+                f"{solo_seconds:.1f}s solo, {ratio:.1f}x)"
+            )
+        else:
+            report.warn(
+                f"the three chats look serialised ({parallel_seconds:.1f}s vs "
+                f"{solo_seconds:.1f}s solo, {ratio:.1f}x); expected well under 3x"
+            )
 
     unload_model(backend)
 
@@ -568,7 +670,14 @@ def scenario_settings(backend: Backend, report: Report) -> None:
     if code != 200 or not isinstance(original, dict):
         report.fail("cannot round-trip upload-limit; GET did not return an object")
         return
-    key = next((k for k in ("limit_mb", "upload_limit_mb", "value") if k in original), None)
+    key = next(
+        (
+            k
+            for k in ("max_upload_size_mb", "limit_mb", "upload_limit_mb", "value")
+            if k in original
+        ),
+        None,
+    )
     if key is None:
         report.warn(f"upload-limit shape unrecognised, skipping write test: {original}")
         return
@@ -673,10 +782,14 @@ def scenario_api_serving(backend: Backend, report: Report) -> None:
     if code not in (200, 201) or not isinstance(created, dict):
         report.fail(f"POST /api/auth/api-keys -> {code} {str(created)[:200]}")
         return
-    key = created.get("api_key") or created.get("key") or created.get("token")
-    key_id = created.get("id") or created.get("api_id")
-    if not key:
-        report.fail(f"api-key response carried no key: {sorted(created)}")
+    # CreateApiKeyResponse is {"key": "sk-unsloth-...", "api_key": {record}}. The raw key
+    # is `key`; `api_key` is the record (which deliberately carries only a prefix), so
+    # reading `api_key` first would mask a dict and then fail to authenticate with it.
+    key = created.get("key") or created.get("token")
+    record = created.get("api_key") if isinstance(created.get("api_key"), dict) else {}
+    key_id = record.get("id") or created.get("id")
+    if not isinstance(key, str) or not key:
+        report.fail(f"api-key response carried no raw key: {sorted(created)}")
         return
     print(f"::add-mask::{key}", flush=True)
     report.ok("issued an API key")

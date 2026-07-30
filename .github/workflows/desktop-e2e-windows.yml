@@ -314,11 +314,47 @@ jobs:
               --out artifacts/drive-report.json 2>&1 | Tee-Object logs/drive.log
           exit $LASTEXITCODE
 
+      - name: Drive the packaged WebView2 renderer
+        if: always()
+        shell: pwsh
+        run: |
+          $py = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          & $py -m pip install --quiet 'playwright>=1.45'
+          # The native layer attaches to the ALREADY-RUNNING WebView2 over CDP, so it
+          # needs no browser download; the attached layer does.
+          & $py -m playwright install chromium
+          & $py tests/studio/desktop_playwright.py `
+              --layer both `
+              --out artifacts/ui `
+              --report artifacts/ui-report.json 2>&1 | Tee-Object logs/ui.log
+          exit $LASTEXITCODE
+
       - name: What did the app's own log say?
         if: always()
         shell: pwsh
         run: |
-          foreach ($f in @("$env:USERPROFILE\.unsloth\studio\tauri.log", 'logs/app-stdout.log')) {
+          # The backend the app spawns writes to ~/.unsloth/studio/logs (process.rs pipes
+          # the child's stdout/stderr into diagnostics phase logs). Without these, a
+          # backend that fails to start leaves tauri.log ending at "spawned" and no
+          # explanation anywhere.
+          $studio = Join-Path $env:USERPROFILE '.unsloth\studio'
+          foreach ($d in 'logs','run') {
+            $src = Join-Path $studio $d
+            if (Test-Path $src) { Copy-Item $src "logs/studio-$d" -Recurse -ErrorAction SilentlyContinue }
+          }
+          Write-Host '=== backend phase logs ==='
+          Get-ChildItem (Join-Path $studio 'logs') -File -ErrorAction SilentlyContinue |
+            Select-Object -First 20 | ForEach-Object {
+              Write-Host "--- $($_.FullName) ---"; Get-Content $_.FullName -Tail 60
+            }
+          Write-Host '=== listening sockets ==='
+          Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object LocalPort -ge 8888 | Where-Object LocalPort -le 8908 |
+            Format-Table -AutoSize | Out-String | Write-Host
+          Write-Host '=== unsloth processes ==='
+          Get-Process | Where-Object ProcessName -like '*unsloth*' |
+            Format-Table -AutoSize | Out-String | Write-Host
+          foreach ($f in @("$studio\tauri.log", 'logs/app-stdout.log', 'logs/app-stderr.log')) {
             if (Test-Path $f) {
               Write-Host "=== $f ==="
               Copy-Item $f logs/ -ErrorAction SilentlyContinue

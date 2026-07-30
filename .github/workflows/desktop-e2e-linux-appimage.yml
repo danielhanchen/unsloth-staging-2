@@ -1,0 +1,195 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# STAGING. The AppImage leg. Separate from the .deb because it fails differently: no
+# package manager resolves its dependencies, FUSE has to be present, and the release
+# notes themselves warn that "Linux AppImage can show a blank window on some
+# Tauri/WebKitGTK + Wayland/Mesa stacks". A blank window is precisely what a
+# "the process stayed alive" check cannot see, so this leg drives the UI and asserts the
+# window actually rendered content.
+
+name: "desktop-e2e linux appimage"
+
+on:
+  push:
+    branches: [desktop-e2e]
+    paths:
+      - 'tests/studio/desktop_drive.py'
+      - 'tests/studio/desktop_playwright.py'
+      - '.github/workflows/desktop-e2e-linux-appimage.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        type: string
+        default: 'desktop-v0.1.51-beta'
+      scenarios:
+        type: string
+        default: 'all'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REL_REPO: unsloth-test/unsloth-test
+  REL_TAG: ${{ inputs.release_tag || 'desktop-v0.1.51-beta' }}
+  SCENARIOS: ${{ inputs.scenarios || 'all' }}
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+  UNSLOTH_DRIVE_MTP_VARIANT: 'UD-Q4_K_XL'
+
+jobs:
+  appimage:
+    name: AppImage install + drive (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.04 has libfuse2; 24.04 renamed it libfuse2t64, which the release notes call
+        # out as a manual step. Both, so the rename is covered rather than assumed.
+        os: [ubuntu-22.04, ubuntu-24.04]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Download the shipped AppImage
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dl logs artifacts
+          gh release download "$REL_TAG" --repo "$REL_REPO" --pattern '*.AppImage' --dir dl
+          chmod +x dl/*.AppImage
+          ls -la dl
+          sha256sum dl/*.AppImage | tee artifacts/appimage.sha256
+
+      - name: Strip the developer toolchain
+        run: |
+          bash .github/scripts/clean-machine-env.sh mask --remove
+          set -a; . ./clean-machine.env; set +a
+          bash .github/scripts/clean-machine-assert.sh absent
+
+      - name: Runtime libs only, no dev tooling
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends xvfb jq
+          # 24.04 renamed libfuse2 -> libfuse2t64. Try the new name first and fall back,
+          # so this leg reports which one the runner actually needed.
+          if apt-cache show libfuse2t64 >/dev/null 2>&1; then
+            sudo apt-get install -y -qq libfuse2t64 && echo "FUSE package: libfuse2t64"
+          else
+            sudo apt-get install -y -qq libfuse2 && echo "FUSE package: libfuse2"
+          fi
+          sudo apt-get install -y -qq --no-install-recommends \
+            libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1
+          BIN="$(ls dl/*.AppImage | head -1)"
+          echo "BIN=$PWD/$BIN" >> "$GITHUB_ENV"
+
+      - name: Run the bundled installer, the path first launch takes
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          set -o pipefail
+          # `ls` returns a bare filename and a command word with no slash resolves through
+          # PATH, not the cwd, so the ./ prefix is required.
+          (cd dl && "./$(ls *.AppImage | head -1)" --appimage-extract >/dev/null)
+          SH="$(find dl/squashfs-root -name install.sh -type f | head -1)"
+          [ -n "$SH" ] && [ -f "$SH" ] || { echo "::error::the AppImage ships no install.sh resource"; exit 1; }
+          echo "bundled installer: $SH"
+          if ! grep -q '_SMART_APT_OPTIONAL' "$SH"; then
+            echo "::error::this bundle predates #7547; it cannot install on a stripped machine"
+            exit 1
+          fi
+          rc=0
+          env -u UNSLOTH_STUDIO_HOME \
+            bash "$SH" --tauri < /dev/null 2>&1 | tee logs/bundled-install.log || rc=$?
+          echo "bundled installer exit code: $rc"
+          [ "$rc" -eq 0 ] || { echo "::error::bundled installer exited $rc"; exit 1; }
+          PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          [ -x "$PY" ] || { echo "::error::bundled installer left no venv at $PY"; exit 1; }
+          "$PY" -c "import torch; print('torch', torch.__version__)"
+
+      - name: Launch under Xvfb
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          # The two mitigations the blank-window reports turn on. Without them WebKitGTK
+          # on a hosted runner either dies on the compositor or paints nothing.
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1
+          nohup xvfb-run -a --server-args="-screen 0 1440x900x24" \
+            "$BIN" > logs/app-stdout.log 2>&1 &
+          echo "APP_PID=$!" >> "$GITHUB_ENV"
+          sleep 20
+          kill -0 "$!" 2>/dev/null || { echo "::error::the app exited during startup"; tail -60 logs/app-stdout.log; exit 1; }
+
+      - name: Drive the running app
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          set -o pipefail
+          python3 tests/studio/desktop_drive.py \
+            --scenarios "$SCENARIOS" \
+            --discover-timeout 420 \
+            --out artifacts/drive-report.json 2>&1 | tee logs/drive.log
+
+      - name: Drive the UI, and prove the window is not blank
+        if: always()
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          set -o pipefail
+          python3 -m pip install --quiet --user 'playwright>=1.45' || true
+          python3 -m playwright install --with-deps chromium || true
+          python3 tests/studio/desktop_playwright.py \
+            --layer attached \
+            --out artifacts/ui \
+            --report artifacts/ui-report.json 2>&1 | tee logs/ui.log
+
+      - name: Logs
+        if: always()
+        run: |
+          # The backend the app spawns writes to ~/.unsloth/studio/logs; without these
+          # a backend that fails to start leaves tauri.log ending at "spawned".
+          cp -r "$HOME/.unsloth/studio/logs" logs/studio-logs 2>/dev/null || true
+          cp -r "$HOME/.unsloth/studio/run" logs/studio-run 2>/dev/null || true
+          echo "=== backend phase logs ==="
+          find "$HOME/.unsloth/studio/logs" -type f 2>/dev/null | head -20 | while read -r f; do
+            echo "--- $f ---"; tail -60 "$f"
+          done
+          echo "=== listening sockets ==="
+          (ss -ltnp 2>/dev/null || netstat -an 2>/dev/null | grep LISTEN) | head -20 || true
+          echo "=== unsloth processes ==="
+          ps aux | grep -i unsloth | grep -v grep | head -10 || true
+          for f in "$HOME/.unsloth/studio/tauri.log" logs/app-stdout.log; do
+            [ -f "$f" ] && { echo "=== $f ==="; cp "$f" logs/ 2>/dev/null || true; tail -80 "$f"; }
+          done
+
+      - name: Stop the app
+        if: always()
+        run: kill -TERM "${APP_PID:-0}" 2>/dev/null || true
+
+      - name: Restore the runner
+        if: always()
+        run: |
+          [ -f .clean-machine/restore.sh ] && bash .clean-machine/restore.sh || \
+            echo "nothing to restore"
+
+      - name: Upload logs and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e-linux-appimage-${{ matrix.os }}
+          path: |
+            logs/
+            artifacts/
+          retention-days: 7
+          if-no-files-found: warn

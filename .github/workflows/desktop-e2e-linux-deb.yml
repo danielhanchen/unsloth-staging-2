@@ -162,20 +162,49 @@ jobs:
         id: drive
         run: |
           set -a; . ./clean-machine.env; set +a
+          # pipefail or the tee swallows the harness's exit code and the job goes green
+          # over a red report -- the worst possible outcome for a test job.
+          set -o pipefail
           python3 tests/studio/desktop_drive.py \
             --scenarios "$SCENARIOS" \
             --discover-timeout 420 \
             --out artifacts/drive-report.json 2>&1 | tee logs/drive.log
 
+      - name: Drive the UI
+        if: always()
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          set -o pipefail
+          python3 -m pip install --quiet --user 'playwright>=1.45' || true
+          python3 -m playwright install --with-deps chromium || true
+          python3 tests/studio/desktop_playwright.py \
+            --layer attached \
+            --out artifacts/ui \
+            --report artifacts/ui-report.json 2>&1 | tee logs/ui.log
+
       - name: What did the app's own log say?
         if: always()
         run: |
+          # The backend the app spawns writes to ~/.unsloth/studio/logs (process.rs pipes
+          # the child's stdout/stderr into diagnostics phase logs). Without these a
+          # backend that fails to start leaves tauri.log ending at "spawned" and no
+          # explanation anywhere -- which is exactly what the first run hit.
+          cp -r "$HOME/.unsloth/studio/logs" logs/studio-logs 2>/dev/null || true
+          cp -r "$HOME/.unsloth/studio/run" logs/studio-run 2>/dev/null || true
           for f in "$HOME/.unsloth/studio/tauri.log" logs/app-stdout.log; do
             [ -f "$f" ] || continue
             echo "=== $f ==="
             cp "$f" logs/ 2>/dev/null || true
             tail -80 "$f"
           done
+          echo "=== backend phase logs ==="
+          find "$HOME/.unsloth/studio/logs" -type f 2>/dev/null | head -20 | while read -r f; do
+            echo "--- $f ---"; tail -60 "$f"
+          done
+          echo "=== listening sockets ==="
+          ss -ltnp 2>/dev/null | head -20 || true
+          echo "=== unsloth processes ==="
+          ps aux | grep -i unsloth | grep -v grep | head -10 || true
 
       - name: Stop the app
         if: always()
