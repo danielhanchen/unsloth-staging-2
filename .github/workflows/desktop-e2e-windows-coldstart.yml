@@ -1,0 +1,379 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# STAGING. Silent-installs the SHIPPED NSIS installer on a machine stripped of developer
+# tooling, audits EVERY installed PE's Authenticode signature, then launches the app and
+# drives it through its own backend.
+#
+# The signature audit is the part that matters for the SmartScreen investigation. The
+# outer installer already verifies clean offline (signer "Unsloth AI Inc.", RFC3161
+# timestamped, chain to Microsoft Identity Verification Root CA 2020, issuer "Microsoft
+# ID Verified CS AOC CA 04"). The open question is whether the binaries INSIDE the
+# bundle -- app exe, sidecars, DLLs, the NSIS uninstaller -- are signed too. Tauri's
+# bundle.windows.signCommand should hand each one to trusted-signing-cli; this proves it
+# on disk rather than trusting the config.
+
+name: "desktop-e2e windows coldstart"
+
+on:
+  push:
+    branches: [desktop-e2e]
+    paths:
+      - 'tests/studio/desktop_drive.py'
+      - '.github/workflows/desktop-e2e-windows-coldstart.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag in the desktop release repo'
+        type: string
+        default: 'desktop-v0.1.51-beta'
+      scenarios:
+        description: 'Comma-separated scenario list, or all'
+        type: string
+        default: 'all'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REL_REPO: unsloth-test/unsloth-test
+  REL_TAG: ${{ inputs.release_tag || 'desktop-v0.1.51-beta' }}
+  SCENARIOS: ${{ inputs.scenarios || 'all' }}
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+  UNSLOTH_DRIVE_MTP_VARIANT: 'UD-Q4_K_XL'
+
+jobs:
+  windows:
+    name: NSIS install + signature audit + drive
+    runs-on: windows-latest
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download the shipped installer
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dl logs artifacts
+          gh release download "$REL_TAG" --repo "$REL_REPO" --pattern '*setup.exe' --dir dl
+          ls -la dl
+          sha256sum dl/*setup.exe | tee artifacts/setup.sha256
+
+      - name: Locate signtool
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse `
+                        -Filter signtool.exe -ErrorAction SilentlyContinue |
+                      Where-Object FullName -like '*\x64\signtool.exe' |
+                      Sort-Object FullName -Descending |
+                      Select-Object -First 1
+          if (-not $signtool) { Write-Host '::error::signtool.exe not found on the image'; exit 1 }
+          Write-Host "signtool: $($signtool.FullName)"
+          "SIGNTOOL=$($signtool.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Verify the INSTALLER signature before running it
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem dl/*setup.exe | Select-Object -First 1).FullName
+          # /pa  normal Authenticode policy (not the driver policy)
+          # /all every embedded signature, not just the first
+          # /tw  treat a missing timestamp as a failure, which a bare /pa accepts silently
+          & $env:SIGNTOOL verify /pa /all /v /tw $exe 2>&1 |
+            Tee-Object artifacts/signtool-installer.txt
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::the shipped installer failed signtool verify /pa /all /tw (exit $LASTEXITCODE)"
+            exit 1
+          }
+          $sig = Get-AuthenticodeSignature $exe
+          Write-Host "Status        : $($sig.Status)"
+          Write-Host "Signer        : $($sig.SignerCertificate.Subject)"
+          Write-Host "ISSUER CA     : $($sig.SignerCertificate.Issuer)"
+          Write-Host "Leaf validity : $($sig.SignerCertificate.NotBefore) .. $($sig.SignerCertificate.NotAfter)"
+          Write-Host "Timestamper   : $($sig.TimeStamperCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { Write-Host "::error::signature status $($sig.Status)"; exit 1 }
+          if (-not $sig.TimeStamperCertificate) {
+            Write-Host '::error::no RFC3161 timestamp; the signature dies when the 3-day leaf expires'
+            exit 1
+          }
+          $global:LASTEXITCODE = 0
+
+      - name: Strip the developer toolchain
+        shell: pwsh
+        run: |
+          # Strawberry: windows-latest ships a MinGW toolchain (cmake, gcc) under
+          # C:\Strawberry\c\bin, which names none of the other fragments.
+          $drop = @('hostedtoolcache\windows\Python', 'WindowsApps', '\Git\', 'CMake',
+                    'Microsoft Visual Studio', 'BuildTools', 'LLVM', 'MSYS', 'mingw',
+                    'Strawberry')
+          # winget is an app-execution alias under ...\Local\Microsoft\WindowsApps, so
+          # dropping WindowsApps (needed to lose the Store python.exe alias) takes the OS
+          # package manager with it. winget is not developer tooling -- every consumer
+          # machine has it and the bundled install.ps1 reaches for it -- so shim it back.
+          $wingetCmd = Get-Command winget -ErrorAction SilentlyContinue
+          if (-not $wingetCmd) {
+            Write-Host '::error::winget was not on PATH before the strip; this image ships it'
+            exit 1
+          }
+          $shim = Join-Path $env:RUNNER_TEMP 'winget-shim'
+          New-Item -ItemType Directory -Force -Path $shim | Out-Null
+          Set-Content -LiteralPath (Join-Path $shim 'winget.cmd') -Encoding ascii `
+            -Value "@`"$($wingetCmd.Source)`" %*"
+          $scrub = {
+            param($entries)
+            ,@($entries | Where-Object { $p = $_; $p -and -not ($drop | Where-Object { $p -like "*$_*" }) })
+          }
+          "PATH=$shim;$((& $scrub ($env:PATH -split ';')) -join ';')" |
+            Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          # Off disk, not just off PATH: py.exe lives in C:\Windows and uv does its own
+          # discovery, so both reach the toolcache whatever PATH says.
+          foreach ($tc in @("$env:AGENT_TOOLSDIRECTORY\Python", 'C:\hostedtoolcache\windows\Python')) {
+            if ($tc -and (Test-Path $tc)) {
+              try { Rename-Item -LiteralPath $tc -NewName 'Python.masked' -ErrorAction Stop
+                    Write-Host "masked toolcache python: $tc" }
+              catch { Write-Host "::error::could not mask $tc ($($_.Exception.Message))"; exit 1 }
+            }
+          }
+          # install.ps1's Refresh-SessionPath MERGES the Machine and User registry PATHs
+          # back into $env:Path, so a process-only scrub lasts until the first refresh.
+          # The runner is ephemeral, so rewrite the registry copies too. Expand first:
+          # SetEnvironmentVariable rewrites REG_EXPAND_SZ as REG_SZ (dotnet/runtime#1442).
+          foreach ($scope in 'Machine','User') {
+            $raw = [System.Environment]::GetEnvironmentVariable('Path', $scope)
+            if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+            $expanded = [System.Environment]::ExpandEnvironmentVariables($raw) -split ';'
+            try {
+              [System.Environment]::SetEnvironmentVariable('Path', ((& $scrub $expanded) -join ';'), $scope)
+            } catch {
+              Write-Host "::error::could not scrub the $scope PATH ($($_.Exception.Message))"
+              exit 1
+            }
+          }
+          foreach ($v in 'VSINSTALLDIR','VCINSTALLDIR','WindowsSdkDir','INCLUDE','LIB','LIBPATH') {
+            "$v=" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          }
+          exit 0
+
+      - name: Verify the strip took effect
+        shell: pwsh
+        run: |
+          $leaked = @()
+          foreach ($t in 'python','py','git','cmake','cl') {
+            $f = Get-Command $t -ErrorAction SilentlyContinue
+            Write-Host ("{0,-8} {1}" -f $t, $(if ($f) { $f.Source } else { 'ABSENT' }))
+            if ($f -and $t -ne 'py') { $leaked += "$t -> $($f.Source)" }
+          }
+          # `py` lives in C:\Windows and stays; only an interpreter it can still START is
+          # a leak, because Find-CompatiblePython probes `py` first. `py -0p` reads the
+          # registry, which still names the renamed paths, so only a start attempt tells
+          # the truth.
+          if (Get-Command py -ErrorAction SilentlyContinue) {
+            foreach ($v in '-3.11', '-3.12', '-3.13') {
+              $out = & py $v -c "import sys; print(sys.executable)" 2>&1
+              $rc = $LASTEXITCODE
+              Write-Host ("py {0} -> exit {1}" -f $v, $rc)
+              if ($rc -eq 0) { $leaked += "py $v -> $out" }
+            }
+            # A failing probe is what we want, but the runner appends
+            # `exit $LASTEXITCODE` to every pwsh step (actions/runner#351).
+            $global:LASTEXITCODE = 0
+          }
+          $winget = Get-Command winget -ErrorAction SilentlyContinue
+          Write-Host ("winget   {0}" -f $(if ($winget) { $winget.Source } else { 'ABSENT' }))
+          if (-not $winget) {
+            Write-Host '::error::winget did not survive the strip'
+            exit 1
+          }
+          if ($leaked) {
+            Write-Host "::error::developer tooling survived the strip: $($leaked -join '; ')"
+            exit 1
+          }
+          exit 0
+
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem dl/*setup.exe | Select-Object -First 1).FullName
+          # /S is the NSIS silent switch. A user double-clicks, but an installer that
+          # cannot run unattended cannot be MDM-deployed either.
+          $p = Start-Process -FilePath $exe -ArgumentList '/S' -Wait -PassThru
+          Write-Host "installer exit: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { Write-Host '::error::silent install failed'; exit 1 }
+          $found = Get-ChildItem -Path "$env:LOCALAPPDATA","$env:ProgramFiles" -Recurse `
+                     -Filter '*Unsloth*.exe' -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+          if (-not $found) { Write-Host '::error::no installed executable found'; exit 1 }
+          Write-Host "installed: $($found.FullName)"
+          "APP_EXE=$($found.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "APP_ROOT=$(Split-Path -Parent $found.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Audit EVERY installed PE's signature
+        # The SmartScreen question the offline analysis cannot answer: is the outer
+        # installer the only signed thing? Reports rather than gates on the inner files,
+        # because "some bundled third-party DLL is unsigned" is a finding to weigh, not a
+        # reason to abort the functional run that follows.
+        shell: pwsh
+        run: |
+          $rows = @()
+          $files = Get-ChildItem -Path $env:APP_ROOT -Recurse -Include '*.exe','*.dll' `
+                     -ErrorAction SilentlyContinue
+          Write-Host "auditing $($files.Count) PE files under $env:APP_ROOT"
+          foreach ($f in $files) {
+            $sig = Get-AuthenticodeSignature $f.FullName
+            $rows += [pscustomobject]@{
+              path        = $f.FullName.Replace($env:APP_ROOT, '')
+              status      = [string]$sig.Status
+              signer      = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { '' }
+              issuer      = if ($sig.SignerCertificate) { $sig.SignerCertificate.Issuer } else { '' }
+              timestamped = [bool]$sig.TimeStamperCertificate
+            }
+          }
+          $rows | Format-Table -AutoSize | Out-String -Width 260 | Write-Host
+          $rows | ConvertTo-Json -Depth 4 | Out-File artifacts/pe-signature-audit.json -Encoding utf8
+
+          $unsigned = @($rows | Where-Object { $_.status -eq 'NotSigned' })
+          $ours     = @($rows | Where-Object { $_.signer -like '*Unsloth*' })
+          Write-Host "signed by Unsloth AI Inc.: $($ours.Count) / $($rows.Count)"
+          Write-Host "unsigned                 : $($unsigned.Count)"
+          foreach ($u in $unsigned) { Write-Host "::warning::unsigned PE: $($u.path)" }
+
+          # The uninstaller is the one inner PE that MUST be signed: users launch it from
+          # Add/Remove Programs and an unsigned one is its own SmartScreen prompt.
+          $uninstall = @($rows | Where-Object { $_.path -match 'uninstall' })
+          if ($uninstall.Count -eq 0) {
+            Write-Host '::warning::no uninstaller found under the install root to audit'
+          } else {
+            foreach ($u in $uninstall) {
+              if ($u.status -eq 'Valid') { Write-Host "uninstaller signed: $($u.path)" }
+              else { Write-Host "::error::the uninstaller is $($u.status): $($u.path)" }
+            }
+          }
+          exit 0
+
+      - name: Run the bundled installer, the path first launch takes
+        # The bundled installer resolves the llama.cpp / whisper.cpp prebuilts from
+        # GitHub. Unauthenticated that is 60 requests/hour PER IP, and hosted runners
+        # share IPs, so on macOS it 403s and the install dies (see D7). A real user is
+        # not behind a shared CI egress IP, so passing a token here makes the job
+        # measure the app instead of GitHub's rate limiter. prebuilt_core.py:332 picks
+        # GH_TOKEN up automatically.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $ps1 = Get-ChildItem -Path $env:APP_ROOT -Recurse -Filter 'install.ps1' `
+                   -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $ps1) { Write-Host '::error::the bundle ships no install.ps1 resource'; exit 1 }
+          Write-Host "bundled installer: $($ps1.FullName)"
+          # --tauri rejects a custom studio home (install.ps1:189-215), so drop the
+          # override, as install.rs:354-357 does.
+          Remove-Item Env:UNSLOTH_STUDIO_HOME -ErrorAction SilentlyContinue
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+              -File $ps1.FullName --tauri *>&1 | Tee-Object -FilePath logs/bundled-install.log
+          $rc = $LASTEXITCODE
+          Write-Host "bundled installer exit: $rc"
+          if ($rc -ne 0) { Write-Host "::error::bundled installer exited $rc"; exit $rc }
+          $py = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          if (-not (Test-Path $py)) { Write-Host "::error::no venv at $py"; exit 1 }
+          & $py -V
+          & $py -c "import torch; print('torch', torch.__version__)"
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host '::error::the bundled install produced a venv with no working torch'
+            exit 1
+          }
+
+
+      - name: Time a COLD backend start, by hand, with no app involved
+        # This is the control every previous D10 arm was missing. All of them ran as
+        # `if: failure()` steps at the very END of the job -- 54 minutes after the app
+        # spawned its own backend seconds after install. So "the app's backend hangs but
+        # a hand-run one comes up in 8s" was comparing a cold first run against warm runs
+        # on a machine that had been paging the same tree in for an hour. That is a
+        # confound, not a finding.
+        #
+        # Here nothing else has run: install, then immediately start the backend by hand,
+        # exactly as the app would, and time it with the same 900s budget the harness
+        # gives the app. The FastAPI app import pulls a far larger tree than the
+        # `import torch` the install step already warmed, and on Windows every DLL in a
+        # just-written venv is on-access scanned the first time it is loaded.
+        #
+        #   comes up in ~15s  -> cold start is NOT the explanation; the app really does
+        #                        something different, and the env/job object is next.
+        #   takes minutes     -> D10 is first-run cost, the app's watchdog simply gives
+        #                        up too early, and the fix is patience plus progress.
+        #   never comes up    -> the backend cannot cold-start on this machine at all,
+        #                        which is a bigger and simpler bug than any spawn theory.
+        shell: pwsh
+        run: |
+          $uns = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
+          New-Item -ItemType Directory -Force -Path logs | Out-Null
+          Write-Host "=== cold backend start on 8888, budget 900s ==="
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $psi = New-Object Diagnostics.ProcessStartInfo
+          $psi.FileName        = $uns
+          $psi.Arguments       = 'studio --api-only -H 127.0.0.1 -p 8888'
+          $psi.UseShellExecute = $false
+          $psi.RedirectStandardOutput = $true
+          $psi.RedirectStandardError  = $true
+          # Match the app: no console, new process group (process.rs:641).
+          $p = [Diagnostics.Process]::Start($psi)
+          $out = $p.StandardOutput.ReadToEndAsync()
+          $err = $p.StandardError.ReadToEndAsync()
+          $up = $false
+          for ($i = 0; $i -lt 180; $i++) {
+            try {
+              Invoke-RestMethod -TimeoutSec 3 http://127.0.0.1:8888/api/health | Out-Null
+              $up = $true; break
+            } catch { Start-Sleep -Seconds 5 }
+            if ($p.HasExited) { Write-Host "::warning::backend EXITED with $($p.ExitCode)"; break }
+          }
+          $secs = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+          if ($up) {
+            Write-Host "::warning::COLD START came up after ${secs}s"
+            if ($secs -gt 60) {
+              Write-Host '::warning::That is far slower than the ~8s a warm start takes, so D10 is'
+              Write-Host '::warning::dominated by first-run cost rather than by how the app spawns it.'
+            } else {
+              Write-Host '::warning::A cold start is as fast as a warm one, so first-run cost does NOT'
+              Write-Host '::warning::explain D10 and the app really does spawn it differently.'
+            }
+          } else {
+            Write-Host "::warning::COLD START never served /api/health in ${secs}s -- the backend does"
+            Write-Host '::warning::not come up on a freshly installed machine at all, with no app involved.'
+          }
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+          Write-Host '=== backend stdout ==='
+          if ($out.IsCompleted) { $out.Result | Out-File logs/coldstart.log -Encoding utf8; Get-Content logs/coldstart.log -Tail 40 }
+          if ($err.IsCompleted) { $err.Result | Out-File logs/coldstart.err.log -Encoding utf8; Get-Content logs/coldstart.err.log -Tail 20 }
+          exit 0
+
+      - name: Collect the backend's own session logs
+        if: always()
+        shell: pwsh
+        run: |
+          $studio = Join-Path $env:USERPROFILE '.unsloth\studio'
+          New-Item -ItemType Directory -Force -Path logs/studio-logs | Out-Null
+          if (Test-Path (Join-Path $studio 'logs')) {
+            Copy-Item -Recurse -Force (Join-Path $studio 'logs') logs/studio-logs -ErrorAction SilentlyContinue
+          }
+          Get-ChildItem -Recurse logs | Select-Object -ExpandProperty FullName
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e-windows-coldstart
+          path: |
+            logs/
+          retention-days: 7
+          if-no-files-found: warn
