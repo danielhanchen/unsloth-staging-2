@@ -474,6 +474,52 @@ def _completion_text(body: Any) -> str:
         return ""
 
 
+# Words common enough that any coherent English answer to our prompts contains one.
+_COHERENCE_WORDS = (
+    " the ", " a ", " is ", " of ", " and ", " to ", " in ", " that ", " it ", " are ",
+)
+
+
+def looks_coherent(text: str) -> tuple[bool, str]:
+    """Is this real language, or did the model emit garbage?
+
+    A non-empty check is not enough. The macOS runs returned things like
+    '&#!56789:;<=>@ABCDEFGHIJKLMNOPQRSTUVWXYZ' and ', a a a a a a a a a' and the
+    scenario called them a pass, because they are non-empty strings. A test that goes
+    green on gibberish is barely a test.
+
+    Deliberately loose: this is a smoke check for degenerate decoding, not a quality
+    score. It only has to separate language from noise.
+    """
+    stripped = text.strip()
+    if len(stripped) < 12:
+        return False, f"too short to judge ({len(stripped)} chars)"
+
+    letters = sum(c.isalpha() for c in stripped)
+    if letters / len(stripped) < 0.55:
+        return False, f"only {letters}/{len(stripped)} characters are letters"
+
+    lowered = f" {stripped.lower()} "
+    if not any(word in lowered for word in _COHERENCE_WORDS):
+        return False, "contains no common English word"
+
+    # ', a a a a a a a' and 'a 100% of the time, a 100% of the time' are both degenerate
+    # loops. Unique-word ratio catches both without flagging normal repetition.
+    words = [w for w in re.split(r"\W+", lowered) if w]
+    if len(words) >= 12 and len(set(words)) / len(words) < 0.3:
+        return False, f"degenerate repetition ({len(set(words))} unique of {len(words)} words)"
+
+    # An ordered walk through the character set ('56789:;<=>@ABCDEF') is the signature of
+    # a broken quantisation or a corrupt kernel, and it survives the letter-ratio test.
+    ascending = sum(
+        1 for a, b in zip(stripped, stripped[1:]) if 0 < ord(b) - ord(a) <= 2
+    )
+    if ascending / max(1, len(stripped) - 1) > 0.6:
+        return False, "characters walk through the character set in order"
+
+    return True, "reads as language"
+
+
 # ─────────────────────────────────────────────────────────────────────────
 # Scenarios
 # ─────────────────────────────────────────────────────────────────────────
@@ -536,8 +582,13 @@ def scenario_inference(backend: Backend, report: Report) -> None:
         return
     text = _completion_text(body)
     report.note("completion", text[:400])
-    if text.strip():
+    coherent, why = looks_coherent(text)
+    if coherent:
         report.ok(f"MTP model generated {len(text)} chars: {text[:80]!r}")
+    elif text.strip():
+        # Non-empty but not language. macOS returned exactly this and the old
+        # "is it non-empty" check called it a pass.
+        report.fail(f"the model generated garbage ({why}): {text[:120]!r}")
     else:
         report.fail(f"completion was empty: {str(body)[:300]}")
 
@@ -619,10 +670,13 @@ def scenario_parallel_chats(backend: Backend, report: Report) -> None:
     if len(results) != 3:
         report.fail(f"only {len(results)}/3 parallel chats returned within 900s")
     for name, (code, text) in sorted(results.items()):
+        coherent, why = looks_coherent(text)
         if code != 200:
             report.fail(f"parallel chat {name} -> {code}")
         elif not text.strip():
             report.fail(f"parallel chat {name} returned empty text")
+        elif not coherent:
+            report.fail(f"parallel chat {name} returned garbage ({why}): {text[:80]!r}")
         else:
             report.ok(f"parallel chat {name} -> {text.strip()[:50]!r}")
 
@@ -930,7 +984,7 @@ def scenario_unsloth_run(backend: Backend, report: Report) -> None:
             },
             timeout=600,
         )
-        if code == 200 and _completion_text(body).strip():
+        if code == 200 and looks_coherent(_completion_text(body))[0]:
             report.ok(
                 f"served a completion through `unsloth run`: "
                 f"{_completion_text(body).strip()[:60]!r}"
@@ -996,8 +1050,12 @@ def scenario_mlx(backend: Backend, report: Report) -> None:
 
         if code != 200:
             report.fail(f"MLX generation -> {code} {str(body)[:300]}")
-        elif text.strip():
+        elif looks_coherent(text)[0]:
             report.ok(f"MLX safetensors generated: {text.strip()[:80]!r}")
+        elif text.strip():
+            report.fail(
+                f"MLX generated garbage ({looks_coherent(text)[1]}): {text[:120]!r}"
+            )
         elif reasoning.strip():
             report.warn(
                 f"MLX produced only reasoning tokens, no content "
