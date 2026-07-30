@@ -338,7 +338,7 @@ jobs:
               --report artifacts/ui-report.json 2>&1 | Tee-Object logs/ui.log
           exit $LASTEXITCODE
 
-      - name: D10 -- is it the stdout pipe? (three arms, one variable)
+      - name: D10 -- control arm, does the backend start at all by hand?
         # Round 5 established that the backend is NOT slow and NOT broken: `import torch`
         # takes 1.6s, and the app's exact command served /api/health in ~14s when run by
         # hand. Yet spawned by the app it is still dead at 900s. The app's own log says
@@ -412,25 +412,44 @@ jobs:
           }
 
           $a = Invoke-Arm -Label 'A' -Port 8907 -Mode 'file'
-          $b = Invoke-Arm -Label 'B' -Port 8909 -Mode 'undrained pipe'
-          $c = Invoke-Arm -Label 'C' -Port 8910 -Mode 'drained pipe'
 
           Write-Host ""
-          Write-Host "=== D10 verdict ==="
-          if ($a -and -not $b -and $c) {
-            Write-Host '::warning::CONFIRMED -- the same command comes up with stdout to a file (A)'
-            Write-Host '::warning::and to a DRAINED pipe (C), but hangs on an UNDRAINED pipe (B).'
-            Write-Host '::warning::D10 is a stdout pipe-drain deadlock in the app spawn path, not a'
-            Write-Host '::warning::slow import. Fix: never stop reading the child stdout/stderr.'
-          } elseif ($a -and $b -and $c) {
-            Write-Host '::warning::NOT REPRODUCED -- all three arms came up, so an undrained pipe alone'
-            Write-Host '::warning::does not explain D10; the app must differ in some other way (env,'
-            Write-Host '::warning::job object, working directory, or window station).'
+          if ($a) {
+            Write-Host '::warning::control arm OK: the app''s exact command serves /api/health when'
+            Write-Host '::warning::run by hand, so the machine, venv, torch and backend are all fine.'
           } else {
-            Write-Host "::warning::inconclusive: A=$a B=$b C=$c"
+            Write-Host '::warning::control arm FAILED: the backend does not start on this machine at'
+            Write-Host '::warning::all, which would change D10 entirely. Check arm A output below.'
           }
           Write-Host '=== arm A output ==='
           Get-Content logs/arm-A.log -Tail 25 -ErrorAction SilentlyContinue
+          exit 0
+
+      - name: D10 -- which part of the app's spawn hangs it?
+        # The stdout pipe is ruled out: file / undrained pipe / drained pipe all came up
+        # (14.7s / 8.8s / 8.8s), and the child writes only a few hundred bytes before
+        # binding, nowhere near enough to fill a pipe buffer anyway.
+        #
+        # The decisive evidence is that the backend's own *file* session log stops at
+        # "loading PyTorch, Unsloth and Transformers..." and never reaches "Imported
+        # FastAPI app", while the same command by hand imports in 7-11s. So the child
+        # hangs inside the import, and something about how it was launched causes it.
+        #
+        # What no arm has controlled for yet is the console. process.rs:641 spawns with
+        # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW, and CREATE_NO_WINDOW leaves the
+        # child with no console at all -- every arm so far inherited the runner's.
+        # Bisect the flags one bit at a time.
+        if: failure()
+        shell: pwsh
+        run: |
+          $py  = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          $uns = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
+          & $py tests/studio/win_spawn_probe.py `
+              --exe $uns `
+              --first-port 8920 `
+              --wait 180 `
+              --log-dir logs/spawn-probe `
+              --report artifacts/spawn-probe.json
           exit 0
 
       - name: What did the app's own log say?
