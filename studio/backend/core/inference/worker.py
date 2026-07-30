@@ -40,6 +40,44 @@ def _ensure_backend_on_path() -> None:
         sys.path.insert(0, _BACKEND_PATH)
 
 
+def _recorded_local_adapter_base(model_name) -> "str | None":
+    """A local adapter's recorded base, read from disk. None when there is no local
+    adapter_config.json to read; a REMOTE adapter is already remote by its own name."""
+    try:
+        import json as _json
+
+        cfg = Path(model_name) / "adapter_config.json"
+        if not cfg.is_file():
+            return None
+        return (
+            _json.loads(cfg.read_text(encoding = "utf-8-sig")).get("base_model_name_or_path") or None
+        )
+    except Exception:
+        return None
+
+
+def _hub_targets_are_local(*targets) -> bool:
+    """True when every non-empty target is a local path, so nothing here needs the Hub.
+
+    Fail closed: an unresolvable target, or an unavailable is_local_path, counts as remote,
+    since skipping a needed probe costs the retry backoff it exists to avoid.
+    """
+    try:
+        _ensure_backend_on_path()
+        from utils.paths import is_local_path
+    except Exception:
+        return False
+    for target in targets:
+        if not target:
+            continue
+        try:
+            if not (isinstance(target, str) and is_local_path(target)):
+                return False
+        except Exception:
+            return False
+    return True
+
+
 def _activate_transformers_version(model_name: str, hf_token: str | None = None) -> None:
     """Activate the correct transformers version BEFORE any ML imports."""
     _ensure_backend_on_path()
@@ -782,6 +820,43 @@ def run_inference_process(
     if config.get("disable_xet"):
         os.environ["HF_HUB_DISABLE_XET"] = "1"
         logger.info("Xet transport disabled (HF_HUB_DISABLE_XET=1)")
+
+    # Offline auto-detect, as the training and export workers already do. The parent's
+    # guard is scoped, so child_env deliberately scrubs it rather than turning a
+    # per-request flag into a lifetime one; without a probe of its own this worker would
+    # then walk back into the retry paths the parent already ruled out, in
+    # _remote_lora_base and in tier activation below. Runs before any HF import, so env
+    # alone is enough.
+    # Skip it entirely for a filesystem-only load: a local checkpoint, and a local
+    # adapter whose recorded base is local too, never reach the Hub, so probing would
+    # spend seconds before a load that has no Hub dependency.
+    _probe_model = config["model_name"]
+    _probe_base = _recorded_local_adapter_base(_probe_model)
+    if "HF_HUB_OFFLINE" not in os.environ and not _hub_targets_are_local(_probe_model, _probe_base):
+        try:
+            _ensure_backend_on_path()
+            from utils.utils import hf_dns_dead, hf_env_offline, hf_probe_disabled
+
+            _offline = hf_env_offline()
+            if not _offline:
+                _offline = hf_dns_dead()
+            if not _offline and not hf_probe_disabled():
+                from utils.transformers_version import hf_endpoint_unreachable
+
+                # Lifetime flags, so only a definite no-egress answer counts: a momentary
+                # 502 or a slow proxy must not strand the worker offline.
+                _offline = hf_endpoint_unreachable(
+                    gateway_errors_offline = False,
+                    proxy_timeouts_offline = False,
+                )
+            if _offline:
+                os.environ["HF_HUB_OFFLINE"] = "1"
+                os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+                logger.warning(
+                    "Hugging Face endpoint unreachable; HF_HUB_OFFLINE=1 for this worker."
+                )
+        except Exception:
+            pass  # fail open: the load decides as it does today
 
     import warnings
     from loggers.config import LogConfig

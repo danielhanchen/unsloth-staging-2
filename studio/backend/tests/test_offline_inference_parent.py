@@ -207,7 +207,7 @@ class TestTrainingWorkerProbeNoGlobalTimeout:
 
         src = Path(_BACKEND_DIR, "core", "training", "worker.py").read_text(encoding = "utf-8")
         m = re.search(
-            r'if\s+"HF_HUB_OFFLINE"\s+not\s+in\s+os\.environ\s*:.*?'
+            r'if\s+"HF_HUB_OFFLINE"\s+not\s+in\s+os\.environ.*?'
             r"print\([^)]*HF_HUB_OFFLINE=1[^)]*\)",
             src,
             flags = re.DOTALL,
@@ -218,6 +218,275 @@ class TestTrainingWorkerProbeNoGlobalTimeout:
             "training worker still calls socket.setdefaulttimeout; "
             "concurrent sockets would inherit the probe timeout"
         )
+        # The probe now lives in the shared helper (endpoint- and proxy-aware), so the
+        # worker must delegate to it rather than resolve a hardcoded host itself.
         assert (
-            "threading" in block and "Thread" in block
-        ), "training worker probe must run on a daemon thread"
+            "hf_env_offline" in block
+        ), "training worker must honor TRANSFORMERS_OFFLINE before probing"
+        assert "hf_dns_dead" in block, "training worker must use the shared DNS helper"
+        assert block.index("hf_env_offline()") < block.index(
+            "hf_dns_dead()"
+        ), "training worker must check explicit offline env before DNS/network probes"
+        assert 'gethostbyname("huggingface.co")' not in block, (
+            "training worker must not hardcode huggingface.co; a reachable HF_ENDPOINT "
+            "mirror would be declared offline"
+        )
+        assert (
+            "proxy_timeouts_offline = False" in block
+        ), "training worker must fail open on an ambiguous proxy timeout"
+
+    def test_shared_dns_helper_uses_thread_probe(self):
+        """The daemon-thread property moved with the probe; pin it where it now lives."""
+        import inspect
+
+        from utils.utils import dns_host_dead
+
+        src = inspect.getsource(dns_host_dead)
+        assert ".setdefaulttimeout(" not in src, (
+            "shared DNS probe calls socket.setdefaulttimeout; "
+            "concurrent sockets would inherit the probe timeout"
+        )
+        assert "Thread" in src and "daemon" in src, "shared DNS probe must run on a daemon thread"
+
+
+class TestInferenceWorkerProbesForItself:
+    """child_env deliberately scrubs the parent's scoped offline flag, so the inference
+    worker needs its own probe like the training and export workers, or it walks back
+    into the retry paths the parent already ruled out."""
+
+    def _block(self):
+        import pathlib
+
+        backend_root = pathlib.Path(__file__).resolve().parent.parent
+        src = (backend_root / "core" / "inference" / "worker.py").read_text(
+            encoding = "utf-8",
+        )
+        start = src.index("# Offline auto-detect")
+        # To the end of the block, not a fixed slice: a gate added ahead of it would
+        # otherwise push the tail out of the window and pass vacuously.
+        return src[start : src.index("\n    import warnings", start)]
+
+    def test_the_probe_exists_and_runs_before_activation(self):
+        import pathlib
+
+        backend_root = pathlib.Path(__file__).resolve().parent.parent
+        src = (backend_root / "core" / "inference" / "worker.py").read_text(
+            encoding = "utf-8",
+        )
+        probe = src.index("# Offline auto-detect")
+        # Both HF-reading steps the parent's verdict was meant to cover.
+        assert probe < src.index("_remote_lora_base(model_name")
+        assert probe < src.index("_activate_transformers_version(_base")
+
+    def test_a_user_set_flag_is_never_overridden(self):
+        block = self._block()
+        assert 'if "HF_HUB_OFFLINE" not in os.environ' in block
+
+    def test_lifetime_flags_use_the_fail_open_verdict(self):
+        """Same reasoning as the training worker: these last the whole process, so an
+        ambiguous answer must not strand it offline."""
+        block = self._block()
+        assert "gateway_errors_offline = False" in block
+        assert "proxy_timeouts_offline = False" in block
+
+    def test_probe_opt_out_is_honoured(self):
+        block = self._block()
+        assert "hf_probe_disabled()" in block
+
+    def test_it_fails_open(self):
+        block = self._block()
+        assert "except Exception:" in block
+
+    def test_it_does_not_force_datasets_offline(self):
+        """An inference worker loads no dataset; the training worker's flag is its own."""
+        block = self._block()
+        assert "HF_DATASETS_OFFLINE" not in block
+
+
+class TestWorkerProbesOnlyWhenTheHubIsNeeded:
+    """A filesystem-only job never reaches the Hub, so the probe is pure latency: this
+    was DNS-only on main for training, and absent entirely for inference."""
+
+    def _load(self, relpath, name):
+        import importlib.util
+        import pathlib
+
+        backend_root = pathlib.Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(name, backend_root / relpath)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_training_gate_classifies_each_shape(self, tmp_path):
+        w = self._load("core/training/worker.py", "training_worker_gate_probe")
+        local = str(tmp_path)
+
+        assert w._training_job_is_local({"model_name": local}) is True
+        assert w._training_job_is_local({"model_name": local, "hf_dataset": ""}) is True
+        # A remote dataset needs the Hub even with a local model.
+        assert w._training_job_is_local({"model_name": local, "hf_dataset": "org/ds"}) is False
+        assert w._training_job_is_local({"model_name": "org/model"}) is False
+        # Fail closed on anything unresolvable.
+        assert w._training_job_is_local({}) is False
+        assert w._training_job_is_local({"model_name": None}) is False
+
+    def test_inference_gate_classifies_each_shape(self, tmp_path):
+        w = self._load("core/inference/worker.py", "inference_worker_gate_probe")
+        local = str(tmp_path)
+
+        assert w._hub_targets_are_local(local) is True
+        assert w._hub_targets_are_local(local, None) is True
+        assert w._hub_targets_are_local(local, "org/base") is False
+        assert w._hub_targets_are_local("org/model") is False
+        assert w._hub_targets_are_local(None) is True
+        assert w._hub_targets_are_local(123) is False
+
+    def test_inference_gate_reads_a_local_adapter_base_from_disk(self, tmp_path):
+        """A local adapter pointing at a REMOTE base still needs the probe, and the base
+        is readable without touching the network."""
+        import json
+
+        w = self._load("core/inference/worker.py", "inference_worker_gate_adapter")
+        (tmp_path / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": "org/base"}),
+            encoding = "utf-8",
+        )
+        base = w._recorded_local_adapter_base(str(tmp_path))
+        assert base == "org/base"
+        assert w._hub_targets_are_local(str(tmp_path), base) is False
+
+    def test_inference_gate_handles_a_missing_adapter_config(self, tmp_path):
+        w = self._load("core/inference/worker.py", "inference_worker_gate_noadapter")
+        assert w._recorded_local_adapter_base(str(tmp_path)) is None
+        assert w._recorded_local_adapter_base("org/model") is None
+
+    def test_both_probes_sit_behind_the_gate(self):
+        import pathlib
+
+        backend_root = pathlib.Path(__file__).resolve().parent.parent
+        inf = (backend_root / "core" / "inference" / "worker.py").read_text(
+            encoding = "utf-8",
+        )
+        trn = (backend_root / "core" / "training" / "worker.py").read_text(
+            encoding = "utf-8",
+        )
+        assert "not _hub_targets_are_local(" in inf
+        assert "not _training_job_is_local(config)" in trn
+        # The user's own flag still wins in both.
+        assert inf.count('if "HF_HUB_OFFLINE" not in os.environ and not') == 1
+        assert trn.count('if "HF_HUB_OFFLINE" not in os.environ and not') == 1
+
+
+class TestLocalLoraTrainingJobStillProbes:
+    """A local adapter can name a remote base, which activation resolves and later
+    training and security code fetches, so the job is not filesystem-only."""
+
+    def _worker(self):
+        import importlib.util
+        import pathlib
+
+        backend_root = pathlib.Path(__file__).resolve().parent.parent
+        spec = importlib.util.spec_from_file_location(
+            "training_worker_lora_gate", backend_root / "core" / "training" / "worker.py",
+        )
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_local_adapter_with_a_remote_base_is_not_local(self, tmp_path):
+        import json
+
+        w = self._worker()
+        (tmp_path / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": "org/base"}), encoding = "utf-8",
+        )
+        assert w._training_job_is_local({"model_name": str(tmp_path)}) is False
+
+    def test_local_adapter_with_a_local_base_is_local(self, tmp_path):
+        import json
+
+        w = self._worker()
+        base = tmp_path / "base"
+        base.mkdir()
+        (tmp_path / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": str(base)}), encoding = "utf-8",
+        )
+        assert w._training_job_is_local({"model_name": str(tmp_path)}) is True
+
+    def test_a_plain_local_checkpoint_is_still_local(self, tmp_path):
+        w = self._worker()
+        assert w._training_job_is_local({"model_name": str(tmp_path)}) is True
+
+    def test_a_null_recorded_base_does_not_force_a_probe(self, tmp_path):
+        import json
+
+        w = self._worker()
+        (tmp_path / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": None}), encoding = "utf-8",
+        )
+        assert w._training_job_is_local({"model_name": str(tmp_path)}) is True
+
+    def test_both_workers_agree(self, tmp_path):
+        """The two gates must classify the same adapter the same way."""
+        import importlib.util
+        import json
+        import pathlib
+
+        backend_root = pathlib.Path(__file__).resolve().parent.parent
+        (tmp_path / "adapter_config.json").write_text(
+            json.dumps({"base_model_name_or_path": "org/base"}), encoding = "utf-8",
+        )
+        spec = importlib.util.spec_from_file_location(
+            "inference_worker_lora_gate", backend_root / "core" / "inference" / "worker.py",
+        )
+        inf = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(inf)
+
+        base = inf._recorded_local_adapter_base(str(tmp_path))
+        assert inf._hub_targets_are_local(str(tmp_path), base) is False
+        assert self._worker()._training_job_is_local({"model_name": str(tmp_path)}) is False
+
+
+class TestLoadRouteResolvesConfigOffTheLoop:
+    """_load_model_impl is awaited directly by the route, so a guard that can spend
+    seconds on DNS plus a HEAD and its TCP fallback must not run inline."""
+
+    def test_the_guard_and_config_resolution_run_in_a_thread(self):
+        import ast
+        import pathlib
+
+        backend_root = pathlib.Path(__file__).resolve().parent.parent
+        src = (backend_root / "routes" / "inference.py").read_text(encoding = "utf-8")
+        tree = ast.parse(src)
+
+        impl = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, ast.AsyncFunctionDef) and n.name == "_load_model_impl"
+        )
+        threaded = set()
+        for node in ast.walk(impl):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "to_thread" and node.args):
+                name = getattr(node.args[0], "id", None)
+                if name:
+                    threaded.add(name)
+        assert "_resolve_config" in threaded, (
+            "the load guard must be awaited off the event loop, as /validate does"
+        )
+
+        # And nothing in that function may enter the guard inline any more.
+        bad = [
+            n.lineno for n in ast.walk(impl)
+            if isinstance(n, ast.With) and any(
+                isinstance(i.context_expr, ast.Call)
+                and (getattr(i.context_expr.func, "id", "") or "").startswith(
+                    "_hf_offline_if_unreachable"
+                )
+                for i in n.items
+            )
+            and not any(
+                isinstance(p, ast.FunctionDef) and n in ast.walk(p)
+                for p in ast.walk(impl)
+            )
+        ]
+        assert bad == [], f"guard still entered inline on the event loop at {bad}"
