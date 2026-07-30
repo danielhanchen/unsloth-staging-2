@@ -7,6 +7,8 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 # Keep this test runnable without optional logging deps.
 if "structlog" not in sys.modules:
 
@@ -156,6 +158,45 @@ def test_list_cached_gguf_reports_snapshot_load_id_for_inactive_cache(monkeypatc
     assert "load_id" not in rows["Org/Here"]
 
 
+def test_list_cached_gguf_pins_a_snapshot_for_a_recovered_active_cache_repo(monkeypatch, tmp_path):
+    """Being in the active cache normally makes the repo id the load target, but not while refs/main
+    names a commit with no directory: an offline client would follow the dangling ref and fail."""
+    active = tmp_path / "active"
+    repo_dir = active / "models--Org--Recovered"
+    snapshot = repo_dir / "snapshots" / ("a" * 40)
+    snapshot.mkdir(parents = True)
+    (snapshot / "Model-Q4_K_M.gguf").write_bytes(b"\0" * 256)
+    (repo_dir / "refs").mkdir(parents = True)
+    (repo_dir / "refs" / "main").write_text("c" * 40, encoding = "utf-8")
+
+    recovered = _repo(
+        "Org/Recovered",
+        [],
+        repo_dir,
+        revisions = [
+            SimpleNamespace(files = [_file("Model-Q4_K_M.gguf", 256)], snapshot_path = snapshot),
+        ],
+    )
+    monkeypatch.setattr(
+        models_route, "_all_hf_cache_scans", lambda: [SimpleNamespace(repos = [recovered])]
+    )
+    monkeypatch.setattr(models_route, "_resolve_hf_cache_dir", lambda: active)
+
+    rows = {
+        c["repo_id"]: c
+        for c in asyncio.run(models_route.list_cached_gguf(current_subject = "test-user"))["cached"]
+    }
+    assert rows["Org/Recovered"]["load_id"] == str(snapshot)
+
+    # Control: the same repo with a resolving ref keeps the repo id.
+    (repo_dir / "refs" / "main").write_text("a" * 40, encoding = "utf-8")
+    rows = {
+        c["repo_id"]: c
+        for c in asyncio.run(models_route.list_cached_gguf(current_subject = "test-user"))["cached"]
+    }
+    assert "load_id" not in rows["Org/Recovered"]
+
+
 def test_list_cached_gguf_load_id_follows_snapshot_dir_mtime(monkeypatch, tmp_path):
     """Pick the snapshot variant discovery reads: newest directory, not newest blob."""
     import os
@@ -194,6 +235,53 @@ def test_list_cached_gguf_load_id_follows_snapshot_dir_mtime(monkeypatch, tmp_pa
     rows = asyncio.run(models_route.list_cached_gguf(current_subject = "test-user"))["cached"]
 
     assert rows[0]["load_id"] == str(newer)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_list_cached_gguf_load_id_breaks_mtime_ties_like_variant_discovery(
+    reverse, monkeypatch, tmp_path
+):
+    """Equal snapshot mtimes must not leave the load id to iteration order.
+
+    ``repo_info.revisions`` is a ``frozenset``, so on a coarse-timestamp filesystem this route
+    published whichever snapshot the hash seed reached first while ``/api/models/gguf-variants``
+    named the one ``snapshot_selection_key`` picks. Both revision orders are driven for that reason.
+    """
+    import os
+
+    from hub.utils.gguf import iter_hf_cache_snapshots
+    from hub.utils.hf_cache_state import snapshot_selection_key
+
+    active = tmp_path / "active"
+    legacy = tmp_path / "legacy"
+    repo_dir = legacy / "models--Org--Tied"
+    low, high = repo_dir / "snapshots" / "rev-a", repo_dir / "snapshots" / "rev-b"
+    for path in (low, high):
+        path.mkdir(parents = True)
+    (low / "Model-Q4_K_M.gguf").write_bytes(b"\0")
+    (high / "Model-Q5_K_M.gguf").write_bytes(b"\0")
+    # One timestamp for both: the tie is the case.
+    for path in (low, high):
+        os.utime(path, (1_700_000_000, 1_700_000_000))
+
+    revisions = [
+        SimpleNamespace(files = [_file("Model-Q4_K_M.gguf", 5_000)], snapshot_path = low),
+        SimpleNamespace(files = [_file("Model-Q5_K_M.gguf", 6_000)], snapshot_path = high),
+    ]
+    repo = _repo("Org/Tied", [], repo_dir, revisions = revisions[::-1] if reverse else revisions)
+
+    monkeypatch.setattr(
+        models_route, "_all_hf_cache_scans", lambda: [SimpleNamespace(repos = [repo])]
+    )
+    monkeypatch.setattr(models_route, "_resolve_hf_cache_dir", lambda: active)
+    monkeypatch.setattr("hub.utils.hf_cache_state.hf_cache_roots", lambda: [legacy], raising = False)
+
+    rows = asyncio.run(models_route.list_cached_gguf(current_subject = "test-user"))["cached"]
+
+    # The shared key's answer, and the directory variant discovery walks first.
+    expected = max((low, high), key = snapshot_selection_key)
+    assert rows[0].get("load_id") == str(expected)
+    assert next(iter(iter_hf_cache_snapshots("Org/Tied"))) == expected
 
 
 def test_list_cached_gguf_load_id_skips_partial_split_snapshot(monkeypatch, tmp_path):
@@ -262,8 +350,9 @@ def test_list_cached_gguf_omits_load_id_when_no_snapshot_is_complete(monkeypatch
     assert "load_id" not in rows[0]
 
 
-def test_list_cached_gguf_skips_snapshot_with_one_incomplete_variant(monkeypatch, tmp_path):
-    """A good quant beside a half-downloaded one is still not a safe load target."""
+def test_list_cached_gguf_load_id_takes_the_snapshot_holding_a_whole_quant(monkeypatch, tmp_path):
+    """One whole quant beside a half-downloaded one is still a safe load target:
+    the lister behind /gguf-variants trims its offer to the completed subset."""
     import os
 
     active = tmp_path / "active"
@@ -271,9 +360,8 @@ def test_list_cached_gguf_skips_snapshot_with_one_incomplete_variant(monkeypatch
     older, newer = repo_dir / "snapshots" / "rev-a", repo_dir / "snapshots" / "rev-b"
     for path in (older, newer):
         path.mkdir(parents = True)
-    (older / "Model-Q8_0.gguf").write_bytes(b"\0")
-    # rev-b has a complete Q8_0 AND a half-downloaded split Q4_K_M. The picker
-    # enumerates the whole directory, so it would offer the broken one.
+    (older / "Model-Q4_K_M.gguf").write_bytes(b"\0")
+    # rev-b has a complete Q8_0 AND a half-downloaded split Q4_K_M.
     (newer / "Model-Q8_0.gguf").write_bytes(b"\0")
     (newer / "Model-Q4_K_M-00001-of-00003.gguf").write_bytes(b"\0")
     os.utime(older, (1_000, 1_000))
@@ -284,7 +372,7 @@ def test_list_cached_gguf_skips_snapshot_with_one_incomplete_variant(monkeypatch
         [],
         repo_dir,
         revisions = [
-            SimpleNamespace(files = [_file("Model-Q8_0.gguf", 5_000)], snapshot_path = older),
+            SimpleNamespace(files = [_file("Model-Q4_K_M.gguf", 5_000)], snapshot_path = older),
             SimpleNamespace(
                 files = [
                     _file("Model-Q8_0.gguf", 5_000),
@@ -302,7 +390,55 @@ def test_list_cached_gguf_skips_snapshot_with_one_incomplete_variant(monkeypatch
 
     rows = asyncio.run(models_route.list_cached_gguf(current_subject = "test-user"))["cached"]
 
-    assert rows[0]["load_id"] == str(older)
+    assert rows[0].get("load_id") == str(newer)
+    # Every quant that offer advertises is on disk in the snapshot it pinned.
+    from hub.utils.gguf import list_local_gguf_variants
+    from hub.utils.inventory_scan import complete_snapshot_variants
+
+    pinned = rows[0]["load_id"]
+    offered = {v.quant for v in list_local_gguf_variants(pinned)[0] if v.quant}
+    advertised = offered & complete_snapshot_variants(pinned)
+    assert advertised == {"Q8_0"}
+    assert advertised - {v.quant for v in list_local_gguf_variants(str(older))[0] if v.quant}
+
+
+@pytest.mark.parametrize(
+    ("files", "expected_default", "expected_ready"),
+    [
+        pytest.param(
+            {"Model-Q8_0.gguf": b"\0" * 256, "Model-Q4_K_M-00001-of-00002.gguf": b"\0" * 256},
+            "Q8_0",
+            {"Q8_0"},
+            id = "the-preferred-quant-is-short-a-shard",
+        ),
+        pytest.param(
+            {"Model-Q8_0.gguf": b"\0" * 256, "Model-Q4_K_M.gguf": b"\0" * 128},
+            "Q4_K_M",
+            {"Q4_K_M", "Q8_0"},
+            id = "both-whole-so-the-usual-preference-stands",
+        ),
+        pytest.param(
+            {"Model-Q4_K_M-00001-of-00002.gguf": b"\0" * 256},
+            "Q4_K_M",
+            set(),
+            id = "nothing-ready-so-the-default-is-a-download-target",
+        ),
+    ],
+)
+def test_the_local_default_variant_is_one_that_can_load(
+    tmp_path, files, expected_default, expected_ready
+):
+    """The picker re-checks only that default_variant fits in memory, never that it is downloaded,
+    so a quant short a shard gets recommended over a whole one sitting beside it."""
+    snapshot = tmp_path / "models--Org--Model" / "snapshots" / ("a" * 40)
+    snapshot.mkdir(parents = True)
+    for name, blob in files.items():
+        (snapshot / name).write_bytes(blob)
+
+    response = asyncio.run(GV.get_gguf_variants_response(str(snapshot), hf_token = None))
+
+    assert response.default_variant == expected_default
+    assert {v.quant for v in response.variants if v.downloaded} == expected_ready
 
 
 def test_list_cached_gguf_includes_non_suffix_repo_when_cache_contains_gguf(monkeypatch, tmp_path):
