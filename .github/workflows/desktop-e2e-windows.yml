@@ -319,7 +319,7 @@ jobs:
           $env:UNSLOTH_DRIVE_APP_BINARY = $env:APP_EXE
           & $py tests/studio/desktop_drive.py `
               --scenarios $env:SCENARIOS `
-              --discover-timeout 420 `
+              --discover-timeout 900 `
               --out artifacts/drive-report.json 2>&1 | Tee-Object logs/drive.log
           exit $LASTEXITCODE
 
@@ -337,6 +337,42 @@ jobs:
               --out artifacts/ui `
               --report artifacts/ui-report.json 2>&1 | Tee-Object logs/ui.log
           exit $LASTEXITCODE
+
+      - name: If the backend never came up, run its exact command by hand
+        # D10: the app's backend printed "loading PyTorch, Unsloth and Transformers..."
+        # and then produced nothing for 420s. That is either a very slow cold import on
+        # a 4-vCPU runner or a genuine hang, and the app's own logs cannot tell them
+        # apart. Running the identical command directly, with a clock on it, can.
+        if: failure()
+        shell: pwsh
+        run: |
+          $py  = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          $uns = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
+          Write-Host '=== how long does importing torch alone take here? ==='
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          & $py -c "import time; t=time.time(); import torch; print('torch', torch.__version__, 'imported in', round(time.time()-t,1), 's')"
+          Write-Host "wall clock: $($sw.Elapsed.TotalSeconds) s"
+          Write-Host '=== the exact command the app spawns, on a free port ==='
+          $p = Start-Process -FilePath $uns `
+                 -ArgumentList 'studio','--api-only','-H','127.0.0.1','-p','8907' `
+                 -PassThru -RedirectStandardOutput logs/manual-backend.log `
+                 -RedirectStandardError logs/manual-backend.err.log
+          $up = $false
+          for ($i = 0; $i -lt 120; $i++) {
+            try { Invoke-RestMethod -TimeoutSec 3 http://127.0.0.1:8907/api/health | Out-Null
+                  $up = $true; break } catch { Start-Sleep -Seconds 5 }
+          }
+          if ($up) {
+            Write-Host "::warning::the same command DID come up when run directly, after ~$($i*5)s"
+          } else {
+            Write-Host '::warning::the same command also never served /api/health in 600s -- the'
+            Write-Host '::warning::backend genuinely does not start on this machine (D10)'
+          }
+          Write-Host '=== manual backend output ==='
+          Get-Content logs/manual-backend.log -Tail 40 -ErrorAction SilentlyContinue
+          Get-Content logs/manual-backend.err.log -Tail 40 -ErrorAction SilentlyContinue
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          exit 0
 
       - name: What did the app's own log say?
         if: always()

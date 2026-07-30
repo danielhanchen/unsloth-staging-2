@@ -216,7 +216,13 @@ async def amain(args) -> int:
 
     if layer in ("native", "both"):
         report.begin("ui_native")
-        await drive_native(report, out_dir)
+        if not authenticated:
+            # The window sits on the startup screen until its backend is reachable, and
+            # never opens the WebView2 debug port, so a CDP refusal here is the backend
+            # defect again rather than a UI one. Reporting it separately double-counts.
+            report.skip("no reachable backend, so the window never left the startup screen")
+        else:
+            await drive_native(report, out_dir)
         report.end()
 
     if layer in ("attached", "both"):
