@@ -842,7 +842,10 @@ def test_chat_autoload_prepares_hf_token_before_gguf_metadata_preflight():
     metadata = autoload.index("fetchGgufStagedMetadata({", prepare)
     assert prepare < metadata
     assert "hf_token: preparedToken.token" in autoload
-    assert 'throw new Error("Model load cancelled.")' in autoload
+    # The throw carries the cancellation marker, so the sweep stops instead of reopening the dialog.
+    assert 'new Error("Model load cancelled.")' in autoload
+    assert "unslothUserCancelled: true" in autoload
+    assert "recordTerminalFailure(failureLabel, cancelled)" in autoload
 
 
 def test_cpu_only_llama_build_hides_gpu_picker():
@@ -1198,3 +1201,57 @@ def test_vulkan_inference_devices_are_the_pickable_set():
         'data?.device_backend === "cuda" || data?.device_backend === "rocm";' in src
     )
     assert 'diffusionPinnable: diffusionBackend && d.index_kind === "physical",' in src
+
+
+def test_chat_autoload_records_a_terminal_validation_failure():
+    """canAutoLoad runs validateModel, which prepares the token, so a dismissed dialog or a dead
+    backend throws there rather than from loadModel and the sweep's bare catches would reach the Hub
+    download. Only the two terminal markers are recorded; an ordinary failure stays per-candidate."""
+    adapter = _read("features/chat/api/chat-adapter.ts")
+    recorder = adapter.split("function recordTerminalFailure", 1)[1]
+    recorder = recorder.split("async function canAutoLoadRecordingTerminalFailures", 1)[0]
+    assert "unslothTransportFailure === true" in recorder
+    assert "unslothUserCancelled === true" in recorder
+    assert recorder.count("noteLoadFailure(label, error)") == 2
+    # A declined dialog halts the sweep, since retrying reopens it per candidate; a transport
+    # failure deliberately does not.
+    assert "autoLoadCancelled = true;" in recorder
+    assert recorder.index("autoLoadCancelled = true;") < recorder.index(
+        "unslothTransportFailure === true"
+    ), "the halt belongs to the cancellation branch, not the transport one"
+    # Rethrown by the wrapper, so the candidate still fails and control flow is unchanged.
+    wrapper = adapter.split("async function canAutoLoadRecordingTerminalFailures", 1)[1]
+    wrapper = wrapper.split("async function loadAutoLoadCandidate", 1)[0]
+    assert "recordTerminalFailure(label, error)" in wrapper
+    assert "throw error;" in wrapper
+    autoload = adapter.split("async function loadAutoLoadCandidate", 1)[1]
+    autoload = autoload.split("async function autoLoadSmallestModel", 1)[0]
+    # The preflight goes through the wrapper, the GGUF metadata probe records too, and a cancelled
+    # sweep skips every later candidate.
+    assert "canAutoLoadRecordingTerminalFailures(failureLabel, {" in autoload
+    assert "recordTerminalFailure(failureLabel, error)" in autoload
+    # The preflight's own cancellation goes through the helper too, or it records without halting.
+    assert "recordTerminalFailure(failureLabel, cancelled)" in autoload
+    assert "noteLoadFailure(failureLabel, cancelled)" not in autoload
+    assert "if (autoLoadCancelled || loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS)" in autoload
+
+
+def test_auth_retries_tag_transport_failures_like_the_first_attempt():
+    """recordTerminalFailure keys on the tag, so an untagged TypeError from a retry reads as "the
+    backend rejected this model" and the sweep walks on to the Hub download. A 401 refresh and the
+    Tauri auto-auth paths all reissue through retryWithCurrentToken, so the conversion has to sit
+    there as well as on the first attempt."""
+    src = (WORKDIR / "studio" / "frontend" / "src" / "features" / "auth" / "api.ts").read_text(
+        encoding = "utf-8"
+    )
+    assert src.count("unslothTransportFailure: true") == 2, "one tag per message, in one helper"
+    tagger = src.split("function asTransportFailure", 1)[1].split("\n}\n", 1)[0]
+    assert "err instanceof TypeError" in tagger
+    assert "navigator.onLine === false" in tagger
+    retry = src.split("async function retryWithCurrentToken", 1)[1]
+    retry = retry.split("\n}\n", 1)[0]
+    assert "fetchWithTauriNetworkRetry" in retry
+    assert "throw asTransportFailure(err);" in retry
+    # The first attempt shares the helper rather than repeating the branch.
+    first = src.split("export async function authFetch", 1)[1]
+    assert "throw asTransportFailure(err);" in first

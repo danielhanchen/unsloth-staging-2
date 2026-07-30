@@ -503,6 +503,18 @@ def _mark_empty_dir_cleanables(
     return response.model_copy(update = {"variants": variants})
 
 
+def _complete_quants_under(snapshot: str):
+    """Quants whose shards are all present under *snapshot*, or None if unknown.
+
+    None on any error, so every row reports downloaded as before: a scan problem must not mark a
+    working folder unusable.
+    """
+    try:
+        return hf_cache_scan.complete_snapshot_variants(snapshot)
+    except Exception:
+        return None
+
+
 async def get_gguf_variants_response(
     repo_id: str,
     prefer_local_cache: bool = False,
@@ -526,11 +538,23 @@ async def get_gguf_variants_response(
         hub_cache = repo_cache_dir.parent if repo_cache_dir is not None else None
 
         def _local_response(
-            response_repo_id: str, variants, has_vision: bool
+            response_repo_id: str,
+            variants,
+            has_vision: bool,
+            complete = None,
         ) -> GgufVariantsResponse:
+            """*complete* is the set of quants whose shards are all on disk; None reports every row
+            downloaded. A quant short a shard stays listed to resume or delete, but is not offered
+            as ready, since the loader would ask llama-server for files that are not there.
+            """
             filenames = [v.filename for v in variants]
             best = pick_best_gguf(filenames)
             default_variant = extract_quant_label(best) if best else None
+
+            def _downloaded(v) -> bool:
+                # An unlabelled quant cannot be judged, so it is kept as ready.
+                return complete is None or not v.quant or v.quant in complete
+
             return GgufVariantsResponse(
                 repo_id = response_repo_id,
                 variants = [
@@ -540,7 +564,8 @@ async def get_gguf_variants_response(
                         display_label = v.display_label,
                         size_bytes = v.size_bytes,
                         download_size_bytes = v.size_bytes,
-                        downloaded = True,
+                        downloaded = _downloaded(v),
+                        partial = not _downloaded(v),
                     )
                     for v in variants
                 ],
@@ -580,8 +605,8 @@ async def get_gguf_variants_response(
         # Local directory path (e.g. LM Studio models) — scan filesystem
         if is_local_path(repo_id):
             variants, has_vision = list_local_gguf_variants(repo_id)
-
-            return _local_response(repo_id, variants, has_vision)
+            # The load id is this path, so a quant offered here has to resolve here.
+            return _local_response(repo_id, variants, has_vision, _complete_quants_under(repo_id))
 
         # Reject invalid remote repo_ids up front (like download/delete) so a
         # malformed id returns 400 instead of a 500 from the HF client.
@@ -592,12 +617,16 @@ async def get_gguf_variants_response(
         if local_only:
             cached = list_gguf_variants_from_hf_cache(repo_id, root = hub_cache)
             if cached is not None:
-                variants, has_vision = cached
-                return _local_response(repo_id, variants, has_vision)
+                variants, has_vision, complete = cached
+                # The lister leaves torn quants in: they stay listed for management, but not ready.
+                return _local_response(repo_id, variants, has_vision, complete)
             if local_path and is_local_path(local_path):
                 variants, has_vision = list_local_gguf_variants(local_path)
                 if variants or has_vision:
-                    return _local_response(repo_id, variants, has_vision)
+                    # Same reason as the is_local_path branch above.
+                    return _local_response(
+                        repo_id, variants, has_vision, _complete_quants_under(local_path)
+                    )
             partial = list_partial_gguf_variants_from_state(repo_id, hub_cache = hub_cache)
             if partial is not None:
                 variants, has_vision = partial
@@ -620,8 +649,9 @@ async def get_gguf_variants_response(
         except Exception:
             cached = list_gguf_variants_from_hf_cache(repo_id, root = hub_cache)
             if cached is not None:
-                variants, has_vision = cached
-                return _local_response(repo_id, variants, has_vision)
+                variants, has_vision, complete = cached
+                # Same reason as the local_only branch above.
+                return _local_response(repo_id, variants, has_vision, complete)
             partial = list_partial_gguf_variants_from_state(repo_id, hub_cache = hub_cache)
             if partial is not None:
                 variants, has_vision = partial
