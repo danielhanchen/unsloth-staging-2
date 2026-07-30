@@ -96,6 +96,9 @@ export interface ValidateModelResponse {
   display_name?: string | null;
   is_gguf?: boolean;
   is_diffusion?: boolean;
+  /** The diffusion check was inconclusive, so `is_diffusion: false` above means
+   *  "not known to be diffusion", not "known to be ordinary". */
+  diffusion_unknown?: boolean;
   is_lora?: boolean;
   is_vision?: boolean;
   requires_trust_remote_code?: boolean;

@@ -279,6 +279,16 @@ class ValidateModelRequest(BaseModel):
             "delegate fitting to llama.cpp, while explicit layers are user-owned."
         ),
     )
+    gpu_layers: int = Field(
+        -1,
+        ge = -1,
+        description = (
+            "Layer count intended for the follow-up load, so the coexistence estimate "
+            "sizes like /load. Only 0 changes the verdict: a zero-layer DiffusionGemma "
+            "split places no layers on any device, so it cannot compete with training "
+            "for VRAM. -1 (Auto) keeps the previous behaviour for callers that omit it."
+        ),
+    )
     n_parallel: Optional[int] = Field(
         None,
         ge = PARALLEL_MIN,
@@ -337,6 +347,14 @@ class ValidateModelResponse(BaseModel):
     is_gguf: bool = Field(False, description = "Whether this is a GGUF model (llama.cpp)")
     is_diffusion: bool = Field(
         False, description = "Whether this is a block-diffusion model (DiffusionGemma)"
+    )
+    diffusion_unknown: bool = Field(
+        False,
+        description = "Whether the diffusion check came back inconclusive: the GGUF is not "
+        "downloaded yet (or its header is unreadable) and its name does not carry the "
+        "DiffusionGemma family, so is_diffusion == False here means 'not known to be "
+        "diffusion', NOT 'known to be an ordinary GGUF'. Callers that choose a GPU-layer "
+        "split before the load must treat this as possibly-diffusion.",
     )
     is_lora: bool = Field(False, description = "Whether this is a LoRA adapter")
     is_vision: bool = Field(False, description = "Whether this is a vision-capable model")
