@@ -357,6 +357,29 @@ jobs:
           if ($err.IsCompleted) { $err.Result | Out-File logs/coldstart.err.log -Encoding utf8; Get-Content logs/coldstart.err.log -Tail 20 }
           exit 0
 
+      - name: D10 -- a console-less GUI parent with inherited stdin
+        # The last mechanical difference between the app's spawn and every arm that has
+        # come up. process.rs pipes stdout and stderr and says NOTHING about stdin, so
+        # the backend inherits the stdin of a GUI-subsystem process that has no console.
+        # Every probe so far passed stdin=DEVNULL or inherited a console. A handle that
+        # is neither a console nor closed, never delivers a byte and never signals EOF,
+        # is a classic Windows hang -- and it would hang only under the app.
+        #
+        # Runs here, in the cold-start job, because this leg is fast and has a freshly
+        # installed machine with no app running to collide with.
+        if: always()
+        shell: pwsh
+        run: |
+          $py  = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          $uns = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
+          & $py tests/studio/win_gui_parent_probe.py `
+              --exe $uns `
+              --port 8930 `
+              --wait 300 `
+              --result artifacts/gui-parent-probe.json `
+              --log logs/gui-parent-backend.log
+          exit 0
+
       - name: Collect the backend's own session logs
         if: always()
         shell: pwsh
@@ -375,5 +398,6 @@ jobs:
           name: desktop-e2e-windows-coldstart
           path: |
             logs/
+            artifacts/
           retention-days: 7
           if-no-files-found: warn
