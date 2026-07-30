@@ -96,7 +96,7 @@ jobs:
         run: |
           # Deliberately no build-essential/cmake/git: a user installing a .deb has none.
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends xvfb jq
+          sudo apt-get install -y -qq --no-install-recommends xvfb jq x11-apps
           sudo apt-get install -y ./dl/*.deb || {
             echo "::error::the .deb does not declare its runtime dependencies correctly"
             exit 1
@@ -147,7 +147,7 @@ jobs:
           # compositor; the release notes name the blank-window failure this avoids.
           export WEBKIT_DISABLE_DMABUF_RENDERER=1
           export WEBKIT_DISABLE_COMPOSITING_MODE=1
-          nohup xvfb-run -a --server-args="-screen 0 1440x900x24" \
+          nohup xvfb-run -n 99 --server-args="-screen 0 1440x900x24" \
             "$BIN" > logs/app-stdout.log 2>&1 &
           echo "APP_PID=$!" >> "$GITHUB_ENV"
           sleep 20
@@ -169,6 +169,15 @@ jobs:
             --scenarios "$SCENARIOS" \
             --discover-timeout 420 \
             --out artifacts/drive-report.json 2>&1 | tee logs/drive.log
+
+      - name: Is the window actually painted, or blank?
+        if: always()
+        run: |
+          # The release notes warn the AppImage "can show a blank window on some
+          # Tauri/WebKitGTK + Wayland/Mesa stacks". Nothing else in this job can see
+          # that: the process is alive, the backend is healthy, the logs are clean.
+          xwd -root -display :99 -out artifacts/screen.xwd
+          python3 tests/studio/xwd_not_blank.py artifacts/screen.xwd
 
       - name: Drive the UI
         if: always()

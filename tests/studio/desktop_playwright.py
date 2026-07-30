@@ -155,8 +155,23 @@ async def drive_native(report: Report, out_dir: Path) -> None:
 
 
 async def drive_backend_attached(backend: Backend, report: Report, out_dir: Path) -> None:
-    """A Chromium against the same backend the desktop window is using."""
+    """A Chromium against the same backend the desktop window is using.
+
+    Only usable against a Studio that serves the frontend. The PACKAGED app spawns
+    `unsloth studio --api-only` (process.rs:537-541) and that mode does not mount the
+    React bundle -- `/` returns 404 -- because the window renders the frontend embedded
+    in the Tauri binary instead. So this layer covers the control arm, and the packaged
+    app's UI has to be driven through its native renderer.
+    """
     from playwright.async_api import async_playwright
+
+    code, _ = backend.http("GET", "/", auth=False, raw=True, timeout=30)
+    if code != 200:
+        report.skip(
+            f"this backend serves no frontend at / (HTTP {code}); it is running "
+            f"--api-only, so the UI lives in the packaged renderer, not here"
+        )
+        return
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=True)

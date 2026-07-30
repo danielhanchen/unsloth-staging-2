@@ -84,7 +84,7 @@ jobs:
       - name: Runtime libs only, no dev tooling
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends xvfb jq
+          sudo apt-get install -y -qq --no-install-recommends xvfb jq x11-apps
           # 24.04 renamed libfuse2 -> libfuse2t64. Try the new name first and fall back,
           # so this leg reports which one the runner actually needed.
           if apt-cache show libfuse2t64 >/dev/null 2>&1; then
@@ -127,7 +127,7 @@ jobs:
           # on a hosted runner either dies on the compositor or paints nothing.
           export WEBKIT_DISABLE_DMABUF_RENDERER=1
           export WEBKIT_DISABLE_COMPOSITING_MODE=1
-          nohup xvfb-run -a --server-args="-screen 0 1440x900x24" \
+          nohup xvfb-run -n 99 --server-args="-screen 0 1440x900x24" \
             "$BIN" > logs/app-stdout.log 2>&1 &
           echo "APP_PID=$!" >> "$GITHUB_ENV"
           sleep 20
@@ -141,6 +141,15 @@ jobs:
             --scenarios "$SCENARIOS" \
             --discover-timeout 420 \
             --out artifacts/drive-report.json 2>&1 | tee logs/drive.log
+
+      - name: Is the window actually painted, or blank?
+        if: always()
+        run: |
+          # The release notes warn the AppImage "can show a blank window on some
+          # Tauri/WebKitGTK + Wayland/Mesa stacks". Nothing else in this job can see
+          # that: the process is alive, the backend is healthy, the logs are clean.
+          xwd -root -display :99 -out artifacts/screen.xwd
+          python3 tests/studio/xwd_not_blank.py artifacts/screen.xwd
 
       - name: Drive the UI, and prove the window is not blank
         if: always()
