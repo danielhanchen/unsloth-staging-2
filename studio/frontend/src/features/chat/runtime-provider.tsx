@@ -67,6 +67,10 @@ import {
   onChatAttachmentDeleted,
 } from "./utils/chat-attachment-events";
 import {
+  refreshContextUsage,
+  setActiveBranchReader,
+} from "./utils/refresh-context-usage";
+import {
   deleteStoredChatThreads,
   ensureStoredChatThread,
   getStoredChatThread,
@@ -1178,6 +1182,10 @@ function useStudioRuntimeAdapters(
             store.setContextUsage(savedUsage);
           }
         }
+        // Saved usage above is the last completion's, and there may be none at all
+        // (a thread opened after a model switch). Price the branch as loaded, so the
+        // bar answers "does this chat still fit" before the next message (#7450).
+        void refreshContextUsage({ threadId: remoteId });
 
         // If any message has a stored parentId, reconstruct the tree so
         // retries/regenerations load as branches rather than a flat list. For
@@ -1381,6 +1389,9 @@ function ThreadNewChatSwitch({
 }: { nonce: string }): ReactElement | null {
   const aui = useAui();
   const isLoading = useAuiState(({ threads }) => threads.isLoading);
+  const checkpoint = useChatRuntimeStore((s) => s.params.checkpoint);
+  const ggufContextLength = useChatRuntimeStore((s) => s.ggufContextLength);
+  const modelLoading = useChatRuntimeStore((s) => s.modelLoading);
   // The outgoing thread is not read here: New Chat leaves it running.
   useEffect(() => {
     if (isLoading) {
@@ -1394,6 +1405,24 @@ function ThreadNewChatSwitch({
     void aui.threads().switchToNewThread();
     useChatRuntimeStore.getState().setActiveThreadId(null);
   }, [aui, isLoading, nonce]);
+
+  // The effect above blanks the bar, and this view reaches no other recount trigger: it
+  // has no persisted thread for the history loader and ActiveThreadSync is off while a
+  // nonce is present. The template and system prompt are already in the request, so price
+  // them. Keyed on the model too, because on a RELOAD of /chat?new=<uuid> neither the
+  // checkpoint nor the window is known until /api/inference/status answers; without that
+  // retry an empty New Chat opened against an already-resident GGUF hides the bar until
+  // the first completion. Only into a blank bar on an unpersisted thread, so a real
+  // completion's usage is never overwritten.
+  useEffect(() => {
+    if (isLoading || modelLoading || !checkpoint || ggufContextLength == null) {
+      return;
+    }
+    const store = useChatRuntimeStore.getState();
+    if (store.activeThreadId != null || store.contextUsage != null) return;
+    void refreshContextUsage();
+    // nonce: a fresh New Chat click re-runs the effect above, which blanks the bar again.
+  }, [checkpoint, ggufContextLength, isLoading, modelLoading, nonce]);
 
   return null;
 }
@@ -1412,6 +1441,68 @@ function ActiveThreadSync({
     }
     setActiveThreadId(mainThreadId ?? null);
   }, [enabled, mainThreadId, setActiveThreadId]);
+
+  return null;
+}
+
+// Lets the token recount read the branch on screen rather than the stored records: an
+// incognito thread stores none at all, and a thread the user retried or edited has a
+// newest stored leaf that is not the branch the runtime would send. Registered only for
+// the single-chat pane, which is the one whose thread the context bar tracks.
+function ActiveBranchRegistrar({
+  enabled,
+}: { enabled: boolean }): ReactElement | null {
+  const aui = useAui();
+
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+    setActiveBranchReader(() => {
+      try {
+        return aui.thread().getState().messages;
+      } catch {
+        // No thread mounted yet; the recount falls back to the stored records.
+        return null;
+      }
+    });
+    return () => setActiveBranchReader(null);
+  }, [aui, enabled]);
+
+  return null;
+}
+
+// Price whichever thread the bar is pointed at whenever it has nothing to show. Two
+// paths reach this and no other: a model change empties contextUsageByThreadId, and a
+// thread already mounted in the runtime does not rerun its history loader on the way
+// back, so revisiting any thread other than the one that was open during the load
+// restores no usage; and on a deep link to /chat/:id the history loader can run before
+// /api/inference/status has a checkpoint, while the status response can land before the
+// thread is active, so neither of those two independently timed callbacks counts.
+// Reading the model fields here is what retries once they hydrate.
+function ThreadContextUsageRecount({
+  enabled,
+}: { enabled: boolean }): ReactElement | null {
+  const activeThreadId = useChatRuntimeStore((s) => s.activeThreadId);
+  const checkpoint = useChatRuntimeStore((s) => s.params.checkpoint);
+  const ggufContextLength = useChatRuntimeStore((s) => s.ggufContextLength);
+  const modelLoading = useChatRuntimeStore((s) => s.modelLoading);
+
+  useEffect(() => {
+    if (
+      !enabled ||
+      !activeThreadId ||
+      modelLoading ||
+      !checkpoint ||
+      ggufContextLength == null
+    ) {
+      return;
+    }
+    // Only into a blank bar: a usage the history loader restored or a completion wrote
+    // is the exact number, and this count would only ever be an estimate of it.
+    if (useChatRuntimeStore.getState().contextUsage != null) return;
+    void refreshContextUsage({ threadId: activeThreadId });
+  }, [activeThreadId, checkpoint, enabled, ggufContextLength, modelLoading]);
 
   return null;
 }
@@ -1598,6 +1689,8 @@ export function ChatRuntimeProvider({
             !initialThreadId
           }
         />
+        <ActiveBranchRegistrar enabled={modelType === "base" && !pairId} />
+        <ThreadContextUsageRecount enabled={modelType === "base" && !pairId} />
         <ThreadBackendAutosave modelType={modelType} pairId={pairId} />
         <CancelRegistrar />
         {initialThreadId && (
