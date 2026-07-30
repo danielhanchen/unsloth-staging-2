@@ -188,14 +188,25 @@ jobs:
         # here it runs inside the venv the SHIPPED bundle built, which is the claim that
         # matters for the desktop app.
         if: always()
+        env:
+          # Same reason mlx-ci.yml does it: the script's llama.cpp release lookup 403s
+          # anonymously on a shared runner IP.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UNSLOTH_COMPILE_DISABLE: '1'
         run: |
           set -a; . ./clean-machine.env; set +a
-          "$PY" -m pip install --quiet mlx mlx-lm 2>&1 | tail -5 || \
+          set -o pipefail
+          mkdir -p mlx_workdir
+          "$PY" -m pip install --quiet mlx mlx-lm numpy 2>&1 | tail -5 || \
             echo "::warning::could not install mlx into the bundled venv"
-          "$PY" tests/studio/run_real_mlx_smoke.py 2>&1 | tee logs/mlx-smoke.log || {
-            echo "::error::MLX training smoke failed inside the bundle's own venv"
-            exit 1
-          }
+          # The script is subcommand-driven: `train --workdir`, then `reload` to prove
+          # the trained adapter loads back. Calling it bare just errors on argparse.
+          "$PY" tests/studio/run_real_mlx_smoke.py train --workdir "$PWD/mlx_workdir" \
+            2>&1 | tee logs/mlx-train.log
+          "$PY" tests/studio/run_real_mlx_smoke.py reload --format lora \
+            --dir "$PWD/mlx_workdir/lora" 2>&1 | tee logs/mlx-reload-lora.log
+          cp mlx_workdir/train_metrics.json artifacts/ 2>/dev/null || true
 
       - name: What did the app's own log say?
         if: always()
