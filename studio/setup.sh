@@ -2335,5 +2335,19 @@ echo ""
 # successful -- the footer above already reports the limitation and Unsloth
 # is still usable for non-GGUF workflows.
 if [ "$_LLAMA_CPP_DEGRADED" = true ] && [ "${SKIP_STUDIO_BASE:-0}" = "1" ]; then
-    setup_fail 1 "llama.cpp setup did not produce a usable server"
+    # ...but in Tauri mode a non-zero exit is not "report", it is "abort": install.rs
+    # turns any [TAURI:ERROR_DEFAULT] into "Installation failed", so a transient
+    # prebuilt download failure (one HTTP 403 rate limit is enough) fails the entire
+    # first-launch install of an app the footer just called Installed. Everything
+    # except GGUF inference works. whisper.cpp in this same script already degrades
+    # rather than failing for exactly this case; match it.
+    case "${UNSLOTH_TAURI_MODE:-0}" in
+        1|true)
+            printf '[TAURI:STEP] %s\n' \
+                "llama.cpp unavailable -- GGUF inference is disabled until 'unsloth studio update' succeeds"
+            ;;
+        *)
+            setup_fail 1 "llama.cpp setup did not produce a usable server"
+            ;;
+    esac
 fi

@@ -7035,6 +7035,21 @@ class LlamaCppBackend:
                 )
                 n_parallel = 1
 
+            # MTP speculative decoding serves one sequence: llama.cpp's draft-mtp path
+            # does not support -np > 1, and the unsloth/Qwen3.5-2B-MTP-GGUF card says
+            # so outright. Left at the default of 4, concurrent chats do not merely run
+            # slowly -- they come back as token soup that shares tokens across replies,
+            # so the slots are corrupting each other. Clamp here, next to the
+            # --kv-unified clamp, so the KV fit matches what actually launches.
+            if n_parallel > 1 and _extra_args_requests_mtp(extra_args):
+                logger.warning(
+                    "MTP speculative decoding (--spec-type draft-mtp) does not support "
+                    "%d parallel slots; using 1. Load without MTP to serve chats in "
+                    "parallel.",
+                    n_parallel,
+                )
+                n_parallel = 1
+
             # ── Vulkan-ordinal preflight (BEFORE the Phase 1 kill) ────────
             # An explicit Vulkan pin the ggml probe never enumerated cannot be honored.
             # Validate it ABOVE the kill so an invalid selection leaves the live model
