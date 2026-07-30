@@ -31,7 +31,9 @@ import argparse
 import json
 import os
 import platform
+import re
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -847,6 +849,112 @@ def scenario_api_serving(backend: Backend, report: Report) -> None:
             report.fail(f"DELETE /api/auth/api-keys/{key_id} -> {code}")
 
 
+def scenario_unsloth_run(backend: Backend, report: Report) -> None:
+    """`unsloth run` -- the one-liner that boots a server, loads a model and prints an
+    API key. This is the CLI path, distinct from `api_serving`, which drives the
+    OpenAI-compatible surface of the already-running desktop backend.
+
+    Opt-in (not in the default `all` set): it starts a SECOND Studio, so it wants a
+    machine that is not already holding a model resident. Run it in its own CI step
+    after the main suite.
+    """
+    venv_bin = studio_root() / "unsloth_studio" / (
+        "Scripts" if platform.system() == "Windows" else "bin"
+    )
+    exe = venv_bin / ("unsloth.exe" if platform.system() == "Windows" else "unsloth")
+    if not exe.exists():
+        report.fail(f"no unsloth CLI at {exe}")
+        return
+
+    # Outside 8888-8908 so it cannot be mistaken for, or collide with, the desktop
+    # app's own backend.
+    port = int(os.environ.get("UNSLOTH_DRIVE_RUN_PORT", "8951"))
+    log_path = Path(os.environ.get("UNSLOTH_DRIVE_RUN_LOG", "logs/unsloth-run.log"))
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+
+    args = [
+        str(exe), "run",
+        "--model", SMALL_REPO,
+        "--gguf-variant", SMALL_VARIANT,
+        "--host", "127.0.0.1",
+        "--port", str(port),
+        "--api-key-name", "desktop-drive-run",
+        "--api-only",
+    ]
+    report.note("unsloth_run_cmd", " ".join(args))
+
+    with log_path.open("wb") as sink:
+        # `unsloth run` execs into the studio child on POSIX, so the process we hold is
+        # the server itself; killing it is enough.
+        proc = subprocess.Popen(args, stdout=sink, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    try:
+        probe = Backend(port)
+        deadline = time.monotonic() + 900
+        healthy = False
+        while time.monotonic() < deadline:
+            if proc.poll() is not None:
+                report.fail(
+                    f"`unsloth run` exited early with {proc.returncode}; "
+                    f"log tail: {log_path.read_text(errors='replace')[-400:]}"
+                )
+                return
+            code, _ = probe.http("GET", "/api/health", timeout=5, auth=False)
+            if code == 200:
+                healthy = True
+                break
+            time.sleep(5)
+        if not healthy:
+            report.fail(f"`unsloth run` never served /api/health on {port} within 900s")
+            return
+        report.ok(f"`unsloth run` came up on 127.0.0.1:{port}")
+
+        # It prints the key inside a ready-to-paste curl example; that is the only place
+        # a user sees it, so parsing it is also a check that the instructions are usable.
+        text = log_path.read_text(errors="replace")
+        match = re.search(r"Authorization:\s*Bearer\s+(\S+?)[\"'\s]", text)
+        if not match:
+            report.fail("`unsloth run` printed no 'Authorization: Bearer <key>' example")
+            return
+        key = match.group(1)
+        print(f"::add-mask::{key}", flush=True)
+        report.ok("`unsloth run` printed a usable API key in its curl example")
+
+        keyed = Backend(port, token=key)
+        code, body = keyed.http(
+            "POST",
+            "/v1/chat/completions",
+            {
+                "messages": [{"role": "user", "content": "Say hi."}],
+                "max_tokens": 24,
+                "temperature": 0.0,
+            },
+            timeout=600,
+        )
+        if code == 200 and _completion_text(body).strip():
+            report.ok(
+                f"served a completion through `unsloth run`: "
+                f"{_completion_text(body).strip()[:60]!r}"
+            )
+        elif code == 200:
+            report.warn(f"`unsloth run` completion was empty: {str(body)[:200]}")
+        else:
+            report.fail(f"`unsloth run` /v1/chat/completions -> {code} {str(body)[:200]}")
+
+        # An unauthenticated request must not be served: this server is the one users
+        # are told to expose.
+        code, _ = Backend(port).http("GET", "/v1/models", timeout=30)
+        if code in (401, 403):
+            report.ok(f"`unsloth run` rejects unauthenticated /v1/models -> {code}")
+        else:
+            report.fail(f"`unsloth run` served unauthenticated /v1/models -> {code}")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=60)
+        except Exception:
+            proc.kill()
+
+
 def scenario_mlx(backend: Backend, report: Report) -> None:
     """macOS only: MLX safetensors inference, plus the adapter-only repo the goal names.
 
@@ -936,7 +1044,12 @@ SCENARIOS: dict[str, Callable[[Backend, Report], None]] = {
     "api_serving": scenario_api_serving,
     "mlx": scenario_mlx,
     "updater": scenario_updater,
+    "unsloth_run": scenario_unsloth_run,
 }
+
+# `unsloth run` boots a SECOND Studio and loads its own model, so it wants a machine
+# that is not already holding one resident. Kept out of `all` and run as its own step.
+OPT_IN_SCENARIOS = {"unsloth_run"}
 
 
 def main() -> int:
@@ -964,7 +1077,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    names = list(SCENARIOS) if args.scenarios == "all" else args.scenarios.split(",")
+    if args.scenarios == "all":
+        names = [n for n in SCENARIOS if n not in OPT_IN_SCENARIOS]
+    else:
+        names = args.scenarios.split(",")
     unknown = [n for n in names if n not in SCENARIOS]
     if unknown:
         parser.error(f"unknown scenarios: {unknown}; known: {list(SCENARIOS)}")

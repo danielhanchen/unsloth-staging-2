@@ -207,6 +207,21 @@ jobs:
           xwd -root -display :99 -out artifacts/screen.xwd
           python3 tests/studio/xwd_not_blank.py artifacts/screen.xwd
 
+      - name: Serve an API with `unsloth run`
+        if: always()
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          set -o pipefail
+          # Opt-in scenario: it boots a SECOND Studio, so it gets its own step and a
+          # port well outside the desktop app's 8888-8908 range. The small GGUF keeps
+          # both resident comfortably on a 16 GB runner.
+          UNSLOTH_DRIVE_RUN_PORT=8951 \
+          UNSLOTH_DRIVE_RUN_LOG=logs/unsloth-run.log \
+          python3 tests/studio/desktop_drive.py \
+            --scenarios unsloth_run \
+            --discover-timeout 120 \
+            --out artifacts/unsloth-run-report.json 2>&1 | tee logs/drive-unsloth-run.log
+
       - name: Drive the UI
         if: always()
         run: |
