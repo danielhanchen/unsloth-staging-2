@@ -10,6 +10,7 @@ import {
 } from "@/hooks/use-gpu-info";
 import { toast } from "@/lib/toast";
 import { create } from "zustand";
+import { GPU_LAYERS_AUTO } from "../lib/gpu-placement";
 import { isExternalModelId, parseExternalModelId } from "../external-providers";
 import {
   type ChatPresetSource,
@@ -568,9 +569,9 @@ export function persistGpuMemoryModeOnLoad(
   if (resp.is_gguf && !resp.is_diffusion) saveGpuMemoryMode(mode);
 }
 
-// Manual-mode gpu_layers sentinel: -1 = Auto (hand layer + context sizing to
-// llama.cpp's --fit). The Manual default; "all on GPU" is the slider's max.
-export const GPU_LAYERS_AUTO = -1;
+// Manual-mode gpu_layers sentinel, re-exported from its dependency-free home so
+// every existing `from "../stores/chat-runtime-store"` import keeps working.
+export { GPU_LAYERS_AUTO } from "../lib/gpu-placement";
 
 // Round real-valued shares to integers summing exactly to `total`, giving the
 // leftover units to the largest fractional parts (largest-remainder method).
@@ -743,17 +744,23 @@ export function loadedGpuMemoryFields(resp: {
           // loaded baseline) -- else a later switch back to Manual would snapshot
           // and send a previous model's stale gpuLayers/nCpuMoe/split that this
           // load never applied. Mirrors the non-GGUF branch above.
-          gpuLayers: GPU_LAYERS_AUTO,
+          // Diffusion is the exception for the layer count: an "auto" diffusion
+          // response can be an older shim DROPPING a manual split (the backend
+          // reports what ran and keeps the ask in diffusion_requested_ngl).
+          // Resetting the slider would turn that ask into manual/-1 on the next
+          // Apply, unapplyable even after the unsloth_zoo upgrade that adds
+          // --ngl. Standing layers survive, like the standing mode below.
+          ...(resp.is_diffusion ? {} : { gpuLayers: GPU_LAYERS_AUTO }),
           nCpuMoe: 0,
           splitRatio: null,
         };
   return {
-    // A diffusion GGUF runs mode-agnostic (pins all layers on one GPU, reports
-    // "auto"), so adopt everything a chat GGUF does EXCEPT the live standing
-    // preference -- the next chat load must still honor the user's manual choice.
-    // The loaded baseline is still "auto", but the UI hides mode controls for a
-    // loaded diffusion model so it can't read as dirty against the preference.
-    ...(resp.is_diffusion ? {} : { gpuMemoryMode: mode }),
+    // A diffusion GGUF reporting "auto" ran on the runner's own defaults, so an
+    // inert standing manual preference must survive it -- the next chat load
+    // still honors the user's choice. But "manual" means a layer split was
+    // actually applied (#7574): adopt it, or a refresh hydrates the store back
+    // to the persisted "auto" while the runner is serving a manual split.
+    ...(resp.is_diffusion && mode !== "manual" ? {} : { gpuMemoryMode: mode }),
     loadedGpuMemoryMode: mode,
     ggufLayerCount: resp.n_layers ?? null,
     // MoE expert-layer count: the n_cpu_moe slider max, and 0 hides the slider.
