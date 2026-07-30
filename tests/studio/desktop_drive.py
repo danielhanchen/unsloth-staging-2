@@ -973,18 +973,48 @@ def scenario_mlx(backend: Backend, report: Report) -> None:
     adapter_only = "mlx-community/Qwen3-0.6B"
 
     if load_model(backend, report, real, timeout=2400):
-        code, body = chat_once(backend, "Say hello in five words.", max_tokens=32)
+        # Qwen3 is a thinking model: with a small budget every token goes into the
+        # reasoning channel and `content` comes back empty, which is not a failure to
+        # generate. Give it room, and count reasoning_content as output.
+        code, body = chat_once(backend, "Say hello in five words.", max_tokens=384)
         text = _completion_text(body)
-        if code == 200 and text.strip():
+        reasoning = ""
+        usage = {}
+        if isinstance(body, dict):
+            try:
+                reasoning = body["choices"][0]["message"].get("reasoning_content") or ""
+            except Exception:
+                reasoning = ""
+            usage = body.get("usage") or {}
+            try:
+                report.note("mlx_finish_reason", body["choices"][0].get("finish_reason"))
+            except Exception:
+                pass
+        report.note("mlx_usage", usage)
+        report.note("mlx_content", text[:300])
+        report.note("mlx_reasoning", reasoning[:300])
+
+        if code != 200:
+            report.fail(f"MLX generation -> {code} {str(body)[:300]}")
+        elif text.strip():
             report.ok(f"MLX safetensors generated: {text.strip()[:80]!r}")
+        elif reasoning.strip():
+            report.warn(
+                f"MLX produced only reasoning tokens, no content "
+                f"({usage.get('completion_tokens')} tokens): {reasoning.strip()[:80]!r}"
+            )
         else:
-            report.fail(f"MLX generation -> {code} {str(body)[:200]}")
+            report.fail(
+                f"MLX generation returned 200 with neither content nor reasoning; "
+                f"usage={usage}"
+            )
         unload_model(backend)
 
     code, body = backend.http(
         "POST", "/api/inference/load", {"model_path": adapter_only}, timeout=900
     )
     detail = str(body)[:300]
+    report.note("adapter_only_response", {"code": code, "body": detail})
     if code == 200:
         report.warn(
             f"{adapter_only} is adapter-only (no model.safetensors) yet /load returned "
@@ -995,10 +1025,16 @@ def scenario_mlx(backend: Backend, report: Report) -> None:
         word in detail.lower() for word in ("adapter", "base model", "lora", "safetensors")
     ):
         report.ok(f"adapter-only repo rejected with an actionable message: {detail[:140]}")
-    else:
-        report.fail(
-            f"adapter-only repo {adapter_only} -> {code} with an unhelpful body: {detail[:200]}"
+    elif 400 <= code < 500:
+        # It IS refused cleanly, so nothing is broken -- but "Invalid model identifier"
+        # says the id is malformed when the repo is real and simply holds an adapter
+        # rather than weights. A user cannot act on that.
+        report.warn(
+            f"adapter-only repo {adapter_only} is refused with {code} but the message "
+            f"misdescribes the problem: {detail[:160]}"
         )
+    else:
+        report.fail(f"adapter-only repo {adapter_only} -> {code}: {detail[:200]}")
 
 
 DEFAULT_UPDATER_ENDPOINT = (

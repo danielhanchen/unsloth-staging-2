@@ -274,6 +274,38 @@ jobs:
             echo "no .clean-machine/restore.sh: nothing to restore"
           fi
 
+      - name: If the backend never came up, run its exact command by hand
+        # D8: on some Linux launches the app's spawned backend produces ZERO bytes and
+        # never writes its session log -- the diagnostics phase log holds only the
+        # "Starting backend:" meta line. That is either "the venv cannot run this
+        # command on this machine" or "the exec was killed". Running the identical
+        # command directly separates the two, which nothing in the app's own logs can.
+        if: failure()
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          UNS="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
+          echo "=== can the venv python start at all? ==="
+          "$PY" -c "import sys; print(sys.version)" || echo "venv python FAILED"
+          echo "=== the exact command the app spawns, on a free port ==="
+          timeout 300 env -u UNSLOTH_STUDIO_HOME "$UNS" studio --api-only \
+            -H 127.0.0.1 -p 8907 > logs/manual-backend.log 2>&1 &
+          MPID=$!
+          for i in $(seq 1 60); do
+            curl -fsS --max-time 3 http://127.0.0.1:8907/api/health >/dev/null 2>&1 && break
+            sleep 5
+          done
+          if curl -fsS --max-time 3 http://127.0.0.1:8907/api/health >/dev/null 2>&1; then
+            echo "::warning::the SAME command works when run directly -- so the venv is"
+            echo "::warning::fine and the app's spawn path is what fails (D8)"
+          else
+            echo "::warning::the same command also fails when run directly -- the venv or"
+            echo "::warning::its environment is what is broken, not the spawn path"
+          fi
+          echo "=== manual backend output ==="
+          cat logs/manual-backend.log || true
+          kill -TERM "$MPID" 2>/dev/null || true
+
       - name: Upload logs and report
         if: always()
         uses: actions/upload-artifact@v4
