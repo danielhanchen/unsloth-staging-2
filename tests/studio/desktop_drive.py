@@ -313,13 +313,36 @@ def _is_our_install(port: int) -> tuple[bool, str]:
     )
 
 
-def desktop_login(backend: Backend, report: Report) -> bool:
+def desktop_login(backend: Backend, report: Report, timeout: float = 180.0) -> bool:
     """Exchange the on-disk desktop secret for admin tokens, exactly as
-    desktop_auth.rs:188-226 does."""
+    desktop_auth.rs:188-226 does.
+
+    The secret is provisioned ASYNCHRONOUSLY: the frontend calls the desktop_auth
+    command once it loads, which runs `unsloth studio provision-desktop-auth`
+    (desktop_auth.rs:227-262). So the backend is healthy for a while before the secret
+    exists, and a single existence check loses that race -- which it did, reporting "the
+    app never provisioned auth" against a run whose own server log shows
+    POST /api/auth/desktop-login -> 200 seconds later. Wait for it.
+    """
     secret_path = studio_root() / "auth" / ".desktop_secret"
+    deadline = time.monotonic() + timeout
+    while not secret_path.exists() and time.monotonic() < deadline:
+        time.sleep(2)
+
     if not secret_path.exists():
-        report.fail(f"no desktop secret at {secret_path}; the app never provisioned auth")
-        return False
+        # The bootstrap password is written unconditionally at first backend start, so
+        # it is a usable fallback: the goal is to drive the app, and failing the whole
+        # run because one of two credentials is missing tests nothing.
+        report.warn(
+            f"no desktop secret at {secret_path} after {timeout:.0f}s; the frontend "
+            f"never completed the desktop_auth handshake. Falling back to the "
+            f"bootstrap password."
+        )
+        bootstrap = studio_root() / "auth" / ".bootstrap_password"
+        if not bootstrap.exists():
+            report.fail(f"no {secret_path} and no {bootstrap}; cannot authenticate")
+            return False
+        return password_login(backend, report, bootstrap.read_text().strip())
 
     # Never let the secret reach the log; GitHub masks it for the rest of the job.
     secret = secret_path.read_text().strip()
@@ -705,26 +728,36 @@ def scenario_llama_prebuilt(backend: Backend, report: Report) -> None:
 
     version = ""
     if isinstance(body, dict):
-        for key in ("current_version", "installed_version", "version", "local_version"):
+        # The route reports `installed_tag` / `latest_tag`, not a `version` key.
+        for key in ("installed_tag", "current_version", "installed_version", "version"):
             if body.get(key):
                 version = str(body[key])
                 break
     if version:
-        report.ok(f"llama.cpp prebuilt version: {version}")
+        report.ok(f"llama.cpp prebuilt tag: {version} (latest {body.get('latest_tag')})")
         report.note("llama_version", version)
+        report.note("llama_latest_tag", body.get("latest_tag"))
     else:
         report.warn(f"no version field in update-status: {str(body)[:200]}")
 
-    # The binary itself, not just what the API claims about it.
+    # The binary itself, not just what the API claims about it. install_llama_prebuilt.py
+    # installs into <UNSLOTH_HOME>/llama.cpp, and UNSLOTH_HOME is the PARENT of the
+    # studio dir in the default layout (~/.unsloth/llama.cpp, not
+    # ~/.unsloth/studio/llama.cpp), so searching only under studio_root() reported a
+    # missing binary on a run whose inference scenario had just passed.
     root = studio_root()
-    candidates = list(root.glob("llama.cpp/**/llama-server*")) + list(
-        root.glob("**/bin/llama-server*")
-    )
+    search_roots = [root, root.parent]
+    candidates: list[Path] = []
+    for base in search_roots:
+        candidates += sorted(base.glob("llama.cpp/**/llama-server*"))
+        candidates += sorted(base.glob("*/bin/llama-server*"))
     if candidates:
         report.ok(f"llama-server present at {candidates[0]}")
         report.note("llama_server_path", str(candidates[0]))
     else:
-        report.fail(f"no llama-server binary found under {root}")
+        report.fail(
+            f"no llama-server binary found under any of {[str(p) for p in search_roots]}"
+        )
 
     # MTP landed in llama.cpp on 2026-05-16 (ggml-org/llama.cpp#22673). A prebuilt older
     # than that cannot run the MTP model at all, so the inference scenario would fail

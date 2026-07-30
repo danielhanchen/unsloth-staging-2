@@ -59,9 +59,15 @@ env:
 
 jobs:
   deb:
-    name: deb install + drive
-    runs-on: ubuntu-22.04
+    name: deb install + drive (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        # 22.04 is where the app died right after spawning its backend; 24.04 passed the
+        # whole suite. Both, so that split is measured rather than inferred.
+        os: [ubuntu-22.04, ubuntu-24.04]
 
     steps:
       - uses: actions/checkout@v4
@@ -149,14 +155,28 @@ jobs:
           export WEBKIT_DISABLE_COMPOSITING_MODE=1
           nohup xvfb-run -n 99 --server-args="-screen 0 1440x900x24" \
             "$BIN" > logs/app-stdout.log 2>&1 &
-          echo "APP_PID=$!" >> "$GITHUB_ENV"
+          APP_PID=$!
+          echo "APP_PID=$APP_PID" >> "$GITHUB_ENV"
           sleep 20
-          if ! kill -0 "$!" 2>/dev/null; then
-            echo "::error::the app exited during startup"
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            echo "app launched (pid $APP_PID)"
+          else
+            # `wait` on the child gives its status; 128+N means signal N, which is the
+            # difference between "it chose to exit" and "the kernel killed it" -- and a
+            # bare "exited during startup" says neither.
+            wait "$APP_PID" 2>/dev/null; rc=$?
+            echo "::error::the app exited during startup with status $rc"
+            if [ "$rc" -gt 128 ]; then
+              echo "::error::that is signal $((rc - 128)) (11=SIGSEGV, 9=SIGKILL/OOM, 6=SIGABRT)"
+            fi
+            echo "=== kernel ring buffer (segfault / OOM kill) ==="
+            dmesg 2>/dev/null | tail -40 | grep -iE "segfault|killed process|oom|unsloth" || \
+              echo "(dmesg unreadable or nothing relevant)"
+            echo "=== memory ==="
+            free -m || true
             tail -60 logs/app-stdout.log
             exit 1
           fi
-          echo "app launched"
 
       - name: Drive the running app
         id: drive
@@ -232,7 +252,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: desktop-e2e-linux-deb
+          name: desktop-e2e-linux-deb-${{ matrix.os }}
           path: |
             logs/
             artifacts/
