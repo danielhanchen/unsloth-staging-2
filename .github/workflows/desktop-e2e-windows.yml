@@ -338,40 +338,99 @@ jobs:
               --report artifacts/ui-report.json 2>&1 | Tee-Object logs/ui.log
           exit $LASTEXITCODE
 
-      - name: If the backend never came up, run its exact command by hand
-        # D10: the app's backend printed "loading PyTorch, Unsloth and Transformers..."
-        # and then produced nothing for 420s. That is either a very slow cold import on
-        # a 4-vCPU runner or a genuine hang, and the app's own logs cannot tell them
-        # apart. Running the identical command directly, with a clock on it, can.
+      - name: D10 -- is it the stdout pipe? (three arms, one variable)
+        # Round 5 established that the backend is NOT slow and NOT broken: `import torch`
+        # takes 1.6s, and the app's exact command served /api/health in ~14s when run by
+        # hand. Yet spawned by the app it is still dead at 900s. The app's own log says
+        # why it might be: it reaches "loading PyTorch, Unsloth and Transformers...",
+        # and 15s later logs "Backend stdout stream ended, but process is still running".
+        # 15s is exactly when the child emits its next burst -- the probe measured
+        # "Imported FastAPI app in 13181.2ms".
+        #
+        # That is the shape of a pipe-drain deadlock: once nobody reads the pipe, the
+        # child blocks forever on the write that fills it, having bound no socket yet.
+        #
+        # So run the SAME binary with the SAME arguments three times, varying only how
+        # stdout is connected:
+        #
+        #   A  stdout -> file        (round 5's control; came up in ~14s)
+        #   B  stdout -> pipe, never read
+        #   C  stdout -> pipe, drained asynchronously
+        #
+        # If B hangs while A and C come up, D10 is a pipe-drain deadlock in the app's
+        # spawn path and the fix is "always drain the child's stdout", which C proves.
         if: failure()
         shell: pwsh
         run: |
           $py  = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
           $uns = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
           Write-Host '=== how long does importing torch alone take here? ==='
-          $sw = [Diagnostics.Stopwatch]::StartNew()
           & $py -c "import time; t=time.time(); import torch; print('torch', torch.__version__, 'imported in', round(time.time()-t,1), 's')"
-          Write-Host "wall clock: $($sw.Elapsed.TotalSeconds) s"
-          Write-Host '=== the exact command the app spawns, on a free port ==='
-          $p = Start-Process -FilePath $uns `
-                 -ArgumentList 'studio','--api-only','-H','127.0.0.1','-p','8907' `
-                 -PassThru -RedirectStandardOutput logs/manual-backend.log `
-                 -RedirectStandardError logs/manual-backend.err.log
-          $up = $false
-          for ($i = 0; $i -lt 120; $i++) {
-            try { Invoke-RestMethod -TimeoutSec 3 http://127.0.0.1:8907/api/health | Out-Null
-                  $up = $true; break } catch { Start-Sleep -Seconds 5 }
+
+          function Invoke-Arm {
+            param([string]$Label, [int]$Port, [string]$Mode, [int]$WaitSeconds = 240)
+            Write-Host ""
+            Write-Host "=== arm $Label : stdout -> $Mode, port $Port ==="
+            $psi = New-Object Diagnostics.ProcessStartInfo
+            $psi.FileName        = $uns
+            $psi.Arguments       = "studio --api-only -H 127.0.0.1 -p $Port"
+            $psi.UseShellExecute = $false
+            $psi.WorkingDirectory = (Get-Location).Path
+            if ($Mode -eq 'file') {
+              # cmd.exe does the redirection so the handle is a real file, not a pipe.
+              $psi.FileName  = $env:ComSpec
+              $psi.Arguments = "/c `"`"$uns`" studio --api-only -H 127.0.0.1 -p $Port > logs\arm-$Label.log 2>&1`""
+            } else {
+              $psi.RedirectStandardOutput = $true
+              $psi.RedirectStandardError  = $true
+            }
+            $sw = [Diagnostics.Stopwatch]::StartNew()
+            $p  = [Diagnostics.Process]::Start($psi)
+            $task = $null
+            if ($Mode -eq 'drained pipe') {
+              # The whole point of arm C: keep reading for the process's lifetime.
+              $task = $p.StandardOutput.ReadToEndAsync()
+              $null = $p.StandardError.ReadToEndAsync()
+            }
+            # Arm B deliberately never touches $p.StandardOutput.
+            $up = $false
+            for ($i = 0; $i -lt [int]($WaitSeconds / 5); $i++) {
+              try {
+                Invoke-RestMethod -TimeoutSec 3 "http://127.0.0.1:$Port/api/health" | Out-Null
+                $up = $true; break
+              } catch { Start-Sleep -Seconds 5 }
+            }
+            $secs = [math]::Round($sw.Elapsed.TotalSeconds, 1)
+            if ($up) { Write-Host "RESULT arm $Label ($Mode): UP after ${secs}s" }
+            else     { Write-Host "RESULT arm $Label ($Mode): NEVER CAME UP in ${secs}s" }
+            if ($task -and $task.IsCompleted) {
+              Write-Host "  (drained $($task.Result.Length) bytes of stdout)"
+            }
+            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
+            return $up
           }
-          if ($up) {
-            Write-Host "::warning::the same command DID come up when run directly, after ~$($i*5)s"
+
+          $a = Invoke-Arm -Label 'A' -Port 8907 -Mode 'file'
+          $b = Invoke-Arm -Label 'B' -Port 8909 -Mode 'undrained pipe'
+          $c = Invoke-Arm -Label 'C' -Port 8910 -Mode 'drained pipe'
+
+          Write-Host ""
+          Write-Host "=== D10 verdict ==="
+          if ($a -and -not $b -and $c) {
+            Write-Host '::warning::CONFIRMED -- the same command comes up with stdout to a file (A)'
+            Write-Host '::warning::and to a DRAINED pipe (C), but hangs on an UNDRAINED pipe (B).'
+            Write-Host '::warning::D10 is a stdout pipe-drain deadlock in the app spawn path, not a'
+            Write-Host '::warning::slow import. Fix: never stop reading the child stdout/stderr.'
+          } elseif ($a -and $b -and $c) {
+            Write-Host '::warning::NOT REPRODUCED -- all three arms came up, so an undrained pipe alone'
+            Write-Host '::warning::does not explain D10; the app must differ in some other way (env,'
+            Write-Host '::warning::job object, working directory, or window station).'
           } else {
-            Write-Host '::warning::the same command also never served /api/health in 600s -- the'
-            Write-Host '::warning::backend genuinely does not start on this machine (D10)'
+            Write-Host "::warning::inconclusive: A=$a B=$b C=$c"
           }
-          Write-Host '=== manual backend output ==='
-          Get-Content logs/manual-backend.log -Tail 40 -ErrorAction SilentlyContinue
-          Get-Content logs/manual-backend.err.log -Tail 40 -ErrorAction SilentlyContinue
-          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Write-Host '=== arm A output ==='
+          Get-Content logs/arm-A.log -Tail 25 -ErrorAction SilentlyContinue
           exit 0
 
       - name: What did the app's own log say?
