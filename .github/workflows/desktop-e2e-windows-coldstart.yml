@@ -20,6 +20,11 @@ on:
     branches: [desktop-e2e]
     paths:
       - 'tests/studio/desktop_drive.py'
+      # The D10 probes live here; without them a probe-only change silently does not
+      # run, which cost a round.
+      - 'tests/studio/win_spawn_probe.py'
+      - 'tests/studio/win_gui_parent_probe.py'
+      - 'tests/studio/win_env_job_probe.py'
       - '.github/workflows/desktop-e2e-windows-coldstart.yml'
   pull_request:
     branches: [main]
