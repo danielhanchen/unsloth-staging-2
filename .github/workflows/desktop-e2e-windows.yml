@@ -260,6 +260,14 @@ jobs:
           exit 0
 
       - name: Run the bundled installer, the path first launch takes
+        # The bundled installer resolves the llama.cpp / whisper.cpp prebuilts from
+        # GitHub. Unauthenticated that is 60 requests/hour PER IP, and hosted runners
+        # share IPs, so on macOS it 403s and the install dies (see D7). A real user is
+        # not behind a shared CI egress IP, so passing a token here makes the job
+        # measure the app instead of GitHub's rate limiter. prebuilt_core.py:332 picks
+        # GH_TOKEN up automatically.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: pwsh
         run: |
           $ps1 = Get-ChildItem -Path $env:APP_ROOT -Recurse -Filter 'install.ps1' `
