@@ -1021,10 +1021,28 @@ def scenario_unsloth_run(backend: Backend, report: Report) -> None:
 
         # It prints the key inside a ready-to-paste curl example; that is the only place
         # a user sees it, so parsing it is also a check that the instructions are usable.
-        text = log_path.read_text(errors="replace")
-        match = re.search(r"Authorization:\s*Bearer\s+(\S+?)[\"'\s]", text)
+        #
+        # Poll rather than read once: /api/health starts answering from the uvicorn
+        # worker before the main thread has finished flushing its banner, so on a warm
+        # machine (second boot, page cache hot) the key is not in the log yet when
+        # health first goes green. Reading once made this fail on both Linux runners in
+        # round 6 while passing in round 5 purely because round 5 booted slower.
+        match = None
+        key_deadline = time.monotonic() + 180
+        while time.monotonic() < key_deadline:
+            text = log_path.read_text(errors="replace")
+            match = re.search(r"Authorization:\s*Bearer\s+(\S+?)[\"'\s]", text)
+            if match:
+                break
+            if proc.poll() is not None:
+                break
+            time.sleep(2)
         if not match:
-            report.fail("`unsloth run` printed no 'Authorization: Bearer <key>' example")
+            report.fail(
+                "`unsloth run` printed no 'Authorization: Bearer <key>' example within "
+                f"180s of serving /api/health; log tail: "
+                f"{log_path.read_text(errors='replace')[-400:]}"
+            )
             return
         key = match.group(1)
         print(f"::add-mask::{key}", flush=True)
