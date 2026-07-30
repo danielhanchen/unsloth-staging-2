@@ -3463,10 +3463,33 @@ def _request_matches_loaded_settings(
         effective_extra, request.tensor_parallel, llama_backend.tensor_parallel
     ):
         return False
-    # The diffusion runner is mode-agnostic (it always reports "auto" and ignores
-    # the layer/MoE/split knobs), so a standing manual preference in the request
-    # must not force a needless reload -- only the GPU pick matters.
-    if not llama_backend.is_diffusion:
+    # The diffusion runner takes the layer split but ignores the MoE/split knobs,
+    # so only the GPU pick and the effective --ngl matter for it.
+    if llama_backend.is_diffusion:
+        # Compare the EFFECTIVE split, not the raw mode: the UI keeps a manual
+        # preference standing across a diffusion load, so comparing modes would
+        # reload forever, while comparing raw gpu_layers would miss that Auto(-1)
+        # and Unsloth mode both mean "runner default".
+        # Compare against what the live runner was ASKED for, not what it applied:
+        # against an unsloth_zoo without --ngl the two differ, and comparing with the
+        # applied default would make the same request mismatch forever and reload on
+        # every /load.
+        from core.inference.llama_cpp import _diffusion_manual_ngl
+
+        loaded_ngl = llama_backend.diffusion_requested_ngl
+        requested_ngl = _diffusion_manual_ngl(request.gpu_memory_mode, request.gpu_layers)
+        if requested_ngl != loaded_ngl:
+            return False
+        # A dropped split (old shim; the runner applied its default) still dedupes
+        # -- unless the shim has gained --ngl since (zoo upgraded mid-session), so
+        # the reload finally applies the ask. Mirrors _already_in_target_state.
+        if (
+            requested_ngl is not None
+            and llama_backend.gpu_layers != requested_ngl
+            and llama_backend.diffusion_split_supported()
+        ):
+            return False
+    else:
         if request.gpu_memory_mode != llama_backend.gpu_memory_mode:
             return False
         # Manual: a layer-count change always reloads; MoE/split only matter with
@@ -4726,6 +4749,25 @@ def _estimate_gguf_required_gb(
         return None
 
 
+def _gguf_layer_count(config: ModelConfig) -> Optional[int]:
+    """Total block count from a local GGUF header, or None (remote / unreadable)."""
+    try:
+        main = getattr(config, "gguf_file", None)
+        if not (main and Path(main).is_file()):
+            repo = getattr(config, "gguf_hf_repo", None)
+            variant = getattr(config, "gguf_variant", None)
+            if repo and variant:
+                from hub.utils.gguf import resolve_local_gguf_path
+                main = resolve_local_gguf_path(repo, variant)
+        if main and Path(main).is_file():
+            probe = LlamaCppBackend()
+            probe._read_gguf_metadata(str(main))
+            return getattr(probe, "_n_layers", None) or None
+    except Exception as e:
+        logger.debug("Could not read GGUF layer count for training guard: %s", e)
+    return None
+
+
 def _classify_diffusion_gguf(config: ModelConfig) -> Optional[bool]:
     """Classify a GGUF as diffusion, normal, or unknown before loading."""
     identity = " ".join(
@@ -4893,6 +4935,7 @@ def _guard_chat_load_against_training(
     cache_type_kv: Optional[str] = None,
     tensor_parallel: bool = False,
     gpu_memory_mode: Literal["auto", "manual"] = "auto",
+    gpu_layers: int = -1,
     gpu_ids_are_vulkan_ordinals: bool = False,
     diffusion_kind: Optional[bool] | object = _DIFFUSION_KIND_UNSET,
 ) -> None:
@@ -4902,9 +4945,10 @@ def _guard_chat_load_against_training(
     effective quantization (see _effective_load_in_4bit). Manual chat-GGUF
     placement is an explicit override: Auto layers delegate fitting to
     llama.cpp's ``--fit`` and pinned layers are owned by the user, so neither is
-    estimated here. Diffusion is still guarded because its mode-agnostic runner
-    ignores those controls and uses one GPU. An unclassified GGUF is guarded as
-    potentially diffusion until its local header proves otherwise. Other loads
+    estimated here. Diffusion is still guarded because its runner uses one GPU --
+    except for an explicit zero-layer split, which places no model layers at all
+    and so cannot compete with training for VRAM. An unclassified GGUF is guarded
+    as potentially diffusion until its local header proves otherwise. Other loads
     raise HTTP 409 when they would not fit beside training.
     """
     from core.training import get_training_backend
@@ -4917,10 +4961,36 @@ def _guard_chat_load_against_training(
         logger.warning("Could not check training state for chat-load guard: %s", e)
         return
 
+    from core.inference.llama_cpp import _diffusion_manual_ngl, _scale_diffusion_required_gb
+
     is_gguf = bool(getattr(config, "is_gguf", False))
     if diffusion_kind is _DIFFUSION_KIND_UNSET:
         diffusion_kind = _classify_diffusion_gguf(config) if is_gguf else False
     if is_gguf and gpu_memory_mode == "manual" and diffusion_kind is False:
+        return
+    # A zero-layer diffusion split places no model layers on any device, so it
+    # cannot compete with training for VRAM and must not be refused by size.
+    # Mirrors the loader, which folds the same condition into its cpu_only
+    # (core/inference/llama_cpp.py, _start_diffusion_server).
+    diffusion_ngl = _diffusion_manual_ngl(gpu_memory_mode, gpu_layers) if is_gguf else None
+    if diffusion_ngl is not None and diffusion_kind is not False:
+        # The loader drops the split when the installed shim has no --ngl and
+        # launches the default GPU-resident configuration. Guard what will run,
+        # not what was asked: otherwise a zero-layer request skips the VRAM
+        # check while the child still takes a whole GPU.
+        try:
+            if not get_llama_cpp_backend().diffusion_split_supported():
+                diffusion_ngl = None
+        except Exception as e:
+            logger.warning("Could not probe diffusion shim for chat-load guard: %s", e)
+            diffusion_ngl = None
+    # `is True`, not `is not False`: only a CONFIRMED diffusion GGUF is known to
+    # place nothing on the device at ngl 0. An unclassified one (unreadable header,
+    # name without the family) may be an ordinary GGUF, and --gpu-layers 0 is not
+    # zero VRAM there -- a device pin, tensor mode, mmproj or a GPU drafter all keep
+    # it resident (see LlamaCppBackend._zero_offload_keeps_gpu_visible). Matches the
+    # scaling block below, which already refuses to size an unknown classification.
+    if is_gguf and diffusion_kind is True and diffusion_ngl == 0:
         return
 
     diffusion_gpu = None
@@ -4932,6 +5002,7 @@ def _guard_chat_load_against_training(
         diffusion_gpu = LlamaCppBackend._diffusion_gpu_arg(
             requested_gpu_ids,
             cpu_only = LlamaCppBackend._effective_gpu_count() == 0,
+            force_cpu = diffusion_ngl == 0,
         )
 
     # Detected once: both the tensor-parallel KV sizing below and the Vulkan
@@ -4976,6 +5047,19 @@ def _guard_chat_load_against_training(
         if is_gguf
         else None
     )
+    # A confirmed-diffusion positive split puts only ngl/n_layers of the weights
+    # on the GPU (the shim-support gate above already nulled a split the loader
+    # would drop). Unknown classification keeps the full estimate: its header was
+    # unreadable, so the layer count would be too.
+    if (
+        required_override_gb is not None
+        and diffusion_kind is True
+        and diffusion_ngl is not None
+        and diffusion_ngl > 0
+    ):
+        required_override_gb = _scale_diffusion_required_gb(
+            required_override_gb, diffusion_ngl, _gguf_layer_count(config)
+        )
 
     vulkan_free_vram_gb = None
     if is_gguf:
@@ -5762,6 +5846,7 @@ async def _load_model_impl(
             cache_type_kv = request.cache_type_kv,
             tensor_parallel = bool(request.tensor_parallel),
             gpu_memory_mode = request.gpu_memory_mode,
+            gpu_layers = request.gpu_layers,
             gpu_ids_are_vulkan_ordinals = gpu_ids_are_vulkan_ordinals,
             diffusion_kind = diffusion_kind,
         )
@@ -6495,6 +6580,7 @@ async def validate_model(
                 cache_type_kv = request.cache_type_kv,
                 tensor_parallel = request.tensor_parallel,
                 gpu_memory_mode = request.gpu_memory_mode,
+                gpu_layers = request.gpu_layers,
                 gpu_ids_are_vulkan_ordinals = gpu_ids_are_vulkan_ordinals,
                 diffusion_kind = diffusion_kind,
             )
