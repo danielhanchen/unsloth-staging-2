@@ -181,7 +181,8 @@ jobs:
           # xvfb-run exports XAUTHORITY to its child only, so this step has to be
           # pointed at the same cookie or xwd reports "unable to open display".
           XAUTHORITY="$PWD/.xvfb-auth" xwd -root -display :99 -out artifacts/screen.xwd
-          python3 tests/studio/xwd_not_blank.py artifacts/screen.xwd
+          python3 tests/studio/xwd_not_blank.py artifacts/screen.xwd \
+            --png artifacts/desktop-window.png
 
       - name: Serve an API with `unsloth run`
         if: always()
