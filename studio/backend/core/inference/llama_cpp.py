@@ -8632,6 +8632,30 @@ class LlamaCppBackend:
                 _spec_start = len(cmd)
                 cmd.extend(spec_flags)
 
+                # Backstop for the MTP/-np clamp above. That one can only see an
+                # explicit --spec-type in extra_args; MTP is also reachable via
+                # speculative_type="auto"/"mtp", which is not resolved until
+                # _build_speculative_flags runs -- here. spec_flags is the final
+                # word on the mode, so re-check it and rewrite --parallel in place.
+                # The KV fit above was sized for the larger slot count, so this
+                # over-reserves rather than under-reserves: wasteful, never unsafe.
+                if n_parallel > 1 and _extra_args_requests_mtp(spec_flags):
+                    try:
+                        _np_at = cmd.index("--parallel")
+                    except ValueError:
+                        _np_at = -1
+                    if _np_at >= 0:
+                        logger.warning(
+                            "%s resolved to MTP speculative decoding, which does not "
+                            "support %d parallel slots; using 1.",
+                            model_identifier,
+                            n_parallel,
+                        )
+                        cmd[_np_at + 1] = "1"
+                        # _commit_effective_parallel_slots(n_parallel) below reports
+                        # what actually launched, so rebind rather than only patching cmd.
+                        n_parallel = 1
+
                 # Apply custom chat template override if provided.
                 self._chat_template_override = chat_template_override
                 if chat_template_override:
