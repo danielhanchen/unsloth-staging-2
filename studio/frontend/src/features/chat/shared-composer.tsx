@@ -107,7 +107,10 @@ import {
   usePlusMenuPrefsStore,
 } from "./stores/plus-menu-prefs-store";
 import {
-  GPU_LAYERS_AUTO,
+  resolveComparePlacement,
+  shouldPinDiffusionPlacement,
+} from "./lib/gpu-placement";
+import {
   loadedGpuMemoryFields,
   type ReasoningEffort,
   reconcilePersistedGpuIds,
@@ -1059,6 +1062,10 @@ export function SharedComposer({
           (sel.ggufVariant ?? null) != null ||
           sel.id.toLowerCase().endsWith(".gguf");
         let resolvedIsDiffusion = sel.isDiffusion;
+        // Set when the preflight could not classify the GGUF either way (not
+        // downloaded yet / unreadable header, and no family in the name), so
+        // resolvedIsDiffusion === false below must not be read as "ordinary".
+        let diffusionUnknown = false;
         if (targetIsGguf && resolvedIsDiffusion === undefined) {
           const preparedToken = await prepareHfTokenForUse(
             currentStore.hfToken,
@@ -1066,13 +1073,13 @@ export function SharedComposer({
           if (!preparedToken.proceed) {
             throw new Error("Model load cancelled.");
           }
-          resolvedIsDiffusion = (
-            await fetchGgufStagedMetadata({
-              model_path: sel.id,
-              gguf_variant: sel.ggufVariant ?? null,
-              hf_token: preparedToken.token,
-            })
-          ).isDiffusion;
+          const staged = await fetchGgufStagedMetadata({
+            model_path: sel.id,
+            gguf_variant: sel.ggufVariant ?? null,
+            hf_token: preparedToken.token,
+          });
+          resolvedIsDiffusion = staged.isDiffusion;
+          diffusionUnknown = staged.diffusionUnknown;
         }
         // Mirror single-view resolveLoadMaxSeqLength: a GGUF pane with no explicit
         // context loads at native (0 -> n_ctx_train), not the session maxSeqLength,
@@ -1103,14 +1110,30 @@ export function SharedComposer({
         if (ownConfig.selectedGpuIds != null) {
           await ensureGpuDeviceCache();
         }
-        const effectiveGpuMemoryMode =
-          resolvedIsDiffusion
-            ? "auto"
-            : (ownConfig.gpuMemoryMode ?? compareLoadKnobs.gpuMemoryMode);
-        const effectiveGpuLayers =
-          resolvedIsDiffusion
-            ? GPU_LAYERS_AUTO
-            : (ownConfig.gpuLayers ?? compareLoadKnobs.gpuLayers);
+        // The diffusion runner honours the layer split (#7574), so a pane's OWN
+        // saved split is sent instead of being forced to Auto. The shared
+        // snapshot is not: it is the live store of whichever chat GGUF was
+        // loaded at Send, and its layer count is bounded by THAT model. No
+        // diffusion UI can show or clear an inherited split (the mode row and
+        // the layer slider are hidden for diffusion, and a saved diffusion
+        // config is stripped of both), so a pane would silently run at another
+        // model's count -- and a leaked 0 masks its devices entirely. Only the
+        // knobs the runner has no equivalent for (MoE offload, tensor parallel)
+        // stay hard-forced. An UNCLASSIFIED GGUF is pinned too: /load downloads
+        // it, may then read a diffusion header, and would apply the inherited
+        // count regardless.
+        const {
+          gpuMemoryMode: effectiveGpuMemoryMode,
+          gpuLayers: effectiveGpuLayers,
+        } = resolveComparePlacement(
+          ownConfig,
+          compareLoadKnobs,
+          shouldPinDiffusionPlacement(
+            targetIsGguf,
+            resolvedIsDiffusion,
+            diffusionUnknown,
+          ),
+        );
         const effectiveNCpuMoe =
           resolvedIsDiffusion
             ? 0
@@ -1164,6 +1187,9 @@ export function SharedComposer({
             ? {
                 gpu_ids: effectiveSelectedGpuIds ?? undefined,
                 gpu_memory_mode: effectiveGpuMemoryMode,
+                // Sized like the load below: a manual DiffusionGemma split must
+                // not be validated as a full-GGUF occupant during training.
+                gpu_layers: effectiveGpuLayers,
                 // Slots scale the KV estimate; keep validate sized like the load.
                 n_parallel: ownConfig.nParallel ?? null,
               }
