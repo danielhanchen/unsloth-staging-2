@@ -316,6 +316,7 @@ jobs:
           # The stripped machine has no python on PATH by design, so use the venv the
           # bundled installer just built -- which is also a check that it is usable.
           $py = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          $env:UNSLOTH_DRIVE_APP_BINARY = $env:APP_EXE
           & $py tests/studio/desktop_drive.py `
               --scenarios $env:SCENARIOS `
               --discover-timeout 420 `

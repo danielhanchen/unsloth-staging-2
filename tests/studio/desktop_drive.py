@@ -1001,16 +1001,46 @@ def scenario_mlx(backend: Backend, report: Report) -> None:
         )
 
 
-def scenario_updater(backend: Backend, report: Report) -> None:
-    """The endpoint the shipped app polls for updates.
+DEFAULT_UPDATER_ENDPOINT = (
+    "https://github.com/unslothai/unsloth/releases/download/desktop-latest/latest.json"
+)
 
-    Read from the installed bundle rather than the source tree, because the question is
-    what the SHIPPED binary points at.
+
+def _installed_updater_endpoint(report: Report) -> str:
+    """The updater URL the SHIPPED binary actually carries.
+
+    tauri.conf.json is baked into the executable at build time, so the source tree only
+    tells us what the NEXT build would use. Recover the real one by scanning the
+    installed binary for the literal string; fall back to the known default, and say
+    which was used so the result is never ambiguous.
     """
-    endpoint = os.environ.get(
-        "UNSLOTH_DRIVE_UPDATER_ENDPOINT",
-        "https://github.com/unslothai/unsloth/releases/download/desktop-latest/latest.json",
-    )
+    override = os.environ.get("UNSLOTH_DRIVE_UPDATER_ENDPOINT")
+    if override:
+        report.note("updater_endpoint_source", "environment override")
+        return override
+
+    binary = os.environ.get("UNSLOTH_DRIVE_APP_BINARY")
+    if binary and Path(binary).is_file():
+        try:
+            blob = Path(binary).read_bytes()
+        except Exception as error:
+            report.warn(f"could not read {binary}: {error}")
+        else:
+            found = re.findall(rb"https://[^\x00\s\"']*latest\.json", blob)
+            if found:
+                endpoint = found[0].decode("utf-8", errors="replace")
+                report.note("updater_endpoint_source", f"extracted from {binary}")
+                report.ok(f"the shipped binary points its updater at {endpoint}")
+                return endpoint
+            report.warn(f"no latest.json URL found inside {binary}")
+
+    report.note("updater_endpoint_source", "default (binary not provided or unreadable)")
+    return DEFAULT_UPDATER_ENDPOINT
+
+
+def scenario_updater(backend: Backend, report: Report) -> None:
+    """The endpoint the shipped app polls for updates."""
+    endpoint = _installed_updater_endpoint(report)
     report.note("updater_endpoint", endpoint)
     request = urllib.request.Request(endpoint, method="GET")
     try:

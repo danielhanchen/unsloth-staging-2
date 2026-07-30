@@ -193,6 +193,7 @@ jobs:
           # pipefail or the tee swallows the harness's exit code and the job goes green
           # over a red report -- the worst possible outcome for a test job.
           set -o pipefail
+          export UNSLOTH_DRIVE_APP_BINARY="$BIN"
           python3 tests/studio/desktop_drive.py \
             --scenarios "$SCENARIOS" \
             --discover-timeout 420 \

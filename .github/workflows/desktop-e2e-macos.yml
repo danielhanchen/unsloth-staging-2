@@ -177,6 +177,7 @@ jobs:
         run: |
           set -a; . ./clean-machine.env; set +a
           set -o pipefail
+          export UNSLOTH_DRIVE_APP_BINARY="$BIN"
           "$PY" tests/studio/desktop_drive.py \
             --scenarios "$SCENARIOS" \
             --discover-timeout 420 \
