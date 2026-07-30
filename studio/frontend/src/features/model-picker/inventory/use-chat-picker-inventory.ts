@@ -28,6 +28,9 @@ function isCompleteCachedRow(row: CachedInventoryRow): boolean {
 function toCachedGgufRepo(row: CachedInventoryRow): CachedGgufRepo {
   return {
     repo_id: row.repoId,
+    // Listed by repo id, loaded by the pinned id. Dropping it sends the picker
+    // back down the ref the cached listing stepped around.
+    load_id: row.loadId,
     size_bytes: row.bytes,
     cache_path: row.cachePath ?? "",
     last_modified: row.lastModified ?? undefined,
@@ -38,6 +41,7 @@ function toCachedGgufRepo(row: CachedInventoryRow): CachedGgufRepo {
 function toCachedModelRepo(row: CachedInventoryRow): CachedModelRepo {
   return {
     repo_id: row.repoId,
+    load_id: row.loadId,
     size_bytes: row.bytes,
     last_modified: row.lastModified ?? undefined,
   };
