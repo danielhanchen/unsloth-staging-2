@@ -558,6 +558,61 @@ def scenario_backend(backend: Backend, report: Report) -> None:
         report.fail(f"no tauri.log at {log}")
 
 
+def _attribute_garbage(backend: Backend, report: Report) -> None:
+    """Garbage output: is it the GPU offload, or the model/quant itself?
+
+    The macOS runners report their GPU as "Apple Silicon (Apple Paravirtual device)" --
+    the virtualised Metal device GitHub's macOS VMs expose. llama.cpp offloading onto a
+    paravirtual Metal device is a known source of corrupt output, and a corrupt kernel
+    is exactly what an ordered character walk looks like.
+
+    So reload the same model pinned to CPU (`gpu_memory_mode=manual`, `gpu_layers=0`)
+    and generate again. Coherent on CPU and garbage on GPU is a decisive attribution --
+    and it is the difference between "this model is broken" and "this machine's GPU
+    offload is broken", which no amount of staring at the output can settle.
+    """
+    gpu = {}
+    code, hardware = backend.http("GET", "/api/system/hardware", timeout=60)
+    if code == 200 and isinstance(hardware, dict):
+        gpu = hardware.get("gpu") or {}
+    report.note("gpu_at_garbage", gpu)
+    report.note("platform", platform.platform())
+    if gpu.get("gpu_name"):
+        report.warn(f"the failing run had GPU offload available: {gpu.get('gpu_name')!r}")
+
+    unload_model(backend)
+    if not load_model(
+        backend,
+        report,
+        MTP_REPO,
+        gguf_variant=MTP_VARIANT,
+        speculative_type="off",
+        gpu_memory_mode="manual",
+        gpu_layers=0,
+        timeout=1800,
+    ):
+        report.warn("could not reload pinned to CPU; attribution inconclusive")
+        return
+
+    code, body = chat_once(backend, "In one sentence, what is a large language model?")
+    text = _completion_text(body)
+    report.note("cpu_only_completion", text[:300])
+    coherent, why = looks_coherent(text)
+    if coherent:
+        report.fail(
+            f"ATTRIBUTION: the same model+quant is COHERENT with gpu_layers=0 "
+            f"({text[:80]!r}) and garbage with GPU offload. The model is fine; the "
+            f"GPU offload path on this machine corrupts inference."
+        )
+    else:
+        report.fail(
+            f"ATTRIBUTION: still not language with gpu_layers=0 ({why}: {text[:80]!r}), "
+            f"so the GPU offload is not the whole story -- suspect the model, the quant, "
+            f"or the llama.cpp build itself."
+        )
+    unload_model(backend)
+
+
 def scenario_inference(backend: Backend, report: Report) -> None:
     """The model the goal names, run the way its card says it must be run."""
     report.note("repo", MTP_REPO)
@@ -589,8 +644,10 @@ def scenario_inference(backend: Backend, report: Report) -> None:
         # Non-empty but not language. macOS returned exactly this and the old
         # "is it non-empty" check called it a pass.
         report.fail(f"the model generated garbage ({why}): {text[:120]!r}")
+        _attribute_garbage(backend, report)
     else:
         report.fail(f"completion was empty: {str(body)[:300]}")
+        _attribute_garbage(backend, report)
 
     usage = body.get("usage") if isinstance(body, dict) else None
     if isinstance(usage, dict) and usage.get("completion_tokens"):
