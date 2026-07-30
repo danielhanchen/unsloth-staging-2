@@ -1,0 +1,202 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# STAGING. Installs the SHIPPED .deb on a machine stripped of developer tooling, then
+# actually DRIVES it.
+#
+# desktop-app-clean-machine-ci.yml already proves the bundle installs and that the
+# process is alive after 90 s. It stops there, because a hosted runner has nobody to
+# click Install. This job goes further: it runs the bundled installer the way first
+# launch does, launches the app under Xvfb, waits for the backend the app itself spawns
+# (127.0.0.1:8888-8908, recorded in ~/.unsloth/studio/run/desktop_backend.json), logs in
+# with the app's own desktop secret, and exercises inference, parallel chats, settings,
+# the llama.cpp/whisper.cpp prebuilts, API serving and the updater endpoint.
+#
+# Two deliberate differences from the upstream job:
+#   * REL_REPO points at unsloth-test/unsloth-test, which is where the CURRENT desktop
+#     bundle lives. Upstream defaults to github.repository, whose newest desktop release
+#     is the stale draft desktop-v0.1.50-beta.
+#   * The "KNOWN OUTCOME PIN" blocks are gone. v0.1.51-beta's bundled install.sh carries
+#     #7547 (verified: _SMART_APT_OPTIONAL x3, _check_macos_deps x2), which is exactly
+#     the condition those pins say to retire them on.
+
+name: "desktop-e2e linux deb"
+
+on:
+  push:
+    branches: [desktop-e2e]
+    paths:
+      - 'tests/studio/desktop_drive.py'
+      - 'tests/studio/desktop_playwright.py'
+      - '.github/workflows/desktop-e2e-linux-deb.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag in the desktop release repo'
+        type: string
+        default: 'desktop-v0.1.51-beta'
+      scenarios:
+        description: 'Comma-separated scenario list, or all'
+        type: string
+        default: 'all'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REL_REPO: unsloth-test/unsloth-test
+  REL_TAG: ${{ inputs.release_tag || 'desktop-v0.1.51-beta' }}
+  SCENARIOS: ${{ inputs.scenarios || 'all' }}
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+  # The 2 B Q4 quant on a 16 GB runner; the macOS legs drop to UD-Q2_K_XL.
+  UNSLOTH_DRIVE_MTP_VARIANT: 'UD-Q4_K_XL'
+
+jobs:
+  deb:
+    name: deb install + drive
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # torch + a 2 B GGUF + the llama.cpp prebuilt do not fit alongside the image's
+      # preinstalled SDKs on a 14 GB disk.
+      - name: Reclaim disk
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Download the shipped .deb
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dl logs artifacts
+          gh release download "$REL_TAG" --repo "$REL_REPO" --pattern '*.deb' --dir dl
+          ls -la dl
+          sha256sum dl/*.deb | tee artifacts/deb.sha256
+
+      - name: Strip the developer toolchain
+        run: |
+          bash .github/scripts/clean-machine-env.sh mask --remove
+          set -a; . ./clean-machine.env; set +a
+          bash .github/scripts/clean-machine-assert.sh absent
+
+      - name: Install with NO dev tooling, only runtime libs
+        run: |
+          # Deliberately no build-essential/cmake/git: a user installing a .deb has none.
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends xvfb jq
+          sudo apt-get install -y ./dl/*.deb || {
+            echo "::error::the .deb does not declare its runtime dependencies correctly"
+            exit 1
+          }
+          BIN="$(dpkg -L "$(dpkg-deb -f dl/*.deb Package)" | grep -E '/usr/bin/' | head -1)"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+          echo "binary: $BIN"
+
+      - name: Re-assert the toolchain is still absent
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          bash .github/scripts/clean-machine-assert.sh absent
+          deps="$(dpkg-deb -f dl/*.deb Depends)"
+          echo "declared Depends: $deps"
+          if printf '%s' "$deps" | grep -qE '(^|[ ,])(git|cmake|build-essential|gcc|g\+\+|clang|llvm)([ ,(]|$)'; then
+            echo "::error::the bundle now declares a developer toolchain dependency: $deps"
+            exit 1
+          fi
+
+      - name: Run the bundled installer, the path first launch takes
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          set -o pipefail
+          SH="$(dpkg -L "$(dpkg-deb -f dl/*.deb Package)" | grep -E '/install\.sh$' | head -1)"
+          [ -n "$SH" ] && [ -f "$SH" ] || { echo "::error::the bundle ships no install.sh resource"; exit 1; }
+          echo "bundled installer: $SH"
+          # The upstream job pins a pre-#7547 outcome here. This bundle carries #7547
+          # (_SMART_APT_OPTIONAL present), so the pin's own retirement condition is met
+          # and a clean exit 0 is now the requirement.
+          if ! grep -q '_SMART_APT_OPTIONAL' "$SH"; then
+            echo "::error::this bundle predates #7547; it cannot install on a stripped machine"
+            exit 1
+          fi
+          rc=0
+          env -u UNSLOTH_STUDIO_HOME \
+            bash "$SH" --tauri < /dev/null 2>&1 | tee logs/bundled-install.log || rc=$?
+          echo "bundled installer exit code: $rc"
+          [ "$rc" -eq 0 ] || { echo "::error::bundled installer exited $rc"; exit 1; }
+          PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          [ -x "$PY" ] || { echo "::error::bundled installer left no venv at $PY"; exit 1; }
+          "$PY" -V
+          "$PY" -c "import torch; print('torch', torch.__version__)"
+
+      - name: Launch the app under Xvfb and keep it up
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          # WebKitGTK on a hosted runner needs both mitigations or it dies on the
+          # compositor; the release notes name the blank-window failure this avoids.
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1
+          nohup xvfb-run -a --server-args="-screen 0 1440x900x24" \
+            "$BIN" > logs/app-stdout.log 2>&1 &
+          echo "APP_PID=$!" >> "$GITHUB_ENV"
+          sleep 20
+          if ! kill -0 "$!" 2>/dev/null; then
+            echo "::error::the app exited during startup"
+            tail -60 logs/app-stdout.log
+            exit 1
+          fi
+          echo "app launched"
+
+      - name: Drive the running app
+        id: drive
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          python3 tests/studio/desktop_drive.py \
+            --scenarios "$SCENARIOS" \
+            --discover-timeout 420 \
+            --out artifacts/drive-report.json 2>&1 | tee logs/drive.log
+
+      - name: What did the app's own log say?
+        if: always()
+        run: |
+          for f in "$HOME/.unsloth/studio/tauri.log" logs/app-stdout.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f ==="
+            cp "$f" logs/ 2>/dev/null || true
+            tail -80 "$f"
+          done
+
+      - name: Stop the app
+        if: always()
+        run: kill -TERM "${APP_PID:-0}" 2>/dev/null || true
+
+      - name: Restore the runner
+        if: always()
+        run: |
+          if [ -f .clean-machine/restore.sh ]; then
+            bash .clean-machine/restore.sh
+          else
+            echo "no .clean-machine/restore.sh: nothing to restore"
+          fi
+
+      - name: Upload logs and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e-linux-deb
+          path: |
+            logs/
+            artifacts/
+          retention-days: 7
+          if-no-files-found: warn

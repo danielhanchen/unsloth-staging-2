@@ -1,0 +1,223 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# STAGING. Installs the SHIPPED .dmg the way a user does -- quarantined download, mount,
+# drag to /Applications -- on a machine stripped of the Xcode toolchain, then launches
+# the app and drives it, including the two things only Apple Silicon can prove: real MLX
+# LoRA training and MLX safetensors inference.
+#
+# macOS is the one platform with no WebDriver route into the packaged renderer (there is
+# no desktop WKWebView WebDriver, and Tauri's embedded-plugin approach cannot be
+# retrofitted into an already-released bundle), so UI coverage here is the
+# backend-attached layer plus Gatekeeper/codesign assertions on the bundle itself.
+#
+# macos-14 is 3 CPU / 7 GB, so the MTP quant drops to UD-Q2_K_XL and models are unloaded
+# between scenarios.
+
+name: "desktop-e2e macos"
+
+on:
+  push:
+    branches: [desktop-e2e]
+    paths:
+      - 'tests/studio/desktop_drive.py'
+      - '.github/workflows/desktop-e2e-macos.yml'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag in the desktop release repo'
+        type: string
+        default: 'desktop-v0.1.51-beta'
+      scenarios:
+        description: 'Comma-separated scenario list, or all'
+        type: string
+        default: 'all'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REL_REPO: unsloth-test/unsloth-test
+  REL_TAG: ${{ inputs.release_tag || 'desktop-v0.1.51-beta' }}
+  SCENARIOS: ${{ inputs.scenarios || 'all' }}
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+  # 7 GB of RAM cannot hold the Q4 quant alongside a llama-server process.
+  UNSLOTH_DRIVE_MTP_VARIANT: 'UD-Q2_K_XL'
+
+jobs:
+  macos:
+    name: dmg install + drive (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Download the shipped .dmg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dl logs artifacts
+          gh release download "$REL_TAG" --repo "$REL_REPO" --pattern '*aarch64.dmg' --dir dl
+          ls -la dl
+          shasum -a 256 dl/*.dmg | tee artifacts/dmg.sha256
+
+      - name: Strip the developer toolchain
+        run: |
+          bash .github/scripts/clean-machine-env.sh mask --remove
+          set -a; . ./clean-machine.env; set +a
+          bash .github/scripts/clean-machine-assert.sh absent
+
+      - name: Mount and install, with the quarantine a real download carries
+        run: |
+          DMG="$(ls dl/*.dmg | head -1)"
+          # Gatekeeper treats a quarantined download differently from a locally built
+          # bundle. Skipping this makes the job pass on something users cannot open.
+          xattr -w com.apple.quarantine \
+            "0081;$(printf %x $(date +%s));Safari;" "$DMG" 2>/dev/null || true
+          hdiutil attach "$DMG" -nobrowse -quiet -mountpoint /Volumes/UnslothCI
+          APP="$(ls -d /Volumes/UnslothCI/*.app | head -1)"
+          echo "app bundle: $APP"
+          cp -R "$APP" /Applications/
+          hdiutil detach /Volumes/UnslothCI -quiet
+          ls -la /Applications | grep -i unsloth
+
+      - name: Inspect the bundle (arch, signature, Gatekeeper)
+        run: |
+          APP="$(ls -d /Applications/*Unsloth*.app | head -1)"
+          BIN="$APP/Contents/MacOS/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+          file "$BIN"
+          # `lipo` is an xcrun shim and is gone once CommandLineTools is masked; `file`
+          # is base system. `lipo -archs` also prints and exits 0 for a thin x86_64
+          # binary, so it cannot be the only check.
+          ARCHS="$(lipo -archs "$BIN" 2>/dev/null || true)"
+          [ -n "$ARCHS" ] || ARCHS="$(file -b "$BIN")"
+          echo "architectures: $ARCHS"
+          case "$ARCHS" in
+            *arm64*|*aarch64*) ;;
+            *) echo "::error::the aarch64 .dmg carries no arm64 binary ($ARCHS)"; exit 1 ;;
+          esac
+          codesign -dv --verbose=2 "$APP" 2>&1 | tee artifacts/codesign.txt | head -20 || true
+          # Strict, deep verification of the whole bundle -- the check that catches a
+          # sidecar or helper the signer missed.
+          if codesign --verify --deep --strict --verbose=2 "$APP" 2>&1 | tee -a artifacts/codesign.txt; then
+            echo "codesign --verify --deep --strict passed"
+          else
+            echo "::warning::codesign --verify --deep --strict failed; see artifacts/codesign.txt"
+          fi
+          # Report rather than gate: an unnotarised beta is expected to fail assessment,
+          # but a user WILL hit this, so it has to be visible.
+          spctl -a -vvv -t install "$APP" 2>&1 | tee artifacts/spctl.txt | head -5 || \
+            echo "::warning::Gatekeeper assessment failed -- users see 'cannot be opened' unless notarised"
+          if [ -f "$APP/Contents/Resources/install.sh" ]; then
+            echo "bundled install.sh present"
+          else
+            echo "::error::no bundled install.sh in the app"
+            exit 1
+          fi
+
+      - name: Run the bundled installer, the path first launch takes
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          set -o pipefail
+          SH="$APP/Contents/Resources/install.sh"
+          # The upstream job pins a pre-#7547 outcome here. This bundle carries #7547, so
+          # the pin's own retirement condition is met and exit 0 is now the requirement.
+          if ! grep -q '_check_macos_deps' "$SH"; then
+            echo "::error::this bundle predates #7547; it cannot install on a stripped Mac"
+            exit 1
+          fi
+          rc=0
+          env -u UNSLOTH_STUDIO_HOME \
+            bash "$SH" --tauri < /dev/null 2>&1 | tee logs/bundled-install.log || rc=$?
+          echo "bundled installer exit code: $rc"
+          [ "$rc" -eq 0 ] || { echo "::error::bundled installer exited $rc"; exit 1; }
+          PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          [ -x "$PY" ] || { echo "::error::bundled installer left no venv at $PY"; exit 1; }
+          echo "PY=$PY" >> "$GITHUB_ENV"
+          "$PY" -V
+          "$PY" -c "import torch; print('torch', torch.__version__)"
+
+      - name: Launch the app and keep it up
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          nohup "$BIN" > logs/app-stdout.log 2>&1 &
+          echo "APP_PID=$!" >> "$GITHUB_ENV"
+          sleep 20
+          if ! kill -0 "$!" 2>/dev/null; then
+            echo "::error::the app exited during startup"
+            tail -60 logs/app-stdout.log
+            exit 1
+          fi
+          echo "app launched"
+
+      - name: Drive the running app
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          "$PY" tests/studio/desktop_drive.py \
+            --scenarios "$SCENARIOS" \
+            --discover-timeout 420 \
+            --out artifacts/drive-report.json 2>&1 | tee logs/drive.log
+
+      - name: Real MLX LoRA training smoke
+        # The one thing only an Apple Silicon host can prove: a real MLX backward pass +
+        # optimizer step + inference call. mlx-ci.yml runs this against a pip install;
+        # here it runs inside the venv the SHIPPED bundle built, which is the claim that
+        # matters for the desktop app.
+        if: always()
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          "$PY" -m pip install --quiet mlx mlx-lm 2>&1 | tail -5 || \
+            echo "::warning::could not install mlx into the bundled venv"
+          "$PY" tests/studio/run_real_mlx_smoke.py 2>&1 | tee logs/mlx-smoke.log || {
+            echo "::error::MLX training smoke failed inside the bundle's own venv"
+            exit 1
+          }
+
+      - name: What did the app's own log say?
+        if: always()
+        run: |
+          for f in "$HOME/.unsloth/studio/tauri.log" logs/app-stdout.log; do
+            [ -f "$f" ] || continue
+            echo "=== $f ==="
+            cp "$f" logs/ 2>/dev/null || true
+            tail -80 "$f"
+          done
+
+      - name: Stop the app
+        if: always()
+        run: kill -TERM "${APP_PID:-0}" 2>/dev/null || true
+
+      - name: Restore the runner
+        if: always()
+        run: |
+          if [ -f .clean-machine/restore.sh ]; then
+            bash .clean-machine/restore.sh
+          else
+            echo "no .clean-machine/restore.sh: nothing to restore"
+          fi
+
+      - name: Upload logs and report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e-macos-${{ matrix.os }}
+          path: |
+            logs/
+            artifacts/
+          retention-days: 7
+          if-no-files-found: warn
