@@ -237,6 +237,7 @@ function serializedMapEntrySize(key: string, value: StoredMap[string]): number {
 function deleteOldestEvictableEntry(
   map: StoredMap,
   protectedKeys?: ReadonlySet<string>,
+  evicted?: string[],
 ): { key: string; value: StoredMap[string] } | null {
   for (const key of Object.keys(map)) {
     // Never evict a future-schema entry an older client cannot interpret.
@@ -248,6 +249,7 @@ function deleteOldestEvictableEntry(
     }
     const value = map[key];
     delete map[key];
+    evicted?.push(key);
     return { key, value };
   }
   return null;
@@ -256,17 +258,18 @@ function deleteOldestEvictableEntry(
 function enforceStorageBudget(
   map: StoredMap,
   protectedKeys?: ReadonlySet<string>,
+  evicted?: string[],
 ): boolean {
   let entryCount = Object.keys(map).length;
   while (entryCount > MAX_ENTRIES) {
-    if (!deleteOldestEvictableEntry(map, protectedKeys)) {
+    if (!deleteOldestEvictableEntry(map, protectedKeys, evicted)) {
       return false;
     }
     entryCount -= 1;
   }
   let bytes = serializedMapSize(map);
   while (bytes > MAX_PER_MODEL_CONFIG_STORAGE_BYTES) {
-    const removed = deleteOldestEvictableEntry(map, protectedKeys);
+    const removed = deleteOldestEvictableEntry(map, protectedKeys, evicted);
     if (!removed) {
       return false;
     }
@@ -438,7 +441,10 @@ function writeMap(map: StoredMap): boolean {
   }
 }
 
-function warnDroppedFields(raw: Record<string, unknown>, version: number): void {
+function warnDroppedFields(
+  raw: Record<string, unknown>,
+  version: number,
+): void {
   if (!import.meta.env?.DEV) {
     return;
   }
@@ -458,7 +464,8 @@ function normalizeV1(partial: RawConfig): PerModelConfig {
     typeof partial.speculativeType === "string"
       ? canonicalizeSpeculativeType(partial.speculativeType)
       : null;
-  const speculativeType = rawSpecType ?? DEFAULT_PER_MODEL_CONFIG.speculativeType;
+  const speculativeType =
+    rawSpecType ?? DEFAULT_PER_MODEL_CONFIG.speculativeType;
   const specDraftNMax =
     speculativeType != null &&
     MTP_SPECULATIVE_TYPES.has(speculativeType) &&
@@ -496,6 +503,15 @@ function normalizeV1(partial: RawConfig): PerModelConfig {
         : null,
     ...normalizeGpuFields(partial),
   };
+}
+
+/**
+ * A config in the exact shape storage keeps it in: the UI carries sentinels storage does
+ * not (Speculative Decoding "auto" canonicalizes to null), so an edited config would
+ * otherwise read as non-default when it is not.
+ */
+export function normalizePerModelConfig(raw: unknown): PerModelConfig {
+  return normalize(raw);
 }
 
 function normalize(raw: unknown): PerModelConfig {
@@ -646,6 +662,12 @@ export function savePerModelConfig(
   modelId: string,
   ggufVariant: string | null | undefined,
   config: PerModelConfig,
+  /**
+   * Receives models dropped to stay inside the storage budget. Eviction is silent and
+   * still reports success, so without this their server overrides would keep applying
+   * with nothing in the UI able to forget them.
+   */
+  evicted?: { modelId: string; ggufVariant: string | null }[],
 ): boolean {
   if (
     typeof config.chatTemplateOverride === "string" &&
@@ -669,10 +691,53 @@ export function savePerModelConfig(
   const [key] = storageKeysForModelVariant(modelId, ggufVariant);
   deleteConfigEntriesForModelVariant(map, modelId, ggufVariant);
   map[key] = toStoredConfig(normalized);
-  if (!enforceStorageBudget(map, new Set([key]))) {
+  const evictedKeys: string[] = [];
+  if (!enforceStorageBudget(map, new Set([key]), evictedKeys)) {
     return false;
   }
-  return writeMap(map);
+  const written = writeMap(map);
+  if (written && evicted) {
+    for (const evictedKey of evictedKeys) {
+      const id = modelIdFromStorageKey(evictedKey);
+      if (!id) {
+        continue;
+      }
+      const variant = ggufVariantFromStorageKey(evictedKey);
+      evicted.push({ modelId: id, ggufVariant: variant ? variant : null });
+    }
+  }
+  return written;
+}
+
+/** Every saved per-model config, decoded back to the ids it was keyed by. */
+export function listPerModelConfigs(): {
+  modelId: string;
+  ggufVariant: string | null;
+  config: PerModelConfig;
+}[] {
+  const out: {
+    modelId: string;
+    ggufVariant: string | null;
+    config: PerModelConfig;
+  }[] = [];
+  for (const [key, raw] of Object.entries(readMap())) {
+    const modelId = modelIdFromStorageKey(key);
+    if (!modelId) {
+      continue;
+    }
+    // Never report a future-schema record: loadPerModelConfig refuses to apply one, so
+    // the backfill would persist this client's partial reading of it.
+    if (storedConfigVersion(raw) > STORAGE_SCHEMA_VERSION) {
+      continue;
+    }
+    const variant = ggufVariantFromStorageKey(key);
+    out.push({
+      modelId,
+      ggufVariant: variant ? variant : null,
+      config: normalize(raw),
+    });
+  }
+  return out;
 }
 
 export function deletePerModelConfig(
@@ -688,6 +753,39 @@ export function deletePerModelConfig(
     return true;
   }
   return writeMap(map);
+}
+
+/**
+ * Move a saved config from an id an older release keyed it by onto the current one.
+ *
+ * A repo cached outside the active HF cache is now keyed by its repo id, because that is
+ * what the picker and the auto-switch index use; it used to be keyed by the snapshot
+ * path it loads from. Nothing else migrates that: the server backfill only mirrors what
+ * is already stored, so without this the model reads as never remembered and comes up on
+ * defaults after an upgrade.
+ *
+ * Returns whether anything moved. A config already saved under *modelId* wins and the
+ * stale record is dropped, so this can never overwrite a newer save.
+ */
+export function adoptLegacyConfigKey(
+  modelId: string,
+  legacyModelId: string,
+  ggufVariant?: string | null,
+): boolean {
+  if (!legacyModelId || legacyModelId === modelId) {
+    return false;
+  }
+  const legacy = loadPerModelConfig(legacyModelId, ggufVariant);
+  if (!legacy) {
+    return false;
+  }
+  const moved = loadPerModelConfig(modelId, ggufVariant)
+    ? true
+    : savePerModelConfig(modelId, ggufVariant, legacy);
+  if (moved) {
+    deletePerModelConfig(legacyModelId, ggufVariant);
+  }
+  return moved;
 }
 
 export function resolveInitialConfig(
