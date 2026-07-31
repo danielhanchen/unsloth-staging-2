@@ -1805,6 +1805,57 @@ def _extra_args_requests_mtp(
     return any(p.strip().lower() in ("mtp", "draft-mtp") for p in value.split(","))
 
 
+@functools.lru_cache(maxsize = 1)
+def _metal_device_is_paravirtual() -> bool:
+    """True when the Metal device is a VIRTUALISED Apple GPU.
+
+    Offloading llama.cpp onto a paravirtual Metal device produces corrupt output. Proved
+    on GitHub's macos-14 and macos-15 runners, which expose
+    "Apple Silicon (Apple Paravirtual device)": the same model, quant and binary give
+
+        GPU          &#!56789:;<=>@ABCDEFGHIJKLMNOPQRSTUVWXYZ...
+        gpu_layers=0 A large language model is an artificial intelligence system...
+
+    An ordered walk through the character set is a corrupt kernel, not a model behaving
+    badly, and MLX on the very same machine is perfectly coherent -- which exonerates the
+    model, the tokenizer, the API layer and the machine, and leaves the Metal offload.
+
+    Affects any virtualised Mac: CI runners, Parallels, UTM, and cloud Mac providers.
+    Physical Apple Silicon is unaffected and keeps full GPU offload, because the device
+    name only carries "Paravirtual" under virtualisation.
+    """
+    if sys.platform != "darwin":
+        return False
+    name = ""
+    try:
+        import mlx.core as mx  # noqa: WPS433 -- optional, Apple Silicon only
+
+        name = str(mx.device_info().get("device_name") or "")
+    except Exception:  # noqa: BLE001 -- MLX absent or device query failed
+        name = ""
+    if "paravirtual" not in name.lower():
+        # MLX is not installed on every Mac, so fall back to the OS itself rather than
+        # silently deciding a virtualised machine is bare metal.
+        try:
+            probe = subprocess.run(
+                ["system_profiler", "SPDisplaysDataType"],
+                capture_output = True, text = True, timeout = 30,
+                encoding = "utf-8", errors = "replace",
+            )
+            name = f"{name} {probe.stdout}"
+        except Exception:  # noqa: BLE001 -- system_profiler missing or slow
+            pass
+    if "paravirtual" in name.lower():
+        logger.warning(
+            "Metal device looks virtualised (%s). llama.cpp GPU offload corrupts output "
+            "on paravirtual Apple GPUs, so GGUF inference will run on CPU. MLX is "
+            "unaffected.",
+            name.strip()[:120] or "unknown",
+        )
+        return True
+    return False
+
+
 def _extra_args_requests_separate_draft(
     extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
 ) -> bool:
@@ -7034,6 +7085,21 @@ class LlamaCppBackend:
                     n_parallel,
                 )
                 n_parallel = 1
+
+            # A virtualised Apple GPU returns corrupt tokens from every offloaded
+            # layer, so pin GGUF inference to CPU there. Sits with the other clamps,
+            # ahead of the KV estimates, so the fit is computed for what actually
+            # launches. Physical Apple Silicon is untouched -- see
+            # _metal_device_is_paravirtual for the evidence.
+            if not (gpu_memory_mode == "manual" and gpu_layers == 0):
+                if _metal_device_is_paravirtual():
+                    logger.warning(
+                        "Forcing gpu_layers=0 for %s: this Mac's Metal device is "
+                        "virtualised and offloaded layers produce corrupt output.",
+                        model_identifier or model_path,
+                    )
+                    gpu_memory_mode = "manual"
+                    gpu_layers = 0
 
             # MTP speculative decoding serves one sequence: llama.cpp's draft-mtp path
             # does not support -np > 1, and the unsloth/Qwen3.5-2B-MTP-GGUF card says

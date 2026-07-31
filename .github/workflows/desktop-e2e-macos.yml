@@ -21,6 +21,9 @@ on:
     branches: [desktop-e2e]
     paths:
       - 'tests/studio/desktop_drive.py'
+      # The D9 guard being validated lives here; without it a fix-only change would
+      # never trigger the leg that tests it.
+      - 'studio/backend/core/inference/llama_cpp.py'
       - '.github/workflows/desktop-e2e-macos.yml'
   pull_request:
     branches: [main]
@@ -208,6 +211,77 @@ jobs:
           "$PY" tests/studio/run_real_mlx_smoke.py reload --format lora \
             --dir "$PWD/mlx_workdir/lora" 2>&1 | tee logs/mlx-reload-lora.log
           cp mlx_workdir/train_metrics.json artifacts/ 2>/dev/null || true
+
+      - name: D9 fix -- does the paravirtual guard make GGUF coherent?
+        # The whole point of the macOS leg. D9: the same model, quant and binary give
+        # `&#!56789:;<=>@ABCDEFG...` with Metal offload and a correct English sentence
+        # with gpu_layers=0, identically on macos-14 and macos-15. MLX on the same
+        # machine is fine, so the model, tokenizer, API and machine are all exonerated.
+        #
+        # The fix teaches llama_cpp.py to recognise a VIRTUALISED Apple GPU and pin GGUF
+        # to CPU there, leaving physical Macs on full Metal offload. Proving it needs the
+        # patch running on a real paravirtual runner, so overlay it onto the installed
+        # bundle's venv and start a fresh backend -- the running one already imported the
+        # old module.
+        #
+        # This is also the UNSLOTH_STUDIO_HOME / non-Tauri control arm: same venv, same
+        # model, no Tauri. Coherent here and garbage in the app above would mean the
+        # wrapper is implicated; coherent in both means the guard is the fix.
+        if: always()
+        shell: bash
+        run: |
+          set -o pipefail
+          STUDIO="$HOME/.unsloth/studio"
+          VENV="$STUDIO/unsloth_studio"
+          TARGET="$(find "$VENV/lib" -path '*/studio/backend/core/inference/llama_cpp.py' | head -1)"
+          if [ -z "$TARGET" ]; then
+            echo "::warning::no llama_cpp.py in the installed venv; cannot test the fix"
+            exit 0
+          fi
+          echo "patching: $TARGET"
+          cp "$TARGET" "$TARGET.orig"
+          cp studio/backend/core/inference/llama_cpp.py "$TARGET"
+          # Import-check against the venv's own interpreter before trusting it.
+          "$VENV/bin/python" -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$TARGET"
+
+          echo "=== what does this machine call its GPU? ==="
+          "$VENV/bin/python" -c 'import mlx.core as mx; print("mlx device_name:", mx.device_info().get("device_name"))' || echo "mlx device query unavailable"
+
+          mkdir -p logs artifacts
+          "$VENV/bin/unsloth" studio --api-only -H 127.0.0.1 -p 8951 \
+            > logs/patched-backend.log 2>&1 &
+          for i in $(seq 1 180); do
+            curl -sf http://127.0.0.1:8951/api/health >/dev/null 2>&1 && break
+            sleep 5
+          done
+          if ! curl -sf http://127.0.0.1:8951/api/health >/dev/null 2>&1; then
+            echo "::warning::the patched backend never came up"
+            tail -40 logs/patched-backend.log || true
+            cp "$TARGET.orig" "$TARGET"
+            exit 0
+          fi
+          echo "patched backend is serving on 8951"
+          grep -i "virtualis\|paravirtual\|gpu_layers=0" logs/patched-backend.log || true
+
+          # Note: NO explicit CPU pin here. If the guard works, the default auto path
+          # produces coherent text on its own -- which is the claim being tested.
+          PW="$(cat "$STUDIO/auth/.bootstrap_password" 2>/dev/null || true)"
+          set +e
+          python3 tests/studio/desktop_drive.py \
+            --scenarios inference \
+            --port 8951 \
+            ${PW:+--password "$PW"} \
+            --out artifacts/macos-fix-report.json 2>&1 | tee logs/macos-fix.log
+          RC=$?
+          set -e
+          cp "$TARGET.orig" "$TARGET"
+          if [ $RC -eq 0 ]; then
+            echo "::warning::D9 FIXED -- with the paravirtual guard, GGUF inference is"
+            echo "::warning::coherent on this runner with no explicit CPU pin."
+          else
+            echo "::warning::D9 NOT fixed by the guard; see logs/macos-fix.log"
+          fi
+          exit 0
 
       - name: What did the app's own log say?
         if: always()
