@@ -377,8 +377,58 @@ jobs:
           Write-Host "backend PID from its own session log: $target"
           $proc = Get-Process -Id $target -ErrorAction SilentlyContinue
           if (-not $proc) {
-            Write-Host "::warning::PID $target is NOT alive -- the backend died rather than hung."
-            Write-Host '::warning::That alone rewrites D10; look for the exit cause, not a hang.'
+            Write-Host "::warning::PID $target is NOT alive -- the backend DIED rather than hung."
+            Write-Host '::warning::Every spawn hypothesis assumed a hang, which is why none reproduced.'
+
+            # The app says "process is still running" while THIS pid is gone, so it is
+            # watching a different process: unsloth.exe is a wrapper that subprocess-spawns
+            # the real server and sits in wait(). Show the tree to prove it.
+            Write-Host ''
+            Write-Host '=== process tree: who does the app actually hold? ==='
+            Get-CimInstance Win32_Process |
+              Where-Object { $_.Name -match 'unsloth|python' } |
+              Select-Object ProcessId, ParentProcessId, Name,
+                            @{n='Cmd';e={$_.CommandLine -replace '^(.{140}).*','$1...'}} |
+              Format-Table -AutoSize | Out-String -Width 260 | Write-Host
+            Write-Host "app PID is $env:APP_PID"
+
+            Write-Host '=== why did it die? Windows Error Reporting / crash events ==='
+            $since = (Get-Date).AddMinutes(-90)
+            foreach ($logName in 'Application', 'System') {
+              Get-WinEvent -FilterHashtable @{LogName=$logName; StartTime=$since} -ErrorAction SilentlyContinue |
+                Where-Object {
+                  $_.Message -match 'unsloth|python|llama|torch' -or
+                  $_.ProviderName -match 'Application Error|Windows Error Reporting|\.NET Runtime'
+                } |
+                Select-Object -First 12 TimeCreated, ProviderName, Id,
+                              @{n='Msg';e={($_.Message -replace '\s+',' ') -replace '^(.{400}).*','$1...'}} |
+                Format-List | Out-String -Width 260 | Write-Host
+            }
+
+            Write-Host '=== the diagnostics phase log (it records the exit) ==='
+            Get-ChildItem (Join-Path $studio 'logs') -Filter 'backend-*.log' -ErrorAction SilentlyContinue |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 2 | ForEach-Object {
+                Write-Host "--- $($_.Name) ---"; Get-Content $_.FullName -Tail 40
+              }
+
+            Write-Host '=== does it die the same way when run by hand? ==='
+            $uns = Join-Path $studio 'unsloth_studio\Scripts\unsloth.exe'
+            $p2 = Start-Process -FilePath $uns -PassThru -NoNewWindow `
+                    -ArgumentList 'studio','--api-only','-H','127.0.0.1','-p','8961' `
+                    -RedirectStandardOutput logs/deathprobe.log -RedirectStandardError logs/deathprobe.err.log
+            for ($i = 0; $i -lt 60; $i++) {
+              if ($p2.HasExited) { break }
+              try { Invoke-RestMethod -TimeoutSec 3 http://127.0.0.1:8961/api/health | Out-Null; break } catch {}
+              Start-Sleep -Seconds 5
+            }
+            if ($p2.HasExited) {
+              Write-Host "::warning::by hand it ALSO exited, code $($p2.ExitCode) -- reproducible outside the app"
+            } else {
+              Write-Host '::warning::by hand it stayed up, so the death needs the app context'
+              Stop-Process -Id $p2.Id -Force -ErrorAction SilentlyContinue
+            }
+            Get-Content logs/deathprobe.log -Tail 25 -ErrorAction SilentlyContinue
+            Get-Content logs/deathprobe.err.log -Tail 25 -ErrorAction SilentlyContinue
             exit 0
           }
           Write-Host "alive: $($proc.ProcessName), threads=$($proc.Threads.Count), WS=$([math]::Round($proc.WorkingSet64/1MB))MB, CPU=$($proc.CPU)s"
