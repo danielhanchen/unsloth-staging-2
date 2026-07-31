@@ -1398,3 +1398,67 @@ fn stop_backend_inner(
 
     result
 }
+
+// The race this fixes is not hypothetical and not visible from the type system, so it is
+// pinned with real processes rather than a mock: a child's stdout pipe can EOF a moment
+// before the kernel reports the exit, and a single non-blocking try_wait() at that instant
+// returns Ok(None). The old code read that as "still running", never emitted
+// server-crashed, and left the window waiting on a backend that was already gone.
+#[cfg(test)]
+#[cfg(unix)]
+mod exit_status_after_stdout_closed_tests {
+    use super::*;
+
+    fn spawn(args: &[&str]) -> Box<dyn ChildWrapper + Send> {
+        let mut cmd = Command::new(args[0]);
+        cmd.args(&args[1..])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut wrap = CommandWrap::from(cmd);
+        wrap.wrap(ProcessGroup::leader());
+        wrap.spawn().expect("spawn test child")
+    }
+
+    #[test]
+    fn reports_the_status_of_a_child_that_has_already_exited() {
+        let mut child = spawn(&["/bin/sh", "-c", "exit 3"]);
+        let status = exit_status_after_stdout_closed(&mut child);
+        let status = status.expect("a child that exited must be reported, not read as alive");
+        assert!(
+            status.contains('3'),
+            "expected the real exit code in {status:?}"
+        );
+    }
+
+    // The half of the contract that a naive "just retry until you get something" would
+    // break: a backend may legitimately close its own stdout after redirecting logging to
+    // its session log, and calling that a crash would kill a healthy backend.
+    #[test]
+    fn a_child_that_is_still_running_is_not_reported_as_dead() {
+        let mut child = spawn(&["/bin/sh", "-c", "exec sleep 30"]);
+        let status = exit_status_after_stdout_closed(&mut child);
+        let _ = child.start_kill();
+        assert!(
+            status.is_none(),
+            "a live child must not be reported as exited (got {status:?})"
+        );
+    }
+
+    // The regression itself: exit and observation are racing, so the check has to survive
+    // the child dying at an arbitrary point rather than only before or only after.
+    #[test]
+    fn wins_the_race_against_a_child_exiting_mid_check() {
+        for delay_ms in [0, 5, 25, 120, 400] {
+            let mut child = spawn(&[
+                "/bin/sh",
+                "-c",
+                &format!("sleep {}; exit 7", delay_ms as f64 / 1000.0),
+            ]);
+            let status = exit_status_after_stdout_closed(&mut child);
+            assert!(
+                status.is_some(),
+                "child exiting after {delay_ms}ms was read as still alive"
+            );
+        }
+    }
+}
