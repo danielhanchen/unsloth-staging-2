@@ -619,19 +619,29 @@ jobs:
           module = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(module)
           module.install()
-          module.shield_stdio_from_epipe()
+          shielded = module.shield_stdio_from_epipe()
+          # To a FILE. Reporting this on stdout is exactly what cannot be trusted here --
+          # stdout is the thing under test, and last time the marker vanished with it.
+          with open("$GITHUB_WORKSPACE/logs/shield-installed.txt", "a") as handle:
+              handle.write(f"shielded fds: {shielded}\n")
           SITEPY
           "$VENV/bin/python" -c "import sys; print('guard active:', type(sys.stdout).__name__)"
 
           echo "=== AFTER: same bundle, same pipe, guard installed ==="
           deadpipe_trial "after " 8720
+          echo "--- did sitecustomize actually install it? ---"
+          cat logs/shield-installed.txt 2>/dev/null | sort | uniq -c || echo "(NEVER INSTALLED)"
           rm -f "$SITE/sitecustomize.py"
 
       - name: The stdio shield's own tests
         if: always()
         run: |
           VENV="$HOME/.unsloth/studio/unsloth_studio"
-          "$VENV/bin/python" -m pytest -q tests/studio/test_pipe_tolerant_stream.py 2>&1 | tail -30 \
+          # PYTHONPATH first: the bundle ships an older unsloth_cli with no _pipe_guard in
+          # it, so without this the tests fail at COLLECTION and report nothing about the
+          # fix either way.
+          PYTHONPATH="$GITHUB_WORKSPACE${PYTHONPATH:+:$PYTHONPATH}" \
+            "$VENV/bin/python" -m pytest -q tests/studio/test_pipe_tolerant_stream.py 2>&1 | tail -30 \
             || echo "(pytest unavailable in the bundle venv; the CI matrix runs these elsewhere)"
 
       - name: Where exactly is the backend stuck?

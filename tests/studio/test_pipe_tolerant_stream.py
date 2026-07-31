@@ -199,3 +199,26 @@ def test_the_shield_leaves_non_pipes_alone():
         [sys.executable, "-c", program], stderr = subprocess.PIPE, timeout = 120,
     )
     assert b"shielded=[]" in result.stderr, result.stderr
+
+
+def test_the_shield_does_not_swallow_output_at_exit():
+    """Regression: the relay thread is a daemon, so it dies with the process.
+
+    The first version lost everything still in the relay pipe at exit -- a short command
+    printed nothing at all, which is a far worse bug than the one being fixed. The
+    descriptor is restored at exit so the relay sees EOF and forwards the remainder.
+    """
+    program = textwrap.dedent(
+        """
+        import sys
+        from unsloth_cli._pipe_guard import shield_stdio_from_epipe
+        shield_stdio_from_epipe(fds = (1,))
+        print("SHORT OUTPUT SURVIVES")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        stdout = subprocess.PIPE, stderr = subprocess.PIPE, timeout = 120,
+    )
+    assert b"SHORT OUTPUT SURVIVES" in result.stdout, (result.stdout, result.stderr)
+    assert result.returncode == 0, result.stderr

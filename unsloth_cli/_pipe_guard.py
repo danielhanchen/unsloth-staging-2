@@ -133,6 +133,7 @@ def shield_stdio_from_epipe(fds = (1, 2)):
     Only pipes are shielded. A file or a terminal cannot EPIPE, and interposing on those
     would add a thread and a copy for nothing.
     """
+    import atexit
     import os
     import stat
     import threading
@@ -190,5 +191,28 @@ def shield_stdio_from_epipe(fds = (1, 2)):
             target = _relay, name = f"stdio-shield-{fd}", daemon = True,
         )
         thread.start()
+
+        # A daemon thread dies with the process, so whatever is still sitting in the relay
+        # pipe at exit would simply be lost -- which showed up immediately as a short
+        # command printing nothing at all. Put the real descriptor back at exit: that drops
+        # the last write end, the relay reads EOF, forwards the remainder and finishes.
+        # The join is bounded because a child process holding the write end open could
+        # otherwise delay exit indefinitely, and losing the tail of a log is a much smaller
+        # problem than hanging on shutdown.
+        def _restore(fd = fd, real_fd = real_fd, thread = thread):
+            for name in ("stdout", "stderr"):
+                stream = getattr(_sys, name, None)
+                try:
+                    if stream is not None and stream.fileno() == fd:
+                        stream.flush()
+                except Exception:
+                    pass
+            try:
+                os.dup2(real_fd, fd)
+            except OSError:
+                pass
+            thread.join(timeout = 2.0)
+
+        atexit.register(_restore)
         shielded.append(fd)
     return shielded
