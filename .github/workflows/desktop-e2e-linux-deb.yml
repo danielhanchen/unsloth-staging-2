@@ -187,6 +187,27 @@ jobs:
             exit 1
           fi
 
+      - name: Is the app still alive before we blame its backend?
+        # The check that would have made D10 obvious on day one instead of after seven
+        # experiments. On Windows the app was being killed at a step boundary, and its
+        # job object then took the backend with it -- so every "the backend never came
+        # up" result was about a process killed as collateral damage. Linux detaches with
+        # `nohup ... &` so it should not happen here, but "should not" is exactly the
+        # assumption that cost those seven rounds. Measure it.
+        run: |
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            echo "app alive: pid $APP_PID"
+            ps -o pid,ppid,stat,etime,rss,comm -p "$APP_PID" || true
+            echo "--- its children ---"
+            pgrep -P "$APP_PID" -a || echo "(none)"
+          else
+            echo "::error::the app (pid $APP_PID) is NOT running before driving started."
+            echo "::error::Any backend failure below is about a process that lost its parent,"
+            echo "::error::not a backend defect. Fix the launch, not the backend."
+            tail -40 logs/app-stdout.log logs/app-stderr.log 2>/dev/null || true
+            exit 1
+          fi
+
       - name: Drive the running app
         id: drive
         run: |
@@ -307,6 +328,49 @@ jobs:
           echo "=== manual backend output ==="
           cat logs/manual-backend.log || true
           kill -TERM "$MPID" 2>/dev/null || true
+
+      - name: D8 -- why did the app's own child produce zero bytes?
+        # ubuntu-22.04 fails where 24.04 passes, on both .deb and .AppImage. The app logs
+        # `start_managed_server spawned` and then NOTHING: no [backend] stdout, no
+        # [stderr], and no server session log at all -- and the backend writes that within
+        # its first three lines, so the child died before printing anything. Run by hand
+        # on the same machine it comes up in ~12s.
+        #
+        # The app spawn and a shell spawn differ in environment, so dump both and diff
+        # them. process.rs scrubs LD_LIBRARY_PATH/PYTHONHOME/PYTHONPATH only under
+        # APPIMAGE, and its own comment says an unscrubbed one breaks the spawned Python
+        # with "No module named encodings" -- exactly a child that dies before its first
+        # print. The .deb leg takes no such scrub.
+        if: failure()
+        run: |
+          set +e
+          BIN="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
+          echo "=== the app's environment (what its child inherits) ==="
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            tr '\0' '\n' < "/proc/$APP_PID/environ" 2>/dev/null |
+              grep -E '^(LD_LIBRARY_PATH|PYTHONHOME|PYTHONPATH|APPIMAGE|APPDIR|LD_PRELOAD|PATH)=' |
+              sed 's/^/  app: /'
+          else
+            echo "  (app not running; cannot read its environ)"
+          fi
+          echo "=== this shell's, for comparison ==="
+          for v in LD_LIBRARY_PATH PYTHONHOME PYTHONPATH APPIMAGE APPDIR LD_PRELOAD; do
+            echo "  shell: $v=${!v-<unset>}"
+          done
+
+          echo "=== does the child die under the app's LD_LIBRARY_PATH? ==="
+          APPENV="$(tr '\0' '\n' < /proc/$APP_PID/environ 2>/dev/null | grep '^LD_LIBRARY_PATH=' | cut -d= -f2-)"
+          if [ -n "$APPENV" ]; then
+            echo "  replaying with LD_LIBRARY_PATH=$APPENV"
+            LD_LIBRARY_PATH="$APPENV" timeout 90 "$BIN" studio --api-only -H 127.0.0.1 -p 8971 \
+              > logs/d8-replay.log 2>&1
+            echo "  exit: $?"
+            echo "  --- output (empty here reproduces the defect) ---"
+            head -20 logs/d8-replay.log
+          else
+            echo "  the app has no LD_LIBRARY_PATH, so that is not the difference"
+          fi
+          exit 0
 
       - name: Upload logs and report
         if: always()

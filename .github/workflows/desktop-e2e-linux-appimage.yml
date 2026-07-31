@@ -161,6 +161,27 @@ jobs:
             exit 1
           fi
 
+      - name: Is the app still alive before we blame its backend?
+        # The check that would have made D10 obvious on day one instead of after seven
+        # experiments. On Windows the app was being killed at a step boundary, and its
+        # job object then took the backend with it -- so every "the backend never came
+        # up" result was about a process killed as collateral damage. Linux detaches with
+        # `nohup ... &` so it should not happen here, but "should not" is exactly the
+        # assumption that cost those seven rounds. Measure it.
+        run: |
+          if kill -0 "$APP_PID" 2>/dev/null; then
+            echo "app alive: pid $APP_PID"
+            ps -o pid,ppid,stat,etime,rss,comm -p "$APP_PID" || true
+            echo "--- its children ---"
+            pgrep -P "$APP_PID" -a || echo "(none)"
+          else
+            echo "::error::the app (pid $APP_PID) is NOT running before driving started."
+            echo "::error::Any backend failure below is about a process that lost its parent,"
+            echo "::error::not a backend defect. Fix the launch, not the backend."
+            tail -40 logs/app-stdout.log logs/app-stderr.log 2>/dev/null || true
+            exit 1
+          fi
+
       - name: Drive the running app
         run: |
           set -a; . ./clean-machine.env; set +a
