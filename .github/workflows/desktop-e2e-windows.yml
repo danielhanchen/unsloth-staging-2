@@ -338,6 +338,75 @@ jobs:
               --report artifacts/ui-report.json 2>&1 | Tee-Object logs/ui.log
           exit $LASTEXITCODE
 
+      - name: D10 -- stack-dump the hung backend (the decisive one)
+        # Seven hypotheses about HOW the app spawns the backend have now been tested and
+        # refuted: the stdout pipe, the creation flags, cold-start cost, a console-less
+        # GUI parent, inherited stdin, the injected Tauri owner env, and the job object.
+        # Every one of them starts the backend fine. So stop guessing from outside and
+        # ask the hung process directly what it is doing.
+        #
+        # No app rebuild needed: the backend writes its own PID into its session log
+        # FILENAME (server-<ts>-pid<PID>.log), and the app records that exact path in
+        # tauri.log. py-spy attaches to a running CPython process and prints the Python
+        # stack, so it names the frame the import is stuck in.
+        #
+        # MUST run before the other D10 probes: those spawn extra backends that write
+        # newer session logs and would poison the PID we pick.
+        if: failure()
+        shell: pwsh
+        run: |
+          $studio = Join-Path $env:USERPROFILE '.unsloth\studio'
+          $py     = Join-Path $studio 'unsloth_studio\Scripts\python.exe'
+
+          # Prefer the path the app itself recorded; fall back to the newest session log.
+          $target = $null
+          $tauriLog = Join-Path $studio 'tauri.log'
+          if (Test-Path $tauriLog) {
+            $m = Select-String -Path $tauriLog -Pattern 'Session log: (.+server-.+-pid(\d+)\.log)' |
+                   Select-Object -Last 1
+            if ($m) { $target = $m.Matches[0].Groups[2].Value }
+          }
+          if (-not $target) {
+            $newest = Get-ChildItem (Join-Path $studio 'logs\server') -Filter 'server-*-pid*.log' `
+                        -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending |
+                      Select-Object -First 1
+            if ($newest -and $newest.Name -match 'pid(\d+)\.log$') { $target = $matches[1] }
+          }
+          if (-not $target) { Write-Host '::warning::could not determine the backend PID'; exit 0 }
+
+          Write-Host "backend PID from its own session log: $target"
+          $proc = Get-Process -Id $target -ErrorAction SilentlyContinue
+          if (-not $proc) {
+            Write-Host "::warning::PID $target is NOT alive -- the backend died rather than hung."
+            Write-Host '::warning::That alone rewrites D10; look for the exit cause, not a hang.'
+            exit 0
+          }
+          Write-Host "alive: $($proc.ProcessName), threads=$($proc.Threads.Count), WS=$([math]::Round($proc.WorkingSet64/1MB))MB, CPU=$($proc.CPU)s"
+
+          & $py -m pip install --quiet --disable-pip-version-check py-spy 2>&1 | Select-Object -Last 3
+          $pyspy = Join-Path $studio 'unsloth_studio\Scripts\py-spy.exe'
+          if (-not (Test-Path $pyspy)) { Write-Host '::warning::py-spy did not install'; exit 0 }
+
+          # Two dumps 45s apart. Identical stacks mean genuinely stuck; different stacks
+          # mean it is progressing, just impossibly slowly -- a distinction no amount of
+          # black-box probing could make.
+          foreach ($round in 1, 2) {
+            Write-Host ""
+            Write-Host "=== py-spy dump #$round (PID $target) ==="
+            & $pyspy dump --pid $target --locals 2>&1 | Tee-Object -FilePath "logs/pyspy-dump-$round.txt"
+            Write-Host "=== py-spy dump #$round with native frames ==="
+            & $pyspy dump --pid $target --native 2>&1 |
+              Tee-Object -FilePath "logs/pyspy-native-$round.txt" | Select-Object -First 60
+            if ($round -eq 1) {
+              $cpu1 = (Get-Process -Id $target).CPU
+              Start-Sleep -Seconds 45
+              $cpu2 = (Get-Process -Id $target).CPU
+              Write-Host "CPU seconds consumed over those 45s: $([math]::Round($cpu2 - $cpu1, 2))"
+              Write-Host '(near zero = blocked on something; climbing = spinning or grinding)'
+            }
+          }
+          exit 0
+
       - name: D10 -- control arm, does the backend start at all by hand?
         # Round 5 established that the backend is NOT slow and NOT broken: `import torch`
         # takes 1.6s, and the app's exact command served /api/health in ~14s when run by
