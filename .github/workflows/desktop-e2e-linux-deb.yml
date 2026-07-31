@@ -67,11 +67,12 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
-        # D8 is intermittent, not an OS split: one run had it on BOTH 22.04 legs and the
-        # next had it on none, with no product change in between. A single attempt per OS
-        # is a weak detector for something non-deterministic, so run each OS twice per
-        # push and let the attempts disagree if they are going to.
-        attempt: [1, 2]
+        # D8 is intermittent AND OS-correlated, which took three runs to see because each
+        # single run looked like a clean story on its own. Cumulative tally: ubuntu-22.04
+        # has failed 4 of 8 legs, ubuntu-24.04 0 of 8. Neither "it is an OS split" nor
+        # "it is just flaky" survives that, so repetition is the only honest detector --
+        # three attempts per OS per push.
+        attempt: [1, 2, 3]
 
     steps:
       - uses: actions/checkout@v4
@@ -194,9 +195,12 @@ jobs:
               || echo "(none of them are set)"
             echo "--- limits / fds ---"
             ulimit -a 2>/dev/null | grep -iE "open files|max memory|virtual|processes" || true
-            echo "--- can the venv python even start? ---"
-            "$HOME/.unsloth/studio/unsloth_studio/bin/python" -c 'import sys,encodings; print("python ok", sys.version.split()[0])' 2>&1 \
-              || echo "!! the venv python cannot start under this environment"
+            # NO warm-up probe here. The first version of this shim ran
+            # `python -c 'import encodings'` before every spawn to prove the interpreter
+            # could start, and D8 then failed to reproduce on all four legs. That probe
+            # warms the loader and page cache immediately before the very process whose
+            # startup is under suspicion, so it is a plausible mask, not a measurement.
+            # An instrument must not perturb the thing it is watching.
             echo "--- running the real entry point ---"
           } >> "$LOG" 2>&1
           # Unbuffered so nothing is lost in a pipe buffer if it dies, and faulthandler
@@ -363,6 +367,36 @@ jobs:
             --layer attached \
             --out artifacts/ui \
             --report artifacts/ui-report.json 2>&1 | tee logs/ui.log
+
+      - name: Where exactly is the backend stuck?
+        if: always()
+        # The right instrument for a HANG, which is what D8 turned out to be. The shim
+        # showed the child reaching the real entry point and then never exiting and never
+        # printing -- alive, silent, not listening. A process that hangs cannot be
+        # diagnosed from its output, because it has none; it has to be asked for its stack.
+        #
+        # py-spy goes into its OWN venv, never the studio one. Installing into the venv
+        # under test would change the thing being measured, which is exactly the mistake
+        # the first version of the shim made with its interpreter warm-up.
+        run: |
+          BACKEND_PID="$(pgrep -f 'unsloth studio --api-only' | head -1)"
+          if [ -z "$BACKEND_PID" ]; then
+            echo "no live 'unsloth studio --api-only' process to dump"
+            exit 0
+          fi
+          echo "backend pid: $BACKEND_PID"
+          echo "--- the kernel's view: state, and what it is blocked in ---"
+          grep -E "^(State|Threads|VmRSS|SigBlk|SigIgn|SigCgt)" "/proc/$BACKEND_PID/status" 2>/dev/null || true
+          echo "wchan: $(cat "/proc/$BACKEND_PID/wchan" 2>/dev/null || echo unknown)"
+          echo "--- kernel stack of the main thread ---"
+          sudo cat "/proc/$BACKEND_PID/stack" 2>/dev/null | head -20 || echo "(kernel stack unreadable)"
+          echo "--- open fds: a hang on a socket, a pipe or a lock file shows here ---"
+          ls -l "/proc/$BACKEND_PID/fd" 2>/dev/null | tail -25 || true
+          echo "--- python stacks, every thread, with locals ---"
+          python3 -m venv /tmp/pyspy-venv 2>/dev/null || true
+          /tmp/pyspy-venv/bin/pip install -q py-spy 2>&1 | tail -2 || true
+          sudo /tmp/pyspy-venv/bin/py-spy dump --pid "$BACKEND_PID" --locals 2>&1 | head -100 \
+            || echo "(py-spy could not attach)"
 
       - name: What did the app's own log say?
         if: always()

@@ -731,7 +731,99 @@ pub fn start_backend(
         });
     }
 
+    start_watchdog(app, state, shutdown, generation, &backend_log);
+
     Ok(generation)
+}
+
+/// How long a backend may take to become reachable before the window stops waiting.
+///
+/// A healthy managed backend imports torch and serves `/api/health` in roughly 12 s on a
+/// CI runner. This is deliberately an order of magnitude looser: the deadline exists to
+/// end an *unbounded* wait, not to police slow machines, and a false "failed to start" on
+/// someone's cold laptop would be a worse bug than the one it is fixing.
+const BACKEND_START_DEADLINE: Duration = Duration::from_secs(300);
+
+/// Fail an unresponsive backend loudly instead of waiting on it forever.
+///
+/// `server-crashed` only fires when the backend's stdout closes, so it covers a backend
+/// that *dies*. A backend that starts and then hangs -- no output, never binds its port,
+/// process still alive -- emits nothing at all, and the window sits on the startup screen
+/// indefinitely with no error and no way to retry. That is the observed failure in D8,
+/// where the child produced zero bytes on both streams and never listened, while the same
+/// command by hand came up in ~12 s.
+///
+/// This does not diagnose why the backend hung, and it deliberately does not kill it. It
+/// converts "spinner forever" into a reported error with the backend's own last log lines,
+/// which is the difference between a user filing a bug and a user thinking the app is
+/// broken.
+fn start_watchdog(
+    app: &AppHandle,
+    state: &BackendState,
+    shutdown: &ShutdownFlag,
+    generation: u64,
+    backend_log: &BackendLog,
+) {
+    let app = app.clone();
+    let state = Arc::clone(state);
+    let shutdown = Arc::clone(shutdown);
+    let backend_log = backend_log.clone();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        while started.elapsed() < BACKEND_START_DEADLINE {
+            std::thread::sleep(Duration::from_secs(1));
+            if shutdown.load(Ordering::SeqCst) {
+                return;
+            }
+            match state.lock() {
+                Ok(proc) => {
+                    // A newer start superseded this one, or the backend is gone: either
+                    // way this watchdog is watching something that no longer exists.
+                    if proc.generation != generation || !proc.has_owned_backend() {
+                        return;
+                    }
+                    // The port is only recorded after it has been validated, so this is
+                    // "reachable", not merely "printed a number".
+                    if proc.port.is_some() {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+
+        let (still_ours, tail) = match state.lock() {
+            Ok(proc) => {
+                if proc.generation != generation || proc.port.is_some() {
+                    (false, String::new())
+                } else {
+                    let skip = proc.logs.len().saturating_sub(20);
+                    let tail: Vec<String> = proc.logs.iter().skip(skip).cloned().collect();
+                    (true, tail.join("\n"))
+                }
+            }
+            Err(_) => (false, String::new()),
+        };
+        if !still_ours || shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let secs = BACKEND_START_DEADLINE.as_secs();
+        let msg = if tail.trim().is_empty() {
+            format!(
+                "The Unsloth backend did not start within {secs} seconds and produced no \
+                 output at all. It is still running but is not responding."
+            )
+        } else {
+            format!(
+                "The Unsloth backend did not start within {secs} seconds. Its last output \
+                 was:\n{tail}"
+            )
+        };
+        error!("Backend start deadline exceeded after {}s", secs);
+        diagnostics::append_phase_line(&backend_log.handle, "error", &msg);
+        let _ = app.emit("server-start-timeout", msg);
+    });
 }
 
 async fn generic_backend_health_ok(port: u16) -> bool {

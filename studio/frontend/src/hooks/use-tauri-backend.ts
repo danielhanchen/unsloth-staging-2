@@ -556,6 +556,15 @@ export function useTauriBackend() {
         setBackendError("Server stopped unexpectedly");
       });
 
+      // server-crashed only fires when the backend's stdout closes, so it covers a
+      // backend that dies. One that starts and then hangs -- alive, silent, never binds
+      // its port -- emitted nothing, and this screen waited on it forever with no error
+      // and no way to retry. The backend now reports its own start deadline instead.
+      register<string>("server-start-timeout", (e) => {
+        startingRef.current = false;
+        setBackendError(e.payload || "The Unsloth backend did not start in time");
+      });
+
       register<string>("server-log", (e) => {
         setLogs((prev) => [...prev.slice(-499), e.payload]);
       });
