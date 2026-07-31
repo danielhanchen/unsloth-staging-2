@@ -267,7 +267,9 @@ jobs:
           # produces coherent text on its own -- which is the claim being tested.
           PW="$(cat "$STUDIO/auth/.bootstrap_password" 2>/dev/null || true)"
           set +e
-          python3 tests/studio/desktop_drive.py \
+          # NOT python3: the toolchain strip masks the Xcode CLT, taking /usr/bin/python3
+          # with it. The venv interpreter is the one that certainly exists here.
+          "$VENV/bin/python" tests/studio/desktop_drive.py \
             --scenarios inference \
             --port 8951 \
             ${PW:+--password "$PW"} \
@@ -279,7 +281,11 @@ jobs:
             echo "::warning::D9 FIXED -- with the paravirtual guard, GGUF inference is"
             echo "::warning::coherent on this runner with no explicit CPU pin."
           else
-            echo "::warning::D9 NOT fixed by the guard; see logs/macos-fix.log"
+            echo "::warning::D9 NOT fixed by the guard (harness exit $RC)"
+            echo "=== harness output ==="
+            tail -60 logs/macos-fix.log 2>/dev/null || echo "(the harness produced no output at all)"
+            echo "=== patched backend tail ==="
+            tail -40 logs/patched-backend.log 2>/dev/null || true
           fi
           exit 0
 
