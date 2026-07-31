@@ -67,11 +67,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04, ubuntu-24.04]
-        # D8 is intermittent AND OS-correlated, which took three runs to see because each
-        # single run looked like a clean story on its own. Cumulative tally: ubuntu-22.04
-        # has failed 4 of 8 legs, ubuntu-24.04 0 of 8. Neither "it is an OS split" nor
-        # "it is just flaky" survives that, so repetition is the only honest detector --
-        # three attempts per OS per push.
+        # Cumulative tally: ubuntu-22.04 has failed 7 of 11 legs, ubuntu-24.04 0 of 11.
+        # The last run failed 3/3 on 22.04 and passed 3/3 on 24.04, so it reproduces
+        # reliably enough to bisect once the shim stops perturbing it.
         attempt: [1, 2, 3]
 
     steps:
@@ -184,33 +182,51 @@ jobs:
           #!/bin/bash
           # Diagnostic shim (staging only) -- see "Wrap the backend entry point".
           LOG="$HOME/unsloth-child.log"
+          # Keep the REAL stdout/stderr (the app's pipes) on fds 3 and 4, so the block
+          # below can go to the log file without stealing them.
+          exec 3>&1 4>&2
           {
             echo "=============================================================="
             echo "[$(date -u +%H:%M:%S)] pid=$$ ppid=$PPID cwd=$PWD"
             echo "argv: $0 $*"
-            # Only the interesting slice: the vars that decide whether a venv Python
-            # can find its own libpython and stdlib.
+            # NO warm-up probe here. The first version of this shim ran
+            # `python -c 'import encodings'` before every spawn, and D8 stopped
+            # reproducing on all four legs. Removing it brought the failure straight back
+            # (3/3 on 22.04), so that probe was masking the defect, not measuring it.
             echo "--- inherited env (loader / python relevant) ---"
             env | grep -E '^(LD_LIBRARY_PATH|LD_PRELOAD|PYTHONHOME|PYTHONPATH|PYTHONEXECUTABLE|VIRTUAL_ENV|APPIMAGE|APPDIR|UNSLOTH_|GTK_PATH|GIO_MODULE_DIR)=' \
               || echo "(none of them are set)"
             echo "--- limits / fds ---"
             ulimit -a 2>/dev/null | grep -iE "open files|max memory|virtual|processes" || true
-            # NO warm-up probe here. The first version of this shim ran
-            # `python -c 'import encodings'` before every spawn to prove the interpreter
-            # could start, and D8 then failed to reproduce on all four legs. That probe
-            # warms the loader and page cache immediately before the very process whose
-            # startup is under suspicion, so it is a plausible mask, not a measurement.
-            # An instrument must not perturb the thing it is watching.
+            # THE question for this run. The backend exits rc=1 having written nothing to
+            # either stream, immediately. Python ignores SIGPIPE, so a write to a closed
+            # stdout raises BrokenPipeError; if stderr is closed too the traceback goes
+            # nowhere, and what is left is exactly this signature -- silent exit 1. So
+            # before running anything, ask whether the streams we were handed are usable.
+            echo "--- are the stdout/stderr we inherited actually writable? ---"
+            ls -lL /proc/self/fd/0 /proc/self/fd/1 /proc/self/fd/2 2>&1 | sed "s/^/  /"
+            if echo "SHIM_PROBE_STDOUT pid=$$" >&3 2>/dev/null; then
+              echo "  stdout: writable"
+            else
+              echo "  !! stdout: WRITE FAILED -- the app handed us a closed pipe"
+            fi
+            if echo "SHIM_PROBE_STDERR pid=$$" >&4 2>/dev/null; then
+              echo "  stderr: writable"
+            else
+              echo "  !! stderr: WRITE FAILED -- the app handed us a closed pipe"
+            fi
             echo "--- running the real entry point ---"
           } >> "$LOG" 2>&1
-          # Unbuffered so nothing is lost in a pipe buffer if it dies, and faulthandler
-          # so a hard crash prints a Python traceback instead of vanishing.
           export PYTHONUNBUFFERED=1
           export PYTHONFAULTHANDLER=1
-          "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.real" "$@"
+          # Tee both streams into files while still passing them through to the app. If
+          # the app's pipe is broken, tee takes the EPIPE and the file still captures what
+          # the backend said -- which is the output that has been invisible all along.
+          "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.real" "$@" \
+            > >(tee -a "$LOG.out" >&3) 2> >(tee -a "$LOG.err" >&4)
           rc=$?
           if [ "$rc" -gt 128 ]; then
-            echo "[$(date -u +%H:%M:%S)] pid=$$ EXIT rc=$rc -> killed by signal $((rc - 128)) (11=SIGSEGV 9=SIGKILL/OOM 6=SIGABRT)" >> "$LOG"
+            echo "[$(date -u +%H:%M:%S)] pid=$$ EXIT rc=$rc -> killed by signal $((rc - 128)) (11=SIGSEGV 9=SIGKILL/OOM 6=SIGABRT 13=SIGPIPE)" >> "$LOG"
           else
             echo "[$(date -u +%H:%M:%S)] pid=$$ EXIT rc=$rc" >> "$LOG"
           fi
@@ -426,7 +442,11 @@ jobs:
           echo "=== the backend child's own log (D8 shim) ==="
           if [ -f "$HOME/unsloth-child.log" ]; then
             cp "$HOME/unsloth-child.log" logs/ 2>/dev/null || true
+            cp "$HOME/unsloth-child.log.out" "$HOME/unsloth-child.log.err" logs/ 2>/dev/null || true
             cat "$HOME/unsloth-child.log"
+            echo "=== what the backend WROTE (recovered past the app's pipe) ==="
+            echo "--- stdout ---"; tail -60 "$HOME/unsloth-child.log.out" 2>/dev/null || echo "(nothing)"
+            echo "--- stderr ---"; tail -60 "$HOME/unsloth-child.log.err" 2>/dev/null || echo "(nothing)"
           else
             echo "(the shim never ran -- the app never executed bin/unsloth at all)"
           fi
