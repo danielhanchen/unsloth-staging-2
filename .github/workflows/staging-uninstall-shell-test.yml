@@ -1,0 +1,41 @@
+name: "staging uninstall shell test"
+
+# tests/sh/test_uninstall_prebuilt_artifacts.sh on both POSIX runners. macOS is
+# the interesting one: a bare `mktemp -d` on BSD implies -t and resolves its own
+# directory, which has broken fixture isolation in this suite before.
+on:
+  push:
+    branches: ["studio-lifecycle-audit"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shell-test:
+    name: "uninstall artifacts (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run the artifact suite
+        run: bash tests/sh/test_uninstall_prebuilt_artifacts.sh
+      - name: Run the argument guard suite
+        run: bash tests/sh/test_uninstall_arg_guard.sh
+      - name: The suite must fail against the previous uninstaller
+        # A test that passes on the unfixed script proves nothing.
+        run: |
+          set -e
+          git show HEAD~1:scripts/uninstall.sh > scripts/uninstall.sh
+          if bash tests/sh/test_uninstall_prebuilt_artifacts.sh > /tmp/neg.log 2>&1; then
+            echo "::error::the suite passed against the pre-fix uninstaller"
+            exit 1
+          fi
+          echo "correctly failed against the pre-fix uninstaller:"
+          grep FAIL /tmp/neg.log | head -10
