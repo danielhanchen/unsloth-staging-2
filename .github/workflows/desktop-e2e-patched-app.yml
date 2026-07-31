@@ -27,9 +27,9 @@
 # other three used to return, dropping the read end and closing the pipe under a running
 # backend. Now it drains to EOF instead.
 #
-# The frontend is a stub on purpose. This measures the backend spawn path, which the
-# harness drives over HTTP; the window may be blank and it changes nothing here. That
-# keeps the job to a cargo build instead of a full release pipeline.
+# The frontend is built for real. A stub was tried first and the app simply sat there:
+# start_managed_server is a Tauri command the FRONTEND invokes, so without it the backend
+# is never spawned at all and the job measures nothing while looking like a failure.
 
 name: "desktop-e2e patched app"
 
@@ -106,10 +106,27 @@ jobs:
             | tee logs/bundled-install.log
           "$HOME/.unsloth/studio/unsloth_studio/bin/python" -V
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+
+      - name: Build the real frontend
+        # A stub does not work here, and the first attempt at this job proved it: with a
+        # placeholder index.html the app started and then sat there, because
+        # start_managed_server is a Tauri command the FRONTEND invokes. Zero occurrences
+        # in the log, 6/6 "failures" that measured nothing. The backend spawn path cannot
+        # be tested without the thing that triggers it.
+        run: |
+          cd studio/frontend
+          npm ci --no-audit --no-fund 2>&1 | tail -5
+          npm run build 2>&1 | tail -10
+          test -f dist/index.html || { echo "::error::frontend build produced no dist"; exit 1; }
+          du -sh dist
+
       - name: Build the app from source, with the fix
         run: |
-          mkdir -p studio/frontend/dist
-          printf '<!doctype html><title>stub</title><body>stub</body>\n' > studio/frontend/dist/index.html
           grep -n "saw_eof" studio/src-tauri/src/process.rs || {
             echo "::error::the D8 fix is not in this checkout"; exit 1; }
           cargo build --release --manifest-path studio/src-tauri/Cargo.toml 2>&1 | tail -20
