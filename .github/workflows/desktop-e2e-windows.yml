@@ -297,18 +297,64 @@ jobs:
           # WebView2 reads this env var and opens a CDP endpoint, which is the only way
           # to drive the REAL packaged renderer (rather than a Chromium pointed at the
           # same backend). Documented under the WebView2 win32 reference.
-          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9222'
-          $p = Start-Process -FilePath $env:APP_EXE -PassThru `
-                 -RedirectStandardOutput logs/app-stdout.log `
-                 -RedirectStandardError logs/app-stderr.log
-          "APP_PID=$($p.Id)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          # Start-Process was WRONG here, and it invented D10 wholesale. On Windows the
+          # Actions runner tears down a step's spawned processes at the step boundary, so
+          # the app was killed the moment this step returned -- its log stops dead at the
+          # 20s mark. Its KILL_ON_JOB_CLOSE job object then took the backend with it,
+          # silently and with no crash event, which is exactly the "backend never becomes
+          # reachable" that seven spawn hypotheses failed to explain. Linux and macOS
+          # never showed it because they launch with `nohup ... &`, which detaches.
+          #
+          # Win32_Process.Create has the WMI service create the process, so it is not a
+          # child of this step and outlives it. WMI-created processes inherit the MACHINE
+          # environment rather than ours, hence setting the WebView2 var there, and get no
+          # inherited stdio, hence the .cmd wrapper doing the redirection.
+          [Environment]::SetEnvironmentVariable(
+            'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', '--remote-debugging-port=9222', 'Machine')
+          $here = (Get-Location).Path
+          $launcher = Join-Path $here 'launch-app.cmd'
+          @"
+          @echo off
+          set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222
+          "$env:APP_EXE" > "$here\logs\app-stdout.log" 2> "$here\logs\app-stderr.log"
+          "@ -replace '(?m)^          ', '' | Set-Content -Path $launcher -Encoding ascii
+          Get-Content $launcher | Write-Host
+
+          $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create `
+                   -Arguments @{ CommandLine = "cmd.exe /c `"$launcher`""; CurrentDirectory = $here }
+          if ($res.ReturnValue -ne 0) {
+            Write-Host "::error::Win32_Process.Create failed with $($res.ReturnValue)"
+            exit 1
+          }
           Start-Sleep -Seconds 20
-          if ($p.HasExited) {
-            Write-Host "::error::the app exited during startup with rc=$($p.ExitCode)"
+
+          # The app is a grandchild of the WMI service now, so find it by image name.
+          $app = Get-Process -Name 'unsloth-studio' -ErrorAction SilentlyContinue |
+                   Sort-Object StartTime -Descending | Select-Object -First 1
+          if (-not $app) {
+            Write-Host '::error::the app is not running 20s after launch'
             Get-Content logs/app-stdout.log, logs/app-stderr.log -Tail 40 -ErrorAction SilentlyContinue
             exit 1
           }
-          Write-Host "app launched (pid $($p.Id))"
+          "APP_PID=$($app.Id)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "app launched (pid $($app.Id)) via WMI, detached from this step"
+
+      - name: Is the app still alive before we blame its backend?
+        # The check that would have caught D10 on day one. If the app is dead here, its
+        # KILL_ON_JOB_CLOSE job object has already taken the backend with it, and every
+        # "the backend never came up" result below is about a process that was killed as
+        # collateral damage rather than anything the backend did.
+        shell: pwsh
+        run: |
+          $app = Get-Process -Id $env:APP_PID -ErrorAction SilentlyContinue
+          if (-not $app) {
+            Write-Host "::error::the app (pid $env:APP_PID) died before driving started."
+            Write-Host '::error::Do NOT read the backend results below as a backend defect:'
+            Write-Host '::error::the job object kills the backend when the app goes.'
+            Get-Content logs/app-stderr.log -Tail 40 -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Write-Host "app alive: pid $($app.Id), $([math]::Round($app.WorkingSet64/1MB))MB"
 
       - name: Drive the running app
         shell: pwsh
