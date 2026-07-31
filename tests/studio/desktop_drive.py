@@ -405,6 +405,30 @@ def password_login(
     backend.token = body["access_token"]
     print(f"::add-mask::{backend.token}", flush=True)
     report.ok("logged in with a password")
+
+    # A freshly seeded admin is created with must_change_password=1, so the token works
+    # for /api/auth/* and NOTHING else: every real call comes back
+    # 403 {"detail": "Password change required"}. Login succeeding is therefore not the
+    # same as being able to use the API, and treating it as such made an inference test
+    # fail for a reason that had nothing to do with inference.
+    if body.get("must_change_password"):
+        rotated = f"{password}-drive1"
+        code, changed = backend.http(
+            "POST",
+            "/api/auth/change-password",
+            {"current_password": password, "new_password": rotated},
+        )
+        if code == 200 and isinstance(changed, dict) and "access_token" in changed:
+            print(f"::add-mask::{rotated}", flush=True)
+            backend.token = changed["access_token"]
+            print(f"::add-mask::{backend.token}", flush=True)
+            report.ok("cleared the forced password change")
+        else:
+            report.fail(
+                f"POST /api/auth/change-password -> {code} {str(changed)[:200]}; "
+                f"every authenticated call will 403 until this succeeds"
+            )
+            return False
     return True
 
 
