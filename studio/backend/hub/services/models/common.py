@@ -229,6 +229,23 @@ def _is_adapter_weight_name(name: str) -> bool:
     return lower.startswith("adapter_model") and lower.endswith((".safetensors", ".bin"))
 
 
+# Trainer state, saved beside the weights and not the model. The .bin side needs no list: its
+# checkpoint names are an allow list that already leaves optimizer.bin out.
+_TRAINING_ARTEFACT_PREFIXES = (
+    "optimizer",
+    "scheduler",
+    "rng_state",
+    "trainer_state",
+    "scaler",
+    "training_args",
+)
+
+
+def _is_training_artefact_name(name: str) -> bool:
+    """Whether *name* is trainer state rather than weights any row loads."""
+    return _weight_basename(name).startswith(_TRAINING_ARTEFACT_PREFIXES)
+
+
 def _is_transformers_safetensors_weight_name(name: str) -> bool:
     lower = _weight_basename(name)
     return lower.endswith(".safetensors") and lower.startswith(
