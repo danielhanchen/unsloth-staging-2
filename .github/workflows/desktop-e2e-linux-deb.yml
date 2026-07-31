@@ -221,6 +221,34 @@ jobs:
             ls -lL /proc/self/fd/0 /proc/self/fd/1 /proc/self/fd/2 2>&1 | sed "s/^/  /"
             echo "--- running the real entry point ---"
           } >> "$LOG" 2>&1
+          # Is the app actually reading the pipe it gave us, and for how long? A pipe with
+          # no reader reproduces this defect's exact signature and nothing else does
+          # (deadpipe 8/8 silent exit 1; file and live-pipe 8/8 fine), so the remaining
+          # question is when the app's reader goes away. This probe answers it with a
+          # timeline instead of an inference.
+          #
+          # Safe on this invocation specifically: the app treats the backend's stdout as
+          # log lines, so an extra line is logged and ignored. It would NOT be safe on
+          # `desktop-capabilities --json`, whose stdout the app parses -- doing that broke
+          # an entire earlier run.
+          exec 3>&1
+          (
+            # Without this, bash takes SIGPIPE and the subshell dies before it can report
+            # what happened, which is the one outcome that makes the probe useless.
+            trap "" PIPE
+            t=0
+            while [ "$t" -lt 60 ]; do
+              if echo "SHIM_PIPE_ALIVE t=${t}s" >&3 2>/dev/null; then
+                echo "[$(date -u +%H:%M:%S)] stdout pipe still has a reader at t=${t}s" >> "$LOG"
+              else
+                echo "[$(date -u +%H:%M:%S)] !! stdout pipe has NO READER at t=${t}s" >> "$LOG"
+                break
+              fi
+              sleep 2
+              t=$((t + 2))
+            done
+          ) &
+          PIPE_PROBE=$!
           export PYTHONUNBUFFERED=1
           export PYTHONFAULTHANDLER=1
           # PYTHONVERBOSE was tried here and MASKED the defect: 3/3 green on 22.04 with
@@ -236,7 +264,8 @@ jobs:
           "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.real" "$@" \
             > >(tee -a "$LOG.out") 2> >(tee -a "$LOG.err" >&2)
           rc=$?
-          wait
+          kill "$PIPE_PROBE" 2>/dev/null || true
+          wait 2>/dev/null
           if [ "$rc" -gt 128 ]; then
             echo "[$(date -u +%H:%M:%S)] pid=$$ EXIT rc=$rc -> killed by signal $((rc - 128)) (11=SIGSEGV 9=SIGKILL/OOM 6=SIGABRT 13=SIGPIPE)" >> "$LOG"
           else
