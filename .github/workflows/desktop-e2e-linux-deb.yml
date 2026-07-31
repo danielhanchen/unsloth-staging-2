@@ -108,7 +108,7 @@ jobs:
         run: |
           # Deliberately no build-essential/cmake/git: a user installing a .deb has none.
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends xvfb jq x11-apps
+          sudo apt-get install -y -qq --no-install-recommends xvfb jq x11-apps strace
           sudo apt-get install -y ./dl/*.deb || {
             echo "::error::the .deb does not declare its runtime dependencies correctly"
             exit 1
@@ -218,9 +218,12 @@ jobs:
             grep -E "^Sig(Blk|Ign|Cgt)" /proc/self/status 2>/dev/null | sed "s/^/  /" || true
             echo "--- limits / fds ---"
             ulimit -a 2>/dev/null | grep -iE "open files|max memory|virtual|processes" || true
-            # Read-only: what fds 0/1/2 ARE. Already established that they are writable
-            # pipes at this point, so nothing is written to them to find out.
-            ls -lL /proc/self/fd/0 /proc/self/fd/1 /proc/self/fd/2 2>&1 | sed "s/^/  /"
+            # EVERY inherited fd, not just 0/1/2. Listing only the standard three was a
+            # real gap: a GUI stack that opens files without CLOEXEC leaks them into its
+            # children, and an inherited lock or database handle is exactly the kind of
+            # thing that changes a child's behaviour while leaving env and argv identical.
+            echo "--- every inherited fd ---"
+            ls -lL /proc/self/fd 2>&1 | sed "s/^/  /"
             echo "--- running the real entry point ---"
           } >> "$LOG" 2>&1
           # Is the app actually reading the pipe it gave us, and for how long? A pipe with
@@ -263,9 +266,21 @@ jobs:
           # output that has been invisible all through this investigation is recoverable
           # even if the app never logs it. `wait` for the tees, so the shim cannot exit
           # before they have flushed.
-          "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.real" "$@" \
-            > >(tee -a "$LOG.out") 2> >(tee -a "$LOG.err" >&2)
-          rc=$?
+          # The child writes nothing at all, so there is no output to diagnose and it has
+          # to be watched from outside. strace goes to a FILE, never to the streams under
+          # test. It does perturb timing, and at a ~50% rate across three legs that is a
+          # real risk of not reproducing -- but a silent process that leaves no trace is
+          # the one case where syscalls are the only remaining evidence.
+          REAL="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.real"
+          if command -v strace > /dev/null 2>&1; then
+            strace -f -tt -qq -o "$LOG.strace" \
+              -e trace=execve,exit_group,exit,write,openat,clone,clone3,wait4,kill,tgkill \
+              "$REAL" "$@" > >(tee -a "$LOG.out") 2> >(tee -a "$LOG.err" >&2)
+            rc=$?
+          else
+            "$REAL" "$@" > >(tee -a "$LOG.out") 2> >(tee -a "$LOG.err" >&2)
+            rc=$?
+          fi
           kill "$PIPE_PROBE" 2>/dev/null || true
           wait 2>/dev/null
           if [ "$rc" -gt 128 ]; then
@@ -663,10 +678,13 @@ jobs:
           if [ -f "$HOME/unsloth-child.log" ]; then
             cp "$HOME/unsloth-child.log" logs/ 2>/dev/null || true
             cp "$HOME/unsloth-child.log.out" "$HOME/unsloth-child.log.err" logs/ 2>/dev/null || true
+            cp "$HOME/unsloth-child.log.strace" logs/ 2>/dev/null || true
             cat "$HOME/unsloth-child.log"
             echo "=== what the backend WROTE (recovered past the app's pipe) ==="
             echo "--- stdout ---"; tail -60 "$HOME/unsloth-child.log.out" 2>/dev/null || echo "(nothing)"
             echo "--- stderr ---"; tail -60 "$HOME/unsloth-child.log.err" 2>/dev/null || echo "(nothing)"
+            echo "--- the last syscalls before it died ---"
+            tail -60 "$HOME/unsloth-child.log.strace" 2>/dev/null || echo "(no strace)"
           else
             echo "(the shim never ran -- the app never executed bin/unsloth at all)"
           fi
