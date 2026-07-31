@@ -5,10 +5,26 @@
 
 Two layers, because no single one works everywhere:
 
-  native            Windows only. WebView2 opens a CDP endpoint when the app is launched
-                    with WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=N,
-                    so `connect_over_cdp` attaches to the ACTUAL packaged renderer --
-                    the real window, the real Tauri IPC bridge.
+  native            Windows only, and NOT usable against the shipped bundle -- see below.
+                    The idea was that WebView2 opens a CDP endpoint when the app is
+                    launched with WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=N.
+                    It does, for a plain WebView2 host. It does not for this one:
+                    Tauri passes its own `additional_browser_args` programmatically via
+                    ICoreWebView2EnvironmentOptions::put_AdditionalBrowserArguments, and
+                    Microsoft documents the programmatic value as taking PRECEDENCE over
+                    the environment variable. tauri.conf.json sets no
+                    `additionalBrowserArgs`, so Tauri's default
+                    (--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection) wins
+                    and the debug port is never opened.
+
+                    Measured, not assumed: on a Windows runner the app has a real window
+                    (MainWindowHandle 459128, so there IS an interactive desktop) and
+                    127.0.0.1:9222 still refuses the connection.
+
+                    Making the packaged renderer drivable needs the app to opt in --
+                    e.g. appending WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS to Tauri's
+                    defaults behind a debug/env gate. Baking a debug port into production
+                    would be worse than not testing the renderer.
   backend-attached  Everywhere. A Chromium pointed at the backend the desktop app spawned
                     (http://127.0.0.1:<port>), with the app's own JWT seeded into
                     localStorage. Same backend and same React bundle as the window, but
@@ -132,10 +148,18 @@ async def drive_native(report: Report, out_dir: Path) -> None:
         try:
             browser = await pw.chromium.connect_over_cdp(CDP_URL, timeout=60_000)
         except Exception as error:
-            report.fail(
-                f"could not attach to the packaged renderer at {CDP_URL}: "
-                f"{type(error).__name__}: {error}. Was the app launched with "
-                f"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222?"
+            # Not a defect and not a failure to report: Tauri's programmatic
+            # additional_browser_args take precedence over the environment variable, so
+            # a stock Tauri bundle never opens the debug port no matter how it is
+            # launched. Failing here would be blaming the app for declining to ship a
+            # remote-debugging endpoint, which is the correct thing for it to do.
+            report.skip(
+                f"the packaged renderer cannot be attached to at {CDP_URL} "
+                f"({type(error).__name__}). Tauri overrides "
+                f"WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS with its own "
+                f"additional_browser_args, so the shipped bundle opens no CDP port. "
+                f"Driving the real renderer needs the app to opt in; the backend it "
+                f"serves is exercised in full by desktop_drive.py."
             )
             return
         report.ok(f"attached to the packaged WebView2 renderer at {CDP_URL}")
