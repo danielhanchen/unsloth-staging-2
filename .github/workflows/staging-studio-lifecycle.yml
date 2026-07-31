@@ -1,0 +1,125 @@
+name: "staging studio lifecycle audit"
+
+# Install -> update xN -> uninstall, then audit what the uninstaller left behind.
+# The repo's own studio-update-smoke.yml checks only 4 leak paths; this diffs the
+# whole HOME tree against a pristine snapshot so every survivor is visible.
+on:
+  push:
+    branches: ["studio-lifecycle-audit"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: "lifecycle (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Snapshot pristine HOME
+        shell: bash
+        run: |
+          set -e
+          mkdir -p "$RUNNER_TEMP/snap"
+          ( cd "$HOME" && find . -xdev 2>/dev/null | LC_ALL=C sort ) > "$RUNNER_TEMP/snap/00_pristine.tree" || true
+          wc -l < "$RUNNER_TEMP/snap/00_pristine.tree"
+
+      - name: Install Studio
+        shell: bash
+        run: bash install.sh --local --no-torch 2>&1 | tail -30
+
+      - name: Snapshot after install
+        shell: bash
+        run: ( cd "$HOME" && find . -xdev 2>/dev/null | LC_ALL=C sort ) > "$RUNNER_TEMP/snap/01_installed.tree" || true
+
+      - name: Update three times
+        shell: bash
+        run: |
+          set -e
+          BIN="$HOME/.local/bin/unsloth"
+          test -x "$BIN" || { echo "::error::no CLI shim at $BIN"; exit 1; }
+          for i in 1 2 3; do
+            echo "::group::update $i"
+            "$BIN" studio update --local 2>&1 | tail -15
+            echo "::endgroup::"
+            ( cd "$HOME" && find . -xdev 2>/dev/null | LC_ALL=C sort ) > "$RUNNER_TEMP/snap/02_update$i.tree" || true
+          done
+
+      - name: Update must be idempotent
+        shell: bash
+        run: |
+          set -e
+          a=$(comm -13 "$RUNNER_TEMP/snap/02_update2.tree" "$RUNNER_TEMP/snap/02_update3.tree" | wc -l)
+          r=$(comm -23 "$RUNNER_TEMP/snap/02_update2.tree" "$RUNNER_TEMP/snap/02_update3.tree" | wc -l)
+          echo "update3 vs update2: +$a -$r"
+          # Caches and logs legitimately churn; a large delta means update is not converging.
+          if [ "$a" -gt 200 ]; then echo "::error::update is not idempotent (+$a paths on the 3rd run)"; exit 1; fi
+
+      - name: Uninstall
+        shell: bash
+        run: sh scripts/uninstall.sh 2>&1 | tail -30
+
+      - name: Artifact audit
+        shell: bash
+        run: |
+          set -e
+          ( cd "$HOME" && find . -xdev 2>/dev/null | LC_ALL=C sort ) > "$RUNNER_TEMP/snap/03_uninstalled.tree" || true
+          comm -13 "$RUNNER_TEMP/snap/00_pristine.tree" "$RUNNER_TEMP/snap/03_uninstalled.tree" > "$RUNNER_TEMP/survivors.txt"
+          echo "survivors: $(wc -l < "$RUNNER_TEMP/survivors.txt")"
+          echo "::group::survivors under .unsloth"
+          grep -E '^\./\.unsloth' "$RUNNER_TEMP/survivors.txt" || echo "  (none)"
+          echo "::endgroup::"
+          echo "::group::all top-level survivors"
+          sed 's#^\./##' "$RUNNER_TEMP/survivors.txt" | awk -F/ 'NF<=3' | head -60
+          echo "::endgroup::"
+          # Known-suspected misses, reported not enforced (this job is a probe).
+          for p in ./.unsloth/whisper.cpp ./.unsloth/.whisper.cpp.install.lock ./.unsloth/.node.install.lock ./.unsloth; do
+            if grep -qx "$p" "$RUNNER_TEMP/survivors.txt"; then echo "MISSED: $p"; fi
+          done
+
+      - name: Shell rc left modified?
+        shell: bash
+        run: |
+          for rc in .bashrc .zshrc .profile; do
+            if [ -f "$HOME/$rc" ] && grep -q "Unsloth" "$HOME/$rc" 2>/dev/null; then
+              echo "MISSED: $rc still contains an Unsloth block"
+              grep -n "Unsloth" "$HOME/$rc" || true
+            fi
+          done
+
+      - name: Uninstall is idempotent
+        shell: bash
+        run: |
+          set -e
+          sh scripts/uninstall.sh > /dev/null 2>&1
+          echo "second uninstall exit: $?"
+          sh scripts/uninstall.sh > /dev/null 2>&1
+          echo "third uninstall exit: $?"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lifecycle-snapshots-${{ matrix.os }}
+          path: ${{ runner.temp }}/snap
+          retention-days: 5
