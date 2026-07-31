@@ -202,8 +202,17 @@ jobs:
             # reproducing on all four legs. Removing it brought the failure straight back
             # (3/3 on 22.04), so that probe was masking the defect, not measuring it.
             echo "--- inherited env (loader / python relevant) ---"
-            env | grep -E '^(LD_LIBRARY_PATH|LD_PRELOAD|PYTHONHOME|PYTHONPATH|PYTHONEXECUTABLE|VIRTUAL_ENV|APPIMAGE|APPDIR|UNSLOTH_|GTK_PATH|GIO_MODULE_DIR)=' \
+            # The previous pattern had UNSLOTH_ followed directly by '=', so it could only
+            # ever match a variable literally named UNSLOTH_. Every reading of "(none of
+            # them are set)" was therefore silent about UNSLOTH_STUDIO_DESKTOP_OWNER_TOKEN
+            # and friends, which process.rs:582-614 does inject.
+            env | grep -E '^(LD_LIBRARY_PATH|LD_PRELOAD|PYTHONHOME|PYTHONPATH|PYTHONEXECUTABLE|VIRTUAL_ENV|APPIMAGE|APPDIR|GTK_PATH|GIO_MODULE_DIR|UNSLOTH_[A-Z0-9_]*|STUDIO_[A-Z0-9_]*)=' \
               || echo "(none of them are set)"
+            # A signal mask or ignored-signal set inherited from a GTK/WebKit parent
+            # survives exec, and is one of the few things that can change how a child
+            # behaves without changing its environment or its fds.
+            echo "--- inherited signal disposition ---"
+            grep -E "^Sig(Blk|Ign|Cgt)" /proc/self/status 2>/dev/null | sed "s/^/  /" || true
             echo "--- limits / fds ---"
             ulimit -a 2>/dev/null | grep -iE "open files|max memory|virtual|processes" || true
             # Read-only: what fds 0/1/2 ARE. Already established that they are writable
@@ -213,6 +222,21 @@ jobs:
           } >> "$LOG" 2>&1
           export PYTHONUNBUFFERED=1
           export PYTHONFAULTHANDLER=1
+          # The question this run has to answer: did Python start at all? The backend
+          # exits 1 having written literally zero bytes to both streams, captured at the
+          # source rather than through the app's pipes, so the usual failure modes are
+          # already excluded -- a traceback, a typer message, a usage error and a
+          # BrokenPipeError would every one of them have produced output. PYTHONVERBOSE
+          # traces every import to stderr from the very first one, so silence under it
+          # means the interpreter never got going, and any output pinpoints where it
+          # stopped.
+          export PYTHONVERBOSE=1
+          # Trace what the shell itself does, into the log rather than onto the streams
+          # under test, so "bash never ran it" and "it ran and said nothing" cannot be
+          # confused for one another.
+          exec 9>>"$LOG"
+          export BASH_XTRACEFD=9
+          set -x
           # Tee both streams to files while still passing them through to the app, so the
           # output that has been invisible all through this investigation is recoverable
           # even if the app never logs it. `wait` for the tees, so the shim cannot exit
