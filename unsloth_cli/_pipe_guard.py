@@ -100,3 +100,95 @@ def install(streams = ("stdout", "stderr"), module = None):
         except Exception:
             pass
     return wrapped
+
+
+def shield_stdio_from_epipe(fds = (1, 2)):
+    """Guarantee that writing to fd 1 and fd 2 can never raise EPIPE or raise SIGPIPE.
+
+    Why this exists, measured rather than guessed. The desktop app spawns the backend
+    with its stdout on a pipe and reads it for the log view. When that reader goes away
+    mid-startup, the next write fails and the server dies. From strace on a failing CI
+    run, with the successful writes immediately before it:
+
+        write(1, "Starting Unsloth Studio on http:"..., 49) = 49
+        write(1, "2026-07-31 20:19:00 [info     ] "..., 95) = 95
+        write(1, "Session log: /home/runner/.unslo"..., 88) = -1 EPIPE (Broken pipe)
+        --- SIGPIPE ---
+        write(4, "Session log: /home/runner/.unslo"..., 88) = 88
+        exit_group(1)
+
+    Note the second-to-last line: the same message reaches the session log on disk. The
+    server had everything it needed to keep running and stopped only because a log
+    consumer went away.
+
+    Wrapping sys.stdout is not enough, and was tried: attribute access delegates
+    `.buffer`, so click and typer's byte writes go straight past it, and a subprocess
+    inherits the raw descriptor regardless. The guarantee has to be at the descriptor
+    level, so it is: the real descriptor is duplicated aside, a fresh pipe is dup2'd over
+    the original number, and a daemon thread drains that pipe and forwards to the real
+    one, discarding quietly once the far end is gone. After this, fd 1 and fd 2 always
+    have a reader -- this process's own thread -- so nothing written by Python, by a C
+    extension, or by a child process can ever fail on them.
+
+    Only pipes are shielded. A file or a terminal cannot EPIPE, and interposing on those
+    would add a thread and a copy for nothing.
+    """
+    import os
+    import stat
+    import threading
+
+    shielded = []
+    for fd in fds:
+        try:
+            if not stat.S_ISFIFO(os.fstat(fd).st_mode):
+                continue
+        except OSError:
+            continue
+
+        # Flush first: anything sitting in Python's buffers belongs to the real
+        # descriptor, and must not be re-routed halfway through a line.
+        for name in ("stdout", "stderr"):
+            stream = getattr(_sys, name, None)
+            try:
+                if stream is not None and stream.fileno() == fd:
+                    stream.flush()
+            except Exception:
+                pass
+
+        try:
+            real_fd = os.dup(fd)
+            read_fd, write_fd = os.pipe()
+            os.dup2(write_fd, fd)
+            os.close(write_fd)
+        except OSError:
+            continue
+
+        def _relay(read_fd = read_fd, real_fd = real_fd):
+            broken = False
+            try:
+                while True:
+                    try:
+                        chunk = os.read(read_fd, 65536)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    if broken:
+                        continue      # keep draining, or writers block on a full pipe
+                    try:
+                        os.write(real_fd, chunk)
+                    except OSError:
+                        broken = True
+            finally:
+                for victim in (read_fd, real_fd):
+                    try:
+                        os.close(victim)
+                    except OSError:
+                        pass
+
+        thread = threading.Thread(
+            target = _relay, name = f"stdio-shield-{fd}", daemon = True,
+        )
+        thread.start()
+        shielded.append(fd)
+    return shielded

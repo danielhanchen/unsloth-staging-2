@@ -1599,6 +1599,17 @@ def studio_default(
         run_mod = _load_run_module()
     run_server = run_mod.run_server
 
+    # From here on this process is a long-lived server, and a log consumer going away
+    # must not be able to kill it. The Tauri app spawns the backend with stdout on a
+    # pipe; when that reader disappeared mid-startup the next write took EPIPE and the
+    # server exited 1, having already written the same line to its session log on disk.
+    # Only pipes are shielded, so an interactive or redirected launch is untouched.
+    try:
+        from unsloth_cli._pipe_guard import shield_stdio_from_epipe
+        shield_stdio_from_epipe()
+    except Exception:
+        pass
+
     if not silent:
         display_host = _display_host_for_bind(run_mod, host)
         typer.echo(f"Starting Unsloth Studio on http://{_url_host(display_host)}:{port}")

@@ -608,6 +608,10 @@ jobs:
           echo "=== BEFORE: shipped bundle, reader-less pipe ==="
           deadpipe_trial "before" 8700
 
+          # The shield is installed the way the shipped fix installs it -- at the
+          # descriptor level, once this process is committed to being a server. Wrapping
+          # sys.stdout was tried first and validated as NOT fixing this: attribute access
+          # delegates .buffer, so click and typer's byte writes go straight past it.
           cat > "$SITE/sitecustomize.py" <<SITEPY
           import importlib.util, sys
           spec = importlib.util.spec_from_file_location(
@@ -615,6 +619,7 @@ jobs:
           module = importlib.util.module_from_spec(spec)
           spec.loader.exec_module(module)
           module.install()
+          module.shield_stdio_from_epipe()
           SITEPY
           "$VENV/bin/python" -c "import sys; print('guard active:', type(sys.stdout).__name__)"
 
@@ -622,11 +627,11 @@ jobs:
           deadpipe_trial "after " 8720
           rm -f "$SITE/sitecustomize.py"
 
-      - name: The pipe guard's own tests
+      - name: The stdio shield's own tests
         if: always()
         run: |
           VENV="$HOME/.unsloth/studio/unsloth_studio"
-          "$VENV/bin/python" -m pytest -q tests/studio/test_pipe_tolerant_stream.py 2>&1 | tail -25 \
+          "$VENV/bin/python" -m pytest -q tests/studio/test_pipe_tolerant_stream.py 2>&1 | tail -30 \
             || echo "(pytest unavailable in the bundle venv; the CI matrix runs these elsewhere)"
 
       - name: Where exactly is the backend stuck?

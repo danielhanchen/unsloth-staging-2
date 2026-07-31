@@ -140,3 +140,62 @@ def test_end_to_end_a_readerless_pipe_no_longer_kills_the_process():
         f"exited {completed.returncode} writing to a reader-less pipe; "
         f"stderr: {completed.stderr[-2000:]!r}"
     )
+
+
+def _shield_probe(shield: bool) -> subprocess.CompletedProcess:
+    """Write to a genuinely dead pipe on fd 1, with and without the shield."""
+    program = textwrap.dedent(
+        """
+        import os, sys
+        from unsloth_cli._pipe_guard import shield_stdio_from_epipe
+        read_fd, write_fd = os.pipe()
+        os.dup2(write_fd, 1); os.close(write_fd)
+        os.close(read_fd)                     # the reader is gone, as the app's was
+        if os.environ.get("SHIELD") == "1":
+            shield_stdio_from_epipe(fds = (1,))
+        try:
+            for _ in range(50):
+                os.write(1, b"x" * 256)       # a raw fd write: C extension or subprocess
+            print("and a normal print too", flush = True)
+            sys.stderr.write("SURVIVED\\n")
+        except BaseException as error:
+            sys.stderr.write(f"DIED: {type(error).__name__}\\n")
+            raise SystemExit(1)
+        """
+    )
+    env = dict(os.environ, SHIELD = "1" if shield else "0")
+    return subprocess.run(
+        [sys.executable, "-c", program],
+        stderr = subprocess.PIPE, timeout = 120, env = env,
+    )
+
+
+def test_without_the_shield_a_dead_stdout_kills_the_process():
+    """The control. If this ever stops failing, the test below proves nothing."""
+    result = _shield_probe(shield = False)
+    assert result.returncode == 1, result.stderr
+    assert b"DIED: BrokenPipeError" in result.stderr, result.stderr
+
+
+def test_the_shield_survives_a_dead_stdout():
+    result = _shield_probe(shield = True)
+    assert b"SURVIVED" in result.stderr, result.stderr
+    assert result.returncode == 0, result.stderr
+
+
+def test_the_shield_leaves_non_pipes_alone():
+    """A file or a terminal cannot EPIPE; interposing there costs a thread for nothing."""
+    program = textwrap.dedent(
+        """
+        import os, sys, tempfile
+        from unsloth_cli._pipe_guard import shield_stdio_from_epipe
+        handle = tempfile.TemporaryFile()
+        os.dup2(handle.fileno(), 1)
+        shielded = shield_stdio_from_epipe(fds = (1,))
+        sys.stderr.write(f"shielded={shielded}\\n")
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program], stderr = subprocess.PIPE, timeout = 120,
+    )
+    assert b"shielded=[]" in result.stderr, result.stderr
