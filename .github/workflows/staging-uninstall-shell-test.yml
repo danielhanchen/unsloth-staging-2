@@ -29,13 +29,33 @@ jobs:
       - name: Run the argument guard suite
         run: bash tests/sh/test_uninstall_arg_guard.sh
       - name: The suite must fail against the previous uninstaller
-        # A test that passes on the unfixed script proves nothing.
+        # A test that passes on the unfixed script proves nothing. checkout is
+        # shallow, so the pre-fix script is synthesised by stripping the added
+        # removals rather than read from history.
         run: |
           set -e
-          git show HEAD~1:scripts/uninstall.sh > scripts/uninstall.sh
-          if bash tests/sh/test_uninstall_prebuilt_artifacts.sh > /tmp/neg.log 2>&1; then
+          python3 - <<'PY'
+          import pathlib, re
+          p = pathlib.Path("scripts/uninstall.sh")
+          s = p.read_text()
+          for line in (
+              '    _remove_path "$HOME/.unsloth/whisper.cpp"\n',
+              '    _remove_path "$HOME/.unsloth/.node.install.lock"\n',
+              '    _remove_path "$HOME/.unsloth/.whisper.cpp.install.lock"\n',
+          ):
+              assert line in s, line
+              s = s.replace(line, "")
+          s = re.sub(
+              r'    for _stale in "\$HOME"/\.unsloth/\.\*\.install\.lock\.stale\.\*; do\n'
+              r'        \[ -e "\$_stale" \] && _remove_path "\$_stale"\n'
+              r'    done\n',
+              "", s)
+          assert ".stale." not in s
+          p.write_text(s)
+          PY
+          if bash tests/sh/test_uninstall_prebuilt_artifacts.sh > neg.log 2>&1; then
             echo "::error::the suite passed against the pre-fix uninstaller"
             exit 1
           fi
           echo "correctly failed against the pre-fix uninstaller:"
-          grep FAIL /tmp/neg.log | head -10
+          grep FAIL neg.log | head -10
