@@ -182,9 +182,17 @@ jobs:
           #!/bin/bash
           # Diagnostic shim (staging only) -- see "Wrap the backend entry point".
           LOG="$HOME/unsloth-child.log"
-          # Keep the REAL stdout/stderr (the app's pipes) on fds 3 and 4, so the block
-          # below can go to the log file without stealing them.
-          exec 3>&1 4>&2
+          # Only the backend launch is instrumented. Every other invocation is passed
+          # through untouched, because the app PARSES the stdout of some of them:
+          # `studio desktop-capabilities --json` is read back as JSON, and an earlier
+          # version of this shim wrote a probe line to the real stdout, corrupting that
+          # JSON. The app then declared the install stale and went into an update loop
+          # instead of ever spawning a backend, and the run measured nothing. An
+          # instrument that writes to the stream under test is not an instrument.
+          case " $* " in
+            *" --api-only "*) ;;
+            *) exec "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.real" "$@" ;;
+          esac
           {
             echo "=============================================================="
             echo "[$(date -u +%H:%M:%S)] pid=$$ ppid=$PPID cwd=$PWD"
@@ -198,33 +206,21 @@ jobs:
               || echo "(none of them are set)"
             echo "--- limits / fds ---"
             ulimit -a 2>/dev/null | grep -iE "open files|max memory|virtual|processes" || true
-            # THE question for this run. The backend exits rc=1 having written nothing to
-            # either stream, immediately. Python ignores SIGPIPE, so a write to a closed
-            # stdout raises BrokenPipeError; if stderr is closed too the traceback goes
-            # nowhere, and what is left is exactly this signature -- silent exit 1. So
-            # before running anything, ask whether the streams we were handed are usable.
-            echo "--- are the stdout/stderr we inherited actually writable? ---"
+            # Read-only: what fds 0/1/2 ARE. Already established that they are writable
+            # pipes at this point, so nothing is written to them to find out.
             ls -lL /proc/self/fd/0 /proc/self/fd/1 /proc/self/fd/2 2>&1 | sed "s/^/  /"
-            if echo "SHIM_PROBE_STDOUT pid=$$" >&3 2>/dev/null; then
-              echo "  stdout: writable"
-            else
-              echo "  !! stdout: WRITE FAILED -- the app handed us a closed pipe"
-            fi
-            if echo "SHIM_PROBE_STDERR pid=$$" >&4 2>/dev/null; then
-              echo "  stderr: writable"
-            else
-              echo "  !! stderr: WRITE FAILED -- the app handed us a closed pipe"
-            fi
             echo "--- running the real entry point ---"
           } >> "$LOG" 2>&1
           export PYTHONUNBUFFERED=1
           export PYTHONFAULTHANDLER=1
-          # Tee both streams into files while still passing them through to the app. If
-          # the app's pipe is broken, tee takes the EPIPE and the file still captures what
-          # the backend said -- which is the output that has been invisible all along.
+          # Tee both streams to files while still passing them through to the app, so the
+          # output that has been invisible all through this investigation is recoverable
+          # even if the app never logs it. `wait` for the tees, so the shim cannot exit
+          # before they have flushed.
           "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.real" "$@" \
-            > >(tee -a "$LOG.out" >&3) 2> >(tee -a "$LOG.err" >&4)
+            > >(tee -a "$LOG.out") 2> >(tee -a "$LOG.err" >&2)
           rc=$?
+          wait
           if [ "$rc" -gt 128 ]; then
             echo "[$(date -u +%H:%M:%S)] pid=$$ EXIT rc=$rc -> killed by signal $((rc - 128)) (11=SIGSEGV 9=SIGKILL/OOM 6=SIGABRT 13=SIGPIPE)" >> "$LOG"
           else
