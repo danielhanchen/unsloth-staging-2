@@ -93,10 +93,16 @@ jobs:
           echo "::group::all top-level survivors"
           sed 's#^\./##' "$RUNNER_TEMP/survivors.txt" | awk -F/ 'NF<=3' | head -60
           echo "::endgroup::"
-          # Known-suspected misses, reported not enforced (this job is a probe).
+          # The previous run of this job left ./.unsloth and
+          # ./.unsloth/.node.install.lock behind on BOTH ubuntu-latest and
+          # macos-14. With the uninstaller fix these must be gone, so this is
+          # now an assertion rather than a probe.
+          fail=0
           for p in ./.unsloth/whisper.cpp ./.unsloth/.whisper.cpp.install.lock ./.unsloth/.node.install.lock ./.unsloth; do
-            if grep -qx "$p" "$RUNNER_TEMP/survivors.txt"; then echo "MISSED: $p"; fi
+            if grep -qx "$p" "$RUNNER_TEMP/survivors.txt"; then echo "::error::MISSED: $p"; fail=1; fi
           done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "PASS: no Unsloth artifacts survived the uninstall"
 
       - name: Shell rc left modified?
         shell: bash
