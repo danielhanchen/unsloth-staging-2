@@ -37,6 +37,8 @@ from core.inference.chat_template_helpers import (
     ReasoningChannelNormalizer,
     detect_reasoning_channel_markers,
     detect_think_prefill,
+    neutralize_control_markup_in_messages,
+    neutralize_tts_prompt_text,
 )
 from core.inference.presence_penalty import _make_presence_penalty_processor
 from io import StringIO
@@ -1223,6 +1225,11 @@ class InferenceBackend:
             else:
                 vision_messages = [user_msg]
 
+            # Processor's own template skips the choke point (#7066). Rebind user_msg
+            # so the no-system retry keeps the copy.
+            vision_messages = neutralize_control_markup_in_messages(vision_messages)
+            user_msg = vision_messages[-1]
+
             try:
                 input_text = processor.apply_chat_template(
                     vision_messages, add_generation_prompt = True, tokenize = False
@@ -1437,6 +1444,9 @@ class InferenceBackend:
                 ],
             },
         ]
+
+        # Direct processor render like the vision path, so neutralize here too (#7066).
+        audio_messages = neutralize_control_markup_in_messages(audio_messages)
 
         # apply_chat_template does audio embedding + tokenization in one step
         inputs = processor.apply_chat_template(
@@ -1834,6 +1844,9 @@ class InferenceBackend:
             raise RuntimeError(f"Model {self.active_model_name} is not an audio model")
 
         top_k = self._normalize_top_k(top_k)
+        # Every codec below concatenates its prompt instead of templating it, so this
+        # is the one choke point for all four (#7066).
+        text = neutralize_tts_prompt_text(text, audio_type)
 
         with self._generation_lock:
             if use_adapter is not None:
@@ -2102,6 +2115,10 @@ class InferenceBackend:
         if chat_messages and chat_messages[-1]["role"] == "assistant":
             logger.debug("Removing final assistant message to ensure proper alternation")
             chat_messages.pop()
+
+        # Direct tokenizer render bypasses the choke point, and the user sub above
+        # leaves system_prompt and replayed assistant text raw (#7066).
+        chat_messages = neutralize_control_markup_in_messages(chat_messages)
 
         logger.info(f"Sending {len(chat_messages)} messages to tokenizer:")
         for i, msg in enumerate(chat_messages):
