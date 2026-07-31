@@ -22,6 +22,11 @@ _backend_root = Path(__file__).resolve().parent.parent
 if str(_backend_root) not in sys.path:
     sys.path.insert(0, str(_backend_root))
 
+# Let the diffusion patch backend lazily import unsloth_zoo on a CPU-only test host: unsloth_zoo
+# runs accelerator detection at import and raises without a GPU unless this is set (a no-op on a
+# real GPU run). setdefault so an explicit override wins.
+os.environ.setdefault("UNSLOTH_ALLOW_CPU", "1")
+
 
 # Pytest CLI options
 
@@ -197,3 +202,20 @@ def stub_embeddings(monkeypatch):
     )
     monkeypatch.setattr(embeddings, "warm", lambda model_name = None: None)
     return dim
+
+
+@pytest.fixture
+def dit_train_host(monkeypatch):
+    """Pretend this host can train the DiT families.
+
+    ``family_train_infos()`` and the start preflight both gate on the accelerator / bf16 probes, so
+    on a GPU-less runner every DiT family reports no precision modes, ``supports_compile`` False,
+    and a "needs a GPU" note that replaces any other preflight message. Tests about family metadata
+    or about a different preflight pin the probes here so they assert the same thing on every host;
+    the gate itself is covered by its own tests in test_diffusion_base_precision.py.
+    """
+    import core.training.diffusion_train_common as dtc
+
+    monkeypatch.setattr(dtc, "dit_accelerator_missing_reason", lambda *_a, **_k: None)
+    monkeypatch.setattr(dtc, "bf16_unsupported_reason", lambda *_a, **_k: None)
+    return dtc

@@ -167,6 +167,8 @@ export function buildCachedInventoryRow(
     partial?: boolean;
     partial_transport?: string | null;
     pipeline_tag?: string | null;
+    task?: string | null;
+    single_file?: boolean;
     tags?: string[];
     library_name?: string | null;
     quant_method?: string | null;
@@ -225,6 +227,8 @@ export function buildCachedInventoryRow(
     partial: row.partial ?? false,
     partialTransport: row.partial_transport ?? null,
     pipelineTag: row.pipeline_tag ?? null,
+    task: row.task ?? null,
+    singleFile: row.single_file ?? false,
     tags: row.tags,
     libraryName: row.library_name ?? null,
     quantMethod: row.quant_method ?? null,
@@ -303,6 +307,7 @@ export function buildLocalInventoryRows(
         partialTransport: model.partial_transport ?? null,
         activeCache: model.active_cache ?? null,
         pipelineTag: model.pipeline_tag ?? null,
+        task: model.task ?? null,
         tags: model.tags,
         libraryName: model.library_name ?? null,
         quantMethod: model.quant_method ?? null,

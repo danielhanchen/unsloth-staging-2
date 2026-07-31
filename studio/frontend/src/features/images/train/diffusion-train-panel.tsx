@@ -1,0 +1,1511 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import { Settings02Icon } from "@hugeicons/core-free-icons";
+import { HugeiconsIcon } from "@hugeicons/react";
+
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectLabel,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import type { TrainingSeriesPoint } from "@/features/training";
+// eslint-disable-next-line no-restricted-imports -- matches images-page.tsx's token access
+import { getHfToken, hfApiToken } from "@/features/hub/stores/hf-token-store";
+import { cn } from "@/lib/utils";
+import { toast } from "@/lib/toast";
+
+import {
+  type DiffusionDatasetExample,
+  type DiffusionTrainableFamily,
+  type DiffusionTrainingInfo,
+  type DiffusionTrainingRunDetail,
+  type DiffusionTrainingRunSummary,
+  type DiffusionTrainingStatus,
+  getDiffusionTrainingInfo,
+  getDiffusionTrainingRun,
+  getDiffusionTrainingStatus,
+  listDiffusionDatasetExamples,
+  listDiffusionTrainingRuns,
+  startDiffusionTraining,
+  stopDiffusionTraining,
+  uploadDiffusionDataset,
+} from "../api";
+import { DatasetLabelingGrid, LabelingGridToggle } from "./dataset-labeling-grid";
+import { DatasetShowcase } from "./dataset-showcase";
+import { DiffusionCharts } from "./diffusion-charts";
+import {
+  ExampleDatasetCards,
+  runExampleImport,
+  shortExampleLabel,
+} from "./example-dataset-cards";
+
+// The families the Train tab can train, in popularity order; a fallback for an older backend whose /info does not report families. When it does, its list wins and these labels/notes fill gaps.
+type FamilyPreset = {
+  name: string;
+  label: string;
+  base_repos: string[];
+  defaults: { rank: number; lr: number; resolution: number };
+  vram_note: string;
+  gated?: boolean;
+};
+
+const FAMILY_PRESETS: FamilyPreset[] = [
+  {
+    name: "flux.1",
+    label: "FLUX.1-dev (12B)",
+    base_repos: ["black-forest-labs/FLUX.1-dev"],
+    defaults: { rank: 16, lr: 0.0001, resolution: 512 },
+    vram_note: "Gated: needs its license and your HF token.",
+    gated: true,
+  },
+  {
+    name: "qwen-image",
+    label: "Qwen-Image (20B)",
+    base_repos: ["unsloth/Qwen-Image-2512-unsloth-bnb-4bit", "Qwen/Qwen-Image"],
+    defaults: { rank: 16, lr: 0.00005, resolution: 512 },
+    vram_note: "The biggest: needs a large GPU. Start at 512px.",
+  },
+  {
+    name: "z-image",
+    label: "Z-Image-Turbo (6B)",
+    base_repos: ["unsloth/Z-Image-Turbo-unsloth-bnb-4bit", "Tongyi-MAI/Z-Image-Turbo"],
+    defaults: { rank: 16, lr: 0.0001, resolution: 768 },
+    vram_note: "The smallest and fastest. A good first pick.",
+  },
+  {
+    name: "sdxl",
+    label: "SDXL (U-Net)",
+    base_repos: ["stabilityai/stable-diffusion-xl-base-1.0", "stabilityai/sdxl-turbo"],
+    defaults: { rank: 16, lr: 0.0001, resolution: 1024 },
+    vram_note: "The classic. Fine at 1024px.",
+  },
+];
+
+const CUSTOM_BASE = "__custom__";
+const UPLOAD_DATASET = "__upload__";
+// Dense DiT base precisions: they load a dense (bf16) base and quantise/cast it, so the backend rejects them for an already-quantised bnb-4bit repo. "nf4"/"auto" stay valid.
+const DENSE_PRECISIONS = new Set(["bf16", "int8", "fp8", "mxfp8"]);
+// Mirror the backend repo_is_prequantized heuristic: a bitsandbytes 4-bit repo already ships a quantised transformer and cannot serve the dense base precisions. Keep in sync with diffusion_train_common.repo_is_prequantized.
+function repoIsPrequantized(baseModel: string): boolean {
+  const name = baseModel.toLowerCase();
+  return (
+    name.includes("bnb-4bit") ||
+    name.includes("-4bit") ||
+    name.includes("int4") ||
+    name.includes("nf4")
+  );
+}
+// Dataset-select option value prefix for a not-yet-imported example; picking it imports.
+const EXAMPLE_PREFIX = "example:";
+const DATASET_FILE_ACCEPT = ".png,.jpg,.jpeg,.webp,.bmp,.txt,.caption,.jsonl";
+// min-w-0 + a truncating value: a long option would otherwise set the grid column min width and push into its neighbour.
+const selectClass =
+  "h-8 w-full min-w-0 text-xs *:data-[slot=select-value]:min-w-0 *:data-[slot=select-value]:truncate";
+// Every settings cell is a grid item, so it needs min-w-0 to be allowed to shrink.
+const fieldClass = "grid min-w-0 gap-2";
+
+// Merge the backend reported families (if any) over the presets, keeping the preset ordering (popularity) and filling labels/notes/defaults the backend omits.
+function mergeFamilies(reported?: DiffusionTrainableFamily[]): FamilyPreset[] {
+  if (!reported || reported.length === 0) return FAMILY_PRESETS;
+  const byName = new Map(reported.map((f) => [f.name, f]));
+  const merged: FamilyPreset[] = FAMILY_PRESETS.map((p) => {
+    const r = byName.get(p.name);
+    if (!r) return p;
+    byName.delete(p.name);
+    return {
+      name: p.name,
+      label: r.label || p.label,
+      base_repos: r.base_repos?.length ? r.base_repos : p.base_repos,
+      defaults: {
+        rank: r.defaults?.lora_rank ?? p.defaults.rank,
+        lr: r.defaults?.learning_rate ?? p.defaults.lr,
+        resolution: r.defaults?.resolution ?? p.defaults.resolution,
+      },
+      vram_note: r.vram_note || p.vram_note,
+      gated: r.gated ?? p.gated,
+    };
+  });
+  // Any backend family not in the presets goes last, so a newly added trainer still shows.
+  for (const r of byName.values()) {
+    merged.push({
+      name: r.name,
+      label: r.label || r.name,
+      base_repos: r.base_repos ?? [],
+      defaults: {
+        rank: r.defaults?.lora_rank ?? 16,
+        lr: r.defaults?.learning_rate ?? 0.0001,
+        resolution: r.defaults?.resolution ?? 768,
+      },
+      vram_note: r.vram_note ?? "",
+      gated: r.gated ?? false,
+    });
+  }
+  return merged;
+}
+
+// A full-page training workspace: left = configure (family, dataset, labeling, settings), right = live run (progress, loss/grad-norm charts, completion + deploy). Kept mounted with the page so a long run survives tab switches; polling is gated on `active`.
+export function DiffusionTrainPanel({
+  active,
+  loadedFamily,
+  loadedBaseRepo,
+  onTrainingComplete,
+  onDeploy,
+  familyName,
+  onFamilyNameChange,
+  baseChoice,
+  onBaseChoiceChange,
+  onFamiliesChange,
+}: {
+  active: boolean;
+  // The currently loaded generation model family / base repo, to preselect a matching training base when it is one we can train.
+  loadedFamily?: string | null;
+  loadedBaseRepo?: string | null;
+  // Family + base are controlled by the page: the top bar picks the training base while Train is showing, and these selects stay in sync with it.
+  familyName: string;
+  onFamilyNameChange: (name: string) => void;
+  baseChoice: string;
+  onBaseChoiceChange: (repo: string) => void;
+  // /info owns the family list, so publish it for the top bar's picker.
+  onFamiliesChange?: (families: FamilyPreset[]) => void;
+  // Bump the page's LoRA discovery so a freshly trained adapter appears in the picker.
+  onTrainingComplete?: () => void;
+  // Deploy a finished adapter into Create mode: load the base then preselect the adapter.
+  onDeploy?: (args: {
+    baseRepo: string;
+    family: string;
+    catalogPath: string;
+    trigger: string;
+  }) => void;
+}) {
+  const [info, setInfo] = useState<DiffusionTrainingInfo | null>(null);
+  const families = useMemo(() => mergeFamilies(info?.families), [info?.families]);
+
+  const setFamilyName = onFamilyNameChange;
+  useEffect(() => {
+    onFamiliesChange?.(families);
+  }, [families, onFamiliesChange]);
+  const family = useMemo(
+    () => families.find((f) => f.name === familyName) ?? families[0],
+    [families, familyName],
+  );
+  // The raw backend family record (precision_modes / recommended_precision / supports_compile live only here, not on the preset). Absent on an older backend -> the DiT speed controls fall back to a sensible default list.
+  const reportedFamily = useMemo(
+    () => info?.families?.find((f) => f.name === familyName),
+    [info?.families, familyName],
+  );
+  // sdxl trains the U-Net in mixed precision (no quantised base), so it uses the mixed_precision control instead of base_precision. Everything else is a DiT family.
+  const isDiT = familyName !== "sdxl";
+  // An EMPTY precision_modes list on a DiT family is the backend signal that this host cannot train it at all (a non-bf16 CUDA GPU fails the preflight for every mode, so /info advertises no precision rather than a start that always 400s; the reason rides in vram_note).
+  // Only an ABSENT field means an older backend, falling back to the default modes. SDXL reports [] too but is not precision-gated (it keeps its mixed_precision lever), hence the isDiT scope.
+  const familyUntrainable =
+    isDiT &&
+    reportedFamily?.precision_modes != null &&
+    reportedFamily.precision_modes.length === 0;
+  // The quantised base precisions this family can train in, with a stable fallback when the backend does not report them (older backend, or a preset-only family).
+  const precisionModes = useMemo<
+    Array<"nf4" | "bf16" | "int8" | "fp8" | "mxfp8" | "auto">
+  >(() => {
+    if (familyUntrainable) return [];
+    const reported = reportedFamily?.precision_modes?.filter(
+      (m): m is "nf4" | "bf16" | "int8" | "fp8" | "mxfp8" =>
+        m === "nf4" || m === "bf16" || m === "int8" || m === "fp8" || m === "mxfp8",
+    );
+    if (reported && reported.length > 0) return ["auto", ...reported];
+    // Fallback without a backend report: the GPU-independent modes only (mxfp8 needs a Blackwell probe, so it is offered strictly when the backend advertises it).
+    return ["auto", "nf4", "bf16", "int8", "fp8"];
+  }, [reportedFamily?.precision_modes, familyUntrainable]);
+  // Whether to show the torch.compile control. The backend advertises this per family (the SDXL U-Net path compiles regionally too now); default on for DiT families when an older backend does not report it.
+  const supportsCompile = reportedFamily?.supports_compile ?? isDiT;
+
+  const setBaseChoice = onBaseChoiceChange;
+  const [customBase, setCustomBase] = useState("");
+
+  const [dataset, setDataset] = useState<string>(UPLOAD_DATASET);
+  const [uploadName, setUploadName] = useState("my-images");
+  const [uploading, setUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // Mirrors the hidden input's selection so the row can report it.
+  const [pickedFileCount, setPickedFileCount] = useState(0);
+  const [gridOpen, setGridOpen] = useState(false);
+  const [gridRefresh, setGridRefresh] = useState(0);
+  const [examples, setExamples] = useState<DiffusionDatasetExample[]>([]);
+  const [importingId, setImportingId] = useState<string | null>(null);
+
+  const [outputDir, setOutputDir] = useState("");
+  const [instancePrompt, setInstancePrompt] = useState("");
+
+  const [steps, setSteps] = useState(500);
+  // Run length is set in either steps or epochs; the trainer resolves epochs -> steps once the dataset size is known (num_epochs overrides train_steps on the backend).
+  const [durationUnit, setDurationUnit] = useState<"steps" | "epochs">("steps");
+  const [epochs, setEpochs] = useState(10);
+  const [learningRate, setLearningRate] = useState(family?.defaults.lr ?? 0.0001);
+  const [rank, setRank] = useState(family?.defaults.rank ?? 16);
+  const [resolution, setResolution] = useState(family?.defaults.resolution ?? 768);
+  const [batchSize, setBatchSize] = useState(1);
+  const [gradAccum, setGradAccum] = useState(1);
+  const [seed, setSeed] = useState(42);
+  // LR schedule. Warmup only applies to the non-constant schedules; plain "constant" ignores it.
+  const [lrScheduler, setLrScheduler] = useState<
+    "constant" | "constant_with_warmup" | "cosine" | "linear"
+  >("constant");
+  const [lrWarmupSteps, setLrWarmupSteps] = useState(0);
+  // Gradient checkpointing trades ~20-30% step time for a large activation-VRAM saving.
+  const [gradCheckpoint, setGradCheckpoint] = useState(true);
+  // sdxl (U-Net) trains in a mixed-precision autocast; the DiT families quantise the frozen base weights (base_precision) and ignore this. Both are surfaced in Advanced.
+  const [precision, setPrecision] = useState<"bf16" | "fp16" | "no">("bf16");
+  // Quantised base precision for DiT families (nf4 QLoRA default, or a speed tier). "auto" lets the backend pick the family recommended mode. Re-seeded to the family recommendation on family change (unless the user picked one).
+  const [basePrecision, setBasePrecision] = useState<
+    "nf4" | "bf16" | "int8" | "fp8" | "mxfp8" | "auto"
+  >("auto");
+  // Whether to torch.compile the DiT transformer. "auto" defers to the backend.
+  const [compileTransformer, setCompileTransformer] = useState<"off" | "on" | "auto">(
+    "auto",
+  );
+  // Track whether the user hand-edited the numeric settings; if not, a family change re-seeds them from that family defaults.
+  const settingsDirty = useRef(false);
+  // Track whether the user hand-picked a base precision; if not, a family change re-seeds it from that family recommended_precision.
+  const precisionDirty = useRef(false);
+  // Same for the base repo: once the user picks one, only a real family change may re-seed it.
+  // `family` is a fresh object after every refreshInfo() (mergeFamilies rebuilds the list), so the seeding effect below re-runs on an unrelated dataset refresh too; without this the user chosen base was silently replaced by the family default and the run started on a different model.
+  // The family the base was last seeded for is tracked by name, since the object identity is not stable.
+  const baseDirty = useRef(false);
+  const seededBaseFamily = useRef<string | null>(null);
+
+  const [starting, setStarting] = useState(false);
+  const [status, setStatus] = useState<DiffusionTrainingStatus | null>(null);
+  // Persisted previous runs (terminal), listed on the idle view; selecting one loads its full record (config + metric logs) and re-plots its charts read-only.
+  const [prevRuns, setPrevRuns] = useState<DiffusionTrainingRunSummary[]>([]);
+  const [viewRun, setViewRun] = useState<DiffusionTrainingRunDetail | null>(null);
+  // The confirm-stop dialog (mirrors the LLM Train tab): Continue / Stop / Stop and save.
+  const [stopDialogOpen, setStopDialogOpen] = useState(false);
+  // Set when the user confirms a stop; the button reads "Stopping..." until the run ends. Clamped to the running state at read time (below) so a fresh run never inherits it.
+  const [stopRequestedLocal, setStopRequestedLocal] = useState(false);
+
+  const refreshInfo = useCallback(async (): Promise<DiffusionTrainingInfo | null> => {
+    try {
+      const i = await getDiffusionTrainingInfo();
+      setInfo(i);
+      return i;
+    } catch {
+      return null;
+    }
+  }, []);
+
+  // On first activation, load the dataset list and preselect a base matching the loaded generation model when it is a trainable family.
+  useEffect(() => {
+    if (!active) return;
+    void refreshInfo().then((i) => {
+      setDataset((cur) => {
+        if (cur !== UPLOAD_DATASET && i?.datasets.some((d) => d.name === cur)) return cur;
+        return i && i.datasets.length > 0 ? i.datasets[0].name : UPLOAD_DATASET;
+      });
+    });
+  }, [active, refreshInfo]);
+
+  // Load the curated example list once (for the dropdown group + the cards). Best-effort: an older backend without the endpoint just yields no examples.
+  useEffect(() => {
+    if (!active) return;
+    let cancelled = false;
+    listDiffusionDatasetExamples()
+      .then((list) => {
+        if (!cancelled) setExamples(list);
+      })
+      .catch(() => {
+        if (!cancelled) setExamples([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [active]);
+
+  // Examples whose folder is not on disk yet: shown in the dropdown Examples group and as cards. An example imports into a folder named after its id, so a matching dataset name means it is already imported (and appears as a normal dataset instead).
+  const importedNames = useMemo(
+    () => new Set((info?.datasets ?? []).map((d) => d.name)),
+    [info?.datasets],
+  );
+  const pendingExamples = useMemo(
+    () => examples.filter((ex) => !importedNames.has(ex.id)),
+    [examples, importedNames],
+  );
+
+  // Import a curated example, then select the resulting folder. Seeds the trigger prompt from the example only when the field is meaningful (the import has no captions of its own).
+  const importExample = useCallback(
+    async (ex: DiffusionDatasetExample) => {
+      setImportingId(ex.id);
+      try {
+        const res = await runExampleImport(ex);
+        await refreshInfo();
+        setDataset(res.name);
+        setGridOpen(false);
+        setGridRefresh((k) => k + 1);
+        if (ex.suggested_trigger && res.caption_count === 0 && !instancePrompt.trim()) {
+          setInstancePrompt(ex.suggested_trigger);
+        }
+      } catch (e) {
+        toast.error(e instanceof Error ? e.message : "Import failed");
+      } finally {
+        setImportingId(null);
+      }
+    },
+    [refreshInfo, instancePrompt],
+  );
+
+  // If the loaded generation model is a trainable family, jump the family selector to it once (only when the panel first sees a loaded family).
+  const seededFromLoaded = useRef(false);
+  useEffect(() => {
+    if (seededFromLoaded.current) return;
+    if (!loadedFamily) return;
+    if (families.some((f) => f.name === loadedFamily)) {
+      setFamilyName(loadedFamily);
+      seededFromLoaded.current = true;
+    }
+  }, [loadedFamily, families]);
+
+  // Re-seed base + numeric settings from the family defaults on family change (unless the user edited the numbers). Prefer the loaded base repo when it belongs to this family.
+  useEffect(() => {
+    if (!family) return;
+    // A NEW family invalidates any earlier base pick (another family repo is not selectable here); a mere info refresh does not, so compare by name rather than object identity.
+    if (seededBaseFamily.current !== family.name) {
+      seededBaseFamily.current = family.name;
+      baseDirty.current = false;
+    }
+    // An already-valid base wins: the top bar sets family and base together, so this must not snap the pick back to the family first repo.
+    const preferLoaded = family.base_repos.includes(baseChoice)
+      ? baseChoice
+      : loadedBaseRepo && family.base_repos.includes(loadedBaseRepo)
+        ? loadedBaseRepo
+        : family.base_repos[0] ?? CUSTOM_BASE;
+    if (!baseDirty.current) setBaseChoice(preferLoaded);
+    if (!settingsDirty.current) {
+      setLearningRate(family.defaults.lr);
+      setRank(family.defaults.rank);
+      setResolution(family.defaults.resolution);
+    }
+    // Re-seed the DiT base precision from the family recommendation (unless the user picked one). "auto" is always a safe default when the backend has no recommendation.
+    if (!precisionDirty.current) {
+      const rec = reportedFamily?.recommended_precision;
+      setBasePrecision(
+        rec === "nf4" || rec === "bf16" || rec === "int8" || rec === "fp8"
+          ? rec
+          : "auto",
+      );
+    }
+  }, [family, loadedBaseRepo, reportedFamily?.recommended_precision]);
+
+  // mixed_precision is an SDXL-only lever (hidden for DiT families). A dense DiT base precision (bf16/int8/fp8) requires bf16 compute, and every DiT family trains in bf16, so reset precision to bf16 on a change to a DiT family.
+  // Without this, an fp16/no value left from SDXL rides along in the DiT start payload and the backend rejects it. Kept in its own effect so it does not re-trigger the reseed above.
+  useEffect(() => {
+    if (isDiT) setPrecision("bf16");
+  }, [isDiT]);
+
+  // The base actually used everywhere (request, deploy, select value). baseChoice can briefly hold another family repo between a family switch and the reseed effect (or if it is skipped);
+  // a raw <select value> would then DISPLAY the first option while the request carried the stale repo. Clamp to the current family repos.
+  const effectiveBase =
+    baseChoice === CUSTOM_BASE || (family?.base_repos ?? []).includes(baseChoice)
+      ? baseChoice
+      : family?.base_repos[0] ?? CUSTOM_BASE;
+
+  // The resolved base repo/path the request will carry, and whether it looks prequantized (bnb-4bit etc.). The dense base precisions are invalid for such a repo, so we gate them.
+  const resolvedBase = (effectiveBase === CUSTOM_BASE ? customBase : effectiveBase).trim();
+  const basePrequantized = isDiT && repoIsPrequantized(resolvedBase);
+
+  // A prequantized base cannot serve the dense precisions; auto-flip a dense selection back to "auto" (which resolves to nf4 for such a repo) so the run does not fail at the backend validator.
+  // Reuses the precisionDirty ref so a later family change still re-seeds from the recommendation. The dense options are also disabled in the select below.
+  useEffect(() => {
+    if (basePrequantized && DENSE_PRECISIONS.has(basePrecision)) {
+      precisionDirty.current = false;
+      setBasePrecision("auto");
+    }
+  }, [basePrequantized, basePrecision]);
+
+  const poll = useCallback(async () => {
+    try {
+      setStatus(await getDiffusionTrainingStatus());
+    } catch {
+      /* best-effort; a failed poll should not surface an error while the tab is open */
+    }
+  }, []);
+
+  // Poll status while the panel is active.
+  useEffect(() => {
+    if (!active) return;
+    void poll();
+    const id = window.setInterval(() => void poll(), 1500);
+    return () => window.clearInterval(id);
+  }, [active, poll]);
+
+  // "Train another" dismisses the completed run card locally (the backend keeps the terminal "completed" status until the next start, so we cannot rely on it clearing).
+  const [dismissedJobId, setDismissedJobId] = useState<string | null>(null);
+  const running = Boolean(status?.active) || status?.status === "running";
+  const completed =
+    status?.status === "completed" && status.job_id !== dismissedJobId;
+  // "Stop and save" ends the run as "stopped" WITH a saved partial adapter; it must get the same ready-to-deploy card as a full run (only a no-save stop has nothing to show).
+  const stoppedWithAdapter =
+    status?.status === "stopped" &&
+    Boolean(status?.lora_path) &&
+    status.job_id !== dismissedJobId;
+  const pct =
+    status && status.total_steps > 0
+      ? Math.min(100, Math.round((status.step / status.total_steps) * 100))
+      : 0;
+
+  // The pending-stop flag only matters while a run is active; clamping at read time (rather than resetting in an effect) means a fresh run never inherits a stale "Stopping..." state.
+  const stopRequested = running && stopRequestedLocal;
+
+  // Whether there is a run to show live: running, or ANY terminal run (completed / stopped / error) the user has not dismissed yet.
+  // Dismissing must cover every terminal status, or "Train another" after a stop (and any error) would trap the run view with no way back to the settings.
+  const terminalStatuses = ["completed", "stopped", "error"];
+  const hasRun = Boolean(
+    status &&
+      status.status !== "idle" &&
+      !(terminalStatuses.includes(status.status) && status.job_id === dismissedJobId),
+  );
+
+  // Notify the parent once per run that produced an adapter (full completion or stop-and-save) so it rescans the LoRA picker.
+  // The flag is re-armed both here (when a new run is seen "running") and in onStart, so a second run still notifies even if the poll never catches the intermediate "running" state; onStart also guards the double-fire when the poll re-observes the same terminal status.
+  const notifiedComplete = useRef(false);
+  useEffect(() => {
+    const producedAdapter =
+      status?.status === "completed" ||
+      (status?.status === "stopped" && Boolean(status?.lora_path));
+    if (producedAdapter && !notifiedComplete.current) {
+      notifiedComplete.current = true;
+      onTrainingComplete?.();
+    } else if (status?.status === "running" && notifiedComplete.current) {
+      notifiedComplete.current = false;
+    }
+  }, [status?.status, status?.lora_path, onTrainingComplete]);
+
+  const selectedDataset =
+    dataset !== UPLOAD_DATASET ? info?.datasets.find((d) => d.name === dataset) : undefined;
+  // A dataset where every image already ships a caption needs no trigger prompt; hide the field and explain why. Partial/no captions (or upload mode) still show it.
+  const fullyCaptioned = Boolean(
+    selectedDataset &&
+      selectedDataset.image_count > 0 &&
+      selectedDataset.caption_count >= selectedDataset.image_count,
+  );
+
+  // Map the backend's paired history arrays into the chart component's {step,value} series.
+  const lossHistory: TrainingSeriesPoint[] = useMemo(() => {
+    const h = status?.metric_history;
+    if (!h) return [];
+    return h.steps.map((step, i) => ({ step, value: h.loss[i] })).filter((p) => p.value != null);
+  }, [status?.metric_history]);
+  const gradNormHistory: TrainingSeriesPoint[] = useMemo(() => {
+    const h = status?.metric_history;
+    if (!h?.grad_norm) return [];
+    return h.steps
+      .map((step, i) => ({ step, value: h.grad_norm?.[i] ?? null }))
+      .filter((p): p is TrainingSeriesPoint => p.value != null);
+  }, [status?.metric_history]);
+
+  // Refresh the previous-runs list whenever the service is not mid-run (on mount and right after a run terminates, when its record has just been persisted).
+  useEffect(() => {
+    if (!active) return;
+    if (status?.status === "running") return;
+    let cancelled = false;
+    const refetch = () => {
+      listDiffusionTrainingRuns()
+        .then((r) => {
+          if (!cancelled) setPrevRuns(r.runs);
+        })
+        .catch(() => {});
+    };
+    refetch();
+    // The service exposes a terminal status before the pump has necessarily finished writing the run JSON record, so the one-shot refetch above can win that race and miss the just-finished run.
+    // A short delayed second refetch after a terminal transition lets the record land so the newest run reliably appears.
+    let delayed: ReturnType<typeof setTimeout> | undefined;
+    if (status?.status === "completed" || status?.status === "stopped" || status?.status === "error") {
+      delayed = setTimeout(refetch, 1500);
+    }
+    return () => {
+      cancelled = true;
+      if (delayed !== undefined) clearTimeout(delayed);
+    };
+  }, [active, status?.status]);
+
+  const openPrevRun = useCallback(async (jobId: string) => {
+    try {
+      setViewRun(await getDiffusionTrainingRun(jobId));
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Could not load that run");
+    }
+  }, []);
+
+  // Chart series for a selected previous run (from its persisted metric logs).
+  const viewLossHistory: TrainingSeriesPoint[] = useMemo(() => {
+    const h = viewRun?.metric_history;
+    if (!h) return [];
+    return h.steps.map((step, i) => ({ step, value: h.loss[i] })).filter((p) => p.value != null);
+  }, [viewRun?.metric_history]);
+  const viewGradNormHistory: TrainingSeriesPoint[] = useMemo(() => {
+    const h = viewRun?.metric_history;
+    if (!h?.grad_norm) return [];
+    return h.steps
+      .map((step, i) => ({ step, value: h.grad_norm?.[i] ?? null }))
+      .filter((p): p is TrainingSeriesPoint => p.value != null);
+  }, [viewRun?.metric_history]);
+
+  const onUpload = useCallback(async () => {
+    const files = Array.from(fileInputRef.current?.files ?? []);
+    if (files.length === 0) {
+      toast.error("Choose the images to upload first.");
+      return;
+    }
+    const name = uploadName.trim();
+    if (!name) {
+      toast.error("Give the dataset a folder name, e.g. my-style-photos.");
+      return;
+    }
+    setUploading(true);
+    try {
+      const res = await uploadDiffusionDataset(name, files);
+      toast.success(
+        `Uploaded ${res.uploaded} file${res.uploaded === 1 ? "" : "s"} - ` +
+          `"${res.name}" now has ${res.image_count} images`,
+      );
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      setPickedFileCount(0);
+      await refreshInfo();
+      setDataset(res.name);
+      setGridRefresh((k) => k + 1);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Upload failed");
+    } finally {
+      setUploading(false);
+    }
+  }, [uploadName, refreshInfo]);
+
+  const onStart = useCallback(async () => {
+    const baseModel = (effectiveBase === CUSTOM_BASE ? customBase : effectiveBase).trim();
+    if (!baseModel) {
+      toast.error("Pick a base model (or fill in the custom repo/path).");
+      return;
+    }
+    if (dataset === UPLOAD_DATASET) {
+      toast.error("Upload your training images first (or pick an existing dataset).");
+      return;
+    }
+    if (!outputDir.trim()) {
+      toast.error("Name the adapter (this becomes its folder under Studio outputs).");
+      return;
+    }
+    // Require a trigger prompt whenever ANY image lacks a caption, not only when none have one: without an instance_prompt the backend discovery silently skips every uncaptioned image, so a partially captioned dataset would train on a subset.
+    if (
+      selectedDataset &&
+      selectedDataset.caption_count < selectedDataset.image_count &&
+      !instancePrompt.trim()
+    ) {
+      toast.error(
+        selectedDataset.caption_count === 0
+          ? "These images have no captions - add a trigger prompt so the trainer knows " +
+              "what to learn (it becomes the caption for every image)."
+          : `Only ${selectedDataset.caption_count} of ${selectedDataset.image_count} images ` +
+              "have captions - the rest would be silently skipped. Add a trigger prompt " +
+              "(it becomes their caption) or caption every image.",
+      );
+      return;
+    }
+    if (durationUnit === "epochs") {
+      if (epochs < 1) return toast.error("Epochs must be at least 1.");
+    } else if (steps < 1) {
+      return toast.error("Steps must be at least 1.");
+    }
+    if (rank < 1) return toast.error("LoRA rank must be at least 1.");
+    if (resolution < 64 || resolution % 8 !== 0) {
+      return toast.error("Resolution must be a multiple of 8 and at least 64.");
+    }
+    if (batchSize < 1) return toast.error("Batch size must be at least 1.");
+    if (gradAccum < 1) return toast.error("Gradient accumulation must be at least 1.");
+    if (learningRate <= 0) return toast.error("Learning rate must be greater than 0.");
+    if (lrWarmupSteps < 0) return toast.error("Warmup steps cannot be negative.");
+    setStarting(true);
+    // A previous run confirmed stop must not leak into this run: without the reset the read-time clamp (running && stopRequestedLocal) re-arms the moment the new run goes active, rendering a permanently disabled "Stopping..." button.
+    setStopRequestedLocal(false);
+    // Re-arm the completion notification for this run. Resetting here (not only when the poll later sees "running") means a second run still notifies even if its "running" phase is never observed, and prevents the prior run terminal status re-firing it.
+    notifiedComplete.current = false;
+    // A history view must not shadow the new live run.
+    setViewRun(null);
+    try {
+      await startDiffusionTraining({
+        base_model: baseModel,
+        model_family: family?.name,
+        data_dir: dataset,
+        output_dir: outputDir.trim(),
+        instance_prompt: instancePrompt.trim() || undefined,
+        resolution,
+        // Epochs mode overrides train_steps on the backend, so send num_epochs and omit train_steps.
+        train_steps: durationUnit === "epochs" ? undefined : steps,
+        num_epochs: durationUnit === "epochs" ? epochs : undefined,
+        learning_rate: learningRate,
+        train_batch_size: batchSize,
+        gradient_accumulation_steps: gradAccum,
+        seed,
+        gradient_checkpointing: gradCheckpoint,
+        lr_scheduler: lrScheduler,
+        lr_warmup_steps: lrScheduler === "constant" ? 0 : lrWarmupSteps,
+        lora_rank: rank,
+        mixed_precision: precision,
+        // DiT families quantise the base weights (base_precision); sdxl uses mixed_precision above and ignores this. Only send compile for families that support it.
+        base_precision: isDiT ? basePrecision : undefined,
+        compile_transformer: supportsCompile ? compileTransformer : undefined,
+        hf_token: hfApiToken(getHfToken()) || undefined,
+      });
+      toast.success("Training started");
+      void poll();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Failed to start training");
+    } finally {
+      setStarting(false);
+    }
+  }, [
+    effectiveBase,
+    customBase,
+    family,
+    dataset,
+    selectedDataset,
+    outputDir,
+    instancePrompt,
+    resolution,
+    steps,
+    durationUnit,
+    epochs,
+    learningRate,
+    batchSize,
+    gradAccum,
+    seed,
+    gradCheckpoint,
+    lrScheduler,
+    lrWarmupSteps,
+    rank,
+    precision,
+    isDiT,
+    basePrecision,
+    supportsCompile,
+    compileTransformer,
+    poll,
+  ]);
+
+  // Confirm-then-stop, mirroring the LLM Train tab. `save` writes the current adapter before halting ("Stop and save"); false discards it ("Stop"). Marks the stop as requested so the button reads "Stopping..." until the backend reports it stopped.
+  const onStop = useCallback(
+    async (save: boolean) => {
+      setStopDialogOpen(false);
+      setStopRequestedLocal(true);
+      try {
+        await stopDiffusionTraining(save);
+        toast.success(
+          save
+            ? "Stop requested; saving the adapter after the current step."
+            : "Stop requested; discarding this run after the current step.",
+        );
+        void poll();
+      } catch (e) {
+        setStopRequestedLocal(false);
+        toast.error(e instanceof Error ? e.message : "Failed to stop training");
+      }
+    },
+    [poll],
+  );
+
+  // Resolve the repo an adapter should be PREVIEWED on. Krea (and any family that trains on one checkpoint but runs adapters on another) declares a deploy_base: preview the adapter there instead of the training checkpoint.
+  // Only a recognised training base is overridden; a custom typed repo is respected as-is.
+  const deployBaseFor = useCallback(
+    (trainedBase: string, famName: string): string => {
+      const rec = info?.families?.find((f) => f.name === famName);
+      if (rec?.deploy_base && rec.base_repos.includes(trainedBase)) return rec.deploy_base;
+      return trainedBase;
+    },
+    [info?.families],
+  );
+
+  const onDeployClick = useCallback(() => {
+    if (!status?.catalog_path) {
+      toast.error("The trained adapter is not available yet.");
+      return;
+    }
+    const trainedBase = status.base_model || (effectiveBase === CUSTOM_BASE ? customBase : effectiveBase);
+    if (!trainedBase) {
+      toast.error("Could not determine the base model to load for this adapter.");
+      return;
+    }
+    const famName = status.family || family?.name || "";
+    onDeploy?.({
+      baseRepo: deployBaseFor(trainedBase, famName),
+      family: famName,
+      catalogPath: status.catalog_path,
+      trigger: instancePrompt.trim(),
+    });
+  }, [status, effectiveBase, customBase, family, instancePrompt, onDeploy, deployBaseFor]);
+
+  const numberField = (
+    label: string,
+    value: number,
+    set: (n: number) => void,
+    fallback: number,
+    extra?: { min?: number; step?: number },
+  ) => (
+    <div className={fieldClass}>
+      <Label className="text-xs">{label}</Label>
+      <Input
+        type="number"
+        min={extra?.min ?? 1}
+        step={extra?.step}
+        value={value}
+        onChange={(e) => {
+          settingsDirty.current = true;
+          // Only fall back when the input parses to NaN (empty/invalid); a real 0 is legal for zero-legal fields (Seed, LR warmup steps) and must be kept.
+          const parsed = Number(e.target.value);
+          set(Number.isNaN(parsed) ? fallback : parsed);
+        }}
+        className="h-8 text-xs"
+      />
+    </div>
+  );
+
+  // Run length: a number paired with a compact unit select (Steps / Epochs). Epochs mode trains for that many full passes; the backend resolves it to steps.
+  const durationField = (
+    <div className={fieldClass}>
+      <Label className="text-xs">{durationUnit === "epochs" ? "Epochs" : "Steps"}</Label>
+      <div className="flex gap-1.5">
+        <Input
+          type="number"
+          min={1}
+          value={durationUnit === "epochs" ? epochs : steps}
+          onChange={(e) => {
+            settingsDirty.current = true;
+            const n = Number(e.target.value) || 1;
+            if (durationUnit === "epochs") setEpochs(n);
+            else setSteps(n);
+          }}
+          className="h-8 min-w-0 flex-1 text-xs"
+        />
+        <Select
+          value={durationUnit}
+          onValueChange={(v) => {
+            settingsDirty.current = true;
+            setDurationUnit(v as "steps" | "epochs");
+          }}
+        >
+          <SelectTrigger className="h-8 w-24 text-xs" aria-label="Run length unit">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="steps">Steps</SelectItem>
+            <SelectItem value="epochs">Epochs</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+    </div>
+  );
+
+  const precisionLabel = (
+    m: "nf4" | "bf16" | "int8" | "fp8" | "mxfp8" | "auto",
+  ): string => {
+    if (m === "auto") return "Auto";
+    if (m === "nf4") return "nf4 (lowest VRAM)";
+    if (m === "bf16") return "bf16 (fastest)";
+    if (m === "int8") return "int8";
+    if (m === "mxfp8") return "mxfp8 (Blackwell)";
+    return "fp8 (experimental)";
+  };
+
+  // The training settings, shown as the run area MAIN content before a run starts; once training starts the run view (progress + charts) replaces them.
+  const trainingSettings = (
+    <div className="flex flex-col gap-6">
+      <div className="grid grid-cols-2 gap-x-6 gap-y-5 lg:grid-cols-3">
+        {durationField}
+        {numberField("LoRA rank", rank, setRank, 1)}
+        {numberField("Resolution", resolution, setResolution, 512, { min: 64, step: 64 })}
+        {numberField("Batch", batchSize, setBatchSize, 1)}
+        {numberField("Grad accumulation", gradAccum, setGradAccum, 1)}
+        {numberField("Seed", seed, setSeed, 42, { min: 0 })}
+      </div>
+
+      <div className="grid grid-cols-2 items-start gap-x-6 gap-y-5 lg:grid-cols-3">
+        {numberField("Learning rate", learningRate, setLearningRate, 0.0001, {
+          min: 0,
+          step: 0.00001,
+        })}
+        <div className={fieldClass}>
+          <Label className="text-xs">LR schedule</Label>
+          <Select
+            value={lrScheduler}
+            onValueChange={(v) => setLrScheduler(v as typeof lrScheduler)}
+          >
+            <SelectTrigger className={selectClass} aria-label="LR schedule">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="constant">Constant</SelectItem>
+              <SelectItem value="constant_with_warmup">Constant + warmup</SelectItem>
+              <SelectItem value="cosine">Cosine decay</SelectItem>
+              <SelectItem value="linear">Linear decay</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-ui-11 leading-snug text-muted-foreground">
+            Constant is fine for most runs.
+          </p>
+        </div>
+        {lrScheduler !== "constant" &&
+          numberField("Warmup steps", lrWarmupSteps, setLrWarmupSteps, 0, { min: 0 })}
+      </div>
+
+      <div className="grid grid-cols-2 items-start gap-x-6 gap-y-5 lg:grid-cols-3">
+        <div className={fieldClass}>
+          <Label className="text-xs">Gradient checkpointing</Label>
+          <Select
+            value={gradCheckpoint ? "on" : "off"}
+            onValueChange={(v) => setGradCheckpoint(v === "on")}
+          >
+            <SelectTrigger className={selectClass} aria-label="Gradient checkpointing">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="on">On (less VRAM)</SelectItem>
+              <SelectItem value="off">Off (faster steps)</SelectItem>
+            </SelectContent>
+          </Select>
+          <p className="text-ui-11 leading-snug text-muted-foreground">
+            Less VRAM, slightly slower steps.
+          </p>
+        </div>
+
+        {isDiT ? (
+          <div className={fieldClass}>
+            <Label className="text-xs">Base precision</Label>
+            <Select
+              value={basePrecision}
+              onValueChange={(v) => {
+                precisionDirty.current = true;
+                setBasePrecision(v as typeof basePrecision);
+              }}
+              disabled={familyUntrainable}
+            >
+              <SelectTrigger className={selectClass} aria-label="Base precision">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {precisionModes.map((m) => (
+                  <SelectItem
+                    key={m}
+                    value={m}
+                    disabled={basePrequantized && DENSE_PRECISIONS.has(m)}
+                  >
+                    {precisionLabel(m)}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <p className="text-ui-11 leading-snug text-muted-foreground">
+              {familyUntrainable ? (
+                // The reason itself (the backend bf16-preflight text) already shows in the family picker vram_note line above.
+                <>This GPU cannot train this model family.</>
+              ) : (
+                <>
+                  Auto picks the best fit for your GPU.
+                  {basePrequantized && (
+                    <> This base is already 4-bit, so only nf4/auto apply.</>
+                  )}
+                </>
+              )}
+            </p>
+          </div>
+        ) : (
+          <div className={fieldClass}>
+            <Label className="text-xs">Precision</Label>
+            <Select
+              value={precision}
+              onValueChange={(v) => setPrecision(v as "bf16" | "fp16" | "no")}
+            >
+              <SelectTrigger className={selectClass} aria-label="Precision">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="bf16">bf16 (default)</SelectItem>
+                <SelectItem value="fp16">fp16 (older GPUs)</SelectItem>
+                <SelectItem value="no">fp32 (no mixed)</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-ui-11 leading-snug text-muted-foreground">
+              bf16 is right for modern GPUs.
+            </p>
+          </div>
+        )}
+        {supportsCompile && (
+          <div className={fieldClass}>
+            <Label className="text-xs">Compile transformer</Label>
+            <Select
+              value={compileTransformer}
+              onValueChange={(v) =>
+                setCompileTransformer(v as typeof compileTransformer)
+              }
+            >
+              <SelectTrigger className={selectClass} aria-label="Compile transformer">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">Auto</SelectItem>
+                <SelectItem value="on">On (faster after warmup)</SelectItem>
+                <SelectItem value="off">Off</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-ui-11 leading-snug text-muted-foreground">
+              Slower first step, faster after.
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="mx-auto flex min-h-0 w-full min-w-0 max-w-[1100px] flex-1 overflow-hidden px-5 pt-9 sm:px-8">
+      {/* Left: configure. No cards: both panes sit on the page background, split by a full-height rule. */}
+      <div className="flex w-[392px] min-w-0 shrink-0 flex-col overflow-hidden border-r border-border/60">
+        {/* pl-0.5 keeps focus rings off the scroll container's edge. */}
+        <div className="hover-scrollbar flex min-h-0 flex-col gap-5 overflow-y-auto overflow-x-hidden pb-7 pl-0.5 pr-7">
+          <div>
+            <h2 className="text-base font-semibold">Train a LoRA</h2>
+            <p className="mt-1 text-ui-11 leading-snug text-muted-foreground">
+              Teach a model a style or subject from your own images.
+            </p>
+          </div>
+
+          {/* Family + base */}
+          <div className={fieldClass}>
+            <Label className="text-xs">Model family</Label>
+            <Select value={familyName} onValueChange={setFamilyName}>
+              <SelectTrigger className={selectClass} aria-label="Model family">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {families.map((f) => (
+                  <SelectItem key={f.name} value={f.name}>
+                    {f.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {family?.vram_note && (
+              <p className="text-ui-11 leading-snug text-muted-foreground">{family.vram_note}</p>
+            )}
+          </div>
+
+          <div className={fieldClass}>
+            <Label className="text-xs">Base model</Label>
+            <Select
+              value={effectiveBase}
+              onValueChange={(v) => {
+                baseDirty.current = true; // an explicit pick survives later info refreshes
+                setBaseChoice(v);
+              }}
+            >
+              <SelectTrigger className={selectClass} aria-label="Base model">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(family?.base_repos ?? []).map((repo) => (
+                  <SelectItem key={repo} value={repo}>
+                    {repo}
+                  </SelectItem>
+                ))}
+                <SelectItem value={CUSTOM_BASE}>Custom repo or local path...</SelectItem>
+              </SelectContent>
+            </Select>
+            {effectiveBase === CUSTOM_BASE && (
+              <Input
+                value={customBase}
+                placeholder="Repo id or local folder"
+                spellCheck={false}
+                onChange={(e) => setCustomBase(e.target.value)}
+                className="h-8 text-xs"
+              />
+            )}
+          </div>
+
+          {/* Dataset */}
+          <div className={fieldClass}>
+            <Label className="text-xs">Training images</Label>
+            <Select
+              value={dataset}
+              onValueChange={(v) => {
+                if (v.startsWith(EXAMPLE_PREFIX)) {
+                  const ex = pendingExamples.find((x) => x.id === v.slice(EXAMPLE_PREFIX.length));
+                  if (ex) void importExample(ex);
+                  return; // the controlled value stays put while the import runs
+                }
+                setDataset(v);
+                setGridOpen(false);
+              }}
+              disabled={importingId !== null}
+            >
+              <SelectTrigger className={selectClass} aria-label="Training images">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {/* Name plus image count only; captions and license show elsewhere. */}
+                {(info?.datasets ?? []).map((d) => (
+                  <SelectItem key={d.name} value={d.name}>
+                    {d.name} - {d.image_count} image{d.image_count === 1 ? "" : "s"}
+                  </SelectItem>
+                ))}
+                {pendingExamples.length > 0 && (
+                  <SelectGroup>
+                    <SelectLabel>Examples</SelectLabel>
+                    {pendingExamples.map((ex) => (
+                      <SelectItem key={ex.id} value={`${EXAMPLE_PREFIX}${ex.id}`}>
+                        {shortExampleLabel(ex.label)} - {ex.image_cap} images
+                      </SelectItem>
+                    ))}
+                  </SelectGroup>
+                )}
+                <SelectItem value={UPLOAD_DATASET}>Upload new images...</SelectItem>
+              </SelectContent>
+            </Select>
+            {importingId && (
+              <p className="text-ui-11 text-muted-foreground">
+                Importing {examples.find((e) => e.id === importingId)?.label ?? "example"}...
+              </p>
+            )}
+
+            {dataset === UPLOAD_DATASET ? (
+              <div className={fieldClass}>
+                <Label className="text-xs font-normal text-muted-foreground">
+                  Name for this set of images
+                </Label>
+                <Input
+                  value={uploadName}
+                  placeholder="my-photos"
+                  spellCheck={false}
+                  onChange={(e) => setUploadName(e.target.value)}
+                  className="h-8 text-xs"
+                  aria-label="New dataset name"
+                />
+                <div className="flex items-center gap-2">
+                  {/* The native input is the file picker but never the control the user sees, so the row keeps the app button styling. */}
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    accept={DATASET_FILE_ACCEPT}
+                    className="hidden"
+                    aria-label="Training image files"
+                    onChange={(e) => setPickedFileCount(e.target.files?.length ?? 0)}
+                  />
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-7 shrink-0 px-3 text-xs"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={uploading}
+                  >
+                    Choose images
+                  </Button>
+                  {/* Count and Upload appear only once files are picked. */}
+                  {pickedFileCount > 0 && (
+                    <>
+                      <span className="min-w-0 flex-1 truncate text-ui-11 text-muted-foreground">
+                        {pickedFileCount} file{pickedFileCount === 1 ? "" : "s"} selected
+                      </span>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-7 shrink-0 px-3 text-xs"
+                        onClick={onUpload}
+                        disabled={uploading}
+                      >
+                        {uploading ? "Uploading..." : "Upload"}
+                      </Button>
+                    </>
+                  )}
+                </div>
+                <p className="text-ui-11 leading-snug text-muted-foreground">
+                  10-50 images is plenty. Captions are optional.
+                </p>
+              </div>
+            ) : (
+              selectedDataset && (
+                <>
+                  {selectedDataset.image_count > 0 && !gridOpen && (
+                    <DatasetShowcase
+                      dataset={dataset}
+                      imageCount={selectedDataset.image_count}
+                      refreshKey={gridRefresh}
+                      onBrowse={() => setGridOpen(true)}
+                    />
+                  )}
+                  <LabelingGridToggle
+                    count={selectedDataset.image_count}
+                    open={gridOpen}
+                    onToggle={() => setGridOpen((o) => !o)}
+                  />
+                  {gridOpen && (
+                    <DatasetLabelingGrid
+                      dataset={dataset}
+                      refreshKey={gridRefresh}
+                      onCountsChanged={() => void refreshInfo()}
+                    />
+                  )}
+                  {selectedDataset.caption_count === 0 && !gridOpen && (
+                    <p className="text-ui-11 leading-snug text-muted-foreground">
+                      No captions yet, so the trigger prompt describes every image.
+                    </p>
+                  )}
+                </>
+              )
+            )}
+
+            <ExampleDatasetCards
+              examples={pendingExamples}
+              busyId={importingId}
+              onImport={(ex) => void importExample(ex)}
+            />
+          </div>
+
+          {/* Trigger + adapter name (trigger first: it describes the dataset, the name just labels the output) */}
+          {fullyCaptioned ? (
+            <p className="text-ui-11 leading-snug text-muted-foreground">
+              All {selectedDataset?.image_count} images have captions, so no trigger prompt
+              is needed.
+            </p>
+          ) : (
+            <div className={fieldClass}>
+              <Label className="text-xs">Trigger prompt</Label>
+              <Input
+                value={instancePrompt}
+                placeholder="a photo in mystyle"
+                onChange={(e) => setInstancePrompt(e.target.value)}
+                className="h-8 text-xs"
+              />
+              <p className="text-ui-11 leading-snug text-muted-foreground">
+                The words you will use later to get this style back.
+              </p>
+            </div>
+          )}
+          <div className={fieldClass}>
+            <Label className="text-xs">Adapter name</Label>
+            <Input
+              value={outputDir}
+              placeholder="my-style"
+              spellCheck={false}
+              onChange={(e) => setOutputDir(e.target.value)}
+              className="h-8 text-xs"
+            />
+            <p className="text-ui-11 leading-snug text-muted-foreground">
+              Its name in the Create tab&apos;s picker.
+            </p>
+          </div>
+
+          {/* Start lives here; Stop lives in the run card next to the live stats. */}
+          <div className="mt-auto pt-2">
+            <Button
+              type="button"
+              className="w-full"
+              onClick={onStart}
+              disabled={starting || uploading || running || familyUntrainable}
+            >
+              {starting
+                ? "Starting..."
+                : running
+                  ? "Training in progress"
+                  : familyUntrainable
+                    ? "Not supported on this GPU"
+                    : "Start training"}
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      {/* Right: the run area. Before a run: training settings + previous-runs history; during/after: the live view (progress with Stop, then the saved-adapter card ABOVE the charts). Selecting a previous run re-plots its persisted logs read-only. */}
+      {/* Sections carry no card of their own: spacing and a rule separate them. p-1.5 keeps the chart cards outer ring from being clipped. */}
+      <div className="hover-scrollbar relative flex min-w-0 flex-1 flex-col gap-5 overflow-y-auto p-1.5 pb-7 pl-6">
+        {viewRun && !hasRun ? (
+          <>
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold">
+                  Previous run: {viewRun.adapter || viewRun.job_id.slice(0, 8)}
+                </span>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setViewRun(null)}
+                >
+                  Back
+                </Button>
+              </div>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <Stat label="Status" value={viewRun.status} />
+                <Stat label="Steps" value={`${viewRun.step}/${viewRun.total_steps}`} />
+                <Stat
+                  label="Avg loss"
+                  value={viewRun.avg_loss != null ? viewRun.avg_loss.toFixed(4) : "-"}
+                />
+                <Stat
+                  label="Peak VRAM"
+                  value={
+                    viewRun.peak_memory_gb != null
+                      ? `${viewRun.peak_memory_gb.toFixed(1)} GB`
+                      : "-"
+                  }
+                />
+              </div>
+              <p className="text-ui-11 text-muted-foreground">
+                {viewRun.family ? `${viewRun.family} - ` : ""}
+                {viewRun.base_model || ""}
+                {viewRun.ended_at
+                  ? ` - ${new Date(viewRun.ended_at * 1000).toLocaleString()}`
+                  : ""}
+              </p>
+              {viewRun.saved && viewRun.catalog_path && (
+                <div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    onClick={() =>
+                      onDeploy?.({
+                        baseRepo: deployBaseFor(viewRun.base_model || "", viewRun.family || ""),
+                        family: viewRun.family || "",
+                        catalogPath: viewRun.catalog_path || "",
+                        trigger: viewRun.instance_prompt || "",
+                      })
+                    }
+                  >
+                    Deploy to Create
+                  </Button>
+                </div>
+              )}
+            </div>
+            <DiffusionCharts
+              lossHistory={viewLossHistory}
+              gradNormHistory={viewGradNormHistory}
+            />
+          </>
+        ) : !hasRun ? (
+          <>
+            <div className="flex flex-col gap-4">
+              <div className="flex items-center justify-between">
+                <span className="font-heading flex items-center gap-1.5 text-base font-medium">
+                  <HugeiconsIcon icon={Settings02Icon} className="size-4" />
+                  Training settings
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  Applied on Start training
+                </span>
+              </div>
+              {trainingSettings}
+              <p className="text-ui-11 leading-snug text-muted-foreground">
+                Progress and charts take over here once training starts.
+              </p>
+            </div>
+
+            {prevRuns.length > 0 && (
+              <div className="flex flex-col gap-2 border-t border-border/60 pt-4">
+                <span className="text-sm font-semibold">Previous runs</span>
+                <div className="flex flex-col divide-y divide-border/60">
+                  {prevRuns.map((r) => (
+                    <button
+                      key={r.job_id}
+                      type="button"
+                      onClick={() => void openPrevRun(r.job_id)}
+                      className="flex items-center justify-between gap-3 rounded-md px-1 py-2 text-left text-xs transition-colors hover:bg-muted/40"
+                    >
+                      <span className="min-w-0 truncate">
+                        <span className="font-medium">
+                          {r.adapter || r.job_id.slice(0, 8)}
+                        </span>
+                        <span className="text-muted-foreground">
+                          {r.family ? ` ${r.family}` : ""} - {r.step}/{r.total_steps} steps
+                          {r.avg_loss != null ? `, avg loss ${r.avg_loss.toFixed(3)}` : ""}
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-2">
+                        {r.saved && (
+                          <span className="rounded-full bg-primary/15 px-2 py-0.5 text-ui-10 text-primary">
+                            adapter saved
+                          </span>
+                        )}
+                        <span className="text-ui-10 uppercase tracking-wide text-muted-foreground">
+                          {r.status}
+                        </span>
+                        <span className="text-ui-10 text-muted-foreground">
+                          {r.ended_at ? new Date(r.ended_at * 1000).toLocaleString() : ""}
+                        </span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+          </>
+        ) : (
+          <>
+            <div className="flex flex-col gap-3">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-semibold capitalize">
+                  {status?.status === "completed" ? "Training complete \u{1F389}" : status?.status}
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  {(status?.total_steps ?? 0) > 0
+                    ? `${status?.step}/${status?.total_steps} steps`
+                    : ""}
+                </span>
+              </div>
+              <div className="h-2 w-full overflow-hidden rounded-full bg-border">
+                <div
+                  className="h-full bg-primary transition-all"
+                  style={{ width: `${pct}%` }}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                <Stat
+                  label="Loss"
+                  value={status?.loss != null ? status.loss.toFixed(4) : "-"}
+                />
+                <Stat
+                  label="Avg loss"
+                  value={status?.avg_loss != null ? status.avg_loss.toFixed(4) : "-"}
+                />
+                <Stat
+                  label="Speed"
+                  value={
+                    status?.samples_per_second != null
+                      ? `${status.samples_per_second.toFixed(2)} img/s`
+                      : "-"
+                  }
+                />
+                <Stat
+                  label="Peak VRAM"
+                  value={
+                    status?.peak_memory_gb != null
+                      ? `${status.peak_memory_gb.toFixed(1)} GB`
+                      : "-"
+                  }
+                />
+              </div>
+              {status?.message && (
+                <p className="text-ui-11 text-muted-foreground">{status.message}</p>
+              )}
+              {running && (
+                <Button
+                  type="button"
+                  variant="destructive"
+                  className="w-full"
+                  onClick={() => setStopDialogOpen(true)}
+                  disabled={stopRequested}
+                >
+                  {stopRequested ? "Stopping..." : "Stop training"}
+                </Button>
+              )}
+              {/* Terminal runs WITHOUT an adapter card (error, or a discarded stop) still need a way back to the settings. */}
+              {!running &&
+                status &&
+                terminalStatuses.includes(status.status) &&
+                !completed &&
+                !stoppedWithAdapter && (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    className="w-full"
+                    onClick={() => setDismissedJobId(status.job_id)}
+                  >
+                    Back to settings
+                  </Button>
+                )}
+            </div>
+
+            {(completed || stoppedWithAdapter) && (
+              <div className="flex flex-col gap-2 border-t border-border/60 pt-4">
+                <span className="text-sm font-semibold">
+                  {completed ? "Adapter ready" : "Partial adapter saved"}
+                </span>
+                <p className="text-ui-11 text-muted-foreground">
+                  {completed
+                    ? "Trained"
+                    : "Stopped early; the adapter as of the last finished step was saved"}
+                  {status?.family ? ` (${status.family})` : ""} and added to the LoRA picker.
+                  {status?.lora_path && (
+                    <span className="mt-1 block break-all">Saved: {status.lora_path}</span>
+                  )}
+                  {status?.ema_path && (
+                    <span className="mt-1 block break-all">EMA adapter: {status.ema_path}</span>
+                  )}
+                </p>
+                <div className="mt-1 flex gap-2">
+                  <Button type="button" size="sm" onClick={onDeployClick}>
+                    Deploy to Create
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => status && setDismissedJobId(status.job_id)}
+                  >
+                    Train another
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            <DiffusionCharts lossHistory={lossHistory} gradNormHistory={gradNormHistory} />
+          </>
+        )}
+      </div>
+
+      {/* Confirm-stop dialog (mirrors the LLM Train tab): Continue / Stop / Stop and save. */}
+      <AlertDialog open={stopDialogOpen} onOpenChange={setStopDialogOpen}>
+        <AlertDialogContent overlayClassName="bg-background/40 supports-backdrop-filter:backdrop-blur-[1px]">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Stop training?</AlertDialogTitle>
+            <AlertDialogDescription>
+              Save the adapter trained so far, or discard this run? Either way the current step
+              finishes first.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {/* flex-wrap keeps all three buttons visible when the row is wider than the dialog at narrow widths; items-center + a real label on the destructive action, since a bare "Stop" read as misaligned between two wide buttons. */}
+          <AlertDialogFooter className="flex-wrap items-center">
+            <AlertDialogCancel>Continue training</AlertDialogCancel>
+            <AlertDialogAction variant="destructive" onClick={() => void onStop(false)}>
+              Stop without saving
+            </AlertDialogAction>
+            <AlertDialogAction onClick={() => void onStop(true)}>
+              Stop and save
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </div>
+  );
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className={cn("rounded-lg border border-border/60 bg-muted/20 px-2.5 py-1.5")}>
+      <div className="text-ui-10 uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className="text-sm font-medium tabular-nums">{value}</div>
+    </div>
+  );
+}
