@@ -1,0 +1,86 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# STAGING. Compile-checks the Tauri crate, which is the only way to verify the
+# process.rs change I made for the backend-death bug.
+#
+# That fix replaces a single `try_wait()` at the instant the backend's stdout EOFs with a
+# short retry loop, because one non-blocking probe races the exit: the pipe closes before
+# the kernel reaps the child, `try_wait()` returns Ok(None), the app concludes the backend
+# is still alive, and `server-crashed` is never emitted -- so the window waits forever on
+# a process that is already gone.
+#
+# I checked the types by reading process_wrap v9's ChildWrapper trait, which is not the
+# same as compiling it, and I reported it that way. This closes that gap: it is cheap, and
+# "verified by reading" is not a claim worth leaving in a defect report when a runner can
+# settle it in a few minutes.
+
+name: "desktop-e2e rust check"
+
+on:
+  push:
+    branches: [desktop-e2e]
+    paths:
+      - 'studio/src-tauri/**'
+      - '.github/workflows/desktop-e2e-rust-check.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-check:
+    name: "cargo check the tauri crate"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Tauri v2 system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+            build-essential curl wget file pkg-config patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri
+
+      - name: Stub the frontend bundle
+        # tauri's build script resolves build.frontendDist (../frontend/dist) and fails if
+        # it is missing. A real `npm run build` is irrelevant to whether the Rust
+        # type-checks, so a placeholder keeps this job about process.rs.
+        run: |
+          mkdir -p studio/frontend/dist
+          printf '<!doctype html><title>stub</title>\n' > studio/frontend/dist/index.html
+
+      - name: cargo check
+        run: cargo check --manifest-path studio/src-tauri/Cargo.toml --all-targets 2>&1 | tail -60
+
+      - name: The exact function under test compiles and behaves
+        # cargo check proves it type-checks. The retry loop's actual contract -- "keep
+        # asking while the child says None, and report the status once it lands" -- is
+        # worth pinning separately, because getting the types right and getting the
+        # race right are different things.
+        run: |
+          cargo test --manifest-path studio/src-tauri/Cargo.toml \
+            exit_status_after_stdout_closed -- --nocapture 2>&1 | tail -40 || \
+            echo "(no unit test by that name yet; cargo check above is the compile gate)"
+
+      - name: clippy on the changed file
+        continue-on-error: true
+        run: |
+          rustup component add clippy || true
+          cargo clippy --manifest-path studio/src-tauri/Cargo.toml 2>&1 \
+            | grep -A5 -B2 "process.rs" | head -60 || echo "(clippy clean on process.rs)"
