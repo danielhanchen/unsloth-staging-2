@@ -44,10 +44,10 @@ jobs:
         shell: pwsh
         run: |
           $venv = "$env:USERPROFILE\.unsloth\studio\unsloth_studio"
-          $target = Get-ChildItem "$venv\Lib\site-packages\unsloth_cli\commands\studio.py" -ErrorAction SilentlyContinue
-          if (-not $target) { Write-Host "::error::installed studio.py not found under $venv"; exit 1 }
-          Copy-Item unsloth_cli\commands\studio.py $target.FullName -Force
-          if (-not (Select-String -Path $target.FullName -Pattern 'PSModulePath' -Quiet)) {
+          $target = Get-ChildItem "$venv\Lib\site-packages\studio\setup.ps1" -ErrorAction SilentlyContinue
+          if (-not $target) { Write-Host "::error::installed setup.ps1 not found under $venv"; exit 1 }
+          Copy-Item studio\setup.ps1 $target.FullName -Force
+          if (-not (Select-String -Path $target.FullName -Pattern 'WindowsPowerShell' -Quiet)) {
             Write-Host "::error::the copied file does not contain the fix"
             exit 1
           }

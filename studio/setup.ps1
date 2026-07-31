@@ -23,6 +23,21 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PackageDir = Split-Path -Parent $ScriptDir
 
+# Windows PowerShell 5.1 needs its own module directory on PSModulePath to load
+# Microsoft.PowerShell.Security, which astral's uv installer calls through
+# Get-ExecutionPolicy. `unsloth studio update` spawns powershell.exe inheriting
+# the caller's environment, so launched from a PowerShell 7 prompt that path can
+# hold only PS7's directories; on some Windows images the machine-level value
+# omits the system one too, so clearing the variable does not help either. The
+# uv install then failed with "the module could not be loaded", and
+# Invoke-SetupCommand turns that into a fatal setup error.
+$_UnslothSystemModules = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+if ((Test-Path $_UnslothSystemModules) -and
+    ($env:PSModulePath -notlike "*$_UnslothSystemModules*")) {
+    # Appended, never replaced: a caller's own module directories stay ahead.
+    $env:PSModulePath = "$env:PSModulePath;$_UnslothSystemModules"
+}
+
 # --------------------------------------------------------------------------
 #  Maintainer-editable defaults
 #  Change these in the GitHub-hosted script so users get updated defaults.

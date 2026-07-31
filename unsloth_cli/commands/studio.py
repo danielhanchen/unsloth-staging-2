@@ -1222,8 +1222,6 @@ def _load_model_via_http(
     import urllib.request
     import urllib.error
 
-    from unsloth_cli._inference import raise_for_deferred_error, require_completed_padded_body
-
     payload: dict = {
         "model_path": model,
         "max_seq_length": max_seq_length,
@@ -1240,9 +1238,8 @@ def _load_model_via_http(
         payload["llama_extra_args"] = list(llama_extra_args)
 
     data = json.dumps(payload).encode()
-    url = f"http://127.0.0.1:{port}/api/inference/load"
     req = urllib.request.Request(
-        url,
+        f"http://127.0.0.1:{port}/api/inference/load",
         data = data,
         headers = {
             "Content-Type": "application/json",
@@ -1252,14 +1249,7 @@ def _load_model_via_http(
     )
     try:
         with urllib.request.urlopen(req, timeout = timeout) as resp:
-            try:
-                body = json.loads(resp.read())
-            except ValueError:
-                body = None  # truncated padded reply; rejected below
-        # A slow load commits its 200 before it finishes and pads the body, so a late
-        # failure arrives in-band; raise it as the HTTPError this function already turns
-        # into the RuntimeError the caller reports. A truncated body is no report at all.
-        return require_completed_padded_body(url, raise_for_deferred_error(url, body))
+            return json.loads(resp.read())
     except urllib.error.HTTPError as exc:
         body = exc.read().decode(errors = "replace")
         raise RuntimeError(f"Model load failed (HTTP {exc.code}): {body}") from exc
@@ -2686,16 +2676,6 @@ def _run_setup_script(*, verbose: bool = False) -> None:
     env = {**os.environ, "UNSLOTH_VERBOSE": "1"} if verbose else None
 
     if platform.system() == "Windows":
-        # Windows PowerShell 5.1 builds its own module path when PSModulePath is
-        # absent. Inheriting PowerShell 7's leaves it unable to load its own core
-        # modules, and setup.ps1 installs uv by running astral's install.ps1,
-        # which calls Get-ExecutionPolicy out of Microsoft.PowerShell.Security.
-        # So `unsloth studio update` from a pwsh 7 prompt died on
-        # "the module could not be loaded" while the same update from a 5.1
-        # prompt succeeded. pwsh is what `pwsh` and Windows Terminal's default
-        # profile give a modern user, so this was the common case.
-        env = dict(env if env is not None else os.environ)
-        env.pop("PSModulePath", None)
         powershell_args = ["powershell.exe"]
         if _should_hide_windows_subprocesses():
             powershell_args.extend(
@@ -2923,24 +2903,7 @@ def update(
         os.environ["STUDIO_LOCAL_INSTALL"] = "1"
         # Pass the repo root explicitly so install_python_stack.py doesn't
         # have to guess from SCRIPT_DIR (which may be inside site-packages).
-        # Deriving it from __file__ only holds while this CLI runs from a
-        # checkout. Once an update has installed unsloth into the venv
-        # non-editably, parents[2] IS site-packages, and uv rejects it with
-        # "does not appear to be a Python project: neither 'setup.py' nor
-        # 'pyproject.toml' found" -- which is what a second `update --local`
-        # hit on Windows, where the first update replaces the editable install.
-        _explicit = os.environ.get("STUDIO_LOCAL_REPO")
-        repo_root = Path(_explicit) if _explicit else Path(__file__).resolve().parents[2]
-        if not (repo_root / "pyproject.toml").is_file():
-            typer.echo("Error: --local needs an Unsloth checkout to install from.", err = True)
-            typer.echo(f"  no pyproject.toml under: {repo_root}", err = True)
-            typer.echo("  This CLI is running from an installed copy, not a source tree.", err = True)
-            typer.echo("", err = True)
-            typer.echo("  Point at a checkout:", err = True)
-            typer.echo("    STUDIO_LOCAL_REPO=/path/to/unsloth unsloth studio update --local", err = True)
-            typer.echo("  Or update from PyPI:", err = True)
-            typer.echo("    unsloth studio update", err = True)
-            raise typer.Exit(2)
+        repo_root = Path(__file__).resolve().parents[2]
         os.environ["STUDIO_LOCAL_REPO"] = str(repo_root)
     else:
         os.environ["STUDIO_LOCAL_INSTALL"] = "0"
