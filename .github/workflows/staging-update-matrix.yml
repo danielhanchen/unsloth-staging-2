@@ -90,9 +90,27 @@ jobs:
           [ "$code" = "200" ] || { echo "::error::Studio did not boot after update"; exit 1; }
 
   windows:
-    name: "update (windows-latest)"
+    name: "update (windows, ${{ matrix.leg }})"
     runs-on: windows-latest
     timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The CLI is launched from PowerShell 7, which is what `pwsh` is and
+          # what a modern Windows user has.
+          - leg: "from pwsh 7"
+            launcher: pwsh
+            clear_psmodulepath: "no"
+          # Same, with PSModulePath dropped before launching. If this passes
+          # where the one above fails, the inherited module path is the cause.
+          - leg: "from pwsh 7, PSModulePath cleared"
+            launcher: pwsh
+            clear_psmodulepath: "yes"
+          # Windows PowerShell 5.1, the shell install.ps1 itself runs under.
+          - leg: "from powershell 5.1"
+            launcher: powershell
+            clear_psmodulepath: "no"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -136,7 +154,19 @@ jobs:
       - name: unsloth studio update
         shell: pwsh
         run: |
-          & $env:UNSLOTH_BIN studio update --local 2>&1 | Select-Object -Last 25
+          if ('${{ matrix.clear_psmodulepath }}' -eq 'yes') {
+            # Windows PowerShell 5.1 computes its own default when this is unset.
+            $env:PSModulePath = ''
+            Write-Host 'PSModulePath cleared before launching the CLI'
+          } else {
+            Write-Host "PSModulePath: $env:PSModulePath"
+          }
+          if ('${{ matrix.launcher }}' -eq 'powershell') {
+            powershell -NoProfile -ExecutionPolicy Bypass -Command "& '$env:UNSLOTH_BIN' studio update --local" 2>&1 |
+              Select-Object -Last 30
+          } else {
+            & $env:UNSLOTH_BIN studio update --local 2>&1 | Select-Object -Last 30
+          }
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::update exited $LASTEXITCODE"; exit $LASTEXITCODE }
 
       - name: Version after, and the post-update contract
