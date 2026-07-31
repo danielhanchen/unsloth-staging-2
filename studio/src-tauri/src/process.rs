@@ -1002,11 +1002,17 @@ fn read_output_stream<R: std::io::Read>(
     let mut reader = std::io::BufReader::new(stream);
     let port_re = Regex::new(r"TAURI_PORT=(\d+)").unwrap();
     let mut buf = Vec::new();
+    // Did we leave because the child closed the stream, or for a reason of our own?
+    // It decides whether dropping the read end here is safe. See below.
+    let mut saw_eof = false;
 
     loop {
         buf.clear();
         match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => break,
+            Ok(0) => {
+                saw_eof = true;
+                break;
+            }
             Ok(_) => {
                 let text = String::from_utf8_lossy(trim_line_endings(&buf)).into_owned();
                 let log_line = if is_stderr {
@@ -1082,6 +1088,32 @@ fn read_output_stream<R: std::io::Read>(
                     e
                 );
                 break;
+            }
+        }
+    }
+
+    // Every other way out of that loop -- a generation mismatch, a poisoned mutex, a
+    // read error -- leaves the child ALIVE while this function is about to drop the read
+    // end. That closes the pipe underneath it, and the backend's next write then takes
+    // EPIPE and the process dies. Measured, on a failing CI run under strace: three
+    // successful writes, then
+    //     write(1, "Session log: ...", 88) = -1 EPIPE (Broken pipe)
+    //     --- SIGPIPE ---
+    //     exit_group(1)
+    // with the same line reaching its session log on disk a moment later. The server had
+    // everything it needed and stopped only because we stopped listening.
+    //
+    // So never hand a live child a reader-less pipe: if we are giving up on parsing, keep
+    // draining to EOF anyway. Discarding costs one blocked thread; closing costs the
+    // backend.
+    if !saw_eof {
+        use std::io::Read;
+        let mut sink = [0u8; 8192];
+        loop {
+            match reader.read(&mut sink) {
+                Ok(0) => break,
+                Ok(_) => continue,
+                Err(_) => break,
             }
         }
     }
