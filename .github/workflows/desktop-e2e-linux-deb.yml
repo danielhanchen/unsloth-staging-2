@@ -588,7 +588,7 @@ jobs:
 
           deadpipe_trial() {
             label="$1"; base="$2"
-            ones=0; started=0; other=0
+            ones=0; started=0; other=0; shown=0
             for i in $(seq 1 8); do
               port=$((base + i))
               rc=0
@@ -600,8 +600,13 @@ jobs:
               timeout 25 "$BIN_REAL" studio --api-only -H 127.0.0.1 -p "$port" \
                 2> "$err" | head -0 > /dev/null || rc=$?
               rc=${PIPESTATUS[0]:-$rc}
-              if [ "$rc" = "1" ] && [ -s "$err" ]; then
-                echo "  --- $label attempt $i said: ---"; head -15 "$err"
+              if [ "$rc" = "1" ] && [ -s "$err" ] && [ "$shown" != "1" ]; then
+                # A rich traceback puts the exception TYPE on the last line, and I read
+                # only the head last time and learned the call site without the reason.
+                # Both ends, once -- eight identical tracebacks is noise.
+                echo "  --- $label attempt $i said (head) ---"; head -8 "$err"
+                echo "  --- ...and the actual exception (tail) ---"; tail -14 "$err"
+                shown=1
               fi
               case "$rc" in
                 124) started=$((started + 1)) ;;
