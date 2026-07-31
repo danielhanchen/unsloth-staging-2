@@ -702,7 +702,7 @@ def test_cached_gguf_scan_dedupes_and_excludes_mmproj_only(monkeypatch, tmp_path
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_gguf_repo_partial",
-        lambda _repo_id, _path: False,
+        lambda _repo_id, _path, **_kw: False,
     )
 
     result = {"cached": cache_inventory._scan_cached_gguf()}
@@ -723,7 +723,7 @@ def test_cached_gguf_scan_preserves_partial_flag(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_gguf_repo_partial",
-        lambda _repo_id, _path: True,
+        lambda _repo_id, _path, **_kw: True,
     )
 
     result = {"cached": cache_inventory._scan_cached_gguf()}
@@ -766,7 +766,7 @@ def test_cached_gguf_scan_includes_variant_state_without_completed_gguf(monkeypa
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_gguf_repo_partial",
-        lambda _repo_id, _path: True,
+        lambda _repo_id, _path, **_kw: True,
     )
 
     result = {"cached": cache_inventory._scan_cached_gguf()}
@@ -799,7 +799,7 @@ def test_cached_gguf_scan_hides_infra_repos_without_user_downloads(monkeypatch, 
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_gguf_repo_partial",
-        lambda _repo_id, _path: False,
+        lambda _repo_id, _path, **_kw: False,
     )
 
     result = {"cached": cache_inventory._scan_cached_gguf()}
@@ -834,7 +834,7 @@ def test_cached_gguf_scan_keeps_infra_repo_with_user_downloaded_variant(monkeypa
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_gguf_repo_partial",
-        lambda _repo_id, _path: False,
+        lambda _repo_id, _path, **_kw: False,
     )
 
     result = {"cached": cache_inventory._scan_cached_gguf()}
@@ -866,7 +866,7 @@ def test_cached_models_scan_hides_non_gguf_embedder(monkeypatch, tmp_path):
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_snapshot_partial",
-        lambda _kind, _repo_id, _path: False,
+        lambda _kind, _repo_id, _path, **_kw: False,
     )
 
     result = {"cached": cache_inventory._scan_cached_models()}
@@ -909,12 +909,12 @@ def test_cached_scans_hide_embedders_configured_by_cache_path(monkeypatch, tmp_p
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_gguf_repo_partial",
-        lambda _repo_id, _path: False,
+        lambda _repo_id, _path, **_kw: False,
     )
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_snapshot_partial",
-        lambda _kind, _repo_id, _path: False,
+        lambda _kind, _repo_id, _path, **_kw: False,
     )
 
     assert cache_inventory._scan_cached_gguf() == []
@@ -972,12 +972,12 @@ def test_cached_scans_hide_embedders_configured_by_snapshot_path(monkeypatch, tm
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_gguf_repo_partial",
-        lambda _repo_id, _path: False,
+        lambda _repo_id, _path, **_kw: False,
     )
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_snapshot_partial",
-        lambda _kind, _repo_id, _path: False,
+        lambda _kind, _repo_id, _path, **_kw: False,
     )
 
     assert cache_inventory._scan_cached_gguf() == []
@@ -1015,7 +1015,7 @@ def test_cached_models_scan_keeps_unrelated_repo_with_custom_generic_embedder(
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_snapshot_partial",
-        lambda _kind, _repo_id, _path: False,
+        lambda _kind, _repo_id, _path, **_kw: False,
     )
 
     result = {"cached": cache_inventory._scan_cached_models()}
@@ -1049,12 +1049,12 @@ def test_cached_scans_hide_stale_default_embedder_after_custom_setting(monkeypat
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_gguf_repo_partial",
-        lambda _repo_id, _path: False,
+        lambda _repo_id, _path, **_kw: False,
     )
     monkeypatch.setattr(
         cache_inventory.hf_cache_scan,
         "is_snapshot_partial",
-        lambda _kind, _repo_id, _path: False,
+        lambda _kind, _repo_id, _path, **_kw: False,
     )
 
     assert cache_inventory._scan_cached_gguf() == []
