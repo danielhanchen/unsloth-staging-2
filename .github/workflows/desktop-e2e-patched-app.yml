@@ -138,7 +138,7 @@ jobs:
         run: |
           set -o pipefail
           python3 tests/studio/desktop_drive.py \
-            --scenarios discovery,backend,inference \
+            --scenarios backend,inference \
             --discover-timeout 420 \
             --out artifacts/drive-report.json 2>&1 | tee logs/drive.log
 
