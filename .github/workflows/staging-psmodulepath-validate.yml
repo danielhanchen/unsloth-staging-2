@@ -58,6 +58,9 @@ jobs:
         run: |
           $bin = "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\unsloth.exe"
           Write-Host "PSModulePath: $env:PSModulePath"
+          Write-Host "--- what Windows PowerShell 5.1 resolves for the Security module ---"
+          powershell -NoProfile -Command "Get-Module -ListAvailable Microsoft.PowerShell.Security | Select-Object -First 3 Name,Version,ModuleBase | Format-List; try { Get-ExecutionPolicy } catch { 'Get-ExecutionPolicy FAILED: ' + $_.Exception.Message }" 2>&1 |
+            Select-Object -First 25
           & $bin studio update 2>&1 | Tee-Object -FilePath update.log | Select-Object -Last 20
           $rc = $LASTEXITCODE
           Write-Host "update exit: $rc"

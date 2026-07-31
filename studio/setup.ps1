@@ -23,19 +23,29 @@ $ErrorActionPreference = "Stop"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $PackageDir = Split-Path -Parent $ScriptDir
 
-# Windows PowerShell 5.1 needs its own module directory on PSModulePath to load
-# Microsoft.PowerShell.Security, which astral's uv installer calls through
-# Get-ExecutionPolicy. `unsloth studio update` spawns powershell.exe inheriting
-# the caller's environment, so launched from a PowerShell 7 prompt that path can
-# hold only PS7's directories; on some Windows images the machine-level value
-# omits the system one too, so clearing the variable does not help either. The
-# uv install then failed with "the module could not be loaded", and
-# Invoke-SetupCommand turns that into a fatal setup error.
-$_UnslothSystemModules = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
-if ((Test-Path $_UnslothSystemModules) -and
-    ($env:PSModulePath -notlike "*$_UnslothSystemModules*")) {
-    # Appended, never replaced: a caller's own module directories stay ahead.
-    $env:PSModulePath = "$env:PSModulePath;$_UnslothSystemModules"
+# `unsloth studio update` spawns powershell.exe, which is Windows PowerShell 5.1,
+# and the child inherits the caller's PSModulePath. Launched from a PowerShell 7
+# prompt that path leads with PowerShell 7's module directories, which ship their
+# own Microsoft.PowerShell.Security. 5.1 finds that copy first and cannot load it:
+#
+#   The 'Get-ExecutionPolicy' command was found in the module
+#   'Microsoft.PowerShell.Security', but the module could not be loaded.
+#
+# astral's uv installer calls Get-ExecutionPolicy, and Invoke-SetupCommand makes
+# a failure there fatal, so the update stopped with exit 1 and no further output.
+#
+# Prepended, not appended: the problem is precedence, not absence. Clearing the
+# variable so 5.1 rebuilds its default does not help either, because the
+# machine-level value on the windows-latest image also leads with PS7.
+if ($PSVersionTable.PSEdition -ne 'Core') {
+    $_UnslothSystemModules = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\Modules'
+    if (Test-Path $_UnslothSystemModules) {
+        $_UnslothKept = @(
+            $env:PSModulePath -split ';' |
+                Where-Object { $_ -and ($_ -ne $_UnslothSystemModules) }
+        )
+        $env:PSModulePath = (@($_UnslothSystemModules) + $_UnslothKept) -join ';'
+    }
 }
 
 # --------------------------------------------------------------------------
