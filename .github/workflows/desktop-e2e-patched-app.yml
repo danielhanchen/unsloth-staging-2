@@ -1,0 +1,165 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# STAGING. Builds the Tauri app FROM SOURCE with the D8 fix and checks whether its
+# backend still dies.
+#
+# Why this job has to exist: every other Linux job installs the shipped .deb, which
+# carries a prebuilt binary. The D8 fix is in process.rs, so the shipped bundle can never
+# exercise it, and `cargo check` only proves it compiles. This is the only way to find out
+# whether it works.
+#
+# What D8 is, from strace on a real failing run: the app stops reading its backend's
+# stdout about two seconds after spawning it, and the backend's next write dies.
+#
+#     write(1, "Starting Unsloth Studio on http:"..., 49) = 49
+#     write(1, "2026-07-31 20:19:00 [info     ] "..., 95) = 95
+#     write(1, "Session log: /home/runner/.unslo"..., 88) = -1 EPIPE (Broken pipe)
+#     --- SIGPIPE ---
+#     write(4, "Session log: /home/runner/.unslo"..., 88) = 88
+#     exit_group(1)
+#
+# The same line reaches the session log on disk. The server had everything it needed and
+# stopped only because the app stopped listening.
+#
+# The fix: read_output_stream leaves its loop on EOF, on a generation mismatch, on a
+# poisoned mutex, or on a read error. Only the first means the child is finished. The
+# other three used to return, dropping the read end and closing the pipe under a running
+# backend. Now it drains to EOF instead.
+#
+# The frontend is a stub on purpose. This measures the backend spawn path, which the
+# harness drives over HTTP; the window may be blank and it changes nothing here. That
+# keeps the job to a cargo build instead of a full release pipeline.
+
+name: "desktop-e2e patched app"
+
+on:
+  push:
+    branches: [desktop-e2e]
+    paths:
+      - 'studio/src-tauri/src/process.rs'
+      - '.github/workflows/desktop-e2e-patched-app.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REL_REPO: unsloth-test/unsloth-test
+  REL_TAG: desktop-v0.1.51-beta
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+
+jobs:
+  patched:
+    name: "patched app (22.04 #${{ matrix.attempt }})"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        # D8 fires on roughly 40% of 22.04 legs. Six attempts means a clean sweep is
+        # under 5% likely by chance, which is the bar this fix has to clear to mean
+        # anything -- three attempts is how I twice talked myself into a wrong conclusion.
+        attempt: [1, 2, 3, 4, 5, 6]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Reclaim disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/share/boost "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Tauri v2 system dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
+            librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
+            build-essential curl wget file pkg-config patchelf xvfb jq
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri
+
+      - name: Install the shipped bundle's runtime, so only the binary differs
+        # The .deb's bundled installer creates ~/.unsloth/studio and its venv. The app
+        # under test then resolves that same managed backend, so the ONLY difference from
+        # the shipped legs is the app binary itself.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dl logs artifacts
+          gh release download "$REL_TAG" --repo "$REL_REPO" --pattern '*.deb' --dir dl
+          sudo apt-get install -y ./dl/*.deb
+          SH="$(dpkg -L "$(dpkg-deb -f dl/*.deb Package)" | grep -E '/install\.sh$' | head -1)"
+          set -o pipefail
+          env -u UNSLOTH_STUDIO_HOME bash "$SH" --tauri < /dev/null 2>&1 \
+            | tee logs/bundled-install.log
+          "$HOME/.unsloth/studio/unsloth_studio/bin/python" -V
+
+      - name: Build the app from source, with the fix
+        run: |
+          mkdir -p studio/frontend/dist
+          printf '<!doctype html><title>stub</title><body>stub</body>\n' > studio/frontend/dist/index.html
+          grep -n "saw_eof" studio/src-tauri/src/process.rs || {
+            echo "::error::the D8 fix is not in this checkout"; exit 1; }
+          cargo build --release --manifest-path studio/src-tauri/Cargo.toml 2>&1 | tail -20
+          BIN="$PWD/studio/src-tauri/target/release/unsloth-studio"
+          [ -x "$BIN" ] || { echo "::error::no binary at $BIN"; ls -la studio/src-tauri/target/release | head -20; exit 1; }
+          echo "PATCHED_BIN=$BIN" >> "$GITHUB_ENV"
+          ls -la "$BIN"
+
+      - name: Launch the patched app and see whether its backend survives
+        run: |
+          export WEBKIT_DISABLE_DMABUF_RENDERER=1
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1
+          nohup xvfb-run -n 99 -f "$PWD/.xvfb-auth" --server-args="-screen 0 1440x900x24" \
+            "$PATCHED_BIN" > logs/app-stdout.log 2>&1 &
+          sleep 25
+          APP_REAL="$(pgrep -x unsloth-studio | head -1)"
+          echo "app pid: ${APP_REAL:-<none>}"
+          if [ -z "$APP_REAL" ]; then
+            echo "::error::the patched app did not start"
+            tail -40 logs/app-stdout.log
+            exit 1
+          fi
+
+      - name: Does the backend come up?
+        id: drive
+        run: |
+          set -o pipefail
+          python3 tests/studio/desktop_drive.py \
+            --scenarios discovery,backend,inference \
+            --discover-timeout 420 \
+            --out artifacts/drive-report.json 2>&1 | tee logs/drive.log
+
+      - name: What happened
+        if: always()
+        run: |
+          echo "=== the app's own log ==="
+          tail -40 logs/app-stdout.log 2>/dev/null || true
+          cp -r "$HOME/.unsloth/studio/logs" logs/studio-logs 2>/dev/null || true
+          echo "=== backend session logs ==="
+          find "$HOME/.unsloth/studio/logs" -type f 2>/dev/null | head -5 | while read -r f; do
+            echo "--- $f ---"; tail -30 "$f"
+          done
+          echo "=== listening ==="
+          ss -ltnp 2>/dev/null | grep -E '888[0-9]|89[0-9][0-9]' || echo "(nothing on the studio range)"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: patched-app-22.04-${{ matrix.attempt }}
+          path: |
+            logs/
+            artifacts/
+          retention-days: 7
