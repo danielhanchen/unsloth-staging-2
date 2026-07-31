@@ -60,15 +60,18 @@ env:
 
 jobs:
   deb:
-    name: deb install + drive (${{ matrix.os }})
+    name: "deb install + drive (${{ matrix.os }} #${{ matrix.attempt }})"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        # 22.04 is where the app died right after spawning its backend; 24.04 passed the
-        # whole suite. Both, so that split is measured rather than inferred.
         os: [ubuntu-22.04, ubuntu-24.04]
+        # D8 is intermittent, not an OS split: one run had it on BOTH 22.04 legs and the
+        # next had it on none, with no product change in between. A single attempt per OS
+        # is a weak detector for something non-deterministic, so run each OS twice per
+        # push and let the attempts disagree if they are going to.
+        attempt: [1, 2]
 
     steps:
       - uses: actions/checkout@v4
@@ -376,7 +379,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: desktop-e2e-linux-deb-${{ matrix.os }}
+          name: desktop-e2e-linux-deb-${{ matrix.os }}-${{ matrix.attempt }}
           path: |
             logs/
             artifacts/
