@@ -1,0 +1,175 @@
+name: "staging-6763 windows-latest diffusion"
+on:
+  push:
+    branches: ["pr-6763-xplat75-ci"]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/staging-6763-windows-latest-diffusion.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  generate:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      STUDIO_PASS: 'Ci-6763-studio-pass'
+      STUDIO_BASE: 'http://127.0.0.1:8899'
+      HF_HUB_ENABLE_HF_TRANSFER: '1'
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_DIFFUSION_SD_CPP: '1'
+      UNSLOTH_DIFFUSION_SD_CPP_INSTALL: '1'
+      # Pin the native engine for the GGUF leg. A CPU-only Linux runner routes there on its own,
+      # but macos-14 reports an MPS backend, so the router picked diffusers and tried to load the
+      # dense 4B build (plus a 4B text encoder) into a 7 GB runner, which killed the server. A
+      # pipeline pick still falls back to diffusers on its own, so this does not affect that leg.
+      UNSLOTH_DIFFUSION_ENGINE: 'sd_cpp'
+      # The prebuilt installer resolves the sd.cpp release through the GitHub API, which is rate
+      # limited per IP when unauthenticated. On the shared macOS runner pool that limit was already
+      # spent, so the lookup 403'd, no binary was installed, the router fell back to diffusers, and
+      # the dense 4B build OOMed the 7 GB MPS runner -- the native path was never exercised at all.
+      # The installer reads GH_TOKEN / GITHUB_TOKEN and uses it as a bearer token.
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Reclaim runner disk
+        run: |
+          rm -rf /c/Android /c/hostedtoolcache/CodeQL /c/Program\ Files/dotnet || true
+          wmic OS get FreePhysicalMemory,TotalVisibleMemorySize || true
+          df -h . || true
+      - name: Install Studio + a CPU torch
+        run: |
+          python -m pip install --no-cache-dir --upgrade pip
+          python -m pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install --no-cache-dir -r studio/backend/requirements/studio.txt
+          python -m pip install --no-cache-dir diffusers transformers accelerate safetensors \
+            sentencepiece protobuf hf_transfer httpx pillow playwright python-multipart
+          python -m playwright install --with-deps chromium || python -m playwright install chromium || true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build the frontend
+        run: |
+          # A fresh checkout has no studio/frontend/dist, and run.py refuses to serve the UI
+          # without one. Build it so the Playwright leg has a real UI to screenshot; --api-only
+          # is the fallback so a frontend break still lets the generation legs run.
+          cd studio/frontend
+          npm ci --no-audit --no-fund || echo "NPM_CI_FAILED" > ../../frontend_failed
+          if [ ! -f ../../frontend_failed ]; then
+            # `npm run build` is `tsc -b && vite build`, so a type-only error leaves no dist and
+            # the UI falls back to --api-only: every screenshot then shows the API 404 body
+            # for a generation that in fact ran fine. A staging tree merged with -X theirs can
+            # carry exactly that (one side's import against the other side's call site), which is
+            # a property of the staging merge, not of the PR. Fall back to the bundler alone,
+            # which strips types rather than checking them, and record that it happened so the
+            # screenshots are never read as a clean type-check.
+            if ! npm run build; then
+              echo "TSC_FAILED_VITE_ONLY" > ../../frontend_typecheck_failed
+              npx vite build || echo "FRONTEND_BUILD_FAILED" > ../../frontend_failed
+            fi
+          fi
+          ls dist 2>/dev/null | head -5 || true
+      - name: Confirm no sd.cpp binary is pre-seeded
+        run: |
+          # Clean-machine baseline for the "installed automatically by the product" claim: nothing
+          # in this workflow fetches, unpacks or ships an sd.cpp binary, so whatever the evidence
+          # step below finds was installed by Studio's own lazy installer during the load.
+          export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/studio_home"
+          command -v sd-cli || echo "no sd-cli on PATH"
+          command -v sd-server || echo "no sd-server on PATH"
+          PYTHONPATH=studio python -c "import install_sd_cpp_prebuilt as m; p = m.default_install_dir(); print('sd.cpp install dir:', p); print('pre-existing contents:', sorted(x.name for x in p.iterdir()) if p.is_dir() else 'ABSENT')"
+      - name: Launch Studio
+        run: |
+          export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/studio_home"
+          export HF_HOME="$RUNNER_TEMP/hf" HF_HUB_CACHE="$RUNNER_TEMP/hf/hub" HUGGINGFACE_HUB_CACHE="$RUNNER_TEMP/hf/hub"
+          mkdir -p "$UNSLOTH_STUDIO_HOME" "$HF_HUB_CACHE"
+          # An `if` rather than an && list. `[ -f frontend_failed ] && UI_ARGS=...` evaluates to
+          # exit 1 on the HEALTHY path (no such file), which is harmless only for as long as it is
+          # not the last line of the step -- GitHub takes the script's final status. One reorder
+          # turns it into a green-build-fails-the-job trap, and the condition reads backwards.
+          UI_ARGS="--frontend studio/frontend/dist"
+          if [ -f frontend_failed ] || [ ! -d studio/frontend/dist ]; then
+            UI_ARGS="--api-only"
+          fi
+          # Recorded because the fallback is silent otherwise: an api-only launch answers /images
+          # with a 404 body, Playwright screenshots it happily, and the artifact reads as UI
+          # evidence. The gate step below fails the job when this says api-only.
+          echo "$UI_ARGS" > ui_mode.txt
+          echo "UI mode: $UI_ARGS"
+          PYTHONPATH=studio/backend python studio/backend/run.py --port 8899 --password "$STUDIO_PASS" \
+            $UI_ARGS > studio.log 2>&1 &
+          for i in $(seq 1 90); do curl -sf "$STUDIO_BASE/api/health" >/dev/null && break; sleep 5; done
+          curl -sf "$STUDIO_BASE/api/health" || (tail -80 studio.log; exit 1)
+      - name: Generate
+        run: |
+          export HF_HOME="$RUNNER_TEMP/hf" HF_HUB_CACHE="$RUNNER_TEMP/hf/hub" HUGGINGFACE_HUB_CACHE="$RUNNER_TEMP/hf/hub"
+          for leg in native-gguf; do
+            # Printed per leg so a torn-down runner still leaves the last reading in the job log,
+            # which is the only thing that survives when the artifact upload never gets to run.
+            wmic OS get FreePhysicalMemory || true
+            python .github/scripts/ci_diffusion/probe.py --leg "$leg" --out "artifacts/windows-latest/$leg"
+          done
+          wmic OS get FreePhysicalMemory || true
+      - name: sd.cpp prebuilt evidence
+        if: always()
+        run: |
+          # The installer's own stdout, kept as an artifact: which repo and release tag it
+          # resolved, which asset it downloaded, and where sd-cli / sd-server landed.
+          mkdir -p "artifacts/windows-latest"
+          grep -E "sd-cli:|downloading sd-|installed sd-cli|installed sd-server|No prebuilt sd-cli|release fetch failed" studio.log > "artifacts/windows-latest/sdcpp_install.txt" || true
+          cat "artifacts/windows-latest/sdcpp_install.txt" || true
+          # Carry the frontend markers into the artifact so a degraded screenshot set explains
+          # itself without re-reading the job log.
+          for m in frontend_failed frontend_typecheck_failed; do
+            [ -f "$m" ] && cp "$m" "artifacts/windows-latest/$m" || true
+          done
+      - name: Screenshots + GIF
+        if: always()
+        run: python .github/scripts/ci_diffusion/shot.py --out "artifacts/windows-latest/ui" || true
+      - name: Studio log tail
+        if: always()
+        run: tail -200 studio.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diffusion-6763-windows-latest
+          path: |
+            artifacts/**
+            studio.log
+            ui_mode.txt
+      - name: UI evidence gate
+        # Last, so the generation artifacts are already uploaded when this fails. The generation
+        # legs are the expensive evidence and stay valid on their own; this only stops a run whose
+        # UI screenshots are 404 pages from being read as "Studio works out of the box".
+        if: always()
+        run: |
+          python - <<'PY'
+          import json, pathlib, sys
+          fail = []
+          if pathlib.Path("frontend_failed").is_file():
+              fail.append("the frontend build failed, so Studio was launched --api-only")
+          p = pathlib.Path("artifacts/windows-latest/ui/ui_results.json")
+          if not p.is_file():
+              fail.append("no ui_results.json: the Playwright leg did not run")
+          else:
+              d = json.loads(p.read_text(encoding="utf-8"))
+              if not d.get("served"):
+                  fail.append(f"UI not served: {d.get('pages')} {d.get('error', '')}")
+          if fail:
+              print("UI EVIDENCE GATE: FAIL")
+              for f in fail:
+                  print(" -", f)
+              sys.exit(1)
+          print("UI EVIDENCE GATE: PASS (every captured page was a served 200 with a mounted app)")
+          PY
