@@ -222,21 +222,12 @@ jobs:
           } >> "$LOG" 2>&1
           export PYTHONUNBUFFERED=1
           export PYTHONFAULTHANDLER=1
-          # The question this run has to answer: did Python start at all? The backend
-          # exits 1 having written literally zero bytes to both streams, captured at the
-          # source rather than through the app's pipes, so the usual failure modes are
-          # already excluded -- a traceback, a typer message, a usage error and a
-          # BrokenPipeError would every one of them have produced output. PYTHONVERBOSE
-          # traces every import to stderr from the very first one, so silence under it
-          # means the interpreter never got going, and any output pinpoints where it
-          # stopped.
-          export PYTHONVERBOSE=1
-          # Trace what the shell itself does, into the log rather than onto the streams
-          # under test, so "bash never ran it" and "it ran and said nothing" cannot be
-          # confused for one another.
-          exec 9>>"$LOG"
-          export BASH_XTRACEFD=9
-          set -x
+          # PYTHONVERBOSE was tried here and MASKED the defect: 3/3 green on 22.04 with
+          # it, 3/3 red without. That is the second instrument to do so (the first was an
+          # interpreter warm-up), and both of them add work to the child's early startup.
+          # Two independent maskings of that shape say the failure is timing-sensitive, so
+          # the app's own attempt is now left completely unperturbed and the question is
+          # asked somewhere else -- see "Does it reproduce without the app at all?".
           # Tee both streams to files while still passing them through to the app, so the
           # output that has been invisible all through this investigation is recoverable
           # even if the app never logs it. `wait` for the tees, so the shim cannot exit
@@ -403,6 +394,47 @@ jobs:
             --layer attached \
             --out artifacts/ui \
             --report artifacts/ui-report.json 2>&1 | tee logs/ui.log
+
+      - name: Does it reproduce without the app at all?
+        if: always()
+        # Everything that instruments the app's own spawn has changed its outcome, so
+        # stop instrumenting it. Run the SAME command the app runs, from this shell,
+        # repeatedly, and let the exit codes answer whether the app's spawn context is
+        # required to reproduce.
+        #
+        # Reading the result: rc=124 means `timeout` had to stop it, i.e. it started and
+        # kept running, which is success. rc=1 is the defect. Each attempt gets its own
+        # port so a survivor never blocks the next one.
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          BIN_REAL="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.real"
+          [ -x "$BIN_REAL" ] || BIN_REAL="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
+          echo "using: $BIN_REAL"
+          ones=0; started=0
+          for i in $(seq 1 10); do
+            port=$((8960 + i))
+            out="logs/repro-$i.log"
+            timeout 25 "$BIN_REAL" studio --api-only -H 127.0.0.1 -p "$port" > "$out" 2>&1
+            rc=$?
+            bytes=$(wc -c < "$out" 2>/dev/null || echo 0)
+            case "$rc" in
+              124) started=$((started + 1)); verdict="started ok (timeout stopped it)" ;;
+              1)   ones=$((ones + 1));       verdict="** REPRODUCED: silent exit 1 **" ;;
+              *)   verdict="unexpected" ;;
+            esac
+            echo "attempt $i: rc=$rc bytes=$bytes  $verdict"
+            [ "$rc" = "1" ] && { echo "--- what it wrote ---"; head -20 "$out"; }
+            pkill -f "api-only -H 127.0.0.1 -p $port" 2>/dev/null || true
+          done
+          echo "=================================================="
+          echo "10 attempts outside the app: $started started, $ones silent exit 1"
+          if [ "$ones" -gt 0 ]; then
+            echo "So the app is NOT required to reproduce it -- this is the backend's own"
+            echo "startup, and the app is only the messenger."
+          else
+            echo "So it does NOT reproduce outside the app, in $started/10 attempts."
+            echo "Something about the app's spawn context is required."
+          fi
 
       - name: Where exactly is the backend stuck?
         if: always()
