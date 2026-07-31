@@ -370,6 +370,74 @@ def test_local_picker_rows_require_chat_capability():
     assert "row.capabilities.canChat" in memo.group(0)
 
 
+def test_a_pinned_cached_row_loads_from_the_id_the_backend_pinned():
+    """The cached listing pins a snapshot when the repo's default ref reaches no copy
+    that loads, and it is the load that has to follow the pin. The id stays the repo
+    id everywhere it is shown, deduped or stored, so only model_path changes."""
+    inventory = _read("features/model-picker/inventory/use-chat-picker-inventory.ts")
+    for mapper in ("toCachedGgufRepo", "toCachedModelRepo"):
+        body = re.search(rf"function {mapper}\(.*?\n}}", inventory, re.S)
+        assert body, f"{mapper} not found"
+        assert "load_id: row.loadId" in body.group(0), f"{mapper} drops the pinned id"
+        # Delete sends this to remove the copy on screen, not the active cache's.
+        assert "cache_path: row.cachePath" in body.group(0), f"{mapper} drops the cache path"
+
+    meta = _read("features/model-picker/components/model-selector/types.ts")
+    assert "loadId?: string | null;" in meta
+
+    picker = _read("features/model-picker/components/model-selector/pickers.tsx")
+    assert "loadId={c.load_id}" in picker, "the quant list cannot pass on a pin it never gets"
+    # Both rows and the gear beside each: Run reloads through the same meta.
+    assert picker.count("loadId: c.load_id") == 2, "the safetensors row and its gear need the pin"
+    block = re.search(r"onConfigure\(repoId, \{.*?\n\s*\}", picker, re.S)
+    assert block and "loadId," in block.group(0), "the GGUF gear drops the pin"
+    # The variant click withholds it: a quant outside the pinned snapshot lands in a different one.
+    block = re.search(r"onSelect\(repoId, \{.*?\n\s*\}", picker, re.S)
+    assert block and "loadId: downloaded === true ? loadId : undefined," in block.group(0)
+    # localPath alone: preferLocalCache would answer from disk and drop the undownloaded quants.
+    assert (
+        "listGgufVariants(repoId, hfToken, localSource ? { localPath: localSource } : undefined)"
+        in picker
+    )
+    assert "cachePath={c.cache_path}" in picker
+
+    # A reload rebuilds its target from the checkpoint id, so the resident model remembers the pin.
+    page = _read("features/chat/chat-page.tsx")
+    assert "loadId: activeLoadId," in page
+    assert "activeLoadId: string | null;" in _read("features/chat/stores/chat-runtime-store.ts")
+
+    runtime = _read("features/chat/hooks/use-chat-model-runtime.ts")
+    assert "activeLoadId: loadPath === modelId ? null : loadPath," in runtime
+    # A failed swap already unloaded the pinned model: reload it from the same place, pin and all.
+    assert "model_path: previousActiveLoadId || previousCheckpoint," in runtime
+    assert "activeLoadId: previousActiveLoadId ?? null," in runtime
+    # A model loaded outside this tab replaces the resident one, and the pin belonged to the old.
+    assert "useChatRuntimeStore.setState({ activeLoadId: null });" in runtime
+
+    # Auto-load keys identity off the backend, so the pin is recorded beside it, not in place of it.
+    adapter = _read("features/chat/api/chat-adapter.ts")
+    assert "activeLoadId: modelPath === candidate.id ? null : modelPath," in adapter
+    assert (
+        '(typeof selection === "string" ? null : selection.loadId) || modelId' in runtime
+    ), "loadPath must fall back to the id, so an unpinned pick is unchanged"
+    # Staged metadata, validate and load: all three read the copy that loads.
+    assert runtime.count("model_path: loadPath,") == 3
+    assert "model_path: modelId," not in runtime
+    # A rollback reads the approval under the snapshot path, so store it under both keys.
+    assert "rememberApprovedRemoteCode(loadPath, approvedRemoteCodeFingerprint);" in runtime
+    assert "approvedRemoteCodeFingerprints.get(previousCheckpoint) ?? null," in runtime
+
+
+def test_a_local_quant_short_a_shard_is_not_selectable():
+    """The variants endpoint now reports a local folder's torn quant as partial. A folder has no
+    download to resume, so the row has to say so and refuse the pick rather than send validate and
+    load at files that are not on disk."""
+    picker = _read("features/model-picker/components/model-selector/pickers.tsx")
+    assert "const unusableLocal = isLocalPath && v.partial === true;" in picker
+    assert "disabled={unusableLocal}" in picker
+    assert "incomplete" in picker
+
+
 def test_model_picker_toolbar_reflows_before_crossing_picker_edge():
     """The content-sized section tabs and fixed-width dropdowns must reflow,
     while an oversized tab group must shrink labels but preserve its icons."""
@@ -831,7 +899,10 @@ def test_chat_autoload_prepares_hf_token_before_gguf_metadata_preflight():
     metadata = autoload.index("fetchGgufStagedMetadata({", prepare)
     assert prepare < metadata
     assert "hf_token: preparedToken.token" in autoload
-    assert 'throw new Error("Model load cancelled.")' in autoload
+    # The throw carries the cancellation marker, so the sweep stops rather than reopen the dialog.
+    assert 'new Error("Model load cancelled.")' in autoload
+    assert "unslothUserCancelled: true" in autoload
+    assert "recordCandidateFailure(failureLabel, cancelled)" in autoload
 
 
 def test_cpu_only_llama_build_hides_gpu_picker():
@@ -1201,630 +1272,69 @@ def test_vulkan_inference_devices_are_the_pickable_set():
     assert 'diffusionPinnable: diffusionBackend && d.index_kind === "physical",' in src
 
 
-def test_only_gguf_configs_are_mirrored_to_the_server():
-    """The server override map is read by the OpenAI-compatible auto-switch, and its
-    resolver indexes GGUFs only."""
-    src = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
-    assert (
-        "if ( !saveFailed && (target.apiLoadable ?? target.isGguf) && !nativePathToken ) "
-        "{ syncModelOverride(" in src
+def test_chat_autoload_records_every_validation_failure():
+    """canAutoLoad runs validateModel, which prepares the token, so a dismissed dialog, a dead
+    backend or a model-specific rejection throws there rather than from loadModel. The sweep's
+    catches are bare, so an unrecorded one reads as an empty device and fetches the Hub default.
+    Only a declined dialog ends the sweep."""
+    adapter = _read("features/chat/api/chat-adapter.ts")
+    recorder = adapter.split("function recordCandidateFailure", 1)[1]
+    recorder = recorder.split("async function canAutoLoadRecordingFailures", 1)[0]
+    # Unconditional: no tag is consulted before recording, so a plain rejection counts too.
+    assert recorder.count("noteLoadFailure(label, error)") == 1
+    assert recorder.index("noteLoadFailure(label, error)") < recorder.index(
+        "unslothUserCancelled === true"
+    ), "recording must not sit behind a marker test"
+    # A declined dialog halts the sweep (retrying reopens it); nothing else does.
+    assert "unslothUserCancelled === true" in recorder
+    assert recorder.count("autoLoadCancelled = true;") == 1
+    assert recorder.index("unslothUserCancelled === true") < recorder.index(
+        "autoLoadCancelled = true;"
+    ), "the halt belongs to the cancellation branch alone"
+    # Rethrown by the wrapper, so the candidate still fails and control flow is unchanged.
+    wrapper = adapter.split("async function canAutoLoadRecordingFailures", 1)[1]
+    wrapper = wrapper.split("async function loadAutoLoadCandidate", 1)[0]
+    assert "recordCandidateFailure(label, error)" in wrapper
+    assert "throw error;" in wrapper
+    autoload = adapter.split("async function loadAutoLoadCandidate", 1)[1]
+    autoload = autoload.split("async function autoLoadSmallestModel", 1)[0]
+    # The preflight and the GGUF metadata probe both record, and a cancelled sweep skips the rest.
+    assert "canAutoLoadRecordingFailures(failureLabel, {" in autoload
+    assert "recordCandidateFailure(failureLabel, error)" in autoload
+    # The preflight's own cancellation goes through the helper too, or it records without halting.
+    assert "recordCandidateFailure(failureLabel, cancelled)" in autoload
+    assert "noteLoadFailure(failureLabel, cancelled)" not in autoload
+    assert "if (autoLoadCancelled || loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS)" in autoload
+
+
+def test_auth_retries_tag_transport_failures_like_the_first_attempt():
+    """noteLoadFailure keys on the tag, so an untagged TypeError from a retry reads as a
+    rejection: retries reissue through retryWithCurrentToken, so it tags like the first attempt."""
+    src = (WORKDIR / "studio" / "frontend" / "src" / "features" / "auth" / "api.ts").read_text(
+        encoding = "utf-8"
     )
-    # The local save is not behind the same gate.
-    assert "if (remember) { saveFailed = !savePerModelConfig(" in src
-
-
-def test_a_native_leased_gguf_is_not_mirrored_to_the_server():
-    """A dropped or file-picked GGUF loads through a signed native-path lease, and
-    /api/inference/status reports model_identifier as null for it, so the checkpoint the
-    browser keys settings by is the bare file name the backend echoes back."""
-    page = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
-    assert "&& !nativePathToken ) { syncModelOverride(" in page
-    assert (
-        "const nativePathToken = target.meta.nativePathToken ?? "
-        "(isActiveModel ? activeNativePathToken : null);" in page
-    ), "the token this gate reads"
-    # The one-time backfill has no token to read, so it goes by the identity shape.
-    backfill = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    assert "!isNativeFileLabel(entry.modelId) &&" in backfill
-    identity = " ".join(_read("features/hub/lib/model-identity.ts").split())
-    assert "export function isNativeFileLabel(" in identity
-    # A bare file name: no separator, and the .gguf the resolver's keys never carry.
-    assert "const NATIVE_FILE_LABEL_RE = /^[^/\\\\]+\\.gguf$/i;" in identity
-
-    inference = _read_backend("routes/inference.py")
-    assert (
-        "model_identifier = None if _native_grant_backed else _model_id" in inference
-    ), "why the checkpoint is only a display name"
-    models = _read_backend("routes/models.py")
-    assert "display_name = gguf_file.stem," in models, "why the name is never an index key"
-
-
-def test_evicted_local_configs_drop_their_server_overrides():
-    """savePerModelConfig evicts older models when the map exceeds its budget."""
-    src = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
-    assert "const evicted: { modelId: string; ggufVariant: string | null }[] = [];" in src
-    assert (
-        "for (const dropped of evicted) { syncModelOverride(dropped.modelId, "
-        "dropped.ggufVariant, null, { keepLaunchFlags: true, }); }" in src
-    )
-    api = " ".join(_read("features/model-picker/api/model-overrides.ts").split())
-    assert "keepLaunchFlags?: boolean;" in api
-    # remove=false with no fields: the route re-supplies stored flags and drops an empty row.
-    assert "remove: config === null && !options?.keepLaunchFlags," in api
-    assert (
-        "...(config === null && !options?.keepLaunchFlags ? { llama_extra_args: [] } : {}),"
-        in api.replace("// biome-ignore lint/style/useNamingConvention: API schema ", "")
-    )
-    route = _read_backend("routes/settings.py")
-    assert 'requested_extra_args = stored.get("llama_extra_args")' in route, "the rule this mirrors"
-
-    # Eviction reports what it dropped as model id + variant, not the normalized storage key.
-    store = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
-    assert "evicted?: { modelId: string; ggufVariant: string | null }[]" in store
-    assert "modelIdFromStorageKey(" in store and "ggufVariantFromStorageKey(" in store
-
-
-def test_backfill_compares_server_keys_by_normalized_identity():
-    """app_settings has no schema version, so an install predating identity normalization
-    holds rows keyed by whatever id was typed, e.g."""
-    src = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    assert "function normalizedOverrideKey(" in src
-    # Folded on both sides: the older `id::variant` local keys are not.
-    assert "known.set(normalizedOverrideKey(storedKey), storedEntry);" in src
-    assert "const stored = known.get(key);" in src
-    # A quant-aware split, so a Windows drive letter is not read as a separator.
-    assert "const split = splitQuantSuffix(key);" in src
-    # Repo ids fold and POSIX paths do not, which is what these do.
-    assert "normalizeModelIdentity(" in src and "normalizeGgufVariantIdentity(" in src
-
-
-def test_monitor_stats_exclude_model_lifecycle_rows():
-    """A load, unload or download is recorded as a monitor entry but is not an HTTP call."""
-    src = " ".join(_read("features/api-monitor/use-api-monitor.ts").split())
-    assert 'if (entry.kind === "lifecycle") { continue; }' in src
-    # "Requests" is a request count too, so it cannot stay entries.length.
-    assert "total: requests," in src
-    assert "total: entries.length" not in src
-
-    backend = _read_backend("core/inference/api_monitor.py")
-    assert 'entry.kind != "lifecycle"' in backend, "the rule this mirrors"
-
-
-def test_api_reach_copy_is_limited_to_gguf_models():
-    """The Hub opens this page for every downloaded model, but ModelConfigPage mirrors
-    settings to the server only when target.isGguf, because API auto-switch indexes
-    GGUFs only."""
-    src = " ".join(_read("features/hub/catalog/hub-model-settings-view.tsx").split())
-    assert "{(target.apiLoadable ?? target.isGguf)" in src
-    assert "Saved settings apply everywhere Studio loads this model." in src
-
-
-def test_backfill_includes_a_standalone_gguf_with_no_variant():
-    """A standalone .gguf picked directly has no quant to choose between, so it is stored
-    with a null variant."""
-    src = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    assert 'entry.modelId.toLowerCase().endsWith(".gguf")' in src
-    # Still excluded for safetensors, which auto-switch does not resolve.
-    assert "entry.ggufVariant != null ||" in src
-
-
-def test_monitor_overlay_does_not_pull_in_the_lazy_page():
-    """The overlay is mounted from __root.tsx, so a static import of the page for two label
-    helpers drags the whole 900-line page and its dependency graph into the eagerly
-    loaded bundle and undoes the route's lazyRouteComponent."""
-    overlay = _read("features/api-monitor/api-monitor-overlay.tsx")
-    assert 'from "./lifecycle"' in overlay
-    assert "api-monitor-page" not in overlay, "the overlay must not reach the page"
-    # The helpers live in their own module, not re-exported through the page.
-    shared = _read("features/api-monitor/lifecycle.ts")
-    assert "export function isLifecycleEntry(" in shared
-    assert "export function lifecycleLabel(" in shared
-
-
-def test_override_writes_are_ordered_per_model():
-    """Two saves for one model, or a save racing the one-time backfill, started independent
-    requests with no sequencing, so the older response could commit last and resurrect
-    the entry the newer one meant to replace."""
-    src = " ".join(_read("features/model-picker/api/model-overrides.ts").split())
-    assert "const writesByKey = new Map<string, Promise<void>>();" in src
-    # Keyed by the same override key the server stores under.
-    assert (
-        "const key = modelOverrideKey( normalizeModelIdentity(modelId), normalizeGgufVariantIdentity(ggufVariant), );"
-        in src
-    )
-    # Chained on the settled tail, so one failed write cannot cancel the next.
-    assert "previous .catch(() => {}) .then(() => sendModelOverride(" in src
-    # Only the last writer clears the slot, or a queue still building loses order.
-    assert "if (writesByKey.get(key) === write) { writesByKey.delete(key); }" in src
-
-
-def test_backfill_skips_future_schema_local_records():
-    """loadPerModelConfig refuses to apply a record written by a newer Studio and eviction
-    refuses to drop one, because this client cannot interpret that schema."""
-    src = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
-    listing = src[src.index("export function listPerModelConfigs()") :]
-    assert "storedConfigVersion(raw) > STORAGE_SCHEMA_VERSION" in listing[:900]
-
-
-def test_detail_settings_need_a_resolved_quant():
-    """The on-device card passes a null variant while its own lookup is pending or after it
-    failed."""
-    src = " ".join(_read("features/hub/hub-page.tsx").split())
-    # `variant`, not the argument: a resident quant may have replaced it, so judge what is saved.
-    guard = "if (!variant && selectedModel.isGguf && selectedModel.requiresVariant) {"
-    assert guard in src
-    assert src.count("Couldn't determine which quant to configure.") == 2
-
-
-def test_a_failed_detail_fetch_is_retried():
-    """A terminal row's updated_at never advances and selectedIsMissing stays true, so a
-    fetch that failed had nothing left to re-run the effect and the payload stayed
-    unavailable until another row was selected."""
-    src = " ".join(_read("features/api-monitor/api-monitor-page.tsx").split())
-    assert "const DETAIL_FETCH_ATTEMPTS = 3;" in src
-    assert "const detailInFlight = selectedId_ != null && loadingDetails.has(selectedId_);" in src
-    assert "if (attemptsRef.current.count >= DETAIL_FETCH_ATTEMPTS) { return; }" in src
-
-
-def test_ollama_models_are_not_advertised_as_api_loadable():
-    """local_model_resolver skips Ollama's scanner, so an Ollama GGUF is never in the
-    auto-switch index and no OpenAI request can resolve it."""
-    types_src = " ".join(_read("features/model-picker/components/model-selector/types.ts").split())
-    assert "apiLoadable?: boolean;" in types_src
-    hub = " ".join(_read("features/hub/hub-page.tsx").split())
-    assert "row.source !== LOCAL_MODEL_SOURCE.OLLAMA" in hub
-    assert "apiLoadable:" in hub
-    backend = _read_backend("core/inference/local_model_resolver.py")
-    assert (
-        "Ollama's\n    scanner is skipped" in backend or "scanner is skipped" in backend
-    ), "the rule this mirrors"
-
-
-def test_cached_repo_settings_are_keyed_by_the_repo_id():
-    """A repo cached outside the active HF cache reports load_id = the snapshot path
-    (hub/services/cache_inventory.py), while the chat picker and the auto-switch index
-    key it by repo_id."""
-    config_page = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
-    assert "const configId = target.configId ?? target.id;" in config_page
-    for call in (
-        "resolveInitialConfig(configId, target.ggufVariant)",
-        "savePerModelConfig( configId, target.ggufVariant,",
-        "deletePerModelConfig(configId, target.ggufVariant)",
-        "syncModelOverride( configId, target.ggufVariant,",
-    ):
-        assert call in config_page, call
-    # The probes have to open the model, so they keep the load id.
-    assert "useDefaultChatTemplate( target.id," in config_page
-    assert "model_path: target.id," in config_page
-
-    hub = " ".join(_read("features/hub/hub-page.tsx").split())
-    assert 'if (kind !== "cache" && resource.source !== "hub_cache") {' in hub
-    assert "return resource.repoId ?? resource.runId;" in hub
-    # Both openers and the Hub's own load resolve through it.
-    assert hub.count("modelConfigIdentity(") == 3
-    assert 'const configId = row.kind === "cache" ? row.repoId : id;' in hub
-    assert hub.count("configId,") >= 2
-
-    backend = _read_backend("hub/tests/test_model_services.py")
-    assert 'fields["load_id"] == str(snapshot)' in backend, "the rule this mirrors"
-
-
-def test_backfill_splits_a_quant_suffix_the_way_the_backend_does():
-    """The backfill compared server keys under an identity taken by splitting on the last
-    colon, so a Windows drive letter and an ordinary colon inside a POSIX filename were
-    read as quant separators: `/models/foo:Bar.gguf` and `/models/foo:bar.gguf` folded
-    to one key, and whichever was already on the server made the other look migrated."""
-    identity = " ".join(_read("features/model-picker/model-config/model-identity.ts").split())
-    assert "export function splitQuantSuffix(" in identity
-    # Two rules keep a path out: no separator in the tail, and a non-.gguf head carries no label.
-    assert 'if (tail.includes("/") || tail.includes("\\\\"))' in identity
-    assert 'if (!head.toLowerCase().endsWith(".gguf")) { return null; }' in identity
-    # A .gguf head is not enough: the suffix must be the label the scanner derives, or a name
-    # containing ".gguf:" folds two real POSIX files onto one key.
-    assert "tail.toLowerCase() === ggufQuantLabel(filename).toLowerCase()" in identity
-
-    migrate = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    assert "const split = splitQuantSuffix(key);" in migrate
-    assert 'key.lastIndexOf(":")' not in migrate, "the unconditional split is gone"
-
-    backend = _read_backend("utils/openai_auto_switch_settings.py")
-    assert "def split_quant_suffix(" in backend, "the rule this mirrors"
-    assert "_BPW_SUFFIX" in backend and "bpw" in identity
-    assert "extract_quant_label(filename).casefold()" in backend, "the label rule"
-    # Both sides accept the same quant vocabulary; the regex lives with the loader.
-    quants = _read_backend("core/inference/llama_cpp.py")
-    for token in ("MXFP", "IQ", "TQ", "BF16", "F16", "F32"):
-        assert token in quants and token in identity, token
-    # The .gguf label helpers are ported too, or the two sides label a filename apart.
-    gguf = _read_backend("hub/utils/gguf.py")
-    assert "def extract_quant_label(" in gguf and "def _gguf_stem(" in gguf
-    assert "function ggufQuantLabel(" in identity and "function ggufStem(" in identity
-    assert "_GGUF_SPLIT_SUFFIX_RE" in gguf and "GGUF_SPLIT_SUFFIX" in identity
-    assert "_FLOAT_PRECISION_QUANTS" in gguf and "FLOAT_PRECISION_QUANTS" in identity
-    # The executable half of this contract, case by case against split_quant_suffix.
-    assert (WORKDIR / "studio" / "frontend" / "tests" / "model-identity.test.ts").is_file()
-
-
-def test_the_detail_card_also_gates_ollama_out_of_the_api_promise():
-    """Settings opens from two places in the Hub."""
-    hub = " ".join(_read("features/hub/hub-page.tsx").split())
-    assert hub.count("LOCAL_MODEL_SOURCE.OLLAMA") == 2
-    assert "selectedModel.localSource !== LOCAL_MODEL_SOURCE.OLLAMA" in hub
-    assert "row.source !== LOCAL_MODEL_SOURCE.OLLAMA" in hub
-
-
-def test_the_settings_page_judges_the_config_storage_actually_keeps():
-    """savePerModelConfig normalizes before deciding, and the runtime hands this page
-    Speculative Decoding "auto", which canonicalizes to null."""
-    src = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
-    assert (
-        "const normalizedRuntimeConfig = normalizePerModelConfig( effectiveRuntimeConfig, );" in src
-    )
-    assert "const defaultConfig = isDefaultConfig(normalizedRuntimeConfig);" in src
-    # The same object goes to storage and to the server, or they disagree again.
-    assert "target.ggufVariant, normalizedRuntimeConfig, evicted," in src
-    assert "remember ? normalizedRuntimeConfig : null," in src
-    assert "isDefaultConfig(effectiveRuntimeConfig)" not in src
-
-    store = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
-    assert "export function normalizePerModelConfig(" in store
-    assert "const normalized = normalize(config);" in store
-    assert "if (isDefaultConfig(normalized)) {" in store, "the rule this mirrors"
-
-
-def test_the_chat_picker_marks_ollama_targets_unloadable_by_the_api():
-    """A settings target opened from the Chat model picker carried no apiLoadable, so the
-    `??"""
-    picker = " ".join(_read("features/model-picker/components/model-selector.tsx").split())
-    assert "apiLoadable: isGguf && !isOllamaLinkPath(id)," in picker
-    sidebar = " ".join(_read("features/model-picker/components/sidebar-model-config.tsx").split())
-    assert "apiLoadable: isGguf && !isOllamaLinkPath(modelId)," in sidebar
-    # The same classification gates the backfill, or an older config still reaches the server.
-    backfill = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    assert "!isOllamaLinkPath(entry.modelId) &&" in backfill
-
-    identity = _read("features/hub/lib/model-identity.ts")
-    assert 'new Set([".studio_links", "ollama_links"])' in identity
-    resolver = _read_backend("core/inference/local_model_resolver.py")
-    assert 'seg in (".studio_links", "ollama_links")' in resolver, "the rule this mirrors"
-
-
-def test_the_backfill_fills_in_fields_rather_than_skipping_known_keys():
-    """The backfill reads the override map once and then writes each model in turn, so a
-    save by another tab during that pass was overwritten by this browser's older
-    localStorage copy."""
-    backfill = " ".join(_read("features/model-picker/api/migrate-model-overrides.ts").split())
-    assert "{ fillAbsentFields: true }," in backfill
-    # Key presence alone is not "done": what the server lacks decides.
-    assert "const stored = known.get(key);" in backfill
-    assert (
-        "if (stored && absentFields(stored, current.config).length === 0) { continue; }" in backfill
-    )
-    assert "const fields = Object.keys(toApiOverride(config));" in backfill
-    assert "return fields.filter((field) => !(field in stored));" in backfill
-
-    api = " ".join(_read("features/model-picker/api/model-overrides.ts").split())
-    assert "fillAbsentFields?: boolean;" in api
-    assert "options?.fillAbsentFields ? { fill_absent_fields: true } : {}" in api.replace(
-        "// biome-ignore lint/style/useNamingConvention: API schema ", ""
-    )
-    # Ordinary saves must stay unconditional, or a settings edit would never land.
-    assert "syncModelOverride" in api and "fill_absent_fields: true" in api
-
-    route = _read_backend("routes/settings.py")
-    assert "fill_absent_fields: bool = False" in route, "the rule this mirrors"
-    assert "fill_absent_fields = payload.fill_absent_fields," in route
-    # A write mode must not leak into saved fields, or model_id-only removal stops working.
-    assert '"remove", "fill_absent_fields"' in route
-
-    # The merge is the server's, in the write's transaction: a client-side one reopens the race.
-    db = _read_backend("storage/studio_db.py")
-    assert "merged = {**entry_value, **stored}" in db
-    assert "BEGIN IMMEDIATE" in db
-
-
-def test_the_hub_settings_page_matches_a_resident_path_loaded_model():
-    """A GGUF loaded from an inactive HF cache or straight off disk loads by path, but
-    /status reports the clean public id, so comparing it to settingsTarget.id said "not
-    loaded" and the page showed saved or default values instead of the live launch
-    config."""
-    hub = " ".join(_read("features/hub/hub-page.tsx").split())
-    assert (
-        "residentModelIdMatches( activeCheckpoint, settingsTarget.id, settingsTarget.configId, )"
-        in hub
-    )
-    assert "loadedConfig={settingsTargetIsResident ? activeModelConfig : null}" in hub
-    assert "settingsTargetIsResident ? activeGgufContextLength : null" in hub
-    # The loadable identifier, as every other status reader records it.
-    assert "checkpointId: resolveInferenceCheckpointId(status)," in hub
-    assert "setCheckpoint(status.active_model" not in hub
-    chat = " ".join(_read("features/chat/lib/apply-inference-status-to-store.ts").split())
-    assert "return status.model_identifier ?? status.active_model;" in chat, "the rule this mirrors"
-    # The alias is the backend's own public id rule, not a private heuristic.
-    identity = _read("features/hub/lib/model-identity.ts")
-    assert "export function publicModelId(" in identity
-    assert "models--" in identity and "snapshots" in identity
-    # Only a namespaced repo id names one model, so a bare stem must never stand in for it.
-    assert 'return publicId.includes("/") && modelIdsMatch(active, publicId);' in identity
-    backend = _read_backend("core/inference/model_ids.py")
-    assert "def public_model_id(" in backend, "the rule this mirrors"
-
-
-def test_the_hub_hydrates_the_live_settings_before_it_offers_them():
-    """The Hub builds activeModelConfig out of the chat runtime store, and landing straight
-    on /hub is the one entry point where nothing has applied /api/inference/status yet:
-    useChatModelRuntime has no mount sync and the chat page is a different route."""
-    hub = " ".join(_read("features/hub/hub-page.tsx").split())
-    assert "adoptResidentModelStatus(" in hub
-    assert "applyActiveModelStatusToStore(status, {" in hub
-    assert "previousCheckpoint: previous.checkpoint ?? undefined," in hub
-    assert "previousGgufVariant: previous.ggufVariant," in hub
-    assert "modelLoading: store.modelLoading," in hub
-
-    adopt = " ".join(_read("features/hub/lib/adopt-inference-status.ts").split())
-    # Unconditional: a persisted checkpoint rehydrates without the fields saying how it launched.
-    assert "actions.applyStatus(previous); return true;" in adopt
-    # Never fight the owning load, nor describe an external model with the resident's settings.
-    assert "if (state.checkpointIsExternal) { return false; }" in adopt
-    assert "if (state.modelLoading) { return false; }" in adopt
-
-    # Same call the chat runtime's own refresh makes, which is the rule this mirrors.
-    runtime = " ".join(_read("features/chat/hooks/use-chat-model-runtime.ts").split())
-    assert "applyActiveModelStatusToStore(statusRes, {" in runtime
-
-
-def test_the_hub_settings_editor_reseeds_when_the_live_config_lands():
-    """ModelConfigPage reads loadedConfig in a useState initializer, so it seeds once per
-    mounted instance."""
-    view = " ".join(_read("features/hub/catalog/hub-model-settings-view.tsx").split())
-    assert "key={modelConfigInstanceKey( target.id, target.ggufVariant, loadedConfig, )}" in view
-    # Same key the sidebar entry uses; that parity is the point.
-    sidebar = " ".join(_read("features/model-picker/components/sidebar-model-config.tsx").split())
-    assert "key={modelConfigInstanceKey(modelId, settingsGgufVariant, loadedConfig)}" in sidebar
-
-    signature = " ".join(_read("features/model-picker/model-config/config-signature.ts").split())
-    # "No live config yet" needs its own value: that transition is the one that must remount.
-    assert 'if (!config) { return "none"; }' in signature
-    for field in (
-        "config.customContextLength",
-        "config.maxSeqLength",
-        "config.kvCacheDtype",
-        "config.speculativeType",
-        "config.specDraftNMax",
-        "config.tensorParallel",
-        "config.chatTemplateOverride",
-    ):
-        assert field in signature, field
-
-    page = " ".join(_read("features/model-picker/components/model-config-page.tsx").split())
-    assert "const [initial] = useState(resolveInitial);" in page, "the rule this mirrors"
-
-
-def test_a_standalone_gguf_has_one_settings_key():
-    """The inventory labels a single scanned .gguf from its filename, so the Hub row menu
-    keyed its settings to `<path>:Q4_K_M` while the Chat picker, the detail card and the
-    backfill all use the bare path: two surfaces, two configs."""
-    hub = " ".join(_read("features/hub/hub-page.tsx").split())
-    assert "let ggufVariant = settingsGgufVariantForRow(row);" in hub
-    assert "row.formatVariant" not in hub, "the row's raw label is not a settings key"
-
-    helper = " ".join(_read("features/hub/inventory/settings-identity.ts").split())
-    assert 'row.kind === "local" && row.path.toLowerCase().endsWith(".gguf")' in helper
-
-    common = _read_backend("hub/services/models/common.py")
-    # The rule this mirrors: a variant is derived only for a single scanned file.
-    assert "extract_quant_label(gguf_files[0].name)" in common
-    assert "if scan_path.is_file() and len(gguf_files) == 1" in common
-
-
-def test_a_standalone_gguf_is_resident_despite_its_derived_quant():
-    """A loose .gguf keys its settings by the bare path with no variant, but the loader
-    derives one from the filename (llama_cpp sets _hf_variant from _extract_quant_label)
-    and /status reports it, so an equality between the two could never hold and the
-    settings page withheld the live launch config from the very file that was loaded."""
-    hub = " ".join(_read("features/hub/hub-page.tsx").split())
-    assert "const settingsTargetIsStandaloneFile =" in hub
-    assert 'settingsTarget.id.toLowerCase().endsWith(".gguf")' in hub
-    assert (
-        "(settingsTargetIsStandaloneFile || ggufVariantsMatch(activeGgufVariant, settingsTarget.ggufVariant))"
-        in hub
-    )
-    backend = _read_backend("core/inference/llama_cpp.py")
-    assert (
-        "self._hf_variant = _extract_quant_label(gguf_path)" in backend
-    ), "the derived label this accounts for"
-
-
-def test_a_standalone_gguf_has_one_settings_identity_everywhere():
-    """A loose .gguf has no quant to choose between, but llama_cpp falls back to
-    _extract_quant_label(gguf_path) when a load names no variant, and /status echoes
-    that as gguf_variant."""
-    sidebar = " ".join(_read("features/model-picker/components/sidebar-model-config.tsx").split())
-    # Nulled for the settings identity, and used for every field that keys it.
-    assert (
-        "const settingsGgufVariant = isStandaloneGgufPath(modelId) ? null : ggufVariant;" in sidebar
-    )
-    assert "ggufVariant: settingsGgufVariant," in sidebar
-    assert "ggufVariant: settingsGgufVariant ?? undefined," in sidebar
-    # The label still shows the quant; only the identity drops it.
-    assert "displayName: ggufVariant ? `${leaf} · ${ggufVariant}` : leaf," in sidebar
-
-    # One rule, one definition: the Hub row applies the same test.
-    identity = _read("features/hub/lib/model-identity.ts")
-    assert "export function isStandaloneGgufPath(" in identity
-    # The suffix, and something that names a file on this machine: see
-    # test_a_repo_id_ending_in_gguf_keeps_its_quant for why the suffix is not enough.
-    assert "GGUF_SUFFIX_RE.test(modelId)" in identity
-    row_identity = _read("features/hub/inventory/settings-identity.ts")
-    assert 'row.path.toLowerCase().endsWith(".gguf")' in row_identity
-
-    # The precedence that makes the bare path the one that wins.
-    route = _read_backend("routes/inference.py")
-    assert 'f"{target_id}:{file_variant}" if file_variant else None,' in route
-    bare = route.index("\n                            target_id,\n")
-    labelled = route.index('f"{target_id}:{file_variant}"')
-    assert bare < labelled, "the bare path must be read before the filename label"
-
-
-def test_monitor_unload_clears_only_the_model_it_freed():
-    """Unload targets the resident local model from /status, but the store may hold either
-    spelling: status reports the concrete load path while the store can hold the
-    advertised repo id.
-
-    The read/unload/recheck sequence itself is pinned behaviourally by
-    studio/frontend/tests/api-monitor-unload-resident.test.ts; this only holds the page to
-    delegating it, since a single-pass unload reports success over a model an API
-    auto-switch loaded under the click."""
-    page = " ".join(_read("features/api-monitor/api-monitor-page.tsx").split())
-    assert (
-        "aliases: [checkpoint, status.active_model].filter( (alias): alias is string "
-        "=> alias != null, )," in page
-    )
-    assert "!isExternalModelId(selected)" in page
-    assert "unloadedAliases.some((alias) => modelIdsMatch(selected, alias))" in page
-    assert "store.clearCheckpoint();" in page
-
-
-def test_settings_open_reads_status_before_resolving_the_quant():
-    """A cache row carries no quant, so opening its settings resolves one from the store's
-    active variant."""
-    page = " ".join(_read("features/hub/hub-page.tsx").split())
-    assert "const refreshResidentModelStatus = useCallback((): Promise<void> => {" in page
-    assert (
-        "await refreshResidentModelStatus(); if (settingsOpenSeq.current !== openSeq) return;"
-        in page
-    )
-    # Three: both handlers read on entry, and openModelSettings reads again after the
-    # variant lookup, whose network round trip is its own window for a switch to land.
-    assert page.count("await refreshResidentModelStatus();") == 3
-
-
-def test_a_local_quant_folder_resolves_its_variants_by_path():
-    """A local row carries a repo id only inside the HF cache, so a plain folder of
-    quants has none while still being marked as needing one, and the row menu's
-    Settings could then only reach the error toast."""
-    hub = " ".join(_read("features/hub/hub-page.tsx").split())
-    assert (
-        'const repoId = row.kind === "cache" ? row.repoId : (row.repoId ?? row.path ?? null);'
-        in hub
-    )
-    # The on-device card already lists by path, so both surfaces choose from one set of quants.
-    card = " ".join(_read("features/hub/catalog/local-on-device-card.tsx").split())
-    assert "repoId: modelId, hfToken, preferLocalCache: true, localPath: localGgufPath," in card
-    # The backend scans a path in the repo_id position before the validation that would 400.
-    variants = _read_backend("hub/services/models/gguf_variants.py")
-    scan = variants.split("if is_local_path(repo_id):", 1)
-    assert len(scan) == 2, "the local-path branch this leans on"
-    assert "_is_valid_repo_id(repo_id)" in scan[1], "the branch has to come first"
-
-
-def test_no_settings_target_is_built_on_an_unread_store():
-    """Every path out of both handlers seeds the editor from the store, and Apply
-    reloads with what it seeded, so a target built before the status read lands can
-    persist and launch the settings of the model an API switch displaced."""
-    page = " ".join(_read("features/hub/hub-page.tsx").split())
-    # Both handlers read first and drop the open if a newer one started meanwhile, and
-    # the variant lookup's await gets the same treatment. Every read carries the guard.
-    assert page.count("await refreshResidentModelStatus();") == 3
-    assert (
-        page.count(
-            "await refreshResidentModelStatus(); if (settingsOpenSeq.current !== openSeq) return;"
-        )
-        == 3
-    )
-    # Nothing may build a target off a concurrent read instead of an awaited one.
-    assert "Promise.all([ listGgufVariants(" not in page
-
-
-def test_an_empty_status_is_read_against_the_idle_unload_setting():
-    """/status cannot say whether an empty answer is an idle eviction that reloads
-    or a real unload, so the Hub reads the only endpoint that knows and keeps the
-    checkpoint only while the loop is armed."""
-    hub = " ".join(_read("features/hub/hub-page.tsx").split())
-    adopt = " ".join(_read("features/hub/lib/adopt-inference-status.ts").split())
-    # Awaited, not raced: the first status read is the one most likely to land on an evicted
-    # model, and an unresolved default of false would clear a checkpoint that is coming back.
-    assert (
-        "Promise.all([getInferenceStatus(), readIdleUnloadArmed()]) "
-        ".then(([status, idleUnloadArmed]) => {" in hub
-    )
-    assert "idleUnloadArmed," in hub
-    # Read with every status read, not cached for the life of the page: the idle timeout
-    # is editable from Settings while this page stays mounted.
-    assert "idleUnloadRead.current ??=" not in hub
-    assert "idleUnloadArmed.current = settings.idleUnloadActive;" in hub
-    # A failed read keeps the last answer. The default is disarmed, which is the side
-    # that clears the checkpoint, so falling back to it would drop a live selection.
-    assert ".catch(() => idleUnloadArmed.current)" in hub
-    assert "if (state.idleUnloadArmed) { return false; }" in adopt
-    assert "actions.clearCheckpoint?.();" in adopt
-
-
-def test_a_repo_id_ending_in_gguf_keeps_its_quant():
-    """Repo ids ending in .gguf are real on the Hub, an iMat repo among them, and
-    those hold every quant. A suffix-only test reads one as a single file, drops
-    the variant, and saves Q4 and Q8 under one key."""
-    identity = " ".join(_read("features/hub/lib/model-identity.ts").split())
-    assert "if (modelId == null || !GGUF_SUFFIX_RE.test(modelId)) { return false; }" in identity
-    assert "PUBLIC_ID_PATH_PREFIX_RE.test(modelId) ||" in identity
-    assert 'modelId.split("/").length - 1 >= 2 ||' in identity
-    assert "isNativeFileLabel(modelId)" in identity
-
-
-def test_cached_repo_settings_key_follows_the_row_not_the_view():
-    """A repo in an inactive HF cache loads by snapshot path while its settings are keyed
-    by repo id."""
-    page = " ".join(_read("features/hub/hub-page.tsx").split())
-    assert 'if (kind !== "cache" && resource.source !== "hub_cache") {' in page
-
-
-def test_detail_settings_defers_a_derived_quant_to_a_fresh_status_read():
-    """The on-device card resolves the quant it shows from the store's active variant, and
-    nothing re-reads status while the window keeps focus, so an API-driven switch leaves
-    that quant naming the model it displaced."""
-    page = " ".join(_read("features/hub/hub-page.tsx").split())
-    card = " ".join(_read("features/hub/catalog/local-on-device-card.tsx").split())
-    assert "if (!quantIsUserPicked) { const settled = useChatRuntimeStore.getState();" in page
-    assert "variant = settled.activeGgufVariant;" in page
-    assert "onOpenSettings(selectedQuant ?? null, quantIsUserPicked)" in card
-
-
-def test_only_a_physical_gpu_pin_is_mirrored_to_the_server():
-    """The same integers are Vulkan ordinals under Vulkan and device indices elsewhere,
-    and the server override carries no namespace, so a backend change would pin the model
-    to a different device with ids that validate."""
-    mirror = " ".join(_read("features/model-picker/api/model-overrides.ts").split())
-    assert 'const gpuIndexKind = config.selectedGpuIndexKind ?? "physical";' in mirror
-    assert 'gpuIndexKind === "physical"' in mirror
-
-
-def test_a_cached_repo_keeps_the_settings_saved_under_its_old_key():
-    """A cached repo was keyed by the snapshot path it loads from and is now keyed by its
-    repo id; the server backfill only mirrors what is stored, so nothing else moves it."""
-    config = " ".join(_read("features/model-picker/model-config/per-model-config.ts").split())
-    assert "export function adoptLegacyConfigKey(" in config
-    # The key is renamed in one write. Saving the second copy first puts a full map one entry
-    # over budget, and savePerModelConfig then evicts the oldest unrelated model silently, with
-    # no eviction list handed back here, so that model's server override outlives its settings.
-    assert "savePerModelConfig(modelId, ggufVariant, legacy)" not in config
-    assert (
-        "const alreadySaved = findConfigKeyForModelVariant(map, modelId, ggufVariant) "
-        "!== null;" in config
-    )
-    # A newer save under the current key wins, and the stale record still goes.
-    assert "if (!(alreadySaved || isDefaultConfig(legacy)))" in config
-    assert "map[key] = toStoredConfig(legacy);" in config
-    assert (
-        "delete map[legacyKey]; deleteConfigEntriesForModelVariant(map, legacyModelId, "
-        "ggufVariant);" in config
-    )
-    # Both entry points move it before anything reads the new key.
-    page = " ".join(_read("features/hub/hub-page.tsx").split())
-    assert page.count("adoptLegacyConfigKey(") == 2
-
-
-def test_clearing_the_log_keeps_a_request_that_is_still_running():
-    """Dropping an own row mid-flight loses the request outright: active_count falls to
-    zero and the finish or fail that follows has no entry left to land on."""
-    monitor = " ".join(_read_backend("core/inference/api_monitor.py").split())
-    assert 'if entry.shared or entry.subject != subject or entry.status == "running"' in monitor
+    assert src.count("unslothTransportFailure: true") == 2, "one tag per message, in one helper"
+    tagger = src.split("function asTransportFailure", 1)[1].split("\n}\n", 1)[0]
+    assert "err instanceof TypeError" in tagger
+    assert "navigator.onLine === false" in tagger
+    retry = src.split("async function retryWithCurrentToken", 1)[1]
+    retry = retry.split("\n}\n", 1)[0]
+    assert "fetchWithTauriNetworkRetry" in retry
+    assert "throw asTransportFailure(err);" in retry
+    first = src.split("export async function authFetch", 1)[1]
+    assert "throw asTransportFailure(err);" in first
+
+
+def test_external_readoption_drops_a_pin_taken_for_another_model():
+    """Status polling skips its own pin clearing while an external provider is selected, so the
+    re-adoption branch can adopt a resident the pin was never taken for and Apply would reload the
+    old model. The branch has to clear it itself."""
+    src = _read("features/chat/hooks/use-chat-model-runtime.ts")
+    branch = src.split("if (!forceReload && isExternalModelId(selectedCheckpoint))", 1)[1]
+    branch = branch.split("const stopDecision = await confirmStopRunningChatsIfNeeded", 1)[0]
+    assert "activeLoadId !== modelId" in branch
+    assert "setState({ activeLoadId: null })" in branch
+    # Clearing must land before the checkpoint moves, so nothing reads the pair half updated.
+    assert branch.index("activeLoadId: null") < branch.index(
+        ".setCheckpoint(modelId, residentStatus.gguf_variant)"
+    ), "the pin must be cleared before the checkpoint is adopted"
