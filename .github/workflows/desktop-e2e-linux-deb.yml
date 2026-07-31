@@ -592,9 +592,17 @@ jobs:
             for i in $(seq 1 8); do
               port=$((base + i))
               rc=0
+              # stderr to a FILE, stdout to the dead pipe. Merging them with 2>&1 was a
+              # mistake: it put the diagnosis on the stream under test, so once the
+              # shield started discarding writes there was no way left to see WHY a
+              # trial failed. stdout is the condition; stderr is the witness.
+              err="logs/deadpipe-$label-$i.err"
               timeout 25 "$BIN_REAL" studio --api-only -H 127.0.0.1 -p "$port" \
-                2>&1 | head -0 > /dev/null || rc=$?
+                2> "$err" | head -0 > /dev/null || rc=$?
               rc=${PIPESTATUS[0]:-$rc}
+              if [ "$rc" = "1" ] && [ -s "$err" ]; then
+                echo "  --- $label attempt $i said: ---"; head -15 "$err"
+              fi
               case "$rc" in
                 124) started=$((started + 1)) ;;
                 1)   ones=$((ones + 1)) ;;

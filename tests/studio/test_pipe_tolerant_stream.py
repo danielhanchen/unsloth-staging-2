@@ -17,7 +17,9 @@ import textwrap
 
 import pytest
 
-from unsloth_cli import _PipeTolerantStream
+# From the module, not the package: unsloth_cli only binds this name under
+# `if _is_entry_point`, so a library import (pytest) never sees it there.
+from unsloth_cli._pipe_guard import _PipeTolerantStream
 
 
 class _Exploding:
@@ -114,9 +116,8 @@ def test_end_to_end_a_readerless_pipe_no_longer_kills_the_process():
     program = textwrap.dedent(
         """
         import os, sys
-        sys.argv[0] = "unsloth"          # the guard is entry-point behaviour
-        import unsloth_cli
-        assert isinstance(sys.stdout, unsloth_cli._PipeTolerantStream), "guard not installed"
+        from unsloth_cli._pipe_guard import install
+        install()
         for _ in range(200):
             print("x" * 512)
             sys.stdout.flush()
