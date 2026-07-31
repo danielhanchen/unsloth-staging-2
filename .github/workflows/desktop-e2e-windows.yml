@@ -291,330 +291,89 @@ jobs:
             exit 1
           }
 
-      - name: Launch the app with the WebView2 debug port open
+      - name: Launch the app and drive it, in ONE step
+        # These were three steps, and that alone invented D10. On Windows the Actions
+        # runner tears down a step's processes at the step boundary, so an app started by
+        # `Start-Process` in its own step was killed the instant that step returned -- its
+        # log stops dead at the 20s mark -- and its KILL_ON_JOB_CLOSE job object took the
+        # backend with it, silently and with no crash event. That produced exactly the
+        # "backend never becomes reachable" signature that seven spawn hypotheses failed
+        # to explain, because the backend was collateral damage rather than the cause.
+        # Linux and macOS never showed it: they launch with `nohup ... &`, which detaches.
+        #
+        # Win32_Process.Create survives the boundary but lands the app in session 0, which
+        # has no interactive desktop, so WebView2 never opens its CDP endpoint. Keeping
+        # the app inside a single step is simpler than either and keeps the interactive
+        # session the packaged renderer needs.
         shell: pwsh
         run: |
-          # WebView2 reads this env var and opens a CDP endpoint, which is the only way
-          # to drive the REAL packaged renderer (rather than a Chromium pointed at the
-          # same backend). Documented under the WebView2 win32 reference.
-          # Start-Process was WRONG here, and it invented D10 wholesale. On Windows the
-          # Actions runner tears down a step's spawned processes at the step boundary, so
-          # the app was killed the moment this step returned -- its log stops dead at the
-          # 20s mark. Its KILL_ON_JOB_CLOSE job object then took the backend with it,
-          # silently and with no crash event, which is exactly the "backend never becomes
-          # reachable" that seven spawn hypotheses failed to explain. Linux and macOS
-          # never showed it because they launch with `nohup ... &`, which detaches.
-          #
-          # Win32_Process.Create has the WMI service create the process, so it is not a
-          # child of this step and outlives it. WMI-created processes inherit the MACHINE
-          # environment rather than ours, hence setting the WebView2 var there, and get no
-          # inherited stdio, hence the .cmd wrapper doing the redirection.
-          [Environment]::SetEnvironmentVariable(
-            'WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', '--remote-debugging-port=9222', 'Machine')
-          $here = (Get-Location).Path
-          $launcher = Join-Path $here 'launch-app.cmd'
-          @"
-          @echo off
-          set WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS=--remote-debugging-port=9222
-          "$env:APP_EXE" > "$here\logs\app-stdout.log" 2> "$here\logs\app-stderr.log"
-          "@ -replace '(?m)^          ', '' | Set-Content -Path $launcher -Encoding ascii
-          Get-Content $launcher | Write-Host
-
-          $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create `
-                   -Arguments @{ CommandLine = "cmd.exe /c `"$launcher`""; CurrentDirectory = $here }
-          if ($res.ReturnValue -ne 0) {
-            Write-Host "::error::Win32_Process.Create failed with $($res.ReturnValue)"
-            exit 1
-          }
+          # WebView2 reads this and opens a CDP endpoint, the only way to drive the REAL
+          # packaged renderer rather than a Chromium pointed at the same backend.
+          $env:WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS = '--remote-debugging-port=9222'
+          $p = Start-Process -FilePath $env:APP_EXE -PassThru `
+                 -RedirectStandardOutput logs/app-stdout.log `
+                 -RedirectStandardError logs/app-stderr.log
+          "APP_PID=$($p.Id)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           Start-Sleep -Seconds 20
-
-          # The app is a grandchild of the WMI service now, so find it by image name.
-          $app = Get-Process -Name 'unsloth-studio' -ErrorAction SilentlyContinue |
-                   Sort-Object StartTime -Descending | Select-Object -First 1
-          if (-not $app) {
-            Write-Host '::error::the app is not running 20s after launch'
+          if ($p.HasExited) {
+            Write-Host "::error::the app exited during startup with rc=$($p.ExitCode)"
             Get-Content logs/app-stdout.log, logs/app-stderr.log -Tail 40 -ErrorAction SilentlyContinue
             exit 1
           }
-          "APP_PID=$($app.Id)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "app launched (pid $($app.Id)) via WMI, detached from this step"
+          Write-Host "app launched (pid $($p.Id))"
 
-      - name: Is the app still alive before we blame its backend?
-        # The check that would have caught D10 on day one. If the app is dead here, its
-        # KILL_ON_JOB_CLOSE job object has already taken the backend with it, and every
-        # "the backend never came up" result below is about a process that was killed as
-        # collateral damage rather than anything the backend did.
+          $py = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          $rc = 0
+
+          & $py tests/studio/desktop_drive.py `
+              --scenarios $env:SCENARIOS `
+              --discover-timeout 420 `
+              --out artifacts/drive-report.json 2>&1 | Tee-Object logs/drive.log
+          if ($LASTEXITCODE -ne 0) { $rc = $LASTEXITCODE }
+
+          # Same step, so the app is guaranteed still up for the renderer walk.
+          if (-not $p.HasExited) {
+            & $py -m pip install --quiet 'playwright>=1.45'
+            & $py -m playwright install chromium
+            & $py tests/studio/desktop_playwright.py `
+                --layer both `
+                --out artifacts/ui `
+                --report artifacts/ui-report.json 2>&1 | Tee-Object logs/ui.log
+            if ($LASTEXITCODE -ne 0) { $rc = $LASTEXITCODE }
+          } else {
+            Write-Host '::error::the app died during driving; the renderer walk cannot run'
+            $rc = 1
+          }
+          exit $rc
+
+      - name: If the backend really is unreachable, prove the app is not the reason
+        # D10 turned out to be this workflow killing the app at a step boundary, not a
+        # backend defect, so the three bisection probes that lived here (stdout plumbing,
+        # creation flags, GUI parent/stdin, injected env, job object -- all of which came
+        # up clean) are retired. What is worth keeping is the one check that would have
+        # caught it: if driving failed, say whether the APP was still alive, because a
+        # dead app kills its backend by design via KILL_ON_JOB_CLOSE.
+        if: failure()
         shell: pwsh
         run: |
           $app = Get-Process -Id $env:APP_PID -ErrorAction SilentlyContinue
-          if (-not $app) {
-            Write-Host "::error::the app (pid $env:APP_PID) died before driving started."
-            Write-Host '::error::Do NOT read the backend results below as a backend defect:'
-            Write-Host '::error::the job object kills the backend when the app goes.'
-            Get-Content logs/app-stderr.log -Tail 40 -ErrorAction SilentlyContinue
-            exit 1
-          }
-          Write-Host "app alive: pid $($app.Id), $([math]::Round($app.WorkingSet64/1MB))MB"
-
-      - name: Drive the running app
-        shell: pwsh
-        run: |
-          # The stripped machine has no python on PATH by design, so use the venv the
-          # bundled installer just built -- which is also a check that it is usable.
-          $py = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
-          $env:UNSLOTH_DRIVE_APP_BINARY = $env:APP_EXE
-          & $py tests/studio/desktop_drive.py `
-              --scenarios $env:SCENARIOS `
-              --discover-timeout 900 `
-              --out artifacts/drive-report.json 2>&1 | Tee-Object logs/drive.log
-          exit $LASTEXITCODE
-
-      - name: Drive the packaged WebView2 renderer
-        if: always()
-        shell: pwsh
-        run: |
-          $py = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
-          & $py -m pip install --quiet 'playwright>=1.45'
-          # The native layer attaches to the ALREADY-RUNNING WebView2 over CDP, so it
-          # needs no browser download; the attached layer does.
-          & $py -m playwright install chromium
-          & $py tests/studio/desktop_playwright.py `
-              --layer both `
-              --out artifacts/ui `
-              --report artifacts/ui-report.json 2>&1 | Tee-Object logs/ui.log
-          exit $LASTEXITCODE
-
-      - name: D10 -- stack-dump the hung backend (the decisive one)
-        # Seven hypotheses about HOW the app spawns the backend have now been tested and
-        # refuted: the stdout pipe, the creation flags, cold-start cost, a console-less
-        # GUI parent, inherited stdin, the injected Tauri owner env, and the job object.
-        # Every one of them starts the backend fine. So stop guessing from outside and
-        # ask the hung process directly what it is doing.
-        #
-        # No app rebuild needed: the backend writes its own PID into its session log
-        # FILENAME (server-<ts>-pid<PID>.log), and the app records that exact path in
-        # tauri.log. py-spy attaches to a running CPython process and prints the Python
-        # stack, so it names the frame the import is stuck in.
-        #
-        # MUST run before the other D10 probes: those spawn extra backends that write
-        # newer session logs and would poison the PID we pick.
-        if: failure()
-        shell: pwsh
-        run: |
-          $studio = Join-Path $env:USERPROFILE '.unsloth\studio'
-          $py     = Join-Path $studio 'unsloth_studio\Scripts\python.exe'
-
-          # Prefer the path the app itself recorded; fall back to the newest session log.
-          $target = $null
-          $tauriLog = Join-Path $studio 'tauri.log'
-          if (Test-Path $tauriLog) {
-            $m = Select-String -Path $tauriLog -Pattern 'Session log: (.+server-.+-pid(\d+)\.log)' |
-                   Select-Object -Last 1
-            if ($m) { $target = $m.Matches[0].Groups[2].Value }
-          }
-          if (-not $target) {
-            $newest = Get-ChildItem (Join-Path $studio 'logs\server') -Filter 'server-*-pid*.log' `
-                        -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending |
-                      Select-Object -First 1
-            if ($newest -and $newest.Name -match 'pid(\d+)\.log$') { $target = $matches[1] }
-          }
-          if (-not $target) { Write-Host '::warning::could not determine the backend PID'; exit 0 }
-
-          Write-Host "backend PID from its own session log: $target"
-          $proc = Get-Process -Id $target -ErrorAction SilentlyContinue
-          if (-not $proc) {
-            Write-Host "::warning::PID $target is NOT alive -- the backend DIED rather than hung."
-            Write-Host '::warning::Every spawn hypothesis assumed a hang, which is why none reproduced.'
-
-            # The app says "process is still running" while THIS pid is gone, so it is
-            # watching a different process: unsloth.exe is a wrapper that subprocess-spawns
-            # the real server and sits in wait(). Show the tree to prove it.
-            Write-Host ''
-            Write-Host '=== process tree: who does the app actually hold? ==='
-            Get-CimInstance Win32_Process |
-              Where-Object { $_.Name -match 'unsloth|python' } |
-              Select-Object ProcessId, ParentProcessId, Name,
-                            @{n='Cmd';e={$_.CommandLine -replace '^(.{140}).*','$1...'}} |
-              Format-Table -AutoSize | Out-String -Width 260 | Write-Host
-            Write-Host "app PID is $env:APP_PID"
-
-            Write-Host '=== why did it die? Windows Error Reporting / crash events ==='
-            $since = (Get-Date).AddMinutes(-90)
-            foreach ($logName in 'Application', 'System') {
-              Get-WinEvent -FilterHashtable @{LogName=$logName; StartTime=$since} -ErrorAction SilentlyContinue |
-                Where-Object {
-                  $_.Message -match 'unsloth|python|llama|torch' -or
-                  $_.ProviderName -match 'Application Error|Windows Error Reporting|\.NET Runtime'
-                } |
-                Select-Object -First 12 TimeCreated, ProviderName, Id,
-                              @{n='Msg';e={($_.Message -replace '\s+',' ') -replace '^(.{400}).*','$1...'}} |
-                Format-List | Out-String -Width 260 | Write-Host
-            }
-
-            Write-Host '=== the diagnostics phase log (it records the exit) ==='
-            Get-ChildItem (Join-Path $studio 'logs') -Filter 'backend-*.log' -ErrorAction SilentlyContinue |
-              Sort-Object LastWriteTime -Descending | Select-Object -First 2 | ForEach-Object {
-                Write-Host "--- $($_.Name) ---"; Get-Content $_.FullName -Tail 40
-              }
-
-            Write-Host '=== does it die the same way when run by hand? ==='
-            $uns = Join-Path $studio 'unsloth_studio\Scripts\unsloth.exe'
-            $p2 = Start-Process -FilePath $uns -PassThru -NoNewWindow `
-                    -ArgumentList 'studio','--api-only','-H','127.0.0.1','-p','8961' `
-                    -RedirectStandardOutput logs/deathprobe.log -RedirectStandardError logs/deathprobe.err.log
-            for ($i = 0; $i -lt 60; $i++) {
-              if ($p2.HasExited) { break }
-              try { Invoke-RestMethod -TimeoutSec 3 http://127.0.0.1:8961/api/health | Out-Null; break } catch {}
-              Start-Sleep -Seconds 5
-            }
-            if ($p2.HasExited) {
-              Write-Host "::warning::by hand it ALSO exited, code $($p2.ExitCode) -- reproducible outside the app"
-            } else {
-              Write-Host '::warning::by hand it stayed up, so the death needs the app context'
-              Stop-Process -Id $p2.Id -Force -ErrorAction SilentlyContinue
-            }
-            Get-Content logs/deathprobe.log -Tail 25 -ErrorAction SilentlyContinue
-            Get-Content logs/deathprobe.err.log -Tail 25 -ErrorAction SilentlyContinue
-            exit 0
-          }
-          Write-Host "alive: $($proc.ProcessName), threads=$($proc.Threads.Count), WS=$([math]::Round($proc.WorkingSet64/1MB))MB, CPU=$($proc.CPU)s"
-
-          & $py -m pip install --quiet --disable-pip-version-check py-spy 2>&1 | Select-Object -Last 3
-          $pyspy = Join-Path $studio 'unsloth_studio\Scripts\py-spy.exe'
-          if (-not (Test-Path $pyspy)) { Write-Host '::warning::py-spy did not install'; exit 0 }
-
-          # Two dumps 45s apart. Identical stacks mean genuinely stuck; different stacks
-          # mean it is progressing, just impossibly slowly -- a distinction no amount of
-          # black-box probing could make.
-          foreach ($round in 1, 2) {
-            Write-Host ""
-            Write-Host "=== py-spy dump #$round (PID $target) ==="
-            & $pyspy dump --pid $target --locals 2>&1 | Tee-Object -FilePath "logs/pyspy-dump-$round.txt"
-            Write-Host "=== py-spy dump #$round with native frames ==="
-            & $pyspy dump --pid $target --native 2>&1 |
-              Tee-Object -FilePath "logs/pyspy-native-$round.txt" | Select-Object -First 60
-            if ($round -eq 1) {
-              $cpu1 = (Get-Process -Id $target).CPU
-              Start-Sleep -Seconds 45
-              $cpu2 = (Get-Process -Id $target).CPU
-              Write-Host "CPU seconds consumed over those 45s: $([math]::Round($cpu2 - $cpu1, 2))"
-              Write-Host '(near zero = blocked on something; climbing = spinning or grinding)'
-            }
-          }
-          exit 0
-
-      - name: D10 -- control arm, does the backend start at all by hand?
-        # Round 5 established that the backend is NOT slow and NOT broken: `import torch`
-        # takes 1.6s, and the app's exact command served /api/health in ~14s when run by
-        # hand. Yet spawned by the app it is still dead at 900s. The app's own log says
-        # why it might be: it reaches "loading PyTorch, Unsloth and Transformers...",
-        # and 15s later logs "Backend stdout stream ended, but process is still running".
-        # 15s is exactly when the child emits its next burst -- the probe measured
-        # "Imported FastAPI app in 13181.2ms".
-        #
-        # That is the shape of a pipe-drain deadlock: once nobody reads the pipe, the
-        # child blocks forever on the write that fills it, having bound no socket yet.
-        #
-        # So run the SAME binary with the SAME arguments three times, varying only how
-        # stdout is connected:
-        #
-        #   A  stdout -> file        (round 5's control; came up in ~14s)
-        #   B  stdout -> pipe, never read
-        #   C  stdout -> pipe, drained asynchronously
-        #
-        # If B hangs while A and C come up, D10 is a pipe-drain deadlock in the app's
-        # spawn path and the fix is "always drain the child's stdout", which C proves.
-        if: failure()
-        shell: pwsh
-        run: |
-          $py  = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
-          $uns = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
-          Write-Host '=== how long does importing torch alone take here? ==='
-          & $py -c "import time; t=time.time(); import torch; print('torch', torch.__version__, 'imported in', round(time.time()-t,1), 's')"
-
-          function Invoke-Arm {
-            param([string]$Label, [int]$Port, [string]$Mode, [int]$WaitSeconds = 240)
-            Write-Host ""
-            Write-Host "=== arm $Label : stdout -> $Mode, port $Port ==="
-            $psi = New-Object Diagnostics.ProcessStartInfo
-            $psi.FileName        = $uns
-            $psi.Arguments       = "studio --api-only -H 127.0.0.1 -p $Port"
-            $psi.UseShellExecute = $false
-            $psi.WorkingDirectory = (Get-Location).Path
-            if ($Mode -eq 'file') {
-              # cmd.exe does the redirection so the handle is a real file, not a pipe.
-              $psi.FileName  = $env:ComSpec
-              $psi.Arguments = "/c `"`"$uns`" studio --api-only -H 127.0.0.1 -p $Port > logs\arm-$Label.log 2>&1`""
-            } else {
-              $psi.RedirectStandardOutput = $true
-              $psi.RedirectStandardError  = $true
-            }
-            $sw = [Diagnostics.Stopwatch]::StartNew()
-            $p  = [Diagnostics.Process]::Start($psi)
-            $task = $null
-            if ($Mode -eq 'drained pipe') {
-              # The whole point of arm C: keep reading for the process's lifetime.
-              $task = $p.StandardOutput.ReadToEndAsync()
-              $null = $p.StandardError.ReadToEndAsync()
-            }
-            # Arm B deliberately never touches $p.StandardOutput.
-            $up = $false
-            for ($i = 0; $i -lt [int]($WaitSeconds / 5); $i++) {
-              try {
-                Invoke-RestMethod -TimeoutSec 3 "http://127.0.0.1:$Port/api/health" | Out-Null
-                $up = $true; break
-              } catch { Start-Sleep -Seconds 5 }
-            }
-            $secs = [math]::Round($sw.Elapsed.TotalSeconds, 1)
-            if ($up) { Write-Host "RESULT arm $Label ($Mode): UP after ${secs}s" }
-            else     { Write-Host "RESULT arm $Label ($Mode): NEVER CAME UP in ${secs}s" }
-            if ($task -and $task.IsCompleted) {
-              Write-Host "  (drained $($task.Result.Length) bytes of stdout)"
-            }
-            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 5
-            return $up
-          }
-
-          $a = Invoke-Arm -Label 'A' -Port 8907 -Mode 'file'
-
-          Write-Host ""
-          if ($a) {
-            Write-Host '::warning::control arm OK: the app''s exact command serves /api/health when'
-            Write-Host '::warning::run by hand, so the machine, venv, torch and backend are all fine.'
+          if ($app) {
+            Write-Host "the app is still alive (pid $($app.Id)) -- failures below are real"
           } else {
-            Write-Host '::warning::control arm FAILED: the backend does not start on this machine at'
-            Write-Host '::warning::all, which would change D10 entirely. Check arm A output below.'
+            Write-Host '::warning::the app is GONE, so any "backend unreachable" result is'
+            Write-Host '::warning::collateral damage from the job object, not a backend defect.'
+            Get-Content logs/app-stderr.log -Tail 40 -ErrorAction SilentlyContinue
           }
-          Write-Host '=== arm A output ==='
-          Get-Content logs/arm-A.log -Tail 25 -ErrorAction SilentlyContinue
-          exit 0
-
-      - name: D10 -- which part of the app's spawn hangs it?
-        # The stdout pipe is ruled out: file / undrained pipe / drained pipe all came up
-        # (14.7s / 8.8s / 8.8s), and the child writes only a few hundred bytes before
-        # binding, nowhere near enough to fill a pipe buffer anyway.
-        #
-        # The decisive evidence is that the backend's own *file* session log stops at
-        # "loading PyTorch, Unsloth and Transformers..." and never reaches "Imported
-        # FastAPI app", while the same command by hand imports in 7-11s. So the child
-        # hangs inside the import, and something about how it was launched causes it.
-        #
-        # What no arm has controlled for yet is the console. process.rs:641 spawns with
-        # CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW, and CREATE_NO_WINDOW leaves the
-        # child with no console at all -- every arm so far inherited the runner's.
-        # Bisect the flags one bit at a time.
-        if: failure()
-        shell: pwsh
-        run: |
-          $py  = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
-          $uns = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
-          & $py tests/studio/win_spawn_probe.py `
-              --exe $uns `
-              --first-port 8920 `
-              --wait 180 `
-              --log-dir logs/spawn-probe `
-              --report artifacts/spawn-probe.json
+          $studio = Join-Path $env:USERPROFILE '.unsloth\studio'
+          $log = Get-ChildItem (Join-Path $studio 'logs\server') -Filter 'server-*-pid*.log' `
+                   -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending |
+                 Select-Object -First 1
+          if ($log -and $log.Name -match 'pid(\d+)\.log$') {
+            $bpid = $matches[1]
+            $alive = Get-Process -Id $bpid -ErrorAction SilentlyContinue
+            Write-Host "backend pid $bpid alive: $([bool]$alive)"
+            Get-Content $log.FullName -Tail 30
+          }
           exit 0
 
       - name: What did the app's own log say?
