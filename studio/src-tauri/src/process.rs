@@ -1008,18 +1008,17 @@ fn read_output_stream<R: std::io::Read>(
                 .as_mut()
                 .and_then(OwnedBackendHandle::spawned_child_mut)
             {
-                match child.try_wait() {
-                    Ok(Some(status)) => {
+                match exit_status_after_stdout_closed(child) {
+                    Some(status) => {
                         info!("Backend stdout stream ended with status: {}", status);
-                        exit_record = Some((status.to_string(), intentional));
+                        exit_record = Some((status, intentional));
                         true
                     }
-                    Ok(None) => {
-                        warn!("Backend stdout stream ended, but process is still running");
-                        false
-                    }
-                    Err(e) => {
-                        warn!("Failed to query backend status after stdout closed: {}", e);
+                    None => {
+                        warn!(
+                            "Backend stdout stream ended and the process has still not \
+                             reported an exit status; leaving it marked as running"
+                        );
                         false
                     }
                 }
@@ -1050,6 +1049,43 @@ fn read_output_stream<R: std::io::Read>(
             let _ = app.emit("server-crashed", ());
         }
     }
+}
+
+/// Exit status of a child whose stdout just closed, or None if it really is still alive.
+///
+/// A single non-blocking `try_wait()` at the instant stdout EOFs is a race. The pipe
+/// closes when the process drops its handles, which is observable slightly before the
+/// process object signals, so a backend that HAS died reports `Ok(None)`.
+///
+/// Losing that race was not cosmetic. `exited` stayed false, so the owner metadata was
+/// never cleared, `proc.port` kept pointing at a dead server, and -- worst -- no
+/// `server-crashed` event was emitted. The window then sat on the startup screen
+/// indefinitely with nothing reported to the user, while the log claimed the process
+/// was still running. Observed on Windows CI: the app logged "process is still running"
+/// for a PID that was already gone.
+///
+/// So give the status a bounded window to appear. Same poll shape as
+/// `wait_for_child_exit` below. Returning None still means "genuinely alive", which
+/// matters because Studio can legitimately close its own stdout after it redirects
+/// logging to the session log -- so stdout EOF alone must not be read as death.
+fn exit_status_after_stdout_closed(child: &mut Box<dyn ChildWrapper + Send>) -> Option<String> {
+    for attempt in 0..30 {
+        match child.try_wait() {
+            Ok(Some(status)) => return Some(status.to_string()),
+            Ok(None) => {
+                // Cheap first look before paying for any sleep: a clean shutdown has
+                // already reaped by the time we get here.
+                if attempt > 0 {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+            Err(e) => {
+                warn!("Failed to query backend status after stdout closed: {}", e);
+                return None;
+            }
+        }
+    }
+    None
 }
 
 fn wait_for_child_exit(child: &mut Box<dyn ChildWrapper + Send>, label: &str) -> bool {
