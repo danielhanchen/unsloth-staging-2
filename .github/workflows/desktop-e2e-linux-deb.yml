@@ -411,11 +411,14 @@ jobs:
           [ -x "$BIN_REAL" ] || BIN_REAL="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
           echo "using: $BIN_REAL"
           ones=0; started=0
-          for i in $(seq 1 10); do
+          for i in $(seq 1 12); do
             port=$((8960 + i))
             out="logs/repro-$i.log"
-            timeout 25 "$BIN_REAL" studio --api-only -H 127.0.0.1 -p "$port" > "$out" 2>&1
-            rc=$?
+            # `|| rc=$?`, not a bare `rc=$?`: the step runs under `bash -e`, and the
+            # SUCCESS case here exits 124 (timeout had to stop a healthy server), so a
+            # bare assignment aborted the whole step on the first good attempt.
+            rc=0
+            timeout 25 "$BIN_REAL" studio --api-only -H 127.0.0.1 -p "$port" > "$out" 2>&1 || rc=$?
             bytes=$(wc -c < "$out" 2>/dev/null || echo 0)
             case "$rc" in
               124) started=$((started + 1)); verdict="started ok (timeout stopped it)" ;;
@@ -427,12 +430,12 @@ jobs:
             pkill -f "api-only -H 127.0.0.1 -p $port" 2>/dev/null || true
           done
           echo "=================================================="
-          echo "10 attempts outside the app: $started started, $ones silent exit 1"
+          echo "12 attempts outside the app: $started started, $ones silent exit 1"
           if [ "$ones" -gt 0 ]; then
             echo "So the app is NOT required to reproduce it -- this is the backend's own"
             echo "startup, and the app is only the messenger."
           else
-            echo "So it does NOT reproduce outside the app, in $started/10 attempts."
+            echo "So it does NOT reproduce outside the app, in $started/12 attempts."
             echo "Something about the app's spawn context is required."
           fi
 
