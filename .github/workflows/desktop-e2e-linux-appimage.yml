@@ -169,33 +169,38 @@ jobs:
         # `nohup ... &` so it should not happen here, but "should not" is exactly the
         # assumption that cost those seven rounds. Measure it.
         run: |
-          if kill -0 "$APP_PID" 2>/dev/null; then
-            echo "app alive: pid $APP_PID"
-            ps -o pid,ppid,stat,etime,rss,comm -p "$APP_PID" || true
+          # $APP_PID is xvfb-run, NOT the app: the launch is
+          # `nohup xvfb-run ... "$BIN" &`, so $! is the wrapper. xvfb-run stays alive as
+          # long as Xvfb does, so checking it reports "app alive" even when the app is
+          # dead -- which is how a run showed `app alive: pid 4569` whose only child was
+          # Xvfb. Watching the wrapper instead of the thing under test is exactly the
+          # mistake that made D10 take seven rounds; resolve the real process by name.
+          APP_REAL="$(pgrep -x "$(basename "$BIN")" 2>/dev/null | head -1)"
+          if [ -z "$APP_REAL" ]; then
+            APP_REAL="$(pgrep -f "$BIN" 2>/dev/null | grep -vx "$APP_PID" | head -1)"
+          fi
+          echo "wrapper pid: $APP_PID   real app pid: ${APP_REAL:-<none found>}"
+          if [ -n "$APP_REAL" ] && kill -0 "$APP_REAL" 2>/dev/null; then
+            echo "app alive: pid $APP_REAL"
+            echo "APP_REAL=$APP_REAL" >> "$GITHUB_ENV"
+            ps -o pid,ppid,stat,etime,rss,comm -p "$APP_REAL" || true
             echo "--- its children ---"
-            pgrep -P "$APP_PID" -a || echo "(none)"
+            pgrep -P "$APP_REAL" -a || echo "(none)"
             # Save the environment the backend inherits WHILE THE APP IS ALIVE. The first
             # attempt read /proc/PID/environ from an `if: failure()` step at the end of
             # the job, by which point "Stop the app" had run and the file was gone -- so
             # it printed "the app has no LD_LIBRARY_PATH" when it simply could not look.
             mkdir -p logs
-            tr '\0' '\n' < "/proc/$APP_PID/environ" > logs/app-environ.txt 2>/dev/null || true
+            tr '\0' '\n' < "/proc/$APP_REAL/environ" > logs/app-environ.txt 2>/dev/null || true
             echo "--- what its child inherits ---"
             grep -E '^(LD_LIBRARY_PATH|PYTHONHOME|PYTHONPATH|APPIMAGE|APPDIR|LD_PRELOAD)=' \
               logs/app-environ.txt | sed 's/^/  /' || echo "  (none of those are set)"
-            # Capture the environment the backend inherits HERE, while the app is
-            # guaranteed alive. The first attempt at this ran as an `if: failure()` step
-            # at the end of the job, by which point "Stop the app" had already run and
-            # /proc/PID/environ was gone -- so it reported "the app has no
-            # LD_LIBRARY_PATH" when in truth it could not look. Save it to a file the
-            # later probe can read even after the app is gone.
-            mkdir -p logs
-            tr '\0' '\n' < "/proc/$APP_PID/environ" > logs/app-environ.txt 2>/dev/null || true
-            echo "--- what the child inherits ---"
-            grep -E '^(LD_LIBRARY_PATH|PYTHONHOME|PYTHONPATH|APPIMAGE|APPDIR|LD_PRELOAD|GTK_PATH|GIO_MODULE_DIR)=' \
-              logs/app-environ.txt | sed 's/^/  /' || echo "  (none of the interesting vars are set)"
           else
-            echo "::error::the app (pid $APP_PID) is NOT running before driving started."
+            echo "::error::the APP is NOT running before driving started (wrapper $APP_PID"
+            echo "::error::is alive, but that is only xvfb-run holding Xvfb open)."
+            echo "--- what is still running ---"
+            ps -o pid,ppid,stat,etime,comm -p "$APP_PID" || true
+            pgrep -P "$APP_PID" -a || echo "(wrapper has no children)"
             echo "::error::Any backend failure below is about a process that lost its parent,"
             echo "::error::not a backend defect. Fix the launch, not the backend."
             tail -40 logs/app-stdout.log logs/app-stderr.log 2>/dev/null || true
