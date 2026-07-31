@@ -1,0 +1,83 @@
+name: "staging psmodulepath validate"
+
+# Does the PSModulePath fix actually make `unsloth studio update` work from a
+# PowerShell 7 prompt?
+#
+# Isolated from --local on purpose. Installing from the checkout makes pip
+# reinstall the unsloth package, which must replace the running unsloth.exe and
+# fails with WinError 32 on this runner, masking the thing under test. Installing
+# from PyPI and then patching the one file into the venv exercises exactly the
+# fix and nothing else.
+on:
+  push:
+    branches: ["studio-update-matrix"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: "pwsh 7 update (${{ matrix.patched }})"
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        patched: ["unpatched", "patched"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install from PyPI
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 --no-torch 2>&1 | Select-Object -Last 15
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::install.ps1 exited $LASTEXITCODE"; exit $LASTEXITCODE }
+
+      - name: Patch the installed CLI
+        if: matrix.patched == 'patched'
+        shell: pwsh
+        run: |
+          $venv = "$env:USERPROFILE\.unsloth\studio\unsloth_studio"
+          $target = Get-ChildItem "$venv\Lib\site-packages\unsloth_cli\commands\studio.py" -ErrorAction SilentlyContinue
+          if (-not $target) { Write-Host "::error::installed studio.py not found under $venv"; exit 1 }
+          Copy-Item unsloth_cli\commands\studio.py $target.FullName -Force
+          if (-not (Select-String -Path $target.FullName -Pattern 'PSModulePath' -Quiet)) {
+            Write-Host "::error::the copied file does not contain the fix"
+            exit 1
+          }
+          Write-Host "patched $($target.FullName)"
+
+      - name: unsloth studio update from pwsh 7
+        shell: pwsh
+        run: |
+          $bin = "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\unsloth.exe"
+          Write-Host "PSModulePath: $env:PSModulePath"
+          & $bin studio update 2>&1 | Tee-Object -FilePath update.log | Select-Object -Last 20
+          $rc = $LASTEXITCODE
+          Write-Host "update exit: $rc"
+          $blocked = Select-String -Path update.log -Pattern 'Microsoft.PowerShell.Security' -Quiet
+          Write-Host "hit the Security module error: $blocked"
+          # Report both facts, then assert only the one under test. The unpatched
+          # leg is expected to hit it; the patched leg must not.
+          if ('${{ matrix.patched }}' -eq 'patched' -and $blocked) {
+            Write-Host "::error::the fix did not prevent the Microsoft.PowerShell.Security failure"
+            exit 1
+          }
+          if ('${{ matrix.patched }}' -eq 'patched' -and $rc -ne 0) {
+            Write-Host "::error::patched update still exited $rc"
+            exit 1
+          }
+          Write-Host "leg '${{ matrix.patched }}': blocked=$blocked rc=$rc"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: psmodulepath-${{ matrix.patched }}
+          path: update.log
+          retention-days: 5
