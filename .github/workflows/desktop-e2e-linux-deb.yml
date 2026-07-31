@@ -29,6 +29,7 @@ on:
       - 'tests/studio/desktop_drive.py'
       - 'tests/studio/xwd_not_blank.py'
       - 'tests/studio/desktop_playwright.py'
+      - 'tests/studio/spawn_with_ignored_rt_signals.py'
       - '.github/workflows/desktop-e2e-linux-deb.yml'
   pull_request:
     branches: [main]
@@ -438,6 +439,53 @@ jobs:
             echo "So it does NOT reproduce outside the app, in $started/12 attempts."
             echo "Something about the app's spawn context is required."
           fi
+
+      - name: Is the inherited signal state what makes 22.04 different?
+        if: always()
+        # The one measured difference between the two OS versions, after env, rlimits and
+        # fds all came back byte-identical:
+        #
+        #     ubuntu-22.04   SigIgn: 0000000180000007
+        #     ubuntu-24.04   SigIgn: 0000000000000007
+        #
+        # 0x7 is HUP/INT/QUIT, which both have and which nohup explains. The extra bits
+        # are signals 32 and 33 -- glibc's internal NPTL signals, SIGCANCEL and SIGSETXID.
+        # Ignored dispositions survive execve, so the app hands them to its backend, and
+        # they appear in neither the environment nor the fd table.
+        #
+        # That correlates with the OS and not with the failure -- the 22.04 leg that
+        # passed carried the same mask -- so it is a precondition at best. This tests it
+        # as one. The previous step establishes the control: from a plain shell, 12 of 12
+        # attempts start fine on a machine where the app's own spawn had just failed.
+        # This step changes exactly one thing about that control.
+        #
+        # The interesting outcome is on 24.04: if putting a 24.04 backend into 22.04's
+        # signal state makes it fail, the signal state IS the OS difference.
+        run: |
+          set -a; . ./clean-machine.env; set +a
+          BIN_REAL="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.real"
+          [ -x "$BIN_REAL" ] || BIN_REAL="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
+          ones=0; started=0
+          for i in $(seq 1 12); do
+            port=$((8980 + i))
+            out="logs/sigrepro-$i.log"
+            rc=0
+            timeout 25 python3 tests/studio/spawn_with_ignored_rt_signals.py \
+              --signals 32,33 -- \
+              "$BIN_REAL" studio --api-only -H 127.0.0.1 -p "$port" > "$out" 2>&1 || rc=$?
+            bytes=$(wc -c < "$out" 2>/dev/null || echo 0)
+            case "$rc" in
+              124) started=$((started + 1)); verdict="started ok" ;;
+              1)   ones=$((ones + 1));       verdict="** silent exit 1 **" ;;
+              *)   verdict="unexpected" ;;
+            esac
+            echo "attempt $i: rc=$rc bytes=$bytes  $verdict"
+            [ "$rc" = "1" ] && { echo "--- what it wrote ---"; head -20 "$out"; }
+            pkill -f "api-only -H 127.0.0.1 -p $port" 2>/dev/null || true
+          done
+          echo "=================================================="
+          echo "12 attempts with signals 32,33 ignored: $started started, $ones exit 1"
+          echo "(control, same machine, same step order: 12/12 started without them)"
 
       - name: Where exactly is the backend stuck?
         if: always()
