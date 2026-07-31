@@ -203,6 +203,15 @@ jobs:
             ps -o pid,ppid,stat,etime,rss,comm -p "$APP_PID" || true
             echo "--- its children ---"
             pgrep -P "$APP_PID" -a || echo "(none)"
+            # Save the environment the backend inherits WHILE THE APP IS ALIVE. The first
+            # attempt read /proc/PID/environ from an `if: failure()` step at the end of
+            # the job, by which point "Stop the app" had run and the file was gone -- so
+            # it printed "the app has no LD_LIBRARY_PATH" when it simply could not look.
+            mkdir -p logs
+            tr '\0' '\n' < "/proc/$APP_PID/environ" > logs/app-environ.txt 2>/dev/null || true
+            echo "--- what its child inherits ---"
+            grep -E '^(LD_LIBRARY_PATH|PYTHONHOME|PYTHONPATH|APPIMAGE|APPDIR|LD_PRELOAD)=' \
+              logs/app-environ.txt | sed 's/^/  /' || echo "  (none of those are set)"
           else
             echo "::error::the app (pid $APP_PID) is NOT running before driving started."
             echo "::error::Any backend failure below is about a process that lost its parent,"
@@ -348,13 +357,12 @@ jobs:
         run: |
           set +e
           BIN="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
-          echo "=== the app's environment (what its child inherits) ==="
-          if kill -0 "$APP_PID" 2>/dev/null; then
-            tr '\0' '\n' < "/proc/$APP_PID/environ" 2>/dev/null |
-              grep -E '^(LD_LIBRARY_PATH|PYTHONHOME|PYTHONPATH|APPIMAGE|APPDIR|LD_PRELOAD|PATH)=' |
-              sed 's/^/  app: /'
+          echo "=== the app's environment (saved at the liveness gate) ==="
+          if [ -s logs/app-environ.txt ]; then
+            grep -E '^(LD_LIBRARY_PATH|PYTHONHOME|PYTHONPATH|APPIMAGE|APPDIR|LD_PRELOAD|PATH)=' \
+              logs/app-environ.txt | sed 's/^/  app: /'
           else
-            echo "  (app not running; cannot read its environ)"
+            echo "  (no capture; the gate could not read /proc/PID/environ)"
           fi
           echo "=== this shell's, for comparison ==="
           for v in LD_LIBRARY_PATH PYTHONHOME PYTHONPATH APPIMAGE APPDIR LD_PRELOAD; do
@@ -362,7 +370,7 @@ jobs:
           done
 
           echo "=== does the child die under the app's LD_LIBRARY_PATH? ==="
-          APPENV="$(tr '\0' '\n' < /proc/$APP_PID/environ 2>/dev/null | grep '^LD_LIBRARY_PATH=' | cut -d= -f2-)"
+          APPENV="$(grep '^LD_LIBRARY_PATH=' logs/app-environ.txt 2>/dev/null | cut -d= -f2-)"
           if [ -n "$APPENV" ]; then
             echo "  replaying with LD_LIBRARY_PATH=$APPENV"
             LD_LIBRARY_PATH="$APPENV" timeout 90 "$BIN" studio --api-only -H 127.0.0.1 -p 8971 \

@@ -174,6 +174,26 @@ jobs:
             ps -o pid,ppid,stat,etime,rss,comm -p "$APP_PID" || true
             echo "--- its children ---"
             pgrep -P "$APP_PID" -a || echo "(none)"
+            # Save the environment the backend inherits WHILE THE APP IS ALIVE. The first
+            # attempt read /proc/PID/environ from an `if: failure()` step at the end of
+            # the job, by which point "Stop the app" had run and the file was gone -- so
+            # it printed "the app has no LD_LIBRARY_PATH" when it simply could not look.
+            mkdir -p logs
+            tr '\0' '\n' < "/proc/$APP_PID/environ" > logs/app-environ.txt 2>/dev/null || true
+            echo "--- what its child inherits ---"
+            grep -E '^(LD_LIBRARY_PATH|PYTHONHOME|PYTHONPATH|APPIMAGE|APPDIR|LD_PRELOAD)=' \
+              logs/app-environ.txt | sed 's/^/  /' || echo "  (none of those are set)"
+            # Capture the environment the backend inherits HERE, while the app is
+            # guaranteed alive. The first attempt at this ran as an `if: failure()` step
+            # at the end of the job, by which point "Stop the app" had already run and
+            # /proc/PID/environ was gone -- so it reported "the app has no
+            # LD_LIBRARY_PATH" when in truth it could not look. Save it to a file the
+            # later probe can read even after the app is gone.
+            mkdir -p logs
+            tr '\0' '\n' < "/proc/$APP_PID/environ" > logs/app-environ.txt 2>/dev/null || true
+            echo "--- what the child inherits ---"
+            grep -E '^(LD_LIBRARY_PATH|PYTHONHOME|PYTHONPATH|APPIMAGE|APPDIR|LD_PRELOAD|GTK_PATH|GIO_MODULE_DIR)=' \
+              logs/app-environ.txt | sed 's/^/  /' || echo "  (none of the interesting vars are set)"
           else
             echo "::error::the app (pid $APP_PID) is NOT running before driving started."
             echo "::error::Any backend failure below is about a process that lost its parent,"
