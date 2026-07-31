@@ -26,6 +26,17 @@ if _is_entry_point:
             pass
     del _name, _stream, _to_utf8
 
+
+# A closed stdout must not be able to abort the CLI. After the encoding fix above so the
+# guard wraps the reconfigured stream, and before typer, which binds whatever sys.stdout
+# is at import time. See _pipe_guard for the measurement behind this.
+if _is_entry_point:
+    try:
+        from unsloth_cli._pipe_guard import _PipeTolerantStream, install as _install_pipe_guard
+        _install_pipe_guard()
+    except Exception:
+        pass
+
 import typer
 from importlib.metadata import version as package_version, PackageNotFoundError
 
