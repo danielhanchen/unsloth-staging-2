@@ -158,6 +158,63 @@ jobs:
           "$PY" -V
           "$PY" -c "import torch; print('torch', torch.__version__)"
 
+      - name: Wrap the backend entry point so the child cannot die silently
+        # D8: on 22.04 the app spawns the backend and then logs nothing at all -- no
+        # [backend] stdout, no [stderr], and a diagnostics session log containing only
+        # the spawn line. Zero bytes on both streams is not something a Python traceback
+        # does, so either the child never reached Python or its output died in a pipe
+        # buffer. Both are invisible from outside, hence this wrapper.
+        #
+        # It answers three things the app's own pipes cannot:
+        #   1. what the child ACTUALLY inherits. /proc/PID/environ is the exec-time
+        #      snapshot of the app's own stack -- it does not show runtime setenv(), and
+        #      process.rs:599 documents exactly such a case (AppImage injecting
+        #      LD_LIBRARY_PATH and breaking the spawned Python). So the environment has
+        #      to be read from inside the child, not inferred from the parent.
+        #   2. the output, unbuffered. Python block-buffers stdout onto a pipe, so a
+        #      process that dies before flushing loses everything it printed.
+        #   3. how it ended -- exit code, or signal, which is the difference between
+        #      "it failed" and "the kernel killed it".
+        run: |
+          BINDIR="$HOME/.unsloth/studio/unsloth_studio/bin"
+          [ -x "$BINDIR/unsloth" ] || { echo "::error::no $BINDIR/unsloth to wrap"; exit 1; }
+          mv "$BINDIR/unsloth" "$BINDIR/unsloth.real"
+          cat > "$BINDIR/unsloth" <<'WRAP'
+          #!/bin/bash
+          # Diagnostic shim (staging only) -- see "Wrap the backend entry point".
+          LOG="$HOME/unsloth-child.log"
+          {
+            echo "=============================================================="
+            echo "[$(date -u +%H:%M:%S)] pid=$$ ppid=$PPID cwd=$PWD"
+            echo "argv: $0 $*"
+            # Only the interesting slice: the vars that decide whether a venv Python
+            # can find its own libpython and stdlib.
+            echo "--- inherited env (loader / python relevant) ---"
+            env | grep -E '^(LD_LIBRARY_PATH|LD_PRELOAD|PYTHONHOME|PYTHONPATH|PYTHONEXECUTABLE|VIRTUAL_ENV|APPIMAGE|APPDIR|UNSLOTH_|GTK_PATH|GIO_MODULE_DIR)=' \
+              || echo "(none of them are set)"
+            echo "--- limits / fds ---"
+            ulimit -a 2>/dev/null | grep -iE "open files|max memory|virtual|processes" || true
+            echo "--- can the venv python even start? ---"
+            "$HOME/.unsloth/studio/unsloth_studio/bin/python" -c 'import sys,encodings; print("python ok", sys.version.split()[0])' 2>&1 \
+              || echo "!! the venv python cannot start under this environment"
+            echo "--- running the real entry point ---"
+          } >> "$LOG" 2>&1
+          # Unbuffered so nothing is lost in a pipe buffer if it dies, and faulthandler
+          # so a hard crash prints a Python traceback instead of vanishing.
+          export PYTHONUNBUFFERED=1
+          export PYTHONFAULTHANDLER=1
+          "$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.real" "$@"
+          rc=$?
+          if [ "$rc" -gt 128 ]; then
+            echo "[$(date -u +%H:%M:%S)] pid=$$ EXIT rc=$rc -> killed by signal $((rc - 128)) (11=SIGSEGV 9=SIGKILL/OOM 6=SIGABRT)" >> "$LOG"
+          else
+            echo "[$(date -u +%H:%M:%S)] pid=$$ EXIT rc=$rc" >> "$LOG"
+          fi
+          exit $rc
+          WRAP
+          chmod +x "$BINDIR/unsloth"
+          head -3 "$BINDIR/unsloth"
+
       - name: Launch the app under Xvfb and keep it up
         run: |
           set -a; . ./clean-machine.env; set +a
@@ -213,7 +270,26 @@ jobs:
             echo "app alive: pid $APP_REAL"
             echo "APP_REAL=$APP_REAL" >> "$GITHUB_ENV"
             ps -o pid,ppid,stat,etime,rss,comm -p "$APP_REAL" || true
-            echo "--- its children ---"
+            # Sample the children only AFTER the app has actually spawned the backend.
+            # The fixed 20 s sleep sampled at t+20 while the app does not reach
+            # "Starting backend" until t+32 (30 s of it stalled registering deep-link
+            # handlers), so "children: (none)" meant "too early", not "the backend died".
+            # An instrument that reports absence before the event can happen is worse
+            # than none -- it reads as evidence.
+            for _ in $(seq 60); do
+              grep -q "Starting backend" logs/app-stdout.log 2>/dev/null && break
+              sleep 1
+            done
+            if grep -q "Starting backend" logs/app-stdout.log 2>/dev/null; then
+              echo "--- the app has spawned its backend; children now ---"
+            else
+              echo "--- the app never even reached 'Starting backend' in 60 s ---"
+            fi
+            pgrep -P "$APP_REAL" -a || echo "(none)"
+            # And again a few seconds later: a child that appears and then vanishes is a
+            # different defect from one that never appears.
+            sleep 8
+            echo "--- children, 8 s later ---"
             pgrep -P "$APP_REAL" -a || echo "(none)"
             # Save the environment the backend inherits WHILE THE APP IS ALIVE. The first
             # attempt read /proc/PID/environ from an `if: failure()` step at the end of
@@ -311,6 +387,20 @@ jobs:
           ss -ltnp 2>/dev/null | head -20 || true
           echo "=== unsloth processes ==="
           ps aux | grep -i unsloth | grep -v grep | head -10 || true
+          # D8: what the child itself saw, from inside the child. This is the one log
+          # that survives the child dying before it flushes anything to the app's pipes.
+          echo "=== the backend child's own log (D8 shim) ==="
+          if [ -f "$HOME/unsloth-child.log" ]; then
+            cp "$HOME/unsloth-child.log" logs/ 2>/dev/null || true
+            cat "$HOME/unsloth-child.log"
+          else
+            echo "(the shim never ran -- the app never executed bin/unsloth at all)"
+          fi
+          echo "=== kernel ring buffer: was the child killed? ==="
+          sudo dmesg -T 2>/dev/null | tail -80 | grep -iE "segfault|killed process|oom|unsloth|python|traps" \
+            || echo "(nothing relevant in dmesg)"
+          echo "=== memory headroom ==="
+          free -m || true
 
       - name: Stop the app
         if: always()
