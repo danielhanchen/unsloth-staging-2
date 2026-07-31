@@ -361,6 +361,46 @@ def test_local_picker_rows_require_chat_capability():
     assert "row.capabilities.canChat" in memo.group(0)
 
 
+def test_a_pinned_cached_row_loads_from_the_id_the_backend_pinned():
+    """The cached listing pins a snapshot when the repo's default ref reaches no copy
+    that loads, and it is the load that has to follow the pin. The id stays the repo
+    id everywhere it is shown, deduped or stored, so only model_path changes."""
+    inventory = _read("features/model-picker/inventory/use-chat-picker-inventory.ts")
+    for mapper in ("toCachedGgufRepo", "toCachedModelRepo"):
+        body = re.search(rf"function {mapper}\(.*?\n}}", inventory, re.S)
+        assert body, f"{mapper} not found"
+        assert "load_id: row.loadId" in body.group(0), f"{mapper} drops the pinned id"
+        # Delete sends this so it removes the copy on screen, not whichever the active cache holds.
+        assert "cache_path: row.cachePath" in body.group(0), f"{mapper} drops the cache path"
+
+    meta = _read("features/model-picker/components/model-selector/types.ts")
+    assert "loadId?: string | null;" in meta
+
+    picker = _read("features/model-picker/components/model-selector/pickers.tsx")
+    assert "loadId={c.load_id}" in picker, "the quant list cannot pass on a pin it never gets"
+    # Both rows, and the settings gear beside each: Run reloads through the same meta, so a pin
+    # missing there sends the load back down the ref the row stepped around.
+    assert picker.count("loadId: c.load_id") == 2, "the safetensors row and its gear need the pin"
+    for call in ("onSelect(repoId, {", "onConfigure(repoId, {"):
+        block = re.search(re.escape(call) + r".*?\n\s*\}", picker, re.S)
+        assert block and "loadId," in block.group(0), f"{call} drops the pin"
+    # localPath alone: preferLocalCache would answer from disk and drop the undownloaded quants
+    # this repo still offers, which is the whole point of the expanded list.
+    assert (
+        "listGgufVariants(repoId, hfToken, localSource ? { localPath: localSource } : undefined)"
+        in picker
+    )
+    assert "cachePath={c.cache_path}" in picker
+
+    runtime = _read("features/chat/hooks/use-chat-model-runtime.ts")
+    assert (
+        '(typeof selection === "string" ? null : selection.loadId) || modelId' in runtime
+    ), "loadPath must fall back to the id, so an unpinned pick is unchanged"
+    # Staged metadata, validate and load: all three read the copy that loads.
+    assert runtime.count("model_path: loadPath,") == 3
+    assert "model_path: modelId," not in runtime
+
+
 def test_model_picker_toolbar_reflows_before_crossing_picker_edge():
     """The content-sized section tabs and fixed-width dropdowns must reflow,
     while an oversized tab group must shrink labels but preserve its icons."""
@@ -842,7 +882,10 @@ def test_chat_autoload_prepares_hf_token_before_gguf_metadata_preflight():
     metadata = autoload.index("fetchGgufStagedMetadata({", prepare)
     assert prepare < metadata
     assert "hf_token: preparedToken.token" in autoload
-    assert 'throw new Error("Model load cancelled.")' in autoload
+    # The throw carries the cancellation marker, so the sweep stops instead of reopening the dialog.
+    assert 'new Error("Model load cancelled.")' in autoload
+    assert "unslothUserCancelled: true" in autoload
+    assert "recordTerminalFailure(failureLabel, cancelled)" in autoload
 
 
 def test_cpu_only_llama_build_hides_gpu_picker():
@@ -1198,3 +1241,54 @@ def test_vulkan_inference_devices_are_the_pickable_set():
         'data?.device_backend === "cuda" || data?.device_backend === "rocm";' in src
     )
     assert 'diffusionPinnable: diffusionBackend && d.index_kind === "physical",' in src
+
+
+def test_chat_autoload_records_a_terminal_validation_failure():
+    """canAutoLoad runs validateModel, which prepares the token, so a dismissed dialog or a dead
+    backend throws there rather than from loadModel and the sweep's bare catches would reach the Hub
+    download. Only the two terminal markers are recorded; an ordinary failure stays per-candidate."""
+    adapter = _read("features/chat/api/chat-adapter.ts")
+    recorder = adapter.split("function recordTerminalFailure", 1)[1]
+    recorder = recorder.split("async function canAutoLoadRecordingTerminalFailures", 1)[0]
+    assert "unslothTransportFailure === true" in recorder
+    assert "unslothUserCancelled === true" in recorder
+    assert recorder.count("noteLoadFailure(label, error)") == 2
+    # A declined dialog halts the sweep, since retrying reopens it per candidate; a transport
+    # failure deliberately does not.
+    assert "autoLoadCancelled = true;" in recorder
+    assert recorder.index("autoLoadCancelled = true;") < recorder.index(
+        "unslothTransportFailure === true"
+    ), "the halt belongs to the cancellation branch, not the transport one"
+    # Rethrown by the wrapper, so the candidate still fails and control flow is unchanged.
+    wrapper = adapter.split("async function canAutoLoadRecordingTerminalFailures", 1)[1]
+    wrapper = wrapper.split("async function loadAutoLoadCandidate", 1)[0]
+    assert "recordTerminalFailure(label, error)" in wrapper
+    assert "throw error;" in wrapper
+    autoload = adapter.split("async function loadAutoLoadCandidate", 1)[1]
+    autoload = autoload.split("async function autoLoadSmallestModel", 1)[0]
+    # The preflight goes through the wrapper, the GGUF metadata probe records too, and a cancelled
+    # sweep skips every later candidate.
+    assert "canAutoLoadRecordingTerminalFailures(failureLabel, {" in autoload
+    assert "recordTerminalFailure(failureLabel, error)" in autoload
+    # The preflight's own cancellation goes through the helper too, or it records without halting.
+    assert "recordTerminalFailure(failureLabel, cancelled)" in autoload
+    assert "noteLoadFailure(failureLabel, cancelled)" not in autoload
+    assert "if (autoLoadCancelled || loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS)" in autoload
+
+
+def test_auth_retries_tag_transport_failures_like_the_first_attempt():
+    """recordTerminalFailure keys on the tag, so an untagged TypeError from a retry reads as a
+    rejection: retries reissue through retryWithCurrentToken, so it tags like the first attempt."""
+    src = (WORKDIR / "studio" / "frontend" / "src" / "features" / "auth" / "api.ts").read_text(
+        encoding = "utf-8"
+    )
+    assert src.count("unslothTransportFailure: true") == 2, "one tag per message, in one helper"
+    tagger = src.split("function asTransportFailure", 1)[1].split("\n}\n", 1)[0]
+    assert "err instanceof TypeError" in tagger
+    assert "navigator.onLine === false" in tagger
+    retry = src.split("async function retryWithCurrentToken", 1)[1]
+    retry = retry.split("\n}\n", 1)[0]
+    assert "fetchWithTauriNetworkRetry" in retry
+    assert "throw asTransportFailure(err);" in retry
+    first = src.split("export async function authFetch", 1)[1]
+    assert "throw asTransportFailure(err);" in first
