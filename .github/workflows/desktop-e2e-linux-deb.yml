@@ -27,6 +27,7 @@ on:
     branches: [desktop-e2e]
     paths:
       - 'tests/studio/desktop_drive.py'
+      - 'tests/studio/xwd_not_blank.py'
       - 'tests/studio/desktop_playwright.py'
       - '.github/workflows/desktop-e2e-linux-deb.yml'
   pull_request:

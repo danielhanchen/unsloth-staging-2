@@ -20,6 +20,7 @@ on:
     branches: [desktop-e2e]
     paths:
       - 'tests/studio/desktop_drive.py'
+      - 'tests/studio/desktop_playwright.py'
       - '.github/workflows/desktop-e2e-windows.yml'
   pull_request:
     branches: [main]

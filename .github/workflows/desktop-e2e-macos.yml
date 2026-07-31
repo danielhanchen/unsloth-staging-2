@@ -21,6 +21,7 @@ on:
     branches: [desktop-e2e]
     paths:
       - 'tests/studio/desktop_drive.py'
+      - 'tests/studio/desktop_playwright.py'
       # The D9 guard being validated lives here; without it a fix-only change would
       # never trigger the leg that tests it.
       - 'studio/backend/core/inference/llama_cpp.py'
