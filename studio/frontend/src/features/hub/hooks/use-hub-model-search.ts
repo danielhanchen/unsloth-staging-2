@@ -217,9 +217,17 @@ function makeMapModel(
     ) {
       return null;
     }
+    // A repo cross-tagged "gguf" that is actually a diffusers pipeline (e.g. an unsloth *-bnb-4bit image model) ships no .gguf
+    // files, so the variant expander would dead-end at "No GGUF variants found." Trust the bare tag only when the repo is not
+    // a diffusers pipeline; the "-GGUF" name suffix and real gguf metadata stay authoritative.
+    const isDiffusersPipeline =
+      m.library_name?.toLowerCase() === "diffusers" ||
+      Boolean(m.tags?.some((tag) => tag.toLowerCase().startsWith("diffusers:")));
     const isGguf =
-      Boolean(m.tags?.some((tag) => tag.toLowerCase() === "gguf")) ||
-      isGgufLike(m.name);
+      isGgufLike(m.name) ||
+      Boolean(m.gguf) ||
+      (Boolean(m.tags?.some((tag) => tag.toLowerCase() === "gguf")) &&
+        !isDiffusersPipeline);
     if (excludeGguf && isGguf) {
       return null;
     }

@@ -312,6 +312,21 @@ def _is_hidden_infra_repo(*values: str | None) -> bool:
     return is_hidden_model(*values)
 
 
+def _cached_row_task(repo_info, *, gguf: bool) -> Optional[str]:
+    """Pipeline task for a cached row, from the same classifiers the models API uses.
+
+    The Images/Video pickers filter On Device rows on this and the chat picker routes a diffusion
+    pick by it, so a row that arrives without one is dropped from those lists entirely. Imported
+    lazily (routes.models imports this package) and best-effort: an unreadable repo just has no
+    task, exactly as before.
+    """
+    try:
+        from routes.models import _cached_repo_task, _repo_gguf_task
+        return _repo_gguf_task(repo_info) if gguf else _cached_repo_task(repo_info)
+    except Exception:  # noqa: BLE001 -- a classification failure never hides a row
+        return None
+
+
 def _scan_cached_gguf() -> list[dict]:
     """Synchronous HF-cache disk walk for GGUF repos; runs in a worker thread."""
     cache_scans = all_hf_cache_scans()
@@ -357,6 +372,7 @@ def _scan_cached_gguf() -> list[dict]:
                     "repo_id": repo_id,
                     "size_bytes": max(total_size, variant_state_size),
                     "cache_path": str(repo_info.repo_path),
+                    "task": _cached_row_task(repo_info, gguf = True),
                     "partial": partial,
                     # GGUF row-level transport is ambiguous (variants may differ);
                     # per-variant detail lives on GgufVariantDetail.
@@ -628,15 +644,21 @@ def _scan_cached_models() -> list[dict]:
                 if local_metadata.pop("_hidden_stt", False):
                     skipped_stt += 1
                     continue
-                snapshot_partial = hf_cache_scan.is_snapshot_partial(
+                download_partial = hf_cache_scan.is_snapshot_partial(
                     "model",
                     repo_id,
                     repo_path,
                 )
+                # A companion-only prefetch (pipeline manifest + VAE / text-encoder but no transformer shards, left by a GGUF load) passes
+                # the download check yet cannot from_pretrained, so mark it partial and the pickers stop advertising it as on-device.
+                companion_only = hf_cache_scan.repo_pipeline_missing_denoiser(repo_info)
+                snapshot_partial = download_partial or companion_only
+                row_task = _cached_row_task(repo_info, gguf = False)
                 row = {
                     "repo_id": repo_id,
                     "size_bytes": payload.size_bytes,
                     "cache_path": str(repo_info.repo_path),
+                    "task": row_task,
                     "partial": snapshot_partial,
                     "partial_transport": (
                         hf_cache_scan.partial_transport_for(
@@ -644,8 +666,15 @@ def _scan_cached_models() -> list[dict]:
                             repo_id,
                             repo_cache_dir = repo_path,
                         )
-                        if snapshot_partial
+                        # Only a genuine download partial has a transport; a companion-only snapshot arrived intact and has no Resume story.
+                        if download_partial
                         else None
+                    ),
+                    # Diffusion repos with no pipeline index load only via from_single_file, so the task pickers must not offer them as
+                    # pipeline loads. Without this the picker's single_file gate sees undefined on every hub-sourced row.
+                    "single_file": bool(
+                        row_task is not None
+                        and not hf_cache_scan.repo_has_pipeline_index(repo_info)
                     ),
                     **local_metadata,
                 }

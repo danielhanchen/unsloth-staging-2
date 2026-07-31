@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { useNavigate } from "@tanstack/react-router";
 import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
@@ -42,6 +43,7 @@ import {
   type HfSortKey,
   useHubModelSearch,
 } from "@/features/hub";
+import type { HfTaskFilter } from "@/features/hub/hooks/use-hub-model-search";
 import {
   classifyUnslothSupport,
   downloadManager,
@@ -126,6 +128,7 @@ import type {
   ModelOption,
   ModelSelectorChangeMeta,
 } from "./types";
+import { type CatalogGroup, artifactForRepoId } from "./model-catalog";
 
 function dedupe(values: string[]): string[] {
   return [...new Set(values.filter(Boolean))];
@@ -832,12 +835,14 @@ function GgufVariantExpander({
   );
 
   const handleVariantClick = useCallback(
-    (quant: string, downloaded?: boolean, sizeBytes?: number) => {
+    // ``filename`` is required, not decorative: the diffusion pages load a quant with {kind: "gguf", filename} and gate that branch on meta.ggufFilename, so the quant label alone made every Images/Video GGUF quant pick a dead click.
+    (quant: string, filename: string, downloaded?: boolean, sizeBytes?: number) => {
       const isAvailable = isLocalPath || downloaded === true;
       onSelect(repoId, {
         source: sourceOverride ?? (isLocalPath ? "local" : "hub"),
         isLora: false,
         ggufVariant: quant,
+        ggufFilename: filename,
         isDownloaded: isLocalPath ? true : downloaded,
         expectedBytes: sizeBytes,
         contextLength: isAvailable ? nativeContext : undefined,
@@ -1011,7 +1016,12 @@ function GgufVariantExpander({
               type="button"
               {...variantList.getOptionProps(variantOptionKey, false)}
               onClick={() =>
-                handleVariantClick(v.quant, v.downloaded, expectedBytes)
+                handleVariantClick(
+                  v.quant,
+                  v.filename,
+                  v.downloaded,
+                  expectedBytes,
+                )
               }
               className={cn(
                 "flex min-w-0 flex-1 items-center justify-between gap-2 rounded-full py-1 pl-2 pr-1.5 text-left text-sm transition-colors hover:bg-[#ececec] focus-visible:bg-[#ececec] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring dark:hover:bg-[var(--sidebar-accent)] dark:focus-visible:bg-[var(--sidebar-accent)]",
@@ -1169,6 +1179,74 @@ function hasGgufSuffix(id: string): boolean {
 
 function isGgufRepo(id: string, hintedIsGguf?: boolean): boolean {
   return Boolean(hintedIsGguf) || hasGgufSuffix(id);
+}
+
+// ── Task scoping: which pages own which pipeline tasks ───────────────────
+
+// True when a repo's inferred task is within the picker's task filter (or no filter). Unknown task (null) passes only with no filter.
+function taskMatchesFilter(
+  repoTask: string | null | undefined,
+  filter: HfTaskFilter,
+): boolean {
+  if (!filter) return true;
+  const wanted = Array.isArray(filter) ? filter : [filter];
+  return repoTask != null && (wanted as readonly string[]).includes(repoTask);
+}
+
+// Image-generation pipeline tasks: owned by the Images page, never chat-loadable. The backend reports "text-to-image" for diffusion-arch GGUFs, and the Images page reuses this as its picker `task` filter.
+export const IMAGE_GEN_TASKS = [
+  "text-to-image",
+  "image-to-image",
+  "image-text-to-image",
+] as const;
+
+// Video-generation pipeline tasks: owned by the Video page, never chat-loadable. The backend reports "text-to-video" for
+// video-diffusion GGUFs. image-to-video is included because that is the pipeline_tag HF gives the LTX-2 family, so a
+// text-to-video-only filter dropped it out of Video Hub search. Locally cached video GGUFs are tagged text-to-video anyway.
+export const VIDEO_GEN_TASKS = ["text-to-video", "image-to-video"] as const;
+
+// Diffusion GGUF archs the Images backend cannot assemble yet (SD/SDXL/PixArt/Wan/...). The backend tags them with this task so the chat picker hides them ("unknown model architecture" in llama.cpp) and the Images picker leaves them out (they would 400 on load).
+const UNSUPPORTED_DIFFUSION_TASK = "image-diffusion-unsupported";
+
+// Generation tasks the Images / Video pages own. Not chat-loadable, so an on-device pick routes to its page instead.
+const DIFFUSION_PAGE_TASKS: readonly string[] = [
+  ...IMAGE_GEN_TASKS,
+  ...VIDEO_GEN_TASKS,
+];
+
+/** The page that runs this task, or null when chat should handle the pick. */
+function diffusionPageForTask(task: string | null | undefined): "images" | "video" | null {
+  if (!task || !DIFFUSION_PAGE_TASKS.includes(task)) return null;
+  return (VIDEO_GEN_TASKS as readonly string[]).includes(task) ? "video" : "images";
+}
+
+// Editing/inpaint checkpoints are tagged image-to-image but need an input image the text-to-image backend rejects (mirrors
+// its _EDIT_KEYWORDS), so they are hidden by id. The task itself must stay: FLUX.2-klein carries it too. "layered" hides Qwen-Image-Layered, which needs a dedicated pipeline.
+const IMAGE_EDIT_KEYWORDS = ["edit", "kontext", "inpaint", "layered"] as const;
+// Editing families the backend now SUPPORTS (their own Edit workflow): not hidden despite the edit keyword. Mirrors the backend's qwen-image-edit family.
+const SUPPORTED_EDIT_KEYWORDS = ["qwen-image-edit", "kontext"] as const;
+// Match a keyword as a whole path/name segment, not a raw substring, so "edit" does not hide ".../edited/..." and "kontext"
+// does not hide ".../kontextual/...". The keywords are [a-z-] literals, so no escaping. Mirrors _token_in_needle.
+function idHasSegment(id: string, keyword: string): boolean {
+  return new RegExp(`(?:^|[-_./\\\\])${keyword}(?:$|[-_./\\\\])`).test(id);
+}
+function isImageEditModel(repoId: string | null | undefined): boolean {
+  if (!repoId) return false;
+  const id = repoId.toLowerCase();
+  if (SUPPORTED_EDIT_KEYWORDS.some((kw) => idHasSegment(id, kw))) return false;
+  return IMAGE_EDIT_KEYWORDS.some((kw) => idHasSegment(id, kw));
+}
+
+// Gate an on-device model by the picker's task scope: with a filter (Images) keep only matching, non-editing tasks; with none (chat) drop image-generation models.
+function passesTaskGate(
+  repoTask: string | null | undefined,
+  repoId: string | null | undefined,
+  filter: HfTaskFilter,
+): boolean {
+  if (filter)
+    return taskMatchesFilter(repoTask, filter) && !isImageEditModel(repoId);
+  // Unfiltered (chat) picker: an on-device diffusion model stays listed and routes to the Images/Video page on click; only the never-loadable tag is hidden.
+  return repoTask !== UNSUPPORTED_DIFFUSION_TASK;
 }
 
 // Module-level caches so re-mounting the popover shows results instantly
@@ -1373,7 +1451,7 @@ export function HubModelPicker({
   loraModels = [],
   externalModels = [],
   value,
-  onSelect,
+  onSelect: onSelectProp,
   onFoldersChange,
   onBrowseHub,
   onModelsChange,
@@ -1382,6 +1460,8 @@ export function HubModelPicker({
   section = "downloaded",
   sectionToggle,
   onEject,
+  task,
+  catalog,
 }: {
   models: ModelOption[];
   /** Fine-tuned models, shown as a section in the On Device view. */
@@ -1401,6 +1481,10 @@ export function HubModelPicker({
   /** Section toggle rendered under the search bar. */
   sectionToggle?: ReactNode;
   onEject?: () => void;
+  /** Restrict results to a pipeline task (e.g. text-to-image for the Images page). Undefined = all tasks (the chat default). */
+  task?: HfTaskFilter;
+  /** Curated catalog for a task-scoped picker: one canonical row per model, with its published formats as the second level. */
+  catalog?: CatalogGroup[];
 }) {
   const gpu = useGpuInfo();
   const inferenceGpu = useInferenceGpuInfo();
@@ -1795,31 +1879,36 @@ export function HubModelPicker({
   const deviceType = usePlatformStore((s) => s.deviceType);
   const isMac = deviceType === "mac";
 
-  // Drop models Unsloth can't run for chat (diffusion / image / video / etc.)
-  // using the Hub's classifier on the tags the listing already carries.
+  // Drop models Unsloth cannot run for chat. A task-scoped picker wants exactly the tasks the chat classifier calls unsupported, so it gates on the task.
   const isChatSupported = useCallback(
-    (r: HfModelResult) =>
-      classifyUnslothSupport({
+    (r: HfModelResult) => {
+      // Image/Video tab (task set): only task-matching, non-editing results.
+      if (task) return taskMatchesFilter(r.pipelineTag, task) && !isImageEditModel(r.id);
+      return classifyUnslothSupport({
         modelId: r.id,
         pipelineTag: r.pipelineTag,
         tags: r.tags,
         libraryName: r.libraryName,
         quantMethod: r.quantMethod,
         deviceType,
-      }).status !== "unsupported",
-    [deviceType],
+      }).status !== "unsupported";
+    },
+    [deviceType, task],
   );
 
   const recommendedIds = useMemo(() => {
     const all = dedupe([...models.map((model) => model.id), value ?? ""])
       .filter((id) => !isHiddenModelId(id))
       .filter((id) => !downloadedSet.has(id.toLowerCase()))
-      // Chat-only keeps runnable formats: GGUF anywhere, plus MLX/safetensors
-      // on Mac (matches the empty Recommended view so search stays consistent).
-      .filter(
-        (id) =>
-          !chatOnly || isRecommendableFormat(id, isKnownGgufRepo(id), isMac),
+      // Task-scoped pages load single-file GGUF only; chat-only keeps runnable formats (GGUF anywhere, plus MLX/safetensors on Mac).
+      // A curated artifact stays listed whatever its format: loadSpecFor knows how to load each, and a GGUF-only rule hid every non-GGUF curated model.
+      .filter((id) =>
+        task
+          ? isKnownGgufRepo(id) || Boolean(catalog && artifactForRepoId(id, catalog))
+          : !chatOnly || isRecommendableFormat(id, isKnownGgufRepo(id), isMac),
       )
+      // Member repos of a catalog group would collapse into the canonical group row, but nothing renders those rows yet and a
+      // task-scoped picker's `models` is exactly group members, so suppressing them emptied Recommended. Keep them until the grouped UI lands.
       .filter((id) => !/-FP8[-.]|FP8-Dynamic/i.test(id));
     // Sort: GGUFs first, then hub models
     const gguf: string[] = [];
@@ -1829,7 +1918,16 @@ export function HubModelPicker({
       else hub.push(id);
     }
     return [...gguf, ...hub];
-  }, [models, value, downloadedSet, chatOnly, isKnownGgufRepo, isMac]);
+  }, [
+    models,
+    value,
+    downloadedSet,
+    chatOnly,
+    isKnownGgufRepo,
+    isMac,
+    task,
+    catalog,
+  ]);
 
   const showHfSection = debouncedQuery.trim().length > 0;
 
@@ -1856,6 +1954,13 @@ export function HubModelPicker({
       formatFilter === "all"
         ? rows.filter((r) => isRecommendableFormat(r.id, r.isGguf, isMac))
         : rows.filter((r) => matchesFormatFilter(r.id, r.isGguf, formatFilter));
+    // Task-scoped pages load single-file GGUF only. As with recommendedIds, a curated artifact is loadable whatever its format, so GGUF-only here hid the catalog's bf16 / bnb-4bit / fp8 models from Hub search.
+    if (task) {
+      rows = rows.filter(
+        (r) => r.isGguf || Boolean(catalog && artifactForRepoId(r.id, catalog)),
+      );
+    }
+    // Members would render under their canonical group row, but that row does not exist yet (see recommendedIds): filtering here removed curated models from Hub search too.
     // The "recommended" sort always applies the device-fit filter; the shared
     // "Fits on device" tick extends it to the other sorts too.
     if (recommendedSort !== "recommended" && !fitOnDeviceOnly) return rows;
@@ -1874,6 +1979,8 @@ export function HubModelPicker({
     gpu,
     inferenceGpu,
     isChatSupported,
+    task,
+    catalog,
   ]);
 
   // Per-row meta + VRAM badge from the recommended listing's own metadata.
@@ -1961,14 +2068,47 @@ export function HubModelPicker({
   }, [results, recommendedSearch.results]);
 
   // Ordered by the On Device dropdown (recent/download date/size/name).
+  // The gate keeps diffusion GGUFs in the Images/Video picker and out of chat.
   const sortedCachedGguf = useMemo(
-    () => sortCachedRepos(cachedGguf, downloadedSort, loadTimes),
-    [cachedGguf, downloadedSort, loadTimes],
+    () =>
+      sortCachedRepos(
+        cachedGguf.filter((c) => passesTaskGate(c.task, c.repo_id, task)),
+        downloadedSort,
+        loadTimes,
+      ),
+    [cachedGguf, downloadedSort, loadTimes, task],
   );
+  // Cached non-GGUF repos. In chat, passesTaskGate drops diffusers image repos; in the Images picker it keeps them, but only unsloth-hosted ones this backend can load. Base repos are cached as dependencies and fail the trust gate.
   const sortedCachedModels = useMemo(
-    () => sortCachedRepos(cachedModels, downloadedSort, loadTimes),
-    [cachedModels, downloadedSort, loadTimes],
+    () =>
+      sortCachedRepos(
+        cachedModels.filter(
+          (c) =>
+            // A partially-downloaded snapshot is not on-device: listing it as loadable errors or triggers a silent multi-GB re-fetch.
+            !c.partial &&
+            passesTaskGate(c.task, c.repo_id, task) &&
+            // Diffusion pickers: unsloth repos plus any repo the backend can LOAD. Gate on a curated ARTIFACT (what loadSpecFor resolves), not a group-key match: a base / uncurated-quant sibling matches the group by key but dead-ends at the trust gate.
+            // An unsloth repo must also be a full pipeline: the fall-through loads uncataloged rows as "pipeline", and from_pretrained on a single-file checkpoint repo fails. Curated single-file artifacts stay, since loadSpecFor carries their filename.
+            (!task ||
+              (isUnslothRepoId(c.repo_id) && !c.single_file) ||
+              (catalog ? artifactForRepoId(c.repo_id, catalog) !== null : false)),
+        ),
+        downloadedSort,
+        loadTimes,
+      ),
+    [cachedModels, downloadedSort, loadTimes, task, catalog],
   );
+  // Task-scoped loads put the whole pipeline on ONE device, so quant fit uses the device the load lands on (the lowest visible ordinal), not the multi-GPU sum or the largest card: sizing against the bigger card OOMs the smaller one. Chat keeps the sum.
+  // The source is picked per row (a GGUF row sizes against the inference GPU, anything else against the system view); this only decides how much of it a row may claim.
+  const expanderGpuGbFrom = (info: typeof inferenceGpu) =>
+    info.available
+      ? task
+        ? info.loadDeviceMemoryGb || info.maxDeviceMemoryGb
+        : info.memoryTotalGb
+      : undefined;
+  const expanderGpuGb = expanderGpuGbFrom(inferenceGpu);
+  const expanderSystemGpuGb = expanderGpuGbFrom(gpu);
+
   // Each local section's search is scoped to its own models (matched by name).
   const localQuery = normalizeForSearch(debouncedQuery.trim());
   const matchesLocalQuery = (m: LocalModelInfo) =>
@@ -1981,23 +2121,27 @@ export function HubModelPicker({
       sortLocalModels(
         lmStudioModels.filter(
           (m) =>
+            // The backend tags every local model with its task for exactly this: on the Images/Video pages a chat GGUF must not be offered.
+            passesTaskGate(m.task, m.model_id ?? m.id, task) &&
             localModelMatchesFormat(m, formatFilter) && matchesLocalQuery(m),
         ),
         downloadedSort,
         loadTimes,
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [lmStudioModels, downloadedSort, formatFilter, loadTimes, localQuery],
+    [lmStudioModels, downloadedSort, formatFilter, loadTimes, localQuery, task],
   );
   // Local ./models entries. Chat-only Unsloth runs GGUF (any host) and MLX (Mac
   // only), so raw checkpoints there are hidden (mirrors the cached non-GGUF
-  // rule). An MLX build a Mac user dropped in ./models stays selectable.
+  // rule). An MLX build a Mac user dropped in ./models stays selectable. A task-scoped picker (Images) is exempt: the image backend loads local diffusers/safetensors pipelines even on chat-only (no-GPU, native) hosts.
   const sortedLocalDir = useMemo(
     () =>
       sortLocalModels(
         localDirModels.filter(
           (m) =>
+            passesTaskGate(m.task, m.model_id ?? m.id, task) &&
             (!chatOnly ||
+              Boolean(task) ||
               localModelIsGguf(m) ||
               (isMac && localModelIsMlx(m))) &&
             localModelMatchesFormat(m, formatFilter) &&
@@ -2015,6 +2159,7 @@ export function HubModelPicker({
       loadTimes,
       localQuery,
       chatOnly,
+      task,
     ],
   );
   const sortedCustomFolderModels = useMemo(
@@ -2022,13 +2167,52 @@ export function HubModelPicker({
       sortLocalModels(
         customFolderModels.filter(
           (m) =>
+            passesTaskGate(m.task, m.model_id ?? m.id, task) &&
             localModelMatchesFormat(m, formatFilter) && matchesLocalQuery(m),
         ),
         customSort,
         loadTimes,
       ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [customFolderModels, customSort, formatFilter, loadTimes, localQuery],
+    [customFolderModels, customSort, formatFilter, loadTimes, localQuery, task],
+  );
+
+  // Chat cannot load a diffusion model but the Images/Video pages can, so a pick routes to the page that runs it instead of hiding it or letting it 400. Task-scoped pickers select normally.
+  const navigateToPage = useNavigate();
+  const diffusionTaskById = useMemo(() => {
+    const byId = new Map<string, string>();
+    const put = (id: string | null | undefined, t: string | null | undefined) => {
+      if (id && t) byId.set(id.toLowerCase(), t);
+    };
+    for (const c of cachedGguf) put(c.repo_id, c.task);
+    for (const c of cachedModels) put(c.repo_id, c.task);
+    // Both ids: a local row's click passes m.id (a filesystem path for models_dir / LM Studio entries) while m.model_id is its HF-style name, so keying on one alone makes the lookup below miss.
+    const putLocal = (m: LocalModelInfo) => {
+      put(m.id, m.task);
+      put(m.model_id, m.task);
+    };
+    for (const m of lmStudioModels) putLocal(m);
+    for (const m of localDirModels) putLocal(m);
+    for (const m of customFolderModels) putLocal(m);
+    return byId;
+  }, [cachedGguf, cachedModels, lmStudioModels, localDirModels, customFolderModels]);
+
+  const onSelect = useCallback(
+    (id: string, meta: ModelSelectorChangeMeta) => {
+      if (!task) {
+        const page = diffusionPageForTask(diffusionTaskById.get(id.toLowerCase()));
+        if (page) {
+          void navigateToPage({
+            to: `/${page}`,
+            // The target page uses this verbatim as the gguf filename, so it must be ggufFilename (an exact repo filename), never ggufVariant (a label like "Q4_K_M", which routed a file that does not exist). No filename means a curated non-GGUF pick, loaded as a pipeline.
+            search: { model: id, quant: meta.ggufFilename ?? undefined },
+          });
+          return;
+        }
+      }
+      onSelectProp(id, meta);
+    },
+    [task, diffusionTaskById, navigateToPage, onSelectProp],
   );
 
   // Fine-tuned models for the On Device "Fine-tuned" section: flat, query-
@@ -2083,7 +2267,8 @@ export function HubModelPicker({
 
   // Non-GGUF cached rows are not shown in chat-only mode, so the empty-state
   // logic must use this (not visibleCachedModels) or the picker can go blank.
-  const visibleCachedModelRows = chatOnly ? [] : visibleCachedModels;
+  // A task-scoped picker (Images) is exempt: the image backend loads local diffusers/safetensors pipelines even on chat-only hosts.
+  const visibleCachedModelRows = chatOnly && !task ? [] : visibleCachedModels;
 
   // Pinned entries surface in their own section above the Unsloth heading.
   // GGUF quants pin individually and their repo stays listed below; non-GGUF
@@ -2919,7 +3104,7 @@ export function HubModelPicker({
             parentOptionKey={optionKey}
             onNavigatePastStart={() => hubModelList.focusOption(optionKey)}
             onNavigatePastEnd={() => hubModelList.moveFocus(optionKey, "next")}
-            gpuGb={inferenceGpu.available ? inferenceGpu.memoryTotalGb : undefined}
+            gpuGb={expanderGpuGb}
             systemRamGb={inferenceGpu.systemRamAvailableGb || undefined}
             budgetKnown={inferenceGpu.budgetKnown}
             variantActions={{
@@ -3256,27 +3441,29 @@ export function HubModelPicker({
                               </TooltipContent>
                             </Tooltip>
                           ) : null}
-                          <Tooltip delayDuration={0}>
-                            <TooltipTrigger asChild={true}>
-                              <button
-                                type="button"
-                                onClick={scrollToFineTuned}
-                                aria-label="Go to fine-tuned models"
-                                className="shrink-0 rounded p-1 text-muted-foreground/60 transition-colors hover:text-foreground"
+                          {!task && (
+                            <Tooltip delayDuration={0}>
+                              <TooltipTrigger asChild={true}>
+                                <button
+                                  type="button"
+                                  onClick={scrollToFineTuned}
+                                  aria-label="Go to fine-tuned models"
+                                  className="shrink-0 rounded p-1 text-muted-foreground/60 transition-colors hover:text-foreground"
+                                >
+                                  <HugeiconsIcon
+                                    icon={TrainIcon}
+                                    className="size-3"
+                                  />
+                                </button>
+                              </TooltipTrigger>
+                              <TooltipContent
+                                side="bottom"
+                                className="tooltip-compact"
                               >
-                                <HugeiconsIcon
-                                  icon={TrainIcon}
-                                  className="size-3"
-                                />
-                              </button>
-                            </TooltipTrigger>
-                            <TooltipContent
-                              side="bottom"
-                              className="tooltip-compact"
-                            >
-                              Go to fine-tuned models
-                            </TooltipContent>
-                          </Tooltip>
+                                Go to fine-tuned models
+                              </TooltipContent>
+                            </Tooltip>
+                          )}
                           <Tooltip delayDuration={0}>
                             <TooltipTrigger asChild={true}>
                               <button
@@ -3333,10 +3520,8 @@ export function HubModelPicker({
                   </div>
                 ) : null}
 
-                {/* Fine-tuned models: a section above Custom Folders. Always shown on
-              On Device so the train shortcut always has a target, with an empty
-              state when none exist. */}
-                {section === "downloaded" ? (
+                {/* Fine-tuned models: a section above Custom Folders, always shown on On Device so the train shortcut has a target. Hidden under a task filter (e.g. Images). */}
+                {section === "downloaded" && !task ? (
                   <>
                     <div
                       ref={fineTunedSectionRef}
@@ -3831,11 +4016,7 @@ export function HubModelPicker({
                                 onNavigatePastEnd={() =>
                                   hubModelList.moveFocus(optionKey, "next")
                                 }
-                                gpuGb={
-                                  inferenceGpu.available
-                                    ? inferenceGpu.memoryTotalGb
-                                    : undefined
-                                }
+                                gpuGb={expanderGpuGb}
                                 systemRamGb={
                                   inferenceGpu.systemRamAvailableGb || undefined
                                 }
@@ -3947,11 +4128,7 @@ export function HubModelPicker({
                                 onNavigatePastEnd={() =>
                                   hubModelList.moveFocus(optionKey, "next")
                                 }
-                                gpuGb={
-                                  inferenceGpu.available
-                                    ? inferenceGpu.memoryTotalGb
-                                    : undefined
-                                }
+                                gpuGb={expanderGpuGb}
                                 systemRamGb={
                                   inferenceGpu.systemRamAvailableGb || undefined
                                 }
@@ -4019,13 +4196,7 @@ export function HubModelPicker({
                               vramStatus={info?.status ?? null}
                               vramEst={info?.est}
                               gpuGb={
-                                isG
-                                  ? inferenceGpu.available
-                                    ? inferenceGpu.memoryTotalGb
-                                    : undefined
-                                  : gpu.available
-                                    ? gpu.memoryTotalGb
-                                    : undefined
+                                isG ? expanderGpuGb : expanderSystemGpuGb
                               }
                               onArrowDownIntoChildren={
                                 expandedGguf === id
@@ -4046,11 +4217,7 @@ export function HubModelPicker({
                                 onNavigatePastEnd={() =>
                                   hubModelList.moveFocus(optionKey, "next")
                                 }
-                                gpuGb={
-                                  inferenceGpu.available
-                                    ? inferenceGpu.memoryTotalGb
-                                    : undefined
-                                }
+                                gpuGb={expanderGpuGb}
                                 systemRamGb={
                                   inferenceGpu.systemRamAvailableGb || undefined
                                 }
@@ -4133,13 +4300,7 @@ export function HubModelPicker({
                               isKnownGgufRepo(id) ? undefined : vram?.est
                             }
                             gpuGb={
-                              isKnownGgufRepo(id)
-                                ? inferenceGpu.available
-                                  ? inferenceGpu.memoryTotalGb
-                                  : undefined
-                                : gpu.available
-                                  ? gpu.memoryTotalGb
-                                  : undefined
+                              isKnownGgufRepo(id) ? expanderGpuGb : expanderSystemGpuGb
                             }
                             onArrowDownIntoChildren={
                               expandedGguf === id
@@ -4164,11 +4325,7 @@ export function HubModelPicker({
                               onNavigatePastEnd={() =>
                                 hubModelList.moveFocus(optionKey, "next")
                               }
-                              gpuGb={
-                                inferenceGpu.available
-                                  ? inferenceGpu.memoryTotalGb
-                                  : undefined
-                              }
+                              gpuGb={expanderGpuGb}
                               systemRamGb={
                                 inferenceGpu.systemRamAvailableGb || undefined
                               }
@@ -4247,13 +4404,7 @@ export function HubModelPicker({
                               }
                               vramEst={isSearchGguf ? undefined : vram?.est}
                               gpuGb={
-                                isSearchGguf
-                                  ? inferenceGpu.available
-                                    ? inferenceGpu.memoryTotalGb
-                                    : undefined
-                                  : gpu.available
-                                    ? gpu.memoryTotalGb
-                                    : undefined
+                                isSearchGguf ? expanderGpuGb : expanderSystemGpuGb
                               }
                               onArrowDownIntoChildren={
                                 expandedGguf === id
@@ -4278,11 +4429,7 @@ export function HubModelPicker({
                                 onNavigatePastEnd={() =>
                                   hubModelList.moveFocus(optionKey, "next")
                                 }
-                                gpuGb={
-                                  inferenceGpu.available
-                                    ? inferenceGpu.memoryTotalGb
-                                    : undefined
-                                }
+                                gpuGb={expanderGpuGb}
                                 systemRamGb={
                                   inferenceGpu.systemRamAvailableGb || undefined
                                 }
