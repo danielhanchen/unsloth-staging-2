@@ -69,11 +69,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
-        # Cumulative tally: ubuntu-22.04 has failed 7 of 11 legs, ubuntu-24.04 0 of 11.
-        # The last run failed 3/3 on 22.04 and passed 3/3 on 24.04, so it reproduces
-        # reliably enough to bisect once the shim stops perturbing it.
-        attempt: [1, 2, 3]
+        # Weighted toward the OS that actually fails. Cumulative tally: ubuntu-22.04 has
+        # failed 10 of 25 legs (~40%), ubuntu-24.04 0 of 25. At 40% a three-leg run comes
+        # back all-green by chance more than a fifth of the time, which is exactly how I
+        # talked myself into two different "this instrument masks it" conclusions. Six
+        # attempts drops that to under 5%, so a green 22.04 run starts meaning something.
+        # 24.04 stays at two purely as a control.
+        include:
+          - {os: ubuntu-22.04, attempt: 1}
+          - {os: ubuntu-22.04, attempt: 2}
+          - {os: ubuntu-22.04, attempt: 3}
+          - {os: ubuntu-22.04, attempt: 4}
+          - {os: ubuntu-22.04, attempt: 5}
+          - {os: ubuntu-22.04, attempt: 6}
+          - {os: ubuntu-24.04, attempt: 1}
+          - {os: ubuntu-24.04, attempt: 2}
 
     steps:
       - uses: actions/checkout@v4
