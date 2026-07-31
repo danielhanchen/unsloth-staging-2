@@ -1,0 +1,257 @@
+name: "staging update matrix"
+
+# Does `unsloth studio update` work on every supported desktop platform?
+#
+# The repo already smokes update on ubuntu (studio-update-smoke.yml) and macOS
+# (studio-mac-update-smoke.yml). Windows and WSL had no update coverage, which
+# is where the historical "just re-run the installer" guidance came from, so
+# they are the point of this job.
+#
+# Contract asserted per platform, in order:
+#   1. install.sh / install.ps1 succeeds and leaves a working CLI
+#   2. `unsloth studio update` exits 0
+#   3. `unsloth studio verify-install` exits 0 afterwards (the repo's own
+#      post-update contract, asserted by studio-update-smoke.yml)
+#   4. a second update is idempotent and still exits 0
+on:
+  push:
+    branches: ["studio-update-matrix"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  posix:
+    name: "update (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        run: bash install.sh --local --no-torch 2>&1 | tail -25
+
+      - name: Version before update
+        run: |
+          set -e
+          BIN="$HOME/.local/bin/unsloth"
+          test -x "$BIN" || { echo "::error::no CLI shim at $BIN"; exit 1; }
+          "$BIN" --version | tee before.txt
+
+      - name: unsloth studio update
+        run: |
+          set -e -o pipefail
+          "$HOME/.local/bin/unsloth" studio update --local 2>&1 | tail -25
+          echo "update exit: $?"
+
+      - name: Version after, and the post-update contract
+        run: |
+          set -e
+          BIN="$HOME/.local/bin/unsloth"
+          "$BIN" --version | tee after.txt
+          echo "before: $(cat before.txt)"
+          echo "after:  $(cat after.txt)"
+          "$BIN" studio verify-install
+          echo "PASS: verify-install clean after update"
+
+      - name: A second update is idempotent
+        run: |
+          set -e -o pipefail
+          "$HOME/.local/bin/unsloth" studio update --local 2>&1 | tail -8
+          "$HOME/.local/bin/unsloth" studio verify-install
+          echo "PASS: second update still clean"
+
+      - name: Studio boots after update
+        run: |
+          set -e
+          BIN="$HOME/.local/bin/unsloth"
+          nohup "$BIN" studio -H 127.0.0.1 -p 8871 > boot.log 2>&1 &
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8871/api/health || true)
+            [ "$code" = "200" ] && break
+            sleep 5
+          done
+          echo "/api/health -> $code"
+          tail -20 boot.log
+          [ "$code" = "200" ] || { echo "::error::Studio did not boot after update"; exit 1; }
+
+  windows:
+    name: "update (windows-latest)"
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 --no-torch 2>&1 | Select-Object -Last 25
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::install.ps1 exited $LASTEXITCODE"; exit $LASTEXITCODE }
+
+      - name: Locate the CLI
+        shell: pwsh
+        run: |
+          # install.ps1 puts the shim on PATH for later steps via a shim dir; resolve it
+          # explicitly so this does not depend on PATH propagation between steps.
+          $candidates = @(
+            "$env:USERPROFILE\.unsloth\studio\unsloth_studio\Scripts\unsloth.exe",
+            "$env:LOCALAPPDATA\Programs\Unsloth\unsloth.exe",
+            "$env:USERPROFILE\.local\bin\unsloth.exe"
+          )
+          $bin = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $bin) {
+            Write-Host "::error::no unsloth CLI found; searched:"
+            $candidates | ForEach-Object { Write-Host "  $_" }
+            Get-ChildItem "$env:USERPROFILE\.unsloth" -Recurse -Filter unsloth.exe -ErrorAction SilentlyContinue |
+              Select-Object -First 5 -ExpandProperty FullName
+            exit 1
+          }
+          Write-Host "CLI: $bin"
+          "UNSLOTH_BIN=$bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Version before update
+        shell: pwsh
+        run: |
+          & $env:UNSLOTH_BIN --version | Tee-Object -FilePath before.txt
+
+      - name: unsloth studio update
+        shell: pwsh
+        run: |
+          & $env:UNSLOTH_BIN studio update --local 2>&1 | Select-Object -Last 25
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::update exited $LASTEXITCODE"; exit $LASTEXITCODE }
+
+      - name: Version after, and the post-update contract
+        shell: pwsh
+        run: |
+          # update replaces unsloth.exe on Windows (the .deleteme dance), so re-resolve
+          # rather than trusting the path captured before the update.
+          if (-not (Test-Path $env:UNSLOTH_BIN)) {
+            Write-Host "::error::the CLI vanished across the update: $env:UNSLOTH_BIN"
+            exit 1
+          }
+          & $env:UNSLOTH_BIN --version | Tee-Object -FilePath after.txt
+          Write-Host "before: $(Get-Content before.txt -Raw)"
+          Write-Host "after:  $(Get-Content after.txt -Raw)"
+          & $env:UNSLOTH_BIN studio verify-install
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::verify-install exited $LASTEXITCODE after update"; exit $LASTEXITCODE }
+          Write-Host "PASS: verify-install clean after update"
+
+      - name: A second update is idempotent
+        shell: pwsh
+        run: |
+          & $env:UNSLOTH_BIN studio update --local 2>&1 | Select-Object -Last 8
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::second update exited $LASTEXITCODE"; exit $LASTEXITCODE }
+          & $env:UNSLOTH_BIN studio verify-install
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::verify-install exited $LASTEXITCODE after the second update"; exit $LASTEXITCODE }
+          Write-Host "PASS: second update still clean"
+
+      - name: No .deleteme orphan survives
+        shell: pwsh
+        run: |
+          # _cleanup_self_exe_lock_windows should remove it; a survivor invites a
+          # cross-version restore on the next update.
+          $orphans = Get-ChildItem "$env:USERPROFILE\.unsloth" -Recurse -Filter "*.deleteme" -ErrorAction SilentlyContinue
+          if ($orphans) {
+            Write-Host "::error::update left a .deleteme orphan behind"
+            $orphans | Select-Object -ExpandProperty FullName
+            exit 1
+          }
+          Write-Host "PASS: no .deleteme orphan"
+
+  wsl:
+    name: "update (wsl ubuntu-24.04)"
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Import a fresh Ubuntu 24.04 WSL distro
+        shell: pwsh
+        run: |
+          # Same rootfs + checksum the repo's clean-machine-install-ci.yml wsl job uses:
+          # an official image plus `wsl --import` is deterministic, no third-party action.
+          wsl --set-default-version 2
+          $url = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz'
+          $expected = '2a790896740b14d637dbdc583cce1ba081ac53b9e9cdb46dc09a2f73abbd9934'
+          New-Item -ItemType Directory -Force -Path wsl-dist, logs | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile wsl-dist/rootfs.tar.gz -UseBasicParsing -TimeoutSec 900
+          $actual = (Get-FileHash wsl-dist/rootfs.tar.gz -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Host "::error::rootfs checksum mismatch: got $actual"; exit 1 }
+          wsl --import unsloth-ci "$PWD/wsl-dist/instance" "$PWD/wsl-dist/rootfs.tar.gz" --version 2
+          wsl -d unsloth-ci -- uname -a
+
+      - name: Install inside WSL
+        shell: pwsh
+        run: |
+          wsl -d unsloth-ci -u root -- sh -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl git' 2>&1 |
+            Tee-Object -FilePath logs/wsl-bootstrap.log
+          # Copy the tree in rather than build across /mnt/c: a DrvFs path carries Windows
+          # permissions and CRLF risk that no real WSL user has.
+          $wslPath = (wsl -d unsloth-ci -- wslpath -a "$($env:GITHUB_WORKSPACE -replace '\\','/')").Trim()
+          wsl -d unsloth-ci -u root -- cp -r "$wslPath" /root/unsloth
+          wsl -d unsloth-ci -u root -- sh -c 'cd /root/unsloth && bash install.sh --local --no-torch' 2>&1 |
+            Tee-Object -FilePath logs/wsl-install.log | Select-Object -Last 25
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::WSL install exited $LASTEXITCODE"; exit $LASTEXITCODE }
+
+      - name: Did it take the wsl branch?
+        shell: pwsh
+        run: |
+          # `platform linux` would mean the WSL-specific path never ran and this job is
+          # just a second Linux run under a different name.
+          $esc = [char]27
+          $lines = @(Get-Content logs/wsl-install.log |
+            ForEach-Object { $_ -replace "$esc\[[0-9;]*[A-Za-z]", '' } |
+            Where-Object { $_ -match '^\s*platform\s+\S' })
+          $lines | ForEach-Object { Write-Host "platform line: $_" }
+          if (-not ($lines | Where-Object { $_ -match '^\s*platform\s+wsl\s*$' })) {
+            Write-Host "::error::installer never reported 'platform wsl'"
+            exit 1
+          }
+
+      - name: unsloth studio update inside WSL
+        shell: pwsh
+        run: |
+          wsl -d unsloth-ci -u root -- sh -c '$HOME/.local/bin/unsloth --version' 2>&1 | Tee-Object -FilePath logs/before.txt
+          wsl -d unsloth-ci -u root -- sh -c 'cd /root/unsloth && $HOME/.local/bin/unsloth studio update --local' 2>&1 |
+            Tee-Object -FilePath logs/wsl-update.log | Select-Object -Last 25
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::WSL update exited $LASTEXITCODE"; exit $LASTEXITCODE }
+          wsl -d unsloth-ci -u root -- sh -c '$HOME/.local/bin/unsloth --version' 2>&1 | Tee-Object -FilePath logs/after.txt
+          Write-Host "before: $(Get-Content logs/before.txt -Raw)"
+          Write-Host "after:  $(Get-Content logs/after.txt -Raw)"
+
+      - name: The post-update contract inside WSL
+        shell: pwsh
+        run: |
+          wsl -d unsloth-ci -u root -- sh -c '$HOME/.local/bin/unsloth studio verify-install'
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::verify-install exited $LASTEXITCODE after the WSL update"; exit $LASTEXITCODE }
+          wsl -d unsloth-ci -u root -- sh -c 'cd /root/unsloth && $HOME/.local/bin/unsloth studio update --local' 2>&1 | Select-Object -Last 8
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::second WSL update exited $LASTEXITCODE"; exit $LASTEXITCODE }
+          Write-Host "PASS: WSL update is clean and idempotent"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wsl-update-logs
+          path: logs
+          retention-days: 5
