@@ -122,7 +122,9 @@ jobs:
       - name: Install
         shell: pwsh
         run: |
-          powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 --no-torch 2>&1 | Select-Object -Last 25
+          # --local matters: without it install.ps1 pulls unsloth from PyPI and the
+          # CLI under test is the published one, not this checkout.
+          powershell -NoProfile -ExecutionPolicy Bypass -File install.ps1 --local --no-torch 2>&1 | Select-Object -Last 25
           if ($LASTEXITCODE -ne 0) { Write-Host "::error::install.ps1 exited $LASTEXITCODE"; exit $LASTEXITCODE }
 
       - name: Locate the CLI
