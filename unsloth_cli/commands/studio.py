@@ -2686,6 +2686,16 @@ def _run_setup_script(*, verbose: bool = False) -> None:
     env = {**os.environ, "UNSLOTH_VERBOSE": "1"} if verbose else None
 
     if platform.system() == "Windows":
+        # Windows PowerShell 5.1 builds its own module path when PSModulePath is
+        # absent. Inheriting PowerShell 7's leaves it unable to load its own core
+        # modules, and setup.ps1 installs uv by running astral's install.ps1,
+        # which calls Get-ExecutionPolicy out of Microsoft.PowerShell.Security.
+        # So `unsloth studio update` from a pwsh 7 prompt died on
+        # "the module could not be loaded" while the same update from a 5.1
+        # prompt succeeded. pwsh is what `pwsh` and Windows Terminal's default
+        # profile give a modern user, so this was the common case.
+        env = dict(env if env is not None else os.environ)
+        env.pop("PSModulePath", None)
         powershell_args = ["powershell.exe"]
         if _should_hide_windows_subprocesses():
             powershell_args.extend(
