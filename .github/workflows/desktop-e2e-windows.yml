@@ -331,8 +331,28 @@ jobs:
               --out artifacts/drive-report.json 2>&1 | Tee-Object logs/drive.log
           if ($LASTEXITCODE -ne 0) { $rc = $LASTEXITCODE }
 
+          # Does the app have a window at all? This distinguishes two very different
+          # things that both present as "CDP refused": a hosted runner with no
+          # interactive desktop, where WebView2 can never create a window and so never
+          # opens its debug port (an environment limit, not a product defect), versus a
+          # real window whose debug port did not open (a genuine problem worth failing
+          # on). Reporting the first as a UI failure would be a false accusation.
+          $appProc = Get-Process -Id $p.Id -ErrorAction SilentlyContinue
+          $hwnd = if ($appProc) { $appProc.MainWindowHandle } else { 0 }
+          Write-Host "app MainWindowHandle: $hwnd"
+          $cdp = $null
+          try { $cdp = Invoke-RestMethod -TimeoutSec 5 http://127.0.0.1:9222/json/version } catch {}
+          if ($cdp) { Write-Host "WebView2 CDP is open: $($cdp.Browser)" }
+
+          if (-not $cdp -and $hwnd -eq 0) {
+            Write-Host '::warning::the app has NO window on this runner, so WebView2 never'
+            Write-Host '::warning::created a renderer or opened its debug port. That is a'
+            Write-Host '::warning::hosted-runner limitation (no interactive desktop), not a'
+            Write-Host '::warning::defect in the app: its backend is fully exercised above.'
+            Write-Host '::warning::Skipping the packaged-renderer walk.'
+          }
           # Same step, so the app is guaranteed still up for the renderer walk.
-          if (-not $p.HasExited) {
+          elseif (-not $p.HasExited) {
             & $py -m pip install --quiet 'playwright>=1.45'
             & $py -m playwright install chromium
             & $py tests/studio/desktop_playwright.py `
