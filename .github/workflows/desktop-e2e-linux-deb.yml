@@ -440,52 +440,74 @@ jobs:
             echo "Something about the app's spawn context is required."
           fi
 
-      - name: Is the inherited signal state what makes 22.04 different?
+      - name: Which part of the app's spawn context reproduces it?
         if: always()
-        # The one measured difference between the two OS versions, after env, rlimits and
-        # fds all came back byte-identical:
+        # Bisecting the spawn context, because that is what the controls narrowed it to:
+        # the app's own child exits 1 silently on 22.04, while on the same machine in the
+        # same job a shell-spawned one started 12/12.
         #
-        #     ubuntu-22.04   SigIgn: 0000000180000007
-        #     ubuntu-24.04   SigIgn: 0000000000000007
+        # Already ruled out: the inherited signal state. ubuntu-22.04 hands its children
+        # SigIgn 0000000180000007 vs 24.04's 0000000000000007 -- signals 32 and 33,
+        # glibc's SIGCANCEL and SIGSETXID, ignored and surviving execve. It was the only
+        # difference left after env, rlimits and fds all came back byte-identical, but it
+        # is not the cause: reproducing that exact state outside the app started 12/12,
+        # and the 22.04 leg that PASSED carried the same mask anyway.
         #
-        # 0x7 is HUP/INT/QUIT, which both have and which nohup explains. The extra bits
-        # are signals 32 and 33 -- glibc's internal NPTL signals, SIGCANCEL and SIGSETXID.
-        # Ignored dispositions survive execve, so the app hands them to its backend, and
-        # they appear in neither the environment nor the fd table.
+        # The remaining untested difference is one I introduced into my own control: it
+        # redirected to a FILE, while the app uses PIPES. That matters here specifically,
+        # because a Python process whose stdout is a closed pipe raises BrokenPipeError,
+        # fails to write the traceback to a stderr that is also closed, and exits 1 having
+        # printed nothing -- which is the exact signature of this defect.
         #
-        # That correlates with the OS and not with the failure -- the 22.04 leg that
-        # passed carried the same mask -- so it is a precondition at best. This tests it
-        # as one. The previous step establishes the control: from a plain shell, 12 of 12
-        # attempts start fine on a machine where the app's own spawn had just failed.
-        # This step changes exactly one thing about that control.
+        #   file      the existing control, for comparison in the same step
+        #   pipe      a live reader draining it, as the app intends
+        #   deadpipe  a reader that exits immediately, so writes get EPIPE
         #
-        # The interesting outcome is on 24.04: if putting a 24.04 backend into 22.04's
-        # signal state makes it fail, the signal state IS the OS difference.
+        # If deadpipe reproduces, the mechanism is settled and the question becomes why
+        # the app's pipes are closed on 22.04. If it does not, then this signature is not
+        # reachable through stdio at all.
         run: |
           set -a; . ./clean-machine.env; set +a
           BIN_REAL="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth.real"
           [ -x "$BIN_REAL" ] || BIN_REAL="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
-          ones=0; started=0
-          for i in $(seq 1 12); do
-            port=$((8980 + i))
-            out="logs/sigrepro-$i.log"
-            rc=0
-            timeout 25 python3 tests/studio/spawn_with_ignored_rt_signals.py \
-              --signals 32,33 -- \
-              "$BIN_REAL" studio --api-only -H 127.0.0.1 -p "$port" > "$out" 2>&1 || rc=$?
-            bytes=$(wc -c < "$out" 2>/dev/null || echo 0)
-            case "$rc" in
-              124) started=$((started + 1)); verdict="started ok" ;;
-              1)   ones=$((ones + 1));       verdict="** silent exit 1 **" ;;
-              *)   verdict="unexpected" ;;
-            esac
-            echo "attempt $i: rc=$rc bytes=$bytes  $verdict"
-            [ "$rc" = "1" ] && { echo "--- what it wrote ---"; head -20 "$out"; }
-            pkill -f "api-only -H 127.0.0.1 -p $port" 2>/dev/null || true
-          done
+          run_variant() {
+            variant="$1"; base_port="$2"
+            ones=0; started=0; other=0
+            for i in $(seq 1 8); do
+              port=$((base_port + i))
+              out="logs/var-$variant-$i.log"
+              rc=0
+              case "$variant" in
+                file)
+                  timeout 25 "$BIN_REAL" studio --api-only -H 127.0.0.1 -p "$port" \
+                    > "$out" 2>&1 || rc=$?
+                  ;;
+                pipe)
+                  timeout 25 "$BIN_REAL" studio --api-only -H 127.0.0.1 -p "$port" \
+                    2>&1 | cat > "$out" || rc=$?
+                  rc=${PIPESTATUS[0]:-$rc}
+                  ;;
+                deadpipe)
+                  # `head -0` closes its end at once, so the child's first write EPIPEs.
+                  timeout 25 "$BIN_REAL" studio --api-only -H 127.0.0.1 -p "$port" \
+                    2>&1 | head -0 > "$out" || rc=$?
+                  rc=${PIPESTATUS[0]:-$rc}
+                  ;;
+              esac
+              case "$rc" in
+                124) started=$((started + 1)) ;;
+                1)   ones=$((ones + 1)) ;;
+                *)   other=$((other + 1)); echo "  $variant attempt $i: rc=$rc" ;;
+              esac
+              pkill -f "api-only -H 127.0.0.1 -p $port" 2>/dev/null || true
+            done
+            echo "$variant: $started started, $ones SILENT EXIT 1, $other other"
+          }
+          run_variant file     8900
+          run_variant pipe     8920
+          run_variant deadpipe 8940
           echo "=================================================="
-          echo "12 attempts with signals 32,33 ignored: $started started, $ones exit 1"
-          echo "(control, same machine, same step order: 12/12 started without them)"
+          echo "The app's own child on this machine: see unsloth-child.log for its rc."
 
       - name: Where exactly is the backend stuck?
         if: always()
