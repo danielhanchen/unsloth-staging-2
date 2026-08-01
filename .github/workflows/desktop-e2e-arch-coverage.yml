@@ -187,26 +187,39 @@ jobs:
             Write-Host "::error::the x64 installer failed on arm64 Windows with exit $($p.ExitCode)"
             exit 1
           }
-          # Match the pattern the x64 job uses; the NSIS product name is not the crate name.
+          # Tauri's NSIS bundle installs per-user under %LOCALAPPDATA%\Programs by
+          # default, so that root matters more than Program Files here. Probe rather
+          # than filter it out: a missing Programs dir is itself the finding.
+          Write-Host "LOCALAPPDATA          : $env:LOCALAPPDATA"
+          foreach ($r in "$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}") {
+            Write-Host ("  {0,-40} {1}" -f $r, $(if (Test-Path $r) { 'exists' } else { 'ABSENT' }))
+          }
           $roots = @("$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}") |
                    Where-Object { $_ -and (Test-Path $_) }
           $installed = Get-ChildItem $roots -Filter '*Unsloth*.exe' -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -notmatch 'uninstall' } | Select-Object -First 1
           if (-not $installed) {
-            # Exit 0 with nothing installed is the interesting outcome, so say what the
-            # installer DID leave before failing, rather than only that it left nothing.
-            Write-Host "=== searched roots ==="; $roots | ForEach-Object { Write-Host "  $_" }
-            Write-Host "=== any Unsloth path on the system drive ==="
+            # Exit 0 with nothing installed is the interesting outcome, so establish it
+            # properly instead of only reporting the absence.
+            Write-Host "=== Unsloth paths outside the checkout ==="
+            $ws = [regex]::Escape($env:GITHUB_WORKSPACE)
             Get-ChildItem "$env:SystemDrive\" -Filter '*Unsloth*' -Recurse -Force `
-              -ErrorAction SilentlyContinue | Select-Object -First 25 -ExpandProperty FullName
-            Write-Host "=== uninstall registry entries ==="
+              -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch $ws -and $_.FullName -notmatch '^C:\\a\\' } |
+              Select-Object -First 25 -ExpandProperty FullName
+            Write-Host "=== uninstall registry entries mentioning Unsloth ==="
+            $found = $false
             foreach ($k in 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
                            'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
                            'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*') {
               Get-ItemProperty $k -ErrorAction SilentlyContinue |
                 Where-Object { $_.DisplayName -like '*Unsloth*' } |
-                Select-Object DisplayName, InstallLocation, DisplayVersion | Format-List
+                ForEach-Object { $found = $true; $_ | Select-Object DisplayName, InstallLocation, DisplayVersion | Format-List }
             }
+            if (-not $found) { Write-Host "  (none)" }
+            Write-Host "=== NSIS left anything in TEMP? ==="
+            Get-ChildItem $env:TEMP -Filter '*ns*' -ErrorAction SilentlyContinue |
+              Select-Object -First 10 -ExpandProperty Name
             Write-Host "::error::the x64 NSIS installer exited 0 on arm64 Windows but installed nothing findable"
             exit 1
           }

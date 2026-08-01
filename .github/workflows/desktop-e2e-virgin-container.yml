@@ -299,9 +299,13 @@ jobs:
             tail -60 logs/backend.log || true
             exit 1
           fi
-          python3 tests/studio/desktop_drive.py \
-            --scenarios "$SCENARIOS" --port "$PINNED_PORT" \
-            --out artifacts/unprivileged-${{ strategy.job-index }}.json 2>&1 | tee logs/drive.log
+          # As tester, not root: the backend wrote its credentials under tester's home,
+          # and desktop_drive resolves ~/.unsloth from $HOME. Running this step as root
+          # looked in /github/home and reported a login failure against a healthy backend.
+          runuser -u tester -- env HOME=/home/tester \
+            python3 tests/studio/desktop_drive.py \
+              --scenarios "$SCENARIOS" --port "$PINNED_PORT" \
+              --out artifacts/unprivileged-${{ strategy.job-index }}.json 2>&1 | tee logs/drive.log
 
       - name: Upload logs
         if: always()
