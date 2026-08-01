@@ -165,7 +165,13 @@ jobs:
           # establish is whether the X SERVER died -- in which case the app is a victim
           # and this is a harness problem -- or whether the server is fine and only the
           # connection broke.
-          Xvfb :99 -screen 0 1440x900x24 -noreset -ac > logs/xvfb.log 2>&1 &
+          # EAGAIN on a server that is verifiably alive and answering means the socket
+          # write would block: the client is pushing X requests faster than the server
+          # drains them. Without MIT-SHM every pixel of a 1440x900 WebKit window travels
+          # through that socket rather than through shared memory, which is exactly the
+          # kind of traffic that fills it. So assert the extension is really there and
+          # cut the framebuffer down; both reduce socket volume.
+          Xvfb :99 -screen 0 1024x768x24 -noreset -ac +extension MIT-SHM > logs/xvfb.log 2>&1 &
           XVFB_PID=$!
           echo "XVFB_PID=$XVFB_PID" >> "$GITHUB_ENV"
           export DISPLAY=:99
@@ -175,6 +181,8 @@ jobs:
           done
           xdpyinfo -display :99 > /dev/null 2>&1 || { echo "::error::Xvfb never came up"; cat logs/xvfb.log; exit 1; }
           echo "Xvfb up (pid $XVFB_PID)"
+          echo "MIT-SHM: $(xdpyinfo -display :99 -queryExtensions 2>/dev/null | grep -ci 'MIT-SHM.*opcode' || echo 0) (1 = present)"
+          xdpyinfo -display :99 2>/dev/null | grep -E "dimensions|depth of root" | sed 's/^/  /' || true
           # No strace on the app this time. It reproduced the failure at ~11/12 rather
           # than the usual ~40%, so it is aggravating whatever this is, and an instrument
           # that changes the rate that much cannot also be trusted to measure it.
