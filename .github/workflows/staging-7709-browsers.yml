@@ -39,12 +39,13 @@ jobs:
 
       - run: python -m playwright install --with-deps chromium firefox webkit
 
-      - name: Install + launch Studio behind a dead proxy
-        env:
-          HTTP_PROXY: http://127.0.0.1:1
-          ALL_PROXY: http://127.0.0.1:1
+      - name: Install Studio (no proxy, pip needs PyPI)
+        run: ./install.sh --local --no-torch || pip install -e .
+
+      - name: Launch Studio behind a dead proxy
         run: |
-          ./install.sh --local --no-torch || pip install -e .
+          HTTP_PROXY=http://127.0.0.1:1 http_proxy=http://127.0.0.1:1 \
+          ALL_PROXY=http://127.0.0.1:1 \
           nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
           for i in $(seq 1 60); do
             curl -sf --noproxy '*' http://127.0.0.1:8888/api/health && break
