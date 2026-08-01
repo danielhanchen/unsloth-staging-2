@@ -1,0 +1,65 @@
+name: "staging-7709 browser matrix"
+
+# Browser half of the unslothai/unsloth#7709 review.
+#
+# The PR changes no frontend code, so this is a non-regression check with a
+# twist that makes it worth running: Studio is started with proxy environment
+# variables pointing at a DEAD port, i.e. the exact machine configuration that
+# breaks the desktop shell without the PR. Chromium, Firefox and WebKit must
+# still load the UI and reach the loopback backend.
+
+on:
+  push:
+    branches: ["pr-7709-xplat-ci"]
+    paths:
+      - '.github/workflows/staging-7709-browsers.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  browsers:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install playwright httpx pillow
+
+      - run: python -m playwright install --with-deps chromium firefox webkit
+
+      - name: Install + launch Studio behind a dead proxy
+        env:
+          HTTP_PROXY: http://127.0.0.1:1
+          http_proxy: http://127.0.0.1:1
+          ALL_PROXY: http://127.0.0.1:1
+        run: |
+          ./install.sh --local --no-torch || pip install -e .
+          nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
+          for i in $(seq 1 60); do
+            curl -sf --noproxy '*' http://127.0.0.1:8888/api/health && break
+            sleep 5
+          done
+          curl -sf --noproxy '*' http://127.0.0.1:8888/api/health
+
+      - name: Drive the UI in chromium, firefox and webkit
+        run: python ci_scratch/browser_check.py chromium firefox webkit
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-browsers-7709
+          path: |
+            studio-*.png
+            studio.log
