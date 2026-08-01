@@ -694,6 +694,15 @@ pub fn start_backend(
 
     info!("{}", start_line);
     diagnostics::append_phase_line(&backend_log.handle, "meta", &start_line);
+    // Whether the pipes were captured at all decides whether anything will ever read
+    // them, and a backend whose stdout has no reader dies on its next write. Nothing in
+    // the log said either way, which is why the app went silent for the whole
+    // investigation.
+    info!(
+        "Backend stdio captured: stdout={} stderr={}",
+        stdout.is_some(),
+        stderr.is_some()
+    );
 
     if let Some(stdout) = stdout {
         let app_handle = app.clone();
@@ -788,7 +797,10 @@ fn start_watchdog(
                         return;
                     }
                 }
-                Err(_) => return,
+                Err(_) => {
+                    warn!("Backend start watchdog giving up: state mutex poisoned");
+                    return;
+                }
             }
         }
 
@@ -999,6 +1011,8 @@ fn read_output_stream<R: std::io::Read>(
     is_stderr: bool,
     generation: u64,
 ) {
+    let stream_name = if is_stderr { "stderr" } else { "stdout" };
+    info!("Backend {} reader started (generation {})", stream_name, generation);
     let mut reader = std::io::BufReader::new(stream);
     let port_re = Regex::new(r"TAURI_PORT=(\d+)").unwrap();
     let mut buf = Vec::new();
@@ -1107,6 +1121,11 @@ fn read_output_stream<R: std::io::Read>(
     // draining to EOF anyway. Discarding costs one blocked thread; closing costs the
     // backend.
     if !saw_eof {
+        warn!(
+            "Backend {} reader stopped parsing WITHOUT eof (generation {}); draining so the \
+             child keeps a reader",
+            stream_name, generation
+        );
         use std::io::Read;
         let mut sink = [0u8; 8192];
         loop {
@@ -1117,6 +1136,8 @@ fn read_output_stream<R: std::io::Read>(
             }
         }
     }
+
+    info!("Backend {} reader exiting (generation {})", stream_name, generation);
 
     // Stream closed. Only the stdout reader checks for crashes.
     if !is_stderr {

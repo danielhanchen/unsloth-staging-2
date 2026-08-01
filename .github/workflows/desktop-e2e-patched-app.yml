@@ -164,6 +164,9 @@ jobs:
         run: |
           echo "=== the app's own log ==="
           tail -40 logs/app-stdout.log 2>/dev/null || true
+          echo "=== the pipe lifecycle, which is the whole question ==="
+          grep -E "stdio captured|reader started|reader exiting|stopped parsing|watchdog|deadline" \
+            logs/app-stdout.log 2>/dev/null || echo "(the app logged nothing about its readers)"
           cp -r "$HOME/.unsloth/studio/logs" logs/studio-logs 2>/dev/null || true
           echo "=== backend session logs ==="
           find "$HOME/.unsloth/studio/logs" -type f 2>/dev/null | head -5 | while read -r f; do
