@@ -234,9 +234,12 @@ jobs:
               || apt-get install -y -qq --no-install-recommends ca-certificates curl python3 libfuse2
             useradd -m tester
           else
-            dnf -y -q install ca-certificates curl python3 fuse-libs shadow-utils
+            # shadow-utils gives useradd; runuser lives in util-linux, which the
+            # fedora base image does not ship.
+            dnf -y -q install ca-certificates curl python3 fuse-libs shadow-utils util-linux
             useradd -m tester
           fi
+          command -v runuser >/dev/null || { echo "::error::no runuser to drop privileges with"; exit 1; }
           echo "sudo is $(command -v sudo >/dev/null && echo present || echo ABSENT)"
 
       - name: Download the AppImage
