@@ -154,6 +154,9 @@ jobs:
           $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
           Set-ItemProperty -Path $key -Name ProxyEnable -Value 0
 
+      - name: 5a. Install the pinned Tauri CLI (matches release-desktop.yml)
+        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
       - name: 5. Tauri debug build (CI parity with the upstream smoke job)
         run: npx --prefix studio tauri build --debug --no-bundle
         env:
