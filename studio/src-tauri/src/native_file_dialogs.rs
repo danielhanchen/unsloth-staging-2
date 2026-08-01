@@ -1,6 +1,7 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 
 use serde::Serialize;
+use std::borrow::Cow;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -35,42 +36,75 @@ fn decode_default_file_name(encoded_name: &str) -> Result<String, String> {
     Ok(default_file_name(&name))
 }
 
-fn save_filter(file_name: &str) -> (&'static str, Vec<&'static str>) {
+fn filter_extensions<const N: usize>(values: [&str; N]) -> Vec<String> {
+    values.into_iter().map(str::to_string).collect()
+}
+
+fn is_safe_filter_extension(extension: &str) -> bool {
+    !extension.is_empty()
+        && extension.len() <= 32
+        && extension
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn save_filter(file_name: &str) -> (&'static str, Vec<String>) {
     match Path::new(file_name)
         .extension()
         .and_then(|extension| extension.to_str())
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("json") => ("JSON", vec!["json"]),
-        Some("jsonl") | Some("ndjson") => ("JSON Lines", vec!["jsonl", "ndjson"]),
-        Some("csv") => ("CSV", vec!["csv"]),
-        Some("md") | Some("markdown") => ("Markdown", vec!["md", "markdown"]),
-        Some("html") | Some("htm") => ("HTML", vec!["html", "htm"]),
-        Some("py") => ("Python", vec!["py"]),
-        Some("sh") => ("Shell script", vec!["sh"]),
-        Some("zip") => ("ZIP archive", vec!["zip"]),
+        Some("json") => ("JSON", filter_extensions(["json"])),
+        Some("jsonl") | Some("ndjson") => ("JSON Lines", filter_extensions(["jsonl", "ndjson"])),
+        Some("csv") => ("CSV", filter_extensions(["csv"])),
+        Some("md") | Some("markdown") => ("Markdown", filter_extensions(["md", "markdown"])),
+        Some("html") | Some("htm") => ("HTML", filter_extensions(["html", "htm"])),
+        Some("yaml") | Some("yml") => ("YAML", filter_extensions(["yaml", "yml"])),
+        Some("py") => ("Python", filter_extensions(["py"])),
+        Some("sh") => ("Shell script", filter_extensions(["sh"])),
+        Some("js") | Some("jsx") => ("JavaScript", filter_extensions(["js", "jsx"])),
+        Some("ts") | Some("tsx") => ("TypeScript", filter_extensions(["ts", "tsx"])),
+        Some("sql") => ("SQL", filter_extensions(["sql"])),
+        Some("zip") => ("ZIP archive", filter_extensions(["zip"])),
         // Saved chat attachments, not just exports: a name outside the active
         // filter can be rejected or silently re-extensioned by the OS dialog.
-        Some("txt") | Some("log") => ("Text", vec!["txt", "log"]),
-        Some("png") => ("PNG image", vec!["png"]),
-        Some("jpg") | Some("jpeg") => ("JPEG image", vec!["jpg", "jpeg"]),
-        Some("webp") => ("WebP image", vec!["webp"]),
-        Some("gif") => ("GIF image", vec!["gif"]),
-        Some("wav") => ("WAV audio", vec!["wav"]),
-        Some("mp3") => ("MP3 audio", vec!["mp3"]),
-        Some("m4a") | Some("mp4") => ("MPEG-4 audio", vec!["m4a", "mp4"]),
-        Some("ogg") | Some("oga") => ("Ogg audio", vec!["ogg", "oga"]),
-        Some("flac") => ("FLAC audio", vec!["flac"]),
-        Some("webm") => ("WebM audio", vec!["webm"]),
+        Some("txt") | Some("log") => ("Text", filter_extensions(["txt", "log"])),
+        Some("png") => ("PNG image", filter_extensions(["png"])),
+        Some("jpg") | Some("jpeg") => ("JPEG image", filter_extensions(["jpg", "jpeg"])),
+        Some("webp") => ("WebP image", filter_extensions(["webp"])),
+        Some("gif") => ("GIF image", filter_extensions(["gif"])),
+        Some("svg") => ("SVG image", filter_extensions(["svg"])),
+        Some("wav") => ("WAV audio", filter_extensions(["wav"])),
+        Some("mp3") => ("MP3 audio", filter_extensions(["mp3"])),
+        Some("m4a") | Some("mp4") => ("MPEG-4 audio", filter_extensions(["m4a", "mp4"])),
+        Some("ogg") | Some("oga") => ("Ogg audio", filter_extensions(["ogg", "oga"])),
+        Some("flac") => ("FLAC audio", filter_extensions(["flac"])),
+        Some("webm") => ("WebM audio", filter_extensions(["webm"])),
+        Some(extension) if is_safe_filter_extension(extension) => {
+            ("Export file", vec![extension.to_string()])
+        }
         _ => (
             "Export files",
-            vec![
-                "json", "jsonl", "ndjson", "csv", "md", "markdown", "html", "htm", "py", "sh",
-                "zip", "txt", "log", "png", "jpg", "jpeg", "webp", "gif", "wav", "mp3", "m4a",
-                "mp4", "ogg", "oga", "flac", "webm",
-            ],
+            filter_extensions([
+                "json", "jsonl", "ndjson", "csv", "md", "markdown", "html", "htm", "yaml", "yml",
+                "py", "sh", "js", "jsx", "ts", "tsx", "sql", "zip", "txt", "log", "png", "jpg",
+                "jpeg", "webp", "gif", "svg", "wav", "mp3", "m4a", "mp4", "ogg", "oga", "flac",
+                "webm",
+            ]),
         ),
+    }
+}
+
+fn invoke_body_bytes(body: &tauri::ipc::InvokeBody) -> Option<Cow<'_, [u8]>> {
+    match body {
+        tauri::ipc::InvokeBody::Raw(content) => Some(Cow::Borrowed(content)),
+        tauri::ipc::InvokeBody::Json(value) => value
+            .as_array()?
+            .iter()
+            .map(|item| u8::try_from(item.as_u64()?).ok())
+            .collect::<Option<Vec<_>>>()
+            .map(Cow::Owned),
     }
 }
 
@@ -183,17 +217,16 @@ pub async fn save_native_file(
         .to_str()
         .map_err(|_| "Invalid native export filename.".to_string())?;
     let file_name = decode_default_file_name(encoded_name)?;
-    let content = match request.body() {
-        tauri::ipc::InvokeBody::Raw(content) => content,
-        _ => return Err("Native export content must be binary.".to_string()),
-    };
+    let content = invoke_body_bytes(request.body())
+        .ok_or_else(|| "Native export content must be binary.".to_string())?;
     let (filter_name, extensions) = save_filter(&file_name);
+    let extension_refs = extensions.iter().map(String::as_str).collect::<Vec<_>>();
     let (tx, rx) = tokio::sync::oneshot::channel();
     app.dialog()
         .file()
         .set_title("Save Unsloth export")
         .set_file_name(file_name)
-        .add_filter(filter_name, &extensions)
+        .add_filter(filter_name, &extension_refs)
         .save_file(move |path| {
             let _ = tx.send(path);
         });
@@ -202,7 +235,7 @@ pub async fn save_native_file(
         .map_err(|_| "Save dialog closed unexpectedly.".to_string())?
         .map(local_dialog_path)
         .transpose()?;
-    save_selected_file(selected_path, content)
+    save_selected_file(selected_path, content.as_ref())
 }
 
 #[tauri::command]
@@ -243,10 +276,46 @@ mod tests {
         ))
     }
 
+    fn assert_save_filter(file_name: &str, name: &str, expected: &[&str]) {
+        let (actual_name, actual_extensions) = save_filter(file_name);
+        assert_eq!(actual_name, name);
+        assert_eq!(
+            actual_extensions
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
+
     #[test]
     fn cancellation_is_quiet_for_save_and_import() {
         assert!(save_selected_file(None, b"x").unwrap().is_none());
         assert!(read_selected_import(None).unwrap().is_none());
+    }
+
+    #[test]
+    fn accepts_raw_and_json_byte_bodies() {
+        let raw = tauri::ipc::InvokeBody::Raw(vec![1, 2, 250]);
+        assert_eq!(
+            invoke_body_bytes(&raw).as_deref(),
+            Some([1, 2, 250].as_slice())
+        );
+
+        let json = tauri::ipc::InvokeBody::Json(serde_json::json!([1, 2, 250]));
+        assert_eq!(
+            invoke_body_bytes(&json).as_deref(),
+            Some([1, 2, 250].as_slice())
+        );
+
+        for value in [
+            serde_json::json!({"content": "hi"}),
+            serde_json::json!([1, 256]),
+            serde_json::json!([1, -2]),
+        ] {
+            let body = tauri::ipc::InvokeBody::Json(value);
+            assert!(invoke_body_bytes(&body).is_none());
+        }
     }
 
     #[test]
@@ -266,40 +335,49 @@ mod tests {
 
     #[test]
     fn markdown_exports_use_a_markdown_save_filter() {
-        assert_eq!(
-            save_filter("message.md"),
-            ("Markdown", vec!["md", "markdown"])
-        );
+        assert_save_filter("message.md", "Markdown", &["md", "markdown"]);
     }
 
     #[test]
     fn html_canvas_exports_use_an_html_save_filter() {
-        assert_eq!(save_filter("canvas.html"), ("HTML", vec!["html", "htm"]));
-        assert_eq!(save_filter("canvas.HTM"), ("HTML", vec!["html", "htm"]));
+        assert_save_filter("canvas.html", "HTML", &["html", "htm"]);
+        assert_save_filter("canvas.HTM", "HTML", &["html", "htm"]);
     }
 
     #[test]
     fn python_scripts_use_a_python_save_filter() {
-        assert_eq!(save_filter("script.py"), ("Python", vec!["py"]));
-        assert_eq!(save_filter("script.PY"), ("Python", vec!["py"]));
+        assert_save_filter("script.py", "Python", &["py"]);
+        assert_save_filter("script.PY", "Python", &["py"]);
     }
 
     #[test]
     fn shell_commands_use_a_shell_save_filter() {
         // The terminal card downloads command.sh through the same cell.
-        assert_eq!(save_filter("command.sh"), ("Shell script", vec!["sh"]));
-        assert_eq!(save_filter("command.SH"), ("Shell script", vec!["sh"]));
+        assert_save_filter("command.sh", "Shell script", &["sh"]);
+        assert_save_filter("command.SH", "Shell script", &["sh"]);
+    }
+
+    #[test]
+    fn browser_generated_exports_keep_their_extension() {
+        assert_save_filter("training.yaml", "YAML", &["yaml", "yml"]);
+        assert_save_filter("snippet.TSX", "TypeScript", &["ts", "tsx"]);
+        assert_save_filter("diagram.svg", "SVG image", &["svg"]);
+        assert_save_filter("snippet.rs", "Export file", &["rs"]);
+
+        let (name, extensions) = save_filter("snippet.bad!");
+        assert_eq!(name, "Export files");
+        assert!(!extensions.iter().any(|extension| extension == "bad!"));
     }
 
     #[test]
     fn saved_chat_attachments_keep_their_own_extension() {
         // Settings > Data saves attachments here; a name outside the filter can
         // be rejected or re-extensioned by the OS dialog.
-        assert_eq!(save_filter("report.txt"), ("Text", vec!["txt", "log"]));
-        assert_eq!(save_filter("photo.PNG"), ("PNG image", vec!["png"]));
-        assert_eq!(save_filter("shot.jpeg"), ("JPEG image", vec!["jpg", "jpeg"]));
-        assert_eq!(save_filter("clip.wav"), ("WAV audio", vec!["wav"]));
-        assert_eq!(save_filter("voice.webm"), ("WebM audio", vec!["webm"]));
+        assert_save_filter("report.txt", "Text", &["txt", "log"]);
+        assert_save_filter("photo.PNG", "PNG image", &["png"]);
+        assert_save_filter("shot.jpeg", "JPEG image", &["jpg", "jpeg"]);
+        assert_save_filter("clip.wav", "WAV audio", &["wav"]);
+        assert_save_filter("voice.webm", "WebM audio", &["webm"]);
     }
 
     #[test]
@@ -307,9 +385,13 @@ mod tests {
         let (name, extensions) = save_filter("no-extension");
         assert_eq!(name, "Export files");
         for wanted in [
-            "py", "sh", "json", "jsonl", "csv", "md", "html", "zip", "txt", "png", "jpg", "wav",
+            "py", "sh", "js", "ts", "sql", "yaml", "json", "jsonl", "csv", "md", "html", "zip",
+            "txt", "png", "jpg", "svg", "wav",
         ] {
-            assert!(extensions.contains(&wanted), "fallback lost {wanted}");
+            assert!(
+                extensions.iter().any(|extension| extension == wanted),
+                "fallback lost {wanted}"
+            );
         }
     }
 
@@ -383,5 +465,191 @@ mod tests {
             decode_default_file_name("Y2hhdC5qc29ubA==").unwrap(),
             "chat.jsonl"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Review-only boundary tests for PR #7710 (staging fork, cross-OS run).
+// Not part of the PR. Windows is the interesting target here: save_selected_file
+// takes a #[cfg(unix)] branch for permissions, and std::path treats '\' as a
+// separator only on Windows, so default_file_name() strips differently.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod pr7710_review_tests {
+    use super::*;
+
+    fn json(value: serde_json::Value) -> Option<Vec<u8>> {
+        invoke_body_bytes(&tauri::ipc::InvokeBody::Json(value)).map(|c| c.into_owned())
+    }
+
+    #[test]
+    fn json_body_accepts_the_full_byte_range_and_rejects_everything_else() {
+        assert_eq!(
+            json(serde_json::json!([0, 1, 127, 128, 254, 255])),
+            Some(vec![0, 1, 127, 128, 254, 255])
+        );
+        assert_eq!(json(serde_json::json!([])), Some(vec![]));
+
+        for bad in [
+            serde_json::json!([256]),
+            serde_json::json!([-1]),
+            serde_json::json!([1.5]),
+            serde_json::json!([1.0]),
+            serde_json::json!(["65"]),
+            serde_json::json!([null]),
+            serde_json::json!([true]),
+            serde_json::json!([[1, 2]]),
+            serde_json::json!([{"a": 1}]),
+            serde_json::json!("hello"),
+            serde_json::json!(42),
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!({"content": [1, 2]}),
+            serde_json::json!([1, 2, 999999999999u64]),
+        ] {
+            assert!(json(bad.clone()).is_none(), "should have rejected {bad}");
+        }
+    }
+
+    #[test]
+    fn raw_body_is_borrowed_not_cloned_and_passes_through_verbatim() {
+        let raw = tauri::ipc::InvokeBody::Raw(vec![0, 255, 128]);
+        let out = invoke_body_bytes(&raw).unwrap();
+        assert!(
+            matches!(out, Cow::Borrowed(_)),
+            "raw bodies should not be copied"
+        );
+        assert_eq!(out.as_ref(), &[0, 255, 128]);
+
+        let empty = tauri::ipc::InvokeBody::Raw(vec![]);
+        assert_eq!(invoke_body_bytes(&empty).unwrap().as_ref(), &[] as &[u8]);
+    }
+
+    #[test]
+    fn a_large_json_body_still_round_trips() {
+        let big: Vec<u8> = (0..64 * 1024).map(|i| (i % 256) as u8).collect();
+        let value = serde_json::Value::Array(big.iter().map(|b| serde_json::json!(b)).collect());
+        assert_eq!(json(value), Some(big));
+    }
+
+    #[test]
+    fn unknown_but_safe_extensions_become_their_own_filter() {
+        for (name, expected) in [
+            ("snippet.rs", "rs"),
+            ("snippet.go", "go"),
+            ("snippet.foo-bar", "foo-bar"),
+            ("snippet.under_score", "under_score"),
+            ("snippet.RS", "rs"),
+            ("snippet.a1", "a1"),
+            (
+                "file.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+        ] {
+            let (label, extensions) = save_filter(name);
+            assert_eq!(label, "Export file", "{name}");
+            assert_eq!(extensions, vec![expected.to_string()], "{name}");
+        }
+    }
+
+    #[test]
+    fn unsafe_or_oversized_extensions_fall_back_to_the_generic_filter() {
+        for name in [
+            "file.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "snippet.bad!",
+            "snippet.with space",
+            "snippet.a+b",
+            "snippet.",
+            "no-extension",
+            ".hidden",
+        ] {
+            let (label, _) = save_filter(name);
+            assert_eq!(label, "Export files", "{name} should use the generic filter");
+        }
+    }
+
+    #[test]
+    fn executable_looking_extensions_are_currently_permitted() {
+        // Documents today's behaviour: the filter is syntactic, not an allowlist.
+        for name in ["payload.exe", "payload.desktop", "payload.bat", "payload.dll"] {
+            let (label, extensions) = save_filter(name);
+            assert_eq!(label, "Export file", "{name}");
+            assert_eq!(extensions.len(), 1);
+        }
+    }
+
+    #[test]
+    fn suggested_file_names_are_stripped_of_any_path() {
+        assert_eq!(default_file_name("../../../etc/passwd"), "passwd");
+        assert_eq!(default_file_name("/etc/shadow"), "shadow");
+        assert_eq!(default_file_name("a/b/c.txt"), "c.txt");
+        assert_eq!(default_file_name(""), "unsloth-export.json");
+        assert_eq!(default_file_name("."), "unsloth-export.json");
+        assert_eq!(default_file_name(".."), "unsloth-export.json");
+        assert_eq!(default_file_name("/"), "unsloth-export.json");
+    }
+
+    #[test]
+    fn windows_style_separators_are_stripped_on_windows() {
+        // On Windows '\' is a path separator, so the basename is taken. On unix
+        // the whole string is one legal file name. Either way nothing escapes
+        // the directory the user picked, because the OS dialog owns the parent.
+        let stripped = default_file_name(r"..\..\evil.sh");
+        if cfg!(windows) {
+            assert_eq!(stripped, "evil.sh");
+        } else {
+            assert_eq!(stripped, r"..\..\evil.sh");
+        }
+    }
+
+    #[test]
+    fn encoded_file_names_round_trip_and_reject_garbage() {
+        use base64::Engine as _;
+        let encoded = BASE64.encode("конфиг-日本語.yaml".as_bytes());
+        assert_eq!(
+            decode_default_file_name(&encoded).unwrap(),
+            "конфиг-日本語.yaml"
+        );
+        assert!(decode_default_file_name("not base64!!!").is_err());
+        assert!(decode_default_file_name(&BASE64.encode([0xff, 0xfe])).is_err());
+        assert_eq!(
+            decode_default_file_name(&BASE64.encode("../../evil.sh")).unwrap(),
+            "evil.sh"
+        );
+    }
+
+    #[test]
+    fn an_empty_body_overwrites_the_destination_with_zero_bytes() {
+        // Documents today's behaviour so a future change is a deliberate one.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.txt");
+        std::fs::write(&path, b"previous contents").unwrap();
+        let saved = save_selected_file(Some(path.clone()), b"").unwrap();
+        assert_eq!(saved.as_deref(), Some("existing.txt"));
+        assert_eq!(std::fs::read(&path).unwrap(), b"");
+    }
+
+    #[test]
+    fn saving_replaces_contents_byte_exactly_for_binary_payloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.png");
+        let payload: Vec<u8> = (0..=255).collect();
+        save_selected_file(Some(path.clone()), &payload).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), payload);
+    }
+
+    #[test]
+    fn overwriting_an_existing_file_is_atomic_and_leaves_no_temp_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export.json");
+        std::fs::write(&path, b"old").unwrap();
+        save_selected_file(Some(path.clone()), b"new contents").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"new contents");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".unsloth-export-"))
+            .collect();
+        assert!(leftovers.is_empty(), "staging temp file was left behind");
     }
 }

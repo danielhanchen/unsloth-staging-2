@@ -1,0 +1,47 @@
+# Cross-OS validation for unslothai/unsloth PR #7710 (desktop file downloads).
+name: "PR-7710 linux"
+on:
+  push:
+    branches: [pr7710-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Tauri system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libssl-dev
+      - uses: actions/setup-node@v4
+        with: { node-version: '24' }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with: { workspaces: studio/src-tauri -> target }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      # The save-dialog boundary: byte handling, save filters, filename
+      # stripping and the atomic replace. save_selected_file has a
+      # #[cfg(unix)] permissions branch and std::path only treats '\' as a
+      # separator on Windows, so this is the part that varies per OS.
+      - name: cargo test (native_file_dialogs)
+        working-directory: studio/src-tauri
+        run: cargo test --no-fail-fast native_file_dialogs
+
+      # The new data-URI decoder imports nothing, so it needs no npm install.
+      - name: node data-uri tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test "tests/data-uri.test.ts"
+
+      - name: pytest desktop contract
+        run: python -m pytest tests/studio/test_desktop_reliability_frontend_contract.py -q
