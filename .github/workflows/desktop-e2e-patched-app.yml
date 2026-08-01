@@ -55,7 +55,7 @@ env:
 
 jobs:
   patched:
-    name: "patched app (22.04 #${{ matrix.attempt }})"
+    name: "patched app (22.04 #${{ matrix.attempt }}, xvfb ${{ matrix.xvfb }})"
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     strategy:
@@ -67,7 +67,17 @@ jobs:
         attempt: [1, 2, 3, 4, 5, 6]
         # The bubblewrap / xdg-dbus-proxy arm is gone: tested A/B in one run and refuted,
         # absent 6/6 pass vs present 4/6, which is the wrong direction as well as the
-        # wrong size. Missing WebKit sandbox dependencies are not why the app quits.
+        # wrong size.
+        #
+        # This arm tests what the app's own last words say killed it:
+        #   Gdk-DEBUG: unsloth-studio: Fatal IO error 11 (Resource temporarily
+        #   unavailable) on X server :99.
+        # logged at the same microsecond as its exit_group(1). GDK treats a fatal X IO
+        # error as unrecoverable and exits(1) -- the app is not crashing, its connection
+        # to Xvfb is breaking. Error 11 is EAGAIN. Xvfb resets by default when its client
+        # count reaches zero, which tears down every connection, and this app spawns
+        # short-lived children throughout startup. -noreset is the standard guard.
+        xvfb: [default, noreset]
 
     steps:
       - uses: actions/checkout@v4
@@ -151,7 +161,13 @@ jobs:
           # wholesale, but execve/exit/wait/kill is exactly the set that answers "who
           # died, and did the app choose to exit or was it told to".
           ulimit -c unlimited || true
-          nohup xvfb-run -n 99 -f "$PWD/.xvfb-auth" --server-args="-screen 0 1440x900x24" \
+          if [ "${{ matrix.xvfb }}" = "noreset" ]; then
+            SERVER_ARGS="-screen 0 1440x900x24 -noreset -ac"
+          else
+            SERVER_ARGS="-screen 0 1440x900x24"
+          fi
+          echo "Xvfb args: $SERVER_ARGS"
+          nohup xvfb-run -n 99 -f "$PWD/.xvfb-auth" --server-args="$SERVER_ARGS" \
             strace -f -tt -qq -o logs/app.strace \
               -e trace=execve,exit_group,exit,wait4,kill,tgkill,prctl \
             "$PATCHED_BIN" > logs/app-stdout.log 2>&1 &
@@ -181,6 +197,9 @@ jobs:
           free -m || true
           echo "=== core dumps ==="
           ls -la core* /var/lib/apport/coredump 2>/dev/null | head -5 || echo "(none)"
+          echo "=== did the X connection die? ==="
+          grep -iE "Fatal IO error|X server|Maximum number of clients|cannot open display" \
+            logs/app-stdout.log 2>/dev/null | tail -5 || echo "(no X errors logged)"
           echo "=== the app's last words ==="
           tail -60 logs/app-stdout.log
           echo "=== who exited, and with what ==="
@@ -220,7 +239,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: patched-app-22.04-${{ matrix.attempt }}
+          name: patched-app-22.04-${{ matrix.attempt }}-${{ matrix.xvfb }}
           path: |
             logs/
             artifacts/
