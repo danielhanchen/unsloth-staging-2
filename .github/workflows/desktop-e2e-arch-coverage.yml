@@ -201,8 +201,11 @@ jobs:
           if ($entry) {
             Write-Host "registry says: $($entry.DisplayName) $($entry.DisplayVersion) at $($entry.InstallLocation)"
           }
-          $roots = @($entry.InstallLocation -replace '^"|"$', '', "$env:LOCALAPPDATA",
-                     "$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}") |
+          # Parenthesised: inside @(...) a bare -replace swallows the following
+          # comma-separated elements as extra operands and the array never forms.
+          $fromRegistry = ($entry.InstallLocation -replace '^"|"$', '')
+          $roots = @($fromRegistry, "$env:LOCALAPPDATA", "$env:LOCALAPPDATA\Programs",
+                     "$env:ProgramFiles", "${env:ProgramFiles(x86)}") |
                    Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
           Write-Host "searching: $($roots -join '; ')"
           $installed = Get-ChildItem $roots -Filter '*Unsloth*.exe' -Recurse -ErrorAction SilentlyContinue |
