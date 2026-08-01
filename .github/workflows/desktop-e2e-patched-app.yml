@@ -61,10 +61,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # D8 fires on roughly 40% of 22.04 legs. Six attempts means a clean sweep is
-        # under 5% likely by chance, which is the bar any claim here has to clear --
-        # three attempts is how I twice talked myself into a wrong conclusion.
-        attempt: [1, 2, 3, 4, 5, 6]
+        # Twelve, because the claim being tested now needs it. Starting Xvfb directly
+        # instead of through xvfb-run came back 6/6 clean, but the pooled rate for this
+        # job without strace is 6 failures in 30 legs (20%), and 0/6 happens a quarter of
+        # the time at that rate. 0/12 more would put the combined 18 at about 2%, which is
+        # a result rather than an impression. Twice already in this investigation I called
+        # a fix from a single clean run and was wrong.
+        attempt: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
         # The bubblewrap / xdg-dbus-proxy arm is gone: tested A/B in one run and refuted,
         # absent 6/6 pass vs present 4/6, which is the wrong direction as well as the
         # wrong size.
