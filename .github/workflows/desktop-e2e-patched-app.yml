@@ -55,16 +55,24 @@ env:
 
 jobs:
   patched:
-    name: "patched app (22.04 #${{ matrix.attempt }})"
+    name: "patched app (22.04 #${{ matrix.attempt }}, bwrap ${{ matrix.webkit_sandbox_deps }})"
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         # D8 fires on roughly 40% of 22.04 legs. Six attempts means a clean sweep is
-        # under 5% likely by chance, which is the bar this fix has to clear to mean
-        # anything -- three attempts is how I twice talked myself into a wrong conclusion.
+        # under 5% likely by chance, which is the bar any claim here has to clear --
+        # three attempts is how I twice talked myself into a wrong conclusion.
         attempt: [1, 2, 3, 4, 5, 6]
+        # A/B in one run, so both arms meet the same runner image and the same load.
+        # WebKitGTK sandboxes its web process with bubblewrap and proxies DBus through
+        # xdg-dbus-proxy; without them the web process can fail to start, and a Tauri app
+        # whose web process dies exits. The bundle declares only libappindicator3-1,
+        # libwebkit2gtk-4.1-0 and libgtk-3-0, so on a machine that lacks them nothing
+        # pulls them in -- precisely the bare-bones case this exercise is about, and it
+        # would explain an OS-correlated failure no environment diff could.
+        webkit_sandbox_deps: [absent, present]
 
     steps:
       - uses: actions/checkout@v4
@@ -135,6 +143,18 @@ jobs:
           echo "PATCHED_BIN=$BIN" >> "$GITHUB_ENV"
           ls -la "$BIN"
 
+      - name: Is bubblewrap here, and should it be?
+        run: |
+          echo "arm: ${{ matrix.webkit_sandbox_deps }}"
+          for tool in bwrap xdg-dbus-proxy; do
+            printf '  %-16s %s\n' "$tool" "$(command -v $tool || echo '<absent>')"
+          done
+          echo "declared Depends: $(dpkg-deb -f dl/*.deb Depends)"
+          if [ "${{ matrix.webkit_sandbox_deps }}" = "present" ]; then
+          sudo apt-get install -y -qq --no-install-recommends bubblewrap xdg-dbus-proxy
+            echo "after install: $(command -v bwrap) $(command -v xdg-dbus-proxy)"
+          fi
+
       - name: Launch the patched app and see whether its backend survives
         run: |
           export WEBKIT_DISABLE_DMABUF_RENDERER=1
@@ -200,7 +220,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: patched-app-22.04-${{ matrix.attempt }}
+          name: patched-app-22.04-${{ matrix.attempt }}-bwrap-${{ matrix.webkit_sandbox_deps }}
           path: |
             logs/
             artifacts/
