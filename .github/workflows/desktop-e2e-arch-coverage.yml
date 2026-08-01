@@ -296,6 +296,11 @@ jobs:
             Get-Content logs\backend-err.log -Tail 60 -ErrorAction SilentlyContinue
             exit 1
           }
+          # Read this BEFORE driving: the first run consumes the bootstrap password
+          # and deletes the file, so a retry has no way back in unless we kept it.
+          $bootstrap = Join-Path $env:USERPROFILE '.unsloth\studio\auth\.bootstrap_password'
+          $seeded = if (Test-Path $bootstrap) { (Get-Content $bootstrap -Raw).Trim() } else { $null }
+
           python tests\studio\desktop_drive.py --scenarios backend,inference `
             --port 8962 --out artifacts\windows-arm.json 2>&1 | Tee-Object logs\drive.log
           $driveRc = $LASTEXITCODE
@@ -306,14 +311,11 @@ jobs:
           if ($driveRc -ne 0 -and (Select-String -Path logs\drive.log -Pattern 'hf_transfer' -Quiet)) {
             Write-Host "::warning::the GGUF download failed inside hf_transfer; retrying with it disabled"
             $env:HF_HUB_ENABLE_HF_TRANSFER = '0'
-            # The first run consumed the bootstrap password and rotated it to
-            # "<bootstrap>-drive1", so the retry must be told the new one or it fails
-            # at login and never reaches the download it is meant to measure.
-            $bootstrap = Join-Path $env:USERPROFILE '.unsloth\studio\auth\.bootstrap_password'
+            # desktop_drive rotates the seeded password to "<seeded>-drive1" on first
+            # login, so that is what the retry has to present.
             $pwArgs = @()
-            if (Test-Path $bootstrap) {
-              $pwArgs = @('--password', ((Get-Content $bootstrap -Raw).Trim() + '-drive1'))
-            }
+            if ($seeded) { $pwArgs = @('--password', ($seeded + '-drive1')) }
+            else { Write-Host "::warning::no seeded password was captured; the retry will not authenticate" }
             python tests\studio\desktop_drive.py --scenarios inference `
               --port 8962 @pwArgs --out artifacts\windows-arm-nohftransfer.json 2>&1 |
               Tee-Object logs\drive-nohftransfer.log
