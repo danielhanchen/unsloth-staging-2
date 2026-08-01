@@ -306,10 +306,24 @@ jobs:
           if ($driveRc -ne 0 -and (Select-String -Path logs\drive.log -Pattern 'hf_transfer' -Quiet)) {
             Write-Host "::warning::the GGUF download failed inside hf_transfer; retrying with it disabled"
             $env:HF_HUB_ENABLE_HF_TRANSFER = '0'
+            # The first run consumed the bootstrap password and rotated it to
+            # "<bootstrap>-drive1", so the retry must be told the new one or it fails
+            # at login and never reaches the download it is meant to measure.
+            $bootstrap = Join-Path $env:USERPROFILE '.unsloth\studio\auth\.bootstrap_password'
+            $pwArgs = @()
+            if (Test-Path $bootstrap) {
+              $pwArgs = @('--password', ((Get-Content $bootstrap -Raw).Trim() + '-drive1'))
+            }
             python tests\studio\desktop_drive.py --scenarios inference `
-              --port 8962 --out artifacts\windows-arm-nohftransfer.json 2>&1 |
+              --port 8962 @pwArgs --out artifacts\windows-arm-nohftransfer.json 2>&1 |
               Tee-Object logs\drive-nohftransfer.log
-            if ($LASTEXITCODE -eq 0) {
+            $retryRc = $LASTEXITCODE
+            # Only conclude if the retry actually got as far as the download. A retry
+            # that died at login measures nothing, and saying "it is the network"
+            # off the back of it would be a guess dressed up as a result.
+            if (Select-String -Path logs\drive-nohftransfer.log -Pattern 'FAILED\s+discovery' -Quiet) {
+              Write-Host "::warning::inconclusive: the retry could not authenticate, so it never reached the download"
+            } elseif ($retryRc -eq 0) {
               Write-Host "::error::hf_transfer cannot download on arm64 Windows; the same load succeeds with HF_HUB_ENABLE_HF_TRANSFER=0"
             } else {
               Write-Host "::warning::the download fails with hf_transfer off too, so this is the network and not the platform"
