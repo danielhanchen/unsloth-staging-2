@@ -136,8 +136,10 @@ jobs:
 
       - name: Build the app from source, with the fix
         run: |
-          grep -n "saw_eof" studio/src-tauri/src/process.rs || {
-            echo "::error::the D8 fix is not in this checkout"; exit 1; }
+          grep -q "saw_eof" studio/src-tauri/src/process.rs || {
+            echo "::error::the drain fix is not in this checkout"; exit 1; }
+          grep -q "pre_exec" studio/src-tauri/src/process.rs || {
+            echo "::error::the fd-leak fix is not in this checkout"; exit 1; }
           cargo build --release --manifest-path studio/src-tauri/Cargo.toml 2>&1 | tail -20
           BIN="$PWD/studio/src-tauri/target/release/unsloth-studio"
           [ -x "$BIN" ] || { echo "::error::no binary at $BIN"; ls -la studio/src-tauri/target/release | head -20; exit 1; }
@@ -218,6 +220,9 @@ jobs:
           echo "=== did the X connection die? ==="
           grep -iE "Fatal IO error|X server|Maximum number of clients|cannot open display" \
             logs/app-stdout.log 2>/dev/null | tail -5 || echo "(no X errors logged)"
+          echo "=== how many fds did the backend inherit? ==="
+          grep -E "inherited fd|every inherited" logs/*.log 2>/dev/null | head -5 \
+            || echo "(not captured in this job)"
           echo "=== the app's last words ==="
           tail -60 logs/app-stdout.log
           exit 1

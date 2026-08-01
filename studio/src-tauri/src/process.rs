@@ -607,6 +607,40 @@ pub fn start_backend(
         cmd.env_remove("PYTHONPATH");
     }
 
+    // Do not hand the GUI's descriptors to the backend. Measured from inside a spawned
+    // child, it inherits far more than stdio: two pipes, two /dev/urandom handles and an
+    // open directory, none of which it has any use for.
+    //
+    // This matters beyond tidiness. O_NONBLOCK lives on the open file DESCRIPTION, which
+    // is shared across fork and dup, so a child that sets it on an inherited descriptor
+    // flips it for the parent too. The app dies of
+    //   Gdk-DEBUG: Fatal IO error 11 (Resource temporarily unavailable) on X server :99
+    // 28 ms after this spawn, while the X server is verified still alive and still
+    // answering queries -- EAGAIN on a healthy server is what a suddenly non-blocking
+    // socket looks like, and GDK treats a fatal X IO error as unrecoverable and exits(1).
+    //
+    // Whether or not that is the mechanism, a backend has no business holding the
+    // window's X connection open.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            // Runs between fork and exec, so only async-signal-safe calls: close(2) is,
+            // and opendir/readdir are not, which rules out walking /proc/self/fd here.
+            // std dup2s stdio into 0/1/2 before these closures run, so those are safe.
+            let mut limit = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+            let max = if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
+                (limit.rlim_cur as libc::c_int).clamp(64, 4096)
+            } else {
+                1024
+            };
+            for fd in 3..max {
+                libc::close(fd);
+            }
+            Ok(())
+        });
+    }
+
     // Tauri uses the legacy root regardless of UNSLOTH_STUDIO_HOME / STUDIO_HOME;
     // scrub so the spawned Python backend can't diverge. UNSLOTH_LLAMA_CPP_PATH
     // is a pre-existing user-controlled llama.cpp dir override; keep it.
