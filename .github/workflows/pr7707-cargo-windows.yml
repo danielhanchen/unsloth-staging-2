@@ -1,0 +1,44 @@
+name: "PR-7707 cargo windows-latest"
+on:
+  push:
+    branches: [pr7707-cargo-crossos]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  cargo:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri -> target
+
+      # bash, not PowerShell: the same two lines then work on every runner.
+      - name: Stub frontend dist
+        shell: bash
+        run: |
+          mkdir -p studio/frontend/dist
+          echo '<!doctype html><html><body></body></html>' > studio/frontend/dist/index.html
+
+      # main.rs pulls in the `windows` / `windows-sys` cfg(windows) deps here,
+      # which nothing in upstream CI ever compiles.
+      - name: cargo check (all targets)
+        shell: bash
+        working-directory: studio/src-tauri
+        run: cargo check --all-targets --locked
+
+      - name: cargo test
+        shell: bash
+        working-directory: studio/src-tauri
+        run: cargo test --no-fail-fast

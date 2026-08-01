@@ -1,0 +1,40 @@
+name: "PR-7707 cargo macos-14"
+on:
+  push:
+    branches: [pr7707-cargo-crossos]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  cargo:
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri -> target
+
+      - name: Stub frontend dist
+        run: |
+          mkdir -p studio/frontend/dist
+          echo '<!doctype html><html><body></body></html>' > studio/frontend/dist/index.html
+
+      # This is the point of the job: main.rs is compiled for WKWebView here,
+      # and upstream CI only ever builds the crate on Linux.
+      - name: cargo check (all targets)
+        working-directory: studio/src-tauri
+        run: cargo check --all-targets --locked
+
+      - name: cargo test
+        working-directory: studio/src-tauri
+        run: cargo test --no-fail-fast

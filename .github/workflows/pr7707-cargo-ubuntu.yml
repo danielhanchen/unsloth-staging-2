@@ -1,0 +1,50 @@
+# Quoted so the '#' in a name is never parsed as a YAML comment, which would
+# collapse every per-OS workflow onto one concurrency group and let
+# cancel-in-progress kill sibling OSes.
+name: "PR-7707 cargo ubuntu-latest"
+on:
+  push:
+    branches: [pr7707-cargo-crossos]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  cargo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Linux native deps for Tauri / WebKit2GTK
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev patchelf
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri -> target
+
+      # tauri-build's build script asserts frontendDist exists. A real vite
+      # build is unnecessary for a type check, so stub the directory.
+      - name: Stub frontend dist
+        run: |
+          mkdir -p studio/frontend/dist
+          echo '<!doctype html><html><body></body></html>' > studio/frontend/dist/index.html
+
+      - name: cargo check (all targets)
+        working-directory: studio/src-tauri
+        run: cargo check --all-targets --locked
+
+      - name: cargo test
+        working-directory: studio/src-tauri
+        run: cargo test --no-fail-fast
