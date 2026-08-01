@@ -1,0 +1,345 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# STAGING. The bare-bones leg the hosted-runner jobs cannot be.
+#
+# desktop-e2e-linux-deb.yml strips the runner's toolchain with clean-machine-env.sh,
+# which is a good simulation but still leaves GitHub's image underneath: its OS packages,
+# its glibc, its preinstalled shared libraries. A user's fresh machine has none of that
+# history. So this job installs into a stock Docker image instead, where "absent" is the
+# default rather than something we arranged.
+#
+# What it is actually asking:
+#   1. Does the .deb declare its runtime dependencies completely enough that apt can
+#      satisfy them on an image with nothing? A missing Depends is invisible on a hosted
+#      runner, which already has the library.
+#   2. Does the bundled install.sh survive a machine with no sudo, no git, no compiler
+#      and no python? It runs as root here, which is the one thing a container gives you
+#      that a normal desktop does not, so `sudo` genuinely is not present.
+#   3. Does the backend then serve and generate?
+#
+# The AppImage legs answer the other half: an unprivileged user with no root at all, and
+# a non-Debian distro where the .deb is not even an option.
+#
+# Runner labels are the free public-repo standard ones:
+# docs.github.com/en/actions/reference/runners/github-hosted-runners
+
+name: "desktop-e2e virgin container"
+
+on:
+  push:
+    branches: [desktop-e2e]
+    paths:
+      - '.github/workflows/desktop-e2e-virgin-container.yml'
+      - 'tests/studio/desktop_drive.py'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag in the desktop release repo'
+        type: string
+        default: 'desktop-v0.1.51-beta'
+      scenarios:
+        description: 'Comma-separated scenario list, or all'
+        type: string
+        default: 'backend,inference'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REL_REPO: unsloth-test/unsloth-test
+  REL_TAG: ${{ inputs.release_tag || 'desktop-v0.1.51-beta' }}
+  SCENARIOS: ${{ inputs.scenarios || 'backend,inference' }}
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+  # Containers share the host's 14 GB disk with no way to reclaim the image's SDKs from
+  # inside, so take the smaller quant the macOS legs use.
+  UNSLOTH_DRIVE_MTP_VARIANT: 'UD-Q2_K_XL'
+  PINNED_PORT: '8961'
+
+jobs:
+  deb:
+    name: "deb into stock ${{ matrix.image }}"
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['ubuntu:24.04', 'ubuntu:22.04', 'debian:12']
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # A stock image cannot fetch anything at all. This is the floor: the two packages
+      # every distro ships and every machine has, and nothing else.
+      - name: Bootstrap only what a bare machine already has
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl
+          echo "image: $(. /etc/os-release && echo "$PRETTY_NAME")"
+          echo "user:  $(id)"
+
+      - name: Prove the machine is virgin
+        run: |
+          leaked=""
+          for tool in git cc gcc g++ clang cmake make ninja cargo rustc python3 pip3 sudo node; do
+            path="$(command -v "$tool" 2>/dev/null || true)"
+            printf '  %-8s %s\n' "$tool" "${path:-ABSENT}"
+            [ -n "$path" ] && leaked="$leaked $tool"
+          done
+          # Not a failure: a distro is entitled to ship python3 in its base image, and
+          # recording what was there is what makes the result readable later.
+          echo "present before install:${leaked:- nothing}"
+          echo "PREEXISTING=${leaked# }" >> "$GITHUB_ENV"
+
+      - name: Download the shipped .deb
+        run: |
+          mkdir -p dl logs artifacts
+          url="https://api.github.com/repos/${REL_REPO}/releases/tags/${REL_TAG}"
+          asset="$(curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                    -H 'Accept: application/vnd.github+json' "$url" \
+                  | grep -o '"browser_download_url": *"[^"]*\.deb"' | cut -d'"' -f4)"
+          [ -n "$asset" ] || { echo "::error::no .deb asset in ${REL_TAG}"; exit 1; }
+          echo "asset: $asset"
+          curl -sSL -o dl/studio.deb "$asset"
+          ls -la dl
+          sha256sum dl/studio.deb | tee artifacts/deb.sha256
+
+      # The real question. On a hosted runner apt has most of this already; here every
+      # single runtime library has to come from the package's own Depends.
+      - name: Install the .deb and let apt resolve every dependency from nothing
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          echo "declared Depends: $(dpkg-deb -f dl/studio.deb Depends)"
+          rc=0
+          apt-get install -y ./dl/studio.deb 2>&1 | tee logs/apt-install.log || rc=$?
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::the .deb cannot install on a stock ${{ matrix.image }}; its Depends are incomplete"
+            exit 1
+          fi
+          pkg="$(dpkg-deb -f dl/studio.deb Package)"
+          dpkg -L "$pkg" | grep -E '/usr/bin/' | head -1
+
+      - name: The toolchain must STILL be absent after the install
+        run: |
+          # Only a tool that was NOT already there before the install is the package's
+          # doing; the image is entitled to whatever it shipped with.
+          leaked=""
+          for tool in git cc gcc cmake cargo rustc; do
+            command -v "$tool" >/dev/null 2>&1 || continue
+            case " $PREEXISTING " in
+              *" $tool "*) ;;
+              *) leaked="$leaked $tool" ;;
+            esac
+          done
+          if [ -n "$leaked" ]; then
+            echo "::error::installing the bundle pulled in a developer toolchain:$leaked"
+            exit 1
+          fi
+          echo "no developer toolchain was pulled in"
+
+      - name: Run the bundled installer, the path first launch takes
+        env:
+          # Unauthenticated prebuilt resolution is 60 requests/hour per IP and hosted
+          # runners share egress, so a token here measures the app rather than GitHub's
+          # rate limiter. A real user is not behind a shared CI IP.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          pkg="$(dpkg-deb -f dl/studio.deb Package)"
+          SH="$(dpkg -L "$pkg" | grep -E '/install\.sh$' | head -1)"
+          [ -n "$SH" ] && [ -f "$SH" ] || { echo "::error::the bundle ships no install.sh resource"; exit 1; }
+          echo "bundled installer: $SH  (sudo is $(command -v sudo >/dev/null && echo present || echo ABSENT))"
+          rc=0
+          env -u UNSLOTH_STUDIO_HOME bash "$SH" --tauri < /dev/null 2>&1 \
+            | tee logs/bundled-install.log || rc=$?
+          echo "bundled installer exit code: $rc"
+          [ "$rc" -eq 0 ] || { echo "::error::bundled installer exited $rc on a stock image"; exit 1; }
+          PY="$HOME/.unsloth/studio/unsloth_studio/bin/python"
+          [ -x "$PY" ] || { echo "::error::bundled installer left no venv at $PY"; exit 1; }
+          "$PY" -V
+          "$PY" -c "import torch; print('torch', torch.__version__)"
+
+      # No GUI here on purpose. A container has no display, and the Tauri window is
+      # already driven on the hosted Linux legs; what is new here is the machine.
+      - name: Start the backend and drive it
+        run: |
+          set -o pipefail
+          BIN="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
+          mkdir -p logs artifacts
+          "$BIN" studio --api-only -H 127.0.0.1 -p "$PINNED_PORT" > logs/backend.log 2>&1 &
+          for _ in $(seq 1 180); do
+            curl -sf "http://127.0.0.1:${PINNED_PORT}/api/health" >/dev/null 2>&1 && break
+            sleep 5
+          done
+          if ! curl -sf "http://127.0.0.1:${PINNED_PORT}/api/health" >/dev/null 2>&1; then
+            echo "::error::the backend never came up on a stock ${{ matrix.image }}"
+            tail -60 logs/backend.log || true
+            exit 1
+          fi
+          python3 tests/studio/desktop_drive.py \
+            --scenarios "$SCENARIOS" --port "$PINNED_PORT" \
+            --out artifacts/virgin-${{ strategy.job-index }}.json 2>&1 | tee logs/drive.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e-virgin-deb-${{ strategy.job-index }}
+          path: |
+            logs/
+            artifacts/
+          if-no-files-found: warn
+
+  appimage_unprivileged:
+    name: "AppImage as a non-root user on ${{ matrix.image }}"
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ matrix.image }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ['ubuntu:24.04', 'fedora:41']
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # fedora is here because the .deb is not an option there at all, which is the
+      # situation the AppImage exists for.
+      - name: Bootstrap and create an unprivileged user
+        run: |
+          if command -v apt-get >/dev/null; then
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends ca-certificates curl python3 libfuse2t64 \
+              || apt-get install -y -qq --no-install-recommends ca-certificates curl python3 libfuse2
+            useradd -m tester
+          else
+            dnf -y -q install ca-certificates curl python3 fuse-libs shadow-utils
+            useradd -m tester
+          fi
+          echo "sudo is $(command -v sudo >/dev/null && echo present || echo ABSENT)"
+
+      - name: Download the AppImage
+        run: |
+          mkdir -p /home/tester/dl
+          url="https://api.github.com/repos/${REL_REPO}/releases/tags/${REL_TAG}"
+          asset="$(curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                    -H 'Accept: application/vnd.github+json' "$url" \
+                  | grep -o '"browser_download_url": *"[^"]*\.AppImage"' | cut -d'"' -f4)"
+          [ -n "$asset" ] || { echo "::error::no AppImage asset in ${REL_TAG}"; exit 1; }
+          curl -sSL -o /home/tester/dl/studio.AppImage "$asset"
+          chmod +x /home/tester/dl/studio.AppImage
+          chown -R tester:tester /home/tester
+          ls -la /home/tester/dl
+
+      # The point of the leg: this user cannot become root, so anything the installer
+      # needs from apt/dnf it simply cannot have.
+      - name: Extract and install as tester, with no path to root
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p logs artifacts && chmod 777 logs artifacts
+          rc=0
+          runuser -u tester -- bash -c '
+            set -o pipefail
+            cd /home/tester/dl
+            # --appimage-extract needs no FUSE and no privileges, which is what an
+            # unprivileged user on a machine without /dev/fuse is left with.
+            ./studio.AppImage --appimage-extract > /dev/null 2>&1 || exit 20
+            SH="$(find squashfs-root -name install.sh -type f | head -1)"
+            [ -n "$SH" ] || exit 21
+            echo "bundled installer: $SH"
+            env -u UNSLOTH_STUDIO_HOME bash "$SH" --tauri < /dev/null 2>&1
+          ' 2>&1 | tee logs/unprivileged-install.log || rc=$?
+          echo "exit code: $rc"
+          case "$rc" in
+            0)  echo "installed with no privileges at all" ;;
+            20) echo "::error::--appimage-extract failed; an unprivileged user cannot open the bundle"; exit 1 ;;
+            21) echo "::error::the extracted AppImage ships no install.sh"; exit 1 ;;
+            *)  echo "::error::the bundled installer exited $rc for an unprivileged user"; exit 1 ;;
+          esac
+
+      - name: Start the backend as tester and drive it
+        run: |
+          set -o pipefail
+          runuser -u tester -- bash -c "
+            /home/tester/.unsloth/studio/unsloth_studio/bin/unsloth studio --api-only \
+              -H 127.0.0.1 -p ${PINNED_PORT} > /home/tester/backend.log 2>&1 &
+            for _ in \$(seq 1 180); do
+              curl -sf http://127.0.0.1:${PINNED_PORT}/api/health >/dev/null 2>&1 && break
+              sleep 5
+            done
+          "
+          cp /home/tester/backend.log logs/ 2>/dev/null || true
+          if ! curl -sf "http://127.0.0.1:${PINNED_PORT}/api/health" >/dev/null 2>&1; then
+            echo "::error::the backend never came up for an unprivileged user"
+            tail -60 logs/backend.log || true
+            exit 1
+          fi
+          python3 tests/studio/desktop_drive.py \
+            --scenarios "$SCENARIOS" --port "$PINNED_PORT" \
+            --out artifacts/unprivileged-${{ strategy.job-index }}.json 2>&1 | tee logs/drive.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e-virgin-appimage-${{ strategy.job-index }}
+          path: |
+            logs/
+            artifacts/
+          if-no-files-found: warn
+
+  slim:
+    # 1 vCPU / 5 GB RAM, and a hard 15 minute job cap, so this can only ever be an
+    # install smoke. It is worth having anyway: it is the smallest machine GitHub
+    # offers, and "the installer needs more than 5 GB of RAM" is a real thing to know.
+    name: "install smoke on the smallest runner"
+    runs-on: ubuntu-slim
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: What are we working with
+        run: |
+          nproc; free -h; df -h /
+          echo "sudo is $(command -v sudo >/dev/null && echo present || echo ABSENT)"
+
+      - name: Download and install the .deb
+        run: |
+          mkdir -p dl logs
+          url="https://api.github.com/repos/${REL_REPO}/releases/tags/${REL_TAG}"
+          asset="$(curl -sSL -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                    -H 'Accept: application/vnd.github+json' "$url" \
+                  | grep -o '"browser_download_url": *"[^"]*\.deb"' | cut -d'"' -f4)"
+          curl -sSL -o dl/studio.deb "$asset"
+          export DEBIAN_FRONTEND=noninteractive
+          # This runner is a container, so the job already runs as root and the elevation
+          # helper the VM runners rely on is not there to call.
+          apt-get update -qq
+          rc=0
+          apt-get install -y ./dl/studio.deb 2>&1 | tee logs/apt-install.log || rc=$?
+          [ "$rc" -eq 0 ] || { echo "::error::the .deb will not install on a 1 vCPU / 5 GB machine"; exit 1; }
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e-virgin-slim
+          path: logs/
+          if-no-files-found: warn

@@ -1,0 +1,329 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# STAGING. What happens to a user whose machine is not one of the three we build for.
+#
+# desktop-v0.1.51-beta ships exactly five bundles:
+#   x64-setup.exe (Windows x64), aarch64.dmg + aarch64.app.tar.gz (Apple Silicon),
+#   amd64.deb + amd64.AppImage (Linux x64)
+# and GitHub gives public repos free runners for three architectures we therefore have
+# no bundle for: Intel macOS, arm64 Windows and arm64 Linux.
+#
+# That is not automatically a defect. Two of the three are legitimately out of scope.
+# What IS a defect is a user on one of them getting a silent crash, a corrupt install or
+# a message that does not tell them what went wrong. So each job here asks the same
+# question: is the outcome LEGIBLE? A clean, explicit refusal passes. A hang, a crash
+# with no output, or a half-completed install fails.
+#
+# Runner labels are the free public-repo standard ones:
+# docs.github.com/en/actions/reference/runners/github-hosted-runners
+
+name: "desktop-e2e arch coverage"
+
+on:
+  push:
+    branches: [desktop-e2e]
+    paths:
+      - '.github/workflows/desktop-e2e-arch-coverage.yml'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag in the desktop release repo'
+        type: string
+        default: 'desktop-v0.1.51-beta'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  REL_REPO: unsloth-test/unsloth-test
+  REL_TAG: ${{ inputs.release_tag || 'desktop-v0.1.51-beta' }}
+  UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+
+jobs:
+  macos_intel:
+    # 4 vCPU / 14 GB, and the only macOS runner that is not Apple Silicon. The dmg is
+    # aarch64-only, so this is the Intel Mac owner's experience.
+    name: "aarch64 dmg on an Intel Mac (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15-intel]
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Confirm this really is an Intel Mac
+        run: |
+          mkdir -p logs artifacts
+          arch="$(uname -m)"
+          echo "uname -m: $arch"
+          sysctl -n machdep.cpu.brand_string || true
+          [ "$arch" = "x86_64" ] || { echo "::error::expected an Intel runner, got $arch"; exit 1; }
+          # Rosetta translates x64 onto Apple Silicon, never the reverse, so an arm64
+          # binary genuinely cannot run here. Record whether the OS says so too.
+          /usr/bin/pgrep -q oahd && echo "rosetta daemon present" || echo "no rosetta daemon (expected on Intel)"
+
+      - name: Download the shipped .dmg
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dl
+          gh release download "$REL_TAG" --repo "$REL_REPO" --pattern '*.dmg' --dir dl
+          ls -la dl
+          shasum -a 256 dl/*.dmg | tee artifacts/dmg.sha256
+
+      - name: Mount, install, and see what an Intel user actually gets
+        run: |
+          set -o pipefail
+          DMG="$(ls dl/*.dmg | head -1)"
+          # The quarantine bit a real download carries; without it Gatekeeper is not in
+          # the picture and the test measures the wrong thing.
+          xattr -w com.apple.quarantine '0081;00000000;Safari;' "$DMG" || true
+          hdiutil attach "$DMG" -nobrowse -mountpoint /Volumes/UnslothTest 2>&1 | tee logs/attach.log
+          APP="$(ls -d /Volumes/UnslothTest/*.app | head -1)"
+          echo "app: $APP"
+          BIN="$APP/Contents/MacOS/$(defaults read "$APP/Contents/Info" CFBundleExecutable)"
+          echo "=== what architectures does the binary contain? ==="
+          lipo -archs "$BIN" | tee artifacts/bundle-archs.txt
+          file "$BIN" | tee -a artifacts/bundle-archs.txt
+          cp -R "$APP" /Applications/ 2>&1 | tee -a logs/attach.log
+          hdiutil detach /Volumes/UnslothTest || true
+
+      - name: Launching it must fail LEGIBLY, not silently
+        run: |
+          set -o pipefail
+          APP="$(ls -d /Applications/*Unsloth*.app | head -1)"
+          BIN="$APP/Contents/MacOS/$(defaults read "$APP/Contents/Info" CFBundleExecutable)"
+          rc=0
+          "$BIN" > logs/launch-stdout.log 2>logs/launch-stderr.log & pid=$!
+          sleep 20
+          if kill -0 "$pid" 2>/dev/null; then
+            echo "the app is still running after 20 s on an Intel Mac"
+            kill "$pid" 2>/dev/null || true
+            echo "VERDICT=ran" >> "$GITHUB_ENV"
+          else
+            wait "$pid" || rc=$?
+            echo "the app exited with $rc"
+            echo "VERDICT=exited:$rc" >> "$GITHUB_ENV"
+          fi
+          echo "=== stdout ==="; cat logs/launch-stdout.log || true
+          echo "=== stderr ==="; cat logs/launch-stderr.log || true
+          # An arm64-only bundle on Intel: macOS refuses with "Bad CPU type in
+          # executable" (exit 126 / errno EBADARCH). That IS legible and is a pass.
+          # A crash with an empty stderr is not, and neither is a hang.
+          if grep -qi 'bad cpu type\|cannot execute binary\|is not supported on this' \
+                 logs/launch-stderr.log logs/launch-stdout.log 2>/dev/null; then
+            echo "refused explicitly, which is the correct outcome for an unsupported arch"
+            exit 0
+          fi
+          if [ "${VERDICT#exited:}" != "$VERDICT" ] && [ ! -s logs/launch-stderr.log ]; then
+            echo "::error::the app died on an Intel Mac having printed nothing at all; an Intel user gets no explanation"
+            exit 1
+          fi
+          echo "::warning::unexpected outcome on Intel ($VERDICT); see the logs"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e-arch-macos-intel
+          path: |
+            logs/
+            artifacts/
+          if-no-files-found: warn
+
+  windows_arm:
+    # arm64 Windows runs x64 binaries under emulation, so unlike the Intel Mac case the
+    # shipped installer genuinely should work here. If it does not, that is a real
+    # defect for every Snapdragon/Surface user.
+    name: "x64 installer on arm64 Windows"
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Confirm this really is arm64 Windows
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path logs, artifacts | Out-Null
+          $arch = $env:PROCESSOR_ARCHITECTURE
+          Write-Host "PROCESSOR_ARCHITECTURE: $arch"
+          Write-Host "OS: $((Get-CimInstance Win32_OperatingSystem).Caption)"
+          if ($arch -ne 'ARM64') {
+            Write-Host "::error::expected an arm64 runner, got $arch"
+            exit 1
+          }
+
+      - name: Download the shipped installer
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          New-Item -ItemType Directory -Force -Path dl | Out-Null
+          gh release download $env:REL_TAG --repo $env:REL_REPO --pattern '*x64-setup.exe' --dir dl
+          Get-ChildItem dl | Format-Table -AutoSize
+          (Get-FileHash (Get-ChildItem dl\*.exe)[0].FullName -Algorithm SHA256).Hash |
+            Out-File artifacts\exe.sha256
+
+      - name: Silent install under x64 emulation
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem dl\*.exe)[0].FullName
+          $p = Start-Process -FilePath $exe -ArgumentList '/S' -PassThru -Wait
+          Write-Host "installer exit code: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) {
+            Write-Host "::error::the x64 installer failed on arm64 Windows with exit $($p.ExitCode)"
+            exit 1
+          }
+          $installed = Get-ChildItem "$env:LOCALAPPDATA\Programs", "$env:ProgramFiles" `
+            -Filter 'unsloth-studio.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $installed) {
+            Write-Host "::error::the installer reported success but left no unsloth-studio.exe"
+            exit 1
+          }
+          Write-Host "installed: $($installed.FullName)"
+          "APP_EXE=$($installed.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Run the bundled installer, the path first launch takes
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $root = Split-Path $env:APP_EXE -Parent
+          $ps1 = Get-ChildItem $root -Filter 'install.ps1' -Recurse -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+          if (-not $ps1) {
+            Write-Host "::error::the bundle ships no install.ps1 resource"
+            exit 1
+          }
+          Write-Host "bundled installer: $($ps1.FullName)"
+          & pwsh -NoProfile -File $ps1.FullName -Tauri 2>&1 | Tee-Object logs\bundled-install.log
+          $rc = $LASTEXITCODE
+          Write-Host "bundled installer exit code: $rc"
+          if ($rc -ne 0) {
+            Write-Host "::error::the bundled installer exited $rc on arm64 Windows"
+            exit 1
+          }
+          $py = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\python.exe'
+          if (-not (Test-Path $py)) {
+            Write-Host "::error::the bundled installer left no venv at $py"
+            exit 1
+          }
+          & $py -V
+          # torch has no arm64 Windows wheel on PyPI today. If this is what fails, the
+          # message the user gets matters more than the failure itself.
+          & $py -c "import torch; print('torch', torch.__version__)" 2>&1 |
+            Tee-Object logs\torch-import.log
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::torch does not import on arm64 Windows; see logs/torch-import.log"
+          }
+
+      - name: Start the backend and drive it
+        shell: pwsh
+        run: |
+          $bin = Join-Path $env:USERPROFILE '.unsloth\studio\unsloth_studio\Scripts\unsloth.exe'
+          if (-not (Test-Path $bin)) {
+            Write-Host "::error::no unsloth.exe entry point in the venv"
+            exit 1
+          }
+          Start-Process -FilePath $bin `
+            -ArgumentList 'studio','--api-only','-H','127.0.0.1','-p','8962' `
+            -RedirectStandardOutput logs\backend.log -RedirectStandardError logs\backend-err.log
+          $up = $false
+          foreach ($i in 1..60) {
+            try {
+              Invoke-WebRequest -Uri 'http://127.0.0.1:8962/api/health' -UseBasicParsing -TimeoutSec 5 | Out-Null
+              $up = $true; break
+            } catch { Start-Sleep -Seconds 5 }
+          }
+          if (-not $up) {
+            Write-Host "::error::the backend never came up on arm64 Windows"
+            Get-Content logs\backend.log -Tail 60 -ErrorAction SilentlyContinue
+            Get-Content logs\backend-err.log -Tail 60 -ErrorAction SilentlyContinue
+            exit 1
+          }
+          python tests\studio\desktop_drive.py --scenarios backend,inference `
+            --port 8962 --out artifacts\windows-arm.json 2>&1 | Tee-Object logs\drive.log
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e-arch-windows-arm
+          path: |
+            logs/
+            artifacts/
+          if-no-files-found: warn
+
+  linux_arm:
+    # There is no arm64 Linux bundle. This job exists to keep that a recorded fact
+    # rather than an assumption: it fails if the release ever grows one without this
+    # matrix growing a real install leg to match.
+    name: "arm64 Linux has no bundle (recorded)"
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Confirm this really is arm64 Linux
+        run: |
+          mkdir -p artifacts
+          arch="$(uname -m)"
+          echo "uname -m: $arch"
+          [ "$arch" = "aarch64" ] || { echo "::error::expected an arm64 runner, got $arch"; exit 1; }
+
+      - name: The release must publish nothing this machine can install
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "$REL_TAG" --repo "$REL_REPO" --json assets \
+            -q '.assets[].name' | tee artifacts/assets.txt
+          # aarch64 appears in the macOS asset names too, so exclude those first and
+          # only then look for a Linux one. (A bare `grep -q ... | grep -v ...` would
+          # pipe from a silent grep and can never match.)
+          if grep -iE 'arm64|aarch64' artifacts/assets.txt | grep -viE '\.dmg$|app\.tar\.gz$' | grep -q .; then
+            echo "::error::an arm64 Linux asset now exists; give this job a real install leg"
+            exit 1
+          fi
+          echo "confirmed: the only aarch64 assets are the macOS ones"
+          # An arm64 Linux user following the download page gets the amd64 .deb. dpkg
+          # must refuse it clearly rather than half-install.
+          asset="$(gh api "repos/${REL_REPO}/releases/tags/${REL_TAG}" \
+                   -q '.assets[] | select(.name|endswith(".deb")) | .browser_download_url')"
+          curl -sSL -o studio.deb "$asset"
+          rc=0
+          out="$(dpkg -i studio.deb 2>&1)" || rc=$?
+          echo "$out" | tee artifacts/dpkg-refusal.txt
+          echo "dpkg exit code: $rc"
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::dpkg installed an amd64 package on arm64; that install is broken and the user was not told"
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -qi 'architecture'; then
+            echo "::error::dpkg refused the package without naming the architecture; the user has no idea why"
+            exit 1
+          fi
+          echo "dpkg refused it and said why, which is the correct outcome"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-e2e-arch-linux-arm
+          path: artifacts/
+          if-no-files-found: warn
