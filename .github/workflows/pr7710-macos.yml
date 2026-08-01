@@ -30,6 +30,12 @@ jobs:
       # stripping and the atomic replace. save_selected_file has a
       # #[cfg(unix)] permissions branch and std::path only treats '\' as a
       # separator on Windows, so this is the part that varies per OS.
+      - name: Stub frontendDist (generate_context! validates it at compile time)
+        shell: bash
+        run: |
+          mkdir -p studio/frontend/dist
+          echo '<!doctype html><title>stub</title>' > studio/frontend/dist/index.html
+
       - name: cargo test (native_file_dialogs)
         working-directory: studio/src-tauri
         run: cargo test --no-fail-fast native_file_dialogs
