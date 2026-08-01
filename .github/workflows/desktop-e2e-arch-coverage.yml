@@ -187,15 +187,24 @@ jobs:
             Write-Host "::error::the x64 installer failed on arm64 Windows with exit $($p.ExitCode)"
             exit 1
           }
-          # Tauri's NSIS bundle installs per-user under %LOCALAPPDATA%\Programs by
-          # default, so that root matters more than Program Files here. Probe rather
-          # than filter it out: a missing Programs dir is itself the finding.
-          Write-Host "LOCALAPPDATA          : $env:LOCALAPPDATA"
-          foreach ($r in "$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}") {
-            Write-Host ("  {0,-40} {1}" -f $r, $(if (Test-Path $r) { 'exists' } else { 'ABSENT' }))
+          # Ask the installer where it went rather than guessing: this bundle installs
+          # per-user to %LOCALAPPDATA%\<ProductName>, not the %LOCALAPPDATA%\Programs
+          # a Tauri NSIS bundle is often assumed to use. Guessing cost a round of
+          # "installed nothing" reports against an install that had worked.
+          $entry = foreach ($k in 'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                                  'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+                                  'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*') {
+            Get-ItemProperty $k -ErrorAction SilentlyContinue |
+              Where-Object { $_.DisplayName -like '*Unsloth*' }
           }
-          $roots = @("$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}") |
-                   Where-Object { $_ -and (Test-Path $_) }
+          $entry = $entry | Select-Object -First 1
+          if ($entry) {
+            Write-Host "registry says: $($entry.DisplayName) $($entry.DisplayVersion) at $($entry.InstallLocation)"
+          }
+          $roots = @($entry.InstallLocation -replace '^"|"$', '', "$env:LOCALAPPDATA",
+                     "$env:LOCALAPPDATA\Programs", "$env:ProgramFiles", "${env:ProgramFiles(x86)}") |
+                   Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+          Write-Host "searching: $($roots -join '; ')"
           $installed = Get-ChildItem $roots -Filter '*Unsloth*.exe' -Recurse -ErrorAction SilentlyContinue |
             Where-Object { $_.Name -notmatch 'uninstall' } | Select-Object -First 1
           if (-not $installed) {

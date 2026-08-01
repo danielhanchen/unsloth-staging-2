@@ -307,6 +307,25 @@ jobs:
               --scenarios "$SCENARIOS" --port "$PINNED_PORT" \
               --out artifacts/unprivileged-${{ strategy.job-index }}.json 2>&1 | tee logs/drive.log
 
+      # llama-server failing to start says nothing on its own; the reason is in the
+      # backend's own logs, which the drive step never reaches.
+      - name: Why did the model fail to load
+        if: failure()
+        run: |
+          for d in /home/tester/.unsloth/studio/logs /home/tester/.unsloth/studio/logs/server; do
+            [ -d "$d" ] || continue
+            echo "=== $d ==="
+            ls -la "$d" | head -20
+            for f in "$d"/*.log; do
+              [ -f "$f" ] || continue
+              echo "--- $f (tail) ---"; tail -40 "$f"
+            done
+          done
+          cp -r /home/tester/.unsloth/studio/logs logs/studio-logs 2>/dev/null || true
+          echo "=== memory / disk ==="; free -h; df -h /
+          echo "=== llama.cpp install ==="
+          ls -la /home/tester/.unsloth/llama.cpp/build/bin 2>/dev/null | head -20 || echo "no llama.cpp build dir"
+
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
