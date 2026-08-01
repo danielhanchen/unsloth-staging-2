@@ -8,7 +8,7 @@
 # bundle, or the Mac llama.cpp prebuilt's HTTP layer behaving
 # differently from the Linux build).
 
-name: Mac Studio UI CI
+name: baseline-main Mac UI
 
 on:
   pull_request:
