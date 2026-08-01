@@ -49,5 +49,8 @@ jobs:
         working-directory: studio/frontend
         run: node --experimental-strip-types --test "tests/data-uri.test.ts"
 
+      - name: Install pytest
+        run: python -m pip install --upgrade pip pytest
+
       - name: pytest desktop contract
         run: python -m pytest tests/studio/test_desktop_reliability_frontend_contract.py -q
