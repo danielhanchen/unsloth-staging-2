@@ -298,6 +298,25 @@ jobs:
           }
           python tests\studio\desktop_drive.py --scenarios backend,inference `
             --port 8962 --out artifacts\windows-arm.json 2>&1 | Tee-Object logs\drive.log
+          $driveRc = $LASTEXITCODE
+          # hf_transfer is a Rust extension running under x64 emulation here. If the
+          # download is what failed, retry once with it off: succeeding then means
+          # hf_transfer is broken on this platform (a real finding for arm64 users),
+          # while failing both ways is just the network.
+          if ($driveRc -ne 0 -and (Select-String -Path logs\drive.log -Pattern 'hf_transfer' -Quiet)) {
+            Write-Host "::warning::the GGUF download failed inside hf_transfer; retrying with it disabled"
+            $env:HF_HUB_ENABLE_HF_TRANSFER = '0'
+            python tests\studio\desktop_drive.py --scenarios inference `
+              --port 8962 --out artifacts\windows-arm-nohftransfer.json 2>&1 |
+              Tee-Object logs\drive-nohftransfer.log
+            if ($LASTEXITCODE -eq 0) {
+              Write-Host "::error::hf_transfer cannot download on arm64 Windows; the same load succeeds with HF_HUB_ENABLE_HF_TRANSFER=0"
+            } else {
+              Write-Host "::warning::the download fails with hf_transfer off too, so this is the network and not the platform"
+            }
+            exit $driveRc
+          }
+          exit $driveRc
 
       - name: Upload logs
         if: always()
