@@ -187,8 +187,10 @@ jobs:
             Write-Host "::error::the x64 installer failed on arm64 Windows with exit $($p.ExitCode)"
             exit 1
           }
+          # Match the pattern the x64 job uses; the NSIS product name is not the crate name.
           $installed = Get-ChildItem "$env:LOCALAPPDATA\Programs", "$env:ProgramFiles" `
-            -Filter 'unsloth-studio.exe' -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+            -Filter '*Unsloth*.exe' -Recurse -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch 'uninstall' } | Select-Object -First 1
           if (-not $installed) {
             Write-Host "::error::the installer reported success but left no unsloth-studio.exe"
             exit 1
@@ -307,7 +309,9 @@ jobs:
                    -q '.assets[] | select(.name|endswith(".deb")) | .browser_download_url')"
           curl -sSL -o studio.deb "$asset"
           rc=0
-          out="$(dpkg -i studio.deb 2>&1)" || rc=$?
+          # Elevated, because otherwise dpkg refuses for lack of privilege and never
+          # reaches the architecture check this step is actually asking about.
+          out="$(command sudo dpkg -i studio.deb 2>&1)" || rc=$?
           echo "$out" | tee artifacts/dpkg-refusal.txt
           echo "dpkg exit code: $rc"
           if [ "$rc" -eq 0 ]; then

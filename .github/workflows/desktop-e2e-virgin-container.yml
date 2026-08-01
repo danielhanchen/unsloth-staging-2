@@ -67,6 +67,11 @@ jobs:
     container:
       image: ${{ matrix.image }}
     timeout-minutes: 90
+    # GitHub falls back to `sh -e {0}` in a container when it cannot resolve bash, and
+    # `set -o pipefail` is not POSIX. Ask for bash rather than write around it.
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -205,6 +210,9 @@ jobs:
     container:
       image: ${{ matrix.image }}
     timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -329,11 +337,11 @@ jobs:
                   | grep -o '"browser_download_url": *"[^"]*\.deb"' | cut -d'"' -f4)"
           curl -sSL -o dl/studio.deb "$asset"
           export DEBIAN_FRONTEND=noninteractive
-          # This runner is a container, so the job already runs as root and the elevation
-          # helper the VM runners rely on is not there to call.
-          apt-get update -qq
+          # Measured: ubuntu-slim does not run the job as root, so apt needs elevation
+          # here even though the runner is itself a container.
+          command sudo apt-get update -qq
           rc=0
-          apt-get install -y ./dl/studio.deb 2>&1 | tee logs/apt-install.log || rc=$?
+          command sudo apt-get install -y ./dl/studio.deb 2>&1 | tee logs/apt-install.log || rc=$?
           [ "$rc" -eq 0 ] || { echo "::error::the .deb will not install on a 1 vCPU / 5 GB machine"; exit 1; }
 
       - name: Upload logs
