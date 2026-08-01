@@ -1,0 +1,161 @@
+name: "staging-7709 rust cross-platform"
+
+# Review harness for unslothai/unsloth#7709 (loopback proxy bypass).
+# Runs the Studio Rust suite on the three shipped desktop platforms, then
+# proves the fix has teeth on each of them:
+#   1. baseline  - the whole crate test suite passes
+#   2. e2e       - the real commands::check_health reaches a fake backend while
+#                  an unusable HTTP proxy is configured in the environment
+#   3. mutation  - with .no_proxy() deleted, both the PR's own regression test
+#                  and the e2e probe FAIL (so neither is vacuous)
+#   4. sysproxy  - Windows HKCU Internet Settings / macOS SystemConfiguration
+#                  proxies divert a default client away from 127.0.0.1, while
+#                  the .no_proxy() client still reaches it
+
+on:
+  push:
+    branches: ["pr-7709-xplat-ci"]
+    paths:
+      - 'studio/src-tauri/**'
+      - 'studio/frontend/**'
+      - 'ci_scratch/**'
+      - '.github/workflows/staging-7709-rust-xplat.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  rust:
+    name: "rust ${{ matrix.os }}"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Linux native deps for Tauri / WebKit2GTK
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri -> target
+
+      - name: Frontend build (tauri_build needs frontend/dist)
+        working-directory: studio/frontend
+        run: |
+          npm ci --no-fund --no-audit
+          npm run build
+          test -f dist/index.html
+
+      - name: 1. Baseline - full Rust unit test suite
+        working-directory: studio/src-tauri
+        run: cargo test --no-fail-fast
+
+      - name: 2. Wire in the review-only e2e probe
+        run: python ci_scratch/prep.py
+
+      - name: 2b. E2E - real check_health under a poison proxy (must PASS)
+        working-directory: studio/src-tauri
+        run: cargo test proxy_e2e_probe -- --nocapture
+
+      - name: 3. Mutation - delete .no_proxy(), both tests must FAIL
+        working-directory: ${{ github.workspace }}
+        run: |
+          python ci_scratch/mutate.py
+          cd studio/src-tauri
+          fails=0
+          if cargo test loopback_http --no-fail-fast; then
+            echo "::error::the PR regression test PASSED with .no_proxy() removed (vacuous test)"
+          else
+            echo "ok: client_ignores_system_proxy failed as expected"
+            fails=$((fails+1))
+          fi
+          if cargo test proxy_e2e_probe --no-fail-fast; then
+            echo "::error::check_health SUCCEEDED with .no_proxy() removed (probe proves nothing here)"
+          else
+            echo "ok: check_health failed as expected, reproducing the reported bug"
+            fails=$((fails+1))
+          fi
+          test "$fails" -eq 2
+
+      - name: 3b. Restore the unmutated helper
+        run: git checkout -- studio/src-tauri/src/loopback_http.rs
+
+      - name: 4a. Configure the OS system proxy (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+          Set-ItemProperty -Path $key -Name ProxyServer -Value "127.0.0.1:38629"
+          Set-ItemProperty -Path $key -Name ProxyEnable -Value 1
+          Remove-ItemProperty -Path $key -Name ProxyOverride -ErrorAction SilentlyContinue
+          Get-ItemProperty -Path $key | Format-List ProxyServer, ProxyEnable, ProxyOverride
+
+      - name: 4a. Configure the OS system proxy (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          svc="$(networksetup -listallnetworkservices | sed -n '2p')"
+          echo "network service: $svc"
+          sudo networksetup -setproxybypassdomains "$svc" "Empty" || true
+          sudo networksetup -setwebproxy "$svc" 127.0.0.1 38629
+          sudo networksetup -setwebproxystate "$svc" on
+          networksetup -getwebproxy "$svc"
+
+      - name: 4b. System-proxy probe (default client vs .no_proxy() client)
+        working-directory: ci_scratch/loopback_matrix
+        env:
+          MATRIX_SYSPROXY_ONLY: '1'
+          MATRIX_FIXED_PROXY_PORT: '38629'
+        run: cargo run --release
+
+      - name: 4c. Full environment-proxy behaviour matrix
+        working-directory: ci_scratch/loopback_matrix
+        run: cargo run --release
+
+      - name: 4d. Turn the OS proxy back off (macOS)
+        if: always() && runner.os == 'macOS'
+        run: |
+          svc="$(networksetup -listallnetworkservices | sed -n '2p')"
+          sudo networksetup -setwebproxystate "$svc" off || true
+
+      - name: 4d. Turn the OS proxy back off (Windows)
+        if: always() && runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $key = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+          Set-ItemProperty -Path $key -Name ProxyEnable -Value 0
+
+      - name: 5. Tauri debug build (CI parity with the upstream smoke job)
+        run: npx --prefix studio tauri build --debug --no-bundle
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ''
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
