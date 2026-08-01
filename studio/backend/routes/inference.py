@@ -11972,8 +11972,18 @@ async def openai_chat_completions(
         and _sf_features.get("supports_tools", False)
         and ((payload.tools and len(payload.tools) > 0) or _sf_has_tool_msgs)
     )
+    # apply_chat_template sanitizes the catalog it renders
+    # (chat_template_helpers.py:1503-1504), so a tool dropped for unsafe markup never
+    # reached the prompt. Gating the healer on the caller's list instead would let a
+    # dropped tool with a clean NAME be promoted out of text-form output, handing the
+    # client a structured call for a tool the model was never shown (#7066).
+    from core.inference.chat_template_helpers import (
+        neutralize_tool_descriptions as _sf_neutralize_tools,
+    )
+
+    _sf_healing_tools = _sf_neutralize_tools(payload.tools) if _sf_client_tools else None
     _sf_heal = (
-        heal_gate(payload.auto_heal_tool_calls, payload.tools, payload.tool_choice)
+        heal_gate(payload.auto_heal_tool_calls, _sf_healing_tools, payload.tool_choice)
         if _sf_client_tools
         else None
     )
@@ -12063,7 +12073,7 @@ async def openai_chat_completions(
 
                 # Client-tool passthrough: heal text-form calls on the fly
                 # (None => relay verbatim).
-                healer = StreamToolCallHealer(_sf_heal, payload.tools) if _sf_heal else None
+                healer = StreamToolCallHealer(_sf_heal, _sf_healing_tools) if _sf_heal else None
                 heal_state = {"idx": 0}
 
                 prev_text = ""
@@ -12287,13 +12297,13 @@ async def openai_chat_completions(
                 _msg["reasoning_content"] = _reasoning_text
             _finish = "stop"
             if _sf_heal:
-                if heal_openai_message(_msg, _sf_heal, payload.tools):
+                if heal_openai_message(_msg, _sf_heal, _sf_healing_tools):
                     _finish = "tool_calls"
                 elif nudge_enabled(payload.nudge_tool_calls):
                     _data = {
                         "choices": [{"message": {"role": "assistant", "content": _visible_text}}]
                     }
-                    if nudge_should_retry(_data, _sf_heal, payload.tools):
+                    if nudge_should_retry(_data, _sf_heal, _sf_healing_tools):
                         # A failed retry must not 500 the request; keep the first
                         # response (GGUF nudge parity). The retry's generate()
                         # overwrites stats_holder, so save the first attempt's stats
@@ -12315,7 +12325,7 @@ async def openai_chat_completions(
                             retry_msg = {"role": "assistant", "content": _retry_visible}
                             if _retry_reasoning:
                                 retry_msg["reasoning_content"] = _retry_reasoning
-                            if heal_openai_message(retry_msg, _sf_heal, payload.tools):
+                            if heal_openai_message(retry_msg, _sf_heal, _sf_healing_tools):
                                 _visible_text, _msg, _finish = (
                                     _retry_visible,
                                     retry_msg,
@@ -16436,15 +16446,30 @@ def _build_passthrough_payload(
     seed = None,
     stream_options = None,
 ):
+    from core.inference.chat_template_helpers import (
+        neutralize_control_markup_in_messages,
+        neutralize_tool_descriptions,
+        reconciled_tool_choice,
+    )
+
+    # The one place to break markup: llama-server applies the template itself, and both
+    # /v1/messages bodies come from here, never the OpenAI builder below (#7066).
     body = {
-        "messages": openai_messages,
+        "messages": neutralize_control_markup_in_messages(openai_messages),
         "temperature": temperature,
         "top_p": top_p,
         "top_k": top_k,
         "stream": stream,
     }
-    if openai_tools:
-        body["tools"] = _llama_compatible_tools(openai_tools)
+    # Tested after the rewrite: an all-injected catalog drops to empty, and
+    # "tools": [] would still advertise tool use.
+    safe_tools = neutralize_tool_descriptions(openai_tools)
+    if safe_tools:
+        body["tools"] = _llama_compatible_tools(safe_tools)
+        # A mixed catalog keeps safe_tools non-empty while dropping the one tool the client
+        # forced; forwarding that choice would name an unadvertised function and hand
+        # llama-server back the raw markup. Fall back to "auto" to stay consistent (#7066).
+        tool_choice = reconciled_tool_choice(tool_choice, openai_tools, safe_tools)
         if tool_choice is not None:
             body["tool_choice"] = tool_choice
     if seed is not None:
@@ -16478,6 +16503,23 @@ def _build_passthrough_payload(
         # of the model's load-time default.
         body["chat_template_kwargs"] = chat_template_kwargs
     return body
+
+
+def _nudge_retry_messages(body, data, allowed_tools):
+    """The nudge retry's message list, re-neutralized like the enable-tools loop.
+
+    The appended suffix is not sanitized text: the assistant turn replays the model's own
+    failed output, and the user turn interpolates ``allowed_tools``, which ``heal_gate``
+    derives from the RAW catalog on the /v1/messages path -- so a name dropped from
+    ``tools`` for carrying markup would come straight back as prose the template renders
+    as structure (#7066). Wrapping the whole concatenation rather than just the suffix is
+    free: the rewrite is idempotent and returns unchanged messages as-is, so the already
+    neutralized prefix stays byte-identical and llama-server still reuses the slot's KV
+    cache, the entire point of appending instead of rebuilding."""
+    from core.inference.chat_template_helpers import neutralize_control_markup_in_messages
+    return neutralize_control_markup_in_messages(
+        [*body.get("messages", []), *nudge_messages(data, allowed_tools)]
+    )
 
 
 async def _anthropic_passthrough_retry_url(llama_backend, exc):
@@ -16572,14 +16614,22 @@ async def _anthropic_passthrough_stream(
         # the opening lines are covered as well.
         _tracker.__enter__()
         emitter = AnthropicPassthroughEmitter()
-        # Promote text-form tool calls (declared client tools only) into
-        # tool_use blocks; verbatim behavior when healing is off or no tools.
-        # tool_choice arrives here already converted to the OpenAI shape.
-        _allowed_tools = heal_gate(auto_heal_tool_calls, openai_tools, tool_choice)
+        # Promote text-form tool calls (declared client tools only) into tool_use blocks;
+        # verbatim when healing is off or no tools. tool_choice is already OpenAI-shaped.
+        # Sanitized catalog, not the caller's: a tool dropped for unsafe markup never reached
+        # the prompt, so promoting it would hand the client an unadvertised tool_use (#7066).
+        from core.inference.chat_template_helpers import neutralize_tool_descriptions
+
+        _healing_tools = neutralize_tool_descriptions(openai_tools)
+        # The reconciled choice the body actually carries, not the caller's: when a forced
+        # tool was dropped, _build_passthrough_payload sent "auto", and gating on the stale
+        # forced name would intersect the safe names with a removed one and disable healing
+        # outright. "none" survives reconciliation, so it still forbids promotion (#7066).
+        _allowed_tools = heal_gate(auto_heal_tool_calls, _healing_tools, body.get("tool_choice"))
         if _allowed_tools:
             emitter.enable_healing(
                 _allowed_tools,
-                openai_tools,
+                _healing_tools,
                 disable_parallel_tool_use = disable_parallel_tool_use,
             )
         # These yields sit outside the teardown try below, so a disconnect while
@@ -16823,19 +16873,27 @@ async def _anthropic_passthrough_non_streaming(
             )
 
         data = resp.json()
-        # tool_choice arrives here already converted to the OpenAI shape.
-        _allowed_tools = heal_gate(auto_heal_tool_calls, openai_tools, tool_choice)
+        # tool_choice is already OpenAI-shaped. Sanitized as in the streaming path: with
+        # nudging on, the retry would otherwise name a tool dropped from the prompt (#7066).
+        from core.inference.chat_template_helpers import neutralize_tool_descriptions
+
+        _healing_tools = neutralize_tool_descriptions(openai_tools)
+        # The reconciled choice the body actually carries, not the caller's: when a forced
+        # tool was dropped, _build_passthrough_payload sent "auto", and gating on the stale
+        # forced name would intersect the safe names with a removed one and disable healing
+        # outright. "none" survives reconciliation, so it still forbids promotion (#7066).
+        _allowed_tools = heal_gate(auto_heal_tool_calls, _healing_tools, body.get("tool_choice"))
 
         # Opt-in single-retry nudge (mirrors the OpenAI passthrough): the tool call came out
         # unusable; re-ask with the prompt prefix intact so the KV cache is reused.
         if (
             _allowed_tools
             and nudge_enabled(nudge_tool_calls)
-            and nudge_should_retry(data, _allowed_tools, openai_tools)
+            and nudge_should_retry(data, _allowed_tools, _healing_tools)
         ):
             retry_body = {
                 **body,
-                "messages": [*body.get("messages", []), *nudge_messages(data, _allowed_tools)],
+                "messages": _nudge_retry_messages(body, data, _allowed_tools),
             }
             try:
                 retry_resp = await _post(retry_body)
@@ -17263,6 +17321,7 @@ def _build_openai_passthrough_body(
     messages = _openai_messages_for_passthrough(payload)
     system_prompt, _, _ = _extract_content_parts(payload.messages)
     messages = _set_or_prepend_system_message(messages, system_prompt)
+    # Markup is broken in _build_passthrough_payload, shared with both /v1/messages (#7066).
     tool_choice = payload.tool_choice if payload.tool_choice is not None else "auto"
     tools = payload.tools
     if payload.tool_choice == "none" and not _has_openai_tool_history(payload.messages):
@@ -18449,7 +18508,7 @@ async def _openai_passthrough_non_streaming_upstream(
     ):
         retry_body = {
             **body,
-            "messages": [*body.get("messages", []), *nudge_messages(data, _allowed_tools)],
+            "messages": _nudge_retry_messages(body, data, _allowed_tools),
         }
         try:
             retry_resp = await _post(retry_body)
