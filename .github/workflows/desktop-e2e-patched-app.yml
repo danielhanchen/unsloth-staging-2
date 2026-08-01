@@ -55,7 +55,7 @@ env:
 
 jobs:
   patched:
-    name: "patched app (22.04 #${{ matrix.attempt }}, bwrap ${{ matrix.webkit_sandbox_deps }})"
+    name: "patched app (22.04 #${{ matrix.attempt }})"
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     strategy:
@@ -65,14 +65,9 @@ jobs:
         # under 5% likely by chance, which is the bar any claim here has to clear --
         # three attempts is how I twice talked myself into a wrong conclusion.
         attempt: [1, 2, 3, 4, 5, 6]
-        # A/B in one run, so both arms meet the same runner image and the same load.
-        # WebKitGTK sandboxes its web process with bubblewrap and proxies DBus through
-        # xdg-dbus-proxy; without them the web process can fail to start, and a Tauri app
-        # whose web process dies exits. The bundle declares only libappindicator3-1,
-        # libwebkit2gtk-4.1-0 and libgtk-3-0, so on a machine that lacks them nothing
-        # pulls them in -- precisely the bare-bones case this exercise is about, and it
-        # would explain an OS-correlated failure no environment diff could.
-        webkit_sandbox_deps: [absent, present]
+        # The bubblewrap / xdg-dbus-proxy arm is gone: tested A/B in one run and refuted,
+        # absent 6/6 pass vs present 4/6, which is the wrong direction as well as the
+        # wrong size. Missing WebKit sandbox dependencies are not why the app quits.
 
     steps:
       - uses: actions/checkout@v4
@@ -91,7 +86,7 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev \
-            build-essential curl wget file pkg-config patchelf xvfb jq
+            build-essential curl wget file pkg-config patchelf xvfb jq strace
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -143,24 +138,22 @@ jobs:
           echo "PATCHED_BIN=$BIN" >> "$GITHUB_ENV"
           ls -la "$BIN"
 
-      - name: Is bubblewrap here, and should it be?
-        run: |
-          echo "arm: ${{ matrix.webkit_sandbox_deps }}"
-          for tool in bwrap xdg-dbus-proxy; do
-            printf '  %-16s %s\n' "$tool" "$(command -v $tool || echo '<absent>')"
-          done
-          echo "declared Depends: $(dpkg-deb -f dl/*.deb Depends)"
-          if [ "${{ matrix.webkit_sandbox_deps }}" = "present" ]; then
-          sudo apt-get install -y -qq --no-install-recommends bubblewrap xdg-dbus-proxy
-            echo "after install: $(command -v bwrap) $(command -v xdg-dbus-proxy)"
-          fi
-
       - name: Launch the patched app and see whether its backend survives
         run: |
           export WEBKIT_DISABLE_DMABUF_RENDERER=1
           export WEBKIT_DISABLE_COMPOSITING_MODE=1
+          # The app exits 1 silently, with no signal, no core and a clean dmesg, so the
+          # only remaining witnesses are what it says and what it asks the kernel for.
+          # GLib/GTK diagnostics go to stderr, which lands in app-stdout.log.
+          export G_MESSAGES_DEBUG=all
+          export RUST_BACKTRACE=full
+          # strace to a FILE, and filtered: a GUI app makes far too many syscalls to trace
+          # wholesale, but execve/exit/wait/kill is exactly the set that answers "who
+          # died, and did the app choose to exit or was it told to".
           ulimit -c unlimited || true
           nohup xvfb-run -n 99 -f "$PWD/.xvfb-auth" --server-args="-screen 0 1440x900x24" \
+            strace -f -tt -qq -o logs/app.strace \
+              -e trace=execve,exit_group,exit,wait4,kill,tgkill,prctl \
             "$PATCHED_BIN" > logs/app-stdout.log 2>&1 &
           WRAPPER=$!
           sleep 25
@@ -189,7 +182,14 @@ jobs:
           echo "=== core dumps ==="
           ls -la core* /var/lib/apport/coredump 2>/dev/null | head -5 || echo "(none)"
           echo "=== the app's last words ==="
-          tail -40 logs/app-stdout.log
+          tail -60 logs/app-stdout.log
+          echo "=== who exited, and with what ==="
+          grep -nE "exit_group|\+\+\+ exited|killed by" logs/app.strace 2>/dev/null | tail -20 \
+            || echo "(no exits recorded)"
+          echo "=== what the app execed (WebKitWebProcess and friends) ==="
+          grep -nE "execve" logs/app.strace 2>/dev/null | tail -15 || true
+          echo "=== last 40 traced syscalls ==="
+          tail -40 logs/app.strace 2>/dev/null || echo "(no strace)"
           exit 1
 
       - name: Does the backend come up?
@@ -220,7 +220,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: patched-app-22.04-${{ matrix.attempt }}-bwrap-${{ matrix.webkit_sandbox_deps }}
+          name: patched-app-22.04-${{ matrix.attempt }}
           path: |
             logs/
             artifacts/
