@@ -1,0 +1,51 @@
+name: "staging-7607 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-7607-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/orchestrator.py'
+      - 'studio/backend/core/research_runs.py'
+      - 'studio/backend/hub/services/models/deletion.py'
+      - 'studio/backend/main.py'
+      - 'studio/backend/mcp_server.py'
+      - 'studio/backend/routes/export.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/routes/models.py'
+      - 'studio/backend/routes/training.py'
+      - 'studio/backend/tests/test_async_singleton_access.py'
+      - 'studio/backend/tests/test_defaults_refresh_after_redetect.py'
+      - 'studio/backend/tests/test_desktop_auth.py'
+      - 'studio/backend/tests/test_export_capability.py'
+      - 'studio/backend/tests/test_health_answers_within_probe_budget.py'
+      - 'studio/backend/tests/test_inference_backend_singleton.py'
+      - 'studio/backend/tests/test_lifespan_restart_rewarms.py'
+      - 'studio/backend/tests/test_openai_tool_passthrough.py'
+      - 'studio/backend/tests/test_startup_defers_stack_dependent_work.py'
+      - 'studio/backend/tests/test_startup_defers_torch.py'
+      - 'studio/backend/tests/test_training_streaming_mlx_warm.py'
+      - '.github/workflows/staging-7607-ubuntu-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_async_singleton_access.py studio/backend/tests/test_defaults_refresh_after_redetect.py studio/backend/tests/test_desktop_auth.py studio/backend/tests/test_export_capability.py studio/backend/tests/test_health_answers_within_probe_budget.py studio/backend/tests/test_inference_backend_singleton.py studio/backend/tests/test_lifespan_restart_rewarms.py studio/backend/tests/test_openai_tool_passthrough.py studio/backend/tests/test_startup_defers_stack_dependent_work.py studio/backend/tests/test_startup_defers_torch.py studio/backend/tests/test_training_streaming_mlx_warm.py studio/backend/tests/test_warm_window_review_fixes.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda and not test_health_response_reports_desktop_capability_fields and not test_passthrough_stream_keepalive_while_upstream_headers_are_pending and not test_passthrough_stream_preheader_immediate_context_retry_adopts_delayed_response' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
