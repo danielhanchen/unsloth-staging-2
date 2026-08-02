@@ -35,6 +35,7 @@ from typing import (
     Literal,
     Mapping,
     MutableMapping,
+    NamedTuple,
     Optional,
     Union,
 )
@@ -136,6 +137,14 @@ LLAMA_SERVER_NOT_FOUND_DETAIL = (
 )
 
 # Shared by the pre-teardown and post-metadata rejections (#7205).
+_PARAVIRTUAL_DIFFUSION_NO_NGL_ERROR = (
+    "This Mac's Metal device is virtualised, where offloaded layers can return "
+    "corrupt output, and the installed unsloth_zoo diffusion shim has no --ngl, "
+    "so the zero-layer CPU pin cannot be applied and the runner would use Metal "
+    "anyway. Run 'unsloth studio update' to get a shim with --ngl, or set "
+    "UNSLOTH_ALLOW_PARAVIRTUAL_METAL=1 to keep the GPU on a VM you have verified."
+)
+
 _VULKAN_DIFFUSION_GPU_IDS_ERROR = (
     "GPU selection (gpu_ids) is not supported for a DiffusionGemma "
     "GGUF on a Vulkan llama.cpp build: the diffusion runner selects "
@@ -1977,10 +1986,11 @@ def _flash_attn_enabled_from_args(
 def _effective_spec_type(
     extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
 ) -> Optional[str]:
-    """The --spec-type llama-server will use: the last CLI --spec-type (or
-    --spec-default, which resolves non-MTP), else LLAMA_ARG_SPEC_TYPE. A CLI flag
-    overrides the env (matching llama.cpp), so a stale MTP env can't make the
-    budget reserve a drafter the launch won't load. None if neither sets it."""
+    """The last --spec-type label a launch carries: the final CLI --spec-type (or
+    --spec-default, which resolves non-MTP), else LLAMA_ARG_SPEC_TYPE. This is the
+    single label to display and compare modes with. It is NOT what llama.cpp
+    enables: types accumulate there, so ask _extra_args_requests_mtp whether MTP
+    is on. None if neither sets it."""
     args = [str(a) for a in extra_args] if extra_args else []
     cli_present = False
     cli_value: Optional[str] = None
@@ -2000,15 +2010,339 @@ def _effective_spec_type(
     return (os.environ if env is None else env).get("LLAMA_ARG_SPEC_TYPE")
 
 
+def _child_spec_env(
+    extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
+) -> Mapping[str, str]:
+    """The spec env the child will actually see.
+
+    The launch scrubs LLAMA_ARG_SPEC_* whenever Unsloth owns the spec block, so
+    only extras that name a --spec-type leave the inherited values in play. Every
+    prediction of what launches has to read this rather than os.environ, or it
+    describes a server that is not the one being started.
+    """
+    if not _extra_args_set_spec_type(extra_args):
+        return {}
+    return os.environ if env is None else env
+
+
+def _accumulated_spec_types(
+    extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
+) -> set:
+    """Every speculative type a launch ends up carrying, lowercased.
+
+    Types accumulate rather than replace: llama.cpp applies the env first through
+    the same handler and every --spec-type inserts at the end, so a later flag
+    cannot clear an earlier one. Even --spec-type none only appends NONE. Callers
+    therefore have to look at all of them, not just the last.
+    """
+    values = []
+    args = [str(a) for a in extra_args] if extra_args else []
+    for i, raw in enumerate(args):
+        _, eq, inline = raw.partition("=")
+        if _flag_name(raw) == "--spec-type":
+            values.append(inline if eq else (args[i + 1] if i + 1 < len(args) else ""))
+    env_value = (os.environ if env is None else env).get("LLAMA_ARG_SPEC_TYPE")
+    if env_value:
+        values.append(env_value)
+    return {p.strip().lower() for v in values for p in v.split(",") if p.strip()}
+
+
 def _extra_args_requests_mtp(
     extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
 ) -> bool:
-    """True if the effective --spec-type selects MTP (mtp/draft-mtp), so the
-    budget must reserve for it."""
-    value = _effective_spec_type(extra_args, env)
-    if not value:
+    """True if MTP lands in llama.cpp's spec-type vector, so the budget must
+    reserve for it and the slots must clamp.
+
+    See _accumulated_spec_types: MTP counts if ANY source names it."""
+    return bool(_accumulated_spec_types(extra_args, env) & {"mtp", "draft-mtp"})
+
+
+@functools.lru_cache(maxsize = 1)
+def _metal_device_is_paravirtual() -> bool:
+    """True when Metal is a virtualised Apple GPU, whose offload can corrupt output.
+
+    Seen on our own macos-14/15 runners: offload returned an ordered walk through
+    the character set while gpu_layers=0 on the same model, quant and binary was
+    coherent, and MLX on that machine stayed correct. It does not reproduce on
+    every build or quant (gemma-3-270m Q4_K_M on b9000 and b10090 was byte
+    identical at gpu_layers 0 and 99), so UNSLOTH_ALLOW_PARAVIRTUAL_METAL=1 keeps
+    the GPU on a VM known to be good. Physical Apple Silicon never matches.
+
+    Three probes, cheapest first. MLX names the device outright and costs about
+    40 ms, but is not on every Mac. hw.model then answers for the headless case
+    that matters most: measured on macos-14 and macos-15, SPDisplaysDataType
+    returns zero bytes on a VM with no display, so it cannot see a cloud or CI
+    Mac at all, while hw.model still reports VirtualMac2,1 or VMM-x86_64 against
+    Mac<n>,<n> on real hardware. SPDisplaysDataType stays last for desktop VMs,
+    which do have a display and do name the paravirtual chipset.
+    """
+    if sys.platform != "darwin":
         return False
-    return any(p.strip().lower() in ("mtp", "draft-mtp") for p in value.split(","))
+    if os.environ.get("UNSLOTH_ALLOW_PARAVIRTUAL_METAL", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        logger.info("UNSLOTH_ALLOW_PARAVIRTUAL_METAL set: keeping Metal offload.")
+        return False
+    name = ""
+    try:
+        import mlx.core as mx
+        name = str(mx.device_info().get("device_name") or "")
+    except Exception:
+        name = ""
+    if "paravirtual" not in name.lower():
+        for _probe_cmd, _match in (
+            # VMM-x86_64 is the Intel-guest identifier and contains neither
+            # "virtual" nor "paravirtual"; upstream ships Metal on macOS x64 too.
+            (["sysctl", "-n", "hw.model"], ("virtual", "vmm-")),
+            (["system_profiler", "SPDisplaysDataType"], ("paravirtual",)),
+        ):
+            try:
+                probe = subprocess.run(
+                    _probe_cmd,
+                    capture_output = True,
+                    text = True,
+                    timeout = 30,
+                    encoding = "utf-8",
+                    errors = "replace",
+                )
+            except Exception:
+                continue
+            _out = (probe.stdout or "").lower()
+            if any(m in _out for m in _match):
+                name = f"{name} {probe.stdout}".strip()
+                break
+    _low = name.lower()
+    if "paravirtual" in _low or "virtual" in _low or "vmm-" in _low:
+        logger.warning(
+            "Metal device looks virtualised (%s). Offload can return corrupt output on "
+            "paravirtual Apple GPUs, so GGUF inference will run on CPU. MLX is "
+            "unaffected. Set UNSLOTH_ALLOW_PARAVIRTUAL_METAL=1 to keep the GPU.",
+            name.strip()[:120] or "unknown",
+        )
+        return True
+    return False
+
+
+def _paravirtual_probe_answered(server_caps: Mapping[str, object]) -> bool:
+    """False when the --help probe failed, so every capability read as absent.
+
+    Both companion flags predate the oldest build Studio can launch at all
+    (--no-mmproj-offload is llama.cpp b5178, --gpu-layers-draft is from 2023, and
+    the base argv already requires b6325), so "capability missing" never really
+    means the build lacks it. It means the probe did not answer, which is easy:
+    one malformed inherited LLAMA_ARG_* makes llama-server --help exit non-zero,
+    and the all-false result is cached for the rest of the process. Dropping the
+    projector or the drafter on that would be a self-inflicted outage, so the
+    drops require a conclusive probe and the pins cover the unanswered case.
+    """
+    return not server_caps.get("mtp_probe_inconclusive")
+
+
+def _paravirtual_draft_ngl_flag(server_caps: Mapping[str, object]) -> Optional[str]:
+    """The draft-layer flag to pin with, or None only when the build truly lacks one."""
+    flag = server_caps.get("spec_draft_ngl_flag")
+    if flag:
+        return str(flag)
+    # Unanswered probe: fall back to the spelling every launchable build has had
+    # since 2023 rather than treating the drafter as unpinnable.
+    if not _paravirtual_probe_answered(server_caps):
+        return "--gpu-layers-draft"
+    return None
+
+
+def _paravirtual_mmproj_pinnable(server_caps: Mapping[str, object]) -> bool:
+    """True when --no-mmproj-offload can be emitted, including on an unanswered probe."""
+    return bool(
+        server_caps.get("supports_no_mmproj_offload")
+        or not _paravirtual_probe_answered(server_caps)
+    )
+
+
+_OVERRIDE_TENSOR_FLAGS: frozenset = frozenset(
+    {
+        "-ot",
+        "--override-tensor",
+        "-otd",
+        "--override-tensor-draft",
+        "--spec-draft-override-tensor",
+    }
+)
+
+
+def _paravirtual_strip_gpu_overrides(
+    extra_args: Optional[Iterable[str]], *, log_dropped: bool = True
+) -> Optional[List[str]]:
+    """Drop --override-tensor entries that place weights back on the corrupt device.
+
+    ``-ot`` is the one placement flag ``--gpu-layers 0`` cannot answer: llama.cpp
+    applies the override while selecting each weight's buffer type, before any
+    layer is assigned to a device, so ``-ot ".*=Metal"`` puts weights on the
+    virtualised GPU no matter what the layer count says. It also accumulates
+    rather than replacing, so appending a later flag cannot neutralise it; the
+    entry has to go. ``-otd`` does the same for the drafter and would defeat the
+    draft-layer pin.
+
+    Only non-CPU targets are dropped. ``-ot exps=CPU`` is the common and useful
+    spelling, it moves weights the same way this fallback does, and stripping it
+    would slow the very load it is meant to rescue.
+
+    ``log_dropped=False`` for the duplicate-load comparators, which normalize a
+    request they are only inspecting: they must not narrate a drop no launch is
+    performing, on every /load.
+    """
+    if not extra_args:
+        return extra_args if extra_args is None else list(extra_args)
+    args = [str(a) for a in extra_args]
+    out: List[str] = []
+    i = 0
+    while i < len(args):
+        tok = args[i]
+        # _flag_name mirrors llama.cpp's own underscore folding (arg.cpp does
+        # std::replace(_ -> -) before matching), so --override_tensor is the same
+        # flag to the child and has to be the same flag here.
+        base, _, inline = tok.partition("=")
+        if _flag_name(base) in _OVERRIDE_TENSOR_FLAGS:
+            value = inline if inline else (args[i + 1] if i + 1 < len(args) else "")
+            targets = [
+                part.rsplit("=", 1)[-1].strip().lower() for part in value.split(",") if "=" in part
+            ]
+            if targets and all(t == "cpu" for t in targets):
+                out.append(tok)
+                if not inline and i + 1 < len(args):
+                    out.append(args[i + 1])
+            elif log_dropped:
+                logger.warning(
+                    "Dropping %s %s: this Mac's Metal device is virtualised, so an "
+                    "override that keeps weights on it would return corrupt output.",
+                    base,
+                    value,
+                )
+            i += 1 if inline else 2
+            continue
+        out.append(tok)
+        i += 1
+    return out
+
+
+class ParavirtualPlacement(NamedTuple):
+    """A load request's GPU placement after the virtualised-Metal CPU pin."""
+
+    gpu_memory_mode: Literal["auto", "manual"]
+    gpu_layers: int
+    tensor_parallel: bool
+    tensor_split: Optional[List[float]]
+    n_cpu_moe: int
+    extra_args: Optional[List[str]]
+
+
+def paravirtual_normalized_request(
+    *,
+    gpu_memory_mode: Literal["auto", "manual"] = "auto",
+    gpu_layers: int = -1,
+    tensor_parallel: bool = False,
+    tensor_split: Optional[List[float]] = None,
+    n_cpu_moe: int = 0,
+    extra_args: Optional[Iterable[str]] = None,
+    log_dropped: bool = True,
+) -> ParavirtualPlacement:
+    """Map a requested placement to the one a virtualised Metal device launches.
+
+    Single source of truth for the CPU pin, shared by the launch (load_model)
+    and by BOTH duplicate-load comparators (``_already_in_target_state`` and the
+    route's ``_request_matches_loaded_settings``). The launch records what it
+    normalized, so a comparator that judged the RAW request would mismatch its
+    own state and tear down a healthy CPU server on every repeat Apply -- and,
+    with an unbounded reload loop, 409 or cancel a live generation.
+
+    Pure and unconditional: callers gate on ``_metal_device_is_paravirtual()``,
+    and it is idempotent, so applying it to an already-normalized request (a
+    respawn replay, or a comparator running inside load_model) is a no-op.
+
+    Deliberately NOT keyed on the request already being manual/0. A user who
+    picks Manual + 0 layers has placed the main model on CPU, but the extras are
+    the caller's, not Unsloth's: ``-ot ".*=Metal"`` is applied while each weight's
+    buffer type is chosen, before any layer is assigned, so it puts weights back
+    on the corrupt device no matter what the layer count says -- and the route
+    only strips the ``-ngl`` family, never ``-ot``.
+
+    ``log_dropped=False`` for the comparators: they normalize a request they are
+    only inspecting, so they must not narrate a rewrite no launch is performing.
+    """
+    normalized = extra_args if extra_args is None else list(extra_args)
+    if normalized:
+        # User pass-through args are appended AFTER the managed --gpu-layers 0 and
+        # llama.cpp's parser is last-wins, so an accepted `-ngl 99` would re-enable
+        # the corrupt offload. Only manual mode strips these at the route, so an
+        # Auto request still carries them here.
+        normalized = strip_shadowing_flags(
+            normalized,
+            strip_context = False,
+            strip_cache = False,
+            strip_spec = False,
+            strip_template = False,
+            strip_split_mode = False,
+            strip_offload = True,
+        )
+        # strip_offload only covers the layer-count family; an --override-tensor
+        # aimed at Metal survives it and places weights before any layer
+        # assignment happens.
+        normalized = _paravirtual_strip_gpu_overrides(normalized, log_dropped = log_dropped)
+    return ParavirtualPlacement(
+        gpu_memory_mode = "manual",
+        gpu_layers = 0,
+        # Nothing is left on the GPU to split or keep on CPU, and the launch drops
+        # these anyway; normalize them here too so the recorded state and the next
+        # identical request agree.
+        tensor_parallel = False,
+        tensor_split = None,
+        n_cpu_moe = 0,
+        extra_args = normalized,
+    )
+
+
+def _paravirtual_split_mode_pin(extra_args: Optional[Iterable[str]]) -> List[str]:
+    """Flags that neutralise a pass-through ``--split-mode`` on a virtualised Mac.
+
+    A user ``--split-mode`` in extras is deliberately allowed (the Tensor
+    Parallelism toggle cannot express row/none), but it is a GPU placement flag
+    and the paravirtual fallback has already pinned this load to CPU. It is NOT
+    inert at ``--gpu-layers 0``: llama.cpp builds a buffer-type list for every
+    device in ``model->devices`` before any layer is assigned, and n_gpu_layers
+    never reaches that step. So ``-sm row`` throws "device <X> does not support
+    split buffers" on every backend except SYCL (``make_gpu_buft_list``,
+    llama-model.cpp, since ggml-org/llama.cpp#24216 removed CUDA's split
+    buffers), and ``-sm tensor`` throws "LLAMA_SPLIT_MODE_TENSOR not implemented
+    for architecture" for every arch ``llm_arch_supports_sm_tensor`` excludes.
+    Either one turns the CPU rescue into a server that refuses to start, and the
+    zero-offload mask cannot save it: that mask only writes CUDA/HIP visibility
+    vars, so the Metal device stays in the list on the one platform this fallback
+    fires on.
+
+    Overridden rather than stripped: llama.cpp is last-wins, so ``layer`` (the
+    default, and a provable no-op at ``--gpu-layers 0`` -- llama-model.cpp
+    computes the split points but never indexes them once ``act_gpu_layers`` is
+    0) neutralises the mode without rewriting ``extra_args``. The route's
+    duplicate-load comparator compares the stored extras verbatim against the
+    request, and the UI does not round-trip the extras box, so stripping would
+    leave the two permanently unequal and turn every later Apply into a real
+    model swap. ``--tensor-split`` needs neither treatment for the same
+    never-indexed reason.
+
+    Returns [] when extras set no mode, or already set ``layer``, so the flag is
+    added only where it changes something.
+    """
+    mode = (parse_split_mode_override(extra_args) or "").strip().lower()
+    if not mode or mode == "layer":
+        return []
+    logger.warning(
+        "Overriding --split-mode %s with the default layer split: this Mac's "
+        "Metal device is virtualised, so the model runs on CPU and a GPU split "
+        "mode would only fail the load.",
+        mode,
+    )
+    return ["--split-mode", "layer"]
 
 
 def _extra_args_requests_separate_draft(
@@ -2016,11 +2350,12 @@ def _extra_args_requests_separate_draft(
 ) -> bool:
     """True if the effective --spec-type selects a non-MTP model draft mode
     (draft-simple/draft-eagle3), which loads a separate draft model the budget
-    must reserve (draft-mtp -> _extra_args_requests_mtp; ngram-* load no model)."""
-    value = _effective_spec_type(extra_args, env)
-    if not value:
-        return False
-    return any(p.strip().lower() in ("draft-simple", "draft-eagle3") for p in value.split(","))
+    must reserve (draft-mtp -> _extra_args_requests_mtp; ngram-* load no model).
+
+    Accumulating for the same reason as _extra_args_requests_mtp: a later
+    --spec-default or --spec-type cannot clear an inherited draft-simple, so
+    reading only the last one under-reserved the separate model it still loads."""
+    return bool(_accumulated_spec_types(extra_args, env) & {"draft-simple", "draft-eagle3"})
 
 
 def _extra_args_spec_draft_n_max(extra_args: Optional[Iterable[str]]) -> Optional[int]:
@@ -2071,7 +2406,15 @@ def _extra_args_mtp_draft_path(
     if found is not None:
         return found
     e = os.environ if env is None else env
-    return e.get("LLAMA_ARG_SPEC_DRAFT_MODEL") or e.get("LLAMA_ARG_SPEC_DRAFT_HF_REPO") or None
+    return (
+        e.get("LLAMA_ARG_SPEC_DRAFT_MODEL")
+        or e.get("LLAMA_ARG_SPEC_DRAFT_HF_REPO")
+        # Pre-b8955 spellings, still live on builds between the launchable floor
+        # (2025-08-30) and the rename (2026-04-28).
+        or e.get("LLAMA_ARG_MODEL_DRAFT")
+        or e.get("LLAMA_ARG_HFD_REPO")
+        or None
+    )
 
 
 def _extra_args_draft_cache_types(
@@ -2460,6 +2803,12 @@ class LlamaCppBackend:
         # Separate MTP drafter launched with the current model; reload-dedup
         # key so a drafter that appears next to the weights forces a reload.
         self._mtp_draft_path: Optional[str] = None
+        # Drafter this load resolved and then deliberately suppressed (virtualised
+        # Metal with no draft-layer flag). The dedup keys on the drafter the caller
+        # asked for, and that file is still on disk, so without this the detected
+        # path never matches the launched None and every repeat Apply tears down a
+        # healthy server. Only an update can lift the suppression, and that unloads.
+        self._mtp_draft_suppressed_path: Optional[str] = None
         # Why MTP was disabled on the last load that asked for it (auto on an
         # MTP model, or forced mtp / mtp+ngram), else None. Drives the "update
         # llama.cpp" hint in the UI. "binary_no_mtp" / "binary_outdated" ->
@@ -2575,6 +2924,11 @@ class LlamaCppBackend:
         # ``_extra_args_source`` records the (model_identifier, hf_variant) the
         # stored args came from so the route can refuse cross-model inheritance.
         self._extra_args: Optional[List[str]] = None
+        # The same extras as REQUESTED, before a launch-time rewrite (the
+        # virtualised-Metal drafter drop strips the spec group). Duplicate-load
+        # comparators key on the caller's list, which keeps arriving unchanged,
+        # so they compare requested-vs-requested like _requested_n_ctx does.
+        self._requested_extra_args: Optional[List[str]] = None
         self._extra_args_source: Optional[tuple[str, Optional[str]]] = None
         self._requested_n_ctx: int = 0
         # Raw kwargs of the last healthy load, for the MTP-crash reload. Memory-only
@@ -2685,6 +3039,13 @@ class LlamaCppBackend:
         return self._mtp_draft_path
 
     @property
+    def mtp_draft_suppressed_path(self) -> Optional[str]:
+        """Drafter the last load resolved and then dropped on purpose, else None.
+        Duplicate-load checks accept it alongside mtp_draft_path so the drafter
+        still on disk does not read as a settings change."""
+        return self._mtp_draft_suppressed_path
+
+    @property
     def spec_fallback_reason(self) -> Optional[str]:
         """Why MTP was disabled on the last MTP-requesting load, else None."""
         return self._spec_fallback_reason
@@ -2695,6 +3056,19 @@ class LlamaCppBackend:
         never set, [] = explicitly cleared. Used by the route for
         inheritance."""
         return list(self._extra_args) if self._extra_args is not None else None
+
+    @property
+    def requested_extra_args(self) -> Optional[List[str]]:
+        """Extras the last load was INVOKED with (a copy), before any launch-time
+        rewrite; falls back to the launched list when nothing was rewritten. Used
+        by the duplicate-load comparators so a rewrite the caller cannot see (the
+        virtualised-Metal drafter drop) never reads as a settings change."""
+        stored = (
+            self._requested_extra_args
+            if self._requested_extra_args is not None
+            else self._extra_args
+        )
+        return list(stored) if stored is not None else None
 
     @property
     def requested_n_ctx(self) -> int:
@@ -3316,6 +3690,8 @@ class LlamaCppBackend:
                 "supports_no_cache_prompt": False,
                 "supports_metrics": False,
                 "supports_slot_save": False,
+                "supports_no_mmproj_offload": False,
+                "spec_draft_ngl_flag": None,
             }
         try:
             mtime = int(Path(bin_path).stat().st_mtime)
@@ -3337,6 +3713,8 @@ class LlamaCppBackend:
         supports_no_cache_prompt = False
         supports_metrics = False
         supports_slot_save = False
+        supports_no_mmproj_offload = False
+        spec_draft_ngl_flag = None
         saw_spec_type = False
         probe_ok = False
         help_text = ""
@@ -3443,6 +3821,17 @@ class LlamaCppBackend:
             supports_no_cache_prompt = _is_real("--no-cache-prompt")
             supports_metrics = _is_real("--metrics")
             supports_slot_save = _is_real("--slot-save-path")
+            supports_no_mmproj_offload = _is_real("--no-mmproj-offload")
+            # Record WHICH alias this build has, not just that one exists:
+            # --spec-draft-ngl only landed in llama.cpp b8955, and an older build
+            # exposing only --gpu-layers-draft would refuse to start on the newer
+            # name. Long forms only, since the block parser above skips short
+            # aliases, so probing "-ngld" could never have matched. Same
+            # prefer-new-fall-back-to-legacy shape as spec_draft_n_max_flag.
+            for _alias in ("--spec-draft-ngl", "--gpu-layers-draft", "--n-gpu-layers-draft"):
+                if _is_real(_alias):
+                    spec_draft_ngl_flag = _alias
+                    break
         except (OSError, subprocess.SubprocessError) as exc:
             logger.debug(f"llama-server --help probe failed: {exc}")
             saw_spec_type = False
@@ -3479,6 +3868,8 @@ class LlamaCppBackend:
             "supports_no_cache_prompt": supports_no_cache_prompt,
             "supports_metrics": supports_metrics,
             "supports_slot_save": supports_slot_save,
+            "supports_no_mmproj_offload": supports_no_mmproj_offload,
+            "spec_draft_ngl_flag": spec_draft_ngl_flag,
         }
         cls._capability_cache[cache_key] = info
         return info
@@ -5953,6 +6344,13 @@ class LlamaCppBackend:
         # (#7574). An older shim has no --ngl, so drop it rather than die in argparse.
         manual_ngl = _diffusion_manual_ngl(gpu_memory_mode, gpu_layers)
         if manual_ngl is not None and not _shim_supports_ngl(shim_cmd):
+            # Dropping a zero-layer split on a virtualised Metal device undoes the
+            # CPU pin: cpu_only below is torch.cuda only, so it reads 0 on a Mac and
+            # the empty --gpu token still leaves the runner free to use Metal. Only
+            # the split keeps the weights off it, so refuse rather than serve output
+            # that may be corrupt.
+            if manual_ngl == 0 and _metal_device_is_paravirtual():
+                raise ValueError(_PARAVIRTUAL_DIFFUSION_NO_NGL_ERROR)
             logger.warning(
                 "DiffusionGemma: ignoring the %d GPU-layer split; the installed "
                 "unsloth_zoo shim has no --ngl. Upgrade unsloth_zoo to set the split.",
@@ -6116,6 +6514,10 @@ class LlamaCppBackend:
             self._gpu_offload_active = not holds_no_gpu
             if extra_args is not None:
                 self._extra_args = list(extra_args)
+                # The diffusion runner has no spec block to drop, so the launched
+                # list IS the requested one; rebind so a prior GGUF load's record
+                # cannot outlive it.
+                self._requested_extra_args = list(extra_args)
                 self._extra_args_source = (model_identifier, hf_variant)
             # The visual server logs "MAXTOK=<N>" with the context budget it actually resolved
             # (auto-sized to VRAM). Read it back so the UI context bar shows the real budget.
@@ -7369,6 +7771,62 @@ class LlamaCppBackend:
             # so any in-flight load has drained) instead of using a half-swapped one.
             if getattr(self, "_llama_update_in_progress", False):
                 raise RuntimeError("llama.cpp is updating; try again in a moment.")
+
+            # A virtualised Apple GPU corrupts every offloaded layer, so pin GGUF
+            # inference to CPU there; physical Apple Silicon is untouched. Settled
+            # ABOVE the duplicate-load check (and the KV estimates) so the compared
+            # placement is the one that launches: the launch records the normalized
+            # values, so comparing the raw request would miss the fast path and tear
+            # down a healthy CPU server on every repeat Auto /load.
+            # Keyed on the hardware, not on the request, and applied whole rather
+            # than only when the request asks for offload: Manual + 0 layers
+            # already places the main model on CPU, but the companions below
+            # (mmproj, a separate drafter) do not read --gpu-layers, and the
+            # extras are the caller's -- an `-ot ".*=Metal"` the route never
+            # strips would put weights straight back on the corrupt device.
+            # paravirtual_normalized_request is the one definition of that
+            # rewrite, shared with both duplicate-load comparators.
+            _paravirtual_cpu_forced = _metal_device_is_paravirtual()
+            if _paravirtual_cpu_forced:
+                _pv_placement = paravirtual_normalized_request(
+                    gpu_memory_mode = gpu_memory_mode,
+                    gpu_layers = gpu_layers,
+                    tensor_parallel = tensor_parallel,
+                    tensor_split = tensor_split,
+                    n_cpu_moe = n_cpu_moe,
+                    extra_args = extra_args,
+                )
+                if (gpu_memory_mode, gpu_layers) != (
+                    _pv_placement.gpu_memory_mode,
+                    _pv_placement.gpu_layers,
+                ):
+                    logger.warning(
+                        "Forcing gpu_layers=0 for %s: this Mac's Metal device is "
+                        "virtualised and offloaded layers produce corrupt output.",
+                        model_identifier or gguf_path,
+                    )
+                if extra_args and _pv_placement.extra_args != list(extra_args):
+                    logger.warning(
+                        "Dropping offload flags from extra args on a "
+                        "virtualised Metal device: %s -> %s",
+                        list(extra_args),
+                        _pv_placement.extra_args,
+                    )
+                if tensor_parallel or tensor_split:
+                    logger.info(
+                        "Virtualised Metal device: dropping tensor split/parallel "
+                        "flags (nothing to split on the GPU)"
+                    )
+                gpu_memory_mode = _pv_placement.gpu_memory_mode
+                gpu_layers = _pv_placement.gpu_layers
+                n_cpu_moe = _pv_placement.n_cpu_moe
+                extra_args = _pv_placement.extra_args
+                # Spelled out rather than read off _pv_placement so the TP-drop
+                # allowlist in tests/test_tp_vision_regression.py still sees this
+                # site; the helper returns exactly these two values.
+                tensor_parallel = False
+                tensor_split = None
+
             # Duplicate /load that raced past the route check: do nothing if the
             # live server already satisfies this request.
             if self._already_in_target_state(
@@ -7442,6 +7900,33 @@ class LlamaCppBackend:
                 )
                 n_parallel = 1
 
+            # MTP is documented as single-slot: the model cards ship "-np 1" and say
+            # "-np > 1 [...] not yet supported with MTP". llama.cpp does keep the MTP
+            # state per sequence, so the committed text stays correct; what breaks at
+            # more slots is the draft. Unequal per-slot token counts make split_equal
+            # reorder the ubatch while the nextn hidden states are still read by raw
+            # token index, so slots read each other's rows, acceptance collapses and
+            # MTP ends up slower than no speculation at all. Clamped beside the
+            # --kv-unified clamp so the KV fit matches.
+            # The env counts. llama.cpp appends spec types rather than replacing them
+            # (--spec-type inserts, --spec-default push_backs, and enablement is a
+            # find over the vector), so an inherited LLAMA_ARG_SPEC_TYPE=draft-mtp
+            # really does launch MTP and no later flag can clear it.
+            _pv_extras_clamped_slots = 0
+            if n_parallel > 1 and _extra_args_requests_mtp(
+                extra_args, env = _child_spec_env(extra_args)
+            ):
+                # Kept so the paravirtual drafter drop can hand them back if it
+                # strips the very spec group this clamped for.
+                _pv_extras_clamped_slots = n_parallel
+                logger.warning(
+                    "MTP speculative decoding (--spec-type draft-mtp) does not support "
+                    "%d parallel slots; using 1. Load without MTP to serve chats in "
+                    "parallel.",
+                    n_parallel,
+                )
+                n_parallel = 1
+
             # ── Vulkan-ordinal preflight (BEFORE the Phase 1 kill) ────────
             # An explicit Vulkan pin the ggml probe never enumerated cannot be honored.
             # Validate it ABOVE the kill so an invalid selection leaves the live model
@@ -7464,8 +7949,13 @@ class LlamaCppBackend:
             # Classify before killing the healthy server (#7205); Phase 2 reuses this
             # path. Diffusion changes the meaning or validity of requested placement,
             # so both the remote and the local branch settle it above the teardown.
+            # A zero-layer diffusion pin this shim cannot apply is refused; probe
+            # once here so the HF case can be settled above the teardown as well.
+            _pv_diffusion_unpinnable = bool(
+                _paravirtual_cpu_forced and not self.diffusion_split_supported()
+            )
             _preflight_model_path = None
-            if hf_repo and (_vulkan_ordinal_pin or _cpu_only_pin):
+            if hf_repo and (_vulkan_ordinal_pin or _cpu_only_pin or _pv_diffusion_unpinnable):
                 _resolved_repo = _resolve_repo_id_casing(hf_repo)
                 if _resolved_repo != hf_repo:
                     logger.info(
@@ -7486,6 +7976,8 @@ class LlamaCppBackend:
                 if _preflight_is_diffusion:
                     if _vulkan_ordinal_pin:
                         raise ValueError(_VULKAN_DIFFUSION_GPU_IDS_ERROR)
+                    if _pv_diffusion_unpinnable:
+                        raise ValueError(_PARAVIRTUAL_DIFFUSION_NO_NGL_ERROR)
                 elif _cpu_only_pin:
                     raise ValueError(
                         f"Requested gpu_ids {list(gpu_ids)} but the llama.cpp build has "
@@ -7503,6 +7995,16 @@ class LlamaCppBackend:
                     gguf_path,
                     model_identifier,
                 )
+            # Same idea for the unpinnable diffusion split: _start_diffusion_server
+            # enforces it for every path, but it runs after the teardown, so settle
+            # the local case here and leave the running server alone.
+            if (
+                _pv_diffusion_unpinnable
+                and gguf_path
+                and not hf_repo
+                and self._gguf_path_is_diffusion(gguf_path, model_identifier)
+            ):
+                raise ValueError(_PARAVIRTUAL_DIFFUSION_NO_NGL_ERROR)
 
             # ── Phase 1: kill old process (under lock, fast) ──────────
             with self._lock:
@@ -7587,6 +8089,11 @@ class LlamaCppBackend:
                 # Not a tensor/layer GGUF: clear any preserved-fallback flag from a
                 # prior load (this path skips the command builder that clears it).
                 self._layer_preserves_tensor_intent = False
+                # Same reason, and a diffusion server never carries a drafter: only
+                # unload clears these, and the dedupe compares the pair, so a stale
+                # one reloads a healthy diffusion server on every Apply.
+                self._mtp_draft_path = None
+                self._mtp_draft_suppressed_path = None
                 with self._lock:
                     if self._cancel_event.is_set():
                         logger.info("Load cancelled before diffusion server start")
@@ -7805,11 +8312,40 @@ class LlamaCppBackend:
                         model_path = model_path,
                         mmproj_path = mmproj_path,
                     )
+                # A virtualised Metal device corrupts the vision encoder too, and
+                # --no-mmproj-offload is the only way to keep it off there (clip.cpp
+                # never reads --gpu-layers). Without that flag the choice is a
+                # projector on the corrupt device or no projector, so drop it: this
+                # fallback exists to stop corrupt output, and silently encoding every
+                # image from garbage is the failure it is meant to prevent.
+                # Only when the probe actually answered. --no-mmproj-offload is from
+                # llama.cpp b5178 and the base argv already needs b6325, so a build
+                # that can start here always has it: a false capability means the
+                # --help probe failed, not that the flag is missing. Dropping vision
+                # on a failed probe would be a self-inflicted outage, and the probe
+                # is easy to fail (one malformed inherited LLAMA_ARG_* makes --help
+                # exit non-zero, and the all-false result is cached for the process).
+                # The pin below covers that case instead.
+                _pv_mmproj_unpinnable = bool(
+                    launch_mmproj_path
+                    and _paravirtual_cpu_forced
+                    and _paravirtual_probe_answered(server_caps)
+                    and not server_caps.get("supports_no_mmproj_offload")
+                )
+                if _pv_mmproj_unpinnable:
+                    logger.warning(
+                        "Disabling image/audio input for this session: this Mac's "
+                        "Metal device is virtualised and this llama-server build has "
+                        "no --no-mmproj-offload, so the vision projector would keep "
+                        "running on the device whose output is corrupt. Run 'unsloth "
+                        "studio update' to install a build that supports it."
+                    )
+                    launch_mmproj_path = None
                 # Need both a resolved mmproj AND the config vision flag; a stray
                 # mmproj passing the family-name heuristic must not flip a non-VLM
                 # GGUF into vision mode.
                 effective_is_vision = bool(launch_mmproj_path) and bool(is_vision)
-                if is_vision and not effective_is_vision:
+                if is_vision and not effective_is_vision and not _pv_mmproj_unpinnable:
                     logger.warning(
                         "Vision-capable GGUF loaded without a usable mmproj; "
                         "image input will be disabled for this session"
@@ -7963,16 +8499,11 @@ class LlamaCppBackend:
                         and _mtp_size_for_fit < _MTP_MIN_SIZE_B
                         and not bool(mtp_draft_path)
                     )
-                    # LLAMA_ARG_SPEC_TYPE only reaches the child when neither extras
-                    # nor Unsloth emit a spec flag (mode "off", no user --spec-type),
-                    # since _build_speculative_flags emits one for every other mode.
-                    # Consult the env for the reserve only then, else a stale MTP env
-                    # would over-reserve.
-                    _spec_env: Mapping[str, str] = (
-                        os.environ
-                        if (not _extra_args_set_spec_type(extra_args) and _mtp_canonical == "off")
-                        else {}
-                    )
+                    # The inherited spec env only reaches the child when the extras
+                    # own --spec-type: the launch scrubs it otherwise, so what Unsloth
+                    # emits is final. Reserve against the env in that case only, where
+                    # the user's flags and the env accumulate and both really launch.
+                    _spec_env: Mapping[str, str] = _child_spec_env(extra_args)
                     # Extras can run MTP even when Unsloth suppresses its own emission.
                     _user_mtp_via_extras = _extra_args_requests_mtp(extra_args, env = _spec_env)
                     # A non-MTP model-based draft mode (draft-simple/draft-eagle3) in
@@ -8055,7 +8586,10 @@ class LlamaCppBackend:
                         )
                         else None
                     )
-                    _env_draft_for_budget = _extra_args_mtp_draft_path([], env = os.environ)
+                    # Same scrubbed view: reserving for an inherited drafter the
+                    # child never loads shrinks the context or rejects a placement
+                    # that fits.
+                    _env_draft_for_budget = _extra_args_mtp_draft_path([], env = _spec_env)
                     _mtp_draft_for_budget = (
                         _cli_draft_for_budget or _studio_draft_for_budget or _env_draft_for_budget
                     )
@@ -9069,6 +9603,96 @@ class LlamaCppBackend:
                 launch_mtp_draft_path = self._resolve_launch_mtp_path(
                     mtp_draft_path = mtp_draft_path,
                 )
+                _pv_suppressed_draft_path: Optional[str] = None
+                _pv_suppressed_spec_extra_args: Optional[List[str]] = None
+                # Same shape as the projector drop above: the CPU pin below needs a
+                # draft-layer flag from the probe, and without one the drafter keeps
+                # its own automatic placement on the virtualised device. Unlike the
+                # projector this is a throughput fix, not a correctness one -- a
+                # token is emitted only when the CPU-side target model samples it
+                # itself (common_sampler_sample_and_accept_n pushes the target's own
+                # draw and stops at the first mismatch), so a corrupt drafter can
+                # only get its proposals rejected. That costs a drafter forward pass
+                # per step and buys nothing, so drop the drafter instead. Both
+                # sources go: Unsloth's own resolved drafter, and a user/env one in
+                # the extras. The rest of the spec group leaves with it, since a
+                # --spec-type that needs a draft model (draft-simple, eagle3) aborts
+                # llama-server once the model is gone; the drafter-free modes are
+                # re-derived by _build_speculative_flags right below. A user who
+                # already pinned the drafter themselves keeps it: the probe only
+                # decides whether Unsloth can emit the flag, and their -ngld 0 /
+                # --spec-draft-device cpu puts the drafter on the CPU regardless.
+                # Same reasoning as the projector drop: --gpu-layers-draft has
+                # existed since 2023, so no build that can start here truly lacks a
+                # draft-layer flag, and a missing one means the probe failed. On an
+                # unanswered probe fall back to that legacy spelling and pin rather
+                # than drop, so a failed probe costs nothing.
+                # Keyed on the drafter the launch really loads, not on one that merely
+                # exists: a user-owned --spec-type returns early from
+                # _build_speculative_flags, so Unsloth's resolved sibling never
+                # becomes --model-draft and only the user's own drafter can be
+                # placed. Keying on the sibling there would strip a drafter-free
+                # mode (--spec-type ngram-mod and its knobs) for a drafter that was
+                # never going to launch. Their own --model-draft/--spec-draft-hf
+                # counts, and the inherited env only where it survives to the child:
+                # the launch scrubs LLAMA_ARG_SPEC_DRAFT_* unless the extras own
+                # --spec-type, so reading os.environ here would drop a drafter that
+                # never loads and strip the caller's spec tuning with it.
+                _pv_draft_unpinnable = bool(
+                    _paravirtual_cpu_forced
+                    and not _paravirtual_draft_ngl_flag(server_caps)
+                    and (
+                        _extra_args_mtp_draft_path(extra_args, env = _child_spec_env(extra_args))
+                        or (launch_mtp_draft_path and not _extra_args_set_spec_type(extra_args))
+                    )
+                    and not _extra_args_draft_offloaded_to_cpu(extra_args)
+                )
+                if _pv_draft_unpinnable:
+                    logger.warning(
+                        "Dropping the speculative drafter for this session: this "
+                        "Mac's Metal device is virtualised and this llama-server "
+                        "build advertises no draft-layer flag, so the drafter would "
+                        "keep running on the device whose output is corrupt. Output "
+                        "stays correct either way; this only costs speed. Run "
+                        "'unsloth studio update' to install a build that supports it."
+                    )
+                    # Remember what was suppressed: the drafter stays on disk, so
+                    # the caller and the route keep detecting it, and comparing
+                    # that against the launched None would reload a healthy server
+                    # on every repeat Apply.
+                    _pv_suppressed_draft_path = launch_mtp_draft_path
+                    launch_mtp_draft_path = None
+                    if extra_args:
+                        # Same reason as the suppressed path: record the extras as
+                        # REQUESTED next to the launched ones. Both comparators key
+                        # on the caller's list, and the caller keeps sending it, so
+                        # comparing it against this rewrite would reload a healthy
+                        # server on every repeat Apply.
+                        _pv_suppressed_spec_extra_args = list(extra_args)
+                        extra_args = strip_shadowing_flags(
+                            extra_args,
+                            strip_context = False,
+                            strip_cache = False,
+                            strip_spec = True,
+                            strip_template = False,
+                            strip_split_mode = False,
+                        )
+                        # The slots were clamped for an MTP that just went away, so
+                        # give them back rather than serve one chat at a time on a
+                        # server that is no longer speculating. Restored before the
+                        # spec flags are rebuilt, so the backstop below re-clamps if
+                        # Unsloth's own resolution turns out to be MTP after all.
+                        if _pv_extras_clamped_slots > 1 and not _extra_args_requests_mtp(
+                            extra_args, env = _child_spec_env(extra_args)
+                        ):
+                            n_parallel = _pv_extras_clamped_slots
+                            if "--parallel" in cmd:
+                                cmd[cmd.index("--parallel") + 1] = str(n_parallel)
+                            logger.info(
+                                "Restoring %d parallel slots: the drafter drop left a "
+                                "non-MTP server.",
+                                n_parallel,
+                            )
                 spec_flags = self._build_speculative_flags(
                     speculative_type = speculative_type,
                     spec_draft_n_max = spec_draft_n_max,
@@ -9080,10 +9704,101 @@ class LlamaCppBackend:
                     mtp_draft_path = launch_mtp_draft_path,
                     draft_device = _draft_device,
                 )
+                # _build_speculative_flags judged the stripped list, so a user
+                # --spec-type that the drop removed left the canonical requested
+                # mode reading "auto" while the caller's own extras still mean
+                # "the user owns it" (None). Restore the requested view, or the
+                # spec-mode compare mismatches forever.
+                if _extra_args_set_spec_type(_pv_suppressed_spec_extra_args):
+                    self._requested_spec_mode = None
                 # Remember where the spec block sits so a drafter-load failure
                 # can be retried with these flags swapped out (see below).
                 _spec_start = len(cmd)
                 cmd.extend(spec_flags)
+
+                # A *separate* drafter does not inherit the main --gpu-layers:
+                # common_base_params_to_speculative overwrites n_gpu_layers with
+                # params.speculative.draft.n_gpu_layers, whose default -1 means
+                # auto, so on a virtualised Metal device the drafter would run the
+                # corrupt path the CPU pin exists to avoid. An embedded MTP head
+                # needs nothing here: with no draft model that override is skipped
+                # (has_draft is false) and the head follows the main placement.
+                # Probe-gated like the other optional flags in this file, so the flag
+                # name matches the build (-ngld predates --spec-draft-ngl) and an
+                # unknown argument never refuses the start. A build advertising none
+                # of them never reaches this pin: the drafter was dropped above.
+                # extra_args is inspected alongside spec_flags because a user-owned
+                # --spec-type makes _build_speculative_flags return nothing, so the
+                # drafter is theirs (--model-draft in extras) and would go unpinned.
+                # Emitted after the pass-through extras below, not here: the parser is
+                # last-wins and the paravirtual strip only covers the *main* offload
+                # flags, so a user -ngld/--spec-draft-ngl would otherwise undo this.
+                _pv_draft_cpu_pin: List[str] = []
+                _pv_mmproj_cpu_pin: List[str] = []
+                _pv_split_mode_pin: List[str] = []
+                # --gpu-layers 0 alone does not keep work off the device: with
+                # op_offload on (the default) ggml_backend_sched still sends ops
+                # whose weights sit in host buffers to a higher-priority backend,
+                # and Metal accepts them at batch >= 32. --device none drops the
+                # device from the list outright, which is the only way to be sure.
+                _pv_device_pin: List[str] = ["--device", "none"] if _paravirtual_cpu_forced else []
+                if (
+                    _paravirtual_cpu_forced
+                    and _extra_args_mtp_draft_path([*spec_flags, *(extra_args or [])]) is not None
+                    and _paravirtual_draft_ngl_flag(server_caps)
+                ):
+                    # The layer count alone is not enough, for the same reason
+                    # --gpu-layers 0 was not: common_base_params_to_speculative
+                    # replaces the draft context's device list with the draft one,
+                    # so the main --device none never reaches it and an empty draft
+                    # list leaves every device visible. --device-draft has carried
+                    # this spelling across the whole supported range.
+                    _pv_draft_cpu_pin = [
+                        str(_paravirtual_draft_ngl_flag(server_caps)),
+                        "0",
+                        "--device-draft",
+                        "none",
+                    ]
+                    logger.warning(
+                        "Pinning the speculative drafter to CPU: this Mac's Metal "
+                        "device is virtualised."
+                    )
+
+                # Emitted after the pass-through extras too, and for the same
+                # last-wins reason as the two pins above.
+                if _paravirtual_cpu_forced:
+                    _pv_split_mode_pin = _paravirtual_split_mode_pin(extra_args)
+
+                # Backstop for the MTP clamp above, which only sees an explicit
+                # --spec-type in extra_args; speculative_type="auto"/"mtp" is not
+                # resolved until _build_speculative_flags runs, here. The KV fit was
+                # sized for more slots, so this over-reserves, never under-reserves.
+                # Skipped when the user's extras own --spec-type: _build_speculative_flags
+                # emits nothing then, and judging the empty flag list would fall through
+                # to LLAMA_ARG_SPEC_TYPE and clamp a launch that is not MTP at all.
+                # Slots given up here, for the MTP-fallback restore below.
+                _mtp_clamped_slots = 0
+                if (
+                    n_parallel > 1
+                    and not _extra_args_set_spec_type(extra_args)
+                    and _extra_args_requests_mtp(spec_flags, env = _child_spec_env(extra_args))
+                ):
+                    try:
+                        _np_at = cmd.index("--parallel")
+                    except ValueError:
+                        _np_at = -1
+                    if _np_at >= 0:
+                        logger.warning(
+                            "%s resolved to MTP speculative decoding, which does not "
+                            "support %d parallel slots; using 1.",
+                            model_identifier,
+                            n_parallel,
+                        )
+                        cmd[_np_at + 1] = "1"
+                        # _commit_effective_parallel_slots below reports what launched,
+                        # so rebind rather than only patching cmd.
+                        _mtp_clamped_slots = n_parallel
+                        n_parallel = 1
 
                 # Apply custom chat template override if provided.
                 self._chat_template_override = chat_template_override
@@ -9160,6 +9875,24 @@ class LlamaCppBackend:
                 if launch_mmproj_path and effective_is_vision:
                     cmd.extend(["--mmproj", launch_mmproj_path])
                     logger.info(f"Using mmproj for vision: {launch_mmproj_path}")
+                    # The projector never reads --gpu-layers: clip.cpp picks a GPU
+                    # backend from the boolean mmproj_use_gpu, which defaults to
+                    # true. So on a virtualised Metal device the vision encoder
+                    # would keep running the corrupt path the CPU pin above exists
+                    # to avoid, and every image would be encoded from garbage.
+                    # A build that conclusively lacks the flag never gets here: the
+                    # projector is dropped up front rather than served on the corrupt
+                    # device. An inconclusive probe still pins, since every build that
+                    # can start here has had the flag since b5178. Deferred past the
+                    # pass-through extras like the drafter pin, since --mmproj-offload
+                    # is a real positive flag a user can pass and llama.cpp is
+                    # last-wins.
+                    if _paravirtual_cpu_forced and _paravirtual_mmproj_pinnable(server_caps):
+                        _pv_mmproj_cpu_pin = ["--no-mmproj-offload"]
+                        logger.warning(
+                            "Disabling mmproj GPU offload: this Mac's Metal device "
+                            "is virtualised."
+                        )
 
                 # Option C: --api-key for direct client access when enabled
                 import secrets as _secrets
@@ -9243,6 +9976,20 @@ class LlamaCppBackend:
                         f"Appending user extra args to llama-server: {list(_emit_extra_args)}"
                     )
 
+                # Last so it wins: the drafter CPU pin on a virtualised Metal device
+                # is a correctness fix, not a preference, and llama.cpp is last-wins.
+                if _pv_draft_cpu_pin:
+                    cmd.extend(_pv_draft_cpu_pin)
+                if _pv_mmproj_cpu_pin:
+                    cmd.extend(_pv_mmproj_cpu_pin)
+                # Also last, and for the same reason: _zero_offload_keeps_gpu_visible
+                # reads the finished cmd, so the override has to be in it before the
+                # env block below decides whether this really is a zero-VRAM server.
+                if _pv_split_mode_pin:
+                    cmd.extend(_pv_split_mode_pin)
+                if _pv_device_pin:
+                    cmd.extend(_pv_device_pin)
+
                 kv_cache_unified = _kv_unified_from_args(cmd)
 
                 logger.info(f"Starting llama-server: {' '.join(self._redacted_cmd_for_log(cmd))}")
@@ -9286,6 +10033,56 @@ class LlamaCppBackend:
                 if gpu_ids is not None:
                     env.pop("LLAMA_ARG_DEVICE", None)
                     env.pop("LLAMA_ARG_MAIN_GPU", None)
+
+                # The unpinnable-drafter drop above rewrites argv, which cannot
+                # reach the drafter the child would pick up from its own env. The
+                # spec type goes too, for the same reason the CLI one did: llama.cpp
+                # appends types rather than replacing them, so an inherited
+                # draft-simple would outlive the model it needs.
+                # Unsloth owns the spec block whenever the extras do not name a
+                # --spec-type: _build_speculative_flags then emits the whole thing.
+                # Nothing it emits can undo an inherited LLAMA_ARG_SPEC_TYPE, since
+                # llama.cpp applies the env first and appends rather than replaces,
+                # so a managed non-MTP launch would still start MTP, a crash-recovery
+                # replay could not drop it, and the fit would not have budgeted the
+                # drafter the env adds. Clearing it makes the emitted flags final.
+                # The user owning --spec-type is left alone: their flags and the env
+                # accumulate, which is what the slot clamp above reads.
+                if _pv_draft_unpinnable or not _extra_args_set_spec_type(extra_args):
+                    for _pv_spec_var in (
+                        "LLAMA_ARG_SPEC_DRAFT_MODEL",
+                        "LLAMA_ARG_SPEC_DRAFT_HF_REPO",
+                        "LLAMA_ARG_SPEC_TYPE",
+                        # Pre-b8955 spellings. Those names arrived 2026-04-28 and the
+                        # launchable floor is 2025-08-30, so a build in that window
+                        # reads these instead and would keep the drafter.
+                        "LLAMA_ARG_MODEL_DRAFT",
+                        "LLAMA_ARG_HFD_REPO",
+                    ):
+                        env.pop(_pv_spec_var, None)
+
+                # The projector guard has the same blind spot, and a worse one: it
+                # only ever clears Unsloth's resolved path, so an inherited
+                # LLAMA_ARG_MMPROJ loads a projector the guard believes it dropped,
+                # unpinned and independent of --gpu-layers 0. LLAMA_ARG_MMPROJ_URL
+                # goes too: its download overwrites mmproj.path, so it outranks even
+                # the --mmproj Unsloth emits. Unsloth always passes its own projector
+                # on the command line (with --no-mmproj-offload), so on this device an
+                # inherited one is only ever the corrupt path.
+                if _paravirtual_cpu_forced:
+                    # LLAMA_ARG_OVERRIDE_TENSOR is the one placement var --gpu-layers 0
+                    # cannot answer: the override is applied during weight-buft
+                    # selection, before any layer is assigned to a device, so it puts
+                    # weights back on the corrupt Metal buffer on its own.
+                    for _pv_mmproj_var in ("LLAMA_ARG_MMPROJ", "LLAMA_ARG_MMPROJ_URL"):
+                        env.pop(_pv_mmproj_var, None)
+                    # Same CPU-target rule as the argv strip, so an inherited
+                    # exps=CPU override keeps working and only a GPU-bound one goes.
+                    _pv_env_ot = env.get("LLAMA_ARG_OVERRIDE_TENSOR")
+                    if _pv_env_ot and not _paravirtual_strip_gpu_overrides(
+                        ["-ot", str(_pv_env_ot)]
+                    ):
+                        env.pop("LLAMA_ARG_OVERRIDE_TENSOR", None)
 
                 # Windows + full offload: PASSIVE OMP + 2 threads stop
                 # spin-wait burning CPU. CPU/partial offload keeps default
@@ -9493,6 +10290,7 @@ class LlamaCppBackend:
                 self._gguf_path = model_path
                 self._hf_repo = hf_repo
                 self._mtp_draft_path = launch_mtp_draft_path
+                self._mtp_draft_suppressed_path = _pv_suppressed_draft_path
                 # For local GGUF files, extract variant from filename if absent
                 if hf_variant:
                     self._hf_variant = hf_variant
@@ -9562,13 +10360,10 @@ class LlamaCppBackend:
                         healthy = _spawn_and_wait(_fa_cmd, label = "-noflash")
 
                 # MTP from Unsloth's spec flags or the user's (extra_args
-                # --spec-type / LLAMA_ARG_SPEC_TYPE). The env reaches the child
-                # only when neither emits a spec flag, so consult it only then.
-                _launch_spec_env: Mapping[str, str] = (
-                    os.environ
-                    if (not _extra_args_set_spec_type(extra_args) and not spec_flags)
-                    else {}
-                )
+                # --spec-type / LLAMA_ARG_SPEC_TYPE). The env survives to the child
+                # only when the extras own --spec-type; the launch scrubs it
+                # otherwise, so anything else would judge a server it is not starting.
+                _launch_spec_env: Mapping[str, str] = _child_spec_env(extra_args)
                 _spec_requested_mtp = any(
                     "mtp" in str(t).lower() for t in spec_flags
                 ) or _extra_args_requests_mtp(extra_args, env = _launch_spec_env)
@@ -9678,6 +10473,14 @@ class LlamaCppBackend:
                     # spec flag, so a trailing --spec-default overrides it too.
                     if _extra_args_requests_mtp(extra_args, env = _launch_spec_env):
                         fallback_cmd.append("--spec-default")
+                    # fallback_cmd inherits the MTP slot clamp, but this retry is
+                    # not MTP: hand back the slots the KV fit was sized for, or the
+                    # caller's --parallel N silently serves one chat at a time (and
+                    # the requested-vs-requested dedupe makes that stick). Every
+                    # later retry derives from this argv, so rebind n_parallel now.
+                    if _mtp_clamped_slots > 1 and "--parallel" in fallback_cmd:
+                        fallback_cmd[fallback_cmd.index("--parallel") + 1] = str(_mtp_clamped_slots)
+                        n_parallel = _mtp_clamped_slots
                     healthy = _spawn_and_wait(fallback_cmd, label = "-retry")
                     if healthy:
                         self._speculative_type = "default"
@@ -9806,6 +10609,18 @@ class LlamaCppBackend:
                         self._strip_device_extra_args(extra_args)
                         if gpu_ids is not None
                         else list(extra_args)
+                    )
+                    # Device-stripped the same way, so the comparators can hold both
+                    # sides to one rule.
+                    _pv_requested = (
+                        _pv_suppressed_spec_extra_args
+                        if _pv_suppressed_spec_extra_args is not None
+                        else extra_args
+                    )
+                    self._requested_extra_args = (
+                        self._strip_device_extra_args(_pv_requested)
+                        if gpu_ids is not None
+                        else list(_pv_requested)
                     )
                     self._extra_args_source = (model_identifier, hf_variant)
                 self._requested_n_ctx = int(n_ctx)
@@ -10237,6 +11052,29 @@ class LlamaCppBackend:
         """
         if not self.is_loaded:
             return False
+        # The stored state is what LAUNCHED, and on a virtualised Metal device
+        # that is the CPU-pinned rewrite of the request, not the request. Apply
+        # the same rewrite here (idempotent, so load_model's own call is a no-op)
+        # or a client that keeps sending Auto -- the API, a second tab, a saved
+        # preset -- mismatches on every single call.
+        _pv_forced = _metal_device_is_paravirtual()
+        if _pv_forced:
+            (
+                gpu_memory_mode,
+                gpu_layers,
+                tensor_parallel,
+                tensor_split,
+                n_cpu_moe,
+                extra_args,
+            ) = paravirtual_normalized_request(
+                gpu_memory_mode = gpu_memory_mode,
+                gpu_layers = gpu_layers,
+                tensor_parallel = tensor_parallel,
+                tensor_split = tensor_split,
+                n_cpu_moe = n_cpu_moe,
+                extra_args = extra_args,
+                log_dropped = False,
+            )
         if (self._model_identifier or "").lower() != (model_identifier or "").lower():
             return False
         # Direct-file loads pass hf_variant=None while the backend stores an
@@ -10267,7 +11105,16 @@ class LlamaCppBackend:
         # launched tensor: if load_model downgraded to layer split it scrubbed
         # the child env, so the env must not force an endless reload of a healthy
         # server. An identical request would downgrade the same way.
-        if not _tensor_parallel_matches_loaded(extra_args, tensor_parallel, self._tensor_parallel):
+        # A virtualised Metal device never launches a tensor split (the load is
+        # CPU-pinned and --split-mode is overridden with the default layer split),
+        # so judge the normalized request there: an extras `-sm tensor`, which the
+        # pin deliberately leaves in place, would otherwise never match.
+        if _pv_forced:
+            if self._tensor_parallel:
+                return False
+        elif not _tensor_parallel_matches_loaded(
+            extra_args, tensor_parallel, self._tensor_parallel
+        ):
             return False
         # Preserved tensor->layer fallback + an EXPLICIT tensor drop: reload so
         # placement re-selects instead of keeping the all-GPU mask (mirrors the route,
@@ -10300,8 +11147,8 @@ class LlamaCppBackend:
             ):
                 return False
         else:
-            requested_extra_args = extra_args if extra_args is not None else self._extra_args
-            if self._swa_full != _swa_full_from_args_or_env(requested_extra_args):
+            _swa_extra_args = extra_args if extra_args is not None else self._extra_args
+            if self._swa_full != _swa_full_from_args_or_env(_swa_extra_args):
                 return False
             # A GPU-memory-mode flip (Unsloth / manual) must always reload.
             if self._gpu_memory_mode != gpu_memory_mode:
@@ -10370,18 +11217,26 @@ class LlamaCppBackend:
         # the route-level probe covers HF cache repos. No sub-3B gate: both
         # sides come from the same config detection, so a sub-3B mismatch
         # only happens when a drafter genuinely appeared (one benign reload,
-        # then the stored path converges).
+        # then the stored path converges). A drafter the last load dropped on
+        # purpose counts as launched here: the file is still there, so comparing
+        # it against the stored None would reload the same drafter-free server
+        # forever. Only an update lifts that suppression, and it unloads first.
         if (
             gguf_path is not None
             and req_mode in ("auto", "mtp", "mtp+ngram")
-            and (mtp_draft_path or None) != (self._mtp_draft_path or None)
+            and (mtp_draft_path or None)
+            != (self._mtp_draft_path or self._mtp_draft_suppressed_path or None)
         ):
             return False
 
         # extra_args=None means "no opinion" (inherit handled at the route
-        # layer); only an explicit list forces equality.
+        # layer); only an explicit list forces equality. Compared against what the
+        # last load was INVOKED with, not what it launched: the caller keeps
+        # sending its own list, so judging a launch-time rewrite it cannot see
+        # (the virtualised-Metal drafter drop) would reload on every Apply.
         if extra_args is not None:
-            current = list(self._extra_args) if self._extra_args is not None else []
+            _stored_requested = self.requested_extra_args
+            current = list(_stored_requested) if _stored_requested is not None else []
             candidate = list(extra_args)
             # Compare the same device-stripped extras that load_model persisted.
             if gpu_ids is not None:
@@ -10409,8 +11264,13 @@ class LlamaCppBackend:
         LLAMA_ARG_SPEC_DRAFT_* env) -- these offload to the GPU regardless of
         the main ``--gpu-layers``. A drafter explicitly forced to CPU
         (--spec-draft-ngl 0 / --spec-draft-device cpu) doesn't count."""
-        if any(str(a).startswith("--mmproj") for a in cmd):
-            return True
+        _args = [str(a) for a in cmd]
+        if any(a.startswith("--mmproj") for a in _args):
+            # --no-mmproj-offload clears mmproj_use_gpu and clip.cpp gates the whole
+            # GPU backend on it, so the projector holds no VRAM. Last flag wins.
+            _off = [a for a in _args if a in ("--mmproj-offload", "--no-mmproj-offload")]
+            if not _off or _off[-1] != "--no-mmproj-offload":
+                return True
         if _extra_args_mtp_draft_path(cmd, env) is None:
             return False
         return not _extra_args_draft_offloaded_to_cpu(cmd, env)
@@ -10492,6 +11352,7 @@ class LlamaCppBackend:
             self._gguf_path = None
             self._hf_repo = None
             self._mtp_draft_path = None
+            self._mtp_draft_suppressed_path = None
             self._spec_fallback_reason = None
             self._last_load_kwargs = None
             self._mtp_runtime_fallback_active = False
@@ -11363,12 +12224,31 @@ class LlamaCppBackend:
                         logger.info("MTP-crash reload skipped: load settings changed.")
                         return
                     snapshot["speculative_type"] = "off"
-                    # Drop user/env MTP too: append a last-wins --spec-default.
+                    # Appending --spec-default cannot drop MTP: llama.cpp appends
+                    # spec types rather than replacing, so the extras have to lose
+                    # theirs. Once they do, Unsloth owns the block and the launch
+                    # scrubs the inherited env for the replay as well.
                     _ea = list(snapshot.get("extra_args") or [])
-                    if _extra_args_requests_mtp(_ea, env = os.environ):
-                        _ea.append("--spec-default")
-                        snapshot["extra_args"] = _ea
+                    if _extra_args_requests_mtp(_ea, env = _child_spec_env(_ea)):
+                        snapshot["extra_args"] = strip_shadowing_flags(
+                            _ea,
+                            strip_context = False,
+                            strip_cache = False,
+                            strip_spec = True,
+                            strip_template = False,
+                            strip_split_mode = False,
+                        )
                     self.load_model(**snapshot)
+                    # Same reason the mode is restored below: the replay launched a
+                    # stripped list, but the caller keeps sending the original, and a
+                    # comparator that saw only the stripped one would miss and reload
+                    # the very MTP configuration that just crashed.
+                    if snapshot.get("extra_args") is not _ea:
+                        self._requested_extra_args = (
+                            self._strip_device_extra_args(_ea)
+                            if snapshot.get("gpu_ids") is not None
+                            else list(_ea)
+                        )
                     # Restore the requested mode + reason load_model("off") cleared,
                     # so /status shows the user's mode + note (like the startup fallback).
                     self._requested_spec_mode = _canonicalize_spec_mode(requested_mode)
