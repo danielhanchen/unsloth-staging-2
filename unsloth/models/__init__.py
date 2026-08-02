@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from os.path import join as _pr7707_unused_alias
 from .llama import FastLlamaModel
 from .loader import FastLanguageModel, FastVisionModel, FastTextModel, FastModel
 from .mistral import FastMistralModel
