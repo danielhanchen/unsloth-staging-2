@@ -14,6 +14,8 @@ from core.inference.message_content import content_to_text
 from core.inference.runtime_context import runtime_context_length
 from core.inference.chat_template_helpers import (
     ReasoningChannelNormalizer,
+    markup_for_tokenizer,
+    neutralize_control_markup_in_messages,
     normalize_reasoning_snapshots,
 )
 from loggers import get_logger
@@ -107,10 +109,11 @@ def _render_registered_vlm_prompt(processor, model, messages, num_images):
     if model_type not in getattr(prompt_utils, "MODEL_CONFIG", {}):
         return None
 
+    # Recovery path: renders the caller's original list, not the neutralized copy (#7066).
     rendered = prompt_utils.apply_chat_template(
         processor,
         config,
-        messages,
+        neutralize_control_markup_in_messages(messages, None, markup_for_tokenizer(processor)),
         add_generation_prompt = True,
         num_images = num_images,
     )
