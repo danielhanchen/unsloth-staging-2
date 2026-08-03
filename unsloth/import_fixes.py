@@ -497,6 +497,10 @@ def fix_transformers5_bare_annotation_configs():
             logger.info(f"Unsloth: dataclass default backfill skipped ({e})")
         return original_func(cls, *args, **kwargs)
 
+    # Keep the original reachable. An irreversible monkey patch cannot be
+    # tested against the failure it fixes, and cannot be undone by anyone
+    # debugging a config problem downstream of it.
+    __init_subclass__.__wrapped__ = original_func
     try:
         PretrainedConfig.__init_subclass__ = classmethod(__init_subclass__)
         PretrainedConfig._unsloth_patched_init_subclass = True
