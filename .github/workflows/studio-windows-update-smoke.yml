@@ -264,6 +264,209 @@ jobs:
           grep -qE "prebuilt up to date and validated|prebuilt installed and validated" logs/update2.log
           echo "second update was clean"
 
+      - name: An update that must replace the unsloth package (issue #7697)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HF_TOKEN: ${{ github.event_name != 'pull_request' && secrets.HF_TOKEN || '' }}
+        run: |
+          set -o pipefail
+          # Every update above is a no-op, so pip never rewrites Scripts/unsloth.exe
+          # and the lock this guards is never reached. Force the replacement.
+          PY="$HOME/.unsloth/studio/unsloth_studio/Scripts/python.exe"
+          SCRIPTS="$HOME/.unsloth/studio/unsloth_studio/Scripts"
+          SHIM="$HOME/.unsloth/studio/bin/unsloth.exe"
+          test -f "$SHIM" || { echo "::error::no launcher at $SHIM"; exit 1; }
+          # With build isolation, not without. The build backend and setuptools-scm
+          # are build requirements, not runtime deps of the --no-torch install, so
+          # --no-build-isolation would rest on whatever happens to be in the Studio
+          # venv -- and if that ever stops including setuptools, this fails here and
+          # the lock coverage below never runs at all.
+          "$PY" -m pip install --no-deps --force-reinstall . 2>&1 | tail -5
+          test -f "$SCRIPTS/unsloth.exe" || { echo "::error::pip left no unsloth.exe"; exit 1; }
+
+          # The reinstall above replaced the editable install with a site-packages
+          # copy, so the CLI can no longer derive the checkout from __file__ and
+          # --local would exit at the argument guard without ever reaching the lock.
+          # A Windows path: MSYS rewrites arguments that look like paths but not
+          # environment variables, so the native python would not resolve /d/a/...
+          STUDIO_LOCAL_REPO="$(cygpath -w "$PWD")"
+          export STUDIO_LOCAL_REPO
+          test -f "$PWD/pyproject.toml" || { echo "::error::not a checkout: $PWD"; exit 1; }
+
+          # Through the launcher, which is a second link to the same binary. Windows
+          # locks the entry an image was launched from, not the file, so this leaves
+          # the venv copy replaceable.
+          "$SHIM" studio update --local 2>&1 | tee logs/update_replace.log
+          if grep -qiE "WinError 32|could not rename unsloth\.exe|being used by another process" \
+                 logs/update_replace.log; then
+            echo "::error::the launcher path hit the unsloth.exe lock (issue #7697)."
+            grep -iE "WinError|rename|permission" logs/update_replace.log | tail -30
+            exit 1
+          fi
+          # Positive, not the absence of an error message: before the export
+          # above, run 30751891659 passed this whole step while the update
+          # resolved its "local repo" to
+          # ...\unsloth_studio\Lib\site-packages and overlaid that, so it was
+          # reinstalling the venv over itself rather than the checkout. Nothing
+          # here noticed, because every assertion below is about the state of
+          # unsloth.exe and all of them held. Assert the checkout was the thing
+          # installed. setup prints the path it overlays, wrapping long ones onto
+          # the next line, so match the file rather than a single line, and fold
+          # case and separators so a resolve() that canonicalises either does not
+          # fail the step over a spelling.
+          NEEDLE="$(printf '%s' "$STUDIO_LOCAL_REPO" | tr 'A-Z\\' 'a-z/')"
+          HAYSTACK="$(tr -d '\r' < logs/update_replace.log | tr 'A-Z\\' 'a-z/')"
+          case "$HAYSTACK" in
+            *"$NEEDLE"*) ;;
+            *)
+              echo "::error::the update did not install from the checkout ($STUDIO_LOCAL_REPO)."
+              grep -iE "local repo|site-packages" logs/update_replace.log | tail -10
+              exit 1
+              ;;
+          esac
+          # The update renames unsloth.exe aside so pip can replace it. If pip then
+          # reinstalls nothing, the renamed copy is the only one there is, so a
+          # cleanup that just deletes it leaves no CLI behind.
+          if [ ! -s "$SCRIPTS/unsloth.exe" ]; then
+            echo "::error::the update left no usable unsloth.exe in the venv."
+            ls -la "$SCRIPTS" | grep -i unsloth || true
+            exit 1
+          fi
+          if ls "$SCRIPTS"/*.deleteme >/dev/null 2>&1; then
+            echo "::error::a .deleteme orphan survived the update."
+            ls -la "$SCRIPTS"/*.deleteme
+            exit 1
+          fi
+          # Run the venv copy itself, not the launcher: that is the file pip
+          # replaced and the one the cleanup could have deleted, so existence
+          # alone is not enough -- it has to still be a working image. Not
+          # `import unsloth`: this install is --no-torch by design (the step
+          # above asserts torch is absent), and the package refuses to import
+          # without it, so that would fail on a perfectly good install. And a
+          # bare import from the repo root resolves to the checked-out source
+          # tree rather than the installed copy, so it would not have been
+          # testing this at all. desktop-capabilities needs neither.
+          CAPS="$("$SCRIPTS/unsloth.exe" studio desktop-capabilities --json)" || {
+            echo "::error::the replaced unsloth.exe does not run."
+            exit 1
+          }
+          echo "$CAPS"
+          echo "$CAPS" | jq -e '.studio_install_ok == true' >/dev/null || {
+            echo "::error::the CLI runs but reports the install as damaged."
+            exit 1
+          }
+          echo "an update that replaces the unsloth package works through the launcher"
+
+      - name: The same update from the venv copy refuses before it breaks the install (issue #7697)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HF_TOKEN: ${{ github.event_name != 'pull_request' && secrets.HF_TOKEN || '' }}
+        run: |
+          set -o pipefail
+          # The step above only ever drives the shim, so nothing here covers the
+          # path a user hits by running Scripts\unsloth.exe directly -- which is
+          # what issue #7697 is about, and what the desktop app did before this PR.
+          SCRIPTS="$HOME/.unsloth/studio/unsloth_studio/Scripts"
+          PY="$SCRIPTS/python.exe"
+          SHIM_UPD="$HOME/.unsloth/studio/bin/unsloth.exe"
+          # Build isolation here for the same reason as the step above.
+          "$PY" -m pip install --no-deps --force-reinstall . 2>&1 | tail -3
+
+          # The step above already reinstalled unsloth non-editably, so the CLI now
+          # runs out of site-packages and cannot derive the checkout from __file__.
+          # Without this, `--local` exits at the argument guard and never reaches
+          # the lock, which is what this step exists to exercise. A Windows path:
+          # MSYS rewrites arguments that look like paths, but not environment
+          # variables, so the native python would not resolve an /d/a/... one.
+          STUDIO_LOCAL_REPO="$(cygpath -w "$PWD")"
+          export STUDIO_LOCAL_REPO
+          test -f "$PWD/pyproject.toml" || { echo "::error::not a checkout: $PWD"; exit 1; }
+
+          # Before this PR the venv-launched update was destructive, not merely
+          # failing: pip uninstalls before it installs, so it removed unsloth_cli
+          # and only then hit the locked stub, leaving an unsloth.exe that starts
+          # and raises ModuleNotFoundError. It now refuses before pip runs, so the
+          # update fails and the install survives intact.
+          set +e
+          "$SCRIPTS/unsloth.exe" studio update --local > logs/update_venv.log 2>&1
+          RC=$?
+          set -e
+          echo "venv-launched update exited $RC"
+          tail -50 logs/update_venv.log
+
+          # Guard against the step passing for the wrong reason: exiting at an
+          # argument guard would satisfy the assertions below while testing none
+          # of them.
+          if grep -q "needs an Unsloth checkout to install from" logs/update_venv.log; then
+            echo "::error::the update never started; this step proved nothing."
+            exit 1
+          fi
+          if [ "$RC" -eq 0 ]; then
+            echo "::error::the venv-launched update succeeded, so the rename no longer"
+            echo "fails and this step has stopped covering the lock it exists for."
+            exit 1
+          fi
+          if ! grep -q "Nothing has been removed" logs/update_venv.log; then
+            echo "::error::it did not stop before pip; the install may be destroyed."
+            exit 1
+          fi
+          # The destruction this prevents: pip must not have started, so no
+          # uninstall line may appear.
+          if grep -qiE "Uninstalling unsloth-|Successfully installed unsloth" logs/update_venv.log; then
+            echo "::error::pip ran anyway; refusing before the install changes did not work."
+            grep -iE "Uninstalling|Successfully installed" logs/update_venv.log | tail -10
+            exit 1
+          fi
+
+          # The install has to be exactly as usable as it was before the attempt.
+          if [ ! -s "$SCRIPTS/unsloth.exe" ]; then
+            echo "::error::no usable unsloth.exe left behind."
+            ls -la "$SCRIPTS" | grep -i unsloth || true
+            exit 1
+          fi
+          # Running at all is the property under test. The wreckage this prevents
+          # is a stub that starts and then cannot import its own package, so the
+          # CLI answering here is what proves unsloth_cli survived.
+          #
+          # Deliberately not studio_install_ok yet: the raw force-reinstall above
+          # moved the installed version without re-running setup, so the manifest
+          # is legitimately out of date, and the update that would refresh it is
+          # the one just refused. Asserting it here would be asserting that a
+          # refusal repaired something, which is the opposite of refusing.
+          CAPS="$("$SCRIPTS/unsloth.exe" studio desktop-capabilities --json)" || {
+            echo "::error::the CLI does not run after a refused update."
+            exit 1
+          }
+          echo "$CAPS" | jq -e '.desktop_protocol_version' >/dev/null || {
+            echo "::error::the CLI ran but produced nothing usable: $CAPS"
+            exit 1
+          }
+          if ls "$SCRIPTS"/*.deleteme >/dev/null 2>&1; then
+            echo "::error::a .deleteme orphan survived."
+            ls -la "$SCRIPTS"/*.deleteme
+            exit 1
+          fi
+
+          # And the update it refused must still work through the launcher, or the
+          # advice it printed is useless. This is also where the install becomes
+          # whole again, so studio_install_ok is asserted after it rather than
+          # before.
+          "$SHIM_UPD" studio update --local > logs/update_after_refusal.log 2>&1 || {
+            echo "::error::the launcher route it points people at does not work."
+            tail -40 logs/update_after_refusal.log
+            exit 1
+          }
+          CAPS_AFTER="$("$SHIM_UPD" studio desktop-capabilities --json)" || {
+            echo "::error::the CLI does not run after the launcher route completed."
+            exit 1
+          }
+          echo "$CAPS_AFTER"
+          echo "$CAPS_AFTER" | jq -e '.studio_install_ok == true' >/dev/null || {
+            echo "::error::the launcher route completed but left the install damaged."
+            exit 1
+          }
+          echo "a venv-launched replacement refuses safely and the launcher route repairs it"
+
       - name: Boot Unsloth briefly to confirm the install is still usable
         run: |
           mkdir -p logs

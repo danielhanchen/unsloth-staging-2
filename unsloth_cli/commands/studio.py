@@ -2952,28 +2952,7 @@ def _fail_if_install_damaged() -> None:
     # install root, and recorded_no_torch defaults to Path(sys.prefix). Passing
     # STUDIO_HOME would look one directory too high, find nothing, and silently
     # never fire. The early return above guarantees sys.prefix is that venv.
-    no_torch = False
-    try:
-        _manifest = _studio_deps.load_install_manifest_module()
-        no_torch = _manifest is not None and _manifest.recorded_no_torch() is True
-    except Exception:
-        no_torch = False
-    if platform.system() == "Windows":
-        prefix = ""
-        if _STUDIO_HOME_IS_CUSTOM:
-            prefix = "$env:UNSLOTH_STUDIO_HOME = '{}'; ".format(str(STUDIO_HOME).replace("'", "''"))
-        if no_torch:
-            prefix += "$env:UNSLOTH_NO_TORCH = '1'; "
-        typer.echo(f"  {prefix}irm https://unsloth.ai/install.ps1 | iex", err = True)
-    else:
-        # The assignments go before `sh`, not before `curl`: that is the form
-        # install.sh documents, and it is sh that reads them.
-        env = ""
-        if _STUDIO_HOME_IS_CUSTOM:
-            env = f"UNSLOTH_STUDIO_HOME={shlex.quote(str(STUDIO_HOME))} "
-        if no_torch:
-            env += "UNSLOTH_NO_TORCH=1 "
-        typer.echo(f"  curl -fsSL https://unsloth.ai/install.sh | {env}sh", err = True)
+    typer.echo(f"  {_reinstall_command()}", err = True)
     typer.echo("", err = True)
     # The installer installs the current requirement sets; it does not prune or
     # reinstall anything outside them. So a package left over from an older
@@ -3079,13 +3058,34 @@ def update(
     else:
         os.environ["STUDIO_LOCAL_INSTALL"] = "0"
         os.environ.pop("STUDIO_LOCAL_REPO", None)
-    _release_self_exe_lock_windows()
+    exe_lock_err = _release_self_exe_lock_windows()
+    # A failed rename means the entry is locked, and nothing destructive has
+    # happened yet. Going on from here is not merely a failed update: pip
+    # uninstalls before it installs, so it removes unsloth_cli and only then hits
+    # the locked stub, leaving an unsloth.exe that starts and immediately raises
+    # ModuleNotFoundError. Hand over to the launcher while that is still avoidable.
+    if exe_lock_err is not None:
+        _refuse_update_that_would_break_the_install(
+            exe_lock_err,
+            repo_root = repo_root,
+            package = package,
+            verify = verify,
+        )
     try:
         _run_setup_script(verbose = verbose, repo_root = repo_root)
     except BaseException:
         # Restore unsloth.exe from .deleteme if setup failed before pip
         # produced a replacement; otherwise the user has no CLI for recovery.
         _restore_self_exe_lock_windows()
+        # A note, never a replacement: the original failure keeps its own error, so
+        # a cause unrelated to the lock is not hidden behind it.
+        if exe_lock_err is not None:
+            _note_self_exe_locked(
+                exe_lock_err,
+                repo_root = repo_root,
+                package = package,
+                verify = verify,
+            )
         raise
     # On Windows clear the .deleteme orphan now that pip wrote a fresh
     # unsloth.exe; on next update os.replace would overwrite it anyway,
@@ -3103,25 +3103,245 @@ def update(
     _refresh_desktop_shortcuts(verbose = verbose)
 
 
-def _release_self_exe_lock_windows() -> None:
-    """Rename running unsloth.exe so pip can replace it. setup.ps1 also retries."""
+def _reinstall_command() -> str:
+    """The reinstall line, carrying whatever this install needs to be reproduced.
+
+    A pasted command runs in a new shell, and _ensure_studio_env_exported only sets
+    os.environ for this process, so a custom root has to be spelled out or the
+    command builds a fresh default install and leaves the real one untouched. The
+    recorded no-torch mode likewise, or a GGUF-only install pulls the whole PyTorch
+    stack back in. Only when the record says True: recorded_no_torch returns None
+    when nothing recorded a mode, and None must not read as False.
+    """
+    no_torch = False
+    try:
+        _manifest = _studio_deps.load_install_manifest_module()
+        no_torch = _manifest is not None and _manifest.recorded_no_torch() is True
+    except Exception:
+        no_torch = False
+    if platform.system() == "Windows":
+        prefix = ""
+        if _STUDIO_HOME_IS_CUSTOM:
+            prefix = f"$env:UNSLOTH_STUDIO_HOME = {_ps_single_quote(str(STUDIO_HOME))}; "
+        if no_torch:
+            prefix += "$env:UNSLOTH_NO_TORCH = '1'; "
+        return f"{prefix}irm https://unsloth.ai/install.ps1 | iex"
+    # The assignments go before `sh`, not before `curl`: that is the form
+    # install.sh documents, and it is sh that reads them.
+    env = ""
+    if _STUDIO_HOME_IS_CUSTOM:
+        env = f"UNSLOTH_STUDIO_HOME={shlex.quote(str(STUDIO_HOME))} "
+    if no_torch:
+        env += "UNSLOTH_NO_TORCH=1 "
+    return f"curl -fsSL https://unsloth.ai/install.sh | {env}sh"
+
+
+def _release_self_exe_lock_windows() -> "OSError | None":
+    """Rename running unsloth.exe so pip can replace it. setup.ps1 also retries.
+
+    Returns the error when the rename could not happen, which on Windows means this
+    process is running out of that very copy. Callers keep going and use it only to
+    explain a later failure.
+    """
     if platform.system() != "Windows":
-        return
+        return None
     try:
         venv_scripts = Path(sys.executable).resolve().parent
     except OSError:
-        return
+        return None
     exe = venv_scripts / "unsloth.exe"
     if not exe.exists():
-        return
+        return None
     stale = exe.with_suffix(".exe.deleteme")
     try:
         # os.replace is atomic-overwrite on Windows; os.rename would raise
         # FileExistsError if a prior aborted update left a .deleteme behind.
         os.replace(exe, stale)
     except OSError as e:
-        # Not fatal; setup.ps1 retries from a sibling process.
-        print(f"[update] could not rename {exe.name} -> {stale.name}: {e}")
+        # Windows locks the directory entry an image was launched from, not the file
+        # behind it, so this fails exactly when the update is running out of the copy
+        # pip would have to replace. Report it rather than abort: an update with no
+        # package change never touches the file and still works from here, and
+        # failing early would break that. If setup does go on to fail, the caller
+        # turns this into the explanation, because pip hits the same lock and reports
+        # it as a permissions problem, which is what sent people to the installer.
+        # Silent: an update with no package change never touches the file and
+        # succeeds from here, and warning every time would be the noise this is
+        # meant to remove. The failure path below renders it if it ever matters.
+        return e
+    return None
+
+
+def _ps_single_quote(value: str) -> str:
+    """Quote for a PowerShell single-quoted string, where '' is a literal quote.
+
+    A custom Studio root is user-chosen and can contain an apostrophe -- an
+    unescaped one ends the string early and the pasted command is a syntax error.
+    """
+    return "'{}'".format(str(value).replace("'", "''"))
+
+
+_ALLOW_LOCKED_ENV = "UNSLOTH_ALLOW_LOCKED_UPDATE"
+
+
+def _refuse_update_that_would_break_the_install(err: OSError, **note_kwargs) -> None:
+    """Stop before pip runs, when going on would destroy the install.
+
+    Only reached when the rename failed, which is the evidence that this process
+    holds the entry pip has to replace. Continuing is not a failed update: pip
+    uninstalls before it installs, so it removes unsloth_cli and only then hits the
+    locked stub, leaving an unsloth.exe that starts and raises ModuleNotFoundError.
+    Nothing has been removed at this point, so this is the last moment it is still
+    avoidable.
+
+    Handing over to the launcher in a child process does not work and was tried:
+    this process stays alive waiting for it, and this process is the one holding
+    the entry, so the child hits the identical lock. Nothing short of exiting first
+    releases it, and exiting first means abandoning the exit status and the
+    streamed output the desktop reads.
+
+    So it refuses instead, whether or not there is a launcher to refuse towards.
+    That last part was the other way round at first, on the grounds that with no
+    usable launcher there is no better path to send anyone down and stopping would
+    leave them unable to update at all. But going on does not leave them able to
+    update either -- it destroys the install and they have to reinstall anyway,
+    only now without being told so. _note_self_exe_locked already prints the
+    reinstall command in that case, and UNSLOTH_ALLOW_LOCKED_UPDATE is there for
+    anyone who would rather take the chance, so nobody is stranded by stopping.
+    """
+    if platform.system() != "Windows":
+        return
+    if os.environ.get(_ALLOW_LOCKED_ENV) == "1":
+        return
+    _note_self_exe_locked(err, **note_kwargs)
+    typer.echo("Stopping before the install is changed. Nothing has been removed.", err = True)
+    typer.echo("", err = True)
+    typer.echo(f"To go ahead anyway, set {_ALLOW_LOCKED_ENV}=1.", err = True)
+    typer.echo("", err = True)
+    raise typer.Exit(1)
+
+
+def _exe_lock_hint() -> str:
+    """The venv copy this process runs from, for messages. Best effort."""
+    try:
+        return str(Path(sys.executable).resolve().parent / "unsloth.exe")
+    except OSError:
+        return "unsloth.exe"
+
+
+def _is_usable_launcher(shim: Path) -> bool:
+    """Is the shim something worth telling someone to run.
+
+    is_file() alone accepts a zero-byte or unreadable one, and that is a realistic
+    case here rather than a hypothetical: a damaged shim is a reason to have run the
+    venv copy directly in the first place. Recommending it then sends the user back
+    to the file that already does not start, and hides the reinstall fallback.
+
+    Size and readability do not cover it either. A truncated or half-written copy is
+    nonempty and readable, and Windows has no execute bit to consult, so the loader
+    is the only thing that would reject it -- after the refusal has already stopped
+    an intact update. The image header is the cheapest stand-in for the loader, and
+    is the same check find_unsloth_launcher_in_studio_dir makes in the Rust
+    launcher selector (studio/src-tauri/src/process.rs), so the two agree on which
+    shims count as runnable.
+    """
+    try:
+        if not shim.is_file() or shim.stat().st_size <= 0:
+            return False
+        if not os.access(shim, os.R_OK):
+            return False
+        if platform.system() == "Windows":
+            with open(shim, "rb") as f:
+                if f.read(2) != b"MZ":
+                    return False
+        return True
+    except OSError:
+        return False
+
+
+def _note_self_exe_locked(
+    err: OSError,
+    repo_root: "Optional[Path]" = None,
+    package: "Optional[str]" = None,
+    verify: bool = True,
+) -> None:
+    """Add the cause behind a setup failure this process cannot avoid.
+
+    setup.ps1 reports this one as a permissions problem, which is what sent people
+    back to the full installer. It stays a note next to the real error rather than
+    replacing it: the output is streamed rather than captured, so there is no way to
+    tell from here whether pip actually reached unsloth.exe, and a missing setup
+    script or a dead download must keep its own message instead of being blamed on
+    this. Hence the conditional wording -- it says what to check, not what happened.
+    """
+    try:
+        exe = Path(sys.executable).resolve().parent / "unsloth.exe"
+    except OSError:
+        return
+    shim = STUDIO_HOME / "bin" / "unsloth.exe"
+    typer.echo("", err = True)
+    typer.echo(f"Note: this update is running from {exe},", err = True)
+    typer.echo("which it could not move aside first:", err = True)
+    typer.echo(f"  {err}", err = True)
+    typer.echo("", err = True)
+    typer.echo(
+        "If the failure above mentions WinError 32, a sharing violation or file "
+        "permissions, that is the cause: pip has to replace that file and cannot "
+        "while this process is running from it.",
+        err = True,
+    )
+    if _is_usable_launcher(shim):
+        typer.echo("", err = True)
+        typer.echo("Re-run through the launcher, a separate entry to the same", err = True)
+        typer.echo("binary, which leaves this copy replaceable:", err = True)
+        typer.echo("", err = True)
+        # The full path, not a bare `unsloth`: reaching this lock is itself evidence
+        # the venv Scripts dir may come first on PATH, in which case an unqualified
+        # name resolves straight back to the locked copy.
+        #
+        # --local and STUDIO_LOCAL_REPO come along when this update was one: the
+        # retry runs in a new shell that inherits neither, so without them it
+        # silently becomes a PyPI update and reports success while the checkout
+        # that prompted the replacement stays uninstalled.
+        #
+        # --package likewise: update exports it as STUDIO_PACKAGE_NAME, so dropping
+        # it resets the retry to `unsloth` and updates something else, and the
+        # manifest then records that package for later verification.
+        # --no-verify too: someone who turned the scan off did it because their
+        # install has files it reports and cannot repair, so a retry that turns it
+        # back on fails after the update it was meant to complete has succeeded.
+        local_flag = " --local" if repo_root is not None else ""
+        if not verify:
+            local_flag += " --no-verify"
+        custom_package = package is not None and package != "unsloth"
+        if platform.system() == "Windows":
+            prefix = ""
+            if repo_root is not None:
+                prefix = f"$env:STUDIO_LOCAL_REPO = {_ps_single_quote(str(repo_root))}; "
+            suffix = local_flag
+            if custom_package:
+                suffix += f" --package {_ps_single_quote(package)}"
+            typer.echo(f"  {prefix}& {_ps_single_quote(str(shim))} studio update{suffix}", err = True)
+        else:
+            prefix = ""
+            if repo_root is not None:
+                prefix = f"STUDIO_LOCAL_REPO={shlex.quote(str(repo_root))} "
+            suffix = local_flag
+            if custom_package:
+                suffix += f" --package {shlex.quote(package)}"
+            typer.echo(f"  {prefix}{shlex.quote(str(shim))} studio update{suffix}", err = True)
+        # The OSError says the entry is locked, not who by. A second process
+        # launched from the same copy holds it just as well, and then the retry
+        # above changes nothing, because it is pip that has to replace the file.
+        typer.echo("", err = True)
+        typer.echo("If that fails the same way, another program is running from", err = True)
+        typer.echo(f"{exe}. Close it and retry.", err = True)
+    else:
+        typer.echo("", err = True)
+        typer.echo("The launcher that avoids this is unusable; reinstall to restore it:", err = True)
+        typer.echo("", err = True)
+        typer.echo(f"  {_reinstall_command()}", err = True)
+    typer.echo("", err = True)
 
 
 def _restore_self_exe_lock_windows() -> None:
@@ -3151,14 +3371,34 @@ def _restore_self_exe_lock_windows() -> None:
 
 
 def _cleanup_self_exe_lock_windows() -> None:
-    """Remove the .deleteme orphan after a successful update on Windows."""
+    """Remove the .deleteme orphan after a successful update on Windows.
+
+    Setup succeeding does not mean pip rewrote unsloth.exe: a dependency pass that
+    finds the package already at the right version reinstalls nothing, and then the
+    only copy is the one renamed aside before it ran. Deleting that leaves no CLI at
+    all. Put it back first -- a no-op once a fresh binary is there -- and clean up
+    whatever is left over.
+    """
     if platform.system() != "Windows":
         return
+    _restore_self_exe_lock_windows()
     try:
         venv_scripts = Path(sys.executable).resolve().parent
     except OSError:
         return
-    stale = (venv_scripts / "unsloth.exe").with_suffix(".exe.deleteme")
+    exe = venv_scripts / "unsloth.exe"
+    stale = exe.with_suffix(".exe.deleteme")
+    # Only once there is something to fall back on. The restore above can fail --
+    # antivirus or another process holding the destination for a moment is enough,
+    # and it reports rather than raises -- and deleting the backup then is the one
+    # outcome with no way back: the update leaves no CLI at all while a working
+    # copy was sitting right there. A surviving .deleteme is harmless by
+    # comparison; the next update's rename overwrites it.
+    try:
+        if exe.stat().st_size <= 0:
+            return
+    except OSError:
+        return
     try:
         stale.unlink(missing_ok = True)
     except OSError:
