@@ -1671,9 +1671,34 @@ class FastSentenceTransformer(FastModel):
             )
 
             # Add save methods
-            def _save_pretrained_merged(self, save_directory, **save_kwargs):
+            def _save_pretrained_merged(
+                self, save_directory, tokenizer = None,
+                save_method = "merged_16bit", **save_kwargs,
+            ):
+                # `tokenizer` and `save_method` are POSITIONAL here to match
+                # FastLanguageModel.save_pretrained_merged(dir, tokenizer,
+                # save_method=...), which is the call every notebook and doc
+                # makes. Taking only (self, save_directory, **kwargs) meant
+                # that same call answered a SentenceTransformer with
+                #   TypeError: _save_pretrained_merged() takes 2 positional
+                #   arguments but 4 were given
+                # so one public method name had two incompatible signatures.
+                if save_method not in ("merged_16bit", None):
+                    # Checked before anything is written. This path merges and
+                    # unloads unconditionally, so silently ignoring "lora"
+                    # would write full weights for a request to write
+                    # adapters, and refusing afterwards would still have left
+                    # a half-written directory behind.
+                    raise NotImplementedError(
+                        f"Unsloth: save_method = {save_method!r} is not "
+                        f"supported for this SentenceTransformer; only "
+                        f"'merged_16bit' is."
+                    )
                 self.save_pretrained(save_directory)
-                tokenizer = save_kwargs.pop("tokenizer", self.tokenizer)
+                if tokenizer is None:
+                    tokenizer = save_kwargs.pop("tokenizer", self.tokenizer)
+                else:
+                    save_kwargs.pop("tokenizer", None)
                 if hasattr(self[0], "auto_model"):
                     inner = self[0].auto_model
                     # Handle compiled model
@@ -1848,7 +1873,14 @@ class FastSentenceTransformer(FastModel):
         st_model = SentenceTransformer(modules = modules, device = st_device)
         st_model.no_modules = no_modules
 
-        def _save_pretrained_merged(self, save_directory, **kwargs):
+        def _save_pretrained_merged(
+            self, save_directory, tokenizer = None,
+            save_method = "merged_16bit", **kwargs,
+        ):
+            # Positional to match FastLanguageModel.save_pretrained_merged;
+            # see the note on the other definition above.
+            if save_method is not None:
+                kwargs.setdefault("save_method", save_method)
             # check which adapter files exist before save_pretrained
             adapter_files = ["adapter_model.safetensors", "adapter_config.json"]
             existing_before = {
@@ -1866,7 +1898,10 @@ class FastSentenceTransformer(FastModel):
                     except:
                         pass
 
-            tokenizer = kwargs.pop("tokenizer", self.tokenizer)
+            if tokenizer is None:
+                tokenizer = kwargs.pop("tokenizer", self.tokenizer)
+            else:
+                kwargs.pop("tokenizer", None)
             if self.no_modules:
                 # fallback for non-sentence-transformers models
                 print("Unsloth: No modules detected. Using standard merge_and_unload for saving...")
