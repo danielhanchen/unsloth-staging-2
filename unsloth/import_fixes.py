@@ -413,6 +413,101 @@ def patch_vllm_for_notebooks():
     sys.stdout.fileno = lambda: 1
 
 
+# TypeError: non-default argument 'vision_config' follows default argument
+_UNSLOTH_DC_BACKFILL_FLAG = "__unsloth_dc_defaults_backfilled__"
+
+
+def _backfill_dataclass_defaults(cls):
+    """Give class-local bare annotations a ``None`` default.
+
+    transformers 5.x runs ``dataclass(cls, repr=False)`` on every
+    ``PretrainedConfig`` subclass. A subclass that declares an annotation with
+    no default -- after a base class that has defaults -- then trips Python's
+    "non-default argument follows default argument" rule at class-creation
+    time.
+
+    Only annotations declared on *this* class are touched, and only when the
+    name has no class attribute yet, so real defaults are never overwritten.
+    ``ClassVar`` / ``InitVar`` are skipped because they are not dataclass
+    fields. Annotations may be strings (``from __future__ import
+    annotations``), so the check is textual.
+    """
+    if cls.__dict__.get(_UNSLOTH_DC_BACKFILL_FLAG):
+        return []
+    own_annotations = cls.__dict__.get("__annotations__") or {}
+    backfilled = []
+    for name, annotation in own_annotations.items():
+        text = annotation if isinstance(annotation, str) else \
+            (getattr(annotation, "__name__", "") or repr(annotation))
+        if "ClassVar" in text or "InitVar" in text:
+            continue
+        if name in cls.__dict__:
+            continue
+        try:
+            setattr(cls, name, None)
+            backfilled.append(name)
+        except Exception:
+            pass
+    try:
+        setattr(cls, _UNSLOTH_DC_BACKFILL_FLAG, True)
+    except Exception:
+        pass
+    return backfilled
+
+
+def fix_transformers5_bare_annotation_configs():
+    """Stop transformers 5.x from breaking third-party config classes.
+
+    vLLM's ``transformers_utils/configs/deepseek_vl2.py`` declares
+    ``vision_config: VisionEncoderConfig`` with no default. Under transformers
+    5.x that raises ``TypeError`` while *importing*
+    ``vllm.transformers_utils.configs``, which takes down ``import vllm`` and,
+    because unsloth imports vLLM, ``import unsloth`` as well -- observed in
+    the wild as ``unsloth: "ABSENT: TypeError"``.
+
+    Patches ``PretrainedConfig.__init_subclass__`` rather than rewriting
+    vLLM's source, so it covers every affected class in any vLLM version
+    instead of one file. No-ops on transformers 4.x, which does not convert
+    config subclasses to dataclasses at all.
+    """
+    try:
+        import transformers
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return
+        from transformers.configuration_utils import PretrainedConfig
+    except Exception as e:
+        logger.info(f"Unsloth: Skipping transformers-5 config fix ({e})")
+        return
+
+    if getattr(PretrainedConfig, "_unsloth_patched_init_subclass", False):
+        return
+
+    original = PretrainedConfig.__dict__.get("__init_subclass__")
+    if original is None:
+        return
+    # `__init_subclass__` is an implicit classmethod; unwrap to the function.
+    original_func = getattr(original, "__func__", original)
+
+    def __init_subclass__(cls, *args, **kwargs):
+        # Never let the backfill itself break class creation: on any
+        # surprise, fall through to stock transformers behaviour.
+        try:
+            _backfill_dataclass_defaults(cls)
+        except Exception as e:
+            logger.info(f"Unsloth: dataclass default backfill skipped ({e})")
+        return original_func(cls, *args, **kwargs)
+
+    try:
+        PretrainedConfig.__init_subclass__ = classmethod(__init_subclass__)
+        PretrainedConfig._unsloth_patched_init_subclass = True
+        logger.info(
+            "Unsloth: Patching transformers `PretrainedConfig.__init_subclass__` "
+            "so vLLM config classes with bare annotations still import"
+        )
+    except Exception as e:
+        logger.info(f"Unsloth: Failed patching PretrainedConfig ({e})")
+
+
 # ValueError: 'aimv2' is already used by a Transformers config, pick another name.
 def fix_vllm_aimv2_issue():
     spec = importlib.util.find_spec("vllm")
