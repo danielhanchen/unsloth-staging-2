@@ -74,7 +74,7 @@ class _Args:
 
 def _run(model_dtype, bf16_supported, fp16 = False, bf16 = False,
          force_float32 = "0", full_finetuning = "0",
-         mixed_precision = "float32"):
+         mixed_precision = "float32", user_float32 = None):
     """Execute the block and report what it decided."""
     config = types.SimpleNamespace(dtype = model_dtype, torch_dtype = model_dtype)
     model = types.SimpleNamespace(config = config)
@@ -83,6 +83,12 @@ def _run(model_dtype, bf16_supported, fp16 = False, bf16 = False,
         "UNSLOTH_FORCE_FLOAT32": force_float32,
         "UNSLOTH_ENABLE_FULL_FINETUNING": full_finetuning,
         "UNSLOTH_MIXED_PRECISION": mixed_precision,
+        # from_pretrained sets this only when the caller passed
+        # dtype = torch.float32 themselves. Defaulting it from the model dtype
+        # keeps each test's intent readable; the V100 recipe below overrides it.
+        "UNSLOTH_USER_FLOAT32": (
+            ("1" if model_dtype is torch.float32 else "0")
+            if user_float32 is None else user_float32),
     }
     fake_os = types.SimpleNamespace(environ = env)
 
@@ -198,6 +204,29 @@ def test_bfloat16_mixed_precision_mode_unchanged():
                      mixed_precision = "bfloat16")
     assert (args.fp16, args.bf16) == (False, False)
     assert env["ACCELERATE_MIXED_PRECISION"] == "no"
+
+
+def test_upcast_float32_on_a_v100_still_gets_fp16_autocast():
+    """The float32 the model was UPCAST to is not a request for float32.
+
+    Full finetuning upcasts trainable weights to float32 by itself, and
+    float16 autocast over float32 master weights is the ordinary V100/T4
+    mixed-precision recipe (issue #4082). Only an explicit
+    `dtype = torch.float32` at load time may suppress it, which is why the
+    new branch is gated on UNSLOTH_USER_FLOAT32 rather than on the dtype.
+    """
+    args, env = _run(torch.float32, bf16_supported = False,
+                     full_finetuning = "1", user_float32 = "0")
+    assert (args.fp16, args.bf16) == (True, False)
+    assert env["ACCELERATE_MIXED_PRECISION"] == "fp16"
+
+
+def test_loaders_record_the_explicit_request():
+    # The gate is worthless if nothing ever sets the variable.
+    for rel in ("unsloth/models/vision.py", "unsloth/models/loader.py"):
+        src = (REPO_ROOT / rel).read_text(encoding = "utf-8")
+        assert 'os.environ["UNSLOTH_USER_FLOAT32"]' in src, rel
+        assert 'dtype == torch.float32 else "0"' in src, rel
 
 
 def test_block_still_compiles():
