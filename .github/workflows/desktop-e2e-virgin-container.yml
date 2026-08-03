@@ -282,9 +282,37 @@ jobs:
             *)  echo "::error::the bundled installer exited $rc for an unprivileged user"; exit 1 ;;
           esac
 
+      # The prebuilt llama-server links libgomp.so.1, which this image does not
+      # ship and an unprivileged user cannot install. Diagnose it in one line
+      # here rather than as an opaque model-load failure three steps later.
+      - name: Can the prebuilt llama-server run on this image
+        id: llama_libs
+        run: |
+          bin=/home/tester/.unsloth/llama.cpp/llama-server
+          if [ ! -x "$bin" ] || ! command -v ldd >/dev/null 2>&1; then
+            echo "runnable=unknown" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          missing=$(ldd "$bin" 2>/dev/null | awk '/not found/ {print $1}' | sort -u | tr '\n' ' ')
+          if [ -n "$missing" ]; then
+            echo "::warning::recorded: the prebuilt llama-server has unmet shared libraries on ${{ matrix.image }}: ${missing}"
+            echo "runnable=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "runnable=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Start the backend as tester and drive it
         run: |
           set -o pipefail
+          # No point driving inference when the engine cannot be loaded at all:
+          # it would only restate the line above as a 500 from /api/inference/load.
+          if [ "${{ steps.llama_libs.outputs.runnable }}" = "false" ]; then
+            SCENARIOS="${SCENARIOS//inference/}"
+            SCENARIOS="${SCENARIOS//,,/,}"
+            SCENARIOS="${SCENARIOS%,}"; SCENARIOS="${SCENARIOS#,}"
+            [ -n "$SCENARIOS" ] || SCENARIOS=backend
+            echo "::warning::driving '${SCENARIOS}' only; the engine has unmet shared libraries here"
+          fi
           runuser -u tester -- bash -c "
             /home/tester/.unsloth/studio/unsloth_studio/bin/unsloth studio --api-only \
               -H 127.0.0.1 -p ${PINNED_PORT} > /home/tester/backend.log 2>&1 &

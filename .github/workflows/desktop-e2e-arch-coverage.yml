@@ -310,7 +310,29 @@ jobs:
           # while failing both ways is just the network.
           if ($driveRc -ne 0 -and (Select-String -Path logs\drive.log -Pattern 'hf_transfer' -Quiet)) {
             Write-Host "::warning::the GGUF download failed inside hf_transfer; retrying with it disabled"
+            # The download runs in the BACKEND, not in the driver, and the backend
+            # was started without the variable. Setting it here and re-running the
+            # driver alone measures nothing, so restart the backend under it.
+            $owner = (Get-NetTCPConnection -LocalPort 8962 -State Listen -ErrorAction SilentlyContinue).OwningProcess
+            if ($owner) { Stop-Process -Id $owner -Force -ErrorAction SilentlyContinue }
+            Get-Process -Name unsloth -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 5
             $env:HF_HUB_ENABLE_HF_TRANSFER = '0'
+            Start-Process -FilePath $bin `
+              -ArgumentList 'studio','--api-only','-H','127.0.0.1','-p','8962' `
+              -RedirectStandardOutput logs\backend-nohftransfer.log `
+              -RedirectStandardError logs\backend-nohftransfer-err.log
+            $up2 = $false
+            foreach ($i in 1..60) {
+              try {
+                Invoke-WebRequest -Uri 'http://127.0.0.1:8962/api/health' -UseBasicParsing -TimeoutSec 5 | Out-Null
+                $up2 = $true; break
+              } catch { Start-Sleep -Seconds 5 }
+            }
+            if (-not $up2) {
+              Write-Host "::warning::inconclusive: the backend did not come back up with hf_transfer disabled"
+              exit $driveRc
+            }
             # desktop_drive rotates the seeded password to "<seeded>-drive1" on first
             # login, so that is what the retry has to present.
             $pwArgs = @()
@@ -322,11 +344,14 @@ jobs:
             $retryRc = $LASTEXITCODE
             # Only conclude if the retry actually got as far as the download. A retry
             # that died at login measures nothing, and saying "it is the network"
-            # off the back of it would be a guess dressed up as a result.
+            # off the back of it would be a guess dressed up as a result. A retry that
+            # still names hf_transfer never had it disabled, which is equally empty.
             if (Select-String -Path logs\drive-nohftransfer.log -Pattern 'FAILED\s+discovery' -Quiet) {
               Write-Host "::warning::inconclusive: the retry could not authenticate, so it never reached the download"
             } elseif ($retryRc -eq 0) {
               Write-Host "::error::hf_transfer cannot download on arm64 Windows; the same load succeeds with HF_HUB_ENABLE_HF_TRANSFER=0"
+            } elseif (Select-String -Path logs\drive-nohftransfer.log -Pattern 'hf_transfer' -Quiet) {
+              Write-Host "::warning::inconclusive: the retry still went through hf_transfer, so the restart did not disable it"
             } else {
               Write-Host "::warning::the download fails with hf_transfer off too, so this is the network and not the platform"
             }
