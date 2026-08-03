@@ -1972,14 +1972,12 @@ def _make_peft_stub_module(fullname):
     return mod
 
 
-def _install_transformers_conversion_mapping_stub():
-    """Stub the 3 symbols peft 0.19.x imports from this module at top level."""
-    name = "transformers.conversion_mapping"
-    existing = sys.modules.get(name)
-    if existing is not None and getattr(existing, _UNSLOTH_STUB_SENTINEL, False):
-        return existing
+def _build_transformers_conversion_mapping_stub():
+    """Build (do not install) the 3 symbols peft imports from this module.
 
-    mod = _make_peft_stub_module(name)
+    Kept separate from installation so the same objects can be used to
+    backfill a REAL transformers module that is missing only some of them."""
+    mod = _make_peft_stub_module("transformers.conversion_mapping")
 
     # peft does ``.copy()`` + keyed assignment at module top; real dict suffices.
     mod._MODEL_TO_CONVERSION_PATTERN = {}
@@ -1994,7 +1992,17 @@ def _install_transformers_conversion_mapping_stub():
 
     mod.get_checkpoint_conversion_mapping = get_checkpoint_conversion_mapping
     mod.get_model_conversion_mapping = get_model_conversion_mapping
+    return mod
 
+
+def _install_transformers_conversion_mapping_stub():
+    """Stub the 3 symbols peft 0.19.x imports from this module at top level."""
+    name = "transformers.conversion_mapping"
+    existing = sys.modules.get(name)
+    if existing is not None and getattr(existing, _UNSLOTH_STUB_SENTINEL, False):
+        return existing
+
+    mod = _build_transformers_conversion_mapping_stub()
     sys.modules[name] = mod
     # Attach to parent so attribute-style access matches a real submodule.
     parent = sys.modules.get("transformers")
@@ -2007,18 +2015,16 @@ def _install_transformers_conversion_mapping_stub():
     return mod
 
 
-def _install_transformers_core_model_loading_stub():
-    """Stub the 8 symbols peft 0.19.x imports from this module at top level.
+def _build_transformers_core_model_loading_stub():
+    """Build (do not install) the 8 symbols peft imports from this module.
 
     ``Concatenate`` and ``ConversionOps`` MUST be real classes (peft
     subclasses them at module top); the rest only appear in runtime
-    ``isinstance`` / construction calls gated behind ``is_transformers_ge_v5``."""
-    name = "transformers.core_model_loading"
-    existing = sys.modules.get(name)
-    if existing is not None and getattr(existing, _UNSLOTH_STUB_SENTINEL, False):
-        return existing
+    ``isinstance`` / construction calls gated behind ``is_transformers_ge_v5``.
 
-    mod = _make_peft_stub_module(name)
+    Kept separate from installation so the same objects can be used to
+    backfill a REAL transformers module that is missing only some of them."""
+    mod = _make_peft_stub_module("transformers.core_model_loading")
 
     class ConversionOps:
         def convert(self, *args, **kwargs):  # pragma: no cover - inert stub
@@ -2087,7 +2093,17 @@ def _install_transformers_core_model_loading_stub():
     mod.WeightRenaming = WeightRenaming
     mod.dot_natural_key = dot_natural_key
     mod.rename_source_key = rename_source_key
+    return mod
 
+
+def _install_transformers_core_model_loading_stub():
+    """Install the core_model_loading stub, unless a real module is present."""
+    name = "transformers.core_model_loading"
+    existing = sys.modules.get(name)
+    if existing is not None and getattr(existing, _UNSLOTH_STUB_SENTINEL, False):
+        return existing
+
+    mod = _build_transformers_core_model_loading_stub()
     sys.modules[name] = mod
     parent = sys.modules.get("transformers")
     if parent is not None and not hasattr(parent, "core_model_loading"):
@@ -2096,6 +2112,63 @@ def _install_transformers_core_model_loading_stub():
         except Exception:
             pass
     return mod
+
+
+# Exactly the names peft's transformers_weight_conversion imports at module
+# top level. A real transformers module missing ANY of them breaks that import
+# just as hard as the module being absent entirely.
+_PEFT_REQUIRED_SYMBOLS = {
+    "transformers.conversion_mapping": (
+        "_MODEL_TO_CONVERSION_PATTERN",
+        "get_checkpoint_conversion_mapping",
+        "get_model_conversion_mapping",
+    ),
+    "transformers.core_model_loading": (
+        "Concatenate",
+        "ConversionOps",
+        "MergeModulelist",
+        "Transpose",
+        "WeightConverter",
+        "WeightRenaming",
+        "dot_natural_key",
+        "rename_source_key",
+    ),
+}
+_PEFT_STUB_BUILDERS = {
+    "transformers.conversion_mapping": _build_transformers_conversion_mapping_stub,
+    "transformers.core_model_loading": _build_transformers_core_model_loading_stub,
+}
+
+
+def _backfill_missing_peft_symbols(name):
+    """Add to a REAL transformers submodule only the peft symbols it lacks.
+
+    transformers 5.0.0.dev0 ships ``transformers.conversion_mapping`` without
+    ``_MODEL_TO_CONVERSION_PATTERN``, so peft's top-level ``from ... import``
+    raises ImportError even though the module itself imports fine. Stubbing
+    the whole module would replace working transformers code, so instead take
+    the missing names from the stub and leave everything else untouched.
+
+    Strictly additive and idempotent. Returns the names added."""
+    try:
+        mod = importlib.import_module(name)
+    except Exception:
+        return ()
+    if getattr(mod, _UNSLOTH_STUB_SENTINEL, False):
+        return ()  # our own stub already provides the full set
+    missing = [s for s in _PEFT_REQUIRED_SYMBOLS[name] if not hasattr(mod, s)]
+    if not missing:
+        return ()
+    donor = _PEFT_STUB_BUILDERS[name]()
+    added = []
+    for symbol in missing:
+        try:
+            setattr(mod, symbol, getattr(donor, symbol))
+            added.append(symbol)
+        except Exception:
+            # Frozen or slotted module object; nothing more we can do here.
+            pass
+    return tuple(added)
 
 
 def fix_peft_transformers_weight_conversion_import():
@@ -2153,6 +2226,22 @@ def fix_peft_transformers_weight_conversion_import():
     if not _peft_stub_module_importable("transformers.core_model_loading"):
         _install_transformers_core_model_loading_stub()
         patched_any = True
+
+    # A submodule that IS importable can still be missing individual symbols --
+    # transformers 5.0.0.dev0 has conversion_mapping but not
+    # _MODEL_TO_CONVERSION_PATTERN. Backfill just those names rather than
+    # replacing a real module wholesale.
+    backfilled = {}
+    for _submodule in _PEFT_REQUIRED_SYMBOLS:
+        added = _backfill_missing_peft_symbols(_submodule)
+        if added:
+            backfilled[_submodule] = added
+            patched_any = True
+    if backfilled:
+        logger.info(
+            "Unsloth: backfilled peft symbols missing from transformers: "
+            + "; ".join(f"{m}: {', '.join(s)}" for m, s in backfilled.items())
+        )
 
     if not patched_any:
         # Real submodules present; failure was for some other reason.
