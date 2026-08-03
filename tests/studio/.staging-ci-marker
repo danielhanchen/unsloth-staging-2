@@ -1,0 +1,1 @@
+Staging-only trigger marker: forces path-filtered CI to fire on an otherwise empty diff.
