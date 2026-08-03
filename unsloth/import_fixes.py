@@ -3383,3 +3383,81 @@ def patch_accelerate_recursively_apply():
                         setattr(mod, "find_device", _patched_find_device)
                     except Exception:
                         pass
+
+
+def fix_peft_stale_torchao_import_error():
+    """Stop an old torchao from aborting LoRA creation that never uses it.
+
+    ``peft.import_utils.is_torchao_available`` returns False when torchao is
+    absent, but *raises* when it is installed and older than peft's minimum::
+
+        ImportError: Found an incompatible version of torchao. Found version
+        0.10.0, but only versions above 0.16.0 are supported
+
+    peft calls it from ``dispatch_torchao`` while building every LoRA layer,
+    so one stale optional dependency ends ``get_peft_model`` for a model that
+    has nothing to do with torchao. FunctionGemma_(270M)-LMStudio dies this
+    way on Kaggle, whose preinstalled torchao is 0.10.0, while the sibling
+    notebook survives only because it happens to upgrade torchao first.
+
+    "Installed but unusable" is much closer to "not installed" than to
+    "fatal", so this answers False and says so once. Anyone actually wanting
+    torchao gets a warning naming the upgrade rather than silence.
+
+    Returns True when patched, False when no patch is needed, None when peft
+    is absent.
+    """
+    try:
+        import peft.import_utils as peft_import_utils
+    except Exception:
+        return None
+
+    original = getattr(peft_import_utils, "is_torchao_available", None)
+    if original is None:
+        return None
+    if getattr(original, "__unsloth_patched__", False):
+        return False
+
+    warned = [False]
+
+    @functools.wraps(original)
+    def is_torchao_available(*args, **kwargs):
+        try:
+            return original(*args, **kwargs)
+        except ImportError as exc:
+            # Only the version complaint. A torchao that fails to import for
+            # any other reason is a real problem and must still surface.
+            message = str(exc)
+            if "torchao" not in message.lower():
+                raise
+            if not warned[0]:
+                warned[0] = True
+                logger.warning(
+                    f"Unsloth: Ignoring an unusable torchao so LoRA can still "
+                    f"be built ({message}). Run "
+                    f"`pip install --upgrade torchao` if you need torchao "
+                    f"quantization."
+                )
+            return False
+
+    is_torchao_available.__unsloth_patched__ = True
+
+    patched = False
+    try:
+        peft_import_utils.is_torchao_available = is_torchao_available
+        patched = True
+    except Exception:
+        return False
+
+    # `from peft.import_utils import is_torchao_available` binds the original
+    # into each importing module, so patching only import_utils would leave
+    # peft.tuners.lora.torchao -- the actual caller -- still raising.
+    for mod_name, mod in tuple(sys.modules.items()):
+        if not mod_name.startswith("peft") or mod is None:
+            continue
+        if getattr(mod, "is_torchao_available", None) is original:
+            try:
+                setattr(mod, "is_torchao_available", is_torchao_available)
+            except Exception:
+                pass
+    return patched
