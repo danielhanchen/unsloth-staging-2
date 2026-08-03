@@ -487,6 +487,7 @@ _tauri_torch_index_family() {
         */cu128) echo "cu128" ;;
         */cu130) echo "cu130" ;;
         */cpu) echo "cpu" ;;
+        */xpu) echo "xpu" ;;
         */rocm[0-9]*.[0-9]*)
             _diag_family=${_diag_url##*/}
             case "$_diag_family" in
@@ -522,6 +523,7 @@ _tauri_gpu_branch() {
                 echo "rocm"
             fi ;;
         radeon) echo "rocm_radeon" ;;
+        xpu) echo "xpu" ;;
         cpu) echo "cpu" ;;
         none) echo "no_torch" ;;
         *) echo "unknown" ;;
@@ -2856,11 +2858,14 @@ get_torch_index_url() {
 }
 
 # ── Torch flavor helpers (to repair a stale CPU / wrong-CUDA wheel) ──
-# torch.__version__ ($1) -> flavor tag (cuXXX / rocm / cpu); untagged wheel = cpu.
+# torch.__version__ ($1) -> flavor tag (cuXXX / rocm / xpu / cpu); untagged wheel = cpu.
+# The xpu arm is load-bearing: without it a correct 2.10.0+xpu wheel reads as "cpu", so every
+# run force-reinstalls it and then warns torch is CPU-only. Parity with the ps1 side.
 _torch_flavor_tag() {
     case "$1" in
         *+cu[0-9]*) printf '%s\n' "$1" | sed -n 's/.*+\(cu[0-9][0-9]*\).*/\1/p' ;;
         *+rocm*)    echo "rocm" ;;
+        *+xpu*)     echo "xpu" ;;
         *+cpu*)     echo "cpu" ;;
         "")         echo "" ;;
         *)          echo "cpu" ;;
@@ -2998,7 +3003,7 @@ _install_torch_default_index() {
     fi
 }
 
-# Expected tag from the index leaf ($1): cuXXX / cpu / rocm (rocmX.Y and gfx* ->
+# Expected tag from the index leaf ($1): cuXXX / cpu / xpu / rocm (rocmX.Y and gfx* ->
 # rocm). Empty on an unknown leaf (odd mirror) so the repair safely no-ops.
 _expected_torch_flavor_tag() {
     _leaf=$(_torch_index_url_leaf "$1")
@@ -3012,6 +3017,9 @@ _expected_torch_flavor_tag() {
             esac
             ;;
         cpu)          echo "cpu" ;;
+        # Intel XPU (SYCL): a GPU flavor like cuXXX/rocm, so a pinned xpu index repairs a
+        # stale CPU wheel instead of keeping it.
+        xpu)          echo "xpu" ;;
         # Exact rocm/gfx families only; a custom rocm*-suffixed leaf -> "" (custom).
         *)
             if _is_pip_rocm_family_leaf "$_leaf"; then echo "rocm"; else echo ""; fi
@@ -3020,7 +3028,7 @@ _expected_torch_flavor_tag() {
 }
 
 # Whether index ($1) supports a plain --default-index reinstall. pytorch.org cuXXX /
-# rocmX.Y AND the repo.amd.com gfx* indexes are all PEP 503 simple indexes that uv
+# xpu / rocmX.Y AND the repo.amd.com gfx* indexes are all PEP 503 simple indexes that uv
 # resolves (torch + every transitive dep) via --default-index -- the same URLs the
 # fresh-install paths above already use -- so a stale wheel is auto-repairable.
 # Unknown/odd-mirror leaves -> no, so we warn rather than risk a wrong reinstall.
@@ -3028,6 +3036,8 @@ _torch_index_repairable() {
     _leaf=$(_torch_index_url_leaf "$1")
     case "$_leaf" in
         cu[0-9]*) echo "yes" ;;
+        # /whl/xpu is a plain PEP 503 index (oneAPI runtime and triton-xpu are ordinary deps).
+        xpu)      echo "yes" ;;
         # Only EXACT rocm/gfx families resolve via --default-index; a suffixed leaf is verbatim.
         *)
             if _is_pip_rocm_family_leaf "$_leaf"; then echo "yes"; else echo "no"; fi
