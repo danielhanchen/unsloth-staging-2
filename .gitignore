@@ -249,3 +249,8 @@ llama.cpp/
 # an interrupted run left 2.9GB of them committed once already.
 test_output/
 grpo_trainer_lora_model_*/
+
+# Left behind by local test runs (see the note above).
+/checkpoints/
+/example_without_context.wav
+/unsloth-*-adapter/
