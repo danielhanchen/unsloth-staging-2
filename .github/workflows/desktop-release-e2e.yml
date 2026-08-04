@@ -543,7 +543,10 @@ jobs:
             Write-Host '::error::EICAR did not fire; a clean verdict below would be meaningless'
             exit 1
           }
+          # A detection is exit 2, and the shell appends `exit $LASTEXITCODE`, so
+          # the control passing would otherwise fail the step.
           Write-Host 'EICAR fired: the scanner works.'
+          exit 0
 
       - name: Download the published installer over the network
         env:
@@ -635,6 +638,10 @@ jobs:
       - name: Defender events during install and launch
         if: always()
         run: |
+          if (-not $env:INSTALL_START) {
+            Write-Host '::warning::install never ran, so there is no window to inspect'
+            exit 0
+          }
           $start = [datetime]::Parse($env:INSTALL_START)
           $ev = Get-WinEvent -FilterHashtable @{
             LogName = 'Microsoft-Windows-Windows Defender/Operational'
@@ -658,6 +665,10 @@ jobs:
       - name: Scan the installed tree
         if: always()
         run: |
+          if (-not $env:APPDIR) {
+            Write-Host '::warning::install never ran, so there is no installed tree to scan'
+            exit 0
+          }
           $out = & $env:MPCMDRUN -Scan -ScanType 3 -File $env:APPDIR -DisableRemediation 2>&1
           $code = $LASTEXITCODE
           $out | ForEach-Object { Write-Host "  $_" }
@@ -667,3 +678,4 @@ jobs:
           }
           if ($code -ne 0) { Write-Host "::error::installed-tree scan did not complete (exit $code)"; exit 1 }
           Write-Host '::notice::installed tree scans CLEAN'
+          exit 0
