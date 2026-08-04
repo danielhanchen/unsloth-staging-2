@@ -260,4 +260,7 @@ Speech_12dB_s16.flac
 
 # Model snapshots pulled down by local test runs. `csm/` was committed by an
 # unscoped `git add -A` and carried a 44MB tokenizer.json into the branch.
+# `whisper/` is the same hazard one suite over: a full `tests/` run leaves 2.9GB
+# of it here, untracked and previously unignored.
 csm/
+whisper/
