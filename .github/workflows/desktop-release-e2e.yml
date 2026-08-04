@@ -1,0 +1,668 @@
+# Full release rehearsal for the desktop app on staging CI.
+#
+# Builds Windows, macOS and Linux the way release-desktop.yml does, publishes
+# them to a staging prerelease, then downloads the Windows installer back over
+# the network, scans it with cloud-enabled Defender, installs it silently and
+# launches it.
+#
+# The unsigned-file gate, the Defender gate and the submission packet below are
+# copied VERBATIM from .github/workflows/release-desktop.yml on main, so this
+# exercises the shipped gate rather than a reimplementation of it.
+#
+# One difference from a real release, and it matters when reading the result:
+# the Azure Trusted Signing credentials are not available here, so Windows is
+# signed with a self-signed certificate and macOS is neither signed nor
+# notarized. A self-signed, zero-reputation binary is a HARDER case for Defender
+# than a Trusted Signing one, so a clean verdict here is meaningful but does not
+# by itself prove a real signed release is clean: publisher reputation and file
+# prevalence are inputs that cannot be reproduced off the release pipeline.
+
+name: "Desktop release rehearsal (all platforms + Defender)"
+
+on:
+  push:
+    branches: [desktop-release-e2e]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  APP_VERSION: '0.1.9990-rehearsal'
+  REHEARSAL_TAG: desktop-rehearsal-${{ github.run_id }}
+
+jobs:
+  build:
+    name: "Build ${{ matrix.label }}"
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            label: Windows (x64)
+            artifact: windows-x64
+            args: ''
+          - platform: macos-latest
+            label: macOS (Apple Silicon)
+            artifact: macos-aarch64
+            args: '--target aarch64-apple-darwin'
+          - platform: ubuntu-22.04
+            label: Linux (x64)
+            artifact: linux-x64
+            args: ''
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+
+      - name: Install pinned Tauri CLI
+        run: npm install --save-dev --prefix studio "@tauri-apps/cli@2.10.1" --no-fund --no-audit
+
+      - name: Verify pinned Tauri CLI
+        shell: bash
+        run: |
+          out="$(npx --prefix studio tauri --version)"
+          echo "$out"
+          [ "$out" = "tauri-cli 2.10.1" ] || { echo "expected tauri-cli 2.10.1, got $out" >&2; exit 1; }
+
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri -> target
+
+      - name: Patch desktop app version
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, re, pathlib
+          p = pathlib.Path('studio/src-tauri/Cargo.toml')
+          t = p.read_text()
+          t = re.sub(r'(?m)^version\s*=\s*"[^"]+"', 'version = "%s"' % os.environ['APP_VERSION'], t, count=1)
+          p.write_text(t)
+          print([l for l in t.splitlines() if l.startswith('version')][0])
+          PY
+
+      - name: Generate a throwaway Tauri updater key
+        shell: bash
+        run: |
+          npx --prefix studio tauri signer generate -w "$RUNNER_TEMP/updater.key" -p ""
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY<<KEYEOF"
+            cat "$RUNNER_TEMP/updater.key"
+            echo "KEYEOF"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
+          } >> "$GITHUB_ENV"
+
+      - name: Create a self-signed code signing certificate
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert `
+            -Subject 'CN=Unsloth Release Rehearsal' `
+            -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(1)
+          "CERT_THUMB=$($cert.Thumbprint)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          # LocalMachine\Root, not CurrentUser\Root: the per-user store raises a
+          # confirmation dialog no runner can answer. Without a trusted root the
+          # signing gate could only ever be exercised failing.
+          $cer = Join-Path $env:RUNNER_TEMP 'rehearsal.cer'
+          Export-Certificate -Cert $cert -FilePath $cer -Type CERT | Out-Null
+          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          Write-Host "thumbprint $($cert.Thumbprint), root trusted"
+
+      - name: Point the bundler at the test certificate
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          # sign_command() prefers signCommand over certificateThumbprint, so the
+          # Azure wrapper has to be replaced rather than supplemented. This still
+          # exercises the same can_sign() path that gates NSIS plugin signing.
+          @{ bundle = @{ windows = @{
+            certificateThumbprint = $env:CERT_THUMB
+            digestAlgorithm = 'sha256'
+          } } } | ConvertTo-Json -Depth 6 | Set-Content 'studio/src-tauri/tauri.windows.conf.json' -Encoding UTF8
+          Get-Content 'studio/src-tauri/tauri.windows.conf.json' | Write-Host
+
+      - name: Sign the bundled install script
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          # Stand-in for release-desktop.yml's trusted-signing step: same signtool,
+          # same ordering, before the bundler packs resources.
+          $script = (Resolve-Path 'install.ps1').Path
+          $st = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match 'x64' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $st) { Write-Host '::error::signtool not found'; exit 1 }
+          & $st.FullName sign /fd SHA256 /sha1 $env:CERT_THUMB $script 2>&1 | Write-Host
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not sign install.ps1 ($LASTEXITCODE)"; exit 1 }
+          $sig = Get-AuthenticodeSignature $script
+          Write-Host "install.ps1 -> $($sig.Status) $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { Write-Host "::error::install.ps1 is $($sig.Status) after signing"; exit 1 }
+
+      - name: Pin linuxdeploy for AppImage
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        env:
+          LINUXDEPLOY_URL: "https://github.com/linuxdeploy/linuxdeploy/releases/download/1-alpha-20250213-2/linuxdeploy-x86_64.AppImage"
+          LINUXDEPLOY_SHA256: "4648f278ab3ef31f819e67c30d50f462640e5365a77637d7e6f2ad9fd0b4522a"
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/tauri-tools-cache/tauri"
+          mkdir -p "$tools_dir"
+          dest="$tools_dir/linuxdeploy-x86_64.AppImage"
+          curl -fsSL "$LINUXDEPLOY_URL" -o "$dest"
+          echo "${LINUXDEPLOY_SHA256}  ${dest}" | sha256sum -c -
+          chmod +x "$dest"
+
+      - name: Build Windows app
+        id: build_windows
+        if: matrix.platform == 'windows-latest'
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
+        with:
+          projectPath: studio
+          tauriScript: npx --prefix . tauri
+          args: -v ${{ matrix.args }}
+
+      - name: Build macOS app
+        id: build_macos
+        if: matrix.platform == 'macos-latest'
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
+        with:
+          projectPath: studio
+          tauriScript: npx --prefix . tauri
+          args: -v ${{ matrix.args }}
+
+      - name: Build Linux app
+        id: build_linux
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5
+        env:
+          XDG_CACHE_HOME: ${{ runner.temp }}/tauri-tools-cache
+        with:
+          projectPath: studio
+          tauriScript: npx --prefix . tauri
+          args: -v ${{ matrix.args }}
+
+      - name: Verify every executable in the Windows bundles is signed
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          ARTIFACT_PATHS: ${{ steps.build_windows.outputs.artifactPaths }}
+        run: |
+          $paths = @($env:ARTIFACT_PATHS | ConvertFrom-Json) |
+                   Where-Object { $_ -like '*-setup.exe' }
+          if (-not $paths) { Write-Host '::error::no Windows installer to verify'; exit 1 }
+          .github/scripts/assert-bundle-signed.ps1 -Path $paths
+
+      - name: Scan Windows bundles with Defender
+        if: matrix.platform == 'windows-latest'
+        timeout-minutes: 20
+        shell: pwsh
+        env:
+          ARTIFACT_PATHS: ${{ steps.build_windows.outputs.artifactPaths }}
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          $atp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
+          if (Test-Path $atp) { Remove-ItemProperty -Path $atp -Name 'ForceDefenderPassiveMode' -ErrorAction SilentlyContinue }
+          Start-Service -Name WinDefend -ErrorAction SilentlyContinue
+
+          foreach ($x in @((Get-MpPreference).ExclusionPath)) {
+            if ($x) { Remove-MpPreference -ExclusionPath $x -ErrorAction SilentlyContinue }
+          }
+          Set-MpPreference `
+            -DisableRealtimeMonitoring $false -DisableIOAVProtection $false `
+            -DisableScriptScanning $false -DisableBehaviorMonitoring $false `
+            -DisableArchiveScanning $false -MAPSReporting Advanced `
+            -SubmitSamplesConsent SendAllSamples -CloudBlockLevel High `
+            -CloudExtendedTimeout 50 -DisableBlockAtFirstSeen $false -ErrorAction Continue
+
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          $plat = Get-ChildItem 'C:\ProgramData\Microsoft\Windows Defender\Platform' -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+          if ($plat -and (Test-Path "$($plat.FullName)\MpCmdRun.exe")) { $mp = "$($plat.FullName)\MpCmdRun.exe" }
+          Update-MpSignature -UpdateSource MicrosoftUpdateServer -ErrorAction Continue
+          & $mp -SignatureUpdate 2>&1 | Write-Host
+
+          $status = Get-MpComputerStatus
+          $pref = Get-MpPreference
+          Write-Host "engine $($status.AMEngineVersion), signatures $($status.AntivirusSignatureVersion) ($($status.AntivirusSignatureLastUpdated))"
+
+          # Set-MpPreference can return cleanly and still be ignored, so verify.
+          # Split by whether the gap invalidates the verdict: cloud-delivered
+          # protection is inactive without active mode, MAPS and block-at-first-
+          # sight, and "!ml" is a cloud verdict, so a clean result without them
+          # cannot see what this gate exists to catch. Leftover exclusions only
+          # weaken it, since -DisableRemediation ignores file exclusions.
+          $fatal = @()
+          $degraded = @()
+          if (-not $status.RealTimeProtectionEnabled) { $fatal += "RealTimeProtectionEnabled=false (AMRunningMode=$($status.AMRunningMode))" }
+          if ([int]$pref.MAPSReporting -ne 2)         { $fatal += "MAPSReporting=$($pref.MAPSReporting), expected 2 (Advanced)" }
+          if ($pref.DisableBlockAtFirstSeen)          { $fatal += 'DisableBlockAtFirstSeen=true' }
+          if ([int]$pref.SubmitSamplesConsent -ne 3)  { $degraded += "SubmitSamplesConsent=$($pref.SubmitSamplesConsent), expected 3 (SendAllSamples)" }
+          if ([int]$pref.CloudBlockLevel -eq 0)       { $degraded += "CloudBlockLevel=$($pref.CloudBlockLevel), expected High" }
+          if ($pref.ExclusionPath)                    { $degraded += "exclusions remain: $($pref.ExclusionPath -join ',')" }
+
+          # Configuration is not connectivity. Retried, so one network blip does
+          # not block a release.
+          $maps = $false
+          foreach ($try in 1..3) {
+            $mapsOut = (& $mp -ValidateMapsConnection 2>&1 | Out-String)
+            if ($LASTEXITCODE -eq 0) { $maps = $true; break }
+            Write-Host "  MAPS check $try failed: $($mapsOut.Trim())"
+            Start-Sleep -Seconds (5 * $try)
+          }
+          if (-not $maps) { $fatal += 'cannot reach the Defender cloud service' }
+
+          # Positive control: clean and broken-scanner look identical. Split into
+          # fragments so this file is not itself a sample.
+          $eicarPath = Join-Path $env:RUNNER_TEMP 'defender-selftest.com'
+          # Real-time protection may block the write; that is the control passing.
+          $controlPassed = $false
+          try {
+            [System.IO.File]::WriteAllText(
+              $eicarPath,
+              'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!' + '$H+H*')
+          } catch { }
+          if (Test-Path $eicarPath) {
+            $controlOut = (& $mp -Scan -ScanType 3 -File $eicarPath -DisableRemediation 2>&1 | Out-String)
+            $controlPassed = [bool](($controlOut -match 'found\s+\d+\s+threat') -or ($controlOut -match 'EICAR'))
+            Remove-Item $eicarPath -Force -ErrorAction SilentlyContinue
+          } else {
+            Write-Host 'EICAR positive control blocked on write; real-time protection is live.'
+            $controlPassed = $true
+          }
+          if (-not $controlPassed) { $fatal += 'EICAR positive control did not fire' }
+
+          if ($degraded) {
+            Write-Host "::warning::Defender is not fully configured on this runner ($($degraded -join '; ')). Scanning anyway."
+          }
+          if ($fatal) {
+            Write-Host "::error::Defender cannot give an authoritative verdict here ($($fatal -join '; ')); refusing to publish on a scan that cannot see the detection class this gate exists for"
+            exit 1
+          }
+
+          # Fatal, not a warning: exiting 0 here would pass an unscanned release.
+          if ([string]::IsNullOrWhiteSpace($env:ARTIFACT_PATHS)) {
+            Write-Host '::error::tauri-action produced no artifactPaths output; refusing to publish unscanned bundles'
+            exit 1
+          }
+          try {
+            $paths = @($env:ARTIFACT_PATHS | ConvertFrom-Json)
+          } catch {
+            Write-Host "::error::could not parse artifactPaths ($($_.Exception.Message)); refusing to publish unscanned bundles"
+            exit 1
+          }
+          $missing = @($paths | Where-Object { $_ -and -not (Test-Path $_ -PathType Leaf) })
+          if ($missing) {
+            Write-Host "::error::artifactPaths lists files that do not exist: $($missing -join ', ')"
+            exit 1
+          }
+          $paths = @($paths | Where-Object { $_ })
+          if (-not $paths) {
+            Write-Host '::error::artifactPaths resolved to an empty list; refusing to publish unscanned bundles'
+            exit 1
+          }
+          Write-Host "scanning $($paths.Count) Windows bundle(s)"
+
+          # Scan copies: real-time protection is live, so a detection would delete
+          # the release artifact itself. Copies double as submission material,
+          # since clearance is per hash and a rebuild hashes differently.
+          $work = Join-Path $env:RUNNER_TEMP 'defender-scan'
+          Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+
+          # Real-time protection acts on open and on write, and -DisableRemediation
+          # governs only the explicit scan, so a hit would quarantine the bundle
+          # mid-copy and leave the failure handler nothing to upload. Exempt both
+          # ends of the copy. The verdict is unaffected: -DisableRemediation
+          # ignores file exclusions. Left in place, since the copies must survive
+          # until the failure-gated preserve step runs.
+          $exclude = @($work) + @($paths | Split-Path -Parent | Sort-Object -Unique)
+          Add-MpPreference -ExclusionPath $exclude -ErrorAction Continue
+
+          # -ErrorAction Continue does not stop on a rejected exclusion, so read
+          # it back. Defender stores these verbatim; normalise anyway.
+          $norm = { param($p) $p.TrimEnd('\').ToLowerInvariant() }
+          $applied = @(@((Get-MpPreference).ExclusionPath) | ForEach-Object { & $norm $_ })
+          $notApplied = @($exclude | Where-Object { $applied -notcontains (& $norm $_) })
+          if ($notApplied) {
+            Write-Host "::error::Defender refused these exclusions: $($notApplied -join ', '); a detection would quarantine the bundle mid-copy and leave nothing to submit"
+            exit 1
+          }
+
+          $detected = @()
+          $unscanned = @()
+          foreach ($f in $paths) {
+            $leaf = Split-Path $f -Leaf
+            $copy = Join-Path $work $leaf
+            Copy-Item $f $copy -Force
+
+            # Block-at-first-sight only consults the cloud for internet-zone files,
+            # so stamp mark-of-the-web or this is not the user path.
+            "[ZoneTransfer]`nZoneId=3" | Set-Content -Path $copy -Stream Zone.Identifier -Encoding Ascii -ErrorAction SilentlyContinue
+
+            $out = & $mp -Scan -ScanType 3 -File $copy -DisableRemediation 2>&1
+            $code = $LASTEXITCODE
+            $text = ($out | Out-String)
+            $out | ForEach-Object { Write-Host "  $_" }
+
+            # Exit 2 is a detection or a scan error, and 0 is the only documented
+            # clean code, so read the output text too.
+            if ($text -match 'found\s+\d+\s+threat') {
+              $names = @([regex]::Matches($text, '((?:Trojan|Virus|Worm|Backdoor|Ransom|HackTool|PUA|Behavior|Program|Misleading)[:\w\./!\-]+)') |
+                         ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+              if (-not $names) { $names = @('unnamed detection') }
+              Write-Host "::error::Defender flagged ${leaf}: $($names -join ', ')"
+              $detected += "$leaf [$($names -join ', ')]"
+            } elseif ($code -ne 0) {
+              Write-Host "::error::Defender did not complete a scan of $leaf (MpCmdRun exit $code)"
+              $unscanned += "$leaf [exit $code]"
+            } else {
+              Write-Host "clean: $leaf"
+            }
+          }
+
+          if ($unscanned) {
+            Write-Host "::error::Refusing to publish bundles Defender could not scan: $($unscanned -join '; ')"
+          }
+          if ($detected) {
+            Write-Host "::error::Refusing to publish a Windows bundle Defender flags: $($detected -join '; ')"
+            Write-Host 'If this is a false positive, submit it at https://www.microsoft.com/en-us/wdsi/filesubmission (Software developer -> incorrectly detected) and re-run once cleared.'
+          }
+          if ($detected -or $unscanned) { exit 1 }
+          Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
+          Write-Host "All $($paths.Count) Windows bundle(s) scanned clean."
+
+      - name: Prepare Microsoft submission packet
+        if: (success() || failure()) && matrix.platform == 'windows-latest' && steps.build_windows.outcome == 'success'
+        shell: pwsh
+        env:
+          ARTIFACT_PATHS: ${{ steps.build_windows.outputs.artifactPaths }}
+        run: |
+          $paths = @($env:ARTIFACT_PATHS | ConvertFrom-Json) |
+                   Where-Object { $_ -like '*-setup.exe' }
+          $md = @(
+            '## Microsoft submission packet',
+            '',
+            'Submit at <https://www.microsoft.com/en-us/wdsi/filesubmission> before announcing this release.',
+            'Choose **Software developer** -> **Incorrectly detected as malware/malicious**.',
+            'The portal caps uploads at 50 MB. Clearance is per hash, so never substitute a',
+            'different file: for a larger bundle use <https://security.microsoft.com/reportsubmission>,',
+            'which takes 500 MB.',
+            ''
+          )
+          foreach ($f in $paths) {
+            $item = Get-Item $f
+            $sig = Get-AuthenticodeSignature $f
+            $md += "### $($item.Name)"
+            $md += ''
+            $md += '| field | value |'
+            $md += '|---|---|'
+            $md += "| SHA-256 | ``$((Get-FileHash -Algorithm SHA256 $f).Hash)`` |"
+            $md += "| SHA-1 | ``$((Get-FileHash -Algorithm SHA1 $f).Hash)`` |"
+            $md += "| Size | $($item.Length) bytes |"
+            $md += "| Signature | $($sig.Status) |"
+            $md += "| Signer | $($sig.SignerCertificate.Subject) |"
+            $md += "| Product | $($env:APP_VERSION) |"
+            $md += ''
+          }
+          $md += '> Clearance is per hash. It fixes the release you submit and nothing after it,'
+          $md += '> so this is a complement to signing, not a substitute.'
+          $out = "$env:RUNNER_TEMP\ms-submission-packet.md"
+          $md -join "`n" | Out-File $out -Encoding utf8
+          $md -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host ($md -join "`n")
+
+      - name: Stage release assets
+        shell: bash
+        env:
+          ARTIFACT_PATHS: ${{ steps.build_linux.outputs.artifactPaths || steps.build_macos.outputs.artifactPaths || steps.build_windows.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, shutil
+          dest = pathlib.Path(os.environ['RUNNER_TEMP'], 'rehearsal-assets')
+          dest.mkdir(parents=True, exist_ok=True)
+          for p in json.loads(os.environ['ARTIFACT_PATHS'] or '[]'):
+              src = pathlib.Path(p)
+              if src.is_file():
+                  shutil.copy(src, dest / src.name)
+                  print('staged', src.name, src.stat().st_size)
+          PY
+          ls -la "$RUNNER_TEMP/rehearsal-assets"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rehearsal-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/rehearsal-assets/*
+          if-no-files-found: error
+
+  publish:
+    name: "Publish the staging prerelease"
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rehearsal-*
+          path: assets
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ls -la assets
+          gh release delete "$REHEARSAL_TAG" --yes --cleanup-tag 2>/dev/null || true
+          gh release create "$REHEARSAL_TAG" --prerelease \
+            --title "Desktop release rehearsal" \
+            --notes "Staging rehearsal build. Not for distribution." assets/*
+          gh release view "$REHEARSAL_TAG" --json assets --jq '.assets[] | "\(.name)  \(.size)"'
+
+  install-verify:
+    name: "Download, scan, install and launch on Windows"
+    needs: publish
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Restore Defender to a cloud-enabled state
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $atp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
+          if (Test-Path $atp) { Remove-ItemProperty -Path $atp -Name 'ForceDefenderPassiveMode' -ErrorAction SilentlyContinue }
+          Start-Service -Name WinDefend -ErrorAction SilentlyContinue
+          foreach ($x in @((Get-MpPreference).ExclusionPath)) { if ($x) { Remove-MpPreference -ExclusionPath $x -ErrorAction SilentlyContinue } }
+          Set-MpPreference `
+            -DisableRealtimeMonitoring $false -DisableIOAVProtection $false `
+            -DisableScriptScanning $false -DisableBehaviorMonitoring $false `
+            -DisableArchiveScanning $false -MAPSReporting Advanced `
+            -SubmitSamplesConsent SendAllSamples -CloudBlockLevel High `
+            -CloudExtendedTimeout 50 -DisableBlockAtFirstSeen $false -ErrorAction Continue
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          $plat = Get-ChildItem 'C:\ProgramData\Microsoft\Windows Defender\Platform' -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+          if ($plat -and (Test-Path "$($plat.FullName)\MpCmdRun.exe")) { $mp = "$($plat.FullName)\MpCmdRun.exe" }
+          "MPCMDRUN=$mp" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          Update-MpSignature -UpdateSource MicrosoftUpdateServer -ErrorAction Continue
+          & $mp -SignatureUpdate 2>&1 | Write-Host
+          $s = Get-MpComputerStatus; $p = Get-MpPreference
+          $s | Format-List AMRunningMode, RealTimeProtectionEnabled, BehaviorMonitorEnabled, IsTamperProtected, AMEngineVersion, AntivirusSignatureVersion | Out-String | Write-Host
+          $p | Format-List MAPSReporting, SubmitSamplesConsent, DisableBlockAtFirstSeen, CloudBlockLevel, ExclusionPath | Out-String | Write-Host
+          & $mp -ValidateMapsConnection 2>&1 | Write-Host
+          Write-Host "ValidateMapsConnection exit: $LASTEXITCODE"
+          $fatal = @()
+          if (-not $s.RealTimeProtectionEnabled) { $fatal += 'real-time protection off' }
+          if ([int]$p.MAPSReporting -ne 2) { $fatal += 'MAPS off' }
+          if ($p.DisableBlockAtFirstSeen) { $fatal += 'block-at-first-sight off' }
+          if ($fatal) { Write-Host "::error::Defender not authoritative: $($fatal -join '; ')"; exit 1 }
+          Write-Host 'Defender is active with cloud protection and block-at-first-sight on.'
+
+      - name: EICAR positive control
+        run: |
+          $eicar = Join-Path $env:RUNNER_TEMP 'selftest.com'
+          $blocked = $false
+          try {
+            [System.IO.File]::WriteAllText($eicar, 'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!' + '$H+H*')
+          } catch { $blocked = $true }
+          if (-not (Test-Path $eicar)) { $blocked = $true }
+          if ($blocked) { Write-Host 'EICAR blocked on write: real-time protection is live.'; exit 0 }
+          $out = (& $env:MPCMDRUN -Scan -ScanType 3 -File $eicar -DisableRemediation 2>&1 | Out-String)
+          Write-Host $out
+          Remove-Item $eicar -Force -ErrorAction SilentlyContinue
+          if ($out -notmatch 'found\s+\d+\s+threat' -and $out -notmatch 'EICAR') {
+            Write-Host '::error::EICAR did not fire; a clean verdict below would be meaningless'
+            exit 1
+          }
+          Write-Host 'EICAR fired: the scanner works.'
+
+      - name: Download the published installer over the network
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $dl = Join-Path $env:RUNNER_TEMP 'dl'
+          New-Item -ItemType Directory -Force -Path $dl | Out-Null
+          gh release download $env:REHEARSAL_TAG --repo $env:GITHUB_REPOSITORY --pattern '*-setup.exe' --dir $dl
+          $setup = Get-ChildItem $dl -Filter '*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { Write-Host '::error::no installer downloaded'; exit 1 }
+          # A programmatic download gets no mark-of-the-web, and block-at-first-sight
+          # only consults the cloud for internet-zone files. Stamp it, or this is not
+          # the path a user takes.
+          "[ZoneTransfer]`nZoneId=3" | Set-Content -Path $setup.FullName -Stream Zone.Identifier -Encoding Ascii
+          $streams = (Get-Item $setup.FullName -Stream *).Stream -join ', '
+          Write-Host "downloaded $($setup.Name) ($($setup.Length) bytes); streams: $streams"
+          Write-Host "sha256: $((Get-FileHash $setup.FullName -Algorithm SHA256).Hash)"
+          $sig = Get-AuthenticodeSignature $setup.FullName
+          Write-Host "signature: $($sig.Status)  $($sig.SignerCertificate.Subject)"
+          "SETUP=$($setup.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Scan the downloaded installer
+        id: scan
+        run: |
+          $out = & $env:MPCMDRUN -Scan -ScanType 3 -File $env:SETUP -DisableRemediation 2>&1
+          $code = $LASTEXITCODE
+          $text = ($out | Out-String)
+          $out | ForEach-Object { Write-Host "  $_" }
+          Write-Host "MpCmdRun exit: $code"
+          if ($text -match 'found\s+\d+\s+threat') {
+            Write-Host "::error::Defender FLAGGED the downloaded installer"
+            "flagged=true" | Out-File $env:GITHUB_OUTPUT -Append
+            exit 1
+          }
+          if ($code -ne 0) { Write-Host "::error::scan did not complete (exit $code)"; exit 1 }
+          Write-Host '::notice::Defender scanned the downloaded installer CLEAN'
+          "flagged=false" | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Silent install
+        run: |
+          $before = Get-Date
+          "INSTALL_START=$($before.ToString('o'))" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          $p = Start-Process -FilePath $env:SETUP -ArgumentList '/S' -PassThru -Wait -NoNewWindow
+          Write-Host "installer exit: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { Write-Host '::error::silent install failed'; exit 1 }
+          $roots = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+                     'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall')
+          $entry = $roots | Where-Object { Test-Path $_ } | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue } |
+                   ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+                   Where-Object { $_.MainBinaryName } | Select-Object -First 1
+          if (-not $entry) { Write-Host '::error::no install registered'; exit 1 }
+          $dir = $entry.InstallLocation.Trim('"')
+          $exe = Join-Path $dir $entry.MainBinaryName
+          Write-Host "installed: $($entry.DisplayName) $($entry.DisplayVersion)"
+          Write-Host "  publisher: $($entry.Publisher)"
+          Write-Host "  location:  $dir"
+          Write-Host "  binary:    $exe"
+          if (-not (Test-Path $exe)) { Write-Host '::error::app binary missing'; exit 1 }
+          "APPEXE=$exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "APPDIR=$dir" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Inspect what landed on disk
+        run: |
+          Get-ChildItem $env:APPDIR -Recurse -File | ForEach-Object {
+            $mark = if ($_.Extension -in '.exe', '.dll', '.ps1', '.psm1') { (Get-AuthenticodeSignature $_.FullName).Status } else { '-' }
+            "{0,-46} {1,12:N0}  {2}" -f $_.Name, $_.Length, $mark | Write-Host
+          }
+          $ps1 = Join-Path $env:APPDIR 'install.ps1'
+          if (Test-Path $ps1) {
+            $sig = Get-AuthenticodeSignature $ps1
+            Write-Host "install.ps1 signature: $($sig.Status) $($sig.SignerCertificate.Subject)"
+            $streams = (Get-Item $ps1 -Stream *).Stream -join ', '
+            Write-Host "install.ps1 streams: $streams"
+            if ($streams -match 'Zone.Identifier') { Write-Host '::error::extracted install.ps1 carries a mark-of-the-web' }
+          }
+
+      - name: Launch the app
+        run: |
+          $app = Start-Process -FilePath $env:APPEXE -PassThru
+          Start-Sleep -Seconds 30
+          $app.Refresh()
+          if ($app.HasExited) {
+            Write-Host "::error::app exited early, code=$($app.ExitCode) (0x$('{0:X8}' -f $app.ExitCode))"
+            exit 1
+          }
+          Write-Host "app alive after 30s (pid $($app.Id), window handle $($app.MainWindowHandle))"
+          Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+
+      - name: Defender events during install and launch
+        if: always()
+        run: |
+          $start = [datetime]::Parse($env:INSTALL_START)
+          $ev = Get-WinEvent -FilterHashtable @{
+            LogName = 'Microsoft-Windows-Windows Defender/Operational'
+            Id = 1006, 1007, 1008, 1015, 1116, 1117, 1118, 1119
+            StartTime = $start
+          } -ErrorAction SilentlyContinue
+          if ($ev) {
+            Write-Host "::error::Defender raised $($ev.Count) detection event(s) during install or launch"
+            $ev | ForEach-Object { Write-Host "  [$($_.Id)] $($_.TimeCreated): $($_.Message.Split([char]10)[0])" }
+            exit 1
+          }
+          Write-Host '::notice::no Defender detection events during install or launch'
+          $threats = Get-MpThreat -ErrorAction SilentlyContinue
+          if ($threats) {
+            Write-Host '::error::Get-MpThreat is not empty:'
+            $threats | Format-List ThreatName, Resources | Out-String | Write-Host
+            exit 1
+          }
+          Write-Host 'Get-MpThreat: empty'
+
+      - name: Scan the installed tree
+        if: always()
+        run: |
+          $out = & $env:MPCMDRUN -Scan -ScanType 3 -File $env:APPDIR -DisableRemediation 2>&1
+          $code = $LASTEXITCODE
+          $out | ForEach-Object { Write-Host "  $_" }
+          if (($out | Out-String) -match 'found\s+\d+\s+threat') {
+            Write-Host '::error::Defender flagged something in the installed tree'
+            exit 1
+          }
+          if ($code -ne 0) { Write-Host "::error::installed-tree scan did not complete (exit $code)"; exit 1 }
+          Write-Host '::notice::installed tree scans CLEAN'
