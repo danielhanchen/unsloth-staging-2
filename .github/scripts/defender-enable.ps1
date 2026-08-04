@@ -92,7 +92,11 @@ $s | Format-List AMServiceEnabled, RealTimeProtectionEnabled, BehaviorMonitorEna
 
 $problems = @()
 if ($p.DisableRealtimeMonitoring)      { $problems += 'DisableRealtimeMonitoring is still true' }
-if ($p.MAPSReporting -ne 'Advanced')   { $problems += "MAPSReporting is $($p.MAPSReporting)" }
+# MAPSReporting comes back as the underlying enum value (2 = Advanced), not the
+# string, so compare numerically. Same for SubmitSamplesConsent (3 = SendAllSamples)
+# and CloudBlockLevel (2 = High).
+if ([int]$p.MAPSReporting -ne 2)       { $problems += "MAPSReporting is $($p.MAPSReporting), expected 2 (Advanced)" }
+if ([int]$p.SubmitSamplesConsent -ne 3){ $problems += "SubmitSamplesConsent is $($p.SubmitSamplesConsent), expected 3 (SendAllSamples)" }
 if ($p.DisableBlockAtFirstSeen)        { $problems += 'block-at-first-sight is still disabled' }
 if ($p.ExclusionPath)                  { $problems += "exclusions remain: $($p.ExclusionPath -join ',')" }
 if (-not $s.RealTimeProtectionEnabled) { $problems += "RealTimeProtectionEnabled is false (AMRunningMode=$($s.AMRunningMode))" }

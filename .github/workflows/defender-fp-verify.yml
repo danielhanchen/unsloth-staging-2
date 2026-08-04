@@ -1,0 +1,206 @@
+# Gate B produced a clean verdict for BOTH installers. A clean result is only
+# meaningful if the harness can detect anything at all, so this workflow does two
+# things the first one did not:
+#
+#   1. A POSITIVE CONTROL. The EICAR test string is the industry-standard
+#      "every scanner must flag this" file. If EICAR does not fire, the harness
+#      is broken and every clean verdict from it is worthless. It is assembled at
+#      runtime from fragments so this workflow file is not itself flagged.
+#
+#   2. The install.ps1 BISECT LADDER. Seven historical versions spanning the two
+#      builds, fetched straight from raw.githubusercontent at each commit. If the
+#      PowerShell is what trips the classifier, exactly one step of this ladder
+#      flips from clean to detected and names the commit. Costs about a minute.
+#
+# It also re-measures the two installers, so a flip caused by a definition update
+# between runs is visible rather than silent.
+
+name: "Defender FP - positive control + install.ps1 bisect"
+
+on:
+  push:
+    branches: [defender-fp-ci]
+    paths:
+      - '.github/workflows/defender-fp-verify.yml'
+      - '.github/scripts/defender-*.ps1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BASE_URL: 'https://github.com/danielhanchen/unsloth-staging-2/releases/download/defender-fp-samples'
+
+jobs:
+  verify:
+    name: "Positive control + bisect ladder"
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Prepare directories
+        run: |
+          foreach ($d in 'reports', 'control', 'ladder', 'samples') {
+            New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\$d" | Out-Null
+          }
+          "REPORTDIR=$env:GITHUB_WORKSPACE\reports" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Restore Defender with cloud-delivered protection
+        continue-on-error: true
+        run: .github/scripts/defender-enable.ps1
+
+      # ---- 1. POSITIVE CONTROL -------------------------------------------
+      # If this step does not report "detected", nothing else in this workflow
+      # (or in the Gate B/C run) can be believed.
+      - name: Positive control - EICAR must be detected
+        id: control
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # Assembled from fragments so this YAML file is not itself a sample.
+          $eicar = 'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!' + '$H+H*'
+          $p = "$env:GITHUB_WORKSPACE\control\eicar-control.com"
+          [System.IO.File]::WriteAllText($p, $eicar)
+
+          # Real-time protection may remove it the instant it is written. That is
+          # itself a pass: it proves on-write scanning is live.
+          $survivedWrite = Test-Path $p
+          Write-Host "EICAR survived the write: $survivedWrite"
+
+          $detected = $false
+          if (-not $survivedWrite) {
+            Write-Host 'Real-time protection removed EICAR on write - harness is live.'
+            $detected = $true
+          } else {
+            $mp = $env:MPCMDRUN
+            if (-not $mp -or -not (Test-Path $mp)) { $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe" }
+            $out = & $mp -Scan -ScanType 3 -File $p -DisableRemediation 2>&1
+            $text = ($out | Out-String)
+            $out | ForEach-Object { Write-Host "  $_" }
+            $detected = [bool](($text -match 'found\s+\d+\s+threat') -or ($text -match 'EICAR'))
+          }
+
+          if ($detected) {
+            Write-Host '::notice::POSITIVE CONTROL PASSED - Defender detects a known-bad file on this runner.'
+            "control_passed=true" | Out-File $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Host '::error::POSITIVE CONTROL FAILED - Defender did not flag EICAR. Every clean verdict from this harness is meaningless.'
+            "control_passed=false" | Out-File $env:GITHUB_OUTPUT -Append
+          }
+          Remove-Item $p -Force -ErrorAction SilentlyContinue
+
+      # ---- 2. install.ps1 bisect ladder ----------------------------------
+      - name: Fetch the seven historical install.ps1 versions
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # Ordered oldest to newest. The two markers that appear in this window
+          # are the $env:PSModulePath prepend (#7692) and the Set-Location out of
+          # System32 (#7744) -- the only behavioural changes to this file between
+          # the clean 0.1.51 build and the flagged 0.1.512 one.
+          $versions = @(
+            @{ tag = '1-baseline-0.1.51'; sha = '7f27d8ea' }
+            @{ tag = '2-pr7641';          sha = 'c670340e' }
+            @{ tag = '3-pr7692-psmodulepath'; sha = '479b46e8' }
+            @{ tag = '4-pr7744-system32'; sha = '5b611730' }
+            @{ tag = '5-pr7754';          sha = 'f916ea7f' }
+            @{ tag = '6-pr7763';          sha = '1770182b' }
+            @{ tag = '7-pr7786-head';     sha = '04cd4d44' }
+          )
+          foreach ($v in $versions) {
+            $url = "https://raw.githubusercontent.com/unslothai/unsloth/$($v.sha)/install.ps1"
+            $dst = "$env:GITHUB_WORKSPACE\ladder\$($v.tag)--$($v.sha).ps1"
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing -TimeoutSec 120
+              $psmp = (Select-String -Path $dst -Pattern 'PSModulePath' -AllMatches).Count
+              $setloc = (Select-String -Path $dst -Pattern 'Set-Location' -AllMatches).Count
+              Write-Host ("  {0,-26} {1,8} bytes  PSModulePath={2} Set-Location={3}" -f $v.tag, (Get-Item $dst).Length, $psmp, $setloc)
+            } catch {
+              Write-Host "::warning::could not fetch $($v.tag): $($_.Exception.Message)"
+            }
+          }
+
+      - name: Scan the ladder
+        continue-on-error: true
+        run: .github/scripts/defender-scan.ps1 -Path "$env:GITHUB_WORKSPACE\ladder" -OutJson "$env:REPORTDIR\ladder.json"
+
+      # ---- 3. re-measure the installers ----------------------------------
+      - name: Re-measure both installers
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          foreach ($n in @('old_0.1.51', 'new_0.1.512')) {
+            $dst = "$env:GITHUB_WORKSPACE\samples\$n.exe"
+            Invoke-WebRequest -Uri "$env:BASE_URL/$n.exe" -OutFile $dst -UseBasicParsing -TimeoutSec 600
+            if (Test-Path $dst) {
+              "[ZoneTransfer]`nZoneId=3`nHostUrl=$env:BASE_URL/$n.exe" |
+                Set-Content -Path $dst -Stream Zone.Identifier -Encoding Ascii
+              Write-Host "$n survived download"
+            } else {
+              Write-Host "::warning::$n removed on write"
+            }
+          }
+
+      - name: Scan both installers again
+        continue-on-error: true
+        run: .github/scripts/defender-scan.ps1 -Path "$env:GITHUB_WORKSPACE\samples" -Filter '*.exe' -OutJson "$env:REPORTDIR\installers-recheck.json"
+
+      - name: Summary
+        if: always()
+        continue-on-error: true
+        run: |
+          $md = @('## Positive control + install.ps1 bisect', '')
+          $md += "Defender environment: **$env:DEFENDER_ENV**"
+          $md += "EICAR positive control passed: **${{ steps.control.outputs.control_passed }}**"
+          $md += ''
+          if ('${{ steps.control.outputs.control_passed }}' -ne 'true') {
+            $md += '> The positive control FAILED, so no clean verdict below carries any weight.'
+            $md += ''
+          }
+          foreach ($pair in @(@('ladder.json', 'install.ps1 ladder'), @('installers-recheck.json', 'installers (re-measured)'))) {
+            $j = "$env:REPORTDIR\$($pair[0])"
+            if (Test-Path $j) {
+              $md += "### $($pair[1])"
+              $md += ''
+              $md += '| file | size | verdict | threats |'
+              $md += '|---|---|---|---|'
+              foreach ($x in ((Get-Content $j -Raw | ConvertFrom-Json) | Sort-Object file)) {
+                $md += "| $($x.file) | $($x.sizeBytes) | $($x.classification) | $($x.threatNames -join ', ') |"
+              }
+              $md += ''
+            }
+          }
+          $md -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $md -join "`n" | Write-Host
+
+      - name: Collect Defender logs
+        if: always()
+        continue-on-error: true
+        run: |
+          $dst = "$env:REPORTDIR\defender-logs"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $src = 'C:\ProgramData\Microsoft\Windows Defender\Support'
+          if (Test-Path $src) {
+            Get-ChildItem $src -Include MPLog-*.log, MPDetection-*.log, MpCmdRun.log -Recurse -ErrorAction SilentlyContinue |
+              ForEach-Object { Copy-Item $_.FullName $dst -Force -ErrorAction SilentlyContinue }
+          }
+          Get-MpThreat          -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4 | Out-File "$dst\mp-threat.json" -Encoding utf8
+          Get-MpThreatDetection -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4 | Out-File "$dst\mp-threatdetection.json" -Encoding utf8
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reports/**
+          retention-days: 14
+          if-no-files-found: warn
