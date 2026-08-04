@@ -112,6 +112,20 @@ jobs:
           "TAURI_SIGNING_PRIVATE_KEY=$($key.Trim())" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
           "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: Sign the bundled install script with the test certificate
+        run: |
+          # Stand-in for the release workflow's trusted-signing step: same
+          # signtool path, same ordering (before the bundler packs resources).
+          $script = (Resolve-Path 'install.ps1').Path
+          $st = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match 'x64' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $st) { Write-Host '::error::signtool not found'; exit 1 }
+          & $st.FullName sign /fd SHA256 /sha1 $env:CERT_THUMB $script 2>&1 | Write-Host
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not sign install.ps1 ($LASTEXITCODE)"; exit 1 }
+          $sig = Get-AuthenticodeSignature $script
+          Write-Host "install.ps1 -> $($sig.Status) $($sig.SignerCertificate.Subject)"
+          if (-not $sig.SignerCertificate) { Write-Host '::error::no signature attached'; exit 1 }
+
       - name: Build the Windows bundle
         id: build
         run: |
