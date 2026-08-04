@@ -3,6 +3,8 @@
 
 import { useCallback, useEffect, useRef } from "react";
 import { toast } from "@/lib/toast";
+import { clearRemoteBackoff, type HubFailure } from "@/features/hub/lib/network";
+import { useHubAvailability } from "./use-online-status";
 import {
   type HfModelResult,
   type HfModelSearchChannel,
@@ -24,10 +26,17 @@ export interface DiscoverSearch {
   hasMore: boolean;
   fetchMore: () => boolean;
   searchError: string | null;
+  /** Classified cause of the last failure, for a diagnosable error panel. */
+  searchFailure: HubFailure | null;
   handleRetrySearch: () => void;
 }
 
-type DiscoverErrorKind = "offline" | "auth" | "rate-limited" | "server" | "unknown";
+type DiscoverErrorKind =
+  | "offline"
+  | "auth"
+  | "rate-limited"
+  | "server"
+  | "unknown";
 
 const RECONNECT_RETRY_COOLDOWN_MS = 90_000;
 
@@ -69,7 +78,7 @@ function classifyDiscoverError(
 function discoverErrorTitle(kind: DiscoverErrorKind): string {
   switch (kind) {
     case "offline":
-      return "You're offline";
+      return "Can't reach Hugging Face";
     case "auth":
       return "Hugging Face auth failed";
     case "rate-limited":
@@ -88,7 +97,6 @@ export function useDiscoverSearch({
   direction,
   channel,
   ownerScope,
-  online,
 }: {
   debouncedQuery: string;
   accessToken: string | undefined;
@@ -98,21 +106,27 @@ export function useDiscoverSearch({
   direction: HfSortDirection;
   channel: HfModelSearchChannel | null;
   ownerScope: "unsloth" | "all";
-  online: boolean;
+  /** Accepted for compatibility; availability is read from the network store. */
+  online?: boolean;
 }): DiscoverSearch {
+  const { phase, failure, proxyServing } = useHubAvailability();
+  const online = phase === "available";
+
+  // Not gated on availability: gating disabled the paginated hook, which
+  // discarded the error, so every cause rendered as the same generic panel.
   const modelSearch = useHubModelSearch(debouncedQuery, {
     accessToken,
     sortBy,
     sortDirection: direction,
     pinUnslothFirst: true,
     ownerScope,
-    enabled: online && isDiscoverTab && !isDatasetMode,
+    enabled: isDiscoverTab && !isDatasetMode,
     keepUnsupportedTags: true,
     channel,
   });
   const datasetSearch = useHubDatasetSearch(debouncedQuery, {
     accessToken,
-    enabled: online && isDiscoverTab && isDatasetMode,
+    enabled: isDiscoverTab && isDatasetMode,
     sortBy,
     sortDirection: direction,
   });
@@ -129,26 +143,30 @@ export function useDiscoverSearch({
   const rawFetchMore = isDatasetMode
     ? datasetSearch.fetchMore
     : modelSearch.fetchMore;
+  // Already sanitized in useHubPaginatedSearch, where every consumer reads it.
   const rawSearchError = isDatasetMode ? datasetSearch.error : modelSearch.error;
   const retrySearch = isDatasetMode ? datasetSearch.retry : modelSearch.retry;
-  const searchError = isDiscoverTab && online ? rawSearchError : null;
+  // Surfaced regardless of availability: the failure IS the thing worth showing.
+  const searchError = isDiscoverTab ? rawSearchError : null;
+  const searchFailure = isDiscoverTab ? failure : null;
+  // Allowed while probing: with results preserved on screen this is the only
+  // request the view can make, so gating it on `online` left Load more a
+  // permanent no-op. The backoff still blocks the `unavailable` window.
+  const canProbe = online || phase === "probing";
   const fetchMore = useCallback(() => {
-    if (!online || !hasMore) return false;
+    if (!canProbe || !hasMore) return false;
     return rawFetchMore();
-  }, [online, hasMore, rawFetchMore]);
+  }, [canProbe, hasMore, rawFetchMore]);
 
   const handleRetrySearch = useCallback(() => {
-    if (!online) {
-      toast.error("You're offline", {
-        description: "Reconnect to the internet to browse Hugging Face.",
-      });
-      return;
-    }
+    // Always re-probe: refusing during the backoff left users unable to test a
+    // firewall, DNS or certificate change without waiting out the timer.
+    clearRemoteBackoff();
     retrySearch();
     toast.message("Retrying…", {
       description: "Reaching Hugging Face for the latest models.",
     });
-  }, [online, retrySearch]);
+  }, [retrySearch]);
 
   const lastErrorRef = useRef<DiscoverErrorKind | null>(null);
   useEffect(() => {
@@ -164,17 +182,22 @@ export function useDiscoverSearch({
     if (lastErrorRef.current === errorKind) return;
     lastErrorRef.current = errorKind;
     toast.error(discoverErrorTitle(errorKind), {
-      description: online
-        ? searchError
-        : "Reconnect to the internet to browse models.",
+      // The classified failure names the cause; the raw message covers HTTP
+      // errors that never reach the network layer.
+      description: searchFailure?.message ?? searchError,
       action: { label: "Retry", onClick: handleRetrySearch },
     });
-  }, [isDiscoverTab, searchError, online, handleRetrySearch]);
+  }, [isDiscoverTab, searchError, searchFailure, online, handleRetrySearch]);
 
-  const wasOfflineRef = useRef(!online);
+  // Driven by a successful request, never a lapsed timer. Announcing recovery
+  // on TTL expiry produced a permanent offline/back-online loop.
+  const wasUnavailableRef = useRef(phase !== "available");
   const lastReconnectAtRef = useRef(0);
   useEffect(() => {
-    if (online && wasOfflineRef.current && isDiscoverTab) {
+    // Not on proxy-served availability: the iterator already has its page, and
+    // retrySearch would build a fresh transport with no affinity and re-attempt
+    // the blocked direct request.
+    if (online && !proxyServing && wasUnavailableRef.current && isDiscoverTab) {
       const now = Date.now();
       if (now - lastReconnectAtRef.current > RECONNECT_RETRY_COOLDOWN_MS) {
         lastReconnectAtRef.current = now;
@@ -184,8 +207,8 @@ export function useDiscoverSearch({
         retrySearch();
       }
     }
-    wasOfflineRef.current = !online;
-  }, [online, retrySearch, isDiscoverTab]);
+    wasUnavailableRef.current = !online;
+  }, [online, proxyServing, retrySearch, isDiscoverTab]);
 
   return {
     results,
@@ -196,6 +219,7 @@ export function useDiscoverSearch({
     hasMore,
     fetchMore,
     searchError,
+    searchFailure,
     handleRetrySearch,
   };
 }
