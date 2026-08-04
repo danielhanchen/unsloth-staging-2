@@ -3465,3 +3465,108 @@ def fix_peft_stale_torchao_import_error():
             except Exception:
                 pass
     return patched
+
+
+# torchao 0.18.0 imports symbols from torch that only exist in torch 2.10+,
+# without the version guard 0.17 had. See fix_torchao_torch_symbol_skew.
+_TORCHAO_TORCH_SYMBOLS = ("ScalingType", "SwizzleType")
+
+
+def _make_torch_symbol_placeholder(name, detail):
+    """A stand-in that imports cleanly and refuses to be used.
+
+    torchao 0.17 simply left these names undefined on older torch, so any code
+    path that wanted them raised NameError. A placeholder that silently
+    pretended to be a real enum would be worse than the crash it replaces --
+    it could hand a float8 path a meaningless value. So it satisfies the
+    `from ... import` and nothing else: touch it and you get the version skew
+    spelled out.
+    """
+    message = (
+        f"Unsloth: `torch.nn.functional.{name}` does not exist in this torch. "
+        f"{detail} Unsloth supplied a placeholder so that importing torchao "
+        f"(and therefore unsloth) still works, but this symbol cannot be used. "
+        f"Install `torchao<0.18` to use float8/MX features on this torch, or "
+        f"upgrade torch."
+    )
+
+    class _Meta(type):
+        def __getattr__(cls, item):
+            raise RuntimeError(message)
+
+        def __call__(cls, *args, **kwargs):
+            raise RuntimeError(message)
+
+        def __repr__(cls):
+            return f"<unsloth placeholder for torch.nn.functional.{name}>"
+
+    placeholder = _Meta(name, (), {"__doc__": message})
+    # So we can recognise (and never double-patch) our own object later.
+    type.__setattr__(placeholder, "__unsloth_placeholder__", True)
+    return placeholder
+
+
+def fix_torchao_torch_symbol_skew():
+    """Let `import unsloth` survive a torchao built for a newer torch.
+
+    torchao 0.17 guarded the import::
+
+        if torch_version_at_least("2.10.0"):
+            from torch.nn.functional import ScalingType, SwizzleType
+
+    0.18.0 moved a neighbouring guard to "2.12.0.dev0" and left this import
+    unguarded at module level, so on any torch below 2.10 it raises::
+
+        ImportError: cannot import name 'ScalingType' from 'torch.nn.functional'
+
+    That surfaces while importing transformers, so unsloth_zoo's import guard
+    catches it, finds no "Unpack" in the text, and re-raises a bare Exception.
+    `import unsloth` is dead, and the message names neither torchao nor torch.
+    Observed on Colab against torch 2.8/2.9 in Gemma3_(4B)-Vision-GRPO,
+    Qwen3_5_(4B)_Vision and Qwen3_8B_FP8_GRPO.
+
+    Deliberately narrow: it fires only when torchao is installed, the torchao
+    version actually has the bug, and torch really is missing the symbol. On a
+    healthy pair it does nothing at all, so nothing is masked.
+    """
+    if importlib.util.find_spec("torchao") is None:
+        return False
+    try:
+        torchao_version = importlib_version("torchao")
+    except Exception:
+        return False
+    try:
+        # 0.17 and earlier guard their own import and need no help.
+        if Version(torchao_version) < Version("0.18.0"):
+            return False
+    except Exception:
+        return False
+
+    try:
+        import torch
+        import torch.nn.functional as F
+        torch_version = str(torch.__version__)
+    except Exception:
+        return False
+
+    detail = (f"torchao {torchao_version} imports it unconditionally, but "
+              f"torch {torch_version} does not provide it (it arrived in "
+              f"torch 2.10).")
+
+    patched = []
+    for name in _TORCHAO_TORCH_SYMBOLS:
+        if hasattr(F, name):
+            continue        # real torch symbol, or already placed by us
+        try:
+            setattr(F, name, _make_torch_symbol_placeholder(name, detail))
+            patched.append(name)
+        except Exception:
+            pass
+    if patched:
+        logger.info(
+            "Unsloth: torchao %s needs torch.nn.functional.%s, which torch %s "
+            "does not have. Adding an unusable placeholder so the import "
+            "succeeds; install torchao<0.18 to use float8/MX features.",
+            torchao_version, "/".join(patched), torch_version,
+        )
+    return bool(patched)

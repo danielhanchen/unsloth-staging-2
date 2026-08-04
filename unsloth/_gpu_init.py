@@ -27,6 +27,7 @@ already_imported = [mod for mod in critical_modules if mod in sys.modules]
 from .import_fixes import (
     fix_message_factory_issue,
     fix_torch_check_is_size,
+    fix_torchao_torch_symbol_skew,
     check_fbgemm_gpu_version,
     disable_broken_causal_conv1d,
     disable_broken_vllm,
@@ -74,6 +75,7 @@ disable_broken_causal_conv1d()
 disable_broken_vllm()
 fix_message_factory_issue()
 fix_torch_check_is_size()
+fix_torchao_torch_symbol_skew()
 check_fbgemm_gpu_version()
 torchvision_compatibility_check()
 fix_diffusers_warnings()
@@ -84,6 +86,7 @@ del disable_broken_causal_conv1d
 del disable_broken_vllm
 del fix_message_factory_issue
 del fix_torch_check_is_size
+del fix_torchao_torch_symbol_skew
 del check_fbgemm_gpu_version
 del torchvision_compatibility_check
 del fix_diffusers_warnings
