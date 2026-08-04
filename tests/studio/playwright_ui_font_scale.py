@@ -28,7 +28,11 @@ ART = Path(os.environ.get("PW_ART_DIR", "logs/playwright_fontscale"))
 ART.mkdir(parents = True, exist_ok = True)
 
 SIZES = (12, 20)
-DEFAULT = 16
+# The product default (UI_FONT_SIZE_RANGE.default), which is the size that leaves
+# data-ui-font-size unset. Distinct from the 16px base the tokens are authored at
+# (UI_FONT_SIZE_CSS_BASE), which is what the scale divides by.
+DEFAULT = 15
+CSS_BASE = 16
 
 
 def step(s):
@@ -233,7 +237,7 @@ def main():
         tab.wait_for(state = "visible", timeout = 15000)
         tab_font = tab.evaluate("el => parseFloat(getComputedStyle(el).fontSize)")
         # text-ui-12p5 at scale 0.75; 16px means twMerge dropped the token.
-        if not near(tab_font, 12.5 * 12 / 16):
+        if not near(tab_font, 12.5 * 12 / CSS_BASE):
             fail(f"hub tab font did not scale (twMerge drop?): {tab_font}")
         icon_w = page.evaluate(
             "() => { const el = document.querySelector('.size-icon');"
