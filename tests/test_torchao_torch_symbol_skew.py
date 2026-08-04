@@ -204,5 +204,61 @@ def test_the_cleanup_in_the_test_above_is_real():
             f"a placeholder for {n} leaked out of a test")
 
 
+# ---- the Mac / MLX path ---------------------------------------------------
+
+INIT = ROOT / "unsloth" / "__init__.py"
+
+
+def test_the_mlx_path_applies_the_fix_too():
+    """`_gpu_init` runs the fix before importing unsloth_zoo, but the MLX
+    branch in __init__.py imports unsloth_zoo directly and never reaches
+    _gpu_init. Without the fix there, an Apple Silicon user with torchao 0.18
+    and torch < 2.10 hits exactly the same dead import."""
+    lines = INIT.read_text(encoding="utf-8").splitlines()
+    fix = next(i for i, l in enumerate(lines) if "_fix_torchao()" in l)
+    zoo = next(i for i, l in enumerate(lines)
+               if l.strip() == "import unsloth_zoo")
+    assert fix < zoo, "the fix must precede the MLX unsloth_zoo import"
+
+
+def test_the_mlx_call_is_inside_the_mlx_branch():
+    """It must not run on GPU hosts from here -- _gpu_init already owns that,
+    and calling it outside the branch would touch torch earlier than the
+    Apple-Silicon detection intends ("before any torch/numpy imports").
+
+    Checked structurally: string offsets cannot tell "inside the if" from
+    "just after it".
+    """
+    import ast as _ast
+    tree = _ast.parse(INIT.read_text(encoding="utf-8"))
+
+    def _mlx_if(nodes):
+        for n in nodes:
+            if isinstance(n, _ast.If) and _ast.dump(n.test).count("_IS_MLX"):
+                return n
+        return None
+
+    node = _mlx_if(tree.body)
+    assert node is not None, "no `if _IS_MLX:` branch found"
+    inside = any(
+        isinstance(c, _ast.Call) and getattr(c.func, "id", "") == "_fix_torchao"
+        for stmt in node.body for c in _ast.walk(stmt))
+    assert inside, "the call must be INSIDE the `if _IS_MLX:` body"
+
+    outside = any(
+        isinstance(c, _ast.Call) and getattr(c.func, "id", "") == "_fix_torchao"
+        for stmt in tree.body if stmt is not node for c in _ast.walk(stmt))
+    assert not outside, "it must not also run on the non-MLX path"
+
+
+def test_the_mlx_call_cannot_break_the_import():
+    """On Mac this runs before anything else; an exception here would replace
+    a torchao problem with an unsloth problem."""
+    src = INIT.read_text(encoding="utf-8")
+    i = src.index("_fix_torchao()")
+    window = src[max(0, i - 400):i + 200]
+    assert "except Exception" in window and "pass" in window
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

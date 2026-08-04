@@ -81,6 +81,19 @@ def _is_mlx_available():
 _IS_MLX = _is_mlx_available()
 
 if _IS_MLX:
+    # The GPU path runs this from _gpu_init before it imports unsloth_zoo. The
+    # MLX path never reaches _gpu_init, so without this an Apple Silicon user
+    # with torchao 0.18 and torch < 2.10 hits the same dead import:
+    #   ImportError: cannot import name 'ScalingType' from 'torch.nn.functional'
+    # It is a no-op unless torchao is both installed and actually affected, so
+    # it costs a find_spec on machines that do not have it, and it touches
+    # nothing CUDA-specific.
+    try:
+        from .import_fixes import fix_torchao_torch_symbol_skew as _fix_torchao
+        _fix_torchao()
+        del _fix_torchao
+    except Exception:
+        pass
     try:
         import unsloth_zoo
     except ImportError as _e:
