@@ -265,6 +265,87 @@ jobs:
           Write-Host "app alive after 25s, window handle $($app.MainWindowHandle)"
           Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
 
+      # ---- 5: VERSIONINFO completeness on the installer -------------------
+      - name: Check the installer VERSIONINFO block
+        id: versioninfo
+        continue-on-error: true
+        run: |
+          $vi = (Get-Item $env:SETUP).VersionInfo
+          $vi | Format-List CompanyName, ProductName, FileDescription, InternalName, LegalCopyright, FileVersion, ProductVersion | Out-String | Write-Host
+          $missing = @()
+          foreach ($f in 'CompanyName','ProductName','FileDescription','InternalName') {
+            if ([string]::IsNullOrWhiteSpace($vi.$f)) { $missing += $f }
+          }
+          if ($missing) { Write-Host "::error::VERSIONINFO missing: $($missing -join ', ')"; exit 1 }
+          Write-Host 'VERSIONINFO is complete.'
+
+      # ---- 6: can RemoteSigned actually load the installed install.ps1? ----
+      - name: Prove RemoteSigned loads the bundled install script
+        id: execpolicy
+        continue-on-error: true
+        run: |
+          # install.rs now spawns powershell with -ExecutionPolicy RemoteSigned
+          # instead of Bypass. That only works if the NSIS-extracted resource
+          # carries no mark-of-the-web, so assert that directly, then prove the
+          # policy really is what blocks a marked file.
+          $installed = Get-ChildItem "$env:LOCALAPPDATA" -Recurse -Filter 'install.ps1' -ErrorAction SilentlyContinue |
+                       Select-Object -First 1
+          if (-not $installed) { Write-Host '::error::no install.ps1 found under LOCALAPPDATA'; exit 1 }
+          Write-Host "installed script: $($installed.FullName)"
+
+          $streams = Get-Item $installed.FullName -Stream * -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Stream
+          Write-Host "streams: $($streams -join ', ')"
+          if ($streams -contains 'Zone.Identifier') {
+            Write-Host '::error::the extracted install.ps1 carries a mark-of-the-web; RemoteSigned would block it'
+            exit 1
+          }
+
+          # Positive and negative controls, so a pass here means something.
+          $dir = Join-Path $env:RUNNER_TEMP 'execpolicy'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $clean = Join-Path $dir 'clean.ps1'
+          $marked = Join-Path $dir 'marked.ps1'
+          "'ran'" | Set-Content $clean -Encoding Ascii
+          "'ran'" | Set-Content $marked -Encoding Ascii
+          "[ZoneTransfer]`nZoneId=3" | Set-Content -Path $marked -Stream Zone.Identifier -Encoding Ascii
+
+          $a = & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File $clean 2>&1 | Out-String
+          $ea = $LASTEXITCODE
+          $b = & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File $marked 2>&1 | Out-String
+          $eb = $LASTEXITCODE
+          Write-Host "unmarked -> exit $ea : $($a.Trim())"
+          Write-Host "marked   -> exit $eb : $($b.Trim())"
+          if ($ea -ne 0)  { Write-Host '::error::RemoteSigned refused an unmarked local script; the premise is wrong'; exit 1 }
+          if ($eb -eq 0)  { Write-Host '::warning::RemoteSigned also ran the marked script, so this control proves nothing on this image' }
+          Write-Host 'RemoteSigned loads the bundled install.ps1.'
+
+      # ---- 7: will the signing toolchain accept a .ps1 at all? ------------
+      - name: Try signing a PowerShell script with signtool
+        id: signps1
+        continue-on-error: true
+        run: |
+          # Deciding whether install.ps1 can join the signed set. Trusted Signing
+          # goes through signtool, so if signtool cannot attach a signature to a
+          # .ps1 here it cannot in the release workflow either.
+          $probe = Join-Path $env:RUNNER_TEMP 'probe.ps1'
+          "Write-Output 'probe'" | Set-Content $probe -Encoding UTF8
+          $st = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match 'x64' } | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $st) { Write-Host '::warning::signtool not found'; exit 0 }
+          Write-Host "signtool: $($st.FullName)"
+          & $st.FullName sign /fd SHA256 /sha1 $env:CERT_THUMB $probe 2>&1 | Write-Host
+          $rc = $LASTEXITCODE
+          $sig = Get-AuthenticodeSignature $probe
+          Write-Host "signtool exit $rc; Get-AuthenticodeSignature -> $($sig.Status) $($sig.SignerCertificate.Subject)"
+          if ($sig.SignerCertificate) {
+            Write-Host '::notice::signtool CAN sign .ps1; install.ps1 can be added to the signed set'
+            "ps1_signable=true" | Out-File $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Host '::notice::signtool cannot sign .ps1; Set-AuthenticodeSignature would be needed instead'
+            "ps1_signable=false" | Out-File $env:GITHUB_OUTPUT -Append
+          }
+          Get-Content $probe -Tail 3 | Write-Host
+
       - name: Summary
         if: always()
         run: |
@@ -273,6 +354,9 @@ jobs:
                   "| installer.nsi NSISPLUGINS | all 4 stock plugin DLLs signed | ${{ steps.inspect.outcome }} (signed=${{ steps.inspect.outputs.plugins_signed }}) |",
                   "| assert-bundle-signed.ps1 | no unsigned PE in bundle | ${{ steps.gate.outcome }} |",
                   "| embedBootstrapper | WebView2 embedded not downloaded | ${{ steps.webview2.outcome }} (embedded=${{ steps.webview2.outputs.embedded }}) |",
+                  "| VERSIONINFO CompanyName/InternalName | present on the installer | ${{ steps.versioninfo.outcome }} |",
+                  "| install.rs RemoteSigned | bundled install.ps1 loads without Bypass | ${{ steps.execpolicy.outcome }} |",
+                  "| signtool on .ps1 | can install.ps1 be signed | ${{ steps.signps1.outcome }} (signable=${{ steps.signps1.outputs.ps1_signable }}) |",
                   "| Defender release gate | fresh bundle scans clean | ${{ steps.defender.outcome }} (clean=${{ steps.defender.outputs.clean }}) |",
                   "| install + launch | installs silently and runs | ${{ steps.install.outcome }} |")
           $md -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
