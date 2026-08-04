@@ -184,6 +184,51 @@ def test_the_patterns_still_exist(modules_json):
     assert "*/*.bin" in U._SUBDIR_WEIGHT_IGNORE_PATTERNS
 
 
+def test_an_older_unsloth_zoo_degrades_instead_of_crashing(modules_json):
+    """Backwards compatibility with an unsloth_zoo that predates the ST module
+    taxonomy. `_ST_WEIGHTED_MODULE_TYPES` is a private name, so a user on an
+    older zoo must fall back to today's pruning rather than get an ImportError
+    on every single model load."""
+    import unsloth_zoo.hf_cache_state as HCS
+    modules_json(EMBEDDINGGEMMA)
+    saved = HCS._ST_WEIGHTED_MODULE_TYPES
+    del HCS._ST_WEIGHTED_MODULE_TYPES
+    try:
+        assert U._repo_has_weighted_st_subfolders("unsloth/embeddinggemma-300m") is False
+    finally:
+        HCS._ST_WEIGHTED_MODULE_TYPES = saved
+    # ...and the taxonomy being back restores the fix, so the assertion above
+    # is about the missing name and not about a broken stub.
+    assert U._repo_has_weighted_st_subfolders("unsloth/embeddinggemma-300m") is True
+
+
+def test_both_weights_at_root_call_sites_go_through_the_check():
+    """File search, pinned. `weights_at_root = True` is passed from exactly two
+    places (vision.py and llama.py) and both reach the prune through
+    maybe_prefetch_hf_snapshot, so one carve-out covers both. If a third call
+    site appears, or someone inlines the patterns elsewhere, this fails rather
+    than silently leaving half the loaders pruning ST weights."""
+    root = Path(U.__file__).resolve().parents[1]
+    sites = []
+    for p in root.rglob("*.py"):
+        if "tests" in p.parts:
+            continue
+        for n, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+            if "weights_at_root = True" in line:
+                sites.append(f"{p.name}:{n}")
+    assert sorted(s.split(":")[0] for s in sites) == ["llama.py", "vision.py"], sites
+
+    # AST, not grep: the name also appears in prose inside a docstring, and a
+    # text count would police the documentation instead of the code.
+    import ast
+    tree = ast.parse(Path(U.__file__).read_text(encoding="utf-8"))
+    loads = [n for n in ast.walk(tree)
+             if isinstance(n, ast.Name)
+             and n.id == "_SUBDIR_WEIGHT_IGNORE_PATTERNS"
+             and isinstance(n.ctx, ast.Load)]
+    assert len(loads) == 1, [n.lineno for n in loads]
+
+
 def test_a_hub_failure_keeps_the_patterns(monkeypatch):
     """Network trouble must not silently enlarge every download."""
     import huggingface_hub
