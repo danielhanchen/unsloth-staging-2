@@ -1,0 +1,277 @@
+# Two experiments the static scans cannot settle.
+#
+# Job "stock-signatures":
+#   The runner image ships whatever Defender definitions were current when the
+#   image was baked, and the earlier runs called Update-MpSignature before
+#   scanning. The user's detection fired at ~2026-08-03 20:24 and the updated
+#   signatures on our runner were stamped 2026-08-03 21:50 -- about ninety
+#   minutes LATER. If Microsoft corrected the classifier in that window, a scan
+#   against the image's older, un-updated definitions could still fire where the
+#   updated one does not. That is a direct test of "Microsoft's model moved,
+#   not our code", so this job deliberately does NOT update signatures.
+#
+# Job "execute":
+#   "!ml" verdicts are behavioural as much as static: they fire on real-time
+#   write and on EXECUTION, via behaviour monitoring and block-at-first-sight.
+#   Every scan so far has been static. This job actually installs the flagged
+#   build silently and launches it, watching for Defender events 1015 (suspicious
+#   behaviour), 1116/1117 (detected / action taken) and for an access-denied
+#   exit that means execution was blocked.
+
+name: "Defender FP - stock signatures + execution"
+
+on:
+  push:
+    branches: [defender-fp-ci]
+    paths:
+      - '.github/workflows/defender-fp-exec.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BASE_URL: 'https://github.com/danielhanchen/unsloth-staging-2/releases/download/defender-fp-samples'
+
+jobs:
+  stock-signatures:
+    name: "Scan against the image's stock (un-updated) signatures"
+    runs-on: windows-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Prepare + enable protection WITHOUT updating signatures
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\reports", "$env:GITHUB_WORKSPACE\samples" | Out-Null
+          "REPORTDIR=$env:GITHUB_WORKSPACE\reports" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+          # Same restoration as defender-enable.ps1 minus the signature update:
+          # the whole point is to keep the image's original definition set.
+          $atp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
+          if (Test-Path $atp) { Remove-ItemProperty -Path $atp -Name 'ForceDefenderPassiveMode' -ErrorAction SilentlyContinue }
+          Start-Service -Name WinDefend -ErrorAction SilentlyContinue
+          $pref = Get-MpPreference
+          foreach ($p in @($pref.ExclusionPath)) { if ($p) { Remove-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue } }
+          Set-MpPreference -DisableRealtimeMonitoring $false -DisableIOAVProtection $false `
+            -DisableScriptScanning $false -DisableBehaviorMonitoring $false -DisableArchiveScanning $false `
+            -MAPSReporting Advanced -SubmitSamplesConsent SendAllSamples -CloudBlockLevel High `
+            -CloudExtendedTimeout 50 -DisableBlockAtFirstSeen $false -ErrorAction Continue
+
+          $s = Get-MpComputerStatus
+          Write-Host "STOCK signature version : $($s.AntivirusSignatureVersion)"
+          Write-Host "STOCK signature updated : $($s.AntivirusSignatureLastUpdated)"
+          Write-Host "engine                  : $($s.AMEngineVersion)"
+          Write-Host "RTP                     : $($s.RealTimeProtectionEnabled)"
+          $s | Select-Object AntivirusSignatureVersion, AntivirusSignatureLastUpdated, AMEngineVersion,
+                RealTimeProtectionEnabled, AMRunningMode |
+            ConvertTo-Json | Out-File "$env:GITHUB_WORKSPACE\reports\stock-sig-env.json" -Encoding utf8
+
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          $plat = Get-ChildItem 'C:\ProgramData\Microsoft\Windows Defender\Platform' -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+          if ($plat -and (Test-Path "$($plat.FullName)\MpCmdRun.exe")) { $mp = "$($plat.FullName)\MpCmdRun.exe" }
+          "MPCMDRUN=$mp" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Fetch both installers
+        continue-on-error: true
+        run: |
+          foreach ($n in @('old_0.1.51', 'new_0.1.512')) {
+            $dst = "$env:GITHUB_WORKSPACE\samples\$n.exe"
+            Invoke-WebRequest -Uri "$env:BASE_URL/$n.exe" -OutFile $dst -UseBasicParsing -TimeoutSec 600
+            if (Test-Path $dst) {
+              "[ZoneTransfer]`nZoneId=3`nHostUrl=$env:BASE_URL/$n.exe" |
+                Set-Content -Path $dst -Stream Zone.Identifier -Encoding Ascii
+              Write-Host "$n survived download under stock signatures"
+            } else {
+              Write-Host "::warning::$n REMOVED ON WRITE under stock signatures - detection reproduced"
+            }
+          }
+
+      - name: Scan under stock signatures
+        continue-on-error: true
+        run: .github/scripts/defender-scan.ps1 -Path "$env:GITHUB_WORKSPACE\samples" -Filter '*.exe' -OutJson "$env:GITHUB_WORKSPACE\reports\stock-signatures.json"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stock-signatures-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reports/**
+          retention-days: 14
+          if-no-files-found: warn
+
+  execute:
+    name: "Silent install + launch under live protection"
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Prepare directories
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\reports", "$env:GITHUB_WORKSPACE\samples" | Out-Null
+          "REPORTDIR=$env:GITHUB_WORKSPACE\reports" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Restore Defender with cloud-delivered protection
+        continue-on-error: true
+        run: .github/scripts/defender-enable.ps1
+
+      - name: Fetch the flagged installer
+        continue-on-error: true
+        run: |
+          $dst = "$env:GITHUB_WORKSPACE\samples\new_0.1.512.exe"
+          Invoke-WebRequest -Uri "$env:BASE_URL/new_0.1.512.exe" -OutFile $dst -UseBasicParsing -TimeoutSec 600
+          if (Test-Path $dst) {
+            "[ZoneTransfer]`nZoneId=3`nHostUrl=$env:BASE_URL/new_0.1.512.exe" |
+              Set-Content -Path $dst -Stream Zone.Identifier -Encoding Ascii
+            "INSTALLER=$dst" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+            Write-Host '::error::installer removed on write'
+          }
+
+      - name: Ensure WebView2 runtime
+        continue-on-error: true
+        run: |
+          # WebView2 is NOT part of the Windows Server 2025 image software list. A
+          # Tauri app without it dies with 0xC0000135, which would otherwise look
+          # like a Defender block.
+          $guid = '{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}'
+          $keys = @(
+            "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$guid",
+            "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$guid",
+            "HKCU:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$guid")
+          $pv = $keys | ForEach-Object { (Get-ItemProperty $_ -Name pv -ErrorAction SilentlyContinue).pv } |
+                Where-Object { $_ -and $_ -ne '0.0.0.0' } | Select-Object -First 1
+          if ($pv) {
+            Write-Host "WebView2 present: $pv"
+          } else {
+            Write-Host 'installing WebView2 evergreen bootstrapper'
+            $bs = "$env:RUNNER_TEMP\MicrosoftEdgeWebview2Setup.exe"
+            Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile $bs -UseBasicParsing
+            Start-Process -FilePath $bs -ArgumentList '/silent', '/install' -Wait -NoNewWindow
+          }
+
+      - name: Silent install
+        id: install
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if (-not $env:INSTALLER -or -not (Test-Path $env:INSTALLER)) {
+            Write-Host '::error::no installer to run'; exit 0
+          }
+          # /S is NSIS silent. No /NCRC (it would skip the integrity check) and no
+          # /R (Tauri implements it via nsis_tauri_utils::RunAsUser, which needs an
+          # interactive shell token a hosted runner does not have).
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          $p = Start-Process -FilePath $env:INSTALLER -ArgumentList '/S' -PassThru -Wait -NoNewWindow
+          $sw.Stop()
+          Write-Host "installer exit=$($p.ExitCode) (0x$('{0:X8}' -f $p.ExitCode)) after $([int]$sw.Elapsed.TotalSeconds)s"
+          if ($p.ExitCode -eq -1073741790) { Write-Host '::error::0xC0000022 access denied - Defender blocked execution' }
+
+          # Find the install via the uninstall key Tauri writes (MainBinaryName is
+          # the Tauri-specific marker). installMode is currentUser, so it is HKCU
+          # and $LOCALAPPDATA.
+          $roots = @(
+            'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+            'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall')
+          $entry = $roots | Where-Object { Test-Path $_ } | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue } |
+                   ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+                   Where-Object { $_.MainBinaryName } | Select-Object -First 1
+          if ($entry) {
+            $dir = $entry.InstallLocation.Trim('"')
+            $exe = Join-Path $dir $entry.MainBinaryName
+            Write-Host "DisplayName    : $($entry.DisplayName)"
+            Write-Host "DisplayVersion : $($entry.DisplayVersion)"
+            Write-Host "Publisher      : $($entry.Publisher)"
+            Write-Host "InstallLocation: $dir"
+            Write-Host "MainBinary     : $exe (exists=$(Test-Path $exe))"
+            Get-ChildItem $dir -Recurse -File -ErrorAction SilentlyContinue |
+              Select-Object @{n='Rel';e={$_.FullName.Replace($dir,'')}}, Length |
+              Format-Table -AutoSize | Out-String | Tee-Object "$env:REPORTDIR\install-tree.txt" | Write-Host
+            "APP_EXE=$exe" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+            Write-Host '::warning::no Tauri uninstall entry found - install may not have completed'
+          }
+
+      - name: Launch and observe
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          if (-not $env:APP_EXE -or -not (Test-Path $env:APP_EXE)) {
+            Write-Host '::error::app binary missing - possibly quarantined at install time'; exit 0
+          }
+          Write-Host "launching $env:APP_EXE"
+          $started = $true
+          try { $p = Start-Process -FilePath $env:APP_EXE -PassThru -ErrorAction Stop }
+          catch { Write-Host "::error::Start-Process failed: $($_.Exception.Message)"; $started = $false }
+
+          if ($started) {
+            Start-Sleep -Seconds 25
+            $p.Refresh()
+            if ($p.HasExited) {
+              Write-Host "::warning::app exited early, code=$($p.ExitCode) (0x$('{0:X8}' -f $p.ExitCode))"
+              switch ($p.ExitCode) {
+                -1073741515 { Write-Host '::error::0xC0000135 DLL not found - missing WebView2, not a Defender block' }
+                -1073741790 { Write-Host '::error::0xC0000022 access denied - Defender blocked execution' }
+              }
+            } else {
+              Write-Host 'app alive after 25s'
+              Write-Host "  MainWindowHandle: $($p.MainWindowHandle)"
+              Write-Host ("  WorkingSet: {0:N1} MB  Threads: {1}" -f ($p.WorkingSet64/1MB), $p.Threads.Count)
+              Get-Process msedgewebview2 -ErrorAction SilentlyContinue |
+                Select-Object Id, ProcessName | Format-Table -AutoSize | Out-String | Write-Host
+              Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+          Write-Host '== Defender events during install + launch =='
+          $ev = Get-WinEvent -FilterHashtable @{
+              LogName='Microsoft-Windows-Windows Defender/Operational'
+              Id=1006,1007,1008,1015,1116,1117,1118,1119
+            } -MaxEvents 100 -ErrorAction SilentlyContinue
+          if ($ev) {
+            $ev | Sort-Object TimeCreated | Select-Object TimeCreated, Id, LevelDisplayName, Message |
+              Format-List | Out-String | Write-Host
+            Write-Host "::warning::$($ev.Count) Defender detection/behaviour event(s) during install or launch"
+          } else {
+            Write-Host 'no Defender detection or behaviour events during install or launch'
+          }
+          Get-MpThreat -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4 |
+            Out-File "$env:REPORTDIR\exec-mp-threat.json" -Encoding utf8
+
+      - name: Collect Defender logs
+        if: always()
+        continue-on-error: true
+        run: |
+          $dst = "$env:REPORTDIR\defender-logs"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $src = 'C:\ProgramData\Microsoft\Windows Defender\Support'
+          if (Test-Path $src) {
+            Get-ChildItem $src -Include MPLog-*.log, MPDetection-*.log, MpCmdRun.log -Recurse -ErrorAction SilentlyContinue |
+              ForEach-Object { Copy-Item $_.FullName $dst -Force -ErrorAction SilentlyContinue }
+          }
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: execute-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reports/**
+          retention-days: 14
+          if-no-files-found: warn
