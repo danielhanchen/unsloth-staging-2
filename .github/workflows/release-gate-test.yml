@@ -55,9 +55,15 @@ jobs:
       - name: NEGATIVE case - real bundles must pass
         id: negative
         continue-on-error: true
-        env:
-          ARTIFACT_PATHS: '["${{ github.workspace }}\\bundles\\old_0.1.51.exe", "${{ github.workspace }}\\bundles\\new_0.1.512.exe"]'
         run: |
+          # Build the JSON with ConvertTo-Json. A literal Windows path contains
+          # sequences like \a that are invalid JSON escapes, and hand-writing this
+          # is what made the first run of this test scan nothing and still pass.
+          $env:ARTIFACT_PATHS = @(
+            "$env:GITHUB_WORKSPACE\bundles\old_0.1.51.exe",
+            "$env:GITHUB_WORKSPACE\bundles\new_0.1.512.exe"
+          ) | ConvertTo-Json -Compress
+          Write-Host "ARTIFACT_PATHS = $env:ARTIFACT_PATHS"
           .github/scripts/release-gate-step.ps1
           Write-Host "gate exit code: $LASTEXITCODE"
 
@@ -69,18 +75,46 @@ jobs:
           [System.IO.File]::WriteAllText(
             $bad,
             'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!' + '$H+H*')
-          $env:ARTIFACT_PATHS = "[""$($bad -replace '\\','\\')""]"
+          $env:ARTIFACT_PATHS = @($bad) | ConvertTo-Json -Compress
+          Write-Host "ARTIFACT_PATHS = $env:ARTIFACT_PATHS"
           .github/scripts/release-gate-step.ps1
           Write-Host "gate exit code: $LASTEXITCODE"
 
-      - name: Assert both cases behaved
+      # Regression test for the bug the first run of this self-test exposed: the
+      # gate could not parse artifactPaths, warned, and exited 0 having scanned
+      # nothing. It must refuse instead.
+      - name: UNPARSEABLE case - a bad artifactPaths must fail the gate
+        id: unparseable
+        continue-on-error: true
         run: |
-          $neg = '${{ steps.negative.outcome }}'
-          $pos = '${{ steps.positive.outcome }}'
-          Write-Host "negative (real bundles, expect success): $neg"
-          Write-Host "positive (known-bad, expect failure):    $pos"
+          $env:ARTIFACT_PATHS = '["D:\a\bundles\thing.exe"]'   # \a is an invalid JSON escape
+          .github/scripts/release-gate-step.ps1
+          Write-Host "gate exit code: $LASTEXITCODE"
+
+      - name: EMPTY case - no artifactPaths must fail the gate
+        id: empty
+        continue-on-error: true
+        run: |
+          $env:ARTIFACT_PATHS = ''
+          .github/scripts/release-gate-step.ps1
+          Write-Host "gate exit code: $LASTEXITCODE"
+
+      - name: Assert every case behaved
+        run: |
+          $cases = @(
+            @{ n = 'negative (real bundles)'; got = '${{ steps.negative.outcome }}';    want = 'success' }
+            @{ n = 'positive (known-bad)';    got = '${{ steps.positive.outcome }}';    want = 'failure' }
+            @{ n = 'unparseable paths';       got = '${{ steps.unparseable.outcome }}'; want = 'failure' }
+            @{ n = 'empty paths';             got = '${{ steps.empty.outcome }}';       want = 'failure' }
+          )
           $ok = $true
-          if ($neg -ne 'success') { Write-Host '::error::gate rejected the real bundles - it would block every release'; $ok = $false }
-          if ($pos -ne 'failure') { Write-Host '::error::gate passed a known-bad file - it cannot catch anything'; $ok = $false }
-          if (-not $ok) { exit 1 }
-          Write-Host 'Release gate behaves correctly in both directions.'
+          foreach ($c in $cases) {
+            $verdict = if ($c.got -eq $c.want) { 'OK' } else { 'WRONG'; }
+            Write-Host ("{0,-24} got={1,-8} want={2,-8} {3}" -f $c.n, $c.got, $c.want, $verdict)
+            if ($c.got -ne $c.want) { $ok = $false }
+          }
+          if (-not $ok) {
+            Write-Host '::error::release gate did not behave correctly in every case'
+            exit 1
+          }
+          Write-Host 'Release gate behaves correctly: passes clean bundles, refuses bad ones, and refuses to pass when it cannot see its input.'
