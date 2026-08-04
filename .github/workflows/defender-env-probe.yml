@@ -63,6 +63,27 @@ jobs:
             Write-Host '::notice::fatal set is dormant on this runner; making these fatal is safe'
           }
 
+          Write-Host '=== Add-MpPreference round trip ==='
+          $work = Join-Path $env:RUNNER_TEMP 'defender-scan'
+          New-Item -ItemType Directory -Force -Path $work | Out-Null
+          $dirs = @($work, 'D:\a\x\y\nsis')
+          Add-MpPreference -ExclusionPath $dirs -ErrorAction Continue
+          $have = @((Get-MpPreference).ExclusionPath)
+          Write-Host "passed:  $($dirs -join ' | ')"
+          Write-Host "stored:  $($have -join ' | ')"
+          $norm = { param($p) $p.TrimEnd('\').ToLowerInvariant() }
+          $set = @($have | ForEach-Object { & $norm $_ })
+          foreach ($d in $dirs) {
+            $ok = $set -contains (& $norm $d)
+            Write-Host "  match '$d' -> $ok"
+          }
+          Write-Host '=== MpCmdRun -CheckExclusion ==='
+          foreach ($d in $dirs) {
+            & $mp -CheckExclusion -Path $d 2>&1 | Write-Host
+            Write-Host "  CheckExclusion '$d' exit=$LASTEXITCODE"
+          }
+          foreach ($d in $dirs) { Remove-MpPreference -ExclusionPath $d -ErrorAction SilentlyContinue }
+
           Write-Host '=== EICAR control ==='
           $eicarPath = Join-Path $env:RUNNER_TEMP 'defender-selftest.com'
           $wrote = $true
