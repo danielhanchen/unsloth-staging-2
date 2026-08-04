@@ -3522,6 +3522,98 @@ def _make_torch_symbol_placeholder(name, detail):
     return placeholder
 
 
+# The same version skew, one layer down. torchao 0.18 does not only import
+# names from torch.nn.functional -- it also registers a handler against an
+# ATEN OP at module scope, in
+# quantization/quantize_/workflows/float8/float8_tensor.py:
+#
+#     @implements([aten._grouped_mm.default])
+#     def float8_grouped_mm(func, types, args, kwargs):
+#
+# `aten::_grouped_mm` arrived in torch 2.8, so on anything older the attribute
+# lookup raises before the decorator is even applied:
+#
+#     AttributeError: '_OpNamespace' 'aten' object has no attribute '_grouped_mm'
+#
+# and because transformers imports torchao from modeling_utils under
+# `is_torchao_available()`, that kills `import transformers` and therefore
+# `import unsloth`. Observed on Colab in Granite4.0, which pins torch 2.7.1
+# via uv while resolving a current torchao.
+#
+# Supplying the missing symbol on torch.nn.functional does not help here: the
+# lookup goes through torch.ops, so the schema itself has to exist.
+_ATEN_GROUPED_MM_SCHEMA = (
+    "_grouped_mm(Tensor self, Tensor mat2, Tensor? offs=None, "
+    "Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor"
+)
+
+# Module level on purpose: a torch.library.Library deregisters everything it
+# defined when it is garbage collected, so a local would undo itself.
+_aten_grouped_mm_library = None
+
+
+def _torch_op_is_missing(namespace, name):
+    """Is `torch.ops.<namespace>.<name>` absent on this torch?
+
+    Only a plain AttributeError counts. Anything else means we could not tell,
+    and the safe answer to "should I register into the aten namespace?" when
+    unsure is no.
+    """
+    try:
+        import torch
+        ns = getattr(torch.ops, namespace)
+    except Exception:
+        return False
+    try:
+        getattr(ns, name)
+    except AttributeError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _ensure_aten_grouped_mm(detail):
+    """Define an unusable `aten::_grouped_mm` so torchao's decorator resolves.
+
+    Deliberately no real implementation. torchao only wants somewhere to hang
+    a float8 handler that this torch will never dispatch to, so the schema is
+    the entire requirement. Giving it a working kernel would be far worse than
+    the crash it replaces -- a silently wrong grouped matmul is not something
+    a user could debug -- so calling it raises and says why.
+    """
+    global _aten_grouped_mm_library
+    if _aten_grouped_mm_library is not None:
+        return False
+    if not _torch_op_is_missing("aten", "_grouped_mm"):
+        return False
+
+    message = (
+        f"Unsloth: `torch.ops.aten._grouped_mm` does not exist in this torch. "
+        f"{detail} Unsloth registered a placeholder schema so that importing "
+        f"torchao (and therefore unsloth) still works, but the operator cannot "
+        f"be used. Upgrade to torch >= 2.8 for grouped matmul, or install "
+        f"`torchao<0.18`."
+    )
+
+    def _refuse(self, mat2, offs = None, bias = None, out_dtype = None):
+        raise RuntimeError(message)
+
+    try:
+        import torch
+        # FRAGMENT is the documented way to add to a namespace someone else
+        # owns; DEF would try to claim "aten" outright and be rejected.
+        library = torch.library.Library("aten", "FRAGMENT")
+        library.define(_ATEN_GROUPED_MM_SCHEMA)
+        library.impl("_grouped_mm", _refuse, "CompositeExplicitAutograd")
+    except Exception:
+        # A torch that will not let us register simply keeps its own error.
+        return False
+
+    _aten_grouped_mm_library = library
+    return True
+
+
 def fix_torchao_torch_symbol_skew():
     """Let `import unsloth` survive a torchao built for a newer torch.
 
@@ -3584,6 +3676,21 @@ def fix_torchao_torch_symbol_skew():
             "does not have. Adding an unusable placeholder so the import "
             "succeeds; install torchao<0.18 to use float8/MX features.",
             torchao_version, "/".join(patched), torch_version,
+        )
+
+    # The aten-op half of the same skew. Independent of the loop above: a
+    # torch can have every torch.nn.functional symbol and still be missing
+    # the operator, and vice versa, so neither result gates the other.
+    op_detail = (f"torchao {torchao_version} registers a handler for it at "
+                 f"import time, but torch {torch_version} does not provide it "
+                 f"(it arrived in torch 2.8).")
+    if _ensure_aten_grouped_mm(op_detail):
+        patched.append("aten::_grouped_mm")
+        logger.info(
+            "Unsloth: torchao %s registers a handler for torch.ops.aten."
+            "_grouped_mm, which torch %s does not have. Registering an "
+            "unusable placeholder schema so the import succeeds.",
+            torchao_version, torch_version,
         )
     return bool(patched)
 
@@ -3698,6 +3805,40 @@ def _apply():
         except Exception:
             pass
 
+    # torchao also hangs a handler off aten._grouped_mm at import time, and
+    # that operator only exists from torch 2.8. Same skew, different lookup:
+    # supplying the torch.nn.functional names above does not help it.
+    try:
+        torch.ops.aten._grouped_mm
+    except AttributeError:
+        op_message = (
+            "Unsloth: `torch.ops.aten._grouped_mm` does not exist in this "
+            "torch. torchao %s registers a handler for it at import time, but "
+            "torch %s does not provide it (it arrived in torch 2.8). Unsloth "
+            "registered a placeholder schema so the import succeeds; the "
+            "operator itself cannot be used."
+            % (version, torch.__version__))
+
+        def _refuse(self, mat2, offs=None, bias=None, out_dtype=None):
+            raise RuntimeError(op_message)
+
+        try:
+            # Held on the module so the Library is not collected -- that
+            # would deregister the schema again.
+            global _ATEN_LIBRARY
+            _ATEN_LIBRARY = torch.library.Library("aten", "FRAGMENT")
+            _ATEN_LIBRARY.define(
+                "_grouped_mm(Tensor self, Tensor mat2, Tensor? offs=None, "
+                "Tensor? bias=None, ScalarType? out_dtype=None) -> Tensor")
+            _ATEN_LIBRARY.impl("_grouped_mm", _refuse,
+                               "CompositeExplicitAutograd")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+_ATEN_LIBRARY = None
 
 _chain_to_the_real_sitecustomize()
 try:
@@ -3740,7 +3881,13 @@ def propagate_torchao_fix_to_subprocesses():
         return None
     try:
         import torch.nn.functional as F
-        if all(hasattr(F, n) for n in _TORCHAO_TORCH_SYMBOLS):
+        # Both halves of the skew have to be absent for there to be nothing to
+        # do. Today a torch missing the operator is always also missing the
+        # functional symbols (2.8 vs 2.10), so the second check never fires on
+        # its own -- it is here so the gate stays correct if that ordering
+        # ever stops holding, rather than silently under-propagating.
+        if (all(hasattr(F, n) for n in _TORCHAO_TORCH_SYMBOLS)
+                and not _torch_op_is_missing("aten", "_grouped_mm")):
             return None          # this torch is new enough; nothing to do
     except Exception:
         return None
