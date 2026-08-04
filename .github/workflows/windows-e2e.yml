@@ -79,6 +79,15 @@ jobs:
           Write-Host "thumbprint: $($cert.Thumbprint)"
           "CERT_THUMB=$($cert.Thumbprint)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
 
+          # LocalMachine\Root, not CurrentUser\Root: the per-user store raises a
+          # confirmation dialog no runner can answer, the machine store does not
+          # when the job is already elevated. Without a trusted root every file
+          # reports UnknownError and the gate can only ever be exercised failing.
+          $cer = Join-Path $env:RUNNER_TEMP 'e2e-signing.cer'
+          Export-Certificate -Cert $cert -FilePath $cer -Type CERT | Out-Null
+          Import-Certificate -FilePath $cer -CertStoreLocation Cert:\LocalMachine\Root | Out-Null
+          Write-Host 'test root installed into LocalMachine\Root'
+
       - name: Point the bundler at the test certificate
         run: |
           # tauri.windows.conf.json sets a signCommand for Azure Trusted Signing,
@@ -186,7 +195,12 @@ jobs:
       - name: Run the unsigned-file gate against the fresh bundle
         id: gate
         continue-on-error: true
-        run: .github/scripts/assert-bundle-signed.ps1 -Path @($env:SETUP)
+        run: |
+          # With the test root trusted this is a real pass/fail, including the
+          # newly signed install.ps1 now that .ps1 is in the checked set.
+          .github/scripts/assert-bundle-signed.ps1 -Path @($env:SETUP)
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::gate failed ($LASTEXITCODE)"; exit 1 }
+          Write-Host 'gate passed: every executable and script in the bundle is validly signed'
 
       # ---- 2: is the WebView2 bootstrapper embedded? ----------------------
       - name: Verify the WebView2 bootstrapper is embedded, not downloaded
