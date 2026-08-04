@@ -155,9 +155,27 @@ def test_it_is_imported_and_cleaned_up():
 
 
 def test_the_symbol_list_matches_what_torchao_imports():
-    """Both names come from one `from torch.nn.functional import` line in
-    torchao 0.18's mx_tensor.py. Shimming only one leaves the import broken."""
-    assert set(_TORCHAO_TORCH_SYMBOLS) == {"ScalingType", "SwizzleType"}
+    """Taken from the whole installed package, not one file.
+
+    Reading only mx_formats/mx_tensor.py yields ScalingType and SwizzleType
+    and misses scaled_grouped_mm, which float8_tensor.py imports -- and that
+    module is on the path of a plain `import torchao`, so a list missing it
+    leaves the import exactly as dead. Found by installing torchao 0.18.0 for
+    real and watching it still fail.
+    """
+    assert set(_TORCHAO_TORCH_SYMBOLS) == {
+        "ScalingType", "SwizzleType", "scaled_grouped_mm",
+        "scaled_dot_product_attention"}
+
+
+def test_symbols_torch_already_provides_are_never_replaced():
+    """scaled_dot_product_attention exists on every supported torch. Handing
+    it a placeholder that raises would break attention itself."""
+    import torch.nn.functional as F
+    import unsloth.import_fixes as IF
+    real = F.scaled_dot_product_attention
+    IF.fix_torchao_torch_symbol_skew()
+    assert F.scaled_dot_product_attention is real
 
 
 # ---- the fix actually unblocks the import --------------------------------

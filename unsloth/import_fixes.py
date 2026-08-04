@@ -3469,7 +3469,23 @@ def fix_peft_stale_torchao_import_error():
 
 # torchao 0.18.0 imports symbols from torch that only exist in torch 2.10+,
 # without the version guard 0.17 had. See fix_torchao_torch_symbol_skew.
-_TORCHAO_TORCH_SYMBOLS = ("ScalingType", "SwizzleType")
+# Every name torchao 0.18.0 imports from torch.nn.functional, taken from the
+# installed package rather than from one file:
+#     grep -rh "from torch.nn.functional import" torchao/
+# scaled_dot_product_attention is listed for completeness and is present on
+# every supported torch, so it never gets a placeholder -- the loop skips any
+# symbol torch already provides.
+#
+# Reading only mx_formats/mx_tensor.py gives ScalingType and SwizzleType and
+# misses scaled_grouped_mm, which is what quantization/quantize_/workflows/
+# float8/float8_tensor.py needs -- and that one is on the path of a plain
+# `import torchao`, so missing it leaves the import just as dead.
+_TORCHAO_TORCH_SYMBOLS = (
+    "ScalingType",
+    "SwizzleType",
+    "scaled_grouped_mm",
+    "scaled_dot_product_attention",
+)
 
 
 def _make_torch_symbol_placeholder(name, detail):
