@@ -952,6 +952,66 @@ jobs:
           }
           Write-Host "All $($paths.Count) Windows bundle(s) scanned clean."
 
+      # ── Windows: every executable in the bundle must be signed ──
+      # Signing the installer is not the same as signing what it drops on disk.
+      # NSIS extracts its plugin DLLs to $PLUGINSDIR at install time and runs
+      # them from there, and an unsigned DLL appearing in a temp folder and being
+      # loaded by an installer is a known AV false-positive trigger.
+      - name: Verify every executable in the Windows bundles is signed
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          ARTIFACT_PATHS: ${{ steps.build_windows.outputs.artifactPaths }}
+        run: |
+          $paths = @($env:ARTIFACT_PATHS | ConvertFrom-Json) |
+                   Where-Object { $_ -like '*-setup.exe' }
+          if (-not $paths) { Write-Host '::error::no Windows installer to verify'; exit 1 }
+          .github/scripts/assert-bundle-signed.ps1 -Path $paths
+
+      # ── Windows: assemble a Microsoft false-positive submission packet ──
+      # Microsoft publishes no API for developer sample submission -- the WDSI
+      # portal is a web form, and Microsoft's own guidance is to use the website.
+      # So this cannot be automated end to end. What it can do is remove all the
+      # lookup work, so pre-submitting a build before announcing it is a
+      # thirty-second job rather than a hunt for hashes and signer details.
+      - name: Prepare Microsoft submission packet
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        env:
+          ARTIFACT_PATHS: ${{ steps.build_windows.outputs.artifactPaths }}
+        run: |
+          $paths = @($env:ARTIFACT_PATHS | ConvertFrom-Json) |
+                   Where-Object { $_ -like '*-setup.exe' }
+          $md = @(
+            '## Microsoft submission packet',
+            '',
+            'Submit at <https://www.microsoft.com/en-us/wdsi/filesubmission> before announcing this release.',
+            'Choose **Software developer** -> **Incorrectly detected as malware/malicious**.',
+            'The 50 MB upload cap applies; if a bundle exceeds it, submit the extracted main binary instead.',
+            ''
+          )
+          foreach ($f in $paths) {
+            $item = Get-Item $f
+            $sig = Get-AuthenticodeSignature $f
+            $md += "### $($item.Name)"
+            $md += ''
+            $md += '| field | value |'
+            $md += '|---|---|'
+            $md += "| SHA-256 | ``$((Get-FileHash -Algorithm SHA256 $f).Hash)`` |"
+            $md += "| SHA-1 | ``$((Get-FileHash -Algorithm SHA1 $f).Hash)`` |"
+            $md += "| Size | $($item.Length) bytes |"
+            $md += "| Signature | $($sig.Status) |"
+            $md += "| Signer | $($sig.SignerCertificate.Subject) |"
+            $md += "| Product | $($env:APP_VERSION) |"
+            $md += ''
+          }
+          $md += '> Clearance is per hash. It fixes the release you submit and nothing after it,'
+          $md += '> so this is a complement to signing, not a substitute.'
+          $out = "$env:RUNNER_TEMP\ms-submission-packet.md"
+          $md -join "`n" | Out-File $out -Encoding utf8
+          $md -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          Write-Host ($md -join "`n")
+
       - name: Stage release assets
         shell: bash
         env:
