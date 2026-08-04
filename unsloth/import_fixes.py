@@ -3586,3 +3586,184 @@ def fix_torchao_torch_symbol_skew():
             torchao_version, "/".join(patched), torch_version,
         )
     return bool(patched)
+
+
+# The in-process fix above is not enough for vLLM.
+#
+# vLLM inspects model architectures in a SEPARATE process. That child imports
+# torch and torchao itself and never sees a monkey-patch applied in the parent,
+# so `import torchao` fails there exactly as it would have here:
+#
+#     ERROR registry.py:781] Error in inspecting model architecture 'Qwen3ForCausalLM'
+#     ERROR registry.py:781] ImportError: cannot import name 'ScalingType' from 'torch.nn.functional'
+#
+# and the user sees only the generic
+# "Model architectures ['Qwen3ForCausalLM'] failed to be inspected", which
+# names neither torchao nor torch. Measured on Colab with
+# `fast_inference = True` AFTER the in-process fix had already reported
+# success, so the parent looked healthy right up to the failure.
+#
+# `sitecustomize` is the one hook that reaches a process we do not launch:
+# the `site` module imports it at interpreter startup, and it is found on
+# PYTHONPATH, which subprocesses inherit. A `.pth` would also work but only
+# in a real site directory, which a library has no business writing into.
+
+_SUBPROCESS_FIX_DIRNAME = "unsloth_subprocess_import_fix"
+
+
+def _subprocess_sitecustomize_source():
+    """The sitecustomize we hand to child processes.
+
+    It must CHAIN rather than shadow. `sitecustomize` is a single global name
+    and other things legitimately install one -- this machine has one at
+    /etc/unslothai/python/sitecustomize.py -- so replacing it silently would
+    disable whatever that does for every subprocess unsloth spawns. Ours
+    therefore loads the next `sitecustomize.py` on sys.path first, and only
+    then applies the fix.
+    """
+    return '''"""Written by unsloth. Makes `import torchao` survive a torch that
+predates the symbols torchao 0.18 imports unconditionally, in processes
+unsloth did not launch (notably vLLM's model-architecture inspector)."""
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _chain_to_the_real_sitecustomize():
+    """Do not shadow somebody else's sitecustomize."""
+    import importlib.util
+    for entry in sys.path:
+        try:
+            if not entry or os.path.abspath(entry) == _HERE:
+                continue
+            cand = os.path.join(entry, "sitecustomize.py")
+            if not os.path.isfile(cand):
+                continue
+            spec = importlib.util.spec_from_file_location(
+                "_unsloth_chained_sitecustomize", cand)
+            if spec is None or spec.loader is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            break
+        except Exception:
+            # A broken sitecustomize elsewhere must not stop us, and must not
+            # take down every subprocess either.
+            break
+
+
+def _apply():
+    import importlib.metadata as md
+    try:
+        version = md.version("torchao")
+    except Exception:
+        return
+    try:
+        major, minor = (int("".join(c for c in p if c.isdigit()) or 0)
+                        for p in str(version).split(".")[:2])
+        if (major, minor) < (0, 18):
+            return
+    except Exception:
+        return
+    try:
+        import torch
+        import torch.nn.functional as F
+    except Exception:
+        return
+    detail = ("torchao %s imports it unconditionally, but torch %s does not "
+              "provide it (it arrived in torch 2.10)." % (version, torch.__version__))
+    for name in ("ScalingType", "SwizzleType", "scaled_grouped_mm",
+                 "scaled_dot_product_attention"):
+        if hasattr(F, name):
+            continue
+        message = ("Unsloth: `torch.nn.functional.%s` does not exist in this "
+                   "torch. %s Unsloth supplied a placeholder so that importing "
+                   "torchao still works, but this symbol cannot be used. "
+                   "Install `torchao<0.18`, or upgrade torch." % (name, detail))
+
+        def _make(msg):
+            class _Meta(type):
+                def __getattr__(cls, item):
+                    raise RuntimeError(msg)
+
+                def __call__(cls, *args, **kwargs):
+                    raise RuntimeError(msg)
+            return _Meta
+
+        try:
+            placeholder = _make(message)(name, (), {"__doc__": message})
+            type.__setattr__(placeholder, "__unsloth_placeholder__", True)
+            setattr(F, name, placeholder)
+        except Exception:
+            pass
+
+
+_chain_to_the_real_sitecustomize()
+try:
+    _apply()
+except Exception:
+    # Never let this abort interpreter startup: it would break every
+    # subprocess, which is far worse than the import error it fixes.
+    pass
+'''
+
+
+def propagate_torchao_fix_to_subprocesses():
+    """Make the torchao fix apply to child processes too.
+
+    Deliberately narrow, and a no-op unless the fix is actually needed: it
+    returns early when torchao is absent, when torchao is old enough to guard
+    its own import, or when torch already has the symbols. On a healthy pair
+    nothing is written and PYTHONPATH is not touched.
+
+    Returns the directory added to PYTHONPATH, or None.
+    """
+    if importlib.util.find_spec("torchao") is None:
+        return None
+    try:
+        if Version(importlib_version("torchao")) < Version("0.18.0"):
+            return None
+    except Exception:
+        return None
+    try:
+        import torch.nn.functional as F
+        if all(hasattr(F, n) for n in _TORCHAO_TORCH_SYMBOLS):
+            return None          # this torch is new enough; nothing to do
+    except Exception:
+        return None
+
+    import tempfile
+    try:
+        directory = os.path.join(tempfile.gettempdir(), _SUBPROCESS_FIX_DIRNAME)
+        os.makedirs(directory, exist_ok=True)
+        target = os.path.join(directory, "sitecustomize.py")
+        source = _subprocess_sitecustomize_source()
+        # Rewrite only when it differs, so concurrent runs do not fight and a
+        # reader never sees a truncated file.
+        try:
+            existing = open(target, "r", encoding="utf-8").read()
+        except Exception:
+            existing = None
+        if existing != source:
+            tmp = target + ".%d.tmp" % os.getpid()
+            with open(tmp, "w", encoding="utf-8") as handle:
+                handle.write(source)
+            os.replace(tmp, target)      # atomic
+    except Exception as exception:
+        logger.warning(
+            "Unsloth: could not stage the torchao subprocess fix (%s). vLLM "
+            "may fail to inspect model architectures.", exception)
+        return None
+
+    # os.pathsep, not ":" -- Windows uses ";".
+    current = os.environ.get("PYTHONPATH", "")
+    parts = [p for p in current.split(os.pathsep) if p]
+    if directory not in parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([directory] + parts)
+        logger.info(
+            "Unsloth: torchao %s needs torch symbols this torch lacks. Added "
+            "a sitecustomize to PYTHONPATH so subprocesses (vLLM's model "
+            "inspector) can import torchao too.",
+            importlib_version("torchao"))
+    return directory
