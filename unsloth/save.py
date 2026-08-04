@@ -2864,6 +2864,48 @@ def push_to_ollama(tokenizer, gguf_location, username: str, model_name: str, tag
 
 
 @_normalize_tied_weights_keys_for_save
+
+def _offloaded_parameter_hint(model):
+    """Explain a save failure caused by offloaded (meta-device) parameters.
+
+    A model that did not fit its GPU gets partially offloaded, and accelerate
+    leaves those parameters on the meta device with the real data in a
+    `weights_map`. Saving then walks into accelerate internals that assume the
+    map exists, and the user is shown one of
+
+        TypeError: 'NoneType' object is not subscriptable
+        NotImplementedError: Cannot copy out of meta tensor; no data!
+
+    Neither names the model, the offload, or the remedy. Observed on
+    Qwen3_MoE, Qwen3_5_MoE and Nemotron-3-Nano-30B, all of which had already
+    logged accelerate's "Some parameters are on the meta device because they
+    were offloaded to the cpu".
+
+    Returns a sentence to append to the error, or "" when offloading is not
+    what went wrong -- an unrelated failure must not be mislabelled.
+    """
+    try:
+        meta = []
+        for name, tensor in model.named_parameters():
+            if getattr(tensor, "device", None) is not None and tensor.device.type == "meta":
+                meta.append(name)
+                if len(meta) >= 3:
+                    break
+        if not meta:
+            return ""
+        return (
+            f" Unsloth: this model has parameters on the meta device "
+            f"(offloaded because it did not fit the GPU), for example "
+            f"{', '.join(meta)}. Saving needs the real weights, which the "
+            f"offload hooks do not expose here. Re-run on a GPU large enough "
+            f"to hold the model without offloading, or reload it with "
+            f"`device_map` pinned to a single device before saving."
+        )
+    except Exception:
+        # A diagnostic must never replace the real error with its own.
+        return ""
+
+
 def unsloth_save_pretrained_gguf(
     self,
     save_directory: Union[str, os.PathLike],
@@ -3025,7 +3067,9 @@ def unsloth_save_pretrained_gguf(
             unsloth_generic_save(**arguments)
 
         except Exception as e:
-            raise RuntimeError(f"Failed to save/merge model: {e}")
+            raise RuntimeError(
+                f"Failed to save/merge model: {e}"
+                f"{_offloaded_parameter_hint(self)}")
     else:
         # Non-PEFT model: checkpoint files already exist; point save_to_gguf
         # at the original path instead of re-saving to a temp subdir.
@@ -3048,7 +3092,9 @@ def unsloth_save_pretrained_gguf(
                 if tokenizer is not None:
                     tokenizer.save_pretrained(save_directory)
             except Exception as e:
-                raise RuntimeError(f"Failed to save model: {e}")
+                raise RuntimeError(
+                    f"Failed to save model: {e}"
+                    f"{_offloaded_parameter_hint(self)}")
 
     if is_processor:
         tokenizer = tokenizer.tokenizer
