@@ -1,0 +1,274 @@
+# Full end-to-end validation on Windows of every desktop hardening change,
+# against a REAL Tauri build rather than the shipped 0.1.512 fixtures.
+#
+# What is under test, and what would otherwise go unverified:
+#
+#   1. installer.nsi  - the guarded !addplugindir "$%NSISPLUGINS%\x86-unicode".
+#      tauri-bundler signs a copy of the NSIS plugins and exports NSISPLUGINS,
+#      but no template references it, so four of the five plugin DLLs ship
+#      unsigned. Only a real bundler run proves the fix takes.
+#   2. tauri.conf.json - webviewInstallMode embedBootstrapper. Must actually
+#      embed the bootstrapper and stop the installer downloading an EXE at
+#      install time.
+#   3. assert-bundle-signed.ps1 - must report every unsigned file, and must pass
+#      once (1) lands.
+#   4. The Defender scan gate and the submission packet, against a fresh bundle.
+#   5. The bundle still installs silently and launches.
+#
+# Signing uses a self-signed certificate: the Azure Trusted Signing credentials
+# are not available here, and for these questions the signer's identity is
+# irrelevant - what matters is which copy of each DLL makensis embedded.
+
+name: "Windows E2E - desktop hardening"
+
+on:
+  push:
+    branches: [windows-e2e]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  APP_VERSION: '0.1.999-e2e'
+
+jobs:
+  build-and-verify:
+    name: "Build the app and verify every change"
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 24 }
+
+      - name: Install pinned Tauri CLI
+        run: npm install --save-dev --prefix studio "@tauri-apps/cli@2.10.1" --no-fund --no-audit
+
+      - name: Install frontend dependencies
+        run: npm install --no-fund --no-audit
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri -> target
+
+      - name: Create a self-signed code signing certificate
+        run: |
+          # Not added to any trust store: writing to CurrentUser\Root raises a
+          # confirmation dialog that a runner with no interactive session cannot
+          # answer, and the job hangs. Assertions below check the signer SUBJECT,
+          # which is the stronger check anyway.
+          $cert = New-SelfSignedCertificate -Type CodeSigningCert `
+            -Subject 'CN=Unsloth E2E Signing Test' `
+            -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(1)
+          Write-Host "thumbprint: $($cert.Thumbprint)"
+          "CERT_THUMB=$($cert.Thumbprint)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Point the bundler at the test certificate
+        run: |
+          # tauri.windows.conf.json sets a signCommand for Azure Trusted Signing,
+          # and sign_command() prefers it over certificateThumbprint. Replace it
+          # so the bundler uses signtool with the self-signed cert instead. This
+          # still exercises the same can_sign() path that gates plugin signing.
+          $winConf = 'studio/src-tauri/tauri.windows.conf.json'
+          $conf = @{ bundle = @{ windows = @{
+            certificateThumbprint = $env:CERT_THUMB
+            digestAlgorithm = 'sha256'
+          } } }
+          $conf | ConvertTo-Json -Depth 6 | Set-Content $winConf -Encoding UTF8
+          Get-Content $winConf | Write-Host
+
+      - name: Patch desktop app version
+        run: |
+          $cargo = 'studio/src-tauri/Cargo.toml'
+          $txt = Get-Content $cargo -Raw
+          $txt = [regex]::Replace($txt, '(?m)^version\s*=\s*"[^"]+"', "version = `"$env:APP_VERSION`"", 1)
+          Set-Content $cargo -Value $txt -Encoding UTF8
+          Select-String -Path $cargo -Pattern '^version' | Select-Object -First 1 | Write-Host
+
+      - name: Build the Windows bundle
+        id: build
+        run: |
+          Push-Location studio
+          npx --prefix . tauri build --bundles nsis --verbose
+          $rc = $LASTEXITCODE
+          Pop-Location
+          if ($rc -ne 0) { Write-Host "::error::tauri build failed ($rc)"; exit 1 }
+
+          $setup = Get-ChildItem 'studio/src-tauri/target/release/bundle/nsis' -Filter '*-setup.exe' -Recurse -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+          if (-not $setup) { Write-Host '::error::no NSIS installer produced'; exit 1 }
+          Write-Host "built: $($setup.FullName) ($($setup.Length) bytes)"
+          "SETUP=$($setup.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      # ---- 1 + 3: are the plugin DLLs signed now? -------------------------
+      - name: Inspect every executable inside the fresh bundle
+        id: inspect
+        continue-on-error: true
+        run: |
+          $dest = "$env:RUNNER_TEMP\e2e-unpack"
+          Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue
+          & 7z x -y "-o$dest" $env:SETUP | Out-Null
+          $rows = @()
+          foreach ($f in (Get-ChildItem $dest -Recurse -File | Where-Object { $_.Extension -in '.exe', '.dll' } | Sort-Object Name)) {
+            $s = Get-AuthenticodeSignature $f.FullName
+            $rows += [pscustomobject]@{
+              File = $f.Name; Size = $f.Length
+              Status = [string]$s.Status
+              Signer = [string]$s.SignerCertificate.Subject
+            }
+          }
+          $rows | Format-Table -AutoSize | Out-String | Write-Host
+          $rows | ConvertTo-Json -Depth 4 | Out-File "$env:RUNNER_TEMP\inner-signatures.json" -Encoding utf8
+
+          # The four that ship unsigned today. Each must now carry our test cert,
+          # which proves it came from the signed plugin copy.
+          $plugins = @('NSISdl.dll', 'StartMenu.dll', 'System.dll', 'nsDialogs.dll')
+          $bad = @()
+          foreach ($p in $plugins) {
+            $row = $rows | Where-Object { $_.File -eq $p } | Select-Object -First 1
+            if (-not $row) { Write-Host "  $p not embedded (fine, it may be unused)"; continue }
+            if ($row.Signer -match 'Unsloth E2E Signing Test') {
+              Write-Host "  FIXED    $p is signed by the test certificate"
+            } else {
+              Write-Host "  STILL BAD $p -> status=$($row.Status) signer='$($row.Signer)'"
+              $bad += $p
+            }
+          }
+          if ($bad) {
+            Write-Host "::error::plugin signing fix did not take for: $($bad -join ', ')"
+            "plugins_signed=false" | Out-File $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Host '::notice::all embedded NSIS plugin DLLs are signed'
+            "plugins_signed=true" | Out-File $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Run the unsigned-file gate against the fresh bundle
+        id: gate
+        continue-on-error: true
+        run: .github/scripts/assert-bundle-signed.ps1 -Path @($env:SETUP)
+
+      # ---- 2: is the WebView2 bootstrapper embedded? ----------------------
+      - name: Verify the WebView2 bootstrapper is embedded, not downloaded
+        id: webview2
+        continue-on-error: true
+        run: |
+          $dest = "$env:RUNNER_TEMP\e2e-unpack"
+          $strings = & 7z l $env:SETUP | Out-String
+          Write-Host $strings
+
+          # embedBootstrapper makes the bundler File-include the bootstrapper, so
+          # a MicrosoftEdgeWebview2Setup.exe should now be inside the installer.
+          $embedded = Get-ChildItem $dest -Recurse -File -ErrorAction SilentlyContinue |
+                      Where-Object { $_.Name -match 'Webview2|WebView2' }
+          if ($embedded) {
+            $embedded | ForEach-Object { Write-Host "  embedded: $($_.Name) ($($_.Length) bytes)" }
+            Write-Host '::notice::WebView2 bootstrapper is embedded in the installer'
+            "embedded=true" | Out-File $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Host '::warning::no embedded WebView2 payload found; the installer may still download at install time'
+            "embedded=false" | Out-File $env:GITHUB_OUTPUT -Append
+          }
+
+      # ---- 4: Defender + submission packet on the fresh bundle -----------
+      - name: Restore Defender and scan the fresh bundle
+        id: defender
+        continue-on-error: true
+        run: |
+          $atp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
+          if (Test-Path $atp) { Remove-ItemProperty -Path $atp -Name 'ForceDefenderPassiveMode' -ErrorAction SilentlyContinue }
+          Start-Service WinDefend -ErrorAction SilentlyContinue
+          foreach ($x in @((Get-MpPreference).ExclusionPath)) { if ($x) { Remove-MpPreference -ExclusionPath $x -ErrorAction SilentlyContinue } }
+          Set-MpPreference -DisableRealtimeMonitoring $false -DisableIOAVProtection $false `
+            -DisableScriptScanning $false -DisableBehaviorMonitoring $false -DisableArchiveScanning $false `
+            -MAPSReporting Advanced -SubmitSamplesConsent SendAllSamples -CloudBlockLevel High `
+            -CloudExtendedTimeout 50 -DisableBlockAtFirstSeen $false -ErrorAction Continue
+          Update-MpSignature -UpdateSource MicrosoftUpdateServer -ErrorAction Continue
+
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          $plat = Get-ChildItem 'C:\ProgramData\Microsoft\Windows Defender\Platform' -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+          if ($plat) { $mp = "$($plat.FullName)\MpCmdRun.exe" }
+
+          # Positive control first: a clean verdict is meaningless without it.
+          $eicar = "$env:RUNNER_TEMP\selftest.com"
+          [System.IO.File]::WriteAllText($eicar, 'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!' + '$H+H*')
+          $ctl = (& $mp -Scan -ScanType 3 -File $eicar -DisableRemediation 2>&1 | Out-String)
+          $ctlOk = [bool](($ctl -match 'found\s+\d+\s+threat') -or ($ctl -match 'EICAR'))
+          Write-Host "EICAR positive control: $ctlOk"
+          Remove-Item $eicar -Force -ErrorAction SilentlyContinue
+          if (-not $ctlOk) { Write-Host '::error::positive control failed; scan result below is not authoritative' }
+
+          "[ZoneTransfer]`nZoneId=3" | Set-Content -Path $env:SETUP -Stream Zone.Identifier -Encoding Ascii
+          $out = (& $mp -Scan -ScanType 3 -File $env:SETUP -DisableRemediation 2>&1 | Out-String)
+          Write-Host $out
+          if ($out -match 'found\s+\d+\s+threat') {
+            Write-Host '::error::Defender flagged the freshly built bundle'
+            "clean=false" | Out-File $env:GITHUB_OUTPUT -Append
+          } else {
+            Write-Host '::notice::freshly built bundle scans clean'
+            "clean=true" | Out-File $env:GITHUB_OUTPUT -Append
+          }
+
+      # ---- 5: does it still install and run? ------------------------------
+      - name: Silent install and launch
+        id: install
+        continue-on-error: true
+        run: |
+          $p = Start-Process -FilePath $env:SETUP -ArgumentList '/S' -PassThru -Wait -NoNewWindow
+          Write-Host "installer exit: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { Write-Host '::error::silent install failed'; exit 1 }
+
+          $roots = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+                     'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall')
+          $entry = $roots | Where-Object { Test-Path $_ } | ForEach-Object { Get-ChildItem $_ -ErrorAction SilentlyContinue } |
+                   ForEach-Object { Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue } |
+                   Where-Object { $_.MainBinaryName } | Select-Object -First 1
+          if (-not $entry) { Write-Host '::error::no install registered'; exit 1 }
+          $exe = Join-Path ($entry.InstallLocation.Trim('"')) $entry.MainBinaryName
+          Write-Host "installed: $($entry.DisplayName) $($entry.DisplayVersion) -> $exe"
+          if (-not (Test-Path $exe)) { Write-Host '::error::app binary missing'; exit 1 }
+
+          $app = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 25
+          $app.Refresh()
+          if ($app.HasExited) {
+            Write-Host "::error::app exited early, code=$($app.ExitCode) (0x$('{0:X8}' -f $app.ExitCode))"
+            exit 1
+          }
+          Write-Host "app alive after 25s, window handle $($app.MainWindowHandle)"
+          Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+
+      - name: Summary
+        if: always()
+        run: |
+          $md = @('## Windows E2E - desktop hardening', '',
+                  '| change | check | outcome |', '|---|---|---|',
+                  "| installer.nsi NSISPLUGINS | all 4 stock plugin DLLs signed | ${{ steps.inspect.outcome }} (signed=${{ steps.inspect.outputs.plugins_signed }}) |",
+                  "| assert-bundle-signed.ps1 | no unsigned PE in bundle | ${{ steps.gate.outcome }} |",
+                  "| embedBootstrapper | WebView2 embedded not downloaded | ${{ steps.webview2.outcome }} (embedded=${{ steps.webview2.outputs.embedded }}) |",
+                  "| Defender release gate | fresh bundle scans clean | ${{ steps.defender.outcome }} (clean=${{ steps.defender.outputs.clean }}) |",
+                  "| install + launch | installs silently and runs | ${{ steps.install.outcome }} |")
+          $md -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $md -join "`n" | Write-Host
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-e2e-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/inner-signatures.json
+          retention-days: 14
+          if-no-files-found: warn
