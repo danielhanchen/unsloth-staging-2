@@ -3160,54 +3160,6 @@ def unsloth_save_pretrained_gguf(
                 quant_method = "q4_k_m"
             quantization_methods.append(quant_method.lower())
 
-
-# Errno 28 / ENOSPC and the wordings the various layers use for it.
-_DISK_FULL_PATTERNS = (
-    "no space left on device",
-    "not enough free space",
-    "disk quota exceeded",
-    "errno 28",
-    "insufficient disk",
-    "write failed: no space",
-)
-
-# Kaggle allows 20GB. Anything under this and a failed conversion really is
-# plausibly about space; above it, blaming disk sends the user somewhere
-# there is nothing to find.
-_DISK_HEADROOM_BYTES = 2 * 1024 ** 3
-
-
-def _gguf_failure_looks_like_disk(exc, save_directory = None):
-    """Is this GGUF failure plausibly about running out of disk?
-
-    The Kaggle branch below used to claim the 20GB limit for EVERY failure,
-    so an unconvertible architecture, a missing tokenizer and a bad quant
-    method all told the user to free up space. ModernBERT sequence
-    classification hits it: llama.cpp has no converter for it, and the
-    notebook reported a disk problem that did not exist.
-
-    Two independent signals, either of which is enough, because each can be
-    absent for good reasons: the message may name ENOSPC while the directory
-    has since been cleaned up, and the disk may be genuinely full while the
-    error surfaced as something vaguer from a subprocess.
-    """
-    text = f"{type(exc).__name__}: {exc}".lower()
-    if any(p in text for p in _DISK_FULL_PATTERNS):
-        return True
-    if getattr(exc, "errno", None) == 28:
-        return True
-    for path in (save_directory, os.getcwd()):
-        if not path:
-            continue
-        try:
-            if shutil.disk_usage(path).free < _DISK_HEADROOM_BYTES:
-                return True
-        except OSError:
-            # Never let the diagnostic be the thing that raises.
-            continue
-    return False
-
-
     try:
         from .tokenizer_utils import fix_sentencepiece_gguf
         fix_sentencepiece_gguf(save_directory)
@@ -3301,6 +3253,53 @@ def _gguf_failure_looks_like_disk(exc, save_directory = None):
         "is_vlm": is_vlm_update,
         "fix_bos_token": fix_bos_token,
     }
+
+
+# Errno 28 / ENOSPC and the wordings the various layers use for it.
+_DISK_FULL_PATTERNS = (
+    "no space left on device",
+    "not enough free space",
+    "disk quota exceeded",
+    "errno 28",
+    "insufficient disk",
+    "write failed: no space",
+)
+
+# Kaggle allows 20GB. Anything under this and a failed conversion really is
+# plausibly about space; above it, blaming disk sends the user somewhere
+# there is nothing to find.
+_DISK_HEADROOM_BYTES = 2 * 1024 ** 3
+
+
+def _gguf_failure_looks_like_disk(exc, save_directory = None):
+    """Is this GGUF failure plausibly about running out of disk?
+
+    The Kaggle branch below used to claim the 20GB limit for EVERY failure,
+    so an unconvertible architecture, a missing tokenizer and a bad quant
+    method all told the user to free up space. ModernBERT sequence
+    classification hits it: llama.cpp has no converter for it, and the
+    notebook reported a disk problem that did not exist.
+
+    Two independent signals, either of which is enough, because each can be
+    absent for good reasons: the message may name ENOSPC while the directory
+    has since been cleaned up, and the disk may be genuinely full while the
+    error surfaced as something vaguer from a subprocess.
+    """
+    text = f"{type(exc).__name__}: {exc}".lower()
+    if any(p in text for p in _DISK_FULL_PATTERNS):
+        return True
+    if getattr(exc, "errno", None) == 28:
+        return True
+    for path in (save_directory, os.getcwd()):
+        if not path:
+            continue
+        try:
+            if shutil.disk_usage(path).free < _DISK_HEADROOM_BYTES:
+                return True
+        except OSError:
+            # Never let the diagnostic be the thing that raises.
+            continue
+    return False
 
 
 def unsloth_push_to_hub_gguf(
