@@ -894,12 +894,32 @@ jobs:
             Write-Host "::warning::Defender is degraded on this runner ($($degraded -join '; ')). Scanning anyway, but a clean result below is not authoritative."
           }
 
-          $paths = @()
-          try { $paths = @($env:ARTIFACT_PATHS | ConvertFrom-Json) } catch {
-            Write-Host "::warning::could not parse artifactPaths: $($_.Exception.Message)"
+          # Every failure to resolve the bundle list is fatal. An earlier draft of
+          # this step warned and exited 0 here, and a self-test caught it letting
+          # an unscanned release straight through -- the gate reported success
+          # having scanned nothing at all. A gate that cannot see its input must
+          # not pass.
+          if ([string]::IsNullOrWhiteSpace($env:ARTIFACT_PATHS)) {
+            Write-Host '::error::tauri-action produced no artifactPaths output; refusing to publish unscanned bundles'
+            exit 1
           }
-          $paths = @($paths | Where-Object { $_ -and (Test-Path $_ -PathType Leaf) })
-          if (-not $paths) { Write-Host '::warning::no Windows artifacts to scan'; exit 0 }
+          try {
+            $paths = @($env:ARTIFACT_PATHS | ConvertFrom-Json)
+          } catch {
+            Write-Host "::error::could not parse artifactPaths ($($_.Exception.Message)); refusing to publish unscanned bundles"
+            exit 1
+          }
+          $missing = @($paths | Where-Object { $_ -and -not (Test-Path $_ -PathType Leaf) })
+          if ($missing) {
+            Write-Host "::error::artifactPaths lists files that do not exist: $($missing -join ', ')"
+            exit 1
+          }
+          $paths = @($paths | Where-Object { $_ })
+          if (-not $paths) {
+            Write-Host '::error::artifactPaths resolved to an empty list; refusing to publish unscanned bundles'
+            exit 1
+          }
+          Write-Host "scanning $($paths.Count) Windows bundle(s)"
 
           $detected = @()
           foreach ($f in $paths) {
