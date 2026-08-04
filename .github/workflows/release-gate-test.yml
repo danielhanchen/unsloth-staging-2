@@ -1,0 +1,86 @@
+# Prove the release gate proposed for unslothai/unsloth release-desktop.yml
+# actually works, before asking anyone to merge it.
+#
+# .github/scripts/release-gate-step.ps1 is a VERBATIM copy of the step's `run:`
+# block, so this exercises the shipped logic rather than a paraphrase of it.
+#
+# Two cases, and the gate has to get both right:
+#   negative -- the two real installers, including the one Defender flagged in
+#               the wild. Must exit 0 and print "scanned clean".
+#   positive -- the EICAR test file. Must exit 1. A gate that cannot fail is not
+#               a gate, and this is exactly the failure mode the -DisableRemediation
+#               ambiguity and the runner image's blanket exclusions can produce.
+
+name: "Release gate self-test"
+
+on:
+  push:
+    branches: [defender-fp-ci]
+    paths:
+      - '.github/workflows/release-gate-test.yml'
+      - '.github/scripts/release-gate-step.ps1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  BASE_URL: 'https://github.com/danielhanchen/unsloth-staging-2/releases/download/defender-fp-samples'
+
+jobs:
+  gate-self-test:
+    name: "Gate must pass clean bundles and fail a bad one"
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Fetch the real bundles
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\bundles" | Out-Null
+          foreach ($n in @('old_0.1.51', 'new_0.1.512')) {
+            Invoke-WebRequest -Uri "$env:BASE_URL/$n.exe" -OutFile "$env:GITHUB_WORKSPACE\bundles\$n.exe" -UseBasicParsing -TimeoutSec 600
+          }
+          Get-ChildItem "$env:GITHUB_WORKSPACE\bundles" | Format-Table Name, Length -AutoSize | Out-String | Write-Host
+
+      - name: NEGATIVE case - real bundles must pass
+        id: negative
+        continue-on-error: true
+        env:
+          ARTIFACT_PATHS: '["${{ github.workspace }}\\bundles\\old_0.1.51.exe", "${{ github.workspace }}\\bundles\\new_0.1.512.exe"]'
+        run: |
+          .github/scripts/release-gate-step.ps1
+          Write-Host "gate exit code: $LASTEXITCODE"
+
+      - name: POSITIVE case - a known-bad bundle must fail the gate
+        id: positive
+        continue-on-error: true
+        run: |
+          $bad = "$env:GITHUB_WORKSPACE\bundles\known-bad.exe"
+          [System.IO.File]::WriteAllText(
+            $bad,
+            'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!' + '$H+H*')
+          $env:ARTIFACT_PATHS = "[""$($bad -replace '\\','\\')""]"
+          .github/scripts/release-gate-step.ps1
+          Write-Host "gate exit code: $LASTEXITCODE"
+
+      - name: Assert both cases behaved
+        run: |
+          $neg = '${{ steps.negative.outcome }}'
+          $pos = '${{ steps.positive.outcome }}'
+          Write-Host "negative (real bundles, expect success): $neg"
+          Write-Host "positive (known-bad, expect failure):    $pos"
+          $ok = $true
+          if ($neg -ne 'success') { Write-Host '::error::gate rejected the real bundles - it would block every release'; $ok = $false }
+          if ($pos -ne 'failure') { Write-Host '::error::gate passed a known-bad file - it cannot catch anything'; $ok = $false }
+          if (-not $ok) { exit 1 }
+          Write-Host 'Release gate behaves correctly in both directions.'
