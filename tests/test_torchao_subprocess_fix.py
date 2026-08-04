@@ -73,6 +73,30 @@ def test_it_does_not_overwrite_existing_torch_symbols():
     assert "if hasattr(F, name):" in IF._subprocess_sitecustomize_source()
 
 
+def test_the_child_never_imports_unsloth():
+    """This runs at the START of every subprocess on the machine. Importing
+    unsloth there would pay the full import cost each time and could recurse
+    back through propagate_torchao_fix_to_subprocesses itself. The logic is
+    inlined for that reason."""
+    src = IF._subprocess_sitecustomize_source()
+    assert "import unsloth" not in src
+    assert "from unsloth" not in src
+
+
+def test_it_only_imports_the_stdlib_and_torch():
+    """Anything heavier makes interpreter startup slower for every process."""
+    import ast
+    tree = ast.parse(IF._subprocess_sitecustomize_source())
+    allowed = {"os", "sys", "importlib", "importlib.util",
+               "importlib.metadata", "torch", "torch.nn.functional"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                assert a.name in allowed, f"unexpected import: {a.name}"
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            assert node.module in allowed, f"unexpected import: {node.module}"
+
+
 # ---- staging ---------------------------------------------------------------
 
 @pytest.fixture(autouse=True)

@@ -3717,6 +3717,18 @@ def propagate_torchao_fix_to_subprocesses():
     its own import, or when torch already has the symbols. On a healthy pair
     nothing is written and PYTHONPATH is not touched.
 
+    Only the torchao symbol fix is propagated, and the generated file inlines
+    that logic rather than importing unsloth. Importing unsloth from a
+    sitecustomize would run at the START of every subprocess on the machine,
+    paying the full import cost each time and risking recursion through this
+    very function -- a cure considerably worse than the disease.
+
+    That is also why the other fixes in this module are not propagated. They
+    were checked: `fix_peft_stale_torchao_import_error` is the only other
+    torchao one, and it guards LoRA construction, which happens in this
+    process. If a further fix is ever found to be needed in a child, it should
+    be inlined here too rather than turned into an `import unsloth`.
+
     Returns the directory added to PYTHONPATH, or None.
     """
     if importlib.util.find_spec("torchao") is None:
