@@ -1,0 +1,78 @@
+name: "Defender env probe"
+
+on:
+  push:
+    branches: [defender-env-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: Can the release gate's fatal checks pass on a hosted runner
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+
+          Write-Host '=== BEFORE ==='
+          Get-MpComputerStatus | Format-List AMRunningMode, AMServiceEnabled, RealTimeProtectionEnabled, IsTamperProtected, AntivirusSignatureVersion | Out-String | Write-Host
+          Get-MpPreference | Format-List MAPSReporting, SubmitSamplesConsent, DisableBlockAtFirstSeen, CloudBlockLevel, ExclusionPath | Out-String | Write-Host
+
+          $atp = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows Advanced Threat Protection'
+          if (Test-Path $atp) { Remove-ItemProperty -Path $atp -Name 'ForceDefenderPassiveMode' -ErrorAction SilentlyContinue }
+          Start-Service -Name WinDefend -ErrorAction SilentlyContinue
+          foreach ($x in @((Get-MpPreference).ExclusionPath)) {
+            if ($x) { Remove-MpPreference -ExclusionPath $x -ErrorAction SilentlyContinue }
+          }
+          Set-MpPreference `
+            -DisableRealtimeMonitoring $false -DisableIOAVProtection $false `
+            -DisableScriptScanning $false -DisableBehaviorMonitoring $false `
+            -DisableArchiveScanning $false -MAPSReporting Advanced `
+            -SubmitSamplesConsent SendAllSamples -CloudBlockLevel High `
+            -CloudExtendedTimeout 50 -DisableBlockAtFirstSeen $false -ErrorAction Continue
+
+          $mp = "$env:ProgramFiles\Windows Defender\MpCmdRun.exe"
+          $plat = Get-ChildItem 'C:\ProgramData\Microsoft\Windows Defender\Platform' -Directory -ErrorAction SilentlyContinue |
+                  Sort-Object Name -Descending | Select-Object -First 1
+          if ($plat -and (Test-Path "$($plat.FullName)\MpCmdRun.exe")) { $mp = "$($plat.FullName)\MpCmdRun.exe" }
+          Update-MpSignature -UpdateSource MicrosoftUpdateServer -ErrorAction Continue
+          & $mp -SignatureUpdate 2>&1 | Write-Host
+
+          Write-Host '=== AFTER ==='
+          $status = Get-MpComputerStatus
+          $pref = Get-MpPreference
+          $status | Format-List AMRunningMode, AMServiceEnabled, RealTimeProtectionEnabled, BehaviorMonitorEnabled, IoavProtectionEnabled, IsTamperProtected, AMEngineVersion, AntivirusSignatureVersion | Out-String | Write-Host
+          $pref | Format-List MAPSReporting, SubmitSamplesConsent, DisableBlockAtFirstSeen, CloudBlockLevel, ExclusionPath | Out-String | Write-Host
+
+          Write-Host '=== ValidateMapsConnection ==='
+          & $mp -ValidateMapsConnection 2>&1 | Write-Host
+          Write-Host "ValidateMapsConnection exit: $LASTEXITCODE"
+
+          Write-Host '=== would the proposed fatal set fire? ==='
+          $fatal = @()
+          if (-not $status.RealTimeProtectionEnabled) { $fatal += "RealTimeProtectionEnabled=false (AMRunningMode=$($status.AMRunningMode))" }
+          if ([int]$pref.MAPSReporting -ne 2)         { $fatal += "MAPSReporting=$($pref.MAPSReporting)" }
+          if ($pref.DisableBlockAtFirstSeen)          { $fatal += 'DisableBlockAtFirstSeen=true' }
+          if ($fatal) {
+            Write-Host "::error::FATAL SET WOULD FIRE: $($fatal -join '; ') -- do NOT make these fatal"
+          } else {
+            Write-Host '::notice::fatal set is dormant on this runner; making these fatal is safe'
+          }
+
+          Write-Host '=== EICAR control ==='
+          $eicarPath = Join-Path $env:RUNNER_TEMP 'defender-selftest.com'
+          $wrote = $true
+          try {
+            [System.IO.File]::WriteAllText($eicarPath, 'X5O!P%@AP[4\PZX54(P^)7CC)7}' + '$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!' + '$H+H*')
+          } catch { $wrote = $false; Write-Host "write blocked: $($_.Exception.Message)" }
+          Write-Host "wrote=$wrote present=$(Test-Path $eicarPath)"
+          if (Test-Path $eicarPath) {
+            $out = (& $mp -Scan -ScanType 3 -File $eicarPath -DisableRemediation 2>&1 | Out-String)
+            Write-Host $out
+            Write-Host "eicar scan exit: $LASTEXITCODE"
+            Remove-Item $eicarPath -Force -ErrorAction SilentlyContinue
+          }
