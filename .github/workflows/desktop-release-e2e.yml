@@ -110,12 +110,13 @@ jobs:
         shell: bash
         run: |
           npx --prefix studio tauri signer generate -w "$RUNNER_TEMP/updater.key" -p ""
-          {
-            echo "TAURI_SIGNING_PRIVATE_KEY<<KEYEOF"
-            cat "$RUNNER_TEMP/updater.key"
-            echo "KEYEOF"
-            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
-          } >> "$GITHUB_ENV"
+          # The key file has no trailing newline, so a heredoc-delimited value
+          # swallows its own delimiter. The key is single-line base64, so assign
+          # it directly with the newlines stripped.
+          key="$(tr -d '\r\n' < "$RUNNER_TEMP/updater.key")"
+          test -n "$key" || { echo "updater key is empty" >&2; exit 1; }
+          echo "TAURI_SIGNING_PRIVATE_KEY=$key" >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
 
       - name: Create a self-signed code signing certificate
         if: matrix.platform == 'windows-latest'
