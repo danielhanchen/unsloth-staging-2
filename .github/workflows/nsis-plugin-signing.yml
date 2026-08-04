@@ -1,0 +1,197 @@
+# Prove the one-line NSIS template fix actually makes makensis embed the SIGNED
+# plugin DLLs, before proposing it upstream.
+#
+# The claim under test: tauri-bundler signs a copy of the NSIS plugins and
+# exports its path as NSISPLUGINS, but no template references $%NSISPLUGINS%, so
+# only nsis_tauri_utils.dll (reached separately via ADDITIONALPLUGINSPATH) ends
+# up signed in the shipped installer. Adding
+#
+#     !if "$%NSISPLUGINS%" != ""
+#       !addplugindir "$%NSISPLUGINS%\x86-unicode"
+#     !endif
+#
+# should fix it, and must still compile when the variable is unset.
+#
+# This tests the mechanism with a minimal NSIS script and a self-signed
+# certificate, which takes about three minutes instead of the forty a full Tauri
+# build would, and isolates the variable properly: no Rust, no frontend, no
+# Azure credentials.
+
+name: "NSIS signed-plugin resolution"
+
+on:
+  push:
+    branches: [defender-fp-ci]
+    paths:
+      - '.github/workflows/nsis-plugin-signing.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  nsis-plugin-signing:
+    name: "makensis must embed the signed plugin copy"
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Install NSIS
+        run: |
+          choco install nsis --no-progress -y
+          $nsisDir = 'C:\Program Files (x86)\NSIS'
+          if (-not (Test-Path "$nsisDir\makensis.exe")) { throw "makensis not found under $nsisDir" }
+          "NSISDIR=$nsisDir" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          & "$nsisDir\makensis.exe" /VERSION
+
+      - name: Create a self-signed code signing certificate
+        run: |
+          # Stands in for Azure Trusted Signing. What matters here is only whether
+          # makensis embeds the copy we signed, not who signed it.
+          $cert = New-SelfSignedCertificate `
+            -Type CodeSigningCert -Subject 'CN=NSIS Plugin Signing Test' `
+            -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(1)
+          Write-Host "thumbprint: $($cert.Thumbprint)"
+          "CERT_THUMB=$($cert.Thumbprint)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          # Trust it locally so Get-AuthenticodeSignature returns Valid rather
+          # than UnknownError, which would make the assertions meaningless.
+          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store 'Root', 'CurrentUser'
+          $store.Open('ReadWrite'); $store.Add($cert); $store.Close()
+          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store 'TrustedPublisher', 'CurrentUser'
+          $store.Open('ReadWrite'); $store.Add($cert); $store.Close()
+
+      - name: Build a signed plugin copy, exactly as tauri-bundler does
+        run: |
+          $signed = "$env:RUNNER_TEMP\signedplugins"
+          New-Item -ItemType Directory -Force -Path "$signed\x86-unicode" | Out-Null
+          Copy-Item "$env:NSISDIR\Plugins\x86-unicode\*" "$signed\x86-unicode" -Recurse -Force
+
+          $signtool = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue |
+                      Where-Object { $_.FullName -match 'x64' } | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found' }
+          Write-Host "signtool: $($signtool.FullName)"
+          "SIGNTOOL=$($signtool.FullName)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+          # The same five files tauri-bundler's NSIS_PLUGIN_FILES lists.
+          foreach ($dll in @('NSISdl.dll', 'StartMenu.dll', 'System.dll', 'nsDialogs.dll')) {
+            $p = "$signed\x86-unicode\$dll"
+            if (Test-Path $p) {
+              & $signtool.FullName sign /fd SHA256 /sha1 $env:CERT_THUMB $p | Out-Null
+              $s = Get-AuthenticodeSignature $p
+              Write-Host ("  signed copy: {0} -> {1}" -f $dll, $s.Status)
+            }
+          }
+          "SIGNEDPLUGINS=$signed" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+          Write-Host 'stock (unsigned) originals for comparison:'
+          foreach ($dll in @('System.dll', 'nsDialogs.dll')) {
+            $s = Get-AuthenticodeSignature "$env:NSISDIR\Plugins\x86-unicode\$dll"
+            Write-Host ("  {0} -> {1}" -f $dll, $s.Status)
+          }
+
+      - name: Write a minimal installer that uses the stock plugins
+        run: |
+          # Built as an array rather than a here-string: PowerShell requires the
+          # terminator at column 0, which a YAML block scalar cannot provide.
+          # Mirrors the real template's shape - the guarded addplugindir sits
+          # above every plugin call in the file.
+          $nsi = @(
+            'Unicode true'
+            'Name "PluginResolutionTest"'
+            'OutFile "out.exe"'
+            'InstallDir "$TEMP\pluginresolutiontest"'
+            'RequestExecutionLevel user'
+            ''
+            '!if "$%NSISPLUGINS%" != ""'
+            '  !addplugindir "$%NSISPLUGINS%\x86-unicode"'
+            '!endif'
+            ''
+            '!include MUI2.nsh'
+            '!include nsDialogs.nsh'
+            '!insertmacro MUI_PAGE_INSTFILES'
+            '!insertmacro MUI_LANGUAGE "English"'
+            ''
+            'Section "Install"'
+            '  ; Reference each stock plugin so makensis actually embeds it.'
+            '  System::Call "kernel32::GetTickCount()i.r0"'
+            '  nsDialogs::Create 1018'
+            '  Pop $0'
+            '  StartMenu::Init'
+            'SectionEnd'
+          )
+          Set-Content -Path "$env:RUNNER_TEMP\test.nsi" -Value $nsi -Encoding UTF8
+          $nsi | ForEach-Object { Write-Host $_ }
+
+      - name: Case A - NSISPLUGINS set, plugins must come out SIGNED
+        id: case_a
+        run: |
+          $env:NSISPLUGINS = $env:SIGNEDPLUGINS
+          Push-Location $env:RUNNER_TEMP
+          & "$env:NSISDIR\makensis.exe" /INPUTCHARSET UTF8 test.nsi
+          $rc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "makensis exit: $rc"
+          if ($rc -ne 0) { Write-Host '::error::makensis failed with NSISPLUGINS set'; exit 1 }
+
+          $dest = "$env:RUNNER_TEMP\unpackA"
+          Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue
+          & 7z x -y "-o$dest" "$env:RUNNER_TEMP\out.exe" | Out-Null
+          $results = @()
+          foreach ($dll in @('System.dll', 'nsDialogs.dll', 'StartMenu.dll')) {
+            $f = Get-ChildItem $dest -Recurse -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($f) {
+              $s = Get-AuthenticodeSignature $f.FullName
+              Write-Host ("  embedded {0} -> {1}" -f $dll, $s.Status)
+              $results += [pscustomobject]@{ Dll = $dll; Status = [string]$s.Status }
+            } else {
+              Write-Host "  $dll not embedded"
+            }
+          }
+          $bad = @($results | Where-Object { $_.Status -ne 'Valid' })
+          if (-not $results) { Write-Host '::error::no stock plugin DLLs were embedded; the test script is wrong'; exit 1 }
+          if ($bad) {
+            Write-Host "::error::with NSISPLUGINS set, these came out unsigned: $(($bad.Dll) -join ', ')"
+            exit 1
+          }
+          Write-Host 'Case A passed: every embedded stock plugin is signed.'
+
+      - name: Case B - NSISPLUGINS unset, must still compile
+        id: case_b
+        run: |
+          Remove-Item Env:\NSISPLUGINS -ErrorAction SilentlyContinue
+          Remove-Item "$env:RUNNER_TEMP\out.exe" -Force -ErrorAction SilentlyContinue
+          Push-Location $env:RUNNER_TEMP
+          & "$env:NSISDIR\makensis.exe" /INPUTCHARSET UTF8 test.nsi
+          $rc = $LASTEXITCODE
+          Pop-Location
+          Write-Host "makensis exit: $rc"
+          if ($rc -ne 0) {
+            Write-Host '::error::the guard does not hold - makensis fails when NSISPLUGINS is unset, which would break every unsigned/local build'
+            exit 1
+          }
+          $dest = "$env:RUNNER_TEMP\unpackB"
+          Remove-Item $dest -Recurse -Force -ErrorAction SilentlyContinue
+          & 7z x -y "-o$dest" "$env:RUNNER_TEMP\out.exe" | Out-Null
+          $f = Get-ChildItem $dest -Recurse -Filter 'System.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($f) {
+            $s = Get-AuthenticodeSignature $f.FullName
+            Write-Host ("  embedded System.dll -> {0} (expected NotSigned: this is the current, broken behaviour)" -f $s.Status)
+          }
+          Write-Host 'Case B passed: the guard compiles cleanly with the variable unset.'
+
+      - name: Summary
+        if: always()
+        run: |
+          $md = @('## NSIS signed-plugin resolution', '',
+                  '| case | expectation | outcome |', '|---|---|---|',
+                  "| A: NSISPLUGINS set | embedded plugins signed | ${{ steps.case_a.outcome }} |",
+                  "| B: NSISPLUGINS unset | still compiles | ${{ steps.case_b.outcome }} |")
+          $md -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $md -join "`n" | Write-Host
