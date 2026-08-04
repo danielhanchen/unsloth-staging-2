@@ -811,8 +811,22 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
     try:
         return _patch_trl_rl_trainers_impl(trainer_file)
     except Exception as e:
-        logger.info(
-            f"Unsloth: Could not patch trl.trainer.{trainer_file}: " f"{type(e).__name__}: {e}"
+        # WARNING, not info. The impl already RETURNS (rather than raising) for
+        # the benign case this swallow exists for -- a trainer this TRL does not
+        # ship -- so anything arriving here means the module imported fine and
+        # generation itself failed. That is not benign: the run silently falls
+        # back to trl's own trainer, losing Unsloth's compute_loss, its
+        # bf16/fp16 fixup and its dataset handling all at once.
+        #
+        # It cost a day to find that once already. `_maybe_compile` was added to
+        # a function whose source the compiler copies verbatim into
+        # UnslothSFTTrainer.py, the name did not resolve there, and the
+        # resulting NameError was logged at info level and never seen. Six
+        # notebooks then failed with six unrelated-looking errors.
+        logger.warning_once(
+            f"Unsloth: Could not build the patched trl.trainer.{trainer_file}, "
+            f"so training will use trl's own trainer instead: "
+            f"{type(e).__name__}: {e}"
         )
         return
 
