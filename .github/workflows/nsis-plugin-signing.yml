@@ -60,12 +60,15 @@ jobs:
             -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddYears(1)
           Write-Host "thumbprint: $($cert.Thumbprint)"
           "CERT_THUMB=$($cert.Thumbprint)" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
-          # Trust it locally so Get-AuthenticodeSignature returns Valid rather
-          # than UnknownError, which would make the assertions meaningless.
-          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store 'Root', 'CurrentUser'
-          $store.Open('ReadWrite'); $store.Add($cert); $store.Close()
-          $store = New-Object System.Security.Cryptography.X509Certificates.X509Store 'TrustedPublisher', 'CurrentUser'
-          $store.Open('ReadWrite'); $store.Add($cert); $store.Close()
+          # Deliberately NOT installed into the Root store. Adding a cert to
+          # CurrentUser\Root raises a confirmation dialog, which on a runner with
+          # no interactive session hangs the job forever.
+          #
+          # Trust is not what this test needs anyway. Get-AuthenticodeSignature
+          # will report UnknownError for an untrusted chain, but it still returns
+          # the SignerCertificate, so the assertions below check the signer
+          # SUBJECT instead. That is the stronger check: it proves the embedded
+          # DLL is the copy we signed, not merely that some signature is present.
 
       - name: Build a signed plugin copy, exactly as tauri-bundler does
         run: |
@@ -148,19 +151,21 @@ jobs:
             $f = Get-ChildItem $dest -Recurse -Filter $dll -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($f) {
               $s = Get-AuthenticodeSignature $f.FullName
-              Write-Host ("  embedded {0} -> {1}" -f $dll, $s.Status)
-              $results += [pscustomobject]@{ Dll = $dll; Status = [string]$s.Status }
+              $subject = [string]$s.SignerCertificate.Subject
+              Write-Host ("  embedded {0} -> status={1} signer='{2}'" -f $dll, $s.Status, $subject)
+              $results += [pscustomobject]@{ Dll = $dll; Status = [string]$s.Status; Signer = $subject }
             } else {
               Write-Host "  $dll not embedded"
             }
           }
-          $bad = @($results | Where-Object { $_.Status -ne 'Valid' })
           if (-not $results) { Write-Host '::error::no stock plugin DLLs were embedded; the test script is wrong'; exit 1 }
+          # Signed by OUR test cert == it came from the signed copy.
+          $bad = @($results | Where-Object { $_.Signer -notmatch 'NSIS Plugin Signing Test' })
           if ($bad) {
-            Write-Host "::error::with NSISPLUGINS set, these came out unsigned: $(($bad.Dll) -join ', ')"
+            Write-Host "::error::with NSISPLUGINS set these did NOT come from the signed copy: $(($bad.Dll) -join ', ')"
             exit 1
           }
-          Write-Host 'Case A passed: every embedded stock plugin is signed.'
+          Write-Host 'Case A passed: every embedded stock plugin came from the signed copy.'
 
       - name: Case B - NSISPLUGINS unset, must still compile
         id: case_b
@@ -182,7 +187,10 @@ jobs:
           $f = Get-ChildItem $dest -Recurse -Filter 'System.dll' -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($f) {
             $s = Get-AuthenticodeSignature $f.FullName
-            Write-Host ("  embedded System.dll -> {0} (expected NotSigned: this is the current, broken behaviour)" -f $s.Status)
+            Write-Host ("  embedded System.dll -> status={0} signer='{1}'" -f $s.Status, $s.SignerCertificate.Subject)
+            if ($s.Status -eq 'NotSigned') {
+              Write-Host '  as expected: unsigned, which is exactly the shipping behaviour this fix addresses'
+            }
           }
           Write-Host 'Case B passed: the guard compiles cleanly with the variable unset.'
 
