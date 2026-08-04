@@ -600,6 +600,57 @@ def _resolve_trainer_params(trainer_class, init_fn):
     return set(params.keys())
 
 
+def _ensure_warnings_issued(model):
+    """Give the model back the `warnings_issued` dict every trl trainer writes into.
+
+    transformers carried `self.warnings_issued = {}` in `PreTrainedModel.__init__`
+    up to and including 5.0.0, and dropped it in 5.1.0 (the string does not appear
+    anywhere in modeling_utils.py from 5.1.0 onward). trl did not follow: eight of
+    its trainers -- grpo, dpo, online_dpo, kto, orpo, cpo, rloo and experimental
+    bco -- still do, unconditionally and before anything else touches the model:
+
+        model.warnings_issued["estimate_tokens"] = True
+
+    With no such attribute, nn.Module.__getattr__ raises
+
+        AttributeError: 'Qwen2ForCausalLM' object has no attribute 'warnings_issued'
+
+    and the trainer never gets built. Measured on Colab at transformers 5.13.1 +
+    trl 0.25.1 (NeMo-Gym-Sudoku); transformers 4.57.6 is unaffected because the
+    attribute is already a dict there, and this function returns immediately.
+
+    unsloth does guard this, but only in the source it GENERATES for the compiled
+    trainer (models/rl.py), so the guard exists exactly when compilation does.
+    UNSLOTH_COMPILE_DISABLE=1 -- the documented way out of a compile problem --
+    takes the generated module and the guard with it while trl's write remains.
+    This wrapper runs in both modes, so the guard belongs here too.
+
+    Best-effort by design, and deliberately no stricter than the generated guard:
+    a non-module (trl accepts a repo id string) is simply left alone.
+    """
+    import torch
+
+    if not isinstance(model, torch.nn.Module):
+        return
+    try:
+        existing = getattr(model, "warnings_issued", None)
+        if isinstance(existing, dict):
+            return
+        if existing is None:
+            model.warnings_issued = {}
+        else:
+            # Something non-dict is there. Preserve what we can rather than
+            # discarding it, since trl only ever writes one boolean key.
+            try:
+                model.warnings_issued = dict(existing)
+            except Exception:
+                model.warnings_issued = {}
+    except Exception:
+        # A model that refuses the assignment is trl's problem to report, not
+        # ours to turn into a different traceback.
+        pass
+
+
 def _backwards_compatible_trainer(trainer_class, config_class):
     original_init = trainer_class.__init__
 
@@ -660,6 +711,7 @@ def _backwards_compatible_trainer(trainer_class, config_class):
             # Reconstruct kwargs for Trainer
             kwargs = trainer_kwargs
             kwargs["args"] = config
+        _ensure_warnings_issued(args[0] if args else kwargs.get("model"))
         original_init(self, *args, **kwargs)
 
     return new_init
