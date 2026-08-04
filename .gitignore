@@ -243,3 +243,9 @@ llama.cpp/
 # Stray "~" dir some tools create from a literal ~ TMPDIR; never part of the repo.
 ~/
 /temp/
+
+# Test-suite outputs. tests/saving/non_peft/* save into ./test_output and
+# then safe_remove_directory it, and the GRPO tests leave adapter dirs behind;
+# an interrupted run left 2.9GB of them committed once already.
+test_output/
+grpo_trainer_lora_model_*/
