@@ -257,3 +257,7 @@ grpo_trainer_lora_model_*/
 
 # Audio fixture downloaded by tests/saving/text_to_speech_models at import time.
 Speech_12dB_s16.flac
+
+# Model snapshots pulled down by local test runs. `csm/` was committed by an
+# unscoped `git add -A` and carried a 44MB tokenizer.json into the branch.
+csm/
