@@ -1,0 +1,272 @@
+# Reproduce (or rule out) the Trojan:Win32/Wacatac.B!ml detection on the Unsloth
+# Desktop Windows installer, on a runner with Defender genuinely restored.
+#
+# Gate B (job: controls)   -- scan the known-good 0.1.51 build and the flagged
+#                             0.1.512 build. If 0.1.512 does not fire, or if
+#                             0.1.51 fires too, the bisect downstream is noise.
+# Gate C (job: components) -- unpack both installers and scan each payload file
+#                             separately, to name the guilty component.
+#
+# Defender's real-time protection is enabled BEFORE the samples are fetched, on
+# purpose: "!ml" is a cloud/FastPath verdict that fires on file write and on
+# execution, and frequently does not reproduce in a later static scan. The
+# download surviving at all is therefore itself a measurement.
+
+name: "Defender FP - Unsloth Desktop installer"
+
+on:
+  push:
+    branches: [defender-fp-ci]
+    paths:
+      - '.github/workflows/defender-fp-windows.yml'
+      - '.github/scripts/defender-*.ps1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Both fixtures are mirrored on this repo's own throwaway release so the runner
+  # needs no credentials at all. Hashes are asserted after every fetch: the old
+  # one matches the unsloth-test release asset digest, the new one matches the
+  # archived copy at danielhanchen/screenshots refs/pr/53 (commit a601d050).
+  BASE_URL: 'https://github.com/danielhanchen/unsloth-staging-2/releases/download/defender-fp-samples'
+  OLD_SHA: 'd2d39bb2751a1fab7325bf2f7a78b54475ddb249ae9af0024531dc169dada0dd'
+  NEW_SHA: '56b9917a5d66d65cf066672f61a3b73f2a11c38c6c91ada7d6eb7b6c6a779442'
+
+jobs:
+  controls:
+    name: "Gate B - controls (old vs new)"
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Prepare directories
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\samples" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\reports" | Out-Null
+          "REPORTDIR=$env:GITHUB_WORKSPACE\reports" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "SAMPLEDIR=$env:GITHUB_WORKSPACE\samples" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: Restore Defender with cloud-delivered protection
+        continue-on-error: true
+        run: .github/scripts/defender-enable.ps1
+
+      # Real-time protection is now live. Everything below is measured under it.
+      - name: Fetch both installers under live real-time protection
+        id: fetch
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $survived = @{}
+          foreach ($s in @(
+              @{ name = 'old_0.1.51';  sha = $env:OLD_SHA },
+              @{ name = 'new_0.1.512'; sha = $env:NEW_SHA })) {
+            $url = "$env:BASE_URL/$($s.name).exe"
+            $dst = "$env:SAMPLEDIR\$($s.name).exe"
+            Write-Host "GET $url"
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $dst -UseBasicParsing -TimeoutSec 600
+            } catch {
+              Write-Host "::warning::download of $($s.name) threw: $($_.Exception.Message)"
+            }
+            if (Test-Path $dst) {
+              $h = (Get-FileHash -Algorithm SHA256 $dst).Hash.ToLower()
+              Write-Host "  present, $((Get-Item $dst).Length) bytes, sha256=$h"
+              if ($h -ne $s.sha) { Write-Host "::warning::$($s.name) sha256 mismatch, expected $($s.sha)" }
+              # Invoke-WebRequest sets no Zone.Identifier. Block-at-first-sight only
+              # consults the cloud for internet-zone files, so stamp it by hand or the
+              # "!ml" code path is never taken and a clean result would mean nothing.
+              "[ZoneTransfer]`nZoneId=3`nHostUrl=$url" |
+                Set-Content -Path $dst -Stream Zone.Identifier -Encoding Ascii
+              $survived[$s.name] = 'true'
+            } else {
+              Write-Host "::error::$($s.name) is GONE after download - real-time protection removed it on write. That is the detection reproducing."
+              $survived[$s.name] = 'false'
+            }
+          }
+          "old_survived=$($survived['old_0.1.51'])"  | Out-File $env:GITHUB_OUTPUT -Append
+          "new_survived=$($survived['new_0.1.512'])" | Out-File $env:GITHUB_OUTPUT -Append
+
+      - name: Static scan both installers
+        continue-on-error: true
+        run: .github/scripts/defender-scan.ps1 -Path "$env:SAMPLEDIR" -Filter '*.exe' -OutJson "$env:REPORTDIR\gateB-controls.json"
+
+      - name: Read Defender threat objects and events
+        if: always()
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          # Get-MpThreatDetection carries no ThreatName, only ThreatID -- join it
+          # against Get-MpThreat to get a readable verdict.
+          $map = @{}
+          Get-MpThreat -ErrorAction SilentlyContinue | ForEach-Object { $map[[string]$_.ThreatID] = $_.ThreatName }
+          Write-Host '== Get-MpThreat =='
+          Get-MpThreat -ErrorAction SilentlyContinue |
+            Select-Object ThreatName, ThreatID, SeverityID, DidThreatExecute, @{n='Resources';e={$_.Resources -join '; '}} |
+            Format-List | Out-String | Write-Host
+          Write-Host '== Get-MpThreatDetection =='
+          Get-MpThreatDetection -ErrorAction SilentlyContinue | ForEach-Object {
+            [pscustomobject]@{
+              Time = $_.InitialDetectionTime; ThreatID = $_.ThreatID
+              ThreatName = $map[[string]$_.ThreatID]
+              Files = ($_.Resources -join '; '); Process = $_.ProcessName
+              ActionID = $_.CleaningActionID; Success = $_.ActionSuccess
+            }
+          } | Sort-Object Time -Descending | Format-List | Out-String | Write-Host
+
+          Get-MpThreat          -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4 | Out-File "$env:REPORTDIR\mp-threat.json" -Encoding utf8
+          Get-MpThreatDetection -ErrorAction SilentlyContinue | ConvertTo-Json -Depth 4 | Out-File "$env:REPORTDIR\mp-threatdetection.json" -Encoding utf8
+
+          Write-Host '== Defender Operational events (1006/1007/1015/1116/1117) =='
+          Get-WinEvent -FilterHashtable @{
+              LogName='Microsoft-Windows-Windows Defender/Operational'
+              Id=1006,1007,1008,1015,1116,1117,1118,1119
+            } -MaxEvents 200 -ErrorAction SilentlyContinue |
+            Sort-Object TimeCreated | Select-Object TimeCreated, Id, LevelDisplayName, Message |
+            Format-List | Out-String | Write-Host
+
+      - name: Gate B verdict
+        if: always()
+        continue-on-error: true
+        run: |
+          $j = "$env:REPORTDIR\gateB-controls.json"
+          if (-not (Test-Path $j)) { Write-Host "::error::no scan results"; exit 0 }
+          $r = Get-Content $j -Raw | ConvertFrom-Json
+          $old = $r | Where-Object { $_.file -like 'old_*' }
+          $new = $r | Where-Object { $_.file -like 'new_*' }
+          $oldSurvived = '${{ steps.fetch.outputs.old_survived }}'
+          $newSurvived = '${{ steps.fetch.outputs.new_survived }}'
+
+          $md = @()
+          $md += '## Gate B - controls'
+          $md += ''
+          $md += "Defender environment: **$env:DEFENDER_ENV**"
+          $md += ''
+          $md += '| build | survived download | static scan | threats |'
+          $md += '|---|---|---|---|'
+          $md += "| 0.1.51 (known good) | $oldSurvived | $($old.classification) | $($old.threatNames -join ', ') |"
+          $md += "| 0.1.512 (flagged) | $newSurvived | $($new.classification) | $($new.threatNames -join ', ') |"
+          $md += ''
+          $oldBad = ($oldSurvived -eq 'false') -or ($old.classification -eq 'detected')
+          $newBad = ($newSurvived -eq 'false') -or ($new.classification -eq 'detected')
+          $md += if ($newBad -and -not $oldBad) {
+            '**REPRODUCED.** The flagged build fires and the known-good build does not, so the cause is content. Proceed to component isolation.'
+          } elseif ($newBad -and $oldBad) {
+            '**BOTH FIRE.** The cause is a Defender model/definition update, not a code change between the builds. A commit bisect would attribute noise.'
+          } elseif (-not $newBad -and -not $oldBad) {
+            '**NEITHER FIRES.** The runner did not reproduce the verdict. Most likely prevalence/block-at-first-sight on a novel hash, or the cloud path was not exercised. Do not bisect on this harness.'
+          } else {
+            '**INVERTED.** Only the known-good build fires. Treat the harness as unreliable and investigate before drawing conclusions.'
+          }
+          $md -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $md -join "`n" | Write-Host
+
+      - name: Collect Defender logs
+        if: always()
+        continue-on-error: true
+        run: |
+          $dst = "$env:REPORTDIR\defender-logs"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          $src = 'C:\ProgramData\Microsoft\Windows Defender\Support'
+          if (Test-Path $src) {
+            Get-ChildItem $src -Include MPLog-*.log, MPDetection-*.log, MpCmdRun.log -Recurse -ErrorAction SilentlyContinue |
+              ForEach-Object { Copy-Item $_.FullName $dst -Force -ErrorAction SilentlyContinue }
+          }
+          wevtutil epl "Microsoft-Windows-Windows Defender/Operational" "$dst\defender-operational.evtx" 2>&1 | Write-Host
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gateB-controls-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reports/**
+          retention-days: 14
+          if-no-files-found: warn
+
+  components:
+    name: "Gate C - component isolation"
+    runs-on: windows-latest
+    timeout-minutes: 45
+    needs: controls
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Prepare directories
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\samples" | Out-Null
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\reports" | Out-Null
+          "REPORTDIR=$env:GITHUB_WORKSPACE\reports" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "SAMPLEDIR=$env:GITHUB_WORKSPACE\samples" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
+      # Fetch and unpack BEFORE restoring Defender, so a detection on the whole
+      # installer cannot destroy the sample before its parts are extracted. The
+      # per-component scan afterwards is what this job measures.
+      - name: Fetch and unpack both installers (Defender still image-default)
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'Continue'
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE\components" | Out-Null
+          foreach ($b in @('old_0.1.51', 'new_0.1.512')) {
+            $exe = "$env:SAMPLEDIR\$b.exe"
+            Invoke-WebRequest -Uri "$env:BASE_URL/$b.exe" -OutFile $exe -UseBasicParsing -TimeoutSec 600
+            if (-not (Test-Path $exe)) { Write-Host "::warning::$b did not download"; continue }
+            # 7-Zip ships on windows-latest and reads the NSIS container.
+            $out = "$env:GITHUB_WORKSPACE\unpacked\$b"
+            New-Item -ItemType Directory -Force -Path $out | Out-Null
+            & 7z x -y -o"$out" $exe | Out-Null
+            Write-Host "unpacked ${b}:"
+            Get-ChildItem $out -Recurse -File | ForEach-Object {
+              # Flatten with a build prefix so one scan pass is unambiguous.
+              Copy-Item $_.FullName (Join-Path "$env:GITHUB_WORKSPACE\components" "$b--$($_.Name)") -Force
+              Write-Host ("  {0,10}  {1}" -f $_.Length, $_.Name)
+            }
+          }
+
+      - name: Restore Defender with cloud-delivered protection
+        continue-on-error: true
+        run: .github/scripts/defender-enable.ps1
+
+      - name: Scan every component separately
+        continue-on-error: true
+        run: .github/scripts/defender-scan.ps1 -Path "$env:GITHUB_WORKSPACE\components" -OutJson "$env:REPORTDIR\gateC-components.json"
+
+      - name: Gate C summary
+        if: always()
+        continue-on-error: true
+        run: |
+          $j = "$env:REPORTDIR\gateC-components.json"
+          if (-not (Test-Path $j)) { Write-Host '::error::no results'; exit 0 }
+          $r = Get-Content $j -Raw | ConvertFrom-Json
+          $md = @('## Gate C - component isolation', '', '| component | size | signed | verdict | threats |', '|---|---|---|---|---|')
+          foreach ($x in ($r | Sort-Object file)) {
+            $md += "| $($x.file) | $($x.sizeBytes) | $($x.signatureStatus) | $($x.classification) | $($x.threatNames -join ', ') |"
+          }
+          $hits = @($r | Where-Object { $_.classification -eq 'detected' })
+          $md += ''
+          $md += if ($hits) { "**Guilty component(s):** $(($hits.file) -join ', ')" }
+                 else { '_No individual component fired. If the whole installer does, the trigger is the NSIS container or its novelty, not any single payload file._' }
+          $md -join "`n" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          $md -join "`n" | Write-Host
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gateC-components-${{ github.run_id }}-${{ github.run_attempt }}
+          path: reports/**
+          retention-days: 14
+          if-no-files-found: warn
