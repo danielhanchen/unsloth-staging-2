@@ -101,6 +101,17 @@ jobs:
           Set-Content $cargo -Value $txt -Encoding UTF8
           Select-String -Path $cargo -Pattern '^version' | Select-Object -First 1 | Write-Host
 
+      - name: Generate a throwaway Tauri updater key
+        run: |
+          # createUpdaterArtifacts is on, so the build fails at the last step
+          # without TAURI_SIGNING_PRIVATE_KEY. Unrelated to what is under test.
+          Push-Location studio
+          npx --prefix . tauri signer generate -w "$env:RUNNER_TEMP\updater.key" -p ""
+          Pop-Location
+          $key = Get-Content "$env:RUNNER_TEMP\updater.key" -Raw
+          "TAURI_SIGNING_PRIVATE_KEY=$($key.Trim())" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+          "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" | Out-File $env:GITHUB_ENV -Append -Encoding utf8
+
       - name: Build the Windows bundle
         id: build
         run: |
