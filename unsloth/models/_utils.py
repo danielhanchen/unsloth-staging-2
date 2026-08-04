@@ -2960,6 +2960,101 @@ def _unsloth_pre_compute_loss(self, model, inputs, *args, **kwargs):
     return outputs
 
 
+# The exact text torch raises from checkpoint.py:_internal_assert. Matched on
+# the message rather than the type because it is a bare AssertionError, and
+# swallowing every AssertionError raised anywhere under a training step would
+# hide real bugs.
+_CHECKPOINT_MISMATCH_TEXT = (
+    "Something went unexpectedly wrong in activation checkpoint"
+)
+
+
+def _compile_mode_flipped_under_us() -> int:
+    """Ask unsloth_zoo to latch every compiled forward to eager.
+
+    Returns how many are now eager, or 0 if none had fallen back -- meaning
+    the assertion we caught did NOT come from a compile-mode flip, so it is
+    somebody else's bug and must keep propagating.
+
+    Tolerant of an older unsloth_zoo that has no such helper: the import
+    failing is not an error, it just means there is no retry to attempt.
+    """
+    try:
+        from unsloth_zoo.temporary_patches.utils import force_eager_fallback
+    except Exception:
+        return 0
+    try:
+        return int(force_eager_fallback())
+    except Exception:
+        return 0
+
+
+def _retry_step_after_compile_mode_flip(step_fn):
+    """Retry the one training step that straddles a torch.compile fallback.
+
+    When Dynamo exhausts its recompilation cache for a fullgraph-compiled
+    forward, unsloth_zoo drops that function to eager for the rest of the run.
+    Non-reentrant activation checkpointing does not tolerate the switch
+    happening mid-step: it recomputes each checkpointed forward during
+    backward and compares what the two saved, and a compiled graph does not
+    save the same intermediates as an eager one. So the backward of the step
+    during which the switch happens dies with
+
+        AssertionError: Something went unexpectedly wrong in activation
+        checkpoint. Please report this bug by filing an issue to PyTorch.
+
+    which names PyTorch for something PyTorch did not do. Gemma4_(E2B)-Vision
+    fails exactly this way at its first backward.
+
+    Exactly one step can ever be in that position, because the fallback
+    latches. So: confirm with unsloth_zoo that a fallback really did happen,
+    drop every remaining compiled forward to eager so nothing else can flip
+    mid-step, discard the half-computed gradients, and run the step again. The
+    retry is consistent by construction, and it costs one repeated step.
+
+    Retried once and once only -- a second failure is not this bug, and a
+    retry loop would turn a crash into a hang.
+    """
+    if getattr(step_fn, "_unsloth_retries_compile_mode_flip", False):
+        return step_fn
+
+    @functools.wraps(step_fn)
+    def training_step(self, *args, **kwargs):
+        try:
+            return step_fn(self, *args, **kwargs)
+        except AssertionError as e:
+            if _CHECKPOINT_MISMATCH_TEXT not in str(e):
+                raise
+            n = _compile_mode_flipped_under_us()
+            if not n:
+                # Nothing had fallen back, so the mismatch is not ours.
+                raise
+            logger.warning(
+                f"Unsloth: torch.compile fell back to eager in the middle of a "
+                f"training step, which activation checkpointing cannot "
+                f"tolerate. {n} compiled forward(s) are now eager and this "
+                f"step is being retried. Training is unaffected apart from "
+                f"speed."
+            )
+            model = kwargs.get("model")
+            if model is None and len(args) > 0:
+                model = args[0]
+            # The failed backward left partial gradients on the parameters;
+            # keeping them would silently double-count this step's data.
+            try:
+                if model is not None:
+                    model.zero_grad(set_to_none=True)
+                optimizer = getattr(self, "optimizer", None)
+                if optimizer is not None:
+                    optimizer.zero_grad(set_to_none=True)
+            except Exception:
+                pass
+            return step_fn(self, *args, **kwargs)
+
+    training_step._unsloth_retries_compile_mode_flip = True
+    return training_step
+
+
 def patch_gradient_accumulation_fix(Trainer):
     # Fixes gradient accumulation
     # Fixes Output 0 of UnslothFusedLossBackward is a view and is being modified inplace.
@@ -3074,6 +3169,11 @@ def patch_gradient_accumulation_fix(Trainer):
 
         exec(function, globals())
         Trainer.training_step = _unsloth_training_step
+
+    # Survive the single training step during which torch.compile gives up.
+    Trainer.training_step = _retry_step_after_compile_mode_flip(
+        Trainer.training_step
+    )
 
     # Wrap Trainer.__init__: (1) pre-init, shadow accepts_loss_kwargs on whatever
     # model was passed in (covers PEFT wrapping done after FastModel.from_pretrained);
