@@ -3926,3 +3926,70 @@ def propagate_torchao_fix_to_subprocesses():
             "inspector) can import torchao too.",
             importlib_version("torchao"))
     return directory
+
+
+# torchao 0.18.0 (published 2026-08-03) moved `torchao/dtypes/nf4tensor.py` to
+# `torchao/quantization/quantize_/workflows/nf4/nf4_tensor.py`. torchtune still
+# imports the old path, and xcodec2 imports torchtune, so every Llasa TTS
+# notebook dies one cell after a green install with
+#
+#   ModuleNotFoundError: No module named 'torchao.dtypes.nf4tensor'
+#
+# Pinning torchao below 0.18 in the notebooks fixes those notebooks and nobody
+# else's code. Aliasing the module fixes anyone who imports the old path, and
+# leaves them free to take the new torchao.
+#
+# Same shape as the vLLM tokenizer stub above: a meta path finder APPENDED
+# after the real finders, so an older torchao that still ships the module
+# always wins, and the alias resolves lazily so `import unsloth` does not pay
+# for a torchao import nobody asked for.
+_TORCHAO_NF4_OLD = "torchao.dtypes.nf4tensor"
+_TORCHAO_NF4_NEW = "torchao.quantization.quantize_.workflows.nf4.nf4_tensor"
+_TORCHAO_NF4_SENTINEL = "__unsloth_torchao_nf4_alias__"
+
+
+class _TorchaoNF4AliasLoader(importlib.abc.Loader):
+    __slots__ = ("module_name",)
+
+    def __init__(self, module_name):
+        self.module_name = module_name
+
+    def create_module(self, spec):
+        # Return the RELOCATED module itself rather than a stub with a
+        # hand-copied surface. Whatever torchtune reaches for is then whatever
+        # torchao actually ships, and this cannot rot as symbols are added.
+        return importlib.import_module(_TORCHAO_NF4_NEW)
+
+    def exec_module(self, module):
+        return None
+
+
+class _TorchaoNF4AliasFinder(importlib.abc.MetaPathFinder):
+    __slots__ = (_TORCHAO_NF4_SENTINEL,)
+
+    def __init__(self):
+        setattr(self, _TORCHAO_NF4_SENTINEL, True)
+
+    def find_spec(self, fullname, path = None, target = None):
+        if fullname != _TORCHAO_NF4_OLD:
+            return None
+        try:
+            if importlib.util.find_spec(_TORCHAO_NF4_NEW) is None:
+                return None      # neither layout: let the real ImportError happen
+        except Exception:
+            return None
+        return importlib.machinery.ModuleSpec(
+            name = fullname,
+            loader = _TorchaoNF4AliasLoader(fullname),
+            is_package = False,
+        )
+
+
+def fix_torchao_nf4tensor_move():
+    if importlib.util.find_spec("torchao") is None:
+        return
+    for finder in sys.meta_path:
+        if getattr(finder, _TORCHAO_NF4_SENTINEL, False):
+            return
+    # Appended, not inserted at 0, so a real module on older torchao wins.
+    sys.meta_path.append(_TorchaoNF4AliasFinder())

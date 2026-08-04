@@ -183,6 +183,7 @@ from .import_fixes import (
     fix_xformers_performance_issue,
     fix_vllm_aimv2_issue,
     fix_vllm_lora_tokenizer_module,
+    fix_torchao_nf4tensor_move,
     check_vllm_torch_sm100_compatibility,
     fix_vllm_guided_decoding_params,
     fix_vllm_pdl_blackwell,
@@ -217,6 +218,9 @@ fix_transformers5_bare_annotation_configs()
 fix_xformers_performance_issue()
 fix_vllm_aimv2_issue()
 fix_vllm_lora_tokenizer_module()
+# torchao 0.18.0 moved nf4tensor; torchtune (via xcodec2) still imports the
+# old path. Lazy alias, so this costs nothing unless someone asks for it.
+fix_torchao_nf4tensor_move()
 # Check vLLM + torch < 2.9.0 + SM100 compatibility BEFORE importing vLLM
 check_vllm_torch_sm100_compatibility()
 fix_vllm_guided_decoding_params()
