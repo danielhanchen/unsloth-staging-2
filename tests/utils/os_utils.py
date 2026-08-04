@@ -111,6 +111,23 @@ def require_python_package(
         pip_name = package_name
 
     if importlib.util.find_spec(import_name) is None:
+        # Under pytest, every caller of this is a TEST MODULE calling it at
+        # import time, so sys.exit(1) does not skip that module -- it kills
+        # the whole session. A missing xcodec2 aborts the entire suite with
+        #     INTERNALERROR> SystemExit: 1
+        # after collection, so 1000+ unrelated tests never run and there is
+        # no report. Optional audio dependencies must cost one module, not
+        # the run.
+        #
+        # Outside pytest the behaviour is unchanged: these helpers are also
+        # used by standalone scripts, where exiting is exactly right.
+        _pytest = sys.modules.get("pytest")
+        if _pytest is not None:
+            _pytest.skip(
+                f"requires the '{package_name}' package "
+                f"(pip install {pip_name})",
+                allow_module_level = True,
+            )
         print(f"❌ Error: Python package '{package_name}' is not installed")
         print(f"\nPlease install {package_name} using pip:")
         print(f"  pip install {pip_name}")

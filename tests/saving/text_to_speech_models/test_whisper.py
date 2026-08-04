@@ -141,7 +141,19 @@ try:
         f.write(response.content)
     print("✅ Audio file downloaded successfully!")
 except Exception as e:
-    assert False, f"Failed to download audio file: {e}"
+    # This runs at module import, so `assert False` is a COLLECTION error:
+    # pytest reports the whole file as broken and, in a run that collects
+    # other modules, gives no result for any test in it.
+    #
+    # Wikimedia rate-limits, and it really does happen -- this exact URL
+    # answered `429 Too Many Requests` during a batch run and took the file
+    # down with it. A fixture we could not fetch says nothing about unsloth,
+    # so skip rather than fail: an unreachable asset is not a regression.
+    import pytest as _pytest
+    _pytest.skip(
+        f"could not download the test audio fixture from {audio_url}: {e}",
+        allow_module_level = True,
+    )
 
 print(f"\n{'='*80}")
 print("🔍 SECTION 7: Running Inference")
