@@ -260,5 +260,42 @@ def test_the_mlx_call_cannot_break_the_import():
     assert "except Exception" in window and "pass" in window
 
 
+# ---- version gating across the strings that actually ship ----------------
+
+@pytest.mark.parametrize("version,affected", [
+    ("0.18.0", True),
+    ("0.18.0+cu130", True),          # wheels carry a local version
+    ("0.19.0.dev20260801", True),    # a dev build of a later release still has it
+    ("1.0.0", True),                 # future majors, until upstream fixes it
+    ("0.17.0", False),               # guards its own import
+    ("0.17.0+cu130", False),
+    ("0.13.0", False),               # the floor in pyproject
+])
+def test_the_version_gate(version, affected):
+    """The gate decides whether we touch torch at all, so it has to cope with
+    local versions and dev builds, not just clean releases."""
+    from unsloth.import_fixes import Version
+    assert (Version(version) >= Version("0.18.0")) is affected
+
+
+def test_an_unparseable_version_is_not_patched(monkeypatch):
+    """Better to leave torch alone and let torchao raise its own error than to
+    guess from a version string we do not understand."""
+    import unsloth.import_fixes as IF
+    monkeypatch.setattr(IF, "importlib_version",
+                        lambda name: "not-a-version-at-all")
+    assert IF.fix_torchao_torch_symbol_skew() is False
+
+
+def test_a_missing_version_is_not_patched(monkeypatch):
+    import unsloth.import_fixes as IF
+
+    def _boom(name):
+        raise Exception("no metadata")
+
+    monkeypatch.setattr(IF, "importlib_version", _boom)
+    assert IF.fix_torchao_torch_symbol_skew() is False
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
