@@ -2863,8 +2863,6 @@ def push_to_ollama(tokenizer, gguf_location, username: str, model_name: str, tag
     print("Successfully pushed to ollama")
 
 
-@_normalize_tied_weights_keys_for_save
-
 def _offloaded_parameter_hint(model):
     """Explain a save failure caused by offloaded (meta-device) parameters.
 
@@ -2906,6 +2904,7 @@ def _offloaded_parameter_hint(model):
         return ""
 
 
+@_normalize_tied_weights_keys_for_save
 def unsloth_save_pretrained_gguf(
     self,
     save_directory: Union[str, os.PathLike],
