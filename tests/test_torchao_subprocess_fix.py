@@ -153,6 +153,49 @@ def test_it_is_idempotent_on_pythonpath():
     assert "if directory not in parts:" in src
 
 
+# ---- the directory it writes into -----------------------------------------
+
+def test_the_directory_is_private_to_this_user():
+    """The temp dir is shared, and everything on PYTHONPATH runs in every
+    subprocess, so a fixed name there is code execution for whoever creates it
+    first."""
+    directory = IF._subprocess_fix_directory()
+    if hasattr(os, "getuid"):
+        assert directory.endswith("-%d" % os.getuid()), directory
+        info = os.lstat(directory)
+        assert info.st_uid == os.getuid()
+        assert oct(info.st_mode & 0o777) == oct(0o700), oct(info.st_mode)
+
+
+def test_it_refuses_a_directory_owned_by_someone_else(monkeypatch, tmp_path):
+    if not hasattr(os, "getuid"):
+        pytest.skip("POSIX ownership only")
+    monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+    hostile = tmp_path / ("unsloth_subprocess_import_fix-%d" % os.getuid())
+    hostile.mkdir()
+
+    real_lstat = os.lstat
+
+    class _NotOurs:
+        st_mode = real_lstat(str(hostile)).st_mode
+        st_uid = os.getuid() + 1
+
+    monkeypatch.setattr(os, "lstat", lambda p: _NotOurs() if str(p) == str(hostile)
+                        else real_lstat(p))
+    with pytest.raises(RuntimeError, match="owned by another user"):
+        IF._subprocess_fix_directory()
+
+
+def test_the_refusal_does_not_propagate_as_a_crash(monkeypatch):
+    """`propagate_...` wraps the staging in try/except and warns. A hostile
+    directory must degrade to "no subprocess fix", not kill the import."""
+    import inspect
+    src = inspect.getsource(IF.propagate_torchao_fix_to_subprocesses)
+    i = src.index("_subprocess_fix_directory()")
+    assert "try:" in src[:i]
+    assert "except Exception as exception:" in src[i:]
+
+
 # ---- behaviour, with real interpreters ------------------------------------
 
 @pytest.fixture

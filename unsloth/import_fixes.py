@@ -3718,6 +3718,33 @@ def fix_torchao_torch_symbol_skew():
 _SUBPROCESS_FIX_DIRNAME = "unsloth_subprocess_import_fix"
 
 
+def _subprocess_fix_directory():
+    """A private directory for the generated sitecustomize.
+
+    Everything on PYTHONPATH is executed by every subprocess, and the temp dir
+    is shared on Linux, so a fixed name there would let whoever created it
+    first run code as everyone else. Scope it per user and refuse a path this
+    user does not own. Windows already gives each user a private TEMP.
+    """
+    import stat
+    import tempfile
+
+    name = _SUBPROCESS_FIX_DIRNAME
+    try:
+        name += "-%d" % os.getuid()
+    except AttributeError:
+        name += "-" + (os.environ.get("USERNAME") or "user")
+    directory = os.path.join(tempfile.gettempdir(), name)
+    os.makedirs(directory, mode = 0o700, exist_ok = True)
+    if hasattr(os, "getuid"):
+        info = os.lstat(directory)
+        if stat.S_ISLNK(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError(
+                "refusing a subprocess fix directory owned by another user: " + directory
+            )
+    return directory
+
+
 def _subprocess_sitecustomize_source():
     """The sitecustomize we hand to child processes.
 
@@ -3892,10 +3919,8 @@ def propagate_torchao_fix_to_subprocesses():
     except Exception:
         return None
 
-    import tempfile
     try:
-        directory = os.path.join(tempfile.gettempdir(), _SUBPROCESS_FIX_DIRNAME)
-        os.makedirs(directory, exist_ok=True)
+        directory = _subprocess_fix_directory()
         target = os.path.join(directory, "sitecustomize.py")
         source = _subprocess_sitecustomize_source()
         # Rewrite only when it differs, so concurrent runs do not fight and a
