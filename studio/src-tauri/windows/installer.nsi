@@ -23,6 +23,17 @@ ManifestDPIAwareness PerMonitorV2
   SetCompressor /SOLID "{{compression}}"
 !endif
 
+; Signed NSIS plugins.
+; tauri-bundler signs a copy of the plugins and exports its path as NSISPLUGINS,
+; but no template references it, so only nsis_tauri_utils.dll (reached via
+; ADDITIONALPLUGINSPATH) ships signed and NSISdl/System/StartMenu/nsDialogs do
+; not. Unsigned DLLs run from $PLUGINSDIR are a known AV false positive trigger.
+; Guarded: NSISPLUGINS is only set when signing is configured. Must precede the
+; includes, or MUI macros resolve System:: against two directories and abort.
+!if "$%NSISPLUGINS%" != ""
+  !addplugindir "$%NSISPLUGINS%\x86-unicode"
+!endif
+
 !include MUI2.nsh
 !include FileFunc.nsh
 !include x64.nsh
@@ -97,33 +108,6 @@ VIAddVersionKey "FileDescription" "${PRODUCTNAME}"
 VIAddVersionKey "LegalCopyright" "${COPYRIGHT}"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
-
-; Signed NSIS plugins.
-;
-; tauri-bundler already does the work: when a signing identity is configured it
-; copies Plugins/x86-unicode aside, signs NSISdl.dll, StartMenu.dll, System.dll,
-; nsDialogs.dll and additional/nsis_tauri_utils.dll in that copy, and exports the
-; copy's path as the NSISPLUGINS environment variable (nsis/mod.rs, the
-; `NSIS_PLUGIN_FILES` loop and the `nsis_cmd.env("NSISPLUGINS", ...)` call).
-;
-; Nothing then uses it. No NSIS template, upstream or forked, references
-; $%NSISPLUGINS%; the only plugin directory added is ADDITIONALPLUGINSPATH,
-; which points at the copy's `additional` subdirectory and therefore contains
-; exactly one file. So nsis_tauri_utils.dll comes from the signed copy and the
-; other four resolve from makensis's default, unsigned directory.
-;
-; That is measurable in the shipped bundles: in both 0.1.51-beta and
-; 0.1.512-beta, nsis_tauri_utils.dll is signed as Unsloth AI Inc. and NSISdl.dll,
-; System.dll, StartMenu.dll and nsDialogs.dll are not. Unsigned DLLs dropped into
-; $PLUGINSDIR and executed at install time are a known AV false-positive trigger
-; (tauri-apps/tauri#11673, tauri-apps/nsis-tauri-utils#37).
-;
-; Adding the directory here is the whole fix. Guarded, because NSISPLUGINS is
-; only set when signing is configured, and it must precede the plugin calls it
-; affects - which all live further down this file, below this point.
-!if "$%NSISPLUGINS%" != ""
-  !addplugindir "$%NSISPLUGINS%\x86-unicode"
-!endif
 
 # additional plugins
 !addplugindir "${ADDITIONALPLUGINSPATH}"

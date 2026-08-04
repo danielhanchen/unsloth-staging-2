@@ -1,24 +1,15 @@
-# Fail fast if any executable inside a Windows bundle is unsigned.
+# Fail if any executable inside a Windows bundle is unsigned.
 #
-# Signing the installer is not the same as signing what the installer drops on
-# disk. NSIS extracts its plugin DLLs to $PLUGINSDIR at install time and runs
-# them; an unsigned DLL appearing in a temp directory and being loaded by an
-# installer is a well-known false-positive trigger for several AV engines
-# (tauri-apps/tauri#11673, tauri-apps/nsis-tauri-utils#37).
-#
-# Shipping 0.1.512-beta, four of the five plugin DLLs were unsigned and nobody
-# knew, because nothing looked inside the installer. This does.
-#
-# Reports EVERY unsigned file rather than stopping at the first, so one run
-# tells you the whole list to fix.
+# Signing the installer is not the same as signing what it drops on disk: NSIS
+# extracts its plugin DLLs to $PLUGINSDIR and runs them from there. Reports every
+# offender rather than stopping at the first.
 
 param(
-    # Bundles to check. Each is unpacked and every PE inside is verified.
+    # Bundles to check; each is unpacked and every PE inside verified.
     [Parameter(Mandatory = $true)][string[]] $Path,
-    # 7-Zip executable. Preinstalled on windows-latest.
+    # 7-Zip, preinstalled on windows-latest.
     [string] $SevenZip = '7z',
-    # Files that are known-unsigned and accepted, by leaf name. Keep this empty
-    # if you can: every entry is a file users' AV will see unsigned.
+    # Known-unsigned files to accept, by leaf name. Keep empty where possible.
     [string[]] $Allow = @()
 )
 
@@ -37,7 +28,6 @@ foreach ($bundle in $Path) {
     Write-Host ''
     Write-Host "=== $name ==="
 
-    # The bundle itself first.
     $sig = Get-AuthenticodeSignature $bundle
     $checked++
     if ($sig.Status -ne 'Valid') {
@@ -91,9 +81,6 @@ foreach ($u in $unsigned) {
     Write-Host "::error file=$($u.File)::$($u.File) in $($u.Bundle) is $($u.Status) and needs signing"
 }
 Write-Host ''
-Write-Host 'These ship inside the installer and are written to disk on the user machine.'
-Write-Host 'If they are NSIS plugin DLLs, see .github/workflows/release-desktop.yml for the'
-Write-Host 'plugin-signing note: tauri-bundler signs its copy of the plugins but no NSIS'
-Write-Host 'template references the NSISPLUGINS directory it puts them in, so only'
-Write-Host 'nsis_tauri_utils.dll (reached via ADDITIONALPLUGINSPATH) ends up signed.'
+Write-Host 'These ship inside the installer and land on the user machine.'
+Write-Host 'For NSIS plugin DLLs see the NSISPLUGINS note in windows/installer.nsi.'
 exit 1
