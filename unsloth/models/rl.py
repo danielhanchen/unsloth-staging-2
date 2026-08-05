@@ -756,7 +756,16 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
     try:
         return _patch_trl_rl_trainers_impl(trainer_file)
     except Exception as e:
-        logger.info(f"Unsloth: Could not patch trl.trainer.{trainer_file}: {type(e).__name__}: {e}")
+        # Warning, not info. The impl RETURNS for the benign case this swallow
+        # exists for (a trainer this TRL does not ship), so anything reaching
+        # here means the module imported and generation itself failed, and the
+        # run silently falls back to trl's trainer, losing Unsloth's
+        # compute_loss, bf16/fp16 fixup and dataset handling at once.
+        logger.warning_once(
+            f"Unsloth: Could not build the patched trl.trainer.{trainer_file}, "
+            f"so training will use trl's own trainer instead: "
+            f"{type(e).__name__}: {e}"
+        )
         return
 
 
@@ -1020,11 +1029,6 @@ def _patch_trl_rl_trainers_impl(trainer_file = "grpo_trainer"):
             "dtype = _get_dtype(dtype)\n"
             "float16 = dtype == torch.float16\n"
             "bfloat16 = dtype == torch.bfloat16\n"
-            "float32 = dtype == torch.float32\n"
-            # Set by from_pretrained only when the caller passed dtype = torch.float32
-            # themselves, which is a request rather than a side effect of upcasting.
-            # On the model, so loading a second model cannot rewrite this one's answer.
-            "user_float32 = bool(getattr(model, '_unsloth_user_float32', False))\n"
             "if full_finetuning:\n"
             "    if bfloat16 and use_fp16: use_fp16 = False\n"
             "    if float16 and use_bf16: use_bf16 = False\n"
@@ -1037,18 +1041,6 @@ def _patch_trl_rl_trainers_impl(trainer_file = "grpo_trainer"):
             "    os.environ['ACCELERATE_MIXED_PRECISION'] = 'no'\n"
             "    if hasattr(args, 'mixed_precision'): args.mixed_precision = 'no'\n"
             "    # args.mixed_precision is a new argument which needs to be set now\n"
-            "elif (not use_bf16 and not use_fp16) and mixed_precision_dtype == 'float32' and float32 and user_float32 and not _bf16_supported():\n"
-            # float32 was asked for at load time and neither precision flag was set. The
-            # only autocast available without bf16 is float16, whose exponent range is far
-            # narrower, so values overflow to inf and then NaN. Gated on the explicit
-            # request because full finetuning upcasts weights to float32 by itself and
-            # float16 autocast over float32 master weights is the normal V100/T4 recipe
-            # (see #4082). bf16 GPUs are unaffected: bf16 has float32's exponent range.
-            "    print('Unsloth: Model is in float32 and this GPU has no bfloat16 support, so training stays in float32. Pass fp16 = True to force float16 mixed precision instead.')\n"
-            "    args.fp16 = False\n"
-            "    args.bf16 = False\n"
-            "    os.environ['ACCELERATE_MIXED_PRECISION'] = 'no'\n"
-            "    if hasattr(args, 'mixed_precision'): args.mixed_precision = 'no'\n"
             "elif (not use_bf16 and not use_fp16) and mixed_precision_dtype == 'float32':\n"
             "    # Mixed precision training. bf16 only if the GPU supports it; V100/T4 use fp16.\n"
             "    use_bf16_amp = (not float16) and _bf16_supported()\n"
@@ -1444,18 +1436,34 @@ def _patch_trl_rl_trainers_impl(trainer_file = "grpo_trainer"):
         extra_args += saving_check
 
     # Edit dataset_num_proc
+    # The policy lives in unsloth_zoo.dataset_num_proc: it had drifted into four
+    # inline copies, two wrong (stdlib `multiprocessing` asked about a start
+    # method `datasets` takes from `multiprocess`, and `1` used as the serial
+    # sentinel when datasets >= 4.1 builds a Pool(1) for it). The zoo rather than
+    # unsloth, so generated source never imports back into its generator;
+    # unsloth.dataset_num_proc is the fallback for an older zoo, and the
+    # ladder is guarded so a stale generated file degrades to the caller's value.
+    # serial_as_none depends on who reads the value back. Only SFT has a
+    # downstream auto-sizer: unsloth_zoo.sft_prepare_dataset reads a config
+    # `None` as "auto-size me", so serial has to be written as `1` there and the
+    # map() call site (rl_replacements.py) turns it back into None. DPO, KTO,
+    # CPO, ORPO, Reward and PRM hand args.dataset_num_proc straight to
+    # Dataset.map, where nothing can inflate a None but a `1` is a Pool(1) on
+    # datasets >= 4.1 -- one worker with its own tokenizer copy, on a host the
+    # memory clamp had just declared too small for workers.
     if "dataset_num_proc" in call_args:
+        _serial_as_none = "False" if trainer_file == "sft_trainer" else "True"
         num_proc_check = (
-            "import multiprocessing as _mp\n"
-            "if dataset_num_proc is None:\n"
-            "    if _mp.get_start_method() != 'fork':\n"
-            "        dataset_num_proc = None\n"
-            "    else:\n"
-            "        import psutil\n"
-            "        dataset_num_proc = min(max((psutil.cpu_count() or 1)+4, 2), 64)\n"
-            "        memory_gb_left = psutil.virtual_memory().available / (1024**3)\n"
-            "        if memory_gb_left <= 2: dataset_num_proc = 1\n"
-            "        else: dataset_num_proc = min(dataset_num_proc, int(memory_gb_left))\n"
+            "try:\n"
+            "    from unsloth_zoo.dataset_num_proc import get_dataset_num_proc as _unsloth_get_dataset_num_proc\n"
+            "except Exception:\n"
+            "    try:\n"
+            "        from unsloth.dataset_num_proc import get_dataset_num_proc as _unsloth_get_dataset_num_proc\n"
+            "    except Exception:\n"
+            "        _unsloth_get_dataset_num_proc = None\n"
+            "if _unsloth_get_dataset_num_proc is not None:\n"
+            "    dataset_num_proc = _unsloth_get_dataset_num_proc("
+            f"dataset_num_proc, serial_as_none = {_serial_as_none})\n"
         )
         extra_args += num_proc_check
 
@@ -2074,7 +2082,7 @@ def patch_functions(RLTrainer, trainer_file, RLTrainer_name, all_imports, import
                 sampling_params = re.sub(r"[\,][\s]{0,}\,", ",", sampling_params)
 
                 new_vllm_part = (
-                    f"\n{' ' * 8}if {args}.use_vllm:\n{sampling_params}\n{' ' * 8}else:\n"
+                    f"\n{' ' * 8}if {args}.use_vllm:\n{sampling_params}" f"\n{' ' * 8}else:\n"
                 )
 
         if trl_version >= Version("0.18.0"):
