@@ -1,0 +1,42 @@
+name: "PR-7938 ubuntu-latest"
+on:
+  push:
+    branches: [pr7938-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: python -m pip install --upgrade pip pytest structlog
+      - name: Watchdog + is_run_finished unit tests
+        env:
+          PYTHONPATH: studio/backend
+        run: python -m pytest citests/test_training_stop_watchdog.py -q -p no:cacheprovider
+      - name: SIM 1 lifecycle state machine
+        env:
+          STUDIO_BACKEND: studio/backend
+        run: python citests/sim/sim1_state_machine.py
+      - name: SIM 2 real spawn subprocesses
+        env:
+          STUDIO_BACKEND: studio/backend
+        run: python citests/sim/sim2_real_subprocess.py
+      - name: SIM 4 platform x GPU matrix
+        env:
+          STUDIO_BACKEND: studio/backend
+        run: python citests/sim/sim4_platform_matrix.py
+      - name: SIM 6 concurrency and races
+        env:
+          STUDIO_BACKEND: studio/backend
+        run: python citests/sim/sim6_concurrency.py
