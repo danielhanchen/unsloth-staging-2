@@ -105,6 +105,9 @@ from ._utils import (
     process_vision_info,
     unsloth_compile_transformers,
     fast_inference_setup,
+    _requested_float32,
+    _mark_requested_float32,
+    _mark_forced_float32,
     _get_text_only_config,
     resolve_model_class,
     _is_family_text_decoder,
@@ -437,6 +440,9 @@ class FastLanguageModel(FastLlamaModel):
                 load_in_4bit = False
 
         # Login to allow private models
+        # Before any normalization: dtype is also derived from a 4bit config's
+        # compute dtype below, which is not a request for the whole model.
+        user_float32 = _requested_float32(dtype)
         token = hf_login(token)
         # Align dtype with bnb_4bit_compute_dtype if provided and dtype is unset.
         if dtype is None and quantization_config is not None:
@@ -463,7 +469,7 @@ class FastLanguageModel(FastLlamaModel):
 
         # @_offline_aware_load already forced offline when needed; delegations inherit it.
         if load_in_8bit or full_finetuning or qat_scheme is not None:
-            return FastModel.from_pretrained(
+            delegated, tokenizer = FastModel.from_pretrained(
                 model_name = model_name,
                 max_seq_length = max_seq_length,
                 dtype = dtype,
@@ -498,6 +504,7 @@ class FastLanguageModel(FastLlamaModel):
                 *args,
                 **kwargs,
             )
+            return _mark_requested_float32(delegated, user_float32), tokenizer
 
         if isinstance(dtype, str) and dtype in ["float16", "bfloat16"]:
             dtype = getattr(torch, dtype)
@@ -881,7 +888,7 @@ class FastLanguageModel(FastLlamaModel):
         # elif model_type == "granite":
         #     dispatch_model = FastGraniteModel
         else:
-            return FastModel.from_pretrained(
+            delegated, tokenizer = FastModel.from_pretrained(
                 model_name = old_model_name,
                 max_seq_length = max_seq_length,
                 dtype = dtype,
@@ -916,6 +923,7 @@ class FastLanguageModel(FastLlamaModel):
                 *args,
                 **kwargs,
             )
+            return _mark_requested_float32(delegated, user_float32), tokenizer
 
         # Apply gradient checkpointing with smart heuristics
         use_gradient_checkpointing = apply_unsloth_gradient_checkpointing(
@@ -1088,7 +1096,11 @@ class FastLanguageModel(FastLlamaModel):
 
         model = _fix_rope_inv_freq(model)
         model = _exclude_rope_inv_freq_from_ddp(model)
-        return model, tokenizer
+        # This path only dispatches archs outside FORCE_FLOAT32 and never sets
+        # UNSLOTH_FORCE_FLOAT32, so answer False rather than leaving the trainer
+        # to read whatever a later load writes into the environment.
+        model = _mark_forced_float32(model, False)
+        return _mark_requested_float32(model, user_float32), tokenizer
 
 
 from ..kernels import (
@@ -1193,6 +1205,9 @@ class FastModel(FastBaseModel):
                 load_in_4bit = False
 
         # Login to allow private models
+        # Before any normalization: dtype is also derived from a 4bit config's
+        # compute dtype below, which is not a request for the whole model.
+        user_float32 = _requested_float32(dtype)
         token = hf_login(token)
         if whisper_language is not None:
             assert type(whisper_language) is str
@@ -1778,6 +1793,7 @@ class FastModel(FastBaseModel):
                 or disable_name.lower() in model_types_all
             ) and ((dtype == torch.float16) or not SUPPORTS_BFLOAT16):
                 os.environ["UNSLOTH_FORCE_FLOAT32"] = "1"
+                do_forced_float32 = True
                 dtype = torch.bfloat16  # Change to bfloat16 loading
                 break
         # Apply gradient checkpointing with smart heuristics
@@ -2133,7 +2149,8 @@ class FastModel(FastBaseModel):
 
         model = _fix_rope_inv_freq(model)
         model = _exclude_rope_inv_freq_from_ddp(model)
-        return model, tokenizer
+        model = _mark_forced_float32(model, do_forced_float32)
+        return _mark_requested_float32(model, user_float32), tokenizer
 
 
 class FastVisionModel(FastModel):

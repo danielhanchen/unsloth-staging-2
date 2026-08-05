@@ -756,9 +756,7 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
     try:
         return _patch_trl_rl_trainers_impl(trainer_file)
     except Exception as e:
-        logger.info(
-            f"Unsloth: Could not patch trl.trainer.{trainer_file}: " f"{type(e).__name__}: {e}"
-        )
+        logger.info(f"Unsloth: Could not patch trl.trainer.{trainer_file}: {type(e).__name__}: {e}")
         return
 
 
@@ -1022,6 +1020,11 @@ def _patch_trl_rl_trainers_impl(trainer_file = "grpo_trainer"):
             "dtype = _get_dtype(dtype)\n"
             "float16 = dtype == torch.float16\n"
             "bfloat16 = dtype == torch.bfloat16\n"
+            "float32 = dtype == torch.float32\n"
+            # Set by from_pretrained only when the caller passed dtype = torch.float32
+            # themselves, which is a request rather than a side effect of upcasting.
+            # On the model, so loading a second model cannot rewrite this one's answer.
+            "user_float32 = bool(getattr(model, '_unsloth_user_float32', False))\n"
             "if full_finetuning:\n"
             "    if bfloat16 and use_fp16: use_fp16 = False\n"
             "    if float16 and use_bf16: use_bf16 = False\n"
@@ -1034,6 +1037,18 @@ def _patch_trl_rl_trainers_impl(trainer_file = "grpo_trainer"):
             "    os.environ['ACCELERATE_MIXED_PRECISION'] = 'no'\n"
             "    if hasattr(args, 'mixed_precision'): args.mixed_precision = 'no'\n"
             "    # args.mixed_precision is a new argument which needs to be set now\n"
+            "elif (not use_bf16 and not use_fp16) and mixed_precision_dtype == 'float32' and float32 and user_float32 and not _bf16_supported():\n"
+            # float32 was asked for at load time and neither precision flag was set. The
+            # only autocast available without bf16 is float16, whose exponent range is far
+            # narrower, so values overflow to inf and then NaN. Gated on the explicit
+            # request because full finetuning upcasts weights to float32 by itself and
+            # float16 autocast over float32 master weights is the normal V100/T4 recipe
+            # (see #4082). bf16 GPUs are unaffected: bf16 has float32's exponent range.
+            "    print('Unsloth: Model is in float32 and this GPU has no bfloat16 support, so training stays in float32. Pass fp16 = True to force float16 mixed precision instead.')\n"
+            "    args.fp16 = False\n"
+            "    args.bf16 = False\n"
+            "    os.environ['ACCELERATE_MIXED_PRECISION'] = 'no'\n"
+            "    if hasattr(args, 'mixed_precision'): args.mixed_precision = 'no'\n"
             "elif (not use_bf16 and not use_fp16) and mixed_precision_dtype == 'float32':\n"
             "    # Mixed precision training. bf16 only if the GPU supports it; V100/T4 use fp16.\n"
             "    use_bf16_amp = (not float16) and _bf16_supported()\n"
@@ -2059,7 +2074,7 @@ def patch_functions(RLTrainer, trainer_file, RLTrainer_name, all_imports, import
                 sampling_params = re.sub(r"[\,][\s]{0,}\,", ",", sampling_params)
 
                 new_vllm_part = (
-                    f"\n{' ' * 8}if {args}.use_vllm:\n{sampling_params}" f"\n{' ' * 8}else:\n"
+                    f"\n{' ' * 8}if {args}.use_vllm:\n{sampling_params}\n{' ' * 8}else:\n"
                 )
 
         if trl_version >= Version("0.18.0"):
