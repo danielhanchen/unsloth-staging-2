@@ -272,22 +272,51 @@ def test_notes_say_where_commands_run(monkeypatch):
     assert "opens a window on the user's desktop" in tools._build_terminal_shell_note()
 
 
+@pytest.fixture(params = ["git-bash", "cmd-fallback"])
+def windows_terminal(request, monkeypatch):
+    """A Windows host, in both shell configurations _get_shell_cmd produces.
+
+    Faking sys.platform, which is all the rest of this file needs, cannot reach
+    _BLOCKED_COMMANDS: it folds in _BLOCKED_COMMANDS_WIN at import, so on the
+    Linux runner powershell/pwsh are not blocked names and every assertion below
+    would pass or fail for the wrong reason. Both shells are parameters because
+    with no trusted bash the blocklist lexes with shlex(posix = False), which
+    keeps the quote marks cmd screening exists for.
+    """
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(
+        tools,
+        "_windows_bash",
+        (lambda: r"C:\Program Files\Git\bin\bash.exe")
+        if request.param == "git-bash"
+        else (lambda: None),
+    )
+    monkeypatch.setattr(
+        tools,
+        "_BLOCKED_COMMANDS",
+        tools._BLOCKED_COMMANDS_COMMON | tools._BLOCKED_COMMANDS_WIN,
+    )
+
+
 @pytest.mark.parametrize(
     "command",
     [
         "cmd /c powershell -Command ls",
         "cmd //c powershell -Command ls",
         "cmd //k powershell -Command ls",
+        'cmd /c "powershell -Command ls"',
         'cmd //c start "" powershell -Command ls',
+        "cmd //c start '' powershell -Command ls",
         'cmd //c start /b "" pwsh -Command ls',
         'cmd //c start //min "" powershell -Command ls',
         r'cmd //c start /d C:/tmp "" powershell -Command ls',
     ],
 )
-def test_cmd_shellout_is_screened_through_mangled_switches(command):
+def test_cmd_shellout_is_screened_through_mangled_switches(windows_terminal, command):
     # Git Bash turns a lone /c into a path, so a model writes //c. That spelling
     # skipped the nested scan, making `cmd //c powershell` reachable where
     # `cmd /c powershell` was blocked, and `start` launches its argument too.
+    # The quoted spellings reach the scan with their quotes on (_unwrap_quotes).
     assert tools._find_blocked_commands(command)
 
 
@@ -300,7 +329,7 @@ def test_cmd_shellout_is_screened_through_mangled_switches(command):
         "start notepad",
     ],
 )
-def test_detached_windows_stay_launchable(command):
+def test_detached_windows_stay_launchable(windows_terminal, command):
     # `start` is the only route to a window on the user's desktop, which the
     # terminal description promises, so screening must not blanket-block cmd.
     assert not tools._find_blocked_commands(command)

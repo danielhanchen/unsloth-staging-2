@@ -1338,6 +1338,20 @@ def _win_switch(token: str) -> str:
     return token[1:] if token.startswith("//") else token
 
 
+def _unwrap_quotes(token: str) -> str:
+    """Drop one surrounding quote pair, which shlex(posix = False) keeps.
+
+    That non-posix lexer is the one a Windows host with no trusted bash uses, so
+    `cmd /c "powershell -Command ls"` recursed into `"powershell` and `start ""`
+    never matched the empty-title idiom, leaving both command positions
+    unscreened. Unwrapping only widens what is screened, so the posix path, with
+    no quotes left to drop, reaches the same verdict.
+    """
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+        return token[1:-1]
+    return token
+
+
 # `start` launches its argument as a program, so that argument is a command
 # position. These switches precede it; the value-taking ones eat a token.
 _START_SWITCHES_WITH_VALUE = {"/d", "/node", "/affinity", "/machine"}
@@ -1641,9 +1655,9 @@ def _find_blocked_commands(command: str) -> set[str]:
                 continue  # skip Windows flags like /s, /q (not /bin/bash)
             prev_base = os.path.basename(prev).lower()
             if is_unix_c and prev_base in _SHELLS:
-                blocked |= _find_blocked_commands(tokens[i + 1])
+                blocked |= _find_blocked_commands(_unwrap_quotes(tokens[i + 1]))
             elif is_win_c and prev_base in _SHELLS_WIN:
-                blocked |= _find_blocked_commands(tokens[i + 1])
+                blocked |= _find_blocked_commands(_unwrap_quotes(tokens[i + 1]))
             break  # stop at first non-flag token
 
     # `cmd /c start "" prog` puts prog in a command position the scan above
@@ -1659,10 +1673,10 @@ def _find_blocked_commands(command: str) -> set[str]:
             # /d C:\dir and friends carry their value in the next token.
             j += 2 if switch in _START_SWITCHES_WITH_VALUE else 1
         # `start ""` is the idiom for "no title"; anything else is the program.
-        if j < len(tokens) and tokens[j] == "":
+        if j < len(tokens) and _unwrap_quotes(tokens[j]) == "":
             j += 1
         if j < len(tokens):
-            blocked |= _find_blocked_commands(tokens[j])
+            blocked |= _find_blocked_commands(_unwrap_quotes(tokens[j]))
 
     # sed's `e COMMAND` hands COMMAND to the shell, a real command position the
     # scan above sees only as a text argument, so screen it like `bash -c`. The
