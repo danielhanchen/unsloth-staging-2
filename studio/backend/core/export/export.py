@@ -168,6 +168,33 @@ def _supports_kwarg(fn, name):
     return name in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
+def _reported_gguf_files(result):
+    """Absolute paths of the GGUFs unsloth says it wrote, or None if it did not say.
+
+    None means "this build told us nothing" -- fall back to the legacy relocation
+    heuristics untouched. That covers every older/other shape: pre-2025.10 unsloth
+    returned nothing, `is_main_process=False` returns None, and save_method="lora"
+    returns a str. An empty surviving list also returns None, because a stale or
+    empty manifest is indistinguishable from an old build and the heuristics are
+    the safer branch.
+    """
+    if not isinstance(result, dict):
+        return None
+    files = result.get("gguf_files")
+    if not isinstance(files, (list, tuple)):
+        return None
+
+    resolved = []
+    for entry in files:
+        if not isinstance(entry, (str, os.PathLike)):
+            # A malformed payload must not be half-trusted.
+            return None
+        path = os.path.abspath(os.fspath(entry))
+        if path.lower().endswith(".gguf") and os.path.isfile(path):
+            resolved.append(path)
+    return resolved or None
+
+
 def _compressed_export_supported():
     """True if the installed unsloth build can do FP8/NVFP4 compressed-tensors export."""
     try:
@@ -1049,12 +1076,48 @@ class ExportBackend:
 
                 _model_tmp = os.path.join(abs_save_dir, f"_tmp_model_{uuid.uuid4().hex[:8]}")
                 model_tmp_to_cleanup = _model_tmp
-                self.current_model.save_pretrained_gguf(
+                _gguf_result = self.current_model.save_pretrained_gguf(
                     _model_tmp,
                     self.current_tokenizer,
                     quantization_method = quant_method,
                     **imatrix_kw,
                 )
+
+                # Modern unsloth reports exactly which files it wrote. Trust that
+                # over guessing: the heuristics below only look in cwd, in new
+                # subdirs of the save dir, and next to the checkpoint, so an output
+                # written anywhere else was silently lost (#7897). Relocate FIRST,
+                # before the flatten pass rmtree's the temp dirs it lives in.
+                for src in _reported_gguf_files(_gguf_result) or []:
+                    dest = os.path.join(abs_save_dir, os.path.basename(src))
+                    if os.path.abspath(src) == os.path.abspath(dest):
+                        continue
+                    try:
+                        shutil.move(src, dest)
+                    except FileNotFoundError:
+                        continue
+                    logger.info(
+                        f"Relocated GGUF (reported by unsloth): "
+                        f"{os.path.basename(src)} → {abs_save_dir}/"
+                    )
+
+                # The Ollama Modelfile lands in the temp *_gguf dir too, and the
+                # flatten pass below only moves *.gguf before deleting it.
+                _modelfile = (
+                    _gguf_result.get("modelfile_location")
+                    if isinstance(_gguf_result, dict)
+                    else None
+                )
+                if (
+                    isinstance(_modelfile, str)
+                    and os.path.isfile(_modelfile)
+                    and os.path.dirname(os.path.abspath(_modelfile)) != abs_save_dir
+                ):
+                    try:
+                        shutil.move(_modelfile, os.path.join(abs_save_dir, "Modelfile"))
+                        logger.info(f"Relocated Modelfile → {abs_save_dir}/")
+                    except OSError:
+                        pass
 
                 # Relocate the .gguf that convert_to_gguf wrote to cwd (repo root).
                 new_ggufs = set(glob.glob(os.path.join(cwd, "*.gguf"))) - pre_existing_ggufs
@@ -1069,7 +1132,9 @@ class ExportBackend:
                         continue
                     if sub.name in pre_existing_subs:
                         continue
-                    for src in sub.glob("*.gguf"):
+                    # rglob, not glob: the rmtree below is unconditional, so a GGUF
+                    # even one level deeper (sharded output) would be destroyed.
+                    for src in sorted(sub.rglob("*.gguf")):
                         dest = os.path.join(abs_save_dir, src.name)
                         shutil.move(str(src), dest)
                         logger.info(f"Relocated GGUF: {src.name} → {abs_save_dir}/")
@@ -1094,15 +1159,34 @@ class ExportBackend:
                         shutil.rmtree(str(gguf_dir), ignore_errors = True)
                         logger.info(f"Cleaned up intermediate GGUF dir: {gguf_dir}")
 
-                # Write export metadata so the Chat page can identify the base model
-                self._write_export_metadata(abs_save_dir)
-
-                final_ggufs = sorted(glob.glob(os.path.join(abs_save_dir, "*.gguf")))
+                # Path.iterdir, not glob.glob: glob applies the hidden-file rule, so a
+                # ".Q4_K_M.gguf" (empty model stem) was reported as "(none)" even
+                # though the flatten pass had put it right here.
+                final_ggufs = sorted(
+                    str(p)
+                    for p in Path(abs_save_dir).iterdir()
+                    if p.is_file() and p.name.lower().endswith(".gguf")
+                )
                 logger.info(
                     "GGUF export complete. Final files in %s:\n  %s",
                     abs_save_dir,
                     "\n  ".join(os.path.basename(f) for f in final_ggufs) or "(none)",
                 )
+                if not final_ggufs:
+                    # A local export that produced nothing is a failed export. Saying
+                    # "success" over an empty directory is what made #7897 invisible.
+                    shutil.rmtree(model_tmp_to_cleanup, ignore_errors = True)
+                    return (
+                        False,
+                        f"GGUF conversion reported success but wrote no .gguf file to "
+                        f"{abs_save_dir}. Check the export log for the path the "
+                        f"converter actually used, then upgrade with "
+                        f"`pip install --upgrade unsloth unsloth_zoo` and retry.",
+                        None,
+                    )
+
+                # Only claim an export once at least one artifact is really present.
+                self._write_export_metadata(abs_save_dir)
                 output_path = str(Path(abs_save_dir).resolve())
 
             if push_to_hub:
@@ -1229,7 +1313,12 @@ class ExportBackend:
                         # Forward the token so convert_lora_to_gguf.py can fetch a gated base's config.
                         token = hf_token or None,
                     )
-                    final_ggufs = sorted(glob.glob(os.path.join(save_directory, "*.gguf")))
+                    # Path.iterdir, not glob.glob: glob hides dot-leading names.
+                    final_ggufs = sorted(
+                        str(p)
+                        for p in Path(save_directory).iterdir()
+                        if p.is_file() and p.name.lower().endswith(".gguf")
+                    )
                     logger.info(
                         "LoRA GGUF export complete. Files in %s:\n  %s",
                         save_directory,

@@ -1,0 +1,40 @@
+name: "PR-7897 export discovery (macos-14)"
+on:
+  push:
+    branches: [pr7897-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  macos:
+    runs-on: macos-14
+    timeout-minutes: 25
+    env:
+      UNSLOTH_ALLOW_CPU: "1"
+      UNSLOTH_IS_PRESENT: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio httpx python-multipart "numpy<3"
+      - name: Case-insensitive APFS reality check
+        run: |
+          python - <<'PY'
+          import pathlib, tempfile
+          d = pathlib.Path(tempfile.mkdtemp())
+          (d / "M.Q4_K_M.gguf").write_bytes(b"GGUF")
+          collides = (d / "m.q4_k_m.gguf").exists()
+          print("APFS case-insensitive:", collides)
+          PY
+      - name: Basename + export discovery
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest tests/test_gguf_model_basename.py -q -p no:cacheprovider
+      - working-directory: studio/backend
+        run: python -m pytest tests/test_export_gguf_discovery.py tests/test_training_finalizing_phase.py -q -p no:cacheprovider

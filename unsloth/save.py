@@ -2863,6 +2863,41 @@ def push_to_ollama(tokenizer, gguf_location, username: str, model_name: str, tag
     print("Successfully pushed to ollama")
 
 
+def _model_basename(name_or_path, default = "model") -> str:
+    """Leaf name of a model id or path, for use as a GGUF *filename* stem.
+
+    Must strip `\\` as well as `/` on every host, not just Windows: the offending
+    value is a Windows path that reaches this code on whichever OS Studio runs on,
+    and `os.path.basename` on POSIX returns the whole `D:\\...` string. Leaving a
+    directory or drive in the stem makes `os.path.join(gguf_directory, stem + ...)`
+    discard `gguf_directory` under ntpath, writing the GGUF next to the base model
+    instead of the export directory (#7897). An empty stem is just as bad: it
+    yields a hidden `.Q4_K_M.gguf` that `glob.glob("*.gguf")` cannot see.
+    """
+    if name_or_path is None: return default
+    try:
+        text = os.fspath(name_or_path)
+    except TypeError:
+        text = str(name_or_path)
+    if not isinstance(text, str) or not text.strip(): return default
+
+    # A real directory is authoritative: a POSIX directory name may legally
+    # contain a backslash, and only the filesystem can settle that.
+    try:
+        if os.path.isdir(text):
+            base = os.path.basename(os.path.normpath(text))
+            if base and base not in (".", ".."): return base
+    except (OSError, ValueError):
+        pass
+
+    base = text.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+    # Drop a bare drive ("D:") or relative marker; both would produce a hidden or
+    # drive-relative output file rather than a name.
+    if not base or base in (".", "..") or (len(base) == 2 and base[1] == ":"):
+        return default
+    return base
+
+
 @_normalize_tied_weights_keys_for_save
 def unsloth_save_pretrained_gguf(
     self,
@@ -2951,12 +2986,14 @@ def unsloth_save_pretrained_gguf(
             _outtype = "f16"
         return _unsloth_save_lora_gguf(self, tokenizer, save_directory, outtype = _outtype)
 
+    # `base_model_name` keeps the full resolved id: create_ollama_modelfile looks it
+    # up in MODEL_TO_OLLAMA_TEMPLATE_MAPPER below. Only the filename stem is trimmed.
+    base_model_name = getattr(getattr(self, "config", None), "_name_or_path", None)
     try:
-        base_model_name = get_model_name(self.config._name_or_path, load_in_4bit = False)
-        model_name = base_model_name.split("/")[-1]
-    except:
-        base_model_name = self.config._name_or_path
-        model_name = base_model_name.split("/")[-1]
+        base_model_name = get_model_name(base_model_name, load_in_4bit = False)
+    except Exception:
+        pass
+    model_name = _model_basename(base_model_name)
 
     # Check if push_to_hub is requested
     if push_to_hub:
@@ -3711,13 +3748,7 @@ def _unsloth_save_lora_gguf(
         base_model_id = get_model_name(base_model_id, load_in_4bit = False)
     except Exception:
         pass
-    # Windows-safe basename (handles both C:\... and / separators).
-    if os.path.isdir(base_model_id):
-        model_name = os.path.basename(os.path.normpath(base_model_id))
-    else:
-        model_name = base_model_id.replace("\\", "/").rstrip("/").split("/")[-1]
-    if not model_name:
-        model_name = "model"
+    model_name = _model_basename(base_model_id)
 
     # Save the adapter; for a hub push use an isolated temp dir, else save_directory itself.
     if push_to_hub:

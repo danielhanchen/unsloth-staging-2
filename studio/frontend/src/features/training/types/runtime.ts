@@ -9,6 +9,9 @@ export type TrainingPhase =
   | "loading_dataset"
   | "configuring"
   | "training"
+  // Steps are done; the worker is still saving. Non-terminal: reaching 100% does
+  // not mean the save succeeded.
+  | "finalizing"
   | "completed"
   | "error"
   | "stopped";

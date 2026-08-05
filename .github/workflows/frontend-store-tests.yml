@@ -1,0 +1,27 @@
+name: "PR-7897 frontend store tests (ubuntu-latest)"
+on:
+  push:
+    branches: [pr7897-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - working-directory: studio/frontend
+        run: npm ci
+      - working-directory: studio/frontend
+        run: npm run typecheck
+      - working-directory: studio/frontend
+        run: npm test

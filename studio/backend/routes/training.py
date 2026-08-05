@@ -98,6 +98,23 @@ logger = get_logger(__name__)
 _PROGRESS_STALL_TIMEOUT_POLLS = 1800  # ~30 min at 1 poll/sec
 
 
+def _is_finalizing(progress, msg_lower: str) -> bool:
+    """Worker still alive past the last step, `complete` not yet drained.
+
+    The post-training save (merge, save_model, adapter_config patch) emits no step
+    updates, so the bar sat at 100% still labelled "training" for the whole save --
+    with nothing to distinguish it from a hang. Reaching the last step means the
+    optimizer loop ended, NOT that the save succeeded, so this stays a *non-terminal*
+    phase: completion is still carried solely by `is_completed`. Inert while
+    total_steps is unknown or steps remain.
+    """
+    if any(k in msg_lower for k in ("saving", "merging")):
+        return True
+    total = getattr(progress, "total_steps", 0) or 0
+    step = getattr(progress, "step", 0) or 0
+    return total > 0 and step >= total
+
+
 def _validate_local_dataset_paths(paths: list[str], label: str = "Local dataset") -> list[str]:
     """Resolve and validate a list of local dataset paths. Returns validated absolute paths."""
     validated = []
@@ -722,6 +739,8 @@ async def get_training_status(current_subject: str = Depends(get_current_subject
                 phase = "loading_model"
             elif any(k in msg_lower for k in ["preparing", "initializing", "configuring"]):
                 phase = "configuring"
+            elif _is_finalizing(progress, msg_lower):
+                phase = "finalizing"
             else:
                 phase = "training"
         elif trainer_stopped:
