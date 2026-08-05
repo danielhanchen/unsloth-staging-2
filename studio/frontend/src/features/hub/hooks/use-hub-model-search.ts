@@ -20,6 +20,8 @@ import { EMBEDDING_TAGS, estimateSizeFromDtypes } from "../lib/hf-model-meta";
 import { detectBaseModel } from "../lib/model-capabilities";
 import { isGgufLike } from "../lib/model-identifiers";
 import { fetchWithTimeout } from "../lib/network";
+import { createHubTransport, isProxyUrl } from "../lib/hub-transport";
+import { hubProxyFirst } from "../lib/hub-endpoint";
 import {
   type UnslothSupport,
   type UnslothSupportStatus,
@@ -140,12 +142,17 @@ function withGgufExpand(input: Parameters<typeof fetch>[0]): string {
 }
 
 function makeHfFetch(signal?: AbortSignal): typeof fetch {
+  // Each call builds its own transport so pagination affinity is per-iterator.
+  const transport = createHubTransport("models", {
+    direct: (input, init, service) =>
+      fetchWithTimeout(input, init, HF_SEARCH_TIMEOUT_MS, {
+        recordFailure: false,
+        service,
+      }),
+    proxyFirst: hubProxyFirst,
+  });
   return (input, init) =>
-    fetchWithTimeout(
-      withGgufExpand(input),
-      signal ? { ...init, signal } : init,
-      HF_SEARCH_TIMEOUT_MS,
-    );
+    transport(withGgufExpand(input), signal ? { ...init, signal } : init);
 }
 
 function makeSortFetch(
@@ -153,6 +160,14 @@ function makeSortFetch(
   direction: HfSortDirection,
   signal?: AbortSignal,
 ): typeof fetch {
+  const transport = createHubTransport("models", {
+    direct: (input, init, service) =>
+      fetchWithTimeout(input, init, HF_SEARCH_TIMEOUT_MS, {
+        recordFailure: false,
+        service,
+      }),
+    proxyFirst: hubProxyFirst,
+  });
   return (input, init) => {
     const rawUrl =
       typeof input === "string"
@@ -160,6 +175,11 @@ function makeSortFetch(
         : input instanceof URL
           ? input.toString()
           : input.url;
+    // A next-page link back into the proxy means the transport is already
+    // proxying; the sort/direction were applied on the first request.
+    if (isProxyUrl(rawUrl)) {
+      return transport(rawUrl, signal ? { ...init, signal } : init);
+    }
     const url = new URL(rawUrl);
 
     if (sortBy && !url.searchParams.has("sort")) {
@@ -172,10 +192,9 @@ function makeSortFetch(
       effectiveSort && DESC_ONLY_SORTS.has(effectiveSort) ? "desc" : direction;
     url.searchParams.set("direction", effectiveDir === "asc" ? "1" : "-1");
 
-    return fetchWithTimeout(
+    return transport(
       withGgufExpand(url),
       signal ? { ...init, signal } : init,
-      HF_SEARCH_TIMEOUT_MS,
     );
   };
 }

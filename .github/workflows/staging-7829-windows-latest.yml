@@ -1,0 +1,51 @@
+name: "staging-7829 windows-latest"
+on:
+  push:
+    branches: ["pr-7829-xplat-ci"]
+    paths:
+      - 'studio/backend/hub/routes/__init__.py'
+      - 'studio/backend/hub/routes/discovery.py'
+      - 'studio/backend/main.py'
+      - 'studio/backend/tests/test_hub_discovery_proxy.py'
+      - 'studio/frontend/src/config/env.ts'
+      - 'studio/frontend/src/features/hub/catalog/catalog-states.tsx'
+      - 'studio/frontend/src/features/hub/catalog/models-catalog-lists.tsx'
+      - 'studio/frontend/src/features/hub/catalog/models-catalog.tsx'
+      - 'studio/frontend/src/features/hub/hooks/use-discover-search.ts'
+      - 'studio/frontend/src/features/hub/hooks/use-hub-dataset-search.ts'
+      - 'studio/frontend/src/features/hub/hooks/use-hub-infinite-scroll.ts'
+      - 'studio/frontend/src/features/hub/hooks/use-hub-model-search.ts'
+      - 'studio/frontend/src/features/hub/hooks/use-hub-paginated-search.ts'
+      - 'studio/frontend/src/features/hub/hooks/use-online-status.ts'
+      - 'studio/frontend/src/features/hub/hooks/use-selected-model-metadata.ts'
+      - 'studio/frontend/src/features/hub/hub-page.tsx'
+      - 'studio/frontend/src/features/hub/index.ts'
+      - 'studio/frontend/src/features/hub/lib/dataset-size.ts'
+      - 'studio/frontend/src/features/hub/lib/hf-owner-avatar.ts'
+      - 'studio/frontend/src/features/hub/lib/hf-readme.ts'
+      - '.github/workflows/staging-7829-windows-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_hub_discovery_proxy.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"

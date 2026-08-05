@@ -3,6 +3,7 @@
 
 import { LruMap } from "@/features/hub/lib/lru-map";
 import { fetchWithTimeout } from "@/features/hub/lib/network";
+import { hubProxyFirst } from "@/features/hub/lib/hub-endpoint";
 import { fingerprintToken } from "@/features/hub/lib/token-fingerprint";
 import { defaultUrlTransform, type UrlTransform } from "streamdown";
 
@@ -48,6 +49,9 @@ async function fetchReadmeOnce(
 ): Promise<FetchedReadme | null> {
   const prefix = readmePrefix(kind);
   const headers: HeadersInit = {};
+  // Hardcoded public URL: with a mirror configured this would disclose a private
+  // repo name and its token to huggingface.co. No card is better than that.
+  if (hubProxyFirst()) return null;
   if (token) headers.Authorization = `Bearer ${token}`;
   let transient = false;
   for (const branch of ["main", "master"] as const) {
@@ -60,6 +64,7 @@ async function fetchReadmeOnce(
           headers,
         },
         README_FETCH_TIMEOUT_MS,
+        { service: "other" },
       );
       if (res.ok) {
         return { markdown: await res.text(), branch };
