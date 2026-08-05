@@ -311,6 +311,39 @@ def _embeddings_are_tied(input_embeddings, output_embeddings):
     return w_in is w_out or w_in.data_ptr() == w_out.data_ptr()
 
 
+def _resolve_offload_embedding(model, offload_embedding):
+    """Decide whether `offload_embedding = True` can actually be honoured.
+
+    It is a VRAM optimisation, not a correctness switch, so a model it cannot
+    help turns it off (as `fast_inference` already does) rather than failing
+    the load. WSL and Windows are returned unchanged, since the offload block
+    skips those platforms anyway.
+    """
+    if not offload_embedding:
+        return False
+    if bool(os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP")):
+        return offload_embedding
+    if os.name == "nt":
+        return offload_embedding
+    try:
+        in_embed = model.get_input_embeddings()
+        out_embed = (
+            model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
+        )
+    except Exception:
+        # Cannot inspect it, so leave the caller's request alone.
+        return offload_embedding
+    if _embeddings_are_tied(in_embed, out_embed):
+        # embed_tokens IS lm_head, so offloading strands the output projection
+        # on CPU and frees nothing.
+        print(
+            "Unsloth: Not offloading embeddings; this model ties embed_tokens "
+            "to lm_head, so offloading saves no VRAM."
+        )
+        return False
+    return True
+
+
 VLLM_SUPPORTED_VLM = [
     "qwen2_5_vl",
     "gemma3",
@@ -554,7 +587,15 @@ def unsloth_base_fast_generate(self, *args, **kwargs):
         autocaster = torch.autocast(device_type = DEVICE_TYPE_TORCH, dtype = torch.float16)
         dtype = torch.float16
     else:
-        autocaster = torch.autocast(device_type = DEVICE_TYPE_TORCH, dtype = dtype)
+        # CUDA autocast does not validate its dtype the way the CPU/XPU/MPS paths do,
+        # so autocast(dtype = torch.float32) enters ENABLED rather than turning into a
+        # no-op, and the compiled graph then returns inf/NaN logits. A float32 model has
+        # nothing to autocast to; disable instead of asking for a dtype that is not one.
+        autocaster = torch.autocast(
+            device_type = DEVICE_TYPE_TORCH,
+            dtype = dtype,
+            enabled = dtype in (torch.float16, torch.bfloat16),
+        )
     # Prepare LoRA
     # state_dict = convert_lora_modules(self, dtype = dtype)
 
@@ -1310,6 +1351,14 @@ class FastBaseModel:
                     # attn_implementation   = attn_implementation,
                     **kwargs,
                 )
+                # Before _attach_bnb_multidevice_hooks, which returns early
+                # while offload_embedding is True; resolving later would skip
+                # hook attachment for tied models.
+                offload_embedding = _resolve_offload_embedding(
+                    model,
+                    offload_embedding,
+                )
+
                 # Attach dispatch hooks for bnb multi-device loads.
                 _attach_bnb_multidevice_hooks(
                     model,
@@ -1346,13 +1395,7 @@ class FastBaseModel:
                             if hasattr(model, "get_output_embeddings")
                             else None
                         )
-                        if _embeddings_are_tied(embed_tokens, out_embed):
-                            raise NotImplementedError(
-                                "offload_embedding = True is not supported for models with tied word "
-                                "embeddings (embed_tokens shares its weight with lm_head). Offloading "
-                                "would strand the output projection on CPU and saves no VRAM. Set "
-                                "offload_embedding = False for this model."
-                            )
+                        # Tied embeddings were screened out above.
                         nbytes = embed_tokens.weight.numel() * embed_tokens.weight.itemsize
                         ngb = round(nbytes / 1024 / 1024 / 1024, 2)
                         print(f"Unsloth: Offloading embeddings to RAM to save {ngb} GB.")
