@@ -2,6 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { sanitizeHubErrorMessage } from "../lib/network";
 
 interface HfPaginatedState<T> {
   results: T[];
@@ -66,6 +67,14 @@ export async function pullBatch<T>(
 
 function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === "AbortError";
+}
+
+// The SDK appends the request URL to its message, and for a proxied request
+// that URL carries the user's search query, which some pickers render raw.
+function hubErrorText(err: unknown, fallback: string): string {
+  return err instanceof Error
+    ? sanitizeHubErrorMessage(err.message)
+    : fallback;
 }
 
 function isDocumentHidden(): boolean {
@@ -157,13 +166,14 @@ export function useHubPaginatedSearch<T>(
         busyRef.current = false;
         busyKindRef.current = null;
       }
+      // `error` is deliberately preserved: disabling the feed must not erase why
+      // the last attempt failed, leaving only a generic "you're offline" panel.
       setState((prev) =>
-        prev.isLoading || prev.isLoadingMore || prev.error
+        prev.isLoading || prev.isLoadingMore
           ? {
               ...prev,
               isLoading: false,
               isLoadingMore: false,
-              error: null,
             }
           : prev,
       );
@@ -224,7 +234,7 @@ export function useHubPaginatedSearch<T>(
           isLoading: false,
           isLoadingMore: false,
           hasMore: false,
-          error: err instanceof Error ? err.message : "Search failed",
+          error: hubErrorText(err, "Search failed"),
           queryKey,
         });
       })
@@ -338,7 +348,7 @@ export function useHubPaginatedSearch<T>(
           // Keep results and hasMore=true: the iterator is still valid, so the
           // next fetchMore() resumes the failed page without discarding the list
           // (retry() restarts from page 1).
-          error: err instanceof Error ? err.message : "Failed to load more",
+          error: hubErrorText(err, "Failed to load more"),
         }));
       })
       .finally(() => {
