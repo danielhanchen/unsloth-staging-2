@@ -1338,9 +1338,98 @@ def _win_switch(token: str) -> str:
     return token[1:] if token.startswith("//") else token
 
 
+def _unwrap_quotes(token: str) -> str:
+    """Drop one surrounding double-quote pair, which shlex(posix = False) keeps.
+
+    That non-posix lexer is the one a Windows host with no trusted bash uses, so
+    `cmd /c "powershell -Command ls"` recursed into `"powershell` and `start ""`
+    never matched the empty-title idiom, leaving both command positions
+    unscreened.
+
+    Only `"`, because cmd has no other quoting: it runs `'powershell ...'` as a
+    program literally named `'powershell`, so stripping `'` here would block a
+    line cmd could never execute.
+
+    Callers must apply this ONLY on the non-posix path (see _unquote). The posix
+    lexer has already removed the delimiters, so a pair still attached is the
+    nested command's own syntax, and re-parsing without it reads a quoted word
+    as a command line.
+    """
+    if len(token) >= 2 and token[0] == '"' == token[-1]:
+        return token[1:-1]
+    return token
+
+
 # `start` launches its argument as a program, so that argument is a command
 # position. These switches precede it; the value-taking ones eat a token.
 _START_SWITCHES_WITH_VALUE = {"/d", "/node", "/affinity", "/machine"}
+
+# What a word has to end in before a path is read as naming a program.
+_WINDOWS_EXE_SUFFIXES = frozenset({".exe", ".com", ".bat", ".cmd"})
+# A drive letter, a separator, or a %VAR% cmd expands before reading the path:
+# how a payload that OPENS with a program path is told from one whose command
+# word was lexed normally.
+_PATH_FRAGMENT_RE = re.compile(r"^(?:[A-Za-z]:|\.{0,2}[/\\]|%[^%]+%[/\\])")
+
+
+def _is_start_switch(token: str) -> bool:
+    """Whether ``token`` is a START option rather than the program it launches.
+
+    Every documented one is a single letter or word after the slash, so an MSYS
+    drive path keeps its own: Git Bash hands `/c/Windows/.../powershell.exe`
+    straight to cmd as a C: executable, and skipping it as an option walks the
+    scan past the program onto its arguments.
+    """
+    switch = _win_switch(token)
+    return switch.startswith("/") and "/" not in switch[1:]
+
+
+def _blocked_quoted_program(payload: str, blocked_names: "frozenset[str]") -> "set[str]":
+    """Blocked names spelled as an executable PATH that lexing split apart.
+
+    `cmd /c "C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command ls` names one
+    program whose path holds spaces, so re-lexing the payload reads
+    `C:\\Program` as the command word and leaves pwsh in argument position.
+
+    Only a payload OPENING with a path fragment can be that shape. Anything else
+    already had its command word lexed normally, and reading further would take
+    `echo C:\\tmp\\pwsh.exe` for a launch when the path is only being printed.
+    The walk stops at the first executable for the same reason: what follows it
+    is arguments.
+    """
+    words = payload.split()
+    if not words or not _PATH_FRAGMENT_RE.match(words[0].strip("\"'")):
+        return set()
+    program: "list[str]" = []
+    for word in words:
+        bare = word.strip("\"'")
+        if bare.startswith("-") or _is_start_switch(bare):
+            break  # an option ends the path and starts the arguments
+        program.append(bare)
+        if os.path.splitext(bare)[1].lower() in _WINDOWS_EXE_SUFFIXES:
+            break  # the executable ends it too; the rest are arguments
+    if not program:
+        return set()
+    # cmd searches PATHEXT, so the suffix is optional: `...\PowerShell\7\pwsh`
+    # launches the same program. os.path.basename does not split a backslash off
+    # Windows, and %VAR% is expanded before the path is read.
+    stem = os.path.splitext(program[-1])[0]
+    base = os.path.basename(stem.replace("\\", "/")).lower()
+    return {base} if base in blocked_names else set()
+
+
+def _is_start_title(token: str, lexed_posix: bool) -> bool:
+    """Whether ``token`` is START's window title rather than the program it runs.
+
+    Documented as `start <"title"> ... [<command>]`: a quoted first argument is
+    always the title, which is why `start ""` is the idiom for launching a
+    quoted path. The posix lexer has already dropped the quote marks, so only
+    the empty-title spelling is still recognisable there and the caller screens
+    one token further on instead.
+    """
+    if lexed_posix:
+        return token == ""
+    return len(token) >= 2 and token[0] == '"' == token[-1]
 
 
 def _find_blocked_commands(command: str) -> set[str]:
@@ -1376,11 +1465,20 @@ def _find_blocked_commands(command: str) -> set[str]:
     except ValueError:
         tokens = command.split()
         lexed_posix = False
+
     # Which separator tokens the shell only produced because the quoting was
     # stripped. The non-posix (cmd) lexer KEEPS the quote marks, so a quoted
     # `';'` never looks like a separator there and nothing has to be recovered;
     # the split() fallback has no quoting model at all, so it reports nothing
     # either and both shells reach the same verdict.
+    def _unquote(tok: str) -> str:
+        # Quote marks survive lexing only under cmd. On the posix path shlex has
+        # already eaten the delimiters, so stripping another pair would turn a
+        # quoted word into a command line: `bash -c '""rm -rf x""'` lexes to
+        # `rm -rf x` and is blocked, but unwrapped it becomes the single word
+        # `rm -rf x` and sails through. bash really runs that.
+        return tok if lexed_posix else _unwrap_quotes(tok)
+
     quoted_separators = (
         _quoted_separator_indexes(command, tokens, ";&|()`") if lexed_posix else frozenset()
     )
@@ -1639,11 +1737,34 @@ def _find_blocked_commands(command: str) -> set[str]:
                 continue  # skip Unix flags like --login, -l
             if is_win_c and prev.startswith("/") and len(prev) <= 3:
                 continue  # skip Windows flags like /s, /q (not /bin/bash)
-            prev_base = os.path.basename(prev).lower()
+            # `start "" "cmd" /c prog` quotes the shell name too, and a leading
+            # quote hid it from this lookup, so nothing recursed into prog.
+            prev_base = os.path.basename(_unquote(prev)).lower()
             if is_unix_c and prev_base in _SHELLS:
-                blocked |= _find_blocked_commands(tokens[i + 1])
+                blocked |= _find_blocked_commands(_unquote(tokens[i + 1]))
             elif is_win_c and prev_base in _SHELLS_WIN:
-                blocked |= _find_blocked_commands(tokens[i + 1])
+                payload = _unquote(tokens[i + 1])
+                blocked |= _find_blocked_commands(payload)
+                bare = _unwrap_quotes(payload)
+                if bare != payload:
+                    # Git Bash keeps cmd's own quotes: `cmd //c '"powershell
+                    # -Command ls"'` reaches cmd as one quoted string, which cmd
+                    # unquotes and runs. Scanned IN ADDITION to the quoted form,
+                    # never instead of it, because the two spans of `""rm -rf
+                    # x""` are what stop that one collapsing into a single word.
+                    blocked |= _find_blocked_commands(bare)
+                    blocked |= _blocked_quoted_program(bare, _BLOCKED_COMMANDS)
+                # A program path holding spaces survives lexing as one quoted
+                # word, so re-lexing it reads only its first path segment.
+                blocked |= _blocked_quoted_program(payload, _BLOCKED_COMMANDS)
+                if not payload and i + 2 < len(tokens):
+                    # `cmd /s /c ""prog" args"`: /s strips the outer pair off the
+                    # WHOLE payload, so the lexer hands back that pair as an
+                    # empty first token and the program sits behind it, each
+                    # word still carrying a stray mark. Documented under cmd /s.
+                    tail = " ".join(word.strip('"') for word in tokens[i + 2 :])
+                    blocked |= _find_blocked_commands(tail)
+                    blocked |= _blocked_quoted_program(tail, _BLOCKED_COMMANDS)
             break  # stop at first non-flag token
 
     # `cmd /c start "" prog` puts prog in a command position the scan above
@@ -1652,17 +1773,56 @@ def _find_blocked_commands(command: str) -> set[str]:
         if os.path.basename(token).lower() not in ("start", "start.exe"):
             continue
         j = i + 1
+        titled = False
         while j < len(tokens):
             switch = _win_switch(tokens[j].lower())
-            if not switch.startswith("/"):
+            if _is_start_switch(tokens[j].lower()):
+                # /d C:\dir and friends carry their value in the next token.
+                j += 2 if switch in _START_SWITCHES_WITH_VALUE else 1
+            elif not titled and _is_start_title(tokens[j], lexed_posix):
+                # START takes its window title as a QUOTED first argument, so
+                # the program is the token behind it. Only the `""` idiom was
+                # stepped over, which read `start "job" powershell` as a program
+                # named job and left powershell in argument position.
+                titled = True
+                j += 1
+            else:
                 break
-            # /d C:\dir and friends carry their value in the next token.
-            j += 2 if switch in _START_SWITCHES_WITH_VALUE else 1
-        # `start ""` is the idiom for "no title"; anything else is the program.
-        if j < len(tokens) and tokens[j] == "":
-            j += 1
         if j < len(tokens):
-            blocked |= _find_blocked_commands(tokens[j])
+            program = _unquote(tokens[j])
+            if any(char.isspace() or char in "\"'" for char in program):
+                # Quoting can hand the whole command line over as one token,
+                # `start "" "powershell -Command ls"`, and an unbalanced quote
+                # drops the scan onto split(), whose tokens keep their marks.
+                # Both only read once lexed again.
+                blocked |= _find_blocked_commands(program)
+            else:
+                # A bare word is a program name, and re-scanning it as a command
+                # line reads `C:\tmp\image.png` as a path followed by the POSIX
+                # `.` builtin, hard-blocking a document launch the terminal note
+                # promises stays usable.
+                program_base = _token_basename(program)
+                if program_base in _BLOCKED_COMMANDS:
+                    blocked.add(program_base)
+                else:
+                    blocked |= _blocked_matching_glob(program_base)
+            # Same split-path shape as the /c payload: START documents a title
+            # followed by the program, and `start "" "C:\Program Files\...
+            # \pwsh.exe"` is one quoted word until it is re-lexed.
+            blocked |= _blocked_quoted_program(program, _BLOCKED_COMMANDS)
+            if (
+                lexed_posix
+                and not titled
+                and j + 1 < len(tokens)
+                and any(char.isspace() for char in tokens[j])
+            ):
+                # Posix dropped the quote marks, so a title is only still
+                # provable by the whitespace it holds: nothing else survives
+                # lexing as one token. A bare word is taken as the program,
+                # since `start notepad powershell.txt` is the ordinary shape and
+                # guessing there blocks the argument. Under cmd the marks
+                # survive and no guess is needed.
+                blocked |= _find_blocked_commands(tokens[j + 1])
 
     # sed's `e COMMAND` hands COMMAND to the shell, a real command position the
     # scan above sees only as a text argument, so screen it like `bash -c`. The
