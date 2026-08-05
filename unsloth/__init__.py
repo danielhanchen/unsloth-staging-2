@@ -81,6 +81,26 @@ def _is_mlx_available():
 _IS_MLX = _is_mlx_available()
 
 if _IS_MLX:
+    # The GPU path runs this from _gpu_init before it imports unsloth_zoo. The
+    # MLX path never reaches _gpu_init, so without it an Apple Silicon user
+    # with torchao 0.18 and torch < 2.10 hits the same dead import:
+    #   ImportError: cannot import name 'ScalingType' from 'torch.nn.functional'
+    # No-op unless torchao is installed and actually affected, so it costs one
+    # find_spec elsewhere and touches nothing CUDA-specific.
+    try:
+        from .import_fixes import fix_torchao_torch_symbol_skew as _fix_torchao
+        _fix_torchao()
+        del _fix_torchao
+    except Exception:
+        pass
+    try:
+        # Same reason: xcodec2 imports torchtune, which still imports the old
+        # torchao.dtypes.nf4tensor, and MLX audio work reaches both.
+        from .import_fixes import fix_torchao_nf4tensor_move as _fix_nf4
+        _fix_nf4()
+        del _fix_nf4
+    except Exception:
+        pass
     try:
         import unsloth_zoo
     except ImportError as _e:
@@ -592,9 +612,7 @@ if _IS_MLX:
 
     def _assign_mlx_positional_kwarg(kwargs, name, value):
         if name in kwargs:
-            raise TypeError(
-                f"UnslothTrainer.__init__() got multiple values for argument " f"{name!r}"
-            )
+            raise TypeError(f"UnslothTrainer.__init__() got multiple values for argument {name!r}")
         kwargs[name] = value
 
     def _normalize_mlx_trainer_init_args(args, kwargs):
