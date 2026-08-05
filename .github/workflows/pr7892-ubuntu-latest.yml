@@ -1,0 +1,43 @@
+name: "PR-7892 frontend ubuntu-latest"
+on:
+  push:
+    branches: [pr7892-cross-os]
+    paths:
+      - 'studio/frontend/**'
+      - '.github/workflows/pr7892-ubuntu-latest.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/frontend/**'
+      - '.github/workflows/pr7892-ubuntu-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: studio/frontend/package-lock.json
+      - run: npm ci --no-fund --no-audit
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+      - name: Bundle sanity (same assertion as Frontend CI)
+        shell: bash
+        run: |
+          count=$(grep -c 'unstable_Provider:' dist/assets/index-*.js || true)
+          echo "unstable_Provider count: $count"
+          test "$count" -le 3
