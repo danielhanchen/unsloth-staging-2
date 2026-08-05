@@ -55,8 +55,18 @@ def check_package_installed(package_name, package_manager = None):
         return None
 
 
+def _skip_if_pytest(reason):
+    """Test modules call the require_* helpers at import time, so under pytest a
+    sys.exit(1) escapes collection and ends the whole session with no report
+    (INTERNALERROR, exit code 3). Degrade to a module-level skip instead, and
+    leave the exit for the standalone scripts that also use these helpers."""
+    _pytest = sys.modules.get("pytest")
+    if _pytest is not None:
+        _pytest.skip(reason, allow_module_level = True)
+
+
 def require_package(package_name, executable_name = None):
-    """Require a package to be installed, exit if not found"""
+    """Require a package to be installed, skip under pytest / exit if not found"""
 
     # Executable in PATH is the most reliable signal
     if executable_name:
@@ -70,6 +80,8 @@ def require_package(package_name, executable_name = None):
     if is_installed:
         print(f"✓ Package {package_name} is installed")
         return
+
+    _skip_if_pytest(f"requires the system package '{package_name}'")
 
     print(f"❌ Error: {package_name} is not installed")
     print(f"\nPlease install {package_name} using your system package manager:")
@@ -104,23 +116,15 @@ def require_python_package(
     import_name = None,
     pip_name = None,
 ):
-    """Require a Python package to be installed, exit if not found"""
+    """Require a Python package to be installed, skip under pytest / exit if not found"""
     if import_name is None:
         import_name = package_name
     if pip_name is None:
         pip_name = package_name
 
     if importlib.util.find_spec(import_name) is None:
-        # Every caller is a test module calling this at import time, so under
-        # pytest sys.exit(1) does not skip one module -- SystemExit escapes
-        # collection and ends the whole session with no report. Outside pytest
-        # the exit is unchanged, since standalone scripts use these helpers too.
-        _pytest = sys.modules.get("pytest")
-        if _pytest is not None:
-            _pytest.skip(
-                f"requires the '{package_name}' package (pip install {pip_name})",
-                allow_module_level = True,
-            )
+        _skip_if_pytest(f"requires the '{package_name}' package (pip install {pip_name})")
+
         print(f"❌ Error: Python package '{package_name}' is not installed")
         print(f"\nPlease install {package_name} using pip:")
         print(f"  pip install {pip_name}")
