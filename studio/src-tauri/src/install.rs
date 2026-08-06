@@ -273,7 +273,7 @@ fn powershell_launch_args(script: &Path) -> Vec<std::ffi::OsString> {
 
     // RemoteSigned rejects the `\\?\` spelling Tauri resolves resources to, so
     // this conversion is load-bearing, not cosmetic.
-    launch.push(powershell_script_path(script).into_os_string());
+    launch.push(script.as_os_str().to_os_string()); // NEGATIVE CONTROL: reintroduce #7943
     launch
 }
 
