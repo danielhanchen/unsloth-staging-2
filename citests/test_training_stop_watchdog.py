@@ -70,6 +70,9 @@ _TRAINING_PRE_IMPORTED = "core.training.training" in sys.modules
 
 from core.training.training import TrainingBackend, TrainingProgress as _TP
 
+# Captured before the eviction below, so it survives the sys.modules cleanup.
+_TRAINING_MODULE_FILE = sys.modules["core.training.training"].__file__
+
 # Restore every stubbed module so this file never pollutes the shared session.
 for _name in (
     "loggers",
@@ -1188,12 +1191,11 @@ def test_mlx_worker_flushes_tracking_before_every_terminal_send():
     writer and calls wandb_run.finish() in a finally; both must be flushed first.
     """
     import ast
-    import inspect
     from pathlib import Path as _P
 
-    # Locate the worker beside the training module we actually imported, not relative to
-    # this file, so the test travels with the package rather than its directory layout.
-    src = (_P(inspect.getfile(TrainingBackend)).resolve().parent / "worker.py").read_text()
+    # Beside the training module we actually imported, not relative to this file, so the
+    # test travels with the package rather than with its directory layout.
+    src = (_P(_TRAINING_MODULE_FILE).resolve().parent / "worker.py").read_text()
     tree = ast.parse(src)
     fn = next(
         n
@@ -1248,9 +1250,9 @@ def test_terminal_stall_arms_the_exit_watchdog(monkeypatch):
     b._handle_event({"type": "stall", "message": "no progress"})
 
     assert b.is_run_finished() is True
-    assert _wait_until(lambda: calls == ["force", "final"]), (
-        "a wedged worker on the terminal stall path must still be reaped"
-    )
+    assert _wait_until(
+        lambda: calls == ["force", "final"]
+    ), "a wedged worker on the terminal stall path must still be reaped"
     if b._stop_watchdog:
         b._stop_watchdog.join(timeout = 5)
 
