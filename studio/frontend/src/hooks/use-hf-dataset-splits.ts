@@ -3,11 +3,13 @@
 
 import { authFetch } from "@/features/auth";
 import { useEffect, useState } from "react";
+import { hubProxyFirst } from "@/features/hub/lib/hub-endpoint";
 import {
   type DatasetSplitFetchers,
   type HfSplitEntry,
   type LoadHfDatasetSplitsArgs,
   loadHfDatasetSplits,
+  MIRROR_SPLITS_UNAVAILABLE,
   normalizeDatasetSplitsError,
 } from "./hf-dataset-split-sources";
 
@@ -100,6 +102,11 @@ async function fetchRemoteSplits({
   datasetName,
   signal,
 }: LoadHfDatasetSplitsArgs): Promise<HfSplitEntry[]> {
+  // Hardcoded public service: with a mirror configured this would send the
+  // dataset id and the mirror token to the wrong host. Reported rather than
+  // returned empty, because an empty list renders nothing at all: no dropdowns
+  // and no explanation, and there is no other way to set these.
+  if (hubProxyFirst()) throw new Error(MIRROR_SPLITS_UNAVAILABLE);
   const url = `${HF_SPLITS_API}?dataset=${encodeURIComponent(datasetName)}`;
   const headers: Record<string, string> = {};
   if (accessToken) {

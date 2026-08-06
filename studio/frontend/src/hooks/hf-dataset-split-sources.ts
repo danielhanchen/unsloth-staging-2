@@ -27,7 +27,14 @@ export type DatasetSplitFetchers = {
   remote: (args: LoadHfDatasetSplitsArgs) => Promise<HfSplitEntry[]>;
 };
 
+// Matched verbatim below, so the message survives normalisation unchanged.
+export const MIRROR_SPLITS_UNAVAILABLE =
+  "Subset and split options come from the public Hugging Face datasets-server, which is not used when a custom Hugging Face endpoint is configured.";
+
 export function normalizeDatasetSplitsError(message: string): string {
+  if (message === MIRROR_SPLITS_UNAVAILABLE) {
+    return message;
+  }
   const normalized = message.toLowerCase();
   if (
     normalized.includes("dataset scripts are no longer supported") ||
