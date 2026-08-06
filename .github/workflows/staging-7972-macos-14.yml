@@ -1,0 +1,62 @@
+name: "staging-7972 macos-14"
+on:
+  push:
+    branches: ["pr-7972-xplat-ci"]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/staging-7972-macos-14.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      # These runners have no GPU, so unsloth_zoo.device_type raises
+      # NotImplementedError("Unsloth cannot find any torch accelerator?") while
+      # `import unsloth` is still running. That leaves unsloth half-initialised, and every
+      # later test module reports the wreckage as
+      # `cannot import name 'get_device_stats' from 'unsloth.device_type' (unknown
+      # location)` -- which reads as a PR fault and is not one. This is the zoo's own
+      # supported CPU escape hatch for exactly this case.
+      #
+      # It is not free, and the cost has now bitten twice. The flag also trips two
+      # deliberate gates on unsloth main (rl.py PatchFastRL returns early, _gpu_init.py
+      # skips _patch_trl_trainer()) that exist so CPU-only drift detectors see pristine
+      # upstream TRL via inspect.getsource. So under this flag `trl.SFTTrainer` stays
+      # STOCK, and any test asserting the patch applied fails here while being green
+      # upstream -- the repo's own version-compat-ci.yml never sets this. It also
+      # short-circuits get_device_type() to "cuda", which rewrites what a hip/xpu test
+      # is testing. Both times the failure read as a PR regression and was not one.
+      # A test that cares must pin the env itself or request the patches explicitly;
+      # do not read a failure in this job as the PR's fault without an origin/main control.
+      UNSLOTH_ALLOW_CPU: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pip install mlx || echo "mlx unavailable on this runner"
+      - run: python -m pip uninstall -y unsloth || true
+      - run: python -m pip install -e . --no-deps
+      - run: |
+          python - <<'PY' || true
+          import importlib.util, os, sys
+          print('cwd', os.getcwd(), 'sys.path[0]', repr(sys.path[0]))
+          spec = importlib.util.find_spec('unsloth')
+          print('unsloth spec', spec.origin, list(spec.submodule_search_locations or []))
+          import unsloth; print('imported', unsloth.__file__)
+          PY
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
