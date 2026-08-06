@@ -23,7 +23,9 @@ jobs:
         with: { python-version: '3.12' }
 
       - name: Contract tests
-        run: python -m pytest tests/studio/test_chat_response_details_ui_contract.py -q
+        run: |
+          python -m pip install --upgrade pip pytest
+          python -m pytest tests/studio/test_chat_response_details_ui_contract.py -q
 
       - name: Frontend install + typecheck + unit tests + build
         working-directory: studio/frontend
