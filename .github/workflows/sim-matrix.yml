@@ -1,0 +1,58 @@
+name: Sim matrix
+
+on:
+  pull_request:
+  push:
+    branches: [sim-argv-equivalence]
+
+concurrency:
+  group: sim-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  matrix:
+    name: ${{ matrix.os }} rust
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          persist-credentials: false
+
+      - name: Linux native deps
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e
+        with:
+          node-version: '24'
+
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+
+      - uses: swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32
+        with:
+          workspaces: studio/src-tauri -> target
+          key: sim-${{ matrix.os }}
+
+      - name: Frontend build (tauri-build needs dist)
+        working-directory: studio/frontend
+        run: |
+          npm ci --no-fund --no-audit
+          npm run build
+
+      - name: cargo check --all-targets
+        working-directory: studio/src-tauri
+        run: cargo check --all-targets
+
+      - name: cargo test
+        working-directory: studio/src-tauri
+        run: cargo test --no-fail-fast -- --nocapture
