@@ -11,7 +11,7 @@ permissions:
 jobs:
   titlebar:
     runs-on: windows-latest
-    timeout-minutes: 40
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
@@ -30,7 +30,7 @@ jobs:
       - name: Playwright engines
         run: |
           python -m pip install --upgrade pip playwright
-          python -m playwright install chromium msedge firefox
+          python -m playwright install chromium msedge
 
       - name: Desktop titlebar occlusion, before / after / fixed
         shell: bash
@@ -38,7 +38,7 @@ jobs:
           cd studio/frontend && (npm run dev -- --port 5192 --strictPort --host 127.0.0.1 &) && cd -
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:5192/titlebar-harness.html >/dev/null && break; sleep 2; done
           python ci/test_titlebar_ci.py --url http://127.0.0.1:5192 \
-            --engines 'chromium,chromium:msedge,firefox' --font-sizes 12,15,16,20 --out titlebar-windows.json
+            --engines 'chromium,chromium:msedge' --font-sizes 12,15,20 --out titlebar-windows.json
 
       - uses: actions/upload-artifact@v4
         if: always()

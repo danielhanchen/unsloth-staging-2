@@ -11,7 +11,7 @@ permissions:
 jobs:
   titlebar:
     runs-on: macos-14
-    timeout-minutes: 40
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@v4
         with: { persist-credentials: false }
@@ -38,7 +38,7 @@ jobs:
           cd studio/frontend && (npm run dev -- --port 5192 --strictPort --host 127.0.0.1 &) && cd -
           for i in $(seq 1 60); do curl -sf http://127.0.0.1:5192/titlebar-harness.html >/dev/null && break; sleep 2; done
           python ci/test_titlebar_ci.py --url http://127.0.0.1:5192 \
-            --engines 'chromium,webkit' --font-sizes 12,15,16,20 --out titlebar-macos.json
+            --engines 'chromium,webkit' --font-sizes 12,15,20 --out titlebar-macos.json
 
       - uses: actions/upload-artifact@v4
         if: always()

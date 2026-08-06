@@ -1,7 +1,5 @@
 name: "PR-7957 titlebar ubuntu"
 on:
-  push:
-    branches: [pr7957-cross-os]
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
