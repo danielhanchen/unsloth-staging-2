@@ -1,0 +1,52 @@
+name: "staging-7972 studio-playwright (macos-14)"
+on:
+  push:
+    branches: ["pr-7972-xplat-ci"]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/staging-7972-playwright-macos-14.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  studio-live:
+    runs-on: macos-14
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install playwright httpx pillow && python -m playwright install chromium
+      # studio_test_kit records webm and transcodes to mp4; without ffmpeg it logs
+      # "ffmpeg not found on PATH; skipping mp4 transcode" and then asserts the mp4 exists.
+      - run: brew install ffmpeg || brew list ffmpeg
+      - name: Install + launch Studio
+        run: |
+          ./install.sh --local --no-torch || pip install -e .
+          nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8888/healthz && break; sleep 5; done
+      - name: Playwright smoke (studio_test_kit)
+        run: PYTHONPATH=.github/scripts python -m studio_test_kit._smoke_ui || true
+      - name: Drive the PR's Playwright script (playwright_chat_ui.py)
+        env:
+          NEW_PW: StagingCI-7972-Pw1!
+        run: |
+          PWFILE=$(grep -oE 'password saved to: *\S+' studio.log | tail -1 | awk '{print $NF}')
+          [ -f "$PWFILE" ] || { echo "::error::no bootstrap password file in studio.log"; tail -40 studio.log; exit 1; }
+          BASE_URL=http://127.0.0.1:8888 STUDIO_OLD_PW="$(cat "$PWFILE")" STUDIO_NEW_PW="$NEW_PW" \
+            PW_ART_DIR=logs/playwright_staging python tests/studio/playwright_chat_ui.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-playwright-7972
+          path: |
+            **/*.png
+            **/*.webm
+            **/*.mp4
+            studio.log
