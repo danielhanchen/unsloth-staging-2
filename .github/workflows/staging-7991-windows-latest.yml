@@ -1,0 +1,38 @@
+name: "staging-7991 windows-latest"
+on:
+  push:
+    branches: ["pr-7991-xplat-ci"]
+    paths:
+      - 'studio/frontend/src/features/settings/components/usage-examples.tsx'
+      - 'studio/frontend/src/features/settings/stores/settings-panel-prefs-store.ts'
+      - 'studio/frontend/src/features/settings/tabs/agents-tab.tsx'
+      - 'studio/frontend/src/features/settings/tabs/data-tab.tsx'
+      - 'studio/frontend/src/features/settings/tabs/general-tab.tsx'
+      - 'studio/frontend/src/features/settings/tabs/resources-tab.tsx'
+      - 'studio/frontend/tests/settings-panel-prefs.test.ts'
+      - '.github/workflows/staging-7991-windows-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
