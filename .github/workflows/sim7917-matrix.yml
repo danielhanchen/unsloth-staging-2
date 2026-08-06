@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Disposable staging workflow for unslothai/unsloth#7917 merge-safety simulations.
+#
+# Runs the Linux-provable simulations on all three OSes, because several of them
+# assert on behavior that is OS-conditional: sim_b spoofs sys.platform == "win32"
+# and the WSL detector, and the schema matrix depends on whatever pydantic the
+# resolver picks (studio/backend/requirements/studio.txt pins no version at all).
+#
+# Filename sits outside the `staging-7917-*` glob that staging_ci.py sweeps on
+# each cross-platform re-run, so it survives re-staging.
+
+name: "sim7917 merge-safety matrix"
+
+on:
+  push:
+    branches: ["pr-7917-xplat-ci"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sims:
+    name: "sims ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ALLOW_CPU: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install pytest pytest-asyncio pytest-timeout python-multipart numpy
+          pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple 'torch==2.10.0'
+          pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo"
+
+      - name: Environment
+        run: |
+          python -c "
+          import platform, sys, pydantic
+          print('system   :', platform.system(), platform.machine())
+          print('sys.platf:', sys.platform)
+          print('pydantic :', pydantic.__version__)
+          "
+
+      - name: A1/A2 schema + JSON-wire matrix
+        run: python tests/staging/sim_a1_schema_matrix.py
+
+      - name: A5 clip-mode + mx.compile eligibility oracle
+        run: python tests/staging/sim_a5_clip_compile_oracle.py
+
+      - name: A4/A7 pipeline + mixed-version compatibility
+        run: python tests/staging/sim_a4_a7_pipeline.py
+
+      - name: B hardware dispatch cartesian product
+        run: python tests/staging/sim_b_dispatch_matrix.py
+
+  browsers:
+    name: browsers
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build the real mapper as a browser bundle
+        working-directory: studio/frontend
+        run: |
+          npm ci
+          mkdir -p ../../tests/staging/browser
+          cat > ../../tests/staging/browser/entry.ts <<'EOF'
+          export { buildTrainingStartPayload } from "@/features/training/api/mappers";
+          EOF
+          cat > vite.sim.config.ts <<'EOF'
+          import path from "node:path";
+          import { defineConfig } from "vite";
+          export default defineConfig({
+            root: __dirname,
+            resolve: { alias: { "@": path.resolve(__dirname, "src") } },
+            build: {
+              lib: {
+                entry: path.resolve(__dirname, "../../tests/staging/browser/entry.ts"),
+                formats: ["iife"], name: "SimMapper",
+                fileName: () => "sim-mapper.js",
+              },
+              outDir: path.resolve(__dirname, "../../tests/staging/browser/dist"),
+              emptyOutDir: true,
+              minify: false,
+            },
+          });
+          EOF
+          ./node_modules/.bin/vite build -c vite.sim.config.ts
+          rm -f vite.sim.config.ts
+
+      - name: Install Playwright engines
+        run: |
+          pip install 'playwright>=1.45'
+          python -m playwright install --with-deps chromium firefox webkit
+
+      - name: C browser matrix (chromium, firefox, webkit)
+        run: python tests/staging/sim_c_browser_matrix.py
+
+      - name: Frontend unit tests + typecheck + build
+        working-directory: studio/frontend
+        run: |
+          npm run typecheck
+          npm test
+          npm run build

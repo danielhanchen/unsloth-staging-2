@@ -1,0 +1,101 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Disposable staging workflow: the three-arm Apple Silicon measurement that decides
+# whether unslothai/unsloth#7917 should keep global-norm clipping or switch to
+# report_grad_norm.
+#
+#   default  max_grad_norm unset  (leaf_norm kept, chart populated by report_grad_norm)
+#   global   max_grad_norm = 1.0  (global_norm, chart populated, explicit value honored)
+#
+# The HF cache is warmed before any arm runs, each arm runs in a fresh process, and
+# repeats alternate order, because the first Mac measurement on this PR timed a cold
+# model download as if it were training throughput.
+
+name: "sim7917 Mac 3-arm measurement"
+
+on:
+  push:
+    branches: ["pr-7917-xplat-ci"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  arms:
+    name: arms
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      UNSLOTH_COMPILE_DISABLE: '0'
+      PYTHONPATH: ${{ github.workspace }}/studio/backend
+      UNSLOTH_REPO: ${{ github.workspace }}
+      MODEL: unsloth/gemma-3-270m-it
+      SIM_D_STEPS: '8'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install pytest python-multipart numpy
+          pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple 'torch==2.10.0'
+          for attempt in 1 2 3; do
+            pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo" && break
+            [ "$attempt" -eq 3 ] && { echo "::error::zoo install failed"; exit 1; }
+            sleep $((5 * attempt))
+          done
+          pip install -e . --no-deps
+
+      - name: Confirm real Apple Silicon + report the stack
+        run: |
+          python -c "
+          import platform, mlx.core as mx, unsloth_zoo
+          assert platform.system() == 'Darwin' and platform.machine() == 'arm64'
+          assert mx.metal.is_available()
+          print('mlx', mx.__version__, '| zoo', unsloth_zoo.__version__)
+          "
+
+      - name: Static oracle (clip mode + compile eligibility) on the installed zoo
+        run: python tests/staging/sim_a5_clip_compile_oracle.py
+
+      - name: Warm the HuggingFace cache so no arm pays the download
+        run: python tests/staging/sim_d_mac_arms.py warm --model "$MODEL"
+
+      - name: Run the arms (3 repeats, alternating order, fresh process each)
+        run: |
+          mkdir -p results
+          for rep in 1 2 3; do
+            if [ "$rep" = "2" ]; then ORDER="global default"; else ORDER="default global"; fi
+            for arm in $ORDER; do
+              echo "::group::rep $rep arm $arm"
+              python tests/staging/sim_d_mac_arms.py run \
+                --model "$MODEL" --arm "$arm" --rep "$rep" \
+                --out "results/${arm}_${rep}.json" \
+                --workdir "$PWD/mlx_d_workdir" || echo "::warning::arm $arm rep $rep failed"
+              echo "::endgroup::"
+            done
+          done
+
+      - name: Report
+        run: python tests/staging/sim_d_mac_arms.py report results
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sim7917-mac-arms
+          path: results/
+          if-no-files-found: warn
