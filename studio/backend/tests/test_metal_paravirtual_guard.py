@@ -1314,15 +1314,19 @@ def test_the_mtp_fallback_gets_the_requested_slots_back():
 
 
 def test_the_startup_retry_drops_the_mtp_the_extras_and_the_env_carry():
-    """A trailing --spec-default cannot override MTP that extras or the env supplied:
-    llama.cpp applies the env first and appends types rather than replacing them, so the
-    retry would relaunch the mode that just failed and lose a main model that loads fine
-    without it. It strips the spec group, and takes the child env with it."""
+    """A trailing --spec-default cannot override MTP or DSpark that extras or the env
+    supplied: llama.cpp applies the env first and appends types rather than replacing
+    them, so the retry would relaunch the mode that just failed and lose a main model
+    that loads fine without it. It strips the spec group, and takes the child env with
+    it."""
     src = _load_model_source()
     retry = src[
         src.index("_fb_tail = cmd[_spec_start") : src.index("fallback_cmd = cmd[:_spec_start]")
     ]
-    assert "_extra_args_requests_mtp(extra_args, env = _launch_spec_env)" in retry
+    # Whitespace-insensitive: the guard wraps across lines once both drafters are named.
+    compact = "".join(retry.split())
+    assert "_extra_args_requests_mtp(extra_args,env=_launch_spec_env)" in compact
+    assert "_extra_args_requests_dspark(extra_args,env=_launch_spec_env)" in compact
     assert "strip_spec = True" in retry
     assert "env.pop(_fb_spec_var, None)" in retry
     # ...and that strip really removes the group rather than shadowing it.
@@ -2260,4 +2264,35 @@ def test_the_route_really_can_deliver_a_manual_cpu_request_carrying_an_override(
             strip_offload = True,
         )
         == extras
+    )
+
+
+def test_dspark_fit_strip_covers_pass_through_spec_type():
+    """Extras owning --spec-type return from _build_speculative_flags before
+    _speculative_type is set, so keying the --fit strip only on that field lets a
+    user --fit on survive a pass-through DSpark launch, which cannot be reshaped."""
+    src = _load_model_source()
+    strip = src[src.index("_emit_extra_args = list(extra_args)") : src.index("strip_fit = True")]
+    compact = "".join(strip.split())
+    assert '_speculative_type=="draft-dspark"' in compact
+    assert "_extra_args_requests_dspark(" in compact
+    # The helper reads the accumulated types, so pass-through and env both count.
+    assert llama_cpp._extra_args_requests_dspark(["--spec-type", "draft-dspark"]) is True
+    assert llama_cpp._extra_args_requests_dspark(["--spec-type", "draft-mtp"]) is False
+
+
+def test_dspark_forces_fit_off_rather_than_only_stripping_the_user_flag():
+    """Stripping is not enough: the managed command already carries --fit on
+    whenever the picker chose auto-fit, so dropping the caller's explicit --fit off
+    would leave fitting ON for a layout llama.cpp cannot reshape. The extras go
+    last and llama.cpp is last-wins, so appending pins the placement either way."""
+    src = _load_model_source()
+    block = src[
+        src.index("_emit_extra_args = list(extra_args)") : src.index(
+            "cmd.extend(str(a) for a in _emit_extra_args)"
+        )
+    ]
+    assert '_emit_extra_args = [*_without_fit, "--fit", "off"]' in block
+    assert src.index('cmd.extend(["--fit", "on"])') < src.index(
+        "cmd.extend(str(a) for a in _emit_extra_args)"
     )
