@@ -39,7 +39,7 @@ jobs:
           for i in $(seq 1 90); do curl -sf http://127.0.0.1:5192/titlebar-harness.html >/dev/null && break; sleep 2; done
           curl -sf -o /dev/null http://127.0.0.1:5192/titlebar-harness.html && echo 'preview server up'
           python ci/test_titlebar_ci.py --url http://127.0.0.1:5192 \
-            --engines 'chromium,chromium:msedge' --font-sizes 12,15,20 --out titlebar-windows.json
+            --engines 'chromium,chromium:msedge' --font-sizes 12,15,20 --engine-timeout 900 --out titlebar-windows.json
 
       - uses: actions/upload-artifact@v4
         if: always()

@@ -100,40 +100,56 @@ async def goto_and_measure(page, url, attempts=3):
     return {"error": f"{type(last).__name__}: {last}"}
 
 
+async def run_engine(p, spec, args, results):
+    name, _, channel = spec.partition(":")
+    launch = {"headless": True}
+    if channel:
+        launch["channel"] = channel
+    browser = await getattr(p, name).launch(**launch, timeout=120_000)
+    label = spec
+    ctx = await browser.new_context(viewport={"width": 1280, "height": 800},
+                                    device_scale_factor=1, color_scheme="light")
+    await ctx.add_init_script(SEED_TAURI)
+    page = await ctx.new_page()
+    for variant in ["before", "after", "fixed"]:
+        for sheet in ["details", "preview"]:
+            for fs in [int(x) for x in args.font_sizes.split(",")]:
+                m = dict(await goto_and_measure(
+                    page,
+                    f"{args.url}/titlebar-harness.html"
+                    f"?variant={variant}&sheet={sheet}&fs={fs}"))
+                m.update(engine=label, variant=variant, sheet=sheet, fontSize=fs)
+                results.append(m)
+                print(f"{label:16s} {variant:6s} {sheet:8s} fs={fs:2d} "
+                      f"top={m.get('closeTop')!s:>7} "
+                      f"delta={m.get('signedDelta')!s:>7} "
+                      f"ctrlOverlap={m.get('yOverlapWithControls')!s:>6} "
+                      f"reachable={m.get('reachablePct')!s:>5}% "
+                      f"centre={m.get('centreHit')}", flush=True)
+    await ctx.close()
+    await browser.close()
+
+
 async def run(args):
     results = []
+    skipped = []
     async with async_playwright() as p:
         for spec in args.engines.split(","):
-            name, _, channel = spec.partition(":")
-            launch = {"headless": True}
-            if channel:
-                launch["channel"] = channel
-            browser = await getattr(p, name).launch(**launch)
-            label = spec
-            ctx = await browser.new_context(viewport={"width": 1280, "height": 800},
-                                            device_scale_factor=1, color_scheme="light")
-            await ctx.add_init_script(SEED_TAURI)
-            page = await ctx.new_page()
-            for variant in ["before", "after", "fixed"]:
-                for sheet in ["details", "preview"]:
-                    for fs in [int(s) for s in args.font_sizes.split(",")]:
-                        m = dict(await goto_and_measure(
-                            page,
-                            f"{args.url}/titlebar-harness.html"
-                            f"?variant={variant}&sheet={sheet}&fs={fs}"))
-                        m.update(engine=label, variant=variant, sheet=sheet, fontSize=fs)
-                        results.append(m)
-                        print(f"{label:16s} {variant:6s} {sheet:8s} fs={fs:2d} "
-                              f"top={m.get('closeTop')!s:>7} "
-                              f"delta={m.get('signedDelta')!s:>7} "
-                              f"ctrlOverlap={m.get('yOverlapWithControls')!s:>6} "
-                              f"reachable={m.get('reachablePct')!s:>5}% "
-                              f"centre={m.get('centreHit')}", flush=True)
-            await ctx.close()
-            await browser.close()
+            try:
+                await asyncio.wait_for(run_engine(p, spec, args, results),
+                                       timeout=args.engine_timeout)
+            except asyncio.TimeoutError:
+                print(f"\n{spec}: exceeded {args.engine_timeout}s, skipping this engine",
+                      flush=True)
+                skipped.append(f"{spec} (timeout)")
+            except Exception as exc:  # noqa: BLE001
+                print(f"\n{spec}: {type(exc).__name__}: {exc}", flush=True)
+                skipped.append(f"{spec} ({type(exc).__name__})")
 
     Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
 
+    if skipped:
+        print(f"\nengines skipped on this runner: {', '.join(skipped)}")
     ok = [r for r in results if not r.get("error")]
     plat = ok[0].get("uaPlatform", "") if ok else ""
     print(f"\nnavigator platform reported by the runner: {plat!r}")
@@ -169,6 +185,9 @@ async def run(args):
     if errored:
         print(f"\nFAIL: {len(errored)} row(s) errored")
         sys.exit(1)
+    if not ok:
+        print("\nFAIL: no engine produced a measurement on this runner")
+        sys.exit(1)
     print("\nOK: every 'fixed' row has a hit-testable close button centre")
 
 
@@ -178,6 +197,7 @@ def main():
     ap.add_argument("--engines", default="chromium")
     ap.add_argument("--font-sizes", default="12,15,20")
     ap.add_argument("--out", default="titlebar.json")
+    ap.add_argument("--engine-timeout", type=float, default=900.0)
     args = ap.parse_args()
     asyncio.run(run(args))
 
