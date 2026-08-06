@@ -83,6 +83,23 @@ async def settle(page):
     await page.wait_for_timeout(700)
 
 
+async def goto_and_measure(page, url, attempts=3):
+    """Runner VMs occasionally drop a dev-server response; retry rather than
+    abandoning the whole matrix on one transient row."""
+    last = None
+    for attempt in range(attempts):
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+            await settle(page)
+            return await page.evaluate(PROBE_JS)
+        except Exception as exc:  # noqa: BLE001 - transient runner flake
+            last = exc
+            print(f"    retry {attempt + 1}/{attempts} after {type(exc).__name__}",
+                  flush=True)
+            await page.wait_for_timeout(2000)
+    return {"error": f"{type(last).__name__}: {last}"}
+
+
 async def run(args):
     results = []
     async with async_playwright() as p:
@@ -100,12 +117,10 @@ async def run(args):
             for variant in ["before", "after", "fixed"]:
                 for sheet in ["details", "preview"]:
                     for fs in [int(s) for s in args.font_sizes.split(",")]:
-                        await page.goto(
+                        m = dict(await goto_and_measure(
+                            page,
                             f"{args.url}/titlebar-harness.html"
-                            f"?variant={variant}&sheet={sheet}&fs={fs}",
-                            wait_until="domcontentloaded")
-                        await settle(page)
-                        m = dict(await page.evaluate(PROBE_JS))
+                            f"?variant={variant}&sheet={sheet}&fs={fs}"))
                         m.update(engine=label, variant=variant, sheet=sheet, fontSize=fs)
                         results.append(m)
                         print(f"{label:16s} {variant:6s} {sheet:8s} fs={fs:2d} "
@@ -119,15 +134,16 @@ async def run(args):
 
     Path(args.out).write_text(json.dumps(results, indent=2), encoding="utf-8")
 
-    plat = results[0].get("uaPlatform", "") if results else ""
+    ok = [r for r in results if not r.get("error")]
+    plat = ok[0].get("uaPlatform", "") if ok else ""
     print(f"\nnavigator platform reported by the runner: {plat!r}")
-    print(f"title font: {results[0].get('titleFont') if results else ''}")
+    print(f"title font: {ok[0].get('titleFont') if ok else ''}")
 
-    custom_titlebar = any(r.get("controlsPresent") for r in results)
+    custom_titlebar = any(r.get("controlsPresent") for r in ok)
     print(f"custom titlebar rendered on this platform: {custom_titlebar}")
 
     def worst(variant):
-        rows = [r for r in results if r["variant"] == variant]
+        rows = [r for r in results if r["variant"] == variant and not r.get("error")]
         return min((r["reachablePct"] for r in rows), default=None), \
                sorted({r["centreHit"] for r in rows})
 
@@ -138,12 +154,20 @@ async def run(args):
     # The PR must not leave the close button unreachable at its centre, and the
     # candidate fix must restore it. On macOS there is no custom titlebar, so
     # every variant should already be clear.
-    fixed_rows = [r for r in results if r["variant"] == "fixed"]
+    errored = [r for r in results if r.get("error")]
+    if errored:
+        print(f"\n{len(errored)} row(s) could not be measured:")
+        for r in errored:
+            print(f"  {r['engine']} {r['variant']} {r['sheet']} fs={r['fontSize']}: {r['error']}")
+    fixed_rows = [r for r in results if r["variant"] == "fixed" and not r.get("error")]
     bad = [r for r in fixed_rows if r["centreHit"] != "CLOSE"]
     if bad:
         print(f"\nFAIL: {len(bad)} 'fixed' rows still have an occluded centre")
         for r in bad[:10]:
             print(f"  {r['engine']} {r['sheet']} fs={r['fontSize']} centre={r['centreHit']}")
+        sys.exit(1)
+    if errored:
+        print(f"\nFAIL: {len(errored)} row(s) errored")
         sys.exit(1)
     print("\nOK: every 'fixed' row has a hit-testable close button centre")
 
