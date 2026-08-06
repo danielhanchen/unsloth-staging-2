@@ -19,6 +19,12 @@ jobs:
       - name: notcancelled
         if: ${{ !cancelled() }}
         run: echo "NOTCANCELLED RAN; stalls outcome=${{ steps.stalls.outcome }} conclusion=${{ steps.stalls.conclusion }}"
+      - name: cancelled_true
+        if: ${{ cancelled() }}
+        run: echo "CANCELLED IS TRUE"
+      - name: failure_true
+        if: failure()
+        run: echo "FAILURE IS TRUE"
       - name: alwaysstep
         if: always()
-        run: echo "ALWAYS RAN; cancelled=${{ cancelled() }} failure=${{ failure() }} success=${{ success() }}"
+        run: echo "ALWAYS RAN"
