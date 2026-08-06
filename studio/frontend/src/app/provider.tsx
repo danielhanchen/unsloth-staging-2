@@ -334,6 +334,39 @@ const CUSTOM_CHROME_STYLE = {
   "--studio-window-control-inset": "112px",
 } as CSSProperties;
 
+/**
+ * Mirrors the desktop titlebar heights onto <html>.
+ *
+ * The chrome styles below are applied to a wrapper <div>, so anything Radix
+ * portals into document.body (sheets, dialogs, popovers) falls outside that
+ * subtree and reads the custom properties as empty. Overlays that need to
+ * clear the window controls therefore cannot use them from the wrapper alone.
+ */
+export function DesktopChromeVarsEffect({
+  usesCustomTitlebar,
+  usesNativeMacTitlebar,
+}: {
+  usesCustomTitlebar: boolean;
+  usesNativeMacTitlebar: boolean;
+}) {
+  useEffect(() => {
+    const el = document.documentElement;
+    const set = (name: string, value: string | null) => {
+      if (value === null) el.style.removeProperty(name);
+      else el.style.setProperty(name, value);
+    };
+    set("--studio-custom-titlebar-height", usesCustomTitlebar ? "34px" : null);
+    set("--studio-mac-titlebar-height", usesNativeMacTitlebar ? "34px" : null);
+    set("--studio-window-control-inset", usesCustomTitlebar ? "112px" : null);
+    return () => {
+      set("--studio-custom-titlebar-height", null);
+      set("--studio-mac-titlebar-height", null);
+      set("--studio-window-control-inset", null);
+    };
+  }, [usesCustomTitlebar, usesNativeMacTitlebar]);
+  return null;
+}
+
 function TauriWrapper({ children }: { children: ReactNode }) {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
   const {
@@ -498,6 +531,13 @@ function TauriWrapper({ children }: { children: ReactNode }) {
     />
   );
 
+  const chromeVars = (
+    <DesktopChromeVarsEffect
+      usesCustomTitlebar={usesCustomTitlebar}
+      usesNativeMacTitlebar={usesNativeMacTitlebar}
+    />
+  );
+
   if (!usesCustomTitlebar) {
     // macOS desktop uses the native titlebar and returns here before the
     // custom-titlebar branch, so mount the updater banner on this path too.
@@ -518,12 +558,18 @@ function TauriWrapper({ children }: { children: ReactNode }) {
               className="pointer-events-auto fixed inset-x-0 top-0 z-50 h-[var(--studio-mac-titlebar-height,34px)] select-none"
             />
           ) : null}
+          {chromeVars}
           {content}
         </div>
       );
     }
 
-    return <>{content}</>;
+    return (
+      <>
+        {chromeVars}
+        {content}
+      </>
+    );
   }
 
   const showSidebarSurface = showApp && !hidesTitlebarSidebar;
@@ -533,6 +579,7 @@ function TauriWrapper({ children }: { children: ReactNode }) {
       className="relative h-dvh min-h-0 overflow-hidden bg-background"
       style={CUSTOM_CHROME_STYLE}
     >
+      {chromeVars}
       <WindowTitlebar showSidebarSurface={showSidebarSurface} />
       <div className="h-full min-h-0 overflow-hidden">{content}</div>
     </div>

@@ -1,0 +1,45 @@
+name: "PR-7957 titlebar ubuntu"
+on:
+  push:
+    branches: [pr7957-cross-os]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  titlebar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Frontend install + build
+        working-directory: studio/frontend
+        run: |
+          npm ci --no-fund --no-audit
+          npm run typecheck
+          npm run build
+
+      - name: Playwright engines
+        run: |
+          python -m pip install --upgrade pip playwright
+          python -m playwright install --with-deps chromium firefox webkit
+
+      - name: Desktop titlebar occlusion, before / after / fixed
+        shell: bash
+        run: |
+          cd studio/frontend && (npm run dev -- --port 5192 --strictPort --host 127.0.0.1 &) && cd -
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:5192/titlebar-harness.html >/dev/null && break; sleep 2; done
+          python ci/test_titlebar_ci.py --url http://127.0.0.1:5192 \
+            --engines 'chromium,firefox,webkit' --font-sizes 12,15,16,20 --out titlebar-ubuntu.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: titlebar-ubuntu, path: titlebar-ubuntu.json, if-no-files-found: ignore }
