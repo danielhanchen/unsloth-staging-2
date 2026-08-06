@@ -53,6 +53,7 @@ import {
 } from "../components/agent-command";
 import { SettingsSection } from "../components/settings-section";
 import { psSingle, shSingle } from "../components/usage-examples";
+import { useSettingsPanelPrefsStore } from "../stores/settings-panel-prefs-store";
 
 const DOCS_URL = "https://unsloth.ai/docs/integrations/unsloth-start";
 const EXAMPLE_MODEL_REPO = "unsloth/gemma-4-E4B-it-GGUF";
@@ -214,6 +215,11 @@ function looksLikePath(value: string): boolean {
   );
 }
 
+// hugging face ids fold case; a path does not, since Linux paths are sensitive.
+function modelKey(model: string): string {
+  return looksLikePath(model) ? model : model.toLowerCase();
+}
+
 function isHuggingFaceRepo(model: string): boolean {
   return HUGGING_FACE_REPO_PATTERN.test(model);
 }
@@ -242,11 +248,9 @@ function discoverGgufModels(
   const variants: Record<string, string> = {};
   // Hugging Face ids are case-insensitive, and the catalog and cache endpoints can
   // disagree on spelling; two rows for one repo would leave the load id on only one.
-  const seen = new Set(models.map((model) => model.toLowerCase()));
+  const seen = new Set(models.map(modelKey));
   const add = (model: string) => {
-    // Local entries arrive here as absolute paths, and a path is case-sensitive on
-    // Linux: folding those would collapse two distinct models into one.
-    const key = looksLikePath(model) ? model : model.toLowerCase();
+    const key = modelKey(model);
     if (seen.has(key)) {
       return;
     }
@@ -635,14 +639,29 @@ export function AgentsTab() {
     ? deviceType === "windows"
     : isWindowsClient;
   const localDetection = canUseLocalAgentDetection(serverUrl ?? origin);
+  const setStoredAgent = useSettingsPanelPrefsStore((s) => s.setAgentsAgent);
+  const setStoredModel = useSettingsPanelPrefsStore((s) => s.setAgentsModel);
+  const setStoredVariant = useSettingsPanelPrefsStore(
+    (s) => s.setAgentsVariant,
+  );
+  // read once: these seed the controls, which write back through the handlers.
+  const [storedPrefs] = useState(() => useSettingsPanelPrefsStore.getState());
   const [agents, setAgents] = useState<string[]>(
     SUPPORTED_AGENTS.map((agent) => agent.id),
   );
-  const [selectedAgent, setSelectedAgent] = useState(FALLBACK_AGENT.id);
-  const agentSelectionChanged = useRef(false);
+  const [selectedAgent, setSelectedAgent] = useState(
+    storedPrefs.agentsAgent ?? FALLBACK_AGENT.id,
+  );
+  // a restored pick counts as explicit, or detection would overwrite it.
+  const agentSelectionChanged = useRef(storedPrefs.agentsAgent != null);
   const [detectedAgents, setDetectedAgents] = useState<Set<string>>(new Set());
   const [loaded, setLoaded] = useState(false);
-  const [models, setModels] = useState<string[]>([EXAMPLE_MODEL_REPO]);
+  // list the restored model until the discovery scan confirms or retires it.
+  const [models, setModels] = useState<string[]>(
+    storedPrefs.agentsModel && storedPrefs.agentsModel !== EXAMPLE_MODEL_REPO
+      ? [storedPrefs.agentsModel, EXAMPLE_MODEL_REPO]
+      : [EXAMPLE_MODEL_REPO],
+  );
   const [cachedLoadIds, setCachedLoadIds] = useState<Record<string, string>>(
     {},
   );
@@ -658,20 +677,42 @@ export function AgentsTab() {
   const [knownVariants, setKnownVariants] = useState<Record<string, string>>({
     [EXAMPLE_MODEL_REPO]: EXAMPLE_MODEL_VARIANT,
   });
-  const [selectedModel, setSelectedModel] = useState(EXAMPLE_MODEL_REPO);
-  const modelSelectionChanged = useRef(false);
+  const initialModel = storedPrefs.agentsModel ?? EXAMPLE_MODEL_REPO;
+  const [selectedModel, setSelectedModel] = useState(initialModel);
+  const modelSelectionChanged = useRef(storedPrefs.agentsModel != null);
+  // held until discovery and the first status can confirm the restored model.
+  const restoredModel = useRef<string | null>(storedPrefs.agentsModel);
+  const [discoveredKeys, setDiscoveredKeys] = useState<Set<string> | null>(
+    null,
+  );
+  const [statusSettled, setStatusSettled] = useState(false);
   // The model status last reported, for the discovery scan to preserve.
-  const activeModelRef = useRef<string | null>(null);
+  const activeModelRef = useRef<{
+    model: string;
+    variant: string | null;
+  } | null>(null);
   // Only the newest status request may apply; a slow earlier one must not win.
   const statusSeq = useRef(0);
   // A quant picked by hand, scoped to its repo: polling and refetches must not
   // overwrite it, but it must not follow the selection onto a different repo.
-  const chosenVariant = useRef<{ model: string; variant: string } | null>(null);
+  // a restored quant is scoped the same way, so it applies when its model does.
+  const chosenVariant = useRef<{ model: string; variant: string } | null>(
+    storedPrefs.agentsVariantModel && storedPrefs.agentsVariant
+      ? {
+          model: storedPrefs.agentsVariantModel,
+          variant: storedPrefs.agentsVariant,
+        }
+      : null,
+  );
   const [modelSearch, setModelSearch] = useState("");
   const [modelPickerOpen, setModelPickerOpen] = useState(false);
   const [variants, setVariants] = useState<GgufVariantDetail[]>([]);
   const [selectedVariant, setSelectedVariant] = useState<string | null>(
-    EXAMPLE_MODEL_VARIANT,
+    chosenVariant.current?.model === initialModel
+      ? chosenVariant.current.variant
+      : initialModel === EXAMPLE_MODEL_REPO
+        ? EXAMPLE_MODEL_VARIANT
+        : null,
   );
   const [variantsLoading, setVariantsLoading] = useState(true);
   const [variantsFailed, setVariantsFailed] = useState(false);
@@ -796,6 +837,27 @@ export function AgentsTab() {
     };
   }, [localDetection]);
 
+  // a restored agent the backend no longer lists cannot build a command.
+  useEffect(() => {
+    if (!agentSelectionChanged.current) return;
+    if (localDetection && !loaded) return;
+    if (agents.includes(selectedAgent)) return;
+    agentSelectionChanged.current = false;
+    setStoredAgent(null);
+    setSelectedAgent(
+      agents.find((agent) => detectedAgents.has(agent)) ??
+        agents[0] ??
+        FALLBACK_AGENT.id,
+    );
+  }, [
+    agents,
+    detectedAgents,
+    loaded,
+    localDetection,
+    selectedAgent,
+    setStoredAgent,
+  ]);
+
   useEffect(() => {
     let cancelled = false;
     Promise.all([
@@ -828,10 +890,11 @@ export function AgentsTab() {
             labels[entry.id] = entry.label;
           }
         }
+        setDiscoveredKeys(new Set(discovered.models.map(modelKey)));
         // Status is applied on its own schedule now, so keep whatever model it has
         // already adopted rather than dropping it when this slower scan lands.
         setModels(() => {
-          const active = activeModelRef.current;
+          const active = activeModelRef.current?.model;
           return active && !discovered.models.includes(active)
             ? [active, ...discovered.models]
             : discovered.models;
@@ -865,9 +928,13 @@ export function AgentsTab() {
       }
       if (!modelSelectionChanged.current) {
         setSelectedModel(active.model);
-        if (chosenVariant.current?.model !== active.model) {
-          setSelectedVariant(active.variant);
-        }
+        // a remembered quant for this model wins, since it may be adopted here
+        // before the variants fetch below has had a chance to apply it.
+        setSelectedVariant(
+          chosenVariant.current?.model === active.model
+            ? chosenVariant.current.variant
+            : active.variant,
+        );
       }
     },
     [],
@@ -920,7 +987,9 @@ export function AgentsTab() {
   const applyStatus = useCallback(
     (status: InferenceStatusResponse) => {
       const active = activeGgufSelection(status);
-      activeModelRef.current = active?.model ?? null;
+      activeModelRef.current = active
+        ? { model: active.model, variant: active.variant }
+        : null;
       const wasAttachOnly = attachOnlyModel;
       setActiveStatusModel(active?.model ?? null);
       setAttachOnlyModel(active && !active.named ? active.model : null);
@@ -958,6 +1027,9 @@ export function AgentsTab() {
         })
         .catch(() => {
           // A failed poll just leaves the last known selection in place.
+        })
+        .finally(() => {
+          if (!cancelled) setStatusSettled(true);
         });
     };
     sync();
@@ -967,6 +1039,31 @@ export function AgentsTab() {
       window.clearInterval(timer);
     };
   }, [applyStatus]);
+
+  // retiring a restored pick needs both reads: either alone can miss a model
+  // the other knows about, and a wrong retire drops the user's choice.
+  useEffect(() => {
+    const restored = restoredModel.current;
+    if (!(restored && discoveredKeys && statusSettled)) return;
+    const active = activeModelRef.current;
+    restoredModel.current = null;
+    if (discoveredKeys.has(modelKey(restored)) || active?.model === restored) {
+      return;
+    }
+    // an uncached pick would pin the builder to a model the CLI cannot load.
+    modelSelectionChanged.current = false;
+    chosenVariant.current = null;
+    setStoredModel(null, null);
+    // adopt straight away rather than parking on the example model: the next
+    // poll is STATUS_POLL_MS away, and a command copied meanwhile would switch
+    // a shared server off whatever is loaded.
+    if (active) {
+      adoptActiveModel(active);
+      return;
+    }
+    setSelectedModel(EXAMPLE_MODEL_REPO);
+    setSelectedVariant(EXAMPLE_MODEL_VARIANT);
+  }, [adoptActiveModel, discoveredKeys, statusSettled, setStoredModel]);
 
   useEffect(() => {
     let cancelled = false;
@@ -1146,6 +1243,7 @@ export function AgentsTab() {
                 onValueChange={(agent) => {
                   agentSelectionChanged.current = true;
                   setSelectedAgent(agent);
+                  setStoredAgent(agent);
                   resetCopied();
                 }}
               >
@@ -1262,8 +1360,15 @@ export function AgentsTab() {
                           data-checked={model === selectedModel}
                           onSelect={() => {
                             modelSelectionChanged.current = true;
+                            restoredModel.current = null;
+                            const variant = knownVariants[model] ?? null;
                             setSelectedModel(model);
-                            setSelectedVariant(knownVariants[model] ?? null);
+                            setSelectedVariant(variant);
+                            // a native-grant label names no path to reuse.
+                            setStoredModel(
+                              model === attachOnlyModel ? null : model,
+                              model === attachOnlyModel ? null : variant,
+                            );
                             setVariants([]);
                             setVariantsFailed(false);
                             setVariantsLoading(isHuggingFaceRepo(model));
@@ -1306,6 +1411,11 @@ export function AgentsTab() {
                 onValueChange={(variant) => {
                   chosenVariant.current = { model: selectedModel, variant };
                   setSelectedVariant(variant);
+                  // stored against its model, so a quant picked while following
+                  // the resident model is remembered without pinning it.
+                  if (selectedModel !== attachOnlyModel) {
+                    setStoredVariant(selectedModel, variant);
+                  }
                   resetCopied();
                 }}
                 disabled={variantsLoading || variants.length === 0}
