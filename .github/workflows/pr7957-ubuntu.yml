@@ -1,0 +1,64 @@
+name: "PR-7957 ubuntu-latest"
+on:
+  push:
+    branches: [pr7957-cross-os]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  sheet-geometry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Contract tests
+        run: python -m pytest tests/studio/test_chat_response_details_ui_contract.py -q
+
+      - name: Frontend install + typecheck + unit tests + build
+        working-directory: studio/frontend
+        run: |
+          npm ci --no-fund --no-audit
+          npm run typecheck
+          npm test
+          npm run build
+
+      - name: Playwright engines
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium firefox webkit
+
+      - name: Measure close-button centring on all three engines
+        run: |
+          cd studio/frontend && (npm run dev -- --port 5192 --strictPort --host 127.0.0.1 &) && cd -
+          for i in $(seq 1 40); do curl -sf http://127.0.0.1:5192/harness.html >/dev/null && break; sleep 2; done
+          python ci/measure_sheet_alignment.py \
+            --base-url http://127.0.0.1:5192 --pr-url http://127.0.0.1:5192 \
+            --font-sizes 12,15,16,20 --out geometry-ubuntu.json
+          python - <<'PY'
+          import json
+          rows = json.load(open("geometry-ubuntu.json"))
+          bad = [r for r in rows if abs(r.get("signedDelta", 99)) > 0.02]
+          for r in rows:
+              print(f"{r['sheet']:8s} fs={r['fontSize']:2d} delta={r['signedDelta']} "
+                    f"font={r.get('titleFontSize')} lineH={r.get('titleLineHeight')} "
+                    f"titleH={r.get('titleHeight')} closes={r.get('closeCount')}")
+          assert not bad, f"off-centre rows: {bad}"
+          assert all(r.get("closeCount") == 1 for r in rows), "close-button count != 1"
+          print(f"OK: {len(rows)} measurements, all centred within 0.02px")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: geometry-ubuntu, path: geometry-ubuntu.json, if-no-files-found: ignore }
