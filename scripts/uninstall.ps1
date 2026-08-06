@@ -402,6 +402,27 @@ Environment:
         _StopByPortFile -PortFile (Join-Path $r "share\studio.port") -KnownRoots $knownRoots
     }
     _StopStudioProcesses -KnownRoots $knownRoots
+    # Desktop app plus the WebView2 helpers holding its profile open: both must
+    # exit before the EBWebView dirs are deleted further down.
+    $webviewProfile = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA "ai.unsloth.studio" } else { $null }
+    $studioPids = @(Get-Process -Name "unsloth-studio" -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+    if ($webviewProfile) {
+        # Escape: an unescaped "[" is a wildcard class, so the helper misses its
+        # own profile and matches others. Trailing \ spares "<bid>2\EBWebView".
+        $pattern = "*" + [System.Management.Automation.WildcardPattern]::Escape($webviewProfile) + "\*"
+        try {
+            foreach ($proc in (Get-CimInstance Win32_Process -Filter "Name = 'msedgewebview2.exe'" -ErrorAction SilentlyContinue)) {
+                # CommandLine is null across an elevation boundary: fall back to
+                # the parent chain rather than skipping the helper.
+                $mine = if ($proc.CommandLine) { $proc.CommandLine -ilike $pattern }
+                        else { $studioPids -contains [int]$proc.ParentProcessId }
+                if ($mine) { try { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } catch { } }
+            }
+        } catch { }
+    }
+    try { Stop-Process -Name "unsloth-studio" -Force -ErrorAction SilentlyContinue } catch { }
+    # WebView2 releases the profile only once its browser processes have exited.
+    if ($studioPids) { Wait-Process -Id $studioPids -Timeout 10 -ErrorAction SilentlyContinue }
     # Only stop the default sd.cpp dir when it carries our owner marker, so stop matches the
     # marker-gated delete and a user's own sd-server at this default path is left running.
     $defaultSdCppToStop = $null
@@ -501,6 +522,13 @@ Environment:
         _RemovePath $defaultUnslothHome
     }
 
+    # Bundle-id runtime data, created at first app launch rather than by
+    # install.ps1: LOCALAPPDATA holds the EBWebView profile (a leftover copy
+    # serves a stale frontend), APPDATA the app config dir. Already stopped above.
+    _Step "Removing WebView caches and app data (ai.unsloth.studio)..."
+    if ($env:LOCALAPPDATA) { _RemovePath (Join-Path $env:LOCALAPPDATA "ai.unsloth.studio") }
+    if ($env:APPDATA) { _RemovePath (Join-Path $env:APPDATA "ai.unsloth.studio") }
+
     # ── Remove desktop and Start Menu shortcuts ──
     _Step "Removing desktop and Start Menu shortcuts..."
     try {
@@ -585,6 +613,8 @@ Environment:
 
     Write-Host ""
     Write-Host "Unsloth Studio uninstalled."
+    Write-Host "Note: this also removed the app's WebView data, so the signed-in session,"
+    Write-Host "      saved provider API keys and local chat history are gone."
     Write-Host "Note: Hugging Face model cache at %USERPROFILE%\.cache\huggingface was left in place."
     Write-Host "Remove it manually with 'Remove-Item -Recurse -Force `"$env:USERPROFILE\.cache\huggingface\hub`"' if desired."
     if (-not $env:UNSLOTH_STUDIO_HOME -and -not $env:STUDIO_HOME) {
