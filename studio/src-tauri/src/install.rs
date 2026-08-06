@@ -1290,6 +1290,140 @@ mod tests {
         assert!(!args.iter().any(|a| a == "Bypass" || a == "-WindowStyle"));
     }
 
+    /// SIMULATION ONLY (not for merge): the refactor must be argv-identical to the
+    /// pre-refactor inline construction. Vector-level, over shapes that cannot all run.
+    #[cfg(windows)]
+    #[test]
+    fn sim_argv_vector_equivalence_over_corpus() {
+        use std::ffi::OsString;
+
+        // Verbatim copy of the construction on origin/main, before the extraction.
+        fn old(script: &Path) -> Vec<OsString> {
+            let mut v: Vec<OsString> = [
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "RemoteSigned",
+                "-File",
+            ]
+            .iter()
+            .map(OsString::from)
+            .collect();
+            v.push(powershell_script_path(script).into_os_string());
+            v
+        }
+
+        let long_ok = format!(r"\\?\C:\{}\install.ps1", "a".repeat(244));
+        let long_over = format!(r"\\?\C:\{}\install.ps1", "a".repeat(300));
+        let corpus: Vec<String> = vec![
+            r"C:\Users\Owner\install.ps1".into(),
+            r"\\?\C:\Users\Owner\install.ps1".into(),
+            r"\\?\c:\Users\Owner\install.ps1".into(),
+            r"\\?\UNC\server\share\install.ps1".into(),
+            r"\\?\unc\server\share\install.ps1".into(),
+            r"\\?\UnC\server\share\install.ps1".into(),
+            r"\\server\share\install.ps1".into(),
+            r"\\?\Volume{1234}\install.ps1".into(),
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\install.ps1".into(),
+            r"\\.\C:\install.ps1".into(),
+            r"\\?\C:".into(),
+            r"\\?\".into(),
+            r"\\?\1:\install.ps1".into(),
+            r"install.ps1".into(),
+            r".\install.ps1".into(),
+            r"C:\Users\Owner\Unsloth Studio (Desktop)\install.ps1".into(),
+            r"\\?\C:\Users\Owner\Unsloth Studio (Desktop)\install.ps1".into(),
+            r"C:\amp & semi ; caret ^\install.ps1".into(),
+            r"C:\quote ' tick\install.ps1".into(),
+            r"C:\unicode \u{5b89}\u{88c5} \u{30e9}\u{30dc}\install.ps1".into(),
+            r"C:\trailing.dot.\install.ps1".into(),
+            long_ok,
+            long_over,
+        ];
+
+        for p in &corpus {
+            let path = Path::new(p.as_str());
+            assert_eq!(
+                old(path),
+                powershell_launch_args(path),
+                "argv diverged for {p:?}"
+            );
+        }
+        // The corpus must actually exercise both branches, or it proves nothing.
+        assert!(corpus.len() >= 20, "corpus too small");
+    }
+
+    /// SIMULATION ONLY (not for merge): spawn the real interpreter both ways and
+    /// require the child observes a byte-identical command line. Covers the shapes
+    /// a production path can really take, including the shipped directory name.
+    #[cfg(windows)]
+    #[test]
+    fn sim_spawned_command_line_identical_old_vs_new() {
+        use std::fs;
+
+        let base = std::env::temp_dir().join(format!("unsloth-sim-cl-{}", std::process::id()));
+        let cases = [
+            "plain",
+            "with spaces",
+            "Unsloth Studio (Desktop)",
+            "amp & semi ; caret ^",
+            "quote ' tick",
+            "unicode \u{5b89}\u{88c5} \u{30e9}\u{30dc}",
+            "deep/nested/three/levels",
+        ];
+
+        for (i, name) in cases.iter().enumerate() {
+            let dir = base.join(format!("{i}-{}", name.replace('/', "\\")));
+            fs::create_dir_all(&dir).expect("create case dir");
+            let script = dir.join("install.ps1");
+            // Echo the raw command line the child was launched with.
+            fs::write(&script, "Write-Output ([Environment]::CommandLine)\r\n").expect("write");
+            let resolved = fs::canonicalize(&script).expect("canonicalize");
+            let script_args = vec!["--tauri".to_string()];
+
+            let old_out = Command::new(powershell_exe())
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "RemoteSigned",
+                    "-File",
+                ])
+                .arg(powershell_script_path(&resolved))
+                .args(&script_args)
+                .output()
+                .expect("spawn old");
+
+            let new_out = Command::new(powershell_exe())
+                .args(powershell_launch_args(&resolved))
+                .args(&script_args)
+                .output()
+                .expect("spawn new");
+
+            let old_stdout = String::from_utf8_lossy(&old_out.stdout).replace("\r\n", "\n");
+            let new_stdout = String::from_utf8_lossy(&new_out.stdout).replace("\r\n", "\n");
+
+            assert_eq!(
+                old_out.status.code(),
+                new_out.status.code(),
+                "exit code diverged for {name:?}"
+            );
+            assert_eq!(old_stdout, new_stdout, "command line diverged for {name:?}");
+            assert!(
+                old_out.status.success(),
+                "{name:?} did not run: {}",
+                String::from_utf8_lossy(&old_out.stderr)
+            );
+            assert!(
+                old_stdout.contains("--tauri"),
+                "{name:?} lost the script argument: {old_stdout}"
+            );
+        }
+        let _ = fs::remove_dir_all(&base);
+    }
+
     #[cfg(windows)]
     #[test]
     fn powershell_exe_resolves_under_the_system_directory() {
