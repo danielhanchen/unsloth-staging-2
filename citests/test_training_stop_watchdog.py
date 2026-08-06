@@ -1188,9 +1188,12 @@ def test_mlx_worker_flushes_tracking_before_every_terminal_send():
     writer and calls wandb_run.finish() in a finally; both must be flushed first.
     """
     import ast
+    import inspect
     from pathlib import Path as _P
 
-    src = (_P(__file__).resolve().parent.parent / "core/training/worker.py").read_text()
+    # Locate the worker beside the training module we actually imported, not relative to
+    # this file, so the test travels with the package rather than its directory layout.
+    src = (_P(inspect.getfile(TrainingBackend)).resolve().parent / "worker.py").read_text()
     tree = ast.parse(src)
     fn = next(
         n
