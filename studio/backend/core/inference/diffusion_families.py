@@ -479,9 +479,12 @@ def resolve_base_repo(fam: DiffusionFamily, base_repo: Optional[str]) -> str:
     return base or fam.base_repo
 
 
-# Byte-identical ungated unsloth mirrors of the gated vendor bases: a GGUF/FP8 pick ships only the
-# denoiser, so a gated base still 401s on the companions. Swapped at the fetch sites only, never in
-# ``resolve_base_repo``, whose result keys the UPSTREAM-id tables below (see ``canonical_base``).
+# Byte-identical unsloth mirrors of the vendor bases: a GGUF/FP8 pick ships only the denoiser, so
+# the companions come from the base. That is a 401 for the gated vendors and a third-party fetch
+# for the ungated ones. Swapped at the fetch sites only, never in ``resolve_base_repo``, whose
+# result keys the UPSTREAM-id tables below (see ``canonical_base``).
+# A mirror stands in for the WHOLE base, plain bf16 pipeline loads included, so it must be a
+# complete copy: a companions-only repo here breaks every pick that needs the transformer.
 _GATED_MIRROR_PAIRS: tuple[tuple[str, str], ...] = (
     ("black-forest-labs/FLUX.1-dev", "unsloth/FLUX.1-dev"),
     ("black-forest-labs/FLUX.1-schnell", "unsloth/FLUX.1-schnell"),
@@ -495,13 +498,32 @@ _GATED_MIRROR_PAIRS: tuple[tuple[str, str], ...] = (
     ("ideogram-ai/ideogram-4-fp8", "unsloth/ideogram-4-fp8"),
     ("ideogram-ai/ideogram-4-nf4", "unsloth/ideogram-4-nf4"),
     ("ideogram-ai/ideogram-4-nf4-diffusers", "unsloth/ideogram-4-nf4-diffusers"),
+    # Ungated from here down: mirrored not to drop a gate but to drop the third-party fetch, which
+    # is what a GGUF/FP8 pick's companions still cost. Every licence here permits redistribution,
+    # and each mirror carries the upstream licence text plus the notice its licence prescribes.
+    #
+    # Qwen-Image-2512 is the one no other redirect could reach: its companions are named by the
+    # artifact repo's base_model card tag rather than the family table.
+    ("Qwen/Qwen-Image-2512", "unsloth/Qwen-Image-2512"),
+    ("Qwen/Qwen-Image", "unsloth/Qwen-Image"),
+    ("Qwen/Qwen-Image-Edit-2511", "unsloth/Qwen-Image-Edit-2511"),
+    ("black-forest-labs/FLUX.2-klein-4B", "unsloth/FLUX.2-klein-4B"),
+    ("Tongyi-MAI/Z-Image-Turbo", "unsloth/Z-Image-Turbo"),
+    ("Alpha-VLLM/Lumina-Image-2.0", "unsloth/Lumina-Image-2.0"),
+    ("HiDream-ai/HiDream-I1-Full", "unsloth/HiDream-I1-Full"),
+    ("stabilityai/stable-diffusion-xl-base-1.0", "unsloth/stable-diffusion-xl-base-1.0"),
+    ("stabilityai/sdxl-turbo", "unsloth/sdxl-turbo"),
+    # NOT mirrored: hunyuanvideo-community/HunyuanImage-2.1-Diffusers. The Tencent Hunyuan
+    # Community License permits distribution "exclusively in the Territory", and the Territory
+    # excludes the EU, the UK and South Korea. A public Hub repo distributes worldwide, so that
+    # mirror cannot be made compliant and the family keeps fetching upstream.
 )
 _GATED_MIRRORS: dict[str, str] = {u.lower(): m for u, m in _GATED_MIRROR_PAIRS}
 _MIRROR_UPSTREAM: dict[str, str] = {m.lower(): u for u, m in _GATED_MIRROR_PAIRS}
 
 
 def mirror_repo(repo_id: Optional[str]) -> Optional[str]:
-    """The ungated unsloth mirror of ``repo_id``, or None when it is not a gated vendor base."""
+    """The unsloth mirror of ``repo_id``, or None when it is not a mirrored vendor base."""
     return _GATED_MIRRORS.get((repo_id or "").strip().lower())
 
 
