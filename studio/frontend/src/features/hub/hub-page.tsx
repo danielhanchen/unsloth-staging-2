@@ -11,7 +11,7 @@ import {
   useChatModelRuntime,
   useChatRuntimeStore,
 } from "@/features/chat";
-import { useOnlineStatus } from "@/features/hub";
+import { useHubAvailability } from "@/features/hub/hooks/use-online-status";
 import { useHubInfiniteScroll } from "@/features/hub";
 import {
   type ModelPickTarget,
@@ -368,7 +368,9 @@ export function ModelsPage() {
   const navigate = useNavigate();
   const gpu = useGpuInfo();
   const inferenceGpu = useInferenceGpuInfo();
-  const online = useOnlineStatus();
+  // Content availability, not browser reachability: a proxied feed is usable
+  // even while the browser itself cannot reach the Hub.
+  const online = useHubAvailability().phase === "available";
   const deviceType = usePlatformStore((s) => s.deviceType);
   const hubSearch = useSearch({ from: "/hub" });
   const urlModel = hubSearch.model ?? null;
@@ -731,7 +733,9 @@ export function ModelsPage() {
     isLoadingMore,
     hasMore,
     fetchMore,
+    fetchMoreManual: fetchMoreDiscoverManual,
     searchError,
+    searchFailure,
     handleRetrySearch,
   } = useDiscoverSearch({
     debouncedQuery,
@@ -1076,6 +1080,10 @@ export function ModelsPage() {
     scannedCount,
     {
       enabled: online && isDiscoverTab && hasMore,
+      // No phase gate: the footer renders on hasMore and so outlives the failed
+      // page, and fetchMoreDiscoverManual clears the backoff itself.
+      manualEnabled: isDiscoverTab && hasMore,
+      manualFetchMore: fetchMoreDiscoverManual,
       isFetching: isLoading || isLoadingMore,
       resultCount: filteredDiscoverRows.length,
       maxAutoFillFetches: 5,
@@ -1624,6 +1632,7 @@ export function ModelsPage() {
         activeCheckpoint,
         activeGgufVariant,
         searchError,
+        searchFailure,
         online,
         isDataset: isDatasetMode,
         inventoryTokens,
@@ -1650,6 +1659,7 @@ export function ModelsPage() {
       activeCheckpoint,
       activeGgufVariant,
       searchError,
+      searchFailure,
       online,
       inventoryTokens,
       scannedCount,

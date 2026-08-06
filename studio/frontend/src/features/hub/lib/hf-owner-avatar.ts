@@ -4,7 +4,8 @@
 import { useEffect, useState } from "react";
 import { LruMap } from "@/features/hub/lib/lru-map";
 import { fetchWithTimeout } from "@/features/hub/lib/network";
-import { useOnlineStatus } from "@/features/hub/hooks/use-online-status";
+import { hubProxyFirst } from "@/features/hub/lib/hub-endpoint";
+import { useDirectHubOnline } from "@/features/hub/hooks/use-online-status";
 
 type AvatarCacheEntry =
   | { kind: "url"; url: string; expiresAt: number }
@@ -88,6 +89,9 @@ function transientMiss(name: string): AvatarCacheEntry {
 async function fetchAvatarUrl(
   name: string,
 ): Promise<{ url: string | null; transient: boolean }> {
+  // Hardcoded public endpoints: with a mirror configured this would disclose a
+  // private owner name to the public Hub. An avatar miss is already non-fatal.
+  if (hubProxyFirst()) return { url: null, transient: false };
   const candidates = [
     `https://huggingface.co/api/organizations/${encodeURIComponent(name)}/overview`,
     `https://huggingface.co/api/users/${encodeURIComponent(name)}/overview`,
@@ -102,6 +106,7 @@ async function fetchAvatarUrl(
           credentials: "omit",
         },
         AVATAR_FETCH_TIMEOUT_MS,
+        { service: "other" },
       );
       if (res.ok) {
         const data = (await res.json()) as { avatarUrl?: string };
@@ -157,7 +162,7 @@ export function useHfOwnerAvatar(
   enabled = true,
 ): string | null {
   const key = owner?.trim() ?? "";
-  const online = useOnlineStatus();
+  const online = useDirectHubOnline();
   const [state, setState] = useState<{ key: string; url: string | null }>(() => {
     return { key, url: readCachedUrl(key) };
   });
