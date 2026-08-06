@@ -7,6 +7,8 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 // https://vite.dev/config/
+import { resolve } from "node:path";
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   // Keep an unrelated PostCSS config in an ancestor directory from leaking
@@ -65,6 +67,14 @@ export default defineConfig({
   build: {
     commonjsOptions: {
       include: [/node_modules/, /@dagrejs\/dagre/, /@dagrejs\/graphlib/],
+    },
+  },
+  build: {
+    rollupOptions: {
+      input: {
+        main: resolve(__dirname, "index.html"),
+        titlebarHarness: resolve(__dirname, "titlebar-harness.html"),
+      },
     },
   },
 });

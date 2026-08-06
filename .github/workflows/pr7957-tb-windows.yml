@@ -35,8 +35,9 @@ jobs:
       - name: Desktop titlebar occlusion, before / after / fixed
         shell: bash
         run: |
-          cd studio/frontend && (npm run dev -- --port 5192 --strictPort --host 127.0.0.1 &) && cd -
-          for i in $(seq 1 60); do curl -sf http://127.0.0.1:5192/titlebar-harness.html >/dev/null && break; sleep 2; done
+          cd studio/frontend && (npx vite preview --port 5192 --strictPort --host 127.0.0.1 &) && cd -
+          for i in $(seq 1 90); do curl -sf http://127.0.0.1:5192/titlebar-harness.html >/dev/null && break; sleep 2; done
+          curl -sf -o /dev/null http://127.0.0.1:5192/titlebar-harness.html && echo 'preview server up'
           python ci/test_titlebar_ci.py --url http://127.0.0.1:5192 \
             --engines 'chromium,chromium:msedge' --font-sizes 12,15,20 --out titlebar-windows.json
 
