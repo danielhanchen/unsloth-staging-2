@@ -186,8 +186,10 @@ _COMMAND_PREFIXES = frozenset(
 # Unconsumed, the value is mistaken for the wrapped command: `env -u FOO rm -rf x`
 # reads as command `FOO`. Shared by the auto gate and the blocklist walk.
 _WRAPPER_VALUE_FLAGS_BY_CMD = {
-    # env -i/--ignore-environment is VALUELESS; only -u/--unset takes a name.
-    "env": frozenset({"-u", "--unset"}),
+    # env -i/--ignore-environment is VALUELESS. -u/--unset takes a name and
+    # -C/--chdir a directory, and reading that directory as the child left the
+    # shell behind it (`env -C /tmp bash -c ...`) unscreened.
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
     "stdbuf": frozenset({"-i", "--input", "-o", "--output", "-e", "--error"}),
     "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
     "nice": frozenset({"-n", "--adjustment"}),
@@ -1338,9 +1340,75 @@ def _win_switch(token: str) -> str:
     return token[1:] if token.startswith("//") else token
 
 
+def _cmd_unquote(token: str) -> str:
+    """Strip the double quotes the cmd lexer leaves on a token; cmd.exe strips
+    them itself. Single quotes stay: cmd has no single-quote syntax."""
+    while len(token) >= 2 and token.startswith('"') and token.endswith('"'):
+        token = token[1:-1]
+    return token
+
+
 # `start` launches its argument as a program, so that argument is a command
 # position. These switches precede it; the value-taking ones eat a token.
 _START_SWITCHES_WITH_VALUE = {"/d", "/node", "/affinity", "/machine"}
+# Only these are switches. Skipping ANY slash-prefixed word walked straight past
+# the program under Git Bash, where a POSIX path is how one is written:
+# `start "" /c/Program Files/PowerShell/7/pwsh.exe` read the path as a switch.
+_START_SWITCHES = _START_SWITCHES_WITH_VALUE | {
+    "/min",
+    "/max",
+    "/wait",
+    "/b",
+    "/i",
+    "/low",
+    "/normal",
+    "/high",
+    "/realtime",
+    "/abovenormal",
+    "/belownormal",
+    "/separate",
+    "/shared",
+}
+# cmd keywords whose command word does not follow immediately, or at all.
+_CMD_CONTROL_FLOW = frozenset({"if", "else", "do", "for"})
+# cmd IF conditions, by how many tokens they occupy before the body command.
+_CMD_IF_UNARY = frozenset({"exist", "defined", "errorlevel", "cmdextversion"})
+_CMD_IF_COMPARISONS = frozenset({"equ", "neq", "lss", "leq", "gtr", "geq"})
+
+# Tells one quoted executable path apart from an argument list mentioning one.
+_EXECUTABLE_PATH_RE = re.compile(r"\.(?:exe|com|bat|cmd)(?=\s|$)", re.IGNORECASE)
+# A drive root or a rooted path: where a SECOND one of these begins, the string
+# is an argument list, not one program path carrying spaces.
+_STARTS_A_NEW_PATH_RE = re.compile(r"(?:[a-zA-Z]:[/\\]|[/\\])")
+
+# `cmd /c ""C:\Program Files\...\prog.exe" args"`: cmd removes the first and
+# last quote of the payload and runs what is left. Anchored to the flag so it
+# reads the payload, not any later quoted argument.
+_CMD_DOUBLED_QUOTE_RE = re.compile(
+    r"(?i)(?:^|[\s;&|(])(?:[^\s;&|(]*[\\/])?cmd(?:\.exe)?\s+"
+    r'(?:/[a-z]\s+|//[a-z]\s+)*//?[ck]\s+(".*")\s*$'
+)
+
+
+def _cmd_outer_quoted_payload(command: str) -> str:
+    """The payload of a doubled-quote `cmd /c` line, outer pair removed."""
+    match = _CMD_DOUBLED_QUOTE_RE.search(command)
+    if not match:
+        return ""
+    return match.group(1)[1:-1]
+
+
+def _cmd_quoted_program(payload: str) -> str:
+    """The program of a payload that opens with a quoted path.
+
+    Re-lexing keeps such a path in one token but leaves the quote marks glued
+    on, so the basename reads `pwsh.exe"` and matches nothing. This is the
+    whole point of the doubled-quote form, so read the program off it directly.
+    """
+    if not payload.startswith('"'):
+        return ""
+    end = payload.find('"', 1)
+    return payload[1:end] if end > 1 else ""
 
 
 def _find_blocked_commands(command: str) -> set[str]:
@@ -1402,6 +1470,38 @@ def _find_blocked_commands(command: str) -> set[str]:
             base = stem
         return base
 
+    def _scan_cmd_payload(payload: str) -> "set[str]":
+        """A cmd payload, read as a command line AND as one quoted program path.
+
+        cmd keeps the quotes when the string after /c names an executable file
+        and never splits a quoted token on its spaces (start's program argument
+        reads the same), so `cmd /c "C:/Program Files/PowerShell/7/pwsh.exe" -c
+        ls` really runs pwsh. Re-lexing alone splits that into `C:/Program` and
+        `Files/...`, leaving the program launched unscreened.
+        """
+        found = _find_blocked_commands(payload)
+        if not any(char in payload for char in " \t"):
+            return found  # no spaces: the re-lex above already read the program
+        # Anything but ONE whole executable path is an argument list cmd splits
+        # itself (`cmd /c "type C:/logs/curl"`), so leave it to the re-lex.
+        if len(_EXECUTABLE_PATH_RE.findall(payload)) != 1 or not payload.lower().endswith(
+            (".exe", ".com", ".bat", ".cmd")
+        ):
+            return found
+        words = payload.split()
+        if not any(char in words[0] for char in ":/\\"):
+            return found  # starts on a command word (`echo C:/tools/curl.exe`)
+        # One path split on ITS OWN spaces continues the same chain, so a later
+        # word starting a fresh absolute path means these are separate operands:
+        # `C:/Windows/System32/findstr curl C:/logs/curl.exe` greps a file whose
+        # name happens to be a blocked one, and reading the LAST word as the
+        # program hard-refused it. The first word is the command there, and the
+        # re-lex above has already screened it.
+        if any(_STARTS_A_NEW_PATH_RE.match(word) for word in words[1:]):
+            return found
+        base = _token_basename(payload)
+        return found | ({base} if base in _BLOCKED_COMMANDS else _blocked_matching_glob(base))
+
     def _exec_child_index(start: int) -> "tuple[int, bool]":
         """The command a `find -exec` actually runs, as ``(index, overflowed)``;
         the index is -1 when the action holds no command word at all.
@@ -1453,6 +1553,9 @@ def _find_blocked_commands(command: str) -> set[str]:
     prefix_command = ""  # which wrapper that was, for its own value-taking options
     skip_operand = False  # consume a wrapper/conditional operand, not the command
     sed_indexes: "list[int]" = []  # command-position sed words, for the `e` scan below
+    command_positions: "set[int]" = set()  # command-position words, for the start scan
+    win_c_payloads: "set[int]" = set()  # the word a `cmd /c` hands over, same
+    start_children: set[int] = set()  # what a `start` launches
     sed_xargs: "dict[int, int]" = {}  # sed word -> the xargs that builds its argv
     xargs_index = -1  # an xargs awaiting the command it wraps
     for token_index, token in enumerate(tokens):
@@ -1514,6 +1617,7 @@ def _find_blocked_commands(command: str) -> set[str]:
         # Numeric wrapper arg: `timeout 1 cmd` / `nice -n 5 cmd`.
         if prefix_pending and token.lstrip("-").isdigit():
             continue
+        command_positions.add(token_index)
         base = _token_basename(token)
         if _is_sed_command(base):
             sed_indexes.append(token_index)
@@ -1610,18 +1714,112 @@ def _find_blocked_commands(command: str) -> set[str]:
         words_alt = "|".join(re.escape(w) for w in sorted(_BLOCKED_COMMANDS))
         pattern = (
             rf"(?:^|[;&|`\n(]\s*|[$]\(\s*|<\(\s*)"
-            rf"(?:[\w./\\-]*/|[a-zA-Z]:[/\\][\w./\\-]*)?"
+            # The path prefix has to END on a separator. Letting it stop
+            # mid-name left the extension's dot to match the `.` builtin, so
+            # every `C:\dir\prog.exe` at the start of a scanned string reported
+            # `.` as a blocked command.
+            rf"(?:[\w./\\-]*/|[a-zA-Z]:[/\\](?:[\w.-]*[/\\])*)?"
             rf"({words_alt})(?:\.(?:exe|com|bat|cmd))?\b"
         )
         blocked.update(re.findall(pattern, lowered))
+
+    def _cmd_payload_commands(start: int) -> "list[int]":
+        """Command positions inside a `cmd /c` payload.
+
+        cmd runs control flow of its own, so the program is not always the first
+        word: `if exist FILE start "" prog` puts it behind a condition that bash
+        grammar reads as plain arguments. But the words after a command really
+        are its arguments, so marking the whole payload made
+        `cmd /c echo start "title" prog` read the echoed text as a launcher.
+        """
+        indexes: "list[int]" = []
+        k, expect = start, True
+        while k < len(tokens):
+            token = tokens[k]
+            if token in _SHELL_SEPARATORS:
+                k, expect = k + 1, True
+                continue
+            if not expect:
+                k += 1
+                continue
+            indexes.append(k)
+            base = _token_basename(_cmd_unquote(token))
+            if base in _COMMAND_PREFIXES:
+                # `env`/`nice` and friends exec their operand, and this branch
+                # now puts the Git userland on PATH, so they resolve inside a
+                # cmd payload too: `cmd /c env powershell` recorded only env and
+                # left the shell it runs sitting in argument position.
+                k += 1
+                while k < len(tokens):
+                    word = _cmd_unquote(tokens[k])
+                    if word in _WRAPPER_VALUE_FLAGS_BY_CMD.get(base, frozenset()):
+                        k += 2  # `env -u FOO prog`: the flag eats its value
+                        continue
+                    if word.startswith("-") or "=" in word:
+                        k += 1  # the wrapper's own flags, and VAR=VALUE
+                        continue
+                    break
+                continue
+            if base not in _CMD_CONTROL_FLOW:
+                k, expect = k + 1, False
+                continue
+            k += 1
+            if base == "for":
+                # `for %i in (set) do CMD`: the body is whatever follows `do`,
+                # not a short condition, so stepping a fixed width recorded the
+                # loop variable and left the body unscreened.
+                while k < len(tokens) and tokens[k] not in _SHELL_SEPARATORS:
+                    is_do = _cmd_unquote(tokens[k]).lower() == "do"
+                    k += 1
+                    if is_do:
+                        break
+            elif base == "if":
+                # `if [/i] [not] <condition> CMD`. Every condition form has its
+                # own width, and assuming one token left the body of the
+                # comparison forms (`if 1 EQU 1 rm -rf x`) unscreened.
+                while k < len(tokens) and _cmd_unquote(tokens[k]).lower() in ("/i", "not"):
+                    k += 1
+                if k < len(tokens):
+                    condition = _cmd_unquote(tokens[k]).lower()
+                    if condition in _CMD_IF_UNARY:
+                        k += 2  # `exist FILE`, `defined VAR`, `errorlevel N`
+                    elif (
+                        k + 2 < len(tokens)
+                        and _cmd_unquote(tokens[k + 1]).lower() in _CMD_IF_COMPARISONS
+                    ):
+                        k += 3  # `a EQU b`
+                    else:
+                        k += 1  # `string1==string2`, one token
+            # `else` / `do`: the command is simply the next word.
+        return indexes
+
+    # Resolved once: testing every -exec flag on every lookup made the whole
+    # scan quadratic (800 exec clauses and 800 start words, 21 kB, spent 1.4s
+    # against 0.05s before). The children do not depend on what the sweep
+    # discovers, so there is nothing to recompute.
+    exec_children = {_exec_child_index(flag + 1)[0] for flag in exec_flag_indexes}
+
+    def _runnable_index(idx: int) -> bool:
+        """True where the shell would execute the word at ``idx``: command
+        position, inside a `cmd /c` payload (cmd runs control flow of its own),
+        or a `find -exec` child. Anything else is data, not an invocation."""
+        return (
+            idx in command_positions
+            or idx in win_c_payloads
+            or idx in start_children
+            or idx in exec_children
+        )
 
     # Nested shell invocations (bash -c '...', bash -lc '...', cmd /c '...'):
     # on a -c/-/c flag, look back for a shell name (skipping flags) and
     # recursively scan the nested command string.
     _SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "csh", "tcsh", "fish"}
     _SHELLS_WIN = {"cmd", "cmd.exe"}
-    for i, token in enumerate(tokens):
-        tok_lower = token.lower()
+
+    def _nested_shell_at(i: int) -> None:
+        nonlocal blocked
+        token = tokens[i]
+        tok_lower = _cmd_unquote(token).lower()
         # Match -c exactly, or combined flags ending in c (e.g. -lc, -xc)
         is_unix_c = tok_lower == "-c" or (
             tok_lower.startswith("-") and tok_lower.endswith("c") and not tok_lower.startswith("--")
@@ -1630,39 +1828,159 @@ def _find_blocked_commands(command: str) -> set[str]:
         # hands cmd back a single slash; /k runs the payload the same way.
         is_win_c = _win_switch(tok_lower) in ("/c", "/k")
         if not (is_unix_c or is_win_c) or i < 1 or i + 1 >= len(tokens):
-            continue
+            return
         # Look back past flags for the shell binary. Windows flags and absolute
         # paths both start with /, so only skip short /X flags (not /bin/bash).
         for j in range(i - 1, -1, -1):
-            prev = tokens[j]
+            # A shell name only invokes a shell where the shell would run it:
+            # `echo "cmd" /c powershell` merely prints it, and reading that as
+            # an invocation hard blocked the payload behind it.
+            prev_runs = _runnable_index(j)
+            prev = _cmd_unquote(tokens[j]) if prev_runs else tokens[j]
             if prev.startswith("-"):
                 continue  # skip Unix flags like --login, -l
             if is_win_c and prev.startswith("/") and len(prev) <= 3:
                 continue  # skip Windows flags like /s, /q (not /bin/bash)
             prev_base = os.path.basename(prev).lower()
-            if is_unix_c and prev_base in _SHELLS:
-                blocked |= _find_blocked_commands(tokens[i + 1])
-            elif is_win_c and prev_base in _SHELLS_WIN:
-                blocked |= _find_blocked_commands(tokens[i + 1])
+            # Same for the payload: the cmd lexer makes `cmd /c "rm -rf x"` one
+            # quoted token, which re-lexes to no command while still quoted.
+            if is_unix_c and prev_runs and prev_base in _SHELLS:
+                blocked |= _find_blocked_commands(_cmd_unquote(tokens[i + 1]))
+            elif is_win_c and prev_runs and prev_base in _SHELLS_WIN:
+                # Tell the start scan below where cmd hands control over, and
+                # screen those words here: the walk above reads the payload with
+                # bash grammar, so a program cmd runs from its own control flow
+                # (`cmd /c if exist FILE powershell`) sat in argument position
+                # and no pass ever looked at it.
+                payload_commands = _cmd_payload_commands(i + 1)
+                win_c_payloads.update(payload_commands)
+                for payload_index in payload_commands:
+                    payload_word = _cmd_unquote(tokens[payload_index])
+                    if any(char in payload_word for char in " \t"):
+                        # A whole command line in one quoted token, which
+                        # _scan_cmd_payload already reads with its own rules;
+                        # a basename here would read `type C:/logs/curl` as curl.
+                        continue
+                    payload_base = _token_basename(payload_word)
+                    if payload_base in _BLOCKED_COMMANDS:
+                        blocked.add(payload_base)
+                    else:
+                        blocked |= _blocked_matching_glob(payload_base)
+                blocked |= _scan_cmd_payload(_cmd_unquote(tokens[i + 1]))
+                if not _cmd_unquote(tokens[i + 1]):
+                    # `cmd /c ""prog" args"` is the documented way to quote a
+                    # program path holding spaces: cmd strips the OUTER pair and
+                    # runs the rest as one string. The cmd lexer ends the first
+                    # token at the doubled quote, so the payload read as EMPTY.
+                    # Rebuild it from the raw command rather than from the
+                    # tokens, which have lost both the adjacency and the inner
+                    # quotes that hold a spaced path together.
+                    payload = _cmd_outer_quoted_payload(command)
+                    blocked |= _find_blocked_commands(payload)
+                    program = _cmd_quoted_program(payload)
+                    if program:
+                        program_base = _token_basename(program)
+                        if program_base in _BLOCKED_COMMANDS:
+                            blocked.add(program_base)
+                        else:
+                            blocked |= _blocked_matching_glob(program_base)
             break  # stop at first non-flag token
 
     # `cmd /c start "" prog` puts prog in a command position the scan above
     # sees only as an argument, so screen what start actually launches.
-    for i, token in enumerate(tokens):
-        if os.path.basename(token).lower() not in ("start", "start.exe"):
-            continue
+    def _start_at(i: int) -> None:
+        nonlocal blocked
+        token = tokens[i]
+        if os.path.basename(_cmd_unquote(token)).lower() not in ("start", "start.exe"):
+            return
         j = i + 1
         while j < len(tokens):
-            switch = _win_switch(tokens[j].lower())
-            if not switch.startswith("/"):
+            switch = _win_switch(_cmd_unquote(tokens[j]).lower())
+            if switch not in _START_SWITCHES:
                 break
             # /d C:\dir and friends carry their value in the next token.
             j += 2 if switch in _START_SWITCHES_WITH_VALUE else 1
-        # `start ""` is the idiom for "no title"; anything else is the program.
-        if j < len(tokens) and tokens[j] == "":
-            j += 1
-        if j < len(tokens):
-            blocked |= _find_blocked_commands(tokens[j])
+        if j >= len(tokens):
+            return
+        # `start ["title"] prog`: cmd reads the first argument as a window title
+        # ONLY when it arrives DOUBLE quoted, so an unquoted token here is the
+        # program and the next one merely its argument; screening both blocked
+        # `start explorer .` on the `.` source builtin.
+        head = tokens[j]
+        if not lexed_posix:
+            titled = head.startswith('"')  # the cmd lexer keeps the quote marks
+        else:
+            # The posix lexer drops them, and bash strips the quoting before
+            # exec anyway, so what arrives quoted is decided by CONTENT: the
+            # MSYS runtime re-quotes for CreateProcess only an empty argument
+            # or one holding a space/tab/newline/quote (cygwin winf.cc,
+            # linebuf::fromargv). `start "explorer" .` therefore reaches cmd
+            # bare, explorer being the program and `.` only its argument, while
+            # `start 'My Window' prog` still reads as a title.
+            titled = head == "" or any(char in head for char in ' \t\n\r"')
+        # Both the head and what follows it only matter where the shell really
+        # runs this start: `echo start "powershell"` launches nothing and was
+        # hard-refused. The bypass this once guarded against is still covered,
+        # because `echo "powershell" && cmd //c start powershell` puts its start
+        # after a separator and inside a cmd payload, both runnable positions.
+        # _runnable_index follows an -exec through its prefix too, so
+        # `find . -exec env start "" powershell \;` still resolves to start
+        # where testing the word right after the flag read `env` and stopped.
+        if _runnable_index(i):
+            blocked |= _scan_cmd_payload(_cmd_unquote(head))
+            k = j + 1 if titled else j
+            # Switches may also FOLLOW the title: the documented shape is
+            # `START ["title"] [switches] command`, so `start "" /b powershell`
+            # put /b where the program was expected and the scan stopped there.
+            while k < len(tokens):
+                switch = _win_switch(_cmd_unquote(tokens[k]).lower())
+                if switch not in _START_SWITCHES:
+                    break
+                k += 2 if switch in _START_SWITCHES_WITH_VALUE else 1
+            if k < len(tokens):
+                blocked |= _scan_cmd_payload(_cmd_unquote(tokens[k]))
+                # start launches a COMMAND LINE, not just a program, so the
+                # child may be a shell of its own: `start cmd /c powershell`
+                # reaches powershell through a nested cmd. Marking the child
+                # RUNNABLE and running the nested pass again screens that,
+                # where re-scanning the joined remainder made the whole scan
+                # QUADRATIC in the input: a few kB stalled the request, and
+                # _bash_exec runs this synchronously before the timeout.
+                # It runs untitled too: only the FIRST operand is a title.
+                start_children.add(k)
+                # A wrapper forwards to whatever it execs, and the Git userland
+                # this branch adds to PATH makes env/nice resolvable here, so
+                # `start "" env rm -rf victim` really deletes. Walk the chain:
+                # a wrapper can wrap a wrapper.
+                while k < len(tokens):
+                    child = _token_basename(_cmd_unquote(tokens[k]))
+                    if child not in _COMMAND_PREFIXES:
+                        break
+                    k += 1
+                    while k < len(tokens):
+                        word = _cmd_unquote(tokens[k])
+                        if word in _WRAPPER_VALUE_FLAGS_BY_CMD.get(child, frozenset()):
+                            k += 2  # the flag takes a separate value
+                            continue
+                        if word.startswith("-") or "=" in word:
+                            k += 1  # its own flags, and VAR=VALUE
+                            continue
+                        break
+                    if k < len(tokens):
+                        blocked |= _scan_cmd_payload(_cmd_unquote(tokens[k]))
+                        start_children.add(k)
+
+    # start can launch a shell and a shell can run a start, so the two feed each
+    # other. Every dependency points BACKWARD (a -c flag reads the shell name
+    # before it, a start reads its own position) and every discovery points
+    # FORWARD (the payload and the launched child both follow), so one sweep in
+    # index order resolves a chain of ANY depth: by the time a word is reached,
+    # what it depends on is final. Alternating whole passes instead needed one
+    # round per layer, and a bounded number of rounds left the deeper ones
+    # unscreened.
+    for index in range(len(tokens)):
+        _nested_shell_at(index)
+        _start_at(index)
 
     # sed's `e COMMAND` hands COMMAND to the shell, a real command position the
     # scan above sees only as a text argument, so screen it like `bash -c`. The
@@ -5601,6 +5919,11 @@ def _terminal_is_high_risk(command: str, _depth: int = 0) -> bool:
                     # Ahead of the wrapper-value skip below, which would otherwise
                     # swallow `--reuid 0` before it is judged.
                     return True
+                if current_command == "env" and flag in ("-C", "--chdir"):
+                    # Also ahead of the skip: -C now carries a separate value,
+                    # so the skip would swallow it before the branch below,
+                    # which asks because the chdir enables a relative read.
+                    return True
                 # A wrapper option taking a SEPARATE value (env -u NAME): the next
                 # token is that value, not the wrapped command.
                 if (
@@ -6562,9 +6885,10 @@ def _build_safe_env(workdir: str) -> dict[str, str]:
     operator's cached creds. PYTHONPATH carries only the sandbox sitecustomize
     shim directory.
 
-    PATH starts with the Studio interpreter / venv and OS system dirs so
-    ``python``/``pip`` stay pinned. On Windows only, Git-for-Windows install
-    dirs from the host PATH are appended so bare ``git`` resolves (#7317).
+    PATH starts with the Studio interpreter / venv so ``python``/``pip`` stay
+    pinned, then the OS system dirs. On Windows only, Git-for-Windows install
+    dirs are inserted between the two so bare ``git`` resolves (#7317) and the
+    userland beats the System32 DOS twins of POSIX names (``find``, ``sort``).
     User-writable host PATH entries (venv, ``node_modules/.bin``, etc.) are
     never inherited — they could shadow auto-safe terminal commands.
     """
@@ -6580,25 +6904,33 @@ def _build_safe_env(workdir: str) -> dict[str, str]:
         if venv_bin not in path_entries:
             path_entries.append(venv_bin)
 
-    if sys.platform == "win32":
-        sysroot = os.environ.get("SystemRoot", r"C:\Windows")
-        path_entries.extend([os.path.join(sysroot, "System32"), sysroot])
-    else:
-        path_entries.extend(["/usr/local/bin", "/usr/bin", "/bin"])
-
     # Windows Git installs live outside System32; inherit the dir of the git
     # the HOST shell resolves, but ONLY when it sits under a system install
     # root (Program Files, windir). A user-writable dir (Scoop/Choco shims)
     # is refused: it would let an attacker drop rg.exe/jq.exe beside git and
     # have an auto-approved bare command execute it (#7317).
     git_ext = ""
+    win_git_entries: list[str] = []
     if sys.platform == "win32":
-        # Append the CANONICAL (realpath) trusted git dir, scanning past any
-        # untrusted user shim that sorts first on PATH; the canonical path
-        # cannot be retargeted via a junction after the trust check.
+        # The CANONICAL (realpath) trusted git dir, scanning past any untrusted
+        # user shim earlier on PATH; a junction cannot retarget it after the
+        # trust check.
         _trusted_git_dir, git_ext = _resolve_trusted_windows_git()
         if _trusted_git_dir:
-            path_entries.append(_trusted_git_dir)
+            win_git_entries.append(_trusted_git_dir)
+        # The shell's own userland, same trust boundary.
+        win_git_entries.extend(_windows_bash_userland_dirs())
+
+    if sys.platform == "win32":
+        sysroot = os.environ.get("SystemRoot", r"C:\Windows")
+        # AHEAD of System32, which ships DOS twins of POSIX names: behind it a
+        # bare `find . -name '*.py'` resolved to FIND.EXE, not GNU find. Still
+        # behind the interpreter dirs above, so a Git-shipped python.exe cannot
+        # shadow the interpreter this server runs in.
+        path_entries.extend(win_git_entries)
+        path_entries.extend([os.path.join(sysroot, "System32"), sysroot])
+    else:
+        path_entries.extend(["/usr/local/bin", "/usr/bin", "/bin"])
 
     # Deduplicate, preserving order.
     deduped = list(dict.fromkeys(p for p in path_entries if p))
@@ -6621,6 +6953,10 @@ def _build_safe_env(workdir: str) -> dict[str, str]:
     # Windows needs SystemRoot for Python/subprocess to work.
     if sys.platform == "win32":
         env["SystemRoot"] = os.environ.get("SystemRoot", r"C:\Windows")
+        # Windows honours TEMP/TMP, not TMPDIR; without them a native program
+        # falls back to GetTempPath and writes outside the sandbox.
+        env["TEMP"] = workdir
+        env["TMP"] = workdir
         # Restrict PATHEXT so cwd .BAT/.CMD cannot hijack bare names (#7317).
         pathext = ".EXE;.COM"
         if git_ext and git_ext not in (".EXE", ".COM"):
@@ -6977,6 +7313,34 @@ def _windows_bash() -> "str | None":
         if os.path.isfile(candidate) and _is_trusted_windows_bash(candidate):
             return candidate
     return None
+
+
+def _windows_bash_userland_dirs() -> list[str]:
+    """Trusted dirs holding the resolved bash and the POSIX tools beside it.
+
+    `bash -c` is non-login, so /etc/profile never runs and Git for Windows'
+    usr\\bin stays off PATH, leaving ls / cat / grep "command not found".
+    bash.exe ships under Git\\bin and Git\\usr\\bin, so both parents are probed.
+    Every candidate clears the same Program Files trust boundary as the git
+    entry (#7317) and is canonicalised against junctions. Fails closed: no
+    trusted bash, no entries, PATH unchanged.
+    """
+    bash = _windows_bash()
+    if not bash:
+        return []
+    bin_dir = os.path.dirname(bash)
+    candidates = [bin_dir]
+    for root in (os.path.dirname(bin_dir), os.path.dirname(os.path.dirname(bin_dir))):
+        if root:
+            candidates.append(os.path.join(root, "usr", "bin"))
+    dirs: list[str] = []
+    for candidate in candidates:
+        if not os.path.isdir(candidate) or not _is_trusted_windows_program_dir(candidate):
+            continue
+        real = os.path.realpath(candidate)
+        if real not in dirs:
+            dirs.append(real)
+    return dirs
 
 
 def _shell_is_posix() -> bool:
