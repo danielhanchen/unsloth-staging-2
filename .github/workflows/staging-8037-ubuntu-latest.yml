@@ -65,3 +65,4 @@ jobs:
           import unsloth; print('imported', unsloth.__file__)
           PY
       - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_mtp_drafter_companion.py studio/backend/tests/test_remote_access_settings.py studio/backend/tests/test_secure_tunnel_gate.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
+# nudge
