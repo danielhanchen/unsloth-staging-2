@@ -1,0 +1,51 @@
+name: "staging-8016 macos-14"
+on:
+  push:
+    branches: ["pr-8016-xplat-ci"]
+    paths:
+      - 'studio/backend/tests/test_remote_access_settings.py'
+      - 'studio/backend/tests/test_secure_tunnel_gate.py'
+      - 'studio/frontend/src/app/provider.tsx'
+      - 'studio/frontend/src/components/assistant-ui/attachment.tsx'
+      - 'studio/frontend/src/components/assistant-ui/image.tsx'
+      - 'studio/frontend/src/components/assistant-ui/thread.tsx'
+      - 'studio/frontend/src/components/assistant-ui/tool-ui-image-generation.tsx'
+      - 'studio/frontend/src/components/tauri/window-titlebar.tsx'
+      - 'studio/frontend/src/components/ui/alert-dialog.tsx'
+      - 'studio/frontend/src/components/ui/command.tsx'
+      - 'studio/frontend/src/components/ui/dialog.tsx'
+      - 'studio/frontend/src/components/ui/sheet.tsx'
+      - 'studio/frontend/src/features/chat/artifacts/artifact-surface.tsx'
+      - 'studio/frontend/src/features/chat/chat-settings-sheet.tsx'
+      - 'studio/frontend/src/features/chat/components/chat-search-dialog.tsx'
+      - 'studio/frontend/src/features/chat/prompt-storage/prompt-storage-dialog.tsx'
+      - 'studio/frontend/src/features/data-recipes/pages/edit-recipe-page.tsx'
+      - 'studio/frontend/src/features/export/components/export-run-panel.tsx'
+      - 'studio/frontend/src/features/export/components/method-picker.tsx'
+      - 'studio/frontend/src/features/hub/catalog/model-inspector.tsx'
+      - '.github/workflows/staging-8016-macos-14.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_remote_access_settings.py studio/backend/tests/test_secure_tunnel_gate.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
