@@ -930,8 +930,8 @@ def _complete_event(output_dir = "/tmp/out"):
 
 
 def test_terminal_event_arms_watchdog_and_reaps_wedged_worker(monkeypatch):
-    # Saved, reported "complete", then never exited. Nothing used to reap it, so
-    # is_training_active() stayed true off _proc.is_alive() and the UI sat at 100%.
+    # Saved, reported "complete", never exited: nothing reaped it, so is_training_active()
+    # stayed true off _proc.is_alive() and the UI sat at 100%.
     monkeypatch.setitem(_G, "_COMPLETE_EXIT_GRACE_S", 0.05)
     monkeypatch.setitem(_G, "_STOP_TIMEOUT_S", 100.0)  # ensure the grace fires, not the cap
     b = TrainingBackend()
@@ -953,8 +953,8 @@ def test_terminal_event_arms_watchdog_and_reaps_wedged_worker(monkeypatch):
 
 
 def test_terminal_error_event_also_arms_watchdog(monkeypatch):
-    # An error never sets _complete_seen, so terminal_seen starts the grace; without it
-    # the watchdog would wait out the full absolute backstop.
+    # An error never sets _complete_seen, so terminal_seen starts the grace; without it the
+    # watchdog would wait out the full absolute backstop.
     monkeypatch.setitem(_G, "_COMPLETE_EXIT_GRACE_S", 0.05)
     monkeypatch.setitem(_G, "_STOP_TIMEOUT_S", 100.0)
     b = TrainingBackend()
@@ -972,8 +972,7 @@ def test_terminal_error_event_also_arms_watchdog(monkeypatch):
 
 
 def test_normal_completion_never_force_terminates(monkeypatch):
-    # The common path: the worker exits a second or two after "complete". Arming on
-    # every run must stay invisible there.
+    # The common path: the worker exits shortly after "complete", so arming stays invisible.
     monkeypatch.setitem(_G, "_COMPLETE_EXIT_GRACE_S", 5.0)
     monkeypatch.setitem(_G, "_STOP_TIMEOUT_S", 10.0)
     b = TrainingBackend()
@@ -993,8 +992,7 @@ def test_normal_completion_never_force_terminates(monkeypatch):
 
 
 def test_completion_watchdog_does_not_preempt_a_stop_watchdog(monkeypatch):
-    # A user stop already armed the tighter grace; the terminal event must not
-    # replace it with the longer completion grace.
+    # A user stop armed the tighter grace; the terminal event must not replace it.
     b = TrainingBackend()
     monkeypatch.setattr(b, "_finalize_run_in_db", lambda **kw: None)
     monkeypatch.setattr(b, "_stop_watchdog_loop", lambda *a, **k: None)
@@ -1012,8 +1010,7 @@ def test_completion_watchdog_does_not_preempt_a_stop_watchdog(monkeypatch):
 
 
 def test_escalation_finalize_keeps_completed_status_message(monkeypatch):
-    # Reaping a wedged worker after a successful save must not relabel the run: the
-    # message drives the UI banner.
+    # Reaping a wedged worker after a successful save must not relabel the run.
     b = TrainingBackend()
     b.current_job_id = "job_1"
     b._output_dir = "/tmp/out"
@@ -1062,8 +1059,8 @@ def test_escalation_finalize_still_reports_a_stop_as_stopped(monkeypatch):
 
 
 def test_pump_loop_exits_when_the_watchdog_drops_the_handle(monkeypatch):
-    # The watchdog drops _proc last. The pump read the attribute twice, so a drop
-    # between the two raised AttributeError and silently killed the pump.
+    # The watchdog drops _proc last; the pump read it twice, so a drop in between raised
+    # AttributeError and silently killed the pump.
     b = TrainingBackend()
     proc = _FakeProc(alive = True)
     b._proc = proc
@@ -1140,8 +1137,8 @@ def test_is_run_finished_does_not_leak_into_the_next_run():
 
 
 def test_is_run_finished_false_during_spawn_and_start_windows():
-    # _progress still holds the previous run until start_training resets it, so these
-    # windows must not report the new run as already finished.
+    # _progress holds the previous run until start_training resets it, so these windows
+    # must not report the new run as already finished.
     b = _running_backend()
     b._handle_event(_complete_event())
     b._spawn_in_progress = True
@@ -1152,8 +1149,7 @@ def test_is_run_finished_false_during_spawn_and_start_windows():
 
 
 def test_is_training_active_still_liveness_only():
-    # Guards for inference/image/video/diffusion/install read this; a lingering worker
-    # still holds its VRAM, so it must keep reporting active.
+    # A lingering worker still holds its VRAM, so the admission guards must see it active.
     b = _running_backend()
     b._handle_event(_complete_event())
     assert b.is_training_active() is True
@@ -1162,8 +1158,7 @@ def test_is_training_active_still_liveness_only():
 
 
 def test_is_run_finished_false_across_an_xet_respawn():
-    # A model-load stall terminates the worker and the pump respawns it over HTTP. The
-    # run is still going, so the UI must not flip to a terminal phase in that window.
+    # A stall respawns the worker over HTTP; the run is still going, so no terminal phase.
     b = _running_backend()
     b._in_model_load = True
     b._handle_event({"type": "stall", "message": "no progress"})
@@ -1180,3 +1175,94 @@ def test_is_run_finished_true_when_a_stall_is_unrecoverable():
     b._handle_event({"type": "stall", "message": "no progress"})
     assert b._needs_xet_respawn is False
     assert b.is_run_finished() is True
+
+
+# ----------------------------------------------------------------------------
+# (f) The terminal event must be the worker's last act.
+# ----------------------------------------------------------------------------
+
+
+def test_mlx_worker_flushes_tracking_before_every_terminal_send():
+    """The parent arms its exit watchdog on `complete`, so anything the worker still
+    does after that send races a force-terminate. The MLX path closes the TensorBoard
+    writer and calls wandb_run.finish() in a finally; both must be flushed first.
+    """
+    import ast
+    from pathlib import Path as _P
+
+    src = (_P(__file__).resolve().parent.parent / "core/training/worker.py").read_text()
+    tree = ast.parse(src)
+    fn = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "_run_mlx_training"
+    )
+
+    def _is_complete_send(node):
+        return (
+            isinstance(node, ast.Call)
+            and getattr(node.func, "id", "") == "_send"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "complete"
+        )
+
+    sends = sorted(n.lineno for n in ast.walk(fn) if _is_complete_send(n))
+    flushes = sorted(
+        n.lineno
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "_finish_tracking"
+    )
+    # Only the sends after _finish_tracking is defined can be guarded by it.
+    defined_at = next(
+        n.lineno
+        for n in ast.walk(fn)
+        if isinstance(n, ast.FunctionDef) and n.name == "_finish_tracking"
+    )
+    guarded = [s for s in sends if s > defined_at]
+    assert guarded, "expected terminal sends after the tracking helper is defined"
+    for send in guarded:
+        assert any(send - 4 <= f < send for f in flushes), (
+            f"_send('complete') at worker.py:{send} is not preceded by _finish_tracking(); "
+            "the watchdog could force-terminate a pending TB/W&B flush"
+        )
+
+
+def test_terminal_stall_arms_the_exit_watchdog(monkeypatch):
+    # An unrecoverable stall is terminal (is_run_finished() goes true), but terminate() is
+    # only a request. Without a backstop a worker that ignores it holds the GPU for good
+    # while the UI has already moved on, and every later start hits the live-_proc guard.
+    monkeypatch.setitem(_G, "_COMPLETE_EXIT_GRACE_S", 0.05)
+    monkeypatch.setitem(_G, "_STOP_TIMEOUT_S", 100.0)
+    b = _running_backend()
+    b._start_stop_watchdog = TrainingBackend._start_stop_watchdog.__get__(b)
+    calls = _record_force_terminate(monkeypatch, b)
+    b._in_model_load = True
+    b._xet_fallback_used = True  # already on HTTP, so the stall is unrecoverable
+
+    proc = b._proc
+    proc.terminate = lambda: None  # worker ignores the terminate request
+    b._handle_event({"type": "stall", "message": "no progress"})
+
+    assert b.is_run_finished() is True
+    assert _wait_until(lambda: calls == ["force", "final"]), (
+        "a wedged worker on the terminal stall path must still be reaped"
+    )
+    if b._stop_watchdog:
+        b._stop_watchdog.join(timeout = 5)
+
+
+def test_recoverable_stall_does_not_arm_the_watchdog(monkeypatch):
+    # The Xet fallback respawns the worker, so the run is not terminal and nothing may reap it.
+    monkeypatch.setitem(_G, "_COMPLETE_EXIT_GRACE_S", 0.05)
+    b = _running_backend()
+    b._start_stop_watchdog = TrainingBackend._start_stop_watchdog.__get__(b)
+    calls = _record_force_terminate(monkeypatch, b)
+    b._in_model_load = True
+
+    b._handle_event({"type": "stall", "message": "no progress"})
+
+    assert b._needs_xet_respawn is True
+    assert b.is_run_finished() is False
+    time.sleep(0.3)
+    assert calls == [], "a respawning run must not be force-terminated"
