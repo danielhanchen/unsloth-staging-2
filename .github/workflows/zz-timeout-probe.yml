@@ -1,0 +1,24 @@
+name: timeout probe
+on:
+  pull_request:
+    branches: [main]
+concurrency:
+  group: timeout-probe-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: stalls
+        id: stalls
+        timeout-minutes: 1
+        run: sleep 300
+      - name: bare
+        run: echo "BARE RAN"
+      - name: notcancelled
+        if: ${{ !cancelled() }}
+        run: echo "NOTCANCELLED RAN; stalls outcome=${{ steps.stalls.outcome }} conclusion=${{ steps.stalls.conclusion }}"
+      - name: alwaysstep
+        if: always()
+        run: echo "ALWAYS RAN; cancelled=${{ cancelled() }} failure=${{ failure() }} success=${{ success() }}"
