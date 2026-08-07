@@ -1,0 +1,48 @@
+name: "PR-7954 sheet matrix windows"
+on:
+  push:
+    branches: [pr7954-cross-os]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  sheets:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Frontend install + build
+        working-directory: studio/frontend
+        run: |
+          npm ci --no-fund --no-audit
+          npm run typecheck
+          npm run build
+
+      - name: Playwright engines
+        run: |
+          python -m pip install --upgrade playwright
+          python -m playwright install chromium
+
+      - name: Sheet geometry, all seven call sites
+        shell: bash
+        run: |
+          cd studio/frontend && (npx vite preview --port 5193 --strictPort --host 127.0.0.1 &) && cd -
+          for i in $(seq 1 90); do curl -sf http://127.0.0.1:5193/sheet-matrix-harness.html >/dev/null && break; sleep 2; done
+          curl -sf -o /dev/null http://127.0.0.1:5193/sheet-matrix-harness.html && echo 'preview server up'
+          python ci/measure_sheet_matrix.py --url http://127.0.0.1:5193 \
+            --engines 'chromium,chromium:msedge' --chromes 'custom,browser' --variants naive,fixed \
+            --sites 1,2,3,4,5,6,7 --font-sizes 15,20 --engine-timeout 900 \
+            --check-variant fixed --out sheets-windows.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: sheets-windows, path: sheets-windows.json, if-no-files-found: ignore }
