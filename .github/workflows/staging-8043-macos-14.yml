@@ -1,0 +1,45 @@
+name: "staging-8043 macos-14"
+on:
+  push:
+    branches: ["pr-8043-xplat-ci"]
+    paths:
+      - 'studio/backend/hub/services/models/cache_inventory.py'
+      - 'studio/backend/hub/services/models/common.py'
+      - 'studio/backend/hub/services/models/local_inventory.py'
+      - 'studio/backend/hub/tests/conftest.py'
+      - 'studio/backend/hub/tests/test_model_services.py'
+      - 'studio/backend/hub/utils/download_manifest.py'
+      - 'studio/backend/hub/utils/inventory_scan.py'
+      - 'studio/backend/hub/utils/state_dir.py'
+      - 'studio/backend/routes/models.py'
+      - 'studio/backend/tests/conftest.py'
+      - 'studio/backend/tests/test_cached_gguf_routes.py'
+      - 'studio/frontend/src/components/resource-picker/picker-tab-policy.ts'
+      - 'studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx'
+      - 'studio/frontend/tests/picker-tab-policy.test.ts'
+      - '.github/workflows/staging-8043-macos-14.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: overall=0; for f in studio/backend/hub/tests/test_model_services.py studio/backend/tests/test_cached_gguf_routes.py; do echo "::group::pytest $f"; rc=0; PYTHONPATH=studio/backend python -m pytest "$f" -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran in $f (deps absent on this runner)"; rc=0; fi; if [ "$rc" != "0" ]; then overall="$rc"; fi; echo '::endgroup::'; done; exit "$overall"
