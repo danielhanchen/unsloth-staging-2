@@ -27,7 +27,12 @@ Write-Host "extracted Clear-WebViewCaches ($($fnAst.Extent.EndLineNumber - $fnAs
 $script:Notes = New-Object System.Collections.Generic.List[string]
 function substep { param([string]$Message, [string]$Color) $script:Notes.Add($Message) }
 
-& ([scriptblock]::Create($fnAst.Extent.Text))
+# Dot-sourced, not invoked: `&` would define the function in a child scope that is
+# discarded the moment the block returns.
+. ([scriptblock]::Create($fnAst.Extent.Text))
+if (-not (Get-Command Clear-WebViewCaches -ErrorAction SilentlyContinue)) {
+    Write-Host "Clear-WebViewCaches did not land in this scope" -ForegroundColor Red; exit 1
+}
 
 $BID = 'ai.unsloth.studio'
 $Root = Join-Path ([System.IO.Path]::GetTempPath()) ("wvprobe_" + [System.Guid]::NewGuid().ToString('N').Substring(0, 8))
