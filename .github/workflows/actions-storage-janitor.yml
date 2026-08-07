@@ -61,12 +61,33 @@ jobs:
           pages=$(( (total + 99) / 100 ))
           echo "artifact records: $total ($pages pages)"
 
+          # Bounded scan. The API returns artifacts newest-first and retention is
+          # uniform per upload step, so live artifacts cluster in the first pages.
+          # Scanning every page does not scale: unsloth has ~191k records (~1,918
+          # pages), which would exhaust GITHUB_TOKEN's 1,000 req/hr limit and take
+          # hours. Stop after STOP_AFTER consecutive fully-expired pages.
+          #
+          # Trade-off: a handful of long-retention stragglers deeper in the list
+          # are skipped. Measured on unsloth those are ~4 KB each, i.e. irrelevant
+          # to a storage sweep. Correctness of the BYTE TOTAL is what matters here.
+          STOP_AFTER=3
           : > live.tsv
+          empty_streak=0
+          scanned=0
           for p in $(seq 1 "$pages"); do
-            gh api "repos/$repo/actions/artifacts?per_page=100&page=$p" \
+            page_live=$(gh api "repos/$repo/actions/artifacts?per_page=100&page=$p" \
               -q '.artifacts[] | select(.expired==false)
-                  | "\(.created_at)\t\(.id)\t\(.size_in_bytes)\t\(.name)"' >> live.tsv || true
+                  | "\(.created_at)\t\(.id)\t\(.size_in_bytes)\t\(.name)"' 2>/dev/null || true)
+            scanned=$((scanned + 1))
+            if [ -z "$page_live" ]; then
+              empty_streak=$((empty_streak + 1))
+              if [ "$empty_streak" -ge "$STOP_AFTER" ]; then break; fi
+            else
+              empty_streak=0
+              printf '%s\n' "$page_live" >> live.tsv
+            fi
           done
+          echo "scanned $scanned/$pages pages (stopped after $STOP_AFTER empty)"
 
           live_bytes=$(awk -F'\t' '{s+=$3} END {print s+0}' live.tsv)
           live_count=$(wc -l < live.tsv)
