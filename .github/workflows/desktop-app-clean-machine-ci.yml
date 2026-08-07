@@ -303,7 +303,7 @@ jobs:
       fail-fast: false
       matrix:
         kind: [deb, appimage]
-        mode: [xvfbrun, manual, strace]
+        mode: [manual, gdb]
         experimental: [false]
 
     steps:
@@ -352,7 +352,7 @@ jobs:
           # Xvfb and WebKit are runtime requirements and apt pulls the .deb's declared
           # deps, so a wrong dependency list fails here.
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends xvfb strace
+          sudo apt-get install -y -qq --no-install-recommends xvfb strace gdb
           if [ "${{ matrix.kind }}" = "deb" ]; then
             sudo apt-get install -y ./dl/*.deb || {
               echo "::error::the .deb does not declare its runtime dependencies correctly"
@@ -440,25 +440,33 @@ jobs:
               sleep 0.5
             done ) &
           SAMPLER=$!
-          XVFB_PID=""
-          if [ "$MODE" = "xvfbrun" ]; then
-            xvfb-run -a --server-args="-screen 0 1440x900x24" \
-              "$BIN" > logs/app-stdout.log 2>&1 &
-            APP_PID=$!
+          Xvfb :77 -screen 0 1440x900x24 -nolisten tcp > logs/xvfb.log 2>&1 &
+          XVFB_PID=$!
+          for i in $(seq 1 40); do [ -e /tmp/.X11-unix/X77 ] && break; sleep 0.5; done
+          export DISPLAY=:77
+          echo "Xvfb pid=$XVFB_PID DISPLAY=$DISPLAY socket=$([ -e /tmp/.X11-unix/X77 ] && echo up || echo MISSING)"
+          # Surface anything GLib/GTK would normally filter, and any Rust panic.
+          export G_MESSAGES_DEBUG=all RUST_BACKTRACE=full
+          if [ "$MODE" = "gdb" ]; then
+            # The whole point: stop ON the exit_group syscall and print who called it.
+            # detach-on-fork keeps the app's many short-lived helper children (bash -ilc,
+            # the preflight probes) from tripping the catchpoint.
+            gdb -q -batch \
+              -ex "set pagination off" \
+              -ex "set confirm off" \
+              -ex "set follow-fork-mode parent" \
+              -ex "set detach-on-fork on" \
+              -ex "catch syscall exit_group" \
+              -ex "run" \
+              -ex "echo \n===== CAUGHT exit_group =====\n" \
+              -ex "info threads" \
+              -ex "thread apply all bt 40" \
+              -ex "kill" \
+              --args "$BIN" > logs/app-stdout.log 2>&1 &
           else
-            Xvfb :77 -screen 0 1440x900x24 -nolisten tcp > logs/xvfb.log 2>&1 &
-            XVFB_PID=$!
-            for i in $(seq 1 40); do [ -e /tmp/.X11-unix/X77 ] && break; sleep 0.5; done
-            export DISPLAY=:77
-            echo "Xvfb pid=$XVFB_PID DISPLAY=$DISPLAY socket=$([ -e /tmp/.X11-unix/X77 ] && echo up || echo MISSING)"
-            if [ "$MODE" = "strace" ]; then
-              strace -f -tt -o logs/strace.log -s 300 \
-                -e trace=execve,exit_group,kill,tgkill "$BIN" > logs/app-stdout.log 2>&1 &
-            else
-              "$BIN" > logs/app-stdout.log 2>&1 &
-            fi
-            APP_PID=$!
+            "$BIN" > logs/app-stdout.log 2>&1 &
           fi
+          APP_PID=$!
           echo "mode=$MODE watched pid=$APP_PID"
           for i in $(seq 1 90); do
             kill -0 "$APP_PID" 2>/dev/null || break
