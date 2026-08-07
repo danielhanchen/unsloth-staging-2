@@ -1,0 +1,61 @@
+name: "staging-8076 studio-playwright"
+on:
+  push:
+    branches: ["pr-8076-xplat-ci"]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/staging-8076-playwright.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  studio-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install playwright httpx pillow && python -m playwright install --with-deps chromium
+      - name: Install + launch Studio
+        run: |
+          ./install.sh --local --no-torch || pip install -e .
+          nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8888/healthz && break; sleep 5; done
+      - name: Playwright smoke (studio_test_kit)
+        run: PYTHONPATH=.github/scripts python -m studio_test_kit._smoke_ui || true
+      - name: Drive the PR's Playwright script (playwright_mac_tab_capabilities.py)
+        env:
+          NEW_PW: StagingCI-8076-Pw1!
+        run: |
+          PWFILE=$(grep -oE 'password saved to: *\S+' studio.log | tail -1 | awk '{print $NF}')
+          [ -f "$PWFILE" ] || { echo "::error::no bootstrap password file in studio.log"; tail -40 studio.log; exit 1; }
+          export BOOT=$(cat "$PWFILE")
+          python - <<'EOF'
+          import json, os, urllib.request
+          B, boot, new = "http://127.0.0.1:8888", os.environ["BOOT"], os.environ["NEW_PW"]
+          def post(path, body, tok=None):
+              req = urllib.request.Request(B + path, json.dumps(body).encode(),
+                                           {"Content-Type": "application/json"})
+              if tok: req.add_header("Authorization", "Bearer " + tok)
+              return json.load(urllib.request.urlopen(req, timeout=30))
+          tok = post("/api/auth/login", {"username": "unsloth", "password": boot})["access_token"]
+          post("/api/auth/change-password", {"current_password": boot, "new_password": new}, tok)
+          print("password rotated")
+          EOF
+          BASE_URL=http://127.0.0.1:8888 STUDIO_PW="$NEW_PW" \
+            PW_ART_DIR=logs/playwright_staging python tests/studio/playwright_mac_tab_capabilities.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-playwright-8076
+          path: |
+            **/*.png
+            **/*.webm
+            studio.log

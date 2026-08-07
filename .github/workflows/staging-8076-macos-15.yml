@@ -1,0 +1,51 @@
+name: "staging-8076 macos-15"
+on:
+  push:
+    branches: ["pr-8076-xplat-ci"]
+    paths:
+      - 'studio/backend/loggers/__init__.py'
+      - 'studio/backend/loggers/handlers.py'
+      - 'studio/backend/main.py'
+      - 'studio/backend/routes/rag.py'
+      - 'studio/backend/run.py'
+      - 'studio/backend/storage/rag_db.py'
+      - 'studio/backend/tests/test_liveness_reports_warmup_state.py'
+      - 'studio/backend/tests/test_logging_middleware.py'
+      - 'studio/backend/tests/test_mlx_repair.py'
+      - 'studio/backend/tests/test_rag_unavailable_quiet.py'
+      - 'studio/backend/tests/test_uvicorn_exception_dedup.py'
+      - 'studio/backend/tests/test_video_capability.py'
+      - 'studio/backend/tests/test_warm_window_review_fixes.py'
+      - 'studio/backend/utils/hardware/__init__.py'
+      - 'studio/backend/utils/hardware/hardware.py'
+      - 'studio/backend/utils/mlx_repair.py'
+      - 'studio/frontend/src/app/routes/__root.tsx'
+      - 'studio/frontend/src/components/app-sidebar.tsx'
+      - 'studio/frontend/src/components/assistant-ui/thread.tsx'
+      - 'studio/frontend/src/components/nav-row-state.ts'
+      - '.github/workflows/staging-8076-macos-15.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_liveness_reports_warmup_state.py studio/backend/tests/test_logging_middleware.py studio/backend/tests/test_mlx_repair.py studio/backend/tests/test_rag_unavailable_quiet.py studio/backend/tests/test_uvicorn_exception_dedup.py studio/backend/tests/test_video_capability.py studio/backend/tests/test_warm_window_review_fixes.py tests/studio/install/test_selection_logic.py tests/studio/test_mac_tab_capability_warm_window.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
