@@ -59,6 +59,8 @@ import {
   MAX_SEQ_LENGTH_MIN,
   MAX_SEQ_LENGTH_STEP,
   MLX_KV_BITS,
+  N_BATCH_MAX,
+  N_BATCH_MIN,
   N_PARALLEL_MAX,
   N_PARALLEL_MIN,
   type PerModelConfig,
@@ -111,6 +113,8 @@ function hasNonDefaultAdvanced(config: PerModelConfig): boolean {
     (config.speculativeType ?? "auto") !== "auto" ||
     config.specDraftNMax != null ||
     config.nParallel != null ||
+    config.nBatch != null ||
+    config.nUbatch != null ||
     config.tensorParallel ||
     config.chatTemplateOverride != null ||
     (config.gpuMemoryMode ?? "auto") !== "auto" ||
@@ -133,6 +137,8 @@ function withoutUnsupportedDiffusionSettings(
     config.gpuLayers == null &&
     config.nCpuMoe == null &&
     !config.tensorParallel &&
+    config.nBatch == null &&
+    config.nUbatch == null &&
     !hasUnsupportedGpuPick
   ) {
     return config;
@@ -143,6 +149,9 @@ function withoutUnsupportedDiffusionSettings(
     gpuLayers: undefined,
     nCpuMoe: undefined,
     tensorParallel: false,
+    // the diffusion runner ignores the llama-server batch flags
+    nBatch: null,
+    nUbatch: null,
     ...(hasUnsupportedGpuPick
       ? {
           selectedGpuIds: undefined,
@@ -628,6 +637,22 @@ function GgufAdvancedSettings({
   gpuLayersInputRef?: Ref<NumericValueInputHandle>;
   moeLayersInputRef?: Ref<NumericValueInputHandle>;
 }) {
+  const batchAdviceId = useId();
+  const ubatchAdviceId = useId();
+  // llama.cpp runs at min(batch, ubatch) and the /status echo is the REQUESTED size, so
+  // the control would otherwise keep showing a value the server never used (batch 8 /
+  // ubatch 4096 measured 8.8x slower).
+  const ubatchExceedsBatch =
+    config.nBatch != null &&
+    config.nUbatch != null &&
+    config.nUbatch > config.nBatch;
+  // llama-server aborts below 2 (GGML_ASSERT(n_tokens_all <= cparams.n_batch)) and below
+  // the slot count (GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max)), so the loader
+  // raises the emitted value to max(slots, 2). Surfaced so the number typed here is not
+  // silently different from the one that runs. With Slots blank the count is the server
+  // default this page cannot see, so only the hard floor of 2 is asserted.
+  const batchFloor = Math.max(2, config.nParallel ?? 2);
+  const batchBelowFloor = config.nBatch != null && config.nBatch < batchFloor;
   return (
     <>
       <div className={ROW_CLASS}>
@@ -777,6 +802,99 @@ function GgufAdvancedSettings({
           className={NUMBER_INPUT_CLASS}
         />
       </div>
+
+      {!isDiffusion && (
+        <div className="space-y-1">
+          <div className={ROW_CLASS}>
+            <div className="flex min-w-0 items-center gap-1.5">
+              <span className={LABEL_CLASS}>Batch Size</span>
+              <InfoHint>
+                Logical prompt batch size (--batch-size). Leave blank for the
+                llama.cpp default (2048). Rarely needs changing; the micro-batch
+                below is what usually matters.
+              </InfoHint>
+            </div>
+            <input
+              type="number"
+              min={N_BATCH_MIN}
+              max={N_BATCH_MAX}
+              step={1}
+              value={config.nBatch ?? ""}
+              placeholder="auto"
+              onChange={(event) => {
+                const raw = event.target.value;
+                if (raw === "") {
+                  update({ nBatch: null });
+                  return;
+                }
+                const parsed = Number.parseInt(raw, 10);
+                if (Number.isFinite(parsed)) {
+                  update({
+                    nBatch: Math.max(N_BATCH_MIN, Math.min(N_BATCH_MAX, parsed)),
+                  });
+                }
+              }}
+              aria-label="Prompt batch size"
+              aria-describedby={batchBelowFloor ? batchAdviceId : undefined}
+              className={NUMBER_INPUT_CLASS}
+            />
+          </div>
+          {batchBelowFloor && (
+            <p id={batchAdviceId} className="text-ui-12 text-muted-foreground">
+              Too small for llama-server, so the load will raise it to {batchFloor}.
+              {config.nParallel != null && config.nParallel > 2
+                ? " It needs one output slot per parallel slot."
+                : " It cannot run a batch below 2."}
+            </p>
+          )}
+        </div>
+      )}
+
+      {!isDiffusion && (
+        <div className="space-y-1">
+          <div className={ROW_CLASS}>
+            <div className="flex min-w-0 items-center gap-1.5">
+              <span className={LABEL_CLASS}>Micro-batch Size</span>
+              <InfoHint>
+                Physical prompt micro-batch size (--ubatch-size). Leave blank for
+                the llama.cpp default (512). Larger values speed up prompt
+                processing but use more VRAM for the compute buffer; capped at the
+                batch size.
+              </InfoHint>
+            </div>
+            <input
+              type="number"
+              min={N_BATCH_MIN}
+              max={N_BATCH_MAX}
+              step={1}
+              value={config.nUbatch ?? ""}
+              placeholder="auto"
+              onChange={(event) => {
+                const raw = event.target.value;
+                if (raw === "") {
+                  update({ nUbatch: null });
+                  return;
+                }
+                const parsed = Number.parseInt(raw, 10);
+                if (Number.isFinite(parsed)) {
+                  update({
+                    nUbatch: Math.max(N_BATCH_MIN, Math.min(N_BATCH_MAX, parsed)),
+                  });
+                }
+              }}
+              aria-label="Prompt micro-batch size"
+              aria-describedby={ubatchExceedsBatch ? ubatchAdviceId : undefined}
+              className={NUMBER_INPUT_CLASS}
+            />
+          </div>
+          {ubatchExceedsBatch && (
+            <p id={ubatchAdviceId} className="text-ui-12 text-muted-foreground">
+              Micro-batch is larger than the batch size, so llama.cpp will run at{" "}
+              {config.nBatch}. Raise the batch size to use {config.nUbatch}.
+            </p>
+          )}
+        </div>
+      )}
 
       <div className={ROW_CLASS}>
         <div className="flex min-w-0 items-center gap-1.5">
@@ -1026,7 +1144,10 @@ export function ModelConfigPage({
   const stagedMetadataPending =
     contextFetchKey != null &&
     stagedDims == null &&
-    (config.gpuMemoryMode === "manual" || config.selectedGpuIds != null);
+    (config.gpuMemoryMode === "manual" ||
+      config.selectedGpuIds != null ||
+      config.nBatch != null ||
+      config.nUbatch != null);
   const gpuIndexKind =
     pinnableGpuContext(gpuDevices, resolvedIsDiffusion).indexKind ?? null;
   const update = (patch: Partial<PerModelConfig>) =>
