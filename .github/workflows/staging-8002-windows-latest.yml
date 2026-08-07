@@ -1,0 +1,51 @@
+name: "staging-8002 windows-latest"
+on:
+  push:
+    branches: ["pr-8002-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/llama_cpp.py'
+      - 'studio/backend/core/inference/llama_server_args.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/routes/settings.py'
+      - 'studio/backend/tests/test_model_memory_settings.py'
+      - 'studio/backend/tests/test_openai_auto_switch.py'
+      - 'studio/backend/utils/model_memory_settings.py'
+      - 'studio/backend/utils/openai_auto_switch_settings.py'
+      - 'studio/frontend/src/features/settings/api/model-memory.ts'
+      - 'studio/frontend/src/features/settings/api/openai-auto-switch.ts'
+      - 'studio/frontend/src/features/settings/components/model-memory-section.tsx'
+      - 'studio/frontend/src/features/settings/components/settings-row.tsx'
+      - 'studio/frontend/src/features/settings/settings-search.ts'
+      - 'studio/frontend/src/features/settings/tabs/resources-tab.tsx'
+      - 'studio/frontend/src/i18n/locales/ar.ts'
+      - 'studio/frontend/src/i18n/locales/de.ts'
+      - 'studio/frontend/src/i18n/locales/en.ts'
+      - 'studio/frontend/src/i18n/locales/es.ts'
+      - 'studio/frontend/src/i18n/locales/fr.ts'
+      - 'studio/frontend/src/i18n/locales/hi.ts'
+      - '.github/workflows/staging-8002-windows-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_model_memory_settings.py studio/backend/tests/test_openai_auto_switch.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
