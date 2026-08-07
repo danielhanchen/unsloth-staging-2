@@ -1667,3 +1667,35 @@ def test_check_py_file_stamps_the_file_digest():
     assert findings, "expected at least one finding"
     expected = hashlib.sha256(src.encode("utf-8", "replace")).hexdigest()
     assert all(f.file_sha256 == expected for f in findings)
+
+
+def test_the_shipped_baseline_hashes_match_their_evidence():
+    """A hand-added entry with a stale `evidence_hash` suppresses nothing: the key
+    is the hash, not the evidence text beside it, so the finding stays red and the
+    entry reads as a review that happened. Recompute every one of them."""
+    import json
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "scan_packages_baseline.json"
+    entries = json.loads(path.read_text())["entries"]
+    assert entries, "the shipped baseline is empty"
+    wrong = [
+        (e.get("package"), e.get("file"), e.get("check"))
+        for e in entries
+        if e.get("evidence_hash") != sp._evidence_hash(e.get("evidence") or "")
+    ]
+    assert not wrong, f"evidence_hash does not match evidence: {wrong}"
+
+
+def test_the_shipped_baseline_has_no_duplicate_keys():
+    """Two entries with the same key means one of them was reviewed against code
+    that is no longer there, and nothing says which."""
+    import json
+    import pathlib
+
+    path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "scan_packages_baseline.json"
+    entries = json.loads(path.read_text())["entries"]
+    keys = [(e.get("package"), e.get("file"), e.get("check"), e.get("evidence_hash"))
+            for e in entries]
+    dupes = {k for k in keys if keys.count(k) > 1}
+    assert not dupes, f"duplicate baseline keys: {sorted(dupes)}"
