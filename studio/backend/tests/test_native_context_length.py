@@ -436,12 +436,24 @@ class TestRouteCompleteness:
     def test_status_path(self):
         """InferenceStatusResponse construction with llama_backend has the field."""
         blocks = self._find_construction_blocks("InferenceStatusResponse")
-        found = False
-        for block in blocks:
-            if "llama_backend" in block and "_llama_runtime_fields(llama_backend)" in block:
-                found = True
-                break
+        # Either spelling. `chat_template_override` is both a runtime field and a
+        # value this route computes, so the inline call made it a duplicate
+        # keyword and every status call raised; hoisting it to a local is how the
+        # computed value wins. What matters is that the fields still come from
+        # the shared helper, not where the call sits.
+        found = any(
+            "llama_backend" in block
+            and (
+                "_llama_runtime_fields(llama_backend)" in block
+                or "**_runtime_fields" in block
+            )
+            for block in blocks
+        )
         assert found, "No InferenceStatusResponse block with llama_backend has runtime fields"
+        assert (
+            "_runtime_fields = _llama_runtime_fields(llama_backend)" in self._source
+            or "**_llama_runtime_fields(llama_backend)" in self._source
+        ), "the status path no longer sources its runtime fields from the helper"
         assert "for name in _InferenceRuntimeFields.model_fields" in self._source
 
     def test_non_gguf_status_path_reports_runtime_context_length(self):
