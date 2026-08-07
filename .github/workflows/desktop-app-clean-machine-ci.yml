@@ -305,8 +305,12 @@ jobs:
       fail-fast: false
       matrix:
         kind: [deb, appimage]
-        mode: [manual, gdb]
+        mode: [manual, fdtrace]
         experimental: [false]
+        exclude:
+          # strace cannot follow the AppImage's setuid fusermount, so that leg dies at
+          # the mount with exit 127 and proves nothing.
+          - {kind: appimage, mode: fdtrace}
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
@@ -449,22 +453,14 @@ jobs:
           echo "Xvfb pid=$XVFB_PID DISPLAY=$DISPLAY socket=$([ -e /tmp/.X11-unix/X77 ] && echo up || echo MISSING)"
           # Surface anything GLib/GTK would normally filter, and any Rust panic.
           export G_MESSAGES_DEBUG=all RUST_BACKTRACE=full
-          if [ "$MODE" = "gdb" ]; then
-            # The whole point: stop ON the exit_group syscall and print who called it.
-            # detach-on-fork keeps the app's many short-lived helper children (bash -ilc,
-            # the preflight probes) from tripping the catchpoint.
-            gdb -q -batch \
-              -ex "set pagination off" \
-              -ex "set confirm off" \
-              -ex "set follow-fork-mode parent" \
-              -ex "set detach-on-fork on" \
-              -ex "catch syscall exit_group" \
-              -ex "run" \
-              -ex "echo \n===== CAUGHT exit_group =====\n" \
-              -ex "info threads" \
-              -ex "thread apply all bt 40" \
-              -ex "kill" \
-              --args "$BIN" > logs/app-stdout.log 2>&1 &
+          if [ "$MODE" = "fdtrace" ]; then
+            # Gdk-DEBUG names the death as "Fatal IO error 11 (Resource temporarily
+            # unavailable)" on the X connection. EAGAIN on a socket Xlib believes is
+            # blocking means the fd changed under it: trace the whole descriptor
+            # lifecycle so the X socket fd can be followed to whatever took it over.
+            strace -f -tt -o logs/strace.log -s 160 -y \
+              -e trace=openat,open,close,dup,dup2,dup3,pipe,pipe2,socket,connect,fcntl,eventfd2,execve,exit_group,kill,tgkill \
+              "$BIN" > logs/app-stdout.log 2>&1 &
           else
             "$BIN" > logs/app-stdout.log 2>&1 &
           fi
@@ -517,11 +513,22 @@ jobs:
           echo "==================== process sampler (tail) ===================="
           tail -150 logs/ps-sampler.log || true
 
-          if [ "$MODE" = "strace" ]; then
-            echo "==================== strace: exits and signals ===================="
-            grep -nE "exit_group|\+\+\+|---|killed by" logs/strace.log | tail -100 || true
-            echo "==================== strace: execve ===================="
-            grep -n "execve(" logs/strace.log | head -40 || true
+          if [ "$MODE" = "fdtrace" ]; then
+            APP_TID="$(grep -m1 -oE '^[0-9]+' logs/strace.log || echo '')"
+            echo "==================== the X connection fd ===================="
+            grep -nE "X11-unix|connect\(.*X77" logs/strace.log | head -20 || true
+            XFD="$(grep -m1 -oE 'connect\([0-9]+<[^>]*X11-unix[^>]*>' logs/strace.log \
+                   | grep -oE '\([0-9]+' | tr -d '(' || echo '')"
+            echo "app main tid=$APP_TID  X socket fd=${XFD:-<not found>}"
+            if [ -n "$XFD" ]; then
+              echo "--- every syscall naming fd $XFD, in the app's own thread group ---"
+              grep -nE "\b$XFD<" logs/strace.log | tail -60 || true
+              echo "--- calls that RETURNED fd $XFD (a reuse shows up here) ---"
+              grep -nE "= $XFD<|= $XFD$" logs/strace.log | tail -40 || true
+            fi
+            echo "==================== exits and signals ===================="
+            grep -nE "exit_group|\+\+\+|---" logs/strace.log | tail -60 || true
+            gzip -f logs/strace.log || true
           fi
 
           [ "$ALIVE" = "1" ] || exit 1
