@@ -1,0 +1,89 @@
+name: "exp: rename a running console-script launcher"
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: exp-rename-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rename-probe:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Does os.replace on a RUNNING console-script launcher succeed? main's
+      # _release_self_exe_lock_windows did exactly this before setup; PR #8092
+      # removes it, and setup.ps1's comment claims it "only ever failed
+      # (WinError 32)". Settle it rather than argue it.
+      - name: Build a console-script package and probe the rename
+        shell: pwsh
+        run: |
+          $root = "$env:RUNNER_TEMP\probe"
+          New-Item -ItemType Directory -Force -Path "$root\sleeper" | Out-Null
+          Set-Content "$root\sleeper\__init__.py" -Value @(
+            "import time",
+            "def main():",
+            "    time.sleep(60)"
+          )
+          Set-Content "$root\pyproject.toml" -Value @(
+            "[project]",
+            "name = 'sleeper'",
+            "version = '1.0'",
+            "[project.scripts]",
+            "sleeper = 'sleeper:main'",
+            "[build-system]",
+            "requires = ['setuptools']",
+            "build-backend = 'setuptools.build_meta'"
+          )
+          python -m venv "$root\venv"
+          & "$root\venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check "$root"
+          "PROBE_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Probe
+        shell: python
+        run: |
+          import os, subprocess, sys, time, shutil
+          root = os.environ["PROBE_ROOT"]
+          scripts = os.path.join(root, "venv", "Scripts")
+          exe = os.path.join(scripts, "sleeper.exe")
+          print("launcher:", exe, os.path.getsize(exe), "bytes")
+
+          def attempt(label, target, stale):
+              try:
+                  os.replace(target, stale)
+                  print(f"RESULT {label}: RENAME SUCCEEDED")
+                  os.replace(stale, target)
+                  return True
+              except OSError as e:
+                  print(f"RESULT {label}: RENAME FAILED  {type(e).__name__} winerror={getattr(e,'winerror',None)} {e}")
+                  return False
+
+          # 1. Not running at all: the control.
+          attempt("idle-launcher", exe, exe + ".deleteme")
+
+          # 2. Running: the stub is alive and its child python holds the
+          #    appended zip, which is the case main's rename actually faced.
+          p = subprocess.Popen([exe])
+          time.sleep(6)
+          try:
+              ok_running = attempt("running-launcher", exe, exe + ".deleteme")
+              # 3. With the launcher renamed aside, can a replacement be published?
+              if ok_running:
+                  os.replace(exe, exe + ".deleteme")
+                  shutil.copyfile(os.path.join(scripts, "python.exe"), exe)
+                  print("RESULT publish-replacement: WROTE a new launcher at the canonical path")
+              # 4. Can the running launcher be DELETED or overwritten in place?
+              try:
+                  os.remove(exe)
+                  print("RESULT delete-running: DELETE SUCCEEDED")
+              except OSError as e:
+                  print(f"RESULT delete-running: DELETE FAILED  winerror={getattr(e,'winerror',None)}")
+          finally:
+              p.kill()
+              p.wait()
