@@ -1,0 +1,106 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Keeps Actions artifact storage under control.
+#
+# Why this exists: on 2026-08-07 org-wide Actions scheduling stalled because
+# live artifact storage had reached ~492 GiB, 449 GiB of it in one repository.
+# Every run across unslothai/* sat queued indefinitely while personal-account
+# repositories ran the same workflows normally. Nothing in the workflows was
+# wrong and runner capacity was idle; the account simply could not schedule.
+#
+# Only UNEXPIRED artifacts are billed. Expired ones linger as API records and
+# must be filtered out, or the measurement is meaningless: this repo had 191,509
+# artifact records but only 1.8 GiB live, because 97% had already expired.
+name: Actions storage janitor
+
+on:
+  schedule:
+    - cron: '17 4 * * *'   # 04:17 UTC daily, off the cron rush
+  workflow_dispatch:
+    inputs:
+      target_gib:
+        description: 'Delete oldest live artifacts until under this many GiB'
+        type: string
+        default: '50'
+      dry_run:
+        description: 'Report only; delete nothing'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: actions-storage-janitor-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  sweep:
+    name: Sweep artifact storage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: write  # delete artifacts
+    steps:
+      - name: Sweep
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_GIB: ${{ inputs.target_gib || '50' }}
+          # scheduled runs sweep for real; manual runs default to dry-run
+          DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          repo="$GITHUB_REPOSITORY"
+          total=$(gh api "repos/$repo/actions/artifacts?per_page=1" -q '.total_count')
+          pages=$(( (total + 99) / 100 ))
+          echo "artifact records: $total ($pages pages)"
+
+          : > live.tsv
+          for p in $(seq 1 "$pages"); do
+            gh api "repos/$repo/actions/artifacts?per_page=100&page=$p" \
+              -q '.artifacts[] | select(.expired==false)
+                  | "\(.created_at)\t\(.id)\t\(.size_in_bytes)\t\(.name)"' >> live.tsv || true
+          done
+
+          live_bytes=$(awk -F'\t' '{s+=$3} END {print s+0}' live.tsv)
+          live_count=$(wc -l < live.tsv)
+          target_bytes=$(( TARGET_GIB * 1073741824 ))
+          echo "live artifacts: $live_count"
+          echo "live storage:   $(( live_bytes / 1073741824 )) GiB"
+          echo "target:         ${TARGET_GIB} GiB"
+          {
+            echo "### Actions storage janitor"
+            echo ""
+            echo "| metric | value |"
+            echo "| --- | --- |"
+            echo "| live artifacts | $live_count |"
+            echo "| live storage | $(( live_bytes / 1073741824 )) GiB |"
+            echo "| target | ${TARGET_GIB} GiB |"
+            echo "| mode | $([ "$DRY_RUN" = "true" ] && echo 'dry run' || echo 'delete') |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$live_bytes" -le "$target_bytes" ]; then
+            echo "under target; nothing to do"
+            exit 0
+          fi
+
+          # oldest first, delete until under target
+          sort -t"$(printf '\t')" -k1,1 live.tsv > live.sorted.tsv
+          freed=0; deleted=0
+          while IFS=$'\t' read -r created id size name; do
+            [ $(( live_bytes - freed )) -le "$target_bytes" ] && break
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "would delete $created $(( size / 1048576 ))MiB $name"
+            else
+              gh api -X DELETE "repos/$repo/actions/artifacts/$id" --silent \
+                && echo "deleted $created $(( size / 1048576 ))MiB $name" \
+                || { echo "failed $id"; continue; }
+            fi
+            freed=$(( freed + size )); deleted=$(( deleted + 1 ))
+          done < live.sorted.tsv
+
+          echo "artifacts swept: $deleted, freed $(( freed / 1073741824 )) GiB"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Swept **$deleted** artifacts, freed **$(( freed / 1073741824 )) GiB**." >> "$GITHUB_STEP_SUMMARY"
