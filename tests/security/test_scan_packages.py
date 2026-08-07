@@ -1695,8 +1695,40 @@ def test_the_shipped_baseline_has_no_duplicate_keys():
 
     path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "scan_packages_baseline.json"
     entries = json.loads(path.read_text())["entries"]
-    keys = [
-        (e.get("package"), e.get("file"), e.get("check"), e.get("evidence_hash")) for e in entries
-    ]
+    # The scanner's OWN key, not the raw fields: `_load_baseline` normalizes the
+    # package name and strips an sdist's version-carrying archive root, so
+    # `huggingface_hub` and `huggingface-hub`, or `foo-1.0/foo/a.py` and
+    # `foo/a.py`, collapse to one runtime entry while a raw comparison sees two
+    # and reports nothing.
+    keys = [(sp._norm_pkg(e.get("package") or ""),
+             sp._relpath_in_package(e.get("file") or ""),
+             e.get("check"),
+             e.get("evidence_hash")) for e in entries]
     dupes = {k for k in keys if keys.count(k) > 1}
     assert not dupes, f"duplicate baseline keys: {sorted(dupes)}"
+
+
+def test_the_duplicate_check_sees_through_normalization(tmp_path):
+    """Two entries that differ only in the ways `_load_baseline` normalizes away
+    are one runtime key, so a raw field comparison reports nothing and leaves
+    exactly the review ambiguity the check exists to catch."""
+    import json
+
+    same = dict(check = "C2 polling/beaconing loop detected",
+                severity = "CRITICAL", evidence = "L1:     while True:",
+                evidence_hash = sp._evidence_hash("L1:     while True:"))
+    entries = [
+        dict(package = "huggingface_hub", file = "foo-1.0/huggingface_hub/a.py", **same),
+        dict(package = "huggingface-hub", file = "huggingface_hub/a.py", **same),
+    ]
+    keys = [(sp._norm_pkg(e["package"]), sp._relpath_in_package(e["file"]),
+             e["check"], e["evidence_hash"]) for e in entries]
+    assert keys[0] == keys[1], "these two must collapse to one runtime key"
+
+    raw = [(e["package"], e["file"], e["check"], e["evidence_hash"]) for e in entries]
+    assert raw[0] != raw[1], "a raw comparison would have called these distinct"
+
+    # And the loader agrees: two entries in, one key out.
+    path = tmp_path / "baseline.json"
+    path.write_text(json.dumps({"version": 1, "entries": entries}))
+    assert len(sp._load_baseline(str(path))) == 1
