@@ -1695,7 +1695,8 @@ def test_the_shipped_baseline_has_no_duplicate_keys():
 
     path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "scan_packages_baseline.json"
     entries = json.loads(path.read_text())["entries"]
-    keys = [(e.get("package"), e.get("file"), e.get("check"), e.get("evidence_hash"))
-            for e in entries]
+    keys = [
+        (e.get("package"), e.get("file"), e.get("check"), e.get("evidence_hash")) for e in entries
+    ]
     dupes = {k for k in keys if keys.count(k) > 1}
     assert not dupes, f"duplicate baseline keys: {sorted(dupes)}"
