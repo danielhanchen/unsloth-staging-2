@@ -1,0 +1,331 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+#
+# Throwaway staging probe. Answers two questions with real runners rather
+# than by reading the toolkit source:
+#
+#   A. What is actually on disk under each model-cache `path` on Linux,
+#      macOS and Windows, and is that on-disk naming cross-OS safe?
+#   B. Can one actions/cache entry, saved on one OS, be RESTORED on another?
+#
+# Never merged. Lives only on a staging branch.
+
+name: Cache Cross-OS Probe
+
+on:
+  push:
+    branches: [cache-xos-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Bump to invalidate every probe cache entry and start from cold.
+  GEN: g1
+  HF_REPO: unsloth/gemma-3-270m-it-GGUF
+  HF_FILE: gemma-3-270m-it-UD-Q4_K_XL.gguf
+
+jobs:
+  # ---------------------------------------------------------------- A ----
+  # On-disk layout of both cache families on all three OSes.
+  diag:
+    name: diag-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.12'
+
+      - name: Tooling relevant to the cache version hash
+        run: |
+          echo "runner.os=${{ runner.os }} arch=$(uname -m 2>/dev/null || echo n/a)"
+          echo "--- which zstd ---"; command -v zstd || echo "NO zstd ON PATH"
+          echo "--- zstd --quiet ---"; zstd --quiet 2>&1 | head -3 || true
+          echo "--- zstd --version ---"; zstd --version 2>&1 | head -3 || true
+          echo "--- which tar ---"; command -v tar || true
+          echo "--- tar --version ---"; tar --version 2>&1 | head -3 || true
+          echo "--- gnu tar on windows ---"; ls -l "C:/Program Files/Git/usr/bin/tar.exe" 2>/dev/null || true
+          ls -l "C:/Program Files/Git/usr/bin/zstd.exe" 2>/dev/null || true
+
+      - name: Install huggingface_hub
+        run: python -m pip install --upgrade huggingface_hub
+
+      - name: Download via HF_HOME (no --local-dir) -- the hf-cache family
+        env:
+          HF_HOME: ${{ github.workspace }}/hf-cache
+        run: |
+          hf download "$HF_REPO" "$HF_FILE"
+
+      - name: Download via --local-dir -- the gguf-cache family
+        run: |
+          hf download "$HF_REPO" "$HF_FILE" --local-dir gguf-flat
+
+      - name: Inventory both families
+        run: |
+          python .github/scripts/cache_inventory.py hf-cache  "hf-cache/${{ runner.os }}"  --hash
+          python .github/scripts/cache_inventory.py gguf-flat "gguf-flat/${{ runner.os }}" --hash
+
+      - name: Save inventories as artifacts
+        run: |
+          mkdir -p inv
+          python .github/scripts/cache_inventory.py hf-cache  "hf-cache"  --hash > inv/hf-cache.txt
+          python .github/scripts/cache_inventory.py gguf-flat "gguf-flat" --hash > inv/gguf-flat.txt
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: inventory-${{ runner.os }}
+          path: inv/
+
+  # ---------------------------------------------------------------- B ----
+  # PROOF A: flat --local-dir payload, NO enableCrossOsArchive.
+  # Linux saves; macOS and Windows try to restore.
+  a-save-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - run: python -m pip install --upgrade huggingface_hub
+      - name: Download flat
+        run: hf download "$HF_REPO" "$HF_FILE" --local-dir gguf-flat
+      - name: Manifest
+        run: |
+          python .github/scripts/cache_inventory.py gguf-flat linux --hash \
+            | tee gguf-flat/MANIFEST.txt
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: gguf-flat
+          key: xosprobe-g1-flat
+
+  a-rest-mac:
+    needs: a-save-linux
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - id: r
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        continue-on-error: true
+        with:
+          path: gguf-flat
+          key: xosprobe-g1-flat
+      - name: Result
+        run: |
+          echo "PROBE_RESULT case=A-linux-save/macos-restore xos=false hit=${{ steps.r.outputs.cache-hit }} matched=${{ steps.r.outputs.cache-matched-key }}"
+          python .github/scripts/cache_inventory.py gguf-flat macos --hash
+          echo "--- manifest recorded by the Linux saver ---"
+          cat gguf-flat/MANIFEST.txt 2>/dev/null || echo "no manifest (miss)"
+
+  a-rest-win:
+    needs: a-save-linux
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - id: r
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        continue-on-error: true
+        with:
+          path: gguf-flat
+          key: xosprobe-g1-flat
+      - name: Result
+        run: |
+          echo "PROBE_RESULT case=A-linux-save/windows-restore xos=false hit=${{ steps.r.outputs.cache-hit }} matched=${{ steps.r.outputs.cache-matched-key }}"
+          python .github/scripts/cache_inventory.py gguf-flat windows --hash
+
+  # PROOF B: flat payload, enableCrossOsArchive: true on BOTH ends.
+  b-save-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - run: python -m pip install --upgrade huggingface_hub
+      - run: hf download "$HF_REPO" "$HF_FILE" --local-dir gguf-flat
+      - run: python .github/scripts/cache_inventory.py gguf-flat linux --hash | tee gguf-flat/MANIFEST.txt
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: gguf-flat
+          key: xosprobe-g1-flatx
+          enableCrossOsArchive: true
+
+  b-rest-win:
+    needs: b-save-linux
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - id: r
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        continue-on-error: true
+        with:
+          path: gguf-flat
+          key: xosprobe-g1-flatx
+          enableCrossOsArchive: true
+      - name: Result
+        run: |
+          echo "PROBE_RESULT case=B-linux-save/windows-restore xos=true hit=${{ steps.r.outputs.cache-hit }} matched=${{ steps.r.outputs.cache-matched-key }}"
+          python .github/scripts/cache_inventory.py gguf-flat windows --hash
+          cat gguf-flat/MANIFEST.txt 2>/dev/null || echo "no manifest (miss)"
+
+  b-rest-mac:
+    needs: b-save-linux
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - id: r
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        continue-on-error: true
+        with:
+          path: gguf-flat
+          key: xosprobe-g1-flatx
+          enableCrossOsArchive: true
+      - name: Result
+        run: |
+          echo "PROBE_RESULT case=B-linux-save/macos-restore xos=true hit=${{ steps.r.outputs.cache-hit }} matched=${{ steps.r.outputs.cache-matched-key }}"
+          python .github/scripts/cache_inventory.py gguf-flat macos --hash
+
+  # PROOF C: the HF_HOME hub layout (blobs + snapshot symlinks), cross-OS.
+  c-save-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - run: python -m pip install --upgrade huggingface_hub
+      - env:
+          HF_HOME: ${{ github.workspace }}/hf-cache
+        run: hf download "$HF_REPO" "$HF_FILE"
+      - run: python .github/scripts/cache_inventory.py hf-cache linux --hash | tee hf-cache/MANIFEST.txt
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: hf-cache
+          key: xosprobe-g1-hf
+          enableCrossOsArchive: true
+
+  c-rest-mac:
+    needs: c-save-linux
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - id: r
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        continue-on-error: true
+        with:
+          path: hf-cache
+          key: xosprobe-g1-hf
+          enableCrossOsArchive: true
+      - name: Result
+        run: |
+          echo "PROBE_RESULT case=C-linux-save/macos-restore-HFHOME xos=true hit=${{ steps.r.outputs.cache-hit }} matched=${{ steps.r.outputs.cache-matched-key }}"
+          python .github/scripts/cache_inventory.py hf-cache macos --hash
+      - name: Can huggingface_hub serve it offline?
+        continue-on-error: true
+        env:
+          HF_HOME: ${{ github.workspace }}/hf-cache
+          HF_HUB_OFFLINE: '1'
+        run: |
+          python -m pip install --upgrade huggingface_hub
+          python -c "
+          import os
+          from huggingface_hub import hf_hub_download
+          p = hf_hub_download(os.environ['HF_REPO'], os.environ['HF_FILE'])
+          print('OFFLINE_RESOLVE ok', p, os.path.getsize(p))
+          "
+
+  c-rest-win:
+    needs: c-save-linux
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - id: r
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        continue-on-error: true
+        with:
+          path: hf-cache
+          key: xosprobe-g1-hf
+          enableCrossOsArchive: true
+      - name: Result
+        run: |
+          echo "PROBE_RESULT case=C-linux-save/windows-restore-HFHOME xos=true hit=${{ steps.r.outputs.cache-hit }} matched=${{ steps.r.outputs.cache-matched-key }}"
+          python .github/scripts/cache_inventory.py hf-cache windows --hash
+      - name: Can huggingface_hub serve it offline?
+        continue-on-error: true
+        env:
+          HF_HOME: ${{ github.workspace }}/hf-cache
+          HF_HUB_OFFLINE: '1'
+        run: |
+          python -m pip install --upgrade huggingface_hub
+          python -c "
+          import os
+          from huggingface_hub import hf_hub_download
+          p = hf_hub_download(os.environ['HF_REPO'], os.environ['HF_FILE'])
+          print('OFFLINE_RESOLVE ok', p, os.path.getsize(p))
+          "
+
+  # PROOF D: reverse direction -- Windows saves, Linux and macOS restore.
+  d-save-win:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - run: python -m pip install --upgrade huggingface_hub
+      - run: hf download "$HF_REPO" "$HF_FILE" --local-dir gguf-flat
+      - run: python .github/scripts/cache_inventory.py gguf-flat windows --hash | tee gguf-flat/MANIFEST.txt
+      - uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: gguf-flat
+          key: xosprobe-g1-winsave
+          enableCrossOsArchive: true
+
+  d-rest-linux:
+    needs: d-save-win
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.12' }
+      - id: r
+        uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        continue-on-error: true
+        with:
+          path: gguf-flat
+          key: xosprobe-g1-winsave
+          enableCrossOsArchive: true
+      - name: Result
+        run: |
+          echo "PROBE_RESULT case=D-windows-save/linux-restore xos=true hit=${{ steps.r.outputs.cache-hit }} matched=${{ steps.r.outputs.cache-matched-key }}"
+          python .github/scripts/cache_inventory.py gguf-flat linux --hash
+          cat gguf-flat/MANIFEST.txt 2>/dev/null || echo "no manifest (miss)"
