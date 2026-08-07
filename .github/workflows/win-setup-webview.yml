@@ -1,0 +1,48 @@
+name: staging-7361 windows setup.ps1 WebView clear
+# Clear-WebViewCaches is the Windows half of PR #7361 and studio/setup.ps1 is not in
+# cross-platform-parity-ci.yml's paths filter, so upstream never executes it. This does.
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  windows-setup-webview:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: PowerShell versions on this runner
+        shell: pwsh
+        run: |
+          Write-Host "pwsh: $($PSVersionTable.PSVersion)"
+          powershell -NoProfile -Command "Write-Host ('Windows PowerShell: ' + `$PSVersionTable.PSVersion)"
+
+      # Both engines: the documented install path is `irm ... | iex` in whichever shell
+      # the user has open, and 5.1 is what ships with Windows.
+      - name: AST parse under Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          $e = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path studio/setup.ps1), [ref]$null, [ref]$e)
+          if ($e) { $e | ForEach-Object { $_.Message }; exit 1 }
+          Write-Host "5.1 AST OK"
+
+      - name: AST parse under PowerShell 7
+        shell: pwsh
+        run: |
+          $e = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path studio/setup.ps1), [ref]$null, [ref]$e)
+          if ($e) { $e | ForEach-Object { $_.Message }; exit 1 }
+          Write-Host "7.x AST OK"
+
+      - name: Run Clear-WebViewCaches against a sandboxed LOCALAPPDATA (pwsh)
+        shell: pwsh
+        run: .github/staging/win_setup_webview_probe.ps1
+
+      - name: Run Clear-WebViewCaches against a sandboxed LOCALAPPDATA (Windows PowerShell 5.1)
+        shell: powershell
+        run: .github\staging\win_setup_webview_probe.ps1
