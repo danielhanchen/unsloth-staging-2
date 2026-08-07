@@ -25,10 +25,16 @@ on:
         description: 'Delete oldest live artifacts until under this many GiB'
         type: string
         default: '50'
-      dry_run:
-        description: 'Report only; delete nothing'
-        type: boolean
-        default: true
+      mode:
+        # A STRING, deliberately not a boolean. An absent boolean input arrives as
+        # null, and GitHub expressions coerce both null and false to 0, so
+        # `inputs.dry_run == false` is TRUE when the input is missing -- which
+        # silently turns a report into a purge on any non-dispatch event. Observed
+        # doing exactly that on a staging repo (1,934 artifacts deleted). A string
+        # compared against 'delete' cannot misfire: null != 'delete'.
+        description: 'report (default, deletes nothing) or delete'
+        type: string
+        default: 'report'
 
 permissions:
   contents: read
@@ -50,10 +56,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_GIB: ${{ inputs.target_gib || '0' }}
-          # Fail safe: only a scheduled sweep, or a dispatch that explicitly set
-          # dry_run:false, deletes. Every other event stays a dry run, so a stray
-          # trigger can never destroy artifacts.
-          DRY_RUN: ${{ (github.event_name == 'schedule' || inputs.dry_run == false) && 'false' || 'true' }}
+          # Fail safe: only a scheduled sweep, or a dispatch that explicitly asked
+          # for mode=delete, deletes. Every other event stays a dry run.
+          DRY_RUN: ${{ (github.event_name == 'schedule' || inputs.mode == 'delete') && 'false' || 'true' }}
         run: |
           set -euo pipefail
           repo="$GITHUB_REPOSITORY"
@@ -103,7 +108,7 @@ jobs:
             echo "| live artifacts | $live_count |"
             echo "| live storage | $(( live_bytes / 1073741824 )) GiB |"
             echo "| target | ${TARGET_GIB} GiB |"
-            echo "| mode | $([ "$DRY_RUN" = "true" ] && echo 'dry run' || echo 'delete') |"
+            echo "| mode | $([ "$DRY_RUN" = "true" ] && echo 'report (no deletes)' || echo 'DELETE') |"
           } >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$live_bytes" -le "$target_bytes" ]; then
