@@ -1677,7 +1677,7 @@ def test_the_shipped_baseline_hashes_match_their_evidence():
     import pathlib
 
     path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "scan_packages_baseline.json"
-    entries = json.loads(path.read_text())["entries"]
+    entries = json.loads(path.read_text(encoding = "utf-8"))["entries"]
     assert entries, "the shipped baseline is empty"
     wrong = [
         (e.get("package"), e.get("file"), e.get("check"))
@@ -1728,7 +1728,7 @@ def test_the_shipped_baseline_has_no_duplicate_keys():
     import pathlib
 
     path = pathlib.Path(__file__).resolve().parents[2] / "scripts" / "scan_packages_baseline.json"
-    entries = json.loads(path.read_text())["entries"]
+    entries = json.loads(path.read_text(encoding = "utf-8"))["entries"]
     dupes = _baseline_duplicates(entries)
     assert not dupes, f"duplicate baseline keys: {sorted(dupes)}"
 
