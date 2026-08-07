@@ -1,0 +1,27 @@
+name: "staging: baseline windows CLI suite"
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: staging-baseline-cli-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  baseline:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pristine upstream main, no fix applied. Establishes whether the four
+      # reinstall-command failures on windows-latest pre-date the change.
+      - name: CLI update-verify suite on Windows (pristine main)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          python -m pip install --quiet --disable-pip-version-check pytest typer click pyyaml pydantic
+          python -m pytest -q unsloth_cli/tests/test_studio_update_verify.py unsloth_cli/tests/test_studio_update_local_repo.py
