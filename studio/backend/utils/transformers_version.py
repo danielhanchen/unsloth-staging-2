@@ -1982,6 +1982,14 @@ def _sidecar_scan(venv_dir: str, limit: int = 3) -> tuple[list[str], bool]:
     return _sidecar_scan_impl(venv_dir, limit)
 
 
+# Deliberately duplicated from unsloth_cli/_studio_deps.py rather than imported, for the same
+# reason the predicate below is: the backend never imports the CLI package. Keep in sync.
+_SHARED_NON_RUNTIME_ROOTS = frozenset(
+    ("test", "tests", "doc", "docs", "example", "examples", "benchmark", "benchmarks", "sample", "samples")
+)
+_INSTALLER_REWRITTEN_NAMES = frozenset(("package-lock.json",))
+
+
 def _sidecar_damaged_files(venv_dir: str, limit: int = 3) -> list[str]:
     """RECORD entries under *venv_dir* that are gone, or shorter than pip recorded.
 
@@ -2073,6 +2081,14 @@ def _sidecar_scan_impl(venv_dir: str, limit: int = 3) -> tuple[list[str], bool]:
                 or (len(rel) > 1 and rel[1] == ":")
                 or ".." in parts
                 or (parts and parts[0] in ("bin", "Scripts"))
+            ):
+                continue
+            # Shared non-runtime trees (a top-level test/ or docs/ that several wheels write into,
+            # so one uninstall deletes another's files) and data files an installer rewrites in
+            # place. Neither is importable, so neither is the damage this looks for. Mirrored from
+            # _SHARED_NON_RUNTIME_ROOTS / _INSTALLER_REWRITTEN_NAMES in unsloth_cli/_studio_deps.py.
+            if (len(parts) > 1 and parts[0] in _SHARED_NON_RUNTIME_ROOTS) or (
+                parts and parts[-1] in _INSTALLER_REWRITTEN_NAMES
             ):
                 continue
             # The size field is optional and real wheels do leave it blank. Keep the row with an

@@ -585,3 +585,78 @@ def test_the_repair_command_quotes_the_interpreter(monkeypatch, capsys, system, 
     with pytest.raises(typer.Exit):
         studio._fail_if_install_damaged()
     assert expected in capsys.readouterr().err
+
+
+# ── runtime-irrelevant rows must not fail an update ──────────────────
+
+
+def test_a_shared_top_level_test_tree_is_not_damage(site):
+    # Reported from a Windows desktop as `einx: test/conftest.py is missing`.
+    # einx and torchao both ship a top-level test/conftest.py, and
+    # studio/install_python_stack.py force-reinstalls torchao on every update:
+    # pip deletes the file with the outgoing torchao, and the pinned incoming
+    # one does not ship it, so einx's RECORD is left describing a file nothing
+    # will ever recreate. Reinstalling Unsloth cannot repair it, and nothing
+    # imports another project's pytest fixtures.
+    _make_dist(site, "einx", {"einx/__init__.py": b"e\n"})
+    (site / "einx-1.0.dist-info" / "RECORD").write_text(
+        "einx/__init__.py,sha256=x,2\ntest/conftest.py,sha256=x,20650\n"
+    )
+    assert _deps().damaged_installed_files() == []
+
+
+def test_an_installer_rewritten_lockfile_is_not_damage(site):
+    # Reported from the same desktop as `package-lock.json is 27225 bytes,
+    # expected 28473`. studio/setup.ps1 and studio/setup.sh run `npm install`
+    # inside the INSTALLED tree, and npm rewrites the lockfile it was handed:
+    # with legacy-peer-deps set it dedupes hoisted transitive entries, so the
+    # file shrinks below the size pip recorded. Studio's own setup damaged it,
+    # and reinstalling only makes setup do it again.
+    lock = "studio/backend/core/data_recipe/oxc-validator/package-lock.json"
+    _make_dist(site, "unsloth", {"unsloth/__init__.py": b"u\n", lock: b"L" * 27225},
+               record_sizes = {lock: 28473})
+    assert _deps().damaged_installed_files() == []
+
+
+def test_a_package_owned_tests_subdirectory_is_still_checked(site):
+    # Only the shared TOP-LEVEL namespace is exempt. A tests/ tree inside a
+    # package is that package's alone, so nothing else can delete it and a
+    # deletion there is real damage.
+    _make_dist(site, "rho", {"rho/tests/helper.py": b"h\n"})
+    (site / "rho" / "tests" / "helper.py").unlink()
+    found = _deps().damaged_installed_files()
+    assert len(found) == 1 and "rho/tests/helper.py is missing" in found[0]
+
+
+def test_a_top_level_module_named_like_a_test_root_is_still_checked(site):
+    # The exemption is for a shared DIRECTORY, not for anything whose name
+    # starts with "test". A top-level tests.py is a single importable module.
+    _make_dist(site, "sigma", {"tests.py": b"t\n"})
+    (site / "tests.py").unlink()
+    found = _deps().damaged_installed_files()
+    assert len(found) == 1 and "tests.py is missing" in found[0]
+
+
+def test_runtime_damage_still_fails_when_ignored_rows_are_present(site):
+    # The whole point: the ignored rows must not mask a genuine finding, and a
+    # torn runtime module must still stop the update.
+    lock = "studio/backend/core/data_recipe/oxc-validator/package-lock.json"
+    _make_dist(site, "unsloth", {"unsloth/__init__.py": b"u\n", lock: b"L" * 10},
+               record_sizes = {lock: 28473})
+    (site / "unsloth" / "__init__.py").unlink()
+    found = _deps().damaged_installed_files()
+    assert len(found) == 1 and "unsloth/__init__.py is missing" in found[0]
+
+
+def test_ignored_rows_do_not_consume_the_finding_budget(site):
+    # Filtering happens while RECORD is read, not when findings are reported,
+    # so a run of harmless rows cannot crowd a real one off the end of a capped
+    # list. Reported unfiltered, the 40 test/ rows would fill limit = 3 and the
+    # deleted module would never be shown.
+    files = {f"test/t{i}.py": b"x" for i in range(40)}
+    files["tau/__init__.py"] = b"t\n"
+    _make_dist(site, "tau", files)
+    for rel in files:
+        (site / rel).unlink()
+    found = _deps().damaged_installed_files(limit = 3)
+    assert len(found) == 1 and "tau/__init__.py is missing" in found[0]

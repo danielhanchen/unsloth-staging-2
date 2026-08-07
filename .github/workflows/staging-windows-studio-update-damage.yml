@@ -1,0 +1,111 @@
+name: "staging: windows studio update damage check"
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: staging-win-damage-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-damage-check:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      # Reproduce, with real pip and real npm on a real Windows box, the two
+      # findings a user's desktop reported. Both are produced by Unsloth's own
+      # installer, so the update they fail is the update meant to repair them.
+      - name: Reproduce the installer-inflicted damage
+        shell: pwsh
+        run: |
+          python -m venv "$env:RUNNER_TEMP\probe"
+          $py = "$env:RUNNER_TEMP\probe\Scripts\python.exe"
+
+          # 1. einx and torchao both ship a top-level test/conftest.py. Studio
+          #    force-reinstalls torchao to a pinned version on every update
+          #    (studio/install_python_stack.py); pip deletes the file with the
+          #    outgoing torchao and the pinned one does not ship it, so einx's
+          #    RECORD is left describing a file nothing recreates.
+          # typer is a module-level import of unsloth_cli/_studio_deps.py, and the
+          # scan must run under THIS interpreter -- it describes its own
+          # site-packages, which is the tree being damaged below.
+          & $py -m pip install --quiet --disable-pip-version-check typer
+          & $py -m pip install --quiet --disable-pip-version-check einx torchao==0.18.0
+          & $py -m pip install --quiet --disable-pip-version-check --force-reinstall --no-deps torchao==0.17.0
+
+          $sp = & $py -c "import sysconfig;print(sysconfig.get_paths()['purelib'])"
+          if (Test-Path "$sp\test\conftest.py") {
+            Write-Host "note: a test/conftest.py survived on this runner"
+          } else {
+            Write-Host "reproduced: test/conftest.py is gone, einx RECORD still claims it"
+          }
+
+          # 2. studio/setup.ps1 runs `npm install` inside the INSTALLED tree.
+          #    npm rewrites the lockfile it is handed; with legacy-peer-deps it
+          #    dedupes hoisted transitive entries and the file SHRINKS, which is
+          #    the one direction the scan calls damage.
+          $oxc = "$sp\studio\backend\core\data_recipe\oxc-validator"
+          New-Item -ItemType Directory -Force -Path $oxc | Out-Null
+          Copy-Item studio\backend\core\data_recipe\oxc-validator\package.json $oxc
+          Copy-Item studio\backend\core\data_recipe\oxc-validator\package-lock.json $oxc
+          $before = (Get-Item "$oxc\package-lock.json").Length
+          Push-Location $oxc
+          npm install --no-fund --no-audit --loglevel=error --legacy-peer-deps
+          Pop-Location
+          $after = (Get-Item "$oxc\package-lock.json").Length
+          Write-Host "package-lock.json: $before -> $after bytes"
+          if ($after -ge $before) {
+            Write-Host "note: npm did not shrink the lockfile on this runner"
+          }
+
+          # Give the scan an `unsloth` RECORD claiming the pristine lockfile
+          # size, exactly as the shipped wheel does. Set-Content with an array
+          # avoids a here-string, whose terminator must sit at column 0 and so
+          # cannot live inside a YAML block scalar.
+          $di = "$sp\unsloth-0.0.0.dist-info"
+          New-Item -ItemType Directory -Force -Path $di | Out-Null
+          Set-Content "$di\METADATA" -Value @("Metadata-Version: 2.1", "Name: unsloth", "Version: 0.0.0")
+          Set-Content "$di\WHEEL" -Value @("Wheel-Version: 1.0")
+          New-Item -ItemType Directory -Force -Path "$sp\unsloth" | Out-Null
+          Set-Content "$sp\unsloth\__init__.py" -Value "x"
+          $lockrow = "studio/backend/core/data_recipe/oxc-validator/package-lock.json,sha256=x,$before"
+          Set-Content "$di\RECORD" -Value @("unsloth/__init__.py,sha256=x,1", $lockrow)
+
+          "PROBE_PY=$py" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "PROBE_SP=$sp" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # The production predicate, run against that tree. Before this change it
+      # returns both findings and `unsloth studio update` exits 1 telling the
+      # user to reinstall over the top -- which cannot help, because the next
+      # setup run recreates the same two.
+      - name: The damaged-files scan must be clean
+        shell: pwsh
+        run: |
+          & $env:PROBE_PY -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('sd','unsloth_cli/_studio_deps.py'); m=importlib.util.module_from_spec(s); sys.modules['sd']=m; s.loader.exec_module(m); f=m.damaged_installed_files(limit=40); [print('FINDING:',x) for x in f]; print('clean: update would exit 0' if not f else 'STILL FAILING'); sys.exit(1 if f else 0)"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # The exemption must not blind the scan: a torn runtime module is the
+      # failure the check was added for, and it must still stop an update.
+      - name: Genuine runtime damage must still be reported
+        shell: pwsh
+        run: |
+          Remove-Item "$env:PROBE_SP\unsloth\__init__.py" -Force
+          & $env:PROBE_PY -c "import importlib.util,sys; s=importlib.util.spec_from_file_location('sd','unsloth_cli/_studio_deps.py'); m=importlib.util.module_from_spec(s); sys.modules['sd']=m; s.loader.exec_module(m); f=m.damaged_installed_files(limit=40); [print('FINDING:',x) for x in f]; ok=any('unsloth/__init__.py is missing' in x for x in f); print('real damage still reported' if ok else 'REGRESSION: real damage went unreported'); sys.exit(0 if ok else 1)"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: CLI update-verify suite on Windows
+        shell: pwsh
+        run: |
+          python -m pip install --quiet --disable-pip-version-check pytest typer
+          python -m pytest -q unsloth_cli/tests/test_studio_update_verify.py unsloth_cli/tests/test_studio_update_local_repo.py

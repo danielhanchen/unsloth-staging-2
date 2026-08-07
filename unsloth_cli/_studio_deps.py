@@ -217,6 +217,43 @@ def _scan_paths() -> Dict[str, list]:
     return {"path": paths} if paths else {}
 
 
+# Top-level directory names that wheels ship by accident rather than as importable
+# runtime. They are a shared namespace: every distribution using one writes into the
+# SAME site-packages/<name>/ tree, so one distribution's uninstall deletes another's
+# files, and the survivor's RECORD then describes a file no longer on disk. Observed
+# in the field as `einx: test/conftest.py is missing` -- einx and torchao both ship a
+# top-level test/conftest.py, and studio/install_python_stack.py force-reinstalls
+# torchao on every update, so pip removes the file whenever the pinned torchao stops
+# shipping it. Nothing imports another project's test tree, so this is never the
+# import-time damage this scan exists to catch.
+_SHARED_NON_RUNTIME_ROOTS = frozenset(
+    ("test", "tests", "doc", "docs", "example", "examples", "benchmark", "benchmarks", "sample", "samples")
+)
+
+# Files Studio's own setup rewrites inside the installed tree. studio/setup.ps1 and
+# studio/setup.sh run `npm install` in site-packages/studio/backend/core/data_recipe/
+# oxc-validator/, and npm rewrites the lockfile it was given -- with legacy-peer-deps
+# set it dedupes hoisted transitive entries and the file SHRINKS, which is the one
+# direction this scan calls damage. Reported in the field as
+# `package-lock.json is 27225 bytes, expected 28473`.
+_INSTALLER_REWRITTEN_NAMES = frozenset(("package-lock.json",))
+
+
+def _runtime_irrelevant(rel: str) -> bool:
+    """True when a RECORD row cannot be the import-time damage this scan looks for.
+
+    Applied while reading RECORD rather than when reporting, so a filtered path also
+    stays out of the multiple-ownership tally and out of the `limit` budget: a run of
+    harmless findings must not crowd a genuine one off the end of the list.
+    """
+    parts = tuple(p for p in rel.replace("\\", "/").split("/") if p and p != ".")
+    if not parts:
+        return False
+    if len(parts) > 1 and parts[0] in _SHARED_NON_RUNTIME_ROOTS:
+        return True
+    return parts[-1] in _INSTALLER_REWRITTEN_NAMES
+
+
 def damaged_installed_files(limit: int = 8) -> List[str]:
     """Installed files that are gone, or shorter than pip recorded.
 
@@ -235,6 +272,11 @@ def damaged_installed_files(limit: int = 8) -> List[str]:
     landed is the one on disk, so its size says nothing about either RECORD --
     in EITHER direction. Sizes are therefore compared after the whole scan, once
     multiply-owned paths are known, rather than during it.
+
+    Rows that cannot be import-time damage are dropped up front; see
+    _runtime_irrelevant. The caller's answer to a finding is "reinstall over the
+    top", so a file no reinstall would change -- another project's test tree, or
+    a lockfile Studio's own setup rewrote -- must not produce one.
 
     Scanned over the interpreter's own site-packages rather than all of
     sys.path. distributions() searches every sys.path entry, so a damaged
@@ -272,6 +314,11 @@ def damaged_installed_files(limit: int = 8) -> List[str]:
             # Installer-owned metadata is rewritten in place and drifts from the
             # size recorded inside itself; .pyc is regenerated from source.
             if ".dist-info/" in rel or ".egg-info/" in rel or rel.endswith(".pyc"):
+                continue
+            # Shared non-runtime trees and installer-rewritten data files; see
+            # _runtime_irrelevant. Skipped here rather than at report time so they
+            # affect neither the ownership tally nor the limit budget.
+            if _runtime_irrelevant(rel):
                 continue
             # The size field is optional and real wheels do leave it blank. Keep
             # the row anyway with an unknown size: existence is still checkable,
