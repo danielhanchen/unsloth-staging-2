@@ -1693,10 +1693,12 @@ def _baseline_key(entry):
     `huggingface_hub` and `huggingface-hub`, or `foo-1.0/foo/a.py` and `foo/a.py`,
     collapse to one runtime entry while a raw comparison sees two and reports
     nothing."""
-    return (sp._norm_pkg(entry.get("package") or ""),
-            sp._relpath_in_package(entry.get("file") or ""),
-            entry.get("check"),
-            entry.get("evidence_hash"))
+    return (
+        sp._norm_pkg(entry.get("package") or ""),
+        sp._relpath_in_package(entry.get("file") or ""),
+        entry.get("check"),
+        entry.get("evidence_hash"),
+    )
 
 
 def _baseline_duplicates(entries):
@@ -1737,10 +1739,14 @@ def test_two_reviewed_versions_may_share_a_key_with_distinct_pins(tmp_path):
     be widened to an unpinned suppression, which approves strictly more."""
     import json
 
-    same = dict(package = "requests", file = "requests/api.py",
-                check = "C2 polling/beaconing loop detected", severity = "CRITICAL",
-                evidence = "L1:     while True:",
-                evidence_hash = sp._evidence_hash("L1:     while True:"))
+    same = dict(
+        package = "requests",
+        file = "requests/api.py",
+        check = "C2 polling/beaconing loop detected",
+        severity = "CRITICAL",
+        evidence = "L1:     while True:",
+        evidence_hash = sp._evidence_hash("L1:     while True:"),
+    )
     entries = [dict(file_sha256 = "a" * 64, **same), dict(file_sha256 = "b" * 64, **same)]
     assert not _baseline_duplicates(entries)
 
@@ -1750,16 +1756,22 @@ def test_two_reviewed_versions_may_share_a_key_with_distinct_pins(tmp_path):
     assert list(loaded.values()) == [{"a" * 64, "b" * 64}], "the loader unions the pins"
 
 
-@pytest.mark.parametrize("pins", [
-    (None, None),                 # the same unpinned approval, written twice
-    ("c" * 64, "c" * 64),         # the same pin, written twice
-    (None, "c" * 64),             # unpinned wins, so the pinned entry is inert
-    ("c" * 64, None),             # and in either order
-])
+@pytest.mark.parametrize(
+    "pins",
+    [
+        (None, None),  # the same unpinned approval, written twice
+        ("c" * 64, "c" * 64),  # the same pin, written twice
+        (None, "c" * 64),  # unpinned wins, so the pinned entry is inert
+        ("c" * 64, None),  # and in either order
+    ],
+)
 def test_a_key_that_says_the_same_thing_twice_is_still_a_duplicate(pins):
-    same = dict(package = "requests", file = "requests/api.py",
-                check = "C2 polling/beaconing loop detected",
-                evidence_hash = sp._evidence_hash("L1:     while True:"))
+    same = dict(
+        package = "requests",
+        file = "requests/api.py",
+        check = "C2 polling/beaconing loop detected",
+        evidence_hash = sp._evidence_hash("L1:     while True:"),
+    )
     entries = [dict(same, **({"file_sha256": p} if p else {})) for p in pins]
     assert _baseline_duplicates(entries) == {_baseline_key(entries[0])}
 
