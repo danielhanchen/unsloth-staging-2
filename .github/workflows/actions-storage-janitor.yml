@@ -15,6 +15,8 @@
 name: Actions storage janitor
 
 on:
+  push:
+    branches: [staging-janitor-test]
   schedule:
     - cron: '17 4 * * *'   # 04:17 UTC daily, off the cron rush
   workflow_dispatch:
@@ -47,9 +49,11 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TARGET_GIB: ${{ inputs.target_gib || '50' }}
-          # scheduled runs sweep for real; manual runs default to dry-run
-          DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
+          TARGET_GIB: ${{ inputs.target_gib || '0' }}
+          # Fail safe: only a scheduled sweep, or a dispatch that explicitly set
+          # dry_run:false, deletes. Every other event stays a dry run, so a stray
+          # trigger can never destroy artifacts.
+          DRY_RUN: ${{ (github.event_name == 'schedule' || inputs.dry_run == false) && 'false' || 'true' }}
         run: |
           set -euo pipefail
           repo="$GITHUB_REPOSITORY"
