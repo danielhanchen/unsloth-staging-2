@@ -357,3 +357,62 @@ def test_mlx_install_env_routes_uv_override_through_safe_path(monkeypatch):
     assert "path" in seen
     assert str(seen["path"]).endswith("overrides-darwin-arm64.txt")
     assert env["UV_OVERRIDE"] == "/space_free/marker.txt"
+
+
+def _fake_venv(tmp_path: Path) -> Path:
+    """A venv-shaped directory: uv accepts a root that carries pyvenv.cfg."""
+    (tmp_path / "pyvenv.cfg").write_text("home = /usr/bin\n", encoding = "utf-8")
+    (tmp_path / "bin").mkdir()
+    return tmp_path
+
+
+def test_venv_root_is_none_outside_a_venv(monkeypatch, tmp_path):
+    monkeypatch.setattr(mr.sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(mr.sys, "base_prefix", str(tmp_path))
+    assert mr._venv_root() is None
+
+
+def test_venv_root_requires_the_marker_file(monkeypatch, tmp_path):
+    # A half-deleted tree must not be offered to uv as an install target.
+    monkeypatch.setattr(mr.sys, "prefix", str(tmp_path))
+    monkeypatch.setattr(mr.sys, "base_prefix", "/usr")
+    assert mr._venv_root() is None
+    _fake_venv(tmp_path)
+    assert mr._venv_root() == str(tmp_path)
+
+
+def test_install_env_names_the_target_venv_for_uv(monkeypatch, tmp_path):
+    # VIRTUAL_ENV is set from sys.prefix, never forwarded from os.environ: it names
+    # the environment uv installs into, so inheriting it would let a caller
+    # redirect the install.
+    venv = _fake_venv(tmp_path)
+    monkeypatch.setattr(mr.sys, "prefix", str(venv))
+    monkeypatch.setattr(mr.sys, "base_prefix", "/usr")
+    monkeypatch.setenv("VIRTUAL_ENV", "/tmp/attacker-controlled")
+
+    env = mr._mlx_install_env()
+
+    assert env["VIRTUAL_ENV"] == str(venv)
+
+
+def test_unresolvable_venv_reports_the_unsloth_repair_command(monkeypatch, tmp_path, capsys):
+    # uv's own text tells the user to run `uv venv`, which would build an
+    # environment Unsloth does not manage. Point at `unsloth studio update`.
+    venv = _fake_venv(tmp_path)
+    monkeypatch.setattr(mr.sys, "prefix", str(venv))
+    monkeypatch.setattr(mr.sys, "base_prefix", "/usr")
+    monkeypatch.setattr(mr, "_uv_executable", lambda: "/usr/bin/uv")
+    monkeypatch.setattr(mr, "_transformers_constraint_args", lambda: ([], None))
+
+    class _Result:
+        returncode = 2
+        stdout = "error: No virtual environment or system Python installation found\n"
+
+    monkeypatch.setattr(mr.subprocess, "run", lambda cmd, **kw: _Result())
+
+    assert mr.attempt_mlx_repair() is False
+
+    # structlog renders to stdout, not through the stdlib logging caplog handler.
+    text = capsys.readouterr().out
+    assert "unsloth studio update" in text
+    assert "uv venv" not in text.split("uv said:")[0]
