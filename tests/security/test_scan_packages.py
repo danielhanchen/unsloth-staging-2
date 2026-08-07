@@ -1700,10 +1700,15 @@ def test_the_shipped_baseline_has_no_duplicate_keys():
     # `huggingface_hub` and `huggingface-hub`, or `foo-1.0/foo/a.py` and
     # `foo/a.py`, collapse to one runtime entry while a raw comparison sees two
     # and reports nothing.
-    keys = [(sp._norm_pkg(e.get("package") or ""),
-             sp._relpath_in_package(e.get("file") or ""),
-             e.get("check"),
-             e.get("evidence_hash")) for e in entries]
+    keys = [
+        (
+            sp._norm_pkg(e.get("package") or ""),
+            sp._relpath_in_package(e.get("file") or ""),
+            e.get("check"),
+            e.get("evidence_hash"),
+        )
+        for e in entries
+    ]
     dupes = {k for k in keys if keys.count(k) > 1}
     assert not dupes, f"duplicate baseline keys: {sorted(dupes)}"
 
@@ -1714,15 +1719,25 @@ def test_the_duplicate_check_sees_through_normalization(tmp_path):
     exactly the review ambiguity the check exists to catch."""
     import json
 
-    same = dict(check = "C2 polling/beaconing loop detected",
-                severity = "CRITICAL", evidence = "L1:     while True:",
-                evidence_hash = sp._evidence_hash("L1:     while True:"))
+    same = dict(
+        check = "C2 polling/beaconing loop detected",
+        severity = "CRITICAL",
+        evidence = "L1:     while True:",
+        evidence_hash = sp._evidence_hash("L1:     while True:"),
+    )
     entries = [
         dict(package = "huggingface_hub", file = "foo-1.0/huggingface_hub/a.py", **same),
         dict(package = "huggingface-hub", file = "huggingface_hub/a.py", **same),
     ]
-    keys = [(sp._norm_pkg(e["package"]), sp._relpath_in_package(e["file"]),
-             e["check"], e["evidence_hash"]) for e in entries]
+    keys = [
+        (
+            sp._norm_pkg(e["package"]),
+            sp._relpath_in_package(e["file"]),
+            e["check"],
+            e["evidence_hash"],
+        )
+        for e in entries
+    ]
     assert keys[0] == keys[1], "these two must collapse to one runtime key"
 
     raw = [(e["package"], e["file"], e["check"], e["evidence_hash"]) for e in entries]
