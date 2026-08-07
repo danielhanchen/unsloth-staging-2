@@ -50,8 +50,10 @@ on:
     - cron: '17 5 * * *'
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # DIAGNOSTIC BRANCH ONLY: keep every dispatch, so repeats and release bisects
+  # can run side by side instead of cancelling each other.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 permissions:
   # Drafts are listed only to a token with push access, and every desktop-v* release here
