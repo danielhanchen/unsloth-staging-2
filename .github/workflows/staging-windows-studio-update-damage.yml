@@ -107,5 +107,8 @@ jobs:
       - name: CLI update-verify suite on Windows
         shell: pwsh
         run: |
-          python -m pip install --quiet --disable-pip-version-check pytest typer
+          # The suite self-bootstraps sys.path and imports neither unsloth nor
+          # torch, but collecting it imports unsloth_cli/__init__.py, which
+          # reaches config.py -> yaml and the typer/click/pydantic chain.
+          python -m pip install --quiet --disable-pip-version-check pytest typer click pyyaml pydantic
           python -m pytest -q unsloth_cli/tests/test_studio_update_verify.py unsloth_cli/tests/test_studio_update_local_repo.py
