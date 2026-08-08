@@ -109,14 +109,69 @@ test("the cap never shrinks the stack below its floor", () => {
   assert.ok(stackGeometry(frame, W, H).maxHeight >= 120);
 });
 
-test("a monitor filling the height still leaves the stack room", () => {
+// Clamping the lift to the stack's floor was worse than not lifting: it put
+// the stack across the monitor's own top edge, which is where its Close and
+// collapse controls are. The chat UI suite maximises the monitor and then
+// clicks Close, and the card swallowed the click.
+//
+// Nothing above such a monitor is free, so the stack goes inside it, and the
+// two things it may not bury are the header at the top and the native resize
+// grip in the bottom-right corner (Chromium's hit area reaches 15px in from
+// that corner, Firefox's 12px). Both edges are checked, because the inset
+// alone does not hold the top: an expanded download list plus the loaded
+// models card grows from the bottom right back over the header.
+/** Where the stack's own edges land, given everything it dodges. */
+function stackEdges(frame: MonitorFrame) {
+  const { bottom, maxHeight } = stackGeometry(frame, W, H);
+  return { bottom, top: H - bottom - maxHeight, edge: H - bottom };
+}
+
+test("a monitor too tall to lift over keeps its header and grip clear", () => {
   const frame: MonitorFrame = {
     left: W - 272,
     top: 16,
     right: W - 16,
     bottom: H - 16,
   };
-  assert.ok(stackBottomInset(frame, W, H) <= H - 120);
+  const { top, edge } = stackEdges(frame);
+  assert.ok(edge <= frame.bottom - 16, "the stack sits clear of the resize grip");
+  assert.ok(top >= frame.top + 64, "and stops below the header controls");
+});
+
+test("a monitor resized to fill the viewport keeps its header and grip clear", () => {
+  const frame: MonitorFrame = { left: 16, top: 16, right: W - 16, bottom: H - 16 };
+  const { top, edge } = stackEdges(frame);
+  assert.ok(edge <= frame.bottom - 16, "the stack sits clear of the resize grip");
+  assert.ok(top >= frame.top + 64, "and stops below the header controls");
+});
+
+// Too tall to lift over, but it stops short of the bottom edge. The corner is
+// free after all, so the stack keeps it and is capped to the room underneath
+// rather than being pushed up inside the monitor.
+test("a monitor too tall to lift over but clear of the bottom is sat under", () => {
+  const frame: MonitorFrame = {
+    left: W - 272,
+    top: 16,
+    right: W - 16,
+    bottom: H / 2 + 100,
+  };
+  const { bottom, top } = stackEdges(frame);
+  assert.equal(bottom, 16, "the corner is free, so stay in it");
+  assert.ok(top >= frame.bottom, "and the stack stays underneath the monitor");
+});
+
+// The lift is dropped only when it cannot clear; one that fits still applies.
+test("a tall monitor that can still be cleared is lifted over", () => {
+  const frame: MonitorFrame = {
+    left: W - 272,
+    top: 200,
+    right: W - 16,
+    bottom: H - 16,
+  };
+  const inset = stackBottomInset(frame, W, H);
+  assert.ok(inset > 16, "the stack must move");
+  assert.ok(H - inset <= frame.top, "no vertical overlap remains");
+  assert.ok(H - inset - 16 >= 120, "and it keeps its floor");
 });
 
 // The union was the trap. A tall monitor and the wide docked composer share
@@ -154,7 +209,15 @@ test("two obstacles are folded one at a time, not as their bounding box", () => 
     unioned.bottom,
     "folding must not agree with the bounding box, or nothing was fixed",
   );
-  assert.ok(both.bottom < unioned.bottom, "and it must lift less, not more");
+  // The union is wrong in whichever direction the clamp happens to send it:
+  // it used to lift to the cap and land on the monitor, and now that a box too
+  // tall to clear is left alone it drops the composer's dodge instead, putting
+  // the card back over the Send button. Folding just gives each box its own.
+  assert.equal(
+    both.bottom,
+    composerOnly.bottom,
+    "the composer still gets the lift it asked for",
+  );
 });
 
 test("an empty list behaves exactly like nothing published", () => {
