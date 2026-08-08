@@ -110,7 +110,8 @@ jobs:
     # the runtime check shim handles patches that legitimately cannot
     # run on a CPU-only runner (real CUDA dispatcher, runtime args).
     env:
-      UNSLOTH_ZOO_REF: ${{ inputs.unsloth_zoo_ref || 'main' }}
+      UNSLOTH_ZOO_REF: ${{ inputs.unsloth_zoo_ref || 'fix/fullgraph-fallback-tests-compile-disable' }}
+      UNSLOTH_ZOO_URL: https://github.com/danielhanchen/unsloth-zoo-staging
       MATRIX_TRANSFORMERS_SPEC: ${{ matrix.combo.transformers_spec }}
       MATRIX_TRL_SPEC: ${{ matrix.combo.trl_spec }}
       MATRIX_COMBO_ID: ${{ matrix.combo.id }}
@@ -253,7 +254,7 @@ jobs:
           for attempt in 1 2 3; do
             rm -rf "$RUNNER_TEMP/unsloth-zoo"
             if git clone --depth=1 --branch="$UNSLOTH_ZOO_REF" \
-                https://github.com/unslothai/unsloth-zoo \
+                "$UNSLOTH_ZOO_URL" \
                 "$RUNNER_TEMP/unsloth-zoo"; then
               break
             fi
@@ -2201,7 +2202,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      UNSLOTH_ZOO_REF: ${{ inputs.unsloth_zoo_ref || 'main' }}
+      UNSLOTH_ZOO_REF: ${{ inputs.unsloth_zoo_ref || 'fix/fullgraph-fallback-tests-compile-disable' }}
+      UNSLOTH_ZOO_URL: https://github.com/danielhanchen/unsloth-zoo-staging
       # Same env contract the matrix cells use: protobuf python parser
       # (transformers' bundled *_pb2.py needs it), studio on PYTHONPATH,
       # compile-disable + UNSLOTH_IS_PRESENT so unsloth_zoo's __init__
@@ -2260,7 +2262,7 @@ jobs:
           for attempt in 1 2 3; do
             rm -rf "$RUNNER_TEMP/unsloth-zoo"
             if git clone --depth=1 --branch="$UNSLOTH_ZOO_REF" \
-                https://github.com/unslothai/unsloth-zoo \
+                "$UNSLOTH_ZOO_URL" \
                 "$RUNNER_TEMP/unsloth-zoo"; then
               break
             fi
