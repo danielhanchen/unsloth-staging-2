@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import gzip
 import json
+import os
+
+import pytest
 
 from hub.schemas.datasets import LocalDatasetOptionsRequest
 from hub.services.datasets import local_options
@@ -181,6 +185,206 @@ def test_snapshot_options_ignore_malformed_card_yaml(tmp_path):
         "---\nconfigs: [unterminated\n---\n",
         encoding = "utf-8",
     )
+
+    assert local_options._snapshot_options(snapshot) == set()
+
+
+def test_snapshot_options_suppress_inference_after_a_card_parse_failure(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    snapshot.mkdir(parents = True)
+    (snapshot / "README.md").write_text("---\nconfigs: [unterminated\n---\n", encoding = "utf-8")
+    (snapshot / "train.jsonl").write_text('{"text":"row"}\n', encoding = "utf-8")
+
+    # datasets raises the YAML error out of DatasetCard.load, so nothing here is loadable.
+    assert local_options._snapshot_options(snapshot) == set()
+
+
+def test_snapshot_options_read_the_standalone_yaml_over_the_card(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    snapshot.mkdir(parents = True)
+    (snapshot / ".huggingface.yaml").write_text(
+        "configs:\n- config_name: foo\n  data_files:\n  - split: test\n    path: records.jsonl\n",
+        encoding = "utf-8",
+    )
+    (snapshot / "records.jsonl").write_text('{"text":"row"}\n', encoding = "utf-8")
+
+    assert local_options._snapshot_options(snapshot) == {("foo", "test")}
+
+
+def test_snapshot_options_keep_a_declared_config_name_when_inferring(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    snapshot.mkdir(parents = True)
+    (snapshot / "README.md").write_text(
+        "---\nconfigs:\n- config_name: foo\n---\ncard\n", encoding = "utf-8"
+    )
+    (snapshot / "records.jsonl").write_text('{"text":"row"}\n', encoding = "utf-8")
+
+    # datasets still builds config foo over the inferred patterns, so default would 422.
+    assert local_options._snapshot_options(snapshot) == {("foo", "train")}
+
+
+def test_snapshot_options_do_not_infer_when_a_loader_only_file_forms_a_split(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    snapshot.mkdir(parents = True)
+    (snapshot / "train.parquet").write_bytes(b"parquet")
+    (snapshot / "test.txt").write_text("row\n", encoding = "utf-8")
+
+    # datasets loads .txt too, so its splits infer parquet and text and none of them build.
+    assert local_options._snapshot_options(snapshot) == set()
+
+
+def test_split_module_samples_only_the_first_files_datasets_would(tmp_path):
+    csv = [(local_options.PurePosixPath(f"train/{i:04d}.csv"), None) for i in range(200)]
+    parquet = [
+        (local_options.PurePosixPath(f"train/{i:04d}.parquet"), None) for i in range(1000, 1201)
+    ]
+
+    assert local_options._split_module(csv + parquet) == "csv"
+
+
+def test_snapshot_options_infer_undeclared_splits_from_loadable_files(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    snapshot.mkdir(parents = True)
+    (snapshot / "README.md").write_text(
+        "---\nlanguage:\n- en\n---\nDataset card without split metadata.\n",
+        encoding = "utf-8",
+    )
+    # The multi30k shape from the report: one format, so datasets can build every split.
+    for name in ("train.jsonl", "test.jsonl", "val.jsonl"):
+        (snapshot / name).write_text('{"text":"row"}\n', encoding = "utf-8")
+
+    assert [
+        item.model_dump()
+        for item in local_options._sorted_options(local_options._snapshot_options(snapshot))
+    ] == [
+        {"dataset": "", "config": "default", "split": "train"},
+        {"dataset": "", "config": "default", "split": "test"},
+        {"dataset": "", "config": "default", "split": "validation"},
+    ]
+
+
+def test_snapshot_options_do_not_infer_splits_that_mix_formats(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    snapshot.mkdir(parents = True)
+    (snapshot / "train.jsonl").write_text('{"text":"train"}\n', encoding = "utf-8")
+    (snapshot / "test.csv").write_text("text\ntest\n", encoding = "utf-8")
+
+    assert local_options._snapshot_options(snapshot) == set()
+
+
+def test_snapshot_options_infer_default_train_for_unlabelled_data(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    snapshot.mkdir(parents = True)
+    (snapshot / "records.jsonl.gz").write_bytes(gzip.compress(b'{"text":"row"}\n'))
+
+    assert local_options._snapshot_options(snapshot) == {("default", "train")}
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["dataset_infos.json", "dataset_info.json", "config.json", "dataset_dict.json"],
+)
+def test_snapshot_options_do_not_infer_from_reserved_metadata(tmp_path, filename):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    snapshot.mkdir(parents = True)
+    (snapshot / filename).write_text("{}", encoding = "utf-8")
+
+    assert local_options._snapshot_options(snapshot) == set()
+
+
+def test_snapshot_options_ignore_reserved_metadata_when_choosing_a_split(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    (snapshot / "test").mkdir(parents = True)
+    (snapshot / "test" / "dataset_infos.json").write_text("{}", encoding = "utf-8")
+    (snapshot / "records.jsonl").write_text('{"text":"row"}\n', encoding = "utf-8")
+
+    assert local_options._snapshot_options(snapshot) == {("default", "train")}
+
+
+@pytest.mark.parametrize("split", ["train-clean", "my split"])
+def test_snapshot_options_do_not_infer_sharded_names_datasets_rejects(tmp_path, split):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    data = snapshot / "data"
+    data.mkdir(parents = True)
+    (data / "train-00000-of-00002.parquet").write_bytes(b"parquet")
+    (data / f"{split}-00001-of-00002.parquet").write_bytes(b"parquet")
+
+    # datasets raises on the bad name before any split loads, so offer nothing at all.
+    assert local_options._snapshot_options(snapshot) == set()
+
+
+def test_snapshot_options_infer_from_blob_backed_symlinks(tmp_path):
+    # The real cache shape on Linux and macOS: snapshot entries link into ../../blobs.
+    # Windows and HF_HUB_DISABLE_SYMLINKS write plain files, which the tests above cover.
+    repo = tmp_path / "datasets--org--data"
+    snapshot = repo / "snapshots" / "commit"
+    blobs = repo / "blobs"
+    snapshot.mkdir(parents = True)
+    blobs.mkdir(parents = True)
+    for index, name in enumerate(("train.jsonl", "val.jsonl", "test.jsonl")):
+        blob = blobs / f"blob{index}"
+        blob.write_text('{"text":"row"}\n', encoding = "utf-8")
+        (snapshot / name).symlink_to(os.path.relpath(blob, snapshot))
+
+    assert local_options._snapshot_options(snapshot) == {
+        ("default", "train"),
+        ("default", "validation"),
+        ("default", "test"),
+    }
+
+
+def test_snapshot_options_infer_sharded_unicode_split(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    data = snapshot / "data"
+    data.mkdir(parents = True)
+    (data / "café-00000-of-00001.parquet").write_bytes(b"parquet")
+
+    assert local_options._snapshot_options(snapshot) == {("default", "café")}
+
+
+@pytest.mark.parametrize(
+    ("filename", "expected"),
+    [
+        ("val.jsonl", {("default", "validation")}),
+        # datasets globs through fsspec, a plain regex with no normcase, so an uppercase
+        # keyword is not a keyword and an uppercase extension is not supported data.
+        ("VAL.jsonl", {("default", "train")}),
+        ("train.JSONL", set()),
+    ],
+)
+def test_snapshot_options_infer_case_sensitively(tmp_path, filename, expected):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    snapshot.mkdir(parents = True)
+    (snapshot / filename).write_text('{"text":"row"}\n', encoding = "utf-8")
+
+    assert local_options._snapshot_options(snapshot) == expected
+
+
+def test_snapshot_options_infer_from_dunder_file_but_not_dunder_directory(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    (snapshot / "__pycache__").mkdir(parents = True)
+    (snapshot / "__pycache__" / "test.jsonl").write_text("{}\n", encoding = "utf-8")
+    (snapshot / "__val.jsonl").write_text('{"text":"row"}\n', encoding = "utf-8")
+
+    assert local_options._snapshot_options(snapshot) == {("default", "validation")}
+
+
+def test_snapshot_options_infer_sharded_custom_split(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    data = snapshot / "data"
+    data.mkdir(parents = True)
+    (data / "holdout-00000-of-00001.parquet").write_bytes(b"parquet")
+
+    assert local_options._snapshot_options(snapshot) == {("default", "holdout")}
+
+
+def test_snapshot_options_do_not_infer_from_non_data_or_unsafe_symlink(tmp_path):
+    snapshot = tmp_path / "datasets--org--data" / "snapshots" / "commit"
+    snapshot.mkdir(parents = True)
+    (snapshot / "README.md").write_text("No metadata or data.\n", encoding = "utf-8")
+    outside = tmp_path / "train.jsonl"
+    outside.write_text('{"text":"outside"}\n', encoding = "utf-8")
+    (snapshot / "train.jsonl").symlink_to(outside)
 
     assert local_options._snapshot_options(snapshot) == set()
 
