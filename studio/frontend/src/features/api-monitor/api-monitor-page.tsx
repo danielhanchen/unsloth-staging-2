@@ -455,6 +455,12 @@ function RequestDetail({
             label: "First token",
             value: entry.ttft_ms != null ? formatDuration(entry.ttft_ms) : "–",
           },
+          // Duration minus this is the wait, so a queued request does not read as a
+          // slow model.
+          {
+            label: "Generating",
+            value: entry.decode_ms != null ? formatDuration(entry.decode_ms) : "–",
+          },
           {
             label: "Speed",
             value: formatTokPerSec(entry.tok_per_sec) ?? "–",
@@ -884,7 +890,7 @@ export function ApiMonitorPage(): ReactElement {
               ? "–"
               : `${stats.tokensPerSecond.toFixed(1)} tok/s`
           }
-          hint={`${formatCount(stats.totalTokens)} tokens`}
+          hint={`${formatCount(stats.totalTokens)} tokens · generation only`}
         />
       </section>
 
