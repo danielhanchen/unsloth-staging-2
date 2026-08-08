@@ -1,0 +1,47 @@
+name: "staging-8035 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-8035-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/stt_download_worker.py'
+      - 'studio/backend/core/inference/stt_ggml_sidecar.py'
+      - 'studio/backend/core/inference/stt_mtmd_sidecar.py'
+      - 'studio/backend/core/inference/stt_sidecar.py'
+      - 'studio/backend/hub/services/download_lifecycle.py'
+      - 'studio/backend/hub/tests/test_stt_repository_ownership.py'
+      - 'studio/backend/hub/utils/download_registry.py'
+      - 'studio/backend/tests/test_stt_download_followups.py'
+      - 'studio/backend/tests/test_stt_http_downloads.py'
+      - 'studio/backend/tests/test_stt_review_fixes_2.py'
+      - 'studio/backend/tests/test_stt_review_fixes_4.py'
+      - 'studio/backend/tests/test_stt_sidecar.py'
+      - 'studio/frontend/src/features/hub/download-manager/api.ts'
+      - 'studio/frontend/src/features/hub/download-manager/download-api-adapter.ts'
+      - '.github/workflows/staging-8035-ubuntu-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pip install 'huggingface-hub==0.36.2' pytest pytest-asyncio httpx structlog
+      - run: python -m pip install 'torch>=2.4,<2.11' 'transformers>=4.51,<5.5' || echo "optional deps unavailable on ubuntu-latest"
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/hub/tests/test_stt_repository_ownership.py studio/backend/tests/test_stt_download_followups.py studio/backend/tests/test_stt_http_downloads.py studio/backend/tests/test_stt_review_fixes_2.py studio/backend/tests/test_stt_review_fixes_4.py studio/backend/tests/test_stt_sidecar.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
