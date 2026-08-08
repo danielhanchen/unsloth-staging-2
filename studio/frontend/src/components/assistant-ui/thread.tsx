@@ -88,6 +88,11 @@ import {
   DeepResearchComposerButton,
   DeepResearchWebsiteAccessDialog,
 } from "@/features/chat/components/deep-research-composer-button";
+import {
+  useNativeAttachmentTargetKey,
+  useNativeIntentStore,
+} from "@/features/native-intents";
+import { nativeAttachmentIntentToFile } from "@/features/native-intents/native-attachment-file";
 import { cancelResearchRun } from "@/features/chat/api/research-api";
 import {
   ingestResearchUpdate,
@@ -2145,6 +2150,156 @@ const Composer: FC<{
   const hasPendingAudio = useChatRuntimeStore((s) =>
     Boolean(s.pendingAudioName),
   );
+  const nativeAttachmentTargetKey = useNativeAttachmentTargetKey();
+  const nativeAttachmentTargetKeyRef = useRef(nativeAttachmentTargetKey);
+  nativeAttachmentTargetKeyRef.current = nativeAttachmentTargetKey;
+  const hasPendingImageAttachments = useNativeIntentStore((s) =>
+    Boolean(
+      nativeAttachmentTargetKey &&
+        (s.pendingImageAttachments[nativeAttachmentTargetKey]?.length ?? 0) > 0,
+    ),
+  );
+  const registeringImageDrops = useNativeIntentStore(
+    (s) => s.registeringImageDrops > 0,
+  );
+  const [materializingDroppedImages, setMaterializingDroppedImages] =
+    useState(false);
+  // A send parked behind indexing must not fire on a drop that failed: the user
+  // is owed the toast and their text, not a send of the text alone. Assigned
+  // below, once the callback it forwards to exists.
+  const cancelQueuedSendRef = useRef<(() => void) | null>(null);
+  // Which composer is mounted, for deciding where a drain puts work back.
+  // Assigned below, next to the identity the dictation send already uses.
+  const composerIdentityRef = useRef("");
+  const imageDropFailures = useNativeIntentStore((s) => s.imageDropFailures);
+  const seenImageDropFailuresRef = useRef(imageDropFailures);
+  // Registration fails before an intent exists, so the drain never sees it.
+  // Cancel here or the parked send goes out with the text alone.
+  useEffect(() => {
+    if (seenImageDropFailuresRef.current === imageDropFailures) return;
+    seenImageDropFailuresRef.current = imageDropFailures;
+    cancelQueuedSendRef.current?.();
+  }, [imageDropFailures]);
+  useEffect(() => {
+    if (!nativeAttachmentTargetKey) {
+      return;
+    }
+    const targetKey = nativeAttachmentTargetKey;
+    const identityAtSetup = composerIdentityRef.current;
+    let disposed = false;
+    let draining = false;
+
+    // A fresh chat re-keys from "single:new" to its thread id under the same
+    // composer, so follow it; a real thread switch leaves the batch with the
+    // chat that received the drop.
+    const requeueKey = () =>
+      composerIdentityRef.current === identityAtSetup
+        ? (nativeAttachmentTargetKeyRef.current ?? targetKey)
+        : targetKey;
+
+    const drainPendingImages = async () => {
+      if (disposed || draining) {
+        return;
+      }
+      draining = true;
+      setMaterializingDroppedImages(true);
+      try {
+        while (!disposed) {
+          const intents = useNativeIntentStore
+            .getState()
+            .takeImageAttachments(targetKey);
+          if (intents.length === 0) {
+            break;
+          }
+          for (let index = 0; index < intents.length; index += 1) {
+            if (disposed) {
+              useNativeIntentStore
+                .getState()
+                .addImageAttachments(requeueKey(), intents.slice(index));
+              return;
+            }
+            const intent = intents[index]!;
+            let file: File;
+            try {
+              file = await nativeAttachmentIntentToFile(intent);
+            } catch (error) {
+              toast.error("Could not attach dropped images", {
+                description:
+                  error instanceof Error ? error.message : String(error),
+              });
+              cancelQueuedSendRef.current?.();
+              const remaining = intents.slice(index + 1);
+              if (remaining.length > 0) {
+                useNativeIntentStore
+                  .getState()
+                  .addImageAttachments(targetKey, remaining);
+              }
+              return;
+            }
+            if (
+              disposed ||
+              nativeAttachmentTargetKeyRef.current !== targetKey
+            ) {
+              useNativeIntentStore
+                .getState()
+                .addImageAttachments(requeueKey(), intents.slice(index));
+              return;
+            }
+            try {
+              await aui.composer().addAttachment(file);
+            } catch (error) {
+              // Every reachable rejection here is about the chat, not the file:
+              // the model can't take images, or it isn't loaded. Rust already
+              // enforces the same 20 MiB cap the adapter checks. So the rest of
+              // the batch would fail identically -- drop it rather than reading
+              // and rejecting each one for its own pair of toasts.
+              toast.error("Could not attach dropped images", {
+                description:
+                  error instanceof Error ? error.message : String(error),
+              });
+              cancelQueuedSendRef.current?.();
+              return;
+            }
+          }
+        }
+      } finally {
+        draining = false;
+        // A drain for a target the composer has already left must not touch the
+        // flag: cleanup cleared it, and the live target may have set it again.
+        if (disposed) {
+          return;
+        }
+        const pending =
+          useNativeIntentStore.getState().pendingImageAttachments[targetKey]
+            ?.length ?? 0;
+        if (pending > 0) {
+          void drainPendingImages();
+        } else {
+          setMaterializingDroppedImages(false);
+        }
+      }
+    };
+
+    const unsubscribe = useNativeIntentStore.subscribe((state) => {
+      const pending =
+        state.pendingImageAttachments[targetKey]?.length ?? 0;
+      if (pending > 0) {
+        void drainPendingImages();
+      }
+    });
+
+    void drainPendingImages();
+
+    return () => {
+      disposed = true;
+      setMaterializingDroppedImages(false);
+      unsubscribe();
+    };
+  }, [nativeAttachmentTargetKey, aui]);
+  const hasMaterializingImageAttachments =
+    registeringImageDrops ||
+    hasPendingImageAttachments ||
+    materializingDroppedImages;
   const threadIsRunning = useAuiState(({ thread }) => thread.isRunning);
   const threadListItemId = useAuiState(
     ({ threadListItem }) => threadListItem.id,
@@ -2184,6 +2339,7 @@ const Composer: FC<{
     !hasPendingAudio &&
     !isComposing &&
     !hasPendingAttachments &&
+    !hasMaterializingImageAttachments &&
     !disabled &&
     !overlay;
 
@@ -2659,6 +2815,7 @@ const Composer: FC<{
     setPendingSend(false);
     dismissWaitToast();
   }, [dismissWaitToast]);
+  cancelQueuedSendRef.current = cancelQueuedSend;
 
   const enqueueSend = useCallback(() => {
     if (pendingSendRef.current) return;
@@ -2674,8 +2831,16 @@ const Composer: FC<{
 
   const shouldBlockSend = useCallback(
     () =>
-      !hasSendableContent || isComposingRef.current || hasPendingAttachments,
-    [hasPendingAttachments, hasSendableContent, isComposingRef],
+      !hasSendableContent ||
+      isComposingRef.current ||
+      hasPendingAttachments ||
+      hasMaterializingImageAttachments,
+    [
+      hasMaterializingImageAttachments,
+      hasPendingAttachments,
+      hasSendableContent,
+      isComposingRef,
+    ],
   );
 
   const sendReservedComposer = useCallback(() => {
@@ -2739,9 +2904,20 @@ const Composer: FC<{
   );
 
   // Fire the parked send once indexing clears, unless the user emptied the
-  // composer while waiting (then drop it quietly).
+  // composer while waiting (then drop it quietly). An image dropped after the
+  // send was parked has to land first, or indexing finishing early sends the
+  // text without it and the image attaches to the next draft.
   useEffect(() => {
-    if (!pendingSend || indexingActive) return;
+    // pendingSendRef too: a cancel earlier in this same commit has already
+    // dropped the send, while `pendingSend` still reads true from this render.
+    if (
+      !pendingSend ||
+      !pendingSendRef.current ||
+      indexingActive ||
+      hasMaterializingImageAttachments
+    ) {
+      return;
+    }
     const { text, attachments } = aui.composer().getState();
     pendingSendRef.current = false;
     setPendingSend(false);
@@ -2753,6 +2929,7 @@ const Composer: FC<{
   }, [
     pendingSend,
     indexingActive,
+    hasMaterializingImageAttachments,
     aui,
     clearStoredDraft,
     dismissWaitToast,
@@ -2780,6 +2957,7 @@ const Composer: FC<{
   // id, not referenceThreadId: that one moves from null to the remote id when
   // a new chat first persists, which is the same composer.
   const composerIdentity = threadListItemId ?? "";
+  composerIdentityRef.current = composerIdentity;
   const sendAfterDictation = useCallback(() => {
     sendAfterDictationRef.current = true;
     dictationComposerRef.current = composerIdentity;
@@ -2790,7 +2968,7 @@ const Composer: FC<{
   // a pending send when the composer changes under it after the press.
   const dictationBlocked = dictationSendBlocked({
     composerDisabled: Boolean(disabled),
-    uploading: hasPendingAttachments,
+    uploading: hasPendingAttachments || hasMaterializingImageAttachments,
     researchActive: isResearchActive,
     runActive: threadIsRunning || promptQueueActive,
     queueDisabled: Boolean(disableQueue),

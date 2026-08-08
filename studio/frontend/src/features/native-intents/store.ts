@@ -11,15 +11,32 @@ interface NativeIntentState {
   // Key each batch to the chat that received the OS drop. Registration crosses an
   // async Rust boundary, so the active chat may change before these arrive.
   pendingAttachments: PendingNativeAttachments;
+  pendingImageAttachments: PendingNativeAttachments;
+  // Image drops registering with Rust, before they have a queue to sit in. Not
+  // keyed: until the intents land there is no settled target -- an implicit
+  // single chat re-keys from "single:new" the moment the thread is created --
+  // and the OS drop went to the window, which has one composer to send from.
+  registeringImageDrops: number;
+  // Bumped when a drop fails before it reaches a queue. The composer watches
+  // this to drop a parked send rather than let it go out without the image.
+  imageDropFailures: number;
   addIntent: (intent: NativeIntent) => void;
   addAttachments: (targetKey: string, intents: NativeIntent[]) => void;
+  addImageAttachments: (targetKey: string, intents: NativeIntent[]) => void;
   takeAttachments: (targetKey: string) => NativeIntent[];
+  takeImageAttachments: (targetKey: string) => NativeIntent[];
+  beginImageDropRegistration: () => void;
+  endImageDropRegistration: () => void;
+  failImageDropRegistration: () => void;
   clearModelIntent: (intentId?: string) => void;
 }
 
 export const useNativeIntentStore = create<NativeIntentState>((set, get) => ({
   pendingModelIntent: null,
   pendingAttachments: {},
+  pendingImageAttachments: {},
+  registeringImageDrops: 0,
+  imageDropFailures: 0,
   addAttachments: (targetKey, intents) => {
     const current = get().pendingAttachments;
     const pendingAttachments = enqueueNativeAttachments(
@@ -29,6 +46,17 @@ export const useNativeIntentStore = create<NativeIntentState>((set, get) => ({
     );
     if (pendingAttachments !== current) {
       set({ pendingAttachments });
+    }
+  },
+  addImageAttachments: (targetKey, intents) => {
+    const current = get().pendingImageAttachments;
+    const pendingImageAttachments = enqueueNativeAttachments(
+      current,
+      targetKey,
+      intents,
+    );
+    if (pendingImageAttachments !== current) {
+      set({ pendingImageAttachments });
     }
   },
   takeAttachments: (targetKey) => {
@@ -41,6 +69,26 @@ export const useNativeIntentStore = create<NativeIntentState>((set, get) => ({
       set({ pendingAttachments });
     }
     return queued;
+  },
+  takeImageAttachments: (targetKey) => {
+    const current = get().pendingImageAttachments;
+    const [queued, pendingImageAttachments] = dequeueNativeAttachments(
+      current,
+      targetKey,
+    );
+    if (pendingImageAttachments !== current) {
+      set({ pendingImageAttachments });
+    }
+    return queued;
+  },
+  beginImageDropRegistration: () => {
+    set({ registeringImageDrops: get().registeringImageDrops + 1 });
+  },
+  endImageDropRegistration: () => {
+    set({ registeringImageDrops: Math.max(0, get().registeringImageDrops - 1) });
+  },
+  failImageDropRegistration: () => {
+    set({ imageDropFailures: get().imageDropFailures + 1 });
   },
   addIntent: (intent) => {
     if (intent.kind !== "model") {
