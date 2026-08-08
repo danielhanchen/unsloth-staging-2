@@ -21,6 +21,12 @@ import time
 from pathlib import Path
 from typing import Optional, Sequence
 
+# Fresh interpreter when run as a spawned module (spawn_download sets
+# PYTHONPATH to the backend dir): re-apply the OS-trust-store injection.
+from utils.native_tls import activate_native_tls
+
+activate_native_tls()
+
 
 # How long a cancelled worker gets to exit on SIGTERM before it is killed.
 TERMINATE_GRACE_SECONDS = 15.0
