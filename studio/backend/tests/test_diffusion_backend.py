@@ -5054,6 +5054,7 @@ _FLUX_BASE_SIBLINGS = [
     _FakeSibling("assets/gallery.pdf", 5000),
     _FakeSibling("README.md", 200),
 ]
+_FLUX_BASE_SIBLINGS_BY_NAME = {s.rfilename: s.size for s in _FLUX_BASE_SIBLINGS}
 
 
 def _fake_hf_api(monkeypatch, repos):
@@ -5421,3 +5422,401 @@ def test_a_superseding_load_fences_queued_generations_too(fake_runtime, tmp_path
 
     assert seen == [1]
     assert backend._teardown_waiters == 0
+
+
+def test_download_plan_skips_files_already_in_the_cache(monkeypatch):
+    # A model fully on disk must plan nothing: entries are what the Downloads panel lists, so
+    # staging a cached repo reads as re-downloading a model the user already has.
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/FLUX.1-dev-GGUF": [_FakeSibling("flux1-dev-Q4_K_M.gguf", 7 * GB)],
+            "black-forest-labs/FLUX.1-dev": _FLUX_BASE_SIBLINGS,
+        },
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo",
+        lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _no_cache(monkeypatch)
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_files_already_cached",
+        staticmethod(lambda repo_id, files, revision = None: set(files)),
+    )
+
+    plan = DiffusionBackend().download_plan(
+        "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+    )
+
+    assert plan["entries"] == []
+    assert plan["total_bytes"] == 0
+
+
+def test_download_plan_stages_only_what_the_cache_is_missing(monkeypatch):
+    # The common case after a base repo is shared: the companion is on disk, a new quant is not.
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/FLUX.1-dev-GGUF": [_FakeSibling("flux1-dev-Q4_K_M.gguf", 7 * GB)],
+            "black-forest-labs/FLUX.1-dev": _FLUX_BASE_SIBLINGS,
+        },
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo",
+        lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _no_cache(monkeypatch)
+    # Everything but the checkpoint repo is cached.
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_files_already_cached",
+        staticmethod(
+            lambda repo_id, files, revision = None: (
+                set() if repo_id.endswith("-GGUF") else set(files)
+            )
+        ),
+    )
+
+    plan = DiffusionBackend().download_plan(
+        "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+    )
+
+    assert [e["repo_id"] for e in plan["entries"]] == ["unsloth/FLUX.1-dev-GGUF"]
+    assert plan["entries"][0]["files"] == ["flux1-dev-Q4_K_M.gguf"]
+    # The cached base is gone from the total too, or the progress bar waits on bytes nobody fetches.
+    assert plan["total_bytes"] == 7 * GB
+
+
+def _seed_cache_file(
+    root,
+    repo_id,
+    filename,
+    sha,
+    *,
+    dangling = False,
+):
+    """Write ``filename`` into a real HF cache layout at ``sha``, refs/main pointing there."""
+    import os as _os
+
+    repo = root / f"models--{repo_id.replace('/', '--')}"
+    (repo / "refs").mkdir(parents = True, exist_ok = True)
+    (repo / "refs" / "main").write_text(sha)
+    target = repo / "snapshots" / sha / filename
+    target.parent.mkdir(parents = True, exist_ok = True)
+    if dangling:
+        # A snapshot entry is a symlink into blobs/; a pruned blob leaves the link but no bytes.
+        # Windows without developer mode cannot make one, and hub writes plain files there too.
+        try:
+            _os.symlink(repo / "blobs" / "gone", target)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks unavailable on this host")
+    else:
+        target.write_bytes(b"x")
+    return target
+
+
+def _two_cache_roots(monkeypatch, tmp_path):
+    """(live, other) roots wired up the way a mid-session cache-folder change leaves them."""
+    from huggingface_hub import constants as hf_constants
+
+    live = tmp_path / "live"
+    other = tmp_path / "other"
+    live.mkdir()
+    other.mkdir()
+    monkeypatch.setattr("core.inference.diffusion.hub_cache_dir", lambda: str(live))
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(other))
+    return live, other
+
+
+def test_files_already_cached_needs_a_revision_to_drop_anything(monkeypatch, tmp_path):
+    """No commit, no verdict. try_to_load_from_cache would otherwise resolve the cache's OWN
+    refs/main, which a republished repo leaves on the superseded commit: the stale blob reads as
+    cached, the file leaves the plan, and the loader pulls the new one outside the panel."""
+    live, _other = _two_cache_roots(monkeypatch, tmp_path)
+    sha = "a" * 40
+    _seed_cache_file(live, "unsloth/FLUX.1-dev-GGUF", "flux1-dev-Q4_K_M.gguf", sha)
+
+    probe = DiffusionBackend._files_already_cached
+    assert probe("unsloth/FLUX.1-dev-GGUF", ["flux1-dev-Q4_K_M.gguf"]) == set()
+    assert probe("unsloth/FLUX.1-dev-GGUF", ["flux1-dev-Q4_K_M.gguf"], sha) == {
+        "flux1-dev-Q4_K_M.gguf"
+    }
+
+
+def test_files_already_cached_ignores_a_superseded_revision(monkeypatch, tmp_path):
+    """The blob is on disk under the old commit and refs/main still names it, but the plan asked
+    about the commit the Hub just reported, so the file stays staged."""
+    live, _other = _two_cache_roots(monkeypatch, tmp_path)
+    _seed_cache_file(live, "unsloth/FLUX.1-dev-GGUF", "flux1-dev-Q4_K_M.gguf", "a" * 40)
+
+    assert (
+        DiffusionBackend._files_already_cached(
+            "unsloth/FLUX.1-dev-GGUF", ["flux1-dev-Q4_K_M.gguf"], "b" * 40
+        )
+        == set()
+    )
+
+
+def test_files_already_cached_reads_both_roots_and_skips_unusable_hits(monkeypatch, tmp_path):
+    """Both roots count: every diffusion fetch passes reuse_other_cache_root, so bytes left in the
+    pre-change root really do satisfy the load. A dangling symlink is a path but not usable bytes,
+    and an absent file is simply missing."""
+    live, other = _two_cache_roots(monkeypatch, tmp_path)
+    sha = "c" * 40
+    repo = "black-forest-labs/FLUX.1-dev"
+    _seed_cache_file(live, repo, "model_index.json", sha)
+    _seed_cache_file(other, repo, "vae/diffusion_pytorch_model.safetensors", sha)
+    _seed_cache_file(live, repo, "text_encoder/model.safetensors", sha, dangling = True)
+
+    assert DiffusionBackend._files_already_cached(
+        repo,
+        [
+            "model_index.json",
+            "vae/diffusion_pytorch_model.safetensors",
+            "text_encoder/model.safetensors",
+            "scheduler/scheduler_config.json",
+        ],
+        sha,
+    ) == {"model_index.json", "vae/diffusion_pytorch_model.safetensors"}
+
+
+def test_files_already_cached_survives_an_unreadable_root(monkeypatch, tmp_path):
+    """A cache we cannot read is not a verdict: the first root raising must not lose the second
+    root's hit, nor abort the files after it."""
+    live, other = _two_cache_roots(monkeypatch, tmp_path)
+    sha = "d" * 40
+    _seed_cache_file(other, "unsloth/FLUX.1-dev-GGUF", "flux1-dev-Q4_K_M.gguf", sha)
+    import huggingface_hub
+
+    real = huggingface_hub.try_to_load_from_cache
+
+    def _boom(
+        repo_id,
+        filename,
+        cache_dir = None,
+        **kwargs,
+    ):
+        if str(cache_dir) == str(live):
+            raise OSError("unreadable")
+        return real(repo_id, filename, cache_dir = cache_dir, **kwargs)
+
+    monkeypatch.setattr(huggingface_hub, "try_to_load_from_cache", _boom)
+
+    assert DiffusionBackend._files_already_cached(
+        "unsloth/FLUX.1-dev-GGUF", ["flux1-dev-Q4_K_M.gguf"], sha
+    ) == {"flux1-dev-Q4_K_M.gguf"}
+
+
+def test_download_plan_stages_a_half_cached_repo_whole(monkeypatch):
+    """A repo is dropped only when ALL of it is cached. A shrinking file list would 409 a second
+    pick sharing this base, since every diffusion entry rides the one "@diffusion" scope slot and
+    download_registry refuses a claim whose scoped_files differ from the live job's."""
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/FLUX.1-dev-GGUF": [_FakeSibling("flux1-dev-Q4_K_M.gguf", 7 * GB)],
+            "black-forest-labs/FLUX.1-dev": _FLUX_BASE_SIBLINGS,
+        },
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo",
+        lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _no_cache(monkeypatch)
+    # The manifest is on disk, the VAE is not; the checkpoint repo is untouched.
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_files_already_cached",
+        staticmethod(
+            lambda repo_id, files, revision = None: (
+                set()
+                if repo_id.endswith("-GGUF")
+                else {n for n in files if n != "vae/diffusion_pytorch_model.safetensors"}
+            )
+        ),
+    )
+
+    plan = DiffusionBackend().download_plan(
+        "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+    )
+
+    by_repo = {e["repo_id"]: e for e in plan["entries"]}
+    # Staged from the ungated mirror, as every other plan test here: nothing is cached, so
+    # prefer_ungated_mirror swaps the gated vendor id for the one the fetch will really name.
+    assert set(by_repo) == {"unsloth/FLUX.1-dev-GGUF", "unsloth/FLUX.1-dev"}
+    base = by_repo["unsloth/FLUX.1-dev"]
+    # The whole scoped list, not just the missing VAE: the cached file is still staged.
+    assert "vae/diffusion_pytorch_model.safetensors" in base["files"]
+    assert "model_index.json" in base["files"]
+    assert base["bytes"] == sum(
+        size for name, size in _FLUX_BASE_SIBLINGS_BY_NAME.items() if name in base["files"]
+    )
+    # Derived, so the panel's rows and the bar it drives can never disagree.
+    assert plan["total_bytes"] == sum(e["bytes"] for e in plan["entries"])
+    assert all(e["files"] for e in plan["entries"])
+
+
+def test_download_plan_files_do_not_shrink_as_a_repo_warms(monkeypatch):
+    """The scope-slot invariant, stated directly: for one pick, a repo's staged file list is the
+    same whether none or some of it is on disk. Only all-cached removes the entry."""
+
+    def _plan(cached_for_base):
+        mp = pytest.MonkeyPatch()
+        try:
+            _fake_hf_api(
+                mp,
+                {
+                    "unsloth/FLUX.1-dev-GGUF": [_FakeSibling("flux1-dev-Q4_K_M.gguf", 7 * GB)],
+                    "black-forest-labs/FLUX.1-dev": _FLUX_BASE_SIBLINGS,
+                },
+            )
+            mp.setattr(
+                "core.inference.diffusion._resolve_base_repo",
+                lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+            )
+            mp.setattr(
+                DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+            )
+            _no_cache(mp)
+            mp.setattr(
+                DiffusionBackend,
+                "_files_already_cached",
+                staticmethod(
+                    lambda repo_id, files, revision = None: (
+                        set() if repo_id.endswith("-GGUF") else set(cached_for_base(files))
+                    )
+                ),
+            )
+            return DiffusionBackend().download_plan(
+                "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+            )
+        finally:
+            mp.undo()
+
+    cold = _plan(lambda files: [])
+    half = _plan(lambda files: files[:1])
+    most = _plan(lambda files: files[:-1])
+    warm = _plan(lambda files: files)
+
+    base_files = {e["repo_id"]: e["files"] for e in cold["entries"]}["unsloth/FLUX.1-dev"]
+    for plan in (half, most):
+        staged = {e["repo_id"]: e["files"] for e in plan["entries"]}
+        assert staged["unsloth/FLUX.1-dev"] == base_files
+    # Fully cached is the one state that removes the row.
+    assert "unsloth/FLUX.1-dev" not in {e["repo_id"] for e in warm["entries"]}
+
+
+class _ShaInfo(_FakeInfo):
+    """A model_info that carries a commit, as the real one does."""
+
+    def __init__(self, siblings, sha):
+        super().__init__(siblings)
+        self.sha = sha
+
+
+def _fake_hf_api_with_shas(monkeypatch, repos):
+    """_fake_hf_api, but each repo also reports the commit its listing describes."""
+
+    class _Api:
+        def model_info(
+            self,
+            repo_id,
+            files_metadata = False,
+            token = None,
+        ):
+            siblings, sha = repos[repo_id]
+            return _ShaInfo(siblings, sha)
+
+    monkeypatch.setattr("huggingface_hub.HfApi", lambda *a, **k: _Api())
+
+
+def test_download_plan_pins_each_probe_to_the_commit_it_just_read(monkeypatch):
+    """The sha every model_info reported must reach that repo's own probe, and the MIRROR must be
+    probed at ITS commit: a mirror is a separate repo with its own history, so the vendor's sha
+    would never hit and a cached mirror would re-stage in full."""
+    gguf_sha, vendor_sha, mirror_sha = "f" * 40, "d" * 40, "e" * 40
+    _fake_hf_api_with_shas(
+        monkeypatch,
+        {
+            "unsloth/FLUX.1-dev-GGUF": ([_FakeSibling("flux1-dev-Q4_K_M.gguf", 7 * GB)], gguf_sha),
+            "black-forest-labs/FLUX.1-dev": (_FLUX_BASE_SIBLINGS, vendor_sha),
+            "unsloth/FLUX.1-dev": (_FLUX_BASE_SIBLINGS, mirror_sha),
+        },
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo",
+        lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _no_cache(monkeypatch)
+    seen: list = []
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_files_already_cached",
+        staticmethod(
+            lambda repo_id, files, revision = None: seen.append((repo_id, revision)) or set()
+        ),
+    )
+
+    DiffusionBackend().download_plan(
+        "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+    )
+
+    assert ("unsloth/FLUX.1-dev-GGUF", gguf_sha) in seen
+    # Nothing is cached, so the swap fired and the base is staged from the mirror.
+    assert ("unsloth/FLUX.1-dev", mirror_sha) in seen
+    assert vendor_sha not in [rev for _repo, rev in seen]
+
+
+def test_download_plan_skips_nothing_when_the_hub_reports_no_commit(monkeypatch):
+    """An old huggingface_hub, or a listing without a sha, must not fall back to the cache's own
+    refs/main: no commit is no verdict, so the pick stages exactly as it did before #8154."""
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/FLUX.1-dev-GGUF": [_FakeSibling("flux1-dev-Q4_K_M.gguf", 7 * GB)],
+            "black-forest-labs/FLUX.1-dev": _FLUX_BASE_SIBLINGS,
+        },
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo",
+        lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _no_cache(monkeypatch)
+    revisions: list = []
+    real = DiffusionBackend._files_already_cached
+
+    def _spy(
+        repo_id,
+        files,
+        revision = None,
+    ):
+        revisions.append(revision)
+        return real(repo_id, files, revision)
+
+    monkeypatch.setattr(DiffusionBackend, "_files_already_cached", staticmethod(_spy))
+
+    plan = DiffusionBackend().download_plan(
+        "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+    )
+
+    assert revisions and all(rev is None for rev in revisions)
+    assert {e["repo_id"] for e in plan["entries"]} == {
+        "unsloth/FLUX.1-dev-GGUF",
+        "unsloth/FLUX.1-dev",
+    }
