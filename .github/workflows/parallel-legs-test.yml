@@ -27,7 +27,10 @@ jobs:
       # No max-parallel: this is the change under test.
       matrix:
         include:
-          - platform: macos-latest
+          # Third leg stands in on Linux: the account's macOS pool is contended
+          # and the artifact plumbing under test is platform independent. The
+          # real macOS leg is covered by the production release run.
+          - platform: ubuntu-22.04
             label: macOS (Apple Silicon)
             artifact: macos-aarch64
           - platform: ubuntu-22.04
