@@ -28,9 +28,101 @@ _CACHE_DIRS = [
 ]
 
 
+def _configured_cache_dirs() -> List[Path]:
+    """Cache dirs outside the source tree: the configured one, and the CWD.
+
+    The candidates above are all source-tree relative, so a cache created in
+    the launcher's CWD (the user profile on Windows) was invisible to cleanup.
+    The CWD is still checked for installs that predate the pinned location.
+    """
+    import os
+
+    dirs: List[Path] = []
+    configured = (os.environ.get("UNSLOTH_COMPILE_LOCATION") or "").strip()
+    if configured:
+        dirs.append(Path(configured).expanduser())
+    try:
+        dirs.append(Path.cwd() / "unsloth_compiled_cache")
+    except OSError:
+        pass
+    return dirs
+
+
 def get_existing_cache_dirs() -> List[Path]:
     """Return known compiled-cache directories that currently exist on disk."""
-    return [d for d in _CACHE_DIRS if d.exists()]
+    seen: set = set()
+    found: List[Path] = []
+    for candidate in [*_CACHE_DIRS, *_configured_cache_dirs()]:
+        try:
+            key = candidate.resolve()
+        except OSError:
+            key = candidate
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.exists():
+            found.append(candidate)
+    return found
+
+
+# Written when Studio creates the directory, so "we made this" is a fact rather
+# than an inference from the contents.
+CACHE_MARKER = ".unsloth_compiled_cache"
+
+# Names only the compiler produces, so a cache Studio did not create is still
+# recognised once it has been written into.
+import re as _re
+
+_GENERATED_NAME_RE = _re.compile(r"\A(unsloth_compiled_module_.+|Unsloth.+Trainer)\.py\Z")
+
+
+def _is_dedicated_cache(path: Path) -> bool:
+    """True only for a directory Studio created for the cache and nothing else."""
+    try:
+        return (path / CACHE_MARKER).exists()
+    except OSError:
+        return False
+
+
+def _holds_generated_modules(path: Path) -> bool:
+    """True when the compiler has written into this directory.
+
+    A shape test is not enough to own the directory: a directory of plain .py
+    files is someone's package, and this decides what gets deleted.
+    """
+    try:
+        return any(_GENERATED_NAME_RE.match(item.name) for item in path.iterdir())
+    except OSError:
+        return False
+
+
+def _cleanable_cache_dirs() -> "List[tuple]":
+    """``(directory, dedicated)`` for every cache dir something may be removed from.
+
+    UNSLOTH_COMPILE_LOCATION is a user-set variable, so it can name a directory
+    that holds other things (`$HOME/.cache`). Built-in paths, and any directory
+    carrying the marker, are ours whole. Anywhere else only the generated files
+    are ours, so only those may go.
+    """
+    builtin = {str(p) for p in _CACHE_DIRS}
+    try:
+        builtin.add(str(Path.cwd() / "unsloth_compiled_cache"))
+    except OSError:
+        pass
+    cleanable: "List[tuple]" = []
+    for cache_dir in get_existing_cache_dirs():
+        if str(cache_dir) in builtin or _is_dedicated_cache(cache_dir):
+            cleanable.append((cache_dir, True))
+        elif _holds_generated_modules(cache_dir):
+            cleanable.append((cache_dir, False))
+        else:
+            logger.warning(
+                "Not clearing %s: Studio did not create it and it holds no generated "
+                "modules. Point UNSLOTH_COMPILE_LOCATION at a directory used only for "
+                "the compiled cache.",
+                cache_dir,
+            )
+    return cleanable
 
 
 def register_compiled_cache_on_path() -> None:
@@ -66,11 +158,21 @@ def clear_unsloth_compiled_cache(preserve_patterns: Optional[List[str]] = None) 
                            (e.g., ["Unsloth*Trainer.py"]). If None or empty,
                            the entire cache directory is deleted (legacy behavior).
     """
-    for cache_dir in _CACHE_DIRS:
-        if not cache_dir.exists():
-            continue
-
-        if preserve_patterns:
+    for cache_dir, dedicated in _cleanable_cache_dirs():
+        if not dedicated:
+            # A shared directory we only ever wrote generated modules into, so
+            # they are the only thing here that may be removed.
+            logger.info(f"Cleaning generated modules from shared directory: {cache_dir}")
+            for item in cache_dir.iterdir():
+                if not item.is_file() or not _GENERATED_NAME_RE.match(item.name):
+                    continue
+                if preserve_patterns and any(item.match(p) for p in preserve_patterns):
+                    continue
+                try:
+                    item.unlink()
+                except OSError as e:
+                    logger.debug(f"Could not delete {item}: {e}")
+        elif preserve_patterns:
             logger.info(
                 f"Cleaning unsloth compiled cache (preserving {preserve_patterns}): " f"{cache_dir}"
             )
