@@ -982,7 +982,7 @@ _studio_owned_adoptable() {
 # we cannot search every probe reports absent, so our own install reads as someone else's.
 _studio_dir_unsearchable() {
     [ -d "$1" ] || return 1
-    ( cd "$1" ) 2>/dev/null && return 1
+    ( cd -- "$1" ) 2>/dev/null && return 1
     return 0
 }
 
@@ -991,7 +991,7 @@ _studio_dir_unsearchable() {
 _studio_dir_unreadable() {
     [ -d "$1" ] || return 1
     _studio_dir_unsearchable "$1" && return 0
-    ls -A "$1" >/dev/null 2>&1 && return 1
+    ls -A -- "$1" >/dev/null 2>&1 && return 1
     return 0
 }
 
@@ -1016,6 +1016,33 @@ _path_access_denied() {
         setup_fail 1 "Permission denied reading $_pad_label at $_pad_dir. Unsloth cannot confirm that folder is its own install while it is unreadable: restore access, or move it aside, then re-run setup."
     fi
     setup_fail 1 "Permission denied reading the existing $_pad_label at $_pad_dir. Delete or rename that folder (Unsloth reinstalls it) or restore access, then re-run setup. Reinstalling the app does not reset it."
+}
+
+# An unsearchable ancestor makes everything under it unstattable, so a real path
+# reads as missing. Walk up to the deepest ancestor we can stat and report if it
+# is the blocker. Returns without reporting when the path is simply absent.
+_report_denied_ancestor() {
+    _rda_probe="$1"
+    _rda_hops=0
+    while [ ! -e "$_rda_probe" ] && [ "$_rda_probe" != "/" ] && [ "$_rda_probe" != "." ]; do
+        # A symlink we cannot follow is the deepest component we can name, so keep
+        # walking through its target: that is where the denied ancestor lives.
+        # The hop cap keeps a symlink cycle from looping forever.
+        if [ -L "$_rda_probe" ] && [ "$_rda_hops" -lt 40 ]; then
+            _rda_hops=$((_rda_hops + 1))
+            _rda_target="$(readlink -- "$_rda_probe")" || break
+            case "$_rda_target" in
+                /*) _rda_probe="$_rda_target" ;;
+                *) _rda_probe="$(dirname -- "$_rda_probe")/$_rda_target" ;;
+            esac
+            continue
+        fi
+        # -- so a path starting with "-" is an operand, not a dirname option.
+        _rda_probe="$(dirname -- "$_rda_probe")"
+    done
+    if _studio_dir_unsearchable "$_rda_probe"; then
+        _path_access_denied "$_rda_probe" "$2" owner-unverified
+    fi
 }
 
 _assert_studio_owned_or_absent() {
@@ -1948,10 +1975,17 @@ _has_local_llama_server() {
 _LOCAL_LLAMA_CPP_LINKED=false
 if [ -n "${UNSLOTH_LOCAL_LLAMA_CPP_DIR:-}" ]; then
     if [ ! -d "$UNSLOTH_LOCAL_LLAMA_CPP_DIR" ]; then
+        # A build under an unsearchable ancestor cannot be stat'd either, so report
+        # permissions first rather than sending the user to fix a correct path.
+        _report_denied_ancestor "$UNSLOTH_LOCAL_LLAMA_CPP_DIR" "UNSLOTH_LOCAL_LLAMA_CPP_DIR"
         step "llama.cpp" "UNSLOTH_LOCAL_LLAMA_CPP_DIR does not exist: $UNSLOTH_LOCAL_LLAMA_CPP_DIR" "$C_ERR"
         setup_fail 1 "UNSLOTH_LOCAL_LLAMA_CPP_DIR does not exist: $UNSLOTH_LOCAL_LLAMA_CPP_DIR"
     fi
-    _RESOLVED_LOCAL="$(CDPATH= cd -P -- "$UNSLOTH_LOCAL_LLAMA_CPP_DIR" && pwd -P)"
+    # In an if condition, so a denied dir reports instead of tripping errexit here.
+    if ! _RESOLVED_LOCAL="$(CDPATH= cd -P -- "$UNSLOTH_LOCAL_LLAMA_CPP_DIR" 2>/dev/null && pwd -P)"; then
+        # owner-unverified: this is the user's own tree, never advise deleting it.
+        _path_access_denied "$UNSLOTH_LOCAL_LLAMA_CPP_DIR" "UNSLOTH_LOCAL_LLAMA_CPP_DIR" owner-unverified
+    fi
     # Canonicalize the install path the same way before comparing: _RESOLVED_LOCAL
     # is fully resolved, but LLAMA_CPP_DIR is textual ($UNSLOTH_HOME/llama.cpp). If
     # $HOME (or UNSLOTH_HOME) contains a symlink, the two never match even when the
@@ -1961,7 +1995,13 @@ if [ -n "${UNSLOTH_LOCAL_LLAMA_CPP_DIR:-}" ]; then
     _CANON_LLAMA_CPP_DIR="$LLAMA_CPP_DIR"
     _LLAMA_CPP_PARENT="$(dirname "$LLAMA_CPP_DIR")"
     if [ -d "$_LLAMA_CPP_PARENT" ]; then
-        _CANON_LLAMA_CPP_DIR="$(CDPATH= cd -P -- "$_LLAMA_CPP_PARENT" && pwd -P)/$(basename "$LLAMA_CPP_DIR")"
+        # Report rather than carry on: nothing can be written under a parent we
+        # cannot search, so the link below would abort raw a few lines later.
+        if _canon_parent="$(CDPATH= cd -P -- "$_LLAMA_CPP_PARENT" 2>/dev/null && pwd -P)"; then
+            _CANON_LLAMA_CPP_DIR="$_canon_parent/$(basename "$LLAMA_CPP_DIR")"
+        else
+            _path_access_denied "$_LLAMA_CPP_PARENT" "Unsloth install directory" owner-unverified
+        fi
     fi
     if [ "$_RESOLVED_LOCAL" = "$_CANON_LLAMA_CPP_DIR" ]; then
         # Points at the canonical install location itself: never delete-then-link
