@@ -1,0 +1,76 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Staging-only. studio-tauri-smoke.yml compiles the crate on Linux (WebKitGTK)
+# and runs cargo test on Linux + Windows; the macOS leg of the Tauri build only
+# exists in release-desktop.yml, which is workflow_dispatch and needs Apple
+# signing secrets. This is that leg with the signing and publishing removed, so
+# a PR touching studio/src-tauri gets its WKWebView compile checked too.
+#
+# Mirrors release-desktop.yml: node 24, Tauri CLI pinned to 2.10.1,
+# --target aarch64-apple-darwin, and --no-bundle in place of the signed bundle.
+
+name: Staging 7982 Tauri macOS
+
+on:
+  pull_request:
+    paths:
+      - 'studio/src-tauri/**'
+      - 'studio/frontend/**'
+      - '.github/workflows/staging-7982-tauri-mac.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  macos-build:
+    name: Tauri macOS build (no codesign)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          save-if: false
+          workspaces: studio/src-tauri -> target
+
+      - name: Install pinned Tauri CLI (matches release-desktop.yml)
+        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
+      # tauri-build resolves frontendDist at compile time, so dist/ has to
+      # exist before cargo runs, exactly as the Linux and Windows jobs do it.
+      - name: Frontend build (npm ci, vite)
+        working-directory: studio/frontend
+        run: |
+          npm ci --no-fund --no-audit
+          npm run build
+          test -f dist/index.html
+
+      - name: Rust unit tests (studio/src-tauri)
+        working-directory: studio/src-tauri
+        run: cargo test --no-fail-fast
+
+      - name: Tauri build (macOS aarch64, no bundle, no codesign)
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ''
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+        run: npx --prefix studio tauri build --no-bundle --target aarch64-apple-darwin
+
+      - name: Inspect produced binary
+        run: |
+          BIN=$(find studio/src-tauri/target/aarch64-apple-darwin/release -maxdepth 1 -type f -perm +111 | head -1)
+          test -n "$BIN" || { echo "no binary produced"; exit 1; }
+          file "$BIN"
+          ls -la "$BIN"
