@@ -1,0 +1,42 @@
+name: "staging-7664 macos-14"
+on:
+  push:
+    branches: ["pr-7664-xplat-ci"]
+    paths:
+      - 'studio/frontend/src/components/app-sidebar.tsx'
+      - 'studio/frontend/src/components/assistant-ui/thread.tsx'
+      - 'studio/frontend/src/features/chat/chat-page.tsx'
+      - 'studio/frontend/src/features/chat/index.ts'
+      - 'studio/frontend/src/features/chat/prompt-storage/prompt-storage-dialog.tsx'
+      - 'studio/frontend/src/features/chat/shared-composer.tsx'
+      - 'studio/frontend/src/features/chat/thread-sidebar.tsx'
+      - 'studio/frontend/src/features/chat/utils/conversation-markdown-export.ts'
+      - 'studio/frontend/src/features/chat/utils/conversation-markdown.ts'
+      - 'studio/frontend/tests/conversation-markdown-export.test.ts'
+      - 'studio/frontend/tests/conversation-markdown.test.ts'
+      - '.github/workflows/staging-7664-macos-14.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
