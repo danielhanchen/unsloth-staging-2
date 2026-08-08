@@ -1,0 +1,40 @@
+name: "staging-8139 macos-14"
+on:
+  push:
+    branches: ["pr-8139-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/api_monitor.py'
+      - 'studio/backend/routes/inference.py'
+      - 'studio/backend/tests/test_api_monitor.py'
+      - 'studio/backend/tests/test_responses_tool_passthrough.py'
+      - 'studio/frontend/src/features/api-monitor/api-monitor-page.tsx'
+      - 'studio/frontend/src/features/api-monitor/stats.ts'
+      - 'studio/frontend/src/features/api-monitor/use-api-monitor.ts'
+      - 'studio/frontend/src/features/chat/types/api.ts'
+      - 'studio/frontend/tests/api-monitor-throughput.test.ts'
+      - '.github/workflows/staging-8139-macos-14.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_api_monitor.py studio/backend/tests/test_responses_tool_passthrough.py tests/studio/test_model_picker_contracts.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
