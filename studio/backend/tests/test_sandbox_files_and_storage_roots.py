@@ -1,0 +1,475 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+
+"""Where a chat's files live, and how a user gets them back.
+
+Every assertion here failed before: the sandbox ignored UNSLOTH_STUDIO_HOME, only
+images could be fetched, nothing listed a chat's files, bash reported none, the
+compiled cache landed in the launcher's CWD, and a deleted chat left its folder
+behind. Verified on Windows, macOS and Linux.
+"""
+
+import json
+import os
+import sys
+import platform
+from pathlib import Path
+
+import pytest
+
+
+# ---------------------------------------------------------------------------
+# 1. Sandbox location
+# ---------------------------------------------------------------------------
+def test_sandbox_lives_under_the_studio_home(tmp_path, monkeypatch):
+    fake_home = tmp_path / "userprofile"
+    studio_home = tmp_path / "custom_studio_home"
+    fake_home.mkdir()
+    studio_home.mkdir()
+
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(studio_home))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    wd = Path(tools.get_sandbox_workdir("__LOCALID_aB3xY7q"))
+    print(f"\n[{platform.system()}] sandbox workdir = {wd}")
+
+    # It follows UNSLOTH_STUDIO_HOME instead of dropping a third folder in the
+    # user's home next to .unsloth.
+    assert str(wd).startswith(str(studio_home)), wd
+    assert not str(wd).startswith(str(fake_home / "studio_sandbox")), wd
+    assert wd.parent.name == "sandbox"
+    assert wd.name.startswith("__LOCALID_")
+
+
+def test_sandbox_home_override(tmp_path, monkeypatch):
+    """A user who wants the sandbox on another volume can say so."""
+    elsewhere = tmp_path / "other volume" / "sandboxes"
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(elsewhere))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    wd = Path(tools.get_sandbox_workdir("__LOCALID_aB3xY7q"))
+    assert wd == elsewhere / "__LOCALID_aB3xY7q"
+
+
+def test_legacy_sandbox_is_migrated(tmp_path, monkeypatch):
+    """Files created before the move are carried over, not abandoned."""
+    fake_home = tmp_path / "userprofile"
+    studio_home = tmp_path / "studio_home"
+    legacy = fake_home / "studio_sandbox" / "__LOCALID_old1234"
+    legacy.mkdir(parents = True)
+    (legacy / "results.csv").write_text("a,b\n1,2\n")
+
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(studio_home))
+    monkeypatch.delenv("UNSLOTH_STUDIO_SANDBOX_HOME", raising = False)
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    tools._legacy_sandbox_migrated = False
+    wd = Path(tools.get_sandbox_workdir("__LOCALID_new5678"))
+    moved = wd.parent / "__LOCALID_old1234" / "results.csv"
+    print(f"\nmigrated to {moved}")
+    assert moved.is_file()
+    assert moved.read_text() == "a,b\n1,2\n"
+
+
+# ---------------------------------------------------------------------------
+# 2. Getting files back out
+# ---------------------------------------------------------------------------
+def test_images_stay_inline_and_everything_else_downloads():
+    """Images keep a real media type; the rest are opaque attachments.
+
+    The allowlist is deliberately NOT just widened: the model picks these
+    filenames, so an inline text/html would be same-origin script execution.
+    """
+    from routes.inference import _SANDBOX_MEDIA_TYPES
+
+    for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"):
+        assert ext in _SANDBOX_MEDIA_TYPES
+    for ext in (".csv", ".txt", ".py", ".json", ".pdf", ".zip", ".html", ".svg"):
+        assert ext not in _SANDBOX_MEDIA_TYPES, ext
+
+    import inspect
+    from routes import inference
+
+    src = inspect.getsource(inference.serve_sandbox_file)
+    assert "application/octet-stream" in src
+    assert "Content-Disposition" in src
+    assert "attachment" in src
+    assert "File type not allowed" not in src, "non-images are no longer rejected"
+
+
+def test_sandbox_listing_route_exists():
+    """The UI can enumerate a chat's files, and learn where they live."""
+    from routes.inference import router
+
+    sandbox_routes = sorted(r.path for r in router.routes if "sandbox" in r.path)
+    print(f"\nsandbox routes = {sandbox_routes}")
+    # :path so a file written into a subdirectory is reachable.
+    assert sandbox_routes == [
+        "/sandbox/{session_id}",
+        "/sandbox/{session_id}/{filename:path}",
+    ]
+
+    import inspect
+    from routes import inference
+
+    src = inspect.getsource(inference.list_sandbox_files)
+    assert '"path"' in src, "the listing must answer 'where did my file go'"
+
+
+# ---------------------------------------------------------------------------
+# 3. Reporting what a call created
+# ---------------------------------------------------------------------------
+def test_both_executors_report_created_files(tmp_path, monkeypatch):
+    """A file is reported whether it came from python or from bash."""
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(tmp_path / "sb"))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    session = "__LOCALID_exec123"
+    workdir = tools.get_sandbox_workdir(session)
+
+    for name, run in (
+        (
+            "py.csv",
+            lambda: tools._python_exec("open('py.csv','w').write('a,b\\n')", session_id = session),
+        ),
+        ("sh.csv", lambda: tools._bash_exec("printf 'a,b\\n' > sh.csv", session_id = session)),
+    ):
+        result = run()
+        print(f"\n{name} -> {result!r}")
+        assert "__FILES__:" in result, result
+        assert name in result
+        assert os.path.isfile(os.path.join(workdir, name))
+
+    # The sentinel never reaches the model.
+    from core.inference.tool_loop_controller import strip_result_for_model
+
+    stripped = strip_result_for_model('done\n__FILES__:[{"name": "x.csv"}]')
+    assert "__FILES__" not in stripped
+    assert stripped.strip() == "done"
+
+
+def test_internal_temp_files_are_not_reported(tmp_path, monkeypatch):
+    """The executor's own scratch script is not a user-facing artifact."""
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(tmp_path / "sb"))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    result = tools._python_exec("print('hi')", session_id = "__LOCALID_tmp999")
+    assert "studio_exec_" not in result
+    assert "__FILES__" not in result
+
+
+def test_tool_description_says_files_are_kept():
+    from core.inference import tools
+
+    note = tools._SANDBOX_PATHS_NOTE
+    print(f"\nsandbox note = {note!r}")
+    assert "download link" in note
+    assert "name the files you created" in note
+    assert "absolute path" in note
+
+
+# ---------------------------------------------------------------------------
+# 4. Compiled cache
+# ---------------------------------------------------------------------------
+def test_compiled_cache_is_pinned_under_the_studio_home(tmp_path, monkeypatch):
+    """Not left CWD-relative, which put it in %USERPROFILE% on Windows."""
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path / "studio_home"))
+    monkeypatch.delenv("UNSLOTH_COMPILE_LOCATION", raising = False)
+
+    import importlib
+    from utils.paths import storage_roots
+
+    importlib.reload(storage_roots)
+    storage_roots.ensure_studio_directories()
+
+    location = Path(os.environ["UNSLOTH_COMPILE_LOCATION"])
+    print(f"\n[{platform.system()}] compiled cache pinned to {location}")
+    assert location.is_absolute()
+    assert str(tmp_path / "studio_home") in str(location)
+
+
+def test_cache_cleanup_finds_the_configured_and_cwd_caches(tmp_path, monkeypatch):
+    """Cleanup can now see a cache created outside the source tree.
+
+    Both cases matter: the pinned location for new installs, and the launcher's
+    CWD for a machine that already has one sitting in the user profile.
+    """
+    from utils import cache_cleanup
+
+    monkeypatch.chdir(tmp_path)
+    configured = tmp_path / "studio_home" / "compiled_cache"
+    configured.mkdir(parents = True)
+    (tmp_path / "unsloth_compiled_cache").mkdir()
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(configured))
+
+    found = {str(Path(d).resolve()) for d in cache_cleanup.get_existing_cache_dirs()}
+    print("\nfound cache dirs:")
+    for d in sorted(found):
+        print("   ", d)
+    assert str(configured.resolve()) in found
+    assert str((tmp_path / "unsloth_compiled_cache").resolve()) in found
+
+
+# ---------------------------------------------------------------------------
+# 5. Cleanup on chat delete
+# ---------------------------------------------------------------------------
+def test_deleting_a_chat_cleans_up_its_sandbox(tmp_path, monkeypatch):
+    """An empty sandbox always goes; files need an explicit opt-in."""
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(tmp_path / "sb"))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    empty = Path(tools.get_sandbox_workdir("__LOCALID_empty11"))
+    assert tools.remove_session_sandbox("__LOCALID_empty11") is True
+    assert not empty.exists()
+
+    tools._workdirs.clear()
+    withfile = Path(tools.get_sandbox_workdir("__LOCALID_files22"))
+    (withfile / "keep.csv").write_text("a\n")
+    # Not deleted implicitly: those files are the user's.
+    assert tools.remove_session_sandbox("__LOCALID_files22") is False
+    assert (withfile / "keep.csv").is_file()
+    assert tools.remove_session_sandbox("__LOCALID_files22", delete_files = True) is True
+    assert not withfile.exists()
+
+
+def test_sandbox_removal_cannot_escape_the_root(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(tmp_path / "sb"))
+
+    from core.inference import tools
+
+    outside = tmp_path / "precious"
+    outside.mkdir()
+    for bad in ("..", "../precious", "/etc", "project-abc", ""):
+        assert tools.remove_session_sandbox(bad, delete_files = True) is False
+    assert outside.is_dir()
+
+
+def test_a_windows_device_name_never_becomes_a_directory(tmp_path, monkeypatch):
+    """CON, NUL and friends are reserved on Windows even as folder names, and
+    the session id comes from the caller."""
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(tmp_path / "sb"))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    for reserved in ("con", "NUL", "aux", "COM1", "lpt9", "nul.txt"):
+        workdir = Path(tools.get_sandbox_workdir(reserved))
+        assert workdir.name == "_invalid", reserved
+        assert tools.remove_session_sandbox(reserved, delete_files = True) is False
+
+
+def test_reading_a_sandbox_never_creates_it(tmp_path, monkeypatch):
+    """A GET must not leave a folder behind for every id it is asked about."""
+    root = tmp_path / "sb"
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(root))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    resolved = Path(tools.resolve_sandbox_workdir("__LOCALID_ghost"))
+    assert resolved == root / "__LOCALID_ghost"
+    assert not resolved.exists()
+    assert not root.exists()
+    # The creating resolver still agrees on the path.
+    assert Path(tools.get_sandbox_workdir("__LOCALID_ghost")) == resolved
+    assert resolved.is_dir()
+
+
+def test_clearing_the_compiled_cache_covers_the_configured_location(tmp_path, monkeypatch):
+    """The cleanup must follow UNSLOTH_COMPILE_LOCATION, not just the defaults."""
+    pinned = tmp_path / "home" / "compiled_cache"
+    pinned.mkdir(parents = True)
+    (pinned / "unsloth_compiled_module_gemma3.py").write_text("x = 1\n")
+    (pinned / "UnslothSFTTrainer.py").write_text("x = 1\n")
+    monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(pinned))
+
+    from utils import cache_cleanup
+
+    assert pinned in cache_cleanup.get_existing_cache_dirs()
+    cache_cleanup.clear_unsloth_compiled_cache(preserve_patterns = ["Unsloth*Trainer.py"])
+    assert not (pinned / "unsloth_compiled_module_gemma3.py").exists()
+    assert (pinned / "UnslothSFTTrainer.py").is_file()
+
+
+def test_a_file_in_a_subdirectory_is_reported_and_servable(tmp_path, monkeypatch):
+    """`df.to_csv("outputs/report.csv")` is ordinary; a top-level listing saw
+    only the directory and dropped it, so no chip and no download."""
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(tmp_path / "sb"))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    workdir = Path(tools.get_sandbox_workdir("__LOCALID_nested1"))
+    before = tools._snapshot_workdir_files(str(workdir))
+    (workdir / "outputs").mkdir()
+    (workdir / "outputs" / "report.csv").write_text("a,b\n")
+    (workdir / "top.txt").write_text("x")
+
+    sentinels = tools._created_file_sentinels(str(workdir), before)
+    assert "outputs/report.csv" in sentinels
+    assert "top.txt" in sentinels
+
+
+def test_the_walk_is_bounded(tmp_path, monkeypatch):
+    """A chat that unpacked an archive must not turn a tool call into a crawl."""
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(tmp_path / "sb"))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    workdir = Path(tools.get_sandbox_workdir("__LOCALID_deep111"))
+    deep = workdir
+    for level in range(8):
+        deep = deep / f"level{level}"
+        deep.mkdir()
+        (deep / "f.txt").write_text("x")
+    found = tools._snapshot_workdir_files(str(workdir))
+    assert found, "nothing was found at all"
+    assert max(name.count("/") for name in found) < tools._MAX_SNAPSHOT_DEPTH + 1
+
+
+def test_files_written_before_a_timeout_are_still_reported(tmp_path, monkeypatch):
+    """`printf data > report.csv; sleep 999` produced that file."""
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(tmp_path / "sb"))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    result = tools._bash_exec(
+        "printf data > report.csv; sleep 30",
+        timeout = 3,
+        session_id = "__LOCALID_slowrun",
+    )
+    assert "timed out" in result
+    assert "__FILES__:" in result, result
+    assert "report.csv" in result
+
+
+def test_the_image_list_is_capped_like_the_file_list(tmp_path, monkeypatch):
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(tmp_path / "sb"))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    workdir = Path(tools.get_sandbox_workdir("__LOCALID_manyimg"))
+    before = tools._snapshot_workdir_files(str(workdir))
+    for i in range(80):
+        (workdir / f"frame{i:03d}.png").write_bytes(b"\x89PNG")
+    sentinels = tools._created_file_sentinels(str(workdir), before)
+    images = json.loads(sentinels.split("__IMAGES__:")[1])
+    files = json.loads(sentinels.split("__FILES__:")[1].split("\n")[0])
+    assert len(images) == tools._MAX_REPORTED_FILES
+    assert len(files) == tools._MAX_REPORTED_FILES
+
+
+def test_a_tool_printing_the_files_marker_keeps_its_output():
+    """Only a structurally valid trailing envelope is stripped."""
+    from core.inference.tool_loop_controller import strip_result_for_model
+
+    printed = "here is the doc:\n__FILES__:see the manual\nand the answer is 42"
+    assert strip_result_for_model(printed) == printed
+
+    real = 'output\n__FILES__:[{"name": "a.csv", "size": 3}]'
+    assert strip_result_for_model(real) == "output"
+
+
+def test_clearing_all_chats_cleans_up_their_sandboxes(tmp_path, monkeypatch):
+    """The UI's "Clear all chats" is the common bulk delete."""
+    monkeypatch.setenv("UNSLOTH_STUDIO_SANDBOX_HOME", str(tmp_path / "sb"))
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    empty = Path(tools.get_sandbox_workdir("__LOCALID_bulk111"))
+    assert empty.is_dir()
+
+    import routes.chat_history as chat_history
+
+    monkeypatch.setattr(chat_history, "list_chat_threads",
+                        lambda: [{"id": "__LOCALID_bulk111"}])
+    monkeypatch.setattr(chat_history, "clear_chat_history", lambda: None)
+    monkeypatch.setattr(chat_history, "_cancel_active_research", lambda request, ids: None)
+
+    import asyncio
+
+    body = asyncio.run(chat_history.clear_history(request = None, current_subject = "tester"))
+    assert body["sandboxes_removed"] == 1
+    assert not empty.exists()
+
+
+def test_the_legacy_migration_runs_for_a_read_too(tmp_path, monkeypatch):
+    """Right after an upgrade, opening a file must not 404 until a tool runs."""
+    home = tmp_path / "home"
+    fake_home = tmp_path / "userprofile"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(home))
+    monkeypatch.delenv("UNSLOTH_STUDIO_SANDBOX_HOME", raising = False)
+
+    legacy = fake_home / "studio_sandbox" / "__LOCALID_upgrade"
+    legacy.mkdir(parents = True)
+    (legacy / "sales.csv").write_text("a,b\n")
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    tools._legacy_sandbox_migrated = False
+    resolved = Path(tools.resolve_sandbox_workdir("__LOCALID_upgrade"))
+    assert (resolved / "sales.csv").is_file(), "the file did not follow the migration"
+
+
+def test_the_migration_is_serialised(tmp_path, monkeypatch):
+    """Two chats running their first tool call at once must not strand files."""
+    import threading
+
+    fake_home = tmp_path / "userprofile"
+    fake_home.mkdir()
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("USERPROFILE", str(fake_home))
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("UNSLOTH_STUDIO_SANDBOX_HOME", raising = False)
+
+    for index in range(6):
+        session = fake_home / "studio_sandbox" / f"__LOCALID_race{index}"
+        session.mkdir(parents = True)
+        (session / "data.csv").write_text("a\n")
+
+    from core.inference import tools
+
+    tools._workdirs.clear()
+    tools._legacy_sandbox_migrated = False
+    results = []
+
+    def first_tool_call(index):
+        results.append(Path(tools.get_sandbox_workdir(f"__LOCALID_race{index}")))
+
+    threads = [threading.Thread(target = first_tool_call, args = (i,)) for i in range(6)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert len(results) == 6
+    for workdir in results:
+        assert (workdir / "data.csv").is_file(), f"{workdir} lost its files"
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-q", "-s"]))
