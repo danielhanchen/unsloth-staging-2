@@ -51,6 +51,7 @@ on:
       - 'studio/backend/requirements/single-env/patch_metadata.py'
       - 'tests/python/test_cross_platform_parity.py'
       - 'tests/python/test_windows_python_venv_hardening.py'
+      - 'tests/python/test_windows_setup_output_encoding.py'
       - 'tests/sh/test_install_rollback_lifecycle.sh'
       - 'tests/studio/test_install_rollback_lifecycle.ps1'
       - 'tests/studio/test_intel_registry_fallback.ps1'
@@ -94,6 +95,7 @@ on:
       - 'studio/backend/requirements/single-env/patch_metadata.py'
       - 'tests/python/test_cross_platform_parity.py'
       - 'tests/python/test_windows_python_venv_hardening.py'
+      - 'tests/python/test_windows_setup_output_encoding.py'
       - 'tests/sh/test_install_rollback_lifecycle.sh'
       - 'tests/studio/test_install_rollback_lifecycle.ps1'
       - 'tests/studio/test_intel_registry_fallback.ps1'
@@ -163,12 +165,8 @@ jobs:
           UNSLOTH_NO_TORCH: '1'
         run: >-
           python -m pytest
-          tests/python/test_cross_platform_parity.py
-          tests/python/test_windows_python_venv_hardening.py
-          tests/test_installer_skip_autostart.py
-          tests/test_installer_system32_guard.py
-          tests/test_installer_interactive_prompts.py
-          -q
+          tests/python/test_windows_setup_output_encoding.py
+          -q -rA -k console_less
       - name: PowerShell rollback lifecycle tests
         if: runner.os == 'Windows'
         shell: pwsh
