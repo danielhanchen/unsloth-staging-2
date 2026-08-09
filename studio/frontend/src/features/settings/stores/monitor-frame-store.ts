@@ -71,6 +71,17 @@ const STACK_GAP = 8;
 const STACK_WIDTH = 448;
 // Never lift so far that the stack itself is pushed off the top.
 const MIN_STACK_ROOM = 120;
+// The Live monitor's own controls, measured from its border-box top edge: its
+// 1px border, 12px of panel padding (p-3), a 24px control row (the drag handle
+// and the size-6 Close button), pb-2 and its 1px rule, then mb-2, come to 54.
+// Rounded up so a font metric or a scaled border cannot eat the margin.
+const MONITOR_HEADER = 64;
+// Its native `resize` grip, in the opposite corner, which the panel grows once
+// it has been dragged or resized. Every engine that paints one draws it at the
+// platform resizer's 15px (Gecko matches its images to that size, and Chromium
+// and WebKit are the same order), so one STACK_INSET of clearance takes the
+// stack off all of them. iOS Safari paints none, which is a strict subset.
+const MONITOR_GRIP = 16;
 
 /**
  * How far above the bottom edge the overlay stack must sit to clear the Live
@@ -132,6 +143,48 @@ function roomBelow(
   return viewportHeight - bottomInset - frame.bottom - STACK_GAP;
 }
 
+/**
+ * Whether `liftOver` can actually clear this box's top edge. It clamps rather
+ * than refuses, and for a box that starts this high the clamp does not clear
+ * it, it parks the stack across the box's own top edge, which is exactly where
+ * the Live monitor's collapse and Close buttons are. Resize the monitor to fill
+ * the window and its Close button stops responding, because the loaded models
+ * card is sitting on top of it.
+ *
+ * Only the monitor gets here. The composer is a strip at the bottom of the
+ * column and never starts that high, so its dodge is unchanged.
+ */
+function tooTallToClear(frame: MonitorFrame, viewportHeight: number): boolean {
+  return (
+    viewportHeight - frame.top + STACK_GAP > viewportHeight - MIN_STACK_ROOM
+  );
+}
+
+/**
+ * Where the stack goes when there is no free space at all: inside the box, off
+ * the native resize grip in its bottom-right corner. Taking the corner instead
+ * buries that grip, which is the only way back to a smaller monitor.
+ * `stackMaxHeight` holds the top of the stack below the box's header.
+ */
+function sitInside(frame: MonitorFrame, viewportHeight: number): number {
+  return Math.max(
+    STACK_INSET,
+    viewportHeight - frame.bottom + MONITOR_GRIP + STACK_GAP,
+  );
+}
+
+/** The inset this box asks for, given the one already in force. */
+function insetFor(
+  frame: MonitorFrame,
+  viewportHeight: number,
+  bottomInset: number,
+): number {
+  if (!reachesStack(frame, viewportHeight, bottomInset)) return STACK_INSET;
+  return tooTallToClear(frame, viewportHeight)
+    ? sitInside(frame, viewportHeight)
+    : liftOver(frame, viewportHeight);
+}
+
 export function stackBottomInset(
   frame: MonitorFrame | null,
   viewportWidth: number,
@@ -140,10 +193,8 @@ export function stackBottomInset(
   if (!frame) return STACK_INSET;
   // Only dodge a box that is in the stack's column and crowds its corner; one
   // parked anywhere else leaves that corner free.
-  const inTheWay =
-    inStackColumn(frame, viewportWidth) &&
-    reachesStack(frame, viewportHeight, STACK_INSET);
-  return inTheWay ? liftOver(frame, viewportHeight) : STACK_INSET;
+  if (!inStackColumn(frame, viewportWidth)) return STACK_INSET;
+  return insetFor(frame, viewportHeight, STACK_INSET);
 }
 
 /**
@@ -164,8 +215,17 @@ export function stackMaxHeight(
 ): number {
   const ownMargin = viewportHeight - bottomInset - STACK_INSET;
   if (!frame || !inStackColumn(frame, viewportWidth)) return ownMargin;
-  // Lifted over: bottomInset already cleared it.
-  if (reachesStack(frame, viewportHeight, bottomInset)) return ownMargin;
+  if (reachesStack(frame, viewportHeight, bottomInset)) {
+    // Lifted over: bottomInset already cleared it.
+    if (!tooTallToClear(frame, viewportHeight)) return ownMargin;
+    // Sitting inside it instead, because nothing around it is free. The inset
+    // took the stack off the resize grip at the bottom; only the cap holds it
+    // off the header at the top, and an expanded download list plus the loaded
+    // models card grows from the corner far enough to reach it.
+    const belowHeader =
+      viewportHeight - bottomInset - frame.top - MONITOR_HEADER - STACK_GAP;
+    return Math.max(MIN_STACK_ROOM, Math.min(ownMargin, belowHeader));
+  }
   // At least MIN_STACK_ROOM, since anything tighter reaches at this inset.
   return Math.min(ownMargin, roomBelow(frame, viewportHeight, bottomInset));
 }
@@ -203,9 +263,7 @@ export function stackGeometry(
   for (let pass = 0; pass <= column.length; pass += 1) {
     let next = bottom;
     for (const frame of column) {
-      if (reachesStack(frame, viewportHeight, bottom)) {
-        next = Math.max(next, liftOver(frame, viewportHeight));
-      }
+      next = Math.max(next, insetFor(frame, viewportHeight, bottom));
     }
     if (next === bottom) break;
     bottom = next;

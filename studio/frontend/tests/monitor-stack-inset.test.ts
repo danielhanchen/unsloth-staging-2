@@ -119,6 +119,105 @@ test("a monitor filling the height still leaves the stack room", () => {
   assert.ok(stackBottomInset(frame, W, H) <= H - 120);
 });
 
+// Clamping the lift to the stack's floor is worse than not lifting: it puts the
+// stack across the monitor's own top edge, which is where its collapse and
+// Close controls are. The chat UI suite maximises the monitor and then clicks
+// Close, and the loaded models card swallowed the click.
+//
+// Nothing around such a monitor is free, so the stack goes inside it, and the
+// two things it may not bury are the header at the top and the native resize
+// grip in the bottom-right corner, which every engine that paints one draws at
+// the platform resizer's 15px. Both edges are checked, because the inset alone
+// does not hold the top: an expanded download list plus the card grows from the
+// bottom right back over the header.
+/** Where the stack's own edges land, given everything it dodges. */
+function stackEdges(frame: MonitorFrame, width = W, height = H) {
+  const { bottom, maxHeight } = stackGeometry(frame, width, height);
+  return { bottom, top: height - bottom - maxHeight, edge: height - bottom };
+}
+
+test("a monitor too tall to lift over keeps its header and grip clear", () => {
+  const frame: MonitorFrame = {
+    left: W - 272,
+    top: 16,
+    right: W - 16,
+    bottom: H - 16,
+  };
+  const { top, edge } = stackEdges(frame);
+  assert.ok(
+    edge <= frame.bottom - 16,
+    "the stack sits clear of the resize grip",
+  );
+  assert.ok(top >= frame.top + 64, "and stops below the header controls");
+});
+
+test("a monitor resized to fill the viewport keeps its header and grip clear", () => {
+  const frame: MonitorFrame = {
+    left: 16,
+    top: 16,
+    right: W - 16,
+    bottom: H - 16,
+  };
+  const { top, edge } = stackEdges(frame);
+  assert.ok(
+    edge <= frame.bottom - 16,
+    "the stack sits clear of the resize grip",
+  );
+  assert.ok(top >= frame.top + 64, "and stops below the header controls");
+});
+
+// Even with the composer lifting the stack higher than the monitor asked for,
+// the cap still has to hold the top clear of the header.
+test("a maximised monitor keeps its header clear under a shared lift", () => {
+  const monitor: MonitorFrame = {
+    left: 16,
+    top: 16,
+    right: W - 16,
+    bottom: H - 16,
+  };
+  const composer: MonitorFrame = {
+    left: 300,
+    top: H - 120,
+    right: W - 340,
+    bottom: H - 40,
+  };
+  const { bottom, maxHeight } = stackGeometry([monitor, composer], W, H);
+  assert.ok(H - bottom <= monitor.bottom - 16, "still off the resize grip");
+  assert.ok(
+    H - bottom - maxHeight >= monitor.top + 64,
+    "and still below the header controls",
+  );
+});
+
+// Too tall to lift over, but it stops short of the bottom edge. The corner is
+// free after all, so the stack keeps it and is capped to the room underneath
+// rather than being pushed up inside the monitor.
+test("a monitor too tall to lift over but clear of the bottom is sat under", () => {
+  const frame: MonitorFrame = {
+    left: W - 272,
+    top: 16,
+    right: W - 16,
+    bottom: H / 2 + 100,
+  };
+  const { bottom, top } = stackEdges(frame);
+  assert.equal(bottom, 16, "the corner is free, so stay in it");
+  assert.ok(top >= frame.bottom, "and the stack stays underneath the monitor");
+});
+
+// The lift is only replaced when it cannot clear; one that fits still applies.
+test("a tall monitor that can still be cleared is lifted over", () => {
+  const frame: MonitorFrame = {
+    left: W - 272,
+    top: 200,
+    right: W - 16,
+    bottom: H - 16,
+  };
+  const inset = stackBottomInset(frame, W, H);
+  assert.ok(inset > 16, "the stack must move");
+  assert.ok(H - inset <= frame.top, "no vertical overlap remains");
+  assert.ok(H - inset - 16 >= 120, "and it keeps its floor");
+});
+
 // The union was the trap. A tall monitor and the wide docked composer share
 // almost no area, so the rectangle around the pair covers most of the viewport;
 // reading that as one obstacle lifted the stack to the top of the screen and
@@ -154,7 +253,19 @@ test("two obstacles are folded one at a time, not as their bounding box", () => 
     unioned.bottom,
     "folding must not agree with the bounding box, or nothing was fixed",
   );
-  assert.ok(both.bottom < unioned.bottom, "and it must lift less, not more");
+  // Pinned on the consequence rather than the direction. Which box the union
+  // lands on depends on how its rectangle happens to fall, and the answer is
+  // wrong either way: it must fail at least one of the two boxes, where folding
+  // serves both. Direction alone was an artifact of the clamp.
+  const clears = (box: MonitorFrame, geometry: typeof both) =>
+    H - geometry.bottom <= box.top ||
+    H - geometry.bottom - geometry.maxHeight >= box.bottom;
+  assert.ok(clears(monitor, both), "folding clears the monitor");
+  assert.ok(clears(composer, both), "and the composer");
+  assert.ok(
+    !(clears(monitor, unioned) && clears(composer, unioned)),
+    "the bounding box cannot clear both, which is why it is not used",
+  );
 });
 
 test("an empty list behaves exactly like nothing published", () => {
@@ -248,11 +359,13 @@ test("a box the shared lift moves the stack into is lifted over too", () => {
 });
 
 // The same, swept: no arrangement may leave the stack overlapping a box, and no
-// cap may come out at zero or below.
+// cap may come out at zero or below. The tall heights reach boxes that fill the
+// column, where there is nowhere clear to go and the stack sits inside them
+// instead; those still have to keep the header and the resize grip usable.
 test("no pairing produces an overlap or an unusable cap", () => {
   const composer = { left: 412, top: 664, right: 1148, bottom: 814 };
   for (let bottom = 60; bottom <= CHAT_H - 16; bottom += 2) {
-    for (const height of [80, 180, 280, 400]) {
+    for (const height of [80, 180, 280, 400, 600, 814]) {
       const box = {
         left: 996,
         top: Math.max(0, bottom - height),
@@ -267,7 +380,15 @@ test("no pairing produces an overlap or an unusable cap", () => {
         for (const each of boxes) {
           const clearsAbove = CHAT_H - geometry.bottom <= each.top;
           const clearsBelow = stackTop >= each.bottom;
-          assert.ok(clearsAbove || clearsBelow, `overlap for ${label}`);
+          // Inside a box that fills the column: no overlap is possible, so the
+          // contract is the controls, not the area.
+          const clearsControls =
+            stackTop >= each.top + 64 &&
+            CHAT_H - geometry.bottom <= each.bottom - 16;
+          assert.ok(
+            clearsAbove || clearsBelow || clearsControls,
+            `overlap for ${label}`,
+          );
         }
       }
     }
