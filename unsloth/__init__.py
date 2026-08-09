@@ -12,9 +12,111 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os, importlib.util, platform
+import os, importlib.util, platform, sys
 
 os.environ["UNSLOTH_IS_PRESENT"] = "1"
+
+# Transformers 4.x imports TensorFlow / Flax merely because they are installed
+# (`processing_utils` -> `image_transforms`, on Unsloth's own import path), so a
+# broken optional backend breaks Unsloth, which uses neither: on Colab an install
+# cell that moves protobuf leaves the first `from unsloth import ...` raising
+# `cannot import name 'runtime_version'`. An explicit USE_TF=1 still wins.
+# Transformers reads these once at import, so this has to land first.
+# 5.x dropped both backends and ignores all of this.
+if "transformers" not in sys.modules:
+    _TRUE = {"1", "ON", "YES", "TRUE"}  # Transformers' ENV_VARS_TRUE_VALUES
+    # Overwrite unless the value is a real opt-in, rather than `setdefault`.
+    # `setdefault` keeps whatever is there, and "whatever is there" includes
+    # `AUTO` -- which Transformers reads as "enable if installed", the exact
+    # state this guard exists to prevent. A launcher that mirrors Transformers'
+    # own defaults into the environment therefore disabled the guard silently:
+    # verified with a broken TensorFlow on the path, `USE_TF=AUTO` plus today's
+    # `setdefault` leaves `_tf_available` True. Anything that is not an opt-in
+    # already means "off" to Transformers, so writing "0" over it changes no
+    # behaviour beyond closing that hole.
+    #
+    # Same hands-off rule as the branch below: a backend that is already
+    # imported is one in use, so opting it out would strand a working
+    # `from_tf = True` load in a process that never set the variable itself.
+    for _var, _modules, _opt_ins in (
+        ("USE_TF", ("tensorflow",), ("USE_TF", "FORCE_TF_AVAILABLE")),
+        ("USE_FLAX", ("flax", "jax"), ("USE_FLAX",)),
+    ):
+        if any(_m in sys.modules for _m in _modules):
+            continue
+        if any(os.environ.get(_v, "").upper() in _TRUE for _v in _opt_ins):
+            continue
+        os.environ[_var] = "0"
+    del _TRUE, _var, _modules, _opt_ins
+else:
+    # Usually too late for the variables, but not for the answer they feed:
+    # Transformers decided `_tf_available` / `_flax_available` from `find_spec`
+    # alone, without importing either backend, so clearing the cached flags still
+    # keeps `image_transforms` from loading a broken one. Only when the backend is
+    # genuinely unused, and never against an explicit opt-in.
+    #
+    # "Usually", because `"transformers" in sys.modules` does not mean
+    # Transformers finished importing. Python publishes a module object before
+    # running its body, so a thread part-way through `import transformers` -- or a
+    # `transformers` submodule importing Unsloth -- lands here while
+    # `transformers.utils.import_utils` does not exist yet and has therefore not
+    # read the environment. Verified with an audit hook on the real package: at
+    # the moment `import_utils` starts importing, `"transformers" in sys.modules`
+    # is already True. Left as flag-clearing only, this branch found nothing to
+    # clear, did nothing, and Transformers then set `_tf_available = True` anyway.
+    # So write the variables here too. Once Transformers has read them the write
+    # is inert, and inside that window it is the only thing that still decides.
+    # Doing it unconditionally is deliberate: waiting on another thread's import
+    # from module scope is a deadlock, not a fix.
+    _TRUE = {"1", "ON", "YES", "TRUE"}  # Transformers' ENV_VARS_TRUE_VALUES
+    _import_utils = sys.modules.get("transformers.utils.import_utils")
+    for _var, _flag, _const, _modules, _opt_ins, _cached in (
+        (
+            "USE_TF",
+            "_tf_available",
+            "USE_TF",
+            ("tensorflow",),
+            ("USE_TF", "FORCE_TF_AVAILABLE"),
+            ("USE_TF", "FORCE_TF_AVAILABLE"),
+        ),
+        (
+            "USE_FLAX",
+            "_flax_available",
+            "USE_JAX",
+            ("flax", "jax"),
+            ("USE_FLAX",),
+            ("USE_JAX",),
+        ),
+    ):
+        if any(_m in sys.modules for _m in _modules):
+            continue
+        if any(os.environ.get(_v, "").upper() in _TRUE for _v in _opt_ins):
+            continue
+        # Transformers read those variables once, at its own import, and kept
+        # the answer. A caller that set one, let Transformers consume it, then
+        # restored the environment -- a `patch.dict` around the import, a
+        # launcher that cleans up after itself -- is still opted in as far as
+        # Transformers is concerned, and `os.environ` no longer shows it. Read
+        # what Transformers actually used. Note the spelling: the environment
+        # variable is `USE_FLAX`, the constant it lands in is `USE_JAX`.
+        if any(str(getattr(_import_utils, _v, "")).upper() in _TRUE for _v in _cached):
+            continue
+        os.environ[_var] = "0"
+        try:
+            # `import_utils` can itself be mid-body: it copies the environment into
+            # `USE_TF` / `USE_JAX` at the top and derives the flag from those same
+            # globals ~150 lines later, so between the two the environment is spent
+            # and the flag does not exist yet -- the only lever left is the constant.
+            # Present means 4.x already ran that copy, so the write is inert once the
+            # flag has been derived and decisive before it. 5.x has neither name.
+            if hasattr(_import_utils, _const):
+                setattr(_import_utils, _const, "0")
+            # Absent on 5.x, and a module proxy can refuse the write.
+            if getattr(_import_utils, _flag, False):
+                setattr(_import_utils, _flag, False)
+        except (AttributeError, TypeError):
+            pass
+    del _TRUE, _import_utils, _var, _flag, _const, _modules, _opt_ins, _cached
 
 # Relax Metal's context-store timeout before MLX modules can initialize Metal.
 # Keep an explicit user value authoritative.
