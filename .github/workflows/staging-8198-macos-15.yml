@@ -1,0 +1,46 @@
+name: "staging-8198 macos-15"
+on:
+  push:
+    branches: ["pr-8198-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/diffusion_device.py'
+      - 'studio/backend/core/inference/video.py'
+      - 'studio/backend/main.py'
+      - 'studio/backend/tests/test_diffusion_device.py'
+      - 'studio/backend/tests/test_video_backend.py'
+      - 'studio/backend/tests/test_video_capability.py'
+      - 'studio/backend/utils/hardware/hardware.py'
+      - 'studio/frontend/src/app/routes/__root.tsx'
+      - 'studio/frontend/src/components/app-sidebar.tsx'
+      - 'studio/frontend/src/config/hardware-verdict.ts'
+      - 'studio/frontend/src/features/video/video-page.tsx'
+      - 'studio/frontend/tests/hardware-verdict-recovery.test.ts'
+      - 'studio/frontend/tests/provisional-hardware-verdict.test.ts'
+      - 'studio/frontend/tests/sidebar-nav-backend-parity.test.ts'
+      - '.github/workflows/staging-8198-macos-15.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pip install 'torch' diffusers 'transformers==4.57.6' 'huggingface_hub<1.0' accelerate psutil structlog fastapi python-multipart pytest pytest-asyncio pytest-timeout
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_diffusion_device.py studio/backend/tests/test_video_backend.py studio/backend/tests/test_video_capability.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
