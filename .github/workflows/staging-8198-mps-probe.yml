@@ -1,0 +1,57 @@
+name: "staging-8198 mps-probe"
+on:
+  push:
+    branches: ["pr-8198-xplat-ci"]
+    paths:
+      - 'studio/backend/core/inference/diffusion_device.py'
+      - 'studio/backend/utils/hardware/hardware.py'
+      - 'tests/studio/mps_video_probe.py'
+      - '.github/workflows/staging-8198-mps-probe.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            torch: 'torch==2.10.0'
+          - os: macos-15
+            torch: 'torch==2.10.0'
+          - os: macos-14
+            torch: 'torch==2.4.1'
+          - os: macos-15
+            torch: 'torch==2.4.1'
+          - os: macos-15
+            torch: 'torch==2.5.1'
+          - os: ubuntu-latest
+            torch: 'torch==2.10.0'
+          - os: windows-latest
+            torch: 'torch==2.10.0'
+    name: "probe ${{ matrix.os }} ${{ matrix.torch }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "${{ matrix.torch }}" || python -m pip install "${{ matrix.torch }}" --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "diffusers==0.39.0" "transformers==4.57.6" "huggingface_hub<1.0" accelerate psutil structlog fastapi python-multipart
+      - name: Probe
+        run: python tests/studio/mps_video_probe.py
