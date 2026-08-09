@@ -8,6 +8,8 @@ import ast
 import codecs
 import fnmatch
 import functools
+import hashlib
+import json
 import http.client
 import os
 import signal
@@ -24,7 +26,9 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import contextlib
 import threading
+import uuid
 import time
 import urllib.parse
 import urllib.request
@@ -7106,18 +7110,214 @@ def _get_shell_cmd(command: str) -> list[str]:
 # Per-session working directories so each chat thread gets its own sandbox.
 # Falls back to ~/studio_sandbox/_default for callers without a session_id.
 _workdirs: dict[str, str] = {}
+# Sessions with a tool call in flight. Deleting a chat unlinks its workdir, and
+# a process whose cwd has been removed fails every relative write with ENOENT.
+_active_sessions: "dict[str, int]" = {}
+# Deletions that arrived while a call was in flight. The thread is already gone
+# from history by then, so nothing would ever ask for this folder again. Keyed
+# like the above, holding every exact id that folded onto that key: on a
+# case-sensitive filesystem those are separate directories and both must go.
+_pending_removals: "dict[str, dict[str, bool]]" = {}
+_active_sessions_lock = threading.Lock()
+
+
+def _busy_owners(session_id: str) -> "dict[str, float]":
+    """pid -> when it said so, for everything still holding this sandbox."""
+    import time
+
+    entry = _recorded_workdir(_session_key(session_id), _BUSY)
+    owners: "dict[str, float]" = {}
+    now = time.time()
+    for part in (entry or "").split(","):
+        pid, _, when = part.partition(":")
+        if not pid:
+            continue
+        try:
+            at = float(when)
+        except ValueError:
+            continue
+        # Older than a tool call can run: whoever wrote it is not coming back.
+        if now - at < _BUSY_TTL_SECONDS:
+            owners[pid] = at
+    return owners
+
+
+def _mark_busy(session_id: str, busy: bool) -> None:
+    """Note in the ledger that this process is running in that sandbox.
+
+    One entry per process: two Studios can be in the same sandbox, and the one
+    that finishes first must not clear the other's note.
+    """
+    import time
+
+    mine = str(os.getpid())
+    # Both sides under one lock: two processes reading before either writes
+    # would each save a ledger without the other's lease in it.
+    with _busy_lock, _owners_file_lock(_owners_path() or ""):
+        owners = _busy_owners(session_id)
+        if busy:
+            owners[mine] = time.time()
+        else:
+            owners.pop(mine, None)
+        _record_workdir(
+            _session_key(session_id),
+            ",".join(f"{pid}:{at:.0f}" for pid, at in owners.items()) or None,
+            _BUSY,
+        )
+
+
+_busy_heartbeat: "threading.Thread | None" = None
+_busy_heartbeat_stop = threading.Event()
+
+
+def _start_busy_heartbeat() -> None:
+    """Renew this process's leases while its calls run.
+
+    A tool call can be given no timeout at all, and a lease that expires under
+    a running call lets another Studio delete the directory it is working in.
+    """
+    global _busy_heartbeat
+    with _busy_lock:
+        if _busy_heartbeat is not None and _busy_heartbeat.is_alive():
+            return
+        _busy_heartbeat_stop.clear()
+
+        def _run() -> None:
+            while not _busy_heartbeat_stop.wait(_BUSY_TTL_SECONDS / 3):
+                with _active_sessions_lock:
+                    live = [key for key, count in _active_sessions.items() if count > 0]
+                if not live:
+                    return
+                for key in live:
+                    _mark_busy(key, True)
+
+        _busy_heartbeat = threading.Thread(
+            target = _run,
+            name = "sandbox-busy-heartbeat",
+            daemon = True,
+        )
+        _busy_heartbeat.start()
+
+
+def _stop_busy_heartbeat_if_idle() -> None:
+    with _active_sessions_lock:
+        idle = not _active_sessions
+    if idle:
+        _busy_heartbeat_stop.set()
+
+
+def _busy_elsewhere(session_id: str) -> bool:
+    """Whether another process says it is running a call for this session."""
+    return any(pid != str(os.getpid()) for pid in _busy_owners(session_id))
+
+
+def _queue_pending_delete(session_id: str, delete_files: bool) -> None:
+    """Add to what is waiting on that sandbox, rather than replacing it.
+
+    Two case-variant ids share the key and are two directories, and a later
+    plain delete must not cancel an earlier request for the files.
+    """
+    key = _session_key(session_id)
+    with _owners_file_lock(_owners_path() or ""):
+        queued = _parse_pending(_recorded_workdir(key, _PENDING_DELETE))
+        queued[session_id] = delete_files or queued.get(session_id, False)
+        _record_workdir(
+            key,
+            ",".join(f"{'1' if flag else '0'}|{sid}" for sid, flag in queued.items()),
+            _PENDING_DELETE,
+        )
+
+
+def _parse_pending(entry: "str | None") -> "dict[str, bool]":
+    queued: "dict[str, bool]" = {}
+    for part in (entry or "").split(","):
+        flag, _, sid = part.partition("|")
+        if sid:
+            queued[sid] = queued.get(sid, False) or flag == "1"
+    return queued
+
+
+def _drain_pending_delete(key: str) -> None:
+    """Carry out a delete left for whoever is still up, if nobody holds it now."""
+    queued = _parse_pending(_recorded_workdir(key, _PENDING_DELETE))
+    if not queued or _busy_owners(key):
+        return
+    _record_workdir(key, None, _PENDING_DELETE)
+    for session_id, wanted in queued.items():
+        try:
+            remove_session_sandbox(session_id, delete_files = wanted)
+        except Exception:  # noqa: BLE001 - best effort, like the rest of this
+            logger.debug("deferred sandbox delete failed", exc_info = True)
+
+
+def sweep_pending_deletes() -> None:
+    """Carry out deletes that were left to whoever outlived the busy process."""
+    entries = _owners_read(_owners_path()).get(_PENDING_DELETE)
+    for key in list(entries.keys() if isinstance(entries, dict) else []):
+        _drain_pending_delete(key)
+
+
+def _session_key(session_id: "str | None") -> str:
+    """Lifecycle key for a session id.
+
+    Case-folded: two ids differing only in case are one directory on Windows and
+    on a default macOS volume, and keying them apart let a delete land while the
+    other chat was running a tool in there.
+    """
+    return (session_id or "_default").casefold()
+
+
+@contextlib.contextmanager
+def _session_in_flight(session_id: "str | None"):
+    key = _session_key(session_id)
+    with _active_sessions_lock:
+        first = _active_sessions.get(key, 0) == 0
+        _active_sessions[key] = _active_sessions.get(key, 0) + 1
+    if first and session_id:
+        _mark_busy(session_id, True)
+        _start_busy_heartbeat()
+    try:
+        yield
+    finally:
+        last = False
+        with _active_sessions_lock:
+            if _active_sessions.get(key, 0) <= 1:
+                last = True
+                _active_sessions.pop(key, None)
+                for pending_id, pending_files in _pending_removals.pop(key, {}).items():
+                    _remove_session_sandbox_locked(pending_id, pending_files)
+            else:
+                _active_sessions[key] -= 1
+        if last and session_id:
+            _mark_busy(session_id, False)
+            _stop_busy_heartbeat_if_idle()
+            # Ours was maybe the call another Studio's delete was waiting on.
+            _drain_pending_delete(key)
 
 
 # Non-matching session_ids collapse to ``_invalid`` to block cross-session escapes.
 _SESSION_ID_RE = re.compile(r"\A[A-Za-z0-9_\-]{1,64}\Z")
+# Reserved on Windows even as a directory name, and an API caller picks this id.
+_WINDOWS_DEVICE_NAMES = frozenset(
+    ["con", "prn", "aux", "nul"]
+    + [f"com{i}" for i in range(1, 10)]
+    + [f"lpt{i}" for i in range(1, 10)]
+)
 _PROJECT_SESSION_PREFIX = "project-"
+
+
+def _usable_session_id(session_id: str) -> bool:
+    """Matches the id charset and is a name every OS can hold as a directory."""
+    if not _SESSION_ID_RE.match(session_id):
+        return False
+    return session_id.split(".")[0].lower() not in _WINDOWS_DEVICE_NAMES
 
 
 def _get_project_workdir(session_id: str) -> str | None:
     if not session_id.startswith(_PROJECT_SESSION_PREFIX):
         return None
     project_id = session_id[len(_PROJECT_SESSION_PREFIX) :]
-    if not project_id or not _SESSION_ID_RE.match(project_id):
+    if not project_id or not _usable_session_id(project_id):
         return None
     try:
         from storage.studio_db import ensure_chat_project_workspace
@@ -7138,43 +7338,990 @@ def _get_project_workdir(session_id: str) -> str | None:
     return sandbox_real
 
 
+# Dropped in every session directory we create. The root can be an existing
+# shared folder the user pointed us at, and a chat id can name something already
+# in there; this is the only evidence the directory is ours to delete.
+_SANDBOX_MARKER = ".unsloth_sandbox"
+
+
+# session id -> its directory, kept under the studio home rather than in the
+# sandbox. Tools run inside their own directory and never here, so this survives
+# a marker they delete or write over, which is otherwise the only thing saying
+# an existing directory in a shared root is ours.
+_OWNERS_FILE = "sandbox_owners.json"
+# Reserved: a directory named this way belongs to the id that hashes to it, and
+# never to a chat that happens to be called the same thing.
+_DERIVED_PREFIX = "_id-"
+# Where a move in progress is noted: its own object, so no session id can name
+# one. Written before the move starts and dropped when it finishes, so an
+# interruption is the only thing that leaves one behind.
+_MIGRATING = "migrating"
+# Sessions with a call in flight, and deletes that arrived while one was. Both
+# in the ledger rather than in memory: another Studio sharing this home is
+# running its own tool calls, and its sandbox is the same directory.
+_BUSY = "busy"
+_PENDING_DELETE = "pending_delete"
+# Longer than a tool call can run, so a process that died holding an entry does
+# not keep a folder alive for good.
+_BUSY_TTL_SECONDS = 900
+# Serialises this process's read-modify-write of its own busy entry; the file
+# lock inside _record_workdir covers the other processes.
+_busy_lock = threading.Lock()
+_SESSIONS = "sessions"
+_owners_lock = threading.Lock()
+
+
+def _owners_path() -> "str | None":
+    try:
+        from utils.paths.storage_roots import studio_root
+        return os.path.join(str(studio_root()), "run", _OWNERS_FILE)
+    except Exception:  # noqa: BLE001 - no studio home, so markers alone
+        return None
+
+
+def _owners_read(path: "str | None") -> dict:
+    if not path:
+        return {}
+    try:
+        with open(path, encoding = "utf-8") as fh:
+            owners = json.load(fh)
+    except (OSError, ValueError):
+        return {}
+    return owners if isinstance(owners, dict) else {}
+
+
+def _record_key(session_id: str, section: str) -> str:
+    # Keyed by directory name in the sessions section, so a marker naming an
+    # owner can be looked up the same way whatever the id behind it looked like.
+    return _sandbox_name(session_id) if section == _SESSIONS else session_id
+
+
+def _recorded_workdir(session_id: str, section: str = _SESSIONS) -> "str | None":
+    session_id = _record_key(session_id, section)
+    entries = _owners_read(_owners_path()).get(section)
+    recorded = entries.get(session_id) if isinstance(entries, dict) else None
+    return recorded if isinstance(recorded, str) and recorded else None
+
+
+_owners_lock_depth = threading.local()
+
+
+@contextlib.contextmanager
+def _owners_file_lock(path: str):
+    """Hold the ledger across a read-modify-write, between processes too.
+
+    Two Studios can share a studio home, and a whole-file rewrite from a stale
+    snapshot drops the other one's entries. A lock that cannot be taken is not
+    a reason to lose the write, so this gives up and proceeds after a moment,
+    and steals one left behind by a process that died holding it.
+    """
+    import time
+
+    # Reentrant: a caller that needs the read and the write to be one operation
+    # takes it around both, and _record_workdir asks for it again inside.
+    depth = getattr(_owners_lock_depth, "value", 0)
+    if depth:
+        _owners_lock_depth.value = depth + 1
+        try:
+            yield
+        finally:
+            _owners_lock_depth.value = depth
+        return
+    lock = f"{path}.lock"
+    fd = None
+    deadline = time.monotonic() + 2.0
+    while fd is None and time.monotonic() < deadline:
+        try:
+            fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            try:
+                if time.time() - os.path.getmtime(lock) > 30:
+                    os.unlink(lock)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.02)
+        except OSError:
+            break
+    _owners_lock_depth.value = 1
+    try:
+        yield
+    finally:
+        _owners_lock_depth.value = 0
+        if fd is not None:
+            os.close(fd)
+            try:
+                os.unlink(lock)
+            except OSError:
+                pass
+
+
+def _record_workdir(
+    session_id: str,
+    workdir: "str | None",
+    section: str = _SESSIONS,
+) -> None:
+    """Remember (or forget) where a session's files are. Best effort.
+
+    Re-read under the lock before writing: another Studio sharing this home
+    writes the same file, and a whole-file rewrite from a stale snapshot would
+    drop its entries.
+    """
+    path = _owners_path()
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok = True)
+    except OSError:
+        return
+    session_id = _record_key(session_id, section)
+    with _owners_lock, _owners_file_lock(path):
+        owners = _owners_read(path)
+        entries = owners.get(section)
+        if not isinstance(entries, dict):
+            entries = {}
+            owners[section] = entries
+        if workdir is None:
+            if entries.pop(session_id, None) is None:
+                return
+        else:
+            if entries.get(session_id) == workdir:
+                return
+            entries[session_id] = workdir
+        try:
+            tmp = f"{path}.{os.getpid()}.tmp"
+            with open(tmp, "w", encoding = "utf-8") as fh:
+                json.dump(owners, fh)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+
+def _sandbox_name(session_id: str) -> str:
+    """The directory name for an id.
+
+    An id the filesystem cannot hold gets a name derived from it rather than a
+    shared bucket: those ids come from API clients, and one bucket meant every
+    such chat could read and delete every other one's files.
+    """
+    if _usable_session_id(session_id) and not session_id.startswith(_DERIVED_PREFIX):
+        return session_id
+    # An id that already looks derived is derived too, or it would land on the
+    # directory of whichever unusable id hashes to it.
+    return _DERIVED_PREFIX + hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:16]
+
+
+def _mark_sandbox(workdir: str, session_id: str) -> None:
+    """(Re)write the marker. Never through a link.
+
+    The file sits where tool code runs, so one replaced by a symlink would send
+    this write to whatever it points at and truncate it.
+    """
+    marker = os.path.join(workdir, _SANDBOX_MARKER)
+    try:
+        if os.path.islink(marker):
+            os.unlink(marker)
+        flags = os.O_CREAT | os.O_WRONLY | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(marker, flags, 0o600)
+        try:
+            os.write(fd, _sandbox_name(session_id).encode("utf-8"))
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _marker_owner(workdir: str) -> "str | None":
+    """The id this directory was created for, when it says.
+
+    Anything that is not an id reads as no owner rather than as somebody else's:
+    a tool writing over this file would otherwise send its own chat to a fresh
+    directory on the next launch, leaving its files behind.
+    """
+    marker = os.path.join(workdir, _SANDBOX_MARKER)
+    if os.path.islink(marker):
+        return None  # not a marker we wrote, and not one to follow
+    try:
+        with open(marker, encoding = "utf-8") as fh:
+            owner = fh.read(256).strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return owner if owner and _usable_session_id(owner) else None
+
+
+def _claimed_by_other(workdir: str, session_id: str) -> bool:
+    """Whether another session holds *workdir*, by its marker and its record."""
+    owner = _marker_owner(workdir)
+    if owner is None or owner == _sandbox_name(session_id):
+        return False
+    return _recorded_workdir(owner) == workdir
+
+
+def _trusted_record(root: str, session_id: str) -> "str | None":
+    """The recorded directory for a session, where it could have been ours.
+
+    The ledger lives under the studio home, which tool code can still reach by
+    relative path, so a forged entry must not be able to point a session
+    outside the root, at a link, or at a directory another session holds. It
+    can only ever name a directory this session would have been given anyway.
+    """
+    recorded = _recorded_workdir(session_id)
+    if not recorded or os.path.islink(recorded) or not os.path.isdir(recorded):
+        return None
+    if not _contained_in_root(recorded, root) or os.path.dirname(recorded) != root:
+        return None
+    # A name this session could have been given, exactly: ids a and ab are
+    # different chats, and a prefix test let one of them name the other's
+    # directory. A marker naming us covers the fresh names we fall back to.
+    name = _sandbox_name(session_id)
+    base = os.path.basename(recorded)
+    # The separator is what makes this safe: ab-1234 does not start with "a-",
+    # so a chat cannot reach a similarly named one, while its own disambiguated
+    # and mkdtemp names both do.
+    if base != name and not base.startswith(f"{name}-") and _marker_owner(recorded) != name:
+        return None
+    if _claimed_by_other(recorded, session_id):
+        return None
+    return recorded
+
+
+def _session_dir(root: str, session_id: str) -> str:
+    """The directory for this exact id.
+
+    Two ids differing only in case are one name on Windows and on a default
+    macOS volume. The marker says which id made the directory, and anyone else
+    gets one of their own rather than sharing files that either chat's deletion
+    would then remove. A directory already sitting in a root the user pointed
+    us at is nobody's sandbox: it is stepped around rather than run in, so no
+    tool can write a marker into it and make it look like ours.
+    """
+    recorded = _trusted_record(root, session_id)
+    if recorded:
+        return recorded  # what we wrote down when we made it
+    name = _sandbox_name(session_id)
+    plain = os.path.join(root, name)
+    # A link is never ours, whatever it points at: claiming through one writes
+    # the marker into a directory somebody else made, inside the root or not.
+    if not os.path.islink(plain):
+        owner = _marker_owner(plain)
+        if owner == name:
+            return plain
+        if owner is None and not (os.path.isdir(plain) and not _root_is_ours()):
+            return plain
+    return _disambiguated_session_dir(root, session_id)
+
+
+def _disambiguated_session_dir(root: str, session_id: str) -> str:
+    digest = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:8]
+    return os.path.join(root, f"{_sandbox_name(session_id)}-{digest}")
+
+
+# Serialises the pick-then-create below. Two case-variant ids racing on a
+# case-insensitive volume could otherwise both see an unowned name and take it.
+_assign_lock = threading.Lock()
+
+
+def _claim_sandbox(workdir: str, session_id: str) -> bool:
+    """Write the marker if nobody has, and report whether this id owns it.
+
+    O_EXCL, so of two processes creating the same directory exactly one claims
+    it and the other is told to go elsewhere.
+    """
+    marker = os.path.join(workdir, _SANDBOX_MARKER)
+    name = _sandbox_name(session_id)
+    try:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return _marker_owner(workdir) == name
+    except OSError:
+        return False
+    try:
+        os.write(fd, name.encode("utf-8"))
+    finally:
+        os.close(fd)
+    return True
+
+
+def _ensure_session_dir(root: str, session_id: str) -> str:
+    """Create this id's sandbox and claim it, stepping aside on a collision."""
+    with _assign_lock:
+        workdir = _session_dir(root, session_id)
+        if not _contained_in_root(workdir, root):
+            return _sandbox_fallback(root, "_invalid")
+        os.makedirs(workdir, exist_ok = True)
+        if _claim_sandbox(workdir, session_id):
+            _record_workdir(session_id, workdir)
+            return workdir
+        # The record is not writable from a sandbox, so it outranks whatever
+        # the marker says; and a marker naming nobody is one a tool wrote over,
+        # which at our own root nothing else could have put here.
+        if (
+            _recorded_workdir(session_id) == workdir and not _claimed_by_other(workdir, session_id)
+        ) or (_root_is_ours() and _marker_owner(workdir) is None):
+            _mark_sandbox(workdir, session_id)
+            _record_workdir(session_id, workdir)
+            return workdir
+        # Someone else got there first, so take a name of our own.
+        workdir = _disambiguated_session_dir(root, session_id)
+        if _contained_in_root(workdir, root):
+            os.makedirs(workdir, exist_ok = True)
+            if _claim_sandbox(workdir, session_id):
+                _record_workdir(session_id, workdir)
+                return workdir
+        # Both names are spoken for. A fresh one is the only thing left that is
+        # certainly ours; running in a directory we could not claim would put
+        # this chat inside someone else's files.
+        try:
+            workdir = tempfile.mkdtemp(prefix = f"{_sandbox_name(session_id)}-", dir = root)
+        except OSError:
+            return _sandbox_fallback(root, "_invalid")
+        _claim_sandbox(workdir, session_id)
+        _record_workdir(session_id, workdir)
+        logger.warning("Sandbox names for %s were taken; using %s", session_id, workdir)
+        return workdir
+
+
+def _root_is_ours() -> bool:
+    """True unless the root is a directory the user pointed us at."""
+    return not (os.environ.get("UNSLOTH_STUDIO_SANDBOX_HOME") or "").strip()
+
+
+def _sandbox_is_ours(target: str) -> bool:
+    """Ours by construction at our own root, otherwise only with the marker."""
+    if _root_is_ours():
+        return True
+    return os.path.isfile(os.path.join(target, _SANDBOX_MARKER))
+
+
+def _legacy_sandbox_root() -> str:
+    """Where the sandbox used to live: a third folder in the user's home."""
+    return os.path.join(os.path.expanduser("~"), "studio_sandbox")
+
+
+def sandbox_root() -> str:
+    """Root of the per-session tool sandboxes.
+
+    Under the studio home, so UNSLOTH_STUDIO_HOME keeps everything in one place
+    instead of leaving a stray ~/studio_sandbox. Falls back to the legacy path
+    only if the studio root cannot be resolved.
+    """
+    override = (os.environ.get("UNSLOTH_STUDIO_SANDBOX_HOME") or "").strip()
+    if override:
+        return os.path.expanduser(override)
+    try:
+        from utils.paths.storage_roots import studio_root
+        return os.path.join(str(studio_root()), "sandbox")
+    except Exception:
+        return _legacy_sandbox_root()
+
+
+_legacy_sandbox_migrated = False
+_legacy_sandbox_lock = threading.Lock()
+# Held only for a single session's move, so a first tool call never waits on
+# the whole-tree pass.
+_legacy_one_lock = threading.Lock()
+
+
+def _migrate_one_legacy_session(root: str, name: str) -> None:
+    """Bring one session up from the legacy root, without waiting for the rest.
+
+    The background migration holds its lock for the whole tree, which on
+    another filesystem is minutes; a call that only needs its own folder takes
+    a lock of its own and moves that.
+    """
+    if _legacy_sandbox_migrated:
+        return
+    source = os.path.join(_legacy_sandbox_root(), name)
+    if not os.path.isdir(source) or os.path.islink(source):
+        return
+    with _legacy_one_lock:
+        if not os.path.isdir(source):
+            return  # the background pass got there first
+        target = os.path.join(root, name)
+        if os.path.exists(target):
+            return  # a collision, left for the whole-tree pass to report
+        try:
+            os.makedirs(root, exist_ok = True)
+            _record_workdir(name, target, _MIGRATING)
+            staging = f"{target}{_STAGING_SUFFIX}{uuid.uuid4().hex[:8]}"
+            shutil.move(source, staging)
+            os.rename(staging, target)
+            _mark_migrated(target, name)
+            _record_workdir(name, target)
+            _record_workdir(name, None, _MIGRATING)
+        except OSError as error:
+            logger.warning("Could not move sandbox %s: %s", name, error)
+
+
+def _migrate_legacy_sandbox(root: str) -> None:
+    """Move sessions from ~/studio_sandbox into the studio home, once.
+
+    Those files are the user's, so they move rather than being dropped. A
+    session already present at the new root wins and its legacy copy is left
+    alone, so nothing is silently overwritten.
+    """
+    global _legacy_sandbox_migrated
+    if _legacy_sandbox_migrated:
+        return
+    # Flagged only once the move is done: setting it first let a concurrent
+    # call create the destination, which then read as a collision.
+    with _legacy_sandbox_lock:
+        if _legacy_sandbox_migrated:
+            return
+        # Only when nothing movable is left: a file locked on Windows is
+        # retryable, and one attempt strands it once the destination exists.
+        if _migrate_legacy_sandbox_locked(root):
+            _legacy_sandbox_migrated = True
+
+
+def _promote_staged_moves(root: str) -> None:
+    """Put a move that was interrupted between the copy and the rename in place.
+
+    The legacy entry is already gone by then, so nothing else would ever look
+    at the staging directory again.
+    """
+    try:
+        names = [n for n in os.listdir(root) if _STAGING_RE.match(n)]
+    except OSError:
+        return
+    for name in names:
+        staged = os.path.join(root, name)
+        session = name.rsplit(_STAGING_SUFFIX, 1)[0]
+        target = os.path.join(root, session)
+        # Only what a move of ours was in the middle of: a shared root can hold
+        # a reports.arriving-backup of the user's own.
+        if _recorded_workdir(session, _MIGRATING) != target:
+            continue
+        if not os.path.isdir(staged) or os.path.islink(staged) or os.path.exists(target):
+            continue
+        try:
+            os.rename(staged, target)
+        except OSError as error:
+            logger.warning("Could not finish a staged sandbox move: %s", error)
+            continue
+        # Claimed and recorded like the ordinary path, or an overridden root
+        # reads the recovered directory as somebody else's.
+        _mark_migrated(target, session)
+        _record_workdir(session, target)
+        _record_workdir(session, None, _MIGRATING)
+
+
+def _finish_partial_move(source: str, target: str) -> bool:
+    """Move what is left of *source* into *target*. True when nothing remains.
+
+    A cross-device move copies and then unlinks, so an interruption leaves both
+    sides. Anything already at the target wins and its copy stays below, the
+    same rule whole directories follow.
+    """
+    moved_all = True
+    try:
+        names = os.listdir(source)
+    except OSError:
+        return False
+    kept = 0
+    for name in names:
+        below = os.path.join(source, name)
+        above = os.path.join(target, name)
+        if os.path.exists(above):
+            # Deliberately left for the user, so this move is done with it: a
+            # retry would find the same conflict on every launch forever.
+            kept += 1
+            continue
+        try:
+            # Same staging trick per file: a copy in progress must not be
+            # readable at the name a download card already points at.
+            staged = f"{above}{_STAGING_SUFFIX}{uuid.uuid4().hex[:8]}"
+            shutil.move(below, staged)
+            os.rename(staged, above)
+        except OSError as error:
+            moved_all = False
+            logger.warning("Could not move sandbox file %s: %s", name, error)
+    if moved_all and not kept:
+        try:
+            os.rmdir(source)
+        except OSError:
+            return False
+    return moved_all
+
+
+def _mark_migrated(workdir: str, session_id: str) -> None:
+    """Claim a sandbox moved up from the legacy root.
+
+    It is ours: it came from our own folder. Without the marker an overridden
+    root would read it as someone else's and the chat could never remove it.
+    """
+    if os.path.isdir(workdir) and not os.path.islink(workdir):
+        _claim_sandbox(workdir, session_id)
+
+
+def _migrate_legacy_sandbox_locked(root: str) -> bool:
+    """True when the legacy root holds nothing that could still be moved.
+
+    A collision is not a failure: the new root already has that session, and the
+    legacy copy is deliberately left for the user to find.
+    """
+    legacy = _legacy_sandbox_root()
+    try:
+        if os.path.realpath(legacy) == os.path.realpath(root) or not os.path.isdir(legacy):
+            return True
+        os.makedirs(root, exist_ok = True)
+        _promote_staged_moves(root)
+        moved = 0
+        complete = True
+        for name in os.listdir(legacy):
+            source = os.path.join(legacy, name)
+            # Through the resolver, so a name already taken by something in a
+            # shared root lands at this session's own name instead of merging
+            # into a directory that is not ours.
+            # Where the last attempt was heading, if it did not finish;
+            # otherwise through the resolver, so a name already taken by
+            # something in a shared root lands at this session's own name
+            # instead of merging into a directory that is not ours.
+            # Only while it still names somewhere in this root: the override
+            # can have changed since, and moving there would put the files
+            # where nothing resolves.
+            target = _recorded_workdir(name, _MIGRATING)
+            if not target or os.path.dirname(target) != root:
+                target = _session_dir(root, name)
+            if os.path.exists(target):
+                # Ours only if we said so before starting this move: a
+                # directory that merely looks similar is somebody's own, and a
+                # claimed one is a session the new root already has, whose
+                # legacy copy is deliberately left for the user to find.
+                if _recorded_workdir(name, _MIGRATING) != target or not os.path.isdir(source):
+                    continue
+                if not _contained_in_root(target, root):
+                    continue
+                # Claimed first: a file that cannot move must not leave the
+                # destination looking like somebody else's directory.
+                _mark_migrated(target, name)
+                _record_workdir(name, target)
+                if _finish_partial_move(source, target):
+                    _record_workdir(name, None, _MIGRATING)
+                    moved += 1
+                else:
+                    complete = False
+                continue
+            try:
+                # Written first, so a move that dies part way through is still
+                # recognisable as ours on the next launch.
+                _record_workdir(name, target, _MIGRATING)
+                # Across filesystems shutil.move copies into the destination as
+                # it goes, and a card opened meanwhile would read a file that is
+                # half there. Filled under a name nothing resolves, then renamed
+                # into place, which on one filesystem is atomic.
+                staging = f"{target}{_STAGING_SUFFIX}{uuid.uuid4().hex[:8]}"
+                shutil.move(source, staging)
+                os.rename(staging, target)
+                _mark_migrated(target, name)
+                _record_workdir(name, target)
+                _record_workdir(name, None, _MIGRATING)
+                moved += 1
+            except OSError as error:
+                complete = False
+                logger.warning("Could not move sandbox %s: %s", name, error)
+        if moved:
+            logger.info("Moved %d chat sandbox folder(s) from %s to %s", moved, legacy, root)
+        # Empty only: a leftover is a collision the user should still find.
+        try:
+            os.rmdir(legacy)
+        except OSError:
+            pass
+        return complete
+    except Exception as error:
+        logger.warning("Sandbox migration skipped: %s", error)
+        return False
+
+
+def _sandbox_fallback(
+    root: str,
+    name: str,
+    create: bool = False,
+) -> str:
+    """``_default`` / ``_invalid`` under the root, contained like any session.
+
+    They are ordinary directories in a writable sandbox, so one replaced by a
+    symlink would otherwise become the root every unchecked request reads from.
+    Dropping that link is only ours to do at our own root; in a directory the
+    user pointed us at, the entry is theirs and a fresh one is used instead.
+    """
+    path = os.path.join(root, name)
+    if os.path.islink(path):
+        if _root_is_ours():
+            try:
+                os.unlink(path)
+                return path
+            except OSError:
+                pass
+    elif _root_is_ours() or not os.path.exists(path) or _marker_owner(path) == name:
+        return path
+    # In a root the user pointed us at, a directory already sitting under this
+    # name is theirs: a call with no session id would otherwise run in it. The
+    # one we made instead is remembered, so it is not a new one every call.
+    ours = _trusted_record(root, name)
+    if ours:
+        return ours
+    if not create:
+        return os.path.join(root, "_unowned", name)
+    try:
+        made = tempfile.mkdtemp(prefix = f"{name}_", dir = root)
+    except OSError:
+        return os.path.join(root, f"{name}_unusable")
+    _claim_sandbox(made, name)
+    _record_workdir(name, made)
+    return made
+
+
+def _contained_in_root(workdir: str, root: str) -> bool:
+    """Whether a resolved session path is still inside the sandbox root.
+
+    Applied to cached paths too: a directory replaced by a symlink after it was
+    cached would otherwise keep serving from wherever it now points.
+    """
+    try:
+        resolved, base = os.path.realpath(workdir), os.path.realpath(root)
+        # commonpath, not a prefix test: a filesystem root already ends in a
+        # separator, and appending another failed every real session path.
+        return resolved != base and os.path.commonpath([resolved, base]) == base
+    except (OSError, ValueError):
+        return False
+
+
+def _owned_by_session(workdir: str, session_id: str) -> bool:
+    """Whether this session may read *workdir*, for a caller that creates nothing.
+
+    ``_ensure_session_dir`` claims or steps aside; a read has to decide on what
+    is already there, and the disambiguated name can be somebody else's too.
+    """
+    if _trusted_record(os.path.dirname(workdir), session_id) == workdir:
+        return True
+    owner = _marker_owner(workdir)
+    if owner is not None:
+        return owner == _sandbox_name(session_id)
+    return _root_is_ours()
+
+
 def _get_workdir(session_id: str | None = None) -> str:
     """Return a per-session sandbox dir at mode 0o700."""
     global _workdirs
     key = session_id or "_default"
-    if key not in _workdirs or not os.path.isdir(_workdirs[key]):
-        home = os.path.expanduser("~")
-        sandbox_root = os.path.join(home, "studio_sandbox")
+    cached = _workdirs.get(key)
+    if cached is not None and not os.path.isdir(cached):
+        cached = None
+    if cached is not None and not _get_project_workdir(session_id or ""):
+        # The same checks a fresh resolve makes: the entry can have been
+        # renamed and replaced with a link to another chat's directory since,
+        # and containment alone accepts that.
+        root_now = sandbox_root()
+        if (
+            os.path.islink(cached)
+            or not _contained_in_root(cached, root_now)
+            or (session_id and not _owned_by_session(cached, session_id))
+        ):
+            cached = None
+    if cached is None:
+        _workdirs.pop(key, None)
+        sandbox_root_path = sandbox_root()
+        root_existed = os.path.isdir(sandbox_root_path)
+        # Only this chat's folder: the whole tree is moving on the startup
+        # thread, and waiting for it would hang the first tool call for as long
+        # as the copy takes.
+        if session_id:
+            _migrate_one_legacy_session(sandbox_root_path, _sandbox_name(session_id))
+        _start_legacy_migration()
         project_workdir = (
             _get_project_workdir(session_id)
-            if session_id and _SESSION_ID_RE.match(session_id)
+            if session_id and _usable_session_id(session_id)
             else None
         )
         if project_workdir:
             workdir = project_workdir
-        elif session_id and _SESSION_ID_RE.match(session_id):
-            workdir = os.path.join(sandbox_root, session_id)
-            if not os.path.realpath(workdir).startswith(os.path.realpath(sandbox_root) + os.sep):
-                workdir = os.path.join(sandbox_root, "_invalid")
         elif session_id:
-            workdir = os.path.join(sandbox_root, "_invalid")
+            workdir = _ensure_session_dir(sandbox_root_path, session_id)
         else:
-            workdir = os.path.join(sandbox_root, "_default")
+            workdir = _sandbox_fallback(sandbox_root_path, "_default", create = True)
+        created = not os.path.isdir(workdir)
         os.makedirs(workdir, exist_ok = True)
-        try:
-            os.chmod(sandbox_root, 0o700)
-        except OSError:
-            pass
-        try:
-            os.chmod(workdir, 0o700)
-        except OSError:
-            pass
+        if not project_workdir and not session_id:
+            # The fallbacks are directories like any other: claimed, so the next
+            # run knows this one is the one we made.
+            _claim_sandbox(workdir, "_default")
+        # Only a root we just created: the override can name a shared
+        # directory, and locking that down would cut off everything else.
+        if not root_existed or not (os.environ.get("UNSLOTH_STUDIO_SANDBOX_HOME") or "").strip():
+            try:
+                os.chmod(sandbox_root_path, 0o700)
+            except OSError:
+                pass
+        # Only ours: a shared root can already hold a directory with this name,
+        # and tightening it would cut off whoever else uses it.
+        if created or _sandbox_is_ours(workdir):
+            try:
+                os.chmod(workdir, 0o700)
+            except OSError:
+                pass
         _workdirs[key] = workdir
     return _workdirs[key]
 
 
 def get_sandbox_workdir(session_id: str | None = None) -> str:
     return _get_workdir(session_id)
+
+
+def resolve_sandbox_workdir(session_id: str | None = None) -> str:
+    """Where a session's sandbox would be, without creating it.
+
+    For read-only callers: serving a file must not materialise a directory for
+    every id someone asks about.
+    """
+    if session_id:
+        project = _get_project_workdir(session_id) if _usable_session_id(session_id) else None
+        if project:
+            return project
+    root = sandbox_root()
+    cached = _workdirs.get(session_id or "_default")
+    if (
+        cached
+        and not os.path.islink(cached)
+        and _contained_in_root(cached, root)
+        and (not session_id or _owned_by_session(cached, session_id))
+    ):
+        return cached
+    if not session_id:
+        return _sandbox_fallback(root, "_default")
+    workdir = _session_dir(root, session_id)
+    # Same containment _get_workdir applies: a session entry symlinked out of
+    # the root would otherwise serve whatever it points at.
+    if not _contained_in_root(workdir, root):
+        return _sandbox_fallback(root, "_invalid")
+    if os.path.isdir(workdir) and not _owned_by_session(workdir, session_id):
+        # Somebody else's, so this session has nothing here to serve. A path
+        # under a directory we never create, so a listing is empty and a
+        # download is a 404 rather than someone else's file.
+        return os.path.join(root, "_unowned", _sandbox_name(session_id))
+    return workdir
+
+
+_DETACHED_SUFFIX = ".deleting-"
+# Where a cross-filesystem move is assembled. Not a session name, so nothing
+# resolves to it while it is being filled.
+_STAGING_SUFFIX = ".arriving-"
+_STAGING_RE = re.compile(r"\A.+\.arriving-[0-9a-f]{8}\Z")
+# The exact name the rename below produces. A substring test would have matched
+# a user's own report.deleting-backup in a shared root.
+_DETACHED_RE = re.compile(r"\A.+\.deleting-[0-9a-f]{8}\Z")
+
+
+def _detached_tombstones(root: str) -> "list[str]":
+    try:
+        names = [n for n in os.listdir(root) if _DETACHED_RE.match(n)]
+    except OSError:
+        return []
+    out = []
+    for name in names:
+        candidate = os.path.join(root, name)
+        if not os.path.isdir(candidate) or os.path.islink(candidate):
+            continue
+        # The rename carries the marker with it, so a shared root's own
+        # backup.deleting-deadbeef is still not ours to remove.
+        if _sandbox_is_ours(candidate):
+            out.append(candidate)
+    return out
+
+
+_detached_swept = False
+
+
+def migrate_legacy_sandbox_in_background() -> "threading.Thread":
+    """Move the legacy sandbox up at startup, off every request.
+
+    Across filesystems this copies every session, which is not something a
+    listing or a download can wait on: those run on the event loop.
+    """
+
+    def _run() -> None:
+        try:
+            _migrate_legacy_sandbox(sandbox_root())
+        except Exception:  # noqa: BLE001 - best effort, like the rest of this
+            logger.debug("legacy sandbox migration failed", exc_info = True)
+
+    thread = threading.Thread(target = _run, name = "sandbox-migrate", daemon = True)
+    thread.start()
+    return thread
+
+
+_legacy_background: "threading.Thread | None" = None
+
+
+def _start_legacy_migration() -> "threading.Thread | None":
+    """Carry the rest of the tree up, without a call waiting on it.
+
+    One pass at a time: the migration is idempotent, but a thread per request
+    would have every one of them queueing on the same lock.
+    """
+    global _legacy_background
+    if _legacy_sandbox_migrated:
+        return None
+    with _legacy_one_lock:
+        if _legacy_background is not None and _legacy_background.is_alive():
+            return _legacy_background
+        _legacy_background = migrate_legacy_sandbox_in_background()
+        return _legacy_background
+
+
+def sweep_detached_sandboxes(root: "str | None" = None) -> None:
+    """Finish deletes a previous run was killed in the middle of.
+
+    Once per process, off the caller's thread: the worker doing the delete is a
+    daemon, so an exit leaves the renamed directory with nothing else to
+    reclaim it until someone happens to delete another chat.
+    """
+    global _detached_swept
+    if _detached_swept:
+        return
+    _detached_swept = True
+    target = root or sandbox_root()
+
+    def _run() -> None:
+        for candidate in _detached_tombstones(target):
+            shutil.rmtree(candidate, ignore_errors = True)
+
+    threading.Thread(target = _run, name = "sandbox-sweep", daemon = True).start()
+
+
+def _delete_detached(path: str, root: str) -> None:
+    """Remove a detached sandbox, and any a previous run left behind.
+
+    An exit mid-delete strands the directory under a name no session id can
+    reach, which is the accumulating folder this whole change is about.
+    """
+    shutil.rmtree(path, ignore_errors = True)
+    for candidate in _detached_tombstones(root):
+        shutil.rmtree(candidate, ignore_errors = True)
+
+
+def remove_session_sandbox(session_id: str, delete_files: bool = False) -> bool:
+    """Drop a deleted chat's sandbox. True when something was removed.
+
+    The chat was the only handle on that directory, so leaving it behind means
+    one unreachable folder per chat forever. Empty folders always go; files
+    need ``delete_files``, since they are the user's and are downloadable from
+    the chat. Project workspaces are shared and have their own delete flow.
+    """
+    if not session_id:
+        return False
+    # Only a session that really resolves to a project workspace: an imported
+    # chat whose id merely starts with the prefix gets an ordinary directory
+    # from _get_workdir, and would otherwise never be cleaned up.
+    if session_id.startswith(_PROJECT_SESSION_PREFIX) and _get_project_workdir(session_id):
+        return False
+    # The folder may still be at the legacy root right after an upgrade.
+    # Outside the lock below: it moves a tree and takes a lock of its own.
+    _migrate_legacy_sandbox(sandbox_root())
+    # Held across the decision AND the unlink: otherwise a tool can start in
+    # between and run in a directory this call then removes.
+    if _busy_elsewhere(session_id):
+        # Another Studio is running in there. Left for whichever process is
+        # still up when that call ends, rather than pulled out from under it.
+        # The id rides along: the key is folded, and the removal is not.
+        _queue_pending_delete(session_id, delete_files)
+        return False
+    key = _session_key(session_id)
+    with _active_sessions_lock:
+        if _active_sessions.get(key, 0) > 0:
+            # Queued rather than dropped: the chat is already gone from history,
+            # so no later delete or clear would ever name this session again.
+            queued = _pending_removals.setdefault(key, {})
+            queued[session_id] = delete_files or queued.get(session_id, False)
+            return False
+        return _remove_session_sandbox_locked(session_id, delete_files)
+
+
+def _forget_removed(session_id: str, target: str) -> bool:
+    """Drop the record once the directory is really gone, and not before.
+
+    Keeping the files means keeping the only note of where they are: without it
+    a card still pointing at this session resolves to nothing.
+    """
+    if os.path.isdir(target):
+        return False
+    _record_workdir(session_id, None)
+    return True
+
+
+def _holds_no_user_files(target: str) -> bool:
+    """Whether a sandbox holds nothing but (possibly empty) directories.
+
+    Our own marker does not count. Bounded like every other walk here, and a
+    tree too big to check is not one to remove without being asked.
+    """
+    budget = _MAX_SNAPSHOT_DIRS
+    for parent, _dirs, files in os.walk(target):
+        for name in files:
+            if parent == target and name in _INTERNAL_SANDBOX_FILES:
+                continue
+            return False
+        budget -= 1
+        if budget <= 0:
+            return False
+    return True
+
+
+def _remove_session_sandbox_locked(session_id: str, delete_files: bool) -> bool:
+    root = os.path.realpath(sandbox_root())
+    entry = os.path.join(root, _sandbox_name(session_id))
+    if not os.path.islink(entry):
+        entry = _session_dir(root, session_id)
+    # The entry itself, not what it resolves to: a symlink to a sibling passes
+    # the check below and would take that chat's files. Drop the link, but only
+    # at our own root: in a shared one it is the user's entry, not a sandbox.
+    if os.path.islink(entry):
+        if not _root_is_ours():
+            return False
+        try:
+            os.unlink(entry)
+            return True
+        except OSError:
+            return False
+    target = os.path.realpath(entry)
+    if os.path.dirname(target) != root or not os.path.isdir(target):  # contained
+        return False
+    if not _sandbox_is_ours(target) and _trusted_record(root, session_id) != target:
+        return False
+    # Made for a different id: the same directory on a case-insensitive volume,
+    # and those files are the other chat's.
+    owner = _marker_owner(target)
+    if owner is not None and owner != _sandbox_name(session_id):
+        return False
+    _workdirs.pop(session_id, None)
+    try:
+        if delete_files:
+            # Renamed while locked, deleted after: rmtree of a large tree would
+            # otherwise hold the lock every tool start takes, and block the
+            # event loop of the route that called this.
+            detached = f"{target}{_DETACHED_SUFFIX}{uuid.uuid4().hex[:8]}"
+            try:
+                os.rename(target, detached)
+            except OSError:
+                shutil.rmtree(target, ignore_errors = True)
+                return _forget_removed(session_id, target)
+            threading.Thread(
+                target = _delete_detached,
+                args = (detached, root),
+                name = "sandbox-delete",
+                daemon = True,
+            ).start()
+            _record_workdir(session_id, None)
+            return True
+        # Empty means no files of the user's: a tool that only ran mkdir, or
+        # deleted what it wrote, leaves directories behind, and the chat record
+        # is already gone by the time this runs.
+        if not _holds_no_user_files(target):
+            return False
+        shutil.rmtree(target, ignore_errors = True)
+        return _forget_removed(session_id, target)
+    except OSError:
+        return False
 
 
 WEB_SEARCH_TOOL = {
@@ -7213,16 +8360,23 @@ def _build_sandbox_paths_note() -> str:
     instead: without it a model assumes the pipe is its only output and declines
     to open a window it believes nobody can see.
     """
+    # Without this a model assumes its output vanished into a scratch dir and
+    # says so, which reads as "the file was not really created".
+    created = (
+        " Any file you create here is kept and shown to the user with a download "
+        "link, so name the files you created in your reply -- by file name only, "
+        "since you do not know their absolute path."
+    )
     if sys.platform != "win32":
         return (
             " Read and write files using relative paths in the current working "
             "directory, which persists for this conversation; absolute paths like "
-            "/mnt/data or /tmp/outputs do not exist."
+            "/mnt/data or /tmp/outputs do not exist." + created
         )
     return (
         " You are on Windows, and this runs on the user's own machine. Read and "
         "write files using relative paths in the current working directory, which "
-        "persists for this conversation."
+        "persists for this conversation." + created
     )
 
 
@@ -7610,24 +8764,28 @@ def execute_tool(
             cancel_event = cancel_event,
             website_policy = website_policy,
         )
+    # Both run with the session's sandbox as cwd, so a chat deleted mid-call
+    # must not unlink it from under them.
     if name == "python":
-        return _python_exec(
-            arguments.get("code", ""),
-            cancel_event,
-            effective_timeout,
-            session_id,
-            disable_sandbox = disable_sandbox,
-            output_callback = output_callback,
-        )
+        with _session_in_flight(session_id):
+            return _python_exec(
+                arguments.get("code", ""),
+                cancel_event,
+                effective_timeout,
+                session_id,
+                disable_sandbox = disable_sandbox,
+                output_callback = output_callback,
+            )
     if name == "terminal":
-        return _bash_exec(
-            arguments.get("command", ""),
-            cancel_event,
-            effective_timeout,
-            session_id,
-            disable_sandbox = disable_sandbox,
-            output_callback = output_callback,
-        )
+        with _session_in_flight(session_id):
+            return _bash_exec(
+                arguments.get("command", ""),
+                cancel_event,
+                effective_timeout,
+                session_id,
+                disable_sandbox = disable_sandbox,
+                output_callback = output_callback,
+            )
     return f"Unknown tool: {name}"
 
 
@@ -10043,9 +11201,9 @@ _MISSING_PATH_PREFIXES = (
 _QUOTED_ABS_PATH_RE = re.compile(r"""['"](/[^'"\n]+)['"]""")
 _BASH_ABS_PATH_RE = re.compile(r"(/[^\s:'\"]+):\s*No such file or directory")
 
-# The sandbox CWD is a per-thread dir under ~/studio_sandbox; an absolute path
+# The sandbox CWD is a per-session dir under the studio home; an absolute path
 # under it is a genuine local miss, not a hallucinated out-of-sandbox write.
-_SANDBOX_ROOT = os.path.join(os.path.expanduser("~"), "studio_sandbox")
+# Resolved through the same helper as _get_workdir so the two cannot drift.
 
 
 def _missing_error_lines(output: str) -> list[str]:
@@ -10082,7 +11240,7 @@ def _is_outside_workdir(abs_path: str, workdir: str | None = None) -> bool:
     or it is wrongly classed as an external habit path.
     """
     try:
-        root = os.path.realpath(workdir or _SANDBOX_ROOT)
+        root = os.path.realpath(workdir or sandbox_root())
         rp = os.path.realpath(abs_path)
     except (OSError, ValueError):
         return True
@@ -10208,6 +11366,122 @@ def _drain_process_output(
     return "".join(chunks), timed_out
 
 
+_MAX_REPORTED_FILES = 25
+# Bounded so an unpacked archive cannot turn a tool call into a filesystem
+# crawl. In path segments, the unit the download route enforces, so a card can
+# never advertise a file that route would refuse.
+_MAX_SANDBOX_PATH_SEGMENTS = 4
+_MAX_SNAPSHOT_FILES = 2000  # a shard-writing script must not blow up the result
+_MAX_SNAPSHOT_DIRS = 2000  # nor a directory-writing one stall the next call
+
+
+# The same allowlist the download route applies per segment, so a name that
+# route would refuse never reaches a file chip.
+_SERVABLE_SEGMENT_RE = re.compile(r"\A[^/\\\x00-\x1f]{1,255}\Z")
+
+
+def _servable_segment(name: str) -> bool:
+    if name in (".", "..") or not _SERVABLE_SEGMENT_RE.match(name):
+        return False
+    # Non-UTF-8 bytes in a POSIX filename surface as lone surrogates, which
+    # encodeURIComponent throws on, so the chip could never issue its download.
+    return not any("\ud800" <= ch <= "\udfff" for ch in name)
+
+
+# Studio's own bookkeeping, written by the sandbox sitecustomize. One exact
+# name we write ourselves, not a pattern reserved over names a tool may pick.
+_INTERNAL_SANDBOX_FILES = frozenset({".unsloth_sandbox_remap.json", _SANDBOX_MARKER})
+
+
+def _snapshot_workdir_files(workdir: str | None) -> "dict[str, tuple]":
+    """relative path -> change key for every regular file, for the post-run diff.
+
+    All files, not just images: a .csv the model wrote used to be invisible.
+    Size rides along with mtime because FAT/exFAT and some network volumes have
+    coarse timestamps, where an overwrite inside one tick would look unchanged.
+    """
+    snapshot: "dict[str, tuple]" = {}
+    if not workdir or not os.path.isdir(workdir):
+        return snapshot
+    # Directories are budgeted separately from files: thousands of empty output
+    # folders never reach the file cap, and this walk runs twice per tool call.
+    visited = 0
+    # Walked, not listed: a script writing outputs/report.csv is ordinary, and a
+    # top-level listing saw only the directory and dropped it.
+    for base, dirs, names in os.walk(workdir):
+        visited += 1
+        if visited > _MAX_SNAPSHOT_DIRS:
+            return snapshot
+        # depth 0 is the workdir itself, whose files are one segment.
+        depth = base[len(workdir) :].count(os.sep)
+        # Dot-directories stay out: .git, .cache and friends are where the noise
+        # lives. Dot-FILES are reported, since .gitignore is a real artifact.
+        dirs[:] = (
+            []
+            if depth >= _MAX_SANDBOX_PATH_SEGMENTS - 1
+            else [d for d in dirs if not d.startswith(".") and _servable_segment(d)]
+        )
+        for name in names:
+            if name in _INTERNAL_SANDBOX_FILES or not _servable_segment(name):
+                continue
+            path = os.path.join(base, name)
+            try:
+                if not os.path.isfile(path) or os.path.islink(path):
+                    continue
+                relative = os.path.relpath(path, workdir).replace(os.sep, "/")
+                stat = os.stat(path)
+                snapshot[relative] = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                continue
+            if len(snapshot) >= _MAX_SNAPSHOT_FILES:
+                return snapshot
+    return snapshot
+
+
+def _created_file_sentinels(
+    workdir: str | None,
+    before: "dict[str, tuple]",
+    exclude: "str | None" = None,
+) -> str:
+    """Sentinels naming the files this call created or overwrote.
+
+    ``__IMAGES__`` renders inline as before; ``__FILES__`` carries every file
+    with its size so the UI can offer a download. Both are stripped before the
+    model sees the result.
+    """
+    after = _snapshot_workdir_files(workdir)
+    # ``exclude`` is this call's own scratch script by exact name, not a pattern
+    # reserved over names a tool might pick.
+    changed = sorted(
+        name
+        for name, key in after.items()
+        if name != exclude and (name not in before or before[name] != key)
+    )
+    if not changed:
+        return ""
+
+    import json as _json
+
+    # Same cap on both: a script writing a frame per step would otherwise put
+    # every name in the result and the stored chat, and the UI would render them all.
+    images = [n for n in changed if os.path.splitext(n)[1].lower() in _IMAGE_EXTS]
+    images = images[:_MAX_REPORTED_FILES]
+    entries = []
+    for name in changed[:_MAX_REPORTED_FILES]:
+        try:
+            size = os.stat(os.path.join(workdir, name)).st_size
+        except OSError:
+            size = None
+        entries.append({"name": name, "size": size})
+
+    # __IMAGES__ stays LAST: older clients slice from it to the end of the
+    # string, so anything after would land inside their JSON.
+    out = f"\n__FILES__:{_json.dumps(entries)}"
+    if images:
+        out += f"\n__IMAGES__:{_json.dumps(images)}"
+    return out
+
+
 def _python_exec(
     code: str,
     cancel_event = None,
@@ -10245,22 +11519,17 @@ def _python_exec(
         )
 
     tmp_path = None
+    _scratch_name = None
     workdir = _get_workdir(session_id)
-    # Snapshot image mtimes to detect new and overwritten files.
-    _before: dict[str, int] = {}
-    if os.path.isdir(workdir):
-        for _name in os.listdir(workdir):
-            if os.path.splitext(_name)[1].lower() in _IMAGE_EXTS:
-                _p = os.path.join(workdir, _name)
-                if os.path.isfile(_p):
-                    try:
-                        _before[_name] = os.stat(_p).st_mtime_ns
-                    except OSError:
-                        pass
+    # Snapshot mtimes to detect new and overwritten files.
+    _before = _snapshot_workdir_files(workdir)
     try:
+        # In the workdir: Python puts it on sys.path[0], so an earlier call's
+        # helper.py stays importable and __file__ resolves inside the sandbox.
         fd, tmp_path = tempfile.mkstemp(suffix = ".py", prefix = "studio_exec_", dir = workdir)
         # utf-8 so non-ASCII in model-written code survives the OS default codec
         # (Windows cp1252 would otherwise raise UnicodeEncodeError).
+        _scratch_name = os.path.basename(tmp_path)
         with os.fdopen(fd, "w", encoding = "utf-8") as f:
             f.write(code)
 
@@ -10310,11 +11579,18 @@ def _python_exec(
         output, timed_out = _drain_process_output(
             proc, timeout, output_callback, cancel_event, pgid = pgid
         )
+        # A run that wrote its file and then hung still produced that file, so
+        # report it: `printf data > report.csv; sleep 999` is downloadable.
         if timed_out:
-            return _truncate(f"Execution timed out after {timeout} seconds.")
+            ended = _truncate(f"Execution timed out after {timeout} seconds.")
+            return ended + (
+                _created_file_sentinels(workdir, _before, _scratch_name) if session_id else ""
+            )
 
         if cancel_event is not None and cancel_event.is_set():
-            return "Execution cancelled."
+            return "Execution cancelled." + (
+                _created_file_sentinels(workdir, _before, _scratch_name) if session_id else ""
+            )
 
         result = output or ""
         if proc.returncode != 0:
@@ -10327,24 +11603,11 @@ def _python_exec(
         result = _truncate(result) if result.strip() else "(no output)"
         result += hint
 
-        # Detect new/overwritten images and append sentinel for the frontend
-        if session_id and os.path.isdir(workdir):
-            new_images = []
-            for _name in os.listdir(workdir):
-                if os.path.splitext(_name)[1].lower() not in _IMAGE_EXTS:
-                    continue
-                _p = os.path.join(workdir, _name)
-                if not os.path.isfile(_p):
-                    continue
-                try:
-                    _mtime = os.stat(_p).st_mtime_ns
-                except OSError:
-                    continue
-                if _name not in _before or _mtime != _before[_name]:
-                    new_images.append(_name)
-            if new_images:
-                import json as _json
-                result += f"\n__IMAGES__:{_json.dumps(sorted(new_images))}"
+        # Only for a chat that has an id: without one every first turn shares
+        # the _default workdir, so a card pinned to it would later download
+        # whatever the next new chat wrote there.
+        if session_id:
+            result += _created_file_sentinels(workdir, _before, _scratch_name)
 
         return result
 
@@ -10396,6 +11659,9 @@ def _bash_exec(
 
     try:
         workdir = _get_workdir(session_id)
+        # Same pre-run snapshot as _python_exec. A command that writes a file used
+        # to produce "(no output)" and no other trace anywhere in the product.
+        _before = _snapshot_workdir_files(workdir)
         safe_env = _build_bypass_env(workdir) if disable_sandbox else _build_safe_env(workdir)
         popen_kwargs = dict(
             stdout = subprocess.PIPE,
@@ -10434,11 +11700,16 @@ def _bash_exec(
         output, timed_out = _drain_process_output(
             proc, timeout, output_callback, cancel_event, pgid = pgid
         )
+        # A run that wrote its file and then hung still produced that file, so
+        # report it: `printf data > report.csv; sleep 999` is downloadable.
         if timed_out:
-            return _truncate(f"Execution timed out after {timeout} seconds.")
+            ended = _truncate(f"Execution timed out after {timeout} seconds.")
+            return ended + (_created_file_sentinels(workdir, _before) if session_id else "")
 
         if cancel_event is not None and cancel_event.is_set():
-            return "Execution cancelled."
+            return "Execution cancelled." + (
+                _created_file_sentinels(workdir, _before) if session_id else ""
+            )
 
         result = output or ""
         if proc.returncode != 0:
@@ -10446,7 +11717,11 @@ def _bash_exec(
         # Same missing-path healing as _python_exec.
         hint = _missing_path_hint(result, workdir)
         result = _truncate(result) if result.strip() else "(no output)"
-        return result + hint
+        result += hint
+        # Only for a chat that has an id (see _python_exec).
+        if session_id:
+            result += _created_file_sentinels(workdir, _before)
+        return result
 
     except Exception as e:
         return f"Execution error: {e}"
