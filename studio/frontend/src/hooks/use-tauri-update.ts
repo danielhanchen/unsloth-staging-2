@@ -22,8 +22,11 @@ export type UpdateStatus =
 export interface UpdateInfo {
   version: string;
   currentVersion: string;
-  // Backend release this build pins; CHANGELOG.md is keyed by it, not the SemVer.
+  // Backend release this build pins, which preflight checks against.
   pypiVersion?: string;
+  // latest.json's `notes`: a static download blurb the release workflow writes,
+  // the same text every release. Carried for the updater's own metadata, not
+  // shown, since the popup fetches the release's own notes.
   body?: string;
   date?: string;
 }
