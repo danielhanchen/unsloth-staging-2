@@ -3474,7 +3474,11 @@ def resolve_upstream_asset_choice(host: HostInfo, llama_tag: str) -> AssetChoice
         # whenever ROCm can run; this only rescues hosts falling through to CPU, and the
         # Vulkan bundle carries CPU backends so it degrades to today's behaviour when
         # there is no usable Vulkan device.
-        if (host.has_intel_gpu or host.has_amd_gpu_without_rocm) and not host.has_physical_nvidia and not host.has_rocm:
+        if (
+            (host.has_intel_gpu or host.has_amd_gpu_without_rocm)
+            and not host.has_physical_nvidia
+            and not host.has_rocm
+        ):
             vulkan_name = f"llama-{llama_tag}-bin-ubuntu-vulkan-x64.tar.gz"
             if vulkan_name in upstream_assets:
                 log(f"Intel GPU detected -- using upstream Vulkan prebuilt {vulkan_name}")

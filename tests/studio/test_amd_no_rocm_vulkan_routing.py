@@ -90,12 +90,12 @@ def test_hostinfo_exposes_the_flag():
 @pytest.mark.parametrize(
     "vendor_ids, expect_amd, expect_intel",
     [
-        (["0x1002"], True, False),              # AMD only
-        (["0x8086"], False, True),              # Intel only
-        (["0x8086", "0x1002"], True, True),     # Intel iGPU + AMD dGPU: both seen
-        (["0x1002", "0x8086"], True, True),     # order must not matter (no early break)
-        (["0x10de"], False, False),             # NVIDIA vendor id is not ours to claim
-        ([], False, False),                     # headless
+        (["0x1002"], True, False),  # AMD only
+        (["0x8086"], False, True),  # Intel only
+        (["0x8086", "0x1002"], True, True),  # Intel iGPU + AMD dGPU: both seen
+        (["0x1002", "0x8086"], True, True),  # order must not matter (no early break)
+        (["0x10de"], False, False),  # NVIDIA vendor id is not ours to claim
+        ([], False, False),  # headless
     ],
 )
 def test_drm_vendor_detection(monkeypatch, tmp_path, vendor_ids, expect_amd, expect_intel):
@@ -111,7 +111,9 @@ def test_drm_vendor_detection(monkeypatch, tmp_path, vendor_ids, expect_amd, exp
 def test_force_cpu_clears_the_flag():
     """--force-cpu must not leak out through the new Vulkan arm."""
     forced = ilp._apply_host_overrides(_host(has_amd_gpu_without_rocm = True), force_cpu = True)
-    assert forced.has_amd_gpu_without_rocm is False, "force_cpu left the flag set; CPU would be bypassed"
+    assert (
+        forced.has_amd_gpu_without_rocm is False
+    ), "force_cpu left the flag set; CPU would be bypassed"
     assert forced.has_intel_gpu is False
     assert forced.has_rocm is False
 
@@ -119,16 +121,18 @@ def test_force_cpu_clears_the_flag():
 @pytest.mark.parametrize(
     "host_kwargs, expect_vulkan_eligible",
     [
-        (dict(has_amd_gpu_without_rocm = True), True),                             # the widening
-        (dict(has_intel_gpu = True), True),                                        # unchanged
+        (dict(has_amd_gpu_without_rocm = True), True),  # the widening
+        (dict(has_intel_gpu = True), True),  # unchanged
         (dict(has_amd_gpu_without_rocm = True, has_physical_nvidia = True), False),  # hidden CUDA card
-        (dict(), False),                                                           # headless / CPU-only
+        (dict(), False),  # headless / CPU-only
     ],
 )
 def test_vulkan_eligibility_gate(host_kwargs, expect_vulkan_eligible):
     """Mirrors the guard used by the Linux x86_64 dispatch branches."""
     host = _host(**host_kwargs)
-    eligible = (host.has_intel_gpu or host.has_amd_gpu_without_rocm) and not host.has_physical_nvidia
+    eligible = (
+        host.has_intel_gpu or host.has_amd_gpu_without_rocm
+    ) and not host.has_physical_nvidia
     assert eligible is expect_vulkan_eligible
 
 
