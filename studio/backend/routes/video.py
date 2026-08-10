@@ -118,6 +118,11 @@ async def video_download_plan(
             # pre-quantized checkpoint has to be refused HERE, on the route that stages the
             # download, or the panel fetches ~98.7 GB before /video/load can say no.
             transformer_quant = request.transformer_quant,
+            # And task-keyed, for the pairing /video/load already refuses: the hosted MiniMax-H3
+            # prequants are keyframe denoisers, so a quantized References pick is rejected rather
+            # than staged. Without the task this route returned a 200 plan carrying that
+            # checkpoint for a request the load would then 400.
+            h3_task = request.h3_task,
         )
         # BEFORE the plan is staged, as on the images side: /video/load refuses a precision this
         # host cannot honour, but the UI plans and downloads first, so an explicit FP8 on an
@@ -149,6 +154,11 @@ async def video_download_plan(
             # checkpoint replaces the dense DiT, so without this the plan stages 66.3 GB of shards
             # the load never opens.
             transformer_quant = request.transformer_quant,
+            # And the MiniMax-H3 task, which picks WHICH denoiser partition: transformer/ (fl2va)
+            # and transformer_ref/ (ref2va) are 66.28 GB each and the load builds exactly one, so
+            # without this a References pick staged the keyframe denoiser and the load then
+            # fetched the reference one inline, outside this manager.
+            h3_task = request.h3_task,
         )
         return DiffusionDownloadPlanResponse(**plan)
     except (ValueError, FileNotFoundError) as exc:

@@ -2767,6 +2767,16 @@ async def start_diffusion_training(
             ),
         )
 
+    # Same rule for the MiniMax-H3 trainer's own restrictions, which are config-only and so
+    # answerable here: a batch > 1, a non-bf16 precision, a weighting scheme, a compile
+    # request or a conditioning-cache directory used to reach the worker and 400 there, with
+    # the user's resident models already evicted for a run that never started.
+    from core.training.diffusion_train_common import h3_train_unsupported_reason
+
+    _h3_reason = h3_train_unsupported_reason(normalized_cfg)
+    if _h3_reason:
+        raise HTTPException(status_code = 400, detail = _h3_reason)
+
     # Preflight the requested DiT precision BEFORE freeing GPU residents: the trainer's own
     # checks fire only in the child, AFTER eviction. Fail fast (400).
     from core.training.diffusion_train_common import training_precision_preflight_error
@@ -2829,10 +2839,19 @@ async def start_diffusion_training(
             raise HTTPException(status_code = 400, detail = str(e))
 
     # Run the trainers' trust gate here too, so an untrusted/typoed base 400s BEFORE freeing GPU residents rather than failing in the child.
-    from core.training.diffusion_train_common import _assert_trusted_base_model
+    from core.training.diffusion_train_common import (
+        MODULAR_BASE_FAMILIES,
+        _assert_trusted_base_model,
+    )
 
     try:
-        _assert_trusted_base_model(config.get("base_model", ""))
+        # Same answer the trainer's own call reaches. A local MiniMax-H3 pipeline is a modular
+        # directory (modular_model_index.json, no model_index.json); without this the gate here
+        # rejected it and returned 400 before the trainer that CAN load it ever ran.
+        _assert_trusted_base_model(
+            config.get("base_model", ""),
+            allow_modular = normalized_cfg.resolved_family in MODULAR_BASE_FAMILIES,
+        )
     except ValueError as e:
         raise HTTPException(status_code = 400, detail = str(e))
 
@@ -2854,7 +2873,8 @@ async def start_diffusion_training(
         # Preflight the dataset: a missing/empty/uncaptionable data_dir otherwise fails inside the trainer AFTER eviction. Same discovery the trainer runs, so the two cannot disagree.
         try:
             pairs = await asyncio.to_thread(
-                _dtc.discover_image_caption_pairs,
+                _dtc.discover_training_pairs,
+                normalized_cfg.resolved_family,
                 config["data_dir"],
                 instance_prompt = config.get("instance_prompt") or None,
                 caption_column = config.get("caption_column") or "text",
@@ -3057,12 +3077,57 @@ def _diffusion_dataset_summary(folder: Path) -> DiffusionDatasetSummary:
     )
 
 
+def _listed_dataset_clip_count(summary: DiffusionDatasetSummary) -> int:
+    """How many trainable CLIPS a listed dataset folder holds, as the dataset layer reports it.
+
+    Read off the summary with a 0 default rather than recounted here. Counting clips is the
+    dataset layer's job, and while that layer is still image-only the summary carries no clip
+    count at all, so every folder answers 0 -- which is precisely the state
+    ``_ui_trainable_families`` below has to detect. When the layer starts reporting clips this
+    starts returning them, with no edit here."""
+    try:
+        return int(getattr(summary, "clip_count", 0) or 0)
+    except (TypeError, ValueError):  # a non-numeric count is no evidence of a clip dataset
+        return 0
+
+
+def _ui_trainable_families(datasets: list[DiffusionDatasetSummary]) -> list[dict]:
+    """The trainable families to ADVERTISE in the Train picker, given the datasets this same
+    response lists as selectable.
+
+    ``family_train_infos()`` describes every family that has a trainer, which is the right
+    answer for the API: ``/diffusion/start`` accepts any of them and must keep doing so. It is
+    the wrong answer for the picker, because the picker offers a family and a dataset together.
+    The families in ``CLIP_TRAINED_FAMILIES`` train from captioned video clips and from nothing
+    else, so while every selectable dataset is stills, choosing one of them can only end in
+    Start failing with "No captioned video clips found" -- an option that cannot be completed
+    from the UI it is offered in.
+
+    Gated on the LISTED datasets rather than on a family name or a feature flag, so this needs
+    no follow-up edit: the moment the dataset layer lists a folder of clips, the family that
+    trains on clips is advertised alongside it, and if the clip listing were ever withdrawn the
+    advertisement withdraws with it. Nothing here decides whether clips are listable; it only
+    reads what the listing already said."""
+    from core.training.diffusion_train_common import CLIP_TRAINED_FAMILIES, family_train_infos
+
+    infos = family_train_infos()
+    if any(_listed_dataset_clip_count(s) > 0 for s in datasets):
+        return infos
+    return [
+        i for i in infos if str(i.get("name") or "").strip().lower() not in CLIP_TRAINED_FAMILIES
+    ]
+
+
 @router.get("/diffusion/info", response_model = DiffusionTrainingInfoResponse)
 async def diffusion_training_info(current_subject: str = Depends(get_current_subject)):
     """Describe where diffusion training reads/writes, and list usable dataset folders.
 
     A dataset folder is any direct child of the datasets root that contains at least one
-    image. The UI uses this to offer a picker instead of a blind free-text path."""
+    image. The UI uses this to offer a picker instead of a blind free-text path.
+
+    The family list is the trainable set NARROWED to what these datasets can feed: see
+    ``_ui_trainable_families``. Only the advertisement narrows -- ``/diffusion/start`` still
+    accepts every family that has a trainer."""
     from utils.paths import datasets_root, outputs_root
 
     def scan() -> DiffusionTrainingInfoResponse:
@@ -3085,9 +3150,7 @@ async def diffusion_training_info(current_subject: str = Depends(get_current_sub
                 continue
             if summary.image_count > 0:
                 found.append(summary)
-        from core.training.diffusion_train_common import family_train_infos
-
-        families = [DiffusionTrainableFamily(**info) for info in family_train_infos()]
+        families = [DiffusionTrainableFamily(**info) for info in _ui_trainable_families(found)]
         return DiffusionTrainingInfoResponse(
             datasets_root = str(root),
             outputs_root = str(outputs_root()),

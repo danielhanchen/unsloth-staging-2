@@ -983,6 +983,7 @@ class VideoBackend:
                 kind,
                 te_sources = te_sources,
                 skip_transformer_weights = skip_transformer_weights,
+                h3_task = kwargs.get("h3_task"),
                 h3_te_scheme = h3_te_scheme,
             )
             with self._lock:
@@ -1039,6 +1040,7 @@ class VideoBackend:
                         ltx23 = True,
                         te_sources = te_sources,
                         skip_transformer_weights = skip_transformer_weights,
+                        h3_task = kwargs.get("h3_task"),
                         h3_te_scheme = h3_te_scheme,
                     )
                     with self._lock:
@@ -1061,6 +1063,7 @@ class VideoBackend:
                 ltx23 = ltx23,
                 skip_te_components = te_skipped + h3_te_skipped,
                 skip_transformer_weights = skip_transformer_weights,
+                h3_task = kwargs.get("h3_task"),
                 cancel_event = cancel_event,
             )
             # The 2.3 assembly pulls per component from the hub id (its snapshot lacks the base VAEs), so it only gets the warmed cache.
@@ -1624,6 +1627,7 @@ class VideoBackend:
         ltx23: bool = False,
         skip_te_components: tuple[str, ...] = (),
         skip_transformer_weights: bool = False,
+        h3_task: Optional[str] = None,
     ) -> list[tuple[str, int]]:
         """The (rfilename, size) list a load actually needs from the base repo.
 
@@ -1647,11 +1651,25 @@ class VideoBackend:
           denoiser checkpoint (H3's transformer is 66.3 GB of its base repo).
           ``transformer/config.json`` is kept for the same reason the pre-cast
           encoders keep theirs: the pre-quant loader meta-inits the DiT from it,
-          so dropping it would break the very load that made the skip safe."""
+          so dropping it would break the very load that made the skip safe;
+        - for MiniMax-H3, the denoiser partition the requested ``h3_task`` does NOT
+          use. The repo ships two, ``transformer/`` (fl2va) and ``transformer_ref/``
+          (ref2va), 66.28 GB each, and ``load_components(workflow=...)`` builds
+          exactly one of them (diffusers' ref2va denoise step is constructed with
+          ``transformer_name="transformer_ref"``). Substituting rather than adding
+          both keeps the stage at one denoiser: listing only ``transformer/`` staged
+          the wrong 66.28 GB for a ref2va load and left the right one to be fetched
+          inline, outside the download manager's disk preflight and cancellation."""
         from .diffusion_te_prequant import is_prequant_covered_weight
+        from .video_minimax_h3 import H3_TASK_REFERENCES
 
         siblings = list(info.siblings or [])
         is_h3_modular = any(s.rfilename == "modular_model_index.json" for s in siblings)
+        h3_denoiser = (
+            "transformer_ref/"
+            if (h3_task or "").strip().lower() == H3_TASK_REFERENCES
+            else "transformer/"
+        )
         h3_prefixes = (
             "audio_scheduler/",
             "audio_vae/",
@@ -1659,7 +1677,7 @@ class VideoBackend:
             "scheduler/",
             "text_encoder/",
             "tokenizer/",
-            "transformer/",
+            h3_denoiser,
             "vae/",
         )
         files: list[tuple[str, int]] = []
@@ -1700,6 +1718,7 @@ class VideoBackend:
         ltx23: bool = False,
         te_sources: Optional[dict[str, Any]] = None,
         skip_transformer_weights: bool = False,
+        h3_task: Optional[str] = None,
         h3_te_scheme: Optional[str] = None,
     ) -> Optional[int]:
         """Total bytes this load will pull (checkpoint + companions), or None.
@@ -1733,6 +1752,7 @@ class VideoBackend:
                         ltx23 = ltx23,
                         skip_te_components = skip_te_components,
                         skip_transformer_weights = skip_transformer_weights,
+                        h3_task = h3_task,
                     )
                 )
             return total or None
@@ -1750,6 +1770,7 @@ class VideoBackend:
         hf_token: Optional[str] = None,
         transformer_quant: Optional[str] = None,
         text_encoder_quant: Optional[str] = None,
+        h3_task: Optional[str] = None,
         **load_kwargs: Any,
     ) -> dict[str, Any]:
         """The repos + exact files this pick needs, for staging through the Hub download
@@ -1764,7 +1785,12 @@ class VideoBackend:
         ``transformer_quant`` is read for the mirror-image reason on the denoiser: a scheme with a
         hosted PRE-QUANTIZED checkpoint replaces the dense DiT, so staging those shards would cost
         66.3 GB the load never opens. It used to be swallowed by ``**load_kwargs`` and the plan
-        stayed dense-sized."""
+        stayed dense-sized.
+
+        ``h3_task`` picks MiniMax-H3's denoiser partition for the same reason: the repo ships
+        ``transformer/`` and ``transformer_ref/`` at 66.28 GB each and the load builds exactly one
+        of them, so a ref2va pick staged through this plan without it downloaded the fl2va
+        denoiser and then fetched the ref2va one inline, outside the download manager."""
         from huggingface_hub import HfApi
 
         fam = _detect_load_family(repo_id, gguf_filename, family_override)
@@ -1867,6 +1893,7 @@ class VideoBackend:
                         skip_transformer_weights = self._denoiser_prequant_covered(
                             fam, transformer_quant, base
                         ),
+                        h3_task = h3_task,
                     ),
                 )
         except Exception as exc:  # noqa: BLE001 -- an unavailable plan falls back to the inline pull
@@ -1993,6 +2020,7 @@ class VideoBackend:
         ltx23: bool = False,
         skip_te_components: tuple[str, ...] = (),
         skip_transformer_weights: bool = False,
+        h3_task: Optional[str] = None,
         cancel_event: Optional[threading.Event] = None,
     ) -> Optional[str]:
         """Pull exactly the base-repo files the load needs; return the local snapshot dir.
@@ -2017,6 +2045,7 @@ class VideoBackend:
                 ltx23 = ltx23,
                 skip_te_components = skip_te_components,
                 skip_transformer_weights = skip_transformer_weights,
+                h3_task = h3_task,
             )
             if not any(name == "model_index.json" for name, _ in files):
                 return None
@@ -3459,7 +3488,11 @@ class VideoBackend:
                 result["mp4_bytes"],
                 {
                     "prompt": gen_kwargs["prompt"],
-                    "negative_prompt": gen_kwargs.get("negative_prompt"),
+                    # From the RESULT, not the request, exactly like guidance below: a
+                    # guidance-distilled family consumes no negative prompt on either engine, and
+                    # persisting the caller's string made the restored recipe claim conditioning
+                    # that never reached a sampler.
+                    "negative_prompt": result.get("negative_prompt"),
                     "width": result["width"],
                     "height": result["height"],
                     "num_frames": result["num_frames"],
@@ -3597,6 +3630,22 @@ class VideoBackend:
                 )
                 steps = int(steps or default_steps)
                 guidance = float(default_guidance if guidance is None else guidance)
+                # A guidance-free family (supports_cfg=False, MiniMax-H3) forwards no CFG control
+                # to either engine: the diffusers branch below skips the kwarg entirely and the
+                # native branch pins --cfg-scale 1.0. The requested number therefore never reached
+                # a sampler, so recording it would label the clip and its gallery sidecar with a
+                # parameter that did nothing. Normalise to the family default instead of refusing:
+                # the value is inert, and a 422 would break every caller that sends the generic
+                # default. negative_prompt goes the same way and for the same reason: a negative
+                # prompt IS the unconditional branch, so a family without one consumes it on
+                # neither engine (the diffusers call adds the kwarg only when the pipeline
+                # signature has it, which a guidance-distilled workflow does not, and
+                # SdCppVideoGenParams has no field for it at all). Left as sent, it reached the
+                # gallery sidecar and the restored recipe claimed conditioning that never touched
+                # a sampler.
+                if not fam.supports_cfg:
+                    guidance = float(default_guidance)
+                    negative_prompt = None
                 shift, audio_shift = self._resolve_flow_shifts(
                     fam, state.engine, flow_shift, audio_flow_shift
                 )
@@ -3894,6 +3943,10 @@ class VideoBackend:
                     "conditioning": conditioning,
                     "steps": steps,
                     "guidance": guidance,
+                    # The EFFECTIVE negative prompt, like guidance beside it: a guidance-distilled
+                    # family normalises it away above, so the sidecar records what conditioned the
+                    # clip instead of what the caller happened to send.
+                    "negative_prompt": negative_prompt,
                     "flow_shift": shift,
                     "audio_flow_shift": audio_shift,
                     # The BUILD this clip came off, read from the ENGAGED state and never from the
@@ -4236,9 +4289,24 @@ class VideoBackend:
                     "conditioning": conditioning,
                     "steps": steps,
                     "guidance": guidance,
+                    # sd-cli's vid_gen mode has no negative-prompt input at all
+                    # (SdCppVideoGenParams carries no field for one), and this path serves only
+                    # MiniMax-H3, which is guidance-distilled. Recorded as the None it ran with.
+                    "negative_prompt": None,
                     "flow_shift": flow_shift,
                     # sd.cpp pins the audio schedule, so the recipe records what it actually ran.
                     "audio_flow_shift": state.family.default_audio_flow_shift,
+                    # The BUILD this clip came off, exactly as the diffusers path records it and
+                    # from the ENGAGED state rather than the request. _run_generate persists these
+                    # with result.get(...), so omitting them wrote nulls into the sidecar and two
+                    # clips off different GGUF quantizations of the same repo became
+                    # indistinguishable and unreproducible.
+                    "model_kind": state.kind,
+                    "gguf_filename": state.gguf_filename,
+                    "transformer_quant": state.transformer_quant,
+                    "text_encoder_quant": state.text_encoder_quant,
+                    "memory_mode": state.memory_mode,
+                    "offload_policy": state.offload_policy,
                 }
             finally:
                 output_path.unlink(missing_ok = True)
