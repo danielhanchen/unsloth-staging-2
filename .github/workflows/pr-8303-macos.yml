@@ -1,0 +1,90 @@
+name: "PR-8303 macos-14 MLX blockers"
+
+on:
+  push:
+    branches: [pr8303-macos-mlx]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  blockers:
+    runs-on: macos-14
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Confirm this really is Apple Silicon
+        run: |
+          python -c "import platform; print(platform.system(), platform.machine())"
+          python -c "import platform, sys; sys.exit(0 if (platform.system()=='Darwin' and platform.machine()=='arm64') else 1)"
+
+      - run: python -m pip install --upgrade pip packaging pytest structlog
+
+      - name: No MLX at all names all three packages
+        run: |
+          cd studio/backend
+          python -c "
+          from utils.mlx_repair import mlx_stack_available, mlx_stack_blockers
+          blockers = mlx_stack_blockers()
+          print(blockers)
+          assert mlx_stack_available() is False
+          assert len(blockers) == 3, blockers
+          assert all('is not installed' in b for b in blockers), blockers
+          "
+
+      - name: A backtracked mlx-vlm is named with the version it found
+        run: |
+          python -m pip install 'mlx>=0.22.0' 'mlx-lm>=0.22.0' 'mlx-vlm==0.1.12'
+          cd studio/backend
+          python -c "
+          from utils.mlx_repair import mlx_stack_available, mlx_stack_blockers
+          blockers = mlx_stack_blockers()
+          print(blockers)
+          assert mlx_stack_available() is False
+          assert any('mlx-vlm' in b and 'older than 0.4.4' in b for b in blockers), blockers
+          "
+
+      - name: A current stack reports nothing, or names the import that fails
+        run: |
+          python -m pip install --upgrade 'mlx-vlm>=0.4.4'
+          cd studio/backend
+          python -c "
+          from utils.mlx_repair import mlx_stack_available, mlx_stack_blockers
+          blockers = mlx_stack_blockers()
+          print('blockers:', blockers)
+          print('available:', mlx_stack_available())
+          # Either the stack is usable and says nothing, or it is not and says why.
+          # The point of the change is that the second case is never silent.
+          assert bool(blockers) == (not mlx_stack_available())
+          for b in blockers:
+              assert 'does not import' in b or 'older than' in b or 'not installed' in b, b
+          "
+
+      - name: detect_hardware records the detail on the mlx_unavailable verdict
+        run: |
+          cd studio/backend
+          python -c "
+          from utils.hardware import hardware as hw
+          device = hw.detect_hardware()
+          print('device', device, 'chat_only', hw.CHAT_ONLY, hw.CHAT_ONLY_REASON, hw.CHAT_ONLY_DETAIL)
+          if hw.CHAT_ONLY_REASON == 'mlx_unavailable':
+              assert hw.CHAT_ONLY_DETAIL, 'the verdict was reached with nothing to say about it'
+          else:
+              assert hw.CHAT_ONLY_DETAIL is None, hw.CHAT_ONLY_DETAIL
+          "
+
+      - name: The unit suite, on the platform it describes
+        run: |
+          cd studio/backend
+          python -m pytest tests/test_mlx_stack_blockers.py tests/test_mlx_repair.py -q
