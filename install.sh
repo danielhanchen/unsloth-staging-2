@@ -3693,6 +3693,29 @@ case "$_torch_index_leaf" in
         TORCHVISION_CONSTRAINT="torchvision>=0.19,<0.27.0"
         TORCHAUDIO_CONSTRAINT="torchaudio>=2.4,<2.12.0"
         ;;
+    # The cpu index ships the full 2.11 trio (torch 2.11.0+cpu, torchvision 0.26.0+cpu,
+    # torchaudio 2.11.0+cpu) for cp312/cp313, on the same manylinux_2_28 platform tag the
+    # 2.10 cpu wheels already used -- so this raises no glibc floor and cannot strand an
+    # older distro.
+    #
+    # The companions move with torch, matching how the rocm7.2 arm pins its trio. To be
+    # precise about what this is NOT: the bounded companion defaults above already prevent
+    # the bare-companion mismatch described there. Verified with a resolve against this
+    # index -- with the current bounds it yields a consistent torch/torchaudio/torchvision
+    # 2.10/2.10/0.25 set, and only bare companion NAMES reproduce torch 2.10.0+cpu with
+    # torchaudio 2.11.0+cpu. So this keeps that property one version up; it fixes nothing.
+    #
+    # Linux/WSL only. macOS resolves through this same leaf (get_torch_index_url returns
+    # $_base/cpu on Darwin) and its arm64 wheels have had no smoke pass here, so macOS keeps
+    # the default window and the Python 3.13 >=2.6 floor set earlier. Windows never runs this
+    # script.
+    cpu)
+        if [ "$OS" != "macos" ]; then
+            TORCH_CONSTRAINT="torch>=2.11.0,<2.12.0"
+            TORCHVISION_CONSTRAINT="torchvision>=0.26.0,<0.27.0"
+            TORCHAUDIO_CONSTRAINT="torchaudio>=2.11.0,<2.12.0"
+        fi
+        ;;
     # Floor 2.6, not the generic 2.4: unsloth/models/_utils.py raises at import for an XPU
     # device below it, so a mirror serving an older +xpu wheel would install something that
     # cannot run. Reached only through an explicit pin (no Intel autodetect on this side).

@@ -326,7 +326,9 @@ assert_eq "install.sh lowercases _torch_index_leaf" "yes" "$_has_lc_ok"
 # and gfx120x-all get the floor, while non-2.11 leaves keep the default.
 run_floor_case() {
     _url="$1"
+    _os="${2:-linux}"
     bash -c '
+        OS="$2"
         TORCH_CONSTRAINT="torch>=2.4,<2.11.0"
         TORCHVISION_CONSTRAINT="torchvision"
         TORCHAUDIO_CONSTRAINT="torchaudio"
@@ -339,9 +341,16 @@ run_floor_case() {
                 TORCHVISION_CONSTRAINT="torchvision>=0.26.0,<0.27.0"
                 TORCHAUDIO_CONSTRAINT="torchaudio>=2.11.0,<2.12.0"
                 ;;
+            cpu)
+                if [ "$OS" != "macos" ]; then
+                    TORCH_CONSTRAINT="torch>=2.11.0,<2.12.0"
+                    TORCHVISION_CONSTRAINT="torchvision>=0.26.0,<0.27.0"
+                    TORCHAUDIO_CONSTRAINT="torchaudio>=2.11.0,<2.12.0"
+                fi
+                ;;
         esac
         echo "$TORCH_CONSTRAINT"
-    ' _ "$_url"
+    ' _ "$_url" "$_os"
 }
 
 assert_eq "gfx120X-all (capital) -> 2.11 floor" "torch>=2.11.0,<2.12.0" \
@@ -362,8 +371,27 @@ assert_eq "rocm6.4 -> default (no floor)" "torch>=2.4,<2.11.0" \
     "$(run_floor_case 'https://download.pytorch.org/whl/rocm6.4')"
 assert_eq "cu128 -> default (no floor)" "torch>=2.4,<2.11.0" \
     "$(run_floor_case 'https://download.pytorch.org/whl/cu128')"
-assert_eq "cpu -> default (no floor)" "torch>=2.4,<2.11.0" \
-    "$(run_floor_case 'https://download.pytorch.org/whl/cpu')"
+# cpu leaf: Linux/WSL take the 2.11 trio, macOS keeps the default window (it resolves
+# through this same leaf on Darwin and has had no smoke pass).
+assert_eq "cpu (linux) -> 2.11 floor" "torch>=2.11.0,<2.12.0" \
+    "$(run_floor_case 'https://download.pytorch.org/whl/cpu' linux)"
+assert_eq "cpu (wsl) -> 2.11 floor" "torch>=2.11.0,<2.12.0" \
+    "$(run_floor_case 'https://download.pytorch.org/whl/cpu' wsl)"
+assert_eq "cpu (macos) -> default (no floor)" "torch>=2.4,<2.11.0" \
+    "$(run_floor_case 'https://download.pytorch.org/whl/cpu' macos)"
+assert_eq "cpu trailing slash (linux) -> 2.11 floor" "torch>=2.11.0,<2.12.0" \
+    "$(run_floor_case 'https://download.pytorch.org/whl/cpu/' linux)"
+# A mirror whose BASE path contains cpu but whose leaf does not must not be floored.
+assert_eq "cpu-private leaf -> default (no floor)" "torch>=2.4,<2.11.0" \
+    "$(run_floor_case 'https://mirror.example/whl/cpu/cpu-private' linux)"
+
+# Structural: the cpu arm exists and is gated so macOS is untouched.
+_cpu_case=$(grep -c '^    cpu)$' "$INSTALL_SH" || true)
+_has_cpu_case=$([ "$_cpu_case" -ge 1 ] && echo "yes" || echo "no")
+assert_eq "cpu index case adjusts TORCH_CONSTRAINT" "yes" "$_has_cpu_case"
+_cpu_mac_gate=$(grep -c 'if \[ "\$OS" != "macos" \]; then' "$INSTALL_SH" || true)
+_has_mac_gate=$([ "$_cpu_mac_gate" -ge 1 ] && echo "yes" || echo "no")
+assert_eq "cpu floor is gated off macOS" "yes" "$_has_mac_gate"
 
 # ======================================================================
 # Summary
