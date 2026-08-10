@@ -4021,7 +4021,16 @@ elif case "$TORCH_INDEX_URL" in */rocm*|*/gfx*) true ;; *) false ;; esac; then
         step "gpu" "AMD ROCm"
     fi
     _rocm_root="${ROCM_PATH:-${HIP_PATH:-/opt/rocm}}"
-    substep "ROCm: $_rocm_root"
+    # Only claim a path that is really there. /opt/rocm is a FALLBACK, not a
+    # detection: _has_amd_rocm_gpu() accepts rocminfo/amd-smi on their own, so a
+    # runtime-only ROCm (driver plus libraries, no SDK tree) reaches here with
+    # nothing at /opt/rocm. Reporting it anyway sent anyone debugging a ROCm setup
+    # off to inspect a directory that does not exist.
+    if [ -d "$_rocm_root" ]; then
+        substep "ROCm: $_rocm_root"
+    else
+        substep "ROCm: runtime detected (no SDK tree at $_rocm_root)"
+    fi
     [ -n "$_gpu_rocm_ver" ] && substep "hipconfig: $_gpu_rocm_ver"
     [ -n "$_gpu_disp_mkt" ] && [ -n "$_gpu_disp_gfx" ] && substep "GPU: $_gpu_disp_mkt"
 elif [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
