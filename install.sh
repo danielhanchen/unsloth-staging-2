@@ -4701,6 +4701,42 @@ fi
 # the shim path (the directory guard above already rejects a real directory).
 ln -sfn "$VENV_DIR/bin/unsloth" "$_shim_path"
 
+# Persist $HOME/.local/bin on PATH for FUTURE shells by appending to the shell rc ($1).
+#
+# History: the three `echo ... >> "$_SHELL_PROFILE"` lines ran unguarded. Combined with
+# the `set -e` at the top of this script, a shell rc that cannot be written aborted the
+# installer at its very last cosmetic step -- AFTER the venv, llama.cpp and the shim were
+# all in place. The user saw "Unsloth Studio Installed" immediately followed by a hard
+# failure and a non-zero exit, and the Tauri/AppImage path (which runs this script and
+# surfaces its exit code) reported the whole install as failed.
+#
+# Immutable and managed home directories hit this every single time: NixOS and
+# home-manager symlink ~/.bashrc into the read-only Nix store, and dotfile managers
+# (chezmoi, GNU stow, yadm) do the same. Read-only rc files are a supported way to run a
+# Linux desktop, not a broken machine, so they must not fail an otherwise good install.
+#
+# The contract now: an rc file we cannot write is a WARNING carrying the exact line to
+# add by hand, never a failure. The three lines are also appended in ONE redirect, so a
+# write that dies midway (full disk, quota) can no longer leave a dangling
+# "# Added by Unsloth installer" comment with no export beneath it.
+_persist_local_bin_on_path() {  # shell rc path ("" when none was found)
+    [ -n "$1" ] || return 0
+    grep -q '\.local/bin' "$1" 2>/dev/null && return 0
+    if {
+        echo ''
+        echo '# Added by Unsloth installer'
+        echo 'export PATH="$HOME/.local/bin:$PATH"'
+    } >> "$1" 2>/dev/null; then
+        step "path" "added ~/.local/bin to PATH in $1"
+    else
+        step "path" "could not write $1 -- it is read-only or managed" "$C_WARN"
+        substep "Unsloth is installed and works; only the PATH line is missing."
+        substep "Add this to your shell config to get 'unsloth' in new shells:"
+        substep '  export PATH="$HOME/.local/bin:$PATH"'
+    fi
+    return 0
+}
+
 case ":$PATH:" in
     *":$_LOCAL_BIN:"*) ;;  # already on PATH
     *)
@@ -4716,14 +4752,7 @@ case ":$PATH:" in
             elif [ -f "$HOME/.profile" ]; then
                 _SHELL_PROFILE="$HOME/.profile"
             fi
-            if [ -n "$_SHELL_PROFILE" ]; then
-                if ! grep -q '\.local/bin' "$_SHELL_PROFILE" 2>/dev/null; then
-                    echo '' >> "$_SHELL_PROFILE"
-                    echo '# Added by Unsloth installer' >> "$_SHELL_PROFILE"
-                    echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$_SHELL_PROFILE"
-                    step "path" "added ~/.local/bin to PATH in $_SHELL_PROFILE"
-                fi
-            fi
+            _persist_local_bin_on_path "$_SHELL_PROFILE"
             export PATH="$_LOCAL_BIN:$PATH"
         fi
         ;;
