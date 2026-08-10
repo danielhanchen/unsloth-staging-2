@@ -32,4 +32,4 @@ jobs:
       - name: Run the simulations on this OS
         env:
           PR_BACKEND: ${{ github.workspace }}/pr/studio/backend
-        run: python -m pytest sims -q --timeout=180
+        run: python -m pytest sims -q --timeout=180 -o python_files="sim_*.py"
