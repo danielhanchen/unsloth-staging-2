@@ -40,7 +40,8 @@ jobs:
         run: python ci_dmg_probe.py .
       - name: stale asset must be rejected
         run: |
-          git show HEAD~1^1:studio/src-tauri/dmg/background.tiff > stale.tiff
+          merge=$(git rev-list --merges -1 HEAD)
+          git show "$merge^1:studio/src-tauri/dmg/background.tiff" > stale.tiff
           python ci_dmg_probe.py . stale.tiff
       - name: the branding suite itself
         run: python -m pytest tests/studio/test_tauri_branding_contract.py -q --tb=short
