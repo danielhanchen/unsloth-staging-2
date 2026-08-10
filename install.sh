@@ -596,6 +596,29 @@ _resolve_studio_destinations() {
 }
 _resolve_studio_destinations
 VENV_DIR="$STUDIO_HOME/unsloth_studio"
+
+# Keep uv's cache on the same filesystem as the venv it fills.
+#
+# uv HARDLINKS wheels out of its cache into the venv when both sit on one
+# filesystem, and falls back to COPYING when they do not. Measured with
+# torch 2.11.0+cpu: co-located, a 749 MB cache and a 748 MB venv occupy 755 MB
+# between them (st_nlink 2 on the shared objects); split across a filesystem
+# boundary the same files are duplicated outright (st_nlink 1).
+#
+# uv's default cache is $HOME/.cache/uv, while STUDIO_HOME can be moved anywhere
+# with UNSLOTH_STUDIO_HOME. Every such install -- Studio on an SD card or a second
+# disk, which is the usual reason to redirect it -- therefore paid twice the disk
+# cost AND left several GB of cache on the drive the user deliberately moved off.
+# Scoping the cache under STUDIO_HOME also means it leaves with the install rather
+# than accumulating in a shared cache across upgrades.
+#
+# An explicit UV_CACHE_DIR from the caller always wins; uv creates the directory
+# itself, so a failed mkdir here is not fatal.
+if [ -z "${UV_CACHE_DIR:-}" ]; then
+    UV_CACHE_DIR="$STUDIO_HOME/cache/uv"
+    export UV_CACHE_DIR
+    mkdir -p "$UV_CACHE_DIR" 2>/dev/null || true
+fi
 _VENV_ROLLBACK_DIR=""
 _VENV_ROLLBACK_TARGET="$VENV_DIR"
 _VENV_ROLLBACK_ACTIVE=false
