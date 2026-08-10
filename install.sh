@@ -2972,7 +2972,37 @@ get_torch_index_url() {
             echo "[WARN] For GPU PyTorch, install or repair rocminfo/amd-smi (e.g. sudo pacman -S rocm-hip-sdk) and re-run this installer." >&2
             echo "$_base/cpu"; return
         fi
-        # AMD GPU confirmed -- detect ROCm version
+        # Archs measured to compute INCORRECTLY under ROCm route to CPU instead.
+        #
+        # This is deliberately NOT "everything outside AMD's hardware support table".
+        # unsloth serves several archs AMD does not list, on purpose and with evidence:
+        # gfx906 (MI50 / Radeon VII) through the rocm6.3 legacy index, verified there
+        # with torch 2.7.0, and gfx1031-gfx1036 through gfx103X-all (#7277). Gating on
+        # AMD's table alone would silently drop support that is known to work.
+        #
+        # gfx1033 (Van Gogh, the Steam Deck APU) is different: ROCm wheels install on
+        # it and then return wrong answers rather than refusing. Training diverges to a
+        # negative MSE loss and then NaN, and torch.autograd.gradcheck fails in float64
+        # -- reproduced on rocm7.1/torch 2.10, rocm7.2/torch 2.11 and AMD's own native
+        # gfx1033 build from TheRock, while forward math matches CPU to 4.2e-07. It is
+        # in gfx103X-all above, so without this it would be routed to ROCm wheels the
+        # moment a ROCm runtime is present. Full measurements in
+        # studio/ROCM_RDNA2_APU.md.
+        #
+        # Deliberately inline rather than a helper: get_torch_index_url is extracted on
+        # its own by several test harnesses, and a helper they did not also extract
+        # would be an undefined command whose negation sends every ROCm case to the cpu
+        # index. Keeping the gate in the function body means every harness gets it.
+        #
+        # Escape hatch: a pinned UNSLOTH_TORCH_INDEX_URL returns long before this point.
+        case "$(printf '%s' "${_amd_gfx_probe%%:*}" | tr '[:upper:]' '[:lower:]')" in
+            gfx1033)
+                echo "[WARN] AMD gfx1033 (Van Gogh) computes incorrect results under ROCm -- installing CPU-only PyTorch." >&2
+                echo "[WARN] ROCm wheels install on it but training diverges to NaN and gradcheck fails; forward math is fine." >&2
+                echo "[WARN] Details: studio/ROCM_RDNA2_APU.md. Override with UNSLOTH_TORCH_INDEX_URL if you want ROCm anyway." >&2
+                echo "$_base/cpu"; return ;;
+        esac
+        # detect ROCm version
         _rocm_tag=""
         _rocm_tag=$({ command -v amd-smi >/dev/null 2>&1 && \
             amd-smi version 2>/dev/null | awk -F'ROCm version: ' \
