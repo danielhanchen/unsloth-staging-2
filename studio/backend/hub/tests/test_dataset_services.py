@@ -2,6 +2,7 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -60,6 +61,7 @@ def test_dataset_cache_scan_merges_raw_and_processed_rows(monkeypatch):
         "is_snapshot_partial",
         lambda _repo_type, _repo_id, _cache_dir: False,
     )
+    monkeypatch.setattr(cache_inventory, "_raw_dataset_cache_has_data", lambda *_args: True)
     monkeypatch.setattr(
         cache_inventory,
         "_scan_hub_dataset_cache_dirs",
@@ -107,6 +109,7 @@ def test_dataset_cache_scan_attaches_app_bytes_without_replacing_raw_path(monkey
         "is_snapshot_partial",
         lambda *_args, **_kwargs: False,
     )
+    monkeypatch.setattr(cache_inventory, "_raw_dataset_cache_has_data", lambda *_args: True)
     monkeypatch.setattr(cache_inventory, "_scan_hub_dataset_cache_dirs", lambda: [])
     monkeypatch.setattr(cache_inventory, "_scan_processed_dataset_caches", lambda: [])
     monkeypatch.setattr(
@@ -138,6 +141,220 @@ def test_dataset_cache_scan_attaches_app_bytes_without_replacing_raw_path(monkey
             "app_processed_cache": True,
         }
     ]
+
+
+def _dataset_snapshot(monkeypatch, tmp_path: Path, filenames: tuple[str, ...]) -> Path:
+    hub_cache = tmp_path / "hub"
+    repo_root = hub_cache / "datasets--Org--Data"
+    snapshot = repo_root / "snapshots" / "abc"
+    snapshot.mkdir(parents = True)
+    for filename in filenames:
+        target = snapshot / filename
+        target.parent.mkdir(parents = True, exist_ok = True)
+        target.write_bytes(b"x")
+    monkeypatch.setattr(hf_cache_state, "hf_cache_roots", lambda **kw: [hub_cache])
+    return repo_root
+
+
+def test_raw_dataset_cache_has_data_rejects_a_metadata_only_snapshot(monkeypatch, tmp_path):
+    repo_root = _dataset_snapshot(
+        monkeypatch,
+        tmp_path,
+        (".gitattributes", "README.md", "dataset_infos.json", "LICENSE"),
+    )
+
+    assert cache_inventory._raw_dataset_cache_has_data("Org/Data", repo_root) is False
+
+
+def test_raw_dataset_cache_has_data_ignores_os_clutter(monkeypatch, tmp_path):
+    """Opening the cache dir in Finder or Explorer drops a `.DS_Store`/`Thumbs.db` beside the
+    card, which must not read as payload."""
+    repo_root = _dataset_snapshot(
+        monkeypatch,
+        tmp_path,
+        ("README.md", ".DS_Store", "Thumbs.db"),
+    )
+
+    assert cache_inventory._raw_dataset_cache_has_data("Org/Data", repo_root) is False
+
+
+def test_raw_dataset_cache_has_data_finds_nested_payload_of_any_format(monkeypatch, tmp_path):
+    """Image and audio repos ship no extension the app keeps a format list for, so the check
+    asks whether anything beyond metadata is present rather than matching known formats."""
+    repo_root = _dataset_snapshot(
+        monkeypatch,
+        tmp_path,
+        ("README.md", "data/train-00000-of-00001.parquet", "data/train/0001.png"),
+    )
+
+    assert cache_inventory._raw_dataset_cache_has_data("Org/Data", repo_root) is True
+
+
+def test_raw_dataset_cache_has_data_ignores_appledouble_sidecars(monkeypatch, tmp_path):
+    """A snapshot carried through a Mac zip picks up `._name` sidecars and a `__MACOSX`
+    tree. `datasets` skips dotted names and `__`-prefixed dirs when it resolves data files,
+    so counting them as payload offered a card-only snapshot On Device again."""
+    repo_root = _dataset_snapshot(
+        monkeypatch,
+        tmp_path,
+        ("README.md", "._README.md", "__MACOSX/._README.md"),
+    )
+
+    assert cache_inventory._raw_dataset_cache_has_data("Org/Data", repo_root) is False
+
+
+def test_raw_dataset_cache_has_data_counts_a_linked_payload_directory(monkeypatch, tmp_path):
+    """A migrated or shared cache can keep its data behind a directory link. The walk must
+    not descend into one -- it can point anywhere -- but pruning it silently made the repo
+    read as metadata-only, and On Device drops every partial row."""
+    payload = tmp_path / "elsewhere"
+    payload.mkdir()
+    (payload / "train-00000-of-00001.parquet").write_bytes(b"PAR1")
+    repo_root = _dataset_snapshot(monkeypatch, tmp_path, ("README.md",))
+    (repo_root / "snapshots" / "abc" / "data").symlink_to(payload, target_is_directory = True)
+
+    assert cache_inventory._raw_dataset_cache_has_data("Org/Data", repo_root) is True
+
+
+def test_raw_dataset_cache_has_data_accepts_payload_in_another_revision(monkeypatch, tmp_path):
+    """`refs/main` can still name a card-only revision while a complete one sits beside it.
+    `is_snapshot_partial` judges the newest snapshot, so checking only the pinned one made
+    the two disagree and took a usable dataset off On Device."""
+    repo_root = _dataset_snapshot(monkeypatch, tmp_path, ("README.md",))
+    (repo_root / "refs").mkdir(parents = True, exist_ok = True)
+    (repo_root / "refs" / "main").write_text("abc")
+    other = repo_root / "snapshots" / "def"
+    other.mkdir(parents = True)
+    (other / "train-00000-of-00001.parquet").write_bytes(b"PAR1")
+
+    assert cache_inventory._raw_dataset_cache_has_data("Org/Data", repo_root) is True
+
+
+def test_raw_dataset_cache_has_data_does_not_read_an_unreadable_tree_as_empty(
+    monkeypatch, tmp_path
+):
+    """`os.walk` swallows `scandir` errors unless `onerror` is given, so a cache written by
+    another user answered "no payload" rather than "could not look", and a dataset that was
+    merely uninspectable vanished from On Device."""
+    repo_root = _dataset_snapshot(monkeypatch, tmp_path, ("README.md", "data/train.parquet"))
+    locked = repo_root / "snapshots" / "abc" / "data"
+    os.chmod(locked, 0o000)
+    try:
+        assert cache_inventory._raw_dataset_cache_has_data("Org/Data", repo_root) is True
+    finally:
+        os.chmod(locked, 0o755)
+
+
+def _metadata_only_raw_repo() -> SimpleNamespace:
+    return SimpleNamespace(
+        repo_id = "Org/Data",
+        repo_type = "dataset",
+        repo_path = "/cache/hub/datasets--Org--Data",
+        size_on_disk = 100,
+        revisions = [SimpleNamespace(files = [], commit_hash = "abc")],
+    )
+
+
+def test_dataset_cache_without_data_files_is_partial(monkeypatch):
+    """A snapshot holding only the dataset card passes every structural check but
+    cannot be loaded, so it must not be offered as usable On Device."""
+    monkeypatch.setattr(
+        cache_inventory,
+        "_collect_hf_cache_scans",
+        lambda: ([SimpleNamespace(repos = [_metadata_only_raw_repo()])], {"/cache/hub"}),
+    )
+    monkeypatch.setattr(
+        cache_inventory.hf_cache_scan,
+        "is_snapshot_partial",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(cache_inventory, "_raw_dataset_cache_has_data", lambda *_args: False)
+    monkeypatch.setattr(cache_inventory, "_scan_hub_dataset_cache_dirs", lambda: [])
+    monkeypatch.setattr(cache_inventory, "_scan_processed_dataset_caches", lambda: [])
+    monkeypatch.setattr(cache_inventory, "_scan_app_processed_dataset_caches", lambda: [])
+
+    rows = cache_inventory._scan_hf_dataset_caches()
+
+    assert len(rows) == 1
+    assert rows[0]["partial"] is True
+
+
+def test_processed_cache_settles_a_partial_raw_row_without_losing_its_path(monkeypatch):
+    """The Arrow cache loads on its own, so it clears `partial`. The row must keep the hub
+    `cache_path`, which is the only handle `delete_cached_dataset_response` can scope a
+    hub-dir purge to."""
+    monkeypatch.setattr(
+        cache_inventory,
+        "_collect_hf_cache_scans",
+        lambda: ([SimpleNamespace(repos = [_metadata_only_raw_repo()])], {"/cache/hub"}),
+    )
+    monkeypatch.setattr(
+        cache_inventory.hf_cache_scan,
+        "is_snapshot_partial",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(cache_inventory, "_raw_dataset_cache_has_data", lambda *_args: False)
+    monkeypatch.setattr(cache_inventory, "_scan_hub_dataset_cache_dirs", lambda: [])
+    monkeypatch.setattr(
+        cache_inventory,
+        "_scan_processed_dataset_caches",
+        lambda: [
+            {
+                "repo_id": "org/data",
+                "size_bytes": 250,
+                "cache_path": "/processed/org___data",
+                "processed_cache": True,
+                "partial": False,
+            }
+        ],
+    )
+    monkeypatch.setattr(cache_inventory, "_scan_app_processed_dataset_caches", lambda: [])
+
+    rows = cache_inventory._scan_hf_dataset_caches()
+
+    assert len(rows) == 1
+    assert rows[0]["cache_path"] == "/cache/hub/datasets--Org--Data"
+    assert rows[0]["load_cache_path"] == "/processed/org___data"
+    assert rows[0]["partial"] is False
+    assert rows[0]["partial_transport"] is None
+
+
+def test_app_processed_cache_never_settles_a_partial_raw_row(monkeypatch):
+    """App caches are written per snapshot commit but grouped without one, so a finished
+    cache proves nothing about the snapshot the loader will resolve."""
+    monkeypatch.setattr(
+        cache_inventory,
+        "_collect_hf_cache_scans",
+        lambda: ([SimpleNamespace(repos = [_metadata_only_raw_repo()])], {"/cache/hub"}),
+    )
+    monkeypatch.setattr(
+        cache_inventory.hf_cache_scan,
+        "is_snapshot_partial",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(cache_inventory, "_raw_dataset_cache_has_data", lambda *_args: False)
+    monkeypatch.setattr(cache_inventory, "_scan_hub_dataset_cache_dirs", lambda: [])
+    monkeypatch.setattr(cache_inventory, "_scan_processed_dataset_caches", lambda: [])
+    monkeypatch.setattr(
+        cache_inventory,
+        "_scan_app_processed_dataset_caches",
+        lambda: [
+            {
+                "repo_id": "org/data",
+                "size_bytes": 40,
+                "cache_path": "/app/entry",
+                "processed_cache": True,
+                "app_processed_cache": True,
+                "app_processed_hub_cache": "/cache/hub",
+                "partial": True,
+            }
+        ],
+    )
+
+    rows = cache_inventory._scan_hf_dataset_caches()
+
+    assert len(rows) == 1
+    assert rows[0]["partial"] is True
 
 
 def test_app_processed_cache_without_raw_snapshot_is_partial(monkeypatch):
