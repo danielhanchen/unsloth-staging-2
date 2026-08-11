@@ -5,9 +5,9 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Windows PowerShell 5.1
+      - name: AMD venv repair loop tests (Windows PowerShell 5.1)
         shell: powershell
-        run: powershell -NoProfile -ExecutionPolicy Bypass -File ps51_probe.ps1
-      - name: PowerShell 7
+        run: powershell -NoProfile -File tests\studio\test_amd_venv_repair_loop.ps1
+      - name: AMD venv repair loop tests (pwsh 7)
         shell: pwsh
-        run: pwsh -NoProfile -File ps51_probe.ps1
+        run: pwsh -NoProfile -File tests/studio/test_amd_venv_repair_loop.ps1
