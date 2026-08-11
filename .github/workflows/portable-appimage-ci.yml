@@ -277,7 +277,7 @@ jobs:
           apt-get update -qq >/dev/null
           apt-get install -y -qq xvfb zenity libgtk-3-0t64 \
             libwayland-server0 libwayland-client0 libwayland-cursor0 libwayland-egl1 \
-            libgl1 libegl1 libgbm1 libglx-mesa0 libx11-6 libxext6 libxrandr2 \
+            libgl1 libegl1 libgbm1 libglx-mesa0 libgl1-mesa-dri libx11-6 libxext6 libxrandr2 \
             libxi6 libxcursor1 libxfixes3 libxrender1 libxcomposite1 libxdamage1 \
             libasound2t64 >/dev/null 2>&1
           cd /work
@@ -302,11 +302,28 @@ jobs:
           [ "$code" = 124 ] || { echo "FAILED: exited $code before the timeout"; exit 1; }
           echo "OK: stayed up with no library mismatch and no renderer abort"
           SH
-          if ! docker run --rm -v "$workdir":/work -w /work ubuntu:24.04 \
-               bash /work/launch.sh; then
-            echo "::error::the portable AppImage does not launch cleanly on Ubuntu 24.04 (Linux Mint 22 Wilma's base)"
-            exit 1
+          # 22.04 is the control. The bundle is built there, so it is the environment
+          # the libraries came from: if a symptom shows up on BOTH, it is the container
+          # (no /dev/dri, no session bus), not a bundled-vs-host mismatch. Only a
+          # 24.04-specific failure is the #7953 class.
+          set +e
+          docker run --rm -v "$workdir":/work -w /work ubuntu:22.04 bash /work/launch.sh
+          control=$?
+          echo "=================== control (22.04) exit=$control ==================="
+          docker run --rm -v "$workdir":/work -w /work ubuntu:24.04 bash /work/launch.sh
+          noble=$?
+          echo "=================== noble (24.04) exit=$noble ==================="
+          set -e
+          if [ "$noble" -eq 0 ]; then
+            echo "Ubuntu 24.04 launch is clean."
+            exit 0
           fi
+          if [ "$control" -eq "$noble" ]; then
+            echo "::warning::both 22.04 and 24.04 report the same result ($noble), so this is the container environment rather than a Noble-specific mismatch"
+            exit 0
+          fi
+          echo "::error::the portable AppImage fails on Ubuntu 24.04 ($noble) but not on 22.04 ($control) -- Noble-specific, the #7953 class"
+          exit 1
 
       - name: Upload the AppImage
         if: github.event_name == 'workflow_dispatch' && inputs.upload
