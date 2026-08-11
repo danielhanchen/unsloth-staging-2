@@ -87,10 +87,9 @@ _TOOL_CLOSED_BLOCK_PATS = [_TC_JSON_CLOSED_PAT, _TC_FUNC_CLOSED_PAT]
 # A lazy closed-pair pattern whose close token is absent would rescan to EOF from every
 # opener; skip that doomed (quadratic) pass. Shared by both strip helpers.
 _PAT_REQUIRED_TOKEN = {
-    # A tuple marks a required CLOSER.  Besides skipping a pass when it is absent,
-    # callers bound the regex at the last such closer: no match can consume anything
-    # after it, and scanning a tail full of openers retries a lazy pattern at every
-    # opener (quadratic).
+    # A tuple marks a required CLOSER. Besides skipping the pass when it is absent,
+    # callers bound the regex at the last such closer: nothing can match past it, and a
+    # tail full of openers would retry a lazy pattern at each one (quadratic).
     _TC_JSON_CLOSED_PAT: ("</tool_call>", "<tool_call>"),
     _TC_GEMMA_CLOSED_PAT: ("<tool_call|>", "<|tool_call>"),
     _TC_FUNC_CLOSED_PAT: ("</function>", "<function="),
@@ -473,9 +472,9 @@ def _iter_bracket_spans(
         kind, m = min(live, key = lambda km: km[1].start())
         last_close = last_array_close if kind == "array" else last_brace_close
         if m.end() > last_close:
-            # This candidate and every later candidate of the same kind lacks even
-            # the required closing character. Keep the other formats live, but do
-            # not run a balanced scan to EOF once per doomed opener.
+            # This and every later candidate of the same kind lacks its closing
+            # character. Keep other formats live, but skip a balanced scan to EOF
+            # per doomed opener.
             nexts[kind] = None
             cursor = m.end()
             continue
@@ -701,10 +700,9 @@ def _inside_open_parameter(
     if param_start_re is None:
         param_start_re = _TC_PARAM_START_RE
     last_param_start = -1
-    # Both supported vocabularies begin with ``<param``.  Search backwards to the
-    # nearest candidate and validate it with the original regex, instead of rescanning
-    # the entire prefix for every function/close marker.  Unknown caller-supplied
-    # patterns keep the general finditer path.
+    # Both supported vocabularies begin with ``<param``, so search backwards to the
+    # nearest candidate and validate it with the original regex instead of rescanning the
+    # whole prefix per marker. Unknown caller patterns keep the general finditer path.
     reverse_param_search = (
         param_start_re is _TC_PARAM_START_RE
         or param_start_re.pattern.startswith(r"<(?:parameter|param)")
@@ -724,24 +722,22 @@ def _inside_open_parameter(
         return False
     # The parameter's OWN close tag decides: if it closes after ``pos`` the position is
     # argument data (even across literal function closes); an unclosed one falls back to func close.
-    # A closer at/before ``pos`` settles the answer immediately. This bounded
-    # search avoids scanning the entire suffix for absent alternate spellings on
-    # every later function marker.
+    # A closer at/before ``pos`` settles it. Bounded, so an absent alternate spelling
+    # does not scan the whole suffix on every later function marker.
     for tag in param_closers:
         found = content.find(tag, last_param_start, min(len(content), pos + len(tag)))
         if 0 <= found <= pos:
             return False
-    # Prefer the closer matching the opener spelling. Cross-spelling closes remain
-    # accepted exactly as before, but the normal form is found after a short scan.
+    # Try the closer matching the opener spelling first. Cross-spelling closes are still
+    # accepted; the normal form just needs a shorter scan.
     if content.startswith("<param", last_param_start) and not content.startswith(
         "<parameter", last_param_start
     ):
         param_closers = tuple(reversed(param_closers))
     if any(content.find(tag, pos + 1) >= 0 for tag in param_closers):
         return True
-    # With no parameter close anywhere, only a function close at/before ``pos``
-    # proves that the parameter no longer contains the candidate. A later close
-    # and no close both mean the candidate is still inside, matching the old min().
+    # With no parameter close anywhere, only a function close at/before ``pos`` proves the
+    # candidate left the parameter. A later close and no close both mean still inside.
     for tag in func_closers:
         found = content.find(tag, last_param_start, min(len(content), pos + len(tag)))
         if 0 <= found <= pos:
@@ -847,8 +843,8 @@ def _build_markers(content: str):
             if last_brace is None or brace_start < last_brace
             else None
         )
-        # The marker tuple keeps the ``-1`` sentinel: ``marker_coverage`` is part of
-        # this module's cross-module contract and its consumers test ``brace_end < 0``.
+        # Keep the ``-1`` sentinel here: ``marker_coverage`` is a cross-module
+        # contract and its consumers test ``brace_end < 0``.
         markers.append((m.start(), -1 if brace_end is None else brace_end, kind, m))
     markers.sort(key = lambda c: c[0])
     return markers
