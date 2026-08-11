@@ -453,9 +453,23 @@ if command -v patchelf >/dev/null 2>&1; then
   while IFS= read -r -d '' obj; do
     patchelf --set-rpath '$ORIGIN/../../lib/unsloth' "$obj" 2>/dev/null || true
   done < <(find "$pixbuf_dir" "$gio_dir" -name '*.so' -type f -print0 2>/dev/null)
+  # Two traps here, both of which shipped a bundle that resolved through nothing:
+  #
+  #   * a shared object does not need the execute bit. Debian installs
+  #     libwebkit2gtkinjectedbundle.so as 0644, so a `-perm -u+x` sweep skipped it
+  #     and patchelf never ran on it. Nix happens to mark its .so files executable,
+  #     which is exactly why this was invisible here and failed on Ubuntu.
+  #   * the injected bundle sits one directory deeper than the helpers, so a fixed
+  #     '../../' would point one level short of $libdir for it.
+  #
+  # So: match objects by name as well as by mode, and compute each one's own way
+  # back to $libdir rather than assuming a depth.
   while IFS= read -r -d '' obj; do
-    patchelf --set-rpath '$ORIGIN/../../lib/unsloth' "$obj" 2>/dev/null || true
-  done < <(find "$webkit_exec" -type f -perm -u+x -print0)
+    rel="$(realpath --relative-to="$(dirname "$obj")" "$libdir" 2>/dev/null || true)"
+    if [[ -n "$rel" ]]; then
+      patchelf --set-rpath "\$ORIGIN/$rel" "$obj" 2>/dev/null || true
+    fi
+  done < <(find "$webkit_exec" -type f \( -perm -u+x -o -name '*.so*' \) -print0)
   patchelf --set-rpath '$ORIGIN/../lib/unsloth' "$binary_file" 2>/dev/null || true
 
   # Every executable must use the HOST's dynamic loader.
