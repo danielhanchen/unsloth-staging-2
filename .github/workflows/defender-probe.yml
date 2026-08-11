@@ -1,0 +1,21 @@
+name: "Defender impact on release download"
+
+on:
+  push:
+    branches: [dl-speed-probe]
+  workflow_dispatch:
+
+concurrency:
+  group: defender-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  defender:
+    name: "windows-latest Defender A/B"
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Defender A/B
+        shell: pwsh
+        run: pwsh -NoProfile -File .github/workflows/defender_probe.ps1
