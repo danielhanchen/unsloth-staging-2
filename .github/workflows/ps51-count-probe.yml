@@ -1,0 +1,13 @@
+name: ps51-count-probe
+on: [push, workflow_dispatch]
+jobs:
+  probe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows PowerShell 5.1
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File ps51_probe.ps1
+      - name: PowerShell 7
+        shell: pwsh
+        run: pwsh -NoProfile -File ps51_probe.ps1
