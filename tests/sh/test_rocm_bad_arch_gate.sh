@@ -90,6 +90,38 @@ assert_eq "empty probe not intercepted"   "rocm" "$(_route '')"
 assert_eq "garbage not intercepted"       "rocm" "$(_route 'not-a-gfx')"
 assert_eq "gfx10330 is not gfx1033"       "rocm" "$(_route gfx10330)"
 
+echo "=== The runtime-less reroute honours the same gate ==="
+# get_torch_index_url's gate is not enough on its own. The reroute below it fires when
+# UNSLOTH_ROCM_GFX_ARCH is set, takes that value as the inferred arch, and rewrites a
+# */cpu index to the arch family index -- so setting UNSLOTH_ROCM_GFX_ARCH=gfx1033 sent
+# a Deck straight back to gfx103X-all, undoing the gate. The documented escape hatch is
+# UNSLOTH_TORCH_INDEX_URL, which returns long before either point.
+_REROUTE_FILE=$(mktemp)
+trap 'rm -f "$_FN_FILE" "$_GATE_FILE" "$_REROUTE_FILE"' EXIT
+{
+    awk '/^_amd_arch_index_family_for_gfx\(\)/,/^}/' "$INSTALL_SH"
+    awk '/^_infer_linux_amd_gfx_arch\(\)/,/^}/' "$INSTALL_SH"
+    echo '_reroute() {'
+    awk '/_linux_inferred_gfx=\$\(_infer_linux_amd_gfx_arch/,/^            if \[ -n "\$_linux_inferred_gfx" \]; then$/' "$INSTALL_SH"
+    echo '    _amd_arch_index_family_for_gfx "$_linux_inferred_gfx" || echo cpu'
+    echo '    else echo cpu'   # gated out: no arch survives, so no reroute happens
+    echo '    fi'
+    echo '}'
+} > "$_REROUTE_FILE"
+
+_reroute_family() {  # UNSLOTH_ROCM_GFX_ARCH -> family index, or cpu when gated out
+    "$_SH" -c "
+        UNSLOTH_ROCM_GFX_ARCH='$1'; export UNSLOTH_ROCM_GFX_ARCH
+        . '$_REROUTE_FILE'
+        _reroute
+    " 2>/dev/null | tail -1
+}
+assert_eq "gfx1033 override does not reroute"  "cpu"          "$(_reroute_family gfx1033)"
+assert_eq "GFX1033 override does not reroute"  "cpu"          "$(_reroute_family GFX1033)"
+assert_eq "gfx1032 override still reroutes"    "gfx103X-all"  "$(_reroute_family gfx1032)"
+assert_eq "gfx1030 override still reroutes"    "gfx103X-all"  "$(_reroute_family gfx1030)"
+assert_eq "gfx1151 override still reroutes"    "gfx1151"      "$(_reroute_family gfx1151)"
+
 echo "=== Structural: the gate precedes the version-keyed index selection ==="
 _gate_line=$(grep -n 'Archs measured to compute INCORRECTLY under ROCm' "$INSTALL_SH" | head -1 | cut -d: -f1)
 _idx_line=$(grep -n 'rocm7.2|rocm7.2.\*) echo "\$_base/rocm7.2"' "$INSTALL_SH" | head -1 | cut -d: -f1)

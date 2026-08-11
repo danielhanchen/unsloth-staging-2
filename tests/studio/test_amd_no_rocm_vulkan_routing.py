@@ -82,6 +82,36 @@ def _patch_drm(monkeypatch, tmp_path, vendor_ids):
     monkeypatch.setattr(ilp.glob, "glob", lambda _pat: files)
 
 
+_HOST_GPU_TOOLS = frozenset(
+    {"nvidia-smi", "rocminfo", "amd-smi", "rocm_agent_enumerator", "hipconfig"}
+)
+
+
+def _patch_no_nvidia_no_rocm(monkeypatch):
+    """Hide the REAL host's NVIDIA/ROCm from detect_host().
+
+    The DRM vendor pass is gated on `not has_usable_nvidia and not has_rocm`, so on any
+    machine with a GPU the fake sysfs above is never read and every case below collapses
+    to False. Stub the two probes that see through to the host: nvidia-smi/rocminfo on
+    PATH, and the /proc/driver/nvidia/gpus fallback.
+    """
+    _which = ilp.shutil.which
+    monkeypatch.setattr(
+        ilp.shutil, "which",
+        lambda name, *a, **k: None if name in _HOST_GPU_TOOLS else _which(name, *a, **k),
+    )
+    _isdir = ilp.os.path.isdir
+    monkeypatch.setattr(
+        ilp.os.path, "isdir",
+        lambda p: False if "nvidia" in str(p) else _isdir(p),
+    )
+    _exists = ilp.os.path.exists
+    monkeypatch.setattr(
+        ilp.os.path, "exists",
+        lambda p: False if ("rocm" in str(p) or "kfd" in str(p)) else _exists(p),
+    )
+
+
 def test_hostinfo_exposes_the_flag():
     assert "has_amd_gpu_without_rocm" in {f.name for f in dataclasses.fields(ilp.HostInfo)}
     assert _host().has_amd_gpu_without_rocm is False
@@ -102,6 +132,7 @@ def test_drm_vendor_detection(monkeypatch, tmp_path, vendor_ids, expect_amd, exp
     """Both vendors come from one sysfs pass; an AMD dGPU next to an Intel iGPU must not
     be lost to an early break."""
     _patch_drm(monkeypatch, tmp_path, vendor_ids)
+    _patch_no_nvidia_no_rocm(monkeypatch)
     monkeypatch.setattr(ilp.platform, "system", lambda: "Linux")
     host = ilp.detect_host()
     assert host.has_amd_gpu_without_rocm is expect_amd

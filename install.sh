@@ -3648,6 +3648,15 @@ if [ "$_torch_index_pinned" = false ] && [ "$SKIP_TORCH" = false ] && \
     case "$TORCH_INDEX_URL" in
         */cpu)
             _linux_inferred_gfx=$(_infer_linux_amd_gfx_arch 2>/dev/null || true)
+            # The gfx1033 gate in get_torch_index_url is not enough on its own: this
+            # reroute fires on UNSLOTH_ROCM_GFX_ARCH alone and would take the */cpu that
+            # gate just chose straight back to gfx103X-all. Drop it here too, so the only
+            # way to ROCm on Van Gogh stays the documented UNSLOTH_TORCH_INDEX_URL pin.
+            case "${_linux_inferred_gfx%%:*}" in
+                gfx1033)
+                    echo "[WARN] AMD gfx1033 (Van Gogh) computes incorrect results under ROCm -- keeping CPU-only PyTorch (studio/ROCM_RDNA2_APU.md)." >&2
+                    _linux_inferred_gfx="" ;;
+            esac
             if [ -n "$_linux_inferred_gfx" ]; then
                 _amd_family=$(_amd_arch_index_family_for_gfx "$_linux_inferred_gfx") || _amd_family=""
                 if [ -n "$_amd_family" ]; then
