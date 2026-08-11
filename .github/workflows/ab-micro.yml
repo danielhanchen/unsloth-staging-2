@@ -1,0 +1,23 @@
+name: "A/B: PowerShell progress bar on real installer URLs"
+
+on:
+  push:
+    branches: [dl-ab-micro]
+  workflow_dispatch:
+
+concurrency:
+  group: ab-micro-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ab:
+    name: "PS 5.1 A/B (speed + byte identity)"
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      # shell: powershell == Windows PowerShell 5.1, the interpreter that actually
+      # runs setup.ps1 in production.
+      - name: A/B under Windows PowerShell 5.1
+        shell: powershell
+        run: .\.github\workflows\ab_micro.ps1
