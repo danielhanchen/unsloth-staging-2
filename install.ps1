@@ -2223,6 +2223,28 @@ exit 0
             return $null
         }
 
+        # $full comes from the python.org listing, so the bytes differ per patch release and
+        # cannot be pinned to a committed SHA-256 the way install_node_prebuilt.py pins Node.
+        # Verify the publisher instead: this executable is about to run with this process's
+        # privileges, and HTTPS only vouches for the transfer, not for what arrived. Status
+        # alone would accept any trusted CA's code-signing cert, including an attacker's.
+        # Inspecting the file can itself fail (antivirus quarantines the download before we
+        # look at it, the path becomes unreadable), and the script-wide 'Stop' at the top
+        # would turn that into a terminating error that escapes the function, skipping the
+        # $null fallback and leaving the executable behind. Unreadable is unverified, so it
+        # takes the same route as a bad signature.
+        $sig = $null
+        try { $sig = Get-AuthenticodeSignature -LiteralPath $dest } catch { $sig = $null }
+        if ($null -eq $sig -or
+            $sig.Status -ne [System.Management.Automation.SignatureStatus]::Valid -or
+            $null -eq $sig.SignerCertificate -or
+            $sig.SignerCertificate.Subject -notmatch '(^|,\s*)O="?Python Software Foundation"?(,|$)') {
+            $sigStatus = if ($null -eq $sig) { "could not be read" } else { $sig.Status }
+            substep "python.org installer is not validly signed by the Python Software Foundation (signature status: $sigStatus); not running it." "Yellow"
+            Remove-Item -LiteralPath $dest -Force -ErrorAction SilentlyContinue
+            return $null
+        }
+
         # Per-user install => no UAC. PrependPath puts python + py on PATH;
         # Include_launcher installs py.exe (preferred by Find-CompatiblePython).
         substep "installing Python $full (silent, per-user)..."
