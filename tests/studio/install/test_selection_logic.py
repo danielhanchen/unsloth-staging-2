@@ -2788,9 +2788,7 @@ class TestLinuxPublishedAttemptsNvidiaCpuGate:
     def test_amd_without_rocm_falls_back_to_cpu_when_no_vulkan_bundle_exists(self):
         """An older release that shipped no Vulkan bundle must still install something."""
         host = self._gpu_host(has_amd_gpu_without_rocm = True)
-        attempts = INSTALL_LLAMA_PREBUILT._linux_published_attempts(
-            host, self._cpu_only_bundle()
-        )
+        attempts = INSTALL_LLAMA_PREBUILT._linux_published_attempts(host, self._cpu_only_bundle())
         assert [a.install_kind for a in attempts] == ["linux-cpu"]
 
 
