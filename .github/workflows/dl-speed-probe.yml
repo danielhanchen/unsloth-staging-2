@@ -1,0 +1,69 @@
+name: "Release asset download speed probe"
+
+on:
+  push:
+    branches: [dl-speed-probe]
+  workflow_dispatch:
+
+concurrency:
+  group: dl-speed-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    name: "windows-latest download timings"
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Defender / environment state
+        shell: pwsh
+        run: |
+          try {
+            $p = Get-MpComputerStatus
+            "RealTimeProtectionEnabled : $($p.RealTimeProtectionEnabled)"
+            "AntivirusEnabled          : $($p.AntivirusEnabled)"
+            "IoavProtectionEnabled     : $($p.IoavProtectionEnabled)"
+            "OnAccessProtectionEnabled : $($p.OnAccessProtectionEnabled)"
+          } catch { "Get-MpComputerStatus unavailable: $($_.Exception.Message)" }
+          "PSVersion: $($PSVersionTable.PSVersion)"
+          "curl.exe : $((curl.exe --version | Select-Object -First 1))"
+      - name: Timings
+        shell: pwsh
+        run: pwsh -NoProfile -File .github/workflows/dl_probe.ps1
+      - name: Windows PowerShell 5.1 (Invoke-WebRequest)
+        shell: powershell
+        run: |
+          $url = 'https://github.com/unslothai/unsloth/releases/download/v0.1.70-beta/Unsloth-Desktop-0_1_70_beta-Windows.exe'
+          $ErrorActionPreference = 'Stop'
+          # progress bar ON (the default a user gets)
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\ps51_progress_on.exe" -UseBasicParsing
+          $sw.Stop()
+          $mb = (Get-Item "$env:RUNNER_TEMP\ps51_progress_on.exe").Length / 1MB
+          "RESULT`tps5.1_IWR_progress_on`t$([math]::Round($sw.Elapsed.TotalSeconds,2))s`t$([math]::Round($mb/$sw.Elapsed.TotalSeconds,2)) MB/s"
+          $ProgressPreference = 'SilentlyContinue'
+          $sw = [Diagnostics.Stopwatch]::StartNew()
+          Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\ps51_progress_off.exe" -UseBasicParsing
+          $sw.Stop()
+          "RESULT`tps5.1_IWR_progress_off`t$([math]::Round($sw.Elapsed.TotalSeconds,2))s`t$([math]::Round($mb/$sw.Elapsed.TotalSeconds,2)) MB/s"
+
+  unix:
+    name: "${{ matrix.os }} download timings"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    steps:
+      - name: Timings
+        shell: bash
+        run: |
+          set -u
+          URL=https://github.com/unslothai/unsloth/releases/download/v0.1.70-beta/Unsloth-Desktop-0_1_70_beta-Windows.exe
+          for i in 1 2 3; do
+            curl -sS -L -o /tmp/u_$i.exe -w "RESULT\tcurl_run$i\t%{time_total}s\t%{speed_download} B/s\tconnect=%{time_connect} ttfb=%{time_starttransfer}\n" "$URL"
+          done
+          echo "--- geo/edge info ---"
+          curl -sS -o /dev/null -D - -L "$URL" 2>&1 | grep -iE '^(HTTP|location|x-github|server|via|x-cache|content-length)' | head -20 || true
