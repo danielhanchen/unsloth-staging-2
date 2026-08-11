@@ -1,0 +1,217 @@
+name: AppImage launch matrix
+
+# Does the portable AppImage LAUNCH on the platform that reported #7953?
+#
+# Three earlier attempts at this measured the wrong thing, so the design here is
+# deliberate:
+#
+#  * Runners, not containers, for the 22.04-vs-24.04 comparison. A bare container has
+#    no /dev/dri and no DRI driver, so EGL fails there for reasons that have nothing to
+#    do with the bundle -- which is exactly how the last run produced an unreadable
+#    EGL_BAD_PARAMETER. Runners carry a working Mesa/llvmpipe.
+#  * The control runs in the SAME modality as the test. Comparing a container against a
+#    runner compares environments, not bundles.
+#  * apt output is never hidden, and the libraries the launch needs are asserted present
+#    BEFORE launching. The previous control silently installed nothing because the
+#    package names were Noble-only (libgtk-3-0t64 does not exist on jammy), and the
+#    failure read as a launch failure.
+#  * "AppRun stopped early on a missing host library" is its own outcome (exit 2), never
+#    a pass: the webview is not reached, so the run proves nothing either way.
+#
+# Linux Mint 22 Wilma itself is included as a container, since that is the actual
+# reported platform. It is informational: a container cannot do EGL properly, so it is
+# read for library-level faults (undefined symbol / GLIBCXX), which is what #7953 was.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [pr-8343-ci]
+    paths:
+      - 'studio/src-tauri/linux/**'
+      - '.github/workflows/appimage-launch-matrix.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Linux native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev patchelf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+      - working-directory: studio/frontend
+        run: npm install --no-fund --no-audit
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Pin AppImage toolchain
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/appimage-tools"; mkdir -p "$d"
+          curl -fsSL "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage" -o "$d/appimagetool-x86_64.AppImage"
+          curl -fsSL "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64" -o "$d/runtime-x86_64"
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  $d/appimagetool-x86_64.AppImage" | sha256sum -c -
+          echo "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  $d/runtime-x86_64" | sha256sum -c -
+          chmod +x "$d/appimagetool-x86_64.AppImage"
+      - name: Build Linux deb
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: studio
+          tauriScript: npx --prefix . tauri
+          args: -v --bundles deb --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - name: Build the portable AppImage
+        run: |
+          set -euo pipefail
+          deb="$(find studio/src-tauri/target/release/bundle/deb -name '*.deb' -print -quit)"
+          out="$RUNNER_TEMP/portable.AppImage"
+          studio/src-tauri/linux/build-portable-appimage.sh "$deb" \
+            "$RUNNER_TEMP/appimage-tools/appimagetool-x86_64.AppImage" \
+            "$RUNNER_TEMP/appimage-tools/runtime-x86_64" "$out"
+          ls -lh "$out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: portable-appimage
+          path: ${{ runner.temp }}/portable.AppImage
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  # ── The real comparison: same bundle, same script, two runner OSes ──
+  launch:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: portable-appimage
+      - name: Install the desktop stack a real machine already has
+        run: |
+          set -euo pipefail
+          # Not silenced: the last attempt hid apt failures and read them as a broken app.
+          sudo apt-get update
+          sudo apt-get install -y xvfb zenity mesa-utils libgl1-mesa-dri \
+            libwayland-server0 libwayland-client0 libgl1 libegl1 libgbm1
+          echo "--- prerequisites present? ---"
+          missing=0
+          for l in libwayland-server.so.0 libGL.so.1 libEGL.so.1; do
+            p=$(find /usr/lib/x86_64-linux-gnu -maxdepth 1 -name "$l" | head -1)
+            printf '  %-24s %s\n' "$l" "${p:-MISSING}"
+            [ -n "$p" ] || missing=1
+          done
+          [ "$missing" -eq 0 ] || { echo "::error::host prerequisites missing, the launch would be unreadable"; exit 1; }
+      - name: Launch
+        id: launch
+        run: |
+          set +e
+          chmod +x ./*.AppImage
+          ./*.AppImage --appimage-extract >/dev/null
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            timeout 45 ./squashfs-root/AppRun > out.txt 2> err.txt
+          code=$?
+          echo "exit=$code"
+          echo "--- stdout ---"; cat out.txt
+          echo "--- stderr ---"; cat err.txt
+          verdict=pass
+          if grep -q 'cannot start because these libraries are missing' out.txt; then
+            verdict=inconclusive-missing-host-lib
+          elif grep -qi 'undefined symbol' out.txt err.txt; then
+            verdict=fail-undefined-symbol
+          elif grep -qi 'GLIBCXX_\|GLIBC_' out.txt err.txt; then
+            verdict=fail-glibc-version
+          elif grep -qi 'EGL_BAD_PARAMETER\|Aborting' out.txt err.txt; then
+            verdict=fail-renderer
+          elif [ "$code" != 124 ]; then
+            verdict="fail-exited-$code"
+          fi
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "VERDICT ${{ matrix.os }}: $verdict"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verdict-${{ matrix.os }}
+          path: |
+            out.txt
+            err.txt
+          retention-days: 1
+      - name: Record
+        run: echo "${{ matrix.os }} = ${{ steps.launch.outputs.verdict }}" | tee "verdict-${{ matrix.os }}.txt"
+
+  # ── Linux Mint 22 Wilma, the actual reported platform ──
+  # Informational: no /dev/dri in a container, so the renderer cannot be judged. Read it
+  # for the library-level faults that #7953 actually was.
+  mint:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: portable-appimage
+      - name: Extract
+        run: |
+          set -euo pipefail
+          chmod +x ./*.AppImage
+          ./*.AppImage --appimage-extract >/dev/null
+      - name: Library probes inside Linux Mint 22
+        run: |
+          set +e
+          cat > probe.sh <<'SH'
+          set -u
+          export DEBIAN_FRONTEND=noninteractive
+          echo "=== distro ==="; cat /etc/os-release | head -3
+          apt-get update -qq
+          apt-get install -y gcc libcurl3-gnutls libgl1 libegl1 libglx-mesa0 libgl1-mesa-dri
+          rc=$?
+          [ $rc -eq 0 ] || { echo "INCONCLUSIVE: apt failed ($rc)"; exit 2; }
+          cat > /tmp/p.c <<'C'
+          #include <dlfcn.h>
+          #include <stdio.h>
+          int main(int c, char **v){ if(!dlopen(v[1],RTLD_NOW)){printf("FAILED: %s\n",dlerror());return 1;} printf("ok\n"); return 0; }
+          C
+          gcc -o /tmp/p /tmp/p.c || { echo "INCONCLUSIVE: no compiler"; exit 2; }
+          libdir=/work/squashfs-root/usr/lib/unsloth
+          bad=0
+          for lib in libcurl-gnutls.so.4 libGLX_mesa.so.0 libGL.so.1 libEGL.so.1; do
+            p=$(find /usr/lib/x86_64-linux-gnu -maxdepth 2 -name "$lib" | head -1)
+            [ -n "$p" ] || { printf '%-22s absent on Mint\n' "$lib"; continue; }
+            printf '%-22s runtime (AppRun conditions): ' "$lib"
+            o=$(/tmp/p "$p"); echo "$o"
+            case "$o" in FAILED*) bad=1 ;; esac
+            printf '%-22s with LD_LIBRARY_PATH (the old behaviour): ' "$lib"
+            LD_LIBRARY_PATH="$libdir" /tmp/p "$p"
+          done
+          # Also check the app's own binary resolves on Mint.
+          printf '%-22s ' "unsloth-studio"
+          ldd /work/squashfs-root/usr/bin/unsloth-studio 2>/dev/null | grep 'not found' \
+            && { echo "FAILED: unresolved deps above"; bad=1; } || echo "all deps resolve"
+          exit $bad
+          SH
+          docker run --rm -v "$PWD":/work -w /work linuxmintd/mint22-amd64:latest bash /work/probe.sh
+          echo "MINT_EXIT=$?"
+
+  verdict:
+    needs: [launch, mint]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: verdict-*
+          merge-multiple: false
+      - name: Compare 22.04 against 24.04
+        run: |
+          set +e
+          echo "Per-OS launch output is attached as artifacts."
+          echo "The differential is what matters: a symptom on BOTH is the environment,"
+          echo "a symptom on 24.04 ONLY is the #7953 class."
+          ls -R . | head -40
