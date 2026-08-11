@@ -6,6 +6,7 @@ import {
   ArrowLeftRightIcon,
   ArrowUpDownIcon,
   ArrowReloadHorizontalIcon,
+  Cancel01Icon,
   Delete02Icon,
   Download01Icon,
   FlimSlateIcon,
@@ -4215,12 +4216,12 @@ export function ImagesPage({ active = true }: { active?: boolean }) {
                 <div
                   key={image.id}
                   data-image-id={image.id}
-                  className="group relative size-16 shrink-0"
+                  className="group/thumb relative size-16 shrink-0"
                 >
                   <button
                     type="button"
                     onClick={() => setSelectedId(image.id)}
-                    className="relative size-full overflow-hidden rounded-[10px] bg-muted/40 outline-none ring-1 ring-transparent transition-shadow hover:ring-border focus-visible:ring-2 focus-visible:ring-ring"
+                    className="size-full overflow-hidden rounded-[10px] bg-muted/40 outline-none ring-1 ring-transparent transition-shadow hover:ring-border focus-visible:ring-2 focus-visible:ring-ring"
                   >
                     {srcById[image.id] ? (
                       <img
@@ -4238,24 +4239,19 @@ export function ImagesPage({ active = true }: { active?: boolean }) {
                       <span className="pointer-events-none absolute inset-0 rounded-[10px] border border-border bg-white/35 dark:border-white/25 dark:bg-white/20" />
                     )}
                   </button>
-                  {/* Pin marker, bottom-left so it never sits under the menu. */}
-                  {image.pinned && (
-                    <span className="pointer-events-none absolute bottom-0.5 left-0.5 rounded-full bg-background/80 p-0.5 text-foreground shadow-sm ring-1 ring-border backdrop-blur">
-                      <HugeiconsIcon icon={PinIcon} className="size-3" />
-                    </span>
-                  )}
-                  <div className="absolute right-0.5 top-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
-                    <GalleryItemMenu
-                      variant="overlay"
-                      noun="image"
-                      active={active}
-                      pinned={Boolean(image.pinned)}
-                      archived={Boolean(image.archived)}
-                      onTogglePin={() => void handleTogglePin(image.id, !image.pinned)}
-                      onToggleArchive={() => void handleArchive(image.id)}
-                      onDelete={() => void handleDelete(image.id)}
-                    />
-                  </div>
+                  <Tooltip>
+                    <TooltipTrigger asChild={true}>
+                      <button
+                        type="button"
+                        aria-label={`Delete image created ${formatTimestamp(image.created_at)}`}
+                        onClick={() => void handleDelete(image.id)}
+                        className="pointer-events-none absolute right-0.5 top-0.5 z-10 flex size-5 items-center justify-center rounded-full bg-background/90 text-muted-foreground opacity-0 shadow-sm ring-1 ring-border backdrop-blur-sm transition-[opacity,color,background-color] hover:bg-background hover:text-destructive focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring group-hover/thumb:pointer-events-auto group-hover/thumb:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100"
+                      >
+                        <HugeiconsIcon icon={Cancel01Icon} className="size-3" />
+                      </button>
+                    </TooltipTrigger>
+                    <TooltipContent>Delete image</TooltipContent>
+                  </Tooltip>
                 </div>
               ))}
               {/* Tail spinner while older pages stream in on scroll. */}
