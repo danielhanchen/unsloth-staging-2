@@ -97,17 +97,20 @@ def _patch_no_nvidia_no_rocm(monkeypatch):
     """
     _which = ilp.shutil.which
     monkeypatch.setattr(
-        ilp.shutil, "which",
+        ilp.shutil,
+        "which",
         lambda name, *a, **k: None if name in _HOST_GPU_TOOLS else _which(name, *a, **k),
     )
     _isdir = ilp.os.path.isdir
     monkeypatch.setattr(
-        ilp.os.path, "isdir",
+        ilp.os.path,
+        "isdir",
         lambda p: False if "nvidia" in str(p) else _isdir(p),
     )
     _exists = ilp.os.path.exists
     monkeypatch.setattr(
-        ilp.os.path, "exists",
+        ilp.os.path,
+        "exists",
         lambda p: False if ("rocm" in str(p) or "kfd" in str(p)) else _exists(p),
     )
 
