@@ -327,8 +327,10 @@ assert_eq "install.sh lowercases _torch_index_leaf" "yes" "$_has_lc_ok"
 run_floor_case() {
     _url="$1"
     _os="${2:-linux}"
+    _pym="${3:-13}"   # interpreter minor version; 3.13 is the installer default
     bash -c '
         OS="$2"
+        _PY_MINOR_FOR_TORCH="$3"
         TORCH_CONSTRAINT="torch>=2.4,<2.11.0"
         TORCHVISION_CONSTRAINT="torchvision"
         TORCHAUDIO_CONSTRAINT="torchaudio"
@@ -342,7 +344,7 @@ run_floor_case() {
                 TORCHAUDIO_CONSTRAINT="torchaudio>=2.11.0,<2.12.0"
                 ;;
             cpu)
-                if [ "$OS" != "macos" ]; then
+                if [ "$OS" != "macos" ] && [ "${_PY_MINOR_FOR_TORCH:-99}" -ge 10 ] 2>/dev/null; then
                     TORCH_CONSTRAINT="torch>=2.11.0,<2.12.0"
                     TORCHVISION_CONSTRAINT="torchvision>=0.26.0,<0.27.0"
                     TORCHAUDIO_CONSTRAINT="torchaudio>=2.11.0,<2.12.0"
@@ -350,7 +352,7 @@ run_floor_case() {
                 ;;
         esac
         echo "$TORCH_CONSTRAINT"
-    ' _ "$_url" "$_os"
+    ' _ "$_url" "$_os" "$_pym"
 }
 
 assert_eq "gfx120X-all (capital) -> 2.11 floor" "torch>=2.11.0,<2.12.0" \
@@ -385,11 +387,27 @@ assert_eq "cpu trailing slash (linux) -> 2.11 floor" "torch>=2.11.0,<2.12.0" \
 assert_eq "cpu-private leaf -> default (no floor)" "torch>=2.4,<2.11.0" \
     "$(run_floor_case 'https://mirror.example/whl/cpu/cpu-private' linux)"
 
+# The 2.11 cpu wheels are cp310-cp314. The installer defaults to 3.13, but --python /
+# UNSLOTH_PYTHON take any version and a venv from an older install is reused as is, and
+# on 3.9 a bare 2.11 floor makes the resolve fail outright rather than fall back --
+# measured: "No solution found", where the default window still yields torch 2.8.0+cpu.
+assert_eq "cpu (linux, py3.9) -> default (no floor)" "torch>=2.4,<2.11.0" \
+    "$(run_floor_case 'https://download.pytorch.org/whl/cpu' linux 9)"
+assert_eq "cpu (linux, py3.10) -> 2.11 floor" "torch>=2.11.0,<2.12.0" \
+    "$(run_floor_case 'https://download.pytorch.org/whl/cpu' linux 10)"
+assert_eq "cpu (linux, py3.13) -> 2.11 floor" "torch>=2.11.0,<2.12.0" \
+    "$(run_floor_case 'https://download.pytorch.org/whl/cpu' linux 13)"
+assert_eq "cpu (wsl, py3.9) -> default (no floor)" "torch>=2.4,<2.11.0" \
+    "$(run_floor_case 'https://download.pytorch.org/whl/cpu' wsl 9)"
+# An unreadable interpreter must not silently drop the floor.
+assert_eq "cpu (linux, unreadable py) -> 2.11 floor" "torch>=2.11.0,<2.12.0" \
+    "$(run_floor_case 'https://download.pytorch.org/whl/cpu' linux 99)"
+
 # Structural: the cpu arm exists and is gated so macOS is untouched.
 _cpu_case=$(grep -c '^    cpu)$' "$INSTALL_SH" || true)
 _has_cpu_case=$([ "$_cpu_case" -ge 1 ] && echo "yes" || echo "no")
 assert_eq "cpu index case adjusts TORCH_CONSTRAINT" "yes" "$_has_cpu_case"
-_cpu_mac_gate=$(grep -c 'if \[ "\$OS" != "macos" \]; then' "$INSTALL_SH" || true)
+_cpu_mac_gate=$(grep -c 'if \[ "\$OS" != "macos" \] && \[ "\${_PY_MINOR_FOR_TORCH:-99}" -ge 10 \]' "$INSTALL_SH" || true)
 _has_mac_gate=$([ "$_cpu_mac_gate" -ge 1 ] && echo "yes" || echo "no")
 assert_eq "cpu floor is gated off macOS" "yes" "$_has_mac_gate"
 

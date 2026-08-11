@@ -2646,6 +2646,13 @@ fi
 # Default torch constraint -- tightened for Python 3.13+ on arm64 macOS
 # (torch <2.6 has no cp313 macOS arm64 wheels)
 TORCH_CONSTRAINT="torch>=2.4,<2.11.0"
+# Minor version of the interpreter the venv actually has, for the wheel floors below.
+# Read once here rather than per-arm: the venv exists by this point, and a version the
+# probe cannot read must not silently drop a floor, so an unreadable one reads as 99
+# (newest) and leaves every arm's own guard to decide.
+_PY_MINOR_FOR_TORCH=$("$VENV_DIR/bin/python" -c \
+    "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "99")
+case "$_PY_MINOR_FOR_TORCH" in ''|*[!0-9]*) _PY_MINOR_FOR_TORCH=99 ;; esac
 if [ "$SKIP_TORCH" = false ] && [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
     _PY_MINOR=$("$VENV_DIR/bin/python" -c \
         "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
@@ -3771,8 +3778,15 @@ case "$_torch_index_leaf" in
     # $_base/cpu on Darwin) and its arm64 wheels have had no smoke pass here, so macOS keeps
     # the default window and the Python 3.13 >=2.6 floor set earlier. Windows never runs this
     # script.
+    #
+    # Floored at Python 3.10, which is where the 2.11 cpu wheels start (cp310-cp314
+    # verified on the index). The default interpreter is 3.13 so this is normally moot,
+    # but --python / UNSLOTH_PYTHON take any version and an existing venv from an older
+    # install is reused as-is. On 3.9 a bare 2.11 floor makes the resolve fail outright
+    # ("No solution found") where the default window still resolves torch 2.8.0+cpu, so
+    # an older interpreter keeps the default window rather than losing torch entirely.
     cpu)
-        if [ "$OS" != "macos" ]; then
+        if [ "$OS" != "macos" ] && [ "${_PY_MINOR_FOR_TORCH:-99}" -ge 10 ] 2>/dev/null; then
             TORCH_CONSTRAINT="torch>=2.11.0,<2.12.0"
             TORCHVISION_CONSTRAINT="torchvision>=0.26.0,<0.27.0"
             TORCHAUDIO_CONSTRAINT="torchaudio>=2.11.0,<2.12.0"
