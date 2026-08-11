@@ -659,7 +659,7 @@ jobs:
           // A pinned version/path is reproducibility, not integrity: the asset
           // can be replaced after upload. Require the immutable SHA-256 digest
           // to be pinned AND verified before chmod +x. Scope every check to the
-          // real "Pin thin AppImage toolchain" step so this guard cannot
+          // real "Pin AppImage toolchain" step so this guard cannot
           // satisfy itself; a file-wide scan would match the guard's own code.
           const expectedAppimagetoolDigest = 'ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0';
           const expectedRuntimeDigest = '2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d';
@@ -667,9 +667,9 @@ jobs:
             const trimmed = line.trim();
             return trimmed.startsWith('#') || trimmed.startsWith('//');
           };
-          const stepStart = lines.findIndex((line) => /^\s*- name: Pin thin AppImage toolchain\s*$/.test(line));
+          const stepStart = lines.findIndex((line) => /^\s*- name: Pin AppImage toolchain\s*$/.test(line));
           if (stepStart === -1) {
-            throw new Error('Desktop Linux release must keep the "Pin thin AppImage toolchain" step');
+            throw new Error('Desktop Linux release must keep the "Pin AppImage toolchain" step');
           }
           const stepIndent = lines[stepStart].search(/\S/);
           let stepEnd = lines.length;
@@ -926,7 +926,7 @@ jobs:
           }
 
       # ── Linux: pin AppImage packaging toolchain ──
-      - name: Pin thin AppImage toolchain
+      - name: Pin AppImage toolchain
         if: matrix.platform == 'ubuntu-22.04'
         shell: bash
         env:
@@ -1003,6 +1003,32 @@ jobs:
           output_dir="studio/src-tauri/target/release/bundle/appimage"
           appimage="$output_dir/unsloth-studio_${APP_VERSION}_amd64.AppImage"
           export APPIMAGE_PATH="$appimage"
+          # The THIN build is what ships, per #7953.
+          #
+          # The portable bundle solves a real problem -- SteamOS has libgtk-3 and
+          # libsoup-3 but no libwebkit2gtk-4.1 and no apt, so the thin AppRun prints a
+          # command that cannot be run there -- but it is not ready to be the only
+          # AppImage. Measured on ubuntu-24.04 (Linux Mint 22 Wilma's base) against the
+          # portable artifact this workflow builds:
+          #
+          #   host libcurl-gnutls.so.4 under AppRun's LD_LIBRARY_PATH:
+          #     undefined symbol: nghttp2_option_set_no_rfc9113_leading_and_trailing_ws_validation
+          #   host libGLX_mesa.so.0 under the same:
+          #     .../libstdc++.so.6: version `GLIBCXX_3.4.32' not found
+          #       (required by /lib/x86_64-linux-gnu/libLLVM.so.20.1)
+          #
+          # The first is #7953 verbatim. Bundling the whole DT_NEEDED closure does fix
+          # the GIO half of that bug, but AppRun puts the bundle first on
+          # LD_LIBRARY_PATH, so host libraries loaded afterwards -- including the
+          # GL/EGL/DRM stack the bundle deliberately does NOT ship -- resolve THEIR
+          # dependencies out of the 22.04 bundle. Both probes are clean on 22.04 and
+          # fail on 24.04, and the app's own launch aborts the renderer there with
+          # EGL_BAD_PARAMETER while 22.04 stays up.
+          #
+          # Mint/Ubuntu 24.04 is a far larger population than the immutable distros, and
+          # #7953 was a release blocker, so the plainly-named download stays the thin
+          # one until the portable bundle stops capturing host loads.
+          # build-portable-appimage.sh and its tests stay in the tree.
           studio/src-tauri/linux/build-thin-appimage.sh \
             "$deb_path" \
             "$RUNNER_TEMP/appimage-tools/appimagetool-x86_64.AppImage" \
