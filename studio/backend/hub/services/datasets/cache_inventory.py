@@ -14,10 +14,11 @@ from fastapi import HTTPException
 from loggers import get_logger
 
 from hub.services import resolve_destructive_repo_ids
-from hub.services.datasets import downloads
+from hub.services.datasets import downloads, local_options
 from hub.utils import download_manifest
 from hub.utils import inventory_scan as hf_cache_scan
 from hub.utils.dataset_cache import (
+    dataset_snapshot_from_cache_path,
     hf_datasets_cache_roots,
     processed_dataset_cache_has_artifacts,
 )
@@ -109,6 +110,193 @@ def _hub_dataset_snapshot_count(path: Path) -> int:
         return 0
 
 
+# anything not named here counts as payload, so unknown formats are never read as an empty
+# snapshot. the windows names are spelled out because huggingface_hub only added them after 0.36.
+# the data-file names come from local_options rather than a second copy, so this check and the
+# resolver that decides whether a cache yields rows can never drift apart.
+_DATASET_NON_PAYLOAD_FILENAMES = (
+    frozenset(
+        {
+            ".ds_store",
+            ".gitattributes",
+            ".huggingface.yaml",
+            "desktop.ini",
+            "license",
+            "license.md",
+            "license.txt",
+            "thumbs.db",
+        }
+    )
+    | {name.lower() for name in hf_cache_scan._CACHE_ENTRIES_TO_IGNORE}
+    | {name.lower() for name in local_options._IGNORED_DATA_FILENAMES}
+)
+
+
+# suffixes no supported loader can turn into rows, whatever the file is called. none of them
+# appear in `datasets`' extension-to-module map, and a loading script needs `trust_remote_code`,
+# which no dataset load path here passes and which `datasets>=4` dropped outright -- so a repo
+# holding only its card, its citation and its script is metadata, not payload.
+_DATASET_NON_PAYLOAD_SUFFIXES = frozenset({".cff", ".md", ".py", ".pyc"})
+
+
+def _is_payload_dir(name: str) -> bool:
+    # The only rule `datasets` applies to a directory: a dotted or `__`-prefixed one is skipped
+    # unless a pattern names it, so nothing beneath it can supply rows. That covers a `__MACOSX`
+    # tree left by a Mac zip. The metadata FILE names are deliberately not applied here -- a
+    # directory called `license/` can hold the parquet the resolver would happily load, and
+    # pruning that subtree hid the dataset from On Device.
+    return not name.startswith(".") and not name.startswith("__")
+
+
+def _is_payload_name(name: str) -> bool:
+    # As above, plus the metadata names: an AppleDouble sidecar (`._train.parquet`),
+    # `.gitignore` and every other dotfile the list does not enumerate, and the cards and
+    # licences that a cancelled download leaves behind.
+    if not _is_payload_dir(name):
+        return False
+    return name.lower() not in _DATASET_NON_PAYLOAD_FILENAMES
+
+
+def _is_payload_file(name: str) -> bool:
+    if not _is_payload_name(name):
+        return False
+    # the resolver's own suffix rule rather than a second reading of the name: it walks the
+    # whole chain and drops a trailing compression suffix first, so `train.parquet.backup` is
+    # still parquet and `data.py.gz` is still a script.
+    suffix = local_options._data_suffix(name)
+    return suffix is None or suffix.lower() not in _DATASET_NON_PAYLOAD_SUFFIXES
+
+
+def _is_present_payload_file(path: Path) -> bool:
+    # the resolver's own emptiness rule rather than mere existence. `_empty_payload` is what
+    # decides whether the builder reads any bytes out of a file, and it answers True for the two
+    # shapes that look like payload and are not: a zero-byte `train.jsonl` left by a cancelled
+    # write, and a snapshot link into `blobs/` whose blob was pruned, which stats through to
+    # nothing. offering either put a row On Device that then failed to load offline.
+    if not _is_payload_file(path.name):
+        return False
+    if local_options._empty_payload(path):
+        return False
+    # bytes are not rows. `_rowless` is the resolver's probe for a csv holding only its header
+    # and a json holding `[]` or `{}`; it reads a short head and only for those two builders,
+    # so it costs nothing on parquet, arrow or media. a rowless file is not counted, but it
+    # does not condemn the snapshot either -- datasets drops that split and builds the rest.
+    module = local_options._file_module(path.name)
+    return module is None or not local_options._rowless(path, path.name, module)
+
+
+def _snapshot_holds_payload(snapshot: Path) -> Optional[bool]:
+    """True/False for this snapshot, or None when a subtree could not be read.
+
+    None is not False. `os.walk` swallows `scandir` errors unless `onerror` is given, so a
+    cache written by another user or on an unavailable mount would otherwise read as an
+    empty snapshot and hide a dataset that was merely uninspectable.
+    """
+    unreadable = False
+
+    def _note(_exc: OSError) -> None:
+        nonlocal unreadable
+        unreadable = True
+
+    # Every directory already walked or queued, by resolved path, and the roots still to walk.
+    # A junction pointing at one of its own ancestors resolves back inside the snapshot, so
+    # containment alone does not stop it: `os.walk(followlinks = False)` keeps descending
+    # `data/loop/loop/...` until the path length gives out, and the inventory request hangs.
+    # Recording what has been visited ends that on every runtime, which matters most on the
+    # pre-3.12 Windows this supports, where neither `is_symlink()` nor a missing `is_junction()`
+    # can report the reparse point.
+    seen: set[Path] = set()
+    pending: list[Path] = []
+
+    def _book(entry: Path) -> Optional[Path]:
+        """The resolved path, booked as visited, or None when already seen or unresolvable."""
+        nonlocal unreadable
+        try:
+            resolved = entry.resolve(strict = True)
+        except (OSError, RuntimeError, ValueError):
+            unreadable = True
+            return None
+        if resolved in seen:
+            return None
+        seen.add(resolved)
+        return resolved
+
+    start = _book(snapshot)
+    if start is None:
+        return None
+    pending.append(start)
+
+    try:
+        while pending:
+            root = pending.pop()
+            for directory, dirnames, filenames in os.walk(root, followlinks = False, onerror = _note):
+                base = Path(directory)
+                kept = []
+                for name in dirnames:
+                    # Nothing under a hidden or `__`-prefixed dir can supply rows, by the same
+                    # rule `datasets` resolves data files with, so it is neither walked nor
+                    # counted -- a `.hidden/notes.txt` must not clear `partial`.
+                    if not _is_payload_dir(name):
+                        continue
+                    entry = base / name
+                    # Containment rather than a link-type test. `Path.is_symlink()` is false for
+                    # a Windows junction (only `S_IFLNK` sets it) and `Path.is_junction()` does
+                    # not exist before 3.12, which this package still supports, so
+                    # `os.walk(followlinks = False)` would descend through a junction into an
+                    # arbitrary external tree. Comparing resolved paths catches every redirect on
+                    # every runtime, with no platform branch.
+                    try:
+                        redirected = not entry.resolve(strict = True).is_relative_to(root)
+                        linked = entry.is_symlink()
+                    except (OSError, RuntimeError, ValueError):
+                        unreadable = True
+                        continue
+                    # A directory leaving this root is walked as a root of its own rather than
+                    # taken as proof. Migrated and shared caches keep their data behind one, so
+                    # pruning it hid them, but a stale redirect to an empty or metadata-only
+                    # target supplies no rows and must not clear `partial` by existing.
+                    if redirected:
+                        target = _book(entry)
+                        if target is not None:
+                            pending.append(target)
+                        continue
+                    # A POSIX symlink pointing back inside this root is skipped outright: the
+                    # walk never descends one, so it cannot loop, and booking its target's
+                    # resolved path would prune the real directory when `alias` happens to be
+                    # listed before `data` -- losing the payload under it on enumeration order.
+                    # A junction reports False here on every runtime, which is the case the
+                    # visited set is for.
+                    if linked:
+                        continue
+                    if _book(entry) is None:
+                        continue
+                    kept.append(name)
+                dirnames[:] = kept
+                if any(_is_present_payload_file(base / name) for name in filenames):
+                    return True
+    except OSError:
+        return None
+    return None if unreadable else False
+
+
+def _raw_dataset_cache_has_data(repo_id: str, cache_path: Path) -> bool:
+    """Whether the snapshot a load would actually open holds anything beyond metadata.
+
+    A cancelled download can leave the dataset card and nothing else, which every structural
+    check reads as complete, so the repo was offered On Device and then failed in load_dataset().
+
+    Only the revision `dataset_snapshot_from_cache_path` selects counts, which is the one
+    `training_dataset_cache_pin` pins for the run. A payload-bearing sibling revision is not
+    a reason to clear `partial`: the pin would still open the metadata-only revision this
+    resolves to, so the row would be offered and then fail, and fail hard offline.
+    """
+    snapshot = dataset_snapshot_from_cache_path(str(cache_path), repo_id)
+    if snapshot is None:
+        return False
+    # True, or unreadable -- and an uninspectable cache is not an empty one.
+    return _snapshot_holds_payload(snapshot) is not False
+
+
 def _scan_hub_dataset_cache_dirs() -> list[dict]:
     """Fallback scanner: ``scan_cache_dir()`` skips repos when one cache entry is partially corrupt, so this keeps On Device matching disk."""
     seen_lower: dict[str, dict] = {}
@@ -128,14 +316,16 @@ def _scan_hub_dataset_cache_dirs() -> list[dict]:
                 continue
             key = repo_id.lower()
             existing = seen_lower.get(key)
-            snapshot_partial = _hub_dataset_snapshot_count(
-                entry
-            ) == 0 or hf_cache_scan.is_snapshot_partial("dataset", repo_id, entry)
+            snapshot_partial = (
+                _hub_dataset_snapshot_count(entry) == 0
+                or hf_cache_scan.is_snapshot_partial("dataset", repo_id, entry)
+                or not _raw_dataset_cache_has_data(repo_id, entry)
+            )
             row = {
                 "repo_id": repo_id,
                 "size_bytes": size_bytes,
                 "cache_path": str(entry.resolve()),
-                # snapshot_count == 0 catches blobs-but-no-snapshot; is_snapshot_partial adds row-state checks.
+                # blobs-but-no-snapshot, then row state, then a card-only snapshot.
                 "partial": snapshot_partial,
                 "partial_transport": (
                     hf_cache_scan.partial_transport_for(
@@ -283,7 +473,7 @@ def _scan_hf_dataset_caches() -> list[dict]:
                     "dataset",
                     repo_info.repo_id,
                     cache_dir,
-                )
+                ) or not _raw_dataset_cache_has_data(repo_info.repo_id, cache_dir)
                 row = {
                     "repo_id": repo_info.repo_id,
                     "size_bytes": total_size,
@@ -321,14 +511,18 @@ def _scan_hf_dataset_caches() -> list[dict]:
     for row in _scan_processed_dataset_caches():
         key = row["repo_id"].lower()
         existing = seen_lower.get(key)
-        if existing is None or (bool(existing.get("partial")) and not bool(row.get("partial"))):
+        if existing is None:
             seen_lower[key] = row
-        else:
-            existing["size_bytes"] = max(existing["size_bytes"], row["size_bytes"])
-            # Preserve the raw path for scoped deletion and expose the processed Arrow path separately.
-            if row.get("processed_cache"):
-                existing["processed_cache"] = True
-                existing["load_cache_path"] = row.get("cache_path")
+            continue
+        existing["size_bytes"] = max(existing["size_bytes"], row["size_bytes"])
+        # Preserve the raw path for scoped deletion and expose the processed Arrow path separately.
+        if row.get("processed_cache"):
+            existing["processed_cache"] = True
+            existing["load_cache_path"] = row.get("cache_path")
+        # annotating rather than replacing keeps the hub cache_path that scoped deletion needs.
+        if existing.get("partial") and not row.get("partial"):
+            existing["partial"] = False
+            existing["partial_transport"] = None
     for row in _scan_app_processed_dataset_caches():
         key = row["repo_id"].lower()
         existing = seen_lower.get(key)
