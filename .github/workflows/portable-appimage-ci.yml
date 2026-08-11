@@ -254,6 +254,60 @@ jobs:
       # Storage is the one Actions resource that is not free on public repos, and
       # this file is ~150MB. PR runs prove the build still works and keep nothing;
       # a manual dispatch is how you get a copy to actually launch.
+      # The dlopen probes above test the mechanism that broke on Mint 22. This tests
+      # the app: the first Noble launch reached the renderer and aborted with
+      # EGL_BAD_PARAMETER, which the libGLX_mesa result should have resolved, but that
+      # is inference until something actually starts. Same noble container, plus the
+      # host display stack a real desktop already has (a bare container has none, and
+      # AppRun correctly refuses to start without it, which would make the run read as
+      # a pass while proving nothing).
+      - name: Launch the app on Ubuntu 24.04
+        shell: bash
+        env:
+          APPIMAGE: ${{ steps.build.outputs.appimage }}
+        run: |
+          set -euo pipefail
+          workdir="$RUNNER_TEMP/noble-launch"
+          rm -rf "$workdir"; mkdir -p "$workdir"
+          cp "$APPIMAGE" "$workdir/app.AppImage"
+          ( cd "$workdir" && chmod +x app.AppImage && ./app.AppImage --appimage-extract >/dev/null )
+          cat > "$workdir/launch.sh" <<'SH'
+          set -u
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq >/dev/null
+          apt-get install -y -qq xvfb zenity libgtk-3-0t64 \
+            libwayland-server0 libwayland-client0 libwayland-cursor0 libwayland-egl1 \
+            libgl1 libegl1 libgbm1 libglx-mesa0 libx11-6 libxext6 libxrandr2 \
+            libxi6 libxcursor1 libxfixes3 libxrender1 libxcomposite1 libxdamage1 \
+            libasound2t64 >/dev/null 2>&1
+          cd /work
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            timeout 45 ./squashfs-root/AppRun > launch.out 2> launch.err
+          code=$?
+          echo "exit=$code (124 = still alive at the timeout, which is success here)"
+          echo "--- stdout ---"; tail -40 launch.out
+          echo "--- stderr ---"; tail -40 launch.err
+
+          # AppRun stops early and explains itself when a host library it does not
+          # bundle is missing. That is correct behaviour, but it means the webview was
+          # never reached, so it must not read as a pass.
+          if grep -q 'cannot start because these libraries are missing' launch.out; then
+            echo "INCONCLUSIVE: AppRun stopped on a missing host library"; exit 2
+          fi
+          if grep -qi 'undefined symbol\|GLIBCXX_\|EGL_BAD_PARAMETER\|Aborting' launch.out launch.err; then
+            echo "FAILED: the renderer or a library mismatch broke the launch"
+            grep -i -m5 'undefined symbol\|GLIBCXX_\|EGL_BAD_PARAMETER\|Aborting' launch.out launch.err
+            exit 1
+          fi
+          [ "$code" = 124 ] || { echo "FAILED: exited $code before the timeout"; exit 1; }
+          echo "OK: stayed up with no library mismatch and no renderer abort"
+          SH
+          if ! docker run --rm -v "$workdir":/work -w /work ubuntu:24.04 \
+               bash /work/launch.sh; then
+            echo "::error::the portable AppImage does not launch cleanly on Ubuntu 24.04 (Linux Mint 22 Wilma's base)"
+            exit 1
+          fi
+
       - name: Upload the AppImage
         if: github.event_name == 'workflow_dispatch' && inputs.upload
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
