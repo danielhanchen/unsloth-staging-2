@@ -1,0 +1,41 @@
+name: "staging-8484 rust macos-14"
+on:
+  push:
+    branches: ["pr-8484-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  desktop:
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # generate_context! embeds frontendDist, so the bundle has to exist
+      # before the crate will compile at all.
+      - name: Build the frontend
+        working-directory: studio/frontend
+        run: |
+          npm install --no-fund --no-audit
+          npm run build
+      - uses: dtolnay/rust-toolchain@stable
+      # The two that failed on the merged code. Named explicitly so the run
+      # reports on them rather than burying them in a suite that has other
+      # pre-existing macOS failures.
+      - name: The zombie tests
+        working-directory: studio/src-tauri
+        run: cargo test --no-fail-fast zombie unreaped -- --nocapture
+      - name: Whole suite
+        working-directory: studio/src-tauri
+        run: cargo test --no-fail-fast
