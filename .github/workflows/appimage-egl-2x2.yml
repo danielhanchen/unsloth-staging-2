@@ -1,0 +1,149 @@
+name: AppImage EGL 2x2
+
+# Is EGL_BAD_PARAMETER on Ubuntu 24.04 caused by the portable bundle, or by Noble?
+#
+# The launch matrix established that the PORTABLE bundle renders on 22.04 and fails on
+# 24.04. What it did not establish is whether anything renders on 24.04 under Xvfb. The
+# thin AppImage is the control that answers it, because it is the same application with
+# the same WebKit, taking its desktop stack from the host instead of the bundle:
+#
+#   thin 24.04 PASS + portable 24.04 FAIL -> the bundle is at fault
+#   thin 24.04 FAIL + portable 24.04 FAIL -> Noble/Xvfb/Mesa, and the earlier
+#                                            "fail-renderer" verdict means nothing
+#
+# 22.04 runs both as well, so each bundle is compared against itself across OSes and
+# against the other bundle on the same OS.
+#
+# When a cell fails it re-runs with the loader and Mesa talking, so the failure names
+# which libraries were involved instead of leaving it to be guessed at.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [pr-8343-ci]
+    paths:
+      - '.github/workflows/appimage-egl-2x2.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Linux native deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev patchelf
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+      - working-directory: studio/frontend
+        run: npm install --no-fund --no-audit
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Pin AppImage toolchain
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/appimage-tools"; mkdir -p "$d"
+          curl -fsSL "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage" -o "$d/appimagetool-x86_64.AppImage"
+          curl -fsSL "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64" -o "$d/runtime-x86_64"
+          echo "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0  $d/appimagetool-x86_64.AppImage" | sha256sum -c -
+          echo "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d  $d/runtime-x86_64" | sha256sum -c -
+          chmod +x "$d/appimagetool-x86_64.AppImage"
+      - name: Build Linux deb
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: studio
+          tauriScript: npx --prefix . tauri
+          args: -v --bundles deb --config '{"bundle":{"createUpdaterArtifacts":false}}'
+      - name: Build BOTH AppImages from the same deb
+        run: |
+          set -euo pipefail
+          deb="$(find studio/src-tauri/target/release/bundle/deb -name '*.deb' -print -quit)"
+          tools="$RUNNER_TEMP/appimage-tools"
+          mkdir -p "$RUNNER_TEMP/out"
+          studio/src-tauri/linux/build-portable-appimage.sh "$deb" \
+            "$tools/appimagetool-x86_64.AppImage" "$tools/runtime-x86_64" \
+            "$RUNNER_TEMP/out/portable.AppImage"
+          # Same deb payload, so any difference between the two is packaging alone.
+          APPIMAGE_PATH="$RUNNER_TEMP/out/thin.AppImage" \
+          studio/src-tauri/linux/build-thin-appimage.sh "$deb" \
+            "$tools/appimagetool-x86_64.AppImage" "$tools/runtime-x86_64" \
+            "$RUNNER_TEMP/out/thin.AppImage"
+          ls -lh "$RUNNER_TEMP/out"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimages
+          path: ${{ runner.temp }}/out/*.AppImage
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+
+  launch:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+        bundle: [thin, portable]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: appimages
+      - name: Host desktop stack
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # The thin bundle needs the real WebKit stack from the host; the portable one
+          # does not, but installing it for both keeps the two cells comparable.
+          sudo apt-get install -y xvfb zenity mesa-utils libgl1-mesa-dri \
+            libgtk-3-0 libwebkit2gtk-4.1-0 libayatana-appindicator3-1 \
+            libwayland-server0 libgl1 libegl1 libgbm1 || \
+          sudo apt-get install -y xvfb zenity mesa-utils libgl1-mesa-dri \
+            libgtk-3-0t64 libwebkit2gtk-4.1-0 libayatana-appindicator3-1 \
+            libwayland-server0 libgl1 libegl1 libgbm1
+          echo "--- host EGL/GL sanity, independent of any AppImage ---"
+          xvfb-run -a glxinfo -B 2>&1 | head -8 || echo "glxinfo failed"
+          xvfb-run -a eglinfo 2>&1 | head -12 || echo "eglinfo unavailable"
+      - name: Launch ${{ matrix.bundle }}
+        id: launch
+        run: |
+          set +e
+          f="./${{ matrix.bundle }}.AppImage"
+          chmod +x "$f"
+          "$f" --appimage-extract >/dev/null
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            timeout 45 ./squashfs-root/AppRun > out.txt 2> err.txt
+          code=$?
+          echo "exit=$code"
+          echo "--- stdout ---"; cat out.txt
+          echo "--- stderr ---"; cat err.txt
+          verdict=pass
+          if grep -q 'cannot start because these libraries are missing' out.txt; then
+            verdict=inconclusive-missing-host-lib
+          elif grep -qi 'undefined symbol' out.txt err.txt; then verdict=fail-undefined-symbol
+          elif grep -qi 'GLIBCXX_\|GLIBC_' out.txt err.txt; then verdict=fail-glibc-version
+          elif grep -qi 'EGL_BAD_PARAMETER\|Aborting' out.txt err.txt; then verdict=fail-renderer
+          elif [ "$code" != 124 ]; then verdict="fail-exited-$code"
+          fi
+          echo "RESULT ${{ matrix.os }} ${{ matrix.bundle }} = $verdict"
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+      - name: Name the libraries involved (only when it failed)
+        if: steps.launch.outputs.verdict != 'pass'
+        run: |
+          set +e
+          echo "Re-running with the loader and Mesa talking, so the failure names names."
+          EGL_LOG_LEVEL=debug LIBGL_DEBUG=verbose MESA_DEBUG=1 LD_DEBUG=libs \
+          xvfb-run -a --server-args="-screen 0 1280x800x24" \
+            timeout 40 ./squashfs-root/AppRun > dbg.out 2> dbg.err
+          echo "--- which libGL/libEGL/mesa objects were opened, and from where ---"
+          grep -hoE '/[^ ]*(libEGL|libGL|libgbm|libdrm|_mesa|libLLVM|libstdc\+\+)[^ ]*' dbg.err dbg.out \
+            | sort -u | head -40
+          echo "--- EGL/Mesa diagnostics ---"
+          grep -iE 'egl|mesa|dri|swrast|llvmpipe' dbg.err dbg.out | grep -viE '^\s*[0-9]+:' | head -30
