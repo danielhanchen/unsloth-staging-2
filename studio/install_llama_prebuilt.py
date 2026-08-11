@@ -5820,7 +5820,14 @@ def _linux_published_attempts(host: HostInfo, bundle: PublishedReleaseBundle) ->
         if published_rocm is not None:
             attempts.append(published_rocm)
     else:
-        if host.has_intel_gpu and not host.has_physical_nvidia:
+        # Same condition as the upstream-filename path in direct_upstream_release_plan
+        # and resolve_upstream_asset_choice. It has to be stated in all three: this is
+        # the branch that actually runs when a published bundle exists, which is the
+        # normal case, so gating Vulkan on has_intel_gpu here left every AMD host
+        # without usable ROCm on the CPU bundle no matter what the other two said.
+        # Measured on a Steam Deck (gfx1033): Vulkan 121 tok/s generation vs 49.8 CPU.
+        # Reaching here already means not has_rocm -- it is the else of that branch.
+        if (host.has_intel_gpu or host.has_amd_gpu_without_rocm) and not host.has_physical_nvidia:
             vulkan_choice = published_asset_choice_for_kind(bundle, "linux-vulkan", host = host)
             if vulkan_choice is not None:
                 attempts.append(vulkan_choice)
