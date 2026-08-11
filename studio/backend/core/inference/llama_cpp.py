@@ -10742,6 +10742,9 @@ class LlamaCppBackend:
                 _vulkan_explicit_unmatched = False
                 _vulkan_requested_ids: list[int] = []
                 _vulkan_available_ordinals: list[int] = []
+                # Auto dropped the drafter because only the target fit. Bound before
+                # the try for the same reason: the launch below reads it either way.
+                _spec_dropped_no_vram = False
                 try:
                     gguf_size = self._get_gguf_size_bytes(model_path)
                     # Include GPU-loaded mmproj in the fit budget (#5825).
@@ -11153,43 +11156,17 @@ class LlamaCppBackend:
                     # llama.cpp split by free VRAM).
                     tp_tensor_split: Optional[list[int]] = None
                     explicit_ctx = requested_ctx > 0
-                    # Flat MTP reserve fraction: used only as the fallback when the
-                    # byte-accurate mtp_overhead_fn can't size the draft KV (dims
-                    # unavailable, or _mtp_kv_unsized = weights-only). A separate
-                    # drafter on CPU uses no GPU (no reserve); an embedded head is on
-                    # GPU regardless of draft-offload flags (keep its reserve).
-                    _flat_mtp_engages = _mtp_will_engage and (
-                        mtp_overhead_fn is None or _mtp_kv_unsized
-                    )
                     _draft_cpu_no_embedded = _draft_on_cpu and not self._nextn_predict_layers
-                    # MTP reserves GPU VRAM unless its only drafter is a separate
-                    # CPU-offloaded one (an embedded head stays on GPU). The tensor
-                    # path reserves like the layer path; gate both on this.
-                    _mtp_reserves_gpu = _mtp_will_engage and not _draft_cpu_no_embedded
-                    _flat_mtp_reserve = (
-                        _MTP_VRAM_RESERVE_FRAC
-                        if (_flat_mtp_engages and not _draft_cpu_no_embedded)
-                        else 0.0
-                    )
-                    _pin_fraction = self._GPU_PIN_VRAM_FRACTION - _flat_mtp_reserve
 
-                    # Charge the soft overhead _CTX_FIT_VRAM_FRACTION under-covers on tight
-                    # tiers, gated so plain dense loads (#5106) only pay the CUDA-ctx base.
-                    # CUDA/cuBLAS context is discrete-GPU only (not Metal); the mmproj and
-                    # MTP draft-graph buffers exist on every backend.
-                    _soft_overhead = self._CUDA_CONTEXT_RESERVE_BYTES if gpus else 0
-                    if effective_is_vision and mmproj_size > 0:
-                        _soft_overhead += int(mmproj_size * (self._MMPROJ_VRAM_SAFETY - 1.0))
-                    if _mtp_reserves_gpu:
-                        _soft_overhead += self._MTP_DRAFT_COMPUTE_BYTES
-                    model_size_fit = model_size + _compute_buffer_pipeline + _soft_overhead
-
-                    def _subset_model_size(n_gpus: int) -> int:
-                        return model_size_fit + max(0, n_gpus - 1) * _pipeline_overhead_bytes
-
-                    # Unified-memory budget (0 off Apple Silicon) for the no-GPU Metal cap below.
-                    _apple_budget_mib = self._apple_metal_memory_budget_bytes() // (1024 * 1024)
-
+                    # The two tensor -> layer downgrades that depend on nothing the
+                    # drafter probe below decides run here, BEFORE it: the probe is
+                    # gated on `not tensor_parallel`, and a load that ends up layer-split
+                    # is a load the probe has to answer for (the layer planner reserves
+                    # the Auto drafter and pays for it in context). Both are knowable
+                    # this early -- a recorded abort is a session lookup, and the usable
+                    # GPU count needs only the tensor compute-buffer reserve -- and
+                    # running them first also hands the probe the restored (possibly
+                    # quantized) KV type the layer load will actually use.
                     def _restore_after_tensor_downgrade():
                         # Restore the quantized KV + extras tensor dropped (layer
                         # split supports them), minus --split-mode.
@@ -11272,6 +11249,248 @@ class LlamaCppBackend:
                         # dropped; restore the original cache type + extras (minus
                         # --split-mode) so the layer launch re-emits them.
                         _restore_after_tensor_downgrade()
+
+                    # When the target pins on GPU but the drafter's reserve is what tips
+                    # it over, Auto drops the drafter: it only buys speed, and paying
+                    # for it with a smaller context (or a --fit offload, where decode
+                    # collapses ~3x) is the worse trade. An explicit dropdown / CLI /
+                    # extras choice is honored and keeps the shrink behaviour below.
+                    # Priced over the SAME ranked subsets the placement loop below
+                    # walks, at the context the target alone would get on each: so it
+                    # drops only when no placement could have held both. A whole-pool
+                    # figure is not the ceiling it looks like, because a busy card adds
+                    # ~nothing to _pool_budget_mib while still charging its pipeline
+                    # overhead and its replicated compute buffer, which can condemn a
+                    # drafter the single healthy GPU would have held. Carried to the
+                    # launch as drafter_no_vram, which downgrades the Auto emit.
+                    # Skipped under tensor parallelism: _plan_tensor_parallel reserves a
+                    # per-device tensor buffer with its own context geometry, so these
+                    # layer-split numbers are not that load's numbers, and a wrong answer
+                    # here costs the user the drafter. TP keeps the behaviour it has.
+                    # `tensor_parallel` here already reflects the two downgrades hoisted
+                    # above (recorded abort, fewer than two usable GPUs), so a request
+                    # that ends up layer-split for either reason IS probed. One
+                    # downgrade still escapes: the pooled tensor weight-budget check
+                    # below, which prices _soft_overhead and therefore _mtp_reserves_gpu
+                    # -- both derived from the _mtp_will_engage this probe may clear.
+                    # Running it first would be circular (dropping the drafter shrinks
+                    # the requirement, so the load could stay on tensor with the drafter
+                    # already gone), so a tensor request that falls back to layer split
+                    # purely because the pooled budget cannot hold weights + MTP reserve
+                    # + per-device buffers keeps today's behaviour: no probe, and the
+                    # layer planner pays for the drafter in context as before.
+                    # The gate reads the user's choice, not _mtp_effective, which by
+                    # here is the kind Auto resolved and can no longer tell the two apart.
+                    if (
+                        _mtp_will_engage
+                        and (_canonicalize_spec_mode(speculative_type) or "auto") == "auto"
+                        and not _user_mtp_via_extras
+                        and not _user_draft_via_extras
+                        and not _extra_args_set_spec_type(extra_args)
+                        # A bare --model-draft / --spec-draft-hf sets neither of the
+                        # two flags above (both key off an accumulated --spec-type),
+                        # yet llama.cpp loads whatever that names regardless of the
+                        # spec type: server load_model gates the draft model on
+                        # has_dft(), i.e. "a draft path was given". Dropping here
+                        # would release the reserve for a drafter the child still
+                        # loads, and the load OOMs. It is also an explicit choice.
+                        and not _extra_args_mtp_draft_path(extra_args, env = _spec_env)
+                        and not _draft_cpu_no_embedded
+                        and not tensor_parallel
+                        and gpus
+                        and effective_ctx > 0
+                        and self._can_estimate_kv()
+                    ):
+
+                        def _probe_frac(drafter: bool) -> float:
+                            # The flat fraction is the reserve whenever _mtp_bytes is 0.
+                            return self._GPU_PIN_VRAM_FRACTION - (
+                                _MTP_VRAM_RESERVE_FRAC
+                                if (drafter and (mtp_overhead_fn is None or _mtp_kv_unsized))
+                                else 0.0
+                            )
+
+                        def _probe_base(drafter: bool, n: int) -> int:
+                            # model_size_fit's terms, before it is built below.
+                            _soft = self._CUDA_CONTEXT_RESERVE_BYTES
+                            if effective_is_vision and mmproj_size > 0:
+                                _soft += int(mmproj_size * (self._MMPROJ_VRAM_SAFETY - 1.0))
+                            if drafter:
+                                _soft += self._MTP_DRAFT_COMPUTE_BYTES
+                            return (
+                                model_size
+                                + _compute_buffer_pipeline
+                                + _soft
+                                + max(0, n - 1) * _pipeline_overhead_bytes
+                            )
+
+                        # Fewest GPUs first, ranked by usable VRAM: the same order and
+                        # the same budget the auto placement loop uses, so the answer is
+                        # about placements that loop could actually choose.
+                        _probe_ranked = sorted(
+                            gpus,
+                            key = lambda g: _gpu_usable(g, _probe_frac(False)),
+                            reverse = True,
+                        )
+                        # Same floor as the placement loop's _auto_min_gpus: a tensor
+                        # downgrade raises _layer_min_gpus to keep the request
+                        # multi-GPU, and a one-GPU placement the loop is forbidden to
+                        # choose must not be the one that saves the drafter.
+                        _probe_overhead_mib = _pipeline_overhead_bytes / (1024 * 1024)
+                        _probe_min_gpus = max(
+                            1,
+                            min(
+                                _layer_min_gpus,
+                                sum(
+                                    1
+                                    for g in _probe_ranked
+                                    if _gpu_usable(g, _probe_frac(False)) > _probe_overhead_mib
+                                )
+                                or 1,
+                            ),
+                        )
+                        _target_fits_somewhere = False
+                        _both_fit_somewhere = False
+                        _probe_ctx = 0
+                        _probe_need = _probe_have = 0.0
+                        for _n in range(_probe_min_gpus, len(_probe_ranked) + 1):
+                            _subset = _probe_ranked[:_n]
+                            _cc_n = lambda c, _k = _n: _cc_bytes(c, _k)
+                            _base_wo = _probe_base(False, _n)
+                            _budget_wo = _pool_budget_mib(_subset, _probe_frac(False))
+                            # Explicit context is honored verbatim, so that is what the
+                            # drafter has to fit alongside; Auto gets its own best cap.
+                            _ctx_wo = (
+                                effective_ctx
+                                if explicit_ctx
+                                else self._fit_context_to_vram(
+                                    effective_ctx,
+                                    _budget_wo,
+                                    _base_wo,
+                                    cache_type_kv,
+                                    swa_full = swa_full,
+                                    n_parallel = n_parallel,
+                                    kv_unified = planned_kv_unified,
+                                    n_ubatch = _effective_ubatch,
+                                    flash_attn = planned_flash_attn,
+                                    mtp_engaged = False,
+                                    mtp_overhead_fn = None,
+                                    compute_ctx_bytes_fn = _cc_n,
+                                    budget_frac = 1.0,
+                                    total_mib = None,
+                                )
+                            )
+                            if _ctx_wo <= 0:
+                                continue
+                            _shared = _kv_bytes(_ctx_wo) + _cc_n(_ctx_wo)
+                            _foot_wo = (_base_wo + _shared) / (1024 * 1024)
+                            if _foot_wo > _budget_wo:
+                                continue
+                            # The pooled figure hides the compute buffer every device
+                            # replicates: on a heterogeneous split the weakest card can
+                            # be unable to hold the context the pool priced, and the
+                            # placement loop caps to what it does hold. Charging the
+                            # drafter at the uncapped context condemns it at a context
+                            # this load can never reach. Same reserve expression and
+                            # same cap the auto-context loop below applies (_reserve_at
+                            # / _every_gpu_holds_reserve / _cap_ctx_to_per_device_reserve),
+                            # so the two cannot disagree. Auto only: an explicit context
+                            # is honored verbatim, never capped, and overflows to --fit.
+                            if not explicit_ctx:
+                                _usable_wo = [_gpu_usable(g, _probe_frac(False)) for g in _subset]
+                                _probe_reserve_at = lambda c, _k = _n: (
+                                    (_pipeline_overhead_bytes if _k > 1 else 0)
+                                    + _cc_bytes(c, _k) // _k
+                                )
+                                if not self._every_gpu_holds_reserve(
+                                    _usable_wo, _probe_reserve_at(_ctx_wo)
+                                ):
+                                    _ctx_wo = self._cap_ctx_to_per_device_reserve(
+                                        _ctx_wo, _usable_wo, _probe_reserve_at
+                                    )
+                                    if _ctx_wo <= 0:
+                                        continue
+                                    # Every pooled term shrinks with the context, so this
+                                    # cannot newly fail; re-price rather than lean on it.
+                                    _shared = _kv_bytes(_ctx_wo) + _cc_n(_ctx_wo)
+                                    _foot_wo = (_base_wo + _shared) / (1024 * 1024)
+                                    if _foot_wo > _budget_wo:
+                                        continue
+                            _foot_w = (_probe_base(True, _n) + _shared + _mtp_bytes(_ctx_wo)) / (
+                                1024 * 1024
+                            )
+                            _budget_w = _pool_budget_mib(_subset, _probe_frac(True))
+                            if not _target_fits_somewhere:
+                                # The placement this reports on: the first subset that
+                                # holds the target, which is the one the loop would pick.
+                                _target_fits_somewhere = True
+                                _probe_ctx, _probe_need, _probe_have = (
+                                    _ctx_wo,
+                                    _foot_w,
+                                    _budget_w,
+                                )
+                            if _foot_w <= _budget_w:
+                                _both_fit_somewhere = True
+                                break
+                        if _target_fits_somewhere and not _both_fit_somewhere:
+                            _spec_dropped_no_vram = True
+                            _mtp_will_engage = False
+                            # Clearing the flag alone leaves the reserve in place: the
+                            # eight _mtp_bytes call sites below are unconditional, and
+                            # _fit_context_to_vram invokes any non-None mtp_overhead_fn
+                            # whatever mtp_engaged says. The fit would then still shrink
+                            # the context (or take --fit) for a drafter that no longer
+                            # launches, which is the whole thing this drop prevents.
+                            # _mtp_kv_unsized goes with it, or _flat_mtp_engages below
+                            # would swap the flat fraction in as its replacement.
+                            mtp_overhead_fn = None
+                            _mtp_kv_unsized = False
+                            logger.warning(
+                                "Speculative decoding disabled for this load: the model "
+                                "fits in VRAM at context %d but its drafter does not "
+                                "(needs %.1f GB of a %.1f GB budget, on any GPU subset). "
+                                "Auto keeps the context rather than shrink it for a speed "
+                                "option. Select the drafter in Settings to force it.",
+                                _probe_ctx,
+                                _probe_need / 1024,
+                                _probe_have / 1024,
+                            )
+
+                    # Flat MTP reserve fraction: used only as the fallback when the
+                    # byte-accurate mtp_overhead_fn can't size the draft KV (dims
+                    # unavailable, or _mtp_kv_unsized = weights-only). A separate
+                    # drafter on CPU uses no GPU (no reserve); an embedded head is on
+                    # GPU regardless of draft-offload flags (keep its reserve).
+                    _flat_mtp_engages = _mtp_will_engage and (
+                        mtp_overhead_fn is None or _mtp_kv_unsized
+                    )
+                    # MTP reserves GPU VRAM unless its only drafter is a separate
+                    # CPU-offloaded one (an embedded head stays on GPU). The tensor
+                    # path reserves like the layer path; gate both on this.
+                    _mtp_reserves_gpu = _mtp_will_engage and not _draft_cpu_no_embedded
+                    _flat_mtp_reserve = (
+                        _MTP_VRAM_RESERVE_FRAC
+                        if (_flat_mtp_engages and not _draft_cpu_no_embedded)
+                        else 0.0
+                    )
+                    _pin_fraction = self._GPU_PIN_VRAM_FRACTION - _flat_mtp_reserve
+
+                    # Charge the soft overhead _CTX_FIT_VRAM_FRACTION under-covers on tight
+                    # tiers, gated so plain dense loads (#5106) only pay the CUDA-ctx base.
+                    # CUDA/cuBLAS context is discrete-GPU only (not Metal); the mmproj and
+                    # MTP draft-graph buffers exist on every backend.
+                    _soft_overhead = self._CUDA_CONTEXT_RESERVE_BYTES if gpus else 0
+                    if effective_is_vision and mmproj_size > 0:
+                        _soft_overhead += int(mmproj_size * (self._MMPROJ_VRAM_SAFETY - 1.0))
+                    if _mtp_reserves_gpu:
+                        _soft_overhead += self._MTP_DRAFT_COMPUTE_BYTES
+                    model_size_fit = model_size + _compute_buffer_pipeline + _soft_overhead
+
+                    def _subset_model_size(n_gpus: int) -> int:
+                        return model_size_fit + max(0, n_gpus - 1) * _pipeline_overhead_bytes
+
+                    # Unified-memory budget (0 off Apple Silicon) for the no-GPU Metal cap below.
+                    _apple_budget_mib = self._apple_metal_memory_budget_bytes() // (1024 * 1024)
 
                     if tensor_parallel and tp_gpus:
                         # Pooled usable budget (after each device's compute buffer)
@@ -12129,6 +12348,7 @@ class LlamaCppBackend:
                     dspark_fit_sized = not use_fit,
                     dflash_draft_path = (launch_mtp_draft_path if _spec_canon == "dflash" else None),
                     dflash_fit_sized = not use_fit,
+                    drafter_no_vram = _spec_dropped_no_vram,
                     draft_device = _draft_device,
                 )
                 # _build_speculative_flags judged the stripped list, so a user
@@ -13495,6 +13715,7 @@ class LlamaCppBackend:
         dspark_fit_sized: bool = True,
         dflash_draft_path: Optional[str] = None,
         dflash_fit_sized: bool = True,
+        drafter_no_vram: bool = False,
         draft_device: Optional[str] = None,
     ) -> List[str]:
         """Return the llama-server flag list for the requested spec mode.
@@ -13874,7 +14095,32 @@ class LlamaCppBackend:
         # UD-Q4_K_XL + mmproj-kquant + dflash-kquant, b10342, B200, n_max=2, greedy,
         # ~545 image tokens gave 92.1 -> 114.2 tok/s at 0.646 acceptance with output
         # byte-identical to the drafter-free run.
-        if dspark_draft_path and caps.get("supports_dspark"):
+        if drafter_no_vram:
+            # The fit found room for the target but not for the drafter's reserve,
+            # and reserved nothing for it, so emitting one now would OOM the load.
+            # Same downgrade as the MLA branch below: ngram-mod costs no VRAM, and
+            # spec-off when the build lacks it. The drafter paths stay recorded, so
+            # the UI still names the kind and a repeat Apply still dedupes.
+            self._spec_fallback_reason = "drafter_no_vram"
+            if caps.get("supports_ngram_mod"):
+                logger.info(
+                    "Auto: the drafter does not fit in VRAM alongside the model at this "
+                    "context, so it is dropped and ngram-mod (zero-VRAM) takes its "
+                    "place. Choose the drafter in the Speculative Decoding dropdown to "
+                    "force it at a smaller context."
+                )
+                _emit_ngram_mod()
+            else:
+                # spec-off: --spec-type ngram-mod is not a value this build's enum
+                # carries, and llama-server aborts on one it cannot parse rather than
+                # ignoring it. Mirrors the MLA and sub-3B branches below.
+                logger.info(
+                    "Auto: the drafter does not fit in VRAM alongside the model at this "
+                    "context, so speculative decoding is disabled (this llama-server "
+                    "does not advertise ngram-mod). Choose the drafter in the "
+                    "Speculative Decoding dropdown to force it at a smaller context."
+                )
+        elif dspark_draft_path and caps.get("supports_dspark"):
             # DSpark first: load_model only hands a sidecar down once it has one
             # this binary can launch, and it beats every other Auto outcome for
             # this architecture (1.84x on 4x B200, 1.91x on one). Without it these

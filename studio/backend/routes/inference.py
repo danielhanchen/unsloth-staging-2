@@ -5674,6 +5674,82 @@ def _remote_gguf_companion_bytes(
         return 0
 
 
+# Stand-in for a drafter repo no listing could price. Matches the loader's own
+# flat MTP reserve for the case where the drafter's dims are unavailable
+# (llama_cpp's _tp_flat_mtp), because it answers the same question: the launch
+# will make a drafter resident and nothing here can say how big it is. Zero is
+# the one answer that is certainly wrong, since it admits the load.
+_REMOTE_DRAFTER_RESERVE_BYTES = 2 * 1024**3
+
+
+def _split_hf_draft_spec(spec: str) -> tuple[Optional[str], str]:
+    """``<user>/<model>[:quant]`` -> (repo id, lowercased narrowing hint).
+
+    llama.cpp's common_download_split_repo_tag splits the value on ':', keeps the
+    tail as the quant tag and then requires the head to be exactly
+    ``<user>/<model>``, so that is the shape a listing can be asked for. A
+    trailing ``/<file>.gguf`` is not that shape and llama.cpp rejects it, but it
+    is a common way to write the flag, and reading the repo out of it prices a
+    real download instead of falling straight to the flat reserve. Repo None when
+    nothing repo-shaped is left, which the caller charges as the reserve.
+    """
+    repo, sep, tag = (spec or "").strip().partition(":")
+    parts = [p for p in repo.split("/") if p]
+    hint = tag.strip().lower() if sep else ""
+    if len(parts) > 2 and parts[-1].lower().endswith(".gguf"):
+        hint = parts[-1].lower()
+        parts = parts[:2]
+    if len(parts) != 2:
+        return None, ""
+    return "/".join(parts), hint
+
+
+def _remote_drafter_repo_bytes(spec: str, *, hf_token: Optional[str]) -> int:
+    """Bytes to charge for a drafter named as an HF repo (--spec-draft-hf/-hfd).
+
+    llama-server downloads that repo and loads the drafter out of it exactly as
+    it does the target model, so it is resident VRAM, but there is no local file
+    to stat before the load and the target repository's own listing says nothing
+    about it. Bounded rather than picked, for the reason dflash_budget_bytes
+    documents and with its arithmetic: which file the fetch lands on is not
+    knowable from a listing, so the largest WHOLE shard set is the answer a
+    listing can give, and a split set is charged as the set because llama-server
+    maps every shard.
+
+    Any failure -- no network, gated repo, malformed id, a repo listing no GGUF
+    -- falls back to the flat reserve. This guard protects a running training
+    job, so an unreadable listing must not become a silent charge of zero for a
+    drafter the launch is certainly going to bring in.
+    """
+    repo, hint = _split_hf_draft_spec(spec)
+    if not repo:
+        return _REMOTE_DRAFTER_RESERVE_BYTES
+    try:
+        from core.inference.llama_cpp import _gguf_extra_shards
+        from huggingface_hub import model_info
+        from utils.models.drafters import dflash_budget_bytes
+
+        info = model_info(repo, token = hf_token, files_metadata = True)
+        sizes: dict[str, int] = {}
+        for sibling in info.siblings or []:
+            name = sibling.rfilename or ""
+            if not Path(name).name.lower().endswith(".gguf"):
+                continue
+            sizes[name] = getattr(sibling, "size", 0) or 0
+        if hint:
+            # The :quant tag (or a named file) is llama.cpp's own narrowing, so
+            # bounding over the rest of the repo would charge an F16 for a Q4
+            # drafter and refuse loads that fit. A tag that matches nothing has
+            # told us nothing -- repos label quants inconsistently -- and every
+            # candidate goes back into the bound.
+            matched = {n: s for n, s in sizes.items() if hint in Path(n).name.lower()}
+            sizes = matched or sizes
+        return dflash_budget_bytes(sizes, _gguf_extra_shards) or _REMOTE_DRAFTER_RESERVE_BYTES
+    except Exception as e:
+        logger.warning(f"Could not size remote drafter repo {spec}: {e}")
+        return _REMOTE_DRAFTER_RESERVE_BYTES
+
+
 # Upper bound on any current tokenizer, used to rebuild the compute buffer when a
 # truncated header drops the token array. Above Llama 4 / Gemma 3 (256k), the widest shipping.
 _ASSUMED_MAX_VOCAB = 262144
@@ -5863,12 +5939,34 @@ def _estimate_gguf_required_gb(
         )
 
         _spec_mode = _canonicalize_spec_mode(speculative_type) or "auto"
+        _extra_args_own_spec = _extra_args_set_spec_type(llama_extra_args)
+        # Extras that own --spec-type AND name their own --model-draft end
+        # _build_speculative_flags before any mode branch, so Studio's sidecar is
+        # neither fetched nor launched: the drafter that becomes resident is theirs,
+        # already charged below as _extras_bytes, and billing both refuses a load that
+        # fits. Both halves matter. Owning the spec type alone keeps the conservative
+        # charge, since the guard protects a running training job and a drafter can
+        # still arrive by a route this cannot see. Applies to every kind, hence one flag.
+        # Only a LOCAL file, because the suppression's whole premise is that the
+        # drafter is "already charged below as _extras_bytes" and that charge is
+        # itself gated on Path(...).is_file(). --spec-draft-hf / -hfd names an HF
+        # repo id, which llama-server downloads and loads all the same (its
+        # has_dft() only asks whether a draft path was given), so suppressing on
+        # one would leave a multi-GB resident drafter charged nowhere and let the
+        # guard admit a load that evicts the training job it protects.
+        _extras_own_draft_path = _extra_args_mtp_draft_path(llama_extra_args, env = {})
+        _extras_own_drafter = bool(
+            _extra_args_own_spec
+            and _extras_own_draft_path
+            and Path(_extras_own_draft_path).is_file()
+        )
         _forced_dspark = bool(
-            _spec_mode == "dspark" or _extra_args_requests_dspark(llama_extra_args, env = {})
+            (_spec_mode == "dspark" or _extra_args_requests_dspark(llama_extra_args, env = {}))
+            and not _extras_own_drafter
         )
         # Auto loads the sidecar whenever the model has one, so size it there too
         # or the guard admits a load 11 GB larger than it estimated.
-        _auto_dspark = _spec_mode == "auto"
+        _auto_dspark = _spec_mode == "auto" and not _extras_own_drafter
         _dspark_capable = True
         if _forced_dspark or _auto_dspark:
             # Gate on the same answer the loader uses: _download_dspark skips the
@@ -5892,13 +5990,12 @@ def _estimate_gguf_required_gb(
         # DFlash: same shape as DSpark above, and Auto sizes it for the same
         # reason. The sidecar is ~1.5 GiB rather than ~11 GB, but a guard that
         # protects a running training job still has to charge for it.
-        # Extra args owning --spec-type end _build_speculative_flags before any mode
-        # branch, so neither forced nor Auto reaches the sidecar and charging it refuses
-        # a load for nothing. Extras asking for draft-dflash themselves still pay.
-        _extra_args_own_spec = _extra_args_set_spec_type(llama_extra_args)
         _forced_dflash = bool(
-            _extra_args_requests_dflash(llama_extra_args, env = {})
-            or (_spec_mode == "dflash" and not _extra_args_own_spec)
+            (
+                _extra_args_requests_dflash(llama_extra_args, env = {})
+                or (_spec_mode == "dflash" and not _extra_args_own_spec)
+            )
+            and not _extras_own_drafter
         )
         _auto_dflash = _spec_mode == "auto" and not _extra_args_own_spec
         _dflash_capable = True
@@ -5919,8 +6016,10 @@ def _estimate_gguf_required_gb(
         # which loads no drafter at all, so charging the MTP one would refuse a load
         # that fits. Auto is different: it falls through to the MTP branch, and keeps
         # its charge.
-        _charge_no_drafter = (_forced_dspark and not _dspark_capable) or (
-            _forced_dflash and not _dflash_capable
+        _charge_no_drafter = (
+            _extras_own_drafter
+            or (_forced_dspark and not _dspark_capable)
+            or (_forced_dflash and not _dflash_capable)
         )
 
         def _same_file_key(p: str) -> str:
@@ -5987,14 +6086,18 @@ def _estimate_gguf_required_gb(
         # a remote repo with a local --model-draft still has to price its weights
         # through the listing, and returning the drafter alone under-estimated a
         # load by the whole target model.
+        # A remote one (--spec-draft-hf / -hfd names an HF repo, never a file) is
+        # charged from its OWN listing, because nothing else charges it: the
+        # target repository's companion scan only ever sees the target's
+        # sidecars, so a target that ships none left a multi-GB drafter billed
+        # nowhere and the guard admitted a load that evicts the training job.
         _extras_bytes = 0
         _extras_draft = _extra_args_mtp_draft_path(llama_extra_args, env = {})
-        if (
-            _extras_draft
-            and Path(_extras_draft).is_file()
-            and _same_file_key(str(_extras_draft)) not in _sized_keys
-        ):
-            _extras_bytes = LlamaCppBackend._get_gguf_size_bytes(str(_extras_draft))
+        if _extras_draft and Path(_extras_draft).is_file():
+            if _same_file_key(str(_extras_draft)) not in _sized_keys:
+                _extras_bytes = LlamaCppBackend._get_gguf_size_bytes(str(_extras_draft))
+        elif _extras_draft:
+            _extras_bytes = _remote_drafter_repo_bytes(str(_extras_draft), hf_token = hf_token)
 
         if total_bytes > 0:
             return (total_bytes + _extras_bytes) / (1024**3) + _estimate_gguf_kv_gb(
@@ -6043,8 +6146,9 @@ def _estimate_gguf_required_gb(
                 # refusal for bytes that never become resident.
                 dspark_first = _auto_dspark,
             )
-            # Plus the local --model-draft, if the caller named one: the repo
-            # listing cannot see it, and it is resident next to these weights.
+            # Plus the caller's own --model-draft / --spec-draft-hf, if they named
+            # one: this repo's listing cannot see it, local or remote, and it is
+            # resident next to these weights.
             total_gb = (main_bytes + companions + _extras_bytes) / (1024**3)
             # remote dims are unreadable; only the kq mask, linear in ubatch x ctx, can be sized here
             from core.inference.llama_server_args import parse_ctx_override
