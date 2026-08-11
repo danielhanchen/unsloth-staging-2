@@ -668,8 +668,7 @@ def run_safetensors_tool_loop(
             not _tool_succeeded("render_html")
             and not _provisional_confirm_gated
             and any(
-                ((tool.get("function") or {}).get("name") == "render_html")
-                for tool in active_tools
+                ((tool.get("function") or {}).get("name") == "render_html") for tool in active_tools
             )
         )
 

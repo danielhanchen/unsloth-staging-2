@@ -114,9 +114,9 @@ def strip_tool_patterns(text: str, patterns) -> str:
             if first_close < 0:
                 continue
             probe_start = first_close + len(token)
-            needs_bound = first_close < first_opener or text.find(
-                opener, probe_start, probe_start + 256
-            ) >= 0
+            needs_bound = (
+                first_close < first_opener or text.find(opener, probe_start, probe_start + 256) >= 0
+            )
             if not needs_bound:
                 text = pat.sub("", text)
             else:
@@ -173,9 +173,7 @@ def apply_tool_strip_patterns(
             if first_close < 0:
                 continue
             probe_start = first_close + len(token)
-            if first_close < first_opener or text.find(
-                opener, probe_start, probe_start + 256
-            ) >= 0:
+            if first_close < first_opener or text.find(opener, probe_start, probe_start + 256) >= 0:
                 scan_end = text.rfind(token) + len(token)
         elif required is not None and required not in text:
             continue
@@ -707,8 +705,9 @@ def _inside_open_parameter(
     # nearest candidate and validate it with the original regex, instead of rescanning
     # the entire prefix for every function/close marker.  Unknown caller-supplied
     # patterns keep the general finditer path.
-    reverse_param_search = param_start_re is _TC_PARAM_START_RE or param_start_re.pattern.startswith(
-        r"<(?:parameter|param)"
+    reverse_param_search = (
+        param_start_re is _TC_PARAM_START_RE
+        or param_start_re.pattern.startswith(r"<(?:parameter|param)")
     )
     if reverse_param_search:
         candidate = content.rfind("<param", 0, pos)
@@ -1154,9 +1153,7 @@ def _tool_call_markup_spans(text: str) -> list[tuple[int, int]]:
             if first_close < 0:
                 continue
             probe_start = first_close + len(token)
-            if first_close < first_opener or text.find(
-                opener, probe_start, probe_start + 256
-            ) >= 0:
+            if first_close < first_opener or text.find(opener, probe_start, probe_start + 256) >= 0:
                 scan_end = text.rfind(token) + len(token)
         elif required is not None and required not in text:
             continue
@@ -1287,9 +1284,7 @@ def _strip_closed_blocks_outside_gemma(text: str) -> str:
             if first_close < 0:
                 continue
             probe_start = first_close + len(token)
-            if first_close < first_opener or text.find(
-                opener, probe_start, probe_start + 256
-            ) >= 0:
+            if first_close < first_opener or text.find(opener, probe_start, probe_start + 256) >= 0:
                 scan_end = text.rfind(token) + len(token)
         elif required is not None and required not in text:
             continue
