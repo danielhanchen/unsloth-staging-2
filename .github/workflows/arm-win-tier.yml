@@ -67,9 +67,13 @@ jobs:
           "every remaining requirement resolves on a native ARM64 interpreter"
           exit 0
 
-      - name: Install the tier
+      # --local, or this proves nothing about the Python half: without it the setup
+      # phase runs setup.ps1 / install_python_stack.py out of the RELEASED unsloth
+      # wheel, and the tier logic under test never executes. --no-torch bounds the
+      # runtime; the datasets filtering is identical on both torch paths.
+      - name: Install the tier from this checkout
         shell: pwsh
-        run: .\install.ps1 --no-torch 2>&1 | Tee-Object -FilePath tier-install.log
+        run: .\install.ps1 --local --no-torch 2>&1 | Tee-Object -FilePath tier-install.log
 
       - name: The venv is ARM64 and has no datasets
         shell: pwsh
