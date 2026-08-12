@@ -1,0 +1,122 @@
+# The ARM64 inference-only tier, end to end on real Windows ARM64 hardware:
+# install with UNSLOTH_NO_DATASETS=1 (what install.ps1 sets when it cannot obtain
+# an x64 interpreter), then prove the server boots without datasets and says so.
+name: "8495 win-arm64 inference-only tier"
+on:
+  push:
+    branches: [pr8495-arm64-cross-os]
+    paths:
+      - 'install.ps1'
+      - 'studio/setup.ps1'
+      - 'studio/install_python_stack.py'
+      - 'studio/install_manifest.py'
+      - 'studio/backend/**'
+      - '.github/workflows/arm-win-tier.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  tier:
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}\studio_home
+      UNSLOTH_NO_DATASETS: '1'
+      UNSLOTH_STUDIO_PASSWORD: 'ci-tier-probe-pw'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Install uv
+        shell: pwsh
+        run: |
+          irm https://astral.sh/uv/install.ps1 | iex
+          "$env:USERPROFILE\.local\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # The tier's whole premise: with the wheel-less packages filtered out, the rest
+      # of the stack resolves on a native ARM64 interpreter. Checked before paying for
+      # a full install so a failure here names the package rather than a timeout.
+      - name: The filtered requirement set resolves natively
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $skip = @("datasets", "trl", "sqlite-vec", "tiktoken", "hf-transfer", "hf_transfer", "ddgs", "pandas")
+          $lift = @{ "pymupdf" = "pymupdf>=1.28.2"; "av" = "av>=17.0.0" }
+          $failed = @()
+          foreach ($file in @("studio/backend/requirements/studio.txt", "studio/backend/requirements/no-torch-runtime.txt")) {
+            Get-Content $file | ForEach-Object {
+              $line = ($_ -split '#')[0].Trim()
+              if (-not $line -or $line.StartsWith("-")) { return }
+              $name = ($line -split '[=<>!;\[ ]')[0].ToLowerInvariant()
+              if ($skip -contains $name) { return }
+              if ($lift.ContainsKey($name)) { $line = $lift[$name] }
+              # --no-deps mirrors how the tier installs this file: a torch-bound
+              # dependency of accelerate/peft is not this check's business.
+              uv pip install --dry-run --system --no-deps --only-binary ":all:" "$line" *> $null
+              if ($LASTEXITCODE -ne 0) { $failed += "$file :: $line" }
+            }
+          }
+          if ($failed.Count -gt 0) {
+            "STILL UNRESOLVABLE ON win-arm64:"
+            $failed | ForEach-Object { "  $_" }
+            exit 1
+          }
+          "every remaining requirement resolves on a native ARM64 interpreter"
+          exit 0
+
+      - name: Install the tier
+        shell: pwsh
+        run: .\install.ps1 --no-torch 2>&1 | Tee-Object -FilePath tier-install.log
+
+      - name: The venv is ARM64 and has no datasets
+        shell: pwsh
+        run: |
+          $py = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe"
+          $tag = & $py -S -c "import sysconfig; print(sysconfig.get_platform())"
+          "venv platform tag = $tag"
+          if ($tag -ne "win-arm64") { "expected a native ARM64 venv in this tier"; exit 1 }
+          & $py -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('datasets') is None else 1)"
+          if ($LASTEXITCODE -ne 0) { "datasets is installed; the tier did not filter it"; exit 1 }
+          "datasets is absent, as the tier intends"
+          # The marker is what keeps `unsloth studio update` inside the tier.
+          if (-not (Test-Path "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\.unsloth-no-datasets")) {
+            "the .unsloth-no-datasets marker was not written"
+            exit 1
+          }
+          "tier marker present"
+
+      - name: The server boots and reports datasets_unavailable
+        shell: pwsh
+        run: |
+          $bin = "$env:UNSLOTH_STUDIO_HOME\bin\unsloth.exe"
+          if (-not (Test-Path $bin)) { $bin = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\unsloth.exe" }
+          Start-Process -FilePath $bin -ArgumentList "studio", "-H", "127.0.0.1", "-p", "8899" `
+            -RedirectStandardOutput studio.log -RedirectStandardError studio.err -NoNewWindow
+          $healthy = $false
+          foreach ($i in 1..90) {
+            Start-Sleep -Seconds 5
+            try {
+              $r = Invoke-RestMethod -Uri "http://127.0.0.1:8899/api/health" -TimeoutSec 10
+              if ($r) { $healthy = $true; $health = $r; break }
+            } catch { }
+          }
+          if (-not $healthy) { "server never became healthy"; Get-Content studio.log -Tail 60; Get-Content studio.err -Tail 60; exit 1 }
+          $health | ConvertTo-Json -Depth 4
+          if (-not $health.chat_only) { "expected chat_only in a tier install"; exit 1 }
+          if ($health.chat_only_reason -ne "datasets_unavailable") {
+            "expected chat_only_reason=datasets_unavailable, got '$($health.chat_only_reason)'"
+            exit 1
+          }
+          "the server booted without datasets and explains why training is off"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arm64-tier-logs
+          path: |
+            tier-install.log
+            studio.log
+            studio.err
