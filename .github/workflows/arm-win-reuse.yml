@@ -48,7 +48,7 @@ jobs:
         shell: pwsh
         run: |
           $src = Get-Content studio/setup.ps1 -Raw
-          $m = [regex]::Match($src, '(?s)function Get-CompatiblePythonVersion \{.*?\n\}\n')
+          $m = [regex]::Match($src, '(?s)function Get-CompatiblePythonVersion \{.*?\r?\n\}')
           if (-not $m.Success) { "Get-CompatiblePythonVersion not found"; exit 1 }
           Invoke-Expression $m.Value
           $py = "${{ github.workspace }}\studio_home\.venv\Scripts\python.exe"
@@ -70,3 +70,4 @@ jobs:
           uv pip install --python $py --only-binary ":all:" "datasets==4.3.0" 2>&1 | Select-Object -Last 12
           if ($LASTEXITCODE -eq 0) { "UNEXPECTED: datasets installed on ARM64"; exit 1 }
           "EXPECTED: the reused ARM64 venv cannot install datasets (pyarrow)"
+          exit 0

@@ -42,7 +42,10 @@ jobs:
           $ErrorActionPreference = "Continue"
           uv pip install --dry-run --system --only-binary ":all:" "pyarrow==23.0.1" 2>&1 | Tee-Object -Variable out
           if ($LASTEXITCODE -eq 0) { "UNEXPECTED: pyarrow resolved on win_arm64"; exit 1 }
-          "EXPECTED FAILURE reproduced: $($out -join ' ')".Substring(0, [Math]::Min(400, "EXPECTED FAILURE reproduced: $($out -join ' ')".Length))
+          # uv's non-zero exit is the expected result; pwsh would otherwise pass
+          # $LASTEXITCODE on as the step's own status.
+          "EXPECTED FAILURE reproduced on a real win-arm64 host"
+          exit 0
 
       - name: Full studio requirement set on native ARM64 (expected FAIL, lists every gap)
         shell: pwsh
@@ -59,6 +62,7 @@ jobs:
           "PACKAGES WITH NO win_arm64 WHEEL:"
           $failed | ForEach-Object { "  $_" }
           if ($failed.Count -eq 0) { "UNEXPECTED: everything resolved"; exit 1 }
+          exit 0
 
       - name: The same set resolves for an x64 (emulated) interpreter
         shell: pwsh
@@ -70,3 +74,4 @@ jobs:
             -r studio/backend/requirements/studio.txt
           if ($LASTEXITCODE -ne 0) { "x64 resolution failed - investigate"; exit 1 }
           "x64 resolution OK: the emulated-x64 route is viable"
+          exit 0
