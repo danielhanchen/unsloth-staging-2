@@ -40,27 +40,38 @@ jobs:
           $py = "$home_\.venv\Scripts\python.exe"
           "seeded venv tag = $(& $py -S -c 'import sysconfig; print(sysconfig.get_platform())')"
 
-      # Hole 3, isolated and cheap: does setup.ps1's reuse gate accept it?
-      # Get-CompatiblePythonVersion checks the version string only, so an ARM64
-      # interpreter passes. This step asserts the CURRENT (buggy) behaviour and
-      # is inverted once the fix lands.
-      - name: setup.ps1 reuse gate against an ARM64 interpreter
+      # The fix: Test-CompatibleSetupPythonArch must reject the ARM64 interpreter
+      # that Get-CompatiblePythonVersion (version only) still accepts. Run both
+      # functions verbatim out of setup.ps1 against the seeded venv.
+      - name: setup.ps1 arch gate rejects an ARM64 interpreter
         shell: pwsh
         run: |
           $src = Get-Content studio/setup.ps1 -Raw
-          $m = [regex]::Match($src, '(?s)function Get-CompatiblePythonVersion \{.*?\r?\n\}')
-          if (-not $m.Success) { "Get-CompatiblePythonVersion not found"; exit 1 }
-          Invoke-Expression $m.Value
+          foreach ($fn in @('Get-CompatiblePythonVersion', 'Get-PythonPlatformTag', 'Test-CompatibleSetupPythonArch')) {
+            $m = [regex]::Match($src, "(?s)function $fn \{.*?\r?\n\}")
+            if (-not $m.Success) { "$fn not found in setup.ps1"; exit 1 }
+            Invoke-Expression $m.Value
+          }
+          function Get-HostMachineArch { return "arm64" }
+          $script:NoDatasetsMode = $false
           $py = "${{ github.workspace }}\studio_home\.venv\Scripts\python.exe"
           $ver = Get-CompatiblePythonVersion $py
-          $tag = & $py -S -c "import sysconfig; print(sysconfig.get_platform())"
+          $tag = Get-PythonPlatformTag $py
           "interpreter tag        = $tag"
-          "reuse gate verdict     = $ver"
-          if ($tag -eq "win-arm64" -and $ver) {
-            "REPRODUCED: an ARM64 interpreter is accepted for reuse (no arch check)"
-          } else {
-            "arch check present or interpreter is not ARM64"
+          "version gate verdict   = $ver"
+          if ($tag -ne "win-arm64") { "the seeded venv is not ARM64; nothing to prove"; exit 1 }
+          if (Test-CompatibleSetupPythonArch $py) {
+            "FAIL: the ARM64 interpreter was accepted for reuse"
+            exit 1
           }
+          "FIXED: the ARM64 interpreter is rejected before any package work"
+          # And the tier still accepts it, or a Snapdragon could install nothing at all.
+          $script:NoDatasetsMode = $true
+          if (-not (Test-CompatibleSetupPythonArch $py)) {
+            "FAIL: the inference-only tier must accept a native ARM64 interpreter"
+            exit 1
+          }
+          "FIXED: the ARM64 inference-only tier still accepts it"
 
       - name: Does the reused interpreter resolve the stack?
         shell: pwsh
