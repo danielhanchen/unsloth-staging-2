@@ -1,0 +1,72 @@
+# Issue 8495 holes 2 and 3: an ARM64 interpreter that is *reused* rather than
+# freshly selected never meets install.ps1's x64 swap.
+#   hole 2 - install.ps1 migrates a legacy venv without probing its arch
+#   hole 3 - setup.ps1 accepts UNSLOTH_SETUP_PYTHON on version + conda only
+name: "8495 win-arm64 venv reuse"
+on:
+  push:
+    branches: [pr8495-arm64-cross-os]
+    paths:
+      - 'install.ps1'
+      - 'studio/setup.ps1'
+      - '.github/workflows/arm-win-reuse.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  reuse:
+    runs-on: windows-11-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Install uv
+        shell: pwsh
+        run: |
+          irm https://astral.sh/uv/install.ps1 | iex
+          "$env:USERPROFILE\.local\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      # Seed a native ARM64 venv where install.ps1 looks for a legacy environment.
+      - name: Seed an ARM64 venv at the legacy path
+        shell: pwsh
+        run: |
+          $home_ = "${{ github.workspace }}\studio_home"
+          New-Item -ItemType Directory -Force -Path $home_ | Out-Null
+          uv venv "$home_\.venv"
+          $py = "$home_\.venv\Scripts\python.exe"
+          "seeded venv tag = $(& $py -S -c 'import sysconfig; print(sysconfig.get_platform())')"
+
+      # Hole 3, isolated and cheap: does setup.ps1's reuse gate accept it?
+      # Get-CompatiblePythonVersion checks the version string only, so an ARM64
+      # interpreter passes. This step asserts the CURRENT (buggy) behaviour and
+      # is inverted once the fix lands.
+      - name: setup.ps1 reuse gate against an ARM64 interpreter
+        shell: pwsh
+        run: |
+          $src = Get-Content studio/setup.ps1 -Raw
+          $m = [regex]::Match($src, '(?s)function Get-CompatiblePythonVersion \{.*?\n\}\n')
+          if (-not $m.Success) { "Get-CompatiblePythonVersion not found"; exit 1 }
+          Invoke-Expression $m.Value
+          $py = "${{ github.workspace }}\studio_home\.venv\Scripts\python.exe"
+          $ver = Get-CompatiblePythonVersion $py
+          $tag = & $py -S -c "import sysconfig; print(sysconfig.get_platform())"
+          "interpreter tag        = $tag"
+          "reuse gate verdict     = $ver"
+          if ($tag -eq "win-arm64" -and $ver) {
+            "REPRODUCED: an ARM64 interpreter is accepted for reuse (no arch check)"
+          } else {
+            "arch check present or interpreter is not ARM64"
+          }
+
+      - name: Does the reused interpreter resolve the stack?
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $py = "${{ github.workspace }}\studio_home\.venv\Scripts\python.exe"
+          uv pip install --python $py --only-binary ":all:" "datasets==4.3.0" 2>&1 | Select-Object -Last 12
+          if ($LASTEXITCODE -eq 0) { "UNEXPECTED: datasets installed on ARM64"; exit 1 }
+          "EXPECTED: the reused ARM64 venv cannot install datasets (pyarrow)"

@@ -1,0 +1,68 @@
+# Issue 8495: end-to-end run of install.ps1 on a real Windows ARM64 host.
+# Pre-fix this reproduces "install unsloth failed (exit code 1): pyarrow".
+# Post-fix the interpreter behind the venv must report win-amd64.
+name: "8495 win-arm64 install.ps1"
+on:
+  push:
+    branches: [pr8495-arm64-cross-os]
+    paths:
+      - 'install.ps1'
+      - 'studio/setup.ps1'
+      - 'studio/install_python_stack.py'
+      - '.github/workflows/arm-win-install.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  install:
+    runs-on: windows-11-arm
+    timeout-minutes: 90
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}\studio_home
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Baseline architecture
+        shell: pwsh
+        run: python -c "import sysconfig, platform; print('get_platform()=', sysconfig.get_platform(), 'machine()=', platform.machine())"
+
+      # --no-torch keeps the run short; the no-torch runtime still pulls datasets
+      # (requirements/no-torch-runtime.txt), so it exercises the same pyarrow wall.
+      - name: Run install.ps1 --no-torch
+        id: run
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          .\install.ps1 --no-torch 2>&1 | Tee-Object -FilePath install.log
+          "exit=$LASTEXITCODE" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Venv interpreter architecture
+        shell: pwsh
+        run: |
+          $py = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe"
+          if (Test-Path $py) {
+            $tag = & $py -S -c "import sysconfig; print(sysconfig.get_platform())"
+            "venv platform tag = $tag"
+            "VENV_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append
+          } else {
+            "no venv was created"
+            "VENV_TAG=none" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+
+      - name: Summarise
+        shell: pwsh
+        run: |
+          "--- last 80 log lines ---"
+          Get-Content install.log -Tail 80
+          "--- pyarrow mentions ---"
+          Select-String -Path install.log -Pattern "pyarrow|win_arm64|x64 Python|windows on arm" | Select-Object -First 40
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: arm64-install-log
+          path: install.log

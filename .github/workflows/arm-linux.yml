@@ -1,0 +1,69 @@
+# Issue 8495 claims Linux fails too. Linux aarch64 has full wheel coverage, so
+# this proves the aarch64 Linux route is NOT a wheel gap and that install.sh
+# completes there.
+name: "8495 linux-arm64 install.sh"
+on:
+  push:
+    branches: [pr8495-arm64-cross-os]
+    paths:
+      - 'install.sh'
+      - 'studio/setup.sh'
+      - 'studio/backend/requirements/**'
+      - '.github/workflows/arm-linux.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  resolve:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - run: uname -m && python3 -VV
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: Every studio requirement resolves on aarch64 Linux
+        run: |
+          set -u
+          export PATH="$HOME/.local/bin:$PATH"
+          failed=0
+          while IFS= read -r raw; do
+            line="${raw%%#*}"
+            line="$(echo "$line" | sed 's/^ *//; s/ *$//')"
+            [ -z "$line" ] && continue
+            if ! uv pip install --dry-run --python-version 3.12 --only-binary :all: \
+                 --target /tmp/dryrun "$line" >/dev/null 2>&1; then
+              echo "NO WHEEL: $line"
+              failed=1
+            fi
+          done < studio/backend/requirements/studio.txt
+          [ "$failed" -eq 0 ] && echo "all studio requirements resolve on aarch64 Linux"
+          exit "$failed"
+
+  install:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/studio_home
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Run install.sh --no-torch
+        continue-on-error: true
+        run: ./install.sh --no-torch 2>&1 | tee install.log
+      - name: Summarise
+        if: always()
+        run: |
+          echo "--- last 60 lines ---"
+          tail -60 install.log || true
+          echo "--- pyarrow mentions ---"
+          grep -n "pyarrow" install.log || echo "no pyarrow mentions"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-arm64-install-log
+          path: install.log

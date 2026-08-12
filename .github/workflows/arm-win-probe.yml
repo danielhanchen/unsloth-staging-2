@@ -1,0 +1,72 @@
+# Issue 8495: Windows on ARM (Snapdragon X2 Elite) cannot resolve the Studio
+# stack on a native ARM64 interpreter. This probe measures the wheel gap on a
+# real Windows ARM64 host, without paying for a full install.
+name: "8495 win-arm64 wheel probe"
+on:
+  push:
+    branches: [pr8495-arm64-cross-os]
+    paths:
+      - 'studio/backend/requirements/**'
+      - '.github/workflows/arm-win-probe.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: windows-11-arm
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Host and interpreter architecture
+        shell: pwsh
+        run: |
+          "PROCESSOR_ARCHITECTURE = $env:PROCESSOR_ARCHITECTURE"
+          "PROCESSOR_ARCHITEW6432 = $env:PROCESSOR_ARCHITEW6432"
+          "OSArchitecture         = $((Get-CimInstance Win32_OperatingSystem).OSArchitecture)"
+          python -c "import sys, sysconfig, platform; print('sys.version     =', sys.version); print('get_platform()  =', sysconfig.get_platform()); print('machine()       =', platform.machine())"
+
+      - name: Install uv
+        shell: pwsh
+        run: |
+          irm https://astral.sh/uv/install.ps1 | iex
+          "$env:USERPROFILE\.local\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: pyarrow has no win_arm64 wheel (expected FAIL)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          uv pip install --dry-run --system --only-binary ":all:" "pyarrow==23.0.1" 2>&1 | Tee-Object -Variable out
+          if ($LASTEXITCODE -eq 0) { "UNEXPECTED: pyarrow resolved on win_arm64"; exit 1 }
+          "EXPECTED FAILURE reproduced: $($out -join ' ')".Substring(0, [Math]::Min(400, "EXPECTED FAILURE reproduced: $($out -join ' ')".Length))
+
+      - name: Full studio requirement set on native ARM64 (expected FAIL, lists every gap)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          $failed = @()
+          Get-Content studio/backend/requirements/studio.txt | ForEach-Object {
+            $line = ($_ -split '#')[0].Trim()
+            if ($line) {
+              uv pip install --dry-run --system --only-binary ":all:" "$line" *> $null
+              if ($LASTEXITCODE -ne 0) { $failed += $line }
+            }
+          }
+          "PACKAGES WITH NO win_arm64 WHEEL:"
+          $failed | ForEach-Object { "  $_" }
+          if ($failed.Count -eq 0) { "UNEXPECTED: everything resolved"; exit 1 }
+
+      - name: The same set resolves for an x64 (emulated) interpreter
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Continue"
+          uv python install --preview 3.13
+          uv pip install --dry-run --python-platform x86_64-pc-windows-msvc --python-version 3.13 `
+            --only-binary ":all:" --target "$env:RUNNER_TEMP\dryrun" `
+            -r studio/backend/requirements/studio.txt
+          if ($LASTEXITCODE -ne 0) { "x64 resolution failed - investigate"; exit 1 }
+          "x64 resolution OK: the emulated-x64 route is viable"

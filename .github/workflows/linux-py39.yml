@@ -1,0 +1,62 @@
+# Issue 8495, Linux half: install.sh never range-validates --python, and
+# constraints.txt pins pyarrow==23.0.1 unconditionally (no cp39 wheel on any
+# platform). A 3.9 request therefore dies with a bare "pyarrow" - the same
+# message the reporter saw. Post-fix this must fail EARLY with a clear reason.
+name: "8495 linux python 3.9 gate"
+on:
+  push:
+    branches: [pr8495-arm64-cross-os]
+    paths:
+      - 'install.sh'
+      - 'studio/backend/requirements/**'
+      - '.github/workflows/linux-py39.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  py39:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/studio_home
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Install uv
+        run: curl -LsSf https://astral.sh/uv/install.sh | sh
+      - name: pyarrow==23.0.1 has no cp39 wheel anywhere
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          set +e
+          uv pip install --dry-run --python-version 3.9 --only-binary :all: \
+            --target /tmp/dryrun "pyarrow==23.0.1" 2>&1 | tail -5
+          rc=${PIPESTATUS[0]}
+          set -e
+          [ "$rc" -ne 0 ] || { echo "UNEXPECTED: pyarrow resolved on 3.9"; exit 1; }
+          echo "EXPECTED: no cp39 pyarrow wheel"
+      - name: Which other studio pins are 3.10+ only
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          while IFS= read -r raw; do
+            line="${raw%%#*}"
+            line="$(echo "$line" | sed 's/^ *//; s/ *$//')"
+            [ -z "$line" ] && continue
+            uv pip install --dry-run --python-version 3.9 --only-binary :all: \
+              --target /tmp/dryrun "$line" >/dev/null 2>&1 || echo "3.10+ only: $line"
+          done < studio/backend/requirements/studio.txt
+      - name: install.sh --python 3.9
+        continue-on-error: true
+        run: ./install.sh --no-torch --python 3.9 2>&1 | tee install39.log
+      - name: Summarise
+        if: always()
+        run: |
+          tail -40 install39.log || true
+          grep -n "pyarrow\|3\.9\|unsupported" install39.log || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-py39-log
+          path: install39.log
