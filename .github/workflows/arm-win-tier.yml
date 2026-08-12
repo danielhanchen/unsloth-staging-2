@@ -43,15 +43,31 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Continue"
-          $skip = @("datasets", "trl", "sqlite-vec", "tiktoken", "hf-transfer", "hf_transfer", "ddgs", "pandas")
-          $lift = @{ "pymupdf" = "pymupdf>=1.28.2"; "av" = "av>=17.0.0" }
+          # Read from the installer itself so this cannot drift from what ships.
+          $ps1 = Get-Content install.ps1 -Raw
+          $skipBlock = [regex]::Match($ps1, '(?s)\$script:ArmInferenceSkipPackages = @\((.*?)\)').Groups[1].Value
+          $skip = [regex]::Matches($skipBlock, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value }
+          $liftBlock = [regex]::Match($ps1, '(?s)\$script:ArmInferenceLiftPackages = @\{(.*?)\}').Groups[1].Value
+          $lift = @{}
+          foreach ($m in [regex]::Matches($liftBlock, '"([^"]+)"\s*=\s*"([^"]+)"')) { $lift[$m.Groups[1].Value] = $m.Groups[2].Value }
+          "skipping: $($skip -join ', ')"
+          "lifting:  $($lift.Keys -join ', ')"
+          # Torch-family packages the tier never installs directly, plus the pure-Python
+          # sdist-only entries (randomname, argbind, openai-whisper) that --only-binary
+          # rejects but pip builds fine anywhere.
+          $skip += @("torchcodec", "triton", "triton-windows", "triton_kernels", "xformers", "bitsandbytes",
+                     "randomname", "argbind", "openai-whisper", "torch", "torchvision", "torchaudio")
           $failed = @()
-          foreach ($file in @("studio/backend/requirements/studio.txt", "studio/backend/requirements/no-torch-runtime.txt")) {
+          $files = Get-ChildItem studio/backend/requirements/*.txt, studio/backend/requirements/single-env/*.txt |
+            Where-Object { $_.Name -notlike "*overrides*" -and $_.Name -notlike "*constraints*" } |
+            ForEach-Object { $_.FullName }
+          foreach ($file in $files) {
             Get-Content $file | ForEach-Object {
               $line = ($_ -split '#')[0].Trim()
               if (-not $line -or $line.StartsWith("-")) { return }
-              $name = ($line -split '[=<>!;\[ ]')[0].ToLowerInvariant()
+              $name = (($line -split '[=<>!~;\[ ]')[0]).Trim().ToLowerInvariant().Replace("_", "-")
               if ($skip -contains $name) { return }
+              if ($line -like "*@ git+*") { return }
               if ($lift.ContainsKey($name)) { $line = $lift[$name] }
               # --no-deps mirrors how the tier installs this file: a torch-bound
               # dependency of accelerate/peft is not this check's business.
