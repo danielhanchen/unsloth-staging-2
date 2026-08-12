@@ -67,7 +67,10 @@ jobs:
               if (-not $line -or $line.StartsWith("-")) { return }
               $name = (($line -split '[=<>!~;\[ ]')[0]).Trim().ToLowerInvariant().Replace("_", "-")
               if ($skip -contains $name) { return }
-              if ($line -like "*@ git+*") { return }
+              # Direct references (git+ or an https source archive, e.g. the
+              # diffusers commit pin) carry no wheel by definition, so --only-binary
+              # rejects them everywhere, not just on ARM64. diffusers is pure Python.
+              if ($line -like "*@ git+*" -or $line -like "*@ http*") { return }
               if ($lift.ContainsKey($name)) { $line = $lift[$name] }
               # --no-deps mirrors how the tier installs this file: a torch-bound
               # dependency of accelerate/peft is not this check's business.
