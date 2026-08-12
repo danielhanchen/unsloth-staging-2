@@ -129,11 +129,33 @@ jobs:
           if (-not $healthy) { "server never became healthy"; Get-Content studio.log -Tail 60; Get-Content studio.err -Tail 60; exit 1 }
           $health | ConvertTo-Json -Depth 4
           if (-not $health.chat_only) { "expected chat_only in a tier install"; exit 1 }
-          if ($health.chat_only_reason -ne "datasets_unavailable") {
-            "expected chat_only_reason=datasets_unavailable, got '$($health.chat_only_reason)'"
+          "the server booted without datasets and reports chat_only"
+
+          # chat_only_reason rides on the AUTHED half of /api/health (main.py assembles
+          # it after the bearer check), so log in with the bootstrap password first.
+          $login = Invoke-RestMethod -Uri "http://127.0.0.1:8899/api/auth/login" -Method Post `
+            -ContentType "application/json" `
+            -Body (@{ username = "unsloth"; password = $env:UNSLOTH_STUDIO_PASSWORD } | ConvertTo-Json)
+          $token = $login.access_token
+          if (-not $token) { "could not obtain a token"; $login | ConvertTo-Json -Depth 4; exit 1 }
+          $authed = Invoke-RestMethod -Uri "http://127.0.0.1:8899/api/health" -TimeoutSec 15 `
+            -Headers @{ Authorization = "Bearer $token" }
+          $authed | ConvertTo-Json -Depth 4
+          if ($authed.chat_only_reason -ne "datasets_unavailable") {
+            "expected chat_only_reason=datasets_unavailable, got '$($authed.chat_only_reason)'"
             exit 1
           }
-          "the server booted without datasets and explains why training is off"
+          if (-not $authed.chat_only_detail) { "expected a detail explaining the reason"; exit 1 }
+          "the verdict names datasets, so the UI can explain the greyed-out Train"
+
+          # The gated endpoints answer 503 with a reason rather than a 500 traceback.
+          $status = 0
+          try {
+            Invoke-WebRequest -Uri "http://127.0.0.1:8899/api/hub/datasets/local" -TimeoutSec 15 `
+              -Headers @{ Authorization = "Bearer $token" } | Out-Null
+          } catch { $status = [int]$_.Exception.Response.StatusCode }
+          if ($status -ne 503) { "expected 503 from the hub datasets router, got $status"; exit 1 }
+          "hub datasets answers 503, not 500"
 
       - uses: actions/upload-artifact@v4
         if: always()
