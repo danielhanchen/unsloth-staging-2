@@ -47,7 +47,10 @@ def main():
 
     fixes = load_import_fixes()
     fixes.patch_psutil_cpu_freq()
-    patched = getattr(psutil.cpu_freq, "__unsloth_patched__", False)
+    # psutil gates cpu_freq on a RUNTIME cext.has_cpu_freq() probe on macOS, so
+    # on Apple Silicon hosts without readable pmgr tables (GitHub's virtualised
+    # runners) the attribute is absent entirely and there is nothing to wrap.
+    patched = getattr(getattr(psutil, "cpu_freq", None), "__unsloth_patched__", False)
     print(f"patch applied : {patched}")
 
     if not IS_APPLE_SILICON:
@@ -72,11 +75,18 @@ def main():
     if IS_APPLE_SILICON:
         tables = fixes._apple_cpu_freq_range_mhz()
         print(f"ioreg voltage-state CPU range (MHz): {tables}")
-        assert studio_mhz is not None, "Apple Silicon must report a frequency"
-        assert 500 <= studio_mhz <= 20000, f"implausible frequency: {studio_mhz}"
-        assert after is not None and 500 <= after.current <= 20000, (
-            f"implausible patched psutil reading: {after}"
-        )
+        if studio_mhz is None:
+            # Both sources declined: psutil's has_cpu_freq() probe said no and
+            # the pmgr tables are not exposed (virtualised runner). Reporting
+            # nothing is correct -- the UI simply omits the row.
+            assert tables is None, "ioreg found tables but no frequency was reported"
+            print("no CPU clock exposed on this host; nothing to correct")
+        else:
+            assert 500 <= studio_mhz <= 20000, f"implausible frequency: {studio_mhz}"
+        if after is not None:
+            assert 500 <= after.current <= 20000, (
+                f"implausible patched psutil reading: {after}"
+            )
     elif before is not None and before.current:
         # Same reading path as before the change, so only the magnitude can be
         # asserted: the clock itself drifts between samples.
