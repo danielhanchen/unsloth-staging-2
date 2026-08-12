@@ -38,7 +38,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple 'torch>=2.4,<2.11'
-          pip install 'transformers>=4.51,<5.5' psutil structlog pytest packaging huggingface_hub peft trl datasets
+          pip install 'transformers>=4.51,<5.5' psutil structlog pytest packaging huggingface_hub peft trl datasets unsloth_zoo
 
       - name: unsloth-side patch tests
         run: python -m pytest tests/test_psutil_apple_cpu_freq.py tests/test_import_fixes_drift.py -q --tb=short
