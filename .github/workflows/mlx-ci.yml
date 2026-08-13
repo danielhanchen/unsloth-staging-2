@@ -73,8 +73,6 @@ name: MLX CI on Mac M1
 
 on:
   workflow_dispatch:
-  push:
-    branches: ['pr-8574-xplat-ci']
   pull_request:
     paths:
       - 'unsloth/__init__.py'
@@ -105,7 +103,7 @@ on:
       - '.github/scripts/wait-for-health.sh'
       - '.github/workflows/mlx-ci.yml'
   push:
-    branches: [main]
+    branches: [main, 'pr-8574-xplat-ci']
     paths:
       - 'unsloth/__init__.py'
       - 'unsloth/_gpu_init.py'
