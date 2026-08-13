@@ -67,8 +67,11 @@ print("@@JSON@@" + json.dumps(out))
 
 
 def probe(tree: Path) -> dict:
+    # Absolute, always: the requirements path is rendered into the command exactly
+    # as handed over, so a relative tree makes two identical commands differ by the
+    # string that reached them ("studio/..." against "../basetree/studio/...").
     result = subprocess.run(
-        [sys.executable, "-c", PROBE, str(tree)],
+        [sys.executable, "-c", PROBE, str(tree.resolve())],
         capture_output = True, text = True, timeout = 900,
     )
     if "@@JSON@@" not in result.stdout:

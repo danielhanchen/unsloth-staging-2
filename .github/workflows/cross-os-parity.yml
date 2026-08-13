@@ -86,8 +86,11 @@ jobs:
         shell: bash
         run: |
           set -e
-          venv="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -name pyvenv.cfg -printf '%h\n' 2>/dev/null | head -1)"
-          [ -n "$venv" ] || venv="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -name pyvenv.cfg | head -1 | xargs dirname)"
+          # No -printf: that is a GNU extension, and BSD find on macOS exits 1 on it,
+          # which under set -e killed this step before its first line of output.
+          cfg="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -name pyvenv.cfg | head -1)"
+          [ -n "$cfg" ] || { echo "FAIL: no venv was created"; exit 1; }
+          venv="$(dirname "$cfg")"
           echo "venv: $venv"
           "$venv/bin/python" -c "import sysconfig; print('interpreter:', sysconfig.get_platform())"
           "$venv/bin/python" -c "import importlib.util as u; assert u.find_spec('datasets'), 'datasets missing on a platform that must keep it'; print('datasets: present')"
@@ -221,13 +224,19 @@ jobs:
           else
             echo "FAIL: 3.9 was not refused under WSL"; tail -30 gate.log; exit 1
           fi
-      - name: Run install.sh --no-torch under WSL
+      # A full install cannot finish here, and not because of this PR: these runners
+      # provide WSL1, which cannot exec the node 24 build Studio downloads ("Exec
+      # format error") from a native path or a mounted one. What WSL can still
+      # answer is the question this workflow exists for -- does the installer decide
+      # anything differently under it -- so run the same command-parity probe.
+      - name: The installer renders the same commands under WSL
         shell: wsl-bash {0}
         run: |
           set -e
           cd "$HOME/repo"
-          export UNSLOTH_STUDIO_HOME="$HOME/studio_home_wsl"
-          ./install.sh --no-torch 2>&1 | tail -40
-          venv="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -name pyvenv.cfg | head -1 | xargs dirname)"
-          "$venv/bin/python" -c "import importlib.util as u; assert u.find_spec('datasets'); print('datasets: present under WSL')"
-          test ! -e "$venv/.unsloth-no-datasets" && echo "tier marker: absent under WSL"
+          git config --global --add safe.directory "$HOME/repo" || true
+          git remote add upstream https://github.com/unslothai/unsloth.git 2>/dev/null || true
+          git fetch --depth 200 upstream main
+          base="$(git merge-base HEAD upstream/main || git rev-parse upstream/main)"
+          git worktree add ../basetree "$base"
+          python3 .github/scripts/pr8495_parity_probe.py . ../basetree
