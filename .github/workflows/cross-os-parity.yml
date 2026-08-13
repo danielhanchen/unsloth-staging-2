@@ -103,7 +103,11 @@ jobs:
         shell: bash
         run: |
           set -e
-          if ./install.sh --python 3.9 --no-torch 2>&1 | tee gate.log | grep -q "not supported by Unsloth Studio"; then
+          # Refusing IS the expected outcome, so the non-zero exit is captured rather
+          # than piped: GitHub's bash runs with -o pipefail, which would otherwise
+          # fail this step on the very behaviour it is testing.
+          ./install.sh --python 3.9 --no-torch > gate.log 2>&1 || true
+          if grep -q "not supported by Unsloth Studio" gate.log; then
             echo "3.9 is refused with the actionable message"
           else
             echo "FAIL: 3.9 was not refused"; cat gate.log; exit 1
@@ -196,18 +200,33 @@ jobs:
         with:
           distribution: Ubuntu-22.04
           additional-packages: curl ca-certificates git python3 python3-venv build-essential
+      - name: Copy the checkout into the distro
+        shell: wsl-bash {0}
+        run: |
+          # Not run from /mnt/d: Studio downloads a Linux node build, and executing
+          # it from the DrvFs mount fails with "Exec format error" under the WSL1
+          # these runners provide. A Linux-native path is what a real WSL user has.
+          uname -a
+          mkdir -p "$HOME/repo"
+          cp -a "$(wslpath '${{ github.workspace }}')/." "$HOME/repo/"
+          echo "copied $(du -sh "$HOME/repo" | cut -f1)"
       - name: The version gate behaves the same under WSL
         shell: wsl-bash {0}
         run: |
-          cd "$(wslpath '${{ github.workspace }}')"
-          uname -a
-          ./install.sh --python 3.9 --no-torch 2>&1 | tee gate.log || true
-          grep -q "not supported by Unsloth Studio" gate.log && echo "3.9 refused under WSL"
+          cd "$HOME/repo"
+          # Refusing IS the expected outcome here, so capture rather than pipe.
+          ./install.sh --python 3.9 --no-torch > gate.log 2>&1 || true
+          if grep -q "not supported by Unsloth Studio" gate.log; then
+            echo "3.9 refused under WSL"
+          else
+            echo "FAIL: 3.9 was not refused under WSL"; tail -30 gate.log; exit 1
+          fi
       - name: Run install.sh --no-torch under WSL
         shell: wsl-bash {0}
         run: |
-          cd "$(wslpath '${{ github.workspace }}')"
-          export UNSLOTH_STUDIO_HOME="$PWD/studio_home_wsl"
+          set -e
+          cd "$HOME/repo"
+          export UNSLOTH_STUDIO_HOME="$HOME/studio_home_wsl"
           ./install.sh --no-torch 2>&1 | tail -40
           venv="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -name pyvenv.cfg | head -1 | xargs dirname)"
           "$venv/bin/python" -c "import importlib.util as u; assert u.find_spec('datasets'); print('datasets: present under WSL')"

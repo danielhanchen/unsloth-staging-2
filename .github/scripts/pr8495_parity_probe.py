@@ -79,10 +79,17 @@ def probe(tree: Path) -> dict:
 
 
 def normalise(cmd: list[str], tree: Path) -> list[str]:
-    """Absolute paths and per-run temp names differ by construction."""
+    """Absolute paths and per-run temp names differ by construction.
+
+    The tree path is resolved first: the two checkouts are passed as `.` and
+    `../basetree`, and substituting those verbatim replaced nothing on one side and
+    the bare word "studio" everywhere on the other, which turned studio.txt into
+    <tree>.txt and made two identical commands look different.
+    """
+    root = str(tree.resolve()).replace("\\", "/")
     out = []
     for token in cmd:
-        token = token.replace(str(tree), "<tree>").replace("\\", "/")
+        token = token.replace("\\", "/").replace(root, "<tree>")
         if "-filtered-" in token or "-arm64-" in token or "parity-" in token:
             token = "<generated>"
         out.append(token)
