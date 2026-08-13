@@ -1,4 +1,4 @@
-name: VirusTotal macOS bisect, step two
+name: VirusTotal macOS bisect, step three
 
 # Swapping install.ps1 back to main's version cleared the detection, so the trigger
 # is this PR's installer script inside the bundle. Two hypotheses remain:
@@ -31,18 +31,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # H2 control: main, one comment added to install.ps1.
-          - label: main-plus-a-comment
-            mode: comment
-          # H1 probe: the PR, but with the generated .cmd payload reduced to the
-          # plainest possible form. Keeps every other installer change.
-          - label: pr-without-the-inline-payload
-            mode: payload
+          # Positive control: main, plus ONE line -- the trampoline string itself.
+          # If this flags, the string is the trigger and nothing else is needed.
+          - label: main-plus-the-trampoline-string
+            mode: add-string
+          # Negative control: the PR, with that string replaced by a harmless one
+          # everywhere it appears. If this is clean, same conclusion from the other
+          # side.
+          - label: pr-with-a-harmless-string
+            mode: neuter-string
     steps:
       - uses: actions/checkout@v4
         with:
           repository: unslothai/unsloth
-          ref: ${{ matrix.mode == 'comment' && 'main' || 'windows-application-control-8490' }}
+          ref: ${{ matrix.mode == 'add-string' && 'main' || 'windows-application-control-8490' }}
           persist-credentials: false
 
       - name: Perturb install.ps1
@@ -55,24 +57,26 @@ jobs:
           path = pathlib.Path("install.ps1")
           text = path.read_text(encoding = "utf-8")
 
-          if mode == "comment":
-              # A new hash, no new behaviour.
+          trampoline = (
+              "import sys, os; sys.path[:1] = [x for x in sys.path[:1] "
+              "if getattr(sys.flags, 'safe_path', False) or x not in ('', os.getcwd())]; "
+              "sys.argv[0] = 'unsloth'; from unsloth_cli import app; sys.exit(app())"
+          )
+
+          if mode == "add-string":
+              # main, plus exactly one new line: the string under suspicion.
+              marker = "\n    # ── Tauri structured output ──"
+              assert marker in text
               text = text.replace(
-                  "\n# ── Tauri structured output ──",
-                  "\n# A comment added only to change this file's hash for a scan experiment.\n"
-                  "# ── Tauri structured output ──",
+                  marker,
+                  f'\n    $script:UnslothCliTrampoline = "{trampoline}"\n' + marker,
                   1,
               )
           else:
-              # Strip the inline -c payload out of the generated .cmd, leaving the
-              # rest of the installer alone.
-              start = text.index('$lines = @(\n            "@echo off"')
-              end = text.index('return (($lines -join "`r`n") + "`r`n")', start)
-              text = (
-                  text[:start]
-                  + '$lines = @("@echo off", "rem placeholder for a scan experiment")\n        '
-                  + text[end:]
-              )
+              # the PR, with the same string reduced to something no classifier
+              # could object to. Every other line of the installer is untouched.
+              assert trampoline in text
+              text = text.replace(trampoline, "import unsloth_cli")
           path.write_text(text, encoding = "utf-8")
           print(f"install.ps1 is now {len(text)} chars")
           PY
