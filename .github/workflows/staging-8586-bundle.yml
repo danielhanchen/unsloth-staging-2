@@ -184,8 +184,15 @@ jobs:
           path: ${{ runner.temp }}/bundles
           merge-multiple: true
 
-      - name: What is being scanned
-        run: find "$RUNNER_TEMP/bundles" -type f -printf '%s\t%p\n' | sort
+      # collect_paths uses iterdir(), not rglob: the release job hands it a flat directory of
+      # assets, so the bundle/<type>/ tree the artifacts preserve here reads as zero files and the
+      # scan reports "no scannable bundles found". Flatten to match the shape the script expects.
+      - name: Flatten the assets
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/flat"
+          find "$RUNNER_TEMP/bundles" -type f -exec mv -t "$RUNNER_TEMP/flat" {} +
+          find "$RUNNER_TEMP/flat" -maxdepth 1 -type f -printf '%s\t%p\n' | sort
 
       - name: VirusTotal scan
         env:
@@ -193,7 +200,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/virustotal_scan.py \
-            "$RUNNER_TEMP/bundles" \
+            "$RUNNER_TEMP/flat" \
             --output-markdown "$RUNNER_TEMP/virustotal-summary.md"
 
       - name: Publish the summary
