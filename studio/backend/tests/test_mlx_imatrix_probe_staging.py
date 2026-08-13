@@ -186,13 +186,23 @@ def test_the_new_probe_tracks_the_installed_unsloth_zoo(binding, record_property
         "old_supports_kwarg_says": _supports_kwarg(save_fn, "imatrix_file"),
         "new_probe_says": verdict,
     }
-    print("MATRIX_ROW " + json.dumps(row))
+    sys.stderr.write("MATRIX_ROW " + json.dumps(row) + "\n")
+    sys.stderr.flush()
     record_property("matrix_row", json.dumps(row))
 
     assert verdict is present, (
         f"the probe disagrees with the installed unsloth_zoo: probe={verdict}, "
         f"resolve_imatrix_file importable={present} ({reason})"
     )
+
+    # Agreement alone is satisfied by both pins, so the workflow states which row it is
+    # and this turns a green tick into the actual claim.
+    expected = os.environ.get("EXPECT_RESOLVER")
+    if expected is not None:
+        assert present is (expected == "1"), (
+            f"pin {row['unsloth_zoo_pin']} expected resolve_imatrix_file "
+            f"importable={expected == '1'}, got {present} ({reason})"
+        )
 
 
 def test_the_real_module_agrees_with_the_source_copy():
