@@ -1,0 +1,122 @@
+name: "staging-8574 desktop bundles (unsigned)"
+# Replicates the build matrix of release-desktop.yml with every signing and
+# publishing step removed, so a PR can be checked for packaging breakage on a
+# staging repo that has none of the release secrets. Nothing is uploaded
+# anywhere except this run's artifacts.
+on:
+  push:
+    branches: ["pr-8574-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+            label: macOS (Apple Silicon)
+            artifact: macos-aarch64
+          - platform: ubuntu-22.04
+            args: ''
+            label: Linux (x64)
+            artifact: linux-x64
+          - platform: windows-latest
+            args: ''
+            label: Windows (x64)
+            artifact: windows-x64
+    name: Build ${{ matrix.label }}
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 75
+    env:
+      APP_VERSION: 0.0.0
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            build-essential curl wget file libssl-dev libgtk-3-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install pinned Tauri CLI
+        working-directory: studio
+        run: npm ci --no-fund --no-audit
+
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm install --no-fund --no-audit
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'studio/src-tauri -> target'
+
+      # The real workflow signs updater artifacts with the release minisign key.
+      # Staging has no such secret, so generate a throwaway one: it proves the
+      # updater artifact is produced and signable without touching the real key.
+      - name: Generate a throwaway updater signing key
+        run: |
+          set -euo pipefail
+          npx --prefix studio tauri signer generate -w "$RUNNER_TEMP/staging.key" -p "" --force
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY<<EOF_KEY"
+            cat "$RUNNER_TEMP/staging.key"
+            echo "EOF_KEY"
+          } >> "$GITHUB_ENV"
+          echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
+
+      - name: Build bundles (no code signing)
+        working-directory: studio
+        run: npx --prefix . tauri build -v ${{ matrix.args }}
+
+      - name: List what was produced
+        if: always()
+        run: |
+          set -uo pipefail
+          find studio/src-tauri/target -maxdepth 5 -type d -name bundle -print
+          find studio/src-tauri/target -path '*/bundle/*' -type f \
+            \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.deb' -o -name '*.AppImage' \
+               -o -name '*.exe' -o -name '*.msi' -o -name '*.sig' \) \
+            -exec ls -l {} +
+
+      - name: Collect bundles
+        if: always()
+        run: |
+          set -uo pipefail
+          mkdir -p "$RUNNER_TEMP/bundles"
+          find studio/src-tauri/target -path '*/bundle/*' -type f \
+            \( -name '*.dmg' -o -name '*.deb' -o -name '*.AppImage' -o -name '*.exe' \
+               -o -name '*.msi' -o -name '*.sig' -o -name '*.app.tar.gz' \) \
+            -exec cp {} "$RUNNER_TEMP/bundles/" \;
+          ls -l "$RUNNER_TEMP/bundles" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: staging-bundles-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/bundles
+          if-no-files-found: warn
