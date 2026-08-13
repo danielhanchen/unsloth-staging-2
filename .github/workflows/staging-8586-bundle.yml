@@ -1,0 +1,113 @@
+name: staging-8586 unsigned bundle contents
+
+on:
+  push:
+    branches: [pr-8586-bundle-ci]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-22.04
+            label: linux
+          - platform: windows-latest
+            label: windows
+          - platform: macos-latest
+            label: macos
+    name: unsigned bundle (${{ matrix.label }})
+    runs-on: ${{ matrix.platform }}
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Linux bundle deps
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libglib2.0-dev libgtk-3-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Frontend
+        working-directory: studio/frontend
+        run: npm install --no-fund --no-audit && npm run build
+
+      # Unsigned on purpose: a staging repo has no Azure Trusted Signing, no Apple
+      # identity and no updater key. The question here is bundle CONTENTS, which
+      # signing does not affect.
+      - name: Build bundles (unsigned)
+        working-directory: studio/src-tauri
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ''
+        run: |
+          set -o pipefail
+          npx --yes @tauri-apps/cli@2 build 2>&1 | tee "$RUNNER_TEMP/build.log" | tail -40
+
+      - name: Assert each bundle carries only its own installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          TARGET=studio/src-tauri/target/release/bundle
+          echo "=== bundle tree ==="
+          find "$TARGET" -maxdepth 2 -type d 2>/dev/null | head -20
+          echo "=== staged resources ==="
+          find studio/src-tauri/target/release -maxdepth 3 -name 'install.*' 2>/dev/null | head -20
+          fail=0
+          case "${{ matrix.label }}" in
+            linux)
+              DEB="$(find "$TARGET" -name '*.deb' | head -1)"
+              [ -n "$DEB" ] || { echo "::error::no .deb built"; exit 1; }
+              echo "deb: $DEB"
+              dpkg-deb -c "$DEB" > "$RUNNER_TEMP/deb.list"
+              grep -E '/install\.sh$' "$RUNNER_TEMP/deb.list" || { echo "::error::deb ships no install.sh"; fail=1; }
+              if grep -qE '/install\.ps1$' "$RUNNER_TEMP/deb.list"; then
+                echo "::error::deb still ships install.ps1"; fail=1
+              else
+                echo "OK: deb carries no install.ps1"
+              fi
+              ;;
+            windows)
+              RES="$(find studio/src-tauri/target/release -maxdepth 3 -name 'install.ps1' | head -1 || true)"
+              if [ -n "$RES" ]; then echo "windows staged installer: $RES"; else echo "::error::windows build staged no install.ps1"; fail=1; fi
+              STRAY="$(find studio/src-tauri/target/release -maxdepth 3 -name 'install.sh' | head -1 || true)"
+              if [ -n "$STRAY" ]; then echo "::error::windows build staged install.sh: $STRAY"; fail=1; else echo "OK: no install.sh staged"; fi
+              ;;
+            macos)
+              APP="$(find "$TARGET/macos" -maxdepth 1 -name '*.app' | head -1)"
+              [ -n "$APP" ] || { echo "::error::no .app built"; exit 1; }
+              echo "app: $APP"
+              find "$APP" -name 'install.*' | sed 's/^/  /'
+              find "$APP" -name 'install.sh' | grep -q . || { echo "::error::.app ships no install.sh"; fail=1; }
+              if find "$APP" -name 'install.ps1' | grep -q .; then
+                echo "::error::.app still ships install.ps1"; fail=1
+              else
+                echo "OK: .app carries no install.ps1"
+              fi
+              ;;
+          esac
+          [ "$fail" -eq 0 ] || exit 1
+
+      - name: Upload bundles for scanning
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-8586-bundle-${{ matrix.label }}
+          path: |
+            studio/src-tauri/target/release/bundle/**/*.deb
+            studio/src-tauri/target/release/bundle/**/*.AppImage
+            studio/src-tauri/target/release/bundle/**/*.dmg
+            studio/src-tauri/target/release/bundle/**/*setup.exe
+            studio/src-tauri/target/release/bundle/**/*.msi
+          if-no-files-found: warn
+          retention-days: 3
