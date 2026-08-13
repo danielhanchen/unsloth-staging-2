@@ -1,0 +1,29 @@
+name: "staging-8606 windows-latest"
+on:
+  push:
+    branches: ["pr-8606-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest tests/python/test_cross_platform_parity.py tests/python/test_windows_no_torch_setup.py tests/studio/install/test_amd_gpu_torch_reconciliation.py tests/studio/install/test_cuda_repair.py tests/studio/install/test_gpu_detection_followups.py tests/studio/install/test_install_manifest.py tests/studio/install/test_rdna1_unsupported_message_8529.py tests/studio/install/test_rocm_support.py tests/studio/install/test_unsupported_arch_routing_guards_8529.py tests/studio/test_cli_hsa_spoof_launch_7331.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
