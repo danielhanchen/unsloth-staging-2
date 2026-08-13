@@ -48,6 +48,17 @@ jobs:
       # createUpdaterArtifacts off, not an empty signing key: a staging repo has no updater
       # key, and Tauri tries to decode an empty one and fails after the bundle is already
       # built. Nothing here depends on the updater artifact.
+      # Azure Trusted Signing exists only on the org repo, and the NSIS bundler runs signCommand
+      # for every binary, so on staging it has to come out of the config entirely. Signing does
+      # not affect which files a bundle carries, which is the whole question here.
+      - name: Drop the Windows sign command
+        if: matrix.platform == 'windows-latest'
+        shell: bash
+        run: |
+          set -e
+          python -c "import json,pathlib; p=pathlib.Path('studio/src-tauri/tauri.windows.conf.json'); c=json.loads(p.read_text()); c['bundle'].pop('windows',None); p.write_text(json.dumps(c,indent=2))"
+          cat studio/src-tauri/tauri.windows.conf.json
+
       - name: Build bundles (unsigned)
         working-directory: studio/src-tauri
         shell: bash
@@ -62,9 +73,9 @@ jobs:
           set -euo pipefail
           TARGET=studio/src-tauri/target/release/bundle
           echo "=== bundle tree ==="
-          find "$TARGET" -maxdepth 2 -type d 2>/dev/null | head -20
+          find "$TARGET" -maxdepth 2 -type d 2>/dev/null | head -20 || true
           echo "=== staged resources ==="
-          find studio/src-tauri/target/release -maxdepth 3 -name 'install.*' 2>/dev/null | head -20
+          find studio/src-tauri/target/release -maxdepth 3 -name 'install.*' 2>/dev/null | head -20 || true
           fail=0
           case "${{ matrix.label }}" in
             linux)
