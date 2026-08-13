@@ -194,6 +194,36 @@ jobs:
           find "$RUNNER_TEMP/bundles" -type f -exec mv -t "$RUNNER_TEMP/flat" {} +
           find "$RUNNER_TEMP/flat" -maxdepth 1 -type f -printf '%s\t%p\n' | sort
 
+      # The staging bundles are unsigned: no Apple identity, no Azure Trusted Signing. Microsoft's
+      # Wacatac.B!ml is a generic ML verdict that weights code signing heavily, so a detection here
+      # says nothing about what ships until the signed equivalent is measured the same way. These
+      # are the SIGNED 0.1.701-beta release assets; the script looks a hash up before uploading, so
+      # this reads VirusTotal's existing report rather than submitting anything new.
+      - name: Baseline the signed shipped release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VT_API_KEY: ${{ secrets.VIRUS_TOTAL_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/signed"
+          for asset in Unsloth-Desktop-0_1_701_beta-MacOS.dmg \
+                       Unsloth-Desktop-0_1_701_beta-Windows.exe \
+                       Unsloth-Desktop-0_1_701_beta-Linux.AppImage \
+                       Unsloth-Desktop-0_1_701_beta-Ubuntu.deb; do
+            gh release download v0.1.701-beta -R unslothai/unsloth -p "$asset" \
+              -D "$RUNNER_TEMP/signed" --clobber
+          done
+          find "$RUNNER_TEMP/signed" -type f -printf '%s\t%p\n' | sort
+          python3 scripts/virustotal_scan.py \
+            "$RUNNER_TEMP/signed" \
+            --output-markdown "$RUNNER_TEMP/signed-summary.md"
+          {
+            echo '## Signed shipped 0.1.701-beta, for comparison'
+            echo
+            cat "$RUNNER_TEMP/signed-summary.md"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/signed-summary.md"
+
       - name: VirusTotal scan
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_API_TOKEN }}
