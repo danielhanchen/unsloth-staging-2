@@ -1,0 +1,110 @@
+name: VirusTotal macOS bisect
+
+# Two builds of the same PR commit were flagged by Microsoft on the macOS dmg
+# (Trojan:Script/Wacatac.B!ml) while a main build, scanned between them, was not.
+# install.ps1 is a bundle resource on every platform and is the file this PR changes
+# most, yet the script scans clean on its own from both refs. So the question is what
+# the engine reacts to inside the container.
+#
+# Two builds here, scanned together:
+#   A. main, again        -> is main's clean verdict stable, or was it one lucky roll?
+#   B. the PR tree with install.ps1 taken from main
+#      -> if B is clean, the trigger is the installer script inside the bundle;
+#         if B is flagged, it is the rest of the PR (the Rust changes).
+
+on:
+  push:
+    branches: ["vt-bisect"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.label }}
+    runs-on: macos-14
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: main-again
+            ref: main
+            swap_installer: "false"
+          - label: pr-with-main-installer
+            ref: windows-application-control-8490
+            swap_installer: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+
+      - name: Take install.ps1 from main
+        if: matrix.swap_installer == 'true'
+        run: |
+          set -euo pipefail
+          git fetch --depth 1 origin main
+          git checkout FETCH_HEAD -- install.ps1
+          git diff --stat HEAD -- install.ps1 || true
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm install --no-fund --no-audit
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the dmg
+        working-directory: studio
+        run: |
+          npx --prefix . tauri build -v --bundles dmg \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Collect
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find studio/src-tauri/target -path '*bundle*' -name '*.dmg' \
+            -exec cp {} "out/${{ matrix.label }}.dmg" \;
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bisect-${{ matrix.label }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
+
+  scan:
+    needs: [build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: vt-8592
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: bisect-*
+          path: ${{ runner.temp }}/bisect
+          merge-multiple: true
+      - name: Scan
+        env:
+          VT_API_KEY: ${{ secrets.VIRUS_TOTAL_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -la "$RUNNER_TEMP/bisect"
+          sha256sum "$RUNNER_TEMP/bisect"/* || true
+          python3 scripts/virustotal_scan.py "$RUNNER_TEMP/bisect" \
+            --output-markdown "$RUNNER_TEMP/bisect.md"
+          cat "$RUNNER_TEMP/bisect.md" | tee -a "$GITHUB_STEP_SUMMARY"
