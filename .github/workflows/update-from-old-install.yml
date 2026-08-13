@@ -57,8 +57,12 @@ jobs:
         run: |
           venv="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -name pyvenv.cfg | head -1 | xargs dirname)"
           echo "VENV=$venv" >> "$GITHUB_ENV"
-          "$venv/bin/python" -m pip freeze 2>/dev/null | sort > old-packages.txt || \
-            "$venv/bin/python" -c "import importlib.metadata as m; print('\n'.join(sorted(f'{d.metadata[\"Name\"]}=={d.version}' for d in m.distributions())))" > old-packages.txt
+          # name==version for every distribution, from the metadata rather than pip
+          # freeze: freeze reports an editable or path install as the URL it came
+          # from, and this test installs from two different trees on purpose, so
+          # those lines differ for a reason that has nothing to do with the code.
+          # The NAME set of those distributions is compared separately below.
+          "$venv/bin/python" "$GITHUB_WORKSPACE/.github/scripts/pr8495_venv_snapshot.py" > old-packages.txt
           wc -l < old-packages.txt
           cat "$venv/unsloth_install_manifest.json" 2>/dev/null || echo "(no manifest)"
 
@@ -69,8 +73,7 @@ jobs:
         run: |
           set -e
           venv="$VENV"
-          "$venv/bin/python" -m pip freeze 2>/dev/null | sort > new-packages.txt || \
-            "$venv/bin/python" -c "import importlib.metadata as m; print('\n'.join(sorted(f'{d.metadata[\"Name\"]}=={d.version}' for d in m.distributions())))" > new-packages.txt
+          "$venv/bin/python" "$GITHUB_WORKSPACE/.github/scripts/pr8495_venv_snapshot.py" > new-packages.txt
           if diff -u old-packages.txt new-packages.txt > packages.diff; then
             echo "package set: identical after the update"
           else
@@ -85,8 +88,7 @@ jobs:
           set -e
           ./install.sh --no-torch 2>&1 | tail -10
           venv="$VENV"
-          "$venv/bin/python" -m pip freeze 2>/dev/null | sort > third-packages.txt || \
-            "$venv/bin/python" -c "import importlib.metadata as m; print('\n'.join(sorted(f'{d.metadata[\"Name\"]}=={d.version}' for d in m.distributions())))" > third-packages.txt
+          "$venv/bin/python" "$GITHUB_WORKSPACE/.github/scripts/pr8495_venv_snapshot.py" > third-packages.txt
           diff -u new-packages.txt third-packages.txt && echo "idempotent: the third run is byte-identical to the second"
 
   windows-x64:
@@ -118,7 +120,7 @@ jobs:
           if (-not $cfg) { Write-Host "FAIL: the old installer produced no venv"; exit 1 }
           $venv = $cfg.Directory.FullName
           "VENV=$venv" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          & (Join-Path $venv "Scripts\python.exe") -m pip freeze | Sort-Object | Out-File old-packages.txt -Encoding utf8
+          & (Join-Path $venv "Scripts\python.exe") "$env:GITHUB_WORKSPACE\.github\scripts\pr8495_venv_snapshot.py" | Out-File old-packages.txt -Encoding utf8
           Write-Host "$((Get-Content old-packages.txt).Count) packages"
 
       - name: Update with the PR code
@@ -130,7 +132,7 @@ jobs:
         run: |
           $venv = $env:VENV
           $py = Join-Path $venv "Scripts\python.exe"
-          & $py -m pip freeze | Sort-Object | Out-File new-packages.txt -Encoding utf8
+          & $py "$env:GITHUB_WORKSPACE\.github\scripts\pr8495_venv_snapshot.py" | Out-File new-packages.txt -Encoding utf8
           $diff = Compare-Object (Get-Content old-packages.txt) (Get-Content new-packages.txt)
           if ($diff) { Write-Host "package set CHANGED by the update:"; $diff | Format-Table | Out-String | Write-Host; exit 1 }
           Write-Host "package set: identical after the update"
@@ -148,7 +150,7 @@ jobs:
         run: |
           ./install.ps1 --no-torch --local 2>&1 | Select-Object -Last 10
           $py = Join-Path $env:VENV "Scripts\python.exe"
-          & $py -m pip freeze | Sort-Object | Out-File third-packages.txt -Encoding utf8
+          & $py "$env:GITHUB_WORKSPACE\.github\scripts\pr8495_venv_snapshot.py" | Out-File third-packages.txt -Encoding utf8
           $diff = Compare-Object (Get-Content new-packages.txt) (Get-Content third-packages.txt)
           if ($diff) { Write-Host "the third run differs from the second:"; $diff | Format-Table | Out-String | Write-Host; exit 1 }
           Write-Host "idempotent: the third run is identical to the second"
