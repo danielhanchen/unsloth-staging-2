@@ -14,6 +14,25 @@ use tokio::process::Command;
 // 3: the cached capability gained studio_install_ok / studio_install_reason.
 const MANAGED_CAPABILITY_CACHE_SCHEMA: u16 = 3;
 
+/// The install is fine; the directory its children must run from is not reachable.
+pub(super) const WORKING_DIRECTORY_UNAVAILABLE: &str = "working_directory_unavailable";
+/// The profile is reachable but a user-written path setting is not resolvable,
+/// so reinstalling hits the same wall. Mirrored in the frontend message map.
+pub(super) const PATH_SETTING_UNRESOLVABLE: &str = "path_setting_unresolvable";
+
+/// The reason a managed context failure is reported under.
+pub(super) fn context_reason(error: &crate::process::ManagedContextError) -> &'static str {
+    match error {
+        crate::process::ManagedContextError::WorkingDirectory(_) => WORKING_DIRECTORY_UNAVAILABLE,
+        crate::process::ManagedContextError::PathSetting(_) => PATH_SETTING_UNRESOLVABLE,
+    }
+}
+
+/// Whether the reason is a context the app cannot build, not a repairable install.
+pub(super) fn is_context_reason(reason: &str) -> bool {
+    reason == WORKING_DIRECTORY_UNAVAILABLE || reason == PATH_SETTING_UNRESOLVABLE
+}
+
 const FNV64_OFFSET_BASIS: u64 = 0xcbf29ce484222325;
 const FNV64_PRIME: u64 = 0x100000001b3;
 const HASHED_MARKER_MAX_BYTES: u64 = 64 * 1024;
@@ -302,10 +321,21 @@ fn write_cached_capability(fingerprint: &ManagedBinFingerprint, capability: &Des
     }
 }
 
-async fn run_cli_probe(bin: &Path, args: &[&str]) -> bool {
+async fn run_cli_probe(bin: &Path, args: &[&str]) -> Result<bool, String> {
     let started = Instant::now();
     let mut cmd = Command::new(bin);
     cmd.args(args).stdout(Stdio::null()).stderr(Stdio::null());
+
+    // Reported, not folded into `false`: the CLI never ran, so calling it broken
+    // would start a repair needing the same context. Re-checking afterwards is not
+    // enough: a context that recovers in between makes an untested install look bad.
+    if let Err(error) = crate::process::apply_managed_cli_context_tokio(&mut cmd) {
+        info!(
+            "Managed preflight probe {:?} has no usable working directory: {}",
+            args, error
+        );
+        return Err(error);
+    }
 
     #[cfg(target_os = "linux")]
     crate::process::scrub_appimage_python_env_tokio(&mut cmd);
@@ -329,7 +359,7 @@ async fn run_cli_probe(bin: &Path, args: &[&str]) -> bool {
             args,
             started.elapsed().as_millis()
         );
-        return false;
+        return Ok(false);
     };
 
     let ok = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
@@ -346,15 +376,24 @@ async fn run_cli_probe(bin: &Path, args: &[&str]) -> bool {
         ok,
         started.elapsed().as_millis()
     );
-    ok
+    Ok(ok)
 }
 
-async fn probe_cli_capability(bin: &Path) -> Option<DesktopCapability> {
+async fn probe_cli_capability(bin: &Path) -> Result<Option<DesktopCapability>, String> {
     let started = Instant::now();
     let mut cmd = Command::new(bin);
     cmd.args(["studio", "desktop-capabilities", "--json"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+
+    // As above: a context that cannot be built is not a probe result.
+    if let Err(error) = crate::process::apply_managed_cli_context_tokio(&mut cmd) {
+        info!(
+            "Managed desktop-capabilities probe has no usable working directory: {}",
+            error
+        );
+        return Err(error);
+    }
 
     #[cfg(target_os = "linux")]
     crate::process::scrub_appimage_python_env_tokio(&mut cmd);
@@ -377,9 +416,11 @@ async fn probe_cli_capability(bin: &Path) -> Option<DesktopCapability> {
             "Managed desktop-capabilities probe failed to spawn in {}ms",
             started.elapsed().as_millis()
         );
-        return None;
+        return Ok(None);
     };
-    let mut stdout = child.stdout.take()?;
+    let Some(mut stdout) = child.stdout.take() else {
+        return Ok(None);
+    };
 
     match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
         Ok(Ok(status)) if status.success() => {}
@@ -390,20 +431,20 @@ async fn probe_cli_capability(bin: &Path) -> Option<DesktopCapability> {
                 "Managed desktop-capabilities probe timed out in {}ms",
                 started.elapsed().as_millis()
             );
-            return None;
+            return Ok(None);
         }
         _ => {
             info!(
                 "Managed desktop-capabilities probe exited unsuccessfully in {}ms",
                 started.elapsed().as_millis()
             );
-            return None;
+            return Ok(None);
         }
     }
 
     let mut output = Vec::new();
     if stdout.read_to_end(&mut output).await.is_err() {
-        return None;
+        return Ok(None);
     }
 
     let capability = serde_json::from_slice::<DesktopCapability>(&output).ok();
@@ -412,7 +453,7 @@ async fn probe_cli_capability(bin: &Path) -> Option<DesktopCapability> {
         capability.is_some(),
         started.elapsed().as_millis()
     );
-    capability
+    Ok(capability)
 }
 
 fn desktop_capability_stale_reason(capability: &DesktopCapability) -> Option<String> {
@@ -451,24 +492,65 @@ fn desktop_capability_ready(capability: &DesktopCapability) -> bool {
     desktop_capability_stale_reason(capability).is_none()
 }
 
+/// The reason an unbuildable context is reported under, if that is what went
+/// wrong. Checked after a probe that did run and failed anyway.
+fn working_directory_reason() -> Option<String> {
+    // The whole context: an unresolvable override fails the same spawn, and is a
+    // different thing to fix.
+    let error = crate::process::managed_cli_context_error()?;
+    info!("Managed preflight: managed context unavailable: {error}");
+    Some(context_reason(&error).to_string())
+}
+
 pub(super) async fn probe_managed_bin(bin: PathBuf) -> ManagedProbe {
     let started = Instant::now();
+
+    // An unmounted roaming profile fails every probe below, which is not a broken
+    // install: "cli_unusable" would start a repair needing the same directory.
+    if let Some(error) = crate::process::managed_cli_context_error() {
+        info!(
+            "Managed preflight: no usable managed context for {:?}: {}",
+            bin, error
+        );
+        return ManagedProbe::Stale {
+            bin,
+            reason: context_reason(&error).to_string(),
+        };
+    }
+
     // Always verify the managed CLI actually launches before trusting the cache.
     // A matching capability fingerprint does not prove the binary can still run:
     // its venv interpreter or a runtime dependency can be broken while the
     // path/size/mtime/markers are unchanged, so the -h probe runs first and a
     // non-launchable install is reported Stale for repair. The capability cache
     // below still skips the heavier desktop-capabilities probe on a hit.
-    if !run_cli_probe(&bin, &["-h"]).await {
-        info!(
-            "Managed preflight: cli unusable for {:?} in {}ms",
-            bin,
-            started.elapsed().as_millis()
-        );
-        return ManagedProbe::Stale {
-            bin,
-            reason: "cli_unusable".to_string(),
-        };
+    match run_cli_probe(&bin, &["-h"]).await {
+        // The CLI was never asked, so do not report a broken install.
+        Err(_) => {
+            info!(
+                "Managed preflight: no usable managed context for {:?} in {}ms",
+                bin,
+                started.elapsed().as_millis()
+            );
+            return ManagedProbe::Stale {
+                bin,
+                reason: working_directory_reason()
+                    .unwrap_or_else(|| WORKING_DIRECTORY_UNAVAILABLE.to_string()),
+            };
+        }
+        Ok(false) => {
+            info!(
+                "Managed preflight: cli unusable for {:?} in {}ms",
+                bin,
+                started.elapsed().as_millis()
+            );
+            // The profile can drop between the check above and the probe, so ask again.
+            return ManagedProbe::Stale {
+                bin,
+                reason: working_directory_reason().unwrap_or_else(|| "cli_unusable".to_string()),
+            };
+        }
+        Ok(true) => {}
     }
 
     if let Some(fingerprint) = managed_bin_fingerprint(&bin) {
@@ -482,7 +564,21 @@ pub(super) async fn probe_managed_bin(bin: PathBuf) -> ManagedProbe {
         }
     }
 
-    let capability = probe_cli_capability(&bin).await;
+    let capability = match probe_cli_capability(&bin).await {
+        Ok(capability) => capability,
+        Err(_) => {
+            info!(
+                "Managed preflight: no usable managed context for {:?} in {}ms",
+                bin,
+                started.elapsed().as_millis()
+            );
+            return ManagedProbe::Stale {
+                bin,
+                reason: working_directory_reason()
+                    .unwrap_or_else(|| WORKING_DIRECTORY_UNAVAILABLE.to_string()),
+            };
+        }
+    };
     if let Some(capability) = capability {
         if let Some(fingerprint) = managed_bin_fingerprint(&bin) {
             write_cached_capability(&fingerprint, &capability);
@@ -514,7 +610,8 @@ pub(super) async fn probe_managed_bin(bin: PathBuf) -> ManagedProbe {
     );
     ManagedProbe::Stale {
         bin,
-        reason: "desktop_capability_probe_failed".to_string(),
+        reason: working_directory_reason()
+            .unwrap_or_else(|| "desktop_capability_probe_failed".to_string()),
     }
 }
 
@@ -522,7 +619,17 @@ pub(super) async fn probe_managed_install() -> ManagedProbe {
     let started = Instant::now();
     let result = match crate::process::find_unsloth_binary() {
         Some(bin) => probe_managed_bin(bin).await,
-        None => ManagedProbe::Missing,
+        // The managed install lives under the profile, so an unreachable one looks
+        // like no install. Say which, or a late network profile sends them to reinstall.
+        None => match crate::process::home_dir_available() {
+            Ok(()) => ManagedProbe::Missing,
+            Err(error) => {
+                info!("Managed preflight: {}", error);
+                ManagedProbe::Unavailable {
+                    reason: WORKING_DIRECTORY_UNAVAILABLE.to_string(),
+                }
+            }
+        },
     };
     info!(
         "Managed preflight: install probe result {:?} in {}ms",
