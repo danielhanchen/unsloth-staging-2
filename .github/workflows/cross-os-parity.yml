@@ -1,0 +1,214 @@
+# Every platform the PR is NOT meant to touch, on real hardware.
+#
+# The claim under test is a negative: on anything other than a native ARM64
+# Windows interpreter, this change renders exactly the install commands it
+# rendered before. A negative is easy to assert badly, so each runner loads the
+# PR's installer module and the merge base's side by side and diffs the actual
+# uv command lines, then (where an install is affordable) runs install.sh /
+# install.ps1 to the end and checks that datasets is present, no tier marker was
+# written and the manifest does not claim the tier.
+name: "8495 cross-OS parity (untouched platforms)"
+on:
+  push:
+    branches: [pr8495-arm64-cross-os]
+    paths:
+      - 'install.ps1'
+      - 'install.sh'
+      - 'studio/setup.ps1'
+      - 'studio/setup.sh'
+      - 'studio/install_python_stack.py'
+      - 'studio/install_manifest.py'
+      - 'studio/backend/requirements/**'
+      - '.github/workflows/cross-os-parity.yml'
+      - '.github/scripts/pr8495_parity_probe.py'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  # ── the cheap, exact check: same commands as before, on every OS/arch ──
+  parity:
+    name: "parity: ${{ matrix.label }}"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: "linux x86_64",        runner: ubuntu-latest }
+          - { label: "linux aarch64",       runner: ubuntu-24.04-arm }
+          - { label: "windows x64",         runner: windows-latest }
+          - { label: "macos apple silicon", runner: macos-15 }
+          - { label: "macos intel",         runner: macos-15-intel }
+          - { label: "windows arm64",       runner: windows-11-arm, expect_change: true }
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false, fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: Check out the merge base beside it
+        shell: bash
+        run: |
+          git remote add upstream https://github.com/unslothai/unsloth.git || true
+          git fetch --depth 200 upstream main
+          base="$(git merge-base HEAD upstream/main || git rev-parse upstream/main)"
+          echo "merge base: $base"
+          git worktree add ../basetree "$base"
+      - name: Same install commands as before this PR
+        shell: bash
+        run: |
+          python .github/scripts/pr8495_parity_probe.py . ../basetree \
+            ${{ matrix.expect_change && '--expect-change' || '' }}
+
+  # ── the full installs, where a runner can afford one ──
+  install-posix:
+    name: "install.sh: ${{ matrix.label }}"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: "linux x86_64",        runner: ubuntu-latest }
+          - { label: "macos apple silicon", runner: macos-15 }
+          - { label: "macos intel",         runner: macos-15-intel }
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/studio_home
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Run install.sh --no-torch
+        run: ./install.sh --no-torch 2>&1 | tee install.log
+      - name: datasets is installed and the tier did NOT engage
+        shell: bash
+        run: |
+          set -e
+          venv="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -name pyvenv.cfg -printf '%h\n' 2>/dev/null | head -1)"
+          [ -n "$venv" ] || venv="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -name pyvenv.cfg | head -1 | xargs dirname)"
+          echo "venv: $venv"
+          "$venv/bin/python" -c "import sysconfig; print('interpreter:', sysconfig.get_platform())"
+          "$venv/bin/python" -c "import importlib.util as u; assert u.find_spec('datasets'), 'datasets missing on a platform that must keep it'; print('datasets: present')"
+          if [ -e "$venv/.unsloth-no-datasets" ]; then
+            echo "FAIL: the inference-only tier marker was written on $venv"; exit 1
+          fi
+          echo "tier marker: absent, as required"
+          manifest="$venv/unsloth_install_manifest.json"
+          if [ -f "$manifest" ]; then
+            python3 -c "import json,sys; d=json.load(open(sys.argv[1])); v=d.get('no_datasets'); print('manifest no_datasets:', v); assert v in (False, None), 'the manifest claims the tier on an untouched platform'" "$manifest"
+          fi
+      - name: The version gate rejects 3.9 and only 3.9
+        shell: bash
+        run: |
+          set -e
+          if ./install.sh --python 3.9 --no-torch 2>&1 | tee gate.log | grep -q "not supported by Unsloth Studio"; then
+            echo "3.9 is refused with the actionable message"
+          else
+            echo "FAIL: 3.9 was not refused"; cat gate.log; exit 1
+          fi
+
+  install-windows-x64:
+    name: "install.ps1: windows x64"
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}\studio_home
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Run install.ps1 --no-torch --local
+        shell: pwsh
+        run: ./install.ps1 --no-torch --local 2>&1 | Tee-Object install.log
+      - name: datasets is installed and the tier did NOT engage
+        shell: pwsh
+        run: |
+          $cfg = Get-ChildItem -Path $env:UNSLOTH_STUDIO_HOME -Recurse -Filter pyvenv.cfg -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $cfg) { Write-Host "FAIL: no venv was created"; exit 1 }
+          $venv = $cfg.Directory.FullName
+          $py = Join-Path $venv "Scripts\python.exe"
+          & $py -c "import sysconfig; print('interpreter:', sysconfig.get_platform())"
+          & $py -c "import importlib.util as u; assert u.find_spec('datasets'), 'datasets missing on windows x64'; print('datasets: present')"
+          if (Test-Path (Join-Path $venv ".unsloth-no-datasets")) {
+              Write-Host "FAIL: the inference-only tier marker was written on x64"; exit 1
+          }
+          Write-Host "tier marker: absent, as required"
+          $manifest = Join-Path $venv "unsloth_install_manifest.json"
+          if (Test-Path $manifest) {
+              $value = (Get-Content -Raw $manifest | ConvertFrom-Json).no_datasets
+              Write-Host "manifest no_datasets: $value"
+              if ($value -eq $true) { Write-Host "FAIL: the manifest claims the tier on x64"; exit 1 }
+          }
+
+  # ── Apple Silicon: the MLX path has its own overrides file and its own branch
+  #    in install.sh, and neither may move because of an ARM64 WINDOWS change ──
+  macos-mlx:
+    name: "macos apple silicon: MLX path untouched"
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false, fetch-depth: 0 }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - name: The Darwin overrides and every mac branch are byte-identical to base
+        shell: bash
+        run: |
+          set -e
+          git remote add upstream https://github.com/unslothai/unsloth.git || true
+          git fetch --depth 200 upstream main
+          base="$(git merge-base HEAD upstream/main || git rev-parse upstream/main)"
+          for path in \
+            studio/backend/requirements/single-env/overrides-darwin-arm64.txt \
+            studio/backend/requirements/single-env/constraints.txt \
+            studio/setup.sh ; do
+            if git diff --quiet "$base" HEAD -- "$path"; then
+              echo "unchanged: $path"
+            else
+              echo "CHANGED: $path"; git diff "$base" HEAD -- "$path"; exit 1
+            fi
+          done
+          echo "--- every mac/mlx mention this PR touches in install.sh ---"
+          git diff "$base" HEAD -- install.sh | grep -inE '^\+.*(darwin|mlx|macos|apple)' || \
+            echo "none: the PR adds no macOS or MLX line to install.sh"
+      - name: The MLX requirement set still resolves on Apple Silicon
+        shell: bash
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          uv pip compile studio/backend/requirements/studio.txt \
+            -c studio/backend/requirements/single-env/constraints.txt \
+            --python-version 3.12 --python-platform aarch64-apple-darwin \
+            --no-header --quiet -o resolved-mac.txt
+          echo "resolved $(grep -c '==' resolved-mac.txt) packages for Apple Silicon"
+          grep -iE '^(datasets|pyarrow|mlx|mlx-lm)==' resolved-mac.txt || true
+
+  # ── WSL: the same install.sh, under the kernel Windows users actually get ──
+  install-wsl:
+    name: "install.sh: WSL (Ubuntu on windows-latest)"
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: Vampire/setup-wsl@v3
+        with:
+          distribution: Ubuntu-22.04
+          additional-packages: curl ca-certificates git python3 python3-venv build-essential
+      - name: The version gate behaves the same under WSL
+        shell: wsl-bash {0}
+        run: |
+          cd "$(wslpath '${{ github.workspace }}')"
+          uname -a
+          ./install.sh --python 3.9 --no-torch 2>&1 | tee gate.log || true
+          grep -q "not supported by Unsloth Studio" gate.log && echo "3.9 refused under WSL"
+      - name: Run install.sh --no-torch under WSL
+        shell: wsl-bash {0}
+        run: |
+          cd "$(wslpath '${{ github.workspace }}')"
+          export UNSLOTH_STUDIO_HOME="$PWD/studio_home_wsl"
+          ./install.sh --no-torch 2>&1 | tail -40
+          venv="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -name pyvenv.cfg | head -1 | xargs dirname)"
+          "$venv/bin/python" -c "import importlib.util as u; assert u.find_spec('datasets'); print('datasets: present under WSL')"
+          test ! -e "$venv/.unsloth-no-datasets" && echo "tier marker: absent under WSL"

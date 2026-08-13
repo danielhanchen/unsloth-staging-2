@@ -1,0 +1,154 @@
+# The question this exists to answer: does an environment built by the CODE AS IT
+# IS TODAY change when this PR's code updates it, and does running the update
+# twice change it again?
+#
+# So each runner installs with the merge base (an "old install", the state every
+# existing user is in), then updates with the PR, then updates once more, and
+# diffs the installed package set and the manifest at each step. Anything other
+# than "identical" on these platforms is a regression, however small.
+name: "8495 update from an old install"
+on:
+  push:
+    branches: [pr8495-arm64-cross-os]
+    paths:
+      - 'install.ps1'
+      - 'install.sh'
+      - 'studio/setup.ps1'
+      - 'studio/setup.sh'
+      - 'studio/install_python_stack.py'
+      - 'studio/install_manifest.py'
+      - '.github/workflows/update-from-old-install.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  posix:
+    name: "old install then update: ${{ matrix.label }}"
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: "linux x86_64",        runner: ubuntu-latest }
+          - { label: "macos apple silicon", runner: macos-15 }
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/studio_home
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false, fetch-depth: 0 }
+
+      - name: Check out the merge base as the "old" installer
+        run: |
+          git remote add upstream https://github.com/unslothai/unsloth.git || true
+          git fetch --depth 200 upstream main
+          base="$(git merge-base HEAD upstream/main || git rev-parse upstream/main)"
+          echo "BASE=$base" >> "$GITHUB_ENV"
+          git worktree add ../basetree "$base"
+
+      - name: Install with the OLD code
+        run: cd ../basetree && ./install.sh --no-torch 2>&1 | tail -30
+
+      - name: Snapshot the old environment
+        run: |
+          venv="$(find "$UNSLOTH_STUDIO_HOME" -maxdepth 3 -name pyvenv.cfg | head -1 | xargs dirname)"
+          echo "VENV=$venv" >> "$GITHUB_ENV"
+          "$venv/bin/python" -m pip freeze 2>/dev/null | sort > old-packages.txt || \
+            "$venv/bin/python" -c "import importlib.metadata as m; print('\n'.join(sorted(f'{d.metadata[\"Name\"]}=={d.version}' for d in m.distributions())))" > old-packages.txt
+          wc -l < old-packages.txt
+          cat "$venv/unsloth_install_manifest.json" 2>/dev/null || echo "(no manifest)"
+
+      - name: Update with the PR code
+        run: ./install.sh --no-torch 2>&1 | tail -30
+
+      - name: Nothing about the environment changed
+        run: |
+          set -e
+          venv="$VENV"
+          "$venv/bin/python" -m pip freeze 2>/dev/null | sort > new-packages.txt || \
+            "$venv/bin/python" -c "import importlib.metadata as m; print('\n'.join(sorted(f'{d.metadata[\"Name\"]}=={d.version}' for d in m.distributions())))" > new-packages.txt
+          if diff -u old-packages.txt new-packages.txt > packages.diff; then
+            echo "package set: identical after the update"
+          else
+            echo "package set CHANGED by the update:"; cat packages.diff; exit 1
+          fi
+          "$venv/bin/python" -c "import importlib.util as u; assert u.find_spec('datasets'), 'the update removed datasets'; print('datasets: still present')"
+          test ! -e "$venv/.unsloth-no-datasets" || { echo "FAIL: the update wrote a tier marker"; exit 1; }
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); v=d.get('no_datasets'); print('manifest no_datasets:', v); assert v in (False, None)" "$venv/unsloth_install_manifest.json"
+
+      - name: And updating a second time changes nothing either
+        run: |
+          set -e
+          ./install.sh --no-torch 2>&1 | tail -10
+          venv="$VENV"
+          "$venv/bin/python" -m pip freeze 2>/dev/null | sort > third-packages.txt || \
+            "$venv/bin/python" -c "import importlib.metadata as m; print('\n'.join(sorted(f'{d.metadata[\"Name\"]}=={d.version}' for d in m.distributions())))" > third-packages.txt
+          diff -u new-packages.txt third-packages.txt && echo "idempotent: the third run is byte-identical to the second"
+
+  windows-x64:
+    name: "old install then update: windows x64"
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}\studio_home
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false, fetch-depth: 0 }
+
+      - name: Check out the merge base as the "old" installer
+        shell: bash
+        run: |
+          git remote add upstream https://github.com/unslothai/unsloth.git || true
+          git fetch --depth 200 upstream main
+          base="$(git merge-base HEAD upstream/main || git rev-parse upstream/main)"
+          git worktree add ../basetree "$base"
+
+      - name: Install with the OLD code
+        shell: pwsh
+        run: cd ../basetree; ./install.ps1 --no-torch --local 2>&1 | Select-Object -Last 30
+
+      - name: Snapshot the old environment
+        shell: pwsh
+        run: |
+          $cfg = Get-ChildItem -Path $env:UNSLOTH_STUDIO_HOME -Recurse -Filter pyvenv.cfg | Select-Object -First 1
+          if (-not $cfg) { Write-Host "FAIL: the old installer produced no venv"; exit 1 }
+          $venv = $cfg.Directory.FullName
+          "VENV=$venv" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          & (Join-Path $venv "Scripts\python.exe") -m pip freeze | Sort-Object | Out-File old-packages.txt -Encoding utf8
+          Write-Host "$((Get-Content old-packages.txt).Count) packages"
+
+      - name: Update with the PR code
+        shell: pwsh
+        run: ./install.ps1 --no-torch --local 2>&1 | Select-Object -Last 30
+
+      - name: Nothing about the environment changed
+        shell: pwsh
+        run: |
+          $venv = $env:VENV
+          $py = Join-Path $venv "Scripts\python.exe"
+          & $py -m pip freeze | Sort-Object | Out-File new-packages.txt -Encoding utf8
+          $diff = Compare-Object (Get-Content old-packages.txt) (Get-Content new-packages.txt)
+          if ($diff) { Write-Host "package set CHANGED by the update:"; $diff | Format-Table | Out-String | Write-Host; exit 1 }
+          Write-Host "package set: identical after the update"
+          & $py -c "import importlib.util as u; assert u.find_spec('datasets'), 'the update removed datasets'; print('datasets: still present')"
+          if (Test-Path (Join-Path $venv ".unsloth-no-datasets")) { Write-Host "FAIL: the update wrote a tier marker"; exit 1 }
+          $manifest = Join-Path $venv "unsloth_install_manifest.json"
+          if (Test-Path $manifest) {
+              $value = (Get-Content -Raw $manifest | ConvertFrom-Json).no_datasets
+              Write-Host "manifest no_datasets: $value"
+              if ($value -eq $true) { Write-Host "FAIL: the manifest claims the tier on x64"; exit 1 }
+          }
+
+      - name: And updating a second time changes nothing either
+        shell: pwsh
+        run: |
+          ./install.ps1 --no-torch --local 2>&1 | Select-Object -Last 10
+          $py = Join-Path $env:VENV "Scripts\python.exe"
+          & $py -m pip freeze | Sort-Object | Out-File third-packages.txt -Encoding utf8
+          $diff = Compare-Object (Get-Content new-packages.txt) (Get-Content third-packages.txt)
+          if ($diff) { Write-Host "the third run differs from the second:"; $diff | Format-Table | Out-String | Write-Host; exit 1 }
+          Write-Host "idempotent: the third run is identical to the second"
