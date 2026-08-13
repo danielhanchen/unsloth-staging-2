@@ -1,9 +1,18 @@
-name: VirusTotal per-engine verdicts
+name: VirusTotal macOS bisect, step two
 
-# "0 malicious" alongside 13 engine timeouts is not a clean verdict, and the
-# question here is specifically what MICROSOFT says, since it is the only engine
-# that ever flagged these disk images. Read the current per-engine table for every
-# macOS build in the experiment, in one job, so the five verdicts are comparable.
+# Swapping install.ps1 back to main's version cleared the detection, so the trigger
+# is this PR's installer script inside the bundle. Two hypotheses remain:
+#
+#   H1 CONTENT: something the PR adds to install.ps1 looks like a dropper to
+#      Microsoft's ML -- most likely writing a .cmd that starts an interpreter with
+#      an inline -c payload, or the hidden-window process probe.
+#   H2 REPUTATION: Wacatac.B!ml is a low-prevalence heuristic. main's install.ps1
+#      hash has shipped in every release and is known-good; ANY new hash inside an
+#      unsigned installer scores as unknown.
+#
+# H2 is testable without touching a line of logic: take main, add a comment to
+# install.ps1, and build. New hash, zero new behaviour. If that is flagged too, the
+# verdict is about novelty rather than about what this PR does.
 
 on:
   push:
@@ -14,25 +23,118 @@ permissions:
   contents: read
 
 jobs:
-  verdicts:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+  build:
+    name: ${{ matrix.label }}
+    runs-on: macos-14
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # H2 control: main, one comment added to install.ps1.
+          - label: main-plus-a-comment
+            mode: comment
+          # H1 probe: the PR, but with the generated .cmd payload reduced to the
+          # plainest possible form. Keeps every other installer change.
+          - label: pr-without-the-inline-payload
+            mode: payload
     steps:
-      - name: Ask VirusTotal about each build
+      - uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: ${{ matrix.mode == 'comment' && 'main' || 'windows-application-control-8490' }}
+          persist-credentials: false
+
+      - name: Perturb install.ps1
+        run: |
+          set -euo pipefail
+          python3 - "${{ matrix.mode }}" <<'PY'
+          import pathlib, sys
+
+          mode = sys.argv[1]
+          path = pathlib.Path("install.ps1")
+          text = path.read_text(encoding = "utf-8")
+
+          if mode == "comment":
+              # A new hash, no new behaviour.
+              text = text.replace(
+                  "\n# ── Tauri structured output ──",
+                  "\n# A comment added only to change this file's hash for a scan experiment.\n"
+                  "# ── Tauri structured output ──",
+                  1,
+              )
+          else:
+              # Strip the inline -c payload out of the generated .cmd, leaving the
+              # rest of the installer alone.
+              start = text.index('$lines = @(\n            "@echo off"')
+              end = text.index('return (($lines -join "`r`n") + "`r`n")', start)
+              text = (
+                  text[:start]
+                  + '$lines = @("@echo off", "rem placeholder for a scan experiment")\n        '
+                  + text[end:]
+              )
+          path.write_text(text, encoding = "utf-8")
+          print(f"install.ps1 is now {len(text)} chars")
+          PY
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm install --no-fund --no-audit
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build the dmg
+        working-directory: studio
+        run: |
+          npx --prefix . tauri build -v --bundles dmg \
+            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Collect
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          find studio/src-tauri/target -path '*bundle*' -name '*.dmg' \
+            -exec cp {} "out/${{ matrix.label }}.dmg" \;
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: step2-${{ matrix.label }}
+          path: out/
+          if-no-files-found: error
+          retention-days: 3
+
+  scan:
+    needs: [build]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: vt-8592
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: step2-*
+          path: ${{ runner.temp }}/step2
+          merge-multiple: true
+      - name: Scan and report Microsoft per file
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_API_TOKEN }}
         run: |
+          set -euo pipefail
+          ls -la "$RUNNER_TEMP/step2"
+          python3 scripts/virustotal_scan.py "$RUNNER_TEMP/step2" \
+            --output-markdown "$RUNNER_TEMP/step2.md" || true
+          cat "$RUNNER_TEMP/step2.md" | tee -a "$GITHUB_STEP_SUMMARY"
           python3 - <<'PY'
-          import json, os, time, urllib.request
+          import hashlib, json, os, pathlib, time, urllib.request
 
           key = os.environ["VT_API_KEY"]
-          builds = [
-              ("PR build 1",              "68bd2cb29736fb5ab4cc649c72ee3e858ab7e6cb9906750ad67b8b30afd6316f"),
-              ("PR build 2",              "6debabad727ba0f79db2ec7c85883fd269a4151cc1c6104b3e567be5936a26c0"),
-              ("main build 1",            "da997311fbdcb64620cf3a8a225a16df4b4907b91d4738da6cf7415b997bfe4c"),
-              ("main build 2",            "cdfc531d627529621a05b2fdb7739fe82cf83910cbc8d7d7ac69715161190ab7"),
-              ("PR + main's install.ps1", "ce70935318106f672d4b4e77e3f7b939873c39b4b17e32b33d4941b44c673d02"),
-          ]
 
           def get(url):
               request = urllib.request.Request(url)
@@ -40,18 +142,21 @@ jobs:
               with urllib.request.urlopen(request, timeout = 120) as response:
                   return json.loads(response.read())
 
-          for label, digest in builds:
-              data = get(f"https://www.virustotal.com/api/v3/files/{digest}")["data"]
-              results = data["attributes"].get("last_analysis_results", {})
+          for path in sorted(pathlib.Path(os.environ["RUNNER_TEMP"], "step2").iterdir()):
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              results = get(f"https://www.virustotal.com/api/v3/files/{digest}")["data"][
+                  "attributes"
+              ].get("last_analysis_results", {})
               microsoft = results.get("Microsoft", {})
               flagged = {
                   engine: verdict.get("result")
                   for engine, verdict in results.items()
                   if verdict.get("category") in ("malicious", "suspicious")
               }
+              print(f"{path.name}: sha256={digest}", flush = True)
               print(
-                  f"{label:26} Microsoft={microsoft.get('category')}"
-                  f"/{microsoft.get('result')}  flagged={flagged}",
+                  f"  Microsoft={microsoft.get('category')}/{microsoft.get('result')}"
+                  f"  flagged={flagged}",
                   flush = True,
               )
               time.sleep(20)
