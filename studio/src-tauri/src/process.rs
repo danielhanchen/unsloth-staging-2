@@ -936,6 +936,365 @@ pub fn find_unsloth_binary() -> Option<std::path::PathBuf> {
     find_unsloth_binary_in_studio_dir(&studio)
 }
 
+/// Whether the user's profile is reachable at all.
+///
+/// The managed install lives under it, so an unmounted roaming profile looks
+/// like no install. One is fixed by reconnecting, the other by installing.
+pub(crate) fn home_dir_available() -> Result<(), String> {
+    usable_home_dir(dirs::home_dir(), &windows_roots()).map(|_| ())
+}
+
+/// The profile a managed install may live under, or why it cannot.
+///
+/// One policy for both callers: a home reported available that the resolver then
+/// rejects sends a SYSTEM account to an install flow that cannot start.
+fn usable_home_dir(
+    home: Option<std::path::PathBuf>,
+    windirs: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, String> {
+    let home = home.ok_or_else(|| "Could not determine the home directory".to_string())?;
+
+    // A service or SYSTEM account reports a home under the Windows tree
+    // (C:\Windows\System32\config\systemprofile); handing that to the child
+    // walks straight back into the folder the CLI rejects.
+    if is_inside_windows_dir(&home, windirs) {
+        return Err(format!(
+            "Home directory {} is inside the Windows directory",
+            home.display()
+        ));
+    }
+
+    if !home.is_dir() {
+        return Err(format!(
+            "Home directory {} is not reachable",
+            home.display()
+        ));
+    }
+    Ok(home)
+}
+
+/// Marker the desktop sets on every CLI child it owns. The Python CLI reads it to
+/// tell a desktop-managed launch from a user typing the same command in a shell.
+pub(crate) const DESKTOP_MANAGED_ENV: &str = "UNSLOTH_DESKTOP_MANAGED";
+
+/// Windows registers "run at login" as an HKCU Run value, which cannot carry a
+/// working directory, so the app starts in C:\Windows\system32 and every child
+/// inherits it. The Python CLI refuses to run from there, which is why a login
+/// start produced a tray icon and no backend. Pick the directory explicitly
+/// rather than passing on whatever the launcher happened to give us.
+pub(crate) fn managed_cli_working_dir_from(
+    home: Option<std::path::PathBuf>,
+    windirs: &[std::path::PathBuf],
+) -> Result<std::path::PathBuf, String> {
+    let home = usable_home_dir(home, windirs)?;
+
+    // Same directory the installer already runs from, so no new state location
+    // is introduced and ~/.unsloth stays the one Unsloth-owned working root.
+    let work_dir = home.join(".unsloth");
+    if !work_dir.exists() {
+        std::fs::create_dir_all(&work_dir)
+            .map_err(|e| format!("Failed to create {}: {}", work_dir.display(), e))?;
+    }
+    if !work_dir.is_dir() {
+        return Err(format!("{} is not a directory", work_dir.display()));
+    }
+    Ok(work_dir)
+}
+
+// Case-insensitive, either separator, no trailing one, no \\?\ prefix. Not
+// cfg-gated, so the check stays unit-testable from Linux CI.
+fn normalize_windows_path(path: &std::path::Path) -> String {
+    // Lowercased first: the object manager accepts \\?\unc\ too, and reading
+    // that as an ordinary path would compare a share against a relative name.
+    let text = path.to_string_lossy().replace('/', "\\").to_lowercase();
+    let text = match text.strip_prefix("\\\\?\\unc\\") {
+        Some(rest) => format!("\\\\{rest}"),
+        None => text.strip_prefix("\\\\?\\").unwrap_or(&text).to_string(),
+    };
+    text.trim_end_matches('\\').to_string()
+}
+
+fn is_inside_windows_dir(path: &std::path::Path, windirs: &[std::path::PathBuf]) -> bool {
+    let normalized = normalize_windows_path(path);
+    windirs.iter().any(|windir| {
+        let root = normalize_windows_path(windir);
+        // "c:" (from a WINDIR of "C:\") would match the whole drive, so require
+        // something under a drive letter before treating it as the Windows tree.
+        root.len() > 2 && (normalized == root || normalized.starts_with(&(root.clone() + "\\")))
+    })
+}
+
+/// Directory a desktop-spawned `unsloth` CLI child should run from.
+///
+/// The inherited one, unless it is unusable (on Windows, a system folder), so
+/// `./models` and other cwd-relative defaults keep resolving where a manually
+/// launched desktop resolved them and only the login start moves. Resolved per
+/// call, so a profile that mounts late recovers without an app restart. Never
+/// falls back to a temp dir: that scatters state and hides a broken profile.
+pub(crate) fn managed_cli_working_dir() -> Result<std::path::PathBuf, String> {
+    let windirs = windows_roots();
+    if let Ok(cwd) = std::env::current_dir() {
+        if !is_unusable_cwd(&cwd, &windirs) {
+            return Ok(cwd);
+        }
+    }
+    managed_cli_working_dir_from(dirs::home_dir(), &windirs)
+}
+
+/// The directories the CLI guard refuses to run from, and only those.
+///
+/// The rest of the Windows tree still disqualifies a *home* (a service account
+/// living under System32), but a child that was already running from, say,
+/// C:\Windows\Temp keeps doing so: the guard allowed it before this change, and
+/// moving it would put that install's state somewhere else than the CLI does.
+fn is_unusable_cwd(path: &std::path::Path, windirs: &[std::path::PathBuf]) -> bool {
+    windirs.iter().any(|windir| {
+        ["System32", "SysWOW64"]
+            .iter()
+            .any(|name| is_inside_windows_dir(path, &[windir.join(name)]))
+    })
+}
+
+/// Every real Windows directory, empty off Windows.
+///
+/// Candidates are checked, not trusted. Trusting one variable lets whoever sets
+/// it aim the check somewhere harmless; trusting all of them is worse, since a
+/// WINDIR aimed at the user's profile would reject that profile and leave the
+/// backend nowhere to start. So a directory counts only if it holds System32.
+fn windows_roots() -> Vec<std::path::PathBuf> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let system_root = std::env::var("SystemRoot").ok();
+    let fallback = system_root
+        .clone()
+        .unwrap_or_else(|| r"C:\Windows".to_string());
+    windows_roots_from(
+        [
+            system_root,
+            std::env::var("WINDIR").ok(),
+            Some(r"C:\Windows".to_string()),
+        ]
+        .into_iter()
+        .flatten()
+        .map(std::path::PathBuf::from)
+        .collect(),
+        std::path::PathBuf::from(fallback),
+        |root| root.join("System32").is_dir(),
+    )
+}
+
+fn windows_roots_from(
+    candidates: Vec<std::path::PathBuf>,
+    fallback: std::path::PathBuf,
+    is_windows_dir: impl Fn(&std::path::Path) -> bool,
+) -> Vec<std::path::PathBuf> {
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for root in candidates {
+        if is_windows_dir(&root) && !roots.contains(&root) {
+            roots.push(root);
+        }
+    }
+    if roots.is_empty() {
+        // Nothing on this machine looks like a Windows installation. Keep the
+        // check alive, on SystemRoot or the default, never on a settable value.
+        roots.push(fallback);
+    }
+    roots
+}
+
+/// Path overrides a relative value makes cwd-dependent, so moving the child
+/// without rewriting them would point them somewhere else. Search lists such as
+/// PATH are absent: they are not single paths. Mirrors `_RELATIVE_PATH_ENV` in
+/// unsloth_cli/_system_dir_guard.py, held identical by a parity test.
+pub(crate) const RELATIVE_PATH_ENV: &[&str] = &[
+    "UNSLOTH_STUDIO_HOME",
+    "STUDIO_HOME",
+    "UNSLOTH_STUDIO_DOCUMENTS_HOME",
+    "UNSLOTH_STUDIO_PROJECTS_HOME",
+    "UNSLOTH_STUDIO_SANDBOX_HOME",
+    "STUDIO_LOCAL_REPO",
+    "UNSLOTH_LLAMA_CPP_PATH",
+    "UNSLOTH_LLAMA_CPP_SCRIPTS_DIR",
+    "UNSLOTH_SD_CPP_PATH",
+    "UNSLOTH_WHISPER_CPP_PATH",
+    "LLAMA_SERVER_PATH",
+    "WHISPER_SERVER_PATH",
+    "SD_CLI_PATH",
+    "SD_SERVER_PATH",
+    "CUDA_PATH",
+    "HIP_PATH",
+    "HIP_PATH_57",
+    "ROCM_PATH",
+    "MLX_HOSTFILE",
+    "OLLAMA_MODELS",
+    "DG_VISUAL_BIN",
+    "UNSLOTH_DG_SHIM",
+    "UNSLOTH_COMPILE_LOCATION",
+    "TORCHINDUCTOR_CACHE_DIR",
+    "UNSLOTH_DIFFUSION_COMPILE_CACHE_DIR",
+    "UNSLOTH_DIFFUSION_COND_CACHE_DIR",
+    "HF_HOME",
+    "HF_HUB_CACHE",
+    "HUGGINGFACE_HUB_CACHE",
+    "HF_XET_CACHE",
+    "HF_DATASETS_CACHE",
+    "HF_ASSETS_CACHE",
+    "TRANSFORMERS_CACHE",
+    "SENTENCE_TRANSFORMERS_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "UNSLOTH_STUDIO_CHILD_RECORD",
+    "UNSLOTH_LLAMA_INSTALLER",
+    "CUDA_HOME",
+    "CUDA_ROOT",
+];
+
+/// The same, for values holding several separated directories: one relative
+/// entry changes what the whole list allows or searches.
+pub(crate) const PATH_LIST_ENV: &[&str] =
+    &["UNSLOTH_ALLOW_LOCAL_PREQUANT_PATH", "CUDA_RUNTIME_DLL_DIR"];
+
+/// Whether a value names one directory whatever the process does next.
+///
+/// Windows rules on every platform: a Windows value is what reaches this code,
+/// and hard-coding them keeps the check testable from Linux CI. Matches
+/// `_is_fully_qualified` in the CLI guard, "C:sub" and "\\cache" included, both
+/// of which name a directory only in combination with process state.
+fn is_fully_qualified(value: &str) -> bool {
+    let lowered = value.to_lowercase();
+    if lowered.starts_with("\\\\?\\unc\\") {
+        return true;
+    }
+    let value = if lowered.starts_with("\\\\?\\") {
+        &value[4..]
+    } else {
+        value
+    };
+    if value.starts_with("\\\\") || value.starts_with("//") {
+        return true;
+    }
+    // Spelled out rather than deferred to Path::is_absolute, so the answer is
+    // the same on the Linux runner that tests it as on the Windows machine that
+    // runs it, and the same as _is_fully_qualified in the CLI guard.
+    matches!(value.as_bytes(), [drive, b':', sep, ..]
+        if drive.is_ascii_alphabetic() && (*sep == b'\\' || *sep == b'/'))
+}
+
+/// Whether the value depends on process state `join` cannot see: the current
+/// directory of a drive ("D:cache") or of the current drive ("\\cache").
+fn needs_os_resolution(value: &str) -> bool {
+    if value.starts_with('\\') || value.starts_with('/') {
+        return true;
+    }
+    matches!(value.as_bytes(), [drive, b':', ..] if drive.is_ascii_alphabetic())
+}
+
+fn relative_override_pins_from(
+    cwd: Option<std::path::PathBuf>,
+    work_dir: &std::path::Path,
+    lookup: impl Fn(&str) -> Option<String>,
+    absolute: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> Vec<(&'static str, std::path::PathBuf)> {
+    let Some(cwd) = cwd else {
+        return Vec::new();
+    };
+    // The usual case: the child keeps the directory it inherited, so every
+    // relative value still means what it did and nothing is rewritten.
+    if cwd == work_dir {
+        return Vec::new();
+    }
+    RELATIVE_PATH_ENV
+        .iter()
+        .filter_map(|name| {
+            let value = lookup(name)?;
+            let value = value.trim();
+            // A `~` value does not consult the working directory.
+            if value.is_empty() || value.starts_with('~') {
+                return None;
+            }
+            if is_fully_qualified(value) {
+                return None;
+            }
+            if needs_os_resolution(value) {
+                // "D:cache" is drive D's own current directory and "\\cache" the
+                // root of the current drive, neither of which join() knows.
+                return Some((*name, absolute(value)?));
+            }
+            Some((*name, cwd.join(value)))
+        })
+        .chain(PATH_LIST_ENV.iter().filter_map(|name| {
+            let raw = lookup(name)?;
+            if raw.trim().is_empty() {
+                return None;
+            }
+            // Only reached on Windows, where the separator is ';'.
+            let entries: Vec<String> = raw
+                .split(';')
+                .map(|entry| {
+                    let entry = entry.trim();
+                    if entry.is_empty() || entry.starts_with('~') || is_fully_qualified(entry) {
+                        return entry.to_string();
+                    }
+                    let anchored = if needs_os_resolution(entry) {
+                        absolute(entry)
+                    } else {
+                        Some(cwd.join(entry))
+                    };
+                    anchored
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| entry.to_string())
+                })
+                .collect();
+            let joined = entries.join(";");
+            if joined == raw {
+                return None;
+            }
+            Some((*name, std::path::PathBuf::from(joined)))
+        }))
+        .collect()
+}
+
+/// Relative overrides, anchored to the directory the child is being moved out of.
+fn relative_override_pins(work_dir: &std::path::Path) -> Vec<(&'static str, std::path::PathBuf)> {
+    relative_override_pins_from(
+        std::env::current_dir().ok(),
+        work_dir,
+        |name| std::env::var(name).ok(),
+        // GetFullPathNameW on Windows, which is what knows each drive's own
+        // current directory.
+        |value| std::path::absolute(value).ok(),
+    )
+}
+
+/// Pin the working directory and mark the child as desktop-managed. Env
+/// scrubbing, creation flags and the ownership handshake stay with the caller.
+pub(crate) fn apply_managed_cli_context(cmd: &mut Command) -> Result<(), String> {
+    apply_managed_cli_context_at(cmd, &managed_cli_working_dir()?);
+    Ok(())
+}
+
+pub(crate) fn apply_managed_cli_context_at(cmd: &mut Command, work_dir: &std::path::Path) {
+    for (name, pinned) in relative_override_pins(work_dir) {
+        cmd.env(name, pinned);
+    }
+    cmd.current_dir(work_dir);
+    cmd.env(DESKTOP_MANAGED_ENV, "1");
+}
+
+pub(crate) fn apply_managed_cli_context_tokio(
+    cmd: &mut tokio::process::Command,
+) -> Result<(), String> {
+    let work_dir = managed_cli_working_dir()?;
+    for (name, pinned) in relative_override_pins(&work_dir) {
+        cmd.env(name, pinned);
+    }
+    cmd.current_dir(work_dir);
+    cmd.env(DESKTOP_MANAGED_ENV, "1");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1137,6 +1496,26 @@ pub fn start_backend(
         }
     };
 
+    // A precondition like resolve_backend_binary above, so it runs before any
+    // ownership or job state is touched.
+    let work_dir = match managed_cli_working_dir() {
+        Ok(work_dir) => work_dir,
+        Err(error) => {
+            let msg = format!(
+                "Failed to pick a working directory for the backend: {}",
+                error
+            );
+            diagnostics::record_backend_start_failure(
+                diagnostics_state,
+                Some(port),
+                None,
+                "resolve_working_directory",
+                &msg,
+            );
+            return Err(msg);
+        }
+    };
+
     let args = backend_args(port);
     let start_line = format!("Starting backend: {:?} {}", bin, args.join(" "));
     let pending_owner = match crate::desktop_backend_owner::new_pending_owner() {
@@ -1157,6 +1536,8 @@ pub fn start_backend(
     cmd.args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    apply_managed_cli_context_at(&mut cmd, &work_dir);
 
     #[cfg(windows)]
     cmd.env(STUDIO_RUNTIME_GATE_HANDOFF_ENV, "1");
@@ -2216,6 +2597,583 @@ fn stop_backend_inner(
     }
 
     result
+}
+
+// A login-started desktop on Windows inherits C:\Windows\system32 (issue #8510),
+// and so did every CLI child, where the Python CLI refuses to run. These pin the
+// replacement directory and that each command carries it.
+#[cfg(test)]
+mod managed_cli_working_dir_tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn scratch(test_name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "unsloth-{test_name}-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_normal_home_yields_the_unsloth_directory_and_creates_it() {
+        let home = scratch("cwd-normal-home");
+        let resolved = managed_cli_working_dir_from(Some(home.clone()), &[])
+            .expect("a normal home must resolve");
+        assert_eq!(resolved, home.join(".unsloth"));
+        assert!(resolved.is_dir(), "the working directory must exist");
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn an_existing_working_directory_is_reused() {
+        let home = scratch("cwd-existing");
+        fs::create_dir_all(home.join(".unsloth")).unwrap();
+        let resolved = managed_cli_working_dir_from(Some(home.clone()), &[]).unwrap();
+        assert_eq!(resolved, home.join(".unsloth"));
+        fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn a_home_with_spaces_and_non_ascii_survives_intact() {
+        let base = scratch("cwd-unicode");
+        let home = base.join("Jane O'Brien ünïcode");
+        fs::create_dir_all(&home).unwrap();
+        let resolved = managed_cli_working_dir_from(Some(home.clone()), &[]).unwrap();
+        assert_eq!(resolved, home.join(".unsloth"));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_home_inside_the_windows_directory_is_not_reported_as_available() {
+        // Reporting it available sends a SYSTEM account to an install flow that
+        // the working directory resolver then refuses to start.
+        let windirs = [PathBuf::from("C:\\Windows")];
+        let home = PathBuf::from("C:\\Windows\\System32\\config\\systemprofile");
+        let error = usable_home_dir(Some(home), &windirs).unwrap_err();
+        assert!(
+            error.contains("inside the Windows directory"),
+            "unexpected error: {error}"
+        );
+        let real_home = scratch("usable-home");
+        fs::create_dir_all(&real_home).unwrap();
+        assert_eq!(
+            usable_home_dir(Some(real_home.clone()), &windirs).unwrap(),
+            real_home
+        );
+        fs::remove_dir_all(&real_home).ok();
+    }
+
+    #[test]
+    fn relative_path_overrides_are_pinned_only_when_the_child_moves() {
+        let cwd = PathBuf::from("C:\\Windows\\System32");
+        let work_dir = PathBuf::from("C:\\Users\\me\\.unsloth");
+        let env = |name: &str| match name {
+            "HF_HOME" => Some("cache".to_string()),
+            "UNSLOTH_STUDIO_HOME" => Some("  studio  ".to_string()),
+            "OLLAMA_MODELS" => Some("D:\\models".to_string()),
+            "HF_HUB_CACHE" => Some("~/hub".to_string()),
+            "XDG_CACHE_HOME" => Some("   ".to_string()),
+            "LLAMA_SERVER_PATH" => Some("\\srv\\llama-server".to_string()),
+            // Relative to drive D's own current directory, not to the cwd.
+            "HF_DATASETS_CACHE" => Some("D:datasets".to_string()),
+            _ => None,
+        };
+        // What GetFullPathNameW would answer: drive D's own current directory,
+        // and the current drive for a root-relative value.
+        let absolute = |value: &str| match value {
+            "D:datasets" => Some(PathBuf::from("D:\\work\\datasets")),
+            "\\srv\\llama-server" => Some(PathBuf::from("C:\\srv\\llama-server")),
+            other => panic!("unexpected value needing the OS: {other}"),
+        };
+
+        let pins = relative_override_pins_from(Some(cwd.clone()), &work_dir, env, absolute);
+        assert_eq!(
+            pins,
+            vec![
+                ("UNSLOTH_STUDIO_HOME", cwd.join("studio")),
+                // Root-relative: the drive is the current one, which the move
+                // can change, so the OS resolves it before that happens.
+                (
+                    "LLAMA_SERVER_PATH",
+                    PathBuf::from("C:\\srv\\llama-server")
+                ),
+                ("HF_HOME", cwd.join("cache")),
+                (
+                    "HF_DATASETS_CACHE",
+                    PathBuf::from("D:\\work\\datasets")
+                ),
+            ],
+            "only values that name no directory on their own are rewritten"
+        );
+
+        // An unresolvable drive-relative value is left alone, not rewritten.
+        assert!(
+            !relative_override_pins_from(Some(cwd.clone()), &work_dir, env, |_| None)
+                .iter()
+                .any(|(name, _)| *name == "HF_DATASETS_CACHE")
+        );
+
+        // Staying put is the common case: nothing is rewritten, so a desktop
+        // started from a project folder keeps every override as it was.
+        assert!(
+            relative_override_pins_from(Some(work_dir.clone()), &work_dir, env, absolute).is_empty()
+        );
+        assert!(relative_override_pins_from(None, &work_dir, env, absolute).is_empty());
+    }
+
+    #[test]
+    fn the_pinned_override_list_matches_the_cli_guard() {
+        // A name in one list and not the other means the same install places
+        // state in two folders, depending on which layer moved the child.
+        let guard = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../unsloth_cli/_system_dir_guard.py");
+        let source = fs::read_to_string(&guard).unwrap();
+        let start = source.find("_RELATIVE_PATH_ENV = (").unwrap();
+        let block = &source[start..start + source[start..].find("\n)").unwrap()];
+        for name in RELATIVE_PATH_ENV {
+            assert!(
+                block.contains(&format!("\"{name}\"")),
+                "{name} is pinned by the desktop but not by the CLI guard"
+            );
+        }
+        let names = block.matches('"').count() / 2;
+        assert_eq!(
+            names,
+            RELATIVE_PATH_ENV.len(),
+            "the CLI guard pins names the desktop does not"
+        );
+    }
+
+    #[test]
+    fn a_missing_home_is_an_error_rather_than_a_fallback() {
+        let error = managed_cli_working_dir_from(None, &[]).unwrap_err();
+        assert!(
+            error.contains("home directory"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_home_that_does_not_exist_is_rejected() {
+        let home = scratch("cwd-absent").join("gone");
+        let error = managed_cli_working_dir_from(Some(home), &[]).unwrap_err();
+        assert!(error.contains("not reachable"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn a_file_masquerading_as_a_home_is_rejected() {
+        let base = scratch("cwd-file-home");
+        let home = base.join("home-is-a-file");
+        fs::write(&home, b"not a directory").unwrap();
+        let error = managed_cli_working_dir_from(Some(home), &[]).unwrap_err();
+        assert!(error.contains("not reachable"), "unexpected error: {error}");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    // The SYSTEM account's profile is C:\Windows\System32\config\systemprofile, so
+    // trusting the home API here would hand the child the folder it just rejected.
+    #[test]
+    fn a_home_inside_the_windows_directory_is_rejected() {
+        let windir = PathBuf::from("C:\\Windows");
+        for home in [
+            "C:\\Windows",
+            "C:\\Windows\\System32\\config\\systemprofile",
+            "C:\\Windows\\",
+        ] {
+            let error = managed_cli_working_dir_from(
+                Some(PathBuf::from(home)),
+                std::slice::from_ref(&windir),
+            )
+            .unwrap_err();
+            assert!(
+                error.contains("inside the Windows directory"),
+                "{home} must be rejected, got: {error}"
+            );
+        }
+    }
+
+    // The separator keeps the match on a path boundary, so a profile that merely
+    // starts with the same letters as the Windows directory is not rejected.
+    #[test]
+    fn a_home_that_merely_shares_a_prefix_with_the_windows_directory_is_allowed() {
+        let error = managed_cli_working_dir_from(
+            Some(PathBuf::from(r"C:\Windows2\Users\jane")),
+            &[PathBuf::from(r"C:\Windows")],
+        )
+        .unwrap_err();
+        assert!(
+            !error.contains("inside the Windows directory"),
+            "C:\\Windows2 is a normal folder, got: {error}"
+        );
+    }
+
+    // A WINDIR of "C:\" would otherwise swallow the whole drive.
+    #[test]
+    fn a_drive_root_windows_directory_does_not_reject_every_home() {
+        let error = managed_cli_working_dir_from(
+            Some(PathBuf::from(r"C:\Users\me")),
+            &[PathBuf::from("C:\\")],
+        )
+        .unwrap_err();
+        assert!(
+            !error.contains("inside the Windows directory"),
+            "unexpected rejection: {error}"
+        );
+    }
+
+    #[test]
+    fn forward_slashes_and_case_do_not_hide_the_windows_directory() {
+        let error = managed_cli_working_dir_from(
+            Some(PathBuf::from("c:/WINDOWS/System32/config/systemprofile")),
+            &[PathBuf::from(r"C:\Windows")],
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("inside the Windows directory"),
+            "got: {error}"
+        );
+    }
+
+    // \\?\C:\Windows\... is the same folder spelled the long way; the Python
+    // guard strips the prefix too.
+    #[test]
+    fn an_extended_length_path_does_not_hide_the_windows_directory() {
+        let error = managed_cli_working_dir_from(
+            Some(PathBuf::from(
+                r"\\?\C:\Windows\System32\config\systemprofile",
+            )),
+            &[PathBuf::from(r"C:\Windows")],
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("inside the Windows directory"),
+            "got: {error}"
+        );
+    }
+
+    // The pin exists to replace an unusable directory, not to relocate every
+    // launch: a desktop started from a project folder keeps resolving ./models
+    // and other cwd-relative defaults there, on every platform.
+    #[test]
+    fn a_usable_inherited_directory_is_kept() {
+        assert_eq!(
+            managed_cli_working_dir().expect("the test's own directory is usable"),
+            std::env::current_dir().unwrap()
+        );
+    }
+
+    #[test]
+    fn only_a_windows_directory_counts_as_unusable() {
+        let windirs = [PathBuf::from(r"C:\Windows")];
+        assert!(is_inside_windows_dir(
+            std::path::Path::new(r"C:\Windows\System32"),
+            &windirs
+        ));
+        assert!(!is_inside_windows_dir(
+            std::path::Path::new(r"D:\projects\llm"),
+            &windirs
+        ));
+        assert!(!is_inside_windows_dir(
+            std::path::Path::new("/home/me"),
+            &windirs
+        ));
+    }
+
+    // A WINDIR aimed at the user's profile would otherwise make this reject that
+    // profile, so the backend would never start anywhere on that machine.
+    #[test]
+    fn a_candidate_that_holds_no_system32_is_not_a_windows_directory() {
+        let roots = windows_roots_from(
+            vec![
+                PathBuf::from(r"C:\Windows"),
+                PathBuf::from(r"C:\Users\me"),
+                PathBuf::from(r"C:\Windows"),
+            ],
+            PathBuf::from(r"C:\Windows"),
+            |root| root == std::path::Path::new(r"C:\Windows"),
+        );
+        assert_eq!(roots, vec![PathBuf::from(r"C:\Windows")]);
+    }
+
+    #[test]
+    fn a_shadowed_windir_does_not_hide_the_real_windows_directory() {
+        let roots = windows_roots_from(
+            vec![PathBuf::from(r"D:\Windows"), PathBuf::from(r"C:\Users\me")],
+            PathBuf::from(r"D:\Windows"),
+            |root| root == std::path::Path::new(r"D:\Windows"),
+        );
+        assert_eq!(roots, vec![PathBuf::from(r"D:\Windows")]);
+    }
+
+    #[test]
+    fn nothing_that_looks_like_windows_falls_back_to_the_authoritative_value() {
+        let roots = windows_roots_from(
+            vec![PathBuf::from(r"E:\Windows"), PathBuf::from(r"C:\Users\me")],
+            PathBuf::from(r"E:\Windows"),
+            |_root| false,
+        );
+        assert_eq!(
+            roots,
+            vec![PathBuf::from(r"E:\Windows")],
+            "the guard must stay alive, and never on the settable value"
+        );
+    }
+
+    #[test]
+    fn a_configured_command_carries_the_directory_and_the_marker() {
+        let work_dir = scratch("cwd-command-shape");
+
+        let mut cmd = Command::new("unsloth");
+        apply_managed_cli_context_at(&mut cmd, &work_dir);
+        assert_eq!(cmd.get_current_dir(), Some(work_dir.as_path()));
+        assert!(
+            cmd.get_envs()
+                .any(|(key, value)| key == DESKTOP_MANAGED_ENV && value == Some("1".as_ref())),
+            "the desktop marker must be set"
+        );
+        fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn only_the_folders_the_cli_refuses_count_as_unusable() {
+        let windirs = [PathBuf::from("C:\\Windows")];
+        for unusable in [
+            "C:\\Windows\\System32",
+            "c:\\windows\\system32\\config\\systemprofile",
+            "C:\\Windows\\SysWOW64",
+            "\\\\?\\C:\\Windows\\System32",
+        ] {
+            assert!(
+                is_unusable_cwd(std::path::Path::new(unusable), &windirs),
+                "{unusable} must be replaced"
+            );
+        }
+        for usable in [
+            // The guard has always allowed these, so a child that was running
+            // from one keeps running from it.
+            "C:\\Windows\\Temp\\project",
+            "C:\\Windows",
+            "C:\\Windows2\\System32",
+            "C:\\Users\\me\\projects",
+        ] {
+            assert!(
+                !is_unusable_cwd(std::path::Path::new(usable), &windirs),
+                "{usable} must be kept"
+            );
+        }
+    }
+
+    #[test]
+    fn an_extended_unc_path_compares_the_same_in_either_case() {
+        // The object manager accepts \\?\unc\, so a profile spelled that way
+        // must not be read as a relative name.
+        assert_eq!(
+            normalize_windows_path(std::path::Path::new("\\\\?\\UNC\\server\\profiles\\me")),
+            normalize_windows_path(std::path::Path::new("\\\\?\\unc\\server\\profiles\\me"))
+        );
+        assert!(is_fully_qualified("\\\\?\\unc\\server\\profiles\\me"));
+        assert!(is_fully_qualified("\\\\?\\UNC\\server\\profiles\\me"));
+    }
+
+    #[test]
+    fn each_entry_of_a_path_list_is_anchored_on_its_own() {
+        let cwd = PathBuf::from("C:\\Windows\\System32");
+        let work_dir = PathBuf::from("C:\\Users\\me\\.unsloth");
+        let pins = relative_override_pins_from(
+            Some(cwd.clone()),
+            &work_dir,
+            |name| match name {
+                "UNSLOTH_ALLOW_LOCAL_PREQUANT_PATH" => {
+                    Some("trusted;D:\\shared;~\\mine".to_string())
+                }
+                _ => None,
+            },
+            |_| None,
+        );
+        let expected = format!("{};D:\\shared;~\\mine", cwd.join("trusted").to_string_lossy());
+        assert_eq!(
+            pins,
+            vec![(
+                "UNSLOTH_ALLOW_LOCAL_PREQUANT_PATH",
+                PathBuf::from(expected)
+            )],
+            "a relative entry must not authorise a different directory after the move"
+        );
+    }
+
+    #[test]
+    fn configuring_a_command_twice_changes_nothing() {
+        let work_dir = scratch("cwd-command-twice");
+
+        let mut once = Command::new("unsloth");
+        apply_managed_cli_context_at(&mut once, &work_dir);
+        let mut twice = Command::new("unsloth");
+        apply_managed_cli_context_at(&mut twice, &work_dir);
+        apply_managed_cli_context_at(&mut twice, &work_dir);
+
+        let envs = |cmd: &Command| {
+            let mut pairs: Vec<(String, Option<String>)> = cmd
+                .get_envs()
+                .map(|(key, value)| {
+                    (
+                        key.to_string_lossy().into_owned(),
+                        value.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            pairs.sort();
+            pairs.dedup();
+            pairs
+        };
+        assert_eq!(envs(&once), envs(&twice));
+        assert_eq!(twice.get_current_dir(), Some(work_dir.as_path()));
+        fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn pinning_an_already_pinned_value_is_a_no_op() {
+        // The child's environment reaches grandchildren, and the desktop
+        // resolves the directory again on every spawn, so the rewrite has to
+        // land on the same value however many times it runs.
+        let cwd = PathBuf::from("C:\\Windows\\System32");
+        let work_dir = PathBuf::from("C:\\Users\\me\\.unsloth");
+        let absolute = |_: &str| Some(PathBuf::from("D:\\work\\datasets"));
+
+        let mut values = vec![
+            ("HF_HOME", "cache".to_string()),
+            ("HF_DATASETS_CACHE", "D:datasets".to_string()),
+        ];
+        for round in 0..3 {
+            let pins = relative_override_pins_from(
+                Some(cwd.clone()),
+                &work_dir,
+                |name| {
+                    values
+                        .iter()
+                        .find(|(key, _)| *key == name)
+                        .map(|(_, value)| value.clone())
+                },
+                absolute,
+            );
+            if round == 0 {
+                assert_eq!(pins.len(), 2, "the first pass rewrites both values");
+            } else {
+                assert!(pins.is_empty(), "pass {round} rewrote an anchored value");
+            }
+            for (name, pinned) in pins {
+                let slot = values.iter_mut().find(|(key, _)| *key == name).unwrap();
+                slot.1 = pinned.to_string_lossy().into_owned();
+            }
+        }
+        // The separator is whatever this platform's join produces; the point is
+        // that the value stopped moving after the first pass.
+        assert_eq!(values[0].1, cwd.join("cache").to_string_lossy());
+        assert_eq!(values[1].1, "D:\\work\\datasets");
+        assert!(is_fully_qualified(&values[0].1) && is_fully_qualified(&values[1].1));
+    }
+
+    #[test]
+    fn a_configured_tokio_command_carries_the_directory_and_the_marker() {
+        let expected = managed_cli_working_dir().expect("home must resolve");
+        let mut tokio_cmd = tokio::process::Command::new("unsloth");
+        apply_managed_cli_context_tokio(&mut tokio_cmd).expect("context must apply");
+        assert_eq!(
+            tokio_cmd.as_std().get_current_dir(),
+            Some(expected.as_path())
+        );
+        assert!(
+            tokio_cmd
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == DESKTOP_MANAGED_ENV && value == Some("1".as_ref())),
+            "the desktop marker must be set on tokio commands too"
+        );
+    }
+
+    // The marker only helps if the Python side reads the same name; a rename on
+    // either side degrades silently to argv matching, which is the fallback path.
+    #[test]
+    fn the_marker_name_matches_the_python_guard() {
+        let guard = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../unsloth_cli/_system_dir_guard.py");
+        let source = fs::read_to_string(&guard).expect("the Python guard must be readable");
+        assert!(
+            source.contains(&format!("DESKTOP_MANAGED_ENV = \"{DESKTOP_MANAGED_ENV}\"")),
+            "{} must define the same marker name",
+            guard.display()
+        );
+    }
+
+    // Configuring a child must not move the desktop process itself: a global chdir
+    // would change relative path resolution for dialogs, the updater and cleanup.
+    #[test]
+    fn configuring_a_child_leaves_the_parent_directory_alone() {
+        let before = std::env::current_dir().unwrap();
+        let work_dir = scratch("cwd-parent-untouched");
+        let mut cmd = Command::new("unsloth");
+        apply_managed_cli_context_at(&mut cmd, &work_dir);
+        assert_eq!(std::env::current_dir().unwrap(), before);
+        fs::remove_dir_all(&work_dir).ok();
+    }
+
+    #[test]
+    fn backend_args_are_unchanged_by_the_working_directory_fix() {
+        assert_eq!(
+            backend_args(8888),
+            vec!["studio", "--api-only", "-H", "127.0.0.1", "-p", "8888"]
+        );
+    }
+
+    // The platform the bug was reported on, on the Windows leg of studio-tauri-smoke:
+    // a child must observe the chosen directory rather than the launcher's.
+    #[cfg(windows)]
+    #[test]
+    fn a_spawned_child_runs_from_the_resolved_directory_on_windows() {
+        let expected = scratch("cwd-spawned-child-win");
+
+        let mut cmd = Command::new("cmd.exe");
+        cmd.args(["/C", "cd"]).stdout(Stdio::piped());
+        apply_managed_cli_context_at(&mut cmd, &expected);
+        let output = cmd.output().expect("spawn test child");
+        let reported = String::from_utf8_lossy(&output.stdout).trim().to_string();
+
+        assert_eq!(
+            normalize_windows_path(std::path::Path::new(&reported)),
+            normalize_windows_path(&expected)
+        );
+        fs::remove_dir_all(&expected).ok();
+    }
+
+    // The end of the chain the bug actually broke: the child must observe the chosen
+    // directory, including through the unix process-group wrapper used by start_backend.
+    #[cfg(unix)]
+    #[test]
+    fn a_spawned_child_runs_from_the_resolved_directory() {
+        let expected = scratch("cwd-spawned-child");
+
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "pwd -P"]).stdout(Stdio::piped());
+        apply_managed_cli_context_at(&mut cmd, &expected);
+        let mut wrap = CommandWrap::from(cmd);
+        wrap.wrap(ProcessGroup::leader());
+        let mut child = wrap.spawn().expect("spawn test child");
+        let mut out = String::new();
+        std::io::Read::read_to_string(child.stdout().as_mut().unwrap(), &mut out).unwrap();
+        let _ = child.wait();
+
+        assert_eq!(
+            std::fs::canonicalize(out.trim()).unwrap(),
+            std::fs::canonicalize(&expected).unwrap()
+        );
+    }
 }
 
 // The race this pins is not visible from the type system, so it uses real processes
