@@ -39,6 +39,52 @@ fn generic_failure_message(code: i32) -> String {
     )
 }
 
+/// PowerShell hands the whole top-level script block to AMSI while compiling it, so a security
+/// product's verdict arrives as a parse error over the entire file before the installer's first
+/// line runs: no `[TAURI:ERROR]` marker, no phase log, just an unexplained stderr tail. Match
+/// the stable error id, never the localized message text; the id can carry a cmdlet suffix, so
+/// this is a substring test.
+const AMSI_MALWARE_ERROR_ID: &str = "ScriptContainedMaliciousContent";
+const AMSI_ADMIN_BLOCK_ERROR_ID: &str = "ScriptHasAdminBlockedContent";
+
+/// "Nothing was changed" only holds for a block on install.ps1 itself, which AMSI rejects before
+/// its first statement. install.ps1 also runs `unsloth studio setup` near the end, and that child
+/// spawns studio/setup.ps1 through the same inherited pipes: a block there arrives after the venv,
+/// PyTorch and the packages are already on disk, so the same reassurance would be a lie. A
+/// `[TAURI:STEP]` marker is the dividing line, since a pre-start block produces none at all.
+const AMSI_MALWARE_GUIDANCE_PRE_START: &str = "Security software blocked the installer before it \
+     started, so no installation steps ran and nothing was changed on this machine. This is a \
+     false positive: update your security product's definitions and retry, or report it to your \
+     vendor. Do not disable endpoint protection.";
+const AMSI_MALWARE_GUIDANCE_IN_PROGRESS: &str = "Security software blocked part of the installer, \
+     so setup did not finish and some components may already be installed. This is a false \
+     positive: update your security product's definitions and retry, or report it to your \
+     vendor. Do not disable endpoint protection.";
+const AMSI_ADMIN_BLOCK_GUIDANCE_PRE_START: &str = "This machine's security policy blocked the \
+     installer before it started, so no installation steps ran and nothing was changed. Ask \
+     whoever manages the device to allow it.";
+const AMSI_ADMIN_BLOCK_GUIDANCE_IN_PROGRESS: &str = "This machine's security policy blocked part \
+     of the installer, so setup did not finish and some components may already be installed. Ask \
+     whoever manages the device to allow it.";
+
+fn security_block_guidance(text: &str, started: bool) -> Option<&'static str> {
+    if text.contains(AMSI_MALWARE_ERROR_ID) {
+        return Some(if started {
+            AMSI_MALWARE_GUIDANCE_IN_PROGRESS
+        } else {
+            AMSI_MALWARE_GUIDANCE_PRE_START
+        });
+    }
+    if text.contains(AMSI_ADMIN_BLOCK_ERROR_ID) {
+        return Some(if started {
+            AMSI_ADMIN_BLOCK_GUIDANCE_IN_PROGRESS
+        } else {
+            AMSI_ADMIN_BLOCK_GUIDANCE_PRE_START
+        });
+    }
+    None
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InstallOutputStream {
     Stdout,
@@ -55,11 +101,17 @@ struct InstallFailureContext {
     explicit_error: Option<String>,
     explicit_error_stream: Option<InstallOutputStream>,
     default_error: Option<String>,
+    security_block: Option<&'static str>,
+    started: bool,
     output_tail: VecDeque<InstallOutputLine>,
 }
 
 impl InstallFailureContext {
     fn observe_stdout(&mut self, text: &str) -> bool {
+        if text.starts_with("[TAURI:STEP] ") {
+            self.started = true;
+        }
+        self.note_security_block(text);
         if text.starts_with("[TAURI:ERROR_CLEAR] ") {
             self.clear_failure(InstallOutputStream::Stdout);
             return true;
@@ -94,6 +146,7 @@ impl InstallFailureContext {
     }
 
     fn observe_stderr(&mut self, text: &str) -> bool {
+        self.note_security_block(text);
         if text.starts_with("[TAURI:ERROR_CLEAR] ") {
             self.clear_failure(InstallOutputStream::Stderr);
             return true;
@@ -130,7 +183,18 @@ impl InstallFailureContext {
         }
     }
 
+    /// Both streams, before marker handling: PowerShell writes the parse error to stderr, but a
+    /// wrapper that folded the streams together would otherwise lose it.
+    fn note_security_block(&mut self, text: &str) {
+        if self.security_block.is_none() {
+            self.security_block = security_block_guidance(text, self.started);
+        }
+    }
+
     fn clear_failure(&mut self, stream: InstallOutputStream) {
+        // A run that cleared its own failure state was never blocked at parse time, so a
+        // verdict here is stale.
+        self.security_block = None;
         if self.explicit_error_stream == Some(stream) {
             self.explicit_error = None;
             self.explicit_error_stream = None;
@@ -172,9 +236,15 @@ impl InstallFailureContext {
             .as_deref()
             .or(self.default_error.as_deref())
             .or_else(|| self.output_tail.back().map(|line| line.text.as_str()));
-        match detail {
+        let base = match detail {
             Some(detail) => format!("Installation failed: {}", detail),
             None => generic_failure_message(code),
+        };
+        // Appended, not substituted: the raw id is what a diagnostics report and a vendor
+        // submission need, the guidance is what the user needs.
+        match self.security_block {
+            Some(guidance) => format!("{} {}", base, guidance),
+            None => base,
         }
     }
 }
@@ -1317,6 +1387,102 @@ mod tests {
         assert!(!is_elevation_request(2, &[]));
         assert!(is_elevation_request(2, &["cmake".to_string()]));
         assert!(!is_elevation_request(1, &["cmake".to_string()]));
+    }
+
+    /// The exact stderr an AMSI provider produced in #8523. The scan covers the whole script
+    /// block, so the parse error points at line 1 char 1 and no statement ever runs.
+    const AMSI_BLOCK_STDERR: [&str; 6] = [
+        r"At C:\Program Files\Unsloth\install.ps1:1 char:1",
+        "+ # Unsloth Studio Installer for Windows PowerShell",
+        "+ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~",
+        "This script contains malicious content and has been blocked by your antivirus software.",
+        "    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException",
+        "    + FullyQualifiedErrorId : ScriptContainedMaliciousContent",
+    ];
+
+    #[test]
+    fn amsi_block_explains_itself_without_losing_the_error_id() {
+        let mut context = InstallFailureContext::default();
+        for line in AMSI_BLOCK_STDERR {
+            context.observe_stderr(line);
+        }
+        let message = context.message(1);
+        // The raw id survives: diagnostics and vendor submissions need it.
+        assert!(message.contains("ScriptContainedMaliciousContent"), "{message}");
+        assert!(message.starts_with("Installation failed: "), "{message}");
+        assert!(message.contains("blocked the installer before it started"), "{message}");
+        assert!(message.contains("nothing was changed on this machine"), "{message}");
+    }
+
+    #[test]
+    fn a_block_after_the_install_started_does_not_claim_nothing_changed() {
+        // install.ps1 runs `unsloth studio setup` near the end, and that child spawns
+        // studio/setup.ps1 on the same inherited pipes. A block there lands after the venv and
+        // PyTorch are on disk, so the pre-start reassurance would be false.
+        let mut context = InstallFailureContext::default();
+        context.observe_stdout("[TAURI:STEP] running unsloth studio setup...");
+        for line in AMSI_BLOCK_STDERR {
+            context.observe_stderr(line);
+        }
+        let message = context.message(1);
+        assert!(message.contains("ScriptContainedMaliciousContent"), "{message}");
+        assert!(message.contains("blocked part of the installer"), "{message}");
+        assert!(!message.contains("nothing was changed"), "{message}");
+        assert!(message.contains("some components may already be installed"), "{message}");
+    }
+
+    #[test]
+    fn an_admin_policy_block_after_the_install_started_is_also_neutral() {
+        let mut context = InstallFailureContext::default();
+        context.observe_stdout("[TAURI:STEP] installing PyTorch");
+        context.observe_stderr("    + FullyQualifiedErrorId : ScriptHasAdminBlockedContent");
+        let message = context.message(1);
+        assert!(message.contains("blocked part of the installer"), "{message}");
+        assert!(!message.contains("nothing was changed"), "{message}");
+    }
+
+    #[test]
+    fn amsi_block_is_recognised_on_stdout_and_when_the_id_carries_a_cmdlet_suffix() {
+        // A wrapper folding stderr into stdout, plus the Invoke-Expression form of the id.
+        let mut context = InstallFailureContext::default();
+        context.observe_stdout(
+            "    + FullyQualifiedErrorId : ScriptContainedMaliciousContent,\
+             Microsoft.PowerShell.Commands.InvokeExpressionCommand",
+        );
+        assert!(context
+            .message(1)
+            .contains("blocked the installer before it started"));
+    }
+
+    #[test]
+    fn admin_policy_block_gets_its_own_guidance() {
+        let mut context = InstallFailureContext::default();
+        context.observe_stderr("    + FullyQualifiedErrorId : ScriptHasAdminBlockedContent");
+        let message = context.message(1);
+        assert!(message.contains("security policy blocked the installer"), "{message}");
+        assert!(!message.contains("report it to your vendor"), "{message}");
+    }
+
+    #[test]
+    fn an_ordinary_failure_gains_no_security_guidance() {
+        let mut context = InstallFailureContext::default();
+        context.observe_stdout("[TAURI:ERROR] Failed to install PyTorch");
+        assert_eq!(
+            context.message(7),
+            "Installation failed: Failed to install PyTorch"
+        );
+    }
+
+    #[test]
+    fn a_run_that_clears_its_failure_state_drops_a_stale_verdict() {
+        let mut context = InstallFailureContext::default();
+        context.observe_stderr("    + FullyQualifiedErrorId : ScriptContainedMaliciousContent");
+        context.observe_stdout("[TAURI:ERROR_CLEAR] retrying");
+        context.observe_stdout("[TAURI:ERROR] Failed to install PyTorch");
+        assert_eq!(
+            context.message(7),
+            "Installation failed: Failed to install PyTorch"
+        );
     }
 
     #[test]

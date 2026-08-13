@@ -2,17 +2,16 @@
 #
 # Unsloth Studio Installer
 #
-# Usage:  curl -fsSL https://unsloth.ai/install.sh | sh
-#         wget  -qO- https://unsloth.ai/install.sh | sh
-#         ./install.sh --local   (install from a cloned repo instead of PyPI)
+# Usage, supported options and the web one-liner are documented in the repository README under
+# "Install Unsloth Studio" -- see https://github.com/unslothai/unsloth#unsloth-studio. They are
+# not repeated here: this file ships inside the Linux desktop bundle, where a header rehearsing
+# download-and-run command lines is the first thing a generic script classifier reads, and
+# nothing in the script consults it.
 #
-# Piped installs take options as env vars after the pipe (a bare `| sh --no-torch`
-# makes sh reject --no-torch as its own option). Flags still work via ./install.sh:
-#   curl -fsSL https://unsloth.ai/install.sh | UNSLOTH_NO_TORCH=1 sh       # skip PyTorch (GGUF-only)
-#   curl -fsSL https://unsloth.ai/install.sh | UNSLOTH_SKIP_AUTOSTART=1 sh # do not prompt to launch
-#   curl -fsSL https://unsloth.ai/install.sh | UNSLOTH_PYTHON=3.12 sh      # pin Python version
-#   curl -fsSL https://unsloth.ai/install.sh | UNSLOTH_STUDIO_HOME=/abs/path sh
-# Equivalent flags: ./install.sh --no-torch --python 3.12  (or pipe them: sh -s -- --no-torch)
+# A piped install takes options as environment variables after the pipe (UNSLOTH_NO_TORCH,
+# UNSLOTH_SKIP_AUTOSTART, UNSLOTH_PYTHON, UNSLOTH_STUDIO_HOME) because a bare `--no-torch` after
+# the pipe would be read as an option to sh itself; a local run takes the equivalent flags
+# (--no-torch, --python, --local).
 #
 # Install dir priority: UNSLOTH_STUDIO_HOME > STUDIO_HOME (alias) > $HOME/.unsloth/studio
 #
@@ -20,7 +19,7 @@
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 set -e
 # ── Why the installer lives in a function ──
-# Under `curl ... | sh`, sh is the pipe READER. This file is ~150KB, so a top-level
+# Under a piped web install, sh is the pipe READER. This file is ~150KB, so a top-level
 # `exit` left most of it unread, the write end failed, and curl tacked
 # "(56) Failure writing output to destination" onto our own error message. Wrapping
 # the body forces sh to parse to the closing brace first, so the pipe always drains
@@ -2048,7 +2047,7 @@ _maybe_reroute_strixhalo_to_2404() {
     echo ""
     substep "ROCm-on-WSL (GPU) needs Ubuntu 24.04; this distro is Ubuntu ${_rr_ver:-unknown}." "$C_WARN"
     substep "Found an existing $_rr_target distro -- continuing the GPU install there." "$C_OK"
-    # A --local checkout can't be replayed via curl|sh (the repo isn't in the target
+    # A --local checkout can't be replayed by a piped web install (the repo isn't in the target
     # distro), so tell the user to re-run there rather than silently run a different install.
     if [ "$STUDIO_LOCAL_INSTALL" = true ]; then
         substep "This is a --local install; re-run it from $_rr_target instead:" "$C_WARN"
@@ -2083,7 +2082,7 @@ _maybe_reroute_strixhalo_to_2404() {
     else
         _rr_cmd="curl -fsSL https://unsloth.ai/install.sh | sh"
     fi
-    # pipefail so a failed curl in `curl | sh` isn't masked by sh exiting 0 on empty
+    # pipefail so a failed download in a piped web install isn't masked by sh exiting 0 on empty
     # input (which would wrongly report success and exit 0 the parent installer).
     _rr_rc=0
     wsl.exe -d "$_rr_target" -- bash -lc "$_rr_exports; $_rr_cmd" || _rr_rc=$?
@@ -2407,6 +2406,110 @@ _uv_version_ok() {  # uv command, floor (defaults to UV_MIN_VERSION)
     return 0
 }
 
+# ── uv from a pinned release ──
+# Same archive, destination and PATH treatment as astral's installer, but it fetches a
+# data file with a pinned SHA-256 instead of a script it runs and deletes. Mirrors
+# Install-UvFromRelease in install.ps1. Bumping the version means bumping every hash:
+#   curl -sL https://github.com/astral-sh/uv/releases/download/<ver>/<asset>.sha256
+#
+# Only the four mainstream targets are pinned. musl, armv7 and the rest fall through to
+# the caller's existing path rather than risk a wrong triple.
+UV_PINNED_VERSION="0.12.1"
+
+# Prints "<asset> <sha256>" for this host, or nothing when the host is not pinned.
+_uv_pinned_asset() {
+    _upa_os=$(uname -s 2>/dev/null || echo unknown)
+    _upa_arch=$(uname -m 2>/dev/null || echo unknown)
+    case "$_upa_os" in
+        Linux)
+            # A musl host needs the musl archive, off a detection we cannot test here.
+            if (ldd --version 2>&1 || true) | grep -qi musl; then return 1; fi
+            case "$_upa_arch" in
+                x86_64|amd64)
+                    echo "uv-x86_64-unknown-linux-gnu.tar.gz 90b2f223fb69d19db49e117da601f64978593417988530aa733d456141b4bcbb" ;;
+                aarch64|arm64)
+                    echo "uv-aarch64-unknown-linux-gnu.tar.gz 769d373e146692c639b5fbaae33b331c297a32e03d30448772051902df52bbf4" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        Darwin)
+            case "$_upa_arch" in
+                x86_64)
+                    echo "uv-x86_64-apple-darwin.tar.gz 69d9f9a00337f25a50dcb13882052da08b8469bac11091c98c5694c3c6721467" ;;
+                arm64|aarch64)
+                    echo "uv-aarch64-apple-darwin.tar.gz 77d2906988e8074fd43f2f329ec452ebbf9b0c257ba1c66451c71de70a6baf42" ;;
+                *) return 1 ;;
+            esac
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+# Echoes the SHA-256 of "$1", or nothing when the host has no digest tool.
+_uv_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" 2>/dev/null | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+_uv_install_pinned() {
+    _uip_spec=$(_uv_pinned_asset) || return 1
+    [ -n "$_uip_spec" ] || return 1
+    _uip_asset=${_uip_spec%% *}
+    _uip_want=${_uip_spec##* }
+    # Unverified is worth less than astral's own release flow, so decline instead.
+    command -v tar >/dev/null 2>&1 || return 1
+    if [ -z "$(_uv_sha256 /dev/null)" ]; then return 1; fi
+
+    # astral's destination priority, so an existing uv is replaced in place and the
+    # PATH lines below still find it.
+    _uip_dest=""
+    for _uip_candidate in "${UV_INSTALL_DIR:-}" "${UV_UNMANAGED_INSTALL:-}" "${XDG_BIN_HOME:-}"; do
+        if [ -n "$_uip_candidate" ]; then _uip_dest="$_uip_candidate"; break; fi
+    done
+    if [ -z "$_uip_dest" ] && [ -n "${XDG_DATA_HOME:-}" ]; then _uip_dest="$XDG_DATA_HOME/../bin"; fi
+    if [ -z "$_uip_dest" ]; then
+        [ -n "${HOME:-}" ] || return 1
+        _uip_dest="$HOME/.local/bin"
+    fi
+
+    _uip_work=$(mktemp -d) || return 1
+    _uip_rc=1
+    # astral's mirrors and precedence; each serves the identical asset, so one pin holds.
+    for _uip_base in \
+        "https://releases.astral.sh/github/uv/releases/download/$UV_PINNED_VERSION" \
+        "https://github.com/astral-sh/uv/releases/download/$UV_PINNED_VERSION"; do
+        if ! download "$_uip_base/$_uip_asset" "$_uip_work/$_uip_asset"; then continue; fi
+        _uip_got=$(_uv_sha256 "$_uip_work/$_uip_asset")
+        if [ "$_uip_got" != "$_uip_want" ]; then
+            tauri_log "WARN" "uv archive digest mismatch from $_uip_base"
+            continue
+        fi
+        # The POSIX archives hold uv and uvx under a uv-<triple>/ directory.
+        if ! tar -xzf "$_uip_work/$_uip_asset" -C "$_uip_work" 2>/dev/null; then continue; fi
+        mkdir -p "$_uip_dest" 2>/dev/null || break
+        _uip_placed=0
+        for _uip_exe in uv uvx; do
+            _uip_src=$(find "$_uip_work" -type f -name "$_uip_exe" 2>/dev/null | head -1)
+            if [ -n "$_uip_src" ] && [ -f "$_uip_src" ]; then
+                cp -f "$_uip_src" "$_uip_dest/$_uip_exe" 2>/dev/null || continue
+                chmod +x "$_uip_dest/$_uip_exe" 2>/dev/null || true
+                [ "$_uip_exe" = "uv" ] && _uip_placed=1
+            fi
+        done
+        if [ "$_uip_placed" = "1" ]; then
+            export PATH="$_uip_dest:$PATH"
+            _uip_rc=0
+        fi
+        break
+    done
+    rm -rf "$_uip_work"
+    return "$_uip_rc"
+}
+
 if ! command -v uv >/dev/null 2>&1 || ! _uv_version_ok uv; then
     # Raising the floor pulled every 0.8.16-0.9.2 host into this block, and those
     # installs used to succeed without touching the network, so a download
@@ -2429,13 +2532,21 @@ if ! command -v uv >/dev/null 2>&1 || ! _uv_version_ok uv; then
     # which an `if` cannot catch, so probe first: a minimal image with uv copied
     # in but no downloader must keep the install it had before the floor moved.
     if command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1; then
-        _uv_tmp=$(mktemp)
-        if download "https://astral.sh/uv/install.sh" "$_uv_tmp"; then
-            run_maybe_quiet sh "$_uv_tmp" </dev/null || _uv_refreshed=false
+        # Pinned release first: a digest-checked data file scores far lower than
+        # download-run-delete, which is the literal shape of a dropper.
+        if _uv_install_pinned; then
+            :
         else
-            _uv_refreshed=false
+            # Unpinned hosts keep the path they have always had: a wrong triple
+            # breaks the install outright, which costs more than the fallback's score.
+            _uv_tmp=$(mktemp)
+            if download "https://astral.sh/uv/install.sh" "$_uv_tmp"; then
+                run_maybe_quiet sh "$_uv_tmp" </dev/null || _uv_refreshed=false
+            else
+                _uv_refreshed=false
+            fi
+            rm -f "$_uv_tmp"
         fi
-        rm -f "$_uv_tmp"
     else
         _uv_refreshed=false
     fi
@@ -2761,7 +2872,7 @@ TORCHAUDIO_CONSTRAINT="torchaudio>=2.4,<2.11.0"
 
 # ── Resolve repo root (for --local installs) ──
 _REPO_ROOT="$(cd "$(dirname "$0" 2>/dev/null || echo ".")" && pwd)"
-# Whether the scripts next to install.sh may be trusted. A piped install (curl ... | sh)
+# Whether the scripts next to install.sh may be trusted. A piped web install
 # has $0 = "sh", so _REPO_ROOT is just the caller's cwd and a file planted there would run.
 # Marker files cannot decide this (whoever can plant a helper can plant those), so require
 # the explicit --local intent AND a run from the file itself; else fetch the official copy.
@@ -3916,7 +4027,7 @@ _maybe_bootstrap_rocm_wsl() {
 
     # Consent: the narrow guarded case is exactly the GPU setup the user ran the
     # installer for, so it proceeds AUTOMATICALLY by default (works with no TTY,
-    # e.g. `curl ... | sh`). Opt out via UNSLOTH_SKIP_ROCM_WSL_SETUP=1 (top of
+    # e.g. a piped web install). Opt out via UNSLOTH_SKIP_ROCM_WSL_SETUP=1 (top of
     # function). The Tauri app drives its own consent UI, so under TAURI_MODE it
     # only runs when the app passes UNSLOTH_ROCM_WSL_AUTO=1; else surface and wait.
     _rw_go=1
@@ -5206,7 +5317,7 @@ if [ "$_SKIP_AUTOSTART" != true ] && [ -t 1 ]; then
     case "${_reply:-y}" in
         [Yy]*|"")
             step "launch" "starting Unsloth Studio..."
-            # Detach stdin from the `curl | sh` pipe: as a foreground server the
+            # Detach stdin from the piped web install's pipe: as a foreground server the
             # studio would otherwise drain the rest of this piped script, leaving
             # the shell to die parsing the now-truncated tail (`unexpected fi`).
             # trap '' INT: wait for studio's shutdown instead of racing the prompt.
