@@ -82,12 +82,37 @@ jobs:
         run: |
           set -euo pipefail
           npx --prefix studio tauri signer generate -w "$RUNNER_TEMP/staging.key" -p "" --force
-          # Point at the file rather than pasting the key through GITHUB_ENV.
-          # The generated key has no trailing newline, so a heredoc block puts
-          # the delimiter on the key's own line and the env command is rejected
-          # ("Matching delimiter not found").
-          echo "TAURI_SIGNING_PRIVATE_KEY_PATH=$RUNNER_TEMP/staging.key" >> "$GITHUB_ENV"
+          # The bare `echo` is the point: the generated key file has no trailing
+          # newline, so without it the heredoc delimiter lands on the key's own
+          # line and the env command is rejected ("Matching delimiter not
+          # found"). TAURI_SIGNING_PRIVATE_KEY_PATH is not a substitute; this
+          # CLI reads only TAURI_SIGNING_PRIVATE_KEY and fails the bundle with
+          # "A public key has been found, but no private key".
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY<<EOF_KEY"
+            cat "$RUNNER_TEMP/staging.key"
+            echo
+            echo "EOF_KEY"
+          } >> "$GITHUB_ENV"
           echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
+
+      # The Windows bundle config runs sign-with-trusted-signing.ps1, which
+      # shells out to trusted-signing-cli. The release workflow installs that
+      # binary (digest pinned) beforehand and holds the Azure credentials it
+      # needs; staging has neither, and the whole point here is an unsigned
+      # build. Drop the hook so bundling gets past code signing.
+      - name: Drop the Windows signing hook
+        if: matrix.platform == 'windows-latest'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, pathlib
+          p = pathlib.Path("studio/src-tauri/tauri.windows.conf.json")
+          conf = json.loads(p.read_text())
+          removed = conf.get("bundle", {}).get("windows", {}).pop("signCommand", None)
+          p.write_text(json.dumps(conf, indent = 2) + "\n")
+          print("removed signCommand" if removed else "no signCommand to remove")
+          PY
 
       - name: Build bundles (no code signing)
         working-directory: studio
