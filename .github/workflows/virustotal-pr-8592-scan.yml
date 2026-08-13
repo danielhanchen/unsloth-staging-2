@@ -32,12 +32,22 @@ jobs:
           - platform: ubuntu-22.04
             label: linux deb
             bundles: deb
+            extra_config: '{}'
           - platform: macos-14
             label: macos dmg
             bundles: dmg
+            extra_config: '{}'
           - platform: windows-latest
             label: windows nsis
             bundles: nsis
+            # tauri.windows.conf.json points signCommand at
+            # sign-with-trusted-signing.ps1, which shells out to
+            # trusted-signing-cli. That binary is a release-only download and the
+            # Azure credentials behind it are org secrets, so bundling here dies
+            # at CommandNotFoundException. Replaced with a command that accepts
+            # the path and does nothing, which is what "unsigned" means for a
+            # scan: the payload the engines see is the same either way.
+            extra_config: '{"bundle":{"windows":{"signCommand":{"cmd":"cmd","args":["/c","echo","skipping signing for %1"]}}}}' 
     steps:
       - uses: actions/checkout@v4
         with:
@@ -66,7 +76,8 @@ jobs:
         shell: bash
         run: |
           npx --prefix . tauri build -v --bundles ${{ matrix.bundles }} \
-            --config '{"bundle":{"createUpdaterArtifacts":false}}'
+            --config '{"bundle":{"createUpdaterArtifacts":false}}' \
+            --config '${{ matrix.extra_config }}'
 
       - name: Collect what was built
         shell: bash
@@ -88,6 +99,7 @@ jobs:
   scan:
     name: VirusTotal scan
     needs: [build]
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
