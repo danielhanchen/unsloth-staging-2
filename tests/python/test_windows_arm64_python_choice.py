@@ -322,16 +322,13 @@ def test_a_failed_install_does_not_leave_the_tier_in_the_callers_shell():
 
 
 def test_the_env_snapshot_is_taken_before_anything_can_fail():
-    """$script: state outlives one `irm ... | iex` invocation in a caller's session,
-    and Exit-InstallFailure restores UNSLOTH_NO_DATASETS from it. Taken after the
-    flag parsing, a second run that dies on its own arguments would put back the
-    value the FIRST run saw, in a shell where the user has since changed it."""
+    """$script: state outlives one `irm ... | iex`, and Exit-InstallFailure restores
+    UNSLOTH_NO_DATASETS from it: snapshotted after the flag parsing, a second run that
+    dies on its own arguments puts back the value the first run saw."""
     source = INSTALL_PS1.read_text(encoding = "utf-8")
     snapshot = source.index("$script:PreviousNoDatasetsEnv = $env:UNSLOTH_NO_DATASETS")
     first_failure = source.index("return (Exit-InstallFailure")
-    assert snapshot < first_failure, (
-        "the snapshot must precede every Exit-InstallFailure call site"
-    )
+    assert snapshot < first_failure, "the snapshot must precede every Exit-InstallFailure call site"
 
 
 def test_install_ps1_falls_back_to_the_inference_only_tier():
@@ -346,11 +343,31 @@ def test_install_ps1_falls_back_to_the_inference_only_tier():
     assert "--no-deps" in source[source.index("arm64 inference-only") :][:800]
 
 
+def test_an_explicit_env_value_beats_the_persisted_tier():
+    """UNSLOTH_NO_DATASETS=0 is how a tier install is brought back to the full set.
+    Consulting the manifest and marker anyway put it straight back, and disagreed
+    with install_python_stack._infer_no_datasets(), where any value set wins."""
+    source = SETUP_PS1.read_text(encoding = "utf-8")
+    assert "$_noDatasetsRequested = ($null -ne $env:UNSLOTH_NO_DATASETS)" in source
+    for guard in ("-not $NoDatasetsMode -and -not $_noDatasetsRequested -and $ReusedSetupPython",
+                  "-not $NoDatasetsMode -and -not $_noDatasetsRequested -and\n"):
+        assert guard in source, guard
+
+
+def test_the_winget_bootstrap_rechecks_the_architecture():
+    """The ARM64 branch clears $HasPython because the python on PATH is native. If
+    winget fails, or its x64 build is not first on PATH, the same interpreter answers
+    the re-probe and setup would continue on the build it just rejected."""
+    source = SETUP_PS1.read_text(encoding = "utf-8")
+    block = source[source.index("winget install -e --id Python.Python.3.12") :][:1600]
+    assert "Test-CompatibleSetupPythonArch $_afterWinget.Source" in block
+    assert "Exit-SetupFailure \"No x64 Python 3.11-3.13 was found\"" in block
+
+
 def test_setup_hands_the_resolved_tier_to_the_python_child():
-    """setup.ps1 resolves manifest over marker, then the dependency pass DELETES the
-    manifest before install_python_stack.py re-infers the tier for itself. Unless the
-    resolved value is exported, a completed x64 manifest saying false loses to a stale
-    marker in the child, and one saying true loses to no record at all."""
+    """setup.ps1 resolves manifest over marker, then the dependency pass deletes the
+    manifest before the child re-infers the tier. Without the handoff a completed x64
+    manifest saying false loses to a stale marker."""
     source = SETUP_PS1.read_text(encoding = "utf-8")
     index = source.index("$_recorded = $null")
     block = source[index : index + 2200]
@@ -371,7 +388,7 @@ def test_setup_reads_the_tier_marker_not_just_the_env_var():
     full-install rule and refuse the environment the installer had just built."""
     source = SETUP_PS1.read_text(encoding = "utf-8")
     index = source.index("$NoDatasetsMode = (")
-    block = source[index : index + 2600]
+    block = source[index : index + 3200]
     assert ".unsloth-no-datasets" in block
     # And it has to come after the venv interpreter is resolved, or there is no
     # venv path to look in.
@@ -618,7 +635,7 @@ def test_setup_adopts_the_tier_for_an_arm64_venv_with_no_marker():
     interpreter the way install.ps1 can. The desktop app will not download a new
     build until its backend update succeeds, so that loop strands the app too."""
     source = SETUP_PS1.read_text(encoding = "utf-8")
-    index = source.index('if (-not $NoDatasetsMode -and (Get-HostMachineArch) -eq "arm64"')
+    index = source.index("(Get-HostMachineArch) -eq \"arm64\" -and $ReusedSetupPython) {")
     block = source[index : index + 1200]
     assert '(Get-PythonPlatformTag $ReusedSetupPython) -eq "win-arm64"' in block
     assert "$NoDatasetsMode = $true" in block

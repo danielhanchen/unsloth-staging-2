@@ -312,16 +312,14 @@ def test_a_manifest_from_before_a_tracked_file_existed_is_not_stale(install_root
 
 
 def test_a_manifest_missing_a_long_standing_file_is_still_stale(install_root, req_root):
-    """The tolerance above is a named exception, not a relaxation of the check: a
-    truncated or hand-edited manifest must still send the install through repair,
-    the way it did before the ARM64 work."""
+    """A named exception, not a relaxation: a truncated or hand-edited manifest
+    still goes through repair, as it did before the ARM64 work."""
     im.write_manifest(root = install_root, req_root = req_root, package_name = "pytest")
     path = im.manifest_path(install_root)
     data = json.loads(path.read_text(encoding = "utf-8"))
     recorded = data["requirement_files"]
     long_standing = [
-        name for name in sorted(recorded)
-        if name not in im.LATE_TRACKED_REQUIREMENT_FILES
+        name for name in sorted(recorded) if name not in im.LATE_TRACKED_REQUIREMENT_FILES
     ]
     assert long_standing, "the fixture should record a file that predates the tier"
     del recorded[long_standing[0]]
