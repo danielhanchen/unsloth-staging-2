@@ -111,6 +111,44 @@ jobs:
           esac
           [ "$fail" -eq 0 ] || exit 1
 
+      # The AppImage is the asset VirusTotal returned malicious=1 for, and Tauri does not build
+      # it: release-desktop.yml wraps the deb with build-thin-appimage.sh. Same tool versions and
+      # same pinned digests as the release job, so the thing being scanned is the real shape.
+      - name: Build the thin AppImage
+        if: matrix.platform == 'ubuntu-22.04'
+        env:
+          APPIMAGETOOL_URL: "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage"
+          APPIMAGETOOL_SHA256: "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+          APPIMAGE_RUNTIME_URL: "https://github.com/AppImage/type2-runtime/releases/download/20251108/runtime-x86_64"
+          APPIMAGE_RUNTIME_SHA256: "2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
+        run: |
+          set -euo pipefail
+          tools_dir="$RUNNER_TEMP/appimage-tools"
+          mkdir -p "$tools_dir"
+          appimagetool="$tools_dir/appimagetool-x86_64.AppImage"
+          runtime="$tools_dir/runtime-x86_64"
+          curl -fsSL "$APPIMAGETOOL_URL" -o "$appimagetool"
+          curl -fsSL "$APPIMAGE_RUNTIME_URL" -o "$runtime"
+          # Digest before chmod, as the release job does.
+          echo "${APPIMAGETOOL_SHA256}  ${appimagetool}" | sha256sum -c -
+          echo "${APPIMAGE_RUNTIME_SHA256}  ${runtime}" | sha256sum -c -
+          chmod +x "$appimagetool"
+          deb="$(find studio/src-tauri/target/release/bundle -name '*.deb' | head -1)"
+          out="studio/src-tauri/target/release/bundle/appimage"
+          mkdir -p "$out"
+          appimage="$out/unsloth-studio_staging-8586_amd64.AppImage"
+          export APPIMAGE_PATH="$appimage"
+          studio/src-tauri/linux/build-thin-appimage.sh "$deb" "$appimagetool" "$runtime" "$appimage"
+          ls -la "$appimage"
+          echo "=== the AppImage must carry install.sh and no install.ps1 ==="
+          "$appimage" --appimage-extract >/dev/null
+          find squashfs-root -name 'install.*' -printf '%s\t%p\n'
+          if find squashfs-root -name 'install.ps1' | grep -q .; then
+            echo "::error::AppImage still ships install.ps1"; exit 1
+          fi
+          echo "OK: AppImage carries no install.ps1"
+          rm -rf squashfs-root
+
       - name: Upload bundles for scanning
         if: always()
         uses: actions/upload-artifact@v4
@@ -124,3 +162,47 @@ jobs:
             studio/src-tauri/target/release/bundle/**/*.msi
           if-no-files-found: warn
           retention-days: 3
+
+  # The release pipeline's own scan step, unmodified, pointed at the bundles above. This is what
+  # returned malicious=1 for the 0.1.701-beta AppImage in run 31528647838.
+  virustotal:
+    name: VirusTotal scan of the PR bundles
+    needs: [bundle]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts/virustotal_scan.py
+          sparse-checkout-cone-mode: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: staging-8586-bundle-*
+          path: ${{ runner.temp }}/bundles
+          merge-multiple: true
+
+      - name: What is being scanned
+        run: find "$RUNNER_TEMP/bundles" -type f -printf '%s\t%p\n' | sort
+
+      - name: VirusTotal scan
+        env:
+          VT_API_KEY: ${{ secrets.VIRUS_TOTAL_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/virustotal_scan.py \
+            "$RUNNER_TEMP/bundles" \
+            --output-markdown "$RUNNER_TEMP/virustotal-summary.md"
+
+      - name: Publish the summary
+        if: always()
+        run: |
+          set -euo pipefail
+          summary="$RUNNER_TEMP/virustotal-summary.md"
+          if [ -f "$summary" ]; then
+            cat "$summary" | tee -a "$GITHUB_STEP_SUMMARY"
+          else
+            echo "The scan step produced no summary." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
