@@ -3769,6 +3769,21 @@ NO_DATASETS_SKIP_PACKAGES = {
     # ASM has no ARM64 Windows target). Only the training worker writes TensorBoard
     # logs (core/training/worker.py:3145), so this tier loses nothing it has.
     "tensorboard",
+    # Same shape one layer down: torch-stoi is pure Python but declares torchaudio,
+    # and the PyTorch CPU index publishes no win_arm64 torchaudio at any version --
+    # which is exactly why install.ps1 installs torch and torchvision without it
+    # there. extras.txt is the one step resolved WITH dependencies, so leaving this
+    # line in is enough to fail the whole tier resolution on the audio stack it was
+    # already told not to install. It scores speech intelligibility for the STT
+    # extras, which need torchaudio anyway.
+    "torch-stoi",
+    # librosa is pure Python but requires numba, and numba and llvmlite publish no
+    # win_arm64 wheel at any version (verified against the index, not the changelog).
+    # extras.txt is resolved WITH dependencies, so this line alone fails the tier.
+    # It is already optional here: routes/inference.py:10784 catches its absence and
+    # tells the caller this format needs librosa, and no-torch skips it for the same
+    # reason (extras.txt says so at the top).
+    "librosa",
 }
 
 # Constraint entries dropped in the ARM64 tier: the skipped packages themselves (a
@@ -3971,6 +3986,20 @@ def _filter_requirements(req: Path, skip: set[str]) -> Path:
     tmp.writelines(filtered)
     tmp.close()
     return Path(tmp.name)
+
+
+def _no_deps_mode_label() -> str:
+    """Why this install is taking the --no-deps route, in the user's own terms.
+
+    The tier is reachable on x64 as well, through UNSLOTH_NO_DATASETS=1, and on a
+    machine that is not ARM64 "ARM64 inference-only mode" is a false explanation of
+    a real change.
+    """
+    if NO_TORCH:
+        return "no-torch mode"
+    if IS_WINDOWS_ARM64_PYTHON:
+        return "ARM64 inference-only mode"
+    return "no-datasets mode"
 
 
 def _win_arm64_lifts() -> dict[str, str]:
@@ -4578,7 +4607,9 @@ def install_python_stack() -> int:
         _progress("base packages (no torch)" if NO_TORCH else "base packages (inference-only)")
         pip_install(
             f"Updating {package_name} + unsloth-zoo "
-            f"({'no-torch mode' if NO_TORCH else 'ARM64 inference-only mode'})",
+            # The tier is reachable on x64 through UNSLOTH_NO_DATASETS=1, where the
+            # architecture is not the reason and saying so would be a false one.
+            f"({_no_deps_mode_label()})",
             "--no-cache-dir",
             "--no-deps",
             "--upgrade-package",
