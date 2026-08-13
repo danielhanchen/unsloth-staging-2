@@ -72,6 +72,9 @@
 name: MLX CI on Mac M1
 
 on:
+  workflow_dispatch:
+  push:
+    branches: ['pr-8574-xplat-ci']
   pull_request:
     paths:
       - 'unsloth/__init__.py'

@@ -1,0 +1,95 @@
+name: "staging-8574 WSL"
+# Genuine WSL2 coverage. GitHub has no WSL runner label, but a windows-latest
+# runner can enable the WSL2 feature and run a real Ubuntu distro, so the Linux
+# branch of the llama-server child environment is exercised on the platform
+# whose ROCm/HIP ordering it special-cases, rather than only under a
+# monkeypatched sys.platform.
+on:
+  push:
+    branches: ["pr-8574-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  wsl:
+    name: WSL2 Ubuntu (on windows-latest)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: Vampire/setup-wsl@v6
+        with:
+          distribution: Ubuntu-24.04
+          set-as-default: 'true'
+          wsl-version: '2'
+
+      - name: Prove this really is WSL
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          uname -a
+          # The marker Unsloth's own _wsl_system_rocm_lib_dirs looks for.
+          grep -qi microsoft /proc/sys/kernel/osrelease \
+            || { echo "::error::not running under WSL"; exit 1; }
+          echo "osrelease: $(cat /proc/sys/kernel/osrelease)"
+
+      - name: Install test deps
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          apt-get update -qq
+          apt-get install -y -qq python3 python3-pip python3-venv >/dev/null
+          python3 -m venv /tmp/venv
+          /tmp/venv/bin/python -m pip install -q -U pip
+          /tmp/venv/bin/python -m pip install -q -r studio/backend/requirements/studio.txt \
+            pytest pytest-asyncio python-multipart
+
+      - name: Run the changed tests under WSL
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          rc=0
+          PYTHONPATH=studio/backend /tmp/venv/bin/python -m pytest \
+            studio/backend/tests/test_llama_cpp_darwin_loader_env.py \
+            studio/backend/tests/test_llama_cpp_start_failure_classification.py \
+            studio/backend/tests/test_rag_embed_llama_server.py \
+            studio/backend/tests/test_llama_cpp_mtp_detection.py \
+            -q --tb=short > out.txt 2>&1 || rc=$?
+          cat out.txt
+          exit "$rc"
+
+      - name: Assert the WSL child environment is the Linux one, unchanged
+        shell: wsl-bash {0}
+        run: |
+          set -euo pipefail
+          PYTHONPATH=studio/backend /tmp/venv/bin/python - <<'PY'
+          import os, sys, tempfile, pathlib
+          from core.inference.llama_cpp import LlamaCppBackend, _loader_path_var
+
+          # Real WSL, real sys.platform == "linux": no monkeypatching anywhere.
+          assert sys.platform == "linux", sys.platform
+          assert _loader_path_var() == "LD_LIBRARY_PATH", _loader_path_var()
+
+          d = pathlib.Path(tempfile.mkdtemp()) / "build" / "bin"
+          d.mkdir(parents = True)
+          (d / "llama-server").write_bytes(b"\x7fELF")
+          os.environ["LD_LIBRARY_PATH"] = "/opt/sentinel"
+          env = LlamaCppBackend._llama_server_env_for_binary(str(d / "llama-server"))
+
+          ld = env["LD_LIBRARY_PATH"]
+          print("LD_LIBRARY_PATH:", ld)
+          assert "DYLD_LIBRARY_PATH" not in env, "macOS variable leaked onto WSL"
+          assert ld.endswith("/opt/sentinel"), ld
+          assert str(d) in ld.split(":"), ld
+          # Repeat calls must not grow it.
+          again = LlamaCppBackend._llama_server_env_for_binary(str(d / "llama-server"))
+          assert again == env, "child environment is not stable across calls"
+          print("WSL child environment is the Linux one, and stable")
+          PY
