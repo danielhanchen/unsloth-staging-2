@@ -198,11 +198,16 @@ class TestOsKillReturncode:
     stays neutral; a recognized output still wins; a hard fault (-11) keeps the
     generic fallback."""
 
-    def test_sigkill_with_no_output_names_oom(self):
+    def test_sigkill_with_no_output_names_oom(self, monkeypatch):
+        # Pin the platform: macOS SIGKILLs an invalid code signature the same
+        # way, so the message there names both readings (see
+        # TestMacOSLoaderFailures) and this wording is the non-Darwin one.
+        monkeypatch.setattr(sys, "platform", "linux")
         msg = _classify("", "/models/big-bf16.gguf", "local/big", -9)
         assert "signal 9" in msg
         assert "out of memory" in msg.lower()
         assert ".wslconfig" in msg
+        assert "code signature" not in msg.lower()
         assert "GGUF file is valid" not in msg
 
     def test_sigterm_is_neutral_not_oom(self):
@@ -494,3 +499,621 @@ class TestMissingSharedLibrary:
         msg = _classify(_QWEN_IMAGE_OUT, "/models/qwen-image.gguf", "local/qwen-image", 127)
         assert "Images page" in msg
         assert "system library" not in msg
+
+
+# Real dyld output. macOS says none of the things glibc says, so before #8566
+# every one of these fell through to "invalid GGUF or not enough memory" on a
+# Mac that had neither problem. Classification is pure text matching, so these
+# run on any host.
+_DYLD_MISSING_OUT = (
+    "dyld[54231]: Library not loaded: @rpath/libllama.dylib\n"
+    "  Referenced from: <A1B2C3D4> /Users/me/.unsloth/studio/llama.cpp/build/bin/llama-server\n"
+    "  Reason: tried: '/Users/me/.unsloth/studio/llama.cpp/build/bin/libllama.dylib' "
+    "(no such file), '/usr/local/lib/libllama.dylib' (no such file)"
+)
+_DYLD_OLD_MACOS_OUT = (
+    "dyld: Library not loaded: @rpath/libggml-metal.dylib\n"
+    "  Referenced from: /Users/me/.unsloth/studio/llama.cpp/build/bin/llama-server\n"
+    "  Reason: image not found"
+)
+_DYLD_SIGNATURE_OUT = (
+    "dyld[54231]: Library not loaded: @rpath/libggml-base.dylib\n"
+    "  Reason: tried: '/Users/me/.unsloth/studio/llama.cpp/build/bin/libggml-base.dylib' "
+    "(code signature in <A1B2> '.../libggml-base.dylib' not valid for use in process: "
+    "mapped file has no cdhash, completely unsigned? Code has to be at least ad-hoc signed.)"
+)
+_DYLD_ARCH_OUT = (
+    "dyld[54231]: Library not loaded: @rpath/libmtmd.dylib\n"
+    "  Reason: tried: '/Users/me/.unsloth/studio/llama.cpp/build/bin/libmtmd.dylib' "
+    "(mach-o file, but is an incompatible architecture (have 'x86_64', need 'arm64'))"
+)
+_DYLD_TOO_NEW_OUT = (
+    "dyld[54231]: Library not loaded: @rpath/libggml-metal.dylib\n"
+    "  Reason: tried: '.../libggml-metal.dylib' (built for macOS 26.0 which is "
+    "newer than running OS)"
+)
+_DYLD_SYMBOL_OUT = (
+    "dyld[54231]: Symbol not found: __ZN4ggml7backend6deviceEv\n"
+    "  Referenced from: <A1B2> /Users/me/.unsloth/studio/llama.cpp/build/bin/libmtmd.dylib\n"
+    "  Expected in: <C3D4> /Users/me/.unsloth/studio/llama.cpp/build/bin/libllama.dylib"
+)
+
+
+def _blames_the_gguf_or_memory(msg: str) -> bool:
+    lowered = msg.lower()
+    return "gguf file is valid" in lowered or "enough memory" in lowered
+
+
+class TestMacOSLoaderFailures:
+    def test_missing_dylib_names_the_library_and_the_installer(self):
+        msg = _classify(_DYLD_MISSING_OUT, "/models/x.gguf", "local/x", 1)
+        assert "libllama.dylib" in msg
+        assert "unsloth studio update" in msg
+        assert not _blames_the_gguf_or_memory(msg)
+
+    def test_old_macos_image_not_found_is_recognised(self):
+        msg = _classify(_DYLD_OLD_MACOS_OUT, "/models/x.gguf", "local/x", 1)
+        assert "libggml-metal.dylib" in msg
+        assert not _blames_the_gguf_or_memory(msg)
+
+    def test_invalid_code_signature_is_not_reported_as_a_bad_file(self):
+        msg = _classify(_DYLD_SIGNATURE_OUT, "/models/x.gguf", "local/x", 1)
+        assert "code signature" in msg.lower()
+        assert not _blames_the_gguf_or_memory(msg)
+
+    def test_wrong_architecture_is_named(self):
+        msg = _classify(_DYLD_ARCH_OUT, "/models/x.gguf", "local/x", 1)
+        assert "architecture" in msg.lower()
+        assert not _blames_the_gguf_or_memory(msg)
+
+    def test_runtime_built_for_a_newer_macos(self):
+        msg = _classify(_DYLD_TOO_NEW_OUT, "/models/x.gguf", "local/x", 1)
+        assert "newer version of macOS" in msg
+        assert not _blames_the_gguf_or_memory(msg)
+
+    def test_mtlresidency_symbol_is_read_as_a_too_new_macos_build(self):
+        # What a Tahoe-built libggml-metal actually reports on macOS 15; the
+        # installer's looks_like_macos_incompatibility keys on the same symbol.
+        out = (
+            "dyld[1]: Symbol not found: _MTLResidencySetDescriptor\n"
+            "  Referenced from: .../libggml-metal.dylib"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "newer version of macOS" in msg
+
+    def test_symbol_mismatch_reports_a_mixed_install(self):
+        msg = _classify(_DYLD_SYMBOL_OUT, "/models/x.gguf", "local/x", 1)
+        assert "different build" in msg
+        assert not _blames_the_gguf_or_memory(msg)
+
+    def test_dyld_output_outranks_signal_9(self):
+        # -9 alone reads as the OOM killer; a dyld diagnostic is a fact and
+        # must win, or the user is sent to free memory they already have.
+        msg = _classify(_DYLD_MISSING_OUT, "/models/x.gguf", "local/x", -9)
+        assert "libllama.dylib" in msg
+        assert "out of memory" not in msg.lower()
+
+    def test_custom_binary_is_not_sent_to_the_unsloth_updater(self, monkeypatch):
+        monkeypatch.setenv("LLAMA_SERVER_PATH", "/opt/mybuild/bin/llama-server")
+        msg = _classify(
+            _DYLD_ARCH_OUT, "/models/x.gguf", "local/x", 1, "/opt/mybuild/bin/llama-server"
+        )
+        assert "unsloth studio update" not in msg
+        assert "custom llama.cpp" in msg
+
+    def test_linux_loader_wording_is_untouched(self):
+        # The glibc branch must keep winning; the macOS branch runs after it.
+        out = (
+            "llama-server: error while loading shared libraries: libgomp.so.1: "
+            "cannot open shared object file: No such file or directory"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 127)
+        assert "libgomp.so.1" in msg
+        assert "macOS" not in msg
+
+    def test_silent_signal_9_on_macos_also_names_the_code_signature(self, monkeypatch):
+        # macOS kills an unsigned or altered Mach-O with SIGKILL before it can
+        # print anything, which is indistinguishable from the OOM killer by
+        # returncode alone. Offer both readings there instead of only memory.
+        monkeypatch.setattr(sys, "platform", "darwin")
+        msg = _classify("", "/models/x.gguf", "local/x", -9)
+        assert "code signature" in msg.lower()
+        assert "out of memory" in msg.lower()
+
+    def test_ordinary_output_mentioning_reason_is_not_a_loader_failure(self):
+        out = "llama_model_load: error loading model: Reason: something went wrong"
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "llama-server failed to start." in msg
+
+
+class TestStartupDiagnostics:
+    _UNKNOWN_OUT = (
+        "build: 9415 (06d26dfd) with Apple clang version 17.0.0 for arm64-apple-darwin24.6.0\n"
+        "ggml_metal_init: error: failed to allocate buffer\n"
+        "GGML_ASSERT(ctx->device != nil) failed"
+    )
+
+    def test_unknown_failure_carries_the_output_tail(self):
+        msg = _classify(self._UNKNOWN_OUT, "/models/x.gguf", "local/x", 1)
+        assert msg.startswith("llama-server failed to start.")
+        assert "GGML_ASSERT" in msg
+        assert "llama-server output:" in msg
+
+    def test_unknown_failure_carries_the_log_path(self, tmp_path):
+        log = tmp_path / "llama-1-port-8080.log"
+        msg = _classify(self._UNKNOWN_OUT, "/models/x.gguf", "local/x", 1, None, log)
+        assert f"Full log: {log}" in msg
+
+    def test_the_tail_is_bounded(self):
+        out = "x" * 50_000 + "\nfinal line"
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "final line" in msg
+        assert len(msg) < 4000
+
+    def test_control_characters_are_stripped(self):
+        out = "loading \x1b[32mmodel\x1b[0m \x00done"
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "\x00" not in msg
+        assert "\x1b" not in msg
+        assert "done" in msg
+
+    def test_no_output_and_no_log_keeps_the_old_message_exactly(self):
+        assert _classify("", "/models/x.gguf", "local/x", 1) == (
+            "llama-server failed to start. "
+            "Check that the GGUF file is valid and you have enough memory."
+        )
+
+    def test_a_classified_message_gains_no_diagnostics(self, tmp_path):
+        # Only the unknown fallback carries evidence; the specific messages are
+        # already actionable and must keep their exact text.
+        log = tmp_path / "llama-1-port-8080.log"
+        msg = _classify(_QWEN_IMAGE_OUT, "/models/q.gguf", "local/q", 1, None, log)
+        assert "Images page" in msg
+        assert "Full log" not in msg
+        assert "llama-server output:" not in msg
+
+
+class TestMacOSLoaderEdgeCases:
+    """dyld's real output shape: a mixed "tried:" list, unrelated text above it,
+    and a reason that can run for kilobytes."""
+
+    def test_a_mixed_tried_list_judges_our_own_copy(self, monkeypatch, tmp_path):
+        # An Apple Silicon Mac with a leftover Intel Homebrew tree lists our
+        # missing dylib AND an x86_64 one under /usr/local. Scanning the whole
+        # list would report "wrong CPU architecture" for a file that is simply
+        # absent from our install.
+        monkeypatch.delenv("LLAMA_SERVER_PATH", raising = False)
+        binary = tmp_path / "llama.cpp" / "build" / "bin" / "llama-server"
+        binary.parent.mkdir(parents = True)
+        binary.write_text("")
+        out = (
+            "dyld[4210]: Library not loaded: @rpath/libmtmd.dylib\n"
+            f"  Reason: tried: '{binary.parent}/libmtmd.dylib' (no such file), "
+            "'/usr/local/lib/libmtmd.dylib' (mach-o file, but is an incompatible "
+            "architecture (have 'x86_64', need 'arm64')), "
+            "'/usr/lib/libmtmd.dylib' (no such file, not in dyld cache)"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1, str(binary))
+        assert "libmtmd.dylib" in msg
+        assert "architecture" not in msg.lower()
+        assert "missing" in msg.lower()
+
+    def test_a_policy_blocked_sibling_does_not_accuse_the_user_of_tampering(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("LLAMA_SERVER_PATH", raising = False)
+        binary = tmp_path / "llama.cpp" / "build" / "bin" / "llama-server"
+        binary.parent.mkdir(parents = True)
+        binary.write_text("")
+        out = (
+            "dyld[4210]: Library not loaded: @rpath/libllama.dylib\n"
+            f"  Reason: tried: '{binary.parent}/libllama.dylib' (no such file), "
+            "'/usr/local/lib/libllama.dylib' (code signature not valid for use in "
+            "process: library load disallowed by system policy)"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1, str(binary))
+        assert "code signature" not in msg.lower()
+        assert "was modified" not in msg
+
+    def test_our_own_copy_really_is_the_signature_failure(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("LLAMA_SERVER_PATH", raising = False)
+        binary = tmp_path / "llama.cpp" / "build" / "bin" / "llama-server"
+        binary.parent.mkdir(parents = True)
+        binary.write_text("")
+        out = (
+            "dyld[4210]: Library not loaded: @rpath/libllama.dylib\n"
+            f"  Reason: tried: '{binary.parent}/libllama.dylib' (code signature in "
+            "<A1B2> not valid for use in process: mapped file has no cdhash)"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1, str(binary))
+        assert "code signature" in msg.lower()
+
+    def test_an_earlier_unrelated_reason_is_not_read_as_dylds(self):
+        # llama.cpp prints its own "Reason:" lines; only the one after the
+        # "Library not loaded:" explains it.
+        out = (
+            "main: loading model\n"
+            "llama_model_load: error loading model: Reason: unknown\n"
+            "ggml_metal_init: skipping device, incompatible architecture\n"
+            "dyld[9]: Library not loaded: @rpath/libggml-base.dylib\n"
+            "  Reason: tried: '/x/libggml-base.dylib' (no such file)"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "libggml-base.dylib" in msg
+        assert "architecture" not in msg.lower()
+
+    def test_a_stray_reason_does_not_disable_symbol_classification(self):
+        # A "reason:" anywhere used to swallow the symbol-mismatch branch.
+        out = (
+            "srv load: Reason: retrying\n"
+            "dyld[1]: Symbol not found: __ZN4ggml7backendE\n"
+            "  Referenced from: /x/libmtmd.dylib\n"
+            "  Expected in: /x/libllama.dylib"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "different build" in msg
+
+    def test_the_classified_reason_is_bounded(self):
+        out = (
+            "dyld[1]: Library not loaded: @rpath/libllama.dylib\n"
+            "  Reason: no suitable image found. Did find: " + "x" * 20_000
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "libllama.dylib" in msg
+        assert len(msg) < 1000
+
+    def test_the_health_timeout_marker_is_not_absorbed_into_a_dyld_reason(self):
+        # Studio appends its own marker to the captured output; it must not be
+        # quoted back to the user as part of dyld's diagnosis.
+        out = (
+            "dyld[1]: Library not loaded: @rpath/libllama.dylib\n"
+            "  Reason: tried: '/x/libllama.dylib' (no such file)\n"
+            "llama-server health check timed out after 600.0s"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "health check timed out" not in msg
+
+    def test_signal_9_on_macos_respects_a_custom_binary(self, monkeypatch):
+        monkeypatch.setattr(sys, "platform", "darwin")
+        monkeypatch.setenv("LLAMA_SERVER_PATH", "/opt/mybuild/bin/llama-server")
+        msg = _classify("", "/models/x.gguf", "local/x", -9, "/opt/mybuild/bin/llama-server")
+        assert "unsloth studio update" not in msg
+        assert "custom llama.cpp" in msg
+
+
+class TestDiagnosticsDoNotLeak:
+    """The output tail is llama-server's own stdout, and llama-server inherits
+    nearly all of Studio's environment."""
+
+    _OUT = "build: 9415\nenv dump: OPENAI_API_KEY=sk-owner-secret-1234567890\nabort"
+
+    def test_a_secret_env_value_is_redacted(self, monkeypatch):
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-owner-secret-1234567890")
+        msg = _classify(self._OUT, "/models/x.gguf", "local/x", 1)
+        assert "sk-owner-secret-1234567890" not in msg
+        assert "***" in msg
+
+    def test_a_non_secret_env_value_is_left_alone(self, monkeypatch):
+        monkeypatch.setenv("UNSLOTH_MODEL_DIR", "/models/mymodels")
+        msg = _classify("loading from /models/mymodels failed", "/models/x.gguf", "local/x", 1)
+        assert "/models/mymodels" in msg
+
+    def test_a_credential_url_is_redacted_whatever_it_is_named(self, monkeypatch):
+        # DATABASE_URL / REDIS_URL match no name marker, so the value has to
+        # carry the verdict: scheme://user:secret@host is a credential.
+        monkeypatch.setenv("DATABASE_URL", "postgres://admin:hunter2secret@db:5432/prod")
+        out = "dump: DATABASE_URL=postgres://admin:hunter2secret@db:5432/prod"
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "hunter2secret" not in msg
+
+    def test_a_token_shape_is_redacted_under_an_unremarkable_name(self, monkeypatch):
+        monkeypatch.setenv("GITHUB_PAT", "github_pat_11ABCDEFG0123456789abcdefghij")
+        out = "dump: GITHUB_PAT=github_pat_11ABCDEFG0123456789abcdefghij"
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "github_pat_11ABCDEFG0123456789abcdefghij" not in msg
+
+    def test_a_bare_hf_token_shape_is_redacted(self):
+        out = "curl -H 'Authorization: Bearer hf_" + "a" * 34 + "' failed"
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "hf_" + "a" * 34 not in msg
+
+    def test_a_huge_unterminated_line_is_cheap(self):
+        # _drain_stdout keeps an unterminated line whole; the tail must be
+        # sliced before it is filtered character by character.
+        import time
+
+        out = "x" * 10_000_000 + "\nggml_metal_init: error"
+        start = time.perf_counter()
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert time.perf_counter() - start < 0.2
+        assert "ggml_metal_init: error" in msg
+
+
+class TestDyldInstallNames:
+    def test_an_rpath_placeholder_is_not_reported_as_a_location(self, monkeypatch):
+        # "@rpath/libfoo.dylib is missing from that exact location" is
+        # unusable advice: @rpath is a search directive, not a directory.
+        monkeypatch.setenv("LLAMA_SERVER_PATH", "/opt/mybuild/bin/llama-server")
+        out = (
+            "dyld[1]: Library not loaded: @rpath/libomp.dylib\n"
+            "  Reason: tried: '/opt/mybuild/bin/libomp.dylib' (no such file)"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1, "/opt/mybuild/bin/llama-server")
+        assert "@rpath" not in msg
+        assert "libomp.dylib" in msg
+        assert "that exact location" not in msg
+
+    def test_a_bundled_dylib_behind_rpath_still_points_at_the_installer(self, monkeypatch):
+        monkeypatch.delenv("LLAMA_SERVER_PATH", raising = False)
+        out = (
+            "dyld[1]: Library not loaded: @rpath/libggml-metal.dylib\n"
+            "  Reason: tried: '/x/libggml-metal.dylib' (no such file)"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "unsloth studio update" in msg
+
+
+class TestMacOSSymbolProvenance:
+    """Where dyld expected the symbol decides the remedy: reinstalling the same
+    build cannot make the OS export a symbol it does not have."""
+
+    def test_a_system_framework_symbol_reads_as_a_too_new_build(self):
+        out = (
+            "dyld[1]: Symbol not found: _MTLDeviceNewCommandQueueWithDescriptor\n"
+            "  Referenced from: /Users/me/.unsloth/llama.cpp/build/bin/libggml-metal.dylib\n"
+            "  Expected in: /System/Library/Frameworks/Metal.framework/Versions/A/Metal"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "newer macOS" in msg
+        assert "different build than the llama-server binary" not in msg
+
+    def test_a_llama_dylib_symbol_still_reads_as_a_mixed_install(self):
+        out = (
+            "dyld[1]: Symbol not found: __ZN4ggml7backendE\n"
+            "  Referenced from: /Users/me/.unsloth/llama.cpp/build/bin/libmtmd.dylib\n"
+            "  Expected in: /Users/me/.unsloth/llama.cpp/build/bin/libllama.dylib"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "different build" in msg
+        assert "newer macOS" not in msg
+
+    def test_a_usr_lib_symbol_is_read_the_same_way_as_a_framework(self):
+        out = (
+            "dyld[1]: Symbol not found: _os_signpost_emit\n"
+            "  Expected in: /usr/lib/libSystem.B.dylib"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "newer macOS" in msg
+
+
+class TestCommandLineSecrets:
+    """--api-key is minted per launch with secrets.token_urlsafe(32), so it is
+    in no environment variable and matches no token shape."""
+
+    _KEY = "Xy9_kQ2mLp7RtVw4NbZc8FgHjKdSaEuI0oPqWxYz1A"
+
+    def test_the_api_key_is_redacted_by_its_flag(self):
+        out = f"exec: llama-server -m x.gguf --api-key {self._KEY} --port 8080\nabort"
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert self._KEY not in msg
+        assert "--api-key" in msg  # the flag stays; only the value goes
+
+    def test_the_equals_form_is_redacted_too(self):
+        out = f"argv: --api-key={self._KEY}"
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert self._KEY not in msg
+
+    def test_a_known_secret_is_redacted_wherever_it_appears(self):
+        # Passed by the caller, so it goes even without the flag next to it.
+        out = f"client sent token {self._KEY} and was refused"
+        msg = _classify(out, "/models/x.gguf", "local/x", 1, None, None, (self._KEY,))
+        assert self._KEY not in msg
+
+    def test_no_known_secret_is_harmless(self):
+        msg = _classify("plain failure", "/models/x.gguf", "local/x", 1, None, None, (None,))
+        assert "plain failure" in msg
+
+
+class TestClassifierScoping:
+    """The classifier is pure text and runs on every platform, so a macOS
+    diagnosis needs macOS evidence, not an English phrase."""
+
+    def test_a_bare_symbol_not_found_is_not_a_macos_diagnosis(self):
+        # A Linux wrapper or a plugin loader saying this is not dyld.
+        out = "plugin loader: Symbol not found in module registry\nexiting"
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "llama.cpp libraries are from" not in msg
+        assert "llama-server failed to start." in msg
+        assert "plugin loader" in msg  # the tail survives instead
+
+    def test_dyld_framing_still_classifies(self):
+        out = (
+            "dyld[1]: Symbol not found: __ZN4ggml7backendE\n"
+            "  Expected in: /Users/me/.unsloth/llama.cpp/build/bin/libllama.dylib"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "different build" in msg
+
+
+class TestNestedDyldPlaceholders:
+    def test_a_nested_placeholder_is_reduced_to_the_library_name(self, monkeypatch):
+        monkeypatch.setenv("LLAMA_SERVER_PATH", "/opt/mybuild/bin/llama-server")
+        out = (
+            "dyld[1]: Library not loaded: @loader_path/../Frameworks/libomp.dylib\n"
+            "  Reason: tried: '/opt/mybuild/Frameworks/libomp.dylib' (no such file)"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1, "/opt/mybuild/bin/llama-server")
+        assert "libomp.dylib" in msg
+        assert "@loader_path" not in msg
+        assert "../Frameworks" not in msg
+        assert "that exact location" not in msg
+
+
+class TestShortSecrets:
+    def test_a_short_password_is_redacted_beside_its_name(self, monkeypatch):
+        monkeypatch.setenv("DATABASE_PASSWORD", "hunter2")
+        out = "env dump: DATABASE_PASSWORD=hunter2 PORT=8080"
+        msg = _classify(out, "/models/x.gguf", "local/x", 1)
+        assert "hunter2" not in msg
+        assert "PORT=8080" in msg  # non-secret short values are untouched
+
+    def test_a_short_non_secret_value_is_not_replaced_globally(self, monkeypatch):
+        monkeypatch.setenv("UNSLOTH_PORT", "8080")
+        msg = _classify("bound 8080 then failed", "/models/x.gguf", "local/x", 1)
+        assert "8080" in msg
+
+
+class TestDiagnosticsAreAFixedPoint:
+    """Decorating an already-decorated message must be a no-op.
+
+    Only one call site exists today, so none of this can fire yet. It is pinned
+    because the failure mode is silent: a second caller would double the tail
+    and the log line, and nothing else would notice.
+    """
+
+    _OUT = "some unrecognised startup noise"
+    _LOG = "/Users/me/.unsloth/studio/logs/llama-server/llama-1-port-8080.log"
+
+    def test_appending_twice_adds_nothing(self):
+        once = LlamaCppBackend._with_startup_diagnostics("base", self._OUT, self._LOG)
+        assert once.count("llama-server output:") == 1
+        assert once.count("Full log: ") == 1
+        assert LlamaCppBackend._with_startup_diagnostics(once, self._OUT, self._LOG) == once
+
+    def test_a_classified_message_fed_back_in_is_not_decorated_twice(self):
+        once = _classify(self._OUT, "/models/x.gguf", "local/x", 1, None, log_path = self._LOG)
+        twice = LlamaCppBackend._with_startup_diagnostics(once, self._OUT, self._LOG)
+        assert twice == once
+
+    def test_a_tail_that_merely_mentions_the_label_is_still_decorated(self):
+        # The guard keys on our own two-newline framing, so a server that
+        # printed the words itself does not suppress the diagnostics.
+        out = "llama-server output: 3 tokens/s\nthen it died"
+        msg = LlamaCppBackend._with_startup_diagnostics("base", out, None)
+        assert msg.startswith("base\n\nllama-server output:\n")
+
+
+class TestTheDyldReasonIsBounded:
+    def test_a_pathological_reason_does_not_stall_the_classifier(self):
+        # 100KB of "'a' (" drove the candidate scan quadratic: 6.3s measured
+        # before the cap, against 0.0s on main, on the thread serving the load.
+        import time
+
+        out = (
+            "dyld[1]: Library not loaded: @rpath/libllama.dylib\n"
+            "  Reason: tried: " + "'a' (" * 20000
+        )
+        start = time.perf_counter()
+        msg = _classify(out, "/models/x.gguf", "local/x", 1, "/Users/me/.unsloth/llama.cpp/build/bin/llama-server")
+        assert time.perf_counter() - start < 1.0
+        assert "libllama.dylib" in msg
+
+    def test_a_real_reason_is_not_truncated(self):
+        out = (
+            "dyld[1]: Library not loaded: @rpath/libggml-base.dylib\n"
+            "  Reason: tried: '/Users/me/.unsloth/llama.cpp/build/bin/libggml-base.dylib' "
+            "(mach-o file, but is an incompatible architecture (have 'x86_64', need 'arm64'))"
+        )
+        msg = _classify(out, "/models/x.gguf", "local/x", 1, "/Users/me/.unsloth/llama.cpp/build/bin/llama-server")
+        assert "architecture" in msg
+
+
+class TestOnlyDyldsOwnOutputIsReadAsDyld:
+    """llama.cpp echoes GGUF metadata while loading.
+
+    A model whose general.name contains "Library not loaded:" or "Symbol not
+    found" put those words in llama-server's stderr, and every case below was
+    answered with library advice instead of the classification it had before.
+    Two of them outranked branches that were already correct.
+    """
+
+    _BIN = "/Users/me/.unsloth/llama.cpp/build/bin/llama-server"
+
+    def test_metadata_does_not_beat_the_tensor_parallel_branch(self):
+        out = (
+            "llama_model_loader: - kv 2: general.name str = Symbol not found: MTLResidency\n"
+            "split_mode_tensor not implemented"
+        )
+        assert "Tensor parallelism" in _classify(out, "/m.gguf", "u/x", 1, self._BIN)
+
+    def test_metadata_does_not_beat_the_diffusion_branch(self):
+        out = (
+            "llama_model_loader: - kv 2: general.name str = Library not loaded: libfake.so\n"
+            "llama_model_load: error loading model architecture: "
+            "unknown model architecture: 'qwen_image'"
+        )
+        assert "diffusion" in _classify(out, "/m.gguf", "u/x", 1, self._BIN)
+
+    def test_metadata_does_not_beat_status_127(self):
+        msg = _classify("wrapper says Library not loaded: libx.so", "/m.gguf", "u/x", 127, self._BIN)
+        assert "status 127" in msg
+
+    def test_metadata_does_not_beat_signal_15(self):
+        msg = _classify("wrapper says Library not loaded: libx.so", "/m.gguf", "u/x", -15, self._BIN)
+        assert "signal 15" in msg
+
+    def test_metadata_does_not_claim_a_too_new_macos(self):
+        out = (
+            "llama_model_loader: - kv 9: general.description str = "
+            "built for macOS 26.0 which is newer than running OS"
+        )
+        msg = _classify(out, "/m.gguf", "u/x", 1, self._BIN)
+        assert "newer version of macOS" not in msg
+
+    def test_real_dyld_framing_still_classifies(self):
+        out = (
+            "dyld[4321]: Library not loaded: @rpath/libllama.dylib\n"
+            "  Referenced from: <A> /Users/me/.unsloth/llama.cpp/build/bin/llama-server\n"
+            "  Reason: tried: '/Users/me/.unsloth/llama.cpp/build/bin/libllama.dylib' (no such file)\n"
+        )
+        assert "libllama.dylib" in _classify(out, "/m.gguf", "u/x", 1, self._BIN)
+
+    def test_the_older_bare_dyld_prefix_is_framing_too(self):
+        out = (
+            "dyld: Library not loaded: @rpath/libllama.dylib\n"
+            "  Reason: image not found\n"
+        )
+        assert "libllama.dylib" in _classify(out, "/m.gguf", "u/x", 1, self._BIN)
+
+
+class TestArchitectureAndQuotedPaths:
+    _BIN = "/Users/me/.unsloth/llama.cpp/build/bin/llama-server"
+
+    def test_a_quoted_system_framework_reads_as_a_too_new_build(self):
+        out = (
+            "dyld[5]: Symbol not found: _MTLFoo\n"
+            "  Referenced from: <A> /Users/me/.unsloth/llama.cpp/build/bin/llama-server\n"
+            "  Expected in: '/System/Library/Frameworks/Metal.framework/Versions/A/Metal'\n"
+        )
+        msg = _classify(out, "/m.gguf", "u/x", 1, self._BIN)
+        assert "newer macOS" in msg
+        assert "different build" not in msg
+
+    def test_the_older_wrong_architecture_wording_is_recognised(self):
+        out = (
+            "dyld[5]: Library not loaded: @rpath/libggml.dylib\n"
+            "  Reason: tried: '/Users/me/.unsloth/llama.cpp/build/bin/libggml.dylib' "
+            "(mach-o, but wrong architecture)\n"
+        )
+        assert "different CPU architecture" in _classify(out, "/m.gguf", "u/x", 1, self._BIN)
+
+    def test_bad_cpu_type_never_reaches_dyld_and_is_still_named(self):
+        out = "/bin/sh: /Users/me/.unsloth/llama.cpp/build/bin/llama-server: Bad CPU type in executable"
+        msg = _classify(out, "/m.gguf", "u/x", 126, self._BIN)
+        assert "different CPU architecture" in msg
+        assert "GGUF file is valid" not in msg
+
+    def test_a_linux_exec_failure_is_not_read_as_a_mac_one(self):
+        out = "bash: /opt/x/llama-server: cannot execute binary file: Exec format error"
+        msg = _classify(out, "/m.gguf", "u/x", 126, "/opt/x/llama-server")
+        assert "this Mac" not in msg
+
+
+class TestHttpCredentialsInTheTail:
+    def test_a_basic_credential_is_redacted(self):
+        msg = _classify("Authorization: Basic QWxhZGRpbjpvcGVuIHNlc2FtZQ==", "/m.gguf", "u/x", 1)
+        assert "QWxhZGRpbg" not in msg
+
+    def test_a_bearer_token_is_redacted_including_its_base64_tail(self):
+        msg = _classify("Authorization: Bearer QUFB+U0VDUkVUL1RBSUw=", "/m.gguf", "u/x", 1)
+        assert "U0VDUkVU" not in msg
