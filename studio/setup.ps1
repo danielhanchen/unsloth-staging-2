@@ -3270,7 +3270,13 @@ $ReusedSetupPython = Resolve-ReusedSetupPython
 # install.ps1 exports UNSLOTH_NO_DATASETS for its own run only, so without the marker
 # an update would judge a tier venv by the full-install rule and refuse the very
 # environment it just built. Mirrors install_manifest.recorded_no_datasets().
-$NoDatasetsMode = ($env:UNSLOTH_NO_DATASETS -eq "1")
+# The same canonical truthy set install.ps1 and install_manifest.NO_TORCH_TRUTHY use.
+# An exact -eq "1" comparison read UNSLOTH_NO_DATASETS=true/yes/on as "off": install.ps1
+# accepted the value and kept the native ARM64 interpreter, then the arch gate below --
+# with no marker yet on a fresh install -- rejected that very interpreter and aborted
+# setup, against an opt-in the user had stated explicitly.
+$NoDatasetsMode = ($null -ne $env:UNSLOTH_NO_DATASETS) -and
+    (@("1", "true", "yes", "on") -contains $env:UNSLOTH_NO_DATASETS.Trim().ToLowerInvariant())
 if (-not $NoDatasetsMode -and $ReusedSetupPython) {
     try {
         # <venv>\Scripts\python.exe -> <venv>
@@ -3279,6 +3285,42 @@ if (-not $NoDatasetsMode -and $ReusedSetupPython) {
             $NoDatasetsMode = $true
         }
     } catch { }
+}
+# The manifest records the tier too, and a marker write can fail on its own (an
+# OSError there is swallowed) or be lost to a copy/restore that skipped dotfiles.
+# Get-PersistedNoTorch does exactly this for no-torch; same shape, same reason.
+if (-not $NoDatasetsMode -and $ReusedSetupPython) {
+    try {
+        $_venvRoot = Split-Path -Parent (Split-Path -Parent $ReusedSetupPython)
+        $_manifest = Join-Path $_venvRoot "unsloth_install_manifest.json"
+        if ($_venvRoot -and (Test-Path -LiteralPath $_manifest -PathType Leaf)) {
+            $_payload = $null
+            try { $_payload = Get-Content -LiteralPath $_manifest -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $_payload = $null }
+            if ($null -ne $_payload -and $null -ne $_payload.no_datasets) {
+                $NoDatasetsMode = ("$($_payload.no_datasets)" -match '^\s*(?i:true|1|yes|on)\s*$')
+            }
+        }
+    } catch { }
+}
+# An ARM64 venv with neither marker nor variable: an environment built before this
+# tier existed, or one whose install died before the marker was written. Without
+# this, the arch gate below refuses it on every run and `unsloth studio update`
+# can never converge -- including the desktop app's own update, which will not
+# fetch a new build until its backend update succeeds. setup.ps1 only updates the
+# venv it is given; it cannot go and fetch an x64 interpreter the way install.ps1
+# can, so adopting the tier is the only outcome here that leaves a working Studio.
+# Said out loud, with the remedy, because it is a reduced install.
+if (-not $NoDatasetsMode -and (Get-HostMachineArch) -eq "arm64" -and $ReusedSetupPython) {
+    if ((Get-PythonPlatformTag $ReusedSetupPython) -eq "win-arm64") {
+        $NoDatasetsMode = $true
+        $env:UNSLOTH_NO_DATASETS = "1"
+        Write-Host "[!] This environment runs a native ARM64 Python, which has no wheel for" -ForegroundColor Yellow
+        Write-Host "    datasets (via pyarrow). Updating it as an inference-only install: chat," -ForegroundColor Yellow
+        Write-Host "    model downloads and the Hub keep working, training does not." -ForegroundColor Yellow
+        Write-Host "    For the full product, install x64 Python from" -ForegroundColor Yellow
+        Write-Host "    https://www.python.org/downloads/windows/ (it runs emulated) and re-run" -ForegroundColor Yellow
+        Write-Host "    the Unsloth installer." -ForegroundColor Yellow
+    }
 }
 
 $HasPython = $null -ne (Get-Command python -ErrorAction SilentlyContinue)
@@ -3384,6 +3426,20 @@ if (-not $PythonOk -and $HasPython) {
                 $PythonOk = $true
             }
         }
+    }
+}
+
+# Windows on ARM, no reusable interpreter, and every candidate rejected on
+# architecture: $HasPython is still true, so the winget branch below -- which is
+# guarded by `-not $HasPython` and is the only thing that would install the x64
+# build -- was skipped, and setup hard-exited with "No supported Python (3.11-3.13)"
+# on a machine that has a perfectly supported 3.12. A present-but-unusable
+# interpreter is no usable Python, so say so and let the bootstrap run.
+if (-not $PythonOk -and $HasPython -and (Get-HostMachineArch) -eq "arm64" -and -not $NoDatasetsMode) {
+    $_barePythonSource = (Get-Command python -ErrorAction SilentlyContinue).Source
+    if ($_barePythonSource -and -not (Test-CompatibleSetupPythonArch $_barePythonSource)) {
+        substep "windows on arm: the Python on PATH is a native ARM64 build, which cannot resolve the stack"
+        $HasPython = $false
     }
 }
 
