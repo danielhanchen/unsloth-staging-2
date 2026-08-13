@@ -39,47 +39,24 @@ jobs:
           for f in base/*.dmg; do cp "$f" "pair/main-baseline-$(basename "$f")"; done
           sha256sum pair/*
 
-      # The forced re-analysis did not finish inside the poll window, and an
-      # unfinished analysis reads as all-zero stats, which is not a clean result.
-      # Read the CURRENT file report for each hash instead: it carries the engine
-      # table VirusTotal has now, so the question "did Microsoft ever answer for
-      # the baseline bundle" can be answered directly rather than inferred from a
-      # count of six silent engines.
-      - name: Report the current per-engine verdicts for both hashes
+      # install.ps1 is a bundle RESOURCE on every platform, including the macOS
+      # dmg, and the verdict on that dmg was Trojan:Script/...!ml -- a SCRIPT
+      # verdict on a disk image. So scan the script itself, from both refs, and
+      # find out whether the engine is reacting to this PR's installer changes
+      # rather than to the bundle. If it is, that is a real problem for users:
+      # Defender quarantining install.ps1 is worse than the bug being fixed.
+      - name: Scan install.ps1 from both refs on its own
         env:
           VT_API_KEY: ${{ secrets.VIRUS_TOTAL_API_TOKEN }}
         run: |
-          python3 - <<'PY'
-          import hashlib, json, os, pathlib, time, urllib.request
-
-          key = os.environ["VT_API_KEY"]
-
-          def get(url):
-              request = urllib.request.Request(url)
-              request.add_header("x-apikey", key)
-              with urllib.request.urlopen(request, timeout = 120) as response:
-                  return json.loads(response.read())
-
-          for path in sorted(pathlib.Path("pair").iterdir()):
-              digest = hashlib.sha256(path.read_bytes()).hexdigest()
-              data = get(f"https://www.virustotal.com/api/v3/files/{digest}")["data"]
-              attributes = data["attributes"]
-              results = attributes.get("last_analysis_results", {})
-              stats = attributes.get("last_analysis_stats", {})
-              flagged = {
-                  engine: verdict.get("result")
-                  for engine, verdict in results.items()
-                  if verdict.get("category") in ("malicious", "suspicious")
-              }
-              silent = sorted(
-                  engine for engine, verdict in results.items()
-                  if verdict.get("category") in ("timeout", "failure", "confirmed-timeout")
-              )
-              microsoft = results.get("Microsoft", {})
-              print(f"{path.name} sha256={digest}", flush = True)
-              print(f"  stats={stats}", flush = True)
-              print(f"  flagged={flagged}", flush = True)
-              print(f"  silent={silent}", flush = True)
-              print(f"  Microsoft={microsoft.get('category')} / {microsoft.get('result')}", flush = True)
-              time.sleep(20)
-          PY
+          set -euo pipefail
+          mkdir -p scripts_pair
+          git fetch --depth 1 https://github.com/unslothai/unsloth main
+          git show FETCH_HEAD:install.ps1 > scripts_pair/main-install.ps1
+          git fetch --depth 1 https://github.com/unslothai/unsloth windows-application-control-8490
+          git show FETCH_HEAD:install.ps1 > scripts_pair/pr8592-install.ps1
+          git show FETCH_HEAD:studio/setup.ps1 > scripts_pair/pr8592-setup.ps1
+          ls -la scripts_pair
+          python3 scripts/virustotal_scan.py scripts_pair \
+            --output-markdown "$RUNNER_TEMP/scripts.md"
+          cat "$RUNNER_TEMP/scripts.md" | tee -a "$GITHUB_STEP_SUMMARY"
