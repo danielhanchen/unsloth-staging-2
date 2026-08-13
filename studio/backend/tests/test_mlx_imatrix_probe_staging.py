@@ -62,7 +62,9 @@ def _probes():
     """
     source = _export_py().read_text(encoding = "utf-8")
     tree = ast.parse(source)
-    wanted = {"_supports_kwarg", "_imatrix_export_supported"}
+    # `_accepts_by_keyword` too: the other two call it, so lifting them alone gives a
+    # NameError at call time rather than a wrong answer.
+    wanted = {"_accepts_by_keyword", "_supports_kwarg", "_imatrix_export_supported"}
     namespace: dict = {}
     found = {}
     for node in tree.body:
