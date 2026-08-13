@@ -1,0 +1,52 @@
+name: VirusTotal recheck, both dmgs together
+
+# The PR run and the main baseline run scanned their macOS bundles minutes apart,
+# and the baseline had six engines time out, so "0 malicious on main, 1 on the PR"
+# could be a difference in the artifact or a difference in which engines answered.
+# This scans BOTH files in one job: same moment, same engine versions, and by then
+# VirusTotal has a completed analysis for each hash, so nothing is waiting on a
+# first upload.
+
+on:
+  push:
+    branches: ["vt-recheck"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  recheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: vt-8592
+          persist-credentials: false
+
+      - name: Download both macOS bundles
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p pair
+          gh run download 31662345202 --repo ${{ github.repository }} -n vt-8592-macos-14 --dir pr
+          gh run download 31665301586 --repo ${{ github.repository }} -n vt-8592-macos-14 --dir base
+          # Renamed so the report says which is which; VirusTotal keys on content.
+          for f in pr/*.dmg; do cp "$f" "pair/pr-8592-$(basename "$f")"; done
+          for f in base/*.dmg; do cp "$f" "pair/main-baseline-$(basename "$f")"; done
+          sha256sum pair/*
+
+      - name: Scan both
+        env:
+          VT_API_KEY: ${{ secrets.VIRUS_TOTAL_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 scripts/virustotal_scan.py pair \
+            --output-markdown "$RUNNER_TEMP/summary.md"
+
+      - name: Publish
+        if: always()
+        run: cat "$RUNNER_TEMP/summary.md" | tee -a "$GITHUB_STEP_SUMMARY"
