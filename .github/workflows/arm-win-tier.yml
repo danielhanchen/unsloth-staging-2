@@ -165,3 +165,73 @@ jobs:
             tier-install.log
             studio.log
             studio.err
+
+  # The path the tier job above deliberately does not take. --no-torch bounds that
+  # job's runtime, but it also skips extras.txt, which is the ONE phase installed
+  # with dependency resolution -- where a pure-Python line drags a compiled package
+  # into the tier through its metadata (openai-whisper -> tiktoken, torch-stoi ->
+  # torchaudio, librosa -> numba, none of which have win_arm64 wheels). A target
+  # platform resolution says those are now filtered; this says it on the hardware.
+  tier-with-torch:
+    runs-on: windows-11-arm
+    timeout-minutes: 150
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}\studio_home_torch
+      UNSLOTH_NO_DATASETS: '1'
+      UNSLOTH_STUDIO_PASSWORD: 'ci-tier-torch-pw'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - name: Install uv
+        shell: pwsh
+        run: |
+          irm https://astral.sh/uv/install.ps1 | iex
+          "$env:USERPROFILE\.local\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+
+      - name: Install the tier from this checkout, with torch
+        shell: pwsh
+        run: .\install.ps1 --local 2>&1 | Tee-Object -FilePath tier-torch-install.log
+
+      - name: Nothing was built from source, and the audio stack stayed out
+        shell: pwsh
+        run: |
+          $built = Select-String -Path tier-torch-install.log -Pattern "Building [a-zA-Z0-9._-]+==" -AllMatches
+          if ($built) {
+              "packages were built from source on ARM64, which is what this tier exists to avoid:"
+              $built.Matches.Value | Sort-Object -Unique
+              exit 1
+          }
+          "no source builds"
+          $py = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\python.exe"
+          & $py -c "import torch; print('torch', torch.__version__)"
+          if ($LASTEXITCODE -ne 0) { "torch did not install on native ARM64"; exit 1 }
+          foreach ($mod in @("torchaudio", "numba", "librosa", "datasets", "pyarrow")) {
+              & $py -c "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec('$mod') is None else 1)"
+              if ($LASTEXITCODE -ne 0) { "$mod is installed; the tier should have filtered it"; exit 1 }
+          }
+          "torchaudio, numba, librosa, datasets and pyarrow are all absent, as intended"
+
+      - name: The server still boots and can answer
+        shell: pwsh
+        run: |
+          $bin = "$env:UNSLOTH_STUDIO_HOME\bin\unsloth.exe"
+          if (-not (Test-Path $bin)) { $bin = "$env:UNSLOTH_STUDIO_HOME\unsloth_studio\Scripts\unsloth.exe" }
+          Start-Process -FilePath $bin -ArgumentList "studio", "-H", "127.0.0.1", "-p", "8901" `
+            -RedirectStandardOutput studio-torch.log -RedirectStandardError studio-torch.err -NoNewWindow
+          $healthy = $false
+          foreach ($i in 1..90) {
+            Start-Sleep -Seconds 5
+            try {
+              $r = Invoke-RestMethod -Uri "http://127.0.0.1:8901/api/health" -TimeoutSec 10
+              if ($r) { $healthy = $true; $health = $r; break }
+            } catch { }
+          }
+          if (-not $healthy) {
+            "server never became healthy"
+            Get-Content studio-torch.log -Tail 80
+            Get-Content studio-torch.err -Tail 80
+            exit 1
+          }
+          $health | ConvertTo-Json -Depth 4
+          "the tier boots with torch installed"
