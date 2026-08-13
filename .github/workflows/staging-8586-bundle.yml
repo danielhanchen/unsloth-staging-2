@@ -45,16 +45,18 @@ jobs:
       # Unsigned on purpose: a staging repo has no Azure Trusted Signing, no Apple
       # identity and no updater key. The question here is bundle CONTENTS, which
       # signing does not affect.
+      # createUpdaterArtifacts off, not an empty signing key: a staging repo has no updater
+      # key, and Tauri tries to decode an empty one and fails after the bundle is already
+      # built. Nothing here depends on the updater artifact.
       - name: Build bundles (unsigned)
         working-directory: studio/src-tauri
         shell: bash
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ''
         run: |
           set -o pipefail
-          npx --yes @tauri-apps/cli@2 build 2>&1 | tee "$RUNNER_TEMP/build.log" | tail -40
+          npx --yes @tauri-apps/cli@2 build --config '{"bundle":{"createUpdaterArtifacts":false}}' 2>&1 | tee "$RUNNER_TEMP/build.log" | tail -40
 
       - name: Assert each bundle carries only its own installer
+        if: always()
         shell: bash
         run: |
           set -euo pipefail
