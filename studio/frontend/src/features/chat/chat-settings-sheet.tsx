@@ -99,7 +99,6 @@ import {
   getExternalMinOutputTokens,
   providerSupportsBuiltinCodeExecution,
   providerSupportsFastMode,
-  resolveExternalMaxTokensClamp,
 } from "./provider-capabilities";
 import {
   isLocalModelPath,
@@ -726,7 +725,6 @@ export function ChatSettingsPanel({
       ? getExternalMaxOutputTokens(
           externalProviderType,
           externalSelection?.modelId,
-          activeExternalProvider?.maxOutputTokens,
         )
       : isGguf && baseContext
         ? baseContext
@@ -762,58 +760,15 @@ export function ChatSettingsPanel({
     };
   }
 
-  // Lower a live Max Tokens that no longer fits the connection's cap.
-  // `resolveExternalMaxTokensClamp` documents why an unresolved provider must not be
-  // read as the 32,768 fallback.
-  useEffect(() => {
-    const clampedMaxTokens = resolveExternalMaxTokensClamp({
-      settingsHydrated,
-      hasActiveExternalProvider: activeExternalProvider != null,
-      isExternalModel,
-      maxTokens: params.maxTokens,
-      maxTokensMax,
-    });
-    if (clampedMaxTokens == null) {
-      return;
-    }
-    const nextParams = { ...params, maxTokens: clampedMaxTokens };
-    const nextSource = isSamePresetConfig(activePresetBaseline, nextParams)
-      ? getPresetSource(activePreset)
-      : "modified";
-    setActivePresetSource(nextSource);
-    onParamsChange(nextParams);
-  }, [
-    activeExternalProvider,
-    activePreset,
-    activePresetBaseline,
-    isExternalModel,
-    maxTokensMax,
-    onParamsChange,
-    params,
-    settingsHydrated,
-    setActivePresetSource,
-  ]);
-
-  function applyPresetParamsWithinCurrentLimits(
-    presetParams: Parameters<typeof applyPresetParams>[1],
-  ): InferenceParams {
-    const nextParams = applyPresetParams(params, presetParams);
-    // Same reason the effect waits for a provider: without one `maxTokensMax` is the
-    // fallback, so applying a preset here would lower the value for good.
-    if (!isExternalModel || activeExternalProvider == null) return nextParams;
-    return {
-      ...nextParams,
-      maxTokens: Math.min(nextParams.maxTokens, maxTokensMax),
-    };
-  }
-
   function applyPreset(name: string) {
     if (!settingsHydrated) {
       return;
     }
     const p = presets.find((pr) => pr.name === name);
     if (p) {
-      onParamsChange(applyPresetParamsWithinCurrentLimits(p.params));
+      onParamsChange({
+        ...applyPresetParams(params, p.params),
+      });
       if (p.loadConfig) {
         applyPresetLoadConfig(p.loadConfig);
       }
@@ -873,9 +828,9 @@ export function ChatSettingsPanel({
     setCustomPresets(next);
     if (activePreset === name) {
       if (fallbackPreset) {
-        onParamsChange(
-          applyPresetParamsWithinCurrentLimits(fallbackPreset.params),
-        );
+        onParamsChange({
+          ...        applyPresetParams(params, fallbackPreset.params),
+        });
         if (fallbackPreset.loadConfig) {
           applyPresetLoadConfig(fallbackPreset.loadConfig);
         }
