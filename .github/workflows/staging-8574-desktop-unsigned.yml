@@ -82,11 +82,11 @@ jobs:
         run: |
           set -euo pipefail
           npx --prefix studio tauri signer generate -w "$RUNNER_TEMP/staging.key" -p "" --force
-          {
-            echo "TAURI_SIGNING_PRIVATE_KEY<<EOF_KEY"
-            cat "$RUNNER_TEMP/staging.key"
-            echo "EOF_KEY"
-          } >> "$GITHUB_ENV"
+          # Point at the file rather than pasting the key through GITHUB_ENV.
+          # The generated key has no trailing newline, so a heredoc block puts
+          # the delimiter on the key's own line and the env command is rejected
+          # ("Matching delimiter not found").
+          echo "TAURI_SIGNING_PRIVATE_KEY_PATH=$RUNNER_TEMP/staging.key" >> "$GITHUB_ENV"
           echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=" >> "$GITHUB_ENV"
 
       - name: Build bundles (no code signing)
