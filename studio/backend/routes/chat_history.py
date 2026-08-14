@@ -122,6 +122,45 @@ class ChatThread(BaseModel):
     forkedFromMessageId: Optional[str] = None
     settings: Optional[ChatThreadSettings] = None
 
+    @field_validator("settings", mode = "before")
+    @classmethod
+    def _tolerate_unknown_stored_settings(cls, value):
+        """Never let a stored snapshot make the chat unreadable.
+
+        This is the response model, so the value comes off disk rather than off the
+        wire. It is the first strictly validated nested model built from the
+        database, and the contract will move: a newer Studio adding a seventeenth
+        setting, or widening an enum, writes a blob this build rejects. Raising
+        there 500s the chat on open AND takes the whole history export with it,
+        since the export validates every thread. `_json_loads` already shrugs off
+        JSON that will not parse; valid JSON from a newer build deserves the same.
+
+        Unknown keys are dropped rather than kept, because the wire contract stays
+        strict (extra = "forbid" on the patch), and the row itself is untouched, so
+        upgrading again restores whatever this build could not read.
+        """
+        if value is None or isinstance(value, ChatThreadSettings):
+            return value
+        if not isinstance(value, dict):
+            return None
+        candidate = {k: v for k, v in value.items() if k in ChatThreadSettings.model_fields}
+        # Drop exactly the fields pydantic names, and keep going: a blob from a
+        # newer build can carry several at once (a widened enum and a raised bound),
+        # and dropping them one guess at a time would give up on the second.
+        for _ in range(len(candidate) + 1):
+            try:
+                return ChatThreadSettings.model_validate(candidate)
+            except ValidationError as exc:
+                bad = {
+                    str(error["loc"][0])
+                    for error in exc.errors()
+                    if error.get("loc")
+                }
+                if not bad or not bad & set(candidate):
+                    return None
+                candidate = {k: v for k, v in candidate.items() if k not in bad}
+        return None
+
 
 class ChatThreadPatch(BaseModel):
     title: Optional[str] = None
