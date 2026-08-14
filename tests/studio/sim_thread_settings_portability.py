@@ -59,6 +59,14 @@ def thread_row(title, **extra):
 
 
 def main():
+    # The Windows console is cp1252 by default, so printing a kbId containing
+    # emoji raises UnicodeEncodeError and fails the run for a reason that has
+    # nothing to do with what is being tested.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding = "utf-8", errors = "replace")
+        except (AttributeError, ValueError):  # pragma: no cover - older stream types
+            pass
     print(f"platform : {platform.system()} {platform.release()} ({platform.machine()})")
     print(f"python   : {sys.version.split()[0]}")
     print(f"sqlite3  : {sqlite3.sqlite_version}")

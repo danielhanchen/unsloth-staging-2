@@ -23,6 +23,7 @@ from routes.chat_history import (  # noqa: E402
     ChatThread,
     ChatThreadPatch,
     ChatThreadSettings,
+    thread_from_row,
 )
 from storage import studio_db  # noqa: E402
 from utils.paths import studio_db_path  # noqa: E402
@@ -226,8 +227,9 @@ def test_settings_column_is_added_to_an_existing_database(tmp_path, monkeypatch)
     ],
 )
 def test_a_snapshot_from_a_newer_build_still_reads(stored, expected):
-    thread = ChatThread(
-        id = "t", title = "T", modelType = "base", createdAt = 1, settings = stored,
+    thread = thread_from_row(
+        {"id": "t", "title": "T", "modelType": "base", "createdAt": 1,
+         "settings": stored},
     )
     if expected is None:
         assert thread.settings is None
@@ -237,11 +239,22 @@ def test_a_snapshot_from_a_newer_build_still_reads(stored, expected):
 
 
 def test_the_wire_contract_stays_strict():
-    # the read is lenient, the write is not: a client may not invent settings.
+    # Only rows off disk are forgiven. A client may not invent a setting on either
+    # the patch or the full-record POST, which shares the ChatThread model.
     with pytest.raises(ValidationError):
         ChatThreadPatch(settings = {"toolsEnabled": True, "voiceModeEnabled": True})
     with pytest.raises(ValidationError):
         ChatThreadPatch(settings = {"ragTopK": 999})
+    with pytest.raises(ValidationError):
+        ChatThread(
+            id = "t", title = "T", modelType = "base", createdAt = 1,
+            settings = {"toolsEnabled": True, "voiceModeEnabled": True},
+        )
+    with pytest.raises(ValidationError):
+        ChatThread(
+            id = "t", title = "T", modelType = "base", createdAt = 1,
+            settings = {"ragTopK": 999},
+        )
 
 
 def test_an_unreadable_key_does_not_disturb_the_stored_row(tmp_path, monkeypatch):
@@ -260,7 +273,7 @@ def test_an_unreadable_key_does_not_disturb_the_stored_row(tmp_path, monkeypatch
         conn.close()
 
     row = studio_db.get_chat_thread("thread-1")
-    assert ChatThread(**row).settings.toolsEnabled is True
+    assert thread_from_row(row).settings.toolsEnabled is True
 
     studio_db.update_chat_thread("thread-1", {"title": "renamed"})
     conn = sqlite3.connect(studio_db_path())
