@@ -46,6 +46,7 @@ from core.inference.tool_call_parser import (
 from core.inference.tool_loop_controller import (
     ToolLoopController,
     awaiting_approval_status,
+    strip_result_for_model,
 )
 from core.inference.tool_stream_exec import (
     TOOL_HEARTBEAT_INTERVAL_S,
@@ -114,6 +115,19 @@ _USAGE_DETAIL_FIELDS = (
 )
 
 _STEP_DONE = object()
+
+# Mirrors the local execution cap. Hosted code execution can return very large
+# stdout, and the local path already refuses to put more than this in front of
+# the model, so the replayed copy is held to the same limit rather than being
+# allowed to fill the next request's context.
+_HOSTED_RESULT_MAX_CHARS = 16000
+
+
+def _truncate_for_model(text: str, limit: int = _HOSTED_RESULT_MAX_CHARS) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n... [truncated, {len(text) - limit} more characters]"
+
 
 # Consecutive turns that asked for a tool but ran none before the loop gives up.
 _MAX_FRUITLESS_TURNS = 2
@@ -275,6 +289,91 @@ class _Turn:
     text: list[str] = field(default_factory = list)
     reasoning_extra: dict[str, Any] | None = None
     finish_reason: str | None = None
+    # Results from tools the PROVIDER ran during this turn, keyed by call id so a
+    # repeated end event cannot record the same result twice.
+    hosted_results: dict[str, dict[str, str]] = field(default_factory = dict)
+
+    def note_hosted_tool_event(self, event: Any) -> None:
+        """Record a provider-side tool call carried on ``_toolEvent``.
+
+        These reach the client as their own frames but are not part of the
+        assistant message this loop replays, so when a hosted tool and a local
+        call land in the same turn the follow-up request loses whatever the
+        provider just produced. Studio's own events do not come through here:
+        the loop writes those as a top-level ``type``, so ``_toolEvent`` is
+        unambiguously the provider's side.
+
+        Both halves matter. The ``tool_end`` producers generally omit
+        ``tool_name``, and for Gemini code execution the code that ran is only
+        ever in the ``tool_start`` arguments, so a result recorded on its own
+        replays as an unlabelled value the model cannot interpret.
+        """
+        if not isinstance(event, dict):
+            return
+        call_id = event.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            return
+        kind = event.get("type")
+
+        if kind == "tool_start":
+            name = event.get("tool_name")
+            entry = self.hosted_results.setdefault(call_id, {})
+            if isinstance(name, str) and name:
+                entry["name"] = name
+            arguments = event.get("arguments")
+            if isinstance(arguments, dict) and arguments:
+                # The operation itself: Gemini puts the executed language and
+                # code here, and a search puts its query.
+                entry["arguments"] = json.dumps(arguments, separators = (",", ":"))[:2000]
+            return
+
+        if kind != "tool_end":
+            return
+        entry = self.hosted_results.setdefault(call_id, {})
+        name = event.get("tool_name")
+        if isinstance(name, str) and name:
+            entry["name"] = name
+        result = event.get("result")
+        if isinstance(result, str) and result.strip():
+            if "__IMAGES__:" in result:
+                # A Gemini plot with no stdout is nothing BUT the sentinel, so
+                # stripping leaves an empty string. Note the picture here or the
+                # entry looks empty and the turn reports that nothing was made.
+                entry["produced_image"] = True
+            # Same normalisation local results get: __IMAGES__ and friends are
+            # frontend sentinels carrying a full data URI, and replaying one
+            # sends megabytes of base64 the model cannot read anyway.
+            stripped = strip_result_for_model(result)
+            if stripped.strip():
+                # Capped like a local result. Hosted code execution can return
+                # very large stdout, and the local path already refuses to put
+                # more than this in front of the model.
+                entry["result"] = _truncate_for_model(stripped)
+        if event.get("image_b64"):
+            # image_generation reports an empty result and carries the picture
+            # separately. Record that it happened rather than the bytes, so the
+            # follow-up turn knows the image exists without paying for it.
+            entry["produced_image"] = True
+
+    def hosted_replay_text(self) -> str:
+        """The provider-run calls of this turn, as prose for the next request."""
+        blocks: list[str] = []
+        for entry in self.hosted_results.values():
+            result = entry.get("result", "")
+            produced_image = entry.get("produced_image")
+            if not result and not produced_image:
+                # A start with no outcome says only that something began.
+                continue
+            name = entry.get("name") or "tool"
+            header = f"[{name} result]"
+            arguments = entry.get("arguments")
+            if arguments:
+                header = f"[{name} {arguments}]"
+            body = result if result else "(produced an image)"
+            if result and produced_image:
+                body = f"{result}\n(produced an image)"
+            blocks.append(f"{header}\n{body}")
+        return "\n\n".join(blocks)
 
     def merge_structured(self, raw_calls: list[Any]) -> None:
         for raw_call in raw_calls:
@@ -678,6 +777,7 @@ async def stream_with_studio_tools(
                 extra = delta.get("extra_content")
                 if isinstance(extra, dict):
                     turn.reasoning_extra = extra
+                turn.note_hosted_tool_event(payload.get("_toolEvent"))
                 if isinstance(choice.get("finish_reason"), str):
                     turn.finish_reason = choice["finish_reason"]
 
@@ -816,6 +916,24 @@ async def stream_with_studio_tools(
             ):
                 reprompts += 1
                 last_reprompt_text = visible_answer
+                stalled_hosted = turn.hosted_replay_text()
+                if stalled_hosted:
+                    # A hosted tool did run this turn, the model just did not go
+                    # on to ask for a local one. The replay below never happens
+                    # on this path, so without this the reprompted request is
+                    # told to continue from a search or execution whose output
+                    # it can no longer see.
+                    append_assistant_turn(
+                        conversation,
+                        {
+                            "role": "assistant",
+                            "content": (
+                                f"{visible_answer}\n\n{stalled_hosted}"
+                                if visible_answer
+                                else stalled_hosted
+                            ),
+                        },
+                    )
                 _append_user_turn(conversation, reprompt_to_act_message(tool_hint))
                 continue
             break
@@ -1071,6 +1189,20 @@ async def stream_with_studio_tools(
                 "".join(turn.text), final = True, enabled_tool_names = allowed_tool_names
             ),
         }
+        hosted_text = turn.hosted_replay_text()
+        if hosted_text:
+            # A tool the provider ran itself in this same turn. Its output went
+            # to the client as its own frame but is not otherwise part of this
+            # message, so without this the follow-up request drops what the
+            # model just produced and it answers from the local results alone.
+            # Replayed as text rather than as native items: the shape differs
+            # per provider (Gemini codeExecutionResult, an OpenAI image call),
+            # while every provider can read its own prior turn's prose.
+            assistant_message["content"] = (
+                f"{assistant_message['content']}\n\n{hosted_text}"
+                if assistant_message["content"]
+                else hosted_text
+            )
         if turn.reasoning_extra:
             assistant_message["extra_content"] = turn.reasoning_extra
         if assistant_tool_calls:
