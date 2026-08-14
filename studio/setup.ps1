@@ -1615,6 +1615,11 @@ $Rule = [string]::new([char]0x2500, 52)
 
 function Enable-StudioVirtualTerminal {
     if ($env:NO_COLOR) { return $false }
+    # A redirected stdout is not a console, GetConsoleMode fails on a non-console handle, and the
+    # block below can then only reach `return $false`. Answer that without the compiler: Add-Type
+    # runs csc.exe and drops source in %TEMP%. This is the path the CLI and the desktop app both
+    # take, where stdout is a pipe, so it is where the compile actually happened.
+    if ($script:StudioStdoutRedirected) { return $false }
     try {
         Add-Type -Namespace StudioVT -Name Native -MemberDefinition @'
 [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int nStdHandle);
