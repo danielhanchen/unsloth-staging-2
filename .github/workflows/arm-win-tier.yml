@@ -148,14 +148,26 @@ jobs:
           if (-not $authed.chat_only_detail) { "expected a detail explaining the reason"; exit 1 }
           "the verdict names datasets, so the UI can explain the greyed-out Train"
 
-          # The gated endpoints answer 503 with a reason rather than a 500 traceback.
+          # The gate is per route, so check both halves. check-format reaches
+          # `from datasets import` and must answer 503 with a reason rather than a 500
+          # traceback; the local listing only walks the filesystem and must still work,
+          # or the tier has lost a feature it can serve.
           $status = 0
           try {
-            Invoke-WebRequest -Uri "http://127.0.0.1:8899/api/hub/datasets/local" -TimeoutSec 15 `
+            Invoke-WebRequest -Uri "http://127.0.0.1:8899/api/hub/datasets/check-format" `
+              -Method Post -TimeoutSec 15 -ContentType "application/json" `
+              -Body '{"dataset_name":"unsloth/LaTeX_OCR"}' `
               -Headers @{ Authorization = "Bearer $token" } | Out-Null
           } catch { $status = [int]$_.Exception.Response.StatusCode }
-          if ($status -ne 503) { "expected 503 from the hub datasets router, got $status"; exit 1 }
-          "hub datasets answers 503, not 500"
+          if ($status -ne 503) { "expected 503 from check-format, got $status"; exit 1 }
+          "the routes that need datasets answer 503, not 500"
+
+          $local = Invoke-WebRequest -Uri "http://127.0.0.1:8899/api/hub/datasets/local" `
+            -TimeoutSec 15 -Headers @{ Authorization = "Bearer $token" }
+          if ($local.StatusCode -ne 200) {
+            "expected 200 from the local listing, got $($local.StatusCode)"; exit 1
+          }
+          "the routes that do not need it keep working"
 
       - uses: actions/upload-artifact@v4
         if: always()
