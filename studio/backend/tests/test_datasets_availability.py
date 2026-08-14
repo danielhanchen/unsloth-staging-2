@@ -370,7 +370,8 @@ class TestCompatibilityRoutersAreGated:
         pandas, while the seed-file deletes only unlink under the upload root."""
         for module in ("seed", "jobs"):
             source = (_BACKEND / "routes" / "data_recipe" / f"{module}.py").read_text(
-                encoding = "utf-8")
+                encoding = "utf-8"
+            )
             if path not in source:
                 continue
             index = source.index(path)
@@ -378,8 +379,10 @@ class TestCompatibilityRoutersAreGated:
             return
         raise AssertionError(f"{path} not found in the data recipe routes")
 
-    @pytest.mark.parametrize("path", ['"/seed/unstructured-file/{block_id}/{file_id}"',
-                                      '"/seed/unstructured-block/{block_id}"'])
+    @pytest.mark.parametrize(
+        "path",
+        ['"/seed/unstructured-file/{block_id}/{file_id}"', '"/seed/unstructured-block/{block_id}"'],
+    )
     def test_data_recipe_cleanup_stays_open(self, path):
         source = (_BACKEND / "routes" / "data_recipe" / "seed.py").read_text(encoding = "utf-8")
         index = source.index(path)
@@ -502,15 +505,26 @@ class TestOnlyDatasetRoutesAreGated:
         assert "router = APIRouter()" in source
         assert "APIRouter(dependencies" not in source
 
-    @pytest.mark.parametrize("path", ["/upload", "/local", "/local-options", "/download",
+    @pytest.mark.parametrize("path", ["/upload", "/local", "/local-options",
                                       "/check-format", "/ai-assist-mapping"])
     def test_dataset_paths_keep_the_gate(self, path):
         source = self._source()
-        decorator = source[source.index(f'"{path}"') : ]
-        assert "needs_datasets" in decorator[: decorator.index("\ndef ") if "\ndef " in decorator[:400] else 400]
+        decorator = source[source.index(f'"{path}"') :]
+        assert (
+            "needs_datasets"
+            in decorator[: decorator.index("\ndef ") if "\ndef " in decorator[:400] else 400]
+        )
 
-    @pytest.mark.parametrize("path", ["/cached", "/download/cancel", "/download-status",
-                                      "/active-downloads", "/transport-status"])
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/cached",
+            "/download/cancel",
+            "/download-status",
+            "/active-downloads",
+            "/transport-status",
+        ],
+    )
     def test_cache_and_download_paths_stay_open(self, path):
         source = self._source()
         for index in range(len(source)):
@@ -548,8 +562,10 @@ class TestVerificationAsksTheTargetVenv:
 
     def test_the_recorded_tag_wins(self):
         import importlib.util
+
         spec = importlib.util.spec_from_file_location(
-            "im_gate", _BACKEND.parent / "install_manifest.py",
+            "im_gate",
+            _BACKEND.parent / "install_manifest.py",
         )
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -558,7 +574,8 @@ class TestVerificationAsksTheTargetVenv:
         # No key: an older manifest, so fall back to this interpreter (Linux here).
         assert module._is_windows_arm64_python({}) is False
         assert "platform_tag" in (_BACKEND.parent / "install_manifest.py").read_text(
-            encoding = "utf-8")
+            encoding = "utf-8"
+        )
 
 
 class TestGatesLeaveWorkingFeaturesAlone:
@@ -570,6 +587,13 @@ class TestGatesLeaveWorkingFeaturesAlone:
         source = (_BACKEND / "routes" / "training.py").read_text(encoding = "utf-8")
         index = source.index('"/diffusion/start"')
         assert "require_datasets_http" not in source[index : index + 300]
+
+    def test_starting_a_download_is_not_gated(self):
+        """hf_download._download_dataset() is huggingface_hub and cache utilities, so a
+        tier install can still fill a cache for the x64 environment it will move to."""
+        source = (_BACKEND / "hub" / "routes" / "datasets.py").read_text(encoding = "utf-8")
+        index = source.index('"/download"')
+        assert "needs_datasets" not in source[index : source.index("\n", index)]
 
     def test_download_progress_is_not_gated(self):
         """Snapshot accounting over the cache dir, so a tier install can still watch
@@ -593,3 +617,32 @@ class TestGatesLeaveWorkingFeaturesAlone:
         block = source[index - 1600 : index + 200]
         assert "$_noDatasetsRequested" in block
         assert "recorded_no_datasets" in block
+
+
+class TestTheTierRemovesTrainingNotTheDevice:
+    """UNSLOTH_NO_DATASETS=1 on an x64 GPU host keeps the GPU, safetensors inference,
+    Video and Hub Run. Only training and the data features go, so the health payload
+    carries that as its own capability instead of calling the device chat-only."""
+
+    def test_health_publishes_the_capability(self):
+        source = (_BACKEND / "main.py").read_text(encoding = "utf-8")
+        assert 'authed["datasets_available"] = datasets_available()' in source
+        assert "datasets_unavailable_detail" in source
+
+    def test_chat_only_is_only_forced_on_native_arm64(self):
+        source = (_BACKEND / "main.py").read_text(encoding = "utf-8")
+        index = source.index('return True, "datasets_unavailable"')
+        assert "is_inference_only_tier() and _is_arm64_windows()" in source[index - 400 : index]
+
+    def test_the_frontend_gates_training_on_it(self):
+        source = (_BACKEND.parent / "frontend" / "src" / "components" / "app-sidebar.tsx").read_text(
+            encoding = "utf-8")
+        assert "const trainingBlocked = chatOnlyMeasured || datasetsMissing;" in source
+        assert "disabled: trainingBlocked," in source
+
+    def test_the_store_keeps_a_measured_false(self):
+        """A provisional or unauthenticated reply omits the field, and must not flip a
+        measured false back to true and re-enable Train on a tier install."""
+        source = (_BACKEND.parent / "frontend" / "src" / "config" / "env.ts").read_text(
+            encoding = "utf-8")
+        assert "data.datasets_available ?? previous.datasetsAvailable" in source
