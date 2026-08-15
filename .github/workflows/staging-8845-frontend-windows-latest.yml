@@ -1,0 +1,32 @@
+name: "staging-8845 frontend windows-latest"
+on:
+  push:
+    branches: ["pr-8845-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+    working-directory: studio/frontend
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out with the repo's own line endings
+        run: git config --global core.autocrlf false
+        working-directory: .
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --no-fund --no-audit
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build
