@@ -1,7 +1,7 @@
-name: "heavy-thread windows-latest"
+name: "heavy-thread macos-14 fast"
 on:
   push:
-    branches: ["pr-9016-ci"]
+    branches: ["pr-9016-mac-ci"]
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -13,13 +13,13 @@ defaults:
     shell: bash
 jobs:
   measure:
-    runs-on: windows-latest
-    timeout-minutes: 150
+    runs-on: macos-14
+    timeout-minutes: 120
     env:
       SMOKE_HEAVY_CHARS: "25000,100000,300000"
       SMOKE_HEAVY_ENGINES: "chromium,webkit,firefox"
-      SMOKE_HEAVY_REPEATS: "2"
-      SMOKE_LABEL: "${{ github.ref_name }}-windows-latest"
+      SMOKE_HEAVY_REPEATS: "1"
+      SMOKE_LABEL: "${{ github.ref_name }}-macos-14"
       PW_ART_DIR: "logs/heavy-thread"
     steps:
       - name: Check out with the repo's own line endings
@@ -47,7 +47,7 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
-          name: heavy-thread-${{ github.ref_name }}-windows-latest
+          name: heavy-thread-${{ github.ref_name }}-macos-14
           path: logs/heavy-thread
           retention-days: 5
           if-no-files-found: warn
