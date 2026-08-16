@@ -89,7 +89,7 @@ from .training import (
     should_use_mlx_training_backend,
 )
 
-from .dataset_bounds import bound_dataset_rows
+from .dataset_bounds import bound_dataset_rows, world_size_env_report, world_size_from_env
 
 logger = get_logger(__name__)
 
@@ -3479,7 +3479,41 @@ class UnslothTrainer:
         if max_steps > 0:
             try:
                 rows = len(train_dataset)
-                world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+                # Every launcher variable, not WORLD_SIZE alone. No MPI sets
+                # WORLD_SIZE: Open MPI advertises OMPI_COMM_WORLD_SIZE, Hydra and
+                # Intel MPI advertise PMI_SIZE, and mlx.launch's NCCL backend
+                # (CUDA-only, so it does reach this path) advertises
+                # MLX_WORLD_SIZE. LOCAL_WORLD_SIZE is defensive rather than
+                # necessary, since torchrun sets both and the max already prefers
+                # the global count on a multi-node run. Reading one variable calls
+                # an mpirun launch single-process and engages a lazy view that
+                # re-tokenizes on every extra pass. It also coerces junk:
+                # int("auto") raises, the except below leaves resolved_epochs None,
+                # and the gate then reads inf and disables the feature outright.
+                #
+                # Deliberately env-only, and NOT worker.py's
+                # _data_parallel_world_size, which also counts visible CUDA devices.
+                # That one bounds a row subset, where over-counting costs nothing.
+                # This one feeds a veto, where both directions are wrong, and
+                # Studio's own multi-GPU load is device_map="balanced", which
+                # transformers treats as model-parallel and pins to _n_gpu = 1: a
+                # balanced 4-GPU run draws the same rows per step as one GPU, so
+                # counting devices here would report 4x the passes and veto a
+                # qualifying run with a fabricated reason.
+                world_size = world_size_from_env()
+                if world_size > 1:
+                    # Say which variable said so. A size left behind by an earlier
+                    # mpirun, or baked into an HPC container image, reads as a
+                    # multi-rank launch on a machine running one process, and the
+                    # only symptom is this run being told it makes several passes.
+                    # The merged row bound already reads the same variables, so the
+                    # environment is being trusted either way; what was missing was
+                    # a way to see it.
+                    logger.info(
+                        f"Launcher environment reports {world_size} data-parallel "
+                        f"processes ({world_size_env_report()}); a step-capped run "
+                        f"consumes that many times the rows per step\n"
+                    )
                 per_step = (
                     int(config_args.get("per_device_train_batch_size", 1))
                     * int(config_args.get("gradient_accumulation_steps", 1))
