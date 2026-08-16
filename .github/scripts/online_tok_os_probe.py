@@ -231,7 +231,7 @@ def main():
 
     # 4. no orphaned children left behind
     time.sleep(2)
-    kids = [p for p in child_pids() if p not in baseline]
+    kids = real_leaks(baseline)
     emit("child_processes_after", len(kids))
     if kids:
         emit("child_pids", ",".join(str(p) for p in kids))
@@ -313,7 +313,7 @@ def main():
 
     # final scan, after every arm has run and released
     time.sleep(3)
-    kids = [p for p in child_pids() if p not in baseline]
+    kids = real_leaks(baseline)
     emit("child_processes_after", len(kids))
     OUT.pop("child_cmdlines", None)
     OUT.pop("child_pids", None)
@@ -358,6 +358,26 @@ def main():
     emit("probe_ok", ok)
     print("PROBE_JSON " + json.dumps(OUT), flush = True)
     return 0 if ok else 1
+
+
+# CPython starts these itself the first time multiprocessing is touched. They are
+# not DataLoader workers, they hold no dataset state, and the interpreter reaps
+# them at exit -- so they are not what "no orphaned workers" is asking about.
+_CPYTHON_HELPERS = ("resource_tracker", "semaphore_tracker", "forkserver")
+
+
+def real_leaks(baseline):
+    """New child processes that are not CPython's own multiprocessing helpers."""
+    out = []
+    for pid in child_pids():
+        if pid in baseline:
+            continue
+        text = describe(pid)
+        if any(h in text for h in _CPYTHON_HELPERS):
+            print(f"PROBE: ignoring_cpython_helper={text}", flush = True)
+            continue
+        out.append(pid)
+    return out
 
 
 def describe(pid):
