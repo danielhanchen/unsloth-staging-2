@@ -161,6 +161,7 @@ import {
   hasUnclosedThinkTag,
   parseAssistantContent,
 } from "../utils/parse-assistant-content";
+import { createStreamPublishGate } from "../utils/stream-pacing";
 import {
   countReasoningGroups,
   createReasoningDurationTracker,
@@ -4580,6 +4581,10 @@ export function createOpenAIStreamAdapter(
       // Seeded with the partial so the bubble reads as one response; the boundary lets
       // the finalizers re-derive the new output and repair a repeat/restart.
       let cumulativeText = continuation ? continuation.partial : "";
+      // What the gate's cap is measured against. Only grows, unlike
+      // cumulativeText, which the ${...} strip can shorten, and it counts
+      // tool-argument deltas, which never reach cumulativeText at all.
+      let streamedChars = 0;
       const continuationPartial = continuation?.partial ?? "";
       // Local backends (and a self-hosted vLLM / llama-server, which get the flags)
       // resume at the exact token boundary, so their output is already the rest of the
@@ -5405,6 +5410,8 @@ export function createOpenAIStreamAdapter(
             requestedMaxTokens = requestPayload.max_tokens;
             await ThreadAutosaveHandle.awaitFirstSave(resolvedThreadId);
             const stream = streamChatCompletions(requestPayload, runSignal);
+            // Per run, not per module: two turns must not share a cycle.
+            const canPublish = createStreamPublishGate();
 
             for await (const chunk of stream) {
               const chunkModel = (chunk as { model?: unknown }).model;
@@ -5556,6 +5563,7 @@ export function createOpenAIStreamAdapter(
                     const accum =
                       (liveArgsTextById.get(liveId) ?? "") + fragment;
                     liveArgsTextById.set(liveId, accum);
+                    streamedChars += fragment.length;
                     const partial = parseLiveToolArgs(accum);
                     const idx = toolCallParts.findIndex(
                       (p) => p.toolCallId === liveId,
@@ -5569,17 +5577,23 @@ export function createOpenAIStreamAdapter(
                         args: partial.args as ToolCallMessagePart["args"],
                         argsText: partial.argsText,
                       };
-                      yield {
-                        content: liveAssistantContent(),
-                        metadata: {
-                          timing: buildTiming(
-                            streamStartTime,
-                            totalChunks,
-                            firstTokenTime,
-                          ),
-                          custom: liveCustom(),
-                        },
-                      };
+                      // Paced like the text path: this preview repeats per
+                      // argument delta and tool_start replaces it with the
+                      // authoritative parse. The tool events themselves are
+                      // rare and carry the card's state, so those stay ungated.
+                      if (canPublish(streamedChars)) {
+                        yield {
+                          content: liveAssistantContent(),
+                          metadata: {
+                            timing: buildTiming(
+                              streamStartTime,
+                              totalChunks,
+                              firstTokenTime,
+                            ),
+                            custom: liveCustom(),
+                          },
+                        };
+                      }
                     }
                   }
                   continue;
@@ -5964,12 +5978,19 @@ export function createOpenAIStreamAdapter(
                   | { extra_content?: unknown }
                   | undefined
               )?.extra_content;
+              // Replay state, not a preview: a Gemini thought signature or a
+              // Codex reasoning ledger reaches the message only through a yield,
+              // and a Stop while the gate holds one persists a turn that then
+              // replays without it. Pace the previews, never a publish that
+              // carries state.
+              let replayStateChanged = false;
               if (deltaExtraContent && typeof deltaExtraContent === "object") {
                 const extraRecord = deltaExtraContent as Record<string, unknown>;
                 const eGoogle = extraRecord.google;
                 if (eGoogle && typeof eGoogle === "object") {
                   const sig = (eGoogle as Record<string, unknown>).thought_signature;
                   if (typeof sig === "string" && sig) {
+                    replayStateChanged ||= sig !== latestTextThoughtSignature;
                     latestTextThoughtSignature = sig;
                   }
                 }
@@ -5980,6 +6001,7 @@ export function createOpenAIStreamAdapter(
                     codexReasoning,
                     codexRoundToolCallIds,
                   );
+                  replayStateChanged = true;
                 }
               }
 
@@ -6025,6 +6047,11 @@ export function createOpenAIStreamAdapter(
                 rawDeltaToolCalls.length > 0
               ) {
                 closeReasoningContent();
+                // A fragment extending an existing call's arguments is the same
+                // per-delta preview as tool_args, so it is paced the same way.
+                // One that introduces a call always publishes: that is state an
+                // aborted turn would otherwise lose.
+                let addedToolCall = false;
                 for (const tc of rawDeltaToolCalls) {
                   if (!tc || typeof tc !== "object") continue;
                   const call = tc as {
@@ -6062,6 +6089,8 @@ export function createOpenAIStreamAdapter(
                     );
                   }
                   const argsFragment = call.function?.arguments ?? "";
+                  streamedChars +=
+                    argsFragment.length + (call.function?.name?.length ?? 0);
                   if (existing) {
                     const prevName = existing.toolName ?? "";
                     const nextName = call.function?.name ?? prevName;
@@ -6081,6 +6110,16 @@ export function createOpenAIStreamAdapter(
                     }
                     const prevExtra = (existing as PositionedToolCallPart)
                       .extra_content;
+                    if (
+                      call.extra_content !== undefined &&
+                      JSON.stringify(call.extra_content) !==
+                        JSON.stringify(prevExtra)
+                    ) {
+                      // Gemini carries the thought signature on the call
+                      // itself, and the next turn is rejected outright without
+                      // it, so this is state rather than a preview.
+                      replayStateChanged = true;
+                    }
                     const updated: PositionedToolCallPart = {
                       ...(existing as PositionedToolCallPart),
                       toolName: nextName,
@@ -6130,24 +6169,56 @@ export function createOpenAIStreamAdapter(
                       ...(idx !== undefined ? { _delta_index: idx } : {}),
                     };
                     toolCallParts.push(fresh);
+                    addedToolCall = true;
                   }
                 }
-                yield {
-                  content: liveAssistantContent(),
-                  metadata: {
-                    timing: buildTiming(
-                      streamStartTime,
-                      totalChunks,
-                      firstTokenTime,
-                    ),
-                    custom: liveCustom(),
-                  },
-                };
+                if (
+                  addedToolCall ||
+                  replayStateChanged ||
+                  canPublish(streamedChars)
+                ) {
+                  yield {
+                    content: liveAssistantContent(),
+                    metadata: {
+                      timing: buildTiming(
+                        streamStartTime,
+                        totalChunks,
+                        firstTokenTime,
+                      ),
+                      custom: liveCustom(),
+                    },
+                  };
+                }
+                continue;
+              }
+              // A chunk whose ONLY payload is extra_content: Gemini ships a
+              // content-free thoughtSignature fragment, and the Codex client
+              // puts its reasoning ledger on a text-free terminal delta. The
+              // skip below would drop both, so the metadata would reach the
+              // message only if some later chunk happened to publish.
+              if (replayStateChanged && !delta && !reasoning) {
+                const replayContent = liveAssistantContent();
+                if (replayContent.length > 0) {
+                  yield {
+                    content: replayContent,
+                    metadata: {
+                      timing: buildTiming(
+                        streamStartTime,
+                        totalChunks,
+                        firstTokenTime,
+                      ),
+                      custom: liveCustom(),
+                    },
+                  };
+                }
                 continue;
               }
               if (!delta && !reasoning) {
                 continue;
               }
+              // Where this chunk's text starts, so the strip below can be
+              // told from a chunk that genuinely added nothing.
+              const textLenBeforeChunk = cumulativeText.length;
               if (waitingFirstChunk) {
                 waitingFirstChunk = false;
                 firstTokenTime = Date.now() - streamStartTime;
@@ -6170,6 +6241,7 @@ export function createOpenAIStreamAdapter(
                 }
                 cumulativeText += delta;
               }
+              streamedChars += reasoning.length + delta.length;
               // Strip a trailing ${...} template-literal fragment from
               // external streams (mistral magistral occasionally emits one).
               if (isExternalRequest) {
@@ -6208,6 +6280,27 @@ export function createOpenAIStreamAdapter(
                 !hasUnclosedThinkTag(cumulativeText)
               ) {
                 reasoningDurationTracker.finishGroup();
+              }
+
+              // Everything above runs on every arrival. Only the publish is
+              // coalesced, because the cost this is here to remove is what
+              // happens AFTER the yield -- assistant-ui, React, markdown and
+              // paint -- not the rebuild above, which measures in tens of
+              // milliseconds across a whole reply.
+              //
+              // A chunk the strip left with nothing new to show is skipped
+              // outright rather than paced: asking the gate would spend this
+              // cycle's publish on an identical rebuild and hold the next real
+              // chunk until a frame, the timer or the cap.
+              if (
+                !replayStateChanged &&
+                (assistantContent.length === 0 ||
+                  cumulativeText.length === textLenBeforeChunk)
+              ) {
+                continue;
+              }
+              if (!replayStateChanged && !canPublish(streamedChars)) {
+                continue;
               }
 
               if (assistantContent.length > 0) {
