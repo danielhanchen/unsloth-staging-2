@@ -390,6 +390,30 @@ export function applyActiveModelStatusToStore(
         tensorParallel: status.tensor_parallel,
         loadedTensorParallel: status.tensor_parallel,
       }),
+    // The Vision switch is a load knob like tensorParallel above, so it needs the
+    // same reseed and the same "unseeded" guard. Without it the switch is only ever
+    // written by a load this tab performed: reload the page, open another tab, or
+    // restart Studio, and Advanced Settings shows Vision ON over a model that is
+    // running with its projector off. The next Reload model then silently puts the
+    // projector back, undoing the setting and the VRAM it freed with nothing said.
+    // Seeded from disable_vision -- the request the load actually ran with -- rather
+    // than vision_disabled_by_user, which is additionally gated on the model having
+    // a projector to disable and so cannot round-trip the switch on a text-only GGUF.
+    ...(seedLoadParams &&
+      status.disable_vision !== undefined &&
+      (prevState.loadedVisionDisabledByUser === null || hydratingExistingModel) && {
+        disableVision: status.disable_vision,
+      }),
+    // Kept unguarded, unlike the seed above: this is the mirror of the live load that
+    // the composer's image gate reads, not a user setting, so every poll must land.
+    ...(seedLoadParams &&
+      status.vision_disabled_by_user !== undefined && {
+        loadedVisionDisabledByUser: status.vision_disabled_by_user,
+      }),
+    ...(seedLoadParams &&
+      status.vision_on_cpu !== undefined && {
+        loadedVisionOnCpu: status.vision_on_cpu,
+      }),
     // Hydration only, so a steady poll never rewrites settings the store owns.
     // Width, verdict and request move together; a late reply can overwrite a newer one.
     ...(seedLoadParams &&

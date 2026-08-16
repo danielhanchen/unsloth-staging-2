@@ -121,6 +121,7 @@ import {
 import { chatHistoryClearBoundary } from "./utils/chat-history-clear-boundary";
 import { fallbackTitleFromUserText } from "./utils/chat-title";
 import { syncExportedRepositoryToBackend } from "./utils/delete-thread-message";
+import { attachmentRejectionAlreadyToasted } from "./utils/attachment-rejection";
 import { getImageInputUnavailableReason } from "./utils/image-input-support";
 import { isAssistantLocalThreadId } from "./utils/thread-ids";
 
@@ -218,10 +219,11 @@ class VisionImageAdapter implements AttachmentAdapter {
       loadedIsMultimodal: state.loadedIsMultimodal,
       modelLoaded,
       loadError: state.lastModelLoadError,
+      visionDisabledByUser: state.loadedVisionDisabledByUser,
     });
     if (unavailableReason) {
       toast.error(unavailableReason);
-      throw new Error(unavailableReason);
+      throw attachmentRejectionAlreadyToasted(unavailableReason);
     }
 
     const maxSize = 20 * 1024 * 1024;

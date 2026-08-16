@@ -37,6 +37,7 @@ import { WebSearchToolUI } from "@/components/assistant-ui/tool-ui-web-search";
 import { ChatDictationBar } from "@/components/assistant-ui/chat-dictation-bar";
 import {
   attachmentsPastedText,
+  isAttachmentRejectionAlreadyToasted,
   isPastedTextFile,
   pasteClipboardFiles,
   extractYoutubeVideoId,
@@ -2183,9 +2184,23 @@ const Composer: FC<{
       pasteClipboardFiles(
         event,
         async (files) => {
-          await Promise.all(
+          const settled = await Promise.allSettled(
             files.map((file) => aui.composer().addAttachment(file)),
           );
+          // Rejections the adapter has already explained are swallowed here. Letting
+          // them through fires the generic message below on top of the adapter's own,
+          // so pasting a screenshot with Vision switched off used to answer with both
+          // "Vision is turned off for <model>" and a flat contradiction of it -- that
+          // the clipboard item was unsupported, unreadable or too big. The page-wide
+          // drop handler already swallows per-file rejections for the same reason.
+          const unexplained = settled.filter(
+            (result) =>
+              result.status === "rejected" &&
+              !isAttachmentRejectionAlreadyToasted(result.reason),
+          );
+          if (unexplained.length > 0) {
+            throw (unexplained[0] as PromiseRejectedResult).reason;
+          }
         },
         () =>
           toast.error("Could not paste files.", {
@@ -4931,7 +4946,25 @@ const ComposerToolsMenu: FC<{
       const files = (event.target as HTMLInputElement).files;
       if (files) {
         for (const file of files) {
-          void aui.composer().addAttachment(file);
+          aui
+            .composer()
+            .addAttachment(file)
+            .catch((error: unknown) => {
+              // Same split as the paste path. A refusal the adapter has already
+              // toasted (no model loaded, Vision switched off) carries nothing
+              // new, and letting it escape only leaves an unhandled rejection in
+              // the console beside the toast that said everything. The rest --
+              // the 20 MB image cap, an unaccepted file type, a composer with no
+              // attachment support -- reject SILENTLY, so picking one of those
+              // from this menu used to fail with no feedback at all.
+              if (isAttachmentRejectionAlreadyToasted(error)) return;
+              toast.error("Could not attach that file.", {
+                description:
+                  error instanceof Error
+                    ? error.message
+                    : "The file is unsupported, unreadable, or exceeds its size limit.",
+              });
+            });
         }
       }
       document.body.removeChild(input);
