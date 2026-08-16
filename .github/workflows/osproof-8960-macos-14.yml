@@ -1,0 +1,44 @@
+name: "osproof-8960 macos-14"
+on:
+  push:
+    branches: ["pr-8960-osproof-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  probe:
+    runs-on: macos-14
+    timeout-minutes: 45
+    env:
+      TOKENIZERS_PARALLELISM: 'false'
+      HF_HUB_DISABLE_PROGRESS_BARS: '1'
+      UNSLOTH_COMPILE_DISABLE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Report the runner
+        run: |
+          python -c "import sys, platform, multiprocessing as mp; print('sys.platform', sys.platform); print('platform', platform.platform()); print('start methods', mp.get_all_start_methods()); import os; print('cpu_count', os.cpu_count())"
+      - name: Install CPU torch
+        run: |
+          python -m pip install --upgrade pip
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python -m pip install torch
+          else
+            python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          fi
+          python -c "import torch; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+      - name: Install the rest
+        run: python -m pip install "transformers<5" trl datasets accelerate structlog
+      - name: Online tokenization OS proof
+        run: python -u .github/scripts/online_tok_os_probe.py
