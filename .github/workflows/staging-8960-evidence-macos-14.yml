@@ -1,0 +1,44 @@
+name: "staging-8960 evidence macos-14"
+on:
+  push:
+    branches: ["pr-8960-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  evidence:
+    runs-on: macos-14
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      TOKENIZERS_PARALLELISM: 'false'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CPU torch and the training stack
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r studio/backend/requirements/studio.txt || true
+          python -m pip install "torch==2.9.1"
+          python -m pip install "transformers==4.57.6" "trl==0.25.1" "datasets==3.6.0" "accelerate==1.14.0"
+          python -m pip list
+      - name: Report the multiprocessing facts this runner gives us
+        run: |
+          python -c "import multiprocessing, sys; print('platform', sys.platform); print('get_all_start_methods', multiprocessing.get_all_start_methods())"
+      - name: End-to-end CPU training proxy for the online tokenization path
+        run: |
+          python -u scripts/ci/xplat_online_tokenization_probe.py --out probe_macos-14.json --timeout 900
+      - name: Show the probe report
+        if: always()
+        run: cat probe_macos-14.json || echo "no report written"
