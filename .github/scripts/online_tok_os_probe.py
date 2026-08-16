@@ -391,7 +391,7 @@ def describe(pid):
         else:
             out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
                                  capture_output = True, text = True, timeout = 60).stdout
-        return f"{pid}:{out.strip()[:120]}"
+        return f"{pid}:{out.strip()[:400]}"
     except Exception:  # noqa: BLE001
         return f"{pid}:?"
 
