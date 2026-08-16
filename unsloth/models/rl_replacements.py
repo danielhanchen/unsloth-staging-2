@@ -40,6 +40,14 @@ from trl import __version__ as trl_version_raw
 from importlib.metadata import version as importlib_version
 from unsloth_zoo.log import logger
 from unsloth_zoo.device_type import device_synchronize
+
+try:
+    # The device map planner sizes the head's card from the same three values,
+    # so both read them here rather than each deriving its own.
+    from unsloth_zoo.device_map_planner import detect_logit_transforms
+except ImportError:
+    # Older unsloth_zoo. Fall back to reading the fields directly.
+    detect_logit_transforms = None
 import importlib.util
 from ..device_type import (
     is_hip,
@@ -1718,13 +1726,21 @@ def grpo_trainer__get_per_token_logps_and_entropies(function_name, function):
 
             temperature = self.temperature
             model_config = _unsloth_get_model_config(model)
-            logit_softcapping = _unsloth_get_final_logit_softcapping(model)
-            logit_scale_multiply = getattr(model_config, "logit_scale", 0)
-            if logit_scale_multiply is None:
-                logit_scale_multiply = 0
-            logit_scale_divide = getattr(model_config, "logits_scaling", 0)
-            if logit_scale_divide is None:
-                logit_scale_divide = 0
+            if detect_logit_transforms is not None:
+                # model_config, not model: under DDP/Accelerate `model` is a wrapper
+                # that never forwards `.config`, so the helper would read zeros.
+                _transforms = detect_logit_transforms(model_config)
+                logit_softcapping = _transforms["logit_softcapping"]
+                logit_scale_multiply = _transforms["logit_scale_multiply"]
+                logit_scale_divide = _transforms["logit_scale_divide"]
+            else:
+                logit_softcapping = _unsloth_get_final_logit_softcapping(model)
+                logit_scale_multiply = getattr(model_config, "logit_scale", 0)
+                if logit_scale_multiply is None:
+                    logit_scale_multiply = 0
+                logit_scale_divide = getattr(model_config, "logits_scaling", 0)
+                if logit_scale_divide is None:
+                    logit_scale_divide = 0
 
             zipped_inputs = zip(
                 input_ids_chunks,
@@ -2612,6 +2628,15 @@ RL_PRE_ITEMS["grpo_trainer"].append(
     "    except Exception:\n"
     "        UNSLOTH_GRPO_PREFIX_GROUPER_ON = False\n"
 )
+# The inlined grpo functions call detect_logit_transforms, and getsource copies their
+# bodies but not this file's imports, so the generated cache needs its own guarded
+# import or the call raises NameError.
+RL_PRE_ITEMS["grpo_trainer"].append(
+    "try:\n"
+    "    from unsloth_zoo.device_map_planner import detect_logit_transforms\n"
+    "except Exception:\n"
+    "    detect_logit_transforms = None\n"
+)
 
 
 # Edit _get_per_token_logps to handle mixed precision
@@ -2722,13 +2747,23 @@ def grpo_trainer_compute_loss(function_name, function):
 
         # Get logit softcapping and logit scale
         model_config = _unsloth_get_model_config(model)
-        logit_softcapping = _unsloth_get_final_logit_softcapping(model)  # Gemma
-        logit_scale_multiply = getattr(model_config, "logit_scale", 0)  # Cohere
-        if logit_scale_multiply is None:
-            logit_scale_multiply = 0
-        logit_scale_divide = getattr(model_config, "logits_scaling", 0)  # Granite
-        if logit_scale_divide is None:
-            logit_scale_divide = 0
+        # Same source as _get_per_token_logps_and_entropies: the old and reference
+        # logps come from there and the gradient logps from here, so both have to read
+        # the transforms the same way or the ratio compares two different policies.
+        if detect_logit_transforms is not None:
+            # model_config, not model: see _get_per_token_logps_and_entropies.
+            _transforms = detect_logit_transforms(model_config)
+            logit_softcapping = _transforms["logit_softcapping"]
+            logit_scale_multiply = _transforms["logit_scale_multiply"]
+            logit_scale_divide = _transforms["logit_scale_divide"]
+        else:
+            logit_softcapping = _unsloth_get_final_logit_softcapping(model)  # Gemma
+            logit_scale_multiply = getattr(model_config, "logit_scale", 0)  # Cohere
+            if logit_scale_multiply is None:
+                logit_scale_multiply = 0
+            logit_scale_divide = getattr(model_config, "logits_scaling", 0)  # Granite
+            if logit_scale_divide is None:
+                logit_scale_divide = 0
 
         max_left_pad = inputs.get("max_left_pad", 0)
         if per_token_logps is not None:
