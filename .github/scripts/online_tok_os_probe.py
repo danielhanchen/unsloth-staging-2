@@ -14,7 +14,8 @@ import subprocess
 import sys
 import time
 
-REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+REPO = os.environ.get("PROBE_REPO") or os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.join(REPO, "studio", "backend"))
 
 BATCH = 2
@@ -53,6 +54,9 @@ def main():
         trl_supports_skip_prepare_dataset,
     )
 
+    baseline = set(child_pids())
+    emit("baseline_children", len(baseline))
+
     emit("torch", torch.__version__)
     emit("transformers", transformers.__version__)
     emit("trl", trl.__version__)
@@ -79,6 +83,7 @@ def main():
     train_dataset = Dataset.from_dict({"text": rows})
     eval_dataset = Dataset.from_dict({"text": rows[:8]})
     emit("train_rows", len(train_dataset))
+    emit("cpu_count", os.cpu_count())
     emit("resolve_worker_count", resolve_worker_count())
 
     # 3. the same gate call trainer.py makes for a plain-text run
@@ -218,16 +223,103 @@ def main():
     emit("b_final_loss", float(b_result.training_loss))
     b_losses = [h["loss"] for h in b_trainer.state.log_history if "loss" in h]
     emit("b_loss_stream", ",".join(f"{v:.4f}" for v in b_losses))
-    # same rows, same tokenizer, same seed as phase A -> the lazy view at 0 workers
-    # must train identically to the lazy view behind 4 workers
-    emit("b_matches_phase_a", abs(OUT["b_final_loss"] - OUT["final_loss"]) < 1e-6)
+    if decision.enabled:
+        # phase A was the same lazy view behind N workers, so at 0 workers it must
+        # train identically. When phase A was eager the two are not comparable:
+        # TRL's eager prepare appends EOS, so the row widths differ by design.
+        emit("b_matches_phase_a", abs(OUT["b_final_loss"] - OUT["final_loss"]) < 1e-6)
 
     # 4. no orphaned children left behind
     time.sleep(2)
-    kids = child_pids()
+    kids = [p for p in child_pids() if p not in baseline]
     emit("child_processes_after", len(kids))
     if kids:
         emit("child_pids", ",".join(str(p) for p in kids))
+        emit("child_cmdlines", " | ".join(describe(p) for p in kids))
+
+    # PHASE C: ask for the workers explicitly, bypassing only the host-sizing
+    # heuristic (a 4-vCPU CI runner resolves to 1 worker, under MIN_ONLINE_WORKERS,
+    # so phase A never exercises the online path here). Every correctness gate still
+    # applies, so on a spawn platform this must STILL be vetoed -- which is the
+    # point: asking for workers must not be able to talk Windows into forking any.
+    c_decision = decide_online_tokenization(
+        dataset = train_dataset,
+        eval_dataset = eval_dataset,
+        processing_class = tokenizer,
+        model = model,
+        text_field = "text",
+        packing = False,
+        is_vlm = False,
+        is_audio = False,
+        is_audio_vlm = False,
+        is_deepseek_ocr = False,
+        is_cpt = False,
+        raw_text_mode = False,
+        has_custom_collator = False,
+        train_on_completions = False,
+        dataset_streaming = False,
+        num_train_epochs = 1,
+        max_steps = MAX_STEPS,
+        grad_accum = GRAD_ACCUM,
+        resolved_max_steps_epochs = (MAX_STEPS * BATCH * GRAD_ACCUM) / len(train_dataset),
+        workers = 2,
+    )
+    emit("c_decision_enabled", bool(c_decision.enabled))
+    emit("c_decision_reason", c_decision.reason)
+    emit("c_decision_workers", int(getattr(c_decision, "workers", 0) or 0))
+    emit("c_path_taken", "online" if c_decision.enabled else "eager")
+
+    if c_decision.enabled:
+        c_view = attach_online_tokenization(
+            train_dataset,
+            tokenizer = tokenizer,
+            text_field = "text",
+            max_length = MAX_LENGTH,
+            add_special_tokens = b_add,
+        )
+        c_args = dict(config_args)
+        c_args["output_dir"] = os.path.join(REPO, "probe_out_c")
+        c_args.update(online_config_args(c_decision))
+        c_model = AutoModelForCausalLM.from_pretrained(model_id)
+        c_trainer = SFTTrainer(
+            model = c_model,
+            processing_class = tokenizer,
+            train_dataset = c_view,
+            args = SFTConfig(**c_args),
+        )
+        emit("c_dataloader_num_workers", int(c_trainer.args.dataloader_num_workers))
+        c_prewarm = int(getattr(c_decision, "prewarm_batches", 0) or 0)
+        emit("c_prewarm_batches", c_prewarm)
+        emit("c_memoized", bool(memoize_train_dataloader(c_trainer)))
+        c_loader = c_trainer.get_train_dataloader()
+        c_iter = iter(c_loader)
+        c_drained = 0
+        for _ in range(max(1, c_prewarm)):
+            try:
+                next(c_iter)
+                c_drained += 1
+            except StopIteration:
+                break
+        emit("c_prewarm_batches_drained", c_drained)
+        del c_iter, c_loader
+        c_result = c_trainer.train()
+        emit("c_steps_completed", int(c_trainer.state.global_step))
+        emit("c_final_loss", float(c_result.training_loss))
+        c_losses = [h["loss"] for h in c_trainer.state.log_history if "loss" in h]
+        emit("c_loss_stream", ",".join(f"{v:.4f}" for v in c_losses))
+        emit("c_workers_released", int(release_train_dataloader(c_trainer)))
+        # N forked workers must produce exactly what 0 workers produced in phase B
+        emit("c_matches_phase_b", abs(OUT["c_final_loss"] - OUT["b_final_loss"]) < 1e-6)
+
+    # final scan, after every arm has run and released
+    time.sleep(3)
+    kids = [p for p in child_pids() if p not in baseline]
+    emit("child_processes_after", len(kids))
+    OUT.pop("child_cmdlines", None)
+    OUT.pop("child_pids", None)
+    if kids:
+        emit("child_pids", ",".join(str(p) for p in kids))
+        emit("child_cmdlines", " | ".join(describe(p) for p in kids))
 
     ok = (
         OUT["steps_completed"] == MAX_STEPS
@@ -237,15 +329,51 @@ def main():
         and OUT["b_steps_completed"] == MAX_STEPS
         and OUT["b_dataloader_num_workers"] == 0
         and OUT["b_final_loss"] == OUT["b_final_loss"]
+        and OUT.get("b_matches_phase_a", True)
     )
     if OUT["decision_enabled"]:
         # the online path must hand back the workers it forked
         ok = ok and OUT["workers_released"] > 0
     if sys.platform in ("win32", "darwin"):
-        ok = ok and not OUT["decision_enabled"] and OUT["args_dataloader_num_workers"] == 0
+        # the gate must decline on both phases, and no path may ask for a worker
+        ok = (
+            ok
+            and not OUT["decision_enabled"]
+            and OUT["args_dataloader_num_workers"] == 0
+            and not OUT["c_decision_enabled"]
+            and OUT["dataloader_worker_start_method"] == "spawn"
+            and OUT["platform_supports_dataloader_workers"] is False
+        )
+    else:
+        # on a fork platform the explicitly-sized arm must really run online
+        ok = (
+            ok
+            and OUT["c_decision_enabled"]
+            and OUT["c_dataloader_num_workers"] == 2
+            and OUT["c_steps_completed"] == MAX_STEPS
+            and OUT["c_prewarm_batches_drained"] > 0
+            and OUT["c_workers_released"] == 2
+            and OUT["c_matches_phase_b"]
+        )
     emit("probe_ok", ok)
     print("PROBE_JSON " + json.dumps(OUT), flush = True)
     return 0 if ok else 1
+
+
+def describe(pid):
+    """Best-effort command line for a surviving child, for the log."""
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 f"(Get-CimInstance Win32_Process -Filter 'ProcessId={pid}').CommandLine"],
+                capture_output = True, text = True, timeout = 120).stdout
+        else:
+            out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+                                 capture_output = True, text = True, timeout = 60).stdout
+        return f"{pid}:{out.strip()[:120]}"
+    except Exception:  # noqa: BLE001
+        return f"{pid}:?"
 
 
 def child_pids():
@@ -255,13 +383,15 @@ def child_pids():
         if sys.platform == "win32":
             # wmic is deprecated and absent on newer Windows images; CIM is the
             # supported replacement.
-            out = subprocess.run(
+            proc = subprocess.Popen(
                 ["powershell", "-NoProfile", "-Command",
                  f"(Get-CimInstance Win32_Process -Filter 'ParentProcessId={me}')"
                  ".ProcessId"],
-                capture_output = True, text = True, timeout = 120,
-            ).stdout
-            return [int(t) for t in out.split() if t.isdigit() and int(t) != me]
+                stdout = subprocess.PIPE, stderr = subprocess.DEVNULL, text = True,
+            )
+            out = proc.communicate(timeout = 120)[0]
+            return [int(t) for t in out.split()
+                    if t.isdigit() and int(t) not in (me, proc.pid)]
         # Popen, not run: the `ps` process is itself a child of this one and would
         # otherwise be counted as a leaked worker.
         proc = subprocess.Popen(
