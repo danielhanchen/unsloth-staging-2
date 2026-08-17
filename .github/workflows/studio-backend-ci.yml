@@ -129,7 +129,7 @@ jobs:
         #   - test_returns_cuda_when_cuda_available / test_calls_cuda_cache_when_cuda:
         #       assume CUDA-capable GPU
         run: |
-          python -m pytest tests/ -q --tb=short \
+          python -m pytest tests/ -q --tb=short --durations=45 \
             --ignore=tests/test_studio_api.py \
             -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda'
 
@@ -235,7 +235,7 @@ jobs:
         # because those files mutate hardware.py module globals, and all three already measure
         # under 0.1 minutes on the runner, so there is nothing to win and isolation to lose.
         run: |
-          python -m pytest tests/ -q --tb=short -n 4 \
+          python -m pytest tests/ -q --tb=short -n 4 --durations=45 \
             --ignore=tests/qlora \
             --ignore=tests/saving \
             --ignore=tests/utils \
