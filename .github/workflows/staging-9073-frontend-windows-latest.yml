@@ -1,0 +1,43 @@
+name: "staging-9073 frontend windows-latest"
+on:
+  push:
+    branches: ["pr-9073-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+    working-directory: studio/frontend
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out with the repo's own line endings
+        run: git config --global core.autocrlf false
+        working-directory: .
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --no-fund --no-audit
+      # Build-side gates first. A red unit test elsewhere in the suite must not
+      # decide whether the build and its budget ever ran on this OS: the job
+      # stops at the first failing step, and on Windows an unrelated pre-existing
+      # failure hid all three.
+      - run: npm run typecheck
+      - run: npm run build
+      - name: Startup bundle budget (when the branch has one)
+        run: |
+          if node -e "process.exit(require('./package.json').scripts['bundle:check'] ? 0 : 1)"; then
+            npm run bundle:check
+          else
+            echo "no bundle:check script on this branch; nothing to run"
+          fi
+      - run: npm test
