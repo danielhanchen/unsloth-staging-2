@@ -1,0 +1,37 @@
+name: "PR-9087 delete-thread-message linux"
+on:
+  push:
+    branches: [pr-9087-g1-ci]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  unit:
+    name: npm test on linux (node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.12', '24']
+    defaults:
+      run:
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - name: The new delete-thread-message cases on their own
+        run: node --experimental-strip-types --test tests/delete-thread-message.test.ts
+      - name: The whole frontend unit suite
+        run: npm test
