@@ -213,3 +213,5 @@ export async function fetchDeviceType(options?: {
 
   return usePlatformStore.getState().deviceType;
 }
+
+// staging-only baseline marker (no functional change)

@@ -2383,3 +2383,5 @@ def setup_frontend(
         return _build_index_response(request)
 
     return True
+
+# staging-only baseline marker (no functional change)
