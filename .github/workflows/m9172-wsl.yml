@@ -1,0 +1,76 @@
+name: "m9172-wsl"
+on:
+  push:
+    branches: ["pr-9172-matrix-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Provision WSL (Ubuntu-24.04)
+        id: wsl
+        continue-on-error: true
+        uses: Vampire/setup-wsl@v7
+        with:
+          distribution: Ubuntu-24.04
+          wsl-version: 2
+          additional-packages: python3 python3-pip python3-venv
+
+      - name: Say plainly whether WSL came up
+        run: |
+          echo "setup-wsl outcome: ${{ steps.wsl.outcome }}"
+          wsl --status || true
+          wsl --list --verbose || true
+
+      - name: Deps inside WSL
+        if: steps.wsl.outcome == 'success'
+        shell: wsl-bash {0}
+        run: |
+          python3 -m venv /tmp/venv
+          . /tmp/venv/bin/activate
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install python-multipart aiofiles sqlalchemy cryptography psutil \
+            pyyaml jinja2 mammoth unpdf requests typer 'numpy<3' \
+            pytest pytest-asyncio pytest-timeout pytest-xdist httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple 'torch>=2.4,<2.11' \
+            || pip install 'torch>=2.4,<2.11' \
+            || echo "NOTE: no torch wheel for this runner"
+          pip install 'transformers>=4.51,<5.5' || echo "NOTE: transformers unavailable on this runner"
+
+      - name: Named files inside WSL (strict)
+        id: named
+        continue-on-error: true
+        if: steps.wsl.outcome == 'success'
+        shell: wsl-bash {0}
+        run: |
+          . /tmp/venv/bin/activate
+          cd studio/backend
+          python -m pytest tests/test_tp_vision_regression.py tests/test_tensor_parallel.py tests/test_vram_budget_settings.py tests/test_metal_explicit_context_guard.py tests/test_health_reports_unified_memory.py -q --tb=short -k "not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda"
+
+      - name: Full studio/backend suite inside WSL (diagnostic)
+        if: steps.wsl.outcome == 'success'
+        shell: wsl-bash {0}
+        run: |
+          . /tmp/venv/bin/activate
+          cd studio/backend
+          python -m pytest tests -q --tb=line -n 4 -k "not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda" \
+            > full_out.txt 2>&1 || true
+          tail -60 full_out.txt

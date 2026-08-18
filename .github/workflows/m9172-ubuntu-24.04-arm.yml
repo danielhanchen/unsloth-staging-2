@@ -1,0 +1,79 @@
+name: "m9172-ubuntu-24.04-arm"
+on:
+  push:
+    branches: ["pr-9172-matrix-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps (same set on both branches)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install python-multipart aiofiles sqlalchemy cryptography psutil \
+            pyyaml jinja2 mammoth unpdf requests typer 'numpy<3' \
+            pytest pytest-asyncio pytest-timeout pytest-xdist httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu \
+            --extra-index-url https://pypi.org/simple 'torch>=2.4,<2.11' \
+            || pip install 'torch>=2.4,<2.11' \
+            || echo "NOTE: no torch wheel for this runner"
+          pip install 'transformers>=4.51,<5.5' || echo "NOTE: transformers unavailable on this runner"
+
+      - name: Report what this host actually is
+        run: |
+          python - <<'PY'
+          import platform, sys, importlib.util
+          print("PLATFORM", platform.system(), platform.machine(), platform.release())
+          print("PYTHON", sys.version.split()[0])
+          def present(mod):
+              # find_spec RAISES ModuleNotFoundError for a submodule whose parent is
+              # absent, so a plain truth test dies on every host without mlx.
+              try:
+                  return importlib.util.find_spec(mod) is not None
+              except (ImportError, ValueError):
+                  return False
+          for mod in ("torch", "transformers", "mlx", "mlx.core", "psutil"):
+              print("MODULE", mod, "present" if present(mod) else "ABSENT")
+          PY
+
+      - name: Named files (strict)
+        id: named
+        continue-on-error: true
+        run: |
+          cd studio/backend
+          python -m pytest tests/test_tp_vision_regression.py tests/test_tensor_parallel.py tests/test_vram_budget_settings.py tests/test_metal_explicit_context_guard.py tests/test_health_reports_unified_memory.py -q --tb=short -k "not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda"
+
+      - name: Full studio/backend suite (diagnostic, never gates)
+        if: always()
+        run: |
+          cd studio/backend
+          python -m pytest tests -q --tb=line -n 4 -k "not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda" \
+            > full_out.txt 2>&1 || true
+          tail -80 full_out.txt
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: m9172-ubuntu-24.04-arm-pr-9172-matrix-ci
+          path: studio/backend/full_out.txt
