@@ -491,7 +491,10 @@ jobs:
           serial_wall=$((SECONDS-s))
 
           s=$SECONDS
-          python -m pytest -q --tb=no -rfs $D -n 4 --dist loadfile tests/ > /tmp/xdist.txt 2>&1 || true
+          # --tb=line on the parallel pass only: the 14 xdist-only failures are
+          # self-contained when run alone, so the cause is another file running
+          # first on the same worker. The traceback names it.
+          python -m pytest -q --tb=line -rfs $D -n 4 --dist loadfile tests/ > /tmp/xdist.txt 2>&1 || true
           xdist_wall=$((SECONDS-s))
 
           grep -oE '^FAILED [^ ]+' /tmp/serial.txt | sed 's/^FAILED //' | sort -u > /tmp/s.txt
@@ -499,6 +502,7 @@ jobs:
 
           echo "=============== SERIAL ==============="; tail -3 /tmp/serial.txt
           echo "=============== XDIST -n 4 ==========="; tail -3 /tmp/xdist.txt
+          echo "=============== XDIST TRACEBACKS ==============="; grep -E "^/|^tests/" /tmp/xdist.txt | head -40
           echo "======================================"
           echo "serial   ${serial_wall}s, $(wc -l < /tmp/s.txt) distinct failures"
           echo "xdist    ${xdist_wall}s, $(wc -l < /tmp/x.txt) distinct failures"
