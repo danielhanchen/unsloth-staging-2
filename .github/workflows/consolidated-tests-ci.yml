@@ -464,10 +464,62 @@ jobs:
         # here unblocks unsloth CI until the loader fixture is fixed.
         working-directory: ${{ runner.temp }}/unsloth-zoo
         run: |
-          python -m pytest -q --tb=short tests/ \
-            --deselect tests/test_unsloth_zoo_lora_merge.py::test_active_merge_device_returns_string_on_cuda_host \
-            --deselect tests/test_unsloth_zoo_lora_merge.py::test_merge_lora_moves_cpu_inputs_to_active_device \
-            --deselect tests/test_mlx_finetune_last_n_layers.py::test_get_peft_model_passes_finetune_last_n_layers_through
+          # EXPERIMENT, staging only. Runs the suite twice -- serial, then
+          # -n 4 --dist loadfile -- and diffs the outcomes. The question is
+          # whether parallelising it changes what it proves, NOT how fast it is;
+          # the timings are reported as a bonus.
+          #
+          # loadfile rather than the default `load` because 34 of the 236 zoo
+          # test files touch sys.modules or importlib.reload, so tests within a
+          # file have to stay on one worker and in order.
+          #
+          # Measured locally at 507s -> 163s, but with SIX extra failures and
+          # twelve extra collection errors. That box has a GPU and 192 cores and
+          # four concurrent bitsandbytes CUDA probes contend on it, which this
+          # GPU-less 4-core runner does not have -- so the local result cannot
+          # tell order-dependence apart from contention. This can.
+          python -m pip install -q pytest-xdist
+
+          D="--deselect tests/test_unsloth_zoo_lora_merge.py::test_active_merge_device_returns_string_on_cuda_host
+             --deselect tests/test_unsloth_zoo_lora_merge.py::test_merge_lora_moves_cpu_inputs_to_active_device
+             --deselect tests/test_mlx_finetune_last_n_layers.py::test_get_peft_model_passes_finetune_last_n_layers_through"
+
+          # Neither run may abort the step: a red suite is a legitimate outcome
+          # here and the diff is the deliverable either way.
+          s=$SECONDS
+          python -m pytest -q --tb=no -rfs $D tests/ > /tmp/serial.txt 2>&1 || true
+          serial_wall=$((SECONDS-s))
+
+          s=$SECONDS
+          # --tb=line on the parallel pass only: the 14 xdist-only failures are
+          # self-contained when run alone, so the cause is another file running
+          # first on the same worker. The traceback names it.
+          python -m pytest -q --tb=line -rfs $D -n 4 --dist loadfile tests/ > /tmp/xdist.txt 2>&1 || true
+          xdist_wall=$((SECONDS-s))
+
+          grep -oE '^FAILED [^ ]+' /tmp/serial.txt | sed 's/^FAILED //' | sort -u > /tmp/s.txt
+          grep -oE '^FAILED [^ ]+' /tmp/xdist.txt  | sed 's/^FAILED //' | sort -u > /tmp/x.txt
+
+          echo "=============== SERIAL ==============="; tail -3 /tmp/serial.txt
+          echo "=============== XDIST -n 4 ==========="; tail -3 /tmp/xdist.txt
+          echo "=============== XDIST TRACEBACKS ==============="; grep -E "^/|^tests/" /tmp/xdist.txt | head -40
+          echo "======================================"
+          echo "serial   ${serial_wall}s, $(wc -l < /tmp/s.txt) distinct failures"
+          echo "xdist    ${xdist_wall}s, $(wc -l < /tmp/x.txt) distinct failures"
+          # 10 tests moved skipped -> passed on the first run. More coverage, not
+          # less, but it means something about the order changed what they decided,
+          # so name them rather than accept the totals.
+          grep -oE '^SKIPPED \[[0-9]+\] [^:]+' /tmp/serial.txt | sed 's/^SKIPPED \[[0-9]*\] //' | sort -u > /tmp/ss.txt
+          grep -oE '^SKIPPED \[[0-9]+\] [^:]+' /tmp/xdist.txt  | sed 's/^SKIPPED \[[0-9]*\] //' | sort -u > /tmp/xs.txt
+          echo "=============== SKIP DIFF (< serial only, > xdist only) ==============="
+          diff /tmp/ss.txt /tmp/xs.txt && echo "identical skip sets"
+
+          echo "=============== DIFF (< serial only, > xdist only) ==============="
+          if diff /tmp/s.txt /tmp/x.txt; then
+            echo "IDENTICAL FAILURE SETS -- parallelising does not change what the suite proves"
+          else
+            echo "DIVERGENT -- the two runs do not agree, so loadfile is not safe as-is"
+          fi
 
       - name: unsloth_zoo — test_apply_fused_lm_head (lives in compiler.py)
         # `test_apply_fused_lm_head` lives at unsloth_zoo/compiler.py:1983,
