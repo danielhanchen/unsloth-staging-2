@@ -487,11 +487,11 @@ jobs:
           # Neither run may abort the step: a red suite is a legitimate outcome
           # here and the diff is the deliverable either way.
           s=$SECONDS
-          python -m pytest -q --tb=no -rf $D tests/ > /tmp/serial.txt 2>&1 || true
+          python -m pytest -q --tb=no -rfs $D tests/ > /tmp/serial.txt 2>&1 || true
           serial_wall=$((SECONDS-s))
 
           s=$SECONDS
-          python -m pytest -q --tb=no -rf $D -n 4 --dist loadfile tests/ > /tmp/xdist.txt 2>&1 || true
+          python -m pytest -q --tb=no -rfs $D -n 4 --dist loadfile tests/ > /tmp/xdist.txt 2>&1 || true
           xdist_wall=$((SECONDS-s))
 
           grep -oE '^FAILED [^ ]+' /tmp/serial.txt | sed 's/^FAILED //' | sort -u > /tmp/s.txt
@@ -502,6 +502,14 @@ jobs:
           echo "======================================"
           echo "serial   ${serial_wall}s, $(wc -l < /tmp/s.txt) distinct failures"
           echo "xdist    ${xdist_wall}s, $(wc -l < /tmp/x.txt) distinct failures"
+          # 10 tests moved skipped -> passed on the first run. More coverage, not
+          # less, but it means something about the order changed what they decided,
+          # so name them rather than accept the totals.
+          grep -oE '^SKIPPED \[[0-9]+\] [^:]+' /tmp/serial.txt | sed 's/^SKIPPED \[[0-9]*\] //' | sort -u > /tmp/ss.txt
+          grep -oE '^SKIPPED \[[0-9]+\] [^:]+' /tmp/xdist.txt  | sed 's/^SKIPPED \[[0-9]*\] //' | sort -u > /tmp/xs.txt
+          echo "=============== SKIP DIFF (< serial only, > xdist only) ==============="
+          diff /tmp/ss.txt /tmp/xs.txt && echo "identical skip sets"
+
           echo "=============== DIFF (< serial only, > xdist only) ==============="
           if diff /tmp/s.txt /tmp/x.txt; then
             echo "IDENTICAL FAILURE SETS -- parallelising does not change what the suite proves"
