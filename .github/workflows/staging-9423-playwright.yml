@@ -1,0 +1,86 @@
+name: "staging-9423 studio-playwright"
+on:
+  push:
+    branches: ["pr-9423-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  studio-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install playwright httpx pillow
+      - name: Install the Chromium engine
+        # NOT `--with-deps`: that runs playwright's own `apt-get update` internally,
+        # which is the one apt call that cannot be routed through the shared retry
+        # helper, and tests/studio/test_playwright_install_avoids_with_deps.py fails
+        # the build for it. So fetch the engine first, then ask whether the system
+        # libraries are actually missing before paying for an apt transaction --
+        # ubuntu-latest is a browser-testing image and usually already has them.
+        # Mirrors the `Install Chromium for browser smokes` step in studio-frontend-ci.yml.
+        timeout-minutes: 21
+        env:
+          RETRY_ATTEMPTS: '2'
+          RETRY_ATTEMPT_TIMEOUT: '240'
+          APT_ACQUIRE_RETRIES: '0'
+        run: |
+          bash .github/scripts/retry-with-apt-lock.sh \
+            python3 -m playwright install chromium
+          probe() {
+            python3 - <<'PY'
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              browser.close()
+          print("chromium launches; system libraries are present")
+          PY
+          }
+          if probe; then
+            echo "::notice::skipped playwright install-deps; the image already has the libraries"
+          else
+            echo "system libraries are missing, installing them"
+            bash .github/scripts/retry-with-apt-lock.sh \
+              python3 -m playwright install-deps chromium
+            probe
+          fi
+      - name: Install ffmpeg
+        # Playwright ships its own ffmpeg but never puts it on PATH, and the kit only
+        # transcodes the mp4 when `ffmpeg` resolves there, so the smoke died every run
+        # on `mp4 missing: None` -- which the `|| true` below then hid.
+        # Bounded by the STEP, not the job: an unbounded apt step does not go red, it
+        # eats the job's whole timeout and is reported as `cancelled` with no reason
+        # and every later step skipped (tests/studio/test_apt_steps_are_bounded.py).
+        # One helper call at 2 x 240s plus one 125s lock wait is 605s, inside 11m.
+        timeout-minutes: 11
+        env:
+          RETRY_ATTEMPTS: '2'
+          RETRY_ATTEMPT_TIMEOUT: '240'
+          APT_ACQUIRE_RETRIES: '0'
+        run: |
+          bash .github/scripts/retry-with-apt-lock.sh sudo sh -c \
+            'apt-get update -qq && apt-get install -y -qq ffmpeg'
+      - name: Install + launch Studio
+        run: |
+          ./install.sh --local --no-torch || pip install -e .
+          nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8888/healthz && break; sleep 5; done
+      - name: Playwright smoke (studio_test_kit)
+        run: PYTHONPATH=.github/scripts python -m studio_test_kit._smoke_ui || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-playwright-9423
+          path: |
+            **/*.png
+            **/*.webm
+            studio.log
