@@ -43,7 +43,7 @@ from core.inference.providers import (
 from core.inference.pricing import pricing_snapshot
 from core.inference.external_provider import ExternalProviderClient
 
-from core.inference import openai_codex_auth
+from core.inference import openai_codex_auth, openai_codex_client
 from models.providers import (
     ProviderCreate,
     ProviderCredentialMigration,
@@ -102,6 +102,9 @@ def _validate_provider_auth_contract(
     models: list[str] | None,
     updating: bool,
     clear_api_key: bool = False,
+    provider_id: str | None = None,
+    persisted_models: list[str] | None = None,
+    validated_account: str | None = None,
 ) -> None:
     if info.get("auth_kind") != "chatgpt_oauth":
         return
@@ -109,7 +112,31 @@ def _validate_provider_auth_contract(
         raise HTTPException(status_code = 400, detail = "ChatGPT subscriptions do not use API keys.")
     if base_url is not None and (not updating or base_url != info["base_url"]):
         raise HTTPException(status_code = 400, detail = "ChatGPT subscription routing is fixed.")
-    if models is not None and (not models or not set(models).issubset(set(info["default_models"]))):
+    if models is None:
+        return
+    # Same order of evidence the chat route uses, so a save cannot persist a model that
+    # every send would then refuse: the plan's catalog once it is known, otherwise the
+    # seed, plus what this row already carries unless it was left by another account.
+    if provider_id and openai_codex_client.subscription_catalog_known(provider_id):
+        allowed = openai_codex_client.offered_subscription_model_ids(provider_id) | {
+            slug
+            for slug in (persisted_models or [])
+            if openai_codex_client.offered_subscription_model(provider_id, slug) is not None
+        }
+    else:
+        allowed = set(info["default_models"])
+        proven = not provider_id or openai_codex_client.saved_models_proven_for(
+            provider_id, validated_account
+        )
+        if (
+            persisted_models
+            and proven
+            and not (provider_id and openai_codex_client.subscription_catalog_stale(provider_id))
+        ):
+            # Already accepted on this row once, so an upstream outage must not make an
+            # unrelated edit such as a rename unsavable.
+            allowed |= set(persisted_models)
+    if not models or not set(models).issubset(allowed):
         raise HTTPException(status_code = 400, detail = "Choose only curated Codex models.")
 
 
@@ -278,6 +305,40 @@ async def update_provider_config(
         max_output_tokens_requested,
         payload.max_output_tokens,
     )
+    persisted_models = list(existing.get("models") or [])
+    # One reading of who owns this connection, used for every decision in this request:
+    # a second lookup later could name a different account than the one the selection was
+    # actually judged against.
+    validated_account: str | None = None
+    if existing_info.get("auth_kind") == "chatgpt_oauth":
+        # The OAuth bundle is shared through the installation DB while the catalog is per
+        # process, so another worker may have rebound this connection. The chat route
+        # makes the same check; without it here a save would persist exactly what every
+        # send then refuses.
+        current_bundle = openai_codex_auth.load_oauth_bundle(provider_id)
+        validated_account = current_bundle.get("account_id") if current_bundle else None
+        current_account = validated_account
+        if current_account and not openai_codex_client.subscription_catalog_matches_account(
+            provider_id, current_account
+        ):
+            openai_codex_client.forget_subscription_models(provider_id)
+            openai_codex_client.mark_subscription_catalog_stale(provider_id)
+    if existing_info.get("auth_kind") == "chatgpt_oauth" and payload.models:
+        # Only a slug that is neither seeded nor already saved here needs the plan
+        # catalog. Reaching upstream for the others would make an ordinary save wait out
+        # the 20s connect / 120s read timeout whenever ChatGPT is unreachable, and would
+        # fail an unrelated edit to a connection whose selection was accepted long ago.
+        unproven = (
+            set(payload.models) - set(existing_info["default_models"]) - set(persisted_models)
+        )
+        if unproven:
+            try:
+                await openai_codex_client.ensure_subscription_models(provider_id)
+            except (
+                openai_codex_auth.CodexAuthError,
+                openai_codex_client.CodexReauthorizationError,
+            ) as exc:
+                raise HTTPException(status_code = 401, detail = str(exc)) from exc
     _validate_provider_auth_contract(
         existing_info,
         encrypted_api_key = payload.encrypted_api_key,
@@ -285,6 +346,9 @@ async def update_provider_config(
         models = payload.models,
         updating = True,
         clear_api_key = payload.clear_api_key,
+        provider_id = provider_id,
+        persisted_models = persisted_models,
+        validated_account = validated_account,
     )
 
     if payload.clear_api_key and payload.encrypted_api_key:
@@ -362,6 +426,15 @@ async def update_provider_config(
         raise HTTPException(status_code = 400, detail = "No fields to update")
 
     row = providers_db.get_provider(provider_id)
+    if existing_info.get("auth_kind") == "chatgpt_oauth" and payload.models is not None:
+        # Record the proof here rather than when a catalog is read: reading one only
+        # shows which account answered, while this is the point where the row's models
+        # were actually judged against it and stored.
+        # The account the selection was judged against, not whatever owns the connection
+        # by now. remember_catalog_account re-reads under the guard and declines to write
+        # when the bundle has moved on, so a rebind in between records nothing.
+        if validated_account:
+            await openai_codex_auth.remember_catalog_account(provider_id, validated_account)
     return _provider_response(row)
 
 
@@ -441,6 +514,15 @@ async def delete_provider_config(
                         "provider.delete_credential_rollback_failed", provider_id = provider_id
                     )
                 raise
+            # The plan catalog is held per connection in this process and is only
+            # released by forget_subscription_models. Disconnecting the OAuth bundle
+            # calls it, deleting the whole connection did not, so every ChatGPT
+            # connection a user removed left its catalog, its account marker and its
+            # request ticket behind for the life of the process. Ids come from uuid4 and
+            # are never reused, so nothing stale could be consulted again; it simply
+            # accumulated. Released here, after the row is gone for good, so a rolled
+            # back delete keeps the catalog it is about to need again.
+            openai_codex_client.forget_subscription_models(provider_id)
 
 
 def _bind_saved_provider_target(payload):
