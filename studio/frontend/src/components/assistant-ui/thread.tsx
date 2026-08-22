@@ -1737,6 +1737,7 @@ export const Thread: FC<{
         onDragLeave={onDragLeave}
         onDrop={onDrop}
       >
+        <span data-parity-probe="v2" hidden />
         <IntentAwareScrollProvider value={autoScrollContext}>
           <ThreadPrimitive.Viewport
             ref={composedViewportRef}
