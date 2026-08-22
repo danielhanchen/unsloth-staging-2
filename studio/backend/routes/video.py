@@ -740,3 +740,5 @@ async def clear_gallery_videos(current_subject: str = Depends(get_current_subjec
     # Clear-all takes the terminal record's clip with it whatever its id.
     _forget_terminal_video(None)
     return {"removed": removed}
+
+# Gate probe: a Python-only change outside the UI-parity path filter.
