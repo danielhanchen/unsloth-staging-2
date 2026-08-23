@@ -31,10 +31,13 @@ from _node_harness import (
 ADAPTER = source_path("studio/frontend/src/features/chat/api/chat-adapter.ts")
 CODEX = source_path("studio/frontend/src/features/chat/codex-reasoning.ts")
 CONTINUATION = source_path("studio/frontend/src/features/chat/utils/continuation.ts")
+# sanitizeAssistantReplayText strips web-search image tokens before replay (#9490), so
+# the real stripper has to come along or the slice references a name that is not there.
+SEARCH_IMAGES = source_path("studio/frontend/src/features/chat/search-images/search-images.ts")
 
 TEMP = WORKDIR / "temp" / "cancelled_turn_history_prune"
 
-SOURCES = (ADAPTER, CODEX, CONTINUATION)
+SOURCES = (ADAPTER, CODEX, CONTINUATION, SEARCH_IMAGES)
 
 # Fixtures the sliced code reads through. Only the tool-call helpers are stand-ins, and they stay
 # real enough to prove a turn carrying a call is NOT abandoned: ``canReplayToolCallWithoutRoleTool``
@@ -112,6 +115,11 @@ def _harness_source() -> str:
         + _adapter_slice(
             "// Refusal flag stamped on assistant metadata",
             "type SerializedMessage = {",
+        )
+        + slice_between(
+            read(SEARCH_IMAGES),
+            "export function stripSearchImageTokens(",
+            "\nexport function",
         )
         + _adapter_slice(
             "function sanitizeAssistantReplayText(",
