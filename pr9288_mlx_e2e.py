@@ -65,7 +65,8 @@ def main() -> int:
             prefilled = _sf_reasoning_prefill_mode(flags, None, template, None)
         parse_think = bool(flags.get("supports_reasoning") or flags.get("reasoning_always_on"))
 
-        prompt = apply_chat_template_for_generation(tokenizer, messages, add_generation_prompt = True)
+        # It picks the boundary itself; a new turn always renders the generation prompt.
+        prompt = apply_chat_template_for_generation(tokenizer, messages)
         if not isinstance(prompt, str):
             prompt = prompt[0] if prompt else ""
         # MLX re-emits a prefilled open tag, since it lives in the prompt not the tokens.
