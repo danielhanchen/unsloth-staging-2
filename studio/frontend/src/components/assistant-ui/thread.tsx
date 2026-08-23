@@ -4540,7 +4540,7 @@ const Composer: FC<{
           <>
             <ComposerPrimitive.Input
               placeholder={
-                overlay ? "Type your edits for your image" : "Ask anything"
+                overlay ? "Type your edits for your image" : "Ask anything at all"
               }
               ref={inputRef}
               className="aui-composer-input unsloth-composer-input"
