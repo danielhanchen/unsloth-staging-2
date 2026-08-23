@@ -244,6 +244,51 @@ def retrieval_budget(
     return room
 
 
+# Headroom against the tokenizer disagreeing with the estimate that sized a result. A
+# result is measured in characters and spent in tokens, so the conversion is the thing
+# that can be wrong; 1% of the budget absorbs that without noticeably shortening output.
+_TOOL_RESULT_BUDGET_BUFFER = 0.99
+
+# What a truncated result costs BESIDES its body: the notice naming the cut, the spill
+# path and the command that resumes it. Measured at 60-85 tokens, held clear of that.
+# Reserved rather than ignored because the body is sized and the notice appended after,
+# so a budget spent entirely on the body overshoots by the notice every time, and at zero
+# room, where the notice IS the message, by the whole of it.
+_RESULT_NOTICE_RESERVE = 128
+
+
+def tool_result_budget(
+    context_length: int,
+    max_tokens: Optional[int],
+    prompt_tokens: int,
+    *,
+    buffer: float = _TOOL_RESULT_BUDGET_BUFFER,
+    results: int = 1,
+) -> int:
+    """Tokens a tool result may add without pushing the next prompt past its budget.
+
+    The cap before this was a share of the WINDOW, so it never fell as the conversation
+    filled: one result could take half a small context however little was left, and the
+    next fit cannot recover because it protects the newest turn, the very result that does
+    not fit. This prices the same result against the room actually remaining.
+
+    Against ``prompt_budget`` rather than ``context_length``: a result sized to fill the
+    physical window leaves the prompt fitting and nothing to answer in. Room for the reply
+    is not room for the result. The figure covers the whole tool message, notice included.
+
+    ``results`` is how many results will share this room: one assistant turn can call
+    several tools, and each truncated result carries its own notice, so the reserve is per
+    result rather than per turn. The caller divides what comes back between them.
+    """
+    target = prompt_budget(context_length, max_tokens)
+    room = (
+        int(target * buffer)
+        - int(prompt_tokens or 0)
+        - _RESULT_NOTICE_RESERVE * max(1, int(results))
+    )
+    return max(0, room)
+
+
 def _latest_turn_tokens(messages: list[dict], count_tokens: Callable[[list[dict]], int]) -> int:
     """Tokens in the newest message, estimated if the template refuses to render it.
 
