@@ -582,8 +582,8 @@ export function useThreadAutosaveHandle(): ThreadAutosaveHandle {
  *      "the request exceeds the available context size (N tokens)".
  *   2. The friendly rewrite from
  *      ``backend/routes/inference.py::_friendly_error``: "Message too long:
- *      ... context window. Try increasing the Context Length ..." (the one
- *      most users see on the streaming GGUF path).
+ *      ... context window. ..." (the one most users see on the streaming GGUF
+ *      path). Its advice branches, so only the lead-in is stable to match on.
  *
  * Match substrings, not full regexes: both layers have drifted across
  * versions (llama.cpp phrasing and _friendly_error copy edits).
@@ -7112,8 +7112,16 @@ export function createOpenAIStreamAdapter(
             // send the user to a new chat that fails identically.
             const budget =
               irreducible?.prompt_target ?? irreducible?.context_length ?? 0;
+            // `latest_turn_exact: false` means the template dropped the newest turn on
+            // its own (every Gemma tool result), so the count is the message's JSON at
+            // four characters a token. Whitespace runs and escaped JSON tokenise several
+            // times denser than that, so printing it as "N tokens on its own" states a
+            // number the turn never cost. Absent means a server that predates the flag,
+            // which only ever sent a count.
             const oneTurnIsTheProblem =
-              irreducible != null && (irreducible.latest_turn_tokens ?? 0) > budget;
+              irreducible != null &&
+              (irreducible.latest_turn_tokens ?? 0) > budget &&
+              (irreducible.latest_turn_exact ?? true);
             // Whose turn it is decides the advice: in a tool loop the offending turn is
             // often output the user never wrote and cannot edit, so "shorten this
             // message" names the wrong thing and offers no remedy.
