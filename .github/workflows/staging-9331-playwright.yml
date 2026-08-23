@@ -37,7 +37,9 @@ jobs:
           # roughly four times the per-URI timeout inside one attempt of the helper.
           APT_ACQUIRE_RETRIES: '0'
         run: |
-          pip install playwright httpx pillow
+          # Bounded below the next major: test_sdk_installs_are_major_bounded fails any
+          # workflow that would let playwright 2.x reach CI with no change on our side.
+          pip install 'playwright<2' httpx pillow
           python -m playwright install chromium
           if python -c "
           from playwright.sync_api import sync_playwright
