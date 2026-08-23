@@ -93,6 +93,12 @@ __all__ = [
     "get_moe_target_modules",
     "warn_if_zoo_cannot_merge_moe_experts",
     "_select_moe_detection_targets",
+    "_redirect_embedding_targets",
+    "_raise_if_no_lora_targets_left",
+    "_resolve_ensure_weight_tying",
+    "_vllm_unmovable_embedding_modules",
+    "_drop_tied_output_module",
+    "_raise_if_fast_inference_modules_to_save",
     "make_fast_generate_wrapper",
     "_mark_unsloth_disable_data_parallel",
     "_patch_transformers_trainer_data_parallel",
@@ -4467,6 +4473,118 @@ def warn_if_zoo_cannot_merge_moe_experts():
         "a merged_16bit checkpoint, so save_pretrained_merged('merged_16bit') would drop "
         "the expert LoRA. Upgrade unsloth_zoo to merge them; saving the LoRA adapter is "
         "unaffected."
+    )
+
+
+EMBEDDING_MODULES = frozenset(("embed_tokens", "lm_head"))
+
+
+def _vllm_unmovable_embedding_modules(model, target_modules):
+    """Names to leave in `target_modules` under fast inference.
+
+    vLLM cannot sync a trainable embedding, so `modules_to_save` is refused below. Only
+    lm_head is spared: LoRA on it never trained under vLLM either, so redirecting it
+    would newly raise on scripts that run today. embed_tokens still redirects, and so
+    still raises, exactly as before.
+    """
+    if getattr(model, "vllm_engine", None) is None:
+        return ()
+    if type(target_modules) in (list, tuple) and "lm_head" in target_modules:
+        logger.warning_once(
+            "Unsloth: Fast inference cannot train `lm_head`, so it is left as an "
+            "untrained LoRA target.\nUse `fast_inference = False` to train it."
+        )
+    return ("lm_head",)
+
+
+def _redirect_embedding_targets(
+    target_modules,
+    modules_to_save,
+    *,
+    allow_redirect = True,
+    skip = (),
+):
+    """Move embed_tokens/lm_head into modules_to_save. Returns (targets, saved, moved).
+
+    LoRA on either is silently dead here: the fused CE loss reads `lm_head.weight`
+    instead of calling the module, and PEFT's `lora_embedding_A/B` are never unfrozen.
+    """
+    if type(target_modules) not in (list, tuple) or not allow_redirect:
+        return target_modules, modules_to_save, ()
+
+    target_modules = list(dict.fromkeys(target_modules))
+    moved = [x for x in target_modules if x in EMBEDDING_MODULES and x not in skip]
+    if not moved:
+        return target_modules, modules_to_save, ()
+
+    remaining = [x for x in target_modules if x not in EMBEDDING_MODULES or x in skip]
+    # list() on a str would shred it into single characters.
+    if modules_to_save is None:
+        saved = []
+    elif isinstance(modules_to_save, str):
+        saved = [modules_to_save]
+    else:
+        saved = list(modules_to_save)
+    saved.extend(x for x in moved if x not in saved)
+    return remaining, saved, tuple(moved)
+
+
+def _raise_if_no_lora_targets_left(
+    target_modules,
+    moved,
+    target_parameters = None,
+):
+    """embed_tokens/lm_head go to modules_to_save, so they cannot be the only targets.
+
+    PEFT accepts `target_parameters` (fused MoE experts) with no target_modules at all.
+    """
+    if (
+        moved
+        and type(target_modules) in (list, tuple)
+        and not target_modules
+        and not target_parameters
+    ):
+        raise RuntimeError(
+            f"Unsloth: {', '.join(moved)} are trained as full modules via `modules_to_save`, "
+            "not as LoRA targets, so `target_modules` is now empty.\n"
+            "Please add at least one projection module, for example "
+            '`target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", '
+            '"gate_proj", "up_proj", "down_proj"]`.'
+        )
+
+
+def _resolve_ensure_weight_tying(model, modules_to_save, requested):
+    """Default `ensure_weight_tying` on when a tied pair lands in modules_to_save.
+
+    PEFT copies each entry, so tied copies diverge and a merge keeps only one; tying
+    moves the counterpart to `modules_to_tie`. Keyed on the final modules_to_save so
+    callers that pass both names themselves are covered. Caller wins if set.
+    """
+    if requested is not None:
+        return bool(requested)
+    if not EMBEDDING_MODULES <= set(modules_to_save or ()):
+        return False
+    return bool(getattr(getattr(model, "config", None), "tie_word_embeddings", False))
+
+
+def _drop_tied_output_module(modules_to_save, ensure_weight_tying):
+    """Keep the input embedding and leave the tied output for PEFT to reconstruct.
+
+    peft 0.18 ties only `tied_weight_keys - modules_to_save`, so naming both there ties
+    nothing and trains two diverging copies. One matrix on 0.18.1 and 0.20.0 alike.
+    """
+    if not ensure_weight_tying or not EMBEDDING_MODULES <= set(modules_to_save or ()):
+        return modules_to_save
+    return [x for x in modules_to_save if x != "lm_head"]
+
+
+def _raise_if_fast_inference_modules_to_save(model, modules_to_save):
+    """Reject trainable saved modules that vLLM cannot keep synchronized."""
+    if getattr(model, "vllm_engine", None) is None or not modules_to_save:
+        return
+    raise NotImplementedError(
+        "Unsloth: Currently fast inference does not work with training "
+        f"{', '.join(modules_to_save)}."
     )
 
 

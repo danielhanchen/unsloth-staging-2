@@ -3086,7 +3086,7 @@ class FastLlamaModel:
         temporary_location = "_unsloth_temporary_saved_buffers",
         qat_scheme = None,
         target_parameters = None,  # For MoE expert layers (nn.Parameter)
-        ensure_weight_tying = False,
+        ensure_weight_tying = None,  # None = auto (tie when we redirect a tied pair)
         **kwargs,
     ):
         if os.environ.get("UNSLOTH_USE_NEW_MODEL", "0") == "1":
@@ -3179,10 +3179,20 @@ class FastLlamaModel:
                 modules_to_save = {}
             modules_to_save = list(modules_to_save)
             old_target_modules += modules_to_save
+            # ensure_weight_tying moves the tied counterpart (lm_head) into
+            # modules_to_tie, so the stored config names it on neither list above. Add it
+            # to both sides or a repeat call reports "parameters are different". Read it
+            # off the config object: to_dict() drops modules_to_tie.
+            modules_to_tie = list(
+                getattr(model.peft_config["default"], "modules_to_tie", None) or []
+            )
+            old_target_modules += modules_to_tie
 
             # Combine all
-            new_target_modules = list(target_modules) + list(
-                modules_to_save if modules_to_save is not None else []
+            new_target_modules = (
+                list(target_modules)
+                + list(modules_to_save if modules_to_save is not None else [])
+                + modules_to_tie
             )
             # Per-expert Linear MoE experts (e.g. gpt-oss bnb-4bit) were auto-added to the
             # saved target_modules when the adapter was first created. Recompute them so a
@@ -3315,29 +3325,48 @@ class FastLlamaModel:
         train_lm_head = False
         train_embed_tokens = False
         final_modules = []
-        for module in target_modules:
+        # LoRA on these never trains (see _redirect_embedding_targets); modules_to_save
+        # does, and is what embedding_learning_rate matches.
+        target_modules, modules_to_save, _moved_embedding_modules = _redirect_embedding_targets(
+            target_modules,
+            modules_to_save,
+            skip = _vllm_unmovable_embedding_modules(model, target_modules),
+        )
+        _raise_if_no_lora_targets_left(
+            target_modules,
+            _moved_embedding_modules,
+            target_parameters,
+        )
+        ensure_weight_tying = _resolve_ensure_weight_tying(
+            model,
+            modules_to_save,
+            ensure_weight_tying,
+        )
+        modules_to_save = _drop_tied_output_module(
+            modules_to_save,
+            ensure_weight_tying,
+        )
+        for module in _moved_embedding_modules:
             if module == "embed_tokens":
-                # logger.warning_once(
-                #     "Unsloth: `embed_tokens` should be placed in `modules_to_save` and not `target_modules`. "\
-                #     "Luckily, we shall do it for you!"
-                # )
                 train_embed_tokens = True
-                if modules_to_save is None:
-                    modules_to_save = ["embed_tokens"]
-                else:
-                    modules_to_save.append("embed_tokens")
-
             else:
-                try:
-                    assert module in accepted_modules
-                    final_modules.append(module)
-                except AssertionError as e:
-                    final_modules.append(module)
-                    print(
-                        "Unsloth: You added custom modules, but Unsloth hasn't optimized for this.\n"
-                        "Beware - your finetuning might be noticeably slower!"
-                    )
-                pass
+                train_lm_head = True
+        if _moved_embedding_modules:
+            logger.warning_once(
+                f"Unsloth: Moved {', '.join(_moved_embedding_modules)} from `target_modules` "
+                f"to `modules_to_save`, so they are trained as full weight matrices.\n"
+                f"This uses more VRAM than LoRA. Please list them in `modules_to_save` directly."
+            )
+        for module in target_modules:
+            try:
+                assert module in accepted_modules
+                final_modules.append(module)
+            except AssertionError as e:
+                final_modules.append(module)
+                print(
+                    "Unsloth: You added custom modules, but Unsloth hasn't optimized for this.\n"
+                    "Beware - your finetuning might be noticeably slower!"
+                )
 
         # Check if we added new tokens!
         if hasattr(model, "_need_to_train_embeddings"):
@@ -3451,6 +3480,9 @@ class FastLlamaModel:
             ensure_weight_tying = ensure_weight_tying,
             **kwargs,
         )
+        # Older PEFT has no `ensure_weight_tying`; passing it would TypeError.
+        if "ensure_weight_tying" not in inspect.signature(LoraConfig).parameters:
+            del arguments["ensure_weight_tying"]
         if not SUPPORTS_LOFTQ:
             del arguments["loftq_config"]
         if not SUPPORTS_RSLORA:
