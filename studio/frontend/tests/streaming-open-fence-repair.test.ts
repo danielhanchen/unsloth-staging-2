@@ -7,6 +7,8 @@ import remend from "remend";
 
 import { IncrementalMarkdownCache } from "../src/components/assistant-ui/streaming-render-schedule.ts";
 
+import { renderBlockContents } from "./streaming-render-plan.ts";
+
 /**
  * A fence that has opened and not yet closed pins the cache: the whole fence
  * lexes into one block, so no prefix is ever retained and the live tail grows
@@ -204,8 +206,7 @@ test("a fence that never closes stays live and is never committed away", () => {
     render = cache.update(text.slice(0, end));
   }
   render = cache.update(text);
-  const blocks = render.parseMarkdownIntoBlocks(render.markdown);
-  assert.equal(blocks.join(""), remend(text));
+  assert.equal(renderBlockContents(render).join(""), remend(text));
 });
 
 /**

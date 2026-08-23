@@ -224,8 +224,11 @@ test("the flag defaults off, and off means today's behaviour", () => {
     /:\s*"off";/.test(SOURCE),
     "any value that is not an understood mode must fall through to off",
   );
-  assert.ok(
-    MARKDOWN_TEXT.includes('useFenceReached(host, mode !== "off", Boolean(isIncomplete))'),
+  // `renderPlainBody === null` is the streaming policy's already-plain body, which carries no
+  // spans to defer. It can only ever withhold the gate, never open it, so the flag still decides.
+  assert.match(
+    MARKDOWN_TEXT,
+    /useFenceReached\(\s*host,\s*mode !== "off" && renderPlainBody === null,\s*Boolean\(isIncomplete\),\s*\)/,
     "with the flag off every fence must render immediately, exactly as it does today",
   );
 });

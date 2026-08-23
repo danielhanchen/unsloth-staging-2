@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { getCompletedFencedCodeOccurrences } from "../../lib/fenced-code-provenance.ts";
+
+import { fromMarkdown } from "mdast-util-from-markdown";
+
 import remend from "remend";
 import { type BlockProps, parseMarkdownIntoBlocks } from "streamdown";
 
-// How far behind the live edge a block has to be before it can be retained.
-// The block list interleaves "\n\n" separators, so this is about four
-// paragraphs of slack for a construct that a later line can still reinterpret.
+import {
+  getTerminalStreamingCodeFence,
+  hasClosingFenceLine,
+  isClosingFenceLine,
+  normalizeCodeFenceLanguage,
+  readFenceMarker,
+} from "./streaming-code-policy.ts";
+
+// Retain blocks only after they are outside the rollback window.
 const ROLLBACK_BLOCKS = 8;
-// A marker the reply never closes leaves the tail growing with nothing to
-// retain, and the boundary scan is then paid on top of the full repair it was
-// meant to replace. Give up at a character budget, since characters are what
-// that scan costs, and a transient imbalance closes far below this. The budget
-// is spent before giving up and that spending grows with the square of the tail,
-// so the value matters. Measured on an emphasis marker that only closes 40,000
-// characters later, 420 updates, five repetitions: the median cost against the
-// full-document path is +73% at 32,768 and +1.6% at 8,192. 8,192 characters is
-// still around 1,300 words of slack, well beyond a marker a later line closes.
+// Group retained blocks so token updates touch only the final partial chunk.
+const COMMITTED_CHUNK_BLOCKS = 8;
+// Bound stalled-tail scans; 8,192 characters preserves enough context for late closures.
 const STALLED_TAIL_CHARACTERS = 8_192;
 // remend repairs the trailing incomplete construct, but it reaches that
 // decision with whole-string passes: one walks the text once per `[` looking
@@ -110,12 +114,7 @@ const createRepairParity = (): RepairParity => ({
   inlineMath: false,
 });
 
-// Marked keeps link reference definitions in one document-wide map and emits
-// no token for a label it has already seen, so a definition that is retained
-// while its twin is still live would be lexed apart and shown as a literal
-// line. Keeping every definition in the live tail makes the two lexes agree.
-// Marked reads a fenced block as code, so those do not count; anything else
-// that merely looks like a definition costs retention, never correctness.
+// Keep link definitions in the live tail so Marked's document-wide map stays consistent.
 function updateLinkDefinitionParity(parity: RepairParity, text: string): void {
   if (!FENCED_CODE_BLOCK_RE.test(text) && LINK_DEFINITION_RE.test(text)) {
     parity.linkDefinition = true;
@@ -529,10 +528,82 @@ const hasNeutralRepairParity = (parity: RepairParity): boolean =>
     parity.inlineMath,
   ].includes(true);
 
-export type IncrementalMarkdownRender = {
+export type IncrementalMarkdownCodeFence = Readonly<{
+  id: string;
+  language: string | null;
+  meta: string | null;
+  openingOffset: number;
+  source: string;
+  // Set only when live source preservation or a validated cold overlay owns
+  // the otherwise ambiguous line feed immediately before the closing fence.
+  terminalLineFeedIsExact?: true;
+
+}>;
+
+export type IncrementalMarkdownBlock = Readonly<{
+  codeFences: readonly IncrementalMarkdownCodeFence[];
+  content: string;
+  id: string;
+}>;
+
+export type IncrementalMarkdownChunk = Readonly<{
+  blocks: readonly IncrementalMarkdownBlock[];
+  id: string;
+  startIndex: number;
+}>;
+
+export type IncrementalMarkdownTerminalCodeTail = Readonly<{
+  blockId: string;
+  fenceMarkdown: string;
+  id: string;
+  isClosed: boolean;
+  language: string | null;
+  openingLine: string;
+  openingOffset: number;
+  prefixBlocks: readonly IncrementalMarkdownBlock[];
+  prefixMarkdown: string;
+  source: string;
+  sourceOffset: number;
+}>;
+
+export type IncrementalMarkdownRender = Readonly<{
+  chunks: readonly IncrementalMarkdownChunk[];
+  committedBlockCount: number;
+  epoch: number;
+  // The repaired Markdown still owned by the mutable rollback tail.
   markdown: string;
-  parseMarkdownIntoBlocks: (markdown: string) => string[];
-};
+  // Streamdown parses this one block only so its public BlockComponent receives
+  // the dependency's exact incomplete-fence state beneath all private providers.
+  shellMarkdown: string;
+  // The same shell before remend appends synthetic closing markers. Presentation
+  // and copy paths use this exact source; Streamdown still parses shellMarkdown.
+  sourceShellMarkdown: string;
+  tail: readonly IncrementalMarkdownBlock[];
+  terminalCodeTail: IncrementalMarkdownTerminalCodeTail | null;
+}>;
+
+
+type IncrementalMarkdownRenderObservation = Readonly<{
+  codeFenceSourceLengths: readonly number[];
+  isStreaming: boolean;
+  sourceLength: number;
+  terminalSourceLength: number | null;
+}>;
+
+let incrementalMarkdownRenderObserver:
+  | ((observation: IncrementalMarkdownRenderObservation) => void)
+  | null = null;
+
+export function observeIncrementalMarkdownRenders(
+  observer: (observation: IncrementalMarkdownRenderObservation) => void,
+): () => void {
+  incrementalMarkdownRenderObserver = observer;
+  return () => {
+    if (incrementalMarkdownRenderObserver === observer) {
+      incrementalMarkdownRenderObserver = null;
+    }
+  };
+}
 
 // Marker facts the retained prefix carries into the tail repair.
 type RetainedContext = {
@@ -818,6 +889,51 @@ function normalizeLineEndings(text: string): string {
  * Semantically identical: `slice` clamps to the string length, so a `b` longer
  * than `a` yields a short slice that cannot equal it.
  */
+/*
+ * Is there a footnote reference or definition here, ignoring fenced code?
+ *
+ * A character class in ordinary code is shaped exactly like a footnote
+ * reference: `/[^a-z]/` matches `FOOTNOTE_REFERENCE_RE`. Testing the repaired
+ * tail as one string therefore reads a regex literal inside an open fence as a
+ * footnote and switches to full-document mode, which is sticky, so every later
+ * token re-repairs and re-lexes the whole reply. That is the quadratic this
+ * class exists to remove, restored by one line of the reply's own code.
+ *
+ * Fenced code is not Markdown, so scan lines and skip the fenced ones. Neither
+ * pattern can span a newline, so testing per line is exactly the whole-string
+ * test with the fenced lines removed.
+ */
+export function hasFootnoteConstruct(markdown: string): boolean {
+  let fence: { marker: "`" | "~"; markerLength: number } | null = null;
+  for (let lineStart = 0; lineStart <= markdown.length; ) {
+    const lf = markdown.indexOf("\n", lineStart);
+    const rawEnd = lf < 0 ? markdown.length : lf;
+    const end =
+      rawEnd > lineStart && markdown[rawEnd - 1] === "\r" ? rawEnd - 1 : rawEnd;
+    const line = markdown.slice(lineStart, end);
+
+    if (fence) {
+      if (isClosingFenceLine(line, fence.marker, fence.markerLength)) {
+        fence = null;
+      }
+    } else {
+      const opening = readFenceMarker(markdown, lineStart);
+      if (opening) {
+        fence = opening;
+      } else if (
+        FOOTNOTE_REFERENCE_RE.test(line) ||
+        FOOTNOTE_DEFINITION_RE.test(line)
+      ) {
+        return true;
+      }
+    }
+
+    if (lf < 0) break;
+    lineStart = lf + 1;
+  }
+  return false;
+}
+
 export const hasPrefix = (a: string, b: string): boolean =>
   a.length >= b.length && a.slice(0, b.length) === b;
 
@@ -905,13 +1021,149 @@ function findCommitBoundary(
 }
 
 // Streamdown normally repairs and lexes the entire growing reply on every
-// update. Retain blocks that are safely behind a rollback window and give
-// Streamdown only the active tail. The parser callback puts the retained blocks
-// back into its block list, so output and React keys stay identical.
+// update. Retain blocks that are safely behind a rollback window and expose
+// them as immutable chunks plus one mutable tail. MarkdownText renders this
+// plan through a single Streamdown provider shell, so neither Streamdown nor
+// React walks the complete growing block list for every token.
+type MarkdownCodeNode = {
+  children?: readonly MarkdownCodeNode[];
+  lang?: string | null;
+  meta?: string | null;
+  position?: { start: { offset?: number } };
+  type: string;
+  value?: string;
+};
+
+// A globally scoped Streamdown block (notably one containing footnotes) can
+// hold many completed nodes. Preserve canonical fenced-code facts before a
+// terminal tail is promoted or followed by prose.
+export function getCompletedCodeFences(
+  content: string,
+  blockId = "detached",
+): IncrementalMarkdownCodeFence[] {
+  const fences: IncrementalMarkdownCodeFence[] = [];
+  const visit = (node: MarkdownCodeNode): void => {
+    if (node.type === "code") {
+      const start = node.position?.start.offset;
+      if (start !== undefined) {
+        const lineEnd = content.indexOf("\n", start);
+        const openingLine = content.slice(
+          start,
+          lineEnd < 0 ? content.length : lineEnd,
+        );
+        // Slicing to "\n" leaves the CR of a CRLF opening line in place.
+        if (/^ {0,3}(?:`{3,}|~{3,})[^\r\n]*\r?$/.test(openingLine)) {
+          fences.push({
+            id: `${blockId}:fence:${start}`,
+            language: normalizeCodeFenceLanguage(node.lang ?? null),
+            meta: node.meta ?? null,
+            openingOffset: start,
+            source: node.value ?? "",
+          });
+        }
+      }
+    }
+    node.children?.forEach(visit);
+  };
+  visit(fromMarkdown(content) as MarkdownCodeNode);
+  return fences;
+}
+
+/*
+ * The same answer for a block that only grew, without re-parsing it.
+ *
+ * A block holding an unclosed fence is the whole live tail, and it is re-lexed
+ * on every token, so charging it a whole-document CommonMark parse each time
+ * makes one chunk cost the length of the fence and a reply the square of it.
+ * That is the exact shape #9517 removed from the repair path.
+ *
+ * While the last fence is open nothing else in the block can change: CommonMark
+ * ends a fenced code block only at a matching closing line or at the end of the
+ * document, so every earlier fence is settled and the appended characters can
+ * only extend that one body. So carry the previous result forward and re-parse
+ * only when a closing line actually arrives, which is once per fence.
+ */
+type OpenFenceMemo = {
+  blockId: string;
+  content: string;
+  fences: IncrementalMarkdownCodeFence[];
+  marker: "`" | "~";
+  markerLength: number;
+};
+
+// What mdast reports as the body of a still-open fence: everything after the
+// opening line, less the single trailing line ending it drops.
+const openFenceBody = (content: string, openingOffset: number): string => {
+  const lf = content.indexOf("\n", openingOffset);
+  if (lf < 0) return "";
+  const body = content.slice(lf + 1);
+  return body.endsWith("\n") ? body.slice(0, -1) : body;
+};
+
+// A block whose last fence runs unclosed to its end, or null. A closed fence
+// cannot pass: its body stops before a closer that is still in the content. Nor
+// can a half-written opening line, where the next character joins the info
+// string rather than the body.
+const openFenceOf = (
+  content: string,
+  fences: readonly IncrementalMarkdownCodeFence[],
+): Pick<OpenFenceMemo, "marker" | "markerLength"> | null => {
+  const last = fences.at(-1);
+  if (
+    !last ||
+    content.indexOf("\n", last.openingOffset) < 0 ||
+    last.source !== openFenceBody(content, last.openingOffset)
+  ) {
+    return null;
+  }
+  return readFenceMarker(content, last.openingOffset);
+};
+
+export function createCompletedCodeFenceCache(): (
+  content: string,
+  blockId: string,
+) => IncrementalMarkdownCodeFence[] {
+  let memo: OpenFenceMemo | null = null;
+
+  return (content, blockId) => {
+    if (
+      memo !== null &&
+      memo.blockId === blockId &&
+      content.length > memo.content.length &&
+      hasPrefix(content, memo.content) &&
+      // A closer has to start a line, and the appended text may continue the
+      // block's last partial one, so rescan from that line's start.
+      !hasClosingFenceLine(
+        content,
+        memo.content.lastIndexOf("\n") + 1,
+        memo.marker,
+        memo.markerLength,
+      )
+    ) {
+      const previous = memo.fences;
+      const last = previous[previous.length - 1];
+      const fences = [
+        ...previous.slice(0, -1),
+        { ...last, source: openFenceBody(content, last.openingOffset) },
+      ];
+      memo = { ...memo, content, fences };
+      return fences;
+    }
+
+    const fences = getCompletedCodeFences(content, blockId);
+    const open = openFenceOf(content, fences);
+    memo = open && { ...open, blockId, content, fences };
+    return fences;
+  };
+}
+
+
 export class IncrementalMarkdownCache {
   private source = "";
   private tail = "";
-  private committedBlocks: string[] = [];
+  private committedBlocks: IncrementalMarkdownBlock[] = [];
+  private committedChunks: IncrementalMarkdownChunk[] = [];
+  private tailBlocks: IncrementalMarkdownBlock[] = [];
   private committedLength = 0;
   private commitPoints: CommitPoint[] = [];
   private context = createRetainedContext();
@@ -919,33 +1171,348 @@ export class IncrementalMarkdownCache {
   private openFenceHead: string | null = null;
   private openFenceHeadInert = false;
   private fullDocumentMode = false;
-  private lastMarkdown: string | null = null;
-  private droppedRetainedBlocks = false;
+  private lastRender: IncrementalMarkdownRender | null = null;
+  private lastCanonicalRender: IncrementalMarkdownRender | null = null;
+  private nextBlockIdentity = 0;
+  private epoch = 0;
+
+  private persistedTrailingLfOrdinals: readonly number[];
+  constructor(persistedTrailingLfOrdinals: readonly number[] = []) {
+    this.persistedTrailingLfOrdinals = [...persistedTrailingLfOrdinals];
+  }
+
+  private updatePersistedFenceProvenance(
+    next: readonly number[],
+  ): boolean {
+    if (
+      next.length === this.persistedTrailingLfOrdinals.length &&
+      next.every(
+        (ordinal, index) =>
+          ordinal === this.persistedTrailingLfOrdinals[index],
+      )
+    ) {
+      return false;
+    }
+    this.persistedTrailingLfOrdinals = [...next];
+    return true;
+  }
+
+  private isStreaming = true;
   // How often a rewrite discarded the whole retained prefix, and how many
   // characters a rewind handed back to the live tail. Both redo work with an
   // identical result, so time is the only other evidence they happened. Tests
   // read these to hold the rewind path in place.
   private retainedPrefixRebuilds = 0;
   private rewoundCharacters = 0;
-  // Bumped only when the Markdown string alone cannot signal a changed render.
-  renderGeneration = 0;
 
-  readonly parseMarkdownIntoBlocks = (markdown: string): string[] => [
-    ...this.committedBlocks,
-    ...parseMarkdownIntoBlocks(markdown),
-  ];
+  private completedCodeFences = createCompletedCodeFenceCache();
 
-  // Streamdown memoises the whole component on the Markdown string and ignores
-  // the parser callback, so the string is the only thing that can schedule a
-  // render. Retaining a block can wait for a string that differs, but dropping
-  // retained blocks cannot, so that case moves the render identity instead.
-  private render(markdown: string): IncrementalMarkdownRender {
-    if (this.droppedRetainedBlocks && markdown === this.lastMarkdown) {
-      this.renderGeneration += 1;
+  private createBlock(content: string): IncrementalMarkdownBlock {
+    const id = `${this.epoch}:${this.nextBlockIdentity}`;
+    const block = {
+      codeFences: this.completedCodeFences(content, id),
+      content,
+      id,
+    } satisfies IncrementalMarkdownBlock;
+    this.nextBlockIdentity += 1;
+    return block;
+  }
+
+  // Streamdown itself uses positional keys inside the bounded live tail. Match
+  // that behavior while preserving an exact block object when its content did
+  // not change. A promoted block carries this same identity into a chunk.
+  private reconcileTailBlocks(contents: string[]): IncrementalMarkdownBlock[] {
+    const previous = this.tailBlocks;
+    const next = contents.map((content, index) => {
+      const existing = previous[index];
+      if (!existing) {
+        return this.createBlock(content);
+      }
+      if (existing.content === content) {
+        return existing;
+      }
+      return {
+        codeFences: this.completedCodeFences(content, existing.id),
+        content,
+        id: existing.id,
+      } satisfies IncrementalMarkdownBlock;
+    });
+    this.tailBlocks = next;
+    return next;
+  }
+
+  // Preserve every closed chunk object. The one open chunk changes only when a
+  // block is committed, never for ordinary token-only tail updates.
+  private syncCommittedChunks(): void {
+    const previous = this.committedChunks;
+    const next: IncrementalMarkdownChunk[] = [];
+    for (
+      let start = 0, chunkIndex = 0;
+      start < this.committedBlocks.length;
+      start += COMMITTED_CHUNK_BLOCKS, chunkIndex += 1
+    ) {
+      const blocks = this.committedBlocks.slice(
+        start,
+        start + COMMITTED_CHUNK_BLOCKS,
+      );
+      const existing = previous[chunkIndex];
+      if (
+        existing &&
+        existing.blocks.length === blocks.length &&
+        existing.blocks.every((block, index) => block === blocks[index])
+      ) {
+        next.push(existing);
+      } else {
+        next.push({
+          blocks,
+          id: `chunk:${blocks[0].id}`,
+          startIndex: start,
+        });
+      }
     }
-    this.droppedRetainedBlocks = false;
-    this.lastMarkdown = markdown;
-    return { markdown, parseMarkdownIntoBlocks: this.parseMarkdownIntoBlocks };
+    this.committedChunks = next;
+  }
+
+  // A closing fence followed immediately by prose is no longer terminal, so
+  // mdast owns only its semantic code value and drops the separator newline.
+  // Carry the exact source observed while the fence was open into that newly
+  // completed block; later chunk promotion then retains the same actions.
+  private preserveTerminalCodeSource(
+    blocks: IncrementalMarkdownBlock[],
+    previous: IncrementalMarkdownTerminalCodeTail | null,
+  ): IncrementalMarkdownBlock[] {
+    if (!previous) return blocks;
+    let changed = false;
+    let blockOffset = this.committedLength;
+    const next = blocks.map((block) => {
+      const currentBlockOffset = blockOffset;
+      blockOffset += block.content.length;
+      let blockChanged = false;
+      const codeFences = block.codeFences.map((fence) => {
+        const samePersistentOccurrence =
+          (block.id === previous.blockId &&
+            fence.openingOffset === previous.openingOffset) ||
+          currentBlockOffset + fence.openingOffset === previous.sourceOffset;
+        if (
+          !samePersistentOccurrence ||
+          fence.language !== previous.language ||
+          fence.source === previous.source ||
+          (`${fence.source}\n` !== previous.source &&
+            `${fence.source}\r\n` !== previous.source)
+        ) {
+          return fence;
+        }
+        blockChanged = true;
+        return {
+          ...fence,
+          source: previous.source,
+          terminalLineFeedIsExact: true as const,
+        };
+      });
+      if (!blockChanged) return block;
+      changed = true;
+      return { ...block, codeFences };
+    });
+    if (changed) this.tailBlocks = next;
+    return changed ? next : blocks;
+  }
+  private overlayPersistedFenceProvenance(
+    render: IncrementalMarkdownRender,
+  ): IncrementalMarkdownRender {
+    const ordinals = this.persistedTrailingLfOrdinals;
+    if (ordinals.length === 0) return render;
+
+    const blocks = [
+      ...render.chunks.flatMap((chunk) => chunk.blocks),
+      ...render.tail,
+    ];
+    const markdown = blocks.map((block) => block.content).join("");
+    const occurrences = getCompletedFencedCodeOccurrences(markdown);
+    const byOrdinal = new Map(occurrences.map((entry) => [entry.ordinal, entry]));
+    const byOpeningOffset = new Map(
+      occurrences.map((entry) => [entry.openingOffset, entry]),
+    );
+    if (
+      ordinals.some((ordinal) => {
+        const occurrence = byOrdinal.get(ordinal);
+        return !occurrence || !occurrence.bodyWithSeparator.endsWith("\n");
+      })
+    ) {
+      return render;
+    }
+
+    const selectedOrdinals = new Set(ordinals);
+    let blockOffset = 0;
+    const targets = new Set<string>();
+    for (const block of blocks) {
+      for (const fence of block.codeFences) {
+        const openingOffset = blockOffset + fence.openingOffset;
+        const occurrence = byOpeningOffset.get(openingOffset);
+        if (occurrence && selectedOrdinals.has(occurrence.ordinal)) {
+          targets.add(fence.id);
+        }
+      }
+      blockOffset += block.content.length;
+    }
+    if (targets.size !== ordinals.length) return render;
+
+    let changed = false;
+    const replaceBlock = (
+      block: IncrementalMarkdownBlock,
+    ): IncrementalMarkdownBlock => {
+      let blockChanged = false;
+      const codeFences = block.codeFences.map((fence) => {
+        if (!targets.has(fence.id) || fence.terminalLineFeedIsExact) {
+          return fence;
+        }
+        blockChanged = true;
+        return {
+          ...fence,
+          source: `${fence.source}\n`,
+          terminalLineFeedIsExact: true as const,
+        };
+      });
+      if (!blockChanged) return block;
+      changed = true;
+      return { ...block, codeFences };
+    };
+
+    const chunks = render.chunks.map((chunk) => {
+      const chunkBlocks = chunk.blocks.map(replaceBlock);
+      return chunkBlocks.every((block, index) => block === chunk.blocks[index])
+        ? chunk
+        : { ...chunk, blocks: chunkBlocks };
+    });
+    const tail = render.tail.map(replaceBlock);
+    if (!changed) return render;
+
+    return { ...render, chunks, tail };
+  }
+
+
+
+
+  private publishCanonicalRender(
+    canonicalRender: IncrementalMarkdownRender,
+  ): IncrementalMarkdownRender {
+    const render = this.overlayPersistedFenceProvenance(canonicalRender);
+    incrementalMarkdownRenderObserver?.({
+      codeFenceSourceLengths: render.tail.flatMap((block) =>
+        block.codeFences.map((fence) => fence.source.length),
+      ),
+      isStreaming: this.isStreaming,
+      sourceLength: this.source.length,
+      terminalSourceLength:
+        canonicalRender.terminalCodeTail?.source.length ?? null,
+    });
+
+    this.lastCanonicalRender = canonicalRender;
+    this.lastRender = render;
+    return render;
+  }
+
+
+  private render(
+    markdown: string,
+    blockContents: string[],
+    previousCodeTail = this.lastRender?.terminalCodeTail ?? null,
+  ): IncrementalMarkdownRender {
+    const tail = this.preserveTerminalCodeSource(
+      this.reconcileTailBlocks(blockContents),
+      previousCodeTail,
+    );
+    const shellMarkdown = tail.at(-1)?.content ?? "";
+    const shellStart = markdown.endsWith(shellMarkdown)
+      ? markdown.length - shellMarkdown.length
+      : -1;
+    const sourceShellIsExact =
+      shellStart >= 0 &&
+      shellStart <= this.tail.length &&
+      markdown.slice(0, shellStart) === this.tail.slice(0, shellStart);
+    const sourceShellMarkdown = sourceShellIsExact
+      ? this.tail.slice(shellStart)
+      : shellMarkdown;
+    // Fence syntax belongs to the source, not the transport status. A stopped or
+    // cold malformed reply still needs the same bounded terminal-code plan; only
+    // animation and action availability follow `isStreaming`.
+
+    // Same argument as the completed-fence cache above: while the fence stays
+    // open its opening offset cannot move, so the whole-tail parse that finds it
+    // is recomputing a constant once per token.
+    const settledOpeningOffset =
+      previousCodeTail !== null &&
+      !previousCodeTail.isClosed &&
+      hasPrefix(sourceShellMarkdown, previousCodeTail.prefixMarkdown) &&
+      sourceShellMarkdown.startsWith(
+        previousCodeTail.openingLine,
+        previousCodeTail.openingOffset,
+      )
+        ? previousCodeTail.openingOffset
+        : undefined;
+    const candidate = sourceShellIsExact
+      ? getTerminalStreamingCodeFence(sourceShellMarkdown, settledOpeningOffset)
+      : null;
+    const sourceOffset = candidate
+      ? this.committedLength + shellStart + candidate.openingOffset
+      : -1;
+    const keepsIdentity =
+      candidate !== null &&
+      previousCodeTail !== null &&
+      previousCodeTail.sourceOffset === sourceOffset &&
+      previousCodeTail.openingLine === candidate.openingLine;
+    const usesTerminalCodeTail =
+      candidate !== null && (!candidate.isClosed || keepsIdentity);
+
+    let terminalCodeTail: IncrementalMarkdownTerminalCodeTail | null = null;
+    const shellBlock = tail.at(-1);
+    if (usesTerminalCodeTail && candidate && shellBlock) {
+      const prefixMarkdown = sourceShellMarkdown.slice(
+        0,
+        candidate.openingOffset,
+      );
+      const prefixBlocks =
+        keepsIdentity && previousCodeTail?.prefixMarkdown === prefixMarkdown
+          ? previousCodeTail.prefixBlocks
+          : parseMarkdownIntoBlocks(remend(prefixMarkdown)).map((content) =>
+              this.createBlock(content),
+            );
+      const source =
+        candidate.isClosed &&
+        keepsIdentity &&
+        previousCodeTail &&
+        (candidate.rawSource === `${previousCodeTail.source}\n` ||
+          candidate.rawSource === `${previousCodeTail.source}\r\n`)
+          ? previousCodeTail.source
+          : candidate.rawSource;
+
+      terminalCodeTail = {
+        blockId: shellBlock.id,
+        fenceMarkdown: candidate.fenceMarkdown,
+        id: keepsIdentity
+          ? previousCodeTail.id
+          : `terminal-code:${this.epoch}:${this.nextBlockIdentity++}`,
+        isClosed: candidate.isClosed,
+        language: candidate.language,
+        openingLine: candidate.openingLine,
+        openingOffset: candidate.openingOffset,
+        prefixBlocks,
+        prefixMarkdown,
+        source,
+        sourceOffset,
+      };
+    }
+
+    const canonicalRender = {
+      chunks: this.committedChunks,
+      committedBlockCount: this.committedBlocks.length,
+      epoch: this.epoch,
+      markdown,
+      shellMarkdown,
+      sourceShellMarkdown,
+      tail,
+      terminalCodeTail,
+    } satisfies IncrementalMarkdownRender;
+    return this.publishCanonicalRender(canonicalRender);
   }
 
   // The repair of a tail sitting inside an open fence, or null to repair the
@@ -971,19 +1538,41 @@ export class IncrementalMarkdownCache {
   }
 
   private resetIncrementalState(markdown: string): void {
-    this.droppedRetainedBlocks ||= this.committedBlocks.length > 0;
+    const invalidatesRenderedBlocks =
+      this.lastRender !== null ||
+      this.committedBlocks.length > 0 ||
+      this.tailBlocks.length > 0;
+    if (invalidatesRenderedBlocks) {
+      this.epoch += 1;
+    }
     this.source = markdown;
     this.tail = markdown;
     this.committedBlocks = [];
+    this.committedChunks = [];
+    this.tailBlocks = [];
     this.committedLength = 0;
     this.commitPoints = [];
     this.context = createRetainedContext();
+    this.lastCanonicalRender = null;
+    this.lastRender = null;
   }
 
   private renderFullDocument(markdown: string): IncrementalMarkdownRender {
-    this.resetIncrementalState(markdown);
-    this.fullDocumentMode = true;
-    return this.render(remend(markdown));
+
+    const previousCodeTail = this.lastRender?.terminalCodeTail ?? null;
+    if (!this.fullDocumentMode) {
+      this.resetIncrementalState(markdown);
+      this.fullDocumentMode = true;
+    } else {
+      this.source = markdown;
+      this.tail = markdown;
+    }
+    const repaired = remend(markdown);
+    return this.render(
+      repaired,
+      parseMarkdownIntoBlocks(repaired),
+      previousCodeTail,
+    );
   }
 
   // The text handed to the cache is not always an extension of the last one:
@@ -1026,7 +1615,7 @@ export class IncrementalMarkdownCache {
     let scanned = this.committedLength;
     while (blocksBeforeLimit > 0 && scanned > safeLimit) {
       blocksBeforeLimit -= 1;
-      scanned -= this.committedBlocks[blocksBeforeLimit].length;
+      scanned -= this.committedBlocks[blocksBeforeLimit].content.length;
     }
     const blockLimit = blocksBeforeLimit - ROLLBACK_BLOCKS;
     if (blockLimit <= 0) {
@@ -1048,10 +1637,14 @@ export class IncrementalMarkdownCache {
     const point = this.commitPoints[index];
     if (point.length < this.committedLength) {
       this.rewoundCharacters += this.committedLength - point.length;
+      const rewoundBlocks = this.committedBlocks.slice(point.blockCount);
       this.committedBlocks.length = point.blockCount;
       this.committedLength = point.length;
       this.commitPoints.length = index + 1;
-      this.droppedRetainedBlocks = true;
+      // Let blocks handed back to the mutable tail retain their identities when
+      // the repaired sequence still has the same positional shape.
+      this.tailBlocks = [...rewoundBlocks, ...this.tailBlocks];
+      this.syncCommittedChunks();
     }
 
     this.context = point.context;
@@ -1072,7 +1665,16 @@ export class IncrementalMarkdownCache {
     this.source = markdown;
   }
 
-  update(rawMarkdown: string): IncrementalMarkdownRender {
+  update(
+    rawMarkdown: string,
+    isStreaming = true,
+    persistedTrailingLfOrdinals = this.persistedTrailingLfOrdinals,
+  ): IncrementalMarkdownRender {
+    const streamingChanged = this.isStreaming !== isStreaming;
+    const provenanceChanged = this.updatePersistedFenceProvenance(
+      persistedTrailingLfOrdinals,
+    );
+    this.isStreaming = isStreaming;
     // Every boundary this class finds is a byte offset into the text it was
     // handed, but the blocks it compares against come back from Streamdown with
     // their line endings already normalised. On a CRLF reply the two disagree
@@ -1080,19 +1682,21 @@ export class IncrementalMarkdownCache {
     // `"para\r"`, nothing is ever committed, and the whole reply re-repairs and
     // re-lexes on every frame. Normalise first so both sides speak LF.
     const markdown = normalizeLineEndings(rawMarkdown);
-
     // Tokens arrive faster than frames, so the coalescer hands the same text to
-    // several renders. Nothing about the result can differ, and repeating the
-    // work would be the whole reply again once the document path is in use.
-    if (markdown === this.source && this.lastMarkdown !== null) {
-      return {
-        markdown: this.lastMarkdown,
-        parseMarkdownIntoBlocks: this.parseMarkdownIntoBlocks,
-      };
+    // several renders. Nothing about the result can differ; return the exact
+    // same plan object so context consumers also do no work.
+    if (
+      !streamingChanged &&
+      markdown === this.source &&
+      this.lastRender !== null
+    ) {
+      if (!provenanceChanged) return this.lastRender;
+      if (this.lastCanonicalRender !== null) {
+        return this.publishCanonicalRender(this.lastCanonicalRender);
+      }
     }
 
     if (this.fullDocumentMode && hasPrefix(markdown, this.source)) {
-      this.source = markdown;
       return this.renderFullDocument(markdown);
     }
 
@@ -1104,18 +1708,14 @@ export class IncrementalMarkdownCache {
     // Streamdown deliberately turns a repaired document containing footnotes
     // into one block so definitions can resolve references anywhere in the
     // document. Such a construct is globally scoped and cannot retain a prefix.
-    if (
-      FOOTNOTE_REFERENCE_RE.test(repaired) ||
-      FOOTNOTE_DEFINITION_RE.test(repaired)
-    ) {
+    if (hasFootnoteConstruct(repaired)) {
       return this.renderFullDocument(markdown);
     }
 
     const blocks = parseMarkdownIntoBlocks(repaired);
-
     const candidateCount = Math.max(0, blocks.length - ROLLBACK_BLOCKS);
     if (candidateCount === 0) {
-      return this.render(repaired);
+      return this.render(repaired, blocks);
     }
 
     const commit = findCommitBoundary(this.tail, blocks, candidateCount);
@@ -1128,7 +1728,7 @@ export class IncrementalMarkdownCache {
       if (commit.repairBroke || this.tail.length > STALLED_TAIL_CHARACTERS) {
         return this.renderFullDocument(markdown);
       }
-      return this.render(repaired);
+      return this.render(repaired, blocks);
     }
 
     const committedText = this.tail.slice(0, commit.length);
@@ -1139,16 +1739,15 @@ export class IncrementalMarkdownCache {
     );
     const nextTail = this.tail.slice(commit.length);
     const nextMarkdown = repairTail(nextTail, nextContext);
-
-    // A repeating reply can leave the tail unchanged once a block is retained.
-    // Streamdown would then see the Markdown it already holds and skip the
-    // render, so the retained blocks would never be displayed. Keep them in the
-    // live tail instead; the next update commits them with a longer string.
-    if (nextMarkdown === this.lastMarkdown) {
-      return this.render(repaired);
-    }
-
-    this.committedBlocks.push(...blocks.slice(0, commit.count));
+    // Preserve the previous terminal occurrence while every reconciled block is
+    // still present. A close can promote that block in this same update, so doing
+    // this after the committed/tail split loses its exact terminal line ending.
+    const reconciled = this.preserveTerminalCodeSource(
+      this.reconcileTailBlocks(blocks),
+      this.lastRender?.terminalCodeTail ?? null,
+    );
+    this.committedBlocks.push(...reconciled.slice(0, commit.count));
+    this.tailBlocks = reconciled.slice(commit.count);
     this.committedLength += commit.length;
     this.context = nextContext;
     this.tail = nextTail;
@@ -1157,8 +1756,9 @@ export class IncrementalMarkdownCache {
       length: this.committedLength,
       context: nextContext,
     });
+    this.syncCommittedChunks();
 
-    return this.render(nextMarkdown);
+    return this.render(nextMarkdown, parseMarkdownIntoBlocks(nextMarkdown));
   }
 }
 
