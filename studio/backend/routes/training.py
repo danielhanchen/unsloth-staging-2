@@ -2067,9 +2067,7 @@ async def get_training_metrics(
         )
 
 
-# POST too: quick tunnels hold a streamed GET until it closes. The hidden GET keeps old clients.
-@router.post("/progress")
-@router.get("/progress", include_in_schema = False)
+@router.get("/progress")
 async def stream_training_progress(
     request: Request,
     expected_job_id: Optional[str] = None,

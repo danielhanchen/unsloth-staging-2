@@ -1,0 +1,46 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Throwaway staging workflow: cross-OS validation for unslothai/unsloth PR #9345
+# (Studio llama.cpp planner: re-fit the context when Auto drops serving slots)
+# plus the ctx_checkpoints / native_ctx_for_cap fixes. Never merged.
+name: "PR-9345 macos-14"
+
+on:
+  push:
+    branches: [pr9345-cross-os]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/pr9345-macos-14.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'studio/backend/**'
+      - '.github/workflows/pr9345-macos-14.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  planner:
+    runs-on: macos-14
+    timeout-minutes: 25
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ALLOW_CPU: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12', cache: 'pip' }
+      - name: Install planner test deps (no torch; the planner is pure arithmetic)
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-xdist httpx structlog pydantic huggingface_hub fastapi starlette pyjwt sqlalchemy cryptography python-multipart aiofiles psutil pyyaml
+      - name: Planner + context-fit + slot-reduction suites
+        working-directory: studio/backend
+        run: python -m pytest -q --tb=short tests/test_slot_reduction_context_refit.py tests/test_slot_refit_ctx_checkpoints.py tests/test_slot_offload_fit.py tests/test_llama_cpp_context_fit.py tests/test_llama_cpp_max_context_threshold.py tests/test_parallel_slots_never_clamped.py tests/test_llama_cpp_placement.py tests/test_compute_buffer.py tests/test_kv_cache_estimation.py tests/test_mtp_vram_budget.py tests/test_llama_server_args.py tests/test_native_context_length.py tests/test_metal_never_starts_at_native_context.py tests/test_metal_explicit_context_guard.py tests/test_metal_paravirtual_guard.py tests/test_llama_extra_args_platforms.py -k 'not TestPerGpuFitGuardAllCounts and not TestPreSpawnGpuResolution and not TestGpuAutoSelection and not TestTransformersIntrospection'
