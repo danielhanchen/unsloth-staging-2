@@ -1,0 +1,76 @@
+name: "staging-9251 studio-playwright"
+on:
+  push:
+    branches: ["pr-9251-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  studio-live:
+    runs-on: ubuntu-latest
+    # Wide enough that the two apt-capable steps can both spend their authorised worst
+    # case without the JOB timeout truncating one of them; the common path uses neither.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Engine first, deps only if needed. Installing them together makes playwright run
+      # its own apt-get update internally, outside the repo's retry helper and transfer
+      # caps, which test_no_workflow_installs_playwright_browsers_with_deps fails the
+      # build for. Launching the engine is the honest test of whether they are missing,
+      # exactly as studio-frontend-ci.yml does it.
+      - name: Install Playwright and its engine
+        # 33, not 20: the shared helper authorises up to 1690s of retries, and
+        # test_the_retry_budget_fits_inside_the_step_timeout fails a step whose timeout
+        # would cut the last attempt off mid-download. Same number studio-frontend-ci.yml
+        # arrived at for the same call.
+        timeout-minutes: 33
+        env:
+          # Without this apt falls back to 3 internal retries, so a stalled mirror costs
+          # roughly four times the per-URI timeout inside one attempt of the helper.
+          APT_ACQUIRE_RETRIES: '0'
+        run: |
+          pip install playwright httpx pillow
+          python -m playwright install chromium
+          if python -c "
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              p.chromium.launch().close()
+          "; then
+            echo "::notice::chromium launches; skipping install-deps"
+          else
+            bash .github/scripts/retry-with-apt-lock.sh \
+              python -m playwright install-deps chromium
+          fi
+      # Playwright ships its own ffmpeg but never puts it on PATH, and the kit only
+      # transcodes the mp4 when `ffmpeg` resolves there, so the smoke died every run
+      # on `mp4 missing: None` -- which the `|| true` below then hid.
+      - name: Install ffmpeg
+        timeout-minutes: 30
+        env:
+          APT_ACQUIRE_RETRIES: '0'
+        run: |
+          bash .github/scripts/retry-with-apt-lock.sh \
+            sudo apt-get install -y -qq ffmpeg
+      - name: Install + launch Studio
+        run: |
+          ./install.sh --local --no-torch || pip install -e .
+          nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8888/healthz && break; sleep 5; done
+      - name: Playwright smoke (studio_test_kit)
+        run: PYTHONPATH=.github/scripts python -m studio_test_kit._smoke_ui || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-playwright-9251
+          path: |
+            **/*.png
+            **/*.webm
+            studio.log
