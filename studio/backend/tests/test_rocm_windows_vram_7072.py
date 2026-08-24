@@ -496,3 +496,302 @@ def test_per_device_vram_uses_the_snapshot_it_is_given(monkeypatch):
     devices, _agg = hw._rocm_windows_per_device_vram([0], [("a", 1.2 * GB)])
 
     assert devices[0]["used_gb"] == round(1.2 * GB / (1024**3), 2)
+
+
+# ----------------------------------------------------------------------------- #
+# The per-device total on a unified-memory APU
+#
+# _rocm_windows_per_device_vram took props.total_memory verbatim, which on an APU
+# is the dedicated carve-out rather than what torch can use, so a 128 GiB Strix
+# Halo budgeted as roughly 8. Every other path already corrects this through
+# _rocm_props_total_is_carve_out; this one did not.
+# ----------------------------------------------------------------------------- #
+APU = ("AMD Radeon(TM) 8060S Graphics", 8 * GB)
+APU_ADAPTERS = [("luid_0x00000000_0x0000c001_phys_0", 2 * GB)]
+
+
+def test_windows_apu_total_is_the_driver_pool_not_the_carve_out(win_rocm, monkeypatch):
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+    torch = _fake_torch([APU])
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda i: (96 * GB, 128 * GB))
+    monkeypatch.setattr(hw, "_rocm_props_total_is_carve_out", lambda props: True)
+    monkeypatch.setattr(
+        hw.subprocess, "run", _subprocess_run(adapter_output = _adapter_output(APU_ADAPTERS))
+    )
+
+    monkeypatch.setattr(hw, "_rocm_windows_unified_used_bytes", lambda: 12.0 * GB)
+    devices, aggregate = hw._rocm_windows_per_device_vram([0])
+    assert devices[0]["total_gb"] == 128.0
+    # Dedicated Usage alone saturates at the carve-out, so a widened total takes
+    # the Dedicated+Shared sum instead. Pairing the carve-out reading with a pool
+    # total would hand back the shared pool as free while a model sits in it.
+    assert devices[0]["used_gb"] == 12.0
+    assert aggregate == 12.0
+
+
+def test_an_unsettled_classifier_does_not_cost_a_card_its_occupancy(win_rocm, monkeypatch):
+    """The classifier answers "carve-out" for a discrete card too whenever the
+    runtime leaves it unsettled (no integrated flag, HIP below 6.2). The driver
+    total comes back equal there, so nothing widened and nothing is unknown."""
+    torch = _fake_torch(DEVICES, free_equals_total = True)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(hw, "_rocm_props_total_is_carve_out", lambda props: True)
+    monkeypatch.setattr(
+        hw.subprocess, "run", _subprocess_run(adapter_output = _adapter_output(REPORTER_ADAPTERS))
+    )
+
+    devices, _ = hw._rocm_windows_per_device_vram([0, 1])
+    assert [d["total_gb"] for d in devices] == [48.0, 8.0]
+    assert devices[0]["used_gb"] == pytest.approx(40.0, abs = 0.01)
+
+
+def test_a_discrete_card_must_not_pay_a_context_for_its_total(win_rocm, monkeypatch):
+    """Only an APU pays mem_get_info for its total; a poll that attaches a
+    context on a discrete card never gives the memory back."""
+    torch = _fake_torch(DEVICES, free_equals_total = True)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda i: pytest.fail("a discrete card must not be asked")
+    )
+    monkeypatch.setattr(hw, "_rocm_props_total_is_carve_out", lambda props: False)
+    monkeypatch.setattr(hw.subprocess, "run", _subprocess_run(adapter_output = "__NONE__\n"))
+
+    devices, _ = hw._rocm_windows_per_device_vram([0, 1])
+    assert [d["total_gb"] for d in devices] == [48.0, 8.0]
+
+
+# ----------------------------------------------------------------------------- #
+# A widened APU total must not follow the APU into the capacity matching
+#
+# _match_adapter_used_to_devices ranks the Dedicated Usage counters against
+# device capacity, and that counter measures the DEDICATED segment, whose ceiling
+# is the carve-out and never the pool. Ranked against a widened total the APU
+# outranks every discrete card, the threshold that forces a pairing rises, and so
+# does the ceiling of the impossible-counter check. The total_is_pool guard runs
+# after the matching and nulls only the widened device, so it cannot reach that.
+# ----------------------------------------------------------------------------- #
+MIXED = [("AMD Radeon(TM) 8060S Graphics", 8 * GB), ("AMD Radeon RX 7900 XTX", 24 * GB)]
+MIXED_ADAPTERS = [
+    ("luid_0x00000000_0x0000c001_phys_0", 2.0 * GB),  # APU carve-out
+    ("luid_0x00000000_0x0000d1e2_phys_0", 10.0 * GB),  # 7900 XTX, model loaded
+    ("luid_0x00000000_0x0000f001_phys_0", 3 * MiB),  # Basic Render Driver
+]
+
+
+def _mixed_host(monkeypatch):
+    """APU (8 GiB carve-out, 128 GiB pool) at ordinal 0, discrete 24 GiB at 1."""
+    torch = _fake_torch(MIXED, free_equals_total = True)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    # _Props carries no is_integrated, so the classifier stays patched; keying it
+    # on the total is what lets one fake host hold an APU and a discrete card.
+    monkeypatch.setattr(
+        hw, "_rocm_props_total_is_carve_out", lambda props: props.total_memory == 8 * GB
+    )
+    monkeypatch.setattr(
+        torch.cuda,
+        "mem_get_info",
+        lambda i: (96 * GB, 128 * GB)
+        if i == 0
+        else pytest.fail("a discrete card must not be asked"),
+    )
+    return torch
+
+
+def test_widened_apu_total_does_not_cost_the_discrete_card_its_usage(win_rocm, monkeypatch):
+    """Hidden-adapter branch. Against carve-out totals [8, 24] the 10 GiB counter
+    exceeds 8 GiB, so capacity forces it onto the 24 GiB card. Against a 128 GiB
+    pool the APU takes rank 0, 10 GiB no longer exceeds the next capacity, and
+    the discrete card reads Unknown."""
+    _mixed_host(monkeypatch)
+    monkeypatch.setattr(
+        hw.subprocess, "run", _subprocess_run(adapter_output = _adapter_output(MIXED_ADAPTERS))
+    )
+
+    devices, aggregate = hw._rocm_windows_per_device_vram([0, 1])
+    assert [d["total_gb"] for d in devices] == [128.0, 24.0]  # displayed total still widened
+    assert devices[0]["used_gb"] is None  # Dedicated Usage is not the pool's numerator
+    assert devices[1]["used_gb"] == pytest.approx(10.0, abs = 0.01)
+    assert aggregate is None  # one member of the visible set is unknown
+
+
+def test_widened_apu_total_does_not_make_every_pairing_ambiguous(win_rocm, monkeypatch):
+    """Equal-length branch, no placeholder counter. The ambiguity check asks
+    whether the two usages could be swapped without breaking capacity: 10 GiB
+    does not fit the 8 GiB carve-out, so they could not, but it fits a 128 GiB
+    slot, so every ranking on a mixed host becomes swappable."""
+    _mixed_host(monkeypatch)
+    monkeypatch.setattr(
+        hw.subprocess, "run", _subprocess_run(adapter_output = _adapter_output(MIXED_ADAPTERS[:2]))
+    )
+
+    devices, _ = hw._rocm_windows_per_device_vram([0, 1])
+    assert devices[1]["used_gb"] == pytest.approx(10.0, abs = 0.01)
+    assert devices[0]["used_gb"] is None
+
+
+def test_widened_apu_total_does_not_admit_an_impossible_counter(win_rocm, monkeypatch):
+    """A 50 GiB counter fits no visible card, so the list is not the visible set
+    and every device must read Unknown. Against a 128 GiB slot it fits, shifts
+    the others down a rank and fabricates 30 GiB on the 48 GiB card: a wrong
+    reading rather than an unknown one, which the guard does not cover."""
+    torch = _fake_torch(
+        [
+            ("AMD Radeon(TM) 8060S Graphics", 8 * GB),
+            ("AMD Radeon PRO W7900", 48 * GB),
+            ("AMD Radeon PRO W7800", 24 * GB),
+        ],
+        free_equals_total = True,
+    )
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0,1,2")
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(
+        hw, "_rocm_props_total_is_carve_out", lambda props: props.total_memory == 8 * GB
+    )
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda i: (96 * GB, 128 * GB))
+    adapters = [
+        ("luid_0x00000000_0x0000a001_phys_0", 50.0 * GB),  # hidden card, no visible home
+        ("luid_0x00000000_0x0000d1e2_phys_0", 30.0 * GB),
+        ("luid_0x00000000_0x0000e34a_phys_0", 1.0 * GB),
+        ("luid_0x00000000_0x0000f001_phys_0", 3 * MiB),
+    ]
+    monkeypatch.setattr(
+        hw.subprocess, "run", _subprocess_run(adapter_output = _adapter_output(adapters))
+    )
+
+    devices, aggregate = hw._rocm_windows_per_device_vram([0, 1, 2])
+    assert [d["used_gb"] for d in devices] == [None, None, None]
+    assert [d["total_gb"] for d in devices] == [128.0, 48.0, 24.0]
+    assert aggregate is None
+
+
+def test_a_driver_total_below_the_carve_out_is_not_adopted(win_rocm, monkeypatch):
+    """The classifier says carve-out for a discrete card on an unsettled runtime
+    too, and this path carries a used alongside the total. A driver total below
+    props.total_memory there reports past 100% utilization and, through
+    free = max(total - used, 0), zero free on a card that is mostly empty."""
+    torch = _fake_torch(DEVICES, free_equals_total = True)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(hw, "_rocm_props_total_is_carve_out", lambda props: True)
+    # Driver under-reports the 48 GiB card.
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda i: (0, 36 * GB) if i == 0 else (0, 8 * GB)
+    )
+    monkeypatch.setattr(
+        hw.subprocess, "run", _subprocess_run(adapter_output = _adapter_output(REPORTER_ADAPTERS))
+    )
+
+    devices, _ = hw._rocm_windows_per_device_vram([0, 1])
+    assert [d["total_gb"] for d in devices] == [48.0, 8.0]
+    assert devices[0]["used_gb"] == pytest.approx(40.0, abs = 0.01)
+    assert all(d["used_gb"] <= d["total_gb"] for d in devices if d["used_gb"] is not None)
+
+
+def test_a_failing_carve_out_probe_keeps_the_device(win_rocm, monkeypatch):
+    """The correction is a probe, and it is the first thing this path asks the
+    classifier. A probe that throws must cost the device its correction, not its
+    place in the visible set: dropping it shows the System tab no GPU at all."""
+    torch = _fake_torch(DEVICES, free_equals_total = True)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+    def _boom(props):
+        raise RuntimeError("classifier unavailable")
+
+    monkeypatch.setattr(hw, "_rocm_props_total_is_carve_out", _boom)
+    monkeypatch.setattr(
+        hw.subprocess, "run", _subprocess_run(adapter_output = _adapter_output(REPORTER_ADAPTERS))
+    )
+
+    devices, _ = hw._rocm_windows_per_device_vram([0, 1])
+    assert [d["total_gb"] for d in devices] == [48.0, 8.0]
+    assert devices[0]["used_gb"] == pytest.approx(40.0, abs = 0.01)
+
+
+def test_the_inventory_path_also_refuses_to_shrink_a_total(monkeypatch):
+    """The sibling correction this one is modelled on. It publishes no used, so a
+    shrink cannot break the used <= total invariant there, but an understated
+    total still hides models the device can hold, which is the failure the
+    classifier exists to prevent."""
+    monkeypatch.setattr(hw, "IS_ROCM", True)
+    torch = _fake_torch(DEVICES)
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(hw, "_rocm_props_total_is_carve_out", lambda props: True)
+    # Under-reports the 48 GiB card, agrees on the 8 GiB one.
+    monkeypatch.setattr(
+        torch.cuda, "mem_get_info", lambda i: (0, 36 * GB) if i == 0 else (0, 8 * GB)
+    )
+
+    devices = hw._torch_get_device_inventory([0, 1])
+    assert [d["total_gb"] for d in devices] == [48.0, 8.0]
+    assert all(d["used_gb"] is None for d in devices)
+
+
+def _apu_host(monkeypatch, unified_used = 12.0 * GB):
+    """A lone 8 GiB carve-out / 128 GiB pool APU.
+
+    ``unified_used`` stands in for _rocm_windows_unified_used_bytes, which sums
+    Dedicated and Shared. Patched rather than driven through the counters because
+    what is under test here is that a widened device takes that figure, not the
+    counter plumbing, which #9362's own tests already cover. ``None`` simulates it
+    declining.
+    """
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+    torch = _fake_torch([APU])
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda i: (96 * GB, 128 * GB))
+    monkeypatch.setattr(hw, "_rocm_props_total_is_carve_out", lambda props: True)
+    monkeypatch.setattr(hw, "_rocm_windows_unified_used_bytes", lambda: unified_used)
+    monkeypatch.setattr(
+        hw.subprocess, "run", _subprocess_run(adapter_output = _adapter_output(APU_ADAPTERS))
+    )
+
+
+def test_widened_total_survives_get_gpu_utilization(win_rocm, monkeypatch):
+    """The helper is not what the user sees. The corrected total has to reach the
+    payload, and the unknown occupancy has to stay unknown through the legacy
+    primary-device mirror rather than being filled in with a zero."""
+    _apu_host(monkeypatch)
+
+    result = hw.get_gpu_utilization()
+    assert result["devices"][0]["vram_total_gb"] == 128.0
+    assert result["devices"][0]["vram_used_gb"] == 12.0
+    assert result["devices"][0]["vram_utilization_pct"] == pytest.approx(9.4, abs = 0.1)
+    assert result["vram_total_gb"] == 128.0  # legacy mirror carries it too
+    assert result["vram_used_gb"] == 12.0
+
+
+def test_the_system_tab_does_not_invent_free_vram_on_an_apu(win_rocm, monkeypatch):
+    """The failure this guards is a 128 GiB card reporting 128 GiB free while a
+    model sits in the shared pool: free is total minus used, and used is unknown,
+    so free must stay unknown rather than defaulting used to zero."""
+    _apu_host(monkeypatch)
+
+    devices = hw.get_visible_gpu_utilization()["devices"]
+    assert devices[0]["vram_total_gb"] == 128.0
+    assert devices[0]["vram_used_gb"] == 12.0
+    assert devices[0]["vram_utilization_pct"] == pytest.approx(9.4, abs = 0.1)
+
+
+def test_a_declining_unified_read_leaves_the_apu_unknown(win_rocm, monkeypatch):
+    """When the sum cannot be established the carve-out reading must not be left
+    standing under a pool-sized total: that is the reading that reports a loaded
+    128 GiB card as almost entirely free."""
+    _apu_host(monkeypatch, unified_used = None)
+
+    devices, aggregate = hw._rocm_windows_per_device_vram([0])
+    assert devices[0]["total_gb"] == 128.0
+    assert devices[0]["used_gb"] is None
+    assert aggregate is None
+
+
+@pytest.mark.parametrize("system", ["Linux", "Darwin"])
+def test_the_windows_path_is_inert_off_windows(win_rocm, monkeypatch, system):
+    """Linux, macOS and WSL (which reports Linux) never reach this path, so no
+    change to it can reach them."""
+    monkeypatch.setattr(hw.platform, "system", lambda: system)
+    monkeypatch.setitem(sys.modules, "torch", _fake_torch(DEVICES))
+    monkeypatch.setattr(
+        hw, "_rocm_props_total_is_carve_out", lambda props: pytest.fail("not on this platform")
+    )
+
+    assert hw._rocm_windows_per_device_vram([0, 1]) == ([], None)
