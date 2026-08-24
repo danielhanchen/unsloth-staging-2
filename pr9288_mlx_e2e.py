@@ -19,6 +19,10 @@ import json
 import os
 import sys
 
+def _opens(text: str) -> bool:
+    return text.rfind("<think>") > text.rfind("</think>")
+
+
 # Ordinary requests. None of them asks to reason; every one should come back with an answer.
 PROMPTS = [
     "What is 2+2?",
@@ -34,7 +38,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default = "mlx-community/Qwen3.5-0.8B-4bit")
     ap.add_argument("--backend", required = True, help = "path to studio/backend under test")
-    ap.add_argument("--max-tokens", type = int, default = 128)
+    ap.add_argument("--max-tokens", type = int, default = 640)
     ap.add_argument("--json", dest = "out")
     args = ap.parse_args()
 
@@ -69,6 +73,15 @@ def main() -> int:
         prompt = apply_chat_template_for_generation(tokenizer, messages)
         if not isinstance(prompt, str):
             prompt = prompt[0] if prompt else ""
+        # The probe's own render of the same request, to see whether the two agree. A
+        # disagreement here is the premise of this PR failing on a real model.
+        from routes.inference import _render_generation_prompt_probe
+
+        if takes_messages:
+            probe_prompt = _render_generation_prompt_probe(template, None, None, messages) or ""
+        else:
+            probe_prompt = _render_generation_prompt_probe(template, None, None) or ""
+        agree = _opens(prompt) == _opens(probe_prompt)
         # MLX re-emits a prefilled open tag, since it lives in the prompt not the tokens.
         think_prefix = detect_think_prefill(prompt, getattr(tokenizer, "all_special_tokens", None))
 
@@ -84,7 +97,11 @@ def main() -> int:
         rows.append({
             "prompt": text,
             "prefilled": bool(prefilled),
-            "prompt_tail": prompt[-40:],
+            "real_prompt_tail": prompt[-40:],
+            "probe_prompt_tail": probe_prompt[-40:],
+            "renders_agree": agree,
+            "template_is_str": isinstance(template, str),
+            "template_chars": len(template) if isinstance(template, str) else -1,
             "think_prefix": think_prefix,
             "content_chars": len(content or ""),
             "reasoning_chars": len(reasoning or ""),
@@ -93,7 +110,8 @@ def main() -> int:
         })
         print(
             f"  prefilled={rows[-1]['prefilled']!s:5s} content={rows[-1]['content_chars']:4d}ch "
-            f"reasoning={rows[-1]['reasoning_chars']:5d}ch blank={rows[-1]['content_blank']}  {text}",
+            f"reasoning={rows[-1]['reasoning_chars']:5d}ch blank={rows[-1]['content_blank']} "
+            f"agree={agree}  real={prompt[-24:]!r} probe={probe_prompt[-24:]!r}",
             flush = True,
         )
 
