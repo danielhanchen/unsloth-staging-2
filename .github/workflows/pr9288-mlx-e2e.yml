@@ -114,7 +114,7 @@ jobs:
           python -m pip install mlx mlx-lm
           python -m pip install -r studio/backend/requirements/studio.txt
           python -m pip install "transformers>=4.51,<5.5" jinja2
-          python -c "import mlx_lm, mlx_lm.version as v; print('mlx-lm', v.__version__)"
+          python -c "import mlx_lm, transformers; print('mlx-lm', mlx_lm.__version__, 'transformers', transformers.__version__)"
 
       - name: Render both tokenizer paths and compare against the PR's verdict
         env:
