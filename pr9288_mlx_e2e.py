@@ -1,29 +1,44 @@
 """PR #9288 end-to-end on real MLX: does a default request come back with content?
 
-Runs on Apple silicon only. Everything load-bearing comes from the repo under test, so the
-verdict is the shipped code's, not a paraphrase of it:
+Apple silicon only. Everything load-bearing comes from the repo under test, so the verdict is
+the shipped code's rather than a paraphrase of it:
 
-  prompt      studio.backend.core.inference.chat_template_helpers.apply_chat_template_for_generation
-  prefill     studio.backend.routes.inference._sf_reasoning_prefill_mode
+  prompt      core.inference.chat_template_helpers.apply_chat_template_for_generation
+  prefill     routes.inference._sf_reasoning_prefill_mode
   re-emit     chat_template_helpers.detect_think_prefill
   extraction  routes.inference._ResponsesReasoningExtractor
 
-Only the token generation is mlx_lm, which is what the Studio MLX backend uses too. Checked
-out at the merge base this reproduces the blank ``content``; at the PR head it should not.
+Only token generation is mlx_lm, which is what the Studio MLX backend uses too.
 
-  python scripts/pr9288_mlx_e2e.py --model mlx-community/Qwen3.5-0.8B-4bit --json out.json
+Also renders the same request three ways to locate any disagreement:
+
+  helper   apply_chat_template_for_generation   (what generation actually uses)
+  raw      tokenizer.apply_chat_template        (the helper's own call, unwrapped)
+  jinja    transformers render_jinja_template   (the template string, no tokenizer)
+
+helper != raw points at the helper; raw != jinja points at the tokenizer object; and jinja is
+what the PR's probe reconstructs. Runs on the merge base as well as the PR head, so a
+difference between them is the change and not the harness.
+
+  python pr9288_mlx_e2e.py --model mlx-community/Qwen3.5-0.8B-4bit --backend studio/backend
 """
 
 import argparse
 import json
-import os
 import sys
 
-def _opens(text: str) -> bool:
-    return text.rfind("<think>") > text.rfind("</think>")
+_OPEN, _CLOSE = "<think>", "</think>"
 
 
-# Ordinary requests. None of them asks to reason; every one should come back with an answer.
+def opens(text: str) -> bool:
+    return text.rfind(_OPEN) > text.rfind(_CLOSE)
+
+
+def tail(text, n = 44):
+    return (text or "")[-n:]
+
+
+# Ordinary requests. None asks to reason; every one should come back with an answer.
 PROMPTS = [
     "What is 2+2?",
     "Name the capital of France.",
@@ -37,8 +52,9 @@ PROMPTS = [
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default = "mlx-community/Qwen3.5-0.8B-4bit")
-    ap.add_argument("--backend", required = True, help = "path to studio/backend under test")
-    ap.add_argument("--max-tokens", type = int, default = 640)
+    ap.add_argument("--backend", required = True)
+    # Generous, so the reasoning block can close and a real content split can be observed.
+    ap.add_argument("--max-tokens", type = int, default = 3000)
     ap.add_argument("--json", dest = "out")
     args = ap.parse_args()
 
@@ -53,39 +69,69 @@ def main() -> int:
 
     from mlx_lm import generate, load
 
+    # The merge base has neither the messages parameter nor the standalone render helper.
     takes_messages = "messages" in inspect.signature(_sf_reasoning_prefill_mode).parameters
+
     model, tokenizer = load(args.model)
     template = getattr(tokenizer, "chat_template", None)
     flags = detect_reasoning_flags(template, model_identifier = args.model, log_source = "mlx_e2e")
-    print(f"model={args.model}\nflags={ {k: flags.get(k) for k in ('reasoning_style', 'supports_reasoning', 'reasoning_always_on')} }", flush = True)
+
+    tok_cls = f"{type(tokenizer).__module__}.{type(tokenizer).__name__}"
+    inner = getattr(tokenizer, "_tokenizer", None)
+    inner_cls = f"{type(inner).__module__}.{type(inner).__name__}" if inner is not None else None
+    chars = len(template) if isinstance(template, str) else -1
+    print(f"model={args.model}", flush = True)
+    print(f"tokenizer={tok_cls}  inner={inner_cls}", flush = True)
+    print(f"template_is_str={isinstance(template, str)} chars={chars}", flush = True)
+    keys = ("reasoning_style", "supports_reasoning", "reasoning_always_on")
+    print(f"flags={ {k: flags.get(k) for k in keys} }  takes_messages={takes_messages}", flush = True)
+
+    def render_raw(messages):
+        """The helper's own call, without the helper around it."""
+        try:
+            out = tokenizer.apply_chat_template(
+                messages, tokenize = False, add_generation_prompt = True
+            )
+            return out if isinstance(out, str) else (out[0] if out else "")
+        except Exception as e:
+            return f"__ERR__ {type(e).__name__}: {e}"
+
+    def render_jinja(messages):
+        """transformers' own renderer on the template string, no tokenizer involved."""
+        try:
+            from transformers.utils.chat_template_utils import render_jinja_template
+
+            out = render_jinja_template(
+                conversations = [messages], chat_template = template, add_generation_prompt = True
+            )
+            while isinstance(out, (tuple, list)):
+                out = out[0]
+            return out
+        except Exception as e:
+            return f"__ERR__ {type(e).__name__}: {e}"
 
     rows = []
     for text in PROMPTS:
         messages = [{"role": "user", "content": text}]
-        # The decision under test, taken exactly as the route takes it.
+
+        # The decision under test, taken as the route takes it.
         if takes_messages:
             prefilled = _sf_reasoning_prefill_mode(flags, None, template, None, messages)
         else:
             prefilled = _sf_reasoning_prefill_mode(flags, None, template, None)
         parse_think = bool(flags.get("supports_reasoning") or flags.get("reasoning_always_on"))
 
-        # It picks the boundary itself; a new turn always renders the generation prompt.
-        prompt = apply_chat_template_for_generation(tokenizer, messages)
-        if not isinstance(prompt, str):
-            prompt = prompt[0] if prompt else ""
-        # The probe's own render of the same request, to see whether the two agree. A
-        # disagreement here is the premise of this PR failing on a real model.
-        from routes.inference import _render_generation_prompt_probe
+        helper = apply_chat_template_for_generation(tokenizer, messages)
+        if not isinstance(helper, str):
+            helper = helper[0] if helper else ""
+        raw = render_raw(messages)
+        jinja = render_jinja(messages)
 
-        if takes_messages:
-            probe_prompt = _render_generation_prompt_probe(template, None, None, messages) or ""
-        else:
-            probe_prompt = _render_generation_prompt_probe(template, None, None) or ""
-        agree = _opens(prompt) == _opens(probe_prompt)
         # MLX re-emits a prefilled open tag, since it lives in the prompt not the tokens.
-        think_prefix = detect_think_prefill(prompt, getattr(tokenizer, "all_special_tokens", None))
-
-        generated = generate(model, tokenizer, prompt = prompt, max_tokens = args.max_tokens, verbose = False)
+        think_prefix = detect_think_prefill(helper, getattr(tokenizer, "all_special_tokens", None))
+        generated = generate(
+            model, tokenizer, prompt = helper, max_tokens = args.max_tokens, verbose = False
+        )
 
         extractor = _ResponsesReasoningExtractor(
             parse_think_markers = parse_think, reasoning_prefilled = prefilled
@@ -94,33 +140,55 @@ def main() -> int:
         r1, v1 = extractor.feed(think_prefix + generated)
         r2, v2 = extractor.finish()
         reasoning, content = r1 + r2, v1 + v2
-        rows.append({
+
+        row = {
             "prompt": text,
             "prefilled": bool(prefilled),
-            "real_prompt_tail": prompt[-40:],
-            "probe_prompt_tail": probe_prompt[-40:],
-            "renders_agree": agree,
-            "template_is_str": isinstance(template, str),
-            "template_chars": len(template) if isinstance(template, str) else -1,
+            "helper_opens": opens(helper),
+            "raw_opens": None if raw.startswith("__ERR__") else opens(raw),
+            "jinja_opens": None if jinja.startswith("__ERR__") else opens(jinja),
+            "helper_tail": tail(helper),
+            "raw_tail": tail(raw),
+            "jinja_tail": tail(jinja),
+            "flag_matches_helper": bool(prefilled) == opens(helper),
             "think_prefix": think_prefix,
-            "content_chars": len(content or ""),
-            "reasoning_chars": len(reasoning or ""),
-            "content_blank": not (content or "").strip(),
-            "content_head": (content or "")[:80],
-        })
+            "generated_closed_block": _CLOSE in (think_prefix + generated),
+            "content_chars": len(content),
+            "reasoning_chars": len(reasoning),
+            "content_blank": not content.strip(),
+            "content_head": content[:80],
+        }
+        rows.append(row)
         print(
-            f"  prefilled={rows[-1]['prefilled']!s:5s} content={rows[-1]['content_chars']:4d}ch "
-            f"reasoning={rows[-1]['reasoning_chars']:5d}ch blank={rows[-1]['content_blank']} "
-            f"agree={agree}  real={prompt[-24:]!r} probe={probe_prompt[-24:]!r}",
+            f"  flag={row['prefilled']!s:5s} helper_opens={row['helper_opens']!s:5s} "
+            f"raw={row['raw_opens']!s:5s} jinja={row['jinja_opens']!s:5s} "
+            f"match={row['flag_matches_helper']!s:5s} closed={row['generated_closed_block']!s:5s} "
+            f"content={row['content_chars']:5d} reasoning={row['reasoning_chars']:5d} "
+            f"blank={row['content_blank']}",
             flush = True,
         )
 
     blank = sum(r["content_blank"] for r in rows)
-    summary = {"model": args.model, "backend": args.backend, "n": len(rows), "blank": blank, "rows": rows}
+    mismatch = sum(not r["flag_matches_helper"] for r in rows)
+    unterminated = sum(not r["generated_closed_block"] for r in rows)
     print(f"\nBLANK CONTENT: {blank}/{len(rows)}")
+    print(f"FLAG DISAGREES WITH THE REAL PROMPT: {mismatch}/{len(rows)}")
+    print(f"GENERATION NEVER CLOSED ITS BLOCK: {unterminated}/{len(rows)}")
+    hr = sum(r["helper_tail"] != r["raw_tail"] for r in rows)
+    rj = sum(r["raw_tail"] != r["jinja_tail"] for r in rows)
+    print(f"helper vs raw tails differ: {hr}/{len(rows)}")
+    print(f"raw vs jinja tails differ:  {rj}/{len(rows)}")
+    print(f"SAMPLE helper_tail={rows[0]['helper_tail']!r}")
+    print(f"SAMPLE raw_tail   ={rows[0]['raw_tail']!r}")
+    print(f"SAMPLE jinja_tail ={rows[0]['jinja_tail']!r}")
+
     if args.out:
         with open(args.out, "w") as f:
-            json.dump(summary, f, indent = 2)
+            json.dump({
+                "model": args.model, "tokenizer": tok_cls, "inner_tokenizer": inner_cls,
+                "takes_messages": takes_messages, "n": len(rows), "blank": blank,
+                "flag_mismatch": mismatch, "unterminated": unterminated, "rows": rows,
+            }, f, indent = 2)
     return 0
 
 
