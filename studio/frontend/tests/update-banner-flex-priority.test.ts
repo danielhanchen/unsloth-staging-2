@@ -245,16 +245,104 @@ test("the rail scrolls rather than spilling its cards", () => {
     // was.
     assert.match(rules, /\bpx-3\b/);
     assert.match(rules, /-mx-3/);
-    // Sideways only. This node is the one useStackGeometry measures, so
-    // vertical padding is counted into scrollHeight and the stack asks for room
-    // it does not occupy: a card that fits under the composer then measures as
-    // one that does not, and the rail lifts over it. The cap has to stay on
-    // this same node too, since measure() lifts it here to read the natural
-    // height; on a parent, the read would be the placement's own output.
-    assert.ok(
-      !/\bp-3\b/.test(rules) && !/\bpy-3\b/.test(rules),
-      "vertical padding on the measured node inflates the measured height",
+    // scrollHeight spans that padding, so the gutter has to be discounted or the
+    // stack asks for room it does not occupy and lifts over the composer for
+    // nothing. The cap stays on this node, since measure() lifts it here.
+    assert.match(
+      STORE,
+      /const natural = railCardsHeight\(node\.scrollHeight, gutter\)/,
+      "the natural height counts the rail's own padding as cards",
     );
+    // Both totals, since the squeezed one is what `overflowing` compares
+    // against the cards' own cap. The per-card readings beside it are border
+    // boxes and carry no padding of the rail's.
+    assert.match(
+      STORE,
+      /const collapsed = railCardsHeight\(node\.scrollHeight, gutter\)/,
+      "the squeezed height counts the rail's own padding as cards",
+    );
+  }
+});
+
+// Reserved, not taken: the cards keep the band they had without the gutter, and
+// the padding hangs below it. A negative margin cannot do this, since `bottom`
+// anchors the margin edge and the padding would move the cards instead.
+test("the rail's block gutter costs the cards no room", () => {
+  const rails = PROVIDER.split('"fixed right-4 ');
+  assert.equal(rails.length - 1, 2, "the rail count changed");
+  for (const rail of rails.slice(1)) {
+    const rules = rail.slice(0, rail.indexOf('"'));
+    const style = rail.slice(rail.indexOf("style={{"), rail.indexOf("}}"));
+    assert.match(
+      style,
+      /bottom: railBottomOffset\(stack\.bottom\)/,
+      "the rail's own edge is anchored where its cards belong",
+    );
+    assert.match(
+      style,
+      /maxHeight: railMaxHeight\(stack\.maxHeight\)/,
+      "the gutter is spent on the cards' cap",
+    );
+    // From the same constants, not from pb-4/pt-2. Those resolve through
+    // --spacing in rem, so at a root font size other than 16px the padding and
+    // the compensation drift apart: the cards move and their band changes size.
+    assert.match(
+      style,
+      /paddingTop: STACK_SHADOW_GUTTER_TOP/,
+      "the top gutter can drift from the cap that pays for it",
+    );
+    assert.match(
+      style,
+      /paddingBottom: STACK_SHADOW_GUTTER_BOTTOM/,
+      "the bottom gutter can drift from the offset that pays for it",
+    );
+    // Every surface here offsets its shadow downwards, so flush against the
+    // clip edge the bottom card loses all of it and reads as cut off, which is
+    // how the llama.cpp toast was reported. A zero gutter is that bug again.
+    assert.doesNotMatch(rules, /\bp[byt]-/, "a rem gutter is back on the rail");
+  // The gutter drops the rail's box to the window's floor, and `-mx-3` already put it 4px
+  // from the right edge, so a scrolling rail's box lands on the window's own resize grips.
+  // Those are under it on Tailwind's scale, so they need the named layer to win. All eight,
+  // because a card is the window's width less 2rem up to its max: on a narrow window the
+  // rail spans nearly the whole width and reaches the north and west targets too.
+  const TITLEBAR = read("components/tauri/window-titlebar.tsx");
+  // A z-index on the window-controls toolbar would read as protection from the grips and
+  // give none: the toolbar sits inside a positioned, numbered header, so that header is a
+  // stacking context and a number inside it is never compared with the grips outside it.
+  const toolbar = TITLEBAR.slice(
+    TITLEBAR.lastIndexOf("<div", TITLEBAR.indexOf('aria-label="Window controls"')),
+    TITLEBAR.indexOf('aria-label="Window controls"'),
+  );
+  assert.doesNotMatch(
+    toolbar,
+    /zIndex:/,
+    "the window-controls toolbar carries a z-index, which its header traps",
+  );
+  for (const grip of [
+    "cursor-n-resize",
+    "cursor-s-resize",
+    "cursor-w-resize",
+    "cursor-e-resize",
+    "cursor-nw-resize",
+    "cursor-ne-resize",
+    "cursor-sw-resize",
+    "cursor-se-resize",
+  ]) {
+    const target = TITLEBAR.slice(
+      TITLEBAR.lastIndexOf("<div", TITLEBAR.indexOf(grip)),
+      TITLEBAR.indexOf("/>", TITLEBAR.indexOf(grip)),
+    );
+    assert.doesNotMatch(
+      target,
+      /z-\[70\]/,
+      `the ${grip} target is back under the overlay stack`,
+    );
+    assert.match(
+      target,
+      /zIndex: Z_LAYER\.WINDOW_RESIZE_EDGE/,
+      `the ${grip} target does not take the named layer, so a scrolling rail covers it`,
+    );
+  }
   }
 });
 
@@ -285,6 +373,30 @@ test("a scrolling rail takes pointer input, a fitting one stays click-through", 
     "the overflow flag is not derived from the placement",
   );
   assert.ok(!/setOverflowing/.test(STORE), "a latched DOM reading is back");
+  // The one place the flag can still latch is the empty-stack return, which
+  // publishes nothing and leaves. Before the rail carried a gutter that cost
+  // nothing: an empty rail was a zero-height box, so a stale "it scrolls"
+  // bought pointer input over no pixels. The gutter gives that box a height,
+  // so the corner would answer clicks with nothing in it. Every reading the
+  // branch leaves behind has to be cleared, the DOM one included.
+  const emptied = STORE.slice(
+    STORE.indexOf("node.childElementCount === 0"),
+    STORE.indexOf('node.style.transition = "none"'),
+  );
+  assert.ok(emptied.length > 0, "the empty-stack branch moved");
+  for (const cleared of [
+    "setNeededRoom",
+    "setFloorRoom",
+    "setCollapsedRoom",
+    "setPersistentTail",
+    "setDomOverflowing",
+  ]) {
+    assert.match(
+      emptied,
+      new RegExp(`${cleared}\\(`),
+      `an emptied rail keeps its ${cleared} reading, so it still holds the corner`,
+    );
+  }
   // The probe writes max-height twice and reads scrollHeight between the
   // writes. transition-property: all reaches the rail, so unsuppressed each
   // write starts a transition, and a transition computes its start value
