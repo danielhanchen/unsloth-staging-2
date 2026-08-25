@@ -33,8 +33,7 @@ name: MLX int8 prefill (Apple Silicon)
 
 on:
   workflow_dispatch:
-  # Staging-only: fire on push to the staging branch, since workflow_dispatch
-  # requires the workflow to exist on the default branch.
+  # Staging-only: fire on push to the staging branch.
   push:
     branches: [mlx-int8-prefill-ci]
   pull_request:
@@ -118,7 +117,7 @@ jobs:
               got = k(inputs=[xq, wq, mx.array([128], dtype=mx.int32)],
                       grid=(1*32*8, 1, 1), threadgroup=(32*8,1,1),
                       output_shapes=[(128,128)], output_dtypes=[mx.int32])[0]
-              want = mx.matmul(xq.astype(mx.int32), wq.astype(mx.int32).T)
+              want = mx.matmul(xq.astype(mx.float32), wq.astype(mx.float32).T).astype(mx.int32)
               mx.eval(got, want)
               same = bool(mx.array_equal(got, want).item())
               print(f'RESULT: MPP int8 matmul2d ran on this device, correct={same}')
@@ -127,6 +126,27 @@ jobs:
           except BaseException as exc:
               print(f'RESULT: MPP int8 matmul2d unavailable here -> {type(exc).__name__}: {exc}')
               print('Expected on M1. Tier 3 remains M5-only.')
+          "
+
+      # Runs before the real kernels so a Metal build failure is attributable: a
+      # trivial kernel failing means this runner's paravirtual GPU cannot JIT at all,
+      # rather than anything being wrong with our source.
+      - name: Trivial metal_kernel must compile and run
+        run: |
+          python -c "
+          import mlx.core as mx
+          k = mx.fast.metal_kernel(
+              name='unsloth_i8_smoke', input_names=['a'], output_names=['o'],
+              header='#include <metal_stdlib>\nusing namespace metal;\n',
+              source='uint i = thread_position_in_grid.x; o[i] = a[i] * 2;')
+          a = mx.arange(64, dtype=mx.float32)
+          o = k(inputs=[a], grid=(64,1,1), threadgroup=(64,1,1),
+                output_shapes=[(64,)], output_dtypes=[mx.float32])[0]
+          mx.eval(o)
+          assert mx.array_equal(o, a * 2).item()
+          print('OK: metal_kernel JIT works on this runner')
+          print('device:', mx.device_info().get('device_name'),
+                '| arch:', mx.device_info().get('architecture'))
           "
 
       # The two MPP-free kernels, against plain-MLX references. This is the part Linux

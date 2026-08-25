@@ -69,9 +69,9 @@ _QUANT_SRC = """
     float inv = 1.0f / scale;
     if (tid == 0) xs[row] = scale;
 
-    device char* qrow = xq + size_t(row) * K;
+    device int8_t* qrow = xq + size_t(row) * K;
     for (int i = tid; i < K; i += NTH) {{
-        qrow[i] = char(clamp(rint(float(xrow[i]) * inv), -127.0f, 127.0f));
+        qrow[i] = int8_t(clamp(rint(float(xrow[i]) * inv), -127.0f, 127.0f));
     }}
 """
 
@@ -94,7 +94,7 @@ _REQUANT_SRC = """
     const device uint* prow = packed + size_t(row) * KW;
     const device {T}* srow = scales + size_t(row) * (KW / WPG);
     const device {T}* brow = biases + size_t(row) * (KW / WPG);
-    device char* orow = out + size_t(row) * KW * VPW;
+    device int8_t* orow = out + size_t(row) * KW * VPW;
 
     float inv = 1.0f / ws[row];
 
@@ -103,11 +103,11 @@ _REQUANT_SRC = """
         int g = i / WPG;
         float s = float(srow[g]);
         float b = float(brow[g]);
-        device char* o = orow + i * VPW;
+        device int8_t* o = orow + i * VPW;
 #pragma unroll
         for (int j = 0; j < VPW; ++j) {{
             float v = float((wrd >> (BITS * j)) & MASK) * s + b;
-            o[j] = char(clamp(rint(v * inv), -127.0f, 127.0f));
+            o[j] = int8_t(clamp(rint(v * inv), -127.0f, 127.0f));
         }}
     }}
 """
@@ -135,10 +135,10 @@ _GEMM_SRC = """
 
     // Row-major X[M,K] -> extents (K, M); row-major W[N,K] used as the transposed right
     // operand -> extents (K, N).
-    auto A = tensor<device char, dextents<int32_t, 2>, tensor_inline>(
-        (device char*)xq, dextents<int32_t, 2>(K, M));
-    auto B = tensor<device char, dextents<int32_t, 2>, tensor_inline>(
-        (device char*)wq, dextents<int32_t, 2>(K, N));
+    auto A = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        (device int8_t*)xq, dextents<int32_t, 2>(K, M));
+    auto B = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
+        (device int8_t*)wq, dextents<int32_t, 2>(K, N));
 
     auto tA = A.slice(0, int(tgid.y) * TM);
     auto tB = B.slice(0, int(tgid.x) * TN);

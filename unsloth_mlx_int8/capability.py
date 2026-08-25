@@ -43,11 +43,16 @@ def _macos_major():
 
 
 def _probe_mpp_int8_gemm():
-    """Compile and run a small int8 MPP GEMM, comparing against an exact int32 matmul.
+    """Compile and run a small int8 MPP GEMM and compare it against an exact reference.
 
-    Integer GEMM is exact, so this compares with `==` and needs no tolerance. A machine
-    that lacks the int8 tensor-op path fails at kernel compilation; a machine that has
-    it but computes wrongly fails the comparison. Both mean unsupported.
+    A machine that lacks the int8 tensor-op path fails at kernel compilation; a machine
+    that has it but computes wrongly fails the comparison. Both mean unsupported.
+
+    The reference is a float32 matmul rather than an integer one, because `mx.matmul`
+    accepts only inexact types. That costs nothing here: with K=256 the largest possible
+    partial sum is 127*127*256 = 4.13e6, well inside float32's exactly representable
+    integer range of 2**24, so the comparison stays exact and needs no tolerance. K must
+    not be raised past ~1000 without revisiting that.
     """
     import mlx.core as mx
 
@@ -69,7 +74,7 @@ def _probe_mpp_int8_gemm():
         output_shapes=[(M, N)],
         output_dtypes=[mx.int32],
     )[0]
-    want = mx.matmul(xq.astype(mx.int32), wq.astype(mx.int32).T)
+    want = mx.matmul(xq.astype(mx.float32), wq.astype(mx.float32).T).astype(mx.int32)
     mx.eval(got, want)
     return bool(mx.array_equal(got, want).item())
 

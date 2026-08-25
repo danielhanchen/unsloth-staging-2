@@ -10,6 +10,7 @@ vjp that only surfaces partway through a fine-tune.
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 import pytest
 
 import unsloth_mlx_int8
@@ -53,6 +54,39 @@ class TestCapability:
         capability.reset()
         assert capability.is_supported() is False
         assert "disabled by" in capability.reason()
+
+    def test_probe_reference_is_computable_and_exact(self):
+        """The capability probe's reference must actually evaluate.
+
+        Regression: the probe originally compared its kernel against
+        `mx.matmul(int32, int32)`, which MLX rejects outright -- "Only inexact types are
+        supported". That made the probe raise, be caught by its own `except BaseException`,
+        and report unsupported. It looked correct on an M1 (which should decline anyway)
+        while guaranteeing the module could never enable on an M5 either. Nothing on
+        Linux caught it because the probe short-circuits at `sys.platform`.
+
+        So assert the two properties the probe relies on, on any backend: integer matmul
+        is unavailable, and the float32 substitute is exact at the probe's size.
+        """
+        M = N = 128
+        K = 256
+        xq = ((mx.arange(M * K) % 251) - 125).reshape(M, K).astype(mx.int8)
+        wq = ((mx.arange(N * K) % 241) - 120).reshape(N, K).astype(mx.int8)
+
+        with pytest.raises(ValueError, match="inexact"):
+            mx.eval(mx.matmul(xq.astype(mx.int32), wq.astype(mx.int32).T))
+
+        got = mx.matmul(xq.astype(mx.float32), wq.astype(mx.float32).T).astype(mx.int32)
+        mx.eval(got)
+        want = np.matmul(
+            np.array(xq, copy=False).astype(np.int64),
+            np.array(wq, copy=False).astype(np.int64).T,
+        )
+        assert np.array_equal(np.array(got, copy=False).astype(np.int64), want)
+
+        # The exactness above holds only while the largest partial sum stays inside
+        # float32's exact integer range. Pin the headroom so raising K trips this.
+        assert 127 * 127 * K < 2**24
 
     def test_probe_never_raises(self, monkeypatch):
         """Whatever goes wrong inside, callers see False, not an exception."""
