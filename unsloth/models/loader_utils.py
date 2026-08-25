@@ -108,6 +108,9 @@ def prepare_device_map():
 
 UNSLOTH_DEVICE_MAP = "unsloth"
 
+# A string, not None, so an explicit False stays distinguishable from "unset".
+OFFLOAD_EMBEDDING_AUTO = "auto"
+
 
 class _DefaultDeviceMap(str):
     """`"sequential"`, marked as the value nobody asked for.
@@ -134,13 +137,14 @@ def unmarked_device_map(device_map):
 
 
 def requested_device_map(device_map):
-    """`UNSLOTH_AUTO_DEVICE_MAP=1` opts in without touching any call site.
+    """Head-aware planning is what a caller who chose nothing gets.
 
-    Only the untouched default. A dict, "auto", or a "sequential" the caller typed is a
-    placement someone chose, and accelerate's greedy fill is a different execution model
-    from a head-aware split, so an operator-wide env var does not get to overrule it.
+    Only the untouched default is upgraded: a dict, "auto", or a "sequential" the caller
+    typed is a placement someone chose, and greedy fill is a different execution model.
+    `UNSLOTH_AUTO_DEVICE_MAP=0` turns it off process-wide, for the multi-GPU operator who
+    wants that fill back.
     """
-    if device_map is DEFAULT_DEVICE_MAP and os.environ.get("UNSLOTH_AUTO_DEVICE_MAP", "0") == "1":
+    if device_map is DEFAULT_DEVICE_MAP and os.environ.get("UNSLOTH_AUTO_DEVICE_MAP", "1") == "1":
         return UNSLOTH_DEVICE_MAP
     return device_map
 
