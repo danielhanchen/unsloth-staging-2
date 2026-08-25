@@ -15,6 +15,7 @@
 import logging
 
 from .loader import FastModel, DISABLE_SDPA_MODEL_NAMES
+from .loader_utils import DEFAULT_DEVICE_MAP, UNSLOTH_DEVICE_MAP, requested_device_map
 from ._utils import (
     SUPPORTS_BFLOAT16,
     resolve_model_class,
@@ -1466,7 +1467,7 @@ class FastSentenceTransformer(FastModel):
         load_in_16bit = True,  # Changed default: 16-bit is optimal for encoders
         full_finetuning = False,
         token = None,
-        device_map = "sequential",
+        device_map = DEFAULT_DEVICE_MAP,
         rope_scaling = None,
         fix_tokenizer = True,
         trust_remote_code = False,
@@ -1492,6 +1493,20 @@ class FastSentenceTransformer(FastModel):
                 "Unsloth: To use `FastSentenceTransformer`, you must install `sentence-transformers`.\n"
                 "Run `pip install sentence-transformers` to install it."
             )
+
+        # The other leaf loaders resolve the "unsloth" sentinel by planning; this one must
+        # decline. The `st_device` blocks below hand `device_map` to
+        # `SentenceTransformer(device = ...)`, which ends in `self.to(device)`: the sentinel
+        # raises there, and that same `.to()` would pull any split model back onto one card.
+        # Resolve the env-var opt-in too, or `UNSLOTH_AUTO_DEVICE_MAP=1` asks for a plan
+        # without ever naming the sentinel.
+        device_map = requested_device_map(device_map)
+        if device_map == UNSLOTH_DEVICE_MAP:
+            print(
+                "Unsloth: Not planning a device map; SentenceTransformer moves the assembled "
+                "model onto a single device. Using `sequential`."
+            )
+            device_map = "sequential"
 
         # Validate the load modes BEFORE the prefetch so a bad config fails without downloading weights.
         # Guard on not for_inference: that branch below never used these flags.
@@ -1833,6 +1848,17 @@ class FastSentenceTransformer(FastModel):
         if _st_cache_dir is not None and "cache_dir" not in kwargs:
             kwargs["cache_dir"] = _st_cache_dir
 
+        # The decline above only spends the sentinel on our copy. Hand the nested load a
+        # plain `str`, not the marked default: FastModel would read that marker as "nobody
+        # chose this" and re-upgrade it under UNSLOTH_AUTO_DEVICE_MAP, splitting the model
+        # across cards while `st_device` below still says "sequential" and
+        # SentenceTransformer pulls it back onto one.
+        #
+        # A plain value rather than pinning the env var around the call: os.environ is
+        # process-wide, so that pin also reached unrelated loads on other threads, and two
+        # overlapping sentence loads could restore it out of order and leave the switch in
+        # whichever state finished last.
+        device_map = str(device_map)
         try:
             model, tokenizer = FastModel.from_pretrained(
                 model_name = model_name,

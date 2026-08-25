@@ -106,6 +106,247 @@ def prepare_device_map():
     return device_map, True
 
 
+UNSLOTH_DEVICE_MAP = "unsloth"
+
+
+class _DefaultDeviceMap(str):
+    """`"sequential"`, marked as the value nobody asked for.
+
+    The env opt-in upgrades the default and must leave a placement the caller chose alone,
+    but both arrive as the string `"sequential"` and a plain comparison cannot tell them
+    apart. Carrying the distinction in the type keeps it: this is a `str` that equals,
+    formats, hashes and serialises exactly like `"sequential"`, so every consumer downstream
+    (transformers included) sees no difference, while `is DEFAULT_DEVICE_MAP` still answers
+    "the signature put this here".
+
+    A sentinel object would have shown up in `inspect.signature` and in the docs as
+    something other than `"sequential"`, which is the one thing the default must not change.
+    """
+
+    __slots__ = ()
+
+
+DEFAULT_DEVICE_MAP = _DefaultDeviceMap("sequential")
+
+
+def requested_device_map(device_map):
+    """`UNSLOTH_AUTO_DEVICE_MAP=1` opts in without touching any call site.
+
+    Only the untouched default is upgraded. A dict, "auto", "balanced" -- or "sequential"
+    typed out by the caller -- is a placement someone chose, and an operator-wide env var is
+    not entitled to overrule it: accelerate's greedy sequential fill is a different
+    execution model from a head-aware split, and a caller who asked for it by name gets it.
+    """
+    if device_map is DEFAULT_DEVICE_MAP and os.environ.get("UNSLOTH_AUTO_DEVICE_MAP", "0") == "1":
+        return UNSLOTH_DEVICE_MAP
+    return device_map
+
+
+def planner_quantization_kwargs(
+    load_in_4bit = False,
+    load_in_8bit = False,
+    quantization_config = None,
+    extra_skip_modules = None,
+):
+    """The quantization the planner must size for, as the load will really apply it.
+
+    The config or the flags, never both: transformers refuses both at once, so loader.py
+    clears `load_in_4bit` / `load_in_8bit` whenever it forwards a `quantization_config`.
+    The bare flags would then describe a full-precision load, and the planner sizes a 4bit
+    model at bf16 and raises `DeviceMapInfeasible` on a load that would have fit.
+
+    The skip list travels with the flags. On-the-fly quantization keeps
+    SKIP_QUANTIZATION_MODULES (`lm_head`, the towers, projectors and MoE routers) in
+    compute dtype, and transformers reads that as `modules_to_not_convert`; sizing them at
+    4bit understates the head device by GiBs on a large-vocab VLM, the one number this
+    plan exists to get right. A pre-quantized checkpoint needs none of it: its own
+    config.json carries the list.
+    """
+    if quantization_config is not None:
+        return {"quantization_config": quantization_config}
+    kwargs = {"load_in_4bit": load_in_4bit, "load_in_8bit": load_in_8bit}
+    if load_in_4bit or load_in_8bit:
+        try:
+            from unsloth_zoo.peft_utils import SKIP_QUANTIZATION_MODULES
+        except Exception:
+            # The leaf loaders build these arguments on every quantized load, planning or
+            # not, so an unsloth_zoo below our pin must not turn a 4bit load into an
+            # ImportError. A zoo without the shared skip list is far older than the planner
+            # that consumes it, so the plan this feeds is going to decline anyway.
+            return kwargs
+        kwargs["llm_int8_skip_modules"] = SKIP_QUANTIZATION_MODULES + list(extra_skip_modules or [])
+    return kwargs
+
+
+def planner_model_class(config, trust_remote_code = False):
+    """The model class the planner's own rules pick for `config`, or None if unknown.
+
+    The planner never sees the auto class the load chose; it picks its own off a config.
+    Note `config` is whatever the caller passed, so when a user supplied `config = ...`
+    this answers for that one, while the planner rebuilds the repo's config from
+    `model_name` -- the two can disagree, and only the caller can tell.
+    """
+    try:
+        from unsloth_zoo.device_map_planner import _auto_class_for
+        from ._utils import resolve_model_class
+
+        auto_class = _auto_class_for(config, trust_remote_code = trust_remote_code)
+        return resolve_model_class(auto_class, config)
+    except Exception:
+        # Unknown, not mismatched: an unsloth_zoo without this has no planner to feed.
+        return None
+
+
+def planner_class_mismatch_reason(loaded_class, planned_class):
+    """Why the planner's model differs from the one being loaded, else None.
+
+    A load that overrides the config's own choice gets a map for a module tree it does not
+    have: `num_labels` swaps in AutoModelForSequenceClassification, whose `score` replaces
+    the planned `lm_head`, and accelerate's dispatch refuses the map with "does not give
+    any device for the following parameters: score.weight". Compared as model classes, not
+    auto classes -- AutoModelForVision2Seq and AutoModelForImageTextToText are distinct
+    objects that resolve to the same VLM.
+    """
+    if loaded_class is None or planned_class is None or loaded_class is planned_class:
+        return None
+    return f"the load builds {loaded_class.__name__}, not the planned {planned_class.__name__}"
+
+
+# accelerate's `max_memory` spellings, in the order it tries them: GiB/MiB/KiB are binary,
+# GB/MB/KB are decimal, and a lowercase trailing `b` on a decimal unit means bits, not bytes.
+_SIZE_UNITS = (("GIB", 2**30, False), ("MIB", 2**20, False), ("KIB", 2**10, False),
+               ("GB", 10**9, True), ("MB", 10**6, True), ("KB", 10**3, True))
+
+def _as_bytes(size):
+    """A `max_memory` budget in bytes, or None if it cannot be read as one.
+
+    accelerate takes `"10GiB"` as readily as an int, so a caller writes here what the load
+    itself would have taken, and the rules above are reproduced rather than imported: this
+    runs while deciding placement, before anything has established that accelerate is
+    installed and exports the parser under the name it used to. An ImportError there would
+    read every budget as unparseable and drop the caller's cap without a word, which is the
+    silent loss this whole path exists to avoid. `test_the_local_size_parser_agrees_with_
+    accelerate` holds the two in step wherever accelerate is in fact present.
+
+    None on anything unreadable, which leaves the measured free memory in place rather than
+    dropping a device out of the budget entirely. A bool is unreadable here where accelerate
+    would take it as its int value: `{0: True}` is a typo, and a one byte budget on a card
+    reads as "unusable" to the planner.
+    """
+    if isinstance(size, bool): return None
+    if isinstance(size, int): return size if size >= 0 else None
+    if not isinstance(size, str): return None
+    upper = size.upper()
+    for unit, scale, has_bit_form in _SIZE_UNITS:
+        if not upper.endswith(unit): continue
+        try:
+            amount = int(float(size[:-len(unit)]) * scale)
+        except ValueError:
+            return None
+        # Bits, if they spelled the unit "Gb" rather than "GB". Binary units have no such form.
+        if has_bit_form and size.endswith("b"): amount //= 8
+        return amount if amount >= 0 else None
+    return None
+
+
+def resolve_unsloth_device_map(
+    device_map,
+    model_name,
+    *,
+    fast_inference = False,
+    full_finetuning = False,
+    planner_kwargs = None,
+    skip_reason = None,
+    **config_kwargs,
+):
+    """Plan a head-aware multi-GPU map for `device_map = "unsloth"`, else return as-is.
+
+    Opt-in only, so nothing an existing caller passes changes meaning. The plan is built
+    on the meta device: no GPU memory, no weight download.
+
+    Falls back to "sequential" wherever a plan cannot apply, since a model that loads the
+    old way beats one that refuses to load at all. `DeviceMapInfeasible` is the exception:
+    the planner raises it rather than spilling a bitsandbytes model to CPU, and swallowing
+    it would hand the user an OOM instead of a diagnosis.
+
+    `skip_reason` is the caller's veto, for when only the caller can tell the planner
+    would describe a different model than the load builds.
+    """
+    if device_map != UNSLOTH_DEVICE_MAP:
+        return device_map
+
+    def _fallback(reason):
+        print(f"Unsloth: Not planning a device map; {reason}. Using `sequential`.")
+        return "sequential"
+
+    if skip_reason is not None:
+        return _fallback(skip_reason)
+    if fast_inference:
+        return _fallback("vLLM places its own weights")
+    if full_finetuning:
+        return _fallback("full finetuning does not use the quantized planner")
+    if is_distributed():
+        # torchrun/DDP/FSDP already give every rank the whole model on its own card;
+        # splitting one across the cards on top puts every rank on every card at once,
+        # which is a different execution model, not a bigger one.
+        return _fallback("each rank of a distributed launch owns its own device")
+    if DEVICE_TYPE_TORCH != "cuda":
+        return _fallback(f"the planner has no memory budgets for {DEVICE_TYPE_TORCH}")
+    try:
+        device_count = torch.cuda.device_count()
+    except Exception as error:
+        return _fallback(f"the devices could not be counted ({error})")
+    if device_count < 2:
+        return "sequential"
+
+    try:
+        from unsloth_zoo.device_map_planner import plan_device_map_for_pretrained
+    except Exception as error:
+        return _fallback(f"the planner is unavailable ({error})")
+
+    # Free, not total: this process's CUDA context and anything else on the card are
+    # already resident, so planning against total overcommits every device.
+    # Inside the try for the same reason the planner call is: `mem_get_info` initialises a
+    # context on every visible device, and one card that refuses (an ECC-error GPU, a MIG
+    # parent handle, another process holding it in Exclusive_Process mode) would abort a
+    # load that has a perfectly good "sequential" placement waiting for it.
+    try:
+        max_memory = {index: torch.cuda.mem_get_info(index)[0] for index in range(device_count)}
+    except Exception as error:
+        return _fallback(f"free memory could not be read ({error})")
+
+    # `max_memory` is a named parameter of the planner, so leaving a caller's copy in
+    # `planner_kwargs` makes this call raise `TypeError: got multiple values for keyword
+    # argument 'max_memory'` -- which the handler below would turn into a silent
+    # "sequential", losing both the cap they asked for and the plan. Take theirs per device
+    # and keep it under what is actually free: a caller reserving room for another workload
+    # knows something we cannot measure, but they cannot conjure memory the card has not
+    # got, and planning above free is how a plan OOMs on dispatch.
+    planner_kwargs = dict(planner_kwargs or {})
+    requested_memory = planner_kwargs.pop("max_memory", None)
+    if requested_memory is not None:
+        for device, budget in dict(requested_memory).items():
+            budget = _as_bytes(budget)
+            if budget is None:
+                continue
+            measured = max_memory.get(device)
+            max_memory[device] = budget if measured is None else min(measured, budget)
+
+    try:
+        plan = plan_device_map_for_pretrained(
+            model_name, max_memory = max_memory, **planner_kwargs, **config_kwargs
+        )
+    except Exception as error:
+        if type(error).__name__ == "DeviceMapInfeasible":
+            raise
+        return _fallback(f"planning failed ({error})")
+
+    if plan is None:
+        return "sequential"
+    print(plan.describe())
+    return plan.device_map
+
+
 def __get_model_name(
     model_name,
     load_in_4bit = True,
