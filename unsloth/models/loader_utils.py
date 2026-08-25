@@ -108,6 +108,9 @@ def prepare_device_map():
 
 UNSLOTH_DEVICE_MAP = "unsloth"
 
+# A string, not None, so an explicit False stays distinguishable from "unset".
+OFFLOAD_EMBEDDING_AUTO = "auto"
+
 
 class _DefaultDeviceMap(str):
     """`"sequential"`, marked as the value nobody asked for.
@@ -124,6 +127,40 @@ class _DefaultDeviceMap(str):
 DEFAULT_DEVICE_MAP = _DefaultDeviceMap("sequential")
 
 
+def planner_hub_kwargs(loader_kwargs):
+    """The Hub options the planner's own `AutoConfig` lookup needs.
+
+    It resolves the config a second time, from `model_name`, so an offline load or a custom
+    cache has to reach it too. Without them the lookup can go to the network behind a
+    `local_files_only` request, or miss a model that only exists in the caller's cache and
+    turn a plan the load needed into a "sequential" fallback.
+    """
+    loader_kwargs = loader_kwargs or {}
+    hub = {}
+    if loader_kwargs.get("cache_dir") is not None:
+        hub["cache_dir"] = loader_kwargs["cache_dir"]
+    if _get_effective_local_files_only(loader_kwargs):
+        hub["local_files_only"] = True
+    return hub
+
+
+def planner_kwargs_with_max_memory(planner_kwargs, loader_kwargs):
+    """The caller's transformers `max_memory` has to reach the planner as well.
+
+    Once a plan is returned the load gets an explicit dict, and transformers only consults
+    `max_memory` when `device_map` is a string (`_get_device_map` gates the whole
+    `infer_auto_device_map` branch on `isinstance(device_map, str)`). So a budget that used
+    to bound placement would be silently dropped, and the plan could exceed their caps or
+    use a card they withheld. An explicit `device_map_planner_kwargs["max_memory"]` wins.
+    """
+    budget = (loader_kwargs or {}).get("max_memory")
+    if budget is None:
+        return planner_kwargs
+    merged = dict(planner_kwargs or {})
+    merged.setdefault("max_memory", budget)
+    return merged
+
+
 def unmarked_device_map(device_map):
     """The default with its marker removed; anything else exactly as it came in.
 
@@ -134,13 +171,14 @@ def unmarked_device_map(device_map):
 
 
 def requested_device_map(device_map):
-    """`UNSLOTH_AUTO_DEVICE_MAP=1` opts in without touching any call site.
+    """Head-aware planning is what a caller who chose nothing gets.
 
-    Only the untouched default. A dict, "auto", or a "sequential" the caller typed is a
-    placement someone chose, and accelerate's greedy fill is a different execution model
-    from a head-aware split, so an operator-wide env var does not get to overrule it.
+    Only the untouched default is upgraded: a dict, "auto", or a "sequential" the caller
+    typed is a placement someone chose, and greedy fill is a different execution model.
+    `UNSLOTH_AUTO_DEVICE_MAP=0` turns it off process-wide, for the multi-GPU operator who
+    wants that fill back.
     """
-    if device_map is DEFAULT_DEVICE_MAP and os.environ.get("UNSLOTH_AUTO_DEVICE_MAP", "0") == "1":
+    if device_map is DEFAULT_DEVICE_MAP and os.environ.get("UNSLOTH_AUTO_DEVICE_MAP", "1") == "1":
         return UNSLOTH_DEVICE_MAP
     return device_map
 

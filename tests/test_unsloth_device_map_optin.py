@@ -22,7 +22,8 @@ import types
 import pytest
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-LOADER_UTILS = os.path.join(HERE, "unsloth", "models", "loader_utils.py")
+MODELS = os.path.join(HERE, "unsloth", "models")
+LOADER_UTILS = os.path.join(MODELS, "loader_utils.py")
 _SRC = open(LOADER_UTILS, encoding = "utf-8").read()
 _SKIP_MODULES = ["lm_head", "vision_tower", "audio_tower"]
 
@@ -124,22 +125,51 @@ def test_an_explicit_dict_is_returned_untouched():
     assert ns["resolve_unsloth_device_map"](explicit, "some/model") is explicit
 
 
-def test_the_env_var_only_upgrades_the_default(monkeypatch):
-    """UNSLOTH_AUTO_DEVICE_MAP is an operator switch, not a licence to override a
-    placement the caller chose. "auto" and a dict must survive it.
-
-    So must a "sequential" the caller typed out, which is why the default carries a marker:
-    the two are the same string, and the switch is only entitled to the one nobody chose.
+@pytest.mark.parametrize("switch", [None, "1"])
+def test_only_the_default_is_ever_upgraded(monkeypatch, switch):
+    """Planning is what a caller who chose nothing gets, never a licence to override one
+    they did choose. "auto", a dict, and a "sequential" they typed out all survive it --
+    hence the marker, since the last of those is the same string as the default.
     """
     ns = _load()
-    monkeypatch.setenv("UNSLOTH_AUTO_DEVICE_MAP", "1")
+    if switch is None:
+        monkeypatch.delenv("UNSLOTH_AUTO_DEVICE_MAP", raising = False)
+    else:
+        monkeypatch.setenv("UNSLOTH_AUTO_DEVICE_MAP", switch)
     assert ns["requested_device_map"](ns["DEFAULT_DEVICE_MAP"]) == "unsloth"
     assert ns["requested_device_map"]("sequential") == "sequential"
     assert ns["requested_device_map"]("auto") == "auto"
     assert ns["requested_device_map"]("balanced") == "balanced"
     assert ns["requested_device_map"]({"": 0}) == {"": 0}
-    monkeypatch.delenv("UNSLOTH_AUTO_DEVICE_MAP")
+
+
+def test_the_env_var_can_turn_planning_back_off(monkeypatch):
+    """The multi-GPU operator who wants accelerate's greedy fill back needs a switch that
+    does not require editing call sites, so `0` has to reach the default itself."""
+    ns = _load()
+    monkeypatch.setenv("UNSLOTH_AUTO_DEVICE_MAP", "0")
     assert ns["requested_device_map"](ns["DEFAULT_DEVICE_MAP"]) == "sequential"
+    # Still a plain "sequential" downstream, marker and all.
+    assert ns["requested_device_map"](ns["DEFAULT_DEVICE_MAP"]) == ns["DEFAULT_DEVICE_MAP"]
+
+
+def test_an_unset_switch_plans_so_a_bare_from_pretrained_needs_no_device_map(monkeypatch):
+    """The reason the default flipped: a notebook should not have to pass
+    `device_map = "unsloth"` to get the placement that fits."""
+    monkeypatch.delenv("UNSLOTH_AUTO_DEVICE_MAP", raising = False)
+    planned = {"model.embed_tokens": 0, "lm_head": 1}
+    calls = []
+    ns = _load(
+        devices = 2,
+        free = {0: 16 * 2**30, 1: 16 * 2**30},
+        planner = lambda name, **kw: calls.append(name) or _Plan(planned),
+    )
+    resolved = ns["resolve_unsloth_device_map"](
+        ns["requested_device_map"](ns["DEFAULT_DEVICE_MAP"]),
+        "unsloth/Muse-Glimmer-30B-unsloth-bnb-4bit",
+    )
+    assert resolved == planned
+    assert calls == ["unsloth/Muse-Glimmer-30B-unsloth-bnb-4bit"]
 
 
 # ------------------------------------------------------- where planning cannot apply
@@ -616,3 +646,117 @@ def test_the_diffusion_plan_is_sized_against_the_config_the_load_applies():
             assert (
                 passed.get("quantization_config") == "qcfg"
             ), f"diffusion.py:{call.lineno} plans without the skip list the load applies"
+
+
+# --------------------------------------------------------------------------------------
+# Planning by default reaches paths the opt-in never did.
+# --------------------------------------------------------------------------------------
+
+
+def _helpers():
+    """`planner_kwargs_with_max_memory` / `planner_hub_kwargs`, without importing torch."""
+    src = open(LOADER_UTILS, encoding = "utf-8").read()
+    ns = {"os": os}
+    for node in ast.parse(src).body:
+        keep = (
+            isinstance(node, ast.FunctionDef)
+            and node.name
+            in (
+                "planner_kwargs_with_max_memory",
+                "planner_hub_kwargs",
+                "_get_effective_local_files_only",
+                "_env_says_offline",
+            )
+        ) or (
+            isinstance(node, ast.Assign)
+            and getattr(node.targets[0], "id", "").startswith("_OFFLINE_ENV_")
+        )
+        if keep:
+            exec(ast.get_source_segment(src, node), ns)
+    return ns
+
+
+def test_a_transformers_max_memory_reaches_the_planner():
+    """Before the default flipped, `max_memory` bounded placement because transformers saw
+    a string device_map. It only consults it then -- `_get_device_map` gates the whole
+    `infer_auto_device_map` branch on `isinstance(device_map, str)` -- so once a plan
+    returns a dict the budget is dropped and the map can exceed the caps or use a card the
+    caller withheld."""
+    ns = _helpers()
+    merged = ns["planner_kwargs_with_max_memory"](None, {"max_memory": {0: "12GiB"}})
+    assert merged["max_memory"] == {0: "12GiB"}
+
+
+def test_an_explicit_planner_max_memory_wins_over_the_loader_one():
+    ns = _helpers()
+    merged = ns["planner_kwargs_with_max_memory"](
+        {"max_memory": {0: "4GiB"}}, {"max_memory": {0: "12GiB"}}
+    )
+    assert merged["max_memory"] == {0: "4GiB"}
+
+
+def test_no_max_memory_leaves_the_planner_kwargs_untouched():
+    ns = _helpers()
+    assert ns["planner_kwargs_with_max_memory"](None, {}) is None
+    same = {"retained_rows": 8}
+    assert ns["planner_kwargs_with_max_memory"](same, {"token": "x"}) is same
+
+
+def test_the_planner_is_told_where_the_hub_is(monkeypatch):
+    """It resolves the config a second time from `model_name`. Without these it can reach
+    the network behind `local_files_only`, or miss a model that only exists in the caller's
+    cache and lose a plan the load needed."""
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
+    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising = False)
+    ns = _helpers()
+    assert ns["planner_hub_kwargs"]({"cache_dir": "/models", "local_files_only": True}) == {
+        "cache_dir": "/models",
+        "local_files_only": True,
+    }
+    assert ns["planner_hub_kwargs"]({}) == {}
+    assert ns["planner_hub_kwargs"]({"local_files_only": False}) == {}
+
+
+@pytest.mark.parametrize("name", ["vision.py", "llama.py"])
+def test_every_leaf_planner_call_forwards_the_budget_and_the_hub(name):
+    """A leaf that misses either one silently plans against the wrong facts."""
+    source = open(os.path.join(MODELS, name), encoding = "utf-8").read()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        if getattr(node.func, "id", None) != "resolve_unsloth_device_map":
+            continue
+        rendered = ast.unparse(node)
+        assert "planner_kwargs_with_max_memory" in rendered, (
+            f"{name}:{node.lineno} plans without the caller's max_memory"
+        )
+        assert "planner_hub_kwargs" in rendered, (
+            f"{name}:{node.lineno} plans without the caller's cache_dir/local_files_only"
+        )
+        return
+    raise AssertionError(f"no resolve_unsloth_device_map call in {name}")
+
+
+def test_a_caller_supplied_config_declines_planning():
+    """The weights load against their config; the planner rebuilds the repo's. Same class,
+    different `num_hidden_layers` or `vocab_size`, and the map omits blocks or under-budgets
+    weights -- which the class comparison cannot see."""
+    source = open(os.path.join(MODELS, "vision.py"), encoding = "utf-8").read()
+    assert "user_config is not None" in source
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        rendered = ast.unparse(node)
+        if "user_config is not None" in rendered and "_planner_skip_reason" in rendered:
+            return
+    raise AssertionError("vision.py plans without vetoing a caller-supplied config")
+
+
+def test_the_optimized_path_says_so_when_it_drops_an_offload_request():
+    """`FastLanguageModel` accepts `offload_embedding`, but the optimized architectures
+    take a path that has never had the parameter, so the request went nowhere in silence.
+    The `"auto"` default stays quiet, since off is a decision it is entitled to make."""
+    source = open(os.path.join(MODELS, "loader.py"), encoding = "utf-8").read()
+    assert "does not support it" in source
+    assert "offload_embedding is not OFFLOAD_EMBEDDING_AUTO" in source

@@ -45,6 +45,9 @@ from ._utils import (
 from ._utils import *
 from .loader_utils import (
     DEFAULT_DEVICE_MAP,
+    OFFLOAD_EMBEDDING_AUTO,
+    planner_hub_kwargs,
+    planner_kwargs_with_max_memory,
     _exclude_rope_inv_freq_from_ddp,
     _get_fp8_mode_and_check_settings,
     _restore_dropped_fp8_scales,
@@ -333,6 +336,33 @@ def _embedding_dispatch_device(input_embeddings):
     return None if hook is None else getattr(hook, "execution_device", None)
 
 
+# Big in absolute terms and big on this card, because every lookup then crosses PCIe.
+# 2.5 GiB is 16% of a 16 GB T4 and worth moving, and 3% of an 80 GB card, where it is not.
+_OFFLOAD_EMBEDDING_MIN_BYTES = 2**30
+_OFFLOAD_EMBEDDING_MIN_FRACTION = 0.05
+
+
+def _embedding_is_worth_offloading(input_embeddings):
+    """Whether `"auto"` should offload, judged from the embedding against its own card.
+
+    False on anything unmeasurable, which is what every release before this one did.
+    """
+    try:
+        weight = getattr(input_embeddings, "weight", None)
+        if weight is None:
+            return False
+        size = weight.numel() * weight.element_size()
+        device = weight.device
+        if device.type != "cuda":
+            return False
+        total = torch.cuda.get_device_properties(device.index or 0).total_memory
+    except Exception:
+        return False
+    if not total:
+        return False
+    return size >= _OFFLOAD_EMBEDDING_MIN_BYTES and size / total >= _OFFLOAD_EMBEDDING_MIN_FRACTION
+
+
 def _resolve_offload_embedding(model, offload_embedding):
     """Report `offload_embedding` as True only when the offload will really run.
 
@@ -340,34 +370,36 @@ def _resolve_offload_embedding(model, offload_embedding):
     cannot help instead of failing the load. It also gates
     `_attach_bnb_multidevice_hooks`, which must still run whenever no offload
     happens, so every "no offload" case has to answer False.
+
+    `"auto"` (the default) decides from the size of the embedding, and the declines below
+    stay silent for it: they explain why something a caller *asked* for is not happening,
+    and nobody asked for a default.
     """
-    if not offload_embedding:
+    automatic = offload_embedding == OFFLOAD_EMBEDDING_AUTO
+
+    def _decline(reason):
+        if not automatic:
+            print(f"Unsloth: Not offloading embeddings; {reason}")
+        return False
+
+    if not automatic and not offload_embedding:
         return False
     platform_name = _offload_embedding_unsupported_platform()
     if platform_name is not None:
-        print(f"Unsloth: Not offloading embeddings; offloading is unsupported on {platform_name}.")
-        return False
+        return _decline(f"offloading is unsupported on {platform_name}.")
     try:
         in_embed = model.get_input_embeddings()
         out_embed = (
             model.get_output_embeddings() if hasattr(model, "get_output_embeddings") else None
         )
     except Exception:
-        # Cannot inspect it, so leave the caller's request alone.
-        return offload_embedding
+        # Cannot inspect it, so leave an explicit request alone and decline the default.
+        return False if automatic else offload_embedding
     if _embeddings_are_tied(in_embed, out_embed):
-        print(
-            "Unsloth: Not offloading embeddings; this model ties embed_tokens "
-            "to lm_head, so offloading saves no VRAM."
-        )
-        return False
+        return _decline("this model ties embed_tokens to lm_head, so offloading saves no VRAM.")
     if _embedding_dispatch_device(in_embed) is not None:
-        print(
-            "Unsloth: Not offloading embeddings; this model is dispatched across devices, "
-            "which overrides the offload."
-        )
-        return False
-    return True
+        return _decline("this model is dispatched across devices, which overrides the offload.")
+    return _embedding_is_worth_offloading(in_embed) if automatic else True
 
 
 VLLM_SUPPORTED_VLM = [
@@ -908,7 +940,7 @@ class FastBaseModel:
         whisper_language = None,
         whisper_task = None,
         auto_config = None,
-        offload_embedding = False,
+        offload_embedding = OFFLOAD_EMBEDDING_AUTO,
         float32_mixed_precision = None,  # Forces float32 mixed precision
         # vLLM parameters
         fast_inference = False,
@@ -1199,6 +1231,15 @@ class FastBaseModel:
                 model_class,
                 planner_model_class(auto_config, trust_remote_code = trust_remote_code),
             )
+        # A config the caller built is the one the weights load against, but the planner
+        # takes a name and rebuilds the repo's own. Same class, different model: another
+        # `num_hidden_layers` or `vocab_size` and the map omits blocks or under-budgets
+        # weights, which the class comparison above cannot see. Only the caller knows
+        # whether their config still describes the repo, so do not guess.
+        if _planner_skip_reason is None and user_config is not None:
+            _planner_skip_reason = (
+                "a caller-supplied config may not describe the repo the planner rebuilds"
+            )
 
         # A no-op unless the caller asked for "unsloth" (or set UNSLOTH_AUTO_DEVICE_MAP);
         # an already-planned map comes back unchanged, so a direct FastBaseModel call
@@ -1208,10 +1249,13 @@ class FastBaseModel:
             model_name,
             fast_inference = fast_inference,
             full_finetuning = full_finetuning,
-            planner_kwargs = device_map_planner_kwargs,
+            planner_kwargs = planner_kwargs_with_max_memory(
+                device_map_planner_kwargs, kwargs
+            ),
             skip_reason = _planner_skip_reason,
             token = token,
             trust_remote_code = trust_remote_code,
+            **planner_hub_kwargs(kwargs),
             # The pin the config and weights below use; the default branch would size a
             # different checkpoint than the one being loaded.
             revision = _revision,
@@ -1412,10 +1456,11 @@ class FastBaseModel:
         raise_handler = RaiseUninitialized()
         try:
             if offload_embedding and fast_inference:
-                # vLLM manages its own weights; embedding offload does not apply.
-                print(
-                    "Unsloth: Not offloading embeddings; incompatible with fast_inference (vLLM)."
-                )
+                # vLLM manages its own weights. Silent for the default, as above.
+                if offload_embedding != OFFLOAD_EMBEDDING_AUTO:
+                    print(
+                        "Unsloth: Not offloading embeddings; incompatible with fast_inference (vLLM)."
+                    )
                 offload_embedding = False
             if not fast_inference:
                 # Prevent load_in_fp8 from being forwarded into HF internal model loading
