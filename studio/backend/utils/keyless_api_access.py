@@ -306,12 +306,67 @@ def _full_scope_transport_allowed(request: Any, app_state: Any) -> bool:
     )
 
 
+def _browser_initiated_elsewhere(request: Any) -> bool:
+    """Whether a page on another site made this request, as the browser reports it.
+
+    ``Origin`` cannot say: no browser attaches it to a same-origin GET or to a
+    cross-site GET in ``no-cors`` mode, and such a fetch at
+    ``http://127.0.0.1:<port>`` does arrive, since only Chromium holds it back with
+    Private Network Access. ``Sec-Fetch-Site`` is set on every request whatever the
+    mode, and the ``Sec-`` prefix makes it a forbidden header name, so a page cannot
+    forge it. Absence stays admitted: curl, the OpenAI SDKs and Safari before 16.4
+    send nothing, and serving them is the point of the setting.
+    """
+    try:
+        site = request.headers.get("sec-fetch-site")
+    except Exception:
+        return True
+    if site is None:
+        return False
+    # `none` is the user typing the URL or opening a bookmark, which no page can cause.
+    return site.strip().lower() not in ("same-origin", "none")
+
+
+def _host_authority_is_direct(request: Any) -> bool:
+    """Whether the caller addressed this server directly rather than through a name.
+
+    Guards DNS rebinding, which the socket checks cannot see: a page on
+    ``evil.example`` re-pointed at ``127.0.0.1`` keeps its own origin, so every
+    signal above reads as a local client and the response is readable by the page.
+    ``Host`` still differs, being the name the page was served from. A direct client
+    sends the literal address or ``localhost``; only a rebound page sends a domain.
+    Absent stays admitted: HTTP/1.0 callers send none and no browser omits it.
+    """
+    from utils.lan_access_settings import _normalized_ip
+
+    try:
+        host = request.headers.get("host")
+    except Exception:
+        return False
+    if not host:
+        return True
+    host = host.strip()
+    if host.startswith("["):  # [::1] or [::1]:port, rejecting junk after the bracket
+        end = host.find("]")
+        if end == -1 or (host[end + 1 :] and not host[end + 1 :].startswith(":")):
+            return False
+        host = host[1:end]
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    host = host.lower().rstrip(".")
+    return host == "localhost" or _normalized_ip(host) is not None
+
+
 def keyless_transport_allowed(request: Any, scope: str) -> bool:
     """Enforce the loopback/private-LAN boundary from authoritative ASGI state."""
     try:
         if request.headers.get("origin") is not None:
             return False
     except Exception:
+        return False
+    if _browser_initiated_elsewhere(request):
+        return False
+    if not _host_authority_is_direct(request):
         return False
     app_state = _request_app_state(request)
     if _hosted_mode_forbidden(app_state):
