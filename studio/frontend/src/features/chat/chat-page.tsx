@@ -57,7 +57,9 @@ import { Tooltip, TooltipContent } from "@/components/ui/tooltip";
 import { useIsMobile } from "@/hooks/use-mobile";
 import {
   DOWNLOAD_KIND,
+  dismissStartToast,
   downloadManager,
+  jobKeyOf,
   useRepoDownload,
 } from "@/features/hub/download-manager";
 import {
@@ -2748,13 +2750,15 @@ export function ChatPage({
             repoId: selection.id,
             variant: selection.ggufVariant ?? null,
             expectedBytes: selection.expectedBytes ?? 0,
-          });
-          if (outcome === "started") {
-            toast.info("Downloading in the background", {
+            // Handed over, not raised here: the manager folds it into the Xet
+            // notice so one start produces one toast carrying both.
+            callerToast: {
+              title: "Downloading in the background",
               description:
                 "It'll be ready to load once the current model finishes.",
-            });
-          } else if (outcome === "conflict") {
+            },
+          });
+          if (outcome === "conflict") {
             toast.info("Resume this download from Models", {
               description:
                 "An earlier partial download used a different transport. Open the Model hub tab to resume or restart it.",
@@ -2852,9 +2856,27 @@ export function ChatPage({
       }
     },
   });
+  // The job the pending auto-load is waiting on, read by the context-change effect
+  // below. Written from an effect, never during render.
+  const pendingAutoLoadKeyRef = useRef<string | null>(null);
+  // The live context, so a start still in flight can be asked whether the thread it
+  // was requested from is still the one on screen.
+  const chatContextKeyRef = useRef(chatContextKey);
+  useEffect(() => {
+    chatContextKeyRef.current = chatContextKey;
+  }, [chatContextKey]);
   useEffect(() => {
     const pending = pendingHubAutoLoad;
-    if (!pending) return;
+    if (!pending) {
+      pendingAutoLoadKeyRef.current = null;
+      return;
+    }
+    const pendingKey = jobKeyOf(
+      DOWNLOAD_KIND.MODEL,
+      pending.selection.id,
+      pending.selection.ggufVariant ?? null,
+    );
+    pendingAutoLoadKeyRef.current = pendingKey;
     let active = true;
     void (async () => {
       const outcome = await downloadManager.requestStart({
@@ -2862,11 +2884,24 @@ export function ChatPage({
         repoId: pending.selection.id,
         variant: pending.selection.ggufVariant ?? null,
         expectedBytes: pending.selection.expectedBytes ?? 0,
+        // Folded into the Xet notice only. #9663 removed this surface's own toast
+        // as a duplicate of the download panel, so it must not come back on an
+        // HTTP start or once the three notices are spent.
+        callerToast: {
+          title: "Downloading model",
+          description: "It'll load automatically once the download finishes.",
+          noticeOnly: true,
+          // Asked again when the toast is finally raised, which can be several round
+          // trips later. The cleanup below only dismisses a toast that already exists;
+          // a raise still in flight would otherwise promise an auto-load that
+          // onComplete refuses, since the contextKey it was staged for has changed.
+          stillValid: () => chatContextKeyRef.current === pending.contextKey,
+        },
       });
       if (!active) return;
       if (outcome === "started") {
-        // No toast: the download panel already shows this download. The
-        // auto-load still runs from onComplete.
+        // No toast HERE, and none from the manager either unless the Xet notice
+        // fires and folds the sentence in. The auto-load runs from onComplete.
         return;
       }
       if (outcome === "conflict") {
@@ -2890,8 +2925,22 @@ export function ChatPage({
     })();
     return () => {
       active = false;
+      // This selection is no longer the pending auto-load: the user picked another
+      // model, so its completion loads nothing. Drop the toast still saying it will.
+      // A no-op once the download itself finished, which dismisses the same id.
+      dismissStartToast(pendingKey);
     };
   }, [pendingHubAutoLoad]);
+  // Switching thread, project or starting a new chat keeps the pathname at /chat and
+  // leaves pendingHubAutoLoad untouched, so neither the route sweep nor the cleanup
+  // above runs. onComplete refuses to load into a different contextKey, so the toast
+  // would go on promising an auto-load that cannot happen.
+  useEffect(() => {
+    return () => {
+      const pendingKey = pendingAutoLoadKeyRef.current;
+      if (pendingKey) dismissStartToast(pendingKey);
+    };
+  }, [chatContextKey]);
   const loadNativeModelIntent = useCallback(
     async (intent: NativeIntent, loadingDescription: string) => {
       const label =

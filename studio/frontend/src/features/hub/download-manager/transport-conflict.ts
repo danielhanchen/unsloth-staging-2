@@ -22,6 +22,7 @@ import {
   setConflict,
 } from "./download-manager-state";
 import { startJob } from "./poll-loop";
+import { currentRoute, showCallerToast } from "./start-toast";
 import { runtimeRegistry } from "./runtime-registry";
 import { getTransportMode } from "./transport-preference";
 import { ACTIVE_STATES, TRANSPORT_STATUS_TIMEOUT_MS } from "./download-manager-config";
@@ -127,7 +128,15 @@ async function runWithPendingStartGuard(
   // Already active or pending for the repo: only report "started" when this
   // exact request is the live transfer; a peer/snapshot/pending start has not.
   if (hasActiveOrPendingStart(req)) {
-    return isJobActiveFor(req) ? "started" : "busy";
+    if (!isJobActiveFor(req)) return "busy";
+    // Returns "started" WITHOUT running the action, so startJob never announces.
+    // Callers used to cover this by toasting themselves; now the manager owns the
+    // message, so without this the user gets no feedback at all.
+    showCallerToast(
+      jobKeyOf(req.kind, req.repoId, req.variant),
+      req.callerToast,
+    );
+    return "started";
   }
   runtimeRegistry.pendingStartRepoKeys.add(startKey);
   try {
@@ -143,6 +152,10 @@ async function runWithPendingStartGuard(
 export async function requestStart(
   req: DownloadRequest,
 ): Promise<DownloadStartOutcome> {
+  // Before the preflight below, which is two round trips the user can navigate
+  // during. A route read after them would name the page they moved to, and the
+  // start toast would then be held against the wrong surface.
+  const originRoute = currentRoute();
   return runWithPendingStartGuard(req, async () => {
     let mode: TransportMode = getTransportMode();
     try {
@@ -183,7 +196,10 @@ export async function requestStart(
             next: mode,
             resumable: status.resumable,
           },
-          pending: req,
+          // Without the caller's line: this start is resolved later from the Hub,
+          // where "it'll load automatically" is a promise chat cannot keep once it
+          // is inactive. The Xet notice still explains the 0% on its own.
+          pending: { ...req, callerToast: undefined },
         });
         return "conflict";
       }
@@ -208,7 +224,7 @@ export async function requestStart(
           description:
             "Starting with HTTP so an existing partial is not discarded. Switch transport to retry with Xet.",
         });
-        await startJob(req, { useXet: false });
+        await startJob(req, { useXet: false, originRoute });
         return isJobActiveFor(req) ? "started" : "error";
       }
       toast.warning("Couldn't verify existing partial download", {
@@ -216,7 +232,7 @@ export async function requestStart(
           "Starting with the selected transport. If a partial from another transport exists, it may be restarted from the beginning.",
       });
     }
-    await startJob(req, { useXet: mode === TRANSPORT.XET });
+    await startJob(req, { useXet: mode === TRANSPORT.XET, originRoute });
     return isJobActiveFor(req) ? "started" : "error";
   });
 }

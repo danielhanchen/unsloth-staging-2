@@ -65,14 +65,18 @@ import type {
   Terminal,
 } from "./download-manager-types";
 import {
-  XET_NOTICE_DESCRIPTION,
-  XET_NOTICE_DESCRIPTION_CLASS,
-  XET_NOTICE_DURATION_MS,
   XET_NOTICE_TITLE,
-  reserveXetNotice,
+  composeNoticeDescription,
   shouldShowXetNotice,
-  xetNoticesShown,
 } from "./xet-progress-notice";
+import { reserveXetNoticeFromServer } from "@/features/settings/api/xet-notice";
+import {
+  currentRoute,
+  dismissStartToast,
+  liveCallerToast,
+  showCallerToast,
+  showStartToast,
+} from "./start-toast";
 import {
   getState,
   hasActiveRepoPeer,
@@ -201,6 +205,10 @@ export function finalize(
 ): void {
   const job = getState().jobs[key];
   teardownRuntime(key);
+  // The 8s duration is a cap, not a description of the transfer: a finished download
+  // left the toast still claiming it was running. Before the early returns below, so
+  // a job already in a terminal display state still clears it.
+  dismissStartToast(key);
   if (!job) return;
   if (TERMINAL_DISPLAY_STATES.has(job.state)) return;
   if (job.kind === DOWNLOAD_KIND.MODEL) {
@@ -573,9 +581,14 @@ export async function startJob(
     state?: DownloadJobState;
     transport?: ResolvedTransport;
     cancelTransport?: ResolvedTransport | null;
+    /** The surface this start was asked for, for the start toast to be held against.
+     * Passed in by `requestStart`, whose transport preflight is itself a round trip
+     * the user can navigate during; taken here only for a direct caller. */
+    originRoute?: string;
   } = {},
 ): Promise<void> {
   const key = jobKeyOf(req.kind, req.repoId, req.variant);
+  const startRoute = opts.originRoute ?? currentRoute();
   // Peer guard stops a FRESH start from double-starting a variant already
   // downloading (or colliding with a no-variant snapshot). Skipped when ADOPTING:
   // the restored own entry would look like a peer and freeze the bar; adoptJob's
@@ -734,28 +747,52 @@ export async function startJob(
     }
     const started = transportAfterStart(mode, result.transport);
     if (started !== activeTransport) patchJob(key, { transport: started });
-    // Explain the 0%-then-done shape of a Xet transfer, for the first few only.
+    // One start, one toast. The only place a start is announced.
+    // A cancel can land while this start is in flight, and the reissue above is
+    // the giveaway. Neither message is true of a start that is already stopping.
+    const stopping = rt.cancelRequested;
+    // Everything above this point was round trips the user could navigate during.
+    // Checked BEFORE reserving, not only when the toast is raised: a reservation is
+    // one of three for the life of the install, and spending it on a toast that will
+    // be discarded on arrival is how starting a download and going to look at it
+    // burns all three unseen.
+    const onOriginRoute = currentRoute() === startRoute;
     if (
+      onOriginRoute &&
       shouldShowXetNotice({
         kind: req.kind,
         transport: started,
         attached: result.attached === true,
-        // A cancel can land while this start is in flight, and the reissue
-        // above is the giveaway. Do not promise a download that is stopping.
-        live: result.state === "running" && !rt.cancelRequested,
-        shown: xetNoticesShown(),
+        live: result.state === "running" && !stopping,
       })
     ) {
-      // Reserving is async (a cross-tab lock), and nothing below waits on a
-      // toast, so let the download get on with it.
-      void reserveXetNotice().then((reserved) => {
-        if (!reserved) return;
-        toast.info(XET_NOTICE_TITLE, {
-          description: XET_NOTICE_DESCRIPTION,
-          duration: XET_NOTICE_DURATION_MS,
-          classNames: { description: XET_NOTICE_DESCRIPTION_CLASS },
-        });
+      // Async (it asks the backend for one of the three) and nothing below waits on
+      // a toast. A lost reservation still leaves the caller owed its message.
+      void reserveXetNoticeFromServer().then(({ granted }) => {
+        // This round trip can outlive the transfer: finalize() dismisses by id
+        // BEFORE this resolves, so raising it here would leave a finished or
+        // cancelled job claiming to be running for another 8s, or hand a restarted
+        // job on the same key the old request's message.
+        if (!isCurrent(key, epoch) || rt.cancelRequested) return;
+        // The caller's line can go stale on its own while the notice stays true: chat
+        // moved to another thread, so nothing auto-loads, but the transfer is still
+        // running and still needs the 0% explained.
+        const caller = liveCallerToast(req.callerToast);
+        if (granted) {
+          showStartToast(
+            key,
+            {
+              title: XET_NOTICE_TITLE,
+              description: composeNoticeDescription(caller),
+            },
+            startRoute,
+          );
+          return;
+        }
+        showCallerToast(key, caller, startRoute);
       });
+    } else if (!stopping && onOriginRoute) {
+      showCallerToast(key, liveCallerToast(req.callerToast), startRoute);
     }
     // An adopted job can already have fallen back from Xet to HTTP, which
     // keeps its original cancel marker and so its stop control.
