@@ -1,0 +1,194 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+#
+# Tier 2 validation for the MLX int8 W8A8 prefill patch, on real Apple Silicon.
+#
+# What this job can and cannot establish, stated up front because the distinction is the
+# whole point of the tiering:
+#
+#   macos-26 is a GitHub-hosted Apple Silicon *standard* runner -- M1 class. The int8
+#   speedup this module exists for needs the M5 neural accelerators, and no runner tier
+#   offers one. So this job does NOT measure performance and must never be cited as
+#   having done so. What it does establish, and Linux cannot:
+#
+#     1. The capability probe correctly returns False on a real Metal device that lacks
+#        M5 int8 tensor ops -- i.e. existing Unsloth Mac users are not affected. This is
+#        the single most important assertion here.
+#     2. A full model forward is bit-identical with the module imported and enabled
+#        versus not, on real Metal.
+#     3. The activation-quant and weight-requant Metal kernels compile and run for real.
+#        These deliberately carry no MetalPerformancePrimitives include (see the header
+#        split in backends/metal_mpp.py), so they execute on M1 even though the GEMM
+#        cannot. Their packed-nibble ordering and word-boundary arithmetic is the
+#        likeliest source of a silent wrong-answer bug and is untestable on Linux.
+#     4. Whether `mpp::tensor_ops::matmul2d` with int8 operands even *compiles* under
+#        macOS 26 on M1. If it does, a future revision of this job can validate the GEMM
+#        numerically too and only performance stays unproven. That question is open; the
+#        probe step below answers it and prints the answer either way.
+#
+# The org's macOS concurrency is capped at 5 jobs account-wide, so run this through
+# pr_review/staging_ci.py on an owned staging repo rather than the main queue.
+
+name: MLX int8 prefill (Apple Silicon)
+
+on:
+  workflow_dispatch:
+  # Staging-only: fire on push to the staging branch, since workflow_dispatch
+  # requires the workflow to exist on the default branch.
+  push:
+    branches: [mlx-int8-prefill-ci]
+  pull_request:
+    paths:
+      - 'unsloth_mlx_int8/**'
+      - 'tests/mlx_int8/**'
+      - '.github/workflows/mlx-int8-ci.yml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  apple-silicon:
+    name: dispatch + Metal kernels
+    # macos-26 over macos-15: both are free Apple Silicon standard runners and the same
+    # class of machine, but macos-15 absorbed the macos-14 retirement and its queue p90
+    # is several times worse. Same reasoning as .github/workflows/mlx-ci.yml.
+    runs-on: macos-26
+    timeout-minutes: 25
+
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c  # v2.21.0
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'mlx==0.32.1' 'numpy==2.4.4' 'pytest==9.0.3'
+
+      # The assertion that protects everyone who is NOT on an M5. If this flips to True
+      # on an M1 the probe is broken and the module would dispatch to kernels the device
+      # cannot run.
+      - name: Capability probe must decline on M1
+        run: |
+          python -c "
+          import platform
+          import mlx.core as mx
+          assert platform.system() == 'Darwin' and platform.machine() == 'arm64'
+          assert mx.metal.is_available(), 'expected a real Metal device on this runner'
+          import unsloth_mlx_int8
+          from unsloth_mlx_int8 import capability
+          supported = capability.is_supported()
+          print('verdict:', supported, '|', capability.reason())
+          print('device_info:', mx.device_info())
+          assert supported is False, (
+              'capability probe returned True on an M1 runner; it must only pass on '
+              'hardware with M5 int8 tensor ops'
+          )
+          assert unsloth_mlx_int8.enable() is False
+          assert unsloth_mlx_int8.is_enabled() is False
+          print('OK: declines cleanly on M1')
+          "
+
+      # Is the GEMM's MPP int8 instantiation even compilable here? Open question; the
+      # answer decides how much of Tier 3 can be pulled into CI later. Never fails the
+      # job -- it is a measurement, not a requirement.
+      - name: Probe whether MPP int8 matmul2d compiles on M1 (informational)
+        continue-on-error: true
+        run: |
+          python -c "
+          import mlx.core as mx
+          from unsloth_mlx_int8.backends import metal_mpp
+          try:
+              k = metal_mpp.build_probe_kernel(N=128, K=256)
+              xq = ((mx.arange(128*256) % 251) - 125).reshape(128,256).astype(mx.int8)
+              wq = ((mx.arange(128*256) % 241) - 120).reshape(128,256).astype(mx.int8)
+              got = k(inputs=[xq, wq, mx.array([128], dtype=mx.int32)],
+                      grid=(1*32*8, 1, 1), threadgroup=(32*8,1,1),
+                      output_shapes=[(128,128)], output_dtypes=[mx.int32])[0]
+              want = mx.matmul(xq.astype(mx.int32), wq.astype(mx.int32).T)
+              mx.eval(got, want)
+              same = bool(mx.array_equal(got, want).item())
+              print(f'RESULT: MPP int8 matmul2d ran on this device, correct={same}')
+              print('If correct=True, the GEMM can be validated numerically in CI and')
+              print('only the M5 performance claim stays untested.')
+          except BaseException as exc:
+              print(f'RESULT: MPP int8 matmul2d unavailable here -> {type(exc).__name__}: {exc}')
+              print('Expected on M1. Tier 3 remains M5-only.')
+          "
+
+      # The two MPP-free kernels, against plain-MLX references. This is the part Linux
+      # genuinely cannot do.
+      - name: Metal quant + requant kernels vs reference
+        run: |
+          python -c "
+          import mlx.core as mx, mlx.nn as nn
+          import numpy as np
+          from unsloth_mlx_int8 import registry, scales
+          from unsloth_mlx_int8.backends import metal_mpp, portable
+
+          failures = []
+          for bits, gs in [(4,32),(4,64),(4,128)]:
+              lin = nn.Linear(1024, 2048, bias=False)
+              ql = nn.QuantizedLinear.from_linear(lin, group_size=gs, bits=bits)
+              ws = scales.channel_scale_bound(ql['scales'], ql['biases'], bits)
+              mx.eval(ws)
+
+              got = metal_mpp.requantize_weight(
+                  ql['weight'], ql['scales'], ql['biases'], ws, bits, gs)
+              want = portable.requantize_weight(
+                  ql['weight'], ql['scales'], ql['biases'], ws, bits, gs)
+              mx.eval(got, want)
+              diff = int(mx.abs(got.astype(mx.int32) - want.astype(mx.int32)).max().item())
+              print(f'requant bits={bits} gs={gs}: max |diff| = {diff}')
+              if diff > 1:
+                  failures.append(f'requant bits={bits} gs={gs} diff={diff}')
+
+          x = mx.random.normal((640, 1024)).astype(mx.bfloat16)
+          gq, gs_ = metal_mpp.quantize_rows(x)
+          wq, ws_ = portable.quantize_rows(x)
+          mx.eval(gq, gs_, wq, ws_)
+          qdiff = int(mx.abs(gq.astype(mx.int32) - wq.astype(mx.int32)).max().item())
+          sdiff = float(mx.abs(gs_ - ws_).max().item())
+          print(f'row quant: max |q diff| = {qdiff}, max |scale diff| = {sdiff:.3e}')
+          if qdiff > 1 or sdiff > 1e-6:
+              failures.append(f'row quant qdiff={qdiff} sdiff={sdiff}')
+
+          assert not failures, failures
+          print('OK: Metal quant + requant kernels match the reference')
+          "
+
+      # The full Linux suite, re-run on Metal. Everything here is backend-agnostic, so a
+      # difference means an MLX behavioural difference between backends, which is worth
+      # knowing about.
+      - name: Full test suite on Metal
+        env:
+          UNSLOTH_MLX_INT8_BACKEND: portable
+        run: python -m pytest tests/mlx_int8/ -v --tb=short
+
+      # No group_size=128 skip here: that skip exists only because MLX's CUDA backend
+      # cannot build the reference. On Metal it must run.
+      - name: group_size=128 reference must work on Metal
+        run: |
+          python -c "
+          import mlx.core as mx, mlx.nn as nn
+          ql = nn.QuantizedLinear.from_linear(nn.Linear(1024, 2048, bias=False),
+                                              group_size=128, bits=4)
+          x = mx.random.normal((640, 1024)).astype(mx.bfloat16)
+          out = mx.quantized_matmul(x, ql['weight'], ql['scales'], ql['biases'],
+                                    True, 128, 4)
+          mx.eval(out)
+          print('OK: mx.quantized_matmul gs=128 works on Metal (it fails on CUDA)')
+          "

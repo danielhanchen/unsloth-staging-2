@@ -1,0 +1,218 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+"""The properties that keep this from breaking anyone who does not want it.
+
+Three of these guard failure modes that would be invisible until they were expensive:
+a capability probe that says yes on hardware that cannot run the kernels, an eval on the
+hot path that only raises once someone wraps generation in `mx.compile`, and a missing
+vjp that only surfaces partway through a fine-tune.
+"""
+
+import mlx.core as mx
+import mlx.nn as nn
+import pytest
+
+import unsloth_mlx_int8
+from unsloth_mlx_int8 import capability, eligibility, patch, registry
+from unsloth_mlx_int8.eligibility import ROW_THRESHOLD
+
+K, N = 1024, 2048
+
+
+class TestCapability:
+    def test_unsupported_off_apple_silicon(self):
+        if mx.metal.is_available():
+            pytest.skip("this host has Metal; the negative case cannot be shown here")
+        assert capability.is_supported() is False
+        assert "macOS" in capability.reason() or "Metal" in capability.reason()
+
+    def test_enable_is_a_noop_when_unsupported(self, make_ql):
+        if mx.metal.is_available():
+            pytest.skip("this host has Metal")
+        assert unsloth_mlx_int8.enable() is False
+        assert unsloth_mlx_int8.is_enabled() is False
+        assert mx.quantized_matmul is patch._ORIG_QMM
+
+    def test_model_forward_bit_identical_when_unsupported(self, quantized_model):
+        """The whole no-op promise in one assertion."""
+        if mx.metal.is_available():
+            pytest.skip("this host has Metal")
+        x = mx.random.normal((ROW_THRESHOLD, 1024)).astype(mx.bfloat16)
+        before = quantized_model(x)
+        mx.eval(before)
+
+        unsloth_mlx_int8.enable()
+        unsloth_mlx_int8.warmup(quantized_model)
+        after = quantized_model(x)
+        mx.eval(after)
+
+        assert mx.array_equal(before, after).item()
+
+    def test_kill_switch(self, monkeypatch):
+        monkeypatch.setenv("UNSLOTH_MLX_INT8_PREFILL", "0")
+        capability.reset()
+        assert capability.is_supported() is False
+        assert "disabled by" in capability.reason()
+
+    def test_probe_never_raises(self, monkeypatch):
+        """Whatever goes wrong inside, callers see False, not an exception."""
+        monkeypatch.setattr(
+            capability, "_decide", lambda: (_ for _ in ()).throw(RuntimeError("boom"))
+        )
+        capability.reset()
+        assert capability.is_supported() is False
+        assert "boom" in capability.reason()
+
+
+class TestEligibility:
+    @pytest.mark.parametrize("group_size", [32, 64, 128])
+    def test_4bit_all_group_sizes_accepted(self, group_size):
+        ok, why = eligibility.is_eligible(2048, 1024, 4, group_size)
+        assert ok, why
+
+    def test_8bit_rejected_by_default(self, monkeypatch):
+        monkeypatch.delenv("UNSLOTH_MLX_INT8_ALLOW_8BIT", raising=False)
+        ok, why = eligibility.is_eligible(2048, 1024, 8, 64)
+        assert not ok
+        assert "ALLOW_8BIT" in why
+
+    def test_8bit_accepted_when_opted_in(self, monkeypatch):
+        monkeypatch.setenv("UNSLOTH_MLX_INT8_ALLOW_8BIT", "1")
+        ok, why = eligibility.is_eligible(2048, 1024, 8, 64)
+        assert ok, why
+
+    @pytest.mark.parametrize("bits", [2, 3, 5, 6])
+    def test_odd_bit_widths_rejected(self, bits):
+        """3/5/6 are a dense bitstream whose values straddle uint32 words."""
+        ok, _ = eligibility.is_eligible(2048, 1024, bits, 64)
+        assert not ok
+
+    def test_non_affine_rejected(self):
+        ok, why = eligibility.is_eligible(2048, 1024, 4, 32, mode="mxfp4", has_biases=False)
+        assert not ok
+        assert "affine" in why
+
+    def test_n_must_tile(self):
+        """N is not ceil-divided when building the launch grid, so a partial tile would
+        silently drop output columns."""
+        ok, why = eligibility.is_eligible(2048 + 64, 1024, 4, 64)
+        assert not ok
+        assert "multiple of 128" in why
+
+    def test_lm_head_sized_output_rejected(self):
+        ok, why = eligibility.is_eligible(151936 // 128 * 128, 4096, 4, 64)
+        assert not ok
+        assert "lm_head" in why
+
+
+class TestCompileSafety:
+    def test_compiled_forward_runs(self, make_ql):
+        """Every mx.eval lives in warmup, so the hot path is trace-safe. An eval inside
+        a compile trace raises '[eval] Attempting to eval an array during function
+        transformations'."""
+        ql = make_ql(K, N)
+        unsloth_mlx_int8.enable(force=True)
+        ok, why = registry.register_module(ql, "w")
+        assert ok, why
+
+        x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.bfloat16)
+        compiled = mx.compile(lambda t: ql(t))
+        out = compiled(x)
+        mx.eval(out)
+        assert out.shape == (ROW_THRESHOLD, N)
+
+    def test_compiled_matches_eager(self, make_ql):
+        ql = make_ql(K, N)
+        unsloth_mlx_int8.enable(force=True)
+        registry.register_module(ql, "w")
+        x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.bfloat16)
+
+        eager = ql(x)
+        compiled = mx.compile(lambda t: ql(t))(x)
+        mx.eval(eager, compiled)
+        assert mx.allclose(eager, compiled, atol=1e-2).item()
+
+
+class TestGradients:
+    """`mx.fast.metal_kernel` outputs carry no vjp, so without custom_function a LoRA
+    backward through an intercepted prefill dies inside the trainer."""
+
+    def test_gradient_flows(self, make_ql):
+        ql = make_ql(K, N)
+        unsloth_mlx_int8.enable(force=True)
+        registry.register_module(ql, "w")
+        x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.float32)
+
+        grad = mx.grad(lambda t: ql(t).sum())(x)
+        mx.eval(grad)
+        assert grad.shape == x.shape
+        assert bool(mx.isfinite(grad).all().item())
+
+    def test_gradient_matches_unpatched(self, make_ql):
+        """The vjp delegates to the stock 4-bit op, so it should be the exact gradient
+        of the unquantized-activation forward, not an approximation of it."""
+        ql = make_ql(K, N)
+        x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.float32)
+
+        want = mx.grad(lambda t: ql(t).sum())(x)
+        mx.eval(want)
+
+        unsloth_mlx_int8.enable(force=True)
+        registry.register_module(ql, "w")
+        got = mx.grad(lambda t: ql(t).sum())(x)
+        mx.eval(got)
+
+        assert mx.allclose(got, want, atol=1e-3).item()
+
+
+class TestSelfTest:
+    def test_passes_on_a_registered_weight(self, make_ql):
+        ql = make_ql(K, N)
+        unsloth_mlx_int8.enable(force=True)
+        registry.register_module(ql, "w")
+        ok, detail = unsloth_mlx_int8.self_test()
+        assert ok, detail
+
+    def test_empty_registry_is_not_a_failure(self):
+        unsloth_mlx_int8.enable(force=True)
+        ok, detail = unsloth_mlx_int8.self_test()
+        assert ok
+        assert "no registered" in detail
+
+    def test_failure_disables_dispatch(self, make_ql, monkeypatch):
+        """A wrong kernel must stop dispatching, not emit wrong tokens."""
+        ql = make_ql(K, N)
+        unsloth_mlx_int8.enable(force=True)
+        registry.register_module(ql, "w")
+
+        from unsloth_mlx_int8 import backends
+        backend = backends.select()
+        monkeypatch.setattr(
+            backend, "matmul",
+            lambda x, e, out_dtype=mx.bfloat16: mx.zeros((x.shape[0], e.n), dtype=out_dtype),
+        )
+        ok, detail = unsloth_mlx_int8.self_test()
+        assert not ok, detail
+        assert patch._disabled_by_selftest is True
+
+        # And from here on, calls fall through untouched.
+        x = mx.random.normal((ROW_THRESHOLD, K)).astype(mx.bfloat16)
+        got = ql(x)
+        want = patch._ORIG_QMM(
+            x, ql["weight"], ql["scales"], ql["biases"], True, ql.group_size, ql.bits, "affine")
+        mx.eval(got, want)
+        assert mx.array_equal(got, want).item()
+
+
+class TestWarmup:
+    def test_registers_eligible_only(self, quantized_model):
+        unsloth_mlx_int8.enable(force=True)
+        registered, skipped = unsloth_mlx_int8.warmup(quantized_model)
+        assert registered == 2, unsloth_mlx_int8.registered()
+        assert skipped >= 1  # the 64x128 projection is far below MIN_DIM
+
+    def test_mlp_scope_filters_by_name(self, quantized_model):
+        unsloth_mlx_int8.enable(force=True)
+        registered, _ = unsloth_mlx_int8.warmup(quantized_model, scope="mlp")
+        assert all("mlp" in name for name in unsloth_mlx_int8.registered())
+        assert registered == 2
