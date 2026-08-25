@@ -19,17 +19,21 @@ patches at op level rather than layer level, covers group sizes 32/64/128, is sa
 ## Status: the speedup is unverified
 
 **Nobody has run this on an M5.** There is no M5 in any CI runner tier, and none was
-available while building it. What *is* verified, on Linux and in principle on a macOS
-M1 runner:
+available while building it. What *is* verified, on Linux and on a macOS runner:
 
 | | Verified | How |
 | --- | --- | --- |
-| Dispatch: what gets intercepted, what falls through bit-identically | yes | Linux, 69 tests |
+| Dispatch: what gets intercepted, what falls through bit-identically | yes | Linux, 70 tests |
 | The W8A8 arithmetic and its error vs MLX's 4-bit op | yes | Linux, via the portable backend |
 | `mx.compile` safety, LoRA backward, idempotency, no-op path | yes | Linux |
-| Packed-weight unpacking in real Metal | pending | macOS M1 CI (kernels are MPP-free by design) |
-| The GEMM kernel's tile conventions | **no** | needs M5 |
+| Packed-weight unpacking in real Metal | yes | macOS CI, all 3 group sizes, within 1 int8 LSB of reference |
+| The GEMM kernel's tile conventions | **no** | needs M5; MPP int8 will not even load on M1 |
 | Any performance claim | **no** | needs M5 |
+
+The macOS job settled one open question: `mpp::tensor_ops::matmul2d` with int8 operands
+does **not** load on an M1 (`[metal::Device] Unable to load kernel`), while a trivial
+Metal kernel JITs fine on the same runner. So the GEMM cannot be validated anywhere but
+on an M5, and the capability probe declines for exactly the right reason everywhere else.
 
 If you have an M5, `python bench/mlx_int8_bench.py --model mlx-community/Qwen3.6-27B-4bit`
 and please report what it says.
@@ -80,7 +84,7 @@ dimension so adding it is a GEMM rather than a rework.
 ## Testing
 
 ```bash
-python -m pytest tests/mlx_int8/ -q          # 69 tests, runs on any MLX backend
+python -m pytest tests/mlx_int8/ -q          # 70 tests, runs on any MLX backend
 python scripts/spike_mlx_int8_patch.py       # architectural assumptions, standalone
 ```
 

@@ -21,23 +21,29 @@ K, N = 1024, 2048
 
 
 class TestCapability:
-    def test_unsupported_off_apple_silicon(self):
-        if mx.metal.is_available():
-            pytest.skip("this host has Metal; the negative case cannot be shown here")
+    # These guard the no-op promise, so they must run wherever the module is not
+    # supported -- which emphatically includes Apple silicon without M5 int8 tensor ops,
+    # the configuration every current Mac user is in. Keying the skip on
+    # `mx.metal.is_available()` instead of on the verdict skipped all three on the macOS
+    # runner, which is the one place they matter most.
+
+    def test_declines_where_unsupported(self):
+        if capability.is_supported():
+            pytest.skip("int8 path is supported here; the negative case cannot be shown")
         assert capability.is_supported() is False
-        assert "macOS" in capability.reason() or "Metal" in capability.reason()
+        assert capability.reason()  # always explains itself, whatever the layer
 
     def test_enable_is_a_noop_when_unsupported(self, make_ql):
-        if mx.metal.is_available():
-            pytest.skip("this host has Metal")
+        if capability.is_supported():
+            pytest.skip("int8 path is supported here")
         assert unsloth_mlx_int8.enable() is False
         assert unsloth_mlx_int8.is_enabled() is False
         assert mx.quantized_matmul is patch._ORIG_QMM
 
     def test_model_forward_bit_identical_when_unsupported(self, quantized_model):
         """The whole no-op promise in one assertion."""
-        if mx.metal.is_available():
-            pytest.skip("this host has Metal")
+        if capability.is_supported():
+            pytest.skip("int8 path is supported here")
         x = mx.random.normal((ROW_THRESHOLD, 1024)).astype(mx.bfloat16)
         before = quantized_model(x)
         mx.eval(before)
