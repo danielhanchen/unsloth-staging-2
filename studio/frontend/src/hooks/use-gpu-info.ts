@@ -64,6 +64,12 @@ export interface GpuInfo {
    *  question per pin, which is the half that is right; this is the reading it needs. */
   systemRamAvailableHostGb: number;
   systemRamTotalGb: number;
+  /** True when the reported budget is shared system memory rather than a
+   * dedicated VRAM pool: a Vulkan iGPU, whose figure is free shared RAM at
+   * probe time and moves with desktop usage. The backend already distinguishes
+   * these one layer down; this carries it up so callers that judge "will it
+   * fit" can decline to answer instead of answering against the wrong pool. */
+  sharedMemory: boolean;
 }
 
 const DEFAULT_GPU: GpuInfo = {
@@ -78,6 +84,7 @@ const DEFAULT_GPU: GpuInfo = {
   loadDeviceMemoryGb: 0,
   cpuCore: 0,
   cpuThread: 0,
+  sharedMemory: false,
   systemRamAvailableGb: 0,
   systemRamAvailableHostGb: 0,
   systemRamTotalGb: 0,
@@ -114,17 +121,7 @@ function toGpuInfo(
     systemRamAvailableGb: devices.some((device) => device.shared_memory)
       ? 0
       : base.systemRamAvailableGb,
-    // EVERY, not some, and deliberately different from the zeroing above. That one
-    // is about a SUM: one shared device is enough to make "GPU total + system RAM"
-    // count the same bytes twice. This one answers "is there only one pool", which a
-    // discrete card sitting beside an iGPU makes false. Reading it as some() marked a
-    // mixed inventory single-pool, and the row shows a lone Shared figure there and
-    // drops the GPU verdict, so a fixed Manual placement larger than the discrete
-    // card read as a fit against a combined ceiling it will never spill into.
-    // Length-guarded because every() on an empty list is true, and a host with
-    // nothing probed has no pool to be single.
-    sharedMemory:
-      devices.length > 0 && devices.every((device) => device.shared_memory),
+    sharedMemory: devices.some((device) => device.shared_memory),
     available: true,
     budgetKnown: true,
     name: devices[0]?.name ?? "Unknown",
