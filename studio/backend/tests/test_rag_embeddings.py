@@ -169,6 +169,87 @@ def test_token_counter_enables_parallelism_only_during_call(monkeypatch):
     assert os.environ.get("TOKENIZERS_PARALLELISM") == "false"  # restored after
 
 
+def test_token_counter_reacquires_backend_retired_between_chunk_calls(monkeypatch):
+    from core.rag.embed_llama_server import LlamaServerBackend
+
+    retired = LlamaServerBackend()
+    replacement = LlamaServerBackend()
+    monkeypatch.setattr(embeddings, "_get_backend", lambda: retired)
+    count = embeddings.token_counter("org/embedder")
+
+    retired._closed = True
+    monkeypatch.setattr(embeddings, "_get_backend", lambda: replacement)
+    monkeypatch.setattr(
+        replacement,
+        "_post",
+        lambda path, payload: {"tokens": [1, 2, 3]},
+    )
+
+    assert count("the next chunk") == 3
+
+
+def test_token_counter_does_not_hide_non_lifecycle_errors(monkeypatch):
+    class _BrokenCounterBackend:
+        _closed = False
+
+        def token_counter(self, *, model_name = None):
+            def _raise(_text):
+                raise RuntimeError("invalid tokenizer response")
+
+            return _raise
+
+    monkeypatch.setattr(embeddings, "_get_backend", lambda: _BrokenCounterBackend())
+    with pytest.raises(RuntimeError, match = "invalid tokenizer response"):
+        embeddings.token_counter()("chunk")
+
+
+def test_st_unload_waits_for_encode_admitted_before_model_lookup(monkeypatch):
+    entered_lookup = threading.Event()
+    finish_lookup = threading.Event()
+    unload_done = threading.Event()
+    order = []
+    errors = []
+
+    class _Model:
+        def encode(self, texts, **kwargs):
+            order.append("encode")
+            return np.zeros((len(texts), 2), dtype = np.float32)
+
+    def _get(model_name = None):
+        entered_lookup.set()
+        assert finish_lookup.wait(timeout = 2)
+        return _Model()
+
+    def _encode():
+        try:
+            embeddings._st_encode(["chunk"])
+        except Exception as exc:  # pragma: no cover - surfaced below
+            errors.append(exc)
+
+    monkeypatch.setattr(embeddings, "_get", _get)
+    monkeypatch.setattr(embeddings, "_model", object())
+    monkeypatch.setattr(embeddings, "_name", "org/embedder")
+    worker = threading.Thread(target = _encode)
+    worker.start()
+    assert entered_lookup.wait(timeout = 2)
+
+    def _unload():
+        embeddings._release_st_model()
+        order.append("unload")
+        unload_done.set()
+
+    closer = threading.Thread(target = _unload)
+    closer.start()
+    assert unload_done.wait(timeout = 0.05) is False
+    finish_lookup.set()
+    worker.join(timeout = 2)
+    closer.join(timeout = 2)
+
+    assert errors == []
+    assert order == ["encode", "unload"]
+    assert unload_done.is_set()
+
+
 def test_sentence_transformer_load_uses_live_cache(monkeypatch, tmp_path):
     observed = {}
 
@@ -415,6 +496,160 @@ def test_st_success_keeps_sentence_transformers(monkeypatch):
     assert isinstance(backend, embeddings._SentenceTransformersBackend)
 
 
+def test_loaded_state_belongs_to_the_resident_sentence_transformer(monkeypatch):
+    monkeypatch.setattr(embeddings, "_backend", embeddings._SentenceTransformersBackend())
+    monkeypatch.setattr(embeddings, "_model", object())
+    monkeypatch.setattr(embeddings, "_name", "org/resident")
+
+    assert embeddings.backend_is_loaded() is True
+    assert embeddings.backend_is_loaded("org/resident") is True
+    assert embeddings.backend_is_loaded("org/new-selection") is False
+
+
+def test_loaded_state_belongs_to_the_resident_gguf_repo(monkeypatch):
+    backend = SimpleNamespace(_model_repo = "org/resident-GGUF")
+    monkeypatch.setattr(embeddings, "_backend", backend)
+    monkeypatch.setattr(embeddings, "_is_llama_backend", lambda value: value is backend)
+    monkeypatch.setattr(
+        embeddings.config,
+        "effective_gguf_repo_for_embedding_model",
+        lambda model: f"{model}-GGUF",
+    )
+
+    assert embeddings.backend_is_loaded("org/resident") is True
+    assert embeddings.backend_is_loaded("org/new-selection") is False
+
+
+def test_unload_clears_the_sentence_transformer_weights(monkeypatch):
+    embeddings._backend = embeddings._SentenceTransformersBackend()
+    embeddings._backend_key = embeddings._current_backend_key()
+    embeddings._model = object()
+    embeddings._name = "org/embedder"
+
+    assert embeddings.release_backend() is True
+    assert embeddings._model is None
+    assert embeddings._name is None
+
+
+def test_pending_sentence_transformer_refuses_implicit_download_and_llama_fallback(monkeypatch):
+    import utils.embedding_model_settings as ems
+    import utils.utils as utils
+
+    class _MustNotLoad:
+        def __init__(self, *args, **kwargs):  # pragma: no cover - failure is the assertion
+            raise AssertionError("pending model reached SentenceTransformer")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sentence_transformers",
+        SimpleNamespace(SentenceTransformer = _MustNotLoad),
+    )
+    monkeypatch.setattr(ems, "get_stored_download_pending", lambda model: True)
+    monkeypatch.setattr(utils, "hf_cache_snapshot_is_loadable", lambda model: False)
+    monkeypatch.setattr(embeddings, "_install_torchao_stub_once", lambda: None)
+    monkeypatch.setattr(embeddings, "_load_device", lambda: "cpu")
+    monkeypatch.setattr(
+        embeddings,
+        "_try_make_llama_backend",
+        lambda: (_ for _ in ()).throw(AssertionError("pending ST fell back to llama")),
+    )
+    embeddings._model = None
+    embeddings._name = None
+
+    with pytest.raises(embeddings.EmbeddingModelDownloadRequiredError, match = "not downloaded"):
+        embeddings._build_st_backend_or_fallback()
+
+
+def test_replacing_a_llama_backend_shuts_it_down(monkeypatch):
+    calls = []
+
+    class _OldLlama:
+        def _shutdown(self):
+            calls.append("shutdown")
+
+    monkeypatch.setattr(embeddings.config, "EMBED_BACKEND", "sentence-transformers")
+    monkeypatch.setattr(
+        embeddings,
+        "_build_st_backend_or_fallback",
+        lambda: embeddings._SentenceTransformersBackend(),
+    )
+    embeddings._backend = _OldLlama()
+    embeddings._backend_key = "stale"
+
+    assert isinstance(embeddings._get_backend(), embeddings._SentenceTransformersBackend)
+    assert calls == ["shutdown"]
+
+
+def test_explicit_llama_backend_disallows_st_resolution(monkeypatch):
+    monkeypatch.setattr(embeddings.config, "EMBED_BACKEND", "llama-server")
+    monkeypatch.setattr(embeddings, "_forced_backend_key", None)
+    assert embeddings.sentence_transformers_fallback_allowed() is False
+
+    monkeypatch.setattr(embeddings.config, "EMBED_BACKEND", "auto")
+    assert embeddings.sentence_transformers_fallback_allowed() is True
+    monkeypatch.setattr(embeddings, "_forced_backend_key", "llama-server")
+    monkeypatch.setattr(
+        embeddings,
+        "_forced_backend_model",
+        embeddings.config.effective_embedding_model(),
+    )
+    assert embeddings.sentence_transformers_fallback_allowed() is False
+
+
+def test_forced_llama_fallback_is_scoped_to_the_model_that_failed(monkeypatch):
+    monkeypatch.setattr(embeddings.config, "EMBED_BACKEND", "auto")
+    monkeypatch.setattr(embeddings, "_forced_backend_key", "llama-server")
+    monkeypatch.setattr(embeddings, "_forced_backend_model", "org/failed")
+    monkeypatch.setattr(
+        embeddings,
+        "_resolve_auto_for_model",
+        lambda model = None: "sentence-transformers",
+    )
+
+    assert embeddings.sentence_transformers_fallback_allowed("org/failed") is False
+    assert embeddings.sentence_transformers_fallback_allowed("org/new-model") is True
+    assert embeddings.resolved_backend_for_model("org/failed") == "llama-server"
+    assert embeddings.resolved_backend_for_model("org/new-model") == "sentence-transformers"
+
+
+def test_runtime_preflight_predicts_the_supported_llama_fallback(monkeypatch):
+    monkeypatch.setattr(embeddings.config, "EMBED_BACKEND", "auto")
+    monkeypatch.setattr(embeddings, "_forced_backend_key", None)
+    monkeypatch.setattr(
+        embeddings,
+        "_resolve_auto_for_model",
+        lambda model = None: "sentence-transformers",
+    )
+    monkeypatch.setattr(embeddings, "sentence_transformers_runtime_available", lambda: False)
+    monkeypatch.setattr(embeddings, "_llama_server_runtime_available", lambda: True)
+
+    assert embeddings.resolved_backend_for_model("org/embedder") == "llama-server"
+
+
+def test_runtime_preflight_keeps_st_when_no_fallback_exists(monkeypatch):
+    monkeypatch.setattr(embeddings.config, "EMBED_BACKEND", "auto")
+    monkeypatch.setattr(embeddings, "_forced_backend_key", None)
+    monkeypatch.setattr(
+        embeddings,
+        "_resolve_auto_for_model",
+        lambda model = None: "sentence-transformers",
+    )
+    monkeypatch.setattr(embeddings, "sentence_transformers_runtime_available", lambda: False)
+    monkeypatch.setattr(embeddings, "_llama_server_runtime_available", lambda: False)
+
+    assert embeddings.resolved_backend_for_model("org/embedder") == "sentence-transformers"
+
+
+def test_runtime_preflight_catches_a_fatal_torch_device_mismatch(monkeypatch):
+    monkeypatch.setattr(
+        embeddings,
+        "_load_device",
+        lambda: (_ for _ in ()).throw(embeddings.TorchDeviceUnusableError("broken torch")),
+    )
+
+    assert embeddings.sentence_transformers_runtime_available() is False
+
+
 class _BoomOnEncodeModel:
     """Loads fine (init probe passes) but raises when encoding."""
 
@@ -429,6 +664,8 @@ def test_st_encode_runtime_failure_switches_to_llama(monkeypatch):
     monkeypatch.setattr(embeddings, "_get", lambda model_name = None: _BoomOnEncodeModel())
     _patch_llama_backend(monkeypatch, binary = "/fake/llama-server")
     calls = {}
+    embeddings._model = object()
+    embeddings._name = "org/embedder"
 
     def _sentinel_encode(
         self,
@@ -446,8 +683,20 @@ def test_st_encode_runtime_failure_switches_to_llama(monkeypatch):
     out = embeddings.encode(["alpha", "beta"])
     assert calls.get("used") is True  # retried on the llama fallback
     assert out.shape == (2, 4)
+    # The failed ST weights are no longer reachable, including after the
+    # published backend became llama rather than an ST wrapper.
+    assert embeddings._model is None
+    assert embeddings._name is None
+    assert embeddings._forced_backend_model == embeddings.config.effective_embedding_model()
     # Switch is process-wide: later calls keep using llama, not ST.
     assert isinstance(embeddings._get_backend(), _SentinelLlamaBackend)
+    # It outranks what the saved model would otherwise resolve to, so a model that
+    # asks for ST cannot walk the process back into the encoder that just failed.
+    monkeypatch.setattr(embeddings, "_resolve_auto_for_model", lambda: "sentence-transformers")
+    assert isinstance(embeddings._get_backend(), _SentinelLlamaBackend)
+    # An explicit unload is a fresh start, so the pin does not outlive it.
+    embeddings._reset_backend()
+    assert embeddings._forced_backend_key is None
 
 
 def test_st_encode_failure_without_llama_binary_reraises(monkeypatch):
@@ -537,3 +786,80 @@ def test_crashing_torch_falls_back_to_llama_server(monkeypatch):
     embeddings._reset_backend()
 
     assert isinstance(embeddings._get_backend(), _SentinelLlamaBackend)
+
+
+def test_encode_reacquires_a_backend_retired_between_batches(monkeypatch):
+    """`release_backend` promises the next embed rebuilds. Without a reacquire here
+    that promise held only for `token_counter`, and pressing Unload mid-ingestion
+    failed the document being indexed instead of continuing it."""
+    from core.rag.embed_llama_server import LlamaServerBackend
+
+    retired = LlamaServerBackend()
+    replacement = LlamaServerBackend()
+    retired._closed = True
+    served = np.zeros((1, 4), dtype = np.float32)
+    monkeypatch.setattr(
+        replacement,
+        "encode",
+        lambda texts, **kwargs: served,
+    )
+    backends = iter([retired, replacement])
+    monkeypatch.setattr(embeddings, "_get_backend", lambda: next(backends))
+
+    assert embeddings.encode(["chunk"]) is served
+    # The identity must name the backend that actually produced the vectors.
+    assert embeddings._served_by.backend is replacement
+
+
+def test_encode_does_not_hide_a_non_lifecycle_runtime_error(monkeypatch):
+    class _BrokenBackend:
+        _closed = False
+
+        def encode(self, texts, **kwargs):
+            raise RuntimeError("llama-server returned no embedding")
+
+    monkeypatch.setattr(embeddings, "_get_backend", lambda: _BrokenBackend())
+    with pytest.raises(RuntimeError, match = "returned no embedding"):
+        embeddings.encode(["chunk"])
+
+
+def test_encode_surfaces_the_unload_when_no_replacement_is_published(monkeypatch):
+    from core.rag.embed_llama_server import LlamaServerBackend
+
+    retired = LlamaServerBackend()
+    retired._closed = True
+    monkeypatch.setattr(embeddings, "_get_backend", lambda: retired)
+    with pytest.raises(RuntimeError, match = "was unloaded"):
+        embeddings.encode(["chunk"])
+
+
+def test_the_token_counter_follows_an_unloaded_sentence_transformer(monkeypatch):
+    """The tokenizer used to be captured when the counter was built and held for the
+    whole document, so it kept counting through an unload that reported the model
+    gone. Reading it per call under the compute lock mirrors `_st_encode`."""
+    looked_up = []
+
+    class _Tok:
+        def __init__(self, n):
+            self.n = n
+
+        def encode(self, text, add_special_tokens = False):
+            return list(range(self.n))
+
+    class _Model:
+        def __init__(self, n):
+            self.tokenizer = _Tok(n)
+
+    models = [_Model(3), _Model(7)]
+
+    def _get(model_name = None):
+        looked_up.append(model_name)
+        return models[min(len(looked_up) - 1, 1)]
+
+    monkeypatch.setattr(embeddings, "_get", _get)
+    count = embeddings._st_token_counter("org/embedder")
+
+    assert looked_up == [], "the lookup must not happen before the first call"
+    assert count("first") == 3
+    assert count("second") == 7
+    assert looked_up == ["org/embedder", "org/embedder"]

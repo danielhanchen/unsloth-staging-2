@@ -16,6 +16,16 @@ import time
 from typing import Any
 
 EMBEDDING_MODEL_SETTING_KEY = "rag_embedding_model"
+# The GGUF repo the picker resolved for that model. Stored so the loader opens
+# what was actually downloaded instead of re-deriving a name that may not exist.
+EMBEDDING_GGUF_SETTING_KEY = "rag_embedding_gguf_repo"
+# Which backend that model needs. An embedder with no GGUF still runs fine on
+# sentence-transformers (safetensors), it just costs about 1 GB more memory.
+EMBEDDING_BACKEND_SETTING_KEY = "rag_embedding_backend"
+# Atomic association between the selected model and the artifacts/backend the
+# resolver validated for it. Unlike the override key, this may name the env
+# default: an off-convention GGUF still has to remain attached to that model.
+EMBEDDING_RESOLUTION_SETTING_KEY = "rag_embedding_resolution"
 MAX_EMBEDDING_MODEL_LENGTH = 512
 
 # The effective model is consulted on the embedder hot path (once per embed /
@@ -23,7 +33,9 @@ MAX_EMBEDDING_MODEL_LENGTH = 512
 # of hitting sqlite each time. Writes invalidate immediately in-process; other
 # readers converge within the TTL.
 _CACHE_TTL_S = 2.0
-_cached: tuple[float, str | None] | None = None
+_StoredState = tuple[str | None, str | None, str | None, str | None, bool]
+# (override model, resolved model, GGUF repo, backend, download pending)
+_cached: tuple[float, _StoredState] | None = None
 # Bumped on every write/invalidate. A reader captures it before the DB read and
 # only fills the cache if it is unchanged afterward, so a read that overlapped a
 # save cannot repopulate the cache with the pre-save value for the whole TTL.
@@ -67,8 +79,66 @@ def validate_embedding_model(value: Any) -> str:
     return cleaned
 
 
+def get_stored_gguf_repo(model: str) -> str | None:
+    """The GGUF repo stored alongside ``model``, or None when it was stored for a
+    different model (a stale pair must not point the loader at the wrong weights)."""
+    stored = _get_stored_state()
+    return stored[2] if stored[1] == model else None
+
+
+def get_stored_backend(model: str) -> str | None:
+    """The backend stored for ``model``, or None. Same staleness rule as above."""
+    stored = _get_stored_state()
+    return stored[3] if stored[1] == model else None
+
+
+def get_stored_download_pending(model: str) -> bool:
+    """Whether ``model`` was activated before its required transfer finished.
+
+    Loaders use this marker to remain cache-only instead of recreating the
+    invisible first-index download the picker is designed to prevent.
+    """
+    stored = _get_stored_state()
+    return stored[4] if stored[1] == model else False
+
+
+def clear_stored_download_pending(model: str) -> bool:
+    """Retire the pending marker for ``model`` once its weights are on disk.
+
+    Nothing else clears it: the picker re-resolves after a transfer but does not
+    save again, so without this the marker outlives the download it described and
+    pins that model cache-only forever. A later eviction then reads as "not
+    downloaded yet" and only re-picking the model would recover. Callers are the
+    loaders, at the point where they have just proven the cache is complete.
+    """
+    stored = _get_stored_state()
+    if stored[1] != model or not stored[4]:
+        return False
+    from storage.studio_db import upsert_app_settings
+
+    resolution = {
+        "model": stored[1],
+        "gguf_repo": stored[2],
+        "backend": stored[3],
+        "download_pending": False,
+    }
+    upsert_app_settings({EMBEDDING_RESOLUTION_SETTING_KEY: resolution})
+    _invalidate_cache()
+    return True
+
+
 def get_stored_embedding_model() -> str | None:
     """The persisted override, or None when unset/invalid."""
+    return _get_stored_state()[0]
+
+
+def _get_stored_state() -> _StoredState:
+    """Read the override and its resolved artifact association as one snapshot.
+
+    The resolution is one JSON value so its model/repo/backend can never be
+    torn. The legacy individual fields are read in the same SQL statement for
+    compatibility with builds from before the atomic record existed.
+    """
     global _cached
     now = time.monotonic()
     with _lock:
@@ -77,8 +147,15 @@ def get_stored_embedding_model() -> str | None:
             return cached[1]
         gen = _generation
     try:
-        from storage.studio_db import get_app_setting
-        stored = get_app_setting(EMBEDDING_MODEL_SETTING_KEY, None)
+        from storage.studio_db import get_app_settings
+        settings = get_app_settings(
+            [
+                EMBEDDING_MODEL_SETTING_KEY,
+                EMBEDDING_RESOLUTION_SETTING_KEY,
+                EMBEDDING_GGUF_SETTING_KEY,
+                EMBEDDING_BACKEND_SETTING_KEY,
+            ]
+        )
     except Exception:
         # Transient store failure: keep the last known value instead of
         # silently reverting the embed/search hot path to the default model,
@@ -87,8 +164,23 @@ def get_stored_embedding_model() -> str | None:
             if _cached is not None:
                 _cached = (time.monotonic(), _cached[1])
                 return _cached[1]
-        return None
-    value = _coerce_embedding_model(stored)
+        return (None, None, None, None, False)
+    override = _coerce_embedding_model(settings.get(EMBEDDING_MODEL_SETTING_KEY))
+    resolution = settings.get(EMBEDDING_RESOLUTION_SETTING_KEY)
+    resolved_model = repo = backend = None
+    download_pending = False
+    if isinstance(resolution, dict):
+        resolved_model = _coerce_embedding_model(resolution.get("model"))
+        repo = _coerce_embedding_model(resolution.get("gguf_repo"))
+        backend = _coerce_embedding_model(resolution.get("backend"))
+        download_pending = resolution.get("download_pending") is True
+    elif override:
+        # Legacy PR builds stored the association in separate keys. The one-shot
+        # read above still gives this compatibility path a consistent snapshot.
+        resolved_model = override
+        repo = _coerce_embedding_model(settings.get(EMBEDDING_GGUF_SETTING_KEY))
+        backend = _coerce_embedding_model(settings.get(EMBEDDING_BACKEND_SETTING_KEY))
+    value: _StoredState = (override, resolved_model, repo, backend, download_pending)
     with _lock:
         # Only cache when no save landed while we were reading; otherwise this
         # value may be pre-save, and caching it would mask the new one for the
@@ -103,14 +195,39 @@ def get_rag_embedding_model() -> str:
     return get_stored_embedding_model() or default_embedding_model()
 
 
-def set_rag_embedding_model(value: Any) -> str:
+def set_rag_embedding_model(
+    value: Any,
+    gguf_repo: Any = None,
+    backend: Any = None,
+    download_pending: bool = False,
+) -> str:
     parsed = validate_embedding_model(value)
     from storage.studio_db import upsert_app_settings
 
     # Saving the default is not an override; keeps is_custom (and the UI's
     # reset affordance) honest.
     stored = parsed if parsed != default_embedding_model() else None
-    upsert_app_settings({EMBEDDING_MODEL_SETTING_KEY: stored})
+    repo = _coerce_embedding_model(gguf_repo)
+    chosen = _coerce_embedding_model(backend)
+    resolution = (
+        {
+            "model": parsed,
+            "gguf_repo": repo,
+            "backend": chosen,
+            "download_pending": download_pending is True,
+        }
+        if repo or chosen or download_pending
+        else None
+    )
+    upsert_app_settings(
+        {
+            EMBEDDING_MODEL_SETTING_KEY: stored,
+            EMBEDDING_RESOLUTION_SETTING_KEY: resolution,
+            # Retire the pre-atomic spelling on the same commit.
+            EMBEDDING_GGUF_SETTING_KEY: None,
+            EMBEDDING_BACKEND_SETTING_KEY: None,
+        }
+    )
     _invalidate_cache()
     return parsed
 
@@ -119,6 +236,13 @@ def reset_rag_embedding_model() -> str:
     """Clear the override; returns the (env/default) model now in effect."""
     from storage.studio_db import upsert_app_settings
 
-    upsert_app_settings({EMBEDDING_MODEL_SETTING_KEY: None})
+    upsert_app_settings(
+        {
+            EMBEDDING_MODEL_SETTING_KEY: None,
+            EMBEDDING_RESOLUTION_SETTING_KEY: None,
+            EMBEDDING_GGUF_SETTING_KEY: None,
+            EMBEDDING_BACKEND_SETTING_KEY: None,
+        }
+    )
     _invalidate_cache()
     return default_embedding_model()
