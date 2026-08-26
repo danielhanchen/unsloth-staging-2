@@ -1,0 +1,97 @@
+name: "staging-9639 studio-playwright"
+on:
+  push:
+    branches: ["pr-9639-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  studio-live:
+    runs-on: ubuntu-latest
+    # Wide enough that the two apt-capable steps can both spend their authorised worst
+    # case without the JOB timeout truncating one of them; the common path uses neither.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Engine first, deps only if needed. Installing them together makes playwright run
+      # its own apt-get update internally, outside the repo's retry helper and transfer
+      # caps, which test_no_workflow_installs_playwright_browsers_with_deps fails the
+      # build for. Launching the engine is the honest test of whether they are missing,
+      # exactly as studio-frontend-ci.yml does it.
+      - name: Install Playwright and its engine
+        # 33, not 20: the shared helper authorises up to 1690s of retries, and
+        # test_the_retry_budget_fits_inside_the_step_timeout fails a step whose timeout
+        # would cut the last attempt off mid-download. Same number studio-frontend-ci.yml
+        # arrived at for the same call.
+        timeout-minutes: 33
+        env:
+          # Without this apt falls back to 3 internal retries, so a stalled mirror costs
+          # roughly four times the per-URI timeout inside one attempt of the helper.
+          APT_ACQUIRE_RETRIES: '0'
+        run: |
+          pip install 'playwright<2' httpx pillow
+          python -m playwright install chromium
+          if python -c "
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              p.chromium.launch().close()
+          "; then
+            echo "::notice::chromium launches; skipping install-deps"
+          else
+            bash .github/scripts/retry-with-apt-lock.sh \
+              python -m playwright install-deps chromium
+          fi
+      # Playwright ships its own ffmpeg but never puts it on PATH, and the kit only
+      # transcodes the mp4 when `ffmpeg` resolves there, so the smoke died every run
+      # on `mp4 missing: None` -- which the `|| true` below then hid.
+      - name: Install ffmpeg
+        timeout-minutes: 30
+        env:
+          APT_ACQUIRE_RETRIES: '0'
+        run: |
+          bash .github/scripts/retry-with-apt-lock.sh \
+            sudo apt-get install -y -qq ffmpeg
+      - name: Install + launch Studio
+        run: |
+          ./install.sh --local --no-torch || pip install -e .
+          nohup unsloth studio -H 127.0.0.1 -p 8888 > studio.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8888/healthz && break; sleep 5; done
+      - name: Playwright smoke (studio_test_kit)
+        run: PYTHONPATH=.github/scripts python -m studio_test_kit._smoke_ui || true
+      - name: Drive the PR's Playwright script (playwright_thread_scoped_settings.py)
+        env:
+          NEW_PW: StagingCI-9639-Pw1!
+        run: |
+          PWFILE=$(grep -oE 'password saved to: *\S+' studio.log | tail -1 | awk '{print $NF}')
+          [ -f "$PWFILE" ] || { echo "::error::no bootstrap password file in studio.log"; tail -40 studio.log; exit 1; }
+          export BOOT=$(cat "$PWFILE")
+          python - <<'EOF'
+          import json, os, urllib.request
+          B, boot, new = "http://127.0.0.1:8888", os.environ["BOOT"], os.environ["NEW_PW"]
+          def post(path, body, tok=None):
+              req = urllib.request.Request(B + path, json.dumps(body).encode(),
+                                           {"Content-Type": "application/json"})
+              if tok: req.add_header("Authorization", "Bearer " + tok)
+              return json.load(urllib.request.urlopen(req, timeout=30))
+          tok = post("/api/auth/login", {"username": "unsloth", "password": boot})["access_token"]
+          post("/api/auth/change-password", {"current_password": boot, "new_password": new}, tok)
+          print("password rotated")
+          EOF
+          BASE_URL=http://127.0.0.1:8888 STUDIO_PW="$NEW_PW" \
+            PW_ART_DIR=logs/playwright_staging python tests/studio/playwright_thread_scoped_settings.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: studio-playwright-9639
+          path: |
+            **/*.png
+            **/*.webm
+            studio.log
