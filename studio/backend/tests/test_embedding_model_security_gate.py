@@ -37,6 +37,14 @@ def _security_stub(blocked):
     return mod
 
 
+def _plan(model, backend):
+    return settings.EmbeddingModelResolveResponse(
+        embedding_model = model,
+        backend = backend,
+        download_repo = f"{model}-GGUF" if backend == "llama" else model,
+    )
+
+
 @pytest.fixture
 def client(monkeypatch):
     # The settings scan unions in the ST module dirs read from modules.json; keep it
@@ -47,15 +55,31 @@ def client(monkeypatch):
     saved: dict = {}
     monkeypatch.setattr(settings, "default_embedding_model", lambda: "unsloth/default-embed")
     monkeypatch.setattr(settings, "validate_embedding_model", lambda v: v)
-    monkeypatch.setattr(settings, "set_rag_embedding_model", lambda v: saved.setdefault("model", v))
-    monkeypatch.setattr(settings, "_llama_backend_active", lambda: False)
+    monkeypatch.setattr(
+        settings,
+        "set_rag_embedding_model",
+        lambda v, gguf_repo = None, backend = None, download_pending = False: saved.update(
+            model = v,
+            gguf_repo = gguf_repo,
+            backend = backend,
+            download_pending = download_pending,
+        ),
+    )
+    monkeypatch.setattr(settings, "_llama_backend_active", lambda *_: False)
+    monkeypatch.setattr(
+        settings,
+        "_resolve_embedding_model_plan",
+        lambda model, token: _plan(
+            model, "llama" if settings._llama_backend_active() else "sentence-transformers"
+        ),
+    )
     monkeypatch.setattr(settings, "_resolves_as_local_gguf", lambda m: False)
     monkeypatch.setattr(settings, "get_rag_embedding_model", lambda: saved.get("model", ""))
     monkeypatch.setattr(settings, "get_stored_embedding_model", lambda: saved.get("model"))
     monkeypatch.setattr(
         settings,
-        "effective_gguf_repo",
-        lambda: f"{saved.get('model', 'unsloth/default-embed')}-GGUF",
+        "effective_gguf_repo_for_embedding_model",
+        lambda model: f"{model or 'unsloth/default-embed'}-GGUF",
     )
     monkeypatch.setattr(
         settings,
@@ -86,6 +110,18 @@ def test_flagged_repo_is_blocked_without_force(client, monkeypatch):
     r = c.put("/embedding-model", json = {"embedding_model": "attacker/malicious-embed"})
     assert r.status_code == 403
     assert "model" not in saved
+
+
+def test_uncached_selection_is_marked_pending_so_loaders_stay_offline(client, monkeypatch):
+    c, saved = client
+    monkeypatch.setitem(sys.modules, "utils.security", _security_stub(blocked = False))
+    import utils.models as models
+
+    monkeypatch.setattr(models, "is_embedding_model", lambda *a, **k: True)
+    response = c.put("/embedding-model", json = {"embedding_model": "acme/embedder"})
+
+    assert response.status_code == 200
+    assert saved["download_pending"] is True
 
 
 def test_hard_block_uses_non_forceable_status(client, monkeypatch):
@@ -142,7 +178,7 @@ def test_offline_skips_remote_gguf_probe(client, monkeypatch):
     # dead-DNS session cannot hang.
     c, _saved = client
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    monkeypatch.setattr(settings, "_llama_backend_active", lambda: True)
+    monkeypatch.setattr(settings, "_llama_backend_active", lambda *_: True)
     monkeypatch.setattr(settings, "_local_gguf_backend_error", lambda model: None)
 
     def _boom(*a, **k):
@@ -156,14 +192,64 @@ def test_offline_skips_remote_gguf_probe(client, monkeypatch):
     assert r.status_code == 200
 
 
+def test_client_cannot_persist_an_unvalidated_gguf_repo(client, monkeypatch):
+    c, saved = client
+    monkeypatch.setattr(settings, "_llama_backend_active", lambda *_: True)
+    monkeypatch.setitem(sys.modules, "utils.security", _security_stub(blocked = False))
+
+    r = c.put(
+        "/embedding-model",
+        json = {
+            "embedding_model": "acme/embedder",
+            "backend": "llama",
+            "gguf_repo": "attacker/unrelated-llm-GGUF",
+        },
+    )
+    assert r.status_code == 400
+    assert "model" not in saved
+
+
+def test_security_scan_uses_the_resolved_destination_backend(client, monkeypatch):
+    """The old backend may be llama while the selected model resolves to ST."""
+    c, saved = client
+    monkeypatch.setattr(settings, "_llama_backend_active", lambda *_: True)
+    monkeypatch.setattr(
+        settings,
+        "_resolve_embedding_model_plan",
+        lambda model, token: _plan(model, "sentence-transformers"),
+    )
+    monkeypatch.setitem(sys.modules, "utils.security", _security_stub(blocked = True))
+
+    r = c.put(
+        "/embedding-model",
+        json = {"embedding_model": "attacker/flagged-st", "backend": "sentence-transformers"},
+    )
+    assert r.status_code == 403
+    assert "model" not in saved
+
+
 def test_llama_backend_skips_the_st_pickle_scan(monkeypatch):
     # On the llama-server backend the embedder loads GGUF (inert), not the ST repo's
     # pickle, so a flagged ST repo with a clean GGUF companion must not be rejected here.
     saved: dict = {}
     monkeypatch.setattr(settings, "default_embedding_model", lambda: "unsloth/default-embed")
     monkeypatch.setattr(settings, "validate_embedding_model", lambda v: v)
-    monkeypatch.setattr(settings, "set_rag_embedding_model", lambda v: saved.setdefault("model", v))
-    monkeypatch.setattr(settings, "_llama_backend_active", lambda: True)
+    monkeypatch.setattr(
+        settings,
+        "set_rag_embedding_model",
+        lambda v, gguf_repo = None, backend = None, download_pending = False: saved.update(
+            model = v,
+            gguf_repo = gguf_repo,
+            backend = backend,
+            download_pending = download_pending,
+        ),
+    )
+    monkeypatch.setattr(settings, "_llama_backend_active", lambda *_: True)
+    monkeypatch.setattr(
+        settings,
+        "_resolve_embedding_model_plan",
+        lambda model, token: _plan(model, "llama"),
+    )
     monkeypatch.setattr(settings, "_resolves_as_local_gguf", lambda m: False)
     monkeypatch.setattr(settings, "get_rag_embedding_model", lambda: saved.get("model", ""))
     monkeypatch.setattr(settings, "get_stored_embedding_model", lambda: saved.get("model"))
@@ -209,12 +295,26 @@ def test_runtime_llama_fallback_skips_the_st_pickle_scan(monkeypatch):
     saved: dict = {}
     monkeypatch.setattr(settings, "default_embedding_model", lambda: "unsloth/default-embed")
     monkeypatch.setattr(settings, "validate_embedding_model", lambda v: v)
-    monkeypatch.setattr(settings, "set_rag_embedding_model", lambda v: saved.setdefault("model", v))
+    monkeypatch.setattr(
+        settings,
+        "set_rag_embedding_model",
+        lambda v, gguf_repo = None, backend = None, download_pending = False: saved.update(
+            model = v,
+            gguf_repo = gguf_repo,
+            backend = backend,
+            download_pending = download_pending,
+        ),
+    )
     # Deliberately do NOT monkeypatch settings._llama_backend_active: this test exercises the
     # real delegation to embeddings.active_backend_is_llama() so the cached fallback is honored.
     monkeypatch.setattr(settings, "_resolves_as_local_gguf", lambda m: False)
     monkeypatch.setattr(settings, "get_rag_embedding_model", lambda: saved.get("model", ""))
     monkeypatch.setattr(settings, "get_stored_embedding_model", lambda: saved.get("model"))
+    monkeypatch.setattr(
+        settings,
+        "_resolve_embedding_model_plan",
+        lambda model, token: _plan(model, "llama"),
+    )
 
     called = {"scanned": False}
     mod = _types.ModuleType("utils.security")
@@ -278,8 +378,22 @@ def test_settings_scan_scopes_module_subdirs(monkeypatch):
     saved: dict = {}
     monkeypatch.setattr(settings, "default_embedding_model", lambda: "unsloth/default-embed")
     monkeypatch.setattr(settings, "validate_embedding_model", lambda v: v)
-    monkeypatch.setattr(settings, "set_rag_embedding_model", lambda v: saved.setdefault("model", v))
-    monkeypatch.setattr(settings, "_llama_backend_active", lambda: False)
+    monkeypatch.setattr(
+        settings,
+        "set_rag_embedding_model",
+        lambda v, gguf_repo = None, backend = None, download_pending = False: saved.update(
+            model = v,
+            gguf_repo = gguf_repo,
+            backend = backend,
+            download_pending = download_pending,
+        ),
+    )
+    monkeypatch.setattr(settings, "_llama_backend_active", lambda *_: False)
+    monkeypatch.setattr(
+        settings,
+        "_resolve_embedding_model_plan",
+        lambda model, token: _plan(model, "sentence-transformers"),
+    )
     monkeypatch.setattr(settings, "_resolves_as_local_gguf", lambda m: False)
     monkeypatch.setattr(settings, "get_rag_embedding_model", lambda: saved.get("model", ""))
     monkeypatch.setattr(settings, "get_stored_embedding_model", lambda: saved.get("model"))
@@ -323,6 +437,8 @@ def test_clean_repo_saves_under_force(client, monkeypatch):
         "default_embedding_model": "unsloth/default-embed",
         "default_embedding_gguf_repo": "unsloth/default-embed-GGUF",
         "is_custom": True,
+        # Nothing is held in this process, so Unload has nothing to offer.
+        "loaded": False,
     }
 
 

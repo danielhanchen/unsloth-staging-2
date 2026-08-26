@@ -29,11 +29,21 @@ def settings_store(monkeypatch):
 
     store: dict = {}
     monkeypatch.setattr(
-        studio_db, "get_app_setting", lambda key, fallback = None: store.get(key, fallback)
+        studio_db,
+        "get_app_settings",
+        lambda keys: {key: store[key] for key in keys if key in store},
     )
     monkeypatch.setattr(
         studio_db, "upsert_app_settings", lambda settings: store.update(settings) or store
     )
+
+    def _cas(key, expected, value):
+        if store.get(key) != expected:
+            return False
+        store[key] = value
+        return True
+
+    monkeypatch.setattr(studio_db, "compare_and_set_app_setting", _cas)
     ems._invalidate_cache()
     yield store
     ems._invalidate_cache()
@@ -60,3 +70,90 @@ def test_env_default_derives_its_gguf_companion(monkeypatch):
     monkeypatch.setattr(rag_config, "EMBEDDING_MODEL", "org/env-default-embedder")
 
     assert rag_config.default_gguf_repo() == "org/env-default-embedder-GGUF"
+
+
+def test_env_default_keeps_its_resolved_gguf_without_becoming_custom(settings_store, monkeypatch):
+    """An env default can resolve to an off-convention repo even though selecting
+    it should not turn the default itself into a persisted override."""
+    monkeypatch.delenv("RAG_EMBED_GGUF_REPO", raising = False)
+    monkeypatch.setattr(rag_config, "EMBEDDING_MODEL", "org/env-default-embedder")
+
+    ems.set_rag_embedding_model(
+        "org/env-default-embedder",
+        gguf_repo = "org/published-conversion",
+        backend = "llama-server",
+    )
+
+    assert ems.get_stored_embedding_model() is None
+    assert ems.get_stored_gguf_repo("org/env-default-embedder") == "org/published-conversion"
+    assert rag_config.effective_gguf_repo() == "org/published-conversion"
+
+
+def test_resolution_record_keeps_model_repo_and_backend_atomic(settings_store):
+    ems.set_rag_embedding_model(
+        "org/embedder",
+        gguf_repo = "org/embedder-conversion",
+        backend = "llama-server",
+    )
+    assert settings_store[ems.EMBEDDING_RESOLUTION_SETTING_KEY] == {
+        "model": "org/embedder",
+        "gguf_repo": "org/embedder-conversion",
+        "backend": "llama-server",
+        "download_pending": False,
+    }
+    assert settings_store[ems.EMBEDDING_GGUF_SETTING_KEY] is None
+    assert settings_store[ems.EMBEDDING_BACKEND_SETTING_KEY] is None
+
+
+def test_pending_download_is_stored_with_the_same_atomic_resolution(settings_store):
+    ems.set_rag_embedding_model(
+        "org/embedder",
+        gguf_repo = "org/embedder-conversion",
+        backend = "llama-server",
+        download_pending = True,
+    )
+    assert ems.get_stored_download_pending("org/embedder") is True
+    assert ems.get_stored_download_pending("org/another") is False
+    assert settings_store[ems.EMBEDDING_RESOLUTION_SETTING_KEY]["download_pending"] is True
+
+
+def test_a_completed_transfer_retires_the_pending_marker(settings_store):
+    """Nothing else clears it: the picker re-resolves after a download but does not
+    save again, so a marker left behind pins the model cache-only for good and a
+    later cache eviction reads as "never downloaded"."""
+    ems.set_rag_embedding_model(
+        "org/embedder",
+        gguf_repo = "org/embedder-conversion",
+        backend = "llama-server",
+        download_pending = True,
+    )
+
+    assert ems.clear_stored_download_pending("org/embedder") is True
+    assert ems.get_stored_download_pending("org/embedder") is False
+    # The rest of the resolution survives: the loader still opens what was fetched.
+    assert ems.get_stored_gguf_repo("org/embedder") == "org/embedder-conversion"
+    assert ems.get_stored_backend("org/embedder") == "llama-server"
+    # Idempotent, and never touches another model's record.
+    assert ems.clear_stored_download_pending("org/embedder") is False
+    assert ems.clear_stored_download_pending("org/another") is False
+    assert ems.get_stored_gguf_repo("org/embedder") == "org/embedder-conversion"
+
+
+def test_a_concurrent_save_is_not_reverted_by_a_late_pending_clear(settings_store):
+    """The loader reads model A's pending resolution, the user saves model B, and
+    only then does the clear land. A plain upsert would put A's record back beside
+    B's override, leaving B to re-derive a backend and a companion it never
+    resolved. The write is conditional on the record it read."""
+    ems.set_rag_embedding_model(
+        "org/a", gguf_repo = "org/a-GGUF", backend = "llama-server", download_pending = True
+    )
+    stale = ems._get_stored_state()  # A's loader has read it
+    assert stale[1] == "org/a" and stale[4] is True
+    ems.set_rag_embedding_model("org/b", gguf_repo = "org/b-GGUF", backend = "sentence-transformers")
+    ems._cached = (0.0, stale)  # its 2s snapshot still says A
+
+    assert ems.clear_stored_download_pending("org/a") is False
+    ems._invalidate_cache()
+    assert ems.get_stored_gguf_repo("org/b") == "org/b-GGUF"
+    assert ems.get_stored_backend("org/b") == "sentence-transformers"
+    assert ems.get_stored_gguf_repo("org/a") is None

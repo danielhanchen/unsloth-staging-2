@@ -253,6 +253,111 @@ def test_snapshot_is_loadable_with_config_and_weights(hf_cache):
     assert hf_cache_snapshot_is_loadable("org/emb") is True
 
 
+def test_snapshot_is_not_loadable_with_only_one_weight_shard(hf_cache):
+    _make_cache(
+        hf_cache,
+        "org/partial-shards",
+        {
+            "config.json": "{}",
+            "model.safetensors.index.json": (
+                '{"weight_map":{"a":"model-00001-of-00002.safetensors",'
+                '"b":"model-00002-of-00002.safetensors"}}'
+            ),
+            "model-00001-of-00002.safetensors": "first",
+        },
+    )
+    assert hf_cache_snapshot_is_loadable("org/partial-shards") is False
+
+
+def test_snapshot_is_loadable_with_a_complete_indexed_weight_family(hf_cache):
+    _make_cache(
+        hf_cache,
+        "org/complete-shards",
+        {
+            "config.json": "{}",
+            "model.safetensors.index.json": (
+                '{"weight_map":{"a":"model-00001-of-00002.safetensors",'
+                '"b":"model-00002-of-00002.safetensors"}}'
+            ),
+            "model-00001-of-00002.safetensors": "first",
+            "model-00002-of-00002.safetensors": "second",
+        },
+    )
+    assert hf_cache_snapshot_is_loadable("org/complete-shards") is True
+
+
+def test_cancel_marker_keeps_a_snapshot_pending(monkeypatch, hf_cache):
+    _make_cache(hf_cache, "org/cancelled", {"config.json": "{}", "model.safetensors": "x"})
+    from hub.utils import download_manifest
+
+    monkeypatch.setattr(download_manifest, "has_cancel_marker", lambda *a, **k: True)
+    assert hf_cache_snapshot_is_loadable("org/cancelled") is False
+
+
+def test_snapshot_manifest_requires_every_expected_file(monkeypatch, hf_cache):
+    _make_cache(hf_cache, "org/manifest-partial", {"config.json": "{}", "model.safetensors": "x"})
+    from hub.utils import download_manifest
+
+    manifest = download_manifest.Manifest(
+        repo_type = "model",
+        repo_id = "org/manifest-partial",
+        variant = None,
+        started_at = "",
+        expected_files = (
+            download_manifest.ExpectedFile(path = "config.json", size = 2),
+            download_manifest.ExpectedFile(path = "model.safetensors", size = 1),
+            download_manifest.ExpectedFile(path = "tokenizer.json", size = 10),
+        ),
+    )
+    monkeypatch.setattr(download_manifest, "read_manifest", lambda *a, **k: manifest)
+
+    assert hf_cache_snapshot_is_loadable("org/manifest-partial") is False
+
+
+def test_verified_snapshot_manifest_ignores_unrelated_incomplete_blob(monkeypatch, hf_cache):
+    _make_cache(
+        hf_cache,
+        "org/manifest-complete",
+        {"config.json": "{}", "model.safetensors": "weights"},
+    )
+    from hub.utils import download_manifest
+
+    manifest = download_manifest.Manifest(
+        repo_type = "model",
+        repo_id = "org/manifest-complete",
+        variant = None,
+        started_at = "",
+        expected_files = (
+            download_manifest.ExpectedFile(path = "config.json", size = 2),
+            download_manifest.ExpectedFile(path = "model.safetensors", size = 7),
+        ),
+    )
+    monkeypatch.setattr(download_manifest, "read_manifest", lambda *a, **k: manifest)
+    monkeypatch.setattr(
+        "hub.utils.hf_cache_state.repo_cache_dir_has_incomplete_blobs",
+        lambda repo_dir: True,
+    )
+
+    assert hf_cache_snapshot_is_loadable("org/manifest-complete") is True
+
+
+def test_sentence_transformer_module_shards_must_be_complete(hf_cache):
+    _make_cache(
+        hf_cache,
+        "org/st-partial",
+        {
+            "modules.json": _modules_json("0_Transformer"),
+            "0_Transformer/config.json": "{}",
+            "0_Transformer/model.safetensors.index.json": (
+                '{"weight_map":{"a":"model-00001-of-00002.safetensors",'
+                '"b":"model-00002-of-00002.safetensors"}}'
+            ),
+            "0_Transformer/model-00001-of-00002.safetensors": "first",
+        },
+    )
+    assert hf_cache_snapshot_is_loadable("org/st-partial") is False
+
+
 def test_snapshot_is_not_loadable_when_metadata_only(hf_cache):
     # A partial cache (refs/main resolves but no weights) is not loadable.
     _make_cache(hf_cache, "org/partial", {"config.json": "{}", "modules.json": MODULES_JSON})
@@ -940,3 +1045,77 @@ def test_get_online_omits_local_files_only(monkeypatch):
     _install_fake_sentence_transformers(monkeypatch, captured)
     embeddings._get("org/online")
     assert captured["local_files_only"] is False
+
+
+def test_an_unrelated_incomplete_blob_does_not_condemn_a_complete_snapshot(hf_cache):
+    """The blob directory is shared by every revision and every scoped GGUF job in
+    the repo, and caches predating managed downloads carry no manifest to appeal to.
+    A stray partial from one of those used to make a model that was entirely on disk
+    report as not downloaded, which the settings save then persisted as a pending
+    transfer and the loader refused to index."""
+    snapshot = _make_cache(
+        hf_cache, "org/stray-blob", {"config.json": "{}", "model.safetensors": "x"}
+    )
+    blobs = Path(snapshot).parent.parent / "blobs"
+    blobs.mkdir(parents = True, exist_ok = True)
+    (blobs / "0badc0ffee.incomplete").write_text("half a file from another revision")
+
+    assert hf_cache_snapshot_is_loadable("org/stray-blob") is True
+
+
+def test_a_snapshot_linking_to_an_unfinished_blob_is_still_pending(hf_cache):
+    """The narrowing above must not lose the case it was guarding: a link this
+    snapshot owns whose blob has not been finalized."""
+    snapshot = Path(
+        _make_cache(hf_cache, "org/dangling", {"config.json": "{}", "model.safetensors": "x"})
+    )
+    weights = snapshot / "model.safetensors"
+    weights.unlink()
+    weights.symlink_to(snapshot.parent.parent / "blobs" / "deadbeef")
+
+    assert hf_cache_snapshot_is_loadable("org/dangling") is False
+
+
+def test_get_online_loads_the_snapshot_settings_called_cached(hf_cache, monkeypatch):
+    """Settings reports on-device from `hf_cache_snapshot_is_loadable`, so handing
+    SentenceTransformer the repo id is what lets it fetch a revision published
+    since and change the vectors without changing the identity they carry. The
+    picker exists to replace exactly that transfer."""
+    from core.rag import embeddings
+
+    snapshot = _make_cache(
+        hf_cache, "org/fresh", {"modules.json": MODULES_JSON, "model.safetensors": "x"}
+    )
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
+    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising = False)
+    monkeypatch.setattr(embeddings, "_model", None, raising = False)
+    monkeypatch.setattr(embeddings, "_name", None, raising = False)
+    monkeypatch.setattr(embeddings, "_install_torchao_stub_once", lambda: None)
+    monkeypatch.setattr(embeddings, "_device", lambda: "cpu")
+    monkeypatch.setattr(embeddings, "_guard_model_security", lambda name, local_only = False: None)
+    captured = {}
+    _install_fake_sentence_transformers(monkeypatch, captured)
+
+    embeddings._get("org/fresh")
+
+    assert captured["name"] == str(snapshot)
+
+
+def test_an_uncached_model_online_still_loads_by_repo_id(monkeypatch):
+    """The pin above must not turn a first-ever load into a failure: with nothing
+    cached there is no snapshot to prefer, so the repo id still goes to the Hub."""
+    from core.rag import embeddings
+
+    monkeypatch.delenv("HF_HUB_OFFLINE", raising = False)
+    monkeypatch.delenv("TRANSFORMERS_OFFLINE", raising = False)
+    monkeypatch.setattr(embeddings, "_model", None, raising = False)
+    monkeypatch.setattr(embeddings, "_name", None, raising = False)
+    monkeypatch.setattr(embeddings, "_install_torchao_stub_once", lambda: None)
+    monkeypatch.setattr(embeddings, "_device", lambda: "cpu")
+    monkeypatch.setattr(embeddings, "_guard_model_security", lambda name, local_only = False: None)
+    captured = {}
+    _install_fake_sentence_transformers(monkeypatch, captured)
+
+    embeddings._get("org/never-fetched-xyz")
+
+    assert captured["name"] == "org/never-fetched-xyz"
