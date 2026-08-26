@@ -1,0 +1,40 @@
+name: "PR-9187 base control windows-latest"
+
+# The merge base of unslothai/unsloth#9187, frontend unit tests only, on Windows.
+# Sole purpose: decide whether `a streaming fence is tokenized once` failing on a
+# Windows runner is caused by that PR or predates it. Same runner, same command,
+# no PR code.
+
+on:
+  push:
+    branches: [pr9187-base-control]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: "base frontend unit tests (windows-latest)"
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+        working-directory: studio/frontend
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: npm ci --no-fund --no-audit
+      - name: Frontend unit tests
+        run: |
+          npm test 2>&1 | tee test-output.txt || true
+          echo "--- failures on the merge base:"
+          grep -E "^not ok" test-output.txt || echo "(none)"
