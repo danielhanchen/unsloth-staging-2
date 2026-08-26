@@ -108,35 +108,6 @@ import {
 import { fallbackTitleFromUserText } from "./utils/chat-title";
 import { syncExportedRepositoryToBackend } from "./utils/delete-thread-message";
 import { getImageInputUnavailableReason } from "./utils/image-input-support";
-import {
-  attachmentContentText,
-  attachmentsSample,
-  isPastedTextFile,
-} from "./utils/pasted-text";
-import {
-  adoptPreStreamRunReservation,
-  claimPreStreamRunReservation,
-  findPreStreamRunReservation,
-  isPreStreamRunReservationCancelled,
-  preStreamRunThreadIdsForRuntime,
-  releasePreStreamRunReservation,
-} from "./utils/pre-stream-run-reservation";
-import {
-  notifyPromptQueueRunFailed,
-  requestPromptQueueStop,
-  requestTemporaryPromptQueueStop,
-} from "./utils/prompt-queue-boundary";
-import {
-  refreshContextUsage,
-  setActiveBranchReader,
-} from "./utils/refresh-context-usage";
-import {
-  type RunCheckpointScheduler,
-  createRunCheckpointScheduler,
-} from "./utils/run-checkpoint-scheduler";
-import { isAssistantLocalThreadId } from "./utils/thread-ids";
-import { sanitizeThreadScopedSettings } from "./utils/thread-scoped-settings";
-import { VideoAttachmentAdapter } from "./video-attachment-adapter";
 
 const pendingHistoryAppendByMessageId = new Map<string, Promise<void>>();
 // Resolves to the thread id assigned when this message's chat was first persisted.
@@ -697,6 +668,7 @@ export async function ensureThreadRecord({
   pairId,
   projectId,
   incognito,
+  neverSent,
   modelId,
   createdAt,
 }: {
@@ -706,6 +678,8 @@ export async function ensureThreadRecord({
   projectId?: string | null;
   /** Snapshot from the send this row belongs to, so a retry cannot read a since-flipped toggle. */
   incognito?: boolean;
+  /** True only from initialize(), which runs once for a thread that has never been sent to. */
+  neverSent?: boolean;
   /** Snapshot from the send this row belongs to, so retries cannot adopt a later checkpoint. */
   modelId?: string;
   /** Snapshot from the send this row belongs to, so retries retain its original creation time. */
@@ -721,9 +695,18 @@ export async function ensureThreadRecord({
   const incognitoAtInit = incognito ?? runtimeStateAtInit.incognito;
   const modelIdAtInit = modelId ?? runtimeStateAtInit.params.checkpoint ?? "";
   const createdAtInit = createdAt ?? Date.now();
-  // Fresh assistant-ui threads are local ids. Temporary chats can skip the
-  // history list entirely so a storage outage cannot block the first send.
-  if (incognitoAtInit && isAssistantLocalThreadId(threadId)) {
+  // A temporary chat can skip the history list entirely so a storage outage cannot block
+  // the first send. Only initialize() can take that shortcut, because only initialize()
+  // knows the thread has never been sent to.
+  //
+  // This used to test `isAssistantLocalThreadId(threadId)` for the same thing, on the
+  // assumption that a `__LOCALID_` id meant a fresh thread. It does not: the id is the
+  // permanent primary key of every chat the app creates, so with the toggle on, any
+  // caller passing the OPEN chat's id tagged that saved chat incognito for the rest of
+  // the session -- openai-code-exec-section calls this with activeThreadId three times.
+  // A tagged chat stops persisting, and now also loses its per-chat settings snapshot and
+  // its fork badge, since both read isThreadIncognito.
+  if (incognitoAtInit && neverSent) {
     markThreadIncognito(threadId);
     return;
   }
@@ -732,9 +715,9 @@ export async function ensureThreadRecord({
   if (existing) {
     return;
   }
-  // For non-local ids, keep the existing check first so an already-persisted
-  // thread is never tagged -- that's what keeps a real thread saving normally
-  // even if the toggle flips on while its run is still streaming.
+  // Keep the existing check first so an already-persisted thread is never tagged --
+  // that's what keeps a real thread saving normally even if the toggle flips on while
+  // its run is still streaming.
   if (incognitoAtInit) {
     markThreadIncognito(threadId);
     return;
@@ -840,6 +823,10 @@ function createStudioDbAdapter(
           pairId,
           projectId: projectIdAtInit,
           incognito: incognitoAtInit,
+          // assistant-ui runs initialize() once, for the thread it has just minted, so this
+          // is the one caller that can promise the chat has never been sent to. Every other
+          // caller hands in whatever chat is open, which may well be saved.
+          neverSent: true,
           modelId: modelIdAtInit,
           createdAt: createdAtInit,
         }),
@@ -2161,17 +2148,19 @@ function ThreadScopedSettingsSync({
   enabled,
 }: { enabled: boolean }): ReactElement | null {
   const activeThreadId = useChatRuntimeStore((state) => state.activeThreadId);
+  const pendingNewThreadId = useAuiState(({ threads }) => threads.newThreadId);
   const settingsHydrated = useChatRuntimeStore(
     (state) => state.settingsHydrated,
   );
 
   useEffect(() => {
     const { applyThreadScopedSettings } = useChatRuntimeStore.getState();
-    // An unsaved chat carries a runtime-made id that no row can exist for, so its read
-    // can only 404. Opening a pairing window for it holds every edit behind a round
-    // trip that is certain to say "no snapshot", which is how an edit made on a fresh
-    // /chat stopped reaching the installation defaults straight away.
-    if (isAssistantLocalThreadId(activeThreadId)) {
+    // A chat that has not been sent to yet has no row, so its read can only 404. Opening a
+    // pairing window for it holds every edit behind a round trip that is certain to say "no
+    // snapshot", which is how an edit made on a fresh /chat stopped reaching the installation
+    // defaults straight away. The id keeps its `__LOCALID_` prefix for good, so only the
+    // runtime's pending-new-thread id tells the two apart.
+    if (activeThreadId !== null && activeThreadId === pendingNewThreadId) {
       applyThreadScopedSettings(null, null);
       return;
     }
@@ -2242,27 +2231,49 @@ function ThreadScopedSettingsSync({
       // over the values the user set and is written out again by the next edit.
       const read = new AbortController();
       reads.add(read);
-      void awaitThreadScopedSettingsWrite(activeThreadId)
-        .then(() =>
-          // Bounded, because this read is what holds sends back: an unbounded GET that
-          // never settles would park every send in the chat behind "Loading this chat's
-          // settings" with nothing to release it, and leave the request open besides.
-          // The fetch carries THIS attempt's deadline and its controller, so a stall ends
-          // the request rather than leaving it running while the retry opens the next one;
-          // the race is the backstop for the rest of the read.
-          Promise.race([
-            getStoredChatThreadReadResult(activeThreadId, {
-              timeoutMs: THREAD_READ_TIMEOUT_MS,
-              signal: read.signal,
-            }),
-            new Promise<never>((_, reject) =>
-              setTimeout(
-                () => reject(new Error("thread settings read timed out")),
-                THREAD_READ_TIMEOUT_MS,
-              ),
-            ),
-          ]),
-        )
+      // Bounded, because this attempt is what holds sends back: anything here that never
+      // settles parks every send in the chat behind "Loading this chat's settings" with
+      // nothing to release it, and leaves the request open besides.
+      //
+      // The deadline covers the WAITS as well as the read. Neither wait has a bound of its
+      // own -- the settings chain is a PATCH, and awaitStoredChatThreadWrites settles a row
+      // write that opens with an unbounded getStoredChatThread GET -- so in front of the
+      // deadline their time was uncounted, and the budget THREAD_PAIRING_WAIT_MS was sized
+      // against (THREAD_READ_RETRIES + 1 reads plus their spacing) no longer bounded the
+      // chain. Past that budget the gate is still shut, so awaitThreadScopedPairing gives
+      // up and the adapter refuses the user's send: a stalled write turned into "the
+      // message was not sent" on a path meant only for a chat left mid-read. Inside the
+      // deadline a stall is just a failed attempt, which retryThreadRead already handles.
+      void Promise.race([
+        Promise.all([
+          // Settle this chat's own PATCH first. Edit a chat, leave, come straight back and
+          // the read can overtake the write and return the pre-edit snapshot, which then
+          // goes back over the values the user set and is written out by the next edit.
+          awaitThreadScopedSettingsWrite(activeThreadId),
+          // And this chat's row itself, which may not exist yet. initialize() resolves as
+          // soon as the id is minted and leaves the row's POST tracked in the background,
+          // so on the first send a read can overtake it, find no row, and release the edits
+          // held for this chat into the installation defaults -- the same leak this pairing
+          // exists to stop, in the window just after the send. Settles at once when nothing
+          // is tracked, so a chat opened from the sidebar waits for nothing.
+          awaitStoredChatThreadWrites(activeThreadId),
+        ]).then(() =>
+          // The fetch carries THIS attempt's deadline and its controller too, so a stall
+          // ends the request rather than leaving it running while the retry opens the next.
+          getStoredChatThreadReadResult(activeThreadId, {
+            timeoutMs: THREAD_READ_TIMEOUT_MS,
+            signal: read.signal,
+          }),
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => {
+            // The waits can expire before the fetch is even issued, and the controller is
+            // the only thing that stops one issued a moment later from outliving them.
+            read.abort();
+            reject(new Error("thread settings read timed out"));
+          }, THREAD_READ_TIMEOUT_MS),
+        ),
+      ])
         .finally(() => {
           reads.delete(read);
         })
@@ -2349,7 +2360,7 @@ function ThreadScopedSettingsSync({
       commitHeldThreadScopedEditsToTheirThread();
       window.removeEventListener(CHAT_HISTORY_UPDATED_EVENT, sync);
     };
-  }, [activeThreadId, enabled, settingsHydrated]);
+  }, [activeThreadId, enabled, pendingNewThreadId, settingsHydrated]);
 
   return null;
 }
