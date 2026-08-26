@@ -40,7 +40,7 @@ def test_the_new_schema_adds_no_sqlite_feature_beyond_what_studio_already_used()
     If this ever regresses -- someone adds a window function or a STRICT table to the
     generation schema -- an install that works today would stop opening its database.
     """
-    backend = Path(__file__).resolve().parents[2] / "unsloth" / "studio" / "backend"
+    from conftest import _BACKEND_ROOT as backend
     new_sql = (backend / "storage" / "chat_generation_runs_db.py").read_text()
     schema = (backend / "storage" / "studio_db.py").read_text()
     start = schema.index("chat_generation_runs")

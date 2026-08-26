@@ -70,7 +70,7 @@ jobs:
             tests/test_orchestrator_load_cancel_event.py \
             tests/test_active_generations.py \
             -q --tb=short --timeout=600 \
-            --deselect tests/test_orchestrator_load_cancel_event.py::test_safetensors_load_event_interrupts_worker_wait
+            -k "not test_safetensors_load_event_interrupts_worker_wait"
 
       - name: How long the cancelled load actually takes on this runner
         working-directory: studio/backend
