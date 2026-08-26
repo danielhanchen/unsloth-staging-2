@@ -1,0 +1,31 @@
+name: "staging-9636 MCP flatten simulation (OS x python)"
+
+on:
+  push:
+    branches: [pr-9636-xplat-ci]
+  workflow_dispatch:
+
+concurrency:
+  group: sim-9636-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  simulate:
+    name: "sim ${{ matrix.os }} py${{ matrix.python }}"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install the versions studio pins
+        run: python -m pip install --quiet "mcp>=1.24,<2" "fastmcp>=3.0.2" structlog
+      - name: Report the host mime registry
+        run: python .github/scripts/pr9636/mime_registry.py
+      - name: Run the 164-case simulation against this checkout
+        run: python .github/scripts/pr9636/simulate.py .
