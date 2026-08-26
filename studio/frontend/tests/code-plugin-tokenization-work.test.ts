@@ -72,6 +72,41 @@ const highlightOnce = (
     if (immediate) resolve(immediate);
   });
 
+/*
+ * THE SAME CALL, BUT WAITING FOR THE TOKENIZED ANSWER RATHER THAN THE FIRST ONE.
+ *
+ * `highlightOnce` takes the synchronous return, which is right during the streaming loop and wrong
+ * for the final correctness check -- a real Windows CI failure. A grown fence past
+ * `MIN_INCREMENTAL_CHARS` called again inside `REFRESH_MS` gets `approximateResult` back
+ * synchronously and the real tokens LATER via the callback, so the deepEqual compared approximate
+ * tokens, all coloured `#005CC5`, against the reference.
+ *
+ * No sleep length fixes it: `settle()` counts from when this test resumed, the throttle counts from
+ * the plugin's `lastTokenizedAt`, and a trailing refresh can push that timestamp past the sleep.
+ * So prefer the callback; if the plugin tokenized it never calls back, and the immediate value is
+ * adopted once the refresh window has provably passed. The assertion is unchanged and just as
+ * strict, only its input stops depending on machine load.
+ */
+const highlightTokenized = (
+  plugin: ReturnType<typeof createCodePlugin>,
+  code: string,
+): Promise<HighlightResult> =>
+  new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: HighlightResult) => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    const immediate = plugin.highlight(
+      { code, language: LANGUAGE, themes: THEMES },
+      finish,
+    );
+    // SETTLE_MS is longer than REFRESH_MS, so a queued refresh has fired by the time this runs; if
+    // none was queued, `immediate` was already the tokenized result.
+    if (immediate) setTimeout(() => finish(immediate), SETTLE_MS);
+  });
+
 test("a streaming fence is tokenized once, not once per update", async () => {
   assert.ok(
     SOURCE.length > 4 * MIN_INCREMENTAL_CHARS,
@@ -100,7 +135,7 @@ test("a streaming fence is tokenized once, not once per update", async () => {
     updates += 1;
   }
   await settle();
-  last = await highlightOnce(plugin, SOURCE);
+  last = await highlightTokenized(plugin, SOURCE);
 
   assert.ok(
     updates >= 12,
