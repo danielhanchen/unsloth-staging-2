@@ -160,6 +160,12 @@ async def test_the_admission_slot_is_released_on_every_outcome(monkeypatch):
     from core.inference import llama_keepwarm
     from state import active_generations
 
+    # A delta, not an absolute: these counters are module globals shared with every
+    # other test in the process, so only the change across this run is ours to assert.
+    base_pending = llama_keepwarm.other_non_preview_pending_count()
+    base_admitted = llama_keepwarm.other_admitted_inference_count()
+    base_active = active_generations.count()
+
     for i, chunks in enumerate((
         [H.text_chunk("a"), H.stop_chunk()],      # completed
         [H.text_chunk("a")],                       # interrupted
@@ -173,11 +179,13 @@ async def test_the_admission_slot_is_released_on_every_outcome(monkeypatch):
         await asyncio.wait_for(
             asyncio.gather(*sup._tasks.values(), return_exceptions = True), 20
         )
-        assert active_generations.count() == 0, f"{run_id} leaked an active generation"
-        assert llama_keepwarm.other_non_preview_pending_count() == 0, (
+        assert active_generations.count() == base_active, (
+            f"{run_id} leaked an active generation"
+        )
+        assert llama_keepwarm.other_non_preview_pending_count() == base_pending, (
             f"{run_id} leaked a lifecycle-gate reservation"
         )
-        assert llama_keepwarm.other_admitted_inference_count() == 0, (
+        assert llama_keepwarm.other_admitted_inference_count() == base_admitted, (
             f"{run_id} leaked an admitted inference slot"
         )
 

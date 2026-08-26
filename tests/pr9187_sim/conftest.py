@@ -17,27 +17,10 @@ from pathlib import Path
 
 import pytest
 
-def _find_backend_root() -> Path:
-    """The backend package root, however this suite was checked out.
-
-    Locally it lives beside the workspace; in CI it is `studio/backend` in the repo.
-    Walk up looking for the marker rather than counting `..`s.
-    """
-    override = os.environ.get("PR9187_BACKEND_ROOT")
-    if override:
-        return Path(override).resolve()
-    here = Path(__file__).resolve()
-    for parent in here.parents:
-        candidate = parent / "studio" / "backend"
-        if (candidate / "storage" / "studio_db.py").is_file():
-            return candidate.resolve()
-        candidate = parent / "unsloth" / "studio" / "backend"
-        if (candidate / "storage" / "studio_db.py").is_file():
-            return candidate.resolve()
-    raise RuntimeError("could not locate studio/backend from " + str(here))
-
-
-_BACKEND_ROOT = _find_backend_root()
+_BACKEND_ROOT = Path(
+    os.environ.get("PR9187_BACKEND_ROOT")
+    or Path(__file__).resolve().parents[2] / "unsloth" / "studio" / "backend"
+).resolve()
 if str(_BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(_BACKEND_ROOT))
 
