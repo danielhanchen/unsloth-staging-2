@@ -46,8 +46,33 @@ def _api_contract() -> dict:
     try:
         import importlib.metadata as md  # noqa: PLC0415
         rec["owning_distributions"] = md.packages_distributions().get("triton") or []
+        # `triton.__version__` is "3.6.0" for every 3.6.0.postN, and the post number is
+        # what decides whether get_cc() has the ROCm clang-cl branch at all. Record the
+        # DIST version or the contract reading below cannot be attributed to a build.
+        for dist in ("triton-windows", "triton"):
+            try:
+                rec[f"dist_version_{dist}"] = md.version(dist)
+            except Exception:  # noqa: BLE001
+                pass
     except Exception as e:  # noqa: BLE001
         rec["distribution_error"] = f"{type(e).__name__}: {e}"
+
+    # Recompute get_cc()'s own ROCm precondition exactly as it does, so a spoof that
+    # did not take can be told apart from a build whose get_cc never looks there.
+    try:
+        rec["CC_env"] = os.environ.get("CC")
+        rocm_cc = os.path.join(
+            sysconfig.get_path("platlib"), "_rocm_sdk_core", "lib", "llvm", "bin",
+            "clang-cl.exe")
+        rec["rocm_cc_path"] = rocm_cc
+        rec["rocm_cc_exists"] = os.path.exists(rocm_cc)
+        rec["platlib"] = sysconfig.get_path("platlib")
+        import triton.runtime.build as _tb  # noqa: PLC0415
+        src = Path(_tb.__file__).read_text(
+            encoding = "utf-8", errors = "replace")
+        rec["get_cc_mentions_rocm_sdk_core"] = "_rocm_sdk_core" in src
+    except Exception as e:  # noqa: BLE001
+        rec["rocm_precondition_error"] = f"{type(e).__name__}: {e}"
 
     try:
         from triton.windows_utils import find_msvc_winsdk  # noqa: PLC0415
