@@ -134,6 +134,19 @@ def _plant_rocm_clang_cl() -> dict:
             dest.write_text("stub", encoding = "utf-8")
         rec["planted"] = str(dest)
         rec["exists"] = dest.is_file()
+
+        # `get_cc` is @functools.lru_cache'd in triton.runtime.build. Reading the API
+        # contract before planting warms that cache, and every later call then returns
+        # the pre-spoof answer -- which looks exactly like "the ROCm branch does not
+        # work" and is not. Drop the cache so the spoof is actually observable.
+        try:
+            from triton.runtime.build import get_cc  # noqa: PLC0415
+            cache_clear = getattr(get_cc, "cache_clear", None)
+            rec["get_cc_was_cached"] = cache_clear is not None
+            if cache_clear is not None:
+                cache_clear()
+        except Exception as e:  # noqa: BLE001
+            rec["cache_clear_error"] = f"{type(e).__name__}: {e}"
     except Exception as e:  # noqa: BLE001
         rec["error"] = f"{type(e).__name__}: {e}"
     return rec
