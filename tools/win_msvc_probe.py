@@ -152,6 +152,77 @@ def _plant_rocm_clang_cl() -> dict:
     return rec
 
 
+_HIDE_VS_KEYS = ("INCLUDE", "LIB", "LIBPATH", "VCINSTALLDIR", "VSINSTALLDIR",
+                 "WindowsSdkDir", "WindowsSdkVerBinPath", "ProgramFiles",
+                 "ProgramFiles(x86)", "ProgramW6432", "PATH")
+
+
+def _gate_without_visual_studio(checkout: Path, tmp: Path) -> dict:
+    """Try to reach the ACTUAL failing shape of issue 7595: Windows, no Visual Studio.
+
+    Hosted runners all ship VS Build Tools, and Triton's discovery deliberately does not
+    depend on the environment -- it reads vswhere, the registry and the Program Files
+    roots. So this points every root it can at an empty directory and strips vswhere off
+    PATH, then records what discovery actually returns.
+
+    This is expected to FAIL to hide VS, because the registry is still there and cannot
+    be redirected from a child process. Recorded either way: a discovery that still finds
+    four include dirs is itself the measurement, and it is the same fact the PR relies on
+    when it argues that importing a vcvarsall environment would be a no-op.
+    """
+    rec: dict = {"scenario": "no_visual_studio_attempt"}
+    saved = {k: os.environ.get(k) for k in _HIDE_VS_KEYS}
+    try:
+        empty = tmp / "no_vs"
+        empty.mkdir(parents = True, exist_ok = True)
+        for k in _HIDE_VS_KEYS:
+            os.environ.pop(k, None)
+        for k in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+            os.environ[k] = str(empty)
+        # Keep enough PATH for python itself, minus anything VS-shaped.
+        keep = [p for p in (saved.get("PATH") or "").split(os.pathsep)
+                if p and "Visual Studio" not in p and "Windows Kits" not in p
+                and "vswhere" not in p.lower()]
+        os.environ["PATH"] = os.pathsep.join(keep)
+
+        try:
+            import triton.runtime.build as _tb  # noqa: PLC0415
+            cc = getattr(_tb.get_cc, "cache_clear", None)
+            if cc:
+                cc()
+            from triton.windows_utils import find_msvc_winsdk  # noqa: PLC0415
+            got = find_msvc_winsdk()
+            inc = list(got[1]) if hasattr(got, "__len__") and len(got) == 3 else []
+            rec["include_dir_count"] = len(inc)
+            rec["stdlib_h_found"] = any(
+                d and os.path.isfile(os.path.join(d, "stdlib.h")) for d in inc)
+            rec["vs_successfully_hidden"] = not rec["stdlib_h_found"]
+            rec["get_cc_basename"] = os.path.basename(_tb.get_cc() or "")
+        except Exception as e:  # noqa: BLE001
+            rec["discovery_error"] = f"{type(e).__name__}: {e}"
+
+        inner = _gate("no_visual_studio_attempt_gate", checkout, False)
+        rec["reachable"] = inner.get("reachable")
+        rec["dynamo_disabled"] = inner.get("dynamo_disabled")
+        rec["gate_error"] = inner.get("error")
+    except Exception as e:  # noqa: BLE001
+        rec["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        try:
+            import triton.runtime.build as _tb2  # noqa: PLC0415
+            cc2 = getattr(_tb2.get_cc, "cache_clear", None)
+            if cc2:
+                cc2()
+        except Exception:  # noqa: BLE001
+            pass
+    return rec
+
+
 def _gate(label: str, checkout: Path, strip_msvc_env: bool) -> dict:
     """Import the checkout's gate and run it. Fresh module each time."""
     rec: dict = {"scenario": label}
@@ -216,6 +287,10 @@ def main() -> int:
         obs["amd_spoofed"] = _gate("amd_spoofed", args.checkout, False)
         obs["amd_spoofed_env_stripped"] = _gate(
             "amd_spoofed_env_stripped", args.checkout, True)
+        import tempfile  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as td:
+            obs["no_visual_studio_attempt"] = _gate_without_visual_studio(
+                args.checkout, Path(td))
 
     args.out.write_text(json.dumps(obs, indent = 2), encoding = "utf-8")
     print(json.dumps(obs, indent = 2))
