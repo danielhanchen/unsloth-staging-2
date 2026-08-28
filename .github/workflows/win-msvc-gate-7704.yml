@@ -1,0 +1,91 @@
+name: PR 7704 CRT gate on real Windows
+
+# Runs the gate against a REAL triton-windows install on a REAL Windows host, base
+# versus head. Everything testable on Linux stubbed Triton's discovery, so the private
+# API contract the gate depends on has never actually been checked. AMD is spoofed by
+# planting the ROCm wheel's clang-cl where get_cc() looks for it; that reaches the AMD
+# branch of the decision, and gives the runner no AMD GPU.
+
+on:
+  push:
+    branches: [ 'pr-7704-**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        state: [ base, head ]
+    steps:
+      - name: Check out the ${{ matrix.state }} state
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Move to the merge base for the base state
+        if: matrix.state == 'base'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch -q origin main
+          BASE=$(git merge-base origin/main HEAD)
+          echo "base = $BASE"
+          git checkout -q "$BASE"
+          # The module is the PR. Its absence at the base is the reading, not an error.
+          test -f studio/backend/core/_msvc_env.py \
+            && echo "_msvc_env.py present at base (unexpected)" \
+            || echo "_msvc_env.py absent at base, as expected"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install triton-windows
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -q --upgrade pip
+          # Pinned the way the repo's own message recommends. Absence is a real result,
+          # so this must not fail the job: the probe records the import error instead.
+          python -m pip install -q "triton-windows<3.7" || echo "triton-windows install failed"
+          python -c "import triton, sys; print('triton', triton.__version__)" || true
+
+      - name: Probe the gate
+        shell: bash
+        run: |
+          set +e
+          mkdir -p out
+          python tools/win_msvc_probe.py --checkout . --out "out/win_${{ matrix.state }}.json"
+          rc=$?
+          echo "probe rc=$rc"
+          exit 0
+
+      - name: Summarise
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          F="out/win_${{ matrix.state }}.json"
+          if [ ! -f "$F" ]; then
+            echo "::error::no probe output for ${{ matrix.state }}"
+            exit 0
+          fi
+          {
+            echo "## ${{ matrix.state }}"
+            echo '```json'
+            cat "$F"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: win-gate-${{ matrix.state }}
+          path: out/
+          if-no-files-found: warn
