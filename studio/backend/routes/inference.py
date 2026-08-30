@@ -32651,3 +32651,6 @@ async def _generate_openai_images(
         _diffusion_persist_active -= 1
 
     return ImageGenerationResponse(created = created, data = data)
+
+# Base-only control run: no behavioural change, present solely to satisfy the
+# studio/** path filter so the inference smoke workflows fire on the merge base.
