@@ -26,7 +26,8 @@ jobs:
       # heavy ML stack is deliberately not installed: it would only add failure modes that
       # have nothing to do with the change.
       - run: python -m pip install --upgrade pip
-      - run: python -m pip install structlog fastapi pytest
+      # Minimal set the storage layer and the repo conftest actually import.
+      - run: python -m pip install structlog fastapi pytest huggingface_hub
       - name: Report the SQLite build actually in use
         run: python -c "import sqlite3, sys, platform; print(platform.platform()); print('python', sys.version); print('sqlite', sqlite3.sqlite_version)"
       - name: studio.db write-lock contention suite
