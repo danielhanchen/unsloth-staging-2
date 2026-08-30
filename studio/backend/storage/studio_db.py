@@ -603,10 +603,18 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         END
         """
     )
+    # Scoped to the two columns _rebuild_chat_attachment_inventory actually reads. The
+    # unscoped version fired on any UPDATE, so a generation status change -- which touches
+    # only metadata_json, from chat_generation_runs_db and research_runs_db -- marked the
+    # inventory dirty, and the next chat autosave paid for a full DELETE + re-hash of every
+    # attachment in every thread while holding the writer lock inside BEGIN IMMEDIATE.
+    # Dropped rather than IF NOT EXISTS: existing installs already carry the unscoped
+    # trigger, and a create would silently keep it.
+    conn.execute("DROP TRIGGER IF EXISTS chat_attachment_inventory_dirty_update")
     conn.execute(
         """
-        CREATE TRIGGER IF NOT EXISTS chat_attachment_inventory_dirty_update
-        AFTER UPDATE ON chat_messages
+        CREATE TRIGGER chat_attachment_inventory_dirty_update
+        AFTER UPDATE OF attachments_json, content_json ON chat_messages
         BEGIN
             INSERT INTO chat_attachment_inventory_state
                 (singleton, inventory_version, dirty, backfilled_at)
@@ -1157,12 +1165,49 @@ def bulk_upsert_prompt_lists(lists: list[dict]) -> int:
         conn.close()
 
 
+def is_sqlite_busy_error(exc: sqlite3.OperationalError) -> bool:
+    """Is this the writer lock being held elsewhere, rather than a real fault?
+
+    sqlite reports it as plain OperationalError, so the message is the only signal.
+    Lives here because studio.db is the contended file and several modules need the
+    same answer; storage.api_usage_db delegates to it.
+    """
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
+
+
 # sqlite's own default, kept for every caller that may run on the event loop
 _BUSY_TIMEOUT_SECONDS = 5.0
 
 # only for the chat history transactions that run in Starlette's threadpool, where a large clear
 # can hold the writer lock past the default and the failure escapes as an unmapped 500
 _CONTENDED_BUSY_TIMEOUT_SECONDS = 30.0
+
+
+def _apply_wal_synchronous(conn: sqlite3.Connection) -> None:
+    """Drop to synchronous=NORMAL, but only while the file is really in WAL mode.
+
+    Under WAL, sqlite still defaults to synchronous=FULL, which fsyncs on every commit
+    while holding the writer lock. On a machine whose disk is busy -- a Colab session
+    pulling a multi-GB GGUF, say -- one commit blocked for 37s, and every other writer
+    (notably the research supervisor's claim_next) spent that whole window timing out
+    with "database is locked". NORMAL is sqlite's own recommended pairing for WAL: it
+    can lose the last transactions to a host power loss, but the database is never
+    corrupted, and commits stay durable across an application crash either way.
+
+    The WAL check is not decoration. `PRAGMA journal_mode=WAL` silently declines on
+    filesystems without proper shared-memory support (network shares, some FUSE and
+    container-mounted paths, which Windows users hit most often), leaving the file on a
+    rollback journal where NORMAL drops the very fsync that keeps it consistent. Those
+    installs keep FULL and simply do not get the speedup. journal_mode is persistent in
+    the file, so this reads what is actually in force rather than what was requested.
+    """
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    except (sqlite3.Error, TypeError, IndexError):
+        return
+    if isinstance(mode, str) and mode.lower() == "wal":
+        conn.execute("PRAGMA synchronous=NORMAL")
 
 
 def get_connection(busy_timeout_seconds: float = _BUSY_TIMEOUT_SECONDS) -> sqlite3.Connection:
@@ -1184,6 +1229,7 @@ def get_connection(busy_timeout_seconds: float = _BUSY_TIMEOUT_SECONDS) -> sqlit
                 except Exception:
                     conn.close()
                     raise
+    _apply_wal_synchronous(conn)
     return conn
 
 
