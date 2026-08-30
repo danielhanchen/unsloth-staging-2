@@ -1231,6 +1231,37 @@ function Test-VenvTorchIsRocm {
     } catch { return $false }
 }
 
+# The NVIDIA counterpart, and the last of the three. A wedged display driver makes `import torch`
+# raise at the DLL load or never return on CUDA exactly as it does on HIP and SYCL -- a GPU that
+# fell off the bus, a driver mid-reinstall, a machine resuming from sleep -- and until this
+# existed that venv had no on-disk rescue: the probe-failure chain fell through to
+# `$shouldRebuild = $true` with a null tag, so a direct `studio update` deleted a healthy CUDA
+# environment and then aborted, with no rollback copy (only install.ps1 makes one). Returns the
+# family tag ("cu124"), not a bool, because the caller compares families -- collapsing it to
+# "cuda" would lose the cu126-vs-cu128 distinction the stale check is built on.
+function Get-VenvTorchCudaTag {
+    param([string]$VenvPath)
+    if (-not $VenvPath) { return $null }
+    try {
+        $verPy = Join-Path $VenvPath "Lib\site-packages\torch\version.py"
+        if (-not (Test-Path -LiteralPath $verPy)) { return $null }
+        $line = (Get-Content -LiteralPath $verPy -TotalCount 40 -ErrorAction Stop |
+                 Where-Object { $_ -match "__version__\s*=\s*'[^']*\+(cu[0-9]+)" } |
+                 Select-Object -First 1)
+        if (-not $line) { return $null }
+        # IsMatch/Match rather than -match so $Matches in the caller's scope is untouched.
+        $m = [regex]::Match($line, "__version__\s*=\s*'[^']*\+(cu[0-9]+)")
+        if ($m.Success) { return $m.Groups[1].Value.ToLowerInvariant() }
+        return $null
+    } catch { return $null }
+}
+
+# Boolean wrapper, so the fallback chain below reads like its XPU and ROCm neighbours.
+function Test-VenvTorchIsCuda {
+    param([string]$VenvPath)
+    return [bool](Get-VenvTorchCudaTag -VenvPath $VenvPath)
+}
+
 # Same free disk read, plus the supported range: unsloth/models/_utils.py raises at import for an
 # XPU device on torch < 2.6, so flavour alone would call a 2.5+xpu venv fine; 2.11 is the trio's
 # ceiling. Flavour and range ONLY -- whether the runtime reaches the GPU is a driver question.
@@ -4098,6 +4129,17 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
             $installedTorchTag = "rocm"
             substep "PyTorch did not respond but this venv holds a ROCm build -- keeping it." "Yellow"
             substep "If training fails, reboot and update the AMD Adrenalin / HIP SDK driver." "Yellow"
+        } elseif (Test-VenvTorchIsCuda -VenvPath $VenvDir) {
+            # The NVIDIA arm of the same rescue, and the reason it is here: a wedged display
+            # driver hangs or faults `import torch` on CUDA just as a faulted HIP runtime does
+            # on AMD, and without this the chain fell through to $shouldRebuild with a NULL
+            # tag -- so the no-wipe escape below could not see a cu* wheel to preserve, and a
+            # direct update deleted a healthy CUDA venv and aborted. Keep the FAMILY, not a
+            # generic "cuda": the stale comparison below is cu126-vs-cu128, and flattening it
+            # would make every driver hiccup look like a family change.
+            $installedTorchTag = Get-VenvTorchCudaTag -VenvPath $VenvDir
+            substep "PyTorch did not respond but this venv holds a $installedTorchTag build -- keeping it." "Yellow"
+            substep "If training fails, reboot and update the NVIDIA driver." "Yellow"
         } else {
             $shouldRebuild = $true
         }
@@ -4286,6 +4328,38 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
         substep "install.ps1 keeps a rollback copy of the previous environment until this run succeeds." "DarkGray"
         $script:PinChangedForceReinstall = $true
         $shouldRebuild = $false
+    }
+
+    # A cu* venv is never wiped by a DIRECT update just because nvidia-smi did not answer.
+    # $HasNvidiaSmi is a bounded probe of one executable (:2030-2058), and every way it can come
+    # back empty on a machine with working NVIDIA GPUs -- nvidia-smi off PATH, a driver still
+    # initializing, the probe timing out -- collapses $expectedTorchTag to "cpu" here. None of
+    # the escapes above catch it: :4162 needs a pin, :4170 needs cu*->cu*, and :4223/:4265 need
+    # $InstallerManagedSetup, which is true only under install.ps1. So a healthy cu124 venv reads
+    # as "torch cu124 != required cpu", gets deleted, and the run aborts a few lines below at
+    # "Virtual environment not found" -- with no rollback copy, because only install.ps1 makes
+    # one. That is a worse outcome than keeping a wheel that may be wrong, and it is unrecoverable
+    # without re-downloading the whole environment. Same reasoning the XPU escape above applies.
+    #
+    # Narrow on purpose: unpinned only (a cpu index PIN is a deliberate CPU install and still
+    # rebuilds), cu* installed only, and only when the expectation collapsed for want of an
+    # NVIDIA answer rather than because another vendor won ($AmdHasGpuWheels / $script:IsIntelXpu
+    # produce "rocm" / "xpu", not "cpu"). $_pinnedIdx and $expectedTorchTag are read only after
+    # $installedTorchTag has answered: both are assigned inside the `if (-not $shouldRebuild)`
+    # block, and a probe that answered is what makes that block run -- so ordering the -and chain
+    # this way is what keeps the reads legal under a caller's Set-StrictMode.
+    if ($shouldRebuild -and -not $InstallerManagedSetup -and
+        $installedTorchTag -and (Test-CudaFamilyLeaf $installedTorchTag) -and
+        -not $_pinnedIdx -and -not $HasNvidiaSmi -and $expectedTorchTag -eq "cpu") {
+        substep "nvidia-smi did not answer, but this venv holds a $installedTorchTag build -- keeping it." "Yellow"
+        substep "If training runs on CPU, re-run install.ps1: irm https://unsloth.ai/install.ps1 | iex" "Yellow"
+        $shouldRebuild = $false
+        # Keeping the wheel is only half the job. The index selection below re-runs the same
+        # rescan, sees no NVIDIA either, and picks $CuTag = "cpu" -- which routes the install to
+        # the CPU arm and the /cpu index. Naming the family already installed keeps the pass on
+        # that family's index instead, where the bare trio the CUDA arm uses is already satisfied
+        # and nothing is force-reinstalled. Mirrors the installer-managed preserve guard above.
+        $script:PreservedInstallerTorchTag = $installedTorchTag
     }
 
     if ($shouldRebuild) {
@@ -5328,6 +5402,49 @@ if (-not $ROCmIndexUrl -and -not $XpuIndexUrl -and ($CuTag -eq "cpu" -or $ROCmCp
 # already-satisfied bare unsloth/unsloth-zoo. Either way unsloth.exe stays.
 # Duplicate metadata repair is the one pass that DOES reinstall unsloth under
 # SKIP_STUDIO_BASE, so the CLI wraps this script in its launcher transaction.
+
+# ── Publish the torch flavor this run settled on ──
+# install_python_stack.py's dependency steps install WITH deps and WITHOUT an --index-url, and
+# constraints.txt names no torch, so the resolver's default source is PyPI -- whose Windows torch
+# is 2.11.0+cpu. It can therefore swap the GPU wheel installed above for a CPU one and still exit
+# 0. install.ps1 repairs exactly that afterwards, but the in-app updater never runs install.ps1:
+# it runs `unsloth studio update`, which lands here. Hand the stack the flavor and the index this
+# run used so it can enforce the same invariant itself (_ensure_expected_torch_flavor).
+#
+# The tag vocabulary is Get-InstalledTorchTag's, because that is what it gets compared against.
+# An unknown leaf (a corporate /simple mirror) names no flavor, so publish nothing rather than a
+# tag nothing can verify -- the stack then falls back to the manifest and to its own probe.
+if (-not $NoTorchMode) {
+    $_expectedLeaf = Get-TorchIndexLeaf $TorchInstallIndexUrl
+    # $ROCmIndexUrl first: the AMD Windows path installs the ROCm trio from repo.amd.com while
+    # $TorchInstallIndexUrl still points at /cpu, so the leaf alone would report the wrong flavor.
+    $_expectedTag = if ($ROCmIndexUrl) { "rocm" }
+                    elseif (Test-CudaFamilyLeaf $_expectedLeaf) { $_expectedLeaf }
+                    elseif ($_expectedLeaf -eq "cpu" -or $_expectedLeaf -eq "xpu") { $_expectedLeaf }
+                    elseif (Test-PipRocmFamilyLeaf $_expectedLeaf) { "rocm" }
+                    else { $null }
+    # Remove-Item, NOT `= ""`. Assigning an empty string deleted the entry on Windows
+    # PowerShell 5.1 and on 7.0-7.4, but 7.5 took .NET 9's change and now KEEPS the name
+    # with an empty value; only $null removes it there. Both spellings would still read
+    # as unset through this pair of readers, which test truthiness rather than presence,
+    # but the setup script must not publish a value whose meaning depends on which
+    # PowerShell the user happens to have. Remove-Item behaves the same on every version.
+    #
+    # Deleting matters beyond tidiness: a value inherited from the caller's environment
+    # (a previous run in the same shell, or a user who exported one by hand) would
+    # otherwise survive a run that deliberately decided it cannot name this host's flavor,
+    # and the stack would enforce a stale expectation against a freshly resolved venv.
+    if ($_expectedTag) {
+        $env:UNSLOTH_EXPECTED_TORCH_TAG = $_expectedTag
+    } else {
+        Remove-Item Env:\UNSLOTH_EXPECTED_TORCH_TAG -ErrorAction SilentlyContinue
+    }
+    if ($TorchInstallIndexUrl) {
+        $env:UNSLOTH_TORCH_INSTALL_INDEX_URL = $TorchInstallIndexUrl
+    } else {
+        Remove-Item Env:\UNSLOTH_TORCH_INSTALL_INDEX_URL -ErrorAction SilentlyContinue
+    }
+}
 
 # Ordered heavy dependency installation -- shared cross-platform script
 substep "running ordered dependency installation..."
