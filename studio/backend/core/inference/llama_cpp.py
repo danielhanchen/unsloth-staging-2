@@ -5568,6 +5568,21 @@ class CountAborted(Exception):
 _PROC_ROOT = "/proc"
 
 
+def _metal_capable_host() -> bool:
+    """True where an empty CUDA/HIP probe still means GPU offload, i.e. Apple Silicon.
+
+    Not ``sys.platform == "darwin"``: auto_detect_backend picks Metal only on Apple
+    Silicon and falls back to CPU otherwise, so an Intel Mac with an empty probe really
+    is CPU-only and wants the diagnostic.
+    """
+    try:
+        from utils.hardware import is_apple_silicon
+
+        return bool(is_apple_silicon())
+    except Exception:  # noqa: BLE001 -- a diagnostic must not break a load
+        return sys.platform == "darwin"
+
+
 class LlamaCppBackend:
     """Manages a llama-server subprocess for GGUF model inference.
 
@@ -9106,6 +9121,70 @@ class LlamaCppBackend:
         except Exception as e:
             logger.debug(f"amd-smi GPU probe failed: {e}")
             return []
+
+    @staticmethod
+    def _explain_empty_gpu_probe(binary: Optional[str] = None) -> str:
+        """Why ``_get_gpu_memory`` came back empty, as one short phrase.
+
+        The probe returns ``[]`` for at least six unrelated reasons -- no torch, a
+        torch without CUDA/HIP, an empty or mismatched visibility mask, the #7624
+        arch gate dropping every card, amd-smi declining, or genuinely no device --
+        and every one of them lands the model on the CPU. A user's log recorded the
+        verdict and none of the reason, so "why did my model go to RAM" could not be
+        answered from it at all.
+
+        Facts only, gathered cheaply: no ``mem_get_info`` call, so this never creates
+        the HIP primary context the amd-smi branch exists to avoid. Never raises, and
+        never returns "" -- an unexplained empty list is the thing being fixed.
+        """
+        try:
+            binary = binary or LlamaCppBackend._find_llama_server_binary()
+            if sys.platform == "darwin":
+                # Not a CPU verdict: this probe only ever sees CUDA and HIP, so it is
+                # empty on every Mac, and an Apple Silicon one still offloads to Metal.
+                return "this probe reads CUDA and HIP only; macOS offloads through Metal"
+            if LlamaCppBackend._is_vulkan_backend(binary):
+                return "the Vulkan probe reported no device"
+
+            masks = []
+            for var in (
+                "CUDA_VISIBLE_DEVICES",
+                "HIP_VISIBLE_DEVICES",
+                "ROCR_VISIBLE_DEVICES",
+                "GPU_DEVICE_ORDINAL",
+            ):
+                raw = os.environ.get(var)
+                if raw is not None:
+                    masks.append(f"{var}={raw!r}" if raw.strip() else f"{var} is empty")
+            mask_note = f" ({', '.join(masks)})" if masks else ""
+
+            try:
+                import torch
+            except Exception:  # noqa: BLE001
+                return f"torch is not importable, so no GPU could be enumerated{mask_note}"
+            if not hasattr(torch, "cuda") or not torch.cuda.is_available():
+                return f"torch reports no usable CUDA or HIP device{mask_note}"
+            # Counting devices does not create a context; reading their memory would.
+            count = torch.cuda.device_count()
+            if not count:
+                return f"torch enumerated 0 devices{mask_note}"
+
+            if LlamaCppBackend._torch_is_rocm(torch):
+                coverage = LlamaCppBackend._installed_llama_gfx_archs(binary)
+                if coverage:
+                    present = sorted(set(LlamaCppBackend._rocm_arch_by_physical_id().values()))
+                    if present and not (set(present) & set(coverage)):
+                        return (
+                            f"the installed llama.cpp build covers {sorted(coverage)} but this "
+                            f"host has {present}, so the arch gate dropped every device"
+                        )
+                return (
+                    f"torch sees {count} ROCm device(s) but the probe returned none, so "
+                    f"amd-smi and the torch fallback both declined{mask_note}"
+                )
+            return f"torch sees {count} device(s) but the probe returned none{mask_note}"
+        except Exception as e:  # noqa: BLE001 -- diagnostics must not break a load
+            return f"the reason could not be determined ({type(e).__name__})"
 
     @staticmethod
     def _get_gpu_memory(
@@ -20308,6 +20387,33 @@ class LlamaCppBackend:
                         # --fit flag state, not "does it fit": off means this subset provably fits.
                         f"GPUs free: {gpus}, selected: {gpu_indices}, --fit: {'on' if use_fit else 'off'}"
                     )
+                    if (
+                        not gpus
+                        and not _detected_gpus
+                        and not gpu_ids
+                        and not _arch_gate_forced_cpu
+                        and not _metal_capable_host()
+                    ):
+                        # States what this process observed, and stops there. It does
+                        # NOT say the model will run on the CPU: llama.cpp enumerates
+                        # devices itself and still gets --fit on, so it can place on a
+                        # GPU this probe never saw. An explicit gpu_ids pick is pinned
+                        # for the child further below, which is why it is excluded too.
+                        #
+                        # _detected_gpus, not gpus: both Manual modes empty `gpus` on
+                        # purpose to stand the planner down, and the GPU is fully used
+                        # there. The arch gate already warns better when it is the cause.
+                        #
+                        # Apple Silicon, not darwin: the probe reads CUDA and HIP, so it
+                        # is empty on every Mac, but only an Apple Silicon one is
+                        # offloading to Metal. An Intel Mac really is CPU-only and wants
+                        # this line (auto_detect_backend picks Metal on is_apple_silicon
+                        # and falls back to CPU otherwise).
+                        logger.warning(
+                            "Studio could not enumerate any GPU, so it planned this load "
+                            "blind and left placement to llama.cpp --fit: %s",
+                            LlamaCppBackend._explain_empty_gpu_probe(binary),
+                        )
                     # The planner ran to completion over a real device list and
                     # left --fit on, i.e. it could not prove the model fits. THAT
                     # is a partial-placement verdict. Set last, so any early
