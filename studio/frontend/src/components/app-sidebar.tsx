@@ -588,6 +588,18 @@ const SIDEBAR_SELECTOR = '[data-slot="sidebar"]';
 const VERDICT_UNKNOWN_POLL_MS = 3000;
 const SELF_HEAL_POLL_MS = 15000;
 const VERDICT_POLL_STALL_MS = 30000;
+// The backend refreshes its physical GPU inventory on a 60s TTL and can reclassify a host
+// without a restart: attach an eGPU to a CPU-torch machine and no_gpu becomes
+// torch_cpu_build. Nothing else re-reads the verdict. Matched to that TTL, because polling
+// faster than the backend can change its answer is pure request traffic.
+const INVENTORY_POLL_MS = 60000;
+// The verdicts the inventory can still move. Everything else describes something a probe
+// cannot change (an Intel Mac stays an Intel Mac).
+const INVENTORY_SENSITIVE_REASONS = new Set([
+  "no_gpu",
+  "torch_cpu_build",
+  "torch_cuda_unavailable",
+]);
 
 /** One workflow in the list under the Images row. */
 function WorkflowChoice({
@@ -810,9 +822,16 @@ export function AppSidebar() {
         : "Training needs MLX. Run `unsloth studio update` to enable Train."
       : chatOnlyReason === "intel_mac"
         ? "Training needs Apple Silicon or a GPU. Intel Macs are chat-only."
-        : chatOnlyReason === "no_gpu"
-          ? "Training needs an NVIDIA or AMD GPU."
-          : undefined;
+        : chatOnlyReason === "torch_cpu_build" ||
+            chatOnlyReason === "torch_cuda_unavailable"
+          ? // The host HAS GPUs; this PyTorch cannot open them. "Get a GPU" is both wrong
+            // and unactionable here, so name the installed build and point at the repair.
+            chatOnlyDetail
+            ? `Training needs a working PyTorch GPU build. This machine's GPUs were detected but PyTorch ${chatOnlyDetail} cannot use them; repair the installation.`
+            : "Training needs a working PyTorch GPU build. This machine's GPUs were detected but PyTorch cannot use them; repair the installation."
+          : chatOnlyReason === "no_gpu"
+            ? "Training needs an NVIDIA or AMD GPU."
+            : undefined;
   // Everything without a hint reaches VideoPage, which answers from the backend's video verdict.
   const videoDisabledHint = videoNavHint(chatOnlyMeasured, chatOnlyReason);
   const videoDisabled = videoDisabledHint !== undefined;
@@ -832,7 +851,9 @@ export function AppSidebar() {
     // recovery poll in the app, and the sidebar is mounted on every route that gates on the
     // verdict (studio-page reads the same store, so it recovers with it; video-page reads the
     // backend's video verdict instead and needs nothing from here).
-    if (selfHealSettled && !capabilitiesUnknown) return;
+    const inventorySensitive =
+      chatOnly && INVENTORY_SENSITIVE_REASONS.has(chatOnlyReason ?? "");
+    if (selfHealSettled && !capabilitiesUnknown && !inventorySensitive) return;
     let pollingSince = 0;
     // Which read currently owns the guard. A read that outlived the stall window is replaced,
     // and the replacement takes the guard with it; without an owner the abandoned read's
@@ -851,7 +872,11 @@ export function AppSidebar() {
         .finally(() => {
           if (owned === pollOwner) pollingSince = 0;
         });
-    }, capabilitiesUnknown ? VERDICT_UNKNOWN_POLL_MS : SELF_HEAL_POLL_MS);
+    }, capabilitiesUnknown
+      ? VERDICT_UNKNOWN_POLL_MS
+      : selfHealSettled
+        ? INVENTORY_POLL_MS
+        : SELF_HEAL_POLL_MS);
     return () => window.clearInterval(id);
   }, [capabilitiesUnknown, chatOnly, chatOnlyReason, detectionDeferred]);
 

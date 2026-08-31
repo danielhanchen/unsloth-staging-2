@@ -274,6 +274,8 @@ def write_manifest(
     steps_total: int = 0,
     package_name: str = "unsloth",
     no_torch: Optional[bool] = None,
+    expected_torch_tag: Optional[str] = None,
+    expected_torch_tag_pinned: Optional[bool] = None,
 ) -> Optional[Path]:
     """Record a completed install. Never raises: no manifest reads as incomplete,
     which is the safe answer."""
@@ -301,6 +303,17 @@ def write_manifest(
     # exports nothing and would otherwise reinstall torch into a GGUF-only venv.
     if no_torch is not None:
         payload["no_torch"] = bool(no_torch)
+    # The FLAVOR, never the index URL it came from: a pinned index can carry a token in
+    # its userinfo, query or fragment, and this file lives in the venv and is read back
+    # by verify-install, desktop-capabilities and the setup fast path.
+    if expected_torch_tag:
+        payload["expected_torch_tag"] = str(expected_torch_tag).strip().lower()
+    # Whether that flavor was NAMED by whoever ran the install, or merely what the selection
+    # landed on: setup.ps1 picks /cpu automatically on a GPU-less host and publishes it exactly
+    # as it publishes a pinned one, and reading the automatic case as deliberate leaves a later
+    # eGPU with no repair offered. Absent means unknown, as with every other additive key.
+    if expected_torch_tag_pinned is not None:
+        payload["expected_torch_tag_pinned"] = bool(expected_torch_tag_pinned)
     path = manifest_path(root)
     try:
         tmp = path.with_suffix(".json.tmp")
@@ -372,6 +385,45 @@ def recorded_no_torch(root: Optional[Path] = None) -> Optional[bool]:
     except OSError:
         pass
     return None
+
+
+def recorded_torch_flavor(root: Optional[Path] = None) -> Optional[str]:
+    """The torch flavor this venv was installed with, or None when unknown.
+
+    None means nothing recorded it: no manifest, or one written before the key
+    existed. Callers must treat None as "unknown" and fall back to their own
+    detection, never as "cpu" -- claiming a flavor nobody selected would let a
+    repair reinstall over a deliberate build.
+
+    There is no marker companion here (unlike no_torch): the manifest is dropped
+    before every dependency pass, so this answers only for the PREVIOUS install,
+    which is exactly the question a repair asks. A run whose own setup script
+    exported the flavor never reaches this.
+    """
+    manifest = read_manifest(root)
+    if manifest is None:
+        return None
+    value = manifest.get("expected_torch_tag")
+    if not isinstance(value, str):
+        return None
+    value = value.strip().lower()
+    return value or None
+
+
+def recorded_torch_flavor_was_pinned(root: Optional[Path] = None) -> bool:
+    """Whether the recorded flavor was NAMED rather than automatically selected.
+
+    False when nothing recorded it, including a manifest written before the key
+    existed. That is the safe direction here and the opposite of the usual "unknown
+    falls back to the old behaviour": treating an unproven CPU record as deliberate is
+    what leaves a host that has since gained a GPU with no repair offered at all, which
+    is the failure this whole field exists to distinguish. A repair is something the
+    user can decline; a silently CPU-only GPU box is not.
+    """
+    manifest = read_manifest(root)
+    if manifest is None:
+        return False
+    return bool(manifest.get("expected_torch_tag_pinned"))
 
 
 def _parse_requirement_line(line: str) -> Optional[Tuple[str, str, str]]:

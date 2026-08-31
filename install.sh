@@ -4559,6 +4559,15 @@ while [ -n "$_torch_index_leaf" ] && [ "${_torch_index_leaf%/}" != "$_torch_inde
 done
 _torch_index_leaf="${_torch_index_leaf##*/}"
 _torch_index_leaf=$(printf '%s' "$_torch_index_leaf" | tr '[:upper:]' '[:lower:]')
+# Whether the caller had already STATED a backend before the assignment below overwrites it.
+# setup.sh documents UNSLOTH_TORCH_BACKEND=cpu as the way to keep a deliberate CPU install,
+# and on a GPU-less host the resolved value is cpu too, so without this the manifest cannot
+# tell a stated choice from the automatic answer.
+if [ -n "${UNSLOTH_TORCH_BACKEND:-}" ]; then
+    _torch_backend_was_stated=true
+else
+    _torch_backend_was_stated=false
+fi
 case "$_torch_index_leaf" in
     rocm*|gfx*) export UNSLOTH_TORCH_BACKEND="rocm" ;;
     cpu)        export UNSLOTH_TORCH_BACKEND="cpu"  ;;
@@ -4567,6 +4576,15 @@ case "$_torch_index_leaf" in
     # the stack probes the GPU.
     *)          unset UNSLOTH_TORCH_BACKEND ;;
 esac
+
+# Derived from the index this script RESOLVED, which on a GPU-less machine is "cpu" whether
+# or not anyone asked. Without the marker every ordinary Linux CPU install is recorded as a
+# deliberate choice, and a machine that later gains a GPU is never offered the repair.
+if [ -n "${UNSLOTH_TORCH_BACKEND:-}" ] && [ "$_torch_backend_was_stated" != true ]; then
+    export UNSLOTH_TORCH_BACKEND_SOURCE="resolved"
+else
+    unset UNSLOTH_TORCH_BACKEND_SOURCE
+fi
 
 # Whether TORCH_INDEX_URL names an actual pip ROCm family (rocm<digit>* / gfx*), gating the
 # ROCm-only side effects below (AMD bitsandbytes, ROCm-torch repair). Digit-gated so a leaf
