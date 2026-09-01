@@ -2956,6 +2956,7 @@ from models.inference import (
 )
 from core.inference.anthropic_compat import (
     anthropic_messages_to_openai,
+    fold_tool_results_into_user,
     anthropic_schema_client_tool_kind,
     anthropic_tools_to_openai,
     anthropic_tool_choice_to_openai,
@@ -27437,12 +27438,7 @@ async def anthropic_count_tokens(
     # Apply the same sanitization /messages does before generation, so the count
     # matches the prompt the real request would build (otherwise empty-assistant
     # sentinels / synthetic tool history inflate the count or hit the fallback).
-    # Coalesce adjacent user turns left behind by dropping an empty / null assistant
-    # turn, so a strict GGUF chat template does not 400 on non-alternating roles
-    # (mirrors the GGUF chat path); a no-op for already-alternating histories.
-    openai_messages = _coalesce_consecutive_user_turns(
-        _strip_provider_synthetic_tool_history(_drop_empty_assistant_sentinels(openai_messages))
-    )
+    openai_messages = _sanitize_anthropic_openai_messages(openai_messages, llama_backend)
     openai_tools = anthropic_tools_to_openai(payload.tools or []) or None
     # Only the client-tool passthrough is forwarded verbatim, so reproduce /messages' own
     # routing rather than "any tools": a Studio server-tool alias, or a template without
@@ -27688,12 +27684,7 @@ async def anthropic_messages(
     # builders apply the same strip; without it an Anthropic /v1/messages caller
     # replaying a prior provider-side tool_use forwards fake builtin tool
     # history to a backend with no matching function declarations.
-    # Coalesce adjacent user turns left behind by dropping an empty / null assistant
-    # turn, so a strict GGUF chat template does not 400 on non-alternating roles
-    # (mirrors the GGUF chat path); a no-op for already-alternating histories.
-    openai_messages = _coalesce_consecutive_user_turns(
-        _strip_provider_synthetic_tool_history(_drop_empty_assistant_sentinels(openai_messages))
-    )
+    openai_messages = _sanitize_anthropic_openai_messages(openai_messages, llama_backend)
 
     # Enforce vision guard + re-encode embedded images to PNG so the Anthropic
     # endpoint matches /v1/chat/completions.
@@ -29908,6 +29899,52 @@ def _coalesce_consecutive_user_turns(messages: list[dict]) -> list[dict]:
             continue
         out.append(m)
     return out
+
+
+def _template_supports_tools(backend) -> bool:
+    """Whether the loaded chat template can render a ``role="tool"`` message.
+
+    ``supports_tool_passthrough`` is the raw template flag and is the question
+    being asked here. ``supports_tools`` is that same flag with DiffusionGemma
+    forced off so it never enters the agentic tool loop, which says nothing
+    about what its template renders: folding on it would strip native tool
+    framing from a client-tool passthrough request, which is dispatched on
+    exactly this predicate. Same order as that gate, so the two cannot disagree.
+
+    Defaults to True when the backend cannot answer, which leaves the message
+    list as the converter built it so an unreadable backend never changes the
+    prompt.
+    """
+    try:
+        for attr in ("supports_tool_passthrough", "supports_tools"):
+            if hasattr(backend, attr):
+                return bool(getattr(backend, attr))
+        return True
+    except Exception:
+        return True
+
+
+def _sanitize_anthropic_openai_messages(messages: list[dict], backend) -> list[dict]:
+    """The post-conversion chain shared by /v1/messages and its token counter.
+
+    Both endpoints must build the identical list or the advertised input_tokens
+    stops matching the prompt that generation actually sends, so the steps live
+    here rather than being repeated at each call site.
+
+    Steps, in order:
+      - drop Stop-button sentinels / normalize reasoning-only assistant turns;
+      - strip synthetic provider-side builtin tool history;
+      - on a template with no tool support, fold role=tool into user turns,
+        which must happen BEFORE the coalesce so a folded result and the note
+        that followed it merge into one turn;
+      - coalesce adjacent user turns, so a strict GGUF chat template does not
+        400 on non-alternating roles (mirrors the GGUF chat path); a no-op for
+        already-alternating histories.
+    """
+    messages = _strip_provider_synthetic_tool_history(_drop_empty_assistant_sentinels(messages))
+    if not _template_supports_tools(backend):
+        messages = fold_tool_results_into_user(messages)
+    return _coalesce_consecutive_user_turns(messages)
 
 
 _LOCAL_SERVER_BUILTIN_TOOL_NAMES = frozenset(
