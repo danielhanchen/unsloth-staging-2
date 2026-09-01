@@ -152,7 +152,6 @@ def hf_endpoint_unreachable(
     import urllib.error
     import urllib.request
 
-    # Shared normaliser so an empty/whitespace HF_ENDPOINT falls back to the default hub.
     try:
         from utils.utils import hf_endpoint_url
         endpoint = hf_endpoint_url()
@@ -161,7 +160,6 @@ def hf_endpoint_unreachable(
         if "://" not in endpoint:
             endpoint = "https://" + endpoint
 
-    # Pin the Hub client's proxy choice: the default urllib opener ignores all_proxy.
     try:
         from utils.utils import hf_proxy_for_endpoint, hf_proxy_usable_by_urllib
         proxy = hf_proxy_for_endpoint(endpoint)
@@ -197,9 +195,8 @@ def hf_endpoint_unreachable(
                 # Resolved below, off-thread, so the extra probe cannot outrun the join.
                 result["timed_out"] = True
             elif isinstance(exc.reason, OSError):
-                result["online"] = False  # gaierror / network unreachable: a real answer
+                result["online"] = False
             else:
-                # A string reason ("no host given") is client-side, not an egress answer.
                 result["online"] = True
         except ssl.SSLError:
             result["online"] = True
@@ -207,8 +204,8 @@ def hf_endpoint_unreachable(
             result["timed_out"] = True
         except ConnectionError:
             # urllib only wraps OSErrors raised while sending; one from getresponse() arrives raw.
-            # Accept-then-close surfaces as RemoteDisconnected (a ConnectionResetError), and a
-            # momentary reset must not read as no egress, same reasoning as the 502/503 case.
+            # Accept-then-close surfaces as RemoteDisconnected, and a momentary reset must not read as no egress, same
+            # reasoning as the 502/503 case.
             result["online"] = True
         except OSError:
             result["online"] = False
@@ -220,9 +217,9 @@ def hf_endpoint_unreachable(
     t.start()
     t.join(timeout + 1)
     if t.is_alive():
-        # Hung past the deadline. Behind a proxy that is as ambiguous as a clean timeout, since
-        # connect, TLS and the response can each stay under `timeout` while the total runs past
-        # the join, so lifetime callers fail open. Direct, a hang means real hub calls would too.
+        # Hung past the deadline. Behind a proxy that is as ambiguous as a clean timeout
+        # Connect, TLS and the response can each stay under `timeout` while the total runs past the join, so lifetime
+        # callers fail open. Direct, a hang means real hub calls would too.
         try:
             from utils.utils import hf_proxy_configured
             if hf_proxy_configured():
@@ -231,8 +228,6 @@ def hf_endpoint_unreachable(
             pass
         return True
     if result["timed_out"]:
-        # A slow server still completes the TCP handshake; a blackholed route does not.
-        # Bounded separately so the whole probe stays within a predictable deadline.
         try:
             from utils.utils import hf_proxy_configured, hf_tcp_reachable
             if hf_proxy_configured():
@@ -261,29 +256,28 @@ def _safe_is_dir(p: Path) -> bool:
         return False
 
 
-# --- Detection ---
 
-# Lowercase substrings — any match in the lowered model name needs transformers 5.3.0.
+# Lowercase substrings; any match in the lowered model name needs transformers 5.3.0.
 TRANSFORMERS_5_MODEL_SUBSTRINGS: tuple[str, ...] = (
-    "ministral-3-",  # Ministral-3-{3,8,14}B-{Instruct,Reasoning,Base}-2512
-    "glm-4.7-flash",  # GLM-4.7-Flash
-    "qwen3-30b-a3b",  # Qwen3-30B-A3B-Instruct-2507 and variants
-    "qwen3.5",  # Qwen3.5 family (35B-A3B, etc.)
-    "qwen3-next",  # Qwen3-Next and variants
-    "tiny_qwen3_moe",  # imdatta0/tiny_qwen3_moe_2.8B_0.7B
-    "lfm2.5-vl-450m",  # LiquidAI/LFM2.5-VL-450M
+    "ministral-3-",
+    "glm-4.7-flash",
+    "qwen3-30b-a3b",
+    "qwen3.5",
+    "qwen3-next",
+    "tiny_qwen3_moe",
+    "lfm2.5-vl-450m",
 )
 
 # Lowercase substrings for models that require transformers 5.10.x (checked first).
 TRANSFORMERS_510_MODEL_SUBSTRINGS: tuple[str, ...] = (
-    "gemma-4-12b",  # Gemma 4 Unified 12B
+    "gemma-4-12b",
     "gemma4-12b",
 )
 
 # Lowercase substrings for models that require the transformers 5.5 sidecar.
 TRANSFORMERS_550_MODEL_SUBSTRINGS: tuple[str, ...] = (
-    "gemma-4",  # Gemma-4 (E2B-it, E4B-it, 31B-it, 26B-A4B-it)
-    "gemma4",  # Gemma-4 alternate naming
+    "gemma-4",
+    "gemma4",
     "qwen3.6",
     "kimi-k3",
     "kimik3",
@@ -355,29 +349,26 @@ _TRANSFORMERS_5_TOKENIZER_CLASSES: set[str] = {
     "TokenizersBackend",
 }
 
-# Caches keyed on (model_name, token-hash) so authed/unauthed reads stay separate (an
-# unauthenticated miss on a gated repo must not poison a later authenticated lookup).
-# Offline negatives are NOT written, so they cannot poison a later online read.
+# Caches keyed on (model_name, token-hash) so authed/unauthed reads stay separate
 _tokenizer_class_cache: dict[tuple[str, str | None], bool] = {}
 _config_json_cache: dict[tuple[str, str | None], dict | None] = {}
 _config_needs_510_cache: dict[tuple[str, str | None], bool] = {}
 _config_needs_550_cache: dict[tuple[str, str | None], bool] = {}
 _config_needs_530_cache: dict[tuple[str, str | None], bool] = {}
 
-# Process-lifetime probe cache, keyed by model_name + a local config.json signature (see
-# _probe_cache_key) so an overwritten checkpoint re-probes. Not keyed by Hub sha, so the
-# probe never imports huggingface_hub before a worker's sidecar venv is activated.
+# Process-lifetime probe cache, keyed by model_name + a local config.json signature
+# Not keyed by Hub sha, so the probe never imports huggingface_hub before a worker's sidecar venv is activated.
 _probe_tier_cache: dict[str, str] = {}
 
 TRANSFORMERS_510_VERSION = "5.10.2"
 TRANSFORMERS_550_VERSION = "5.5.0"
 TRANSFORMERS_530_VERSION = "5.3.0"
 TRANSFORMERS_DEFAULT_VERSION = "5.5.0" if sys.version_info >= (3, 10) else "4.57.6"
-# Backwards-compat alias for the highest 5.x tier; prefer TRANSFORMERS_510_VERSION /
-# TRANSFORMERS_550_VERSION / TRANSFORMERS_530_VERSION.
+# Backwards-compat alias for the highest 5.x tier; prefer the explicit TRANSFORMERS_5*_VERSION.
+# Prefer TRANSFORMERS_510_VERSION / TRANSFORMERS_550_VERSION / TRANSFORMERS_530_VERSION.
 TRANSFORMERS_5_VERSION = TRANSFORMERS_510_VERSION
 
-# Pre-installed directories — created by setup.sh / setup.ps1.
+# Pre-installed directories - created by setup.sh / setup.ps1.
 from utils.paths.storage_roots import studio_root as _studio_root  # noqa: E402
 
 _VENV_T5_530_DIR = str(_studio_root() / ".venv_t5_530")
@@ -394,7 +385,7 @@ _VENV_LLMCOMPRESSOR_DIR = str(_studio_root() / ".venv_llmcompressor")
 _VENV_T5_LATEST_DIR = str(_studio_root() / ".venv_t5_latest")
 _LATEST_PIN_MARKER = ".unsloth_pinned_transformers"
 
-# Tier precedence: higher rank wins in _higher_tier. "latest" outranks every fixed tier.
+# Tier precedence: higher rank wins in _higher_tier, and "latest" outranks every fixed tier.
 _TIER_RANK = {"default": 0, "530": 1, "550": 2, "510": 3, "latest": 4}
 
 
@@ -424,9 +415,9 @@ def activate_transformers_for_subprocess(model_name: str, hf_token: str | None =
     ``hf_token`` is forwarded to tier detection so a gated/private model whose only 5.x
     signal is an authenticated config/tokenizer reaches the right sidecar, not the default.
     """
-    # Pre-resolve LoRA adapters (local dir or remote adapter repo); full checkpoints go to
-    # get_transformers_tier so their local config.json drives the tier (a private/offline
-    # _name_or_path must not resolve to an unreachable HF id). Remote adapters use their BASE.
+    # Pre-resolve LoRA adapters (local dir or remote adapter repo); full checkpoints go to get_transformers_tier so
+    # their local config.json drives the tier (a private/offline _name_or_path must not resolve to an unreachable HF
+    # id). Remote adapters use their BASE.
     tier = get_transformers_activation_tier(model_name, hf_token)
 
     if tier == "latest":
@@ -594,7 +585,6 @@ def _resolve_base_model(model_name: str) -> str:
     warnings for plain HF model IDs). Returns *model_name* unchanged if not a
     LoRA adapter.
     """
-    # --- Fast local check ---
     local_path = Path(model_name)
     adapter_cfg_path = local_path / "adapter_config.json"
     if _safe_is_file(adapter_cfg_path):
@@ -612,7 +602,6 @@ def _resolve_base_model(model_name: str) -> str:
         except Exception as exc:
             logger.debug("Could not read %s: %s", adapter_cfg_path, exc)
 
-    # --- config.json fallback (LoRA and full fine-tune) ---
     config_json_path = local_path / "config.json"
     if _safe_is_file(config_json_path):
         try:
@@ -740,7 +729,7 @@ def _remote_lora_base(model_name: str, hf_token: str | None = None) -> str | Non
     try:
         from utils.paths import is_local_path
         if is_local_path(model_name):
-            return None  # an existing relative path is a local checkpoint, not a Hub repo
+            return None
     except Exception:
         pass
     if _env_offline():
@@ -784,7 +773,6 @@ def _check_tokenizer_config_needs_v5(model_name: str, hf_token: str | None = Non
     if cache_key in _tokenizer_class_cache:
         return _tokenizer_class_cache[cache_key]
 
-    # --- Check local tokenizer_config.json first ---
     local_path = Path(model_name)
     local_tc = local_path / "tokenizer_config.json"
     if _safe_is_file(local_tc):
@@ -812,7 +800,6 @@ def _check_tokenizer_config_needs_v5(model_name: str, hf_token: str | None = Non
     if _env_offline():
         return False
 
-    # --- Fall back to fetching from HuggingFace ---
     import urllib.request
 
     url = _hf_raw_url(model_name, "tokenizer_config.json")
@@ -914,8 +901,7 @@ def _load_config_json(model_name: str, hf_token: str | None = None) -> dict | No
         return None
 
     if _env_offline():
-        # No network: a downloaded repo can still tier from the hub cache. Cache a real hit,
-        # never the miss, so a later online read still fetches the config.
+        # No network: a downloaded repo can still tier from the hub cache.
         cfg = _config_json_from_hf_cache(model_name)
         if cfg is not None:
             _config_json_cache[cache_key] = cfg
@@ -1101,9 +1087,9 @@ def _cached_config_json(model_name: str, hf_token: str | None) -> dict | None:
     return _config_json_cache.get(_token_cache_key(model_name, hf_token))
 
 
-# --- Static tier from CONFIG_MAPPING_NAMES (AST only: no import/network/exec) ---
 # A model_type absent from an overlay's mapping can't load there. Parse each sidecar's
 # config map and pick the lowest tier that ships it. Only upgrades default, never lowers.
+# AST only: no import, network or exec.
 _config_mapping_cache: dict[str, frozenset[str]] = {}
 
 
@@ -1118,15 +1104,13 @@ def _latest_tier_disabled() -> bool:
     )
 
 
-# Failed lazy repairs back off so a broken sidecar can't turn every routing call into pip.
+# Failed lazy repairs back off, so a broken sidecar cannot turn every routing call into pip.
 _latest_repair_failed_at: float = 0.0
 _LATEST_REPAIR_BACKOFF_SECS = 5 * 60
 
 
-# Remembers that a RECORD scan found the sidecar damaged, so the cheap predicate can act
-# on damage it cannot see. Written by a worker child (which cannot repair) and by the
-# parent when a repair fails, so the backoff suppresses pip retries without handing the
-# damaged sidecar back. Lives inside the sidecar dir, so a stage-and-swap clears it.
+# Remembers that a RECORD scan found the sidecar damaged, so the cheap predicate can act on damage
+# it cannot see. Lives inside the sidecar dir, so a stage-and-swap clears it.
 _LATEST_REPAIR_MARKER = ".unsloth_sidecar_repair_needed"
 
 
@@ -1141,9 +1125,7 @@ def _latest_repair_requested() -> bool:
     scan that produced the request costs ~25 ms and cannot.
     """
     if _sidecar_file_check_disabled():
-        # The marker only records a file-level finding, which is exactly what the switch turns
-        # off. Ignoring it here is what makes the hatch immediate: otherwise a false-positive
-        # marker withholds the sidecar for the whole backoff, since the scan never clears it.
+        # The marker only records a file-level finding.
         return False
     try:
         return _latest_repair_marker_path().is_file()
@@ -1224,14 +1206,11 @@ def _overlay_transformers_dir(tier: str) -> str | None:
         }.get(tier)
         src = os.path.join(root, "transformers") if root else None
         if src and tier == "latest":
-            # A valid pin whose sidecar vanished, lost a package or had a recorded file truncated
-            # must self-heal, or latest-only models silently route to older tiers or reach a worker
-            # that cannot repair, failing every load until a manual reinstall. Repair under the swap
-            # reservation; back off after a failure so routing calls don't hammer pip.
+            # A valid pin whose sidecar vanished or was damaged must self-heal, or latest-only models route
+    # to older tiers or reach a worker that cannot repair, failing every load until a manual
+    # reinstall. Repaired under the swap reservation, with a backoff so routing cannot hammer pip.
             heal_due = time.time() - _latest_repair_failed_at >= _LATEST_REPAIR_BACKOFF_SECS
-            # The ~25 ms RECORD scan runs only when a repair could follow it, and only on a
-            # _config_mapping_cache miss (once per process while healthy) -- never during the backoff
-            # window, where every routing call would re-pay it for an answer it cannot act on.
+            # The ~25 ms RECORD scan runs only when a repair could follow it.
             broken = not _latest_sidecar_intact() or (heal_due and not _latest_sidecar_undamaged())
             repaired = False
             if broken and heal_due:
@@ -1292,7 +1271,7 @@ def _mapping_first_keys(value: ast.AST) -> set[str]:
     if isinstance(value, ast.Call):
         for a in value.args:
             nodes += keys_of(a)
-        for kw in value.keywords:  # **{...} unpacking has kw.arg is None
+        for kw in value.keywords:
             if kw.arg is None:
                 nodes += keys_of(kw.value)
     return {n.value for n in nodes if isinstance(n, ast.Constant) and isinstance(n.value, str)}
@@ -1422,9 +1401,9 @@ def _raise_tier_for_nested(cfg: dict | None, tier: str) -> str:
     return tier
 
 
-# --- AutoConfig probe: general tier resolution for ambiguous models ----------
 # When the cheap signals only say "needs some 5.x", parse config.json with each candidate
-# sidecar's built-in parser (lowest first) instead of guessing, e.g. dense NemotronH.
+# sidecar's built-in parser, lowest first, instead of guessing.
+# --- AutoConfig probe: general tier resolution for ambiguous models ----------
 _PROBE_TIER_ORDER = ("530", "550", "510")
 _PROBE_TIMEOUT_SECS = 60
 
@@ -1456,7 +1435,7 @@ except Exception as exc:
 """
 )
 
-# stderr fragments meaning "couldn't fetch/auth", NOT "needs a newer parser".
+# stderr fragments meaning "could not fetch/auth", NOT "needs a newer parser".
 _PROBE_TRANSIENT_MARKERS = (
     "ConnectionError",
     "HTTPError",
@@ -1578,16 +1557,14 @@ def _probe_tier(
     if os.environ.get("UNSLOTH_DISABLE_TIER_PROBE", "").lower() in ("1", "true", "yes", "on"):
         return floor
     key = _probe_cache_key(model_name)
-    # Key by probe mode: the default-first path can return 'default', which must not be
-    # reused for a tokenizer/known-5.x caller (floor='530'). Legacy 530 keeps the bare key.
+    # Key by probe mode: the default-first path can return 'default'.
     if include_default or floor != "530":
         key = f"{key}\0floor={floor}:def={int(include_default)}"
     if key in _probe_tier_cache:
         cached = _probe_tier_cache[key]
-        # Kill switch beats the cache (like _config_model_types): a stale 'latest' probe must not
-        # keep activating it. So does a sidecar since found damaged, or a probe cached while it
-        # was healthy keeps spawning workers into a tier whose activation fails. So does an
-        # unpinned tier: deleting the pin takes the repair marker with it. Falling through re-probes.
+        # Kill switch, a sidecar since found damaged, and an unpinned tier all beat the cache: a probe
+    # cached while healthy would otherwise keep spawning workers into a tier whose activation fails.
+    # Falling through re-probes.
         if cached != "latest" or not (
             _latest_tier_disabled()
             or _latest_repair_requested()
@@ -1627,7 +1604,7 @@ def _probe_tier(
             return _cache(tier, skipped = skipped_any)
         if ok is None:
             logger.info("Tier probe inconclusive for %s (%s); using %s", model_name, reason, floor)
-            return floor  # transient: retry next load
+            return floor
 
     # Nothing parsed. Only treat it as conclusive (and cache) when every tier was actually
     # probed; a skipped sidecar means the environment is incomplete, so retry uncached.
@@ -1811,7 +1788,7 @@ def get_transformers_tier(
                 return _probe_tier(model_name, hf_token, "local tokenizer needs 5.x")
             if _config_saved_by_transformers_5(cfg):
                 if not probe:
-                    return "530"  # cheap 5.x hint; the real path resolves the exact tier
+                    return "530"
                 tier = _probe_tier(
                     model_name,
                     hf_token,
@@ -1845,6 +1822,7 @@ def get_transformers_tier(
         )
         return tier
 
+    # Slow config fallbacks: network for HF IDs, authenticated with hf_token.
     # --- Slow config fallbacks (network for HF IDs; authenticated with hf_token) --------
     if _check_config_needs_510(model_name, hf_token):
         tier = _raise_tier_for_nested(_load_config_json(model_name, hf_token), "510")
@@ -1892,7 +1870,7 @@ def get_transformers_tier(
 
     if _config_saved_by_transformers_5(_cached_config_json(model_name, hf_token)):
         if not probe:
-            return "530"  # cheap 5.x hint; the real path resolves the exact tier
+            return "530"
         tier = _probe_tier(
             model_name,
             hf_token,
@@ -1921,7 +1899,6 @@ def needs_transformers_5(model_name: str) -> bool:
     return get_transformers_tier(model_name, probe = False) != "default"
 
 
-# --- Version switching (in-process, used only by export) ---
 
 
 def _get_in_memory_version() -> str | None:
@@ -1942,10 +1919,9 @@ _PURGE_PREFIXES = (
     "trl",
     "accelerate",
     "auto_gptq",
-    # NOTE: bitsandbytes is intentionally EXCLUDED -- it registers torch custom operators via
-    # torch.library.define() into torch's global registry, which survives a module purge, so
-    # re-importing after purge means duplicate registration and a crash.
-    # Our own modules that import from transformers at module level.
+    # NOTE: bitsandbytes is intentionally EXCLUDED -- it registers torch custom operators via torch.library.define()
+    # into torch's global registry, which survives a module purge, so re-importing after purge means duplicate
+    # registration and a crash.
     "utils.models",
     "core.training",
     "core.inference",
@@ -2021,8 +1997,7 @@ def _sidecar_scan(venv_dir: str, limit: int = 3) -> tuple[list[str], bool]:
     return _sidecar_scan_impl(venv_dir, limit)
 
 
-# Mirrored from unsloth_cli/_studio_deps.py, not imported, for the reason given in
-# _sidecar_scan_impl below: the backend never imports the CLI package. Keep in sync.
+# Mirrored from unsloth_cli/_studio_deps.py, not imported.
 _SHARED_NON_RUNTIME_ROOTS = frozenset(
     (
         "test",
@@ -2039,18 +2014,15 @@ _SHARED_NON_RUNTIME_ROOTS = frozenset(
     )
 )
 _INSTALLER_REWRITTEN_NAMES = frozenset(("package-lock.json",))
-# Version-tagged extension suffixes (.cpython-313-darwin.so, .cp313-win_amd64.pyd,
-# free-threaded .cpython-314t-*). Untagged binaries carry no version and are skipped, as
-# are pypy/graalpy/debug spellings, which this deliberately does not match: an unrecognised
-# name reports nothing rather than guessing, in line with the rest of the scan.
+# Version-tagged extension suffixes only. Untagged binaries carry no version and are skipped, as
+# are pypy/graalpy/debug spellings: an unrecognised name reports nothing rather than guessing.
+# The suffixes are .cpython-313-darwin.so, .cp313-win_amd64.pyd and free-threaded .cpython-314t-*.
 _EXT_VERSION_TAG_RE = re.compile(r"\.(?:cpython-|cp)(\d{2,}t?)\b")
-# Stable-ABI binaries. A GIL build imports one produced by any older CPython, so they are
-# skipped there. A free-threaded build cannot: it still advertises .abi3.so in
-# EXTENSION_SUFFIXES, but the object layout differs and importing a GIL-built one takes the
-# whole interpreter down with SIGSEGV instead of raising ImportError. No installer ever puts
-# one into a free-threaded tree -- packaging offers those builds abi3t, never abi3 -- so
-# reporting it cannot loop: the reinstall fetches the cp<ver>t wheel and the next scan is
-# clean. Only a venv whose interpreter was swapped underneath it can hold one.
+# Stable-ABI binaries. A GIL build imports one produced by any older CPython, so they are skipped there. A free-threaded
+# build cannot: it still advertises .abi3.so in EXTENSION_SUFFIXES, but the object layout differs and importing a GIL-
+# built one takes the whole interpreter down with SIGSEGV instead of raising ImportError. No installer puts one into a
+# free-threaded tree, since packaging offers those builds abi3t, so reporting it cannot loop; only a venv whose
+# interpreter was swapped underneath it can hold one.
 _ABI3_EXT_RE = re.compile(r"\.abi3\.(?:so|pyd)$")
 _CURRENT_EXT_TAG = "{}{}{}".format(
     sys.version_info.major,
@@ -2123,7 +2095,6 @@ def _sidecar_scan_impl(venv_dir: str, limit: int = 3) -> tuple[list[str], bool]:
             # No RECORD says nothing about damage; some installs legitimately have none.
             continue
         except OSError:
-            # Present but unreadable: a real gap, so the result cannot be called clean.
             inconclusive = True
             continue
         try:
@@ -2140,11 +2111,10 @@ def _sidecar_scan_impl(venv_dir: str, limit: int = 3) -> tuple[list[str], bool]:
             # size recorded inside itself; .pyc is regenerated from source.
             if ".dist-info/" in rel or ".egg-info/" in rel or rel.endswith(".pyc"):
                 continue
-            # Console scripts are not checkable in a flat --target tree, and believing them fails
-            # CLOSED on a healthy sidecar. pip installs through a temporary normal-scheme prefix and
-            # records ../../bin/hf before flattening, while the file lands in <target>/bin; uv records
-            # bin/hf, but pip's --upgrade rmtree's a colliding directory. Either way the sidecar is
-            # only ever prepended to sys.path, never PATH, so nothing here is imported.
+            # Console scripts are not checkable in a flat --target tree.
+            # Believing them fails CLOSED on a healthy sidecar: pip records ../../bin/hf before flattening while the
+            # file lands in <target>/bin, and uv records bin/hf. The sidecar is only ever prepended to sys.path, never
+            # PATH, so nothing here is imported.
             parts = tuple(p for p in rel.replace("\\", "/").split("/") if p)
             if (
                 rel.startswith("/")
@@ -2184,9 +2154,10 @@ def _sidecar_scan_impl(venv_dir: str, limit: int = 3) -> tuple[list[str], bool]:
             # component is a file, which is the same tree damage one level up.
             found.append(f"{name}: {rel} is missing")
         except OSError:
-            # Inconclusive, not damage. EIO, ESTALE on NFS or EACCES says the file could not be read,
-            # never that it is gone, and the answer costs a several-hundred-MB re-download. Skip the
-            # row but remember the gap: a scan that cannot see the disk must not certify it either.
+            # Inconclusive, not damage: EIO, ESTALE or EACCES says the file could not be read, never that it
+            # is gone, and answering wrong costs a several-hundred-MB re-download. Remember the gap: a
+            # scan that cannot see the disk must not certify it either.
+            # ESTALE is the NFS case.
             inconclusive = True
             continue
         else:
@@ -2197,12 +2168,10 @@ def _sidecar_scan_impl(venv_dir: str, limit: int = 3) -> tuple[list[str], bool]:
             elif owners[key] == 1 and recorded is not None and info.st_size < recorded:
                 found.append(f"{name}: {rel} is {info.st_size} bytes, expected {recorded}")
             elif rel.endswith((".so", ".pyd")):
-                # A sidecar built by one interpreter survives a Python upgrade intact,
-                # but its compiled extensions no longer load (issue: cp313 .so under 3.14).
-                # The BASENAME alone decides. rel is a whole RECORD path, and a directory
-                # component carrying a wheel-style tag (build.cp312/, pkg.cp312.libs/) says
-                # nothing about the untagged binary sitting inside it; searching the path
-                # would wipe several hundred MB over a directory name.
+                # The BASENAME alone decides: rel is a whole RECORD path, and a directory component carrying a
+                # wheel-style tag says nothing about the untagged binary inside it.
+                # The issue is a cp313 .so under 3.14, and the misleading directory tags are build.cp312/ and
+                # pkg.cp312.libs/.
                 base = rel.replace("\\", "/").rsplit("/", 1)[-1]
                 m = _EXT_VERSION_TAG_RE.search(base)
                 if m and m.group(1) != _CURRENT_EXT_TAG:
@@ -2363,10 +2332,9 @@ def _install_to_dir(pkg: str, target_dir: str) -> bool:
     return True
 
 
-# setup.sh / setup.ps1 write this beside a sidecar venv they created, and refuse to touch
-# an unmarked directory under a custom UNSLOTH_STUDIO_HOME. A runtime rebuild takes the
-# marker with the old directory, so it has to put one back, or the next `unsloth studio
-# update` aborts on a sidecar we just repaired (adoption needs a prebuilt-info file).
+# setup.sh / setup.ps1 write this beside a sidecar venv they created and refuse to touch an
+# unmarked directory under a custom UNSLOTH_STUDIO_HOME, so a runtime rebuild must put one back or
+# the next `unsloth studio update` aborts on a sidecar just repaired.
 _STUDIO_OWNED_MARKER = ".unsloth-studio-owned"
 
 
@@ -2424,11 +2392,12 @@ def _ensure_venv_t5_exists() -> bool:
     return _ensure_venv_t5_550_exists()
 
 
-# --- User-consented "latest transformers" sidecar (.venv_t5_latest) --------------------------
+
 # Provisioned via ensure_latest_transformers_venv() after the user confirms the upgrade popup
 # (utils/transformers_latest.py); pinned in a marker file so restarts revalidate and routing auto-picks it.
-
 # PEP 440-ish release strings only (guards the pip install spec against injection).
+# The sidecar directory is .venv_t5_latest.
+# --- User-consented "latest transformers" sidecar (.venv_t5_latest) --------------------------
 _LATEST_VERSION_RE = r"[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?"
 
 
@@ -2437,8 +2406,8 @@ def _is_valid_version_string(version: str) -> bool:
     return isinstance(version, str) and re.fullmatch(_LATEST_VERSION_RE, version) is not None
 
 
-# Only the sidecar recipe's own packages, as plain (optionally ==pinned) specs, may
-# come from the on-disk pin marker; anything else (URLs, extras, options) is rebuilt.
+# Only the sidecar recipe's own packages, as plain (optionally pinned) specs, may come from the
+# on-disk pin marker; anything else (URLs, extras, options) is rebuilt.
 _PIN_SPEC_RE = re.compile(r"^[A-Za-z0-9_.-]+(==[A-Za-z0-9_.+-]+)?$")
 _PIN_ALLOWED_NAMES = frozenset(
     {
@@ -2537,9 +2506,8 @@ def _venv_t5_latest_packages(version: str, extra_packages: tuple[str, ...] = ())
     ) + tuple(extra_packages)
 
 
-# Single reservation for ANY .venv_t5_latest replacement (consented install or lazy
-# repair), checked by training/export starts so no worker spawns mid-swap. Backed by a
-# lock FILE so a repair in a worker subprocess stays visible to the parent's checks.
+# Single reservation for ANY .venv_t5_latest replacement, checked by training/export starts so no
+# worker spawns mid-swap. Backed by a lock FILE so a repair in a worker subprocess stays visible.
 _sidecar_swap_lock = threading.Lock()
 _sidecar_swap_active = False
 _sidecar_swap_token: str | None = None
@@ -2561,8 +2529,6 @@ def _pid_alive(pid) -> bool:
     except Exception:
         pass
     if os.name == "nt":
-        # os.kill(pid, 0) is not a liveness probe on Windows: signal 0 is CTRL_C_EVENT, which
-        # CPython routes through GenerateConsoleCtrlEvent. Probe via OpenProcess instead.
         try:
             import ctypes
             from ctypes import wintypes
@@ -2807,16 +2773,13 @@ def _ensure_venv_t5_latest_exists() -> bool:
     packages = tuple(pin["packages"])
     undamaged, conclusive = _venv_dir_health(_VENV_T5_LATEST_DIR, packages)
     if undamaged and (conclusive or not _latest_repair_requested()):
-        # A repair request that a clean scan contradicts (another process repaired it, or a child
-        # lost the race with a swap) must not survive, or routing re-enters self-heal forever.
-        # Only a scan that actually read the files may retire it; one that hit EIO has not.
+        # A repair request that a clean scan contradicts
+        # Only a scan that actually read the files may retire it, and one that hit EIO has not.
         if conclusive:
             _clear_latest_repair_request()
         return True
-    # Broken, and every path below can still fail to fix it (offline, a child, a swap already
-    # running, pip). Flag it here rather than per bailout, so the routing predicate withholds
-    # the sidecar whichever we take: it cannot see sub-file damage itself, and a mapping
-    # cached before the damage keeps it off the scanning path. A successful repair clears it.
+    # Flag it here rather than per bailout, so the routing predicate withholds the sidecar whichever path is taken: it
+    # cannot see sub-file damage itself. A successful repair clears it.
     _request_latest_repair()
     if _env_offline():
         logger.warning(
@@ -2825,9 +2788,6 @@ def _ensure_venv_t5_latest_exists() -> bool:
             version,
         )
         return False
-    # Repairs are a parent-process action: a worker child's backend singletons are empty, so
-    # it cannot see live siblings that may still lazy-import from the sidecar. Fail activation
-    # in the child; the parent's routing self-heal performs the actual repair.
     try:
         import multiprocessing as _mp
         if _mp.parent_process() is not None:
@@ -2846,9 +2806,10 @@ def _ensure_venv_t5_latest_exists() -> bool:
         )
         return False
     try:
-        # Worker check UNDER the reservation (the install route quiesces workers; a repair has
-        # none): worker starts set their active markers BEFORE rechecking the reservation, so
-        # either this check sees them or their recheck sees this reservation -- never both miss.
+        # Worker check UNDER the reservation
+        # The install route quiesces workers, a repair has none, and worker starts set their active markers BEFORE
+        # rechecking the reservation, so either this check sees them or their recheck sees this reservation, never both
+        # miss.
         if _workers_active_for_repair():
             logger.warning(
                 "Cannot repair .venv_t5_latest: active chat/training/export workers "
@@ -2893,8 +2854,10 @@ def ensure_latest_transformers_venv(
     return _stage_and_swap_latest_venv(version, packages, before_swap = before_swap)
 
 
+# Exact, reproducible pins (bump deliberately in review); validated to FP8-quantize Qwen3.5 /
+# Gemma-4 / Llama.
+# FP8/FP4 export of newer-transformers models.
 # --- llm-compressor-main shadow (FP8/FP4 export of newer-transformers models) ---------------------
-# Exact, reproducible pins (bump deliberately in review); validated to FP8-quantize Qwen3.5 / Gemma-4 / Llama.
 _LLMC_MAIN_TRANSFORMERS = "5.10.2"
 _LLMC_MAIN_SHA = "973c9c539a84dd9efaf74e115ede5ca419704c18"
 _LLMC_MAIN_COMPRESSED_TENSORS = "0.17.2a20260702"
@@ -3098,8 +3061,8 @@ def ensure_transformers_version(model_name: str) -> None:
         resolved = _remote_lora_base(model_name) or model_name
     tier = get_transformers_tier(resolved)
     if model_name != resolved and _safe_is_file(Path(model_name) / "config.json"):
-        # Gate on a real local config.json: a checkpoint carries config the base may not
-        # surface, but path names alone must not upgrade a plain adapter.
+        # Gate on a real local config.json: a checkpoint carries config the base may not surface, but
+    # path names alone must not upgrade a plain adapter.
         tier = _higher_tier(tier, get_transformers_tier(model_name))
 
     if tier == "latest":
@@ -3141,7 +3104,6 @@ def ensure_transformers_version(model_name: str) -> None:
         in_memory,
     )
 
-    # --- Already correct? ---
     if in_memory is not None:
         if in_memory == target_version:
             logger.info(
@@ -3153,7 +3115,7 @@ def ensure_transformers_version(model_name: str) -> None:
         # Different 5.x -> need to switch (e.g. 5.3.0 loaded but need 5.10.x).
         in_memory_major = int(in_memory.split(".")[0])
         if in_memory_major == target_major and venv_dir is None:
-            # Both are default (4.x) — close enough.
+            # Both are default (4.x) - close enough.
             logger.info(
                 "transformers %s already loaded — correct for '%s'",
                 in_memory,
@@ -3161,7 +3123,6 @@ def ensure_transformers_version(model_name: str) -> None:
             )
             return
 
-    # --- Switch version ---
     if venv_dir is not None:
         # First remove any other 5.x venv from sys.path.
         _deactivate_5x()
