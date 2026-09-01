@@ -109,7 +109,6 @@ def _invoke_run(monkeypatch, args):
     [
         # Default (no flag) forwards --no-cloudflare explicitly so a mixed-version child venv (old
         # default: --cloudflare on) can't re-enable the tunnel.
-        # child venv (old default: --cloudflare on) can't re-enable the tunnel.
         ([], "--no-cloudflare", "--cloudflare", "unset"),
         (["--cloudflare"], "--cloudflare", "--no-cloudflare", "enabled"),
         (["--no-cloudflare"], "--no-cloudflare", "--cloudflare", "disabled"),

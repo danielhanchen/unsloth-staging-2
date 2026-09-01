@@ -4745,7 +4745,6 @@ def test_opencode_inline_scopes_session_to_studio_provider(fake_studio):
     # opencode filters even config-defined providers through enabled/disabled_providers and a model
     # pin does not bypass that, so the inline overlay allowlists our provider and clears the denylist
     # without reading the user's config.
-    # The model is registered under providers.* and model.provider points at it.
     result = CliRunner().invoke(start.start_app, ["opencode", "--no-launch"])
     assert result.exit_code == 0, result.output
     inline = _opencode_inline_config(result.output)
@@ -4986,6 +4985,8 @@ def test_write_hermes_config_fresh(hermes_config):
     yaml = pytest.importorskip("yaml")
     start.write_hermes_config(BASE, MODEL, hermes_config)
     config = yaml.safe_load(hermes_config.read_text())
+    # Hermes only honors the key for a *named* custom provider, so the endpoint is registered
+    # under providers.* and model.provider points at it.
     assert config["model"]["provider"] == "custom:unsloth"
     assert config["model"]["default"] == MODEL["id"]
     assert config["model"]["api_mode"] == "openai"
@@ -7453,9 +7454,8 @@ def test_codex_attach_check_accepts_symlinked_split_shards(tmp_path, monkeypatch
     ],
 )
 def test_codex_attach_check_refuses_companion_gguf_files(monkeypatch, capsys, path):
-    # Projector and drafter name prefixes read the basename alone, so the name settles it under any
-    # root; a drafter FOLDER is root-dependent instead.
-    # So detect_gguf_model refuses them.
+    # Projector and drafter name prefixes read the basename alone, so detect_gguf_model refuses
+    # them under any root and the name settles it; a drafter FOLDER is root-dependent instead.
     monkeypatch.setattr(
         start,
         "_http_json",
