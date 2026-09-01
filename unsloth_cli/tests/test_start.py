@@ -3510,9 +3510,7 @@ def test_verify_studio_identity_end_to_end(tmp_path, monkeypatch):
     monkeypatch.setattr(storage, "DB_PATH", tmp_path / "auth.db")
     monkeypatch.setattr(storage, "_identity_secret_cache", None)
 
-    good = lambda nonce, host, port: storage.compute_identity_proof(
-        nonce, host, port
-    )
+    good = lambda nonce, host, port: storage.compute_identity_proof(nonce, host, port)
     bad = lambda nonce, host, port: "00" * 32
     base_ok, stop_ok = _serve_identity(good)
     base_bad, stop_bad = _serve_identity(bad)
@@ -4363,8 +4361,6 @@ def test_connect_explicit_api_key_skips_mint(fake_studio):
     assert not any(c[1].endswith("/api/auth/api-keys") for c in fake_studio)
 
 
-
-
 def test_write_openclaw_config_fresh(tmp_path):
     path = tmp_path / "openclaw.json"
     start.write_openclaw_config(BASE, "sk-unsloth-abc", MODEL, path)
@@ -4540,8 +4536,6 @@ def test_connect_openclaw_no_launch_keeps_explicit_tui(fake_studio):
     )
     assert result.exit_code == 0, result.output
     assert _launch_command(result.output) == ["openclaw", "tui", "--message", "hi"]
-
-
 
 
 def test_write_opencode_config_fresh(tmp_path):
@@ -4983,8 +4977,6 @@ def test_connect_opencode_subagent_yolo_no_launch_stays_append_safe(fake_studio,
     assert _opencode_inline_config(result.output)["permission"] == captured["permission"]
 
 
-
-
 @pytest.fixture()
 def hermes_config(tmp_path):
     return tmp_path / "config.yaml"
@@ -5064,8 +5056,6 @@ def test_connect_hermes_no_launch(fake_studio, tmp_path):
     assert config["providers"]["unsloth"]["base_url"] == f"{BASE}/v1"
     assert config["model"]["default"] == MODEL["id"]
     assert not any(c[1].endswith("/api/inference/status") for c in fake_studio)
-
-
 
 
 def test_write_pi_config_fresh(tmp_path):
@@ -5158,8 +5148,6 @@ def test_connect_pi_no_launch_windows_relocates_userprofile(fake_studio, tmp_pat
     assert f'$env:USERPROFILE = "{home}"' in result.output
 
 
-
-
 def test_wsl_bridge_names_flags_paths_not_scalars():
     # WSLENV only translates a var to a Windows path when its entry carries /p; scalar knobs and URLs must not get it.
     env = {
@@ -5207,7 +5195,6 @@ def test_powershell_quote_single_quotes_json():
     assert quoted == "'" + overlay + "'"
     assert "\\" not in quoted
     assert start._powershell_quote("a'b") == "'a''b'"
-
 
 
 _NATIVE_YOLO = {

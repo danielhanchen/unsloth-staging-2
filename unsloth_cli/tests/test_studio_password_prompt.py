@@ -34,8 +34,6 @@ _BASE = ["--model", "unsloth/Qwen3-1.7B-GGUF"]
 _NEW_PW = "brand-new-password"
 
 
-
-
 @pytest.mark.parametrize(
     "cloudflare,host,secure,api_only,expected",
     [
@@ -63,8 +61,6 @@ def test_should_prompt_password_change_matrix(cloudflare, host, secure, api_only
         )
         is expected
     )
-
-
 
 
 class _ExecCaptured(SystemExit):
@@ -473,8 +469,6 @@ def test_an_ephemeral_multi_address_bind_is_rejected_before_password_or_launch(
     assert result.exit_code == 2, result.output
     assert "--port 0 cannot be used" in result.output
     assert events == []
-
-
 
 
 def test_studio_default_secure_prompts_and_updates_before_reexec(monkeypatch, tmp_path):
@@ -1055,8 +1049,6 @@ def test_studio_default_wildcard_cloudflare_prompts(monkeypatch, tmp_path):
     assert _auth_state(studio_mod)["must_change_password"] == 0
 
 
-
-
 def test_run_secure_prompts_and_updates_before_reexec(monkeypatch, tmp_path):
     studio_mod = _studio()
     events = _install_prompt_env(monkeypatch, tmp_path, interactive = True)
@@ -1485,8 +1477,6 @@ def test_seeded_bootstrap_file_ends_with_a_newline(monkeypatch, tmp_path):
     finally:
         conn.close()
     assert studio_mod._pbkdf2_hex(raw.decode("utf-8").strip(), salt.encode("utf-8")) == pwd_hash
-
-
 
 
 def _exec_argv(events):

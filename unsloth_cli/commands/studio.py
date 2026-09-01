@@ -818,7 +818,6 @@ def _find_frontend_dist() -> Optional[Path]:
     return None
 
 
-
 _direct_http_opener = None
 
 
@@ -1700,8 +1699,6 @@ def _format_context_length_line(load_result: dict) -> Optional[str]:
     return f"  Context length: {value_int} tokens"
 
 
-
-
 @studio_app.callback(invoke_without_command = True)
 def studio_default(
     ctx: typer.Context,
@@ -2076,8 +2073,6 @@ def studio_default(
         typer.echo("\nShutting down...")
     finally:
         getattr(run_mod, "_wait_for_server_shutdown", lambda: None)()
-
-
 
 
 def _split_repo_variant(model_arg: str) -> tuple[str, Optional[str]]:
@@ -2894,7 +2889,6 @@ def run(
         getattr(run_mod, "_wait_for_server_shutdown", lambda: None)()
 
 
-
 _PID_FILE = STUDIO_HOME / "studio.pid"
 PID_FILE_GLOB = "studio-*.pid"
 
@@ -3129,8 +3123,6 @@ def stop():
         _report_unreadable(unreadable)
     if failed or unreadable:
         raise typer.Exit(1)
-
-
 
 
 def _wait_for_windows_setup_process(process) -> int:
@@ -4527,8 +4519,6 @@ class _WindowsLauncherUpdateTransaction:
         finally:
             self._release_lock()
         return False
-
-
 
 
 @studio_app.command("desktop-capabilities", hidden = True)

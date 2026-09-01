@@ -27,8 +27,6 @@ def _studio():
 _BASE = ["--model", "unsloth/Qwen3-1.7B-GGUF"]
 
 
-
-
 def test_run_exposes_secure_option_default_off():
     import inspect
 
@@ -56,8 +54,6 @@ def test_secure_exposes_hidden_not_secure_alias():
         assert "--not-secure" in decls
         assert getattr(opt, "hidden", False) is True
         assert getattr(opt, "default", None) is False
-
-
 
 
 class _ExecCaptured(SystemExit):
@@ -138,8 +134,6 @@ def _invoke_studio_default(monkeypatch, args):
     app.command()(studio_mod.studio_default)
     CliRunner().invoke(app, args, catch_exceptions = True)
     return captured
-
-
 
 
 @pytest.mark.parametrize(
@@ -231,8 +225,6 @@ def test_run_not_secure_alias_respects_last_wins(monkeypatch, argv_order, expect
     assert expected in argv and unexpected not in argv, argv
 
 
-
-
 class _RunServerCaptured(SystemExit):
     def __init__(self, kwargs):
         super().__init__(0)
@@ -294,8 +286,6 @@ def test_run_in_venv_passes_secure_and_forces_host(monkeypatch, tmp_path, stub_t
     assert captured.get("host") == "127.0.0.1", captured
 
 
-
-
 def test_run_secure_rejects_no_cloudflare(monkeypatch):
     studio_mod = _studio()
     import typer as _typer
@@ -318,8 +308,6 @@ def test_studio_default_rejects_secure_with_subcommand():
     assert result.exit_code == 2, result.output
     combined = (result.output or "") + (getattr(result, "stderr", "") or "")
     assert "--secure" in combined, combined
-
-
 
 
 def test_run_secure_resolves_tools_against_loopback(monkeypatch):
@@ -384,8 +372,6 @@ def test_run_secure_enable_tools_no_auto_yes(monkeypatch):
     argv = captured[0]
     assert "--enable-tools" in argv, argv
     assert "--yes" not in argv, argv
-
-
 
 
 def test_studio_default_exposes_enable_tools_option_default_none():
