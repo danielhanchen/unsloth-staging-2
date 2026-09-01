@@ -2,6 +2,10 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { create } from "zustand";
+// Module state outlives a logout, so this store clears with the session. Relative and
+// extensioned like the sibling import below: the store's own test runs under
+// `node --experimental-strip-types`, which does not resolve the `@/` alias.
+import { AUTH_SESSION_CLEARED_EVENT } from "../../auth/session-events.ts";
 import { isTrainingProgressForJob } from "../lib/training-stream-scope.ts";
 import type {
   TrainingMetricsResponse,
@@ -61,6 +65,7 @@ const initialState: TrainingRuntimeState = {
   startError: null,
   startModelName: null,
   startDatasetName: null,
+  startHfToken: null,
   startProjectName: null,
   startFromResume: false,
   sseConnected: false,
@@ -263,10 +268,12 @@ export const useTrainingRuntimeStore = create<TrainingRuntimeStore>()(
       startDatasetName,
       startFromResume = false,
       startProjectName = null,
+      startHfToken = null,
     ) =>
       set({
         startModelName,
         startDatasetName,
+        startHfToken,
         startProjectName,
         startFromResume,
       }),
@@ -602,6 +609,22 @@ export const useTrainingRuntimeStore = create<TrainingRuntimeStore>()(
       }),
   }),
 );
+
+// startHfToken holds a raw Hub credential, and this store is module state that outlives a
+// logout: reconcile() in __root remounts the app rather than reloading the document, so the
+// next account in the same tab would resume progress polling with the previous one's token.
+// useHfTokenStore already clears on this event; the runtime store has to as well.
+if (typeof window !== "undefined") {
+  window.addEventListener(AUTH_SESSION_CLEARED_EVENT, () => {
+    useTrainingRuntimeStore.getState().resetRuntime();
+    useTrainingRuntimeStore.setState({
+      startHfToken: null,
+      startModelName: null,
+      startDatasetName: null,
+      startProjectName: null,
+    });
+  });
+}
 
 export function shouldShowTrainingView(state: TrainingRuntimeStore): boolean {
   return (

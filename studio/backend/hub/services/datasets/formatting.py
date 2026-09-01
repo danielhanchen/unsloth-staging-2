@@ -43,6 +43,8 @@ from hub.utils.paths import (
     normalize_path,
     resolve_dataset_path,
 )
+from hub.utils.hf_tokens import is_anonymous
+from utils.utils import anonymous_and_offline
 from utils.datasets.audio_decode import ensure_audio_decoding
 from utils.paths.path_utils import drop_shadowed_appledouble_names
 
@@ -308,6 +310,15 @@ def _load_any_cached_hf_preview_slice(
     preview_size: int,
     hf_token: Optional[str] = None,
 ):
+    # Both paths below return real rows off disk without asking the Hub anything: the raw
+    # slice reads the snapshot directly, and the processed one loads through
+    # DownloadConfig(local_files_only=True), which never authorizes and drops the sentinel
+    # anyway because `False` is falsy. So a caller denied the ambient credential could name
+    # a private dataset the UI had already cached and read its contents back. Refuse the
+    # whole disk route for that caller; the handler's prefer_local_cache path then answers
+    # 404 rather than serving the rows. A UI session resolves to None and keeps both.
+    if is_anonymous(hf_token):
+        return None
     cached_preview = _load_cached_hf_preview_slice(request, preview_size)
     if cached_preview is not None:
         return cached_preview
@@ -359,6 +370,14 @@ def check_format_response(
         if not dataset_exists and _is_local_dataset_ref(request.dataset_name):
             raise HTTPException(status_code = 404, detail = _MISSING_DATASET_DETAIL)
 
+        # Offline, `datasets` answers a streaming load from its own cache without ever
+        # authorizing, and Tier 2 below runs on the default prefer_local_cache=false, so
+        # it would return rows before the cached-preview guard is ever consulted.
+        if anonymous_and_offline(hf_token) and not dataset_exists:
+            raise HTTPException(
+                status_code = 404,
+                detail = "This request cannot be authorized without network access.",
+            )
         if dataset_exists:
             train_split = request.train_split or "train"
             preview_slice, total_rows = _load_local_preview_slice(
@@ -391,11 +410,14 @@ def check_format_response(
                 try:
                     from huggingface_hub import HfApi
 
+                    # No token on the constructor: list_repo_files below is given the
+                    # credential explicitly and that argument wins, so passing it twice
+                    # only adds a second way for the call to be built wrong.
                     api = HfApi()
                     repo_files = api.list_repo_files(
                         request.dataset_name,
                         repo_type = "dataset",
-                        token = hf_token or None,
+                        token = hf_token,
                     )
                     train_split = request.train_split or "train"
                     first_file = _select_tier1_repo_file(
@@ -411,9 +433,8 @@ def check_format_response(
                             "data_files": {train_split: [first_file]},
                             "split": train_split,
                             "streaming": True,
+                            "token": hf_token,
                         }
-                        if hf_token:
-                            load_kwargs["token"] = hf_token
 
                         streamed_ds = load_dataset(**load_kwargs)
                         rows = list(islice(streamed_ds, PREVIEW_SIZE))
@@ -433,11 +454,10 @@ def check_format_response(
                         "path": request.dataset_name,
                         "split": request.train_split or "train",
                         "streaming": True,
+                        "token": hf_token,
                     }
                     if request.subset:
                         load_kwargs["name"] = request.subset
-                    if hf_token:
-                        load_kwargs["token"] = hf_token
 
                     streamed_ds = load_dataset(**load_kwargs)
 
