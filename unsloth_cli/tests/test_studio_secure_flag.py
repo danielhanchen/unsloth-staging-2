@@ -27,7 +27,6 @@ def _studio():
 _BASE = ["--model", "unsloth/Qwen3-1.7B-GGUF"]
 
 
-# ── option registration ──────────────────────────────────────────────
 
 
 def test_run_exposes_secure_option_default_off():
@@ -59,7 +58,6 @@ def test_secure_exposes_hidden_not_secure_alias():
         assert getattr(opt, "default", None) is False
 
 
-# ── re-exec capture plumbing (mirrors test_studio_cloudflare_flag.py) ─
 
 
 class _ExecCaptured(SystemExit):
@@ -74,8 +72,7 @@ def _install_run_reexec_capture(monkeypatch):
     monkeypatch.setattr(sys, "prefix", "/nonexistent/outer/venv")
     fake_venv = Path("/fake/studio/venv/unsloth_studio")
     monkeypatch.setattr(studio_mod, "_studio_venv_python", lambda: fake_venv / "bin" / "python")
-    # A built frontend dist is present so the public-launch UI check passes
-    # deterministically (independent of whether the repo dist was built).
+    # A built frontend dist is present so the public-launch UI check passes deterministically.
     monkeypatch.setattr(
         studio_mod, "_find_frontend_dist", lambda: Path("/fake/studio/frontend/dist")
     )
@@ -125,8 +122,8 @@ def _invoke_studio_default(monkeypatch, args):
     fake_venv = Path("/fake/studio/venv/unsloth_studio")
     monkeypatch.setattr(studio_mod, "_studio_venv_python", lambda: fake_venv / "bin" / "python")
     monkeypatch.setattr(studio_mod, "_find_run_py", lambda: Path("/fake/studio/run.py"))
-    # A built frontend dist is present so the public-launch UI check passes; this
-    # suite exercises flag forwarding, not the missing-dist lockout guard.
+    # A built frontend dist is present so the public-launch UI check passes; this suite exercises flag
+    # forwarding, not the missing-dist lockout guard.
     monkeypatch.setattr(
         studio_mod, "_find_frontend_dist", lambda: Path("/fake/studio/frontend/dist")
     )
@@ -143,7 +140,6 @@ def _invoke_studio_default(monkeypatch, args):
     return captured
 
 
-# ── re-exec forwarding ────────────────────────────────────────────────
 
 
 @pytest.mark.parametrize(
@@ -182,8 +178,8 @@ def test_studio_default_reexec_forwards_secure(monkeypatch):
 
 
 def test_run_secure_warns_when_host_overridden(monkeypatch):
-    # -H 0.0.0.0 --secure forces the loopback bind; warn (not error) that -H is
-    # ignored so it does not silently read as "secure and on the network".
+    # -H 0.0.0.0 --secure forces the loopback bind; warn (not error) that -H is ignored so it does not
+    # silently read as "secure and on the network".
     import typer as _typer
 
     _install_run_reexec_capture(monkeypatch)
@@ -221,8 +217,8 @@ def test_studio_default_not_secure_alias_forwards_no_secure(monkeypatch):
 @pytest.mark.parametrize(
     "argv_order,expected,unexpected",
     [
-        # --not-secure tracks --no-secure: the last secure flag on argv wins,
-        # matching the backend BooleanOptionalAction.
+        # --not-secure tracks --no-secure: the last secure flag on argv wins, matching the backend
+        # BooleanOptionalAction.
         (["--secure", "--not-secure"], "--no-secure", "--secure"),
         (["--not-secure", "--secure"], "--secure", "--no-secure"),
     ],
@@ -235,7 +231,6 @@ def test_run_not_secure_alias_respects_last_wins(monkeypatch, argv_order, expect
     assert expected in argv and unexpected not in argv, argv
 
 
-# ── in-venv path forwards secure + forced host into run_server ────────
 
 
 class _RunServerCaptured(SystemExit):
@@ -248,10 +243,9 @@ def test_run_in_venv_passes_secure_and_forces_host(monkeypatch, tmp_path, stub_t
     import types
 
     studio_mod = _studio()
-    # Real STUDIO_HOME with an already-changed admin (must_change_password=0) so
-    # the pre-exposure gate is a no-op and the in-venv path reaches run_server.
-    # (The gate now fails closed if it cannot open the auth DB, so a fake path
-    # would refuse the launch before this assertion.)
+    # Real STUDIO_HOME with an already-changed admin (must_change_password=0) so the pre-exposure gate
+    # is a no-op and the in-venv path reaches run_server. The gate now fails closed if it cannot open
+    # the auth DB, so a fake path would refuse the launch first.
     monkeypatch.setattr(studio_mod, "STUDIO_HOME", tmp_path)
     _seed = studio_mod._connect_auth_db()
     studio_mod._ensure_cli_default_admin(_seed)
@@ -261,8 +255,8 @@ def test_run_in_venv_passes_secure_and_forces_host(monkeypatch, tmp_path, stub_t
 
     fake_venv = tmp_path / "unsloth_studio"
     monkeypatch.setattr(sys, "prefix", str(fake_venv))
-    # A built dist is not present in a fresh clone, and without it the public
-    # launch gate exits before run_server is ever reached.
+    # A built dist is not present in a fresh clone, and without it the public launch gate exits before
+    # run_server is ever reached.
     monkeypatch.setattr(
         studio_mod, "_find_frontend_dist", lambda: Path("/fake/studio/frontend/dist")
     )
@@ -300,7 +294,6 @@ def test_run_in_venv_passes_secure_and_forces_host(monkeypatch, tmp_path, stub_t
     assert captured.get("host") == "127.0.0.1", captured
 
 
-# ── --secure + --no-cloudflare is rejected ───────────────────────────
 
 
 def test_run_secure_rejects_no_cloudflare(monkeypatch):
@@ -327,19 +320,17 @@ def test_studio_default_rejects_secure_with_subcommand():
     assert "--secure" in combined, combined
 
 
-# ── secure resolves tools against the loopback bind (no flag -> no override) ──
 
 
 def test_run_secure_resolves_tools_against_loopback(monkeypatch):
-    # --secure is a loopback bind behind an authenticated tunnel, so tools resolve
-    # against 127.0.0.1. With no flag the resolver returns None, and the child gets
-    # neither --enable-tools nor --disable-tools (per-request enable_tools decides).
+    # --secure is a loopback bind behind an authenticated tunnel, so tools resolve against 127.0.0.1.
+    # With no flag the resolver returns None and the child gets neither --enable-tools nor
+    # --disable-tools (per-request enable_tools decides).
     studio_mod = _studio()
     monkeypatch.setattr(sys, "prefix", "/nonexistent/outer/venv")
     fake_venv = Path("/fake/studio/venv/unsloth_studio")
     monkeypatch.setattr(studio_mod, "_studio_venv_python", lambda: fake_venv / "bin" / "python")
-    # A built frontend dist is present so the public-launch UI check passes
-    # deterministically (independent of whether the repo dist was built).
+    # A built frontend dist is present so the public-launch UI check passes deterministically.
     monkeypatch.setattr(
         studio_mod, "_find_frontend_dist", lambda: Path("/fake/studio/frontend/dist")
     )
@@ -386,8 +377,8 @@ def test_run_secure_resolves_tools_against_loopback(monkeypatch):
 
 
 def test_run_secure_enable_tools_no_auto_yes(monkeypatch):
-    # No prompt now, so a secure --enable-tools forwards --enable-tools but not
-    # --yes (only an explicit --yes is forwarded).
+    # No prompt now, so a secure --enable-tools forwards --enable-tools but not --yes (only an explicit
+    # --yes is forwarded).
     captured = _invoke_run(monkeypatch, _BASE + ["-H", "0.0.0.0", "--secure", "--enable-tools"])
     assert len(captured) == 1, captured
     argv = captured[0]
@@ -395,7 +386,6 @@ def test_run_secure_enable_tools_no_auto_yes(monkeypatch):
     assert "--yes" not in argv, argv
 
 
-# ── plain `unsloth studio` exposes + forwards --enable-tools/--disable-tools ──
 
 
 def test_studio_default_exposes_enable_tools_option_default_none():
