@@ -1,0 +1,78 @@
+name: "staging-9152 spoof fedora amd host"
+on:
+  push:
+    branches: ["pr-9152-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  spoof-linux:
+    name: "spoof fedora amd (${{ matrix.shellname }})"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        shellname: [bash, dash]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: What this runner really is
+        run: |
+          uname -a
+          echo "--- version sources actually present on the runner:"
+          for c in rocminfo amd-smi hipconfig rpm dpkg-query nvidia-smi lspci; do
+            printf '%-12s %s\n' "$c" "$(command -v "$c" 2>/dev/null || echo '(absent)')"
+          done
+          echo "--- AMD kernel interfaces actually present:"
+          ls -ld /dev/kfd /sys/class/kfd /sys/bus/pci/devices /opt/rocm 2>&1 || true
+      - name: Resolve the shell under test
+        run: |
+          if [ "${{ matrix.shellname }}" = dash ]; then
+            command -v dash >/dev/null 2>&1 || { sudo apt-get update -qq; sudo apt-get install -y -qq dash; }
+            SH=$(command -v dash)
+          else
+            SH=$(command -v bash)
+          fi
+          echo "SPOOF_SHELL=$SH" >> "$GITHUB_ENV"
+          "$SH" --version 2>&1 | head -1 || true
+      - name: Unit suite (42 assertions)
+        run: "$SPOOF_SHELL" tests/sh/test_rocm_no_version_arch_route.sh
+      - name: End-to-end reroute suite (21 assertions, executes the decision)
+        run: "$SPOOF_SHELL" tests/sh/test_rocm_no_version_arch_route_e2e.sh
+      - name: Spoofed Fedora/Bazzite host table
+        run: "$SPOOF_SHELL" .github/spoof/spoof_fedora_amd_host_table.sh
+      # test_torch_constraint.sh is deliberately absent: its one dash-only failure is about
+      # install.ps1, which this PR does not touch, and it fails identically on origin/main.
+      - name: Adjacent AMD routing suites
+        run: |
+          for t in tests/sh/test_rocm_version_source_disagreement.sh \
+                   tests/sh/test_get_torch_index_url.sh \
+                   tests/sh/test_strixhalo_wsl_reroute.sh; do
+            echo "### $t"
+            "$SPOOF_SHELL" "$t"
+          done
+
+  spoof-macos:
+    name: "spoof fedora amd (macos-14, bash)"
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: What this runner really is
+        run: uname -a
+      - name: Spoofed host table under BSD userland
+        env:
+          SPOOF_SHELL: /bin/bash
+        run: /bin/bash .github/spoof/spoof_fedora_amd_host_table.sh
