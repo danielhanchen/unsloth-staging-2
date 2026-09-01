@@ -154,8 +154,7 @@ def sandbox_is_referenced_elsewhere(
         return False
     conn = get_connection()
     try:
-        # The LIKE only narrows, on the id as JSON writes it, so a quote or a
-        # backslash is still found. Every hit is parsed and the id has to be a
+        # The LIKE only narrows, on the id as JSON writes it, so every hit is parsed and the id has to be a
         # sessionId value: a short one is a substring of ordinary prose.
         escaped = json.dumps(session_id)[1:-1]
         rows = conn.execute(
@@ -170,9 +169,8 @@ def sandbox_is_referenced_elsewhere(
                 return True
         return False
     except sqlite3.Error:
-        # A locked database is not an answer, and every caller reads False as
-        # "nothing shows these files any more" before deleting them. Kept, so
-        # the worst case is a folder collected on the next delete.
+        # A locked database is not an answer, and every caller reads False as "nothing shows these files any
+        # more" before deleting them, so the worst case is a folder collected on the next delete.
         logger.warning("Could not check references for sandbox %s; keeping it", session_id)
         return True
     finally:
@@ -293,7 +291,6 @@ def _replace_inventory_update_trigger(conn: sqlite3.Connection) -> None:
         (_INVENTORY_UPDATE_TRIGGER,),
     ).fetchone()
     # row[0], not row["sql"]: _ensure_schema also runs on connections whose row_factory
-    # is still the default tuple.
     if row is not None and "UPDATE OF" in (row[0] or ""):
         return
     if conn.in_transaction:
@@ -446,14 +443,11 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE chat_threads ADD COLUMN settings_json TEXT")
     if "model_gguf_variant" not in chat_thread_cols:
         conn.execute("ALTER TABLE chat_threads ADD COLUMN model_gguf_variant TEXT")
-    # Orders one writer's snapshot writes against its own earlier ones. A tab closing
-    # sends its last edit keepalive, which can overtake a PATCH already accepted by the
-    # server, and no client-side cancel reaches a handler that is already running: the
-    # older write has to be refused here. Scoped to the writer that sent it, so two
-    # browsers are never ordered against each other; see write_chat_thread_settings.
-    # {writer id: highest seq seen from it}. One writer and one seq is not enough: a
-    # write from another tab overwrites them, and the delayed request the ordering exists
-    # to refuse is then compared against a watermark that is no longer its own.
+    # Orders one writer's snapshot writes against its own earlier ones: a closing tab's last keepalive
+    # can overtake a PATCH already accepted. Scoped to the writer, so two browsers are never ordered
+    # against each other.
+    # One writer and one seq is not enough: a write from another tab overwrites them, and the delayed
+    # request this exists to refuse is then compared against a watermark that is no longer its own.
     if "settings_seqs" not in chat_thread_cols:
         conn.execute("ALTER TABLE chat_threads ADD COLUMN settings_seqs TEXT")
     if "project_id" not in chat_thread_cols:
@@ -510,13 +504,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE chat_clear_operations ADD COLUMN deleted_thread_ids_json TEXT NOT NULL DEFAULT '[]'"
         )
-    # The thumbnail reap happens AFTER this transaction commits, behind seconds of archive and
-    # sandbox cleanup. A crash in that window leaves the operation recorded and the cache
-    # unreaped, and the retry that follows replays -- skipping the one cleanup that had not
-    # run. These two columns let the replay finish it: the ids the original clear was
-    # responsible for, and whether the reap has since completed. NULL in either means the
-    # answer is unknown (a row written by an older build), which is treated as done, since a
-    # replay must never reap on a guess.
+    # The thumbnail reap happens after this transaction commits, so a crash in that window leaves the
+    # operation recorded and the cache unreaped. These two columns let the replay finish it; NULL in
+    # either is treated as done, since a replay must never reap on a guess.
     if "reapable_image_ids_json" not in chat_clear_operation_cols:
         conn.execute("ALTER TABLE chat_clear_operations ADD COLUMN reapable_image_ids_json TEXT")
     if "caches_cleared_at" not in chat_clear_operation_cols:
@@ -560,8 +550,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             row[2] for row in conn.execute("PRAGMA foreign_key_list(chat_attachment_tombstones)")
         }
         if "thread_id" not in tombstone_columns or "chat_threads" not in tombstone_fk_targets:
-            # The first implementation cascaded through chat_messages, which erased deletion knowledge
-            # during pruneMissing. Rebuild once, retaining every tombstone whose thread still exists.
+            # The first implementation cascaded through chat_messages, which erased deletion knowledge during
+            # pruneMissing; rebuild once, retaining every tombstone whose thread still exists.
             conn.execute("SAVEPOINT migrate_chat_attachment_tombstones")
             try:
                 conn.execute(
@@ -645,9 +635,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         END
         """
     )
-    # Scoped to the columns _rebuild_chat_attachment_inventory reads: unscoped, a generation
-    # status change (metadata_json only) dirtied the inventory, so the next autosave re-hashed
-    # every attachment under the writer lock. Dropped, since a create would keep the old one.
+    # Scoped to the columns _rebuild_chat_attachment_inventory reads: unscoped, a generation status
+    # change (metadata_json only) dirtied the inventory and the next autosave re-hashed every
+    # attachment.
     _replace_inventory_update_trigger(conn)
     conn.execute(
         """
@@ -700,8 +690,8 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    # Import ledger inside studio.db (vs a localStorage boolean) so a db wipe re-triggers the
-    # legacy Dexie import instead of silently hiding threads. Keyed by legacy thread id.
+    # The import ledger lives in studio.db rather than a localStorage boolean so a db wipe re-triggers
+    # the legacy Dexie import instead of silently hiding threads.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS chat_legacy_imports (
@@ -1205,8 +1195,8 @@ def is_sqlite_busy_error(exc: sqlite3.OperationalError) -> bool:
 # sqlite's own default, kept for every caller that may run on the event loop
 _BUSY_TIMEOUT_SECONDS = 5.0
 
-# only for the chat history transactions that run in Starlette's threadpool, where a large clear
-# can hold the writer lock past the default and the failure escapes as an unmapped 500
+# Only for the chat history transactions in Starlette's threadpool, where a large clear can hold the
+# writer lock past the default and the failure escapes as an unmapped 500.
 _CONTENDED_BUSY_TIMEOUT_SECONDS = 30.0
 
 
@@ -1263,27 +1253,24 @@ def get_connection(
     return conn
 
 
-# Every accessor here opens and closes its own connection, so a writer is routinely the last
-# WAL participant, and sqlite checkpoints the WAL back into studio.db on that close. At the
-# durable chat stream's flush cadence that is several rewrites a second (#9934).
+# Every accessor opens and closes its own connection, so a writer is routinely the last WAL
+# participant and sqlite checkpoints the WAL back into studio.db on that close: several rewrites
+# a second at the durable stream's flush cadence (#9934).
 _wal_keeper: sqlite3.Connection | None = None
 _wal_keeper_lock = threading.Lock()
 
 
 def open_wal_keeper() -> bool:
     """Hold this database's WAL open for the process. Returns whether a keeper is engaged."""
-    # Replace rather than inherit: a keeper from an earlier lifespan can belong to another
-    # database or a dead thread, and reusing it would keep nothing for the current one.
+    # Replace rather than inherit: a keeper from an earlier lifespan can belong to another database or a dead thread.
     close_wal_keeper()
     global _wal_keeper
     with _wal_keeper_lock:
-        # Only ever runs the pragma below, on this thread. check_same_thread is off so a
-        # keeper stranded by an earlier lifespan can still be closed from this one.
+        # check_same_thread is off so a keeper stranded by an earlier lifespan can still be closed from this one.
         conn = get_connection(check_same_thread = False)
         try:
-            # What is in force, not what was asked for: journal_mode=WAL declines silently
-            # on filesystems without shared-memory support and persists in the file. Nothing
-            # to hold open there, so those installs go without, as _apply_wal_synchronous.
+            # What is in force, not what was asked for: journal_mode=WAL declines silently on filesystems
+            # without shared-memory support, and those installs have nothing to hold open.
             mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         except (sqlite3.Error, TypeError, IndexError) as exc:
             conn.close()
@@ -1735,8 +1722,8 @@ def delete_run(id: str) -> None:
             (id,),
         ).fetchone()
         if source is not None:
-            # Keep an explicit resume chain connected when its middle row is removed: the surviving tail
-            # still carries the source's cumulative counters, so profile totals must trace it.
+            # Keep an explicit resume chain connected when its middle row is removed: the surviving tail still
+            # carries the source's cumulative counters.
             conn.execute(
                 """
                 UPDATE training_runs
@@ -1811,9 +1798,8 @@ def add_scan_folder_with_status(path: str) -> tuple[dict, bool]:
         raise ValueError("Path does not exist")
     if not os.path.isdir(normalized):
         raise ValueError("Path must be a directory, not a file")
-    # Reject a local filesystem root ("/", or a bare "C:\\"): registering one seeds the browse
-    # allowlist above denied system dirs. A UNC share root has none under it, so it stays
-    # allowed (it was registerable before this guard). Mirrors scan_folders.py.
+    # Reject a local filesystem root: registering one seeds the browse allowlist above denied system
+    # dirs. A UNC share root has none under it and stays allowed. Mirrors scan_folders.py.
     if is_local_filesystem_root(normalized):
         raise ValueError("The filesystem root cannot be registered")
     if _contains_sensitive_path_component(normalized):
@@ -1828,9 +1814,8 @@ def add_scan_folder_with_status(path: str) -> tuple[dict, bool]:
                 continue
             raise ValueError(f"Path under {prefix} is not allowed")
 
-    # Last, so a denied path is never opened: os.access alone passes on folders
-    # macOS TCC or a Windows ACL still refuses at scan time, which is how a
-    # registered folder ends up looking empty instead of blocked.
+    # Last, so a denied path is never opened: os.access alone passes on folders macOS TCC or a Windows
+    # ACL still refuses at scan time, so a registered folder looks empty instead of blocked.
     if not is_readable_dir(normalized):
         raise ValueError("Path is not readable")
 
@@ -1859,7 +1844,7 @@ def add_scan_folder_with_status(path: str) -> tuple[dict, bool]:
             conn.commit()
             inserted = True
         except sqlite3.IntegrityError:
-            pass  # duplicate; fall through to SELECT
+            pass
         # Same collation as the pre-check to catch concurrent writes (Windows).
         fallback_sql = (
             "SELECT id, path, created_at FROM scan_folders WHERE path = ? COLLATE NOCASE"
@@ -2033,8 +2018,8 @@ class ChatThreadPreconditionFailed(Exception):
     """The thread changed between the caller reading it and writing it."""
 
 
-# Same order the title migration picks its opening message in.
-# Watermarks kept per thread, one per tab that has written its settings.
+# Same order the title migration picks its opening message in. Watermarks kept per thread, one per tab that has
+# written its settings.
 _MAX_SETTINGS_WRITERS = 32
 
 _OPENING_USER_MESSAGE = """(
@@ -2097,8 +2082,8 @@ def update_chat_thread(
 
     conn = get_connection()
     try:
-        # The snapshot rides in the same transaction as the guarded metadata write, or a
-        # rejected precondition returns 409 with the settings change already committed.
+        # The snapshot rides in the same transaction as the guarded metadata write, or a rejected
+        # precondition returns 409 with the settings change already committed.
         conn.execute("BEGIN IMMEDIATE")
         # Guards ride in the WHERE clause, so check and write are one statement.
         where = ["id = ?"]
@@ -2169,18 +2154,14 @@ def _write_chat_thread_settings_in_conn(
     if seq is not None and writer is not None:
         seen = seqs.get(writer)
         if isinstance(seen, int) and seq <= seen:
-            # This writer has already had a newer snapshot stored; this one is the
-            # straggler. Held per writer, so a write from another tab in between does
-            # not wipe the watermark this comparison depends on.
+            # This writer already had a newer snapshot stored, so this one is the straggler. Held per writer, so
+            # a write from another tab does not wipe the watermark this comparison depends on.
             return False
         # Re-inserted, not just assigned, so this writer moves to the end and the map
-        # stays in least-recently-used order.
         seqs.pop(writer, None)
         seqs[writer] = seq
-        # One entry per tab that has ever written, so bound it. Evicted by last use and
-        # never by counter: every session starts its own counter at 1, so comparing them
-        # across writers would throw out the newest tab and keep long-dead ones, leaving
-        # the active writer with no watermark for its own stragglers to be refused by.
+        # Bounded, and evicted by last use rather than by counter: every session starts its counter at 1,
+        # so comparing across writers would throw out the newest tab.
         while len(seqs) > _MAX_SETTINGS_WRITERS:
             seqs.pop(next(iter(seqs)))
     stored = _json_loads(row["settings_json"], None)
@@ -2363,8 +2344,8 @@ def _tombstone_chat_threads(conn: sqlite3.Connection, thread_ids: Iterable[str])
     )
 
 
-# Only these states can already own a worker. Queued, paused, and approval rows are removed before
-# they can be claimed, so signalling them would only leave unused supervisor cancellation events.
+# Only these states can already own a worker: queued, paused and approval rows are removed before
+# they can be claimed, so signalling them would leave unused cancellation events.
 _ACTIVE_RESEARCH_RUN_STATUSES = (
     "planning",
     "running",
@@ -2375,9 +2356,8 @@ _ACTIVE_RESEARCH_RUN_STATUSES = (
 def _active_research_run_ids(
     conn: sqlite3.Connection, thread_ids: set[str] | None = None
 ) -> list[str]:
-    # lease_owner is the other half of "can already own a worker": a planning run that no worker
-    # has claimed yet never will once its row is gone, and signalling it would leave a
-    # cancellation event in the supervisor that nothing is left to consume.
+    # lease_owner is the other half of "can already own a worker": a planning run no worker has
+    # claimed never will once its row is gone, and signalling it would leave nothing consuming it.
     status_placeholders = ",".join("?" for _ in _ACTIVE_RESEARCH_RUN_STATUSES)
     if thread_ids is None:
         rows = conn.execute(
@@ -2441,8 +2421,8 @@ def delete_chat_threads_with_active_runs(ids: list[str]) -> tuple[list[str], lis
         active_research_run_ids = _active_research_run_ids(conn, thread_ids)
         active_chat_run_ids = _active_chat_generation_run_ids(conn, thread_ids)
         _reparent_surviving_forks(conn, thread_ids)
-        # Record the delete even when no row exists yet. A late POST carrying the same unique id
-        # must not recreate a thread after this request has confirmed deletion.
+        # Record the delete even when no row exists yet: a late POST carrying the same unique id must not
+        # recreate a thread after this request confirmed deletion.
         _tombstone_chat_threads(conn, thread_ids)
         conn.executemany(
             "DELETE FROM chat_attachment_tombstones WHERE thread_id = ?",
@@ -2619,8 +2599,8 @@ def clear_chat_history_with_replay_status(
             ).fetchone()
             if completed is not None:
                 conn.commit()
-                # The original request already signalled its workers. Replaying that signal can
-                # leave a cancellation event behind after the worker has exited.
+                # The original request already signalled its workers, and replaying that signal can leave a
+                # cancellation event behind after the worker has exited.
                 replay = (list(json.loads(completed["deleted_thread_ids_json"])), [])
                 return (*replay, [], True) if include_chat_generation_runs else (*replay, True)
         _ensure_chat_attachment_inventory_current(conn)
@@ -2746,11 +2726,8 @@ def ensure_chat_project_workspace(id: str) -> Optional[dict]:
         return None
     root_path = project.get("rootPath") or _default_project_root(project)
     root_path = _ensure_project_workspace(root_path)
-    # a delete running in another threadpool worker can drop the row at any point before the
-    # directory is created, so confirm the project outlived the create rather than trusting a
-    # pre-create snapshot. Removing the directory here is not this function's call: only the
-    # delete path knows whether the user asked to keep the files, and the row may have had a
-    # populated workspace already. An empty directory left behind is the cheaper outcome.
+    # A delete running in another threadpool worker can drop the row before the directory is created, so
+    # confirm the project outlived the create.
     project = get_chat_project(id)
     if project is None:
         return None
@@ -2806,9 +2783,8 @@ def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
                 (id,),
             )
         }
-        # Read before the cascade removes them: afterwards nothing can tell the
-        # supervisor which runs to stop, and a worker keeps doing model, web and
-        # RAG work for a project that is gone.
+        # Read before the cascade removes them: afterwards nothing can tell the supervisor which runs to
+        # stop, and a worker keeps doing model, web and RAG work for a project that is gone.
         active_runs = (
             [
                 row["id"]
@@ -2827,8 +2803,8 @@ def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
         )
         active_chat_runs = _active_chat_generation_run_ids(conn, thread_ids)
         _reparent_surviving_forks(conn, thread_ids)
-        # Fence the exact membership selected by this transaction so a late writer cannot
-        # recreate a project member after the project and its workspace are gone.
+        # Fence the exact membership selected by this transaction so a late writer cannot recreate a project
+        # member after the project and its workspace are gone.
         _tombstone_chat_threads(conn, thread_ids)
         conn.execute("DELETE FROM chat_threads WHERE project_id = ?", (id,))
         conn.execute("DELETE FROM chat_projects WHERE id = ?", (id,))
@@ -2836,8 +2812,8 @@ def delete_chat_project(id: str, delete_files: bool = False) -> Optional[dict]:
         conn.commit()
         if delete_files:
             _delete_project_workspace(project)
-        # The membership this transaction actually deleted, which is not the
-        # caller's earlier listing when a chat was moved in between the two.
+        # The membership this transaction actually deleted, which is not the caller's earlier listing when a
+        # chat was moved in between.
         project = dict(project)
         project["memberIds"] = sorted(thread_ids)
         project["activeResearchRunIds"] = active_runs
@@ -3068,8 +3044,8 @@ def _surviving_parent_id(
             (thread_id, str(parent)),
         ).fetchone()
         parent = row["parent_id"] if row is not None else None
-    # Normalized the way the caller reads parentId (`or None`), so an empty stored parent_id
-    # cannot make the two disagree, and a self-link left by a corrupt chain resolves to the root.
+    # Normalized the way the caller reads parentId, so an empty stored parent_id cannot make the two
+    # disagree and a self-link left by a corrupt chain resolves to the root.
     survivor = str(parent) if parent else None
     return None if survivor == message_id else survivor
 
@@ -3096,14 +3072,13 @@ def _research_message_would_change(
     sent_parent = message.get("parentId") or None
     parent_changed = sent_parent != stored_parent
     if parent_changed and stored_parent is not None and str(stored_parent) in pruned:
-        # The same sync is deleting this message's parent, so the client is repairing a link this
-        # request is about to break rather than editing a protected message. Only the relink the
-        # server itself would compute is accepted; anything else is still a rejected edit.
+        # The same sync is deleting this message's parent, so the client is repairing a link this request
+        # is about to break rather than editing a protected message; only the server's own relink is
+        # accepted.
         parent_changed = sent_parent != _surviving_parent_id(conn, thread_id, message_id, pruned)
 
     # created_at is compared too: without it a client could re-upsert a protected message with an
-    # unchanged body but a different timestamp and silently reorder the research prompt/response
-    # pair. Absent createdAt defaults to the stored value (a no-op re-sync).
+    # unchanged body but a different timestamp and silently reorder the research prompt/response pair.
     return (
         canon(message.get("content", [])) != canon(json.loads(row["content_json"] or "[]"))
         or canon(message.get("metadata"))
@@ -3172,9 +3147,8 @@ def _safe_generation_assistant_update(
     ) != json.dumps(json.loads(row["content_json"] or "[]"), sort_keys = True):
         return False
 
-    # A settled terminal row is immutable. Repeated repository syncs may send
-    # the exact row again, but an old tab must not erase authoritative finish
-    # metadata or replace it with an earlier view at the same cursor.
+    # A settled terminal row is immutable: repeated syncs may send the exact row again, but an old tab
+    # must not erase authoritative finish metadata or replace it with an earlier view.
     if stored.get("generationSettled") is True:
         return incoming == stored
 
@@ -3186,8 +3160,8 @@ def _safe_generation_assistant_update(
     if run_status in _GENERATION_TERMINAL_STATUSES and incoming_status != run_status:
         return False
     if run_status in _GENERATION_TERMINAL_STATUSES:
-        # Terminal settlement may add client timing/details, but it must retain
-        # every field already persisted by the producer (especially incomplete).
+        # Terminal settlement may add client timing and details, but it must retain every field already
+        # persisted by the producer, especially incomplete.
         for key in stored:
             if key not in incoming:
                 return False
@@ -3673,25 +3647,23 @@ def sync_chat_messages(
     try:
         conn.execute("BEGIN IMMEDIATE")
         _ensure_chat_attachment_inventory_current(conn)
-        # Dropping a stale tab's view of a tombstoned run is a content decision, not a delete
-        # one. Once an edit detaches an assistant, the run row is gone, so the id no longer
-        # counts as generation-linked and nothing else would hold it back from the prune below.
+        # Dropping a stale tab's view of a tombstoned run is a content decision, not a delete one: once an
+        # edit detaches an assistant the run row is gone, so the id is no longer generation-linked.
         tombstoned_ids = {
             str(message["id"])
             for message in messages
             if _references_tombstoned_generation(conn, message)
         }
         messages = [message for message in messages if str(message["id"]) not in tombstoned_ids]
-        # Generation-linked messages are server-managed: keep the record rather than reject the
-        # batch on client drift. No _guard_research_messages call here as a result -- these ids
-        # never reach it. upsert_chat_message still guards, so the single-message route keeps
-        # rejecting edits.
+        # Generation-linked messages are server-managed: keep the record rather than reject the batch on
+        # client drift. No _guard_research_messages call as a result; upsert_chat_message still guards, so
+        # the single-message route keeps rejecting edits.
         research_ids = _research_message_ids(conn, thread_id)
         generation_ids = _generation_message_ids(conn, thread_id)
         managed_ids = research_ids | generation_ids
         requested_ids = {str(m["id"]) for m in messages}
-        # Snapshot pruning is not delete intent: terminal generation messages may be absent from
-        # a stale client snapshot and must survive unless the delete flow names them explicitly.
+        # Snapshot pruning is not delete intent: terminal generation messages may be absent from a stale
+        # client snapshot and must survive unless the delete flow names them explicitly.
         explicitly_deleted_ids = {str(message_id) for message_id in deleted_message_ids}
         explicitly_deleted_terminal_ids = explicitly_deleted_ids & _terminal_generation_message_ids(
             conn, thread_id
@@ -3701,10 +3673,7 @@ def sync_chat_messages(
             | (generation_ids - explicitly_deleted_terminal_ids)
             | (tombstoned_ids - explicitly_deleted_ids)
         )
-        # The rows this sync will delete, computed before the upsert so a relink forced by
-        # that deletion can be told apart from an edit. Research ids are subtracted because
-        # the delete below exempts them: counting one as pruned would walk the reseat past a
-        # parent that actually survives, detaching a research turn from its own prompt.
+        # Computed before the upsert so a relink forced by that deletion can be told apart from an edit.
         pruned: set = set()
         if prune_missing:
             pruned = (
@@ -3728,14 +3697,11 @@ def sync_chat_messages(
                 and _safe_generation_assistant_update(conn, thread_id, m)
             )
         ]
-        # Content is dropped, structure is not: the prune below can delete a research
-        # message's parent, and a dangling parent makes the whole thread unimportable. The
-        # replacement is walked from the stored chain, never taken from the client.
-        #
-        # Candidates come from managed_ids rather than `protected` because the delete exempts
-        # research rows whatever allow_research_update says, so a narrower set would leave one
-        # dangling. Ids the batch itself writes are excluded: an authorized caller reparenting
-        # a research row must not have that overwritten by the repair.
+        # Content is dropped, structure is not: the prune can delete a research message's parent, and a
+        # dangling parent makes the whole thread unimportable.
+        # Candidates come from managed_ids rather than `protected`, since the delete exempts research rows
+        # whatever allow_research_update says; ids the batch writes are excluded so an authorized reparent
+        # is not overwritten.
         reseat_candidates = managed_ids - {str(m["id"]) for m in messages}
         reseat_parents = {
             message_id: _surviving_parent_id(conn, thread_id, message_id, pruned)
@@ -3806,8 +3772,7 @@ def sync_chat_messages(
                     (thread_id,),
                 ).fetchall()
             }
-            # Update permission is not delete permission: prune-exempt even for
-            # allow_research_update callers.
+            # Update permission is not delete permission: prune-exempt even for allow_research_update callers.
             missing_ids = sorted(existing_ids - requested_ids - prune_protected_ids)
             for start in range(0, len(missing_ids), _SQLITE_IN_CHUNK_SIZE):
                 chunk = missing_ids[start : start + _SQLITE_IN_CHUNK_SIZE]
@@ -3970,7 +3935,7 @@ def fork_chat_thread(
                 "SELECT * FROM chat_messages WHERE thread_id = ? AND id = ?",
                 (source_thread_id, parent),
             ).fetchone()
-        ancestry.reverse()  # root .. branch msg
+        ancestry.reverse()
         id_map: dict[str, str] = {row["id"]: id_factory() for row in ancestry}
         src_dict = dict(src)
         conn.execute(
@@ -3987,7 +3952,7 @@ def fork_chat_thread(
                 src_dict["model_type"],
                 src_dict.get("model_id") or "",
                 src_dict.get("model_gguf_variant"),
-                None,  # pairId: forks always standalone (compare-mode disabled v1)
+                None,
                 src_dict.get("project_id"),
                 int(created_at),
                 source_thread_id,
@@ -4632,8 +4597,8 @@ def upsert_chat_settings(settings: dict[str, Any]) -> dict[str, Any]:
         conn.close()
 
 
-# Discriminated unions, not partial patches: merging a `thread` pick into a stored
-# `kb` one keeps `kbId`, which the payload's thread variant forbids.
+# Discriminated unions, not partial patches: merging a `thread` pick into a stored `kb` one keeps
+# kbId, which the thread variant forbids.
 _ATOMIC_SETTING_KEYS = frozenset({"ragSource"})
 
 
@@ -4661,8 +4626,8 @@ def upsert_chat_settings_merge(updates: dict[str, Any]) -> dict[str, Any]:
     try:
         conn.execute("BEGIN IMMEDIATE")
         current, corrupt = _load_chat_settings_for_merge(conn)
-        # An atomic key carries its whole value, so it repairs a quarantined row
-        # rather than patching a base that is no longer there.
+        # An atomic key carries its whole value, so it repairs a quarantined row rather than patching a base
+        # that is no longer there.
         unsafe_partial_keys = [
             key
             for key, value in updates.items()
@@ -4697,9 +4662,9 @@ def upsert_chat_settings_merge(updates: dict[str, Any]) -> dict[str, Any]:
         conn.close()
 
 
+
+
 # --- Legacy Dexie import ledger (recovery rationale in _ensure_schema's schema comment) ---
-
-
 def list_chat_legacy_imports() -> list[str]:
     """Return the legacy_thread_id of every thread already imported."""
     conn = get_connection()

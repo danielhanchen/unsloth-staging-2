@@ -6,8 +6,8 @@
 from pathlib import Path
 import sys
 
-# Seed platform._sys_version_cache before attrs->rich->structlog->platform crash on conda Python.
-# See: https://github.com/python/cpython/issues/102396
+# Seed platform._sys_version_cache: conda Python crashes via attrs->rich->structlog->platform.
+# https://github.com/python/cpython/issues/102396
 _backend_dir = str(Path(__file__).parent)
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
@@ -190,8 +190,8 @@ def _finalize_colab_admin_password() -> "tuple[str, str] | None":
             creds = _load_colab_login_credentials()
             if creds is not None and _colab_credentials_still_valid(username, creds[1]):
                 return creds
-            # The admin password was changed through the app after the first run,
-            # so the cached copy is stale; drop it instead of printing dead credentials.
+            # The admin password was changed through the app after the first run, so the cached copy is stale;
+            # drop it instead of printing dead credentials.
             _clear_colab_login_credentials()
             return None
         password = get_bootstrap_password() or generate_bootstrap_password()
@@ -581,8 +581,8 @@ def _show_and_embed(
         except Exception as e:
             logger.info(f"Could not render Colab login card ({e}).")
 
-    # With a tunnel up the embed below is skipped, so the ready card would only restate
-    # the link card and print a proxy URL that 404s outside this tab.
+    # With a tunnel up the embed below is skipped, so the ready card would only restate the link card and print
+    # a proxy URL that 404s outside this tab.
     skip_ready_card = _is_colab_runtime() and bool(cloudflare_url)
     if not skip_ready_card:
         try:
@@ -679,11 +679,12 @@ def start(port: int = 8888, *, cloudflare: "bool | None" = None):
 
     logger.info(f"   Server started on port {actual_port}!")
 
-    # Poll health before showing the link: avoids the race where ready_event fires pre-bind.
+    # ready_event can fire before the port is bound, so poll health before showing the link.
     import urllib.request
 
     server_ready = False
     for _ in range(40):
+        # Server healthy: finalize Colab auth, open the tunnel, publish URL, tear down on interrupt.
         try:
             with urllib.request.urlopen(f"http://localhost:{actual_port}/api/health", timeout = 1):
                 server_ready = True
@@ -698,7 +699,6 @@ def start(port: int = 8888, *, cloudflare: "bool | None" = None):
         )
         return
 
-    # Server healthy: finalize Colab auth, open the tunnel, publish URL, tear down on interrupt.
     try:
         colab_login = _finalize_colab_admin_password() if use_cloudflare else None
         cf_url = start_cloudflare_tunnel(actual_port) if use_cloudflare else None

@@ -48,10 +48,8 @@ _TOKENIZER_CONFIG_PATHS = ("tokenizer_config.json", "LLM/tokenizer_config.json")
 _JINJA_TEMPLATE_PATHS = ("chat_template.jinja", "LLM/chat_template.jinja")
 _PROCESSOR_TEMPLATE_PATHS = ("chat_template.json", "LLM/chat_template.json")
 
-# Cap sidecar reads so a malformed or hostile metadata file cannot exhaust memory
-# before its template is size-checked. The JSON envelope may exceed a bare template
-# (it carries other tokenizer metadata); the extracted template is still bounded by
-# MAX_CHAT_TEMPLATE_BYTES downstream.
+# Cap sidecar reads so a malformed or hostile metadata file cannot exhaust memory before its
+# template is size-checked; the template is still bounded by MAX_CHAT_TEMPLATE_BYTES downstream.
 MAX_TEMPLATE_METADATA_BYTES = 4 * 1024 * 1024
 
 
@@ -71,8 +69,7 @@ def _read_bounded_text(path: Path, limit: int) -> Optional[str]:
 
 
 def _leaf_inside_allowlist(path: Path, allow_roots: Optional[list[Path]]) -> bool:
-    # Block symlinked children from escaping the validated directory (realpath-checked).
-    # None = trusted caller (HF cache / remote download).
+    # Block symlinked children from escaping the validated directory (realpath-checked); None means a trusted caller.
     return allow_roots is None or _is_path_inside_allowlist(path, allow_roots)
 
 
@@ -80,8 +77,7 @@ def validate_chat_template(template: str) -> ValidateChatTemplateResponse:
     text = (template or "").strip()
     if not text:
         return ValidateChatTemplateResponse(valid = True, error = None)
-    # Import Jinja lazily: optional at runtime (e.g. GGUF-only installs), so a
-    # missing dependency must not crash API startup.
+    # Import Jinja lazily: it is optional at runtime, so a missing dependency must not crash API startup.
     try:
         from jinja2 import TemplateError
         from jinja2.ext import Extension
@@ -90,8 +86,8 @@ def validate_chat_template(template: str) -> ValidateChatTemplateResponse:
         return ValidateChatTemplateResponse(valid = True, error = None)
 
     class _GenerationTag(Extension):
-        # Accept Transformers' {% generation %} assistant-mask tag so a pasted HF
-        # chat template validates (we only parse it).
+        # Accept Transformers' {% generation %} assistant-mask tag so a pasted HF chat template validates (we
+        # only parse it).
         tags = {"generation"}
 
         def parse(self, parser):
@@ -157,8 +153,8 @@ def _chat_template_from_jinja_file(
 
 
 def _chat_template_from_processor_payload(payload: object) -> Optional[str]:
-    # processor chat_template.json may be the template string itself or a
-    # {name: template} map, not only a tokenizer_config-shaped object.
+    # processor chat_template.json may be the template string itself or a {name: template} map, not only
+    # a tokenizer_config-shaped object.
     if isinstance(payload, str):
         return payload if payload.strip() else None
     template = _chat_template_from_tokenizer_config(payload)  # type: ignore[arg-type]
@@ -166,7 +162,6 @@ def _chat_template_from_processor_payload(payload: object) -> Optional[str]:
         return template
     if isinstance(payload, dict):
         # Named-template map: prefer "default", else the first non-empty entry
-        # (mirrors the tokenizer-config list fallback).
         default = payload.get("default")
         if isinstance(default, str) and default.strip():
             return default
@@ -252,8 +247,8 @@ def _iter_ggufs(dir_path: Path) -> list[Path]:
 def _variant_matches(relative_path: str, needle: str) -> bool:
     from hub.utils.gguf import gguf_variant_key
 
-    # The variant's own key first: in a repo holding several checkpoints at one quant
-    # the bare label names every one of them, so it cannot pick between them.
+    # The variant's own key first: in a repo holding several checkpoints at one quant the bare label
+    # names every one of them.
     if gguf_variant_key(relative_path).lower() == needle:
         return True
     quant = _extract_quant_label(relative_path).lower()
@@ -323,10 +318,9 @@ def _chat_template_from_dir(
             return None
         return read_gguf_chat_template(str(gguf))
 
-    # Sidecar tokenizer files (chat_template.jinja / tokenizer_config.json) are the
-    # author's maintained template and supersede the GGUF's possibly-stale embedded
-    # copy. The variant only picks the GGUF fallback, so tokenizer-first precedence
-    # holds whether or not a variant is given.
+    # Sidecar tokenizer files (chat_template.jinja / tokenizer_config.json) are the author's
+    # maintained template and supersede the GGUF's possibly-stale embedded copy, whether or not a
+    # variant is given.
     return _chat_template_from_tokenizer_dir(dir_path, allow_roots) or from_gguf()
 
 
@@ -347,8 +341,8 @@ def read_default_chat_template(
                 logger.debug("Refused chat template read outside allowed folders: %s", name)
                 return None
             if name.lower().endswith(".gguf"):
-                # Prefer a maintained sidecar next to the file over the GGUF's
-                # embedded copy (tokenizer-first precedence, as elsewhere).
+                # Prefer a maintained sidecar next to the file over the GGUF's embedded copy (tokenizer-first
+                # precedence, as elsewhere).
                 sidecar = _chat_template_from_tokenizer_dir(target.parent, allow_roots)
                 if sidecar:
                     return sidecar
@@ -363,10 +357,10 @@ def read_default_chat_template(
 
     resolved = resolve_cached_repo_id_case(name)
 
+    # Reuse the size lookup to skip absent or oversized files.
     try:
-        # Resolve within each cached revision, newest first. A revision's sidecar
-        # supersedes its own embedded GGUF copy, but must not override a newer
-        # revision, so precedence stays per-snapshot rather than global.
+        # A revision's sidecar supersedes its own embedded GGUF copy but must not override a newer revision,
+        # so precedence stays per-snapshot rather than global.
         for snapshot in iter_snapshots_preferring_whole(resolved, gguf_variant):
             template = _chat_template_from_dir(snapshot, gguf_variant)
             if template:
@@ -380,7 +374,6 @@ def read_default_chat_template(
         _api = HfApi()
 
         def _remote_worth_downloading(rel: str) -> bool:
-            # Reuse the size lookup to skip absent or oversized files.
             try:
                 infos = _api.get_paths_info(resolved, [rel], repo_type = "model", token = hf_token)
             except Exception:
@@ -410,11 +403,9 @@ def read_default_chat_template(
             template = _download_text(rel)
             if not template or not template.strip():
                 continue
-            # A raw Jinja sidecar is the whole template, so it must fit the route's
-            # response cap (the local path skips oversized .jinja too). Download stays
-            # bounded at MAX_TEMPLATE_METADATA_BYTES so a large JSON embedding a small
-            # template still extracts below, but an over-cap Jinja is dropped so the
-            # search falls through to the tokenizer/processor template.
+            # A raw Jinja sidecar is the whole template, so it must fit the route's response cap; the download
+            # stays bounded at MAX_TEMPLATE_METADATA_BYTES so a large JSON embedding a small template still
+            # extracts, but an over-cap Jinja falls through to the tokenizer template.
             if len(template.encode("utf-8")) > MAX_CHAT_TEMPLATE_BYTES:
                 continue
             return template
