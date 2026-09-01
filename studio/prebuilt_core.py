@@ -98,15 +98,12 @@ SCHEMA_VERSION = 1
 FALLBACK_BACKEND: str | None = "cpu"
 _RATE_LIMIT_WAIT_CAP_SECONDS = 60.0
 
-# Lowest CUDA major we ship prebuilts for, and highest we probe for installed
-# runtime libraries. Detection and runtime-line derivation are generated per
-# major, so a new toolkit (cuda14, ...) needs no code change while ggml keeps
-# the cudart64_<major>.dll / libcudart.so.<major> naming.
+# Lowest CUDA major we ship prebuilts for and highest we probe for runtime libraries; detection is generated per major,
+# so a new toolkit needs no code change while ggml keeps its naming.
 _MIN_CUDA_MAJOR = 12
 _MAX_PROBE_CUDA_MAJOR = 19
 
-# Blackwell floor is sm_100 (B100/B200 sm_100, B300/GB300 sm_103 below consumer
-# RTX 50 sm_120); the family needs toolkit >= 12.8, sm_103/sm_121 need 12.9.
+# Blackwell floor is sm_100
 _BLACKWELL_MIN_SM = 100
 _BLACKWELL_MIN_TOOLKIT = (12, 8)
 _BLACKWELL_SM_MIN_TOOLKIT = {103: (12, 9), 121: (12, 9)}
@@ -210,12 +207,12 @@ class ComponentDescriptor:
     core defaults behind them.
     """
 
-    component: str  # manifest "component" value, e.g. "whisper.cpp"
-    log_prefix: str  # stderr prefix, e.g. "whisper-prebuilt"
-    published_repo: str  # fork publishing the prebuilt releases
+    component: str
+    log_prefix: str
+    published_repo: str
     manifest_asset_name: str
     sha256_asset_name: str
-    metadata_filename: str  # marker written into the install dir
+    metadata_filename: str
     user_agent: str
     supported_backends: tuple[str, ...] = ("cpu", "cuda", "metal", "vulkan", "rocm")
     schema_version: int = SCHEMA_VERSION
@@ -225,8 +222,8 @@ class ComponentDescriptor:
     fallback_backend: str | None = "cpu"
     staging_root_name: str = INSTALL_STAGING_ROOT_NAME
     run_staged_validation: bool = False
-    # Hooks. Each mirrors the module-level function it replaces; None keeps the
-    # core default (which raises if truly required).
+    # Each hook mirrors the module-level function it replaces; None keeps the core default, which
+    # raises if truly required.
     detect_host: Callable[[], Any] | None = None
     host_platform_tokens: Callable[[Any], tuple[str, str]] | None = None
     server_binary_name: Callable[[Any], str] | None = None
@@ -390,11 +387,8 @@ def is_github_api_url(url: str | None) -> bool:
 
 def is_retryable_url_error(exc: Exception) -> bool:
     if isinstance(exc, urllib.error.HTTPError):
-        # GitHub returns 403 (not 429) on API rate-limit; anonymous calls share a
-        # 60-req/hour bucket per runner IP that CI fleets exhaust. Treat 403
-        # against api.github.com as retryable so we get a backoff cycle or two
-        # (honouring Retry-After / X-RateLimit-Reset) before the source-build
-        # fallback fires. 403s on other hosts (private downloads, auth) stay non-retryable.
+        # GitHub returns 403, not 429, on API rate-limit, and anonymous calls share a 60/hour bucket per runner IP, so a
+        # 403 against api.github.com is retryable; 403s on other hosts are not.
         if exc.code == 403:
             return is_github_api_url(getattr(exc, "url", None))
         return exc.code in RETRYABLE_HTTP_STATUS
@@ -426,7 +420,7 @@ def _http_error_retry_delay(exc: Exception) -> float | None:
     if rate_reset and rate_reset.strip().isdigit():
         wait = float(rate_reset.strip()) - time.time()
         if 0.0 < wait <= _RATE_LIMIT_WAIT_CAP_SECONDS:
-            return wait + 1.0  # +1s of slack so the bucket is fresh
+            return wait + 1.0
     return None
 
 
@@ -1094,9 +1088,8 @@ def install_lock(lock_path: Path) -> Iterator[None]:
                 break
             except FileExistsError:
                 stale = False
-                try:
-                    # errors="replace" so an undecodable lock reaches the int()
-                    # below and is treated as a corrupt PID, not retried forever.
+                try:  # errors="replace" so an undecodable lock reaches the int() below and is treated as a corrupt
+            # PID, not retried forever.
                     raw = lock_path.read_text(encoding = "utf-8", errors = "replace").strip()
                 except FileNotFoundError:
                     # Lock vanished between our open and read -- retry
@@ -1111,13 +1104,13 @@ def install_lock(lock_path: Path) -> Iterator[None]:
                     continue
                 try:
                     holder_pid = int(raw)
-                    os.kill(holder_pid, 0)  # signal 0 = existence check
+                    os.kill(holder_pid, 0)
                 except ValueError:
-                    stale = True  # PID unreadable (corrupted file)
+                    stale = True  # PID unreadable (corrupted file).
                 except ProcessLookupError:
-                    stale = True  # holder is dead
+                    stale = True
                 except PermissionError:
-                    pass  # alive but owned by another user -- not stale
+                    pass
                 if stale:
                     lock_path.unlink(missing_ok = True)
                     continue
@@ -1474,8 +1467,8 @@ def blackwell_capable_linux_runtime_lines(host_sms: list[str], artifacts: list[A
     lines: set[str] = set()
     for artifact in artifacts:
         line = artifact.runtime_line
-        # Only rank "cuda<major>" lines; skip malformed/future-format values
-        # (e.g. "cuda13.1") rather than crash the major sort.
+        # Only rank "cuda<major>" lines, skipping malformed or future-format values ("cuda13.1") rather
+    # than crashing the major sort.
         if not (line and line.startswith("cuda") and line[len("cuda") :].isdigit()):
             continue
         if not artifact.supported_sms or artifact.min_sm is None or artifact.max_sm is None:
@@ -1502,10 +1495,8 @@ def blackwell_min_toolkit_for_host(host: Any) -> tuple[int, int]:
     return req
 
 
-# ════════════════════════════════════════════════════════════════════════════
-# Generic descriptor-driven install flow (whisper dialect: one release carries
-# a manifest of os/arch/backend artifacts plus a same-origin checksum index).
-# ════════════════════════════════════════════════════════════════════════════
+# Generic descriptor-driven install flow, whisper dialect: one release carries a manifest of os/arch/backend artifacts
+# plus a same-origin checksum index.
 def host_platform_tokens(host: Any) -> tuple[str, str]:
     """Default (os, arch) asset tokens; components with their own HostInfo field
     names override this hook."""
@@ -1895,7 +1886,7 @@ def resolve_release_via_download_host(
     try:
         checksums = ops.parse_release_checksums(repo, release_tag, sha_payload)
     except PrebuiltFallback:
-        return None  # schema/component/tag mismatch -> let the API path decide
+        return None
     manifest_url = ops.release_asset_download_url(repo, release_tag, manifest_asset)
     try:
         manifest_payload = ops._download_host_json(manifest_url)
@@ -1992,8 +1983,7 @@ class InstallSelection:
     runtime_line: str | None
     coverage: dict[str, Any]
     studio_protocol: str | None
-    # Slim pairing identity (whisper slim bundles ride the llama ggml runtime);
-    # all None for fat installs, never part of the fingerprint.
+    # Slim pairing identity (whisper slim bundles ride the llama ggml runtime)
     install_kind: str | None = None
     paired_llama_tag: str | None = None
     linked_from: str | None = None
@@ -2246,10 +2236,8 @@ def install_from_bundle(
 
         staged_root = staging / "staged"
         ops.assemble_install_tree(bundle_root, staged_root, host)
-        # Component hook (default no-op): slim whisper wires the llama ggml
-        # runtime here so staged validation sees the final linked tree; a returned
-        # selection (with the wired filenames) supersedes the input so the marker
-        # records what was actually linked.
+        # Component hook: slim whisper wires the llama ggml runtime here so staged validation sees the final linked
+        # tree, and a returned selection supersedes the input so the marker records what was linked.
         updated = ops.prepare_runtime_payload(staged_root, host, selection)
         if updated is not None:
             selection = updated
