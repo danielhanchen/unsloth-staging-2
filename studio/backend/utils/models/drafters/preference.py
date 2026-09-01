@@ -3,9 +3,17 @@
 
 """Ranking keys that decide which sidecar a load prefers.
 
-The download, the snapshot reuse, the offline cache lookup and the local scan
-all order candidates with these, so a repo resolves to the same file whichever
-path reaches it first.
+The download, the snapshot reuse and the offline cache lookup all order
+candidates with these, so a repo resolves to the same file whichever of those
+paths reaches it first.
+
+The local-folder scan does NOT: detect_mtp_file ranks with its own
+``_smallest_first``, which is size-first on purpose, so a folder holding several
+copies costs the least disk. These keys are speed-first instead, because the hub
+path is choosing what to spend a download on. The two therefore agree on the
+family and can differ on the copy, which is a deliberate difference and not an
+oversight -- an earlier version of this docstring claimed the local scan shared
+them, and it never has.
 """
 
 from pathlib import Path
@@ -35,6 +43,44 @@ def dspark_precision_rank(name: str) -> int:
 def dspark_preference_key(name: str) -> tuple[int, str]:
     """Sort key picking the preferred sidecar by name alone (no filesystem)."""
     return dspark_precision_rank(name), Path(name).name.lower()
+
+
+def mtp_precision_rank(name: str) -> int:
+    """MTP head precision preference: Q8_0 first. Correctness does not enter into
+    it, since the target verifies every drafted token, so this is purely which
+    head drafts fastest. Q8_0 measured both quicker and more accepted than bf16 on
+    Qwen3.8-Flash-Next: a draft step is dominated by the LM head, and that head is
+    cheaper to execute at 8 bits, so bf16 is larger and slower for no gain."""
+    base = Path(name).name.lower()
+    if "-q8_0" in base:
+        return 0
+    if "-q6_k" in base:
+        return 1
+    if "-q5_k" in base:
+        return 2
+    if "-q4_k" in base or "-q4_0" in base:
+        return 3
+    if "-bf16" in base or "-f16" in base:
+        return 4
+    return 5
+
+
+def mtp_preference_key(name: str) -> tuple[int, int, str]:
+    """Sort key picking the preferred MTP head by name alone.
+
+    A head that omits its own token_embd/output and borrows the target's wins the
+    tie. It is 1.35 GB smaller at Q8_0 (2.79 against 4.14) and drafts no worse:
+    on the shipped prebuilt against Qwen3.8-Flash-Next UD-IQ1_S the shared and
+    full Q8_0 heads accept identically, 159 of 284, and shared Q4_K_M beats full
+    Q4_K_M (0.560 against 0.541) because it borrows the target's real embeddings
+    instead of carrying its own quantized copies.
+
+    The borrow is not a portability risk here, because only ``_pick_mtp``'s
+    qwen4exp path reaches a repo publishing both forms, and qwen4exp MTP and the
+    borrow live in the same fork -- a build that can draft one carries the other.
+    """
+    borrows = 0 if "shared" in Path(name).name.lower() else 1
+    return mtp_precision_rank(name), borrows, Path(name).name.lower()
 
 
 # DFlash publishes the same precision vocabulary (and the published sidecar
