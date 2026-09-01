@@ -46,6 +46,12 @@ _FAKE_PROC_NV_DIR=$(mktemp -d)
     sed -n '/^_infer_linux_amd_gfx_arch()/,/^}/p' "$INSTALL_SH"
     echo ""
     sed -n '/^_amd_arch_index_family_for_gfx()/,/^}/p' "$INSTALL_SH"
+    echo
+    sed -n '/^_amd_probe_arches()/,/^}/p' "$INSTALL_SH"
+    echo
+    sed -n '/^_amd_agreed_index_family()/,/^}/p' "$INSTALL_SH"
+    echo
+    sed -n '/^_amd_sole_index_arch()/,/^}/p' "$INSTALL_SH"
     echo ""
     sed -n '/^_trim_index_path_slashes()/,/^}/p' "$INSTALL_SH"
     echo ""
@@ -430,14 +436,15 @@ assert_eq "the named override reaches this path -> rocm6.4" "$_BASE/rocm6.4" "$_
 # ── 9. Every source missing: warn, do not die ───────────────────────────────
 # rocminfo alone, a fresh AMD host with no ROCm userspace. Under set -e the whole
 # detection must still succeed.
+# gfx1100 has its own repo.amd.com index, so since unslothai#8731 an unreadable version
+# routes on the arch rather than settling for CPU.
 reset_sources
 assert_eq "no version source at all -> cpu" "$_BASE/cpu" "$(run_index)"
 assert_eq "no version source at all -> exit 0 under set -e" "0" "$(run_status_under_set_e)"
 _warn=$(run_warnings)
-assert_contains "no-version host still reaches its actionable warning" \
-    "no ROCm/HIP install was found" "$_warn"
-assert_contains "no-version warning still lists the detection sources" \
-    "Minimum required for version detection" "$_warn"
+assert_contains "no-version host still reaches an actionable warning" \
+    "routing to AMD per-arch wheels" "$_warn"
+assert_contains "no-version warning names the arch it routed on" "gfx1100" "$_warn"
 
 # 10. Sources present but every one of them unparseable: same contract.
 reset_sources
@@ -446,8 +453,8 @@ add_hipconfig "unknown"
 add_version_file "not-a-version"
 assert_eq "unparseable sources -> cpu" "$_BASE/cpu" "$(run_index)"
 assert_eq "unparseable sources -> exit 0 under set -e" "0" "$(run_status_under_set_e)"
-assert_contains "unparseable sources reach the no-version warning" \
-    "no ROCm/HIP install was found" "$(run_warnings)"
+assert_contains "unparseable sources are treated as no version at all" \
+    "routing to AMD per-arch wheels" "$(run_warnings)"
 
 # 11. A source reporting major 0 is garbage, not a version below every other.
 reset_sources
