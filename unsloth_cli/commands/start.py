@@ -49,36 +49,14 @@ start_app = typer.Typer(
 
 _CODEX_PROFILE = "unsloth_api"
 _CODEX_ENV_KEY = "UNSLOTH_STUDIO_AUTH_TOKEN"
-# Codex treats an SSE stream with no bytes for this long as lost, cancels it, and
-# reconnects. Its default is 300000 (5 minutes), which is measured against the WHOLE
-# quiet period -- and llama-server sends nothing at all while it processes the prompt.
-#
-# That is not a corner case on the hardware Unsloth is for. A local CPU host chews
-# through a prompt at low tens of tokens a second, and Codex's own preamble is several
-# thousand tokens before the user has typed anything: 16.1 tok/s measured on a 2-core
-# box means ~460s of silence for a ~7300-token first turn, so the default trips before
-# the first token exists. The reconnect is worse than the wait, because llama-server
-# hands the retry a different parallel slot whose KV cache shares no prefix, so each
-# attempt restarts prompt processing from zero and the five retries can never converge.
-# Observed as a request completing in exactly 300056ms with `Reconnecting... 1/5` and
-# no turn ever finishing.
-#
-# 20 minutes. Sized to be longer than a slow local first turn rather than to any
-# server-side budget: nothing here bounds generation, and a genuinely dead stream is
-# still caught, just later. Same reason the Codex docs' own local-model example raises
-# it for Ollama.
+# Codex's 300000 idle-SSE default trips before a slow local first turn, and each reconnect takes a fresh KV slot.
+# A ~7300-token first turn is ~460s of silence; this is 20 minutes.
+# Measured 16.1 tok/s on a 2-core box; observed as a request ending at exactly 300056ms.
 _CODEX_STREAM_IDLE_TIMEOUT_MS = 1_200_000
 _HERMES_ENV_KEY = "UNSLOTH_API_KEY"
 _HERMES_PROVIDER = "unsloth"
-# Skip the installer's interactive setup wizard: `unsloth start hermes` runs
-# this hint unattended and then writes its own session-scoped Hermes config, so
-# the wizard's global API-key/model prompts would block the launch and point the
-# user at a different (global) provider than the one Unsloth just configured.
-# Both installers expose a skip flag: `-SkipSetup` (PowerShell) and
-# `--skip-setup` (POSIX; passed to the piped script via `bash -s --`). Pin both
-# the fetched script and the repository checkout it performs to the same full
-# commit so a later change to either upstream branch cannot silently replace
-# code that Unsloth executes with the user's privileges.
+# Skip the installer's setup wizard: its global API-key prompts block an unattended launch.
+# Script and checkout are pinned to one commit.
 _HERMES_INSTALL_COMMIT = "f1af945f6c576eccb126fa955edc9be258b33020"
 _HERMES_INSTALL_BASE = (
     "https://raw.githubusercontent.com/NousResearch/hermes-agent/"
@@ -92,10 +70,8 @@ _HERMES_POSIX_INSTALL_HINT = (
     f"curl -fsSL {_HERMES_INSTALL_BASE}/install.sh | bash -s --"
     f" --skip-setup --commit {_HERMES_INSTALL_COMMIT}"
 )
-# Hermes refuses to initialize when the model window is under 64,000 tokens; its
-# error message points at the model.context_length / auxiliary.compression
-# overrides in config.yaml. write_hermes_config claims this value for smaller
-# windows and scales the compaction threshold back down to the real window.
+# Hermes refuses to initialize under a 64,000-token window; write_hermes_config scales compaction back to the real one.
+# Its error points at model.context_length / auxiliary.compression.
 _HERMES_MIN_CONTEXT = 65536
 _PI_PROVIDER = "unsloth"
 _SUBAGENT_NAME = "unsloth"
@@ -139,8 +115,7 @@ _CODEX_SUBAGENT_ROUTING_INSTRUCTIONS = (
     "subagents for other delegation requests."
 )
 _PI_SUBAGENT_EXTENSION = Path(__file__).parent.parent / "pi_subagent.ts"
-# OpenCode selects a model by "<providerID>/<modelID>". Use a dedicated id to avoid
-# colliding with a user's providers; provider filters are set in the launch-time overlay.
+# OpenCode selects a model by "<providerID>/<modelID>"; a dedicated id avoids colliding with a user's providers.
 _OPENCODE_PROVIDER = "unsloth-studio"
 _PROVIDER_HEADER = f"[model_providers.{_CODEX_PROFILE}]"
 _PASSTHROUGH = {"allow_extra_args": True, "ignore_unknown_options": True}
@@ -180,9 +155,6 @@ _CLAUDE_ENV_UNSET = (
 )
 _CODEX_ENV_UNSET = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
 
-# Shared by every agent command; only the config/env/command differ.
-# Help is grouped into rich panels so `--help` reads as Model / Server / Session
-# instead of one long unaligned list.
 _PANEL_MODEL = "Model"
 _PANEL_SERVER = "Server"
 _PANEL_SAMPLING = "Sampling"
@@ -234,8 +206,7 @@ _GPU_MEMORY_MODE_OPTION = typer.Option(
     ),
 )
 
-# Server knobs. Only used when `unsloth start` auto-starts the server (--serve);
-# they have no effect when attaching to a server someone else already started.
+# Server knobs: only used when `unsloth start` auto-starts the server (--serve).
 _SERVE_OPTION = typer.Option(
     True,
     "--serve/--no-serve",
@@ -284,8 +255,7 @@ _REASONING_EFFORT_OPTION = typer.Option(
         "unset, which keeps the template's level."
     ),
 )
-# Sampling overrides pin a value on the auto-started server (winning over the client and the
-# per-model recommendation). Default unset -> the model's recommended sampling is used.
+# Sampling overrides pin a value on the auto-started server; unset means the model's recommended sampling.
 _TEMPERATURE_OPTION = typer.Option(
     None,
     "--temperature",
@@ -335,7 +305,6 @@ _PRESENCE_PENALTY_OPTION = typer.Option(
     help = "Pin the presence penalty. Default: unset (per-model recommendation).",
 )
 
-# Agent-session knobs.
 _KEY_OPTION = typer.Option(
     None,
     "--api-key",
@@ -351,9 +320,7 @@ _LAUNCH_OPTION = typer.Option(
     rich_help_panel = _PANEL_SESSION,
     help = "--no-launch prints the env and command instead (remote shells, WSL).",
 )
-# One normalized "run tools without prompting" switch. Each agent spells this
-# differently and it's easy to forget which is which, so accept every spelling and
-# route to the agent's own mechanism in _yolo_command_flags / the config writers.
+# One normalized "run tools without prompting" switch: accept every agent's spelling, route it per agent below.
 _YOLO_OPTION = typer.Option(
     False,
     "--yolo",
@@ -386,14 +353,12 @@ _AS_SUBAGENT_OPTION = typer.Option(
     help = "Keep the coding agent's current model and add Unsloth as a local subagent.",
 )
 
-# Per-agent CLI flag for "run tools without prompting". OpenCode (native --auto is
-# command-scoped, handled below) and OpenClaw (config-only) are absent from this prefix map.
+# Per-agent flag for "run tools without prompting"; OpenCode (command-scoped) and OpenClaw (config-only) are absent.
 _YOLO_COMMAND_FLAGS = {
     "claude": ["--dangerously-skip-permissions"],
     "codex": ["--dangerously-bypass-approvals-and-sandbox"],
     "hermes": ["--yolo"],
-    # Pi never prompts per tool call; its only approval gate is project trust, so -a
-    # (trust project resources) is the closest "don't ask me" equivalent.
+    # Pi never prompts per tool call; -a (trust project resources) is its closest equivalent.
     "pi": ["--approve"],
 }
 
@@ -403,9 +368,8 @@ def _yolo_command_flags(agent: str, yolo: bool) -> list:
     return _YOLO_COMMAND_FLAGS.get(agent, []) if yolo else []
 
 
-# Subcommands that reject --auto (OpenCode exposes it only on the default TUI and `run`),
-# so `opencode serve --auto` is never emitted. Includes console/generate, hidden from
-# `opencode --help` but still registered. Unknown first positionals are TUI paths -> --auto.
+# Subcommands that reject --auto (OpenCode exposes it on the TUI and `run` only); unknown first positionals are TUI
+# paths.
 _OPENCODE_NON_AUTO_SUBCOMMANDS = frozenset(
     "completion acp mcp attach debug providers auth agent upgrade uninstall serve web "
     "models stats export import github pr session plugin plug db console generate".split()
@@ -435,8 +399,7 @@ def _opencode_supports_native_auto(command: str = "opencode") -> bool:
         return True
     executable = _which_with_install_dirs(command)
     if executable is None:
-        # No local binary: a --no-launch recipe may run elsewhere, and _run installs the
-        # current release on launch -- either way assume native --auto is available.
+        # No local binary: assume native --auto is available, since _run installs the current release on launch.
         return True
     try:
         output = subprocess.check_output(
@@ -470,8 +433,7 @@ def _opencode_subcommand(args: list[str]) -> tuple[Optional[str], Optional[int]]
         if any(arg.startswith(f"{option}=") for option in _OPENCODE_GLOBAL_VALUE_OPTIONS):
             index += 1
             continue
-        # A non-global option (e.g. --session) is a TUI flag; stop before its value is
-        # mistaken for a subcommand.
+        # A non-global option (e.g. --session) is a TUI flag; stop before its value is mistaken for a subcommand.
         if arg.startswith("-"):
             return None, None
         return arg, index
@@ -494,8 +456,7 @@ def _opencode_native_auto_args(
     if not v2 and subcommand in _OPENCODE_NON_AUTO_SUBCOMMANDS:
         return routed, False
     separator = routed.index("--") if "--" in routed else len(routed)
-    # --mini's runMini TUI forces auto=false and never forwards --auto, so appending it is
-    # useless; fall back to the config permission block so --yolo still auto-approves.
+    # --mini's runMini TUI forces auto=false and never forwards --auto, so fall back to the config permission block.
     if any(arg == "--mini" or arg.startswith("--mini=") for arg in routed[:separator]):
         return routed, False
     if "--auto" not in routed[:separator]:
@@ -563,8 +524,8 @@ def _hermes_resume_oneshot_args(args: list[str]) -> list[str]:
         if arg in ("-z", "--oneshot"):
             rewritten[index] = "-q"
         elif len(arg) > 2 and arg.startswith("-z"):
-            # argparse accepts attached short-option values (`-zPROMPT` and
-            # `-z=PROMPT`); preserve the value byte-for-byte when switching to -q.
+            # argparse accepts attached short-option values (`-zPROMPT`, `-z=PROMPT`); preserve the value
+            # byte-for-byte under -q.
             rewritten[index] = f"-q{arg[2:]}"
         elif arg.startswith("--oneshot="):
             rewritten[index] = f"--query={arg.partition('=')[2]}"
@@ -574,14 +535,10 @@ def _hermes_resume_oneshot_args(args: list[str]) -> list[str]:
             raise typer.BadParameter(
                 "Hermes cannot resume a one-shot session with --usage-file; remove that option."
             )
-        # `chat -Q -q` is the only mode that can resume a session, but it does not
-        # inherit hermes' one-shot approval semantics: `-z` itself sets
-        # HERMES_YOLO_MODE=1 and HERMES_ACCEPT_HOOKS=1 for the call (hermes_cli/
-        # oneshot.py in _HERMES_INSTALL_COMMIT), because a one-shot has no user at
-        # the terminal to answer a prompt. Re-add the equivalent flags so a resumed `-z` keeps behaving like a
-        # plain `-z` instead of stalling on an approval nobody can answer. This is
-        # parity with the flag the user already typed, not the --yolo option: a
-        # resumed *interactive* session still prompts as usual.
+        # `chat -Q -q` does not set HERMES_YOLO_MODE/HERMES_ACCEPT_HOOKS, so re-add them or a resumed `-z` stalls on
+        # an approval. `-z` sets both for a one-shot (hermes_cli/oneshot.py), which has no user at the
+        # terminal to answer one. Parity with the flag already typed, not --yolo: a resumed interactive
+        # session still prompts.
         prefix = ["chat", "-Q"]
         if "--yolo" not in rewritten:
             prefix.append("--yolo")
@@ -706,8 +663,7 @@ def _subagent_model_id(
     if variant and _is_hub_model_id(model_id):
         return _display_model_spec(model_id, str(variant))
     if variant:
-        # A path load is advertised as a bare basename with no ":variant" channel,
-        # so the quant cannot be recorded and a later reload picks for itself.
+        # A path load is advertised as a bare basename with no ":variant" channel, so a later reload picks for itself.
         typer.echo(
             f"Warning: {model_id} loaded from a path, so the subagent config cannot "
             f"pin the {variant} quant; a reload may choose a different one. Load the "
@@ -759,8 +715,8 @@ def _http_json(
         # No redirects: a 3xx would leak this bearer token to an unvetted base.
         with urlopen_no_redirect(request, timeout = timeout) as response:
             body = json.loads(response.read().decode() or "{}")
-        # A padded /load or /unload commits its 200 early, so a late failure arrives
-        # in-band; raise it as the HTTPError handled below.
+        # A padded /load or /unload commits its 200 early, so a late failure arrives in-band; raise it as the
+        # HTTPError below.
         return raise_for_deferred_error(url, body)
     except urllib.error.HTTPError as exc:
         if error is None:
@@ -772,9 +728,8 @@ def _http_json(
         _fail(f"{error}: {getattr(exc, 'reason', None) or exc}")
 
 
-# A server that WE auto-started (never one we merely found). Kept at module scope so
-# failure paths and the atexit backstop can tear it down without threading a handle
-# through all six agent commands. Only one agent runs per process, so one slot is enough.
+# A server WE auto-started (never one we merely found). Module scope so failure paths and the atexit backstop reach it.
+# Only one agent runs per process.
 _auto_served_server: Optional[subprocess.Popen] = None
 # Model download + load can be slow; give the auto-started server room before giving up.
 _SERVER_START_TIMEOUT_S = 900
@@ -823,8 +778,7 @@ class _DownloadProgressDisplay:
         fraction = float(progress.get("progress") or 0)
         if downloaded <= 0:
             return
-        # A fully cached snapshot can report 99% with no incomplete bytes; that is
-        # not a transfer, so don't show it as a download.
+        # A fully cached snapshot can report 99% with no incomplete bytes; that is not a transfer.
         if completed >= downloaded > 0:
             return
 
@@ -916,8 +870,8 @@ class _ModelDownloadProgress:
         self._configured = True
         if self._disabled:
             return
-        # GGUF repos need the selected quant's size; the repo endpoint totals every
-        # quant. Resolve the variant first, otherwise show bytes only.
+        # GGUF repos need the selected quant's size (the repo endpoint totals every quant), so resolve the variant
+        # first.
         if self._variant or "gguf" in self._model.lower():
             try:
                 params = urlencode({"repo_id": self._model})
@@ -1028,8 +982,8 @@ def _load_model_with_progress(
         ok, value = result[0]
         if not ok:
             assert isinstance(value, BaseException)
-            # A pad-only or half-written body fails `_http_json`'s json.loads: report
-            # the padded 200 that never completed, not a JSON error from the API.
+            # A pad-only or half-written body fails json.loads: report the padded 200 that never completed, not a JSON
+            # error.
             if isinstance(value, ValueError):
                 require_completed_padded_body(load_url, None)
             raise value
@@ -1062,14 +1016,12 @@ def _redacted_log_tail(path: Path, lines: int = 20) -> str:
 
 
 def _shutdown_server(server: Optional[subprocess.Popen]) -> None:
-    # Idempotent teardown of a server WE started, plus its own children (llama-server,
-    # cloudflared). A no-op once the process is already gone.
+    # Idempotent teardown of a server WE started, plus its children (llama-server, cloudflared).
     if server is None or server.poll() is not None:
         return
     if os.name == "nt":
-        # terminate()/kill() reach only the parent `unsloth run`; taskkill /T walks the
-        # whole tree so the llama-server child doesn't keep the port and GPU (matches the
-        # taskkill /T /F pattern already used in unsloth/dataprep/synthetic.py).
+        # terminate()/kill() reach only the parent `unsloth run`; taskkill /T walks the tree so llama-server frees the
+        # port and GPU. Matches the taskkill /T /F pattern already used in unsloth/dataprep/synthetic.py.
         try:
             subprocess.run(
                 ["taskkill", "/PID", str(server.pid), "/T", "/F"],
@@ -1119,23 +1071,18 @@ def _start_studio_server(
 ) -> subprocess.Popen:
     """Spawn `unsloth run` for `model`, wait until it is fully ready, and return it."""
     global _auto_served_server
-    # Windows goes through this interpreter, not the launcher on PATH: shutil.which
-    # resolves `unsloth` to the denied unsloth.exe, since PATHEXT puts .EXE ahead of
-    # the .cmd shim (issue #8490). Without this, a user who reached the CLI through
-    # unsloth.cmd would still fail here. sys.executable is the interpreter already
-    # running this command, so the child inherits the same environment.
+    # Go through this interpreter, not PATH: PATHEXT resolves `unsloth` to the denied unsloth.exe (issue #8490).
     if sys.platform == "win32":
-        # Local import: unsloth_cli.commands.studio imports at package init after
-        # this module, so a top-level import would be circular.
+        # Local import: commands.studio imports at package init after this module, so a top-level import would be
+        # circular.
         from unsloth_cli.commands.studio import _managed_cli_argv
         launch_head = _managed_cli_argv(Path(sys.executable))
     else:
         launch_head = [shutil.which("unsloth") or "unsloth"]
     parsed = urlparse(base)
-    # Tools default off = passthrough mode (relay the agent's own tools); --no-cloudflare =
-    # loopback only, no tunnel. Mirrors .github/scripts/serve-unsloth-run.sh. Healing/nudging
-    # travel via the child env below (version-agnostic) rather than new run flags that an
-    # older re-exec'd run could mistake for llama-server args.
+    # Tools default off = passthrough; --no-cloudflare = loopback only. Healing/nudging travel
+    # via the child env so an older re-exec'd run cannot mistake them for llama-server args.
+    # Mirrors .github/scripts/serve-unsloth-run.sh.
     command = [
         *launch_head,
         "run",
@@ -1163,30 +1110,21 @@ def _start_studio_server(
     typer.echo("Starting Unsloth server")
     typer.echo(f"Model: {_display_model_spec(model, load.gguf_variant)}")
     typer.echo(f"Server log: {log_path}")
-    # 0600: the `unsloth run` banner in this log carries the minted sk-unsloth- key, and
-    # the tempdir is world-traversable. Unlink first so a stale looser-mode file (pid
-    # reuse) can't survive with its old permissions.
+    # 0600: this log carries the minted sk-unsloth- key. Unlink first so a stale looser-mode file cannot survive.
     log_path.unlink(missing_ok = True)
     log = os.fdopen(os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb")
-    # Own session/process group so a mid-session Ctrl+C (cancel a turn) doesn't reach the
-    # server. It survives a successful agent session; torn down on startup/launch failure.
+    # Own session/process group so a mid-session Ctrl+C does not reach the server.
     child_env = os.environ.copy()
-    # Current llama-server versions read this documented env equivalent of --reasoning.
-    # Older managed versions ignore an unknown env variable instead of failing startup on
-    # an unknown passthrough CLI flag. An omitted start option follows the model template.
+    # Use the env equivalent of --reasoning: older managed versions ignore an unknown env var but fail on an unknown
+    # flag.
     child_env["LLAMA_ARG_REASONING"] = server.reasoning or "auto"
-    # Always written, like the line above: an inherited value would otherwise pin
-    # a level the omitted flag promises to leave alone. 'default' is llama.cpp's
-    # own sentinel for "keep the chat template's level".
+    # Always written: an inherited value would pin a level the omitted flag leaves alone. 'default' is llama.cpp's
+    # sentinel.
     child_env["LLAMA_ARG_REASONING_EFFORT"] = server.reasoning_effort or "default"
-    # Pass the marker via env so an older launcher ignores it instead of treating an
-    # unknown CLI flag as a llama-server arg; new launchers preserve it across re-exec.
+    # Marker via env so an older launcher ignores it rather than treating it as a llama-server arg.
     child_env[_START_API_KEY_MARKER_ENV] = "1"
-    # Convey healing/nudging through the env; `unsloth run` reads these when its own
-    # flags are omitted, so this works even if run re-execs into an older Unsloth venv.
-    # Only write when the operator set the flag explicitly; otherwise keep whatever they
-    # already exported (child_env is a copy of os.environ), falling back to the start
-    # defaults (healing on, nudging on) when nothing was inherited.
+    # Healing/nudging via the env, so they survive a re-exec into an older Unsloth venv.
+    # Only write when the operator set the flag; otherwise keep the inherited value, falling back to the start defaults.
     if server.tool_call_healing is not None:
         child_env["UNSLOTH_DISABLE_TOOL_CALL_HEALING"] = "0" if server.tool_call_healing else "1"
     elif "UNSLOTH_DISABLE_TOOL_CALL_HEALING" not in child_env:
@@ -1195,8 +1133,7 @@ def _start_studio_server(
         child_env["UNSLOTH_TOOL_CALL_NUDGE"] = "1" if server.tool_call_nudging else "0"
     elif "UNSLOTH_TOOL_CALL_NUDGE" not in child_env:
         child_env["UNSLOTH_TOOL_CALL_NUDGE"] = "1"
-    # Forward any sampling pin via the env; `unsloth run` reads UNSLOTH_SAMPLING_* and the
-    # backend resolver applies it as a hard override. Only set fields the operator specified.
+    # Forward sampling pins via UNSLOTH_SAMPLING_*; the backend resolver applies them as a hard override.
     for _sampling_env, _sampling_value in (
         ("UNSLOTH_SAMPLING_TEMPERATURE", server.temperature),
         ("UNSLOTH_SAMPLING_TOP_P", server.top_p),
@@ -1251,8 +1188,8 @@ def _start_studio_server(
                     )
             if progress is not None:
                 progress.poll()
-            # New children emit an early key marker, so wait for the final model banner;
-            # older children only print the key after load, so fall back to that.
+            # New children emit an early key marker, so wait for the final model banner; older children print the key
+            # after load.
             ready_signal = "Model loaded:" in tail if early_key_seen else "sk-unsloth-" in tail
             if _studio_healthy(base) and ready_signal:
                 if progress is not None:
@@ -1271,11 +1208,8 @@ def _start_studio_server(
 
 
 def _effective_base(base: str) -> str:
-    # `unsloth run` binds to `parsed.port or 8888` and serves at the root, so normalize
-    # UNSLOTH_STUDIO_URL to plain scheme://host:port. A portless http://127.0.0.1 would
-    # otherwise launch on 8888 but poll port 80, and a path like /studio would poll
-    # /studio/api/health (404) -- either way hitting the startup timeout. IPv6 literals
-    # stay bracketed.
+    # Normalize UNSLOTH_STUDIO_URL to scheme://host:port: `unsloth run` binds `parsed.port or 8888`. IPv6 stays
+    # bracketed.
     parsed = urlparse(base)
     host = parsed.hostname or "127.0.0.1"
     if ":" in host:  # bare IPv6 literal (urlparse strips the brackets)
@@ -1294,10 +1228,8 @@ def _require_studio(
     """Return (base, server). server is a Popen only when WE auto-started it."""
     base = find_studio_server()
     if base is not None:
-        # Attaching to a server someone else started: UNSLOTH_SAMPLING_* pins only reach the
-        # server process when WE launch it (via _start_studio_server), so a sampling flag on the
-        # attach path can't take effect. Warn instead of silently dropping it, so the operator is
-        # not misled into thinking generation now uses the pinned value.
+        # UNSLOTH_SAMPLING_* pins only reach a server WE launch, so warn rather than silently drop them on the attach
+        # path.
         _pinned = [
             _flag
             for _flag, _value in (
@@ -1336,10 +1268,8 @@ def _require_studio(
             )
         return base, None
     expected = os.environ.get("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888").rstrip("/")
-    # Auto-start a local server only for an interactive launch with a model to serve, and
-    # only for a plain-HTTP loopback target: never stand in for an explicit remote
-    # UNSLOTH_STUDIO_URL, and never for an https:// one -- `unsloth run` serves plain
-    # HTTP, so the health poll against https would spin until the startup timeout.
+    # Auto-start only for an interactive plain-HTTP loopback target: an https health poll would spin to the startup
+    # timeout.
     if (
         serve
         and launch
@@ -1347,13 +1277,12 @@ def _require_studio(
         and is_loopback_url(expected)
         and urlparse(expected).scheme == "http"
     ):
-        # Normalize to the port unsloth run actually binds, so the health poll and the
-        # returned base hit the same server we launch (not a portless :80).
+        # Normalize to the port `unsloth run` binds, so the health poll and the returned base hit the same server.
         expected = _effective_base(expected)
         load = load or LoadOptions()
-        # Leave a bare GGUF repo's variant unset: the server's own quant preference already
-        # picks the best available (UD-Q4_K_XL for Unsloth uploads, else Q4_K_M) and falls back
-        # when that exact quant is missing, which forcing a fixed variant here would break.
+        # Leave a bare GGUF repo's variant unset: the server's own quant preference picks and falls back when one is
+        # It prefers UD-Q4_K_XL for Unsloth uploads, else Q4_K_M.
+        # missing.
         return expected, _start_studio_server(expected, model, load, server_options)
     model_hint = "" if model else " Pass --model to have it start one for you, or"
     _fail(
@@ -1380,8 +1309,7 @@ def _read_cache(cache: Path) -> dict:
 
 
 def _server_buckets(servers: dict, base: str) -> dict:
-    # Normalise a server's entry to {"saved": [...], "minted": [...]}, tolerating a
-    # corrupt/legacy value (bare string/list -> treated as minted, behind the handshake).
+    # Normalise to {"saved": [...], "minted": [...]}, tolerating a corrupt or legacy bare string/list as minted.
     entry = servers.get(base) if isinstance(servers, dict) else None
     if isinstance(entry, list):
         return {"saved": [], "minted": [k for k in entry if isinstance(k, str)]}
@@ -1396,15 +1324,13 @@ def _server_buckets(servers: dict, base: str) -> dict:
 
 
 def _cached_keys(cache: Path, base: str, source: str) -> list:
-    # Keys are scoped per server. `source` splits user-supplied --api-key keys
-    # ("saved", trusted for that base) from auto-minted ones ("minted", replayed
-    # only after the identity check). Legacy unscoped caches are ignored.
+    # Keys are scoped per server: "saved" are trusted for that base, "minted" are replayed only after the identity
+    # check.
     return _server_buckets(_read_cache(cache).get("servers", {}), base)[source]
 
 
 def _write_private_json(path: Path, data: dict) -> None:
-    # O_CREAT with 0o600 so a file holding an API key is never world-readable,
-    # even briefly (existing files keep whatever perms the user set).
+    # O_CREAT with 0o600 so a file holding an API key is never world-readable, even briefly.
     path.parent.mkdir(parents = True, exist_ok = True, mode = 0o700)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as handle:
@@ -1419,8 +1345,7 @@ def _write_private_text(path: Path, text: str) -> None:
 
 
 def _read_json_object(path: Path) -> Optional[dict]:
-    # {} when missing, None when it can't be parsed as an object (so the caller
-    # leaves a user-managed file untouched rather than clobbering it).
+    # {} when missing, None when unparseable, so the caller leaves a user-managed file untouched.
     if not path.exists():
         return {}
     try:
@@ -1450,7 +1375,6 @@ def _remember_key(cache: Path, base: str, key: str, source: str) -> None:
     if servers.get(base) == new_entry:
         return
     servers[base] = new_entry
-    # Collapse legacy unscoped fields.
     data.pop("keys", None)
     data.pop("key", None)
     try:
@@ -1460,10 +1384,8 @@ def _remember_key(cache: Path, base: str, key: str, source: str) -> None:
 
 
 def _key_accepted(base: str, key: str) -> bool:
-    # Only a genuine auth rejection (401/403) means "this key is bad -- skip it and try
-    # the next cached key or mint a fresh one". A 5xx or a network blip is a server-side
-    # outage, not a bad key: fail with a clean message (never a traceback) instead of
-    # silently discarding a working key and minting extras against a struggling server.
+    # Only 401/403 means the key is bad; a 5xx or network blip is an outage, so keep the working key rather than
+    # minting.
     try:
         _http_json("GET", f"{base}/v1/models", key)
         return True
@@ -1492,23 +1414,16 @@ def _agent_api_key(
         if not auto_started or _key_accepted(base, explicit):
             _remember_key(cache, base, explicit, "saved")
             return explicit
-        # The server was auto-started for this run, so an exported
-        # UNSLOTH_API_KEY meant for some other server must not fail the
-        # launch: the loopback mint path below is guaranteed to work.
-        # (An explicit key that the fresh server accepts, e.g. one persisted
-        # in this Unsloth home's auth db, is still honored above.)
+        # The server was auto-started for this run, so a stray exported UNSLOTH_API_KEY must not fail the launch.
 
-    # Replay a key the user saved for *this exact* server first (scoped per base,
-    # so it only goes back there -- including a remote/SSH-tunnelled Unsloth whose
-    # secret the local handshake can't match). Skip ones the server rejects.
+    # Replay a key the user saved for this exact server first, including a tunnelled remote the handshake cannot match.
     for key in _cached_keys(cache, base, "saved"):
         if _key_accepted(base, key):
             _remember_key(cache, base, key, "saved")
             return key
 
-    # Beyond here we auto-mint or replay an auto-minted key. find_studio_server()
-    # trusts a base after only a health check, so both are limited to a loopback
-    # server we can cryptographically confirm is ours.
+    # find_studio_server() trusts a base after a health check alone, so mint and replay only against a confirmed
+    # loopback.
     if not is_loopback_url(base):
         _fail(
             f"No saved API key for {base} and automatic minting only runs against "
@@ -1574,12 +1489,9 @@ def _is_hub_model_id(value: object) -> bool:
         return False
     if len(text) >= 2 and text[1] == ":" and text[0].isalpha():
         return False
-    # A hub id is exactly "namespace/name" over a restricted charset. Anything with
-    # extra path segments (e.g. a server-side relative path such as
-    # models/Llama/Foo.gguf on a remote Unsloth) is not a hub id and must not be
-    # casefold-matched against a differently cased path on a case-sensitive
-    # filesystem. This is host independent, unlike the existence probe below which
-    # cannot see a path that only exists on the server.
+    # A hub id is exactly "namespace/name": extra segments must not casefold-match a path on a case-sensitive
+    # filesystem.
+    # Host independent, unlike the existence probe below.
     parts = text.split("/")
     if len(parts) != 2:
         return False
@@ -1632,12 +1544,9 @@ def _model_id_matches(
 ) -> bool:
     if actual == requested:
         return True
-    # Case-insensitive matching is only safe when the local existence probe in
-    # _is_hub_model_id is authoritative, i.e. against a loopback Unsloth on this host.
-    # Against a remote Unsloth a two-segment string is indistinguishable from a
-    # server-side relative path (e.g. Models/Foo vs models/foo), so casefolding it
-    # could attach to the wrong model on a case-sensitive server; defer to an exact
-    # match there and let the load endpoint resolve the requested path.
+    # Case-insensitive matching is only safe against a loopback Unsloth, where _is_hub_model_id's local probe is
+    # authoritative.
+    # Remotely a two-segment string is indistinguishable from a server-side relative path.
     if not allow_casefold:
         return False
     if not (_is_hub_model_id(actual) and _is_hub_model_id(requested)):
@@ -1654,15 +1563,10 @@ def _resolve_model(
 ) -> dict:
     models = _loaded_models(base, key)
     load_requested = False
-    # Only casefold-match ids against a loopback Unsloth, where _is_hub_model_id's
-    # local existence probe can actually reject a server-side path; see the note there.
+    # Only casefold-match ids against a loopback Unsloth; see the note in _is_hub_model_id.
     allow_casefold = is_loopback_url(base)
-    # /v1/models reports the model id but not the active GGUF variant or runtime load
-    # settings, so an id match alone can hide the wrong quant (Q8_0 serving while the
-    # user asked for UD-Q4_K_XL). When the user passed any explicit load knob, defer to
-    # /api/inference/load: the server's already-loaded dedup answers "already_loaded"
-    # without reloading when the variant AND settings match, so a second session running
-    # the same command still attaches without evicting the first.
+    # /v1/models reports the id but not the active variant, so with any explicit load knob defer to /api/inference/load,
+    # whose dedup answers already_loaded without reloading.
     load_has_overrides = bool(
         load.gguf_variant
         or load.max_seq_length
@@ -1670,9 +1574,7 @@ def _resolve_model(
         or load.tensor_parallel
         or load.gpu_memory_mode is not None
     )
-    # /v1/models also lists cached-but-unloaded catalog entries (loaded == False);
-    # matching one would skip /api/inference/load and leave the agent pointed at a
-    # model that is not resident, so only attach to an entry that is actually loaded.
+    # /v1/models also lists cached-but-unloaded entries, so only attach to one that is actually loaded.
     match = (
         None
         if requested and load_has_overrides
@@ -1688,23 +1590,19 @@ def _resolve_model(
     )
     if requested and match is None:
         load_requested = True
-        # Only here is an evicting load certain: the gate must not reject a request the
-        # resident model already satisfies (a path-loaded GGUF shown as a bare basename
-        # can collide with a non-GGUF unsloth/<name>).
+        # A path-loaded GGUF shown as a bare basename can collide with a non-GGUF unsloth/<name>.
+        # The gate must not reject a request the resident model already satisfies.
         active = next((m for m in models if m.get("loaded") is not False), None)
         if preload_check is not None:
-            # An explicit knob forces match to None so the server's disk-free dedupe can
-            # answer already_loaded; gating it would reject a second session for the model
-            # already serving, whose file may have moved. Only the quant is checked below:
-            # any other run knob changes the runtime intent, a real reload nothing dedupes.
+            # An explicit knob forces match to None so the server's disk-free dedupe can answer already_loaded.
+            # Only the quant is checked below, since any other knob is a real reload.
             other_overrides = bool(
                 load.max_seq_length
                 or not load.load_in_4bit
                 or load.tensor_parallel
                 or load.gpu_memory_mode is not None
             )
-            # /v1/models shows a path-loaded GGUF under its basename, so match that spelling
-            # too, or a second session reruns the gate.
+            # /v1/models shows a path-loaded GGUF under its basename, so match that spelling too.
             wanted_ids = {requested, _public_model_id(requested)} - {None}
             resident_serves_request = not other_overrides and any(
                 m.get("loaded") is not False
@@ -1714,9 +1612,9 @@ def _resolve_model(
                 )
                 for m in models
             )
-            # /v1/models shows only the basename, so confirm a path request against the
-            # identifier the server loaded -- else /new/foo.gguf reads as resident because
-            # /old/foo.gguf is.
+            # /v1/models shows only the basename, so confirm a path request against the loaded identifier, else
+            # /new/foo.gguf
+            # reads as resident because /old/foo.gguf is.
             if resident_serves_request and _is_model_path(requested):
                 try:
                     status = _http_json("GET", f"{base}/api/inference/status", key)
@@ -1738,8 +1636,8 @@ def _resolve_model(
                 except Exception:
                     status = {}
                 resident_variant = status.get("gguf_variant") if status.get("is_gguf") else None
-                # Casefold, not _normalized_variant (it strips separators): a mistyped Q4KM
-                # would skip the gate here yet still really reload on the server.
+                # Casefold, not _normalized_variant (it strips separators): a mistyped Q4KM would skip the gate yet
+                # still reload.
                 resident_serves_request = (
                     bool(resident_variant)
                     and str(resident_variant).strip().lower()
@@ -1758,8 +1656,8 @@ def _resolve_model(
             typer.echo("This unloads the current model for every attached session.")
             announced_switch = True
         elif active_id and load.gguf_variant:
-            # Same repo id but an explicit quant still replaces the resident
-            # weights; /v1/models has no variant, so ask the status endpoint.
+            # Same repo id with an explicit quant still replaces the weights, and /v1/models has no variant, so ask
+            # status.
             try:
                 status = _http_json("GET", f"{base}/api/inference/status", key)
             except Exception:
@@ -1772,8 +1670,7 @@ def _resolve_model(
                 )
                 typer.echo("This unloads the current model for every attached session.")
                 announced_switch = True
-        # Mirror `unsloth run`'s load knobs; keep the default payload as just
-        # model_path so a bare `--model` load is unchanged.
+        # Mirror `unsloth run`'s load knobs; keep the default payload as just model_path.
         payload = {"model_path": requested}
         if load.gguf_variant:
             payload["gguf_variant"] = load.gguf_variant
@@ -1790,18 +1687,13 @@ def _resolve_model(
         try:
             loaded = _load_model_with_progress(base, key, requested, load, payload)
         except Exception:
-            # The warning above promised an unload; if the server refused the
-            # load before evicting anything, say so. Not BaseException: Ctrl+C
-            # must stay immediate, without a probe or a survivor claim.
+            # If the load was refused before evicting, say so. Not BaseException: Ctrl+C must stay immediate.
             if announced_switch and _model_still_loaded(base, key, active_id):
                 typer.echo(f"Nothing was unloaded; {active_id} is still serving.", err = True)
             raise
         if loaded.get("status") == "already_loaded":
             typer.echo(f"Reusing loaded model: {_display_model_spec(requested, load.gguf_variant)}")
-        # Unsloth registers the model under a canonical id (resolved identifier,
-        # casing) that /v1/models echoes but which may differ from the path we
-        # passed; match on the id the load reports so we don't silently fall
-        # through to models[0] and connect to a different loaded model.
+        # Unsloth registers a canonical id that may differ from the path we passed, so match the id the load reports.
         wanted = {requested, _public_model_id(requested)} - {None}
         if isinstance(loaded, dict):
             wanted |= {loaded.get("model"), loaded.get("display_name")} - {None}
@@ -1822,8 +1714,7 @@ def _resolve_model(
             typer.echo(f"Reusing loaded model: {_display_model_spec(requested, load.gguf_variant)}")
         return match
     if requested:
-        # We asked Unsloth to load it and it didn't surface in /v1/models; don't
-        # silently hand back an unrelated loaded model.
+        # We asked Unsloth to load it and it did not surface in /v1/models; do not hand back an unrelated loaded model.
         _fail(
             f"Unsloth didn't report '{requested}' as loaded. Double-check the model "
             "id, or load it from the model dropdown in the UI."
@@ -1873,19 +1764,17 @@ def _hub_gguf_files(repo: str) -> Optional[list]:
     return [n for n in ggufs if not _is_auxiliary_gguf(n)]
 
 
-# Mirrors hub.utils.gguf._DRAFTER_KINDS / _DRAFTER_DIR_KINDS: dspark and dflash are the same
-# DeepSeek V4 Flash drafter, but dflash/ is also a real family name, so only mtp/ and dspark/
-# count as a companion folder.
+# Mirrors hub.utils.gguf._DRAFTER_KINDS: dflash is also a family name, so only mtp/ and dspark/ are companion folders.
+# dflash is the DeepSeek V4 Flash drafter; mirrors is_mtp_drafter_path.
 _DRAFTER_KINDS = ("mtp", "dspark", "dflash")
 _DRAFTER_DIR_KINDS = ("mtp", "dspark")
 
 
 def _is_auxiliary_gguf(filename: str) -> bool:
-    # Mirrors detect_gguf_model_remote (hub.utils.gguf.is_mtp_drafter_path): projectors,
-    # separate-file drafters and big-endian builds are not loadable weights. Drafters match
-    # by basename prefix or exact parent dir, never substring -- the kind names double as
-    # family names, so Qwen3.6-...-DFlash-Q4_K_M.gguf IS the model. Only the root-level
-    # trailing -be form is filtered; the fuller quant-aware check would over-reject here.
+    # Mirrors detect_gguf_model_remote: projectors, separate-file drafters and big-endian builds are not loadable
+    # weights.
+    # Drafters match by basename prefix or exact parent dir, never substring, since the kind names double as family
+    # names.
     p = filename.lower().replace("\\", "/")
     parts = [segment for segment in p.split("/") if segment]
     if not parts:
@@ -1915,8 +1804,7 @@ def _direct_gguf_is_companion(path: str) -> bool:
     name = parts[-1].lower()
     if not name.endswith(".gguf"):
         return False
-    # Root-independent refusals only: name prefixes read the basename alone, so they mean
-    # the same under any model root. A drafter FOLDER does not.
+    # Root-independent refusals only: name prefixes read the basename alone, a drafter FOLDER does not.
     if "mmproj" in name:
         return True
     return any(name.startswith(f"{kind}-") for kind in _DRAFTER_KINDS)
@@ -2032,8 +1920,7 @@ def _direct_gguf_is_big_endian(path: str) -> bool:
     return False
 
 
-# Mirrors gguf_variants._DIRECT_SPLIT_RE / the load path's _GGUF_SPLIT_FILE_RE; change in
-# lockstep. Five digits exactly: a shorter -001-of-002 name loads as an ordinary file.
+# Mirrors gguf_variants._DIRECT_SPLIT_RE; five digits exactly, a shorter -001-of-002 name loads as an ordinary file.
 _DIRECT_SPLIT_FILE_RE = re.compile(
     r"^(?P<stem>.+)-(?P<index>\d{5})-of-(?P<total>\d{5})$", re.IGNORECASE
 )
@@ -2072,8 +1959,7 @@ def _direct_gguf_file_is_ready(path: str) -> bool:
 
     try:
         p = Path(os.path.expanduser(path))
-        # A broken symlink is visible here, and the .gguf suffix alone still makes it a
-        # load, which fails after teardown.
+        # A broken symlink is visible here and the .gguf suffix still makes it a load, which fails after teardown.
         if p.is_symlink() and not p.exists():
             return False
         if not p.is_file():
@@ -2083,8 +1969,8 @@ def _direct_gguf_file_is_ready(path: str) -> bool:
         whole = _split_set_complete(p)
         if whole is not False:
             return True
-        # Mirror _local_gguf_load_path: an incomplete nominal set still loads when the shard
-        # is a symlink whose target sits with the full set.
+        # Mirror _local_gguf_load_path: an incomplete nominal set still loads when the shard is a symlink to the full
+        # set.
         if p.is_symlink():
             target = p.resolve()
             return _split_set_complete(target) is not False
@@ -2114,8 +2000,8 @@ def _answer_offers_variant(
     for row in variants:
         if not isinstance(row, dict):
             return True
-        # A torn local row proves a load llama cannot serve, so its labels do not vouch in
-        # strict mode; hub partials stay resumable and count.
+        # A torn local row proves a load llama cannot serve, so it does not vouch in strict mode; hub partials still
+        # count.
         if strict and row.get("partial") is True:
             continue
         quant = row.get("quant")
@@ -2128,13 +2014,12 @@ def _answer_offers_variant(
             if wanted in (label, re.sub(r"-[0-9]+(?:\.[0-9]+)?bpw$", "", label)):
                 return True
         if isinstance(filename, str):
-            # The local resolver also takes the exact shard-stripped stem: full relative
-            # spelling only, never a nested file's bare basename.
+            # The local resolver also takes the exact shard-stripped stem: full relative spelling only, never a nested
+            # basename.
             stem = re.sub(r"-\d{3,}-of-\d{3,}$", "", filename.rsplit(".", 1)[0]).lower()
             if wanted == stem:
                 return True
-            # Also any whole quant token of the BASENAME, which is how the listing's default
-            # can name the file by its other label (F16-checkpoint-Q4_K_M -> Q4_K_M).
+            # Also any whole quant token of the BASENAME (F16-checkpoint-Q4_K_M -> Q4_K_M).
             if any(
                 wanted
                 in (
@@ -2180,11 +2065,9 @@ def _preflight_codex_gguf(
     serve: bool = True,
     launch: bool = True,
 ) -> None:
-    # Hub-listing preflight for the auto-start path only: with a server running, identifiers
-    # resolve against its cwd/cache/token, so _attach_gguf_check_for_codex asks the server
-    # instead. Only a complete listing with no .gguf files rejects; unknown defers to the
-    # post-connect check. Mirrors _require_studio's auto-start condition, so with no start
-    # possible its "no running server" error comes first, without a hub probe.
+    # Hub-listing preflight for the auto-start path only; with a server running, identifiers resolve against its cwd and
+    # cache. Only a complete listing with no .gguf rejects.
+    # Mirrors _require_studio's auto-start condition so its "no running server" error comes first.
     if not (serve and launch and model):
         return
     expected = os.environ.get("UNSLOTH_STUDIO_URL", "http://127.0.0.1:8888").rstrip("/")
@@ -2193,8 +2076,7 @@ def _preflight_codex_gguf(
     if find_studio_server() is not None:
         return
     repo, _ = _split_repo_variant(model)
-    # A bare foo.gguf naming no local file is a shorthand, not a path: the load
-    # canonicalizes it like any other owner-less name.
+    # A bare foo.gguf naming no local file is a shorthand, not a path: the load canonicalizes it.
     if "/" not in repo and (not _is_model_path(repo) or repo.lower().endswith(".gguf")):
         # The server canonicalizes owner-less shorthands to unsloth/<name>.
         try:
@@ -2216,17 +2098,15 @@ def _attach_gguf_check_for_codex(
     model: Optional[str],
     variant: Optional[str] = None,
 ) -> None:
-    # Attach path: the server resolves the identifier with its own cwd, cache and token, so
-    # ask it before the load evicts the resident model. A live empty list is definitive;
-    # any error (an older server included) defers.
+    # Attach path: the server resolves the identifier with its own cwd, cache and token, so ask before the load evicts.
+    # A live empty list is definitive; any error defers.
     if not model:
         return
     repo, inline_variant = _split_repo_variant(model)
     # `--model repo:QUANT` is split before the gate runs, so the caller passes the quant on.
     variant = variant or inline_variant
-    # A .gguf filesystem path is GGUF by definition; only the hub-id shape (owner/name.gguf)
-    # gets probed. A bare foo.gguf naming no local file takes the shorthand route, since the
-    # load canonicalizes it to unsloth/foo.gguf.
+    # Only the owner/name.gguf hub shape gets probed; a .gguf path is GGUF by definition and a bare foo.gguf is
+    # shorthand.
     bare_missing_gguf = False
     if repo.lower().endswith(".gguf") and not _is_model_path(repo.rsplit(".", 1)[0]):
         try:
@@ -2243,24 +2123,20 @@ def _attach_gguf_check_for_codex(
             and "\\" not in repo
         )
     ):
-        # detect_gguf_model refuses a companion or big-endian build, so the load falls through
-        # to transformers and unloads llama-server before failing. Settled by name: the probe's
-        # empty answer defers whenever the path exists here, which on a loopback attach is
-        # exactly when it does. The quant never redirects a direct file (from_identifier
-        # consults it only for a DIRECTORY), though an explicit one still reaches the probe.
+        # detect_gguf_model refuses a companion or big-endian build, so the load falls through to transformers after
+        # unloading
+        # llama-server. Settled by name; the quant never redirects a direct file.
+        # `from_identifier` consults it only for a DIRECTORY.
         refused = _direct_gguf_is_companion(repo) or _direct_gguf_is_big_endian(repo)
         if refused:
             _fail_codex_needs_gguf(repo)
         # A drafter folder further up is the server's call.
         uncertain = _direct_gguf_companion_is_uncertain(repo)
-        # The variant does not exempt this: a direct file is loaded as itself, so a complete
-        # sibling matching the quant is never substituted for it.
+        # A direct file is loaded as itself, never replaced by a complete sibling matching the quant.
         if not refused and not uncertain:
-            # Only when this process really shares the server's filesystem: the .gguf suffix
-            # alone gets an incomplete file loaded, and llama-server finds the missing bytes
-            # only after teardown. Loopback does not prove that -- 127.0.0.1 may be an SSH or
-            # container forward where a server-valid path is simply absent here -- so confirm
-            # this machine's Unsloth and otherwise defer to the probe.
+            # Loopback does not prove a shared filesystem (127.0.0.1 may be an SSH or container forward), so confirm
+            # this machine's
+            # Unsloth and otherwise defer to the probe.
             if is_loopback_url(base) and verify_studio_identity(base):
                 # A .gguf-NAMED DIRECTORY is scanned, not loaded, so the suffix proves nothing.
                 try:
@@ -2268,16 +2144,14 @@ def _attach_gguf_check_for_codex(
                 except OSError:
                     is_gguf_dir = False
                 if not is_gguf_dir:
-                    # On loopback this reads the server's filesystem, so a name absent from a
-                    # listable directory is absent for the load too, and the .gguf suffix
-                    # still makes it a load that fails after teardown. An unreadable parent
-                    # stays unknowable and defers.
+                    # On loopback this reads the server's filesystem, so a name absent from a listable directory is
+                    # absent for the load
+                    # too; an unreadable parent defers.
                     try:
                         probe = Path(os.path.expanduser(repo))
                         missing = (
-                            # Only a path this OS spells: a Windows path seen from WSL parses
-                            # to nonsense (C:\... has parent '.') and the server may hold the
-                            # real file, so it defers to the probe.
+                            # Only a path this OS spells: a Windows path seen from WSL parses to nonsense, so it
+                            # defers to the probe.
                             _path_syntax_is_native(repo)
                             and not probe.is_symlink()
                             and probe.parent.is_dir()
@@ -2292,19 +2166,15 @@ def _attach_gguf_check_for_codex(
                             f"{repo} is incomplete (zero bytes or a split missing shards); "
                             "re-download or re-copy it before pointing Codex at it."
                         )
-                    # Only a spelling this OS can judge is settled here: a Windows path read
-                    # from WSL skipped the absence check above and reads as ready, so returning
-                    # would vouch for a file nobody looked at. An explicit variant also goes to
-                    # the probe, which judges the marked parent.
+                    # Only a spelling this OS can judge is settled here: a Windows path read from WSL would vouch for
+                    # a file nobody looked
+                    # at. An explicit variant also goes to the probe.
                     if not variant and _path_syntax_is_native(repo):
                         return
-            # A remote server's filesystem is not ours to read, and the load takes the .gguf
-            # suffix as authoritative, so ask the server instead. Its errors defer as always.
-    # Mirrors the load path's shorthand precedence: the raw name first (it may be a directory
-    # under the server's cwd), then the unsloth/<name> form the load falls back to only when
-    # the raw name resolves to nothing. A live answer settles that exact id, so the canonical
-    # form must not vouch for a raw name already answered, else a non-GGUF directory in the
-    # server's cwd passes the gate and evicts. Only an error falls through.
+            # A remote server's filesystem is not ours to read and the load takes the .gguf suffix as authoritative,
+            # so ask it.
+    # Mirrors the load path's shorthand precedence: the raw name first, then unsloth/<name>. A live answer settles that
+    # exact id, so the canonical form must not vouch for an already-answered raw name. Only an error falls through.
     candidates = [repo]
     if "/" not in repo and (not _is_model_path(repo) or bare_missing_gguf):
         candidates.append(f"unsloth/{repo}")
@@ -2317,14 +2187,12 @@ def _attach_gguf_check_for_codex(
             continue
         variants = info.get("variants") if isinstance(info, dict) else None
         if isinstance(variants, list):
-            # A cleanable row is an empty leftover <quant>/ folder: it offers a delete, never
-            # weights, so it cannot stand in for the load finding something.
+            # A cleanable row is an empty leftover <quant>/ folder: it offers a delete, never weights.
             variants = [
                 row for row in variants if not (isinstance(row, dict) and row.get("cleanable"))
             ]
-        # The load uses a bare name only when it resolves locally, else it canonicalizes to
-        # unsloth/<name>, so a raw answer the server calls non-local settles nothing. Without
-        # the flag (older server) the raw answer is still the best evidence there is.
+        # A raw answer the server calls non-local settles nothing, since the load then canonicalizes to unsloth/<name>.
+        # Without the flag (older server) it is still the best evidence there is.
         if (
             "/" not in candidate
             and candidate != candidates[-1]
@@ -2333,13 +2201,11 @@ def _attach_gguf_check_for_codex(
             and not info["resolved_locally"]
         ):
             continue
-        # The server can answer the gate's real question with the load resolver itself, so it
-        # settles the round -- even an EMPTY listing, since a root-blind lister can miss a file
-        # detect_gguf_model still resolves. No filename grammar beats the code that loads.
+        # The server answers with the load resolver itself, so it settles the round even on an EMPTY listing.
         if isinstance(variants, list) and isinstance(info, dict):
             offered = info.get("loadable_variants")
-            # No allow-list means a direct file, which loads as itself whatever the quant, so
-            # the variantless verdict decides. Only a server omitting the field falls through.
+            # No allow-list means a direct file, which loads as itself whatever the quant, so the variantless verdict
+            # decides.
             if variant and offered is None and isinstance(info.get("loadable"), bool):
                 if not info["loadable"]:
                     _fail_codex_needs_gguf(candidate)
@@ -2356,14 +2222,11 @@ def _attach_gguf_check_for_codex(
                     _fail_codex_needs_gguf(candidate)
                 return
         if isinstance(variants, list) and variants:
-            # llama.cpp kills the resident model before resolving the quant, so a quant this
-            # answer cannot serve is settled here. Local answers take exact labels only; the
-            # looser filename-token tier is for hub answers.
-            #
-            # "Local" means the server says so (resolved_locally) or, predating that field,
-            # path syntax / bare names, which resolve locally anyway. owner/name.gguf is
-            # exempted like the direct-file branch (_is_model_path sees only the suffix),
-            # since a remote answer wrongly judged local would face local-only rules.
+            # llama.cpp kills the resident model before resolving the quant, so an unservable quant is settled here;
+            # local answers
+            # take exact labels only.
+            # "Local" means resolved_locally or, predating that field, path syntax and bare names, owner/name.gguf
+            # exempted.
             hub_shaped = (
                 candidate.count("/") == 1
                 and not candidate.startswith(("/", ".", "~"))
@@ -2373,8 +2236,8 @@ def _attach_gguf_check_for_codex(
             local_answer = bool(info.get("resolved_locally")) or (
                 not hub_shaped and (_is_model_path(candidate) or "/" not in candidate)
             )
-            # A local answer of only torn rows has no resumable side: llama-server would get
-            # the incomplete split only after teardown.
+            # A local answer of only torn rows has no resumable side: llama-server gets the incomplete split only
+            # after teardown.
             if local_answer and all(
                 isinstance(row, dict) and row.get("partial") is True for row in variants
             ):
@@ -2382,9 +2245,8 @@ def _attach_gguf_check_for_codex(
                     f"{candidate} has only incomplete GGUF weights on the server; "
                     "finish or re-copy the download before pointing Codex at it."
                 )
-            # A variantless local load picks from the directory's top level, so rows living
-            # only in quant subdirectories need the variant that resolves them -- else this
-            # answer evicts for a load that finds nothing.
+            # A variantless local load picks from the directory's top level, so rows in quant subdirectories need the
+            # variant.
             if (
                 local_answer
                 and not variant
@@ -2412,13 +2274,10 @@ def _attach_gguf_check_for_codex(
                 _fail_codex_variant_missing(candidate, variant, variants)
             return
         if isinstance(variants, list):
-            # Explicit local syntax resolves locally on every server version, so its live empty
-            # answer settles the load; deferring would let the same GGUF-less directory go down
-            # the transformers path and evict. Only marker-less names keep deferring: older
-            # servers read them as hub ids, and a local hit may be a server-side model from the
-            # server's cwd -- unless it reports resolved_locally, having already resolved them.
-            # A bare foo.gguf naming no local file is only the canonicalized spelling, so it
-            # settles nothing until the canonical form has answered too.
+            # Explicit local syntax resolves locally on every server version, so a live empty answer settles the load;
+            # deferring
+            # would let a GGUF-less directory evict. Marker-less names defer unless the server reports resolved_locally.
+            # A bare foo.gguf settles nothing until the canonical form has answered.
             if bare_missing_gguf and candidate != candidates[-1]:
                 continue
             if not _is_model_path(repo) and not info.get("resolved_locally"):
@@ -2473,8 +2332,7 @@ def _write_claude_settings(path: Path, model_id: str, local_env: dict) -> Path:
 
 
 def _claude_version() -> Optional[tuple]:
-    # None = no local `claude` (a --no-launch printout for another machine; assume a
-    # current build). An unparseable version is treated as too old for the new flags.
+    # None = no local `claude`; an unparseable version counts as too old.
     executable = _which_with_install_dirs("claude")
     if executable is None:
         return None
@@ -2482,10 +2340,8 @@ def _claude_version() -> Optional[tuple]:
         result = subprocess.run(
             [executable, "--version"], capture_output = True, text = True, timeout = 10, env = _probe_env()
         )
-        # Pull the X.Y.Z out of the output rather than assuming it is the first token.
-        # claude prints it first today ("2.1.98 (Claude Code)"), but a format change
-        # (e.g. "claude version 2.1.98") shouldn't silently drop the optimization flags;
-        # no match falls through to "too old", same as an unparseable version.
+        # Pull the X.Y.Z out of the output rather than assuming it is the first token; no match falls through to "too
+        # old".
         match = re.search(r"(\d+)\.(\d+)\.(\d+)", result.stdout)
         return tuple(int(part) for part in match.groups()) if match else (0,)
     except Exception:
@@ -2493,10 +2349,7 @@ def _claude_version() -> Optional[tuple]:
 
 
 def _claude_flags(model_id: str, settings: Optional[str] = None) -> list:
-    # KV-cache-preserving flags: move per-session context out of the system prompt and pass
-    # the session overlay. claude < 2.1.98 rejects the dynamic-sections flag but already
-    # supports --settings; no local binary means a printout for another machine, so assume
-    # a current build.
+    # KV-cache-preserving flags: claude < 2.1.98 rejects the dynamic-sections flag but already supports --settings.
     version = _claude_version()
     settings_flags = ["--settings", settings or _claude_settings_overlay(model_id)]
     if version is not None and version < (2, 1, 98):
@@ -2551,8 +2404,8 @@ def _claude_local_env(base: str, key: str, entry: dict) -> dict:
     }
     window = entry.get("context_length") or entry.get("max_context_length")
     if window:
-        # claude assumes 200k for a model id it does not recognize, and clamps
-        # AUTO_COMPACT_WINDOW to [100k, that]. MAX_CONTEXT_TOKENS sets the window itself.
+        # claude assumes 200k for an unrecognized model id and clamps AUTO_COMPACT_WINDOW; MAX_CONTEXT_TOKENS sets the
+        # window.
         env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(int(window))
         env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(int(window))
         env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = "90"
@@ -2583,8 +2436,7 @@ def _merge_codex_config(existing: str, base: str) -> str:
     )
 
 
-# Keep custom-model behavior aligned with Codex's own unknown-model fallback. This
-# Apache-2.0 prompt is copied from openai/codex rust-v0.144.0 models-manager/prompt.md.
+# Copied from openai/codex rust-v0.144.0 models-manager/prompt.md (Apache-2.0), Codex's own unknown-model fallback.
 _CODEX_FALLBACK_PROMPT = Path(__file__).parent.parent / "codex_fallback_prompt.md"
 _CODEX_MODEL_CATALOG_MIN_VERSION = (0, 110, 0)
 _CODEX_PATCH_LINE_ENDINGS_MIN_VERSION = (0, 148, 0)
@@ -2664,8 +2516,7 @@ def write_codex_config(base: str, model: dict, home: Path) -> None:
         config.write_text(merged, encoding = "utf-8")
         typer.echo(f"Updated {config}")
 
-    # oss_provider here too: codex --oss picks the provider from it, and the
-    # profile layer must beat a user-set value (e.g. "ollama") in config.toml.
+    # oss_provider here too: codex --oss picks the provider from it, and the profile layer must beat config.toml.
     profile_text = (
         f'oss_provider = "{_CODEX_PROFILE}"\n'
         f'model_provider = "{_CODEX_PROFILE}"\n'
@@ -2682,8 +2533,7 @@ def write_codex_config(base: str, model: dict, home: Path) -> None:
         if not catalog.exists() or catalog.read_text(encoding = "utf-8") != catalog_text:
             catalog.write_text(catalog_text, encoding = "utf-8")
             typer.echo(f"Updated {catalog}")
-        # Resolve relative to the profile file. This also survives WSL launching a Windows
-        # Codex binary, where a Linux absolute path inside TOML would not be usable.
+        # Resolve relative to the profile file; this also survives WSL launching a Windows Codex binary.
         profile_text += f"model_catalog_json = {json.dumps(catalog.name)}\n"
 
     window = model.get("context_length") or model.get("max_context_length")
@@ -2825,15 +2675,14 @@ def write_codex_parent_overlay(overlay: Path) -> Path:
             if isinstance(name, str) and name not in {"", ".", ".."} and Path(name).name == name:
                 _remove_overlay_entry(overlay / name)
     else:
-        # A reused overlay must never mix credentials, config, or plugins from two
-        # different Codex homes. Legacy overlays have no manifest, so rebuild them once.
+        # A reused overlay must never mix credentials, config or plugins from two Codex homes; legacy overlays have no
+        # manifest, so rebuild them once.
         for target in list(overlay.iterdir()):
             _remove_overlay_entry(target)
 
-    # Keep the user's auth, config, plugins, agents, skills, rules, and session state visible.
-    # Symlinks make this an overlay rather than a stale copy. If Windows denies them,
-    # use directory junctions so large runtime state remains shared without a bulk copy.
-    # Copy the configuration surfaces and sessions only if both link forms are unavailable.
+    # Symlink the user's auth, config, plugins, agents, skills, rules and session state so this is an overlay rather
+    # than a
+    # stale copy; fall back to directory junctions when Windows denies links, and copy only if neither works.
     fallback_dirs = {"agents", "skills", "rules", "plugins", "marketplaces", "sessions"}
     entries = []
     if source_home.is_dir():
@@ -2930,9 +2779,7 @@ def _opencode_subagent_inline_config(
                 provider for provider in disabled if provider != _OPENCODE_PROVIDER
             ]
 
-    # Keep an inherited inline allowlist usable by the local provider. V2 turns these
-    # filters into policies where global/project rules still intentionally outrank this
-    # content; the message at launch makes that boundary explicit.
+    # Keep an inherited inline allowlist usable by the local provider; under V2 global/project rules outrank these.
     merge_provider_filters(inline)
     effective = inline
 
@@ -3072,10 +2919,9 @@ def write_claude_subagent_plugin(path: Path, server_env: dict) -> Path:
             }
         },
     )
-    # Claude already refuses the editing tool in plan mode, since it advertises
-    # readOnlyHint false. This PreToolUse hook replaces that dead end with a reason
-    # naming the read-only tool to call instead. Skipped under the WSL bridge, where
-    # the gate is a Linux path but the hook would run beside the Windows claude.
+    # This PreToolUse hook replaces Claude's dead-end plan-mode refusal with a reason naming the read-only tool. Skipped
+    # under the WSL bridge, where it would run beside the Windows claude.
+    # Claude refuses the editing tool in plan mode with readOnlyHint false.
     gate = plugin / "hooks" / "plan_gate.py"
     if command == "wsl.exe":
         # A persisted plugin dir may still hold a gate from an earlier non-WSL run.
@@ -3093,23 +2939,18 @@ def write_claude_subagent_plugin(path: Path, server_env: dict) -> Path:
                             "hooks": [
                                 {
                                     "type": "command",
-                                    # Run through runpy rather than handing the path to
-                                    # the interpreter: a missing gate is then an
-                                    # ordinary traceback (exit 1, fails open) instead
-                                    # of exit 2, which Claude treats as a blocking
-                                    # error and would deny the tool in every mode.
-                                    # The path is base64'd because this string goes
-                                    # through a shell: a temp root holding $(..) or a
-                                    # backtick expands under sh, %VAR% under cmd, and
-                                    # the gate then silently fails open. base64's
-                                    # alphabet has no metacharacter in either.
+                                    # runpy, not the path: a missing gate is then an ordinary traceback (exit 1, fails
+                                    # open) rather than exit 2, which
+                                    # Claude treats as a blocking error.
+                                    # The path is base64'd because this string goes through a shell, where $(..), a
+                                    # backtick or %VAR% would expand.
                                     "command": (
                                         f'"{sys.executable}" -c '
                                         f'"import base64,runpy; runpy.run_path('
                                         f"base64.b64decode('{_b64_path(gate)}').decode())\""
                                     ),
-                                    # A hook with no timeout stalls the parent for as
-                                    # long as it hangs; measured unbounded past 400s.
+                                    # A hook with no timeout stalls the parent as long as it hangs; measured unbounded
+                                    # past 400s.
                                     "timeout": 10,
                                 }
                             ],
@@ -3183,27 +3024,21 @@ def _wsl_windows_path(path: Path) -> str:
 
 
 def _looks_like_path(value: str) -> bool:
-    # A var only wants the WSLENV /p flag if its value is a filesystem path: an
-    # absolute POSIX path (/...), a UNC path (\\...), or a drive-qualified Windows
-    # path (C:...). Scalar knobs (e.g. a numeric context window) must pass through
-    # untranslated, so they get no flag.
+    # Only path-valued vars want WSLENV's /p flag; scalar knobs must pass through untranslated.
     return bool(value) and (value.startswith(("/", "\\")) or (len(value) >= 2 and value[1] == ":"))
 
 
 def _wsl_bridge_names(env: dict, unset_env: tuple) -> tuple:
-    # Build the WSLENV share list for a Windows shim reached from WSL. Path-valued
-    # vars get /p so WSLENV translates them to the Windows path the /mnt shim can
-    # actually open; a cleared var carries no value to translate.
+    # Build the WSLENV share list for a Windows shim reached from WSL; a cleared var carries no value to translate.
     names = [name + ("/p" if _looks_like_path(value) else "") for name, value in env.items()]
     names.extend(unset_env)
     return tuple(dict.fromkeys(names))
 
 
 def _merge_wslenv(current: str, names: tuple) -> str:
-    # Index WSLENV entries by bare var name, preserving first-seen order. The vars we
-    # bridge are applied last so our entry wins: a user's pre-existing unflagged "HOME"
-    # is upgraded to "HOME/p" (rather than left as-is), since WSLENV ignores a duplicate
-    # name and a bare entry would leave the path untranslated for a Windows shim.
+    # Index WSLENV entries by bare var name, first-seen order. Our vars apply last so a user's unflagged "HOME" is
+    # upgraded
+    # to "HOME/p": WSLENV ignores a duplicate name and a bare entry leaves the path untranslated.
     ordered = []
     by_name = {}
     for entry in (*current.split(":"), *names):
@@ -3217,9 +3052,8 @@ def _merge_wslenv(current: str, names: tuple) -> str:
 
 
 def _powershell_quote(arg: str) -> str:
-    # PowerShell reads single-quoted strings literally (an embedded ' is doubled), so
-    # JSON args such as `--settings {"env":...}` survive intact. list2cmdline's
-    # backslash-escaped double quotes are cmd.exe syntax and PowerShell mis-parses them.
+    # PowerShell reads single-quoted strings literally; list2cmdline's backslash-escaped quotes are cmd.exe syntax it
+    # mis-parses.
     if arg and re.fullmatch(r"[A-Za-z0-9_./:=+-]+", arg):
         return arg
     return "'" + arg.replace("'", "''") + "'"
@@ -3253,12 +3087,8 @@ def _print_env(
         typer.echo(
             f"export WSLENV={shlex.quote(_merge_wslenv(os.environ.get('WSLENV', ''), wsl_env_bridge))}"
         )
-    # The final line is a SELF-CONTAINED one-liner (inline env, VAR=... cmd) rather than a
-    # bare command. People copy just the last line, and a bare `codex`/`claude` would then
-    # run against their real ~/.codex or Anthropic credentials with zero isolation -- e.g.
-    # inheriting a pre-existing damaged ~/.codex state DB and blaming the recipe. Inline
-    # assignments scope every var (and empty-string the conflicting ones) to this single
-    # invocation, so a partial copy behaves the same as pasting the whole block.
+    # The final line is a self-contained one-liner: people copy just it, and a bare `codex`/`claude` would run against
+    # their real credentials.
     inline = [f"{name}=" for name in unset_env]
     inline += [f"{name}={shlex.quote(value)}" for name, value in env.items()]
     inline += [f'{name}="$PWD"' for name in cwd_env]
@@ -3270,8 +3100,8 @@ def _print_env(
 
 
 def _refresh_windows_path() -> None:
-    # Merge Windows registry PATH hives after the current process PATH so a
-    # freshly installed agent is visible without changing existing precedence.
+    # Merge Windows registry PATH hives after the process PATH so a freshly installed agent is visible without changing
+    # precedence.
     if os.name != "nt":
         return
     try:
@@ -3343,10 +3173,8 @@ def _managed_node_tools() -> Optional[tuple[Path, Path, bool]]:
 
 
 def _augment_path_with_install_dirs() -> None:
-    # Add known install dirs to PATH so a freshly installed agent resolves without a new shell.
-    # User dirs are appended (existing tools keep precedence); a preferred managed Node is
-    # prepended so Node-backed shims use it. Only user dirs need a home, so a missing home must
-    # not drop the managed Node, or a shim fails on `env node` under a bare container UID.
+    # Add known install dirs to PATH so a fresh agent resolves without a new shell. A missing home must not drop the
+    # managed Node, or a shim fails on `env node`.
     try:
         home = Path.home()
     except (RuntimeError, OSError):
@@ -3361,10 +3189,8 @@ def _augment_path_with_install_dirs() -> None:
         candidates.append(managed_node[0].parent)
     current = os.environ.get("PATH")
     if current is None:
-        # PATH unset: shutil.which() and exec*p* fall back to os.defpath (e.g. /bin:/usr/bin), so
-        # keep that default instead of collapsing to just the install dirs (which would hide a
-        # system-installed agent and strip the launched child's normal PATH). An explicitly empty
-        # PATH is left as-is: like shutil.which, it means "search nothing", not os.defpath.
+        # PATH unset: shutil.which() and exec*p* fall back to os.defpath, so keep that. An explicitly empty PATH means
+        # "search nothing".
         current = os.defpath
     preferred_node = (
         str(managed_node[0].parent) if managed_node is not None and managed_node[2] else None
@@ -3431,16 +3257,13 @@ def _prefer_windows_cmd_sibling(executable: Optional[str]) -> Optional[str]:
 
 
 def _which_with_install_dirs(name: str) -> Optional[str]:
-    # shutil.which(name), but searching the known agent install dirs too, so a version probe
-    # resolves the same binary _launch() will (it augments PATH before it runs). Without this an
-    # agent present only in ~/.local/bin / %APPDATA%\npm is missed, wrongly assumed current, and
-    # launched with flags an older build rejects. PATH is restored afterward: only _launch()
-    # should persist the augmentation for the child process.
+    # shutil.which(name) plus the known agent install dirs, so a version probe resolves the same binary _launch() will;
+    # otherwise an agent only in ~/.local/bin or %APPDATA%\npm is launched with flags an older build
+    # rejects. PATH is restored afterward: only _launch() should persist the augmentation.
     original = os.environ.get("PATH")
     _augment_path_with_install_dirs()
     try:
-        # Callers spawn this result directly, so the shim rescue is needed here
-        # too, not only in _resolved_launch_command.
+        # Callers spawn this result directly, so the shim rescue is needed here too.
         return _prefer_windows_cmd_sibling(shutil.which(name))
     finally:
         if original is None:
@@ -3506,8 +3329,9 @@ def _install_command(install_hint: str) -> tuple[list[str], Optional[dict]]:
         )
     args = shlex.split(install_hint)
     env = dict(os.environ)
-    # dirname, not Path().parent: Path picks its flavour from os.name, which the tests
-    # override. Empty means npm is a bare name; prepending "" would put the cwd on PATH.
+    # dirname, not Path().parent: Path picks its flavour from os.name, which the tests override. Empty means a bare
+    # name,
+    # and prepending "" would put the cwd on PATH.
     npm_dir = os.path.dirname(npm)
     current_path = env.get("PATH", "")
     if npm_dir:
@@ -3529,17 +3353,13 @@ def _install_command(install_hint: str) -> tuple[list[str], Optional[dict]]:
 
 
 def _install_agent(name: str, install_hint: str) -> Optional[str]:
-    # Missing agent under --launch: offer to run its documented install command, then
-    # re-resolve it on PATH. Consent-based (we never auto-run a remote install script
-    # silently), and a non-interactive stdin cannot answer the prompt, so both the
-    # no-TTY and declined cases return None and let the caller print the hint and exit.
+    # Missing agent under --launch: offer its documented install command, then re-resolve on PATH. Consent-based, so
+    # no-TTY and declined both return None.
     if not sys.stdin.isatty():
         return None
     typer.echo(f"`{name}` is not installed.")
-    # Make the supply-chain risk explicit before the prompt: these are the vendors'
-    # own installers (curl | bash, irm | iex, npm), run with the user's privileges,
-    # and nothing checks a signature or hash on the fetched content. Naming the source
-    # turns a blind "yes" into informed consent.
+    # Name the source before the prompt: these are the vendors' own installers, run with the user's privileges, and
+    # nothing checks a signature or hash.
     source = _install_source(install_hint)
     if source:
         pinned_commit = _pinned_raw_github_commit(source)
@@ -3582,8 +3402,7 @@ def _install_agent(name: str, install_hint: str) -> Optional[str]:
                 "  Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned"
             )
         _fail(message)
-    # Resolve the freshly installed agent without a shell restart: pull registry PATH
-    # (Windows) plus well-known install dirs the installer may not have added to PATH.
+    # Resolve the freshly installed agent without a shell restart: registry PATH plus well-known install dirs.
     _refresh_windows_path()
     _augment_path_with_install_dirs()
     executable = shutil.which(name)
@@ -3619,10 +3438,9 @@ def _wsl_shim_env(
     wsl_env_bridge = _wsl_bridge_names(env, unset_env)
     if not wsl_env_bridge and not cwd_env:
         return env, ()
-    # Bridge PWD via WSLENV (PWD/p) so the Windows shim finds its project root from the
-    # live cwd, not a stale inherited Linux PWD. Don't freeze env["PWD"]: a --no-launch
-    # recipe must translate the live PWD when run, not when generated; _launch overrides it.
-    # cwd_env values likewise resolve at execution time and are always filesystem paths.
+    # Bridge PWD via WSLENV (PWD/p) so the Windows shim finds its project root from the live cwd.
+    # Do not freeze env["PWD"]: a --no-launch recipe must translate the PWD when run, not when
+    # generated.
     return env, tuple(dict.fromkeys((*wsl_env_bridge, *(f"{name}/p" for name in cwd_env), "PWD/p")))
 
 
@@ -3748,13 +3566,11 @@ def _resolved_launch_command(
     environment: Optional[dict] = None,
 ) -> list:
     """Return an argv that preserves arguments through standard Windows npm shims."""
-    # _launch resolves with raw shutil.which, so rescue here too; the sibling
-    # then enters the parser below.
+    # _launch resolves with raw shutil.which, so rescue here too; the sibling then enters the parser below.
     executable = _prefer_windows_cmd_sibling(executable)
     if os.name == "nt" and Path(executable).suffix.lower() in {".cmd", ".bat"}:
-        # cmd.exe treats CR/LF inside `%*` as command separators, and Windows
-        # PowerShell's native-command bridge also rewrites embedded quotes. Match
-        # complete cmd-shim templates so custom wrappers keep their setup behavior.
+        # cmd.exe treats CR/LF inside `%*` as command separators and PowerShell rewrites embedded quotes; match complete
+        # cmd-shim templates so custom wrappers keep their setup behavior.
         with contextlib.suppress(OSError, UnicodeError, IndexError):
             shim = Path(executable)
             contents = shim.read_text(encoding = "utf-8").replace("\r\n", "\n").strip()
@@ -3799,8 +3615,8 @@ def _launch(
     unset_env: tuple = (),
     cwd_env: tuple = (),
 ) -> int:
-    # Resolve well-known install dirs (e.g. ~/.local/bin) first, so an already-installed
-    # agent not yet on PATH is found instead of prompting a needless reinstall.
+    # Resolve well-known install dirs (e.g. ~/.local/bin) first, so an installed agent not yet on PATH is not
+    # reinstalled.
     _augment_path_with_install_dirs()
     executable = _resolve_or_install_agent(command[0], install_hint, shutil.which)
     env, wsl_env_bridge = _wsl_shim_env(command, env, unset_env, cwd_env)
@@ -3817,12 +3633,10 @@ def _launch(
             child_env.pop(name, None)
     child_env.update(env)
     if os.name != "nt" and not wsl_env_bridge:
-        # Keep POSIX child processes from seeing a stale inherited PWD when
-        # subprocess cwd was changed by the caller. Some Node CLIs use PWD for
-        # project-root discovery instead of process.cwd().
+        # Some Node CLIs use PWD, not process.cwd(), for project-root discovery, so do not let a child see a stale PWD.
         child_env["PWD"] = os.getcwd()
-    # Ctrl+C cancels a turn inside the agent; don't let it kill this wrapper. A no-op
-    # handler, not SIG_IGN: exec preserves an ignored signal but resets a caught one.
+    # A no-op handler, not SIG_IGN: exec preserves an ignored signal but resets a caught one, and Ctrl+C must cancel a
+    # turn.
     previous = signal.signal(signal.SIGINT, lambda *_: None)
     try:
         launch_command = _resolved_launch_command(executable, command[1:], child_env)
@@ -3843,10 +3657,8 @@ def _connect(
     server_options: ServerOptions = ServerOptions(),
     preload_check = None,
 ) -> tuple:
-    # `--model org/name:QUANT` is shorthand for `--model org/name --gguf-variant QUANT`.
-    # Split it before we match/serve so the attach path resolves against the already-loaded
-    # `org/name` (listed without the suffix) instead of reloading a `:`-suffixed repo id --
-    # which Unsloth rejects and which would evict a model another session is using.
+    # `--model org/name:QUANT` is shorthand for --model org/name --gguf-variant QUANT; split before matching so attach
+    # resolves against the loaded `org/name` instead of reloading a `:`-suffixed id and evicting another session.
     if model:
         repo, variant = _split_repo_variant(model)
         if variant:
@@ -3858,10 +3670,8 @@ def _connect(
     )
     try:
         key = _agent_api_key(base, api_key, auto_started = server is not None)
-        # A server we just started has exactly the requested model loaded, so resolve to
-        # whatever it is serving instead of re-matching the raw --model string.
-        # Only an attach can still trigger an evicting load, so _resolve_model gets the
-        # pre-load check and runs it only when that load is imminent.
+        # A server we just started has the requested model loaded. Only an attach can trigger an evicting load, so
+        # _resolve_model runs the pre-load check then.
         entry = _resolve_model(
             base,
             key,
@@ -3887,12 +3697,7 @@ def _run(
     clear_screen: bool = False,
     cwd_env: tuple = (),
 ) -> None:
-    # Some agents (Pi) render inline from wherever the cursor sits: their first
-    # paint assumes a clean screen rather than clearing or entering the
-    # alternate screen themselves. Hand them one so the session doesn't start
-    # mid-scroll under our connection output. click.clear() is cross-platform
-    # and a no-op when stdout is not a terminal (piped/CI), so transcripts and
-    # --no-launch recipes stay intact.
+    # Some agents (Pi) paint inline and assume a clean screen; click.clear() is a no-op when stdout is not a terminal.
     if launch and clear_screen:
         click.clear()
     typer.echo(f"Unsloth ready at {base} · model {entry['id']}")
@@ -3918,8 +3723,7 @@ def _run(
             cwd_env = cwd_env,
         )
     except BaseException:
-        # Startup succeeded but the agent failed to launch; tear the server down
-        # rather than orphan it.
+        # Startup succeeded but the agent failed to launch; tear the server down rather than orphan it.
         _shutdown_auto_served()
         raise
     auto_started = _auto_served_server is not None
@@ -3944,16 +3748,15 @@ def _agents_config_root() -> Path:
 
 @contextlib.contextmanager
 def _temporary_agent_config(prefix: str):
-    # Nothing else prunes Unsloth's auth tree, so reuse the locked session helper: the next
-    # launch reclaims homes left by a killed wrapper, and the lock spares live sessions.
+    # Reuse the locked session helper: the next launch reclaims homes left by a killed wrapper, and the lock spares
+    # live sessions.
     temp_root = _agents_config_root() / ".tmp"
     with contextlib.ExitStack() as stack:
         try:
             temp_root.mkdir(parents = True, exist_ok = True, mode = 0o700)
             path = stack.enter_context(_short_ephemeral_session(temp_root, prefix))
         except OSError:
-            # Attaching to a remote or running Unsloth needs no local auth tree, so it may be
-            # absent or unwritable. Fall back to the system temp dir, as before: no
+            # Attaching to a remote or running Unsloth needs no local auth tree, so fall back to the system temp dir: no
             # reclamation there, but the OS prunes it.
             path = Path(tempfile.mkdtemp(prefix = prefix))
             stack.callback(shutil.rmtree, path, ignore_errors = True)
@@ -3968,11 +3771,8 @@ def _ephemeral_session_parent(agent: str) -> Optional[Path]:
     """Return a non-system-temp parent when an agent needs one."""
     if os.name != "nt" or agent not in _CODEX_SHORT_HOME_AGENTS:
         return None
-    # Codex creates a deeply nested curated-plugin checkout below CODEX_HOME.
-    # A normal %TEMP%\unsloth-codex-* home can exceed legacy Windows path
-    # limits during startup, and Codex also refuses to create its PATH helpers
-    # below the system temp directory. Keep the throwaway home short but still
-    # private to the current user; _session_config removes it on exit.
+    # Codex nests a deep curated-plugin checkout below CODEX_HOME and refuses PATH helpers under the system temp dir, so
+    # keep the throwaway home short but private to the user.
     root = Path.home() / ".unsloth" / ".tmp"
     root.mkdir(parents = True, exist_ok = True, mode = 0o700)
     return root
@@ -4009,9 +3809,8 @@ def _locked_file(path: Path, blocking: bool = True):
                         raise
                     if not blocking:
                         break
-                    # LK_LOCK gives up after roughly ten seconds. Poll LK_NBLCK
-                    # instead so a large stale plugin checkout cannot make a
-                    # concurrent launch fail just because cleanup takes longer.
+                    # LK_LOCK gives up after roughly ten seconds; poll LK_NBLCK so a large stale plugin checkout
+                    # cannot fail a launch.
                     time.sleep(0.05)
         else:
             import fcntl
@@ -4042,9 +3841,9 @@ def _reclaim_stale_ephemeral_sessions(parent: Path, prefix: str) -> None:
             modified = active_lock.stat().st_mtime if active_lock.exists() else path.stat().st_mtime
         except FileNotFoundError:
             continue
-        # The wrapper owns the advisory lock, not the Codex child. If only the
-        # wrapper is killed, its child may still be using CODEX_HOME; give that
-        # process a full day to finish before treating the unlocked home as stale.
+        # The wrapper owns the advisory lock, not the Codex child, so give a possibly-live child a full day before
+        # treating
+        # an unlocked home as stale.
         if time.time() - modified < _CODEX_EPHEMERAL_STALE_SECONDS:
             continue
         try:
@@ -4098,8 +3897,8 @@ def _short_ephemeral_session(parent: Path, prefix: str = "u-codex-"):
             with _locked_file(parent / ".cleanup.lock") as cleanup_lock:
                 if not cleanup_lock:  # The blocking acquisition should always succeed.
                     raise RuntimeError(f"Could not lock ephemeral session root: {parent}")
-                # Release the live marker only after deletion is serialized with
-                # startup scavenging, so no scanner can race this rmtree.
+                # Release the live marker only after deletion is serialized with startup scavenging, so no scanner
+                # races this rmtree.
                 active_lock.close()
                 if path is not None:
                     shutil.rmtree(path, ignore_errors = True)
@@ -4132,11 +3931,9 @@ def _session_config(
             with _temporary_agent_config(prefix) as path:
                 yield path
     else:
-        # Never wipe this dir: a previously printed recipe may still be running
-        # an agent whose sessions/state live here, and every config writer
-        # merges idempotently into an existing home anyway. Writers must also
-        # reset any state a previous run's flags left behind (--yolo especially),
-        # since files here outlive the invocation that wrote them.
+        # Never wipe this dir: a previously printed recipe may still be running an agent whose state lives here.
+        # Writers merge
+        # idempotently and must reset state a previous run's flags left behind (--yolo especially).
         path = _agents_config_root() / agent
         path.mkdir(parents = True, exist_ok = True, mode = 0o700)
         yield path
@@ -4176,44 +3973,39 @@ def write_openclaw_config(
     agents = _subdict(config, "agents")
     defaults = _subdict(agents, "defaults")
     _subdict(defaults, "model")["primary"] = f"unsloth/{model['id']}"
-    # `unsloth start openclaw` is a coding-agent entry point, so the selected
-    # project may already contain its own AGENTS.md and git metadata. Do not seed
-    # OpenClaw's personal-assistant bootstrap files or initialize a repository in it.
+    # The selected project may already have its own AGENTS.md and git metadata, so do not seed OpenClaw's bootstrap
+    # files
+    # or initialize a repository.
     defaults["skipBootstrap"] = True
-    # OPENCLAW_STATE_DIR does not relocate the workspace. Callers normally pin it to
-    # the directory where `unsloth start openclaw` was invoked so OpenClaw edits the
-    # same project as every other coding agent. Keep the managed fallback for direct
-    # config-writer callers that do not provide an explicit workspace.
+    # OPENCLAW_STATE_DIR does not relocate the workspace; callers pin it to the invocation directory so OpenClaw edits
+    # the
+    # same project. The managed fallback stays for callers with no explicit workspace.
     if workspace_path is None:
         workspace = path.parent / "workspace"
         workspace.mkdir(parents = True, exist_ok = True, mode = 0o700)
         workspace_path = str(workspace)
     defaults["workspace"] = workspace_path
-    # Per-agent paths override agents.defaults.workspace and OPENCLAW_STATE_DIR. This
-    # config is itself an isolated Unsloth copy, so remove stale explicit paths and let
-    # OpenClaw resolve every listed agent beneath the managed defaults/state directory.
+    # Per-agent paths override agents.defaults.workspace and OPENCLAW_STATE_DIR, so remove stale explicit paths.
     agent_list = agents.get("list")
     if isinstance(agent_list, list):
         for agent_config in agent_list:
             if isinstance(agent_config, dict):
                 agent_config.pop("workspace", None)
                 agent_config.pop("agentDir", None)
-    # Unauthenticated loopback gateway: without auth.mode=none the client won't open
-    # the websocket. The daemon must still be started separately (`openclaw gateway`).
+    # Unauthenticated loopback gateway: without auth.mode=none the client will not open the websocket.
+    # The daemon still needs `openclaw gateway`.
     gateway = _subdict(config, "gateway")
     gateway.setdefault("mode", "local")
     _subdict(gateway, "auth").setdefault("mode", "none")
     if yolo:
-        # OpenClaw has no --yolo flag, and it gates tool execution on BOTH the
-        # tools.exec config AND a host-local approvals file (the stricter wins), so
-        # setting only the config still lets the agent prompt/deny. Set both, mirroring
-        # `openclaw exec-policy preset yolo`.
+        # OpenClaw gates execution on BOTH tools.exec and a host-local approvals file (the stricter wins), so set both,
+        # mirroring `openclaw exec-policy preset yolo`.
         exec_policy = _subdict(_subdict(config, "tools"), "exec")
         exec_policy["host"] = "gateway"
         exec_policy["security"] = "full"
         exec_policy["ask"] = "off"
-        # Approvals file in OPENCLAW_STATE_DIR (== this config's dir). ask=off means
-        # nothing is ever prompted, so the runtime socket block is unnecessary here.
+        # Approvals file in OPENCLAW_STATE_DIR; ask=off means nothing is ever prompted.
+        # ask=off makes the runtime socket block unnecessary.
         approvals = path.parent / "exec-approvals.json"
         _write_private_json(
             approvals,
@@ -4221,22 +4013,14 @@ def write_openclaw_config(
         )
         typer.echo(f"Updated {approvals}")
     else:
-        # The no-launch config dir is reused across runs, so a previous --yolo run may
-        # have left auto-approval state behind. OpenClaw treats an omitted exec policy as
-        # security=full, ask=off on the gateway host, so deleting the keys would keep
-        # auto-approval on: a non-yolo run must WRITE a prompting policy. Only a
-        # permissive/yolo policy is replaced; a stricter one set by hand survives.
+        # The config dir is reused across runs and OpenClaw reads an omitted exec policy as security=full/ask=off, so a
+        # non-yolo run must WRITE a prompting policy rather than delete keys. Only a permissive policy is replaced.
         tools = config.get("tools")
         exec_policy = tools.get("exec") if isinstance(tools, dict) else None
         exec_policy = exec_policy if isinstance(exec_policy, dict) else {}
-        # Match ONLY the exact fingerprint --yolo writes (host=gateway, security=full,
-        # ask=off, all explicit, no mode); anything else is left untouched. host=auto or an
-        # omitted host resolves to security=deny under an active sandbox, so treating those
-        # as the permissive gateway default would broaden a fresh sandboxed config from
-        # deny to allowlist. host=node and host=sandbox are user-set (--yolo only writes
-        # gateway). tools.exec.mode is OpenClaw's normalized knob (it cannot be combined
-        # with security/ask, and OpenClaw never rewrites our security/ask write into it),
-        # so a mode is always a deliberate user policy; never clobber it.
+        # Match ONLY the exact fingerprint --yolo writes (host=gateway, security=full, ask=off, no mode); host=node,
+        # host=sandbox and tools.exec.mode are always deliberate user policy.
+        # host=auto or an omitted host resolves to security=deny under a sandbox.
         permissive = (
             "mode" not in exec_policy
             and exec_policy.get("host") == "gateway"
@@ -4248,17 +4032,14 @@ def write_openclaw_config(
             exec_policy.pop("host", None)  # routing only; defaults to the gateway host
             exec_policy["security"] = "allowlist"  # only allowlisted commands skip approval
             exec_policy["ask"] = "on-miss"  # prompt on every non-allowlisted command
-        # Drop the yolo defaults from the host approvals file (a stricter default set by
-        # the user or OpenClaw is kept). With a prompting tools.exec the stricter of the
-        # two layers wins, so an omitted approvals default still prompts.
+        # Drop the yolo defaults from the host approvals file; with a prompting tools.exec the stricter layer wins.
         approvals = path.parent / "exec-approvals.json"
         if approvals.exists():
             state = _read_json_object(approvals)
             if state is not None:
                 defaults = state.get("defaults")
-                # Strip the defaults only when they are exactly the yolo fingerprint; a
-                # user-managed mixed policy that merely shares a field (e.g. askFallback=full,
-                # whose omitted default is deny) must be kept intact.
+                # Strip the defaults only on the exact yolo fingerprint; a user-managed policy sharing a field is kept
+                # intact.
                 yolo_defaults = (("security", "full"), ("ask", "off"), ("askFallback", "full"))
                 is_yolo = isinstance(defaults, dict) and all(
                     defaults.get(k) == v for k, v in yolo_defaults
@@ -4299,15 +4080,14 @@ def write_opencode_config(
         return {}
     before = json.dumps(config, sort_keys = True)
     config.setdefault("$schema", "https://opencode.ai/config.json")
-    # Keep the provider definition in this private session file. The launch path
-    # adjusts effective provider filters in the higher-priority inline overlay.
+    # Keep the provider definition in this private session file; effective filters are adjusted in the inline overlay.
     model_entry = {"name": model["id"]}
     window = model.get("context_length") or model.get("max_context_length")
     if window:
         window = int(window)
-        # A custom-provider model with no limit defaults to context 0, which silently
-        # disables OpenCode's auto-compaction; declare the real window (and a sane
-        # output cap) so it compacts instead of overflowing the server.
+        # A custom-provider model with no limit defaults to context 0, silently disabling auto-compaction, so declare
+        # the
+        # real window and a sane output cap.
         model_entry["limit"] = {"context": window, "output": min(window // 4, 8192)}
     _subdict(config, "provider")[_OPENCODE_PROVIDER] = {
         "npm": "@ai-sdk/openai-compatible",
@@ -4315,8 +4095,8 @@ def write_opencode_config(
         "options": {"baseURL": f"{base}/v1", "apiKey": key},
         "models": {model["id"]: model_entry},
     }
-    # Normal mode pins this as the session model. Subagent mode leaves the user's
-    # main/small models alone and exposes the local model to @unsloth and /models.
+    # Normal mode pins this as the session model; subagent mode leaves the user's models alone and exposes ours to
+    # @unsloth.
     opencode_model = f"{_OPENCODE_PROVIDER}/{model['id']}"
     if as_subagent:
         for field in ("model", "small_model"):
@@ -4339,29 +4119,22 @@ def write_opencode_config(
             if not agents:
                 config.pop("agent", None)
     if window and not as_subagent:
-        # Compact with ~10% headroom (near 90% full). The fixed 20k-token default
-        # buffer over-compacts, or never settles, on a small local context.
+        # Compact with ~10% headroom: the fixed 20k-token default buffer over-compacts on a small local context.
         compaction = _subdict(config, "compaction")
         compaction["auto"] = True
         compaction["reserved"] = max(1, window // 10)
     tools = ("edit", "bash", "webfetch", *(("task",) if as_subagent else ()))
     if yolo:
-        # Fallback for commands without native --auto and for the append-safe bare
-        # --no-launch command (subcommand unknown yet). Rides inline (OPENCODE_CONFIG_CONTENT)
-        # so it wins over a project config. TUI and `run` launches use --auto and call here
-        # with yolo=False, letting OpenCode preserve explicit deny rules.
+        # Fallback for commands without native --auto. Rides inline (OPENCODE_CONFIG_CONTENT) so it wins over a
+        # project config.
         session_permission = {t: "allow" for t in tools}
         session_permission["external_directory"] = {"*": "allow"}
         config["permission"] = dict(session_permission)
     else:
-        # Undo only what --yolo wrote: our yolo sets an explicit per-tool "allow" for these
-        # three tools, so flip exactly those explicit allows back to "ask". A "deny"/"ask",
-        # a granular object, a string, or a "*" catch-all is the user's own rule and is left
-        # untouched. We do NOT carry a permission inline for a non-yolo session: since
-        # OPENCODE_CONFIG_CONTENT outranks the project opencode.json we cannot read, any
-        # value forced there would override the user's project rules (weakening a project
-        # deny, or auto-approving through a granular object's permissive default). Clearing
-        # our own persisted yolo state is the fix; the project's own permissions are honored.
+        # Undo only what --yolo wrote: flip our three explicit "allow" tools back to "ask" and leave any other rule
+        # alone.
+        # A non-yolo session carries no permission: OPENCODE_CONFIG_CONTENT outranks the project opencode.json we
+        # cannot read.
         session_permission: dict = {}
         permission = config.get("permission")
         if isinstance(permission, dict):
@@ -4400,8 +4173,8 @@ def write_hermes_config(base: str, model: dict, path: Path) -> None:
                 err = True,
             )
             return
-    # Hermes only reads the key for a *named* custom provider (a bare
-    # `provider: custom` ignores it), so register it under providers.*.
+    # Hermes reads the key only for a named custom provider (a bare `provider: custom` ignores it), so register it under
+    # providers.*.
     _subdict(config, "model").update(
         provider = f"custom:{_HERMES_PROVIDER}",
         default = model["id"],
@@ -4410,19 +4183,17 @@ def write_hermes_config(base: str, model: dict, path: Path) -> None:
     window = model.get("context_length") or model.get("max_context_length")
     if window:
         window = int(window)
-        # Hermes auto-detects context from GET /v1/models, but OpenAI's schema has no
-        # context field, so it can fall back to a 256k default that overflows a small
-        # local model. Pin the real window (top-level model.context_length is the
-        # highest-priority override) and compact at 90% of it (Hermes defaults to 50%).
+        # Hermes auto-detects context from GET /v1/models, which has no context field, so it can
+        # default to 256k and overflow a small model. Pin the real window and compact at 90%.
+        # Top-level model.context_length is the window.
         if window >= _HERMES_MIN_CONTEXT:
             _subdict(config, "model")["context_length"] = window
             _subdict(config, "compression").update(enabled = True, threshold = 0.9)
         else:
-            # Below Hermes' 64,000-token floor it refuses to initialize, so claim
-            # the floor and shrink the threshold so compaction still fires at 90%
-            # of the REAL window (the threshold is a fraction of the claimed
-            # context_length). The auxiliary override keeps the same floor check
-            # from rejecting the compression model mid-session.
+            # Below Hermes' 64,000-token floor it refuses to initialize, so claim the floor and shrink the threshold
+            # (a fraction of
+            # the claimed context_length) to fire at 90% of the REAL window.
+            # The auxiliary override keeps the same check from rejecting the compression model.
             _subdict(config, "model")["context_length"] = _HERMES_MIN_CONTEXT
             threshold = round(0.9 * window / _HERMES_MIN_CONTEXT, 4)
             _subdict(config, "compression").update(enabled = True, threshold = threshold)
@@ -4450,16 +4221,14 @@ def write_pi_config(base: str, key: str, model: dict, path: Path) -> None:
         )
         return
     before = json.dumps(config, sort_keys = True)
-    # Pi reads custom providers from ~/.pi/agent/models.json (HOME-relocated for the
-    # session). Unsloth is a generic OpenAI-compatible /v1 endpoint, and the key lives
-    # in the config rather than the env (matching openclaw/opencode).
+    # Pi reads custom providers from ~/.pi/agent/models.json (HOME-relocated); the key lives in the config, not the env.
     provider_model = {"id": model["id"]}
     window = model.get("context_length") or model.get("max_context_length")
     if window:
         window = int(window)
-        # An unspecified model defaults to contextWindow 128000 / maxTokens 16384,
-        # far larger than a small Unsloth context, so Pi compacts too late and overflows
-        # the server. Pin the real window and a sane output cap (mirrors OpenCode).
+        # An unspecified model defaults to contextWindow 128000 / maxTokens 16384, so Pi compacts too late and
+        # overflows the
+        # server; pin the real window and output cap.
         provider_model["contextWindow"] = window
         provider_model["maxTokens"] = min(window // 4, 8192)
     _subdict(config, "providers")[_PI_PROVIDER] = {
@@ -4571,9 +4340,9 @@ def claude(
                 "claude",
                 "--plugin-dir",
                 _agent_config_path(plugin, ["claude"]),
-                # Before ctx.args: a forwarded `--` would turn later flags positional.
-                # `=` form: --allowedTools is variadic, so a detached value swallows
-                # the first forwarded positional.
+                # Before ctx.args: a forwarded `--` would turn later flags positional. Use the `=` form, since
+                # --allowedTools is
+                # variadic and a detached value swallows the first forwarded positional.
                 f"--allowedTools={_CLAUDE_SUBAGENT_TOOL},{_CLAUDE_SUBAGENT_PLAN_TOOL}",
                 *_yolo_command_flags("claude", yolo),
                 *ctx.args,
@@ -4593,14 +4362,10 @@ def claude(
         return
 
     env = _claude_local_env(base, key, entry)
-    # Claude Code auto-compacts against its native context window. The local env
-    # above supplies the loaded model's real window and a 90% threshold instead.
-    # --yolo (or its aliases) maps to Claude's own --dangerously-skip-permissions.
-    # IS_SANDBOX is left unset on purpose: Claude refuses bypass mode as root unless a
-    # sandbox is detected, and we don't want to falsely claim one on the user's host.
-    # claude keeps its history in ~/.claude/projects, which --settings/env never
-    # relocate, so a session already survives exit; resume it with `claude --continue`
-    # or `--resume <id>` passed through.
+    # Claude auto-compacts against its native window; the env above supplies the real one and a 90% threshold. --yolo
+    # maps
+    # to --dangerously-skip-permissions. IS_SANDBOX stays unset: Claude refuses bypass mode as root without a sandbox.
+    # History lives in ~/.claude/projects, so resume with `claude --continue`.
     with _session_config("claude", launch, persist = persist) as config:
         settings = _write_claude_settings(config, model_id, env)
         command = _claude_local_command(
@@ -4674,9 +4439,9 @@ def codex(
             presence_penalty = presence_penalty,
         ),
     )
-    # This preflight runs after _connect may have auto-started a server but before _run
-    # takes over its lifecycle, so tear the server down here if it rejects the model
-    # (e.g. a transformers-backend model) rather than leaving it on the atexit backstop.
+    # This preflight runs after _connect may have auto-started a server but before _run takes over its lifecycle, so
+    # tear
+    # the server down here if it rejects the model.
     try:
         _require_gguf_for_codex(base, key, entry["id"])
     except BaseException:
@@ -4784,21 +4549,17 @@ def openclaw(
         ),
     )
     openclaw_args = list(ctx.args)
-    # Default a bare `unsloth start openclaw` to the local TUI. Anything the caller
-    # passes through is forwarded verbatim so OpenClaw parses it under its own grammar
-    # (openclaw [global-flags] <command> [options]): an explicit subcommand, a global
-    # flag that must precede the command such as --profile/--dev, or a tui option. We
-    # cannot reinterpret those safely because a leading "--flag value" is ambiguous
-    # between a global (`--profile test`) and a tui option (`--message hi`); prepending
-    # `tui --local` would break the global form, so only the empty case is defaulted.
+    # Default a bare `unsloth start openclaw` to the local TUI; anything passed through is forwarded verbatim, since a
+    # leading "--flag value" is ambiguous and prepending `tui --local` would break the global form.
     if not openclaw_args:
         openclaw_args = ["tui", "--local"]
     command = ["openclaw", *openclaw_args]
     with _session_config("openclaw", launch, persist = persist) as cfg:
         config_path = cfg / "openclaw.json"
         # key lives in the config, not the env; --yolo writes the exec policy here too.
-        # Resolve the project only when the recipe executes: a --no-launch command may be
-        # generated in one directory, saved, and intentionally run later from another.
+        # Resolve the project only when the recipe executes: a --no-launch command may be generated in one directory
+        # and run
+        # from another.
         write_openclaw_config(
             base,
             key,
@@ -4881,8 +4642,9 @@ def opencode(
     if as_subagent:
         subagent_id = _subagent_model_id(base, key, entry, model, gguf_variant)
         subagent_model = {**entry, "id": subagent_id}
-        # Stay append-safe for a bare no-launch recipe: a later `run <prompt>` would make
-        # `opencode --auto run ...` parse as the TUI, so keep yolo in the inline fallback.
+        # Stay append-safe for a bare no-launch recipe: a later `run <prompt>` would make `opencode --auto run ...`
+        # parse as
+        # the TUI, so keep yolo in the inline fallback.
         route_native_auto = (
             yolo and _opencode_supports_native_auto(command_name) and (launch or bool(ctx.args))
         )
@@ -4910,8 +4672,9 @@ def opencode(
                 command = command_name,
                 v2 = opencode_v2,
             )
-            # A project opencode.json outranks the session file and could field-merge its
-            # own agent.unsloth over ours. Pin ours in the inline overlay so it wins.
+            # A project opencode.json outranks the session file and could field-merge its own agent.unsloth, so pin
+            # ours in the
+            # inline overlay.
             inline_config.setdefault("agent", {})[_SUBAGENT_NAME] = {
                 "description": _SUBAGENT_DESCRIPTION,
                 "mode": "subagent",
@@ -4930,13 +4693,8 @@ def opencode(
             )
         return
     opencode_model = f"{_OPENCODE_PROVIDER}/{entry['id']}"
-    # The inline OPENCODE_CONFIG_CONTENT below pins the model in the highest-priority
-    # layer, so the session model is forced without a --model flag. Only add --model for
-    # an interactive bare launch (a convenience so the TUI opens on our model). It is
-    # omitted for passthrough (inserting it before a subcommand can be misparsed) and for
-    # --no-launch, where the printed command is consumed by drivers that append a
-    # subcommand such as `run <prompt>`; a leading --model would land before that
-    # subcommand and break it. Those paths rely on the inline pin instead.
+    # The inline OPENCODE_CONFIG_CONTENT pins the model in the highest-priority layer, so --model is only added for an
+    # interactive bare launch: passthrough can misparse it, and no-launch drivers append a subcommand it would break.
     native_auto = False
     route_native_auto = yolo and _opencode_supports_native_auto(command_name)
     if ctx.args:
@@ -4958,17 +4716,16 @@ def opencode(
         )
         command = [command_name, *opencode_args]
     else:
-        # Append-safe base: `opencode --auto run ...` parses as the TUI with a project
-        # "run", not the run subcommand. Command unknown here, so keep the config fallback.
+        # Append-safe base: `opencode --auto run ...` parses as the TUI and the command is unknown here, so keep the
+        # fallback.
         opencode_args = _opencode_v2_standalone_args([]) if opencode_v2 else []
         command = [command_name, *opencode_args]
-    # opencode keeps sessions in ~/.local/share/opencode (never relocated), so resume
-    # already survives exit; reopen the last one by passing `opencode --continue` through.
+    # opencode keeps sessions in ~/.local/share/opencode (never relocated), so resume already survives exit.
     with _session_config("opencode", launch, persist = persist) as cfg:
         config_path = cfg / "opencode.json"
-        # OPENCODE_CONFIG is an overlay (loaded between the user's global and project
-        # configs), so this adds the Unsloth provider/model for the session without
-        # changing the user's default model. Key lives in the config, not the env.
+        # OPENCODE_CONFIG is an overlay between the user's global and project configs, so it adds the provider/model
+        # for the
+        # session without changing their default. The key lives in the config.
         session_permission = write_opencode_config(
             base,
             key,
@@ -4976,18 +4733,11 @@ def opencode(
             config_path,
             yolo = yolo and not native_auto,
         )
-        # A project's own opencode.json outranks OPENCODE_CONFIG, so the session model pin
-        # would silently lose to a repo config. Carry it in OPENCODE_CONFIG_CONTENT, which
-        # outranks project config; the API key stays in the private file, never the env.
-        # Only the config fallback carries a permission. Native --auto omits it (auto-approve
-        # asks, keep explicit denies); a non-yolo session omits it too, honoring project rules.
-        # V1 filters are ordinary overlays, so scope that session to our provider. V2 turns
-        # filters into security policies where global/project rules intentionally win; keep
-        # those policies intact and tell the user above that they must allow our provider.
-        # small_model is opencode's separate model for lightweight tasks; pin it to the
-        # session model too, or a user/project small_model on another (now filtered)
-        # provider would resolve a not-found error mid-session. The session serves one
-        # model, so the session model is the only valid target here anyway.
+        # A project opencode.json outranks OPENCODE_CONFIG, so the session model pin rides OPENCODE_CONFIG_CONTENT
+        # while the
+        # API key stays in the private file. small_model is pinned too, or a user's small_model on a filtered provider
+        # resolves not-found mid-session.
+        # V1 filters are ordinary overlays; V2 turns them into policies global/project rules win, so leave those intact.
         inline_config: dict = {
             "model": opencode_model,
             "small_model": opencode_model,
@@ -5059,8 +4809,7 @@ def hermes(
         ),
     )
     with _session_config("hermes", launch, persist = persist) as home:
-        # HERMES_HOME relocates hermes' whole home dir (config.yaml, sessions, state)
-        # like CODEX_HOME, so the user's ~/.hermes is left untouched for the session.
+        # HERMES_HOME relocates hermes' whole home dir like CODEX_HOME, so the user's ~/.hermes is untouched.
         write_hermes_config(base, entry, home / "config.yaml")
         env = {_HERMES_ENV_KEY: key, "HERMES_HOME": str(home)}
         _run(base, entry, env, command, launch = launch, install_hint = install_hint)
@@ -5157,9 +4906,8 @@ def pi(
                 clear_screen = True,
             )
         return
-    # Pi defaults to the google provider, so pin our provider/model on the command
-    # line; the custom OpenAI-compatible endpoint itself is only configurable via
-    # ~/.pi/agent/models.json.
+    # Pi defaults to the google provider, so pin our provider/model on the command line; the endpoint itself is only
+    # configurable via ~/.pi/agent/models.json.
     command = [
         "pi",
         "--provider",
@@ -5169,30 +4917,22 @@ def pi(
         *_yolo_command_flags("pi", yolo),
         *ctx.args,
     ]
-    # --ignore-scripts matches Pi's documented install recipe (its README notes Pi needs
-    # no install scripts), so accepting the prompt skips dependency lifecycle scripts.
+    # --ignore-scripts matches Pi's documented install recipe, so accepting the prompt skips lifecycle scripts.
     with _session_config("pi", launch, persist = persist) as home:
-        # Pi resolves its config dir from PI_CODING_AGENT_DIR first (getAgentDir() prefers
-        # it over $HOME/.pi/agent), so pin it at the session dir: an inherited
-        # PI_CODING_AGENT_DIR in the user's shell would otherwise send Pi to their real
-        # config and skip our provider/key. HOME is relocated too so any other ~/.pi paths
-        # stay in the session. The key rides in the config rather than the env.
+        # Pi prefers PI_CODING_AGENT_DIR over $HOME/.pi/agent, so pin it or an inherited value finds the user's real
+        # config.
         pi_agent_dir = home / ".pi" / "agent"
         write_pi_config(base, key, entry, pi_agent_dir / "models.json")
         env = {"HOME": str(home), "PI_CODING_AGENT_DIR": str(pi_agent_dir)}
         if os.name == "nt" or os.environ.get("WSL_DISTRO_NAME"):
-            # Node resolves ~/.pi via USERPROFILE (then HOMEDRIVE + HOMEPATH) on Windows,
-            # not HOME. Set them whenever Pi may run as a Windows process: native Windows,
-            # or a /mnt Windows shim launched from WSL (the WSLENV bridge then translates
-            # the path). Otherwise the Windows process falls back to the user's real
-            # %USERPROFILE%\.pi. splitdrive yields no drive off a POSIX path, so
-            # HOMEDRIVE/HOMEPATH stay unset there.
+            # Node resolves ~/.pi via USERPROFILE (then HOMEDRIVE + HOMEPATH) on Windows, not HOME, so set them
+            # whenever Pi may
+            # run as a Windows process. splitdrive yields no drive off a POSIX path, so they stay unset there.
             env["USERPROFILE"] = str(home)
             drive, tail = os.path.splitdrive(str(home))
             if drive:
                 env["HOMEDRIVE"], env["HOMEPATH"] = drive, tail
-        # Pi paints inline from the current cursor position (no alternate screen,
-        # no clear on first render), so give it the clean screen it assumes.
+        # Pi paints inline from the cursor with no alternate screen, so give it the clean screen it assumes.
         _run(
             base,
             entry,
