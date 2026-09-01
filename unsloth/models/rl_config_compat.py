@@ -41,9 +41,8 @@ __all__ = [
 ]
 
 
-# Straight renames from TRL's own deprecation warnings. Only entries where the
-# old value can be handed to the new name unchanged belong here, so anything
-# needing a different value or setting goes in the advice table below.
+# Straight renames from TRL's own deprecation warnings: only entries where the old value can be
+# handed to the new name unchanged; anything needing a different value goes in the advice table.
 TRL_CONFIG_RENAMES = {
     # Deprecated in TRL 0.26.0 (DPO) / 0.27.0 (GRPO), removed in 0.28.0.
     "use_liger_loss": "use_liger_kernel",
@@ -54,10 +53,9 @@ TRL_CONFIG_RENAMES = {
 }
 
 
-# What TRL tells users to do instead, keyed on the retired argument name. Only
-# consulted for arguments the installed config rejects, so an entry is harmless
-# for a config that still accepts the field (`max_completion_length` is retired
-# on `DPOConfig` but current on `GRPOConfig`).
+# What TRL tells users to do instead, keyed on the retired argument name. Only consulted for
+# arguments the installed config rejects, so an entry is harmless for a config that still accepts
+# the field (max_completion_length is retired on DPOConfig but current on GRPOConfig).
 TRL_REMOVED_FIELD_ADVICE = {
     # GRPOConfig, removed in TRL 0.28.0.
     "max_prompt_length": ("filter overlong prompts out of your dataset before training instead"),
@@ -111,7 +109,7 @@ def _accepted_parameters(config_class):
             elif parameter.kind is not inspect.Parameter.VAR_POSITIONAL:
                 names.add(name)
     elif dataclasses.is_dataclass(config_class):
-        # Unreadable `__init__`: the field list is the next best description.
+        # Unreadable __init__: the field list is the next best description.
         names = {f.name for f in dataclasses.fields(config_class) if f.init}
     else:
         # Nothing to go on. Forward everything rather than guess.
@@ -185,8 +183,8 @@ def filter_config_init_kwargs(
         notify = _default_notifier
     config_name = getattr(config_class, "__name__", str(config_class))
 
-    # Two passes so the outcome does not depend on dict ordering: take what the
-    # config accepts, then rename or drop the leftovers.
+    # Two passes so the outcome does not depend on dict ordering: take what the config accepts, then
+    # rename or drop the leftovers.
     forwarded = {key: value for key, value in kwargs.items() if key in accepted}
 
     for key, value in kwargs.items():
@@ -195,9 +193,8 @@ def filter_config_init_kwargs(
 
         renamed = TRL_CONFIG_RENAMES.get(key)
         if renamed is not None and renamed in accepted:
-            # The new name is a mirrored parameter, so it is already in the dict
-            # carrying either the caller's value or the class default. Only
-            # overwrite the default: an explicitly set new name wins.
+            # The new name is a mirrored parameter, so it is already in the dict carrying either the caller's
+            # value or the class default. Only overwrite the default: an explicitly set new name wins.
             existing = kwargs.get(renamed, _MISSING)
             if existing is _MISSING or _is_untouched(config_class, renamed, existing):
                 forwarded[renamed] = value

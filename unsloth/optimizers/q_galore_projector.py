@@ -110,10 +110,6 @@ class GaLoreProjector:
         self.ortho_matrix_zeros = None
         self.ortho_matrix_shape = None
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def project(self, full_rank_grad: torch.Tensor, step: int) -> torch.Tensor:
         """Project a full-rank gradient into the low-rank subspace.
 
@@ -131,7 +127,8 @@ class GaLoreProjector:
         assert self.proj_type == "std", "Only proj_type='std' is supported."
 
         if full_rank_grad.shape[0] >= full_rank_grad.shape[1]:
-            # "tall" matrix → right projection  (grad @ Q^T)
+            # A "tall" matrix takes the right projection (grad @ Q^T), a "wide" one the left (Q^T @ grad).
+            # "wide" matrix → left projection (Q^T @ grad)
             if self.ortho_matrix is None or step % self.update_proj_gap == 0:
                 float_ortho = self._compute_orthogonal(
                     full_rank_grad,
@@ -144,7 +141,6 @@ class GaLoreProjector:
             self._ortho_float_cache = self._load_ortho()
             low_rank_grad = torch.matmul(full_rank_grad, self._ortho_float_cache.t())
         else:
-            # "wide" matrix → left projection  (Q^T @ grad)
             if self.ortho_matrix is None or step % self.update_proj_gap == 0:
                 float_ortho = self._compute_orthogonal(
                     full_rank_grad,
@@ -180,10 +176,6 @@ class GaLoreProjector:
 
         return full_rank_grad * self.scale
 
-    # ------------------------------------------------------------------
-    # SVD
-    # ------------------------------------------------------------------
-
     @staticmethod
     def _compute_orthogonal(weights: torch.Tensor, rank: int, side: str) -> torch.Tensor:
         """Compute the top-``rank`` orthogonal matrix via truncated SVD.
@@ -209,8 +201,8 @@ class GaLoreProjector:
             U, s, Vh = torch.linalg.svd(matrix, full_matrices = False)
             result = Vh[:rank, :] if side == "right" else U[:, :rank]
         else:
-            # Oversampling p=10 per Halko et al. 2009 (arXiv:0909.4061)
-            # recommendation of p=5..10 for large low-rank matrices.
+            # Oversampling p=10, per Halko et al. 2009 (arXiv:0909.4061), which recommends p=5..10 for large
+            # low-rank matrices.
             q = min(rank + 10, min(m, n))
             U, s, V = torch.svd_lowrank(matrix, q = q, niter = 2)
             result = V[:, :rank].t() if side == "right" else U[:, :rank]
@@ -218,10 +210,6 @@ class GaLoreProjector:
         if original_dtype != torch.float32:
             result = result.to(device = original_device, dtype = original_dtype)
         return result
-
-    # ------------------------------------------------------------------
-    # Adaptive scheduling
-    # ------------------------------------------------------------------
 
     def _update_adaptive_schedule(self, float_ortho: torch.Tensor, side: str) -> None:
         """Track subspace stability and increase ``update_proj_gap`` if stable."""
@@ -244,10 +232,6 @@ class GaLoreProjector:
                 self.update_proj_gap = int(self.update_proj_gap * self.gamma_proj)
 
         self.past_ortho_vector = current_vector.clone()
-
-    # ------------------------------------------------------------------
-    # Quantized projection matrix storage
-    # ------------------------------------------------------------------
 
     def _store_ortho(self, float_ortho: torch.Tensor) -> None:
         """Store the orthogonal matrix, optionally quantized."""
@@ -274,11 +258,6 @@ class GaLoreProjector:
                 self.ortho_matrix_shape,
             )
         return self.ortho_matrix
-
-
-# ======================================================================
-# Quantization utilities (shared with the optimizer)
-# ======================================================================
 
 
 @torch.no_grad()
@@ -318,7 +297,7 @@ def _dequantize(
     w: torch.Tensor, scales: torch.Tensor, zeros: torch.Tensor, original_shape: tuple
 ) -> torch.Tensor:
     """Dequantize from uint8 back to float."""
-    # Infer group size: scales has shape (n_groups, 1), so n_groups = scales.shape[0]
+    # Infer the group size: scales has shape (n_groups, 1), so n_groups = scales.shape[0].
     total = w.numel()
     n_groups = scales.shape[0] if scales.dim() > 1 else scales.numel()
     group_size = total // n_groups if n_groups > 0 else total

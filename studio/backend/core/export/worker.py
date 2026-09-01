@@ -33,12 +33,9 @@ from utils.native_tls import activate_native_tls
 activate_native_tls()
 
 
-# Gate controlling whether captured stdout/stderr lines are forwarded to the
-# parent's resp_queue (and on to the export-dialog SSE stream). Closed by default
-# so the noisy bootstrap phase (imports, model resolution, loading bars) is
-# suppressed in the UI; _handle_export() opens it when export work starts. The
-# orchestrator spawns a fresh subprocess per checkpoint load, resetting this.
-# Dropped lines are still echoed to the saved fds so the server log keeps them.
+# Whether captured stdout/stderr reaches the parent's resp_queue (and the export-dialog SSE).
+# Closed by default so the noisy bootstrap phase is suppressed in the UI; dropped lines still
+# reach the saved fds and the server log.
 _log_forward_gate = threading.Event()
 
 
@@ -83,6 +80,7 @@ def _setup_log_capture(resp_queue: Any) -> None:
     os.close(w_out)
     os.close(w_err)
 
+    # Echo to the original fd so the server console keeps the full output.
     # Replace sys.stdout/sys.stderr with line-buffered writers on fds 1 and 2.
     try:
         sys.stdout = os.fdopen(1, "w", buffering = 1, encoding = "utf-8", errors = "replace")
@@ -92,22 +90,24 @@ def _setup_log_capture(resp_queue: Any) -> None:
 
     def _reader(read_fd: int, stream_name: str, echo_fd: int) -> None:
         buf = bytearray()
+        # Split on \n OR \r so tqdm-style progress bars update.
         while True:
             try:
                 chunk = os.read(read_fd, 4096)
             except OSError as exc:
                 if exc.errno == errno.EBADF:
                     break
+                # Gate closed (bootstrap): already echoed above; drop the line so the export dialog skips import
+                # noise.
                 continue
             if not chunk:
                 break
-            # Echo to the original fd so the server console keeps the full output.
             try:
                 os.write(echo_fd, chunk)
             except OSError:
+                # Queue put failed; drop the line rather than crash the thread.
                 pass
             buf.extend(chunk)
-            # Split on \n OR \r so tqdm-style progress bars update.
             while True:
                 nl = -1
                 for i, b in enumerate(buf):
@@ -121,8 +121,6 @@ def _setup_log_capture(resp_queue: Any) -> None:
                 if not line:
                     continue
                 if not _log_forward_gate.is_set():
-                    # Gate closed (bootstrap): already echoed above; drop the
-                    # line so the export dialog skips import noise.
                     continue
                 try:
                     resp_queue.put_nowait(
@@ -134,7 +132,6 @@ def _setup_log_capture(resp_queue: Any) -> None:
                         }
                     )
                 except Exception:
-                    # Queue put failed; drop the line rather than crash the thread.
                     pass
         if buf and _log_forward_gate.is_set():
             try:
@@ -204,7 +201,7 @@ def _offline_window_if_unreachable(step = "loading"):
                 try:
                     from unsloth.models.loader_utils import _force_hf_offline
                     force_ctx = _force_hf_offline()
-                    force_ctx.__enter__()  # sets env + in-process flags + resets sessions
+                    force_ctx.__enter__()
                 except Exception:
                     force_ctx = None
             if force_ctx is None:
@@ -241,8 +238,7 @@ def _handle_load(backend, cmd: dict, resp_queue: Any) -> None:
     checkpoint_path = cmd["checkpoint_path"]
     max_seq_length = cmd.get("max_seq_length", 2048)
     load_in_4bit = cmd.get("load_in_4bit", True)
-    # Latest-sidecar checkpoints load 16-bit here too: bnb 4-bit feeds quantized
-    # expert weights into unvalidated paths (same flip as the chat worker).
+    # bnb 4-bit feeds quantized expert weights into unvalidated paths, so load 16-bit here too.
     if load_in_4bit:
         from utils.transformers_version import latest_tier_active_for
         if latest_tier_active_for(checkpoint_path, cmd.get("hf_token")):
@@ -263,8 +259,8 @@ def _handle_load(backend, cmd: dict, resp_queue: Any) -> None:
         if (
             any(sub in _cp_lower for sub in _NEMOTRON_TRUST_SUBSTRINGS)
             and (_cp_lower.startswith("unsloth/") or _cp_lower.startswith("nvidia/"))
-            # Genuine first-party Hub repo only (not a local/spoof name starting
-            # with "unsloth/"); authenticated so private repos resolve.
+            # Genuine first-party Hub repo only, not a local name starting with "unsloth/"; authenticated so
+            # private repos resolve.
             and is_trusted_org_repo(checkpoint_path, hf_token = cmd.get("hf_token"))
         ):
             trust_remote_code = True
@@ -273,10 +269,8 @@ def _handle_load(backend, cmd: dict, resp_queue: Any) -> None:
                 checkpoint_path,
             )
 
-    # Malware gate: a poisoned pickle deserializes on load even with
-    # trust_remote_code False, so check HF's security scan (metadata-only) every
-    # load. Local checkpoints have no Hub scan and are skipped in the helper; a
-    # LoRA merges its base weights, so gate that repo too.
+    # A poisoned pickle deserializes on load even with trust_remote_code False, so check HF's scan every
+    # load; a LoRA merges its base, so gate that repo too.
     from utils.security import evaluate_file_security, load_scan_target, security_load_subdirs
 
     requested_security_targets = [checkpoint_path]
@@ -322,8 +316,8 @@ def _handle_load(backend, cmd: dict, resp_queue: Any) -> None:
             )
             return
 
-    # Consent gate: scan auto_map code before it runs; block CRITICAL/HIGH unless
-    # pinned-approved. A LoRA merges its base model, whose code runs, so gate it too.
+    # Scan auto_map code before it runs and block CRITICAL/HIGH unless pinned-approved; a LoRA merges
+    # its base model, whose code also runs.
     if trust_remote_code:
         from utils.security import evaluate_remote_code_consent_for_targets
 
@@ -400,16 +394,15 @@ def _handle_load(backend, cmd: dict, resp_queue: Any) -> None:
 
 def _handle_export(backend, cmd: dict, resp_queue: Any) -> None:
     """Handle any export command (merged, base, gguf, lora)."""
-    export_type = cmd["export_type"]  # "merged", "base", "gguf", "lora"
+    export_type = cmd["export_type"]
     response_type = f"export_{export_type}_done"
 
-    # Open the log forwarding gate so the user sees export progress in the live
-    # log panel. Stays open for the rest of this subprocess's life; the
-    # orchestrator spawns a fresh subprocess per checkpoint load, resetting it.
+    # Stays open for the rest of this subprocess's life; the orchestrator spawns a fresh subprocess per
+    # checkpoint load, resetting it.
     _log_forward_gate.set()
 
-    # Phase milestone so the heavy export step shows in the server log; the
-    # merge/save/convert itself only forwards stdout to the live panel.
+    # Phase milestone so the heavy export step shows in the server log; the merge/save/convert itself only
+    # forwards stdout to the live panel.
     _phase = {
         "merged": f"Exporting merged model ({cmd.get('format_type', '16-bit (FP16)')})...",
         "gguf": f"Exporting GGUF ({cmd.get('quantization_method', 'Q4_K_M')})...",
@@ -525,16 +518,14 @@ def run_export_process(*, cmd_queue: Any, resp_queue: Any, config: dict) -> None
     """
     import queue as _queue
 
-    # Install fd-level stdout/stderr capture FIRST so every subsequent print and
-    # every child process inherits the redirected fds (powers the live log stream).
+    # Install fd-level capture FIRST so every subsequent print and child process inherits the redirected fds.
     _setup_log_capture(resp_queue)
 
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    os.environ["PYTHONWARNINGS"] = "ignore"  # suppress C-level warnings before imports
+    os.environ["PYTHONWARNINGS"] = "ignore"
     # Unbuffered output from child Python (e.g. GGUF converter) so prints surface live.
     os.environ["PYTHONUNBUFFERED"] = "1"
-    # tqdm defaults to a 10s mininterval when stdout isn't a tty (we redirected
-    # fd 1/2 to a pipe), making multi-step bars look frozen; force frequent flushes.
+    # tqdm defaults to a 10s mininterval when stdout is not a tty, making multi-step bars look frozen.
     os.environ.setdefault("TQDM_MININTERVAL", "0.5")
 
     import warnings
@@ -543,9 +534,7 @@ def run_export_process(*, cmd_queue: Any, resp_queue: Any, config: dict) -> None
     if os.getenv("ENVIRONMENT_TYPE", "production") == "production":
         warnings.filterwarnings("ignore")
 
-    # This worker's stdout is forwarded to the export dialog once the log gate opens,
-    # and the Hub upload bar is the only live byte progress a long push_to_hub has, so
-    # it keeps its progress bars even though the server turned its own off.
+    # The Hub upload bar is the only live byte progress a long push_to_hub has, so keep progress bars on here.
     from loggers.config import allow_progress_bars
 
     allow_progress_bars()
@@ -557,7 +546,6 @@ def run_export_process(*, cmd_queue: Any, resp_queue: Any, config: dict) -> None
 
     checkpoint_path = config["checkpoint_path"]
 
-    # ── 1. Activate correct transformers version BEFORE any ML imports ──
     with _offline_window_if_unreachable(step = "activating transformers"):
         try:
             _activate_transformers_version(checkpoint_path, config.get("hf_token") or None)
@@ -573,7 +561,6 @@ def run_export_process(*, cmd_queue: Any, resp_queue: Any, config: dict) -> None
             )
             return
 
-    # ── 1b. Check Triton on Windows (must precede import torch) ──
     if sys.platform == "win32":
         try:
             import triton  # noqa: F401
@@ -585,14 +572,12 @@ def run_export_process(*, cmd_queue: Any, resp_queue: Any, config: dict) -> None
                 'Install for better performance: pip install "triton-windows<3.7"'
             )
 
-    # ── 1c. Stub torchao on Windows ROCm ──
-    # See core/_torchao_stub.py: torchao crashes on Windows ROCm (RCCL absent).
-    # No-op off Windows ROCm. Must run before importing transformers / unsloth_zoo.
+    # See core/_torchao_stub.py: torchao crashes on Windows ROCm (RCCL absent); must run before
+    # importing transformers / unsloth_zoo.
     from core._torchao_stub import install_torchao_windows_rocm_stub
 
     install_torchao_windows_rocm_stub()
 
-    # ── 2. Import ML libraries (fresh in this clean process) ──
     try:
         _send_response(
             resp_queue,
@@ -630,12 +615,11 @@ def run_export_process(*, cmd_queue: Any, resp_queue: Any, config: dict) -> None
         )
         return
 
-    # ── 3. Create export backend and load initial checkpoint ──
     try:
         backend = ExportBackend()
 
-        # Offline window covers the load preflights (malware/consent scans hit the Hub)
-        # before load_checkpoint runs its own probe; restored after so later loads re-decide.
+        # Offline window covers the load preflights (malware/consent scans hit the Hub) before
+        # load_checkpoint runs its own probe; restored after so later loads re-decide.
         with _offline_window_if_unreachable():
             _handle_load(backend, config, resp_queue)
 
@@ -651,7 +635,6 @@ def run_export_process(*, cmd_queue: Any, resp_queue: Any, config: dict) -> None
         )
         return
 
-    # ── 4. Command loop — process commands until shutdown ──
     logger.info("Export subprocess ready, entering command loop")
 
     while True:
@@ -671,9 +654,7 @@ def run_export_process(*, cmd_queue: Any, resp_queue: Any, config: dict) -> None
 
         try:
             if cmd_type == "load":
-                # Load a new checkpoint, reusing this subprocess.
                 backend.cleanup_memory()
-                # Offline window also covers this load's Hub preflights (re-probed per load).
                 with _offline_window_if_unreachable():
                     _handle_load(backend, cmd, resp_queue)
 
