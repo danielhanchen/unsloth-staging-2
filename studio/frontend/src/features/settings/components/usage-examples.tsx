@@ -13,7 +13,11 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { fetchDeviceType, usePlatformStore } from "@/config/env";
-import { useChatRuntimeStore } from "@/features/chat";
+import {
+  getInferenceStatus,
+  isExternalModelId,
+  useChatRuntimeStore,
+} from "@/features/chat";
 import { useT } from "@/i18n";
 import type { TranslationKey } from "@/i18n";
 import { isTauri } from "@/lib/api-base";
@@ -37,11 +41,16 @@ import { loadOpenAIAutoSwitchSettings } from "../api/openai-auto-switch";
 import { type OpenAIModel, listOpenAIModels } from "../api/openai-models";
 import { useSettingsPanelPrefsStore } from "../stores/settings-panel-prefs-store";
 import {
+  agentRunsOnActiveModel,
   buildAgentCommand,
+  fallbackAgent,
   isLoopbackHost,
   normalizeHost,
+  pickCompatibleAgent,
   psSingle,
+  resolveGgufCompatibility,
   shSingle,
+  statusGgufVerdict,
 } from "./agent-command";
 import { keylessBaseEligible } from "./keyless-example-eligibility";
 
@@ -588,11 +597,110 @@ export function UsageExamples({
   // True once the user has picked an agent themselves; guards the detection
   // effect below from clobbering that choice if it resolves afterward.
   const agentPickedByUserRef = useRef(storedPrefs.apiExampleAgent != null);
+  // isGguf at the moment of a hand-made pick, null if there has been none this session.
+  // A manual pick is kept only until the model's GGUF-ness changes under it.
+  const clickedUnderGgufRef = useRef<boolean | null>(null);
   const [useTunnel, setUseTunnel] = useState<boolean>(readUseTunnelPref);
   const origin = typeof window !== "undefined" ? window.location.origin : "";
   const base =
     useTunnel && cloudflareUrl ? cloudflareUrl : (serverUrl ?? origin);
   const localAgentDetection = canUseLocalAgentDetection(base);
+  // Three signals: a hub pick reports a variant, a drag-dropped file only a path token,
+  // and ggufContextLength is set only when /api/inference/status said is_gguf.
+  const activeGgufVariant = useChatRuntimeStore((s) => s.activeGgufVariant);
+  const activeNativePathToken = useChatRuntimeStore(
+    (s) => s.activeNativePathToken,
+  );
+  const ggufContextLength = useChatRuntimeStore((s) => s.ggufContextLength);
+  // null when these fields do not describe the model the snippet names. They all start
+  // null, so before /api/inference/status lands they are indistinguishable from a real
+  // non-GGUF model; acting on that guess re-steered a GGUF session to opencode for good
+  // and cleared a saved preference on the way. An external selection is the other case:
+  // use-chat-model-runtime deliberately stops applying local status while one is active,
+  // so the fields freeze while useExampleModelName keeps naming the resident model from
+  // /v1/models, and the two can drift apart with no way back.
+  const activeCheckpoint = useChatRuntimeStore((s) => s.params.checkpoint);
+  const storeIsGguf: boolean | null =
+    !activeCheckpoint || isExternalModelId(activeCheckpoint)
+      ? null
+      : activeGgufVariant != null ||
+        activeNativePathToken != null ||
+        ggufContextLength != null;
+
+  // Those fields are filled by useChatModelRuntime, which only the chat and hub pages
+  // mount, and local checkpoints are deliberately not persisted (chat-runtime-store:
+  // "re-derived from the backend in useChatModelRuntime"). This dialog opens from any
+  // route -- the API Monitor page has its own button into this very panel -- so off
+  // those two pages the store answers "unknown" forever and the gate never runs.
+  // Ask the server the question the CLI gate asks instead: is_gguf on
+  // /api/inference/status is the same field _require_gguf_for_agent reads, and it
+  // describes the resident model, which is the model these snippets name.
+  // What the store currently claims to describe. The answer below is tagged with it, so
+  // a switch made here invalidates the previous answer instead of outliving it.
+  // JSON rather than a delimiter: every one of these can be a path or a repo id, so
+  // there is no separator that is guaranteed not to appear inside one of them.
+  const storeModelKey = JSON.stringify([
+    activeCheckpoint,
+    activeGgufVariant,
+    activeNativePathToken,
+  ]);
+  const [statusAnswer, setStatusAnswer] = useState<{
+    key: string;
+    isGguf: boolean | null;
+  } | null>(null);
+  // Polled on the catalog's own cadence, because nothing else here would notice a swap:
+  // useChatModelRuntime re-reads status on mount, on model-list changes and on tab focus,
+  // never on a timer, so an API request or a CLI load that switches the resident model
+  // while this tab stays focused leaves the store describing the model that left, while
+  // useExampleModelName's own poll renames the snippet after the new one.
+  useEffect(() => {
+    let cancelled = false;
+    let timeoutId: number | null = null;
+
+    const update = () => {
+      void getInferenceStatus()
+        .then((status) => {
+          if (cancelled) return false;
+          // Two silences, both read as unknown, the same way the CLI gate reads them.
+          // Absent is a server that does not report the field. Present but naming no
+          // model is InferenceStatusResponse's False default on an idle server, which
+          // says nothing about a model that is not there; taking it as a verdict cleared
+          // a saved Claude preference for a server that simply had nothing loaded.
+          const answer = statusGgufVerdict(
+            status.active_model ?? status.model_identifier,
+            status.is_gguf,
+          );
+          setStatusAnswer({ key: storeModelKey, isGguf: answer });
+          return answer !== null;
+        })
+        .catch(() => {
+          // Keep the last answer: a failed probe is no evidence about the model.
+          return false;
+        })
+        .then((resolved) => {
+          if (cancelled) return;
+          timeoutId = window.setTimeout(
+            update,
+            resolved ? CATALOG_IDLE_MS : CATALOG_RETRY_MS,
+          );
+        });
+    };
+
+    update();
+    return () => {
+      cancelled = true;
+      if (timeoutId !== null) window.clearTimeout(timeoutId);
+    };
+  }, [storeModelKey]);
+
+  // The server wins whenever its answer still describes what the store describes, since
+  // only the server sees a swap this tab did not make. A switch made here changes the key
+  // first, which drops the stale answer back to unknown and leaves the freshly updated
+  // store answering until the refetch lands.
+  const isGguf: boolean | null = resolveGgufCompatibility(
+    storeIsGguf,
+    statusAnswer?.key === storeModelKey ? statusAnswer.isGguf : null,
+  );
 
   useEffect(() => {
     void fetchDeviceType({ force: true });
@@ -612,6 +720,7 @@ export function UsageExamples({
       // longer targets a loopback base -- don't leave it selected, but
       // never touch a choice the user made by hand.
       if (!agentPickedByUserRef.current) {
+        // The effect below corrects this; isGguf read here would be a stale closure.
         setAgent(DEFAULT_AGENT);
       }
       return;
@@ -635,68 +744,54 @@ export function UsageExamples({
     };
   }, [localAgentDetection]);
 
-  // a restored agent this build no longer offers cannot build a command.
+  // Drop a restored preference this build no longer offers, or that cannot run the model.
   useEffect(() => {
     if (!agentPickedByUserRef.current) return;
+    if (isGguf === null) return;
+    if (clickedUnderGgufRef.current === isGguf) return;
     if (localAgentDetection && !agentsLoaded) return;
-    if (availableAgents.includes(agent)) return;
+    if (
+      availableAgents.includes(agent) &&
+      agentRunsOnActiveModel(agent, isGguf)
+    ) {
+      return;
+    }
+    const reset = fallbackAgent(isGguf, availableAgents);
+    if (reset === null) return; // nothing offered runs; moving would not help
     agentPickedByUserRef.current = false;
     setStoredAgent(null);
-    setAgent(DEFAULT_AGENT);
+    setAgent(reset);
   }, [
     agent,
     agentsLoaded,
     availableAgents,
+    isGguf,
     localAgentDetection,
     setStoredAgent,
   ]);
 
-  // Single source of truth for the auto-picked agent, re-derived whenever
-  // the detected list or the loaded model's GGUF-ness changes -- in either
-  // direction. `codex` needs a GGUF model (unsloth_cli's
-  // _require_gguf_for_codex exits otherwise), so it's only preferred once
-  // the loaded model actually qualifies; loading a GGUF model *after* a
-  // non-GGUF-gated fallback picked something else re-steers back to codex
-  // just as loading a non-GGUF model steers away from it. Never overrides a
-  // choice the user made by hand.
-  // activeGgufVariant alone only covers an HF-repo GGUF pick (a specific
-  // quant variant string) -- a direct local .gguf file (custom folder /
-  // LM Studio / drag-drop) is just as much a GGUF the codex preflight would
-  // accept, but never has a "variant" to report, and would otherwise read as
-  // non-GGUF here. activeNativePathToken covers the drag-drop/picked-file
-  // case; ggufContextLength is only ever populated when the backend's
-  // /api/inference/status last reported is_gguf: true for the active model
-  // (see applyActiveModelStatusToStore), so together these three cover every
-  // path a model can be GGUF through, matching the same is_gguf-or-equivalent
-  // check hasGgufSource applies to a staged pick.
-  const activeGgufVariant = useChatRuntimeStore((s) => s.activeGgufVariant);
-  const activeNativePathToken = useChatRuntimeStore(
-    (s) => s.activeNativePathToken,
-  );
-  const ggufContextLength = useChatRuntimeStore((s) => s.ggufContextLength);
+  // The guard is "detection has not answered", not "the list is empty": empty is a valid
+  // answer, and acting on an unresolved list flips the command between paints.
   useEffect(() => {
     if (agentPickedByUserRef.current) return;
-    if (detectedAgents.length === 0) return;
-    const isGguf =
-      activeGgufVariant != null ||
-      activeNativePathToken != null ||
-      ggufContextLength != null;
-    const preferred = detectedAgents.find((a) => a !== "codex" || isGguf);
-    if (preferred) {
-      setAgent(preferred);
-    } else if (agent === "codex" && !isGguf) {
-      // codex was auto-picked while a GGUF model was active and it's the
-      // only detected agent; now that the model isn't GGUF anymore, nothing
-      // detected is actually runnable, so fall back to the default instead
-      // of leaving a codex command unsloth_cli will reject.
-      setAgent(DEFAULT_AGENT);
+    if (isGguf === null) return;
+    if (localAgentDetection && !agentsLoaded) return;
+    const next = pickCompatibleAgent(
+      detectedAgents,
+      agent,
+      isGguf,
+      availableAgents,
+    );
+    if (next !== null) {
+      setAgent(next);
     }
   }, [
     agent,
+    agentsLoaded,
+    availableAgents,
     detectedAgents,
-    activeGgufVariant,
-    activeNativePathToken,
-    ggufContextLength,
+    isGguf,
+    localAgentDetection,
   ]);
 
   const keylessBase =
@@ -931,6 +1026,7 @@ export function UsageExamples({
                   type="button"
                   onClick={() => {
                     agentPickedByUserRef.current = true;
+                    clickedUnderGgufRef.current = isGguf;
                     setAgent(id);
                     setStoredAgent(id);
                   }}

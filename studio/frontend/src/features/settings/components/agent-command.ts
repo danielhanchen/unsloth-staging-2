@@ -128,3 +128,75 @@ export function buildAgentShellCommands(
     dryRun: `${buildAgentCommand(base, null, os, "claude")} --no-launch`,
   };
 }
+
+// Codex (/v1/responses) and Claude Code (/v1/messages) are llama-server only; the rest use
+// /v1/chat/completions, which serves safetensors and MLX.
+export const GGUF_ONLY_AGENTS: readonly string[] = ["codex", "claude"];
+
+export function agentRunsOnActiveModel(agent: string, isGguf: boolean): boolean {
+  return isGguf || !GGUF_ONLY_AGENTS.includes(agent);
+}
+
+// The non-GGUF reset target: DEFAULT_AGENT is itself GGUF-only.
+export const UNIVERSAL_AGENT = "opencode";
+
+// Stays inside `offered`, or a narrower backend list names an agent with no chip. null =
+// nothing offered runs.
+export function fallbackAgent(
+  isGguf: boolean,
+  offered: readonly string[] = [],
+): string | null {
+  const runs = (agent: string) => agentRunsOnActiveModel(agent, isGguf);
+  if (offered.length === 0) {
+    return runs(DEFAULT_AGENT) ? DEFAULT_AGENT : UNIVERSAL_AGENT;
+  }
+  for (const preference of [DEFAULT_AGENT, UNIVERSAL_AGENT]) {
+    if (offered.includes(preference) && runs(preference)) {
+      return preference;
+    }
+  }
+  return offered.find(runs) ?? null;
+}
+
+export function pickCompatibleAgent(
+  detectedAgents: readonly string[],
+  currentAgent: string,
+  isGguf: boolean,
+  offered: readonly string[] = [],
+): string | null {
+  const preferred = detectedAgents.find((agent) =>
+    agentRunsOnActiveModel(agent, isGguf),
+  );
+  if (preferred) {
+    return preferred;
+  }
+  return agentRunsOnActiveModel(currentAgent, isGguf)
+    ? null
+    : fallbackAgent(isGguf, offered);
+}
+
+// Where the panel's "is the resident model a GGUF" answer comes from, and in which order.
+// The server wins: only it sees a switch made from another tab, the CLI or an API request
+// that auto-switched, and the chat runtime store re-reads status on mount, on model-list
+// changes and on tab focus, never on a timer. The store is the fallback, for the routes
+// that never mount that hook at all and for the moment after a switch made here, before
+// the server has been re-asked about it. null from both means unknown, which is not false
+// and must not gate anything.
+export function resolveGgufCompatibility(
+  fromStore: boolean | null,
+  fromServer: boolean | null,
+): boolean | null {
+  return fromServer ?? fromStore;
+}
+
+// What /api/inference/status is actually saying about the resident model. is_gguf carries
+// a False default on InferenceStatusResponse, so a server holding nothing answers false
+// while naming no model; that is the default, not a verdict, and reading it as one cleared
+// a saved preference on an idle server. Only a status that names what it holds decides.
+export function statusGgufVerdict(
+  resident: string | null | undefined,
+  isGguf: boolean | null | undefined,
+): boolean | null {
+  if (resident == null) return null;
+  return isGguf ?? null;
+}
