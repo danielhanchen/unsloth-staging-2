@@ -46,11 +46,14 @@ jobs:
           echo "SPOOF_SHELL=$SH" >> "$GITHUB_ENV"
           "$SH" --version 2>&1 | head -1 || true
       - name: Unit suite (42 assertions)
-        run: "$SPOOF_SHELL" tests/sh/test_rocm_no_version_arch_route.sh
+        run: |
+          "$SPOOF_SHELL" tests/sh/test_rocm_no_version_arch_route.sh
       - name: End-to-end reroute suite (21 assertions, executes the decision)
-        run: "$SPOOF_SHELL" tests/sh/test_rocm_no_version_arch_route_e2e.sh
+        run: |
+          "$SPOOF_SHELL" tests/sh/test_rocm_no_version_arch_route_e2e.sh
       - name: Spoofed Fedora/Bazzite host table
-        run: "$SPOOF_SHELL" .github/spoof/spoof_fedora_amd_host_table.sh
+        run: |
+          "$SPOOF_SHELL" .github/spoof/spoof_fedora_amd_host_table.sh
       # test_torch_constraint.sh is deliberately absent: its one dash-only failure is about
       # install.ps1, which this PR does not touch, and it fails identically on origin/main.
       - name: Adjacent AMD routing suites
