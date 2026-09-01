@@ -1403,6 +1403,7 @@ def _raise_tier_for_nested(cfg: dict | None, tier: str) -> str:
 
 # When the cheap signals only say "needs some 5.x", parse config.json with each candidate
 # sidecar's built-in parser, lowest first, instead of guessing.
+# --- AutoConfig probe: general tier resolution for ambiguous models ----------
 _PROBE_TIER_ORDER = ("530", "550", "510")
 _PROBE_TIMEOUT_SECS = 60
 
@@ -1804,6 +1805,7 @@ def get_transformers_tier(
             )
             return "default"
 
+    # --- Fast substring checks (no I/O) ------------------------------------
     result = _tier_from_name(model_name)
     if result is not None:
         tier, match = result
@@ -1821,6 +1823,7 @@ def get_transformers_tier(
         return tier
 
     # Slow config fallbacks: network for HF IDs, authenticated with hf_token.
+    # --- Slow config fallbacks (network for HF IDs; authenticated with hf_token) --------
     if _check_config_needs_510(model_name, hf_token):
         tier = _raise_tier_for_nested(_load_config_json(model_name, hf_token), "510")
         logger.info("Transformers tier %s selected for %s (config.json check)", tier, model_name)
@@ -2394,6 +2397,7 @@ def _ensure_venv_t5_exists() -> bool:
 # (utils/transformers_latest.py); pinned in a marker file so restarts revalidate and routing auto-picks it.
 # PEP 440-ish release strings only (guards the pip install spec against injection).
 # The sidecar directory is .venv_t5_latest.
+# --- User-consented "latest transformers" sidecar (.venv_t5_latest) --------------------------
 _LATEST_VERSION_RE = r"[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?"
 
 
@@ -2853,6 +2857,7 @@ def ensure_latest_transformers_venv(
 # Exact, reproducible pins (bump deliberately in review); validated to FP8-quantize Qwen3.5 /
 # Gemma-4 / Llama.
 # FP8/FP4 export of newer-transformers models.
+# --- llm-compressor-main shadow (FP8/FP4 export of newer-transformers models) ---------------------
 _LLMC_MAIN_TRANSFORMERS = "5.10.2"
 _LLMC_MAIN_SHA = "973c9c539a84dd9efaf74e115ede5ca419704c18"
 _LLMC_MAIN_COMPRESSED_TENSORS = "0.17.2a20260702"
