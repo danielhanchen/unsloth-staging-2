@@ -1598,10 +1598,6 @@ class InferenceStatusResponse(_InferenceRuntimeFields):
     )
 
 
-
-
-
-
 class TextContentPart(BaseModel):
     """Text content part in a multimodal message."""
 
@@ -1713,8 +1709,6 @@ ContentPart = Annotated[
     Discriminator(_content_part_discriminator),
 ]
 """Union type for multimodal content parts, discriminated by the 'type' field."""
-
-
 
 
 class ChatMessage(BaseModel):
@@ -2529,8 +2523,6 @@ class ToolConfirmRequest(BaseModel):
     decision: Literal["allow", "deny"] = "deny"
 
 
-
-
 class OpenAIContainerRequest(BaseModel):
     """Shared body for the OpenAI container endpoints (list / create / delete).
 
@@ -2593,8 +2585,6 @@ class ListOpenAIContainersResponse(BaseModel):
     containers: list[OpenAIContainerSummary]
 
 
-
-
 class ChoiceDelta(BaseModel):
     """Delta content for a streaming chunk."""
 
@@ -2627,8 +2617,6 @@ class ChatCompletionChunk(BaseModel):
     usage: Optional[CompletionUsage] = None
     timings: Optional[dict] = None
     context_truncated: Optional[dict] = None
-
-
 
 
 class CompletionMessage(BaseModel):
@@ -2680,10 +2668,6 @@ class ChatCompletion(BaseModel):
     choices: list[CompletionChoice]
     usage: CompletionUsage = Field(default_factory = CompletionUsage)
     system_fingerprint: Optional[str] = None
-
-
-
-
 
 
 class ResponsesInputTextPart(BaseModel):
@@ -2921,8 +2905,6 @@ class ResponsesRequest(BaseModel):
     model_config = {"extra": "allow"}
 
 
-
-
 class ResponsesOutputTextContent(BaseModel):
     """A text content block inside an output message."""
 
@@ -3021,10 +3003,6 @@ class ResponsesResponse(BaseModel):
     tool_choice: Optional[Any] = None
     tools: list = Field(default_factory = list)
     truncation: Optional[Any] = None
-
-
-
-
 
 
 class AnthropicTextBlock(BaseModel):
@@ -3343,8 +3321,6 @@ class AnthropicMessagesRequest(BaseModel):
         return self
 
 
-
-
 class AnthropicUsage(BaseModel):
     input_tokens: int = 0
     cache_creation_input_tokens: int = 0
@@ -3388,8 +3364,6 @@ class AnthropicMessagesResponse(BaseModel):
     stop_reason: Optional[str] = None
     stop_sequence: Optional[str] = None
     usage: AnthropicUsage = Field(default_factory = AnthropicUsage)
-
-
 
 
 class DiffusionLoadRequest(BaseModel):
@@ -4167,8 +4141,6 @@ class ImageGenerationResponse(BaseModel):
     data: list[ImageGenerationData] = Field(..., description = "The generated images.")
 
 
-
-
 class AudioSpeechRequest(BaseModel):
     """OpenAI ``CreateSpeechRequest`` for ``POST /v1/audio/speech``.
 
@@ -4255,8 +4227,6 @@ class AudioGalleryListResponse(BaseModel):
     next_before_id: Optional[str] = None
 
 
-
-
 class VideoJobCreateRequest(BaseModel):
     prompt: str = Field(..., min_length = 1)
     model: Optional[str] = None
@@ -4308,8 +4278,6 @@ class VideoJobDeleteResponse(BaseModel):
     id: str
     object: Literal["video.deleted"] = "video.deleted"
     deleted: bool = True
-
-
 
 
 class VideoLoadRequest(BaseModel):

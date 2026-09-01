@@ -4662,8 +4662,6 @@ def upsert_chat_settings_merge(updates: dict[str, Any]) -> dict[str, Any]:
         conn.close()
 
 
-
-
 # --- Legacy Dexie import ledger (recovery rationale in _ensure_schema's schema comment) ---
 def list_chat_legacy_imports() -> list[str]:
     """Return the legacy_thread_id of every thread already imported."""

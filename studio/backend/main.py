@@ -1423,7 +1423,6 @@ from utils.remote_access_settings import RemoteAccessStopResponseMiddleware  # n
 app.add_middleware(RemoteAccessStopResponseMiddleware)
 
 
-
 app.include_router(auth_router, prefix = "/api/auth", tags = ["auth"])
 app.include_router(training_router, prefix = "/api/train", tags = ["training"])
 app.include_router(models_router, prefix = "/api/models", tags = ["models"])
@@ -1472,7 +1471,6 @@ app.include_router(youtube_router, prefix = "/api/youtube", tags = ["youtube"])
 
 # Re-wrap /v1/* client errors into OpenAI/Anthropic envelopes; non-/v1 keeps {"detail": ...}.
 install_api_error_handlers(app)
-
 
 
 # /api/health has a hard deadline: preflight/backend.rs probes it with a 2s timeout right after
@@ -2170,8 +2168,6 @@ def get_hardware_info(
         ]
         body["llama_cpp"] = get_installed_llama_version()
     return body
-
-
 
 
 def _strip_crossorigin(html_bytes: bytes) -> bytes:
