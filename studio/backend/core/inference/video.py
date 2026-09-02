@@ -79,6 +79,7 @@ from .diffusion_memory import (
     normalize_memory_mode,
     plan_diffusion_memory,
     raise_on_unified_memory_shortfall,
+    reclaim_offload_host_memory,
     settled_snapshot_device_memory,
 )
 from .diffusion_speed import (
@@ -5712,6 +5713,17 @@ class VideoBackend:
                     raise RuntimeError(VIDEO_CANCELLED_MSG)
                 duration_s = len(video_frames) / float(out_fps) if out_fps else 0.0
                 self._gen = {"active": False}
+                # Deregister the cancel event BEFORE the trim below, under the lock
+                # cancel_generate takes, and re-check inside it. The trim blocks for a few
+                # hundred ms and the last is_set() check has already run, so a Stop landing in
+                # that window would otherwise be answered true while this clip is still returned
+                # and persisted. Mirrors the image backend's cancellation-lock epilogue.
+                with self._lock:
+                    if cancel.is_set():
+                        raise RuntimeError(VIDEO_CANCELLED_MSG)
+                    if self._active_generate_cancel is cancel:
+                        self._active_generate_cancel = None
+                reclaim_offload_host_memory(state.offload_policy, logger = logger)
                 return {
                     "mp4_bytes": mp4_bytes,
                     "seed": int(seed),
