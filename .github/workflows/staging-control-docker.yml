@@ -1,0 +1,219 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+#
+# CONTROL BASELINE: this branch is PURE upstream unslothai/unsloth main with NO pull
+# request merged into it. Its only purpose is to tell a pre-existing main failure apart
+# from one a PR introduced. Compare job-for-job against the staging-<PR> runs.
+#
+# Staging CI for unslothai/unsloth#control -- DOCKER validation.
+#
+# Upstream's docker-publish.yml has no pull_request trigger, so a PR that adds or
+# edits docker/** currently gets zero Docker validation. This workflow closes that
+# gap with everything that fits on a GPU-less runner with ~14 GB of free disk.
+#
+# Explicitly NOT attempted: building docker/Dockerfile. Its builder stage is
+# nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 plus a full torch + llama.cpp stack;
+# that is tens of GB and needs a GPU to be worth smoke-testing. `--check` resolves
+# base-image METADATA only, so it costs no layer downloads.
+#
+#   dockerfile-lint  buildx --check on both Dockerfiles, bash -n + shellcheck on
+#                    docker/*.sh, byte-compile of docker/**/*.py, and a drift
+#                    check on docker/.dockerignore's deny-all allowlist
+#   docker-tests     the repo's own tests that exercise docker/ code
+name: "staging-control docker"
+on:
+  push:
+    branches: ["pr-control-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  dockerfile-lint:
+    name: "docker lint / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-22.04
+          - ubuntu-24.04-arm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Runner capacity
+        run: |
+          df -h . | tail -1
+          docker version --format '{{.Client.Version}} / {{.Server.Version}}' || docker version
+          docker buildx version
+      - name: Dockerfile lint (docker buildx build --check)
+        run: |
+          set -u
+          rc=0
+          # Build context is docker/ for both images: docker/build.sh cd's into
+          # docker/ and builds ".", and docker-publish.yml uses context: ./docker.
+          echo "::group::docker/Dockerfile"
+          docker buildx build --check -f docker/Dockerfile docker/ || rc=1
+          echo "::endgroup::"
+          echo "::group::docker/Dockerfile.studio"
+          # BASE_IMAGE defaults to the not-yet-built unsloth image, and --check
+          # resolves base metadata before linting, so pin it to a public image.
+          docker buildx build --check --build-arg BASE_IMAGE=ubuntu:24.04 \
+              -f docker/Dockerfile.studio docker/ || rc=1
+          echo "::endgroup::"
+          [ "$rc" -eq 0 ] || echo "::error::docker buildx build --check reported findings"
+          exit "$rc"
+      - name: Shell parse gate (bash -n) on docker/*.sh
+        run: |
+          set -u
+          rc=0
+          for f in docker/*.sh; do
+              if bash -n "$f"; then echo "RESULT PASS bash -n $f"; else echo "::error file=$f::shell parse error"; rc=1; fi
+          done
+          exit "$rc"
+      - name: shellcheck docker/*.sh
+        run: |
+          set -u
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends shellcheck
+          shellcheck --version | head -2
+          # Blocking at -S warning. The repo-wide step in lint-ci.yml runs at the
+          # default severity with continue-on-error, so it adds no gate; docker/
+          # ships as a published image and warrants a real one.
+          shellcheck -S warning docker/*.sh
+      - name: Informational shellcheck (all severities)
+        continue-on-error: true
+        run: shellcheck -e SC1090,SC2034 docker/*.sh
+      - name: Byte-compile docker/**/*.py
+        run: |
+          python -m compileall -q -j 0 docker
+          echo "RESULT PASS compileall docker"
+      - name: Import-surface check on docker/*.py
+        run: |
+          # docker/*.py must not need third-party packages at module import time:
+          # several of them run inside the image before the venv is on sys.path.
+          python - <<'PY'
+          import ast, pathlib, sys
+          STDLIB = set(sys.stdlib_module_names)
+          bad = []
+          for p in sorted(pathlib.Path("docker").rglob("*.py")):
+              tree = ast.parse(p.read_text(encoding="utf-8"), str(p))
+              for node in tree.body:  # module level only
+                  names = []
+                  if isinstance(node, ast.Import):
+                      names = [a.name.split(".")[0] for a in node.names]
+                  elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                      names = [node.module.split(".")[0]]
+                  for n in names:
+                      if n not in STDLIB and not (p.parent / f"{n}.py").exists():
+                          bad.append(f"{p}:{node.lineno}: {n}")
+          if bad:
+              for b in bad:
+                  print(f"::error::module-level third-party import in docker/: {b}")
+              raise SystemExit(1)
+          print("RESULT PASS no module-level third-party imports under docker/")
+          PY
+      - name: .dockerignore allowlist drift
+        run: |
+          # docker/.dockerignore is deny-all ("**") plus an explicit "!" allowlist.
+          # A new file COPY'd by either Dockerfile but not allowlisted is silently
+          # missing from the build context, which only shows up at image runtime.
+          python - <<'PY'
+          import pathlib, re, shlex, sys
+          root = pathlib.Path("docker")
+          allow = set()
+          for line in (root / ".dockerignore").read_text(encoding="utf-8").splitlines():
+              line = line.strip()
+              if line.startswith("!"):
+                  allow.add(line[1:].strip().rstrip("/"))
+          missing = []
+          for df in ("Dockerfile", "Dockerfile.studio"):
+              text = (root / df).read_text(encoding="utf-8")
+              text = re.sub(r"\\\s*\n", " ", text)  # join line continuations
+              for m in re.finditer(r"^\s*COPY\s+(.*)$", text, re.M):
+                  parts = shlex.split(m.group(1))
+                  if any(p.startswith("--from=") for p in parts):
+                      continue
+                  srcs = [p for p in parts if not p.startswith("--")][:-1]
+                  for s in srcs:
+                      s = s.strip().rstrip("/")
+                      if not s or "*" in s or "?" in s:
+                          continue
+                      parents = {str(pathlib.PurePosixPath(s).parent)}
+                      for anc in pathlib.PurePosixPath(s).parents:
+                          parents.add(str(anc))
+                      if s in allow or parents & allow:
+                          continue
+                      missing.append(f"{df}: COPY {s}")
+          if missing:
+              for m in missing:
+                  print(f"::error file=docker/.dockerignore::{m} is not un-ignored in docker/.dockerignore")
+              raise SystemExit(1)
+          print(f"RESULT PASS every COPY source is allowlisted ({len(allow)} ! entries)")
+          PY
+      - name: JSON assets under docker/ parse cleanly
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          bad = 0
+          for p in sorted(pathlib.Path("docker").rglob("*.json")):
+              if p.name.startswith("tsconfig"):
+                  continue  # JSONC by convention, same skip as lint-ci.yml
+              try:
+                  json.loads(p.read_text(encoding="utf-8"))
+                  print(f"RESULT PASS json {p}")
+              except Exception as exc:
+                  print(f"::error file={p}::invalid JSON: {exc}")
+                  bad += 1
+          raise SystemExit(1 if bad else 0)
+          PY
+
+  docker-tests:
+    name: "docker tests / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - windows-latest
+          - macos-15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip pytest
+      - name: pytest files that exercise docker/ code
+        run: |
+          # Found with: grep -rn -i docker tests/ , keeping only the hits that
+          # actually import or parse something under docker/.
+          #   test_unsloth_pip_shim.py    -> docker/unsloth_pip_shim.py
+          #   test_unsloth_nb_pip_magic.py-> docker/unsloth_nb_pip_magic.py
+          #   test_branding_guard.py      -> docker/jupyter/unsloth_branding.py
+          python -m pytest -q --tb=short \
+            tests/python/test_unsloth_pip_shim.py \
+            tests/python/test_unsloth_nb_pip_magic.py \
+            tests/studio/test_branding_guard.py
+      - name: select_cuda_jit_tools unit test (extracted from docker/entrypoint.sh)
+        run: bash tests/sh/test_select_cuda_jit_tools.sh
+      - name: Studio / JupyterLab feature validation
+        run: python tests/validate_studio_features.py
