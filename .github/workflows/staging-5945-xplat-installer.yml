@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+#
+# Staging CI for unslothai/unsloth#5945 -- PLATFORM axis.
+#
+# Upstream runs the installer unit suites on exactly three labels
+# (ubuntu-latest / windows-latest / macos-14).
+# PR #5945 adds Windows-on-ARM and NVIDIA WSL2 install paths with DGX /
+# RTX Spark auto-detection, so the installer suites have to hold on every
+# GitHub-hosted standard runner family, and windows-11-arm in particular
+# is the one label that exercises the WoA branch on real ARM64 Windows.
+#
+# Every job here runs the repo's OWN tests. Nothing is re-implemented.
+#   shell-suite      -> tests/sh/*.sh, discovered from the directory (never listed
+#                       by name, see tests/studio/test_ci_shell_suite_coverage.py)
+#   python-suite     -> tests/python + tests/studio/install + the installer tests
+#                       at tests/test_installer_*.py
+#   powershell-suite -> tests/studio/*.ps1 + the Pester project in
+#                       tests/studio_setup_ps1
+#
+# GitHub-hosted standard runners have no GPU of any vendor. The vendor axis is
+# simulated in staging-5945-vendor-matrix.yml, not here.
+name: "staging-5945 xplat installer"
+on:
+  push:
+    branches: ["pr-5945-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  shell-suite:
+    name: "sh / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-22.04
+          - ubuntu-24.04-arm
+          - windows-latest
+          - windows-11-arm
+          - macos-15
+          - macos-15-intel
+          - macos-14
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Runner identity
+        run: |
+          echo "label=${{ matrix.os }}"
+          uname -a || true
+          echo "uname -s=$(uname -s) uname -m=$(uname -m)"
+          bash --version | head -1
+      - name: Shell installer tests (tests/sh, directory-discovered)
+        run: |
+          set -u
+          # Discovered from the directory, never listed by name: the invariant in
+          # tests/studio/test_ci_shell_suite_coverage.py. One documented skip,
+          # matching .github/workflows/studio-backend-ci.yml:
+          #   test_install_host_defaults.sh - asserts an install.ps1 layout that has
+          #   drifted; it already fails on upstream main at this PR's merge base.
+          # Unlike Backend CI we DO run test_install_rollback_lifecycle.sh here,
+          # because this workflow exists precisely to widen the runner matrix past
+          # the three labels cross-platform-parity-ci.yml covers.
+          skip="test_install_host_defaults.sh"
+          found=0
+          failed=""
+          for s in tests/sh/test_*.sh; do
+              case " $skip " in
+                  *" $(basename "$s") "*) echo "skipping $s (see workflow comment)"; continue ;;
+              esac
+              found=$((found + 1))
+              echo "::group::$s"
+              if bash "$s"; then
+                  echo "RESULT PASS $s"
+              else
+                  echo "RESULT FAIL $s"
+                  echo "::error file=$s::shell installer test failed on ${{ matrix.os }}"
+                  failed="$failed $s"
+              fi
+              echo "::endgroup::"
+          done
+          [ "$found" -gt 0 ] || { echo "::error::no shell tests discovered under tests/sh"; exit 1; }
+          echo "ran $found shell installer test files on ${{ matrix.os }}"
+          if [ -n "$failed" ]; then
+              echo "FAILED ON ${{ matrix.os }}:$failed"
+              exit 1
+          fi
+
+  python-suite:
+    name: "py / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-22.04
+          - ubuntu-24.04-arm
+          - windows-latest
+          - windows-11-arm
+          - macos-15
+          - macos-15-intel
+          - macos-14
+    defaults:
+      run:
+        shell: bash
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Install test deps
+        # structlog: studio/backend/utils/paths/path_utils.py imports it at module
+        # level, and tests/studio/install/test_managed_node_runtime.py reaches it.
+        # pyyaml: tests/studio/test_ci_shell_suite_coverage.py imports yaml to
+        # parse the workflow files it asserts against.
+        # starlette: reached through studio/backend/utils/paths/storage_roots.py
+        # by tests/studio/install/test_managed_node_runtime.py.
+        run: python -m pip install --upgrade pip pytest structlog pyyaml starlette
+      - name: Installer / routing unit tests
+        run: |
+          # tests/studio/install/conftest.py already puts studio/ on sys.path;
+          # PYTHONPATH matches studio-backend-ci.yml so behaviour is identical.
+          # test_rocm_rdna_routing.py is excluded on purpose: it uses
+          # pytest.importorskip("unsloth_zoo"), which only swallows ImportError,
+          # and unsloth_zoo raises RuntimeError through bitsandbytes when torch is
+          # absent. It is covered in staging-5945-vendor-matrix.yml where a CPU
+          # torch stack is installed.
+          PYTHONPATH="$PWD/studio" python -m pytest -q --tb=short \
+            tests/python/test_cross_platform_parity.py \
+            tests/python/test_install_python_stack.py \
+            tests/python/test_flash_attn_install_python_stack.py \
+            tests/python/test_install_uv_override_space.py \
+            tests/test_installer_skip_autostart.py \
+            tests/test_installer_unsloth_version.py \
+            tests/test_windows_rocm_bnb_version.py \
+            tests/studio/test_ci_shell_suite_coverage.py \
+            tests/studio/install/ \
+            --ignore=tests/studio/install/test_rocm_rdna_routing.py \
+            --deselect tests/studio/install/test_rocm_support.py::TestEnsureRocmTorch
+      - name: TestEnsureRocmTorch (upstream-documented Linux x86_64 only)
+        # _ensure_rocm_torch no-ops on macOS and on non-x86_64 Linux by design
+        # (studio/install_python_stack.py:1656 and :1782), but TestEnsureRocmTorch
+        # asserts an install happens regardless of host, so it cannot pass off
+        # Linux x86_64. Non-blocking HERE so this job keeps measuring the
+        # cross-platform installer surface; it stays blocking in
+        # staging-5945-vendor-matrix.yml so the defect is still reported once.
+        continue-on-error: true
+        run: |
+          PYTHONPATH="$PWD/studio" python -m pytest -q --tb=line \
+            tests/studio/install/test_rocm_support.py::TestEnsureRocmTorch
+
+  powershell-suite:
+    name: "pwsh / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - windows-latest
+          - windows-11-arm
+          - macos-15
+          - macos-15-intel
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: PowerShell parse gate on the installers
+        run: |
+          $bad = $false
+          foreach ($f in @('install.ps1', 'studio/setup.ps1', 'scripts/uninstall.ps1')) {
+            if (-not (Test-Path $f)) { continue }
+            $errs = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$null, [ref]$errs)
+            if ($errs) { $errs | ForEach-Object { Write-Host "::error file=$f::$($_.ToString())" }; $bad = $true }
+            else { Write-Host "RESULT PASS parse $f" }
+          }
+          if ($bad) { exit 1 }
+      - name: PowerShell installer unit tests
+        run: |
+          # The repo's own pwsh harnesses. test_torch_index_pin_hardening.ps1 and
+          # test_setup_pin_stale.ps1 are referenced by no upstream workflow today;
+          # they cover the pin/leaf classification this PR's Docker entrypoint
+          # shares, so they are wired in here.
+          $tests = @(
+            'tests/studio/test_torch_flavor.ps1',
+            'tests/studio/test_node_decision.ps1',
+            'tests/studio/test_node_probe_guard.ps1',
+            'tests/studio/test_setup_pin_stale.ps1',
+            'tests/studio/test_torch_index_pin_hardening.ps1',
+            'tests/studio/test_resolve_cuda_toolkit.ps1',
+            'tests/studio/test_install_rollback_lifecycle.ps1',
+            'tests/studio/test_uninstall_dual_install_icon.ps1'
+          )
+          $failed = @()
+          foreach ($t in $tests) {
+            if (-not (Test-Path $t)) { Write-Host "::error::missing $t"; $failed += $t; continue }
+            Write-Host "::group::$t"
+            & pwsh -NoProfile -File $t
+            if ($LASTEXITCODE -ne 0) { Write-Host "RESULT FAIL $t"; Write-Host "::error file=$t::pwsh installer test failed on ${{ matrix.os }}"; $failed += $t }
+            else { Write-Host "RESULT PASS $t" }
+            Write-Host "::endgroup::"
+          }
+          if ($failed.Count -gt 0) { Write-Host "FAILED ON ${{ matrix.os }}: $($failed -join ' ')"; exit 1 }
+      - name: Pester project (tests/studio_setup_ps1)
+        if: startsWith(matrix.os, 'windows')
+        run: |
+          if (-not (Get-PSRepository -Name PSGallery -ErrorAction SilentlyContinue)) { Register-PSRepository -Default }
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          Import-Module Pester -MinimumVersion 5.5.0
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = 'tests/studio_setup_ps1'
+          $cfg.Run.Exit = $true
+          $cfg.Run.Throw = $true
+          Invoke-Pester -Configuration $cfg

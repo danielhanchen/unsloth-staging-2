@@ -1,0 +1,195 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+#
+# Staging CI for unslothai/unsloth#5945 -- GPU VENDOR axis.
+#
+# GitHub-hosted STANDARD runners have no GPU of any vendor. Real NVIDIA or AMD
+# execution is impossible here and is not attempted. The vendor axis is covered
+# by SIMULATION, using the same override variables and the same fake-probe
+# mechanism the repository already uses in tests/sh/test_get_torch_index_url.sh
+# and tests/studio/install/test_rocm_support.py:
+#
+#   NVIDIA   fake nvidia-smi on PATH answering -L and the driver banner
+#   AMD/ROCm fake rocminfo + amd-smi on PATH reporting gfx1100 / ROCm 6.4
+#   CPU-only no vendor tool on PATH at all
+#   masking  CUDA_VISIBLE_DEVICES='' / -1 to hide a present NVIDIA GPU
+#   pins     UNSLOTH_TORCH_INDEX_URL / _FAMILY / UNSLOTH_PYTORCH_MIRROR /
+#            UNSLOTH_ROCM_GFX_ARCH / UNSLOTH_ROCM_WINDOWS_MIRROR
+#
+# Jobs:
+#   install-sh-routing   .github/staging-5945/vendor_probe.sh  (bash installer)
+#   install-ps1-routing  .github/staging-5945/vendor_probe.ps1 (Windows installer)
+#   vendor-unit-suites   the repo's own vendor/ROCm/CUDA unit tests
+#   runtime-dispatch     the repo's hardware spoof pipelines (NVIDIA / ROCm /
+#                        Intel XPU / Apple MLX / CPU) which need a CPU torch
+name: "staging-5945 vendor matrix"
+on:
+  push:
+    branches: ["pr-5945-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  install-sh-routing:
+    name: "install.sh vendor / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-22.04
+          - ubuntu-24.04-arm
+          - windows-latest
+          - windows-11-arm
+          - macos-15
+          - macos-15-intel
+          - macos-14
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Prove there is no real GPU on this runner
+        run: |
+          echo "nvidia-smi: $(command -v nvidia-smi || echo '<absent>')"
+          echo "rocminfo:   $(command -v rocminfo   || echo '<absent>')"
+          echo "amd-smi:    $(command -v amd-smi    || echo '<absent>')"
+          ls /proc/driver/nvidia/gpus 2>/dev/null || echo "/proc/driver/nvidia/gpus: <absent>"
+          ls /dev/kfd 2>/dev/null || echo "/dev/kfd: <absent>"
+      - name: Simulated vendor routing (NVIDIA / AMD-ROCm / CPU-only)
+        # The whole tests/sh directory already runs on all eight runner labels in
+        # staging-5945-xplat-installer.yml, so it is deliberately not repeated
+        # here: this job is the vendor harness and nothing else, which keeps its
+        # red/green meaning unambiguous.
+        run: bash .github/staging-5945/vendor_probe.sh install.sh
+
+  install-ps1-routing:
+    name: "install.ps1 vendor / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - windows-11-arm
+          - ubuntu-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Simulated vendor routing through install.ps1
+        run: pwsh -NoProfile -File .github/staging-5945/vendor_probe.ps1 install.ps1
+
+  vendor-unit-suites:
+    name: "vendor units / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - windows-latest
+          - macos-15
+    defaults:
+      run:
+        shell: bash
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install --upgrade pip pytest structlog
+      - name: AMD / ROCm routing suites (spoofed, no AMD hardware)
+        run: |
+          PYTHONPATH="$PWD/studio" python -m pytest -q --tb=short \
+            tests/studio/install/test_rocm_support.py \
+            tests/studio/install/test_rocm_arch_table_parity.py \
+            tests/studio/install/test_rocm_native_linux_lib_dirs.py \
+            tests/studio/install/test_pr5940_followups.py
+      - name: NVIDIA / AMD GPU-detection suites (spoofed probes)
+        run: |
+          PYTHONPATH="$PWD/studio" python -m pytest -q --tb=short \
+            tests/studio/install/test_gpu_detection_followups.py \
+            tests/studio/install/test_selection_logic.py \
+            tests/studio/install/test_cuda_repair.py \
+            tests/studio/install/test_download_host_resolve.py
+      - name: install.sh <-> install.ps1 <-> install_python_stack.py vendor-table parity
+        run: |
+          PYTHONPATH="$PWD/studio" python -m pytest -q --tb=short \
+            tests/python/test_cross_platform_parity.py
+
+  runtime-dispatch:
+    name: "runtime dispatch spoof / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-15
+    defaults:
+      run:
+        shell: bash
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: CPU torch + Studio backend deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r studio/backend/requirements/studio.txt
+          python -m pip install pytest 'numpy<3'
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+                                --extra-index-url https://pypi.org/simple \
+                                'torch>=2.4,<2.11' 'torchvision<0.26'
+      - name: Hardware dispatch matrix (NVIDIA / AMD-ROCm / Intel XPU / Apple MLX / CPU)
+        run: |
+          # These three mutate hardware.py module globals, so upstream runs them
+          # in their own pytest process (studio-backend-ci.yml:223-227). Same here.
+          PYTHONPATH="$PWD/studio" python -m pytest -q --tb=short \
+            tests/studio/test_hardware_dispatch_matrix.py \
+            tests/studio/test_is_mlx_dispatch_gate.py \
+            tests/studio/test_xpu_spoof_pipeline.py
+      - name: ROCm RDNA routing through the unsloth_zoo spoof
+        run: |
+          # Excluded from staging-5945-xplat-installer.yml because its
+          # pytest.importorskip("unsloth_zoo") only swallows ImportError. Here a
+          # CPU torch stack is present, so it either runs or skips cleanly.
+          # The whole module skips at collection when unsloth_zoo is absent, and
+          # pytest exits 5 ("no tests collected") for that, which is not a
+          # failure here -- treat it as the documented skip it is.
+          set +e
+          PYTHONPATH="$PWD/studio" python -m pytest -q --tb=short \
+            tests/studio/install/test_rocm_rdna_routing.py
+          rc=$?
+          set -e
+          if [ "$rc" -eq 5 ]; then
+              echo "RESULT SKIP unsloth_zoo not installed; the RDNA spoof module skipped at collection"
+              exit 0
+          fi
+          exit "$rc"

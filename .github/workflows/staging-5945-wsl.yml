@@ -1,0 +1,138 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+#
+# Staging CI for unslothai/unsloth#5945 -- WSL axis.
+#
+# install.sh has a real WSL branch: OS detection via /proc/version, the ROCm-on-WSL
+# bootstrap, the Strix Halo reroute to Ubuntu 24.04, the librocdxg.so gate on gfx
+# inference, and the WSL-flavoured Windows shortcut/uninstall paths. None of that
+# is exercised by any upstream workflow on an actual WSL.
+#
+# The windows-2025 image README claims WSLv1 "Enabled" and WSLv2 2.7.10.0, but
+# actions/runner-images#11265 reports `wsl --status` answering "not installed" on
+# that image. Rather than assume either way, the probe jobs REPORT what the image
+# actually has and the real-WSL job is gated on that result. If WSL is unusable
+# the gated job is skipped and the probe log says so -- nothing is faked, and the
+# WSL-specific code paths are still covered on plain Windows by wsl-codepaths.
+name: "staging-5945 wsl"
+on:
+  push:
+    branches: ["pr-5945-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  wsl-probe-x64:
+    name: "wsl probe / windows-latest"
+    runs-on: windows-latest
+    timeout-minutes: 30
+    outputs:
+      usable: ${{ steps.probe.outputs.usable }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Probe WSL availability
+        id: probe
+        run: pwsh -NoProfile -File .github/staging-5945/wsl_probe.ps1
+
+  wsl-probe-arm:
+    name: "wsl probe / windows-11-arm"
+    runs-on: windows-11-arm
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Probe WSL availability
+        id: probe
+        run: pwsh -NoProfile -File .github/staging-5945/wsl_probe.ps1
+
+  wsl-linux-tests:
+    name: "linux install tests under real WSL"
+    needs: wsl-probe-x64
+    if: needs.wsl-probe-x64.outputs.usable == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - name: Bring the distro up in this job
+        shell: pwsh
+        run: |
+          & wsl.exe --install --no-distribution 2>&1 | Out-String | Write-Host
+          & wsl.exe --install -d Ubuntu-24.04 --no-launch 2>&1 | Out-String | Write-Host
+          & wsl.exe -d Ubuntu-24.04 -- uname -a
+          if ($LASTEXITCODE -ne 0) { throw "WSL distro did not come up" }
+      - name: Linux install-path shell tests inside WSL
+        shell: pwsh
+        run: |
+          $win = $PWD.Path
+          $repo = (& wsl.exe -d Ubuntu-24.04 -- wslpath -a "$($win -replace '\\','/')").Trim()
+          Write-Host "repo inside WSL: $repo"
+          & wsl.exe -d Ubuntu-24.04 -- bash "$repo/.github/staging-5945/wsl_linux_tests.sh" "$repo"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+  wsl-codepaths:
+    name: "wsl code paths on plain Windows / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - windows-11-arm
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: '3.12'
+      - name: Install test deps
+        shell: bash
+        run: python -m pip install --upgrade pip pytest structlog
+      - name: WSL-specific shell tests (fixtures + mock wsl.exe, no real WSL)
+        shell: bash
+        run: |
+          set -u
+          rc=0
+          # test_strixhalo_wsl_reroute.sh rewrites /dev/dxg, /proc/cpuinfo,
+          # /opt/rocm/lib*/librocdxg.so and /etc/os-release to fixture paths and
+          # supplies a mock wsl.exe, so it needs no real WSL at all.
+          for s in tests/sh/test_strixhalo_wsl_reroute.sh tests/sh/test_uninstall_shared_icon.sh; do
+              echo "::group::$s"
+              if bash "$s"; then echo "RESULT PASS $s"; else echo "RESULT FAIL $s"; echo "::error file=$s::failed on ${{ matrix.os }}"; rc=1; fi
+              echo "::endgroup::"
+          done
+          exit "$rc"
+      - name: WSL-specific pytest classes
+        shell: bash
+        run: |
+          # TestWslSystemRocmLibDirs / TestBinaryEnvWslOrdering /
+          # TestLlamaCppRuntimeWslOrdering / TestWslRerouteNvidiaGuard live in
+          # test_rocm_support.py; test_pr5940_followups.py covers the reroute's
+          # bash -lc exports prefix; test_rocm_native_linux_lib_dirs.py asserts the
+          # WSL host is excluded from the native-Linux lib-dir prepend.
+          # Narrowed with -k to the WSL node ids: the full test_rocm_support.py
+          # run lives in staging-5945-vendor-matrix.yml, so an unrelated failure
+          # there does not muddy this job's WSL verdict.
+          PYTHONPATH="$PWD/studio" python -m pytest -q --tb=short \
+            tests/studio/install/test_rocm_support.py \
+            tests/studio/install/test_pr5940_followups.py \
+            tests/studio/install/test_rocm_native_linux_lib_dirs.py \
+            -k "Wsl or wsl or WSL"
+      - name: WSL uninstall icon path (PowerShell)
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/studio/test_uninstall_dual_install_icon.ps1
