@@ -83,7 +83,11 @@ jobs:
       - name: Sandbox test suite (live tests run where the backend qualifies)
         working-directory: studio/backend
         run: |
-          python -m pytest -q -rs --tb=short -p no:cacheprovider tests/test_os_sandbox.py tests/test_tool_isolation_api.py 2>&1 | tail -60
+          python -m pytest -q -rs --tb=short -p no:cacheprovider tests/test_os_sandbox.py tests/test_tool_isolation_api.py > pytest_out.txt 2>&1 || true
+          grep -E "^(FAILED|ERROR) " pytest_out.txt | sed 's/ - .*//' | sort -u | sed 's/^/PR10285_FAIL /'
+          grep -E "passed|failed" pytest_out.txt | tail -1 | sed 's/^/PR10285_SUMMARY /'
+          grep -E "^SKIPPED" pytest_out.txt | sed 's/^/PR10285_SKIP /' | sort -u | head -30
+          grep -E "^E  |^_{3,} test_" pytest_out.txt | head -60
       - name: Symlinked virtualenv live tests, full traceback
         working-directory: studio/backend
         run: python -m pytest -q --tb=long -p no:cacheprovider tests/test_os_sandbox.py -k "symlink or pyenv or virtualenv" 2>&1 | tail -80
