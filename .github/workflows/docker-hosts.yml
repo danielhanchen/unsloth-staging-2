@@ -1,0 +1,110 @@
+# Can the published unsloth/unsloth image run on GitHub-hosted Windows, macOS and
+# Linux runners? None has a GPU, so every leg is CPU mode (UNSLOTH_ALLOW_CPU=1).
+# Each leg first records whether a Docker daemon exists at all, then pulls the
+# image, runs the entrypoint, imports the stack, and boots JupyterLab.
+name: Docker on hosted runners
+
+on:
+  push:
+    branches: ['docker-hosts-*']
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'image to test'
+        default: 'unsloth/unsloth:core'
+
+env:
+  IMAGE: ${{ github.event.inputs.image || 'unsloth/unsloth:core' }}
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Docker present
+        run: docker version && docker info --format '{{.OSType}}/{{.Architecture}} {{.ServerVersion}}'
+      - name: Reclaim disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true; df -h /
+      - name: Pull
+        run: docker pull "$IMAGE" && docker image inspect "$IMAGE" --format 'arch={{.Architecture}} size={{.Size}}'
+      - name: Entrypoint + imports (CPU mode)
+        run: |
+          docker run --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 "$IMAGE" python - <<'PY'
+          import platform, torch, unsloth, transformers, trl, peft
+          print("machine", platform.machine(), "torch", torch.__version__, "cuda", torch.cuda.is_available())
+          print("unsloth", unsloth.__version__, "transformers", transformers.__version__)
+          import subprocess; print(subprocess.run(["unsloth", "--version"], capture_output=True, text=True).stdout.strip())
+          PY
+      - name: JupyterLab boots and authenticates
+        run: |
+          CID=$(docker run -d -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 -p 127.0.0.1:8888:8888 "$IMAGE" \
+                jupyter lab --ip 0.0.0.0 --port 8888 --allow-root --no-browser)
+          for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8888/api/status && break; sleep 2; done
+          TOK=$(docker logs "$CID" 2>&1 | grep -o 'token=[0-9a-f]*' | head -1 | cut -d= -f2)
+          NOTOK=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8888/api/status)
+          OK=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:8888/api/status?token=$TOK")
+          echo "no token: $NOTOK  with token: $OK"
+          docker logs "$CID" 2>&1 | grep -i 'unsloth container\|CPU\|notebooks' | head -5
+          docker rm -f "$CID" >/dev/null
+          test "$NOTOK" = 403 && test "$OK" = 200
+      - name: llama.cpp prebuilt present
+        run: docker run --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 "$IMAGE" bash -c '/opt/unsloth/llama.cpp/build/bin/llama-server --version 2>&1 | tail -2; cat /opt/unsloth/llama.cpp/UNSLOTH_PREBUILT_INFO.json | head -c 300'
+
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Docker present, and which container OS
+        shell: pwsh
+        run: |
+          docker version
+          docker info --format '{{.OSType}}/{{.Architecture}} {{.ServerVersion}}'
+          wsl --status 2>&1 | Select-Object -First 5
+      - name: Try to switch to Linux containers
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $dc = "C:\Program Files\Docker\Docker\DockerCli.exe"
+          if (Test-Path $dc) { & $dc -SwitchLinuxEngine; docker info --format '{{.OSType}}' } else { "DockerCli.exe not present: no Docker Desktop, Windows-container-only daemon" }
+      - name: Pull the Linux image
+        shell: pwsh
+        continue-on-error: true
+        run: docker pull $env:IMAGE
+      - name: Run the entrypoint (CPU mode)
+        shell: pwsh
+        continue-on-error: true
+        run: docker run --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 $env:IMAGE python -c "import torch, unsloth; print('torch', torch.__version__, 'unsloth', unsloth.__version__)"
+
+  macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-13, macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Host
+        run: uname -m; sw_vers; which docker colima lima podman || true; sysctl -n kern.hv_support || true
+      - name: Install a Docker daemon (colima)
+        continue-on-error: true
+        run: |
+          brew install --quiet docker colima 2>&1 | tail -3
+          colima start --cpu 3 --memory 8 --disk 60 2>&1 | tail -5
+          docker info --format '{{.OSType}}/{{.Architecture}} {{.ServerVersion}}'
+      - name: Pull
+        continue-on-error: true
+        run: docker pull "$IMAGE" && docker image inspect "$IMAGE" --format 'arch={{.Architecture}} size={{.Size}}'
+      - name: Entrypoint + imports (CPU mode)
+        continue-on-error: true
+        run: docker run --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 "$IMAGE" python -c "import platform, torch, unsloth; print('machine', platform.machine(), 'torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'unsloth', unsloth.__version__)"
+      - name: Stop
+        if: always()
+        run: colima stop 2>/dev/null || true
