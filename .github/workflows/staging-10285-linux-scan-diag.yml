@@ -149,8 +149,6 @@ jobs:
           echo "TERM_NNP=$(grep NoNewPrivs /proc/self/status)"
           echo "TERM_SECCOMP=$(grep Seccomp: /proc/self/status)"
           echo "TERM_USERNS_NESTED=$(unshare -U true 2>&1 && echo nested-userns-ALLOWED)"
-          echo "TERM_MOUNT=$( (mount -t tmpfs none /mnt) 2>&1 | head -c 80)"
-          echo "TERM_KILL_PID1=$( (kill -0 1 && echo can-signal-pid1) 2>&1 | head -c 80)"
           setsid sleep 300 >/dev/null 2>&1 &
           echo "TERM_SETSID_SPAWNED=yes"
           '''
