@@ -15,7 +15,7 @@ env:
 jobs:
   macos-intel:
     runs-on: macos-15-intel
-    timeout-minutes: 90
+    timeout-minutes: 300
     steps:
       - name: Host
         run: uname -m; sw_vers; sysctl -n kern.hv_support || true; df -h / | tail -1
