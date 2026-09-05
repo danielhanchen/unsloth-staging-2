@@ -81,6 +81,8 @@ jobs:
         working-directory: studio/backend
         run: |
           python -m pytest -q -rs --tb=short -p no:cacheprovider tests/test_os_sandbox.py 2>&1 | tail -40
+          echo "===== full traceback of the symlinked-virtualenv live test"
+          python -m pytest -q --tb=long -p no:cacheprovider tests/test_os_sandbox.py -k symlink_virtualenv 2>&1 | tail -70
           python - <<'PY'
           import os, json, socket, tempfile, textwrap, subprocess, time
           os.environ["UNSLOTH_STUDIO_HOME"] = tempfile.mkdtemp(prefix="pr10285-home-")
@@ -120,6 +122,43 @@ jobs:
           '''
           out = tools._python_exec(textwrap.dedent(code), session_id="pr10285-escape", timeout=120)
           print(out[-3000:])
+          # The Python tool's static pre-scan rejects the probe text before bwrap sees it, so the
+          # same escape attempts go through the Terminal tool, where only the OS sandbox decides.
+          term = f'''
+          echo "TERM_UID=$(id -u) $(id -un)"
+          echo "TERM_SECRET=$(cat {secret.name} 2>&1 | head -c 60)"
+          echo "TERM_SSH=$(ls -a ~/.ssh /home/runner/.ssh 2>&1 | head -c 80)"
+          echo "TERM_HOME_LIST=$(ls /home 2>&1 | head -c 80)"
+          echo "TERM_WRITE_ETC=$( (echo x > /etc/pr10285) 2>&1 | head -c 80)"
+          echo "TERM_WRITE_ROOT=$( (echo x > /pr10285) 2>&1 | head -c 80)"
+          echo "TERM_WRITE_USR=$( (echo x > /usr/pr10285) 2>&1 | head -c 80)"
+          echo "TERM_WRITE_WORKDIR=$( (echo x > ok.txt && echo written) 2>&1 | head -c 80)"
+          echo "TERM_TCP_LOOPBACK=$( (timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/{port}' && echo CONNECTED) 2>&1 | head -c 80)"
+          echo "TERM_TCP_INTERNET=$( (timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/443' && echo CONNECTED) 2>&1 | head -c 80)"
+          echo "TERM_DNS=$(getent hosts example.com 2>&1 | head -c 80)"
+          echo "TERM_IFACES=$(ls /sys/class/net 2>&1 | tr '\\n' ' ')"
+          echo "TERM_UNIX_SOCKET=$(python3 -c "import socket; s=socket.socket(socket.AF_UNIX); s.connect({usock!r}); print('CONNECTED')" 2>&1 | tail -1 | head -c 80)"
+          echo "TERM_PROC1_ENVIRON=$(cat /proc/1/environ 2>&1 | head -c 60)"
+          echo "TERM_PROC_LIST=$(ls /proc | grep -c '^[0-9]')"
+          echo "TERM_DEV=$(ls /dev | tr '\\n' ' ')"
+          echo "TERM_GPU_NODES=$(ls /dev/dri /dev/kfd /dev/nvidia* 2>&1 | head -c 80)"
+          echo "TERM_CANARY=$(env | grep -c hf_canary)"
+          echo "TERM_ENV_COUNT=$(env | wc -l)"
+          echo "TERM_MOUNTS=$(cat /proc/self/mounts | wc -l)"
+          echo "TERM_CAPS=$(grep CapEff /proc/self/status)"
+          echo "TERM_NNP=$(grep NoNewPrivs /proc/self/status)"
+          echo "TERM_SECCOMP=$(grep Seccomp: /proc/self/status)"
+          echo "TERM_USERNS_NESTED=$(unshare -U true 2>&1 && echo nested-userns-ALLOWED)"
+          echo "TERM_MOUNT=$( (mount -t tmpfs none /mnt) 2>&1 | head -c 80)"
+          echo "TERM_KILL_PID1=$( (kill -0 1 && echo can-signal-pid1) 2>&1 | head -c 80)"
+          setsid sleep 300 >/dev/null 2>&1 &
+          echo "TERM_SETSID_SPAWNED=yes"
+          '''
+          tout = tools._bash_exec(textwrap.dedent(term), session_id="pr10285-escape", timeout=60)
+          print(tout[-4000:])
+          time.sleep(2)
+          ps = subprocess.run(["pgrep", "-af", "sleep 300"], capture_output=True, text=True).stdout
+          print("SURVIVING setsid sleep processes after the terminal call returned:", repr(ps))
           time.sleep(1)
           ps = subprocess.run(["pgrep", "-af", "sleep 300"], capture_output=True, text=True).stdout
           print("SURVIVING setsid sleep processes:", repr(ps))
