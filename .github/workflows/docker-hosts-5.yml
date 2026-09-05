@@ -1,0 +1,47 @@
+# Round 5: the Intel Mac leg. macos-13 was retired by GitHub in December 2025 (a job
+# on that label sat queued with no runner for 90 minutes), so this uses the
+# macos-15-intel label, the last x86_64 macOS image. The amd64 image runs inside a
+# colima VM; the default backend is tried first, QEMU second.
+name: Docker on hosted runners, round 5 (Intel Mac)
+
+on:
+  push:
+    branches: ['docker-hosts-*']
+  workflow_dispatch:
+
+env:
+  IMAGE: unsloth/unsloth:core
+
+jobs:
+  macos-intel:
+    runs-on: macos-15-intel
+    timeout-minutes: 90
+    steps:
+      - name: Host
+        run: uname -m; sw_vers; sysctl -n kern.hv_support || true; df -h / | tail -1
+      - name: Install colima and start a Linux VM
+        run: |
+          brew install --quiet docker colima qemu 2>&1 | tail -2
+          if colima start --cpu 3 --memory 8 --disk 60 2>&1 | tail -8; then
+            echo "backend: default"
+          else
+            colima delete -f 2>/dev/null || true
+            colima start --vm-type qemu --cpu 3 --memory 8 --disk 60 2>&1 | tail -8
+            echo "backend: qemu"
+          fi
+          docker info --format '{{.OSType}}/{{.Architecture}} {{.ServerVersion}}'
+      - name: Pull
+        run: docker pull "$IMAGE" 2>&1 | tail -2 && docker image inspect "$IMAGE" --format 'arch={{.Architecture}} size={{.Size}}'
+      - name: Entrypoint + imports (CPU mode), asserted
+        run: |
+          OUT=$(docker run -i --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 "$IMAGE" python - <<'PY'
+          import platform, torch, unsloth, subprocess
+          print("machine", platform.machine(), "torch", torch.__version__, "cuda", torch.cuda.is_available(), "unsloth", unsloth.__version__)
+          print("cli:", subprocess.run(["unsloth", "--version"], capture_output=True, text=True).stdout.strip())
+          PY
+          )
+          echo "$OUT"
+          echo "$OUT" | grep -q "machine x86_64 torch 2.11" || { echo "::error::import output missing or wrong arch"; exit 1; }
+      - name: Stop
+        if: always()
+        run: colima stop 2>/dev/null || true

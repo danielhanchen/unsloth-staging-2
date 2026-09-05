@@ -4,8 +4,6 @@
 name: Docker on hosted runners, round 3 (WSL 2)
 
 on:
-  push:
-    branches: ['docker-hosts-*']
   workflow_dispatch:
 
 jobs:
