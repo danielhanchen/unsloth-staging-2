@@ -6,8 +6,6 @@
 name: Docker on hosted runners, round 2
 
 on:
-  push:
-    branches: ['docker-hosts-*']
   workflow_dispatch:
 
 env:
