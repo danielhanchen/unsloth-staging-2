@@ -47,7 +47,7 @@ jobs:
           OUT=$(docker run -i --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 unsloth/unsloth:core python - <<'PY'
           import platform, torch, unsloth, subprocess
           print("machine", platform.machine(), "torch", torch.__version__, "cuda", torch.cuda.is_available(), "unsloth", unsloth.__version__)
-          print(subprocess.run(["unsloth", "--version"], capture_output=True, text=True).stdout.strip())
+          print("cli:", subprocess.run(["unsloth", "--version"], capture_output=True, text=True).stdout.strip())
           PY
           )
           echo "$OUT"
@@ -69,7 +69,12 @@ jobs:
           foreach ($pair in @(@('setup', $setup), @('run', $run), @('jupyter', $jupyter))) {
             [IO.File]::WriteAllText("$PWD/wsl-dist/$($pair[0]).sh", ($pair[1] -replace "`r`n", "`n"))
           }
-          wsl -d unsloth-ci -- wslpath -a "$PWD/wsl-dist" | Tee-Object -Variable p
+          # wslpath through `wsl --` loses the backslashes; derive the mount path in pwsh
+          $drive = $PWD.Drive.Name.ToLower()
+          $rest = $PWD.Path.Substring(2) -replace '\\', '/'
+          $p = "/mnt/$drive$rest/wsl-dist"
+          Write-Host "WSL_DIR=$p"
+          wsl -d unsloth-ci -- ls -la "$p"
           Add-Content -Path $env:GITHUB_ENV -Value "WSL_DIR=$p"
 
       - name: Install Docker inside WSL 2 and start the daemon

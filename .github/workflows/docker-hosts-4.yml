@@ -4,8 +4,6 @@
 name: Docker on hosted runners, round 4 (Linux imports, non-vacuous)
 
 on:
-  push:
-    branches: ['docker-hosts-*']
   workflow_dispatch:
 
 env:
