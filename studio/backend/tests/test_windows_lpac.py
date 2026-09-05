@@ -18,6 +18,7 @@ import socket
 import statistics
 import subprocess
 import sys
+import sysconfig
 import threading
 import time
 from types import SimpleNamespace
@@ -64,12 +65,21 @@ def test_source_only_public_api_and_profile_are_narrow_and_unique():
     assert "subprocess.Popen(" not in source
     assert "secrets.token_hex(16)" in source
     assert "_SECURITY_CAPABILITIES(identity.sid, None, 0, 0)" in source
+    # Both container kinds are zero-capability; only the opt-out attribute differs.
+    assert source.count("_SECURITY_CAPABILITIES(identity.sid, None, 0, 0)") == 1
+    assert "_PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY" in source
+    assert windows_lpac._PROFILE_ID == "windows-lpac-preview-v1"
+    assert windows_lpac._APPCONTAINER_PROFILE_ID == "windows-appcontainer-preview-v1"
     profiles = {
         os_sandbox.LinuxBubblewrapBackend.profile_id,
         os_sandbox.MacOSSeatbeltBackend.profile_id,
         windows_lpac.WindowsLpacBackend.profile_id,
+        windows_lpac._APPCONTAINER_PROFILE_ID,
     }
-    assert len(profiles) == 3
+    assert len(profiles) == 4
+    backend = windows_lpac.WindowsLpacBackend()
+    assert backend.active_profile == "lpac"
+    assert backend.active_profile_id() == windows_lpac.WindowsLpacBackend.profile_id
 
 
 def test_network_probe_rejects_an_unrestricted_process():
@@ -682,6 +692,381 @@ def test_reconciliation_accepts_only_owned_well_formed_manifests(monkeypatch, tm
     assert invalid.exists() and escaped.exists() and active.exists()
 
 
+
+def _sid_bytes(*subauthorities: int) -> bytes:
+    """A syntactically valid SID: revision 1, authority 15 (package), given subauthorities."""
+    import struct
+
+    return bytes([1, len(subauthorities)]) + (15).to_bytes(6, "big") + b"".join(
+        struct.pack("<I", value) for value in subauthorities
+    )
+
+
+def _fake_acl(*aces: tuple[int, int, int, bytes]) -> tuple[ctypes.Array, list[int]]:
+    """Build an in-memory ACL of (type, flags, mask, sid) ACEs and return the buffer."""
+    import struct
+
+    body = b""
+    offsets: list[int] = []
+    for kind, flags, mask, sid in aces:
+        size = 4 + 4 + len(sid)
+        offsets.append(8 + len(body))
+        body += bytes([kind, flags]) + struct.pack("<H", size) + struct.pack("<I", mask) + sid
+    header = struct.pack("<BBHHH", 2, 0, 8 + len(body), len(aces), 0)
+    buffer = ctypes.create_string_buffer(header + body, len(header) + len(body))
+    return buffer, offsets
+
+
+@contextmanager
+def _fake_acl_api(monkeypatch, buffer, offsets):
+    base = ctypes.addressof(buffer)
+
+    def get_ace(_acl, index, entry):
+        entry._obj.value = base + offsets[index]
+        return 1
+
+    def equal_sid(left, right):
+        left_len = ctypes.string_at(left, 2)[1] * 4 + 8
+        right_len = ctypes.string_at(right, 2)[1] * 4 + 8
+        return int(ctypes.string_at(left, left_len) == ctypes.string_at(right, right_len))
+
+    api = SimpleNamespace(
+        advapi32 = SimpleNamespace(GetAce = get_ace, EqualSid = equal_sid),
+        kernel32 = SimpleNamespace(LocalFree = lambda _value: None),
+    )
+    monkeypatch.setattr(windows_lpac, "_api", lambda: api)
+    yield ctypes.c_void_p(base)
+
+
+def _sid_pointer(raw: bytes):
+    buffer = ctypes.create_string_buffer(raw, len(raw))
+    return buffer, ctypes.c_void_p(ctypes.addressof(buffer))
+
+
+def test_acl_walk_accepts_ambient_read_execute_and_rejects_other_sids(monkeypatch):
+    package = _sid_bytes(2, 111, 222)
+    ambient = _sid_bytes(2, 1)  # S-1-15-2-1
+    stranger = _sid_bytes(2, 999)
+    buffer, offsets = _fake_acl(
+        (0, 0, windows_lpac._FILE_GENERIC_READ | windows_lpac._FILE_GENERIC_EXECUTE, ambient),
+        (0, 0, windows_lpac._GENERIC_ALL, stranger),
+    )
+    keep_a, package_ptr = _sid_pointer(package)
+    keep_b, ambient_ptr = _sid_pointer(ambient)
+    keep_c, stranger_ptr = _sid_pointer(_sid_bytes(2, 555))
+    with _fake_acl_api(monkeypatch, buffer, offsets) as acl:
+        required = windows_lpac._FILE_GENERIC_READ | windows_lpac._FILE_GENERIC_EXECUTE
+        assert windows_lpac._acl_grants(acl, (package_ptr, ambient_ptr), required)
+        assert windows_lpac._acl_grants(acl, (ambient_ptr,), windows_lpac._FILE_TRAVERSE)
+        # The package SID alone holds nothing; a stranger's GENERIC_ALL never counts for us.
+        assert not windows_lpac._acl_grants(acl, (package_ptr,), required)
+        assert not windows_lpac._acl_grants(acl, (stranger_ptr,), windows_lpac._FILE_TRAVERSE)
+
+
+def test_acl_walk_ignores_inherit_only_and_honours_deny(monkeypatch):
+    ambient = _sid_bytes(2, 2)  # S-1-15-2-2
+    buffer, offsets = _fake_acl(
+        (0, windows_lpac._INHERIT_ONLY_ACE, windows_lpac._GENERIC_ALL, ambient),
+    )
+    keep, ambient_ptr = _sid_pointer(ambient)
+    with _fake_acl_api(monkeypatch, buffer, offsets) as acl:
+        assert not windows_lpac._acl_grants(acl, (ambient_ptr,), windows_lpac._FILE_TRAVERSE)
+    buffer, offsets = _fake_acl(
+        (1, 0, windows_lpac._FILE_TRAVERSE, ambient),
+        (0, 0, windows_lpac._GENERIC_ALL, ambient),
+    )
+    with _fake_acl_api(monkeypatch, buffer, offsets) as acl:
+        assert not windows_lpac._acl_grants(acl, (ambient_ptr,), windows_lpac._FILE_TRAVERSE)
+    # Rights accumulate across allow ACEs the way the access check applies them.
+    buffer, offsets = _fake_acl(
+        (0, 0, windows_lpac._GENERIC_READ, ambient),
+        (0, 0, windows_lpac._GENERIC_EXECUTE, ambient),
+    )
+    with _fake_acl_api(monkeypatch, buffer, offsets) as acl:
+        required = windows_lpac._FILE_GENERIC_READ | windows_lpac._FILE_GENERIC_EXECUTE
+        assert windows_lpac._acl_grants(acl, (ambient_ptr,), required)
+
+
+def test_ambient_sid_matches_the_container_kind():
+    assert windows_lpac._ambient_sid_text("lpac") == "S-1-15-2-2"
+    assert windows_lpac._ambient_sid_text("appcontainer") == "S-1-15-2-1"
+
+
+@contextmanager
+def _prepared_with_fakes(monkeypatch, tmp_path, *, events, existing, denied, ancestors):
+    """Drive WindowsLpacBackend._prepare with every Windows API replaced by recorders."""
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    runtime = str(tmp_path / "Program Files" / "Python")
+    os.makedirs(runtime)
+    sid = ctypes.c_void_p(4242)
+    identity = windows_lpac._InvocationIdentity(
+        "unsloth.studio.test",
+        sid,
+        "S-1-15-2-4242",
+        str(tmp_path / "profile"),
+        str(tmp_path / "profile" / "Temp"),
+        str(tmp_path / "owned.json"),
+        (runtime, str(workdir), *ancestors),
+        tuple(ancestors),
+        1,
+        2,
+    )
+    monkeypatch.setattr(windows_lpac, "_validate_workdir", lambda value: value)
+    monkeypatch.setattr(windows_lpac, "_canonical_inner_argv", lambda argv, env: tuple(argv))
+    monkeypatch.setattr(windows_lpac, "_runtime_roots", lambda _workdir, _argv: (runtime,))
+    monkeypatch.setattr(windows_lpac, "_needs_explicit_acl", lambda _path: True)
+    monkeypatch.setattr(windows_lpac, "_validate_runtime_trees", lambda _roots: None)
+    monkeypatch.setattr(windows_lpac, "_create_identity", lambda _roots: identity)
+    monkeypatch.setattr(windows_lpac, "_machine_wide", lambda path: "Program Files" in path)
+    monkeypatch.setattr(windows_lpac, "_safe_environment", lambda env, *_a: dict(env))
+    monkeypatch.setattr(identity, "cleanup", lambda: events.append(("cleanup",)))
+
+    @contextmanager
+    def fake_well_known(text):
+        events.append(("ambient", text))
+        yield ctypes.c_void_p(7)
+
+    monkeypatch.setattr(windows_lpac, "_well_known_sid", fake_well_known)
+    monkeypatch.setattr(
+        windows_lpac,
+        "_existing_access",
+        lambda path, sids, required: events.append(("check", path, required)) or path in existing,
+    )
+
+    def grant(kind):
+        def _grant(path, value, **_kwargs):
+            events.append((kind, path))
+            if path in denied:
+                raise OSError(5, f"SetFileSecurityW({path}): Access is denied.")
+
+        return _grant
+
+    monkeypatch.setattr(windows_lpac, "_grant_read_execute", grant("read_execute"))
+    monkeypatch.setattr(windows_lpac, "_grant_modify", grant("modify"))
+    monkeypatch.setattr(windows_lpac, "_grant_traverse", grant("traverse"))
+    yield windows_lpac.WindowsLpacBackend(), _spec(workdir), identity, runtime
+
+
+def test_prepare_skips_grants_the_dacl_already_covers(monkeypatch, tmp_path):
+    events: list[tuple] = []
+    ancestors = (r"C:\Users", r"C:\Program Files")
+    with _prepared_with_fakes(
+        monkeypatch,
+        tmp_path,
+        events = events,
+        existing = {r"C:\Program Files"},
+        denied = set(),
+        ancestors = ancestors,
+    ) as (backend, spec, identity, runtime):
+        prepared = backend.prepare(spec)
+    kinds = [event for event in events if event[0] in {"read_execute", "traverse", "modify"}]
+    assert ("read_execute", runtime) in kinds
+    assert ("traverse", r"C:\Users") in kinds
+    assert ("traverse", r"C:\Program Files") not in kinds
+    assert events[0] == ("ambient", "S-1-15-2-2")
+    assert identity.unverified_access == ()
+    assert identity.profile == "lpac"
+    assert prepared.backend == "windows-lpac"
+
+
+def test_prepare_records_access_denied_on_machine_wide_paths_instead_of_failing(monkeypatch, tmp_path):
+    events: list[tuple] = []
+    with _prepared_with_fakes(
+        monkeypatch,
+        tmp_path,
+        events = events,
+        existing = set(),
+        denied = {r"C:\Program Files", "RUNTIME"},
+        ancestors = (r"C:\Program Files",),
+    ) as (backend, spec, identity, runtime):
+        monkeypatch.setattr(
+            windows_lpac,
+            "_grant_read_execute",
+            lambda path, value, **_k: (_ for _ in ()).throw(OSError(5, "denied")),
+        )
+        backend._profile = "appcontainer"
+        prepared = backend.prepare(spec)
+    assert set(identity.unverified_access) == {runtime, r"C:\Program Files"}
+    assert identity.profile == "appcontainer"
+    assert events[0] == ("ambient", "S-1-15-2-1")
+    assert ("cleanup",) not in events
+    assert prepared.spawn_callback._lpac_identity is identity
+
+
+def test_prepare_still_fails_when_a_user_owned_grant_is_denied(monkeypatch, tmp_path):
+    events: list[tuple] = []
+    with _prepared_with_fakes(
+        monkeypatch,
+        tmp_path,
+        events = events,
+        existing = set(),
+        denied = set(),
+        ancestors = (),
+    ) as (backend, spec, identity, runtime):
+        monkeypatch.setattr(windows_lpac, "_machine_wide", lambda _path: False)
+        monkeypatch.setattr(
+            windows_lpac,
+            "_grant_read_execute",
+            lambda path, value, **_k: (_ for _ in ()).throw(OSError(5, "denied")),
+        )
+        with pytest.raises(OSError, match = "denied"):
+            backend.prepare(spec)
+    assert ("cleanup",) in events
+
+
+def test_probe_falls_back_to_appcontainer_when_lpac_cannot_start_python(monkeypatch):
+    backend = windows_lpac.WindowsLpacBackend()
+    calls: list[str] = []
+
+    def probe_profile(profile):
+        calls.append(profile)
+        if profile == "lpac":
+            return (-1073741790, "the LPAC live probe failed (-1073741790): STATUS_ACCESS_DENIED")
+        backend._last_probe_limitations = ()
+        return None
+
+    monkeypatch.setattr(windows_lpac, "_is_windows", lambda: True)
+    monkeypatch.setattr(windows_lpac, "_api", lambda: SimpleNamespace())
+    monkeypatch.setattr(backend, "reconcile_stale_manifests", lambda: None)
+    monkeypatch.setattr(backend, "_probe_profile", probe_profile)
+
+    capability = backend.probe()
+
+    assert calls == ["lpac", "appcontainer"]
+    assert capability.available is True and capability.qualified is True
+    assert capability.protection_state == "preview"
+    assert capability.profile_id == "windows-appcontainer-preview-v1"
+    assert capability.limitations == ("all_application_packages_ambient_read", "null_device_and_named_pipes_denied")
+    assert "AppContainer fallback passed" in capability.reason
+    assert backend.active_profile == "appcontainer"
+    assert backend.active_profile_id() == "windows-appcontainer-preview-v1"
+    assert backend.profile_id == "windows-appcontainer-preview-v1"
+    assert windows_lpac.WindowsLpacBackend.profile_id == "windows-lpac-preview-v1"
+
+
+def test_probe_does_not_fall_back_for_other_failures_and_reports_both(monkeypatch):
+    backend = windows_lpac.WindowsLpacBackend()
+    backend._profile = "appcontainer"  # a stale fallback from a previous fingerprint
+    calls: list[str] = []
+
+    def probe_profile(profile):
+        calls.append(profile)
+        return (1, f"the {profile} live probe failed (1): boom")
+
+    monkeypatch.setattr(windows_lpac, "_is_windows", lambda: True)
+    monkeypatch.setattr(windows_lpac, "_api", lambda: SimpleNamespace())
+    monkeypatch.setattr(backend, "reconcile_stale_manifests", lambda: None)
+    monkeypatch.setattr(backend, "_probe_profile", probe_profile)
+
+    capability = backend.probe()
+
+    assert calls == ["lpac"]
+    assert capability.available is False
+    assert backend.active_profile == "lpac"
+
+    def probe_profile_denied(profile):
+        calls.append(profile)
+        return (-1073741515, f"the {profile} live probe failed: dll")
+
+    monkeypatch.setattr(backend, "_probe_profile", probe_profile_denied)
+    capability = backend.probe()
+    assert calls[-2:] == ["lpac", "appcontainer"]
+    assert capability.available is False
+    assert "AppContainer fallback probe also failed" in capability.reason
+    assert backend.active_profile == "lpac"
+
+
+def test_probe_success_under_lpac_keeps_the_strong_profile(monkeypatch):
+    backend = windows_lpac.WindowsLpacBackend()
+    monkeypatch.setattr(windows_lpac, "_is_windows", lambda: True)
+    monkeypatch.setattr(windows_lpac, "_api", lambda: SimpleNamespace())
+    monkeypatch.setattr(backend, "reconcile_stale_manifests", lambda: None)
+    backend._last_probe_limitations = ("ipv6_unavailable_on_host",)
+    monkeypatch.setattr(backend, "_probe_profile", lambda profile: None)
+    capability = backend.probe()
+    assert capability.profile_id == "windows-lpac-preview-v1"
+    assert capability.limitations == ("null_device_and_named_pipes_denied", "ipv6_unavailable_on_host")
+    assert backend.active_profile == "lpac"
+    assert backend.profile_id == "windows-lpac-preview-v1"
+
+
+def test_probe_payload_asserts_the_token_kind_for_each_profile():
+    lpac = windows_lpac._probe_payload("wd", "ext", "S-1-15-2-1", [], less_privileged = True)
+    plain = windows_lpac._probe_payload("wd", "ext", "S-1-15-2-1", [], less_privileged = False)
+    assert "assert token_dword(46) == 1" in lpac
+    assert "assert token_dword_or_zero(46) == 0" in plain
+    # Zero capabilities and the file policy are asserted under both kinds.
+    for payload in (lpac, plain):
+        assert "assert token_dword(29) == 1" in payload
+        assert "ctypes.POINTER(wintypes.DWORD)).contents.value == 0" in payload
+        assert "LPAC escaped file policy" in payload
+
+
+def test_network_probe_skips_ipv6_when_the_host_cannot_bind_it(monkeypatch):
+    real_socket = socket.socket
+
+    class NoIpv6Socket(real_socket):
+        def bind(self, address):
+            if self.family == socket.AF_INET6:
+                raise OSError(99, "Cannot assign requested address")
+            return super().bind(address)
+
+    monkeypatch.setattr(socket, "socket", NoIpv6Socket)
+    with windows_lpac._probe_network_endpoints() as endpoints:
+        assert len(endpoints) == 2
+        assert {family for family, _kind, _address in endpoints} == {int(socket.AF_INET)}
+        assert endpoints.limitations == ("ipv6_unavailable_on_host",)
+
+
+def test_network_probe_reports_no_limitation_when_ipv6_binds():
+    try:
+        with socket.socket(socket.AF_INET6) as check:
+            check.bind(("::1", 0))
+    except OSError:
+        pytest.skip("this host has no IPv6 loopback")
+    with windows_lpac._probe_network_endpoints() as endpoints:
+        assert len(endpoints) == 4
+        assert endpoints.limitations == ()
+
+
+def test_environment_keeps_the_trusted_git_directory(monkeypatch, tmp_path):
+    workdir = tmp_path / "work"
+    private = tmp_path / "profile" / "Temp"
+    git_dir = tmp_path / "Program Files" / "Git" / "cmd"
+    workdir.mkdir()
+    private.mkdir(parents = True)
+    git_dir.mkdir(parents = True)
+    identity = SimpleNamespace(private_temp = str(private), profile_folder = str(private.parent))
+    monkeypatch.setattr(inference_tools, "_resolve_trusted_windows_git", lambda: (str(git_dir), ".exe"))
+    safe = windows_lpac._safe_environment({}, str(workdir), identity, (sys.executable,))
+    assert safe["PATH"].split(os.pathsep)[-1] == str(git_dir)
+
+    monkeypatch.setattr(inference_tools, "_resolve_trusted_windows_git", lambda: ("", ""))
+    safe = windows_lpac._safe_environment({}, str(workdir), identity, (sys.executable,))
+    assert str(git_dir) not in safe["PATH"]
+
+
+def test_spawn_attribute_count_follows_the_profile():
+    source = Path(windows_lpac.__file__).read_text(encoding = "utf-8")
+    assert "attribute_count = 3 if less_privileged else 2" in source
+    assert 'less_privileged = identity.profile != _PROFILE_APPCONTAINER' in source
+
+
+def test_limited_windows_job_requests_kill_on_close_and_is_terminated_after_drain():
+    source = Path(inference_tools.__file__).read_text(encoding = "utf-8")
+    assert "LimitFlags = 0x2 | 0x8 | 0x100 | 0x200 | 0x2000" in source
+    call = "        _terminate_limited_windows_job(pgid, effective_execution_mode)\n"
+    assert source.count(call) == 2  # _python_exec and _bash_exec, right after the drain
+    events = []
+    job = SimpleNamespace(terminate = lambda: events.append("terminated") or True)
+    inference_tools._terminate_limited_windows_job(("windows-job", job), "limited")
+    inference_tools._terminate_limited_windows_job(("windows-job", job), "os_isolation_required")
+    inference_tools._terminate_limited_windows_job(None, "limited")
+    inference_tools._terminate_limited_windows_job(("windows-tree", 1, None), "limited")
+    assert events == ["terminated"]
+
+
 @pytest.fixture(scope = "module")
 def live_lpac_backend():
     if sys.platform != "win32":
@@ -691,10 +1076,17 @@ def live_lpac_backend():
     assert capability.qualified is True, capability.reason
     assert capability.backend == "windows-lpac"
     assert capability.protection_state == "preview"
-    assert capability.profile_id == windows_lpac.WindowsLpacBackend.profile_id
-    assert "zero-capability LPAC live enforcement probe passed" in capability.reason
     backend = os_sandbox._platform_backend()
     assert isinstance(backend, windows_lpac.WindowsLpacBackend)
+    assert capability.profile_id == backend.active_profile_id()
+    if backend.active_profile == "appcontainer":
+        assert capability.profile_id == windows_lpac._APPCONTAINER_PROFILE_ID
+        assert "AppContainer fallback passed" in capability.reason
+        assert windows_lpac._LIMITATION_AMBIENT_READ in capability.limitations
+    else:
+        assert capability.profile_id == windows_lpac.WindowsLpacBackend.profile_id
+        assert "zero-capability LPAC live enforcement probe passed" in capability.reason
+    print(f"live Windows container profile: {backend.active_profile}")
     return backend
 
 
@@ -779,10 +1171,13 @@ def test_live_profiles_sids_acl_and_owned_artifacts_are_per_invocation(live_lpac
         acl = _acl_text(workdir)
         assert one.sid_string in acl and two.sid_string in acl
         first.cleanup()
+        assert first.cleanup_diagnostics == [], first.cleanup_diagnostics
         assert not Path(one.manifest_path).exists()
         assert not Path(one.private_temp).exists()
+        # DeleteAppContainerProfile reports S_OK again for a profile whose folder
+        # is already gone, so both outcomes mean "no profile left behind".
         deleted = windows_lpac._api().userenv.DeleteAppContainerProfile(one.moniker)
-        assert ctypes.c_uint32(deleted).value == 0x80070002
+        assert ctypes.c_uint32(deleted).value in (0, 0x80070002)
         assert Path(two.manifest_path).is_file()
         assert Path(two.private_temp).is_dir()
         acl = _acl_text(workdir)
@@ -793,7 +1188,7 @@ def test_live_profiles_sids_acl_and_owned_artifacts_are_per_invocation(live_lpac
     acl = _acl_text(workdir)
     assert one.sid_string not in acl and two.sid_string not in acl
     deleted = windows_lpac._api().userenv.DeleteAppContainerProfile(two.moniker)
-    assert ctypes.c_uint32(deleted).value == 0x80070002
+    assert ctypes.c_uint32(deleted).value in (0, 0x80070002)
 
 
 def test_live_workdir_home_runtime_native_extension_and_fresh_temp(live_lpac_backend, tmp_path):
@@ -879,22 +1274,26 @@ def test_live_ipv4_ipv6_udp_dns_loopback_and_host_pipe_are_denied(live_lpac_back
     code = f"""
 import socket, threading
 from multiprocessing.connection import Client
-def denied(family, address):
-    client = socket.socket(family); client.settimeout(1)
+def denied(family, address, kind=socket.SOCK_STREAM):
+    # A zero-capability AppContainer cannot even initialize Winsock
+    # (WSAEPROVIDERFAILEDINIT), so socket() itself may be the denial.
+    client = None
     try:
-        client.connect(address)
+        client = socket.socket(family, kind); client.settimeout(1)
+        if kind == socket.SOCK_STREAM:
+            client.connect(address)
+        else:
+            client.sendto(b'LPAC_ESCAPE', address)
     except OSError:
         return
     finally:
-        client.close()
-    raise AssertionError('host endpoint reachable: ' + repr(address))
+        if client is not None:
+            client.close()
+    if kind == socket.SOCK_STREAM:
+        raise AssertionError('host endpoint reachable: ' + repr(address))
 denied(socket.AF_INET, {address4!r})
 denied(socket.AF_INET6, {address6!r})
-packet = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-try:
-    try: packet.sendto(b'LPAC_ESCAPE', {udp_address!r})
-    except OSError: pass
-finally: packet.close()
+denied(socket.AF_INET, {udp_address!r}, socket.SOCK_DGRAM)
 try:
     socket.getaddrinfo('example.com', 443)
 except OSError:
@@ -967,7 +1366,14 @@ k.GetHandleInformation.restype = wintypes.BOOL
 for raw in os.environ['UNSLOTH_TEST_HANDLES'].split(','):
     flags = wintypes.DWORD()
     ctypes.set_last_error(0)
-    assert not k.GetHandleInformation(wintypes.HANDLE(int(raw)), ctypes.byref(flags))
+    try:
+        ok = k.GetHandleInformation(wintypes.HANDLE(int(raw)), ctypes.byref(flags))
+    except OSError as exc:
+        # STATUS_INVALID_HANDLE: strict handle checks turn the bad handle into an
+        # exception, which proves the same thing as ERROR_INVALID_HANDLE below.
+        assert exc.winerror == -1073741816, exc
+        continue
+    assert not ok
     assert ctypes.get_last_error() == 6
 print('LPAC_HANDLES_OK')
 """
@@ -979,68 +1385,58 @@ print('LPAC_HANDLES_OK')
     assert "LPAC_HANDLES_OK" in output
 
 
-def test_live_private_multiprocessing_and_resource_sharing(live_lpac_backend, tmp_path):
+def test_live_null_device_and_named_pipes_are_denied_and_disclosed(live_lpac_backend, tmp_path):
+    """The container cannot open NUL or create named pipes; the capability says so.
+
+    multiprocessing.Pipe() and therefore Queue(), Process() with the spawn
+    context, and torch (through dill, which opens os.devnull at import) cannot
+    work inside the sandbox. The limitation is advertised so the UI and the
+    model can route such work to Limited or Full mode instead of guessing.
+    """
     workdir = tmp_path / "work"
     workdir.mkdir()
     code = """
-import multiprocessing as mp
-from multiprocessing.resource_sharer import DupSocket, stop
-import os, socket
-
-def child(queue):
-    queue.put(('child-ok', os.environ['TEMP']))
-
-if __name__ == '__main__':
-    raw = socket.socket(socket.AF_UNIX)
-    duplicate = DupSocket(raw).detach()
-    assert duplicate.family == socket.AF_UNIX
-    duplicate.close(); raw.close(); stop()
-    context = mp.get_context('spawn')
-    queue = context.Queue()
-    process = context.Process(target=child, args=(queue,))
-    process.start()
-    value, child_temp = queue.get(timeout=15)
-    process.join(15)
-    assert process.exitcode == 0
-    assert value == 'child-ok'
-    assert child_temp == os.environ['TEMP']
-    queue.close(); queue.join_thread()
-    print('LPAC_MULTIPROCESSING_OK')
+import multiprocessing.connection as connection
+import os
+outcomes = {}
+try:
+    open(os.devnull, 'rb').close()
+    outcomes['devnull'] = 'opened'
+except PermissionError:
+    outcomes['devnull'] = 'denied'
+try:
+    reader, writer = connection.Pipe(duplex=False)
+    reader.close(); writer.close()
+    outcomes['pipe'] = 'created'
+except PermissionError:
+    outcomes['pipe'] = 'denied'
+print('LPAC_NULL_PIPES ' + repr(outcomes))
 """
+    output, _elapsed = _run_native(live_lpac_backend, workdir, code)
+    assert "LPAC_NULL_PIPES {'devnull': 'denied', 'pipe': 'denied'}" in output, output
+    capability = os_sandbox.capability_snapshot()
+    assert windows_lpac._LIMITATION_NULL_DEVICE_PIPES in capability.limitations
 
-    output, _elapsed = _run_native(live_lpac_backend, workdir, code, timeout = 40, script = True)
 
-    assert "LPAC_MULTIPROCESSING_OK" in output
-
-
-def test_live_pytorch_tensor_transfer_when_installed(live_lpac_backend, tmp_path):
+def test_live_pytorch_import_failure_is_the_disclosed_null_device_limit(live_lpac_backend, tmp_path):
+    """torch cannot import inside the container, and the failure is the advertised one."""
     if importlib.util.find_spec("torch") is None:
         pytest.skip("PyTorch is not installed")
     workdir = tmp_path / "work"
     workdir.mkdir()
-    code = """
-import torch
-import torch.multiprocessing as mp
-
-def child(queue):
-    queue.put(torch.arange(4))
-
-if __name__ == '__main__':
-    context = mp.get_context('spawn')
-    queue = context.Queue()
-    process = context.Process(target=child, args=(queue,))
-    process.start()
-    tensor = queue.get(timeout=30)
-    process.join(30)
-    assert process.exitcode == 0
-    assert torch.equal(tensor, torch.arange(4))
-    queue.close(); queue.join_thread()
-    print('LPAC_PYTORCH_OK')
+    site_dirs = [
+        path for path in (sysconfig.get_paths().get("purelib"), sysconfig.get_paths().get("platlib")) if path
+    ]
+    code = f"import sys; sys.path[:0] = {site_dirs!r}\n" + """
+try:
+    import torch
+except PermissionError as exc:
+    print('LPAC_TORCH_DENIED ' + repr(exc.filename))
+else:
+    print('LPAC_TORCH_IMPORTED')
 """
-
-    output, _elapsed = _run_native(live_lpac_backend, workdir, code, timeout = 60, script = True)
-
-    assert "LPAC_PYTORCH_OK" in output
+    output, _elapsed = _run_native(live_lpac_backend, workdir, code, timeout = 120)
+    assert "LPAC_TORCH_DENIED 'nul'" in output or "LPAC_TORCH_IMPORTED" in output, output
 
 
 def test_live_python_and_terminal_share_launcher_and_stream(

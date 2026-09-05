@@ -13,6 +13,7 @@ import hashlib
 import json
 import http.client
 import os
+import secrets
 import signal
 
 os.environ["UNSLOTH_IS_PRESENT"] = "1"
@@ -37,6 +38,9 @@ from contextvars import ContextVar
 # than held back from the room in advance. See its definition for why that matters.
 from .context_window import _RESULT_NOTICE_RESERVE
 from .os_sandbox import (
+    _pidfd_open,
+    _pidfd_send_signal,
+    descendant_sweep_supported,
     SandboxUnavailableError,
     ToolLaunchPlan,
     prepare_tool_launch,
@@ -7195,9 +7199,14 @@ def _limited_resource_limits() -> tuple[int, int, int, int]:
 
 
 def _limited_preexec() -> None:
-    """Establish every resource limit promised by Limited mode or abort exec."""
-    os.setsid()
-    os.umask(0o077)
+    """Establish every resource limit promised by Limited mode or abort exec.
+
+    The shared guard (session leader, umask, ``PR_SET_NO_NEW_PRIVS``,
+    ``PR_SET_PDEATHSIG`` and the best-effort limits) runs first so Limited mode
+    keeps every protection the pre-isolation sandboxed path had; the limits below
+    are then re-applied fail-closed. NPROC is left to the fail-closed pass.
+    """
+    _sandbox_preexec_impl(apply_no_new_privs = True, apply_nproc = False)
     if _resource is None:
         raise RuntimeError("POSIX resource limits are unavailable")
 
@@ -7369,14 +7378,22 @@ def _shell_is_posix() -> bool:
     return sys.platform != "win32" or _windows_bash() is not None
 
 
-def _get_shell_cmd(command: str) -> list[str]:
-    """Return the platform-appropriate shell invocation for a command string."""
+def _get_shell_cmd(command: str, *, os_isolated: bool = False) -> list[str]:
+    """Return the platform-appropriate shell invocation for a command string.
+
+    ``os_isolated`` says the launch runs inside the Windows AppContainer. Git for
+    Windows bash is an MSYS2 program and MSYS2 opens a shared object under
+    ``\\BaseNamedObjects`` at startup, which an AppContainer is denied
+    (``NtCreateDirectoryObject: 0xC0000022``), so it can never start there. The
+    isolated launch uses cmd and the model is told so by
+    apply_os_isolated_tool_descriptions.
+    """
     if sys.platform == "win32":
         # why: the model is told this tool is bash and writes bash. cmd /c runs
         # only the first line of a multi-line command, keeps single quotes
         # literal, and does not understand bash quoting, so a correct script
         # silently half-executes. Use a real bash when the host has one.
-        bash = _windows_bash()
+        bash = None if os_isolated else _windows_bash()
         if bash:
             return [bash, "-c", command]
         return ["cmd", "/c", command]
@@ -9947,15 +9964,19 @@ def _build_terminal_shell_note() -> str:
     if sys.platform != "win32":
         return ""
     if _windows_bash():
-        return (
-            " The shell is bash (Git for Windows), and native Windows programs are "
-            "available; a program you start detached opens a window on the user's "
-            "desktop."
-        )
-    return (
-        " The shell is cmd, not bash: send one command per call, chain with &&, and "
-        "do not use bash syntax such as multi-line loops or single-quoted arguments."
-    )
+        return _TERMINAL_BASH_NOTE
+    return _TERMINAL_CMD_NOTE
+
+
+_TERMINAL_BASH_NOTE = (
+    " The shell is bash (Git for Windows), and native Windows programs are "
+    "available; a program you start detached opens a window on the user's "
+    "desktop."
+)
+_TERMINAL_CMD_NOTE = (
+    " The shell is cmd, not bash: send one command per call, chain with &&, and "
+    "do not use bash syntax such as multi-line loops or single-quoted arguments."
+)
 
 
 _SANDBOX_PATHS_NOTE = _build_sandbox_paths_note()
@@ -10031,6 +10052,35 @@ _LIMITED_TOOL_DESCRIPTION_PREFIX = (
     "This tool runs with Unsloth software safeguards but without OS isolation; "
     "it may access anything available to the Studio process. "
 )
+
+
+def apply_os_isolated_tool_descriptions(tools: list[dict]) -> list[dict]:
+    """Name the shell that actually runs inside the Windows sandbox.
+
+    The module-level terminal description promises Git bash whenever the host
+    has one, but an OS-isolated launch on Windows runs cmd (see _get_shell_cmd),
+    so a Required-mode turn on such a host gets the cmd note instead. Every
+    other platform, mode and tool is returned untouched, and a list without the
+    terminal tool is returned as-is.
+    """
+    if sys.platform != "win32" or not _windows_bash():
+        return tools
+    out: list[dict] = []
+    swapped = False
+    for tool in tools:
+        function = tool.get("function") if isinstance(tool, dict) else None
+        name = function.get("name") if isinstance(function, dict) else None
+        if name != "terminal":
+            out.append(tool)
+            continue
+        description = str(function.get("description", ""))
+        if _TERMINAL_BASH_NOTE in description:
+            description = description.replace(_TERMINAL_BASH_NOTE, _TERMINAL_CMD_NOTE)
+        else:
+            description = description + _TERMINAL_CMD_NOTE
+        out.append({**tool, "function": {**function, "description": description}})
+        swapped = True
+    return out if swapped else tools
 
 
 def apply_limited_tool_descriptions(tools: list[dict]) -> list[dict]:
@@ -14526,8 +14576,11 @@ class _WindowsToolJob:
 
     Windows has no process groups, and ``taskkill`` cannot reach a tree whose
     root has already exited, which is exactly the case this capture exists for.
-    The job stays a valid handle on every descendant either way. Created without
-    kill-on-close, so releasing it never kills a process that outlived the call.
+    The job stays a valid handle on every descendant either way. When the job
+    carries Limited-mode resource limits it is also created with kill-on-close,
+    so a detached grandchild dies with the tool call instead of outliving it,
+    which is what the ``reaping`` safeguard promises. A plain capture (Full
+    access) keeps the historical behaviour and never kills on release.
     """
 
     def __init__(self, handle, kernel32):
@@ -14702,7 +14755,8 @@ def _windows_job_capture(proc, *, apply_resource_limits: bool = False) -> "_Wind
             info = _ExtendedLimits()
             info.BasicLimitInformation.PerProcessUserTimeLimit = cpu_time
             info.BasicLimitInformation.ActiveProcessLimit = nproc
-            info.BasicLimitInformation.LimitFlags = 0x2 | 0x8 | 0x100 | 0x200
+            # PROCESS_TIME | ACTIVE_PROCESS | PROCESS_MEMORY | JOB_MEMORY | KILL_ON_JOB_CLOSE
+            info.BasicLimitInformation.LimitFlags = 0x2 | 0x8 | 0x100 | 0x200 | 0x2000
             info.ProcessMemoryLimit = memory
             info.JobMemoryLimit = memory
             if not kernel32.SetInformationJobObject(
@@ -14794,6 +14848,71 @@ def _kill_process_tree(proc) -> None:
         pass
 
 
+# Limited mode has no pid namespace, so a `setsid` grandchild leaves the captured
+# process group and survives `_killpg_captured`. Every Limited launch therefore
+# carries a per-call random marker in its environment; after the leader is gone
+# the sweep kills every process of our uid still carrying that exact marker.
+_LIMITED_RUN_MARKER_ENV = "UNSLOTH_STUDIO_TOOL_RUN_ID"
+_LIMITED_SWEEP_PASSES = 2
+_LIMITED_SWEEP_PAUSE_SECONDS = 0.05
+
+
+def _sweep_marked_descendants(marker: str) -> int:
+    """SIGKILL processes of this uid whose environment carries the Limited run marker.
+
+    Linux only (it reads ``/proc/<pid>/environ``); elsewhere it is a no-op and
+    the Limited execution record discloses ``detached_descendant_cleanup_unverified``.
+    Pids without the marker are never signalled; unreadable or vanished pids are
+    skipped. A child that scrubs its own environment escapes the sweep, which is
+    why Limited mode is offered only where no OS sandbox qualifies.
+    """
+    if not marker or not descendant_sweep_supported():
+        return 0
+    needle = f"{_LIMITED_RUN_MARKER_ENV}={marker}".encode()
+    own_pid = os.getpid()
+    own_uid = os.getuid()
+    killed = 0
+    for _pass in range(_LIMITED_SWEEP_PASSES):
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return killed
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid == own_pid:
+                continue
+            # The pidfd pins this exact process before anything about it is
+            # read: if the pid is recycled after the match, the signal still
+            # goes to the (already dead) process the fd refers to, never to the
+            # newcomer.
+            try:
+                pidfd = _pidfd_open(pid)
+            except OSError:
+                continue
+            try:
+                try:
+                    if os.stat(f"/proc/{pid}").st_uid != own_uid:
+                        continue
+                    with open(f"/proc/{pid}/environ", "rb") as stream:
+                        environ = stream.read()
+                except OSError:
+                    continue
+                if needle not in environ.split(b"\0"):
+                    continue
+                try:
+                    _pidfd_send_signal(pidfd, signal.SIGKILL)
+                    killed += 1
+                except (ProcessLookupError, PermissionError, OSError):
+                    pass
+            finally:
+                os.close(pidfd)
+        if _pass + 1 < _LIMITED_SWEEP_PASSES:
+            time.sleep(_LIMITED_SWEEP_PAUSE_SECONDS)
+    return killed
+
+
 def _killpg_captured(pgid) -> None:
     """SIGKILL a process group captured before its leader was waited on.
 
@@ -14821,6 +14940,23 @@ def _killpg_captured(pgid) -> None:
     try:
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
+def _terminate_limited_windows_job(pgid, effective_execution_mode) -> None:
+    """Once a Limited tool call's leader is done, take its whole Windows job with it.
+
+    The job was created with kill-on-close, so this is the eager half of the
+    same guarantee: a ``start /b`` grandchild left running by the leader does
+    not survive the call. No-op outside Limited mode and off Windows.
+    """
+    if effective_execution_mode != "limited" or not isinstance(pgid, tuple):
+        return
+    if pgid[0] != "windows-job":
+        return
+    try:
+        pgid[1].terminate()
+    except Exception:  # noqa: BLE001 - best effort; kill-on-close still applies
         pass
 
 
@@ -16282,6 +16418,31 @@ def _created_file_sentinels(
     return out
 
 
+# One process-wide notice: API clients written before OS isolation existed send no
+# tool_execution_mode, and on a host without a qualified backend their tool calls now
+# fail closed. The request models record the omission; the launch path reports it once.
+_LEGACY_MODE_NOTICE_LOGGED = False
+_API_OPT_OUT_HINT = (
+    "API clients that accept running without OS isolation must say so explicitly with "
+    "permission_mode \"full\" (or bypass_permissions true); an omitted tool_execution_mode "
+    "means OS isolation is required."
+)
+
+
+def _tool_failure_message(exc: BaseException) -> str:
+    """The string a failed tool call hands back to the model."""
+    message = f"Execution error: {exc}"
+    if isinstance(exc, SandboxUnavailableError) and "OS_ISOLATION_UNAVAILABLE" in message:
+        global _LEGACY_MODE_NOTICE_LOGGED
+        if not _LEGACY_MODE_NOTICE_LOGGED:
+            _LEGACY_MODE_NOTICE_LOGGED = True
+            logger.warning(
+                "Python/Terminal tool refused: %s. %s", str(exc)[:300], _API_OPT_OUT_HINT
+            )
+        message = f"{message} {_API_OPT_OUT_HINT}"
+    return message
+
+
 def _python_exec(
     code: str,
     cancel_event = None,
@@ -16336,6 +16497,7 @@ def _python_exec(
     tmp_path = None
     _scratch_name = None
     prepared_launch = None
+    run_marker = None
     workdir = _get_workdir(session_id)
     # `_get_workdir(None)` is the shared `_default` sandbox, and a project's chats share
     # one session by design. Retaining a result in either, under a path the next chat can
@@ -16363,6 +16525,10 @@ def _python_exec(
             # Match the sandboxed Python path without changing bypass shell I/O.
             safe_env = dict(safe_env)
             safe_env["PYTHONIOENCODING"] = "utf-8"
+        elif effective_execution_mode == "limited":
+            run_marker = secrets.token_hex(16)
+            safe_env = dict(safe_env)
+            safe_env[_LIMITED_RUN_MARKER_ENV] = run_marker
         launch_argv = (sys.executable, "-u", tmp_path)
         launch_preexec = (
             _bypass_preexec
@@ -16472,6 +16638,7 @@ def _python_exec(
             cancel_event,
             pgid = pgid,
         )
+        _terminate_limited_windows_job(pgid, effective_execution_mode)
         # A run that wrote its file and then hung still produced that file, so
         # report it: `printf data > report.csv; sleep 999` is downloadable.
         if timed_out:
@@ -16520,13 +16687,15 @@ def _python_exec(
     except Exception as e:
         # An exception message carries whatever the failure put in it, so it is capped
         # like the result would have been.
-        return _truncate(f"Execution error: {e}")
+        return _truncate(_tool_failure_message(e))
     finally:
         _call_finished(call_token)
         if _scratch_name:
             with _scratch_lock:
                 _active_scratch.discard(_scratch_name)
         _forget_tool_pid(locals().get("proc"))
+        if run_marker is not None:
+            _sweep_marked_descendants(run_marker)
         if prepared_launch is not None:
             prepared_launch.cleanup()
         if tmp_path and os.path.exists(tmp_path):
@@ -16590,6 +16759,7 @@ def _bash_exec(
     spill_scope = None
     call_token = None
     prepared_launch = None
+    run_marker = None
     try:
         workdir = _get_workdir(session_id)
         # Same scoping as _python_exec: nothing is retained in a sandbox that is shared.
@@ -16600,7 +16770,16 @@ def _bash_exec(
         # to produce "(no output)" and no other trace anywhere in the product.
         _before = _snapshot_workdir_files(workdir)
         safe_env = _build_bypass_env(workdir) if full_access else _build_safe_env(workdir)
-        launch_argv = tuple(_get_shell_cmd(command))
+        if not full_access and effective_execution_mode == "limited":
+            run_marker = secrets.token_hex(16)
+            safe_env = dict(safe_env)
+            safe_env[_LIMITED_RUN_MARKER_ENV] = run_marker
+        launch_argv = tuple(
+            _get_shell_cmd(
+                command,
+                os_isolated = not full_access and effective_execution_mode == "os_isolation_required",
+            )
+        )
         launch_preexec = (
             _bypass_preexec
             if full_access
@@ -16701,6 +16880,7 @@ def _bash_exec(
             cancel_event,
             pgid = pgid,
         )
+        _terminate_limited_windows_job(pgid, effective_execution_mode)
         # A run that wrote its file and then hung still produced that file, so
         # report it: `printf data > report.csv; sleep 999` is downloadable.
         if timed_out:
@@ -16733,9 +16913,11 @@ def _bash_exec(
     except Exception as e:
         # An exception message carries whatever the failure put in it, so it is capped
         # like the result would have been.
-        return _truncate(f"Execution error: {e}")
+        return _truncate(_tool_failure_message(e))
     finally:
         _call_finished(call_token)
         _forget_tool_pid(locals().get("proc"))
+        if run_marker is not None:
+            _sweep_marked_descendants(run_marker)
         if prepared_launch is not None:
             prepared_launch.cleanup()
