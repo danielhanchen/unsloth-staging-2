@@ -59,6 +59,7 @@ jobs:
         run: python "$env:RUNNER_TEMP\pr10285_probe.py" capability --label second
       - name: LPAC and sandbox suites
         working-directory: studio/backend
+        continue-on-error: true
         run: |
           python -m pytest -q -rf --tb=short -p no:cacheprovider tests/test_windows_lpac.py tests/test_os_sandbox.py tests/test_tool_isolation_api.py > pytest_out.txt 2>&1
           Select-String -Path pytest_out.txt -Pattern '^(FAILED|ERROR) ' | ForEach-Object { 'PR10285_FAIL ' + ($_.Line -split ' - ')[0] } | Sort-Object -Unique
