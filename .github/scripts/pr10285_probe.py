@@ -71,6 +71,8 @@ def escape() -> int:
     srv.listen(1)
     port = srv.getsockname()[1]
     if sys.platform == "win32":
+        # cmd only: the isolated Terminal tool runs cmd, and powershell is on the
+        # static blocklist, so it would be refused before the sandbox is involved.
         term = textwrap.dedent(
             f"""
             echo PR10285_ESC uid=%USERNAME%
@@ -79,8 +81,9 @@ def escape() -> int:
             echo PR10285_ESC write_windows_temp=& (echo x > C:\\Windows\\Temp\\pr10285.txt && echo WRITTEN) 2>&1
             echo PR10285_ESC write_program_files=& (echo x > "C:\\Program Files\\pr10285.txt" && echo WRITTEN) 2>&1
             echo PR10285_ESC write_workdir=& (echo x > ok.txt && echo WRITTEN) 2>&1
-            echo PR10285_ESC tcp_loopback=& powershell -NoProfile -Command "try {{ (New-Object Net.Sockets.TcpClient('127.0.0.1', {port})) | Out-Null; 'CONNECTED' }} catch {{ 'denied: ' + $_.Exception.InnerException.Message }}" 2>&1
-            echo PR10285_ESC tcp_internet=& powershell -NoProfile -Command "try {{ (New-Object Net.Sockets.TcpClient('1.1.1.1', 443)) | Out-Null; 'CONNECTED' }} catch {{ 'denied: ' + $_.Exception.InnerException.Message }}" 2>&1
+            echo PR10285_ESC tcp_loopback=& python -c "import socket; s=socket.create_connection(('127.0.0.1', {port}), timeout=3); print('CONNECTED')" 2>&1
+            echo PR10285_ESC tcp_internet=& python -c "import socket; s=socket.create_connection(('1.1.1.1', 443), timeout=3); print('CONNECTED')" 2>&1
+            echo PR10285_ESC devnull=& python -c "open('nul','rb').close(); print('OPENED')" 2>&1
             echo PR10285_ESC canary=& set PR10285 2>&1
             echo PR10285_ESC env_count=& set | find /c "="
             echo PR10285_ESC integrity=& whoami /groups | findstr /i "Mandatory Label" 2>&1
@@ -123,7 +126,7 @@ def escape() -> int:
             print(line.strip()[:400], flush = True)
     time.sleep(2)
     if sys.platform == "win32":
-        ps = subprocess.run(["wmic", "process", "where", "name='PING.EXE'", "get", "CommandLine"], capture_output = True, text = True).stdout
+        ps = subprocess.run(["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | Select-Object -ExpandProperty CommandLine"], capture_output = True, text = True).stdout
         survivors = "1285" in ps
     else:
         ps = subprocess.run(["pgrep", "-u", str(os.getuid()), "-af", "sleep 1285"], capture_output = True, text = True).stdout
@@ -192,7 +195,7 @@ def limited_survivor() -> int:
         return 0
     time.sleep(2)
     if sys.platform == "win32":
-        ps = subprocess.run(["wmic", "process", "where", "name='PING.EXE'", "get", "CommandLine"], capture_output = True, text = True).stdout
+        ps = subprocess.run(["powershell", "-NoProfile", "-Command", "Get-CimInstance Win32_Process -Filter \"Name='PING.EXE'\" | Select-Object -ExpandProperty CommandLine"], capture_output = True, text = True).stdout
         survivors = "1286" in ps
     else:
         ps = subprocess.run(["pgrep", "-u", str(os.getuid()), "-af", "sleep 1286"], capture_output = True, text = True).stdout

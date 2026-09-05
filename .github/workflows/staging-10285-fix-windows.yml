@@ -38,6 +38,7 @@ jobs:
         run: |
           git fetch --depth 1 origin pr-10285-fix-ci
           git show origin/pr-10285-fix-ci:.github/scripts/pr10285_probe.py | Set-Content -Path "$env:RUNNER_TEMP\pr10285_probe.py" -Encoding utf8
+          git show origin/pr-10285-fix-ci:.github/scripts/pr10285_timing.py | Set-Content -Path "$env:RUNNER_TEMP\pr10285_timing.py" -Encoding utf8
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -57,6 +58,10 @@ jobs:
       - name: Capability probe (second, cached path)
         working-directory: studio/backend
         run: python "$env:RUNNER_TEMP\pr10285_probe.py" capability --label second
+      - name: Launch timing breakdown
+        working-directory: studio/backend
+        continue-on-error: true
+        run: python "$env:RUNNER_TEMP\pr10285_timing.py"
       - name: LPAC and sandbox suites
         working-directory: studio/backend
         continue-on-error: true
@@ -85,6 +90,13 @@ jobs:
         continue-on-error: true
       - name: Shared suites (existing tests at both refs)
         working-directory: studio/backend
-        run: |
-          python -m pytest -q --tb=line -p no:cacheprovider tests/test_secure_tools_execute.py tests/test_bypass_permissions.py tests/test_tool_output_streaming.py tests/test_studio_tool_loop.py tests/test_orphaned_children.py tests/test_exec_utf8.py tests/test_windows_bash_shell.py tests/test_sandbox_files_and_storage_roots.py -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' 2>&1 | Select-String -Pattern '^(FAILED|ERROR)|passed|failed' | ForEach-Object { ($_.Line -split ' - ')[0] } | Sort-Object -Unique
+        timeout-minutes: 25
         continue-on-error: true
+        run: |
+          python -m pytest -q -v --tb=line -o faulthandler_timeout=180 -p no:cacheprovider tests/test_secure_tools_execute.py tests/test_bypass_permissions.py tests/test_tool_output_streaming.py tests/test_studio_tool_loop.py tests/test_orphaned_children.py tests/test_exec_utf8.py tests/test_windows_bash_shell.py tests/test_sandbox_files_and_storage_roots.py -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > shared_out.txt 2>&1
+          Select-String -Path shared_out.txt -Pattern '^(FAILED|ERROR)|passed|failed' | ForEach-Object { 'PR10285_SHARED ' + ($_.Line -split ' - ')[0] } | Sort-Object -Unique
+      - name: Shared suites tail (also after a timeout)
+        if: always()
+        working-directory: studio/backend
+        run: |
+          if (Test-Path shared_out.txt) { Get-Content shared_out.txt | Select-Object -Last 120 } else { 'no shared_out.txt' }
