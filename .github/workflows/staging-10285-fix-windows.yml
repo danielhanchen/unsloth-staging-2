@@ -63,7 +63,13 @@ jobs:
           python -m pytest -q -rf --tb=short -p no:cacheprovider tests/test_windows_lpac.py tests/test_os_sandbox.py tests/test_tool_isolation_api.py > pytest_out.txt 2>&1
           Select-String -Path pytest_out.txt -Pattern '^(FAILED|ERROR) ' | ForEach-Object { 'PR10285_FAIL ' + ($_.Line -split ' - ')[0] } | Sort-Object -Unique
           Select-String -Path pytest_out.txt -Pattern 'passed|failed' | Select-Object -Last 1 | ForEach-Object { 'PR10285_SUMMARY ' + $_.Line }
-          Select-String -Path pytest_out.txt -Pattern '^E  |^_{3,} test_|^_{3,} ERROR' | Select-Object -First 80 | ForEach-Object { $_.Line }
+          Select-String -Path pytest_out.txt -Pattern '^E  |^_{3,} test_|^_{3,} ERROR' | Select-Object -First 200 | ForEach-Object { $_.Line }
+      - name: Symlink tests with full tracebacks and readlink facts
+        working-directory: studio/backend
+        continue-on-error: true
+        run: |
+          python -c "import os,sys,tempfile; d=tempfile.mkdtemp(); os.makedirs(os.path.join(d,'b','bin')); open(os.path.join(d,'b','bin','t'),'w').close(); os.makedirs(os.path.join(d,'a','bin')); os.symlink('../../b/bin/t', os.path.join(d,'a','bin','rel')); os.symlink(os.path.join(d,'b','bin','t'), os.path.join(d,'a','bin','abs')); print('PR10285_READLINK tmp=', tempfile.gettempdir(), 'rel=', repr(os.readlink(os.path.join(d,'a','bin','rel'))), 'abs=', repr(os.readlink(os.path.join(d,'a','bin','abs'))), 'exists_rel=', os.path.exists(os.path.join(d,'a','bin','rel')), 'realpath_rel=', os.path.realpath(os.path.join(d,'a','bin','rel')), 'exe=', sys.executable, 'realexe=', os.path.realpath(sys.executable))"
+          python -m pytest -q --tb=long -p no:cacheprovider tests/test_os_sandbox.py -k "symlink" 2>&1 | Select-Object -Last 150
       - name: Terminal escape probe
         working-directory: studio/backend
         run: python "$env:RUNNER_TEMP\pr10285_probe.py" escape
