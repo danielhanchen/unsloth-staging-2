@@ -43,11 +43,15 @@ jobs:
           set -eu
           docker pull unsloth/unsloth:core 2>&1 | tail -3
           docker image inspect unsloth/unsloth:core --format 'arch={{.Architecture}} size={{.Size}}'
-          docker run --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 unsloth/unsloth:core python - <<'PY'
+          # -i: without it the heredoc never reaches python, which exits 0 having run nothing
+          OUT=$(docker run -i --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 unsloth/unsloth:core python - <<'PY'
           import platform, torch, unsloth, subprocess
           print("machine", platform.machine(), "torch", torch.__version__, "cuda", torch.cuda.is_available(), "unsloth", unsloth.__version__)
           print(subprocess.run(["unsloth", "--version"], capture_output=True, text=True).stdout.strip())
           PY
+          )
+          echo "$OUT"
+          echo "$OUT" | grep -q 'torch 2.11' || { echo 'import step printed nothing usable'; exit 1; }
           '@
           $jupyter = @'
           set -eu

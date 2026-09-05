@@ -1,0 +1,51 @@
+# Round 4: the Linux legs again, because round 1's import step fed a heredoc to
+# `docker run` without -i, so python read EOF and exited 0 having run nothing. The
+# step is now interactive and asserts on its own output.
+name: Docker on hosted runners, round 4 (Linux imports, non-vacuous)
+
+on:
+  push:
+    branches: ['docker-hosts-*']
+  workflow_dispatch:
+
+env:
+  IMAGE: unsloth/unsloth:core
+
+jobs:
+  linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: amd64
+            machine: x86_64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+            machine: aarch64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - name: Reclaim disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache || true; df -h /
+      - name: Pull
+        run: docker pull "$IMAGE" 2>&1 | tail -1 && docker image inspect "$IMAGE" --format 'arch={{.Architecture}} size={{.Size}}'
+      - name: Imports + unsloth CLI (CPU mode), asserted
+        run: |
+          OUT=$(docker run -i --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 "$IMAGE" python - <<'PY'
+          import platform, torch, unsloth, transformers, trl, peft, bitsandbytes, subprocess
+          print("machine", platform.machine(), "torch", torch.__version__, "cuda", torch.cuda.is_available())
+          print("unsloth", unsloth.__version__, "transformers", transformers.__version__, "trl", trl.__version__, "peft", peft.__version__, "bnb", bitsandbytes.__version__)
+          print("cli:", subprocess.run(["unsloth", "--version"], capture_output=True, text=True).stdout.strip())
+          PY
+          )
+          echo "$OUT"
+          echo "$OUT" | grep -q "machine ${{ matrix.machine }} torch 2.11" || { echo "::error::import output missing or wrong arch"; exit 1; }
+      - name: llama.cpp prebuilt loads and lists devices (CPU)
+        run: |
+          docker run -i --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 "$IMAGE" bash -c '
+            set -e
+            B=/opt/unsloth/llama.cpp/build/bin
+            $B/llama-server --version 2>&1 | tail -1
+            $B/llama-cli --list-devices 2>&1 | tail -4 || true
+            head -c 300 /opt/unsloth/llama.cpp/UNSLOTH_PREBUILT_INFO.json; echo'
