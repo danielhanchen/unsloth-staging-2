@@ -5,8 +5,6 @@
 name: Docker on hosted runners
 
 on:
-  push:
-    branches: ['docker-hosts-*']
   workflow_dispatch:
     inputs:
       image:

@@ -1,0 +1,68 @@
+# Round 2 of the hosted-runner probe. Round 1 established: the windows-latest daemon
+# is Windows-containers only (no Docker Desktop, `no matching manifest for
+# windows/amd64`), and colima's default VZ backend cannot start a VM on the Apple
+# Silicon macos-14/15 runners (no nested virtualization). This round tries the two
+# paths real users take: WSL 2 on Windows, and a QEMU VM on the Mac.
+name: Docker on hosted runners, round 2
+
+on:
+  push:
+    branches: ['docker-hosts-*']
+  workflow_dispatch:
+
+env:
+  IMAGE: unsloth/unsloth:core
+
+jobs:
+  windows-wsl2:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - name: Import a fresh Ubuntu 24.04 WSL distro
+        shell: pwsh
+        run: |
+          wsl --set-default-version 2
+          $url = 'https://cloud-images.ubuntu.com/wsl/releases/24.04/20240423/ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz'
+          $expected = '2a790896740b14d637dbdc583cce1ba081ac53b9e9cdb46dc09a2f73abbd9934'
+          New-Item -ItemType Directory -Force -Path wsl-dist | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile wsl-dist/rootfs.tar.gz -UseBasicParsing -TimeoutSec 900
+          $actual = (Get-FileHash wsl-dist/rootfs.tar.gz -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { Write-Host "::error::rootfs checksum mismatch: got $actual"; exit 1 }
+          wsl --import unsloth-ci "$PWD/wsl-dist/instance" "$PWD/wsl-dist/rootfs.tar.gz" --version 2
+          wsl -d unsloth-ci -- uname -a
+          wsl -d unsloth-ci -- sh -c 'df -h / | tail -1; nproc; free -g | head -2'
+      - name: Install Docker inside WSL 2 and start the daemon
+        shell: pwsh
+        run: |
+          wsl -d unsloth-ci -u root -- sh -c 'apt-get update -qq && apt-get install -y -qq --no-install-recommends ca-certificates curl docker.io iptables >/dev/null && dockerd --version'
+          wsl -d unsloth-ci -u root -- sh -c 'nohup dockerd --iptables=false --bridge=none > /var/log/dockerd.log 2>&1 & for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 2; done; docker info --format "{{.OSType}}/{{.Architecture}} {{.ServerVersion}} storage={{.Driver}}" || tail -40 /var/log/dockerd.log'
+      - name: Pull and run the entrypoint (CPU mode)
+        shell: pwsh
+        run: |
+          wsl -d unsloth-ci -u root -- sh -c 'docker pull unsloth/unsloth:core 2>&1 | tail -3 && docker image inspect unsloth/unsloth:core --format "arch={{.Architecture}} size={{.Size}}"'
+          wsl -d unsloth-ci -u root -- sh -c 'docker run --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 unsloth/unsloth:core python -c "import platform, torch, unsloth; print(\"machine\", platform.machine(), \"torch\", torch.__version__, \"cuda\", torch.cuda.is_available(), \"unsloth\", unsloth.__version__)"'
+      - name: JupyterLab boots and authenticates inside WSL 2
+        shell: pwsh
+        run: |
+          wsl -d unsloth-ci -u root -- sh -c 'CID=$(docker run -d -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 -p 127.0.0.1:8888:8888 unsloth/unsloth:core jupyter lab --ip 0.0.0.0 --port 8888 --allow-root --no-browser); for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8888/api/status && break; sleep 2; done; TOK=$(docker logs $CID 2>&1 | grep -o "token=[0-9a-f]*" | head -1 | cut -d= -f2); NOTOK=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8888/api/status); OK=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8888/api/status?token=$TOK"); echo "no token: $NOTOK  with token: $OK"; docker rm -f $CID >/dev/null; test "$NOTOK" = 403 && test "$OK" = 200'
+
+  macos-qemu:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - name: Install colima with the QEMU backend
+        run: |
+          brew install --quiet docker colima qemu 2>&1 | tail -2
+          colima start --vm-type qemu --cpu 3 --memory 8 --disk 60 2>&1 | tail -8
+          docker info --format '{{.OSType}}/{{.Architecture}} {{.ServerVersion}}'
+      - name: Pull
+        run: docker pull "$IMAGE" 2>&1 | tail -2 && docker image inspect "$IMAGE" --format 'arch={{.Architecture}} size={{.Size}}'
+      - name: Entrypoint + imports (CPU mode)
+        run: docker run --rm -e UNSLOTH_ALLOW_CPU=1 -e UNSLOTH_SKIP_NOTEBOOK_SYNC=1 "$IMAGE" python -c "import platform, torch, unsloth; print('machine', platform.machine(), 'torch', torch.__version__, 'cuda', torch.cuda.is_available(), 'unsloth', unsloth.__version__)"
+      - name: Stop
+        if: always()
+        run: colima stop 2>/dev/null || true
