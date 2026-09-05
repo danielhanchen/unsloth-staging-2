@@ -1,0 +1,42 @@
+name: "staging-10285 LPAC diagnostic"
+
+on:
+  push:
+    branches: [pr-10285-lpac-diag]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lpac-diag:
+    name: ${{ matrix.runner }} LPAC variants
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [windows-latest, windows-2022]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install minimal deps
+        shell: pwsh
+        run: python -m pip install structlog psutil
+      - name: Run LPAC variants
+        shell: pwsh
+        working-directory: studio/backend
+        run: |
+          $ErrorActionPreference = "Continue"
+          python ..\..\.github\scripts\lpac_diag.py
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lpac-diag-${{ matrix.runner }}
+          path: ${{ runner.temp }}/lpac_diag.json
+          if-no-files-found: warn
