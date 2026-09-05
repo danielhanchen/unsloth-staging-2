@@ -60,7 +60,10 @@ jobs:
       - name: LPAC and sandbox suites
         working-directory: studio/backend
         run: |
-          python -m pytest -q -rs --tb=short -p no:cacheprovider tests/test_windows_lpac.py tests/test_os_sandbox.py tests/test_tool_isolation_api.py 2>&1 | Select-Object -Last 70
+          python -m pytest -q -rf --tb=short -p no:cacheprovider tests/test_windows_lpac.py tests/test_os_sandbox.py tests/test_tool_isolation_api.py > pytest_out.txt 2>&1
+          Select-String -Path pytest_out.txt -Pattern '^(FAILED|ERROR) ' | ForEach-Object { 'PR10285_FAIL ' + ($_.Line -split ' - ')[0] } | Sort-Object -Unique
+          Select-String -Path pytest_out.txt -Pattern 'passed|failed' | Select-Object -Last 1 | ForEach-Object { 'PR10285_SUMMARY ' + $_.Line }
+          Select-String -Path pytest_out.txt -Pattern '^E  |^_{3,} test_|^_{3,} ERROR' | Select-Object -First 80 | ForEach-Object { $_.Line }
       - name: Terminal escape probe
         working-directory: studio/backend
         run: python "$env:RUNNER_TEMP\pr10285_probe.py" escape
