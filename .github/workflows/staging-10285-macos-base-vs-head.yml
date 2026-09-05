@@ -1,0 +1,53 @@
+name: "staging-10285 macOS base vs head"
+on:
+  push:
+    branches: ["pr-10285-base-macos"]
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    name: macos-15 ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: base
+            ref: e8a88546ddef77ac6efc3d034ba4a142e7f61179
+          - label: head
+            ref: 35d6cd295aa8031d9376b425c1c953a2ed39d644
+    runs-on: macos-15
+    timeout-minutes: 40
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -q -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pip install -q structlog aiofiles sqlalchemy cryptography psutil pyyaml jinja2 mammoth requests 'numpy<3' httpx 'transformers>=4.51,<5.5'
+      - name: Existing suites, one pytest session (as the staging job ran them)
+        working-directory: studio/backend
+        run: |
+          FILES=""
+          for f in tests/test_bypass_permissions.py tests/test_orphaned_children.py tests/test_sandbox_files_and_storage_roots.py tests/test_safetensors_tool_loop.py tests/test_secure_tools_execute.py tests/test_exec_utf8.py tests/test_windows_bash_shell.py tests/test_tool_output_streaming.py tests/test_studio_tool_loop.py; do
+            [ -f "$f" ] && FILES="$FILES $f"
+          done
+          echo "files:$FILES"
+          python -m pytest -q --tb=line -p no:cacheprovider $FILES -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' 2>&1 | grep -E "^(FAILED|ERROR)|passed|failed" | sed 's/ - .*//' | sort -u
+      - name: Same suites, one pytest session per file (isolates cross-file contamination)
+        working-directory: studio/backend
+        run: |
+          for f in tests/test_bypass_permissions.py tests/test_orphaned_children.py tests/test_sandbox_files_and_storage_roots.py tests/test_safetensors_tool_loop.py tests/test_macos_seatbelt.py tests/test_os_sandbox.py; do
+            [ -f "$f" ] || { echo "== $f absent at this ref"; continue; }
+            echo "== $f"
+            python -m pytest -q --tb=line -p no:cacheprovider "$f" -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' 2>&1 | grep -E "^(FAILED|ERROR)|passed|failed|no tests ran" | sed 's/ - .*//' | sort -u
+          done
