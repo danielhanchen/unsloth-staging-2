@@ -1,0 +1,111 @@
+name: "staging-10285 Linux live Bubblewrap"
+
+on:
+  push:
+    branches: [pr-10285-lpac-diag]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  live:
+    name: ${{ matrix.runner }} live enforcement
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install bubblewrap and backend deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          python -m pip install -q -r studio/backend/requirements/studio.txt
+          python -m pip install -q python-multipart aiofiles sqlalchemy cryptography psutil pyyaml jinja2 mammoth requests 'numpy<3' pytest pytest-asyncio httpx structlog 'transformers>=4.51,<5.5'
+          python -m pip install -q --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple 'torch>=2.4,<2.11'
+      - name: Capability as shipped (records the AppArmor state)
+        working-directory: studio/backend
+        run: |
+          echo "apparmor_restrict_unprivileged_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null || echo n/a)"
+          ls /etc/apparmor.d | grep -i bwrap || echo "no bwrap AppArmor profile shipped"
+          bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp -- /bin/true && echo "plain bwrap OK" || echo "plain bwrap FAILED rc=$?"
+          python - <<'PY'
+          from core.inference.os_sandbox import capability_snapshot
+          c = capability_snapshot(force=True)
+          print("AS_SHIPPED", c.environment, c.protection_state, c.available, c.qualified)
+          print("REASON", c.reason)
+          print("REMEDIATION", c.remediation)
+          PY
+      - name: Apply the documented Ubuntu 24.04 remediation (bwrap AppArmor profile)
+        if: matrix.runner == 'ubuntu-24.04'
+        run: |
+          sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap>
+          }
+          PROFILE
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+          bwrap --unshare-all --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp -- /bin/true && echo "plain bwrap OK after profile" || echo "plain bwrap still FAILED rc=$?"
+      - name: Capability after remediation and live enforcement tests
+        working-directory: studio/backend
+        run: |
+          python - <<'PY'
+          from core.inference.os_sandbox import capability_snapshot
+          c = capability_snapshot(force=True)
+          print("AFTER", c.environment, c.protection_state, c.available, c.qualified)
+          print("REASON", c.reason)
+          PY
+          python -m pytest -q -rs --tb=short -p no:cacheprovider tests/test_os_sandbox.py tests/test_tool_isolation_api.py tests/test_bypass_permissions.py tests/test_secure_tools_execute.py tests/test_tool_output_streaming.py 2>&1 | tail -70
+      - name: Escape probes through the real tool path
+        working-directory: studio/backend
+        run: |
+          python - <<'PY'
+          import os, json, socket, tempfile, textwrap, subprocess, time
+          os.environ["UNSLOTH_STUDIO_HOME"] = tempfile.mkdtemp(prefix="pr10285-home-")
+          os.environ["PR10285_HF_CANARY"] = "hf_canary_should_never_leak"
+          from core.inference import tools
+          from core.inference.os_sandbox import capability_snapshot
+          print("capability:", capability_snapshot(force=True).protection_state)
+          secret = tempfile.NamedTemporaryFile("w", prefix="pr10285-secret-", delete=False); secret.write("SECRET"); secret.close()
+          srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1); port = srv.getsockname()[1]
+          usock = os.path.join(tempfile.mkdtemp(), "studio.sock"); us = socket.socket(socket.AF_UNIX); us.bind(usock); us.listen(1)
+          code = f'''
+          import os, socket, json, subprocess
+          r = {{}}
+          def attempt(name, fn):
+              try:
+                  r[name] = "ALLOWED:" + str(fn())[:60]
+              except Exception as e:
+                  r[name] = "denied:" + type(e).__name__
+          attempt("read_host_secret", lambda: open({secret.name!r}).read())
+          attempt("read_ssh_dir", lambda: os.listdir(os.path.expanduser("~/.ssh")))
+          attempt("write_etc", lambda: open("/etc/pr10285", "w").write("x"))
+          attempt("write_root", lambda: open("/pr10285-escape", "w").write("x"))
+          attempt("tcp_loopback", lambda: socket.create_connection(("127.0.0.1", {port}), timeout=1))
+          attempt("tcp_internet", lambda: socket.create_connection(("1.1.1.1", 443), timeout=2))
+          attempt("dns", lambda: socket.getaddrinfo("example.com", 443))
+          attempt("unix_socket_host", lambda: socket.socket(socket.AF_UNIX).connect({usock!r}))
+          attempt("parent_environ", lambda: open("/proc/{os.getpid()}/environ").read())
+          attempt("dev_gpu_nodes", lambda: [d for d in os.listdir("/dev") if d.startswith(("nvidia","kfd","dri"))])
+          attempt("setsid_survivor", lambda: subprocess.Popen(["sh","-c","setsid sleep 300 >/dev/null 2>&1 &"]).wait())
+          r["canary_in_env"] = "PR10285_HF_CANARY" in os.environ or any("hf_canary" in v for v in os.environ.values())
+          r["uid"] = os.getuid(); r["cwd"] = os.getcwd()
+          print("PROBE_JSON=" + json.dumps(r))
+          '''
+          out = tools._python_exec(textwrap.dedent(code), session_id="pr10285-escape", timeout=60)
+          print(out[-2500:])
+          time.sleep(1)
+          ps = subprocess.run(["pgrep", "-af", "sleep 300"], capture_output=True, text=True).stdout
+          print("SURVIVING setsid sleep processes:", repr(ps))
+          PY
