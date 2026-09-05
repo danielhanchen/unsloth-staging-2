@@ -1,0 +1,107 @@
+name: "staging-10285 fix Linux (shipped vs fixed, cold vs warm, stock vs remediated)"
+
+on:
+  push:
+    branches: [pr-10285-fix-ci]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: ${{ matrix.runner }} ${{ matrix.label }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04]
+        include:
+          - label: shipped
+            ref: 35d6cd295aa8031d9376b425c1c953a2ed39d644
+          - label: fixed
+            ref: pr-10285-fixed
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - name: Fetch the probe driver from the workflow branch
+        run: |
+          git fetch --depth 1 origin pr-10285-fix-ci
+          git show origin/pr-10285-fix-ci:.github/scripts/pr10285_probe.py > /tmp/pr10285_probe.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install bubblewrap and backend deps
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          bwrap --version
+          python -m pip install -q -r studio/backend/requirements/studio.txt
+          python -m pip install -q python-multipart aiofiles sqlalchemy cryptography psutil pyyaml jinja2 mammoth requests 'numpy<3' pytest pytest-asyncio httpx structlog 'transformers>=4.51,<5.5'
+          python -m pip install -q --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple 'torch>=2.4,<2.11'
+      - name: Host facts
+        run: |
+          echo "PR10285_HOST runner=${{ matrix.runner }} ref=${{ matrix.label }} bwrap=$(bwrap --version) apparmor_userns=$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null) kernel=$(uname -r) entries=$(find /usr/lib /usr/share -xdev 2>/dev/null | wc -l)"
+      - name: Stock host, cold cache probe
+        working-directory: studio/backend
+        run: |
+          sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+          python /tmp/pr10285_probe.py capability --label stock_cold
+      - name: Stock host, warm probe
+        working-directory: studio/backend
+        run: python /tmp/pr10285_probe.py capability --label stock_warm
+      - name: Remediate (Ubuntu 24.04 AppArmor profile for bwrap)
+        if: matrix.runner == 'ubuntu-24.04'
+        run: |
+          sudo tee /etc/apparmor.d/bwrap >/dev/null <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          profile bwrap /usr/bin/bwrap flags=(unconfined) {
+            userns,
+            include if exists <local/bwrap>
+          }
+          PROFILE
+          sudo apparmor_parser -r /etc/apparmor.d/bwrap
+      - name: Remediated host, cold cache probe
+        working-directory: studio/backend
+        run: |
+          sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null
+          python /tmp/pr10285_probe.py capability --label remediated_cold
+      - name: Remediated host, warm probe
+        working-directory: studio/backend
+        run: python /tmp/pr10285_probe.py capability --label remediated_warm
+      - name: Second warm probe (per-launch cost)
+        working-directory: studio/backend
+        run: python /tmp/pr10285_probe.py capability --label remediated_warm2
+      - name: Sandbox test suite (live tests run where the backend qualifies)
+        working-directory: studio/backend
+        run: |
+          python -m pytest -q -rs --tb=short -p no:cacheprovider tests/test_os_sandbox.py tests/test_tool_isolation_api.py 2>&1 | tail -60
+      - name: Symlinked virtualenv live tests, full traceback
+        working-directory: studio/backend
+        run: python -m pytest -q --tb=long -p no:cacheprovider tests/test_os_sandbox.py -k "symlink or pyenv or virtualenv" 2>&1 | tail -80
+      - name: Terminal escape probe
+        working-directory: studio/backend
+        run: python /tmp/pr10285_probe.py escape
+      - name: Python tool escape probe
+        working-directory: studio/backend
+        run: python /tmp/pr10285_probe.py python-escape
+      - name: IPv6 disabled on the host, then probe
+        working-directory: studio/backend
+        run: |
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1 net.ipv6.conf.lo.disable_ipv6=1 >/dev/null
+          python /tmp/pr10285_probe.py capability --label ipv6_disabled || true
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.default.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0 >/dev/null
+      - name: Limited mode detached child check
+        working-directory: studio/backend
+        run: python /tmp/pr10285_probe.py limited-survivor || true
+      - name: Shared suites (existing tests at both refs)
+        working-directory: studio/backend
+        run: |
+          python -m pytest -q --tb=line -p no:cacheprovider tests/test_secure_tools_execute.py tests/test_bypass_permissions.py tests/test_tool_output_streaming.py tests/test_studio_tool_loop.py tests/test_orphaned_children.py tests/test_exec_utf8.py tests/test_windows_bash_shell.py tests/test_sandbox_files_and_storage_roots.py -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' 2>&1 | grep -E "^(FAILED|ERROR)|passed|failed" | sed 's/ - .*//' | sort -u
