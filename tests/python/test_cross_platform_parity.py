@@ -1229,12 +1229,21 @@ class TestInstallUvCacheRootParity:
 
         # Both writes are gated on the old entry being gone: the unlink is what keeps a
         # symlinked marker from truncating its target, and it can fail silently.
-        for body in (
-            sh[sh.index("_record_uv_cache_choice() {") : sh.index("_restore_uv_cache_marker() {")],
-            sh[sh.index("_restore_uv_cache_marker() {") :][:600],
+        # The record writes the chosen path plus a delimiter; the restore writes back the bytes
+        # it saved, whose delimiter is already part of them, so the two spellings differ.
+        for body, write_form in (
+            (
+                sh[
+                    sh.index("_record_uv_cache_choice() {") : sh.index(
+                        "_restore_uv_cache_marker() {"
+                    )
+                ],
+                "printf '%s\\n'",
+            ),
+            (sh[sh.index("_restore_uv_cache_marker() {") :][:600], "printf '%s'"),
         ):
             unlink = body.index('rm -f "$_uv_marker_file"')
-            write = body.index("printf '%s\\n'", unlink)
+            write = body.index(write_form, unlink)
             assert '[ -L "$_uv_marker_file" ]' in body[unlink:write], body[unlink:write]
         ps1_marker = ps1[
             ps1.index("function Write-StudioUvCacheMarker") : ps1.index(
@@ -1250,16 +1259,48 @@ class TestInstallUvCacheRootParity:
         assert "UV_WORKING_DIR" in sh[sh.index("_absolutize_uv_cache_dir() {") :][:600]
         assert "UV_WORKING_DIR" in ps1[ps1.index("function Resolve-StudioUvCachePath") :][:800]
         for start in _all_indexes(ps1_marker, "Remove-Item -LiteralPath $markerFile"):
-            # The call form: the comment above the gate names the cmdlet too.
-            window = ps1_marker[
-                start : ps1_marker.index("Set-Content -LiteralPath $markerFile", start)
+            # The call form; the record writes text, the restore writes saved bytes.
+            ends = [
+                end
+                for end in (
+                    ps1_marker.find("[System.IO.File]::WriteAllText($markerFile", start),
+                    ps1_marker.find("[System.IO.File]::WriteAllBytes($markerFile", start),
+                )
+                if end != -1
             ]
+            window = ps1_marker[start : min(ends)]
             assert "Get-Item -LiteralPath $markerFile -Force" in window, window
 
-        # UTF-8, not the ANSI code page: the update writes this file BOM-less UTF-8 and
-        # 5.1 would restore mojibake. Asserted on source, since pwsh 7 passes either way.
-        read_back = ps1_marker.index("Get-Content -LiteralPath $markerFile")
-        assert "-Encoding UTF8" in ps1_marker[read_back : read_back + 220], ps1_marker[read_back:]
+        # Bytes, not text: 5.1 decoded a BOM-less file with the ANSI code page and restored
+        # mojibake. Asserted on source, since pwsh 7 passes either way.
+        assert "[System.IO.File]::ReadAllBytes($markerFile)" in ps1_marker
+        assert (
+            "[System.IO.File]::WriteAllBytes($markerFile, [byte[]]$script:StudioUvMarkerPrevious)"
+            in ps1_marker
+        )
+        assert "Get-Content -LiteralPath $markerFile" not in ps1_marker
+
+        # The ENCODING of the write, which nothing asserted: the whole cross-installer contract
+        # is that one marker is plain UTF-8 with one LF, because install.sh writes
+        # `printf '%s\n'` and the CLI writes os.fsencode(f"{chosen}\n"). `Set-Content -Encoding
+        # utf8` emits a BOM under Windows PowerShell 5.1 and none under 7, and the only job that
+        # runs the Pester file is `shell: pwsh`, so no runner ever executes the 5.1 encoder.
+        # Source is therefore the only place this can be pinned at all.
+        assert "New-Object System.Text.UTF8Encoding($false)" in ps1_marker, ps1_marker
+        assert "Set-Content -LiteralPath $markerFile" not in ps1_marker
+        # WriteAllText appends nothing, so the single LF has to be explicit.
+        assert '($Cache + "`n")' in ps1_marker, ps1_marker
+
+        # And the POSIX rollback keeps the bytes it found, as the Windows one now does: a
+        # `$(cat ...)` + `printf '%s\n'` round-trip renames a path that ends in a newline.
+        _sh_record = sh[sh.index("_record_uv_cache_choice() {") :]
+        _sh_record = _sh_record[: _sh_record.index("\n}\n")]
+        assert 'cat "$_uv_marker_file" 2>/dev/null && printf x' in _sh_record, _sh_record
+        _sh_restore = sh[sh.index("_restore_uv_cache_marker() {") :]
+        _sh_restore = _sh_restore[: _sh_restore.index("\n}\n")]
+        assert (
+            'printf \'%s\' "$_UV_MARKER_PREVIOUS" > "$_uv_marker_file"' in _sh_restore
+        ), _sh_restore
 
         # One flag decides both rollbacks. Clearing them separately leaves a window either
         # way round, where a signal restores one half of a committed install.

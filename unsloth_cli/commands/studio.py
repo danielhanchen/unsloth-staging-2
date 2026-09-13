@@ -3310,6 +3310,17 @@ def _backfill_uv_cache_marker(env: Optional[dict]) -> None:
         pass
 
 
+def _uv_cache_is_writable(cache_dir: Path) -> bool:
+    """A real create, as install.sh's write probe does: mode bits do not answer for a network mount, and uv aborts on a cache it
+    cannot write rather than falling back."""
+    try:
+        with tempfile.NamedTemporaryFile(dir = cache_dir, prefix = ".unsloth-write-probe."):
+            pass
+    except OSError:
+        return False
+    return True
+
+
 def _with_studio_uv_cache(env: Optional[dict], cwd: Optional[Path] = None) -> Optional[dict]:
     """An update reached neither installer nor _setup_cache_env, so uv re-downloaded
     what the install had just fetched."""
@@ -3319,13 +3330,35 @@ def _with_studio_uv_cache(env: Optional[dict], cwd: Optional[Path] = None) -> Op
         return env
     studio_cache = STUDIO_HOME / "cache" / "uv"
     recorded = _recorded_install_uv_cache()
-    if recorded is not None and _uv_cache_has_packages(recorded):
-        # Only while it holds something: a marker for an emptied cache loses to a warm one.
+    if (
+        recorded is not None
+        and _uv_cache_has_packages(recorded)
+        and _uv_cache_is_writable(recorded)
+    ):
+        # Only while it holds something and uv can still write to it: a marker for an emptied cache loses to a warm one, and setup treats
+        # the value this hands it as the caller's choice, so a cache gone read-only since the install would abort every uv command.
         return {**(env or os.environ), "UV_CACHE_DIR": str(recorded)}
     # No marker, and content cannot settle it: one on-demand wheel warms the Studio cache even in shared mode, so use uv's default.
     default_cache = _uv_default_cache_dir(cwd)
-    if default_cache is not None and _uv_cache_has_packages(default_cache):
+    if (
+        default_cache is not None
+        and _uv_cache_has_packages(default_cache)
+        and _uv_cache_is_writable(default_cache)
+    ):
         return {**(env or os.environ), "UV_CACHE_DIR": str(default_cache)}
+    # setup.sh treats an inherited UV_CACHE_DIR as the caller's choice and skips its own write
+    # probe, so handing it an unwritable Studio cache aborts every uv command in the update --
+    # the one branch here that was still unprobed. Left unset, setup.sh probes and falls back.
+    try:
+        studio_cache.mkdir(parents = True, exist_ok = True)
+    except OSError:
+        pass
+    if not _uv_cache_is_writable(studio_cache):
+        # Explicitly absent rather than a bare `return env`: the other branches all hand back a
+        # dict, and setup.sh's own probe wants the variable gone, not inherited from this process.
+        unset = {**(env or os.environ)}
+        unset.pop("UV_CACHE_DIR", None)
+        return unset
     return {**(env or os.environ), "UV_CACHE_DIR": str(studio_cache)}
 
 
