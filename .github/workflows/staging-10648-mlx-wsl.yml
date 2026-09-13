@@ -1,0 +1,40 @@
+name: "staging-10648 mlx + wsl shapes"
+on:
+  push:
+    branches: ["pr-10648-xplat-ci"]
+permissions:
+  contents: read
+jobs:
+  mlx:
+    # Apple Silicon is the only hardware MLX runs on. This PR touches no MLX code; the point
+    # is to show the MLX surface still imports and resolves after the installer changes.
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -U pip pytest mlx || echo "mlx unavailable on this runner"
+      - name: MLX and Mac-path tests
+        run: |
+          python -c "import platform; print('arch:', platform.machine())"
+          python -m pytest tests/ studio/backend/tests -q --tb=short -k "mlx or metal or apple_silicon or macos" -p no:cacheprovider 2>&1 | tail -30
+  wsl:
+    # No hosted runner IS WSL. A WSL host is Linux with /dev/dxg present and /dev/kfd absent,
+    # which is exactly what the host matrix simulates, so this leg runs those rows explicitly
+    # on real Linux rather than claiming hardware nobody here has.
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -U pip pytest pytest-xdist
+      - name: WSL-shaped rows of the host matrix
+        run: |
+          PYTHONPATH=studio/backend python -m pytest \
+            tests/studio/install/test_pr10648_host_matrix.py \
+            tests/studio/install/test_keep_install_backcompat_9979.py \
+            -q --tb=short -k "wsl or linux" -p no:cacheprovider -rs
