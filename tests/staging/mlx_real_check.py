@@ -24,7 +24,11 @@ import os
 import sys
 import time
 
-BACKEND = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "studio", "backend")
+# The repo, not this file's own directory: the workflow copies the harness out of the
+# checkout so a `git checkout` of the base revision cannot move it under our feet.
+BACKEND = os.environ.get("STUDIO_BACKEND") or os.path.join(os.getcwd(), "studio", "backend")
+if not os.path.isdir(BACKEND):
+    raise SystemExit(f"no studio backend at {BACKEND}; run from the repo root or set STUDIO_BACKEND")
 sys.path.insert(0, BACKEND)
 
 
