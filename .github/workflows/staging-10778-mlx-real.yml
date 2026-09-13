@@ -1,0 +1,79 @@
+name: "staging-10778 real mlx-vlm on Apple Silicon"
+on:
+  push:
+    branches: ["pr-10778-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  real-mlx:
+    runs-on: macos-15
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: qwen2-vl-image
+            model: mlx-community/Qwen2-VL-2B-Instruct-4bit
+            flags: "--image --turns 2 --filler 1200"
+          - name: smolvlm-text
+            model: mlx-community/SmolVLM-256M-Instruct-4bit
+            flags: "--turns 3 --filler 1500"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: sanity, this really is Apple Silicon
+        run: |
+          uname -m
+          sysctl -n machdep.cpu.brand_string || true
+          python -c "import platform; print(platform.system(), platform.machine())"
+      - name: install mlx-vlm
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "mlx-vlm==0.6.17" pillow structlog pyyaml
+          python -c "import mlx.core as mx; print('mlx device', mx.default_device()); print('metal', mx.metal.is_available() if hasattr(mx,'metal') else 'n/a')"
+          python -c "from mlx_vlm.generate.common import DEFAULT_PREFILL_STEP_SIZE as d; print('mlx-vlm default prefill step', d)"
+      - name: keep the harness where a checkout cannot move it
+        run: |
+          mkdir -p "$RUNNER_TEMP/harness"
+          cp tests/staging/mlx_real_check.py "$RUNNER_TEMP/harness/"
+      - name: HEAD (this PR)
+        id: head
+        run: |
+          set +e
+          python "$RUNNER_TEMP/harness/mlx_real_check.py" --model "${{ matrix.model }}" ${{ matrix.flags }} 2>&1 | tee head.log
+          echo "rc=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+      - name: BASE (upstream main, without this PR)
+        id: base
+        run: |
+          set +e
+          git fetch --no-tags https://github.com/unslothai/unsloth.git main
+          git checkout -q FETCH_HEAD -- studio/backend/core/inference/mlx_inference.py
+          python "$RUNNER_TEMP/harness/mlx_real_check.py" --model "${{ matrix.model }}" ${{ matrix.flags }} 2>&1 | tee base.log
+          echo "rc=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          git checkout -q HEAD -- studio/backend/core/inference/mlx_inference.py
+      - name: verdict
+        run: |
+          echo "head rc = ${{ steps.head.outputs.rc }}   (must be 0)"
+          echo "base rc = ${{ steps.base.outputs.rc }}   (informational)"
+          test "${{ steps.head.outputs.rc }}" = "0"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mlx-real-${{ matrix.name }}
+          path: |
+            head.log
+            base.log
