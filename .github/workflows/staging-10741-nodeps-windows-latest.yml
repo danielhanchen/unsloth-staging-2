@@ -1,0 +1,31 @@
+name: "staging-10741 nodeps windows-latest"
+on:
+  push:
+    branches: ["pr-10741-xplat-ci"]
+  workflow_dispatch:
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: clean_text tests, no third party deps
+        run: |
+          python -c "import sys, platform; print(sys.version, platform.machine(), platform.system())"
+          python tests/test_raw_text.py
+      - name: cross-interpreter decision hash over all 1114112 code points
+        run: python .ci_clean_text_hash.py
