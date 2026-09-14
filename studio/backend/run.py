@@ -2035,6 +2035,7 @@ def _terminal_password_gate(
 
     from auth import hashing as _auth_hashing
     from auth import storage as _auth_storage
+    from auth import terminal_prompt as _terminal_prompt
     from auth.bootstrap_timeout import (
         bootstrap_timeout_seconds,
         should_arm_bootstrap_timeout,
@@ -2124,36 +2125,27 @@ def _terminal_password_gate(
         apply_change = _apply_change,
         out = sys.stderr,
         exposure = _exposure_phrase(tunnel_will_start = tunnel_will_start, host = host),
-        # Ctrl+C aborts a tunnel launch and only a tunnel launch; on a raw bind it
-        # declines the prompt and the launch continues, so the banner must not
-        # promise an abort that will not happen.
-        refusal_aborts = tunnel_will_start,
         # A raw bind must never block a launch that used to start. A detached pty
         # (`tmux new -d`, `docker run -dt`) passes every isatty and process-group
         # test yet nobody will ever type, so an undeadlined read waits forever and
-        # the socket never binds; no answer is handled below as a refusal and
-        # proceeds on the bootstrap deadline. The tunnel waits forever instead,
-        # failing closed.
+        # the socket never binds; only that unattended first-key timeout proceeds
+        # on the bootstrap deadline. Ctrl+C / EOF is an explicit refusal and
+        # always fails closed. The tunnel waits forever instead.
         first_key_timeout = None if tunnel_will_start else _UNATTENDED_PROMPT_SECONDS,
     )
-    if changed:
+    if changed is True:
         return True, True
     if tunnel_will_start:
-        # Refusing to secure a launch about to publish a public URL aborts it,
-        # exactly as before.
         return False, False
-    # A raw bind is different: it worked before the prompt existed, and aborting
-    # would turn Ctrl+C into "no Studio". docker/studio_run.sh execs
-    # `unsloth studio -H 0.0.0.0` and only supplies a password when the
-    # initial-password file is non-empty, so `docker run -it` on a fresh volume
-    # meets this prompt and aborting would stop a container that starts today.
-    # Warn and proceed at the protection level this launch already had.
-    #
+    # Ctrl+C / EOF is a refusal, but only a module that reports the deadline as
+    # None can tell the two apart; an older one folds both into False, where
+    # reading refusal would stop the detached-pty launch (`docker run -dt`).
+    if changed is False and getattr(_terminal_prompt, "UNATTENDED_RETURNS_NONE", False):
+        return False, False
+    # Only the unattended raw bind keeps the historical startup behavior.
     # Which is sometimes NO protection: UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT=0 never
     # arms the deadline, so say what will actually happen rather than promise a
-    # shutdown -- that is the one sentence an operator acts on. Still proceed: the
-    # operator disabled the deadline and cancelled the prompt deliberately, and
-    # refusing to start would break the case above.
+    # shutdown -- that is the one sentence an operator acts on.
     deadline_arms = should_arm_bootstrap_timeout(
         host = host,
         secure = secure,
@@ -2681,9 +2673,15 @@ def run_server(
         is_colab = _IS_COLAB,
     )
     if not _pw_proceed:
+        # A raw bind passed neither flag, so naming them is a no-op for it.
         print(
-            "Not starting Unsloth; set a new admin password first, or launch "
-            "without --secure/--cloudflare.",
+            "Not starting Unsloth; set a new admin password first, or pass one "
+            "non-interactively with --password / UNSLOTH_STUDIO_PASSWORD. "
+            + (
+                "Launch without --secure/--cloudflare to stay off the public internet."
+                if _launch_tunnel_managed
+                else "Launch with -H 127.0.0.1 to keep Unsloth off the network."
+            ),
             file = sys.stderr,
             flush = True,
         )
