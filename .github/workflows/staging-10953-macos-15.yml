@@ -1,7 +1,7 @@
 name: "staging-10953 macos-15"
 on:
   push:
-    branches: ["pr-10953-xplat-ci"]
+    branches: ["pr-10953-base-xplat-ci"]
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
