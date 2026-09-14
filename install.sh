@@ -2436,6 +2436,77 @@ _has_usable_nvidia_gpu() {
     return 1
 }
 
+# Row index of the GPU whose UUID starts with $1, or empty. NVIDIA allows a UUID to
+# be abbreviated to any unique leading portion, hence the prefix match.
+_nv_idx_from_uuid() {
+    _run_bounded "$_nvsmi" --query-gpu=uuid --format=csv,noheader 2>/dev/null \
+        | awk -v want="$1" 'NF { gsub(/^[[:space:]]+|[[:space:]]+$/,""); if (index($0, want) == 1) { print NR-1; exit } }' || true
+}
+
+# Resolves the banner's NVIDIA fields into _nv_name / _nv_sm / _nv_driver, each empty
+# when it could not be read. compute_cap is the counterpart of the gfx arch shown for
+# AMD and the driver version the counterpart of the hipconfig line, so one query gets
+# all three.
+#
+# Bounded, and fed the executable _has_usable_nvidia_gpu already resolved into $_nvsmi.
+# Both matter: a wedged driver blocks nvidia-smi indefinitely (the reason _run_bounded
+# exists), and detection also succeeds via /usr/bin/nvidia-smi off PATH or via
+# /proc/driver/nvidia/gpus with no nvidia-smi at all -- re-resolving with `command -v`
+# would silently skip the name on exactly those hosts.
+_nv_banner_fields() {
+    _nv_name=""; _nv_sm=""; _nv_driver=""; _nv_row=""; _nv_cc=""
+    [ -n "${_nvsmi:-}" ] || return 0
+    # nvidia-smi ignores CUDA_VISIBLE_DEVICES, so its rows are the physical devices and
+    # the mask has to be resolved against them by hand.
+    _nv_idx=0
+    _nv_vis="${CUDA_VISIBLE_DEVICES:-}"
+    _nv_tok="${_nv_vis%%,*}"
+    case "$_nv_vis" in
+        '') ;;
+        *[!0-9,]*)
+            # A non-numeric mask names a device rather than indexing one.
+            case "$_nv_tok" in
+                MIG-GPU-*)
+                    # Pre-R470 MIG name, MIG-<GPU-UUID>/<gi>/<ci>: the parent UUID is
+                    # embedded, so it still matches a --query-gpu=uuid row.
+                    _nv_tok="${_nv_tok#MIG-}"; _nv_tok="${_nv_tok%%/*}"
+                    _nv_idx=$(_nv_idx_from_uuid "$_nv_tok") ;;
+                MIG-*)
+                    # R470 and later give each MIG instance its OWN opaque UUID, which
+                    # carries nothing of the parent, so --query-gpu=uuid can never match
+                    # it. `nvidia-smi -L` nests the instances under their GPU, which is
+                    # the documented way to map one back to the card it lives on.
+                    _nv_idx=$(_run_bounded "$_nvsmi" -L 2>/dev/null | awk -v want="$_nv_tok" '
+                        /^GPU[[:space:]]+[0-9]+:/ { cur = $2 + 0 }
+                        index($0, want) > 0 { print cur; exit }' || true) ;;
+                *)
+                    _nv_idx=$(_nv_idx_from_uuid "$_nv_tok") ;;
+            esac
+            case "$_nv_idx" in ''|*[!0-9]*) _nv_idx=0 ;; esac
+            ;;
+        *) _nv_idx="$_nv_tok" ;;
+    esac
+    _nv_row=$(_run_bounded "$_nvsmi" --query-gpu=name,compute_cap,driver_version --format=csv,noheader 2>/dev/null \
+        | awk -v idx="$_nv_idx" 'NF { a[n++]=$0 } END { if(idx>=n) idx=0; if(n>0) print a[idx] }' || true)
+    [ -n "$_nv_row" ] || return 0
+    # Split from the right: nvidia-smi does not quote, so a comma in a device name
+    # would otherwise shift every field.
+    _nv_driver=$(printf '%s' "$_nv_row" | awk -F, 'NF>=3 { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$NF); print $NF }')
+    _nv_cc=$(printf '%s' "$_nv_row" | awk -F, 'NF>=3 { gsub(/^[[:space:]]+|[[:space:]]+$/,"",$(NF-1)); print $(NF-1) }')
+    _nv_name=$(printf '%s' "$_nv_row" | awk -F, 'NF>=3 { out=$1; for(i=2;i<=NF-2;i++) out=out","$i; gsub(/^[[:space:]]+|[[:space:]]+$/,"",out); print out }')
+    # Short row: keep field 1 only. Taking the whole row would print the compute
+    # capability as part of the device name ("RTX 4090, 8.9").
+    [ -n "$_nv_name" ] || _nv_name=$(printf '%s' "$_nv_row" | awk -F, '{ gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); print $1 }')
+    # An nvidia-smi too old for a field answers with a placeholder rather than failing
+    # (the 470 branch has no compute_cap at all). "[N/A]" is not a name.
+    case "$_nv_name"   in '[N/A]'|'[Not Supported]'|'[Unknown Error]') _nv_name="" ;; esac
+    case "$_nv_driver" in '[N/A]'|'[Not Supported]'|'[Unknown Error]') _nv_driver="" ;; esac
+    case "$_nv_cc" in
+        [0-9]*.[0-9]*) _nv_sm="sm_$(printf '%s' "$_nv_cc" | awk -F. '{ print ($1*10)+$2 }')" ;;
+    esac
+    return 0
+}
+
 # Strix Halo ROCm-on-WSL needs Ubuntu 24.04: re-run in one, else CPU. Never create a distro.
 _maybe_reroute_strixhalo_to_2404() {
     [ "${OS:-}" = "wsl" ] || return 0
@@ -4859,7 +4930,17 @@ _amd_smi_gpu_records() {
 
 # ── GPU detection summary (mirrors install.ps1 step "gpu" block) ──
 if _has_usable_nvidia_gpu; then
-    step "gpu" "NVIDIA GPU detected"
+    _nv_banner_fields
+    if [ -n "$_nv_name" ] && [ -n "$_nv_sm" ]; then
+        step "gpu" "$_nv_name ($_nv_sm)"
+    elif [ -n "$_nv_name" ]; then
+        step "gpu" "$_nv_name"
+    else
+        step "gpu" "NVIDIA GPU detected"
+    fi
+    # An `if`, not `[ ... ] && substep ...`: the AND-list form leaves a non-zero status
+    # behind on the common path where there is no driver string to print.
+    if [ -n "$_nv_driver" ]; then substep "Driver: $_nv_driver"; fi
 elif case "$TORCH_INDEX_URL" in */rocm*|*/gfx*) true ;; *) false ;; esac; then
     # Probe gfx arch for the display label, honouring HIP_VISIBLE_DEVICES
     _ensure_rocm_probe_env
@@ -4948,7 +5029,14 @@ elif case "$TORCH_INDEX_URL" in */rocm*|*/gfx*) true ;; *) false ;; esac; then
         _gpu_rocm_ver=$(amd-smi version 2>/dev/null | awk -F'ROCm version: ' \
             'NF>1{gsub(/[[:space:]]/,"", $2); print $2; exit}' || true)
     fi
-    if [ -n "$_gpu_disp_gfx" ]; then
+    # $_gpu_disp_mkt is the marketing name of the SAME record the arch came from, so it
+    # is safe to put on the step line: _rocminfo_gpu_records pairs it per GPU agent and
+    # _amd_smi_hip_order puts the amd-smi records in the order the mask indexes.
+    if [ -n "$_gpu_disp_mkt" ] && [ -n "$_gpu_disp_gfx" ]; then
+        step "gpu" "$_gpu_disp_mkt ($_gpu_disp_gfx)"
+    elif [ -n "$_gpu_disp_mkt" ]; then
+        step "gpu" "$_gpu_disp_mkt"
+    elif [ -n "$_gpu_disp_gfx" ]; then
         step "gpu" "AMD ROCm ($_gpu_disp_gfx)"
     else
         step "gpu" "AMD ROCm"
@@ -4961,7 +5049,6 @@ elif case "$TORCH_INDEX_URL" in */rocm*|*/gfx*) true ;; *) false ;; esac; then
         substep "ROCm: runtime detected (no SDK tree at $_rocm_root)"
     fi
     [ -n "$_gpu_rocm_ver" ] && substep "hipconfig: $_gpu_rocm_ver"
-    [ -n "$_gpu_disp_mkt" ] && [ -n "$_gpu_disp_gfx" ] && substep "GPU: $_gpu_disp_mkt"
 elif [ "$OS" = "macos" ] && [ "$_ARCH" = "arm64" ]; then
     # Apple Silicon: PyTorch gets Metal (MPS) acceleration over unified memory, so not CPU-only.
     step "gpu" "Apple Silicon (Metal, unified memory)"
