@@ -10,6 +10,7 @@ import io
 import os
 import re
 import shutil
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -66,6 +67,239 @@ STUDIO_DIR = Path(__file__).resolve().parents[2] / "studio"
 sys.path.insert(0, str(STUDIO_DIR))
 
 import install_python_stack as ips
+
+
+_RESOLVE_ZOO_COMMIT = ips._resolve_unsloth_zoo_commit
+
+
+@pytest.fixture(autouse = True)
+def _no_zoo_commit_lookup(monkeypatch):
+    """Unresolved spec everywhere but the pinning tests, which would otherwise
+    depend on the network and on wherever unsloth-zoo main happened to point."""
+    ips._ZOO_COMMIT_CACHE.clear()
+    monkeypatch.setattr(ips, "_resolve_unsloth_zoo_commit", lambda _ref: "")
+
+
+class TestUnslothZooGitSpec:
+    """The --local overlay pins unsloth-zoo to a commit, and never to anything else."""
+
+    @pytest.fixture(autouse = True)
+    def _allow_lookup(self, monkeypatch):
+        monkeypatch.setattr(ips, "_resolve_unsloth_zoo_commit", _RESOLVE_ZOO_COMMIT)
+        ips._ZOO_COMMIT_CACHE.clear()
+
+    def _fake_ls_remote(
+        self,
+        monkeypatch,
+        stdout,
+        returncode = 0,
+    ):
+        """Stand in for git. Returns the argv of each probe; kwargs land in self.kwargs."""
+        calls = []
+        self.kwargs = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            self.kwargs.append(kwargs)
+            return types.SimpleNamespace(returncode = returncode, stdout = stdout)
+
+        monkeypatch.setattr(ips.shutil, "which", lambda _name: "/usr/bin/git")
+        monkeypatch.setattr(ips.subprocess, "run", fake_run)
+        return calls
+
+    def test_branch_is_pinned_to_the_resolved_commit(self, monkeypatch):
+        sha = "a" * 40
+        calls = self._fake_ls_remote(monkeypatch, f"{sha}\trefs/heads/main\n".encode())
+        monkeypatch.delenv("UNSLOTH_ZOO_REF", raising = False)
+
+        assert ips._unsloth_zoo_git_spec() == f"{ips._UNSLOTH_ZOO_GIT_URL}@{sha}"
+        assert calls[0][-4:] == [
+            ips._UNSLOTH_ZOO_GIT_REPO,
+            "refs/heads/main",
+            "refs/tags/main",
+            "refs/tags/main^{}",
+        ]
+
+    def test_a_ref_that_merely_ends_in_the_name_is_not_the_ref(self, monkeypatch):
+        """A pattern matches the ref tail at slash boundaries, so `main` also matches
+        refs/heads/archive/main, which sorts first: line one is the wrong history."""
+        wanted, archived = "a" * 40, "b" * 40
+        self._fake_ls_remote(
+            monkeypatch,
+            f"{archived}\trefs/heads/archive/main\n{wanted}\trefs/heads/main\n".encode(),
+        )
+        monkeypatch.delenv("UNSLOTH_ZOO_REF", raising = False)
+
+        assert ips._unsloth_zoo_git_spec() == f"{ips._UNSLOTH_ZOO_GIT_URL}@{wanted}"
+
+    def test_a_branch_wins_over_a_tag_of_the_same_name(self, monkeypatch):
+        branch, tag = "a" * 40, "b" * 40
+        self._fake_ls_remote(
+            monkeypatch,
+            f"{branch}\trefs/heads/x\n{tag}\trefs/tags/x\n".encode(),
+        )
+        monkeypatch.setenv("UNSLOTH_ZOO_REF", "x")
+
+        assert ips._unsloth_zoo_git_spec() == f"{ips._UNSLOTH_ZOO_GIT_URL}@{branch}"
+
+    def test_an_annotated_tag_pins_the_commit_it_points_at(self, monkeypatch):
+        """Both install the same code, but a pin that names a commit is the point."""
+        tag_object, commit = "a" * 40, "b" * 40
+        self._fake_ls_remote(
+            monkeypatch,
+            f"{tag_object}\trefs/tags/v1\n{commit}\trefs/tags/v1^{{}}\n".encode(),
+        )
+        monkeypatch.setenv("UNSLOTH_ZOO_REF", "v1")
+
+        assert ips._unsloth_zoo_git_spec() == f"{ips._UNSLOTH_ZOO_GIT_URL}@{commit}"
+
+    def test_a_full_ref_name_is_asked_for_as_given(self, monkeypatch):
+        sha = "a" * 40
+        calls = self._fake_ls_remote(monkeypatch, f"{sha}\trefs/heads/main\n".encode())
+        monkeypatch.setenv("UNSLOTH_ZOO_REF", "refs/heads/main")
+
+        assert ips._unsloth_zoo_git_spec() == f"{ips._UNSLOTH_ZOO_GIT_URL}@{sha}"
+        assert calls[0][-2:] == ["refs/heads/main", "refs/heads/main^{}"]
+
+    def test_the_probe_can_never_stop_and_ask_a_human(self, monkeypatch):
+        """An install that stops behind a hidden credential prompt is worse than one
+        that skips the pin, so the probe closes both doors and bounds its wait."""
+        sha = "a" * 40
+        calls = self._fake_ls_remote(monkeypatch, f"{sha}\trefs/heads/main\n".encode())
+        monkeypatch.delenv("UNSLOTH_ZOO_REF", raising = False)
+        monkeypatch.setenv("SOME_UNRELATED_VAR", "kept")
+
+        ips._unsloth_zoo_git_spec()
+
+        assert calls[0][1:3] == ["-c", "credential.helper="]
+        # install.sh's only bound on a host with no `timeout`.
+        assert "http.lowSpeedLimit=1000" in calls[0]
+        assert "http.lowSpeedTime=20" in calls[0]
+        kwargs = self.kwargs[0]
+        assert kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+        # Empty, not removed: git uses the first of the three that is SET.
+        assert kwargs["env"]["GIT_ASKPASS"] == ""
+        assert kwargs["env"]["SSH_ASKPASS"] == ""
+        assert "core.askPass=" in calls[0]
+        assert kwargs["env"]["SOME_UNRELATED_VAR"] == "kept"  # extended, not replaced
+        assert kwargs["timeout"] == 20
+        assert kwargs["stderr"] is ips.subprocess.DEVNULL
+
+    def test_a_timed_out_probe_is_not_fatal(self, monkeypatch):
+        def timed_out(cmd, **kwargs):
+            raise subprocess.TimeoutExpired(cmd, 20)
+
+        monkeypatch.setattr(ips.shutil, "which", lambda _name: "/usr/bin/git")
+        monkeypatch.setattr(ips.subprocess, "run", timed_out)
+        monkeypatch.delenv("UNSLOTH_ZOO_REF", raising = False)
+
+        assert ips._unsloth_zoo_git_spec() == ips._UNSLOTH_ZOO_GIT_URL
+
+    def test_the_commit_is_resolved_once_per_run(self, monkeypatch):
+        sha = "b" * 40
+        calls = self._fake_ls_remote(monkeypatch, f"{sha}\trefs/heads/main\n".encode())
+        monkeypatch.delenv("UNSLOTH_ZOO_REF", raising = False)
+
+        first = ips._unsloth_zoo_git_spec()
+        assert ips._unsloth_zoo_git_spec() == first
+        assert len(calls) == 1  # staging and the install must not straddle a branch move
+
+    def test_an_explicit_ref_is_resolved_too(self, monkeypatch):
+        sha = "c" * 40
+        calls = self._fake_ls_remote(monkeypatch, f"{sha}\trefs/tags/v1\n".encode())
+        monkeypatch.setenv("UNSLOTH_ZOO_REF", "v1")
+
+        assert ips._unsloth_zoo_git_spec() == f"{ips._UNSLOTH_ZOO_GIT_URL}@{sha}"
+        assert calls[0][-3:] == ["refs/heads/v1", "refs/tags/v1", "refs/tags/v1^{}"]
+
+    @pytest.mark.parametrize("ref", ["feature+cuda", "release/2026.5", "v2026.5.4", "a.b_c-d"])
+    def test_a_legal_branch_name_is_not_quietly_rewritten_to_main(self, monkeypatch, ref):
+        """`+` is legal and inert in a requirement, so it must not become main."""
+        sha = "e" * 40
+        calls = self._fake_ls_remote(monkeypatch, f"{sha}\trefs/heads/{ref}\n".encode())
+        monkeypatch.setenv("UNSLOTH_ZOO_REF", ref)
+
+        assert ips._unsloth_zoo_git_spec() == f"{ips._UNSLOTH_ZOO_GIT_URL}@{sha}"
+        assert calls[0][-3] == f"refs/heads/{ref}"
+
+    def test_a_refused_ref_is_announced_rather_than_silently_replaced(self, monkeypatch):
+        said = []
+        monkeypatch.setattr(ips, "_step", lambda _label, msg, *a, **k: said.append(msg))
+        self._fake_ls_remote(monkeypatch, b"")
+        ips._ZOO_REF_WARNED.clear()
+        monkeypatch.setenv("UNSLOTH_ZOO_REF", "release@2026")
+
+        ips._unsloth_zoo_git_spec()
+
+        assert any("UNSLOTH_ZOO_REF" in msg and "release@2026" in msg for msg in said)
+
+    def test_a_full_commit_is_used_without_asking_git(self, monkeypatch):
+        sha = "d" * 40
+        calls = self._fake_ls_remote(monkeypatch, b"")
+        monkeypatch.setenv("UNSLOTH_ZOO_REF", sha)
+
+        assert ips._unsloth_zoo_git_spec() == f"{ips._UNSLOTH_ZOO_GIT_URL}@{sha}"
+        assert calls == []
+
+    @pytest.mark.parametrize(
+        "stdout, returncode",
+        [
+            (b"", 0),  # ls-remote matched no ref
+            (b"not-a-sha\trefs/heads/main\n", 0),  # unexpected output shape
+            (b"", 128),  # remote unreachable
+        ],
+    )
+    def test_an_unresolvable_ref_falls_back_to_the_url_as_written(
+        self, monkeypatch, stdout, returncode
+    ):
+        self._fake_ls_remote(monkeypatch, stdout, returncode)
+        monkeypatch.delenv("UNSLOTH_ZOO_REF", raising = False)
+
+        assert ips._unsloth_zoo_git_spec() == ips._UNSLOTH_ZOO_GIT_URL
+
+    def test_a_missing_git_falls_back_to_the_url_as_written(self, monkeypatch):
+        monkeypatch.setattr(ips.shutil, "which", lambda _name: None)
+        monkeypatch.delenv("UNSLOTH_ZOO_REF", raising = False)
+
+        assert ips._unsloth_zoo_git_spec() == ips._UNSLOTH_ZOO_GIT_URL
+
+    def test_git_failing_outright_falls_back_to_the_url_as_written(self, monkeypatch):
+        def boom(*_a, **_k):
+            raise OSError("git exploded")
+
+        monkeypatch.setattr(ips.shutil, "which", lambda _name: "/usr/bin/git")
+        monkeypatch.setattr(ips.subprocess, "run", boom)
+        monkeypatch.delenv("UNSLOTH_ZOO_REF", raising = False)
+
+        assert ips._unsloth_zoo_git_spec() == ips._UNSLOTH_ZOO_GIT_URL
+
+    @pytest.mark.parametrize(
+        "ref",
+        [
+            "main --index-url https://example.invalid/simple",
+            "main;curl evil",
+            "main#egg=unsloth-zoo",
+            "../../attacker/repo",
+            "-oProxyCommand=evil",
+            "main\nunsloth-zoo @ git+https://example.invalid/repo",
+            # Legal in git, but uv reads the revision after the last @, so this is
+            # revision "2026" against a URL that does not exist.
+            "release@2026",
+        ],
+    )
+    def test_a_malformed_ref_never_reaches_the_requirement(self, monkeypatch, ref):
+        """UNSLOTH_ZOO_REF is pasted into a pip requirement, so only ref shapes pass."""
+        calls = self._fake_ls_remote(monkeypatch, b"")
+        monkeypatch.setenv("UNSLOTH_ZOO_REF", ref)
+        monkeypatch.setattr(ips, "_step", lambda *a, **k: None)
+
+        spec = ips._unsloth_zoo_git_spec()
+
+        assert spec == ips._UNSLOTH_ZOO_GIT_URL
+        assert all(ref not in call for call in calls)
+
+    def test_the_repository_url_is_the_hardcoded_one(self):
+        assert ips._UNSLOTH_ZOO_GIT_URL.endswith("git+https://github.com/unslothai/unsloth-zoo")
 
 
 class TestBuildUvCmdTorchBackend:

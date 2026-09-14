@@ -3294,9 +3294,61 @@ case "$0" in
         [ "$STUDIO_LOCAL_INSTALL" = true ] && [ -r "$0" ] && _REPO_IS_CHECKOUT=1 ;;
 esac
 
-# Honor UNSLOTH_ZOO_REF so the Studio venv tracks the requested zoo (the Docker publish workflow forwards one ref to both builds). Unset means main.
-_ZOO_REF="${UNSLOTH_ZOO_REF:-main}"
-_ZOO_GIT_SPEC="unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo@${_ZOO_REF}"
+# Pins the --local unsloth-zoo overlay to the commit UNSLOTH_ZOO_REF (default main)
+# names, as docker/build.sh does. Unresolvable falls back to the ref as written: this
+# buys a reproducible install, it is not a gate on one.
+_resolve_zoo_git_spec() {
+    _ZOO_REF="${UNSLOTH_ZOO_REF:-main}"
+    # Narrower than check-ref-format, which accepts `a#b`, `a;b` and `release@2026`:
+    # a requirement reads those as a fragment, a marker separator and the revision
+    # delimiter (uv resolves `repo@release@2026` as "2026"; `%40` is not decoded).
+    case "$_ZOO_REF" in
+        -*|*..*|*[!A-Za-z0-9._/+-]*)
+            echo "unsloth: UNSLOTH_ZOO_REF='${_ZOO_REF}' cannot be used in a pip requirement; installing unsloth-zoo main instead" >&2
+            _ZOO_REF="main" ;;
+    esac
+    _ZOO_PIN=""
+    if [ "$STUDIO_LOCAL_INSTALL" = true ] && command -v git >/dev/null 2>&1; then
+        # Full ref names: a pattern matches the ref TAIL at slash boundaries, so bare
+        # `main` also matches refs/heads/archive/main, which sorts first. A qualified
+        # ref goes as given. Positional parameters: zsh does not word-split a list.
+        case "$_ZOO_REF" in
+            refs/*) set -- "$_ZOO_REF" "$_ZOO_REF^{}" ;;
+            *)      set -- "refs/heads/$_ZOO_REF" "refs/tags/$_ZOO_REF" "refs/tags/$_ZOO_REF^{}" ;;
+        esac
+        # Empty askpass rather than unset: git runs the first of GIT_ASKPASS,
+        # core.askPass, SSH_ASKPASS that is SET and reads an empty one as none.
+        # http.lowSpeed* is the only bound where `timeout` is absent (stock macOS).
+        # Both branches spelled out: a "timeout 20" prefix is one word in zsh.
+        # shellcheck disable=SC1007  # the empty askpass assignments are deliberate
+        if command -v timeout >/dev/null 2>&1; then
+            _ZOO_LS_OUT="$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= timeout 20 git -c credential.helper= -c core.askPass= -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 ls-remote https://github.com/unslothai/unsloth-zoo "$@" 2>/dev/null || true)"
+        else
+            _ZOO_LS_OUT="$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS= SSH_ASKPASS= git -c credential.helper= -c core.askPass= -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 ls-remote https://github.com/unslothai/unsloth-zoo "$@" 2>/dev/null || true)"
+        fi
+        # Branch, then an annotated tag's commit, then the tag object, as `git clone
+        # --branch` resolves. ls-remote exits 0 even when nothing matched.
+        case "$_ZOO_REF" in
+            refs/*) set -- "$_ZOO_REF^{}" "$_ZOO_REF" ;;
+            *)      set -- "refs/heads/$_ZOO_REF" "refs/tags/$_ZOO_REF^{}" "refs/tags/$_ZOO_REF" ;;
+        esac
+        # A minimal image may ship no awk: that costs the pin, not a visible error.
+        for _ZOO_WANT in "$@"; do
+            _ZOO_LS="$(printf '%s\n' "$_ZOO_LS_OUT" | awk -F'\t' -v want="$_ZOO_WANT" '$2 == want { print $1; exit }' 2>/dev/null || true)"
+            case "$_ZOO_LS" in
+                *[!0-9a-f]*) ;;
+                ????????????????????????????????????????) _ZOO_PIN="$_ZOO_LS"; break ;;
+            esac
+        done
+    fi
+    _ZOO_GIT_SPEC="unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo@${_ZOO_PIN:-$_ZOO_REF}"
+    if [ -n "$_ZOO_PIN" ]; then
+        _ZOO_REF_LABEL="$_ZOO_REF ($(printf '%.12s' "$_ZOO_PIN"))"
+    else
+        _ZOO_REF_LABEL="$_ZOO_REF"
+    fi
+}
+_resolve_zoo_git_spec
 
 # ── Helper: find no-torch-runtime.txt (local repo or site-packages) ──
 _find_no_torch_runtime() {
@@ -5184,8 +5236,8 @@ if [ "$_MIGRATED" = true ]; then
     if [ "$STUDIO_LOCAL_INSTALL" = true ]; then
         substep "overlaying local repo (editable)..."
         run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
-        substep "overlaying unsloth-zoo from git ${_ZOO_REF}..."
-        run_install_cmd_retry "overlay unsloth-zoo (git ${_ZOO_REF})" uv pip install --python "$_VENV_PY" \
+        substep "overlaying unsloth-zoo from git ${_ZOO_REF_LABEL}..."
+        run_install_cmd_retry "overlay unsloth-zoo (git ${_ZOO_REF_LABEL})" uv pip install --python "$_VENV_PY" \
             --no-deps --reinstall-package unsloth-zoo \
             "$_ZOO_GIT_SPEC"
     fi
@@ -5381,8 +5433,8 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
         if [ "$STUDIO_LOCAL_INSTALL" = true ]; then
             substep "overlaying local repo (editable)..."
             run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
-            substep "overlaying unsloth-zoo from git ${_ZOO_REF}..."
-            run_install_cmd_retry "overlay unsloth-zoo (git ${_ZOO_REF})" uv pip install --python "$_VENV_PY" \
+            substep "overlaying unsloth-zoo from git ${_ZOO_REF_LABEL}..."
+            run_install_cmd_retry "overlay unsloth-zoo (git ${_ZOO_REF_LABEL})" uv pip install --python "$_VENV_PY" \
                 --no-deps --reinstall-package unsloth-zoo \
                 "$_ZOO_GIT_SPEC"
         fi
@@ -5392,8 +5444,8 @@ elif [ -n "$TORCH_INDEX_URL" ]; then
             --upgrade-package unsloth "$_unsloth_release_install_spec" "unsloth-zoo>=2026.9.3"
         substep "overlaying local repo (editable)..."
         run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
-        substep "overlaying unsloth-zoo from git ${_ZOO_REF}..."
-        run_install_cmd_retry "overlay unsloth-zoo (git ${_ZOO_REF})" uv pip install --python "$_VENV_PY" \
+        substep "overlaying unsloth-zoo from git ${_ZOO_REF_LABEL}..."
+        run_install_cmd_retry "overlay unsloth-zoo (git ${_ZOO_REF_LABEL})" uv pip install --python "$_VENV_PY" \
             --no-deps --reinstall-package unsloth-zoo \
             "$_ZOO_GIT_SPEC"
     else
@@ -5423,8 +5475,8 @@ else
         run_install_cmd_retry "install unsloth (auto torch backend)" uv pip install --python "$_VENV_PY" "unsloth-zoo>=2026.9.3" "$_unsloth_release_install_spec" --torch-backend=auto
         substep "overlaying local repo (editable)..."
         run_install_cmd "overlay local repo" uv pip install --python "$_VENV_PY" -e "$_REPO_ROOT" --no-deps
-        substep "overlaying unsloth-zoo from git ${_ZOO_REF}..."
-        run_install_cmd_retry "overlay unsloth-zoo (git ${_ZOO_REF})" uv pip install --python "$_VENV_PY" \
+        substep "overlaying unsloth-zoo from git ${_ZOO_REF_LABEL}..."
+        run_install_cmd_retry "overlay unsloth-zoo (git ${_ZOO_REF_LABEL})" uv pip install --python "$_VENV_PY" \
             --no-deps --reinstall-package unsloth-zoo \
             "$_ZOO_GIT_SPEC"
     else
