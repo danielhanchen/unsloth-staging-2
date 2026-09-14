@@ -21,6 +21,8 @@ jobs:
       UNSLOTH_COMPILE_DISABLE: '1'
       UNSLOTH_IS_PRESENT: '1'
       UNSLOTH_ZOO_DISABLE_GPU_INIT: '1'
+      # Documented test-only CPU fallback; these runners have no GPU.
+      UNSLOTH_ALLOW_CPU: '1'
     steps:
       - uses: actions/checkout@v4
         with:
