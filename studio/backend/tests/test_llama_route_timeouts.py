@@ -46,48 +46,65 @@ def test_stream_first_item_deadline_after_headers():
     asyncio.run(_run())
 
 
-def test_stream_first_item_deadline_does_not_hop_tasks():
-    async def _run():
-        outer_task = asyncio.current_task()
-        seen_tasks = []
+def test_stream_read_is_never_cancelled_to_implement_a_deadline():
+    """Replaces a pair that asserted `__anext__` ran in the request task.
 
-        class _One:
+    That targeted `asyncio.wait_for`, which times out by CANCELLING the read --
+    and httpcore closes the body on any streaming exception, so a cancelled read
+    is a dead stream that surfaces as a truncated 200. Cancellation was the
+    hazard, task identity only its proxy; emitting while a read is outstanding
+    needs a task, so pin the hazard itself.
+    """
+
+    async def _run():
+        cancels = []
+        reads = []
+
+        class _Items:
             def __init__(self):
-                self.done = False
+                self.count = 0
 
             async def __anext__(self):
-                seen_tasks.append(asyncio.current_task())
-                if self.done:
+                reads.append(1)
+                try:
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    cancels.append(1)
+                    raise
+                self.count += 1
+                if self.count > 2:
                     raise StopAsyncIteration
-                self.done = True
                 return "data: {}"
 
         out = []
         async for item in inf_mod._aiter_llama_stream_items(
-            _One(),
-            first_token_deadline = time.monotonic() + 1,
+            _Items(),
+            first_token_deadline = time.monotonic() + 5,
+            keepalive_interval_s = 0.01,
         ):
+            if item is inf_mod._LLAMA_STREAM_KEEPALIVE:
+                continue
             out.append(item)
 
-        assert out == ["data: {}"]
-        assert seen_tasks == [outer_task, outer_task]
+        assert out == ["data: {}", "data: {}"]
+        assert cancels == [], "a keepalive tick must never cancel the in-flight read"
+        # One per item plus the StopAsyncIteration: same read, never restarted.
+        assert len(reads) == 3, reads
 
     asyncio.run(_run())
 
 
-def test_stream_first_item_deadline_uses_compat_timeout_without_task_hop(monkeypatch):
+def test_stream_pump_does_not_require_asyncio_timeout(monkeypatch):
+    """The repo floor is 3.9, which has no `asyncio.timeout`. The rewrite needs
+    only `ensure_future` + `wait`, so removing it must change nothing."""
     monkeypatch.setattr(inf_mod.asyncio, "timeout", None, raising = False)
 
     async def _run():
-        outer_task = asyncio.current_task()
-        seen_tasks = []
-
         class _One:
             def __init__(self):
                 self.done = False
 
             async def __anext__(self):
-                seen_tasks.append(asyncio.current_task())
                 if self.done:
                     raise StopAsyncIteration
                 self.done = True
@@ -101,7 +118,8 @@ def test_stream_first_item_deadline_uses_compat_timeout_without_task_hop(monkeyp
             out.append(item)
 
         assert out == ["data: {}"]
-        assert seen_tasks == [outer_task, outer_task]
+
+    asyncio.run(_run())
 
     asyncio.run(_run())
 
@@ -159,6 +177,88 @@ def test_stream_wait_does_not_shorten_upstream_read_for_disconnect_poll():
     asyncio.run(_run())
 
 
+def test_latched_read_ceiling_covers_the_stall_guard():
+    """A lowered first-token env must not cap the whole body under it.
+
+    httpcore reads `extensions["timeout"]["read"]` once, before the body loop
+    (`_async/http11.py::_receive_response_body`), so the value armed before the
+    FIRST read is the ceiling for every later one and the post-token re-arm
+    cannot raise it. With UNSLOTH_OPENAI_COMPAT_FIRST_TOKEN_TIMEOUT below the
+    stall timeout, a healthy mid-stream gap would then be cut at the smaller
+    first-token value instead of the configured stall guard.
+    """
+    async def _run():
+        response = SimpleNamespace(request = SimpleNamespace(extensions = {"timeout": {}}))
+        armed = []
+
+        class _Items:
+            def __init__(self):
+                self.count = 0
+
+            async def __anext__(self):
+                armed.append(response.request.extensions["timeout"].get("read"))
+                self.count += 1
+                if self.count > 1:
+                    raise StopAsyncIteration
+                return "data: {}"
+
+        async for _ in inf_mod._aiter_llama_stream_items(
+            _Items(),
+            response = response,
+            first_token_deadline = time.monotonic() + 30.0,
+            post_first_item_read_timeout_s = 120.0,
+        ):
+            pass
+
+        # The latched (first) ceiling is the stall bound, not the 30s first-token
+        # budget; the wall clock still enforces the 30s on its own.
+        assert armed[0] == 120.0, armed
+
+    asyncio.run(_run())
+
+
+def test_deadline_does_not_discard_a_read_that_already_landed():
+    """A token that arrives while the pump is suspended on a keepalive yield.
+
+    Downstream backpressure can hold the generator past the deadline after the
+    read has already completed. Timing out then would throw away a valid item
+    and report a stall that did not happen, so the deadline is only allowed to
+    fire on an empty `asyncio.wait`.
+    """
+    async def _run():
+        gate = asyncio.Event()
+
+        class _Items:
+            def __init__(self):
+                self.count = 0
+
+            async def __anext__(self):
+                self.count += 1
+                if self.count > 1:
+                    raise StopAsyncIteration
+                await gate.wait()
+                return "data: {}"
+
+        out = []
+        agen = inf_mod._aiter_llama_stream_items(
+            _Items(),
+            first_token_deadline = time.monotonic() + 0.2,
+            keepalive_interval_s = 0.05,
+        )
+        async for item in agen:
+            if item is inf_mod._LLAMA_STREAM_KEEPALIVE:
+                # Let the read finish, then stay suspended here until the
+                # first-token deadline has certainly gone by.
+                gate.set()
+                await asyncio.sleep(0.4)
+                continue
+            out.append(item)
+
+        assert out == ["data: {}"], out
+
+    asyncio.run(_run())
+
+
 def test_preheader_send_cleanup_on_disconnect_and_cancel():
     async def _run(cancel_parent):
         state = SimpleNamespace(disconnected = False, closed = False, cancelled = False)
@@ -212,7 +312,10 @@ def test_stream_stall_timeout_callable_re_resolved_each_read():
     # not captured once at generator start.
     async def _run():
         response = SimpleNamespace(request = SimpleNamespace(extensions = {"timeout": {}}))
-        values = iter([100.0, 2.0])
+        # The leading value is consumed by the pre-first-read ceiling, which now
+        # resolves the post-token bound too so the latched socket timeout cannot
+        # come in under it. The rest is the sequence this test is about.
+        values = iter([50.0, 100.0, 2.0])
         seen = []
 
         class _Items:
@@ -275,8 +378,10 @@ def test_stream_stall_timeout_disabled_clears_read_timeout():
         ):
             seen.append(response.request.extensions["timeout"].get("read"))
 
-        # The first-token path armed a finite read timeout; after the first chunk
-        # with the guard disabled, it is cleared to None on every subsequent read.
+        # With the guard off there is no socket ceiling at any point, including
+        # the latched first read: the first-token wall clock is what bounds the
+        # prefill, and a leftover finite read timeout would trip a deadline the
+        # operator asked to turn off.
         assert seen == [None, None], seen
 
     asyncio.run(_run())
