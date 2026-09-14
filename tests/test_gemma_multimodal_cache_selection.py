@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
 """Cache selection for multimodal generation (unslothai/unsloth#6028).
 
 A static cache makes transformers skip mask materialisation at prefill and rely
@@ -6,8 +9,11 @@ multimodal families build. Image tokens then attend causally and spatial
 grounding degrades. `generate` must fall back to the dynamic cache for those
 requests, and only those.
 """
+
 import sys
 import types
+
+import torch
 
 import pytest
 
@@ -16,12 +22,18 @@ from unsloth.models.vision import (
     _needs_bidirectional_multimodal_mask,
 )
 
+# Both helpers landed in transformers 5.10; earlier versions expose neither.
+_FIRST_VERSION_WITH_BLOCK_MASK = "5.10.0"
 
-def _make_model(module_name, has_helper, helper=None):
+
+def _make_model(
+    module_name,
+    has_helper,
+    helper = None,
+):
     module = types.ModuleType(module_name)
     if has_helper:
-        setattr(module, helper or _BIDIRECTIONAL_MASK_BUILDERS[0],
-                lambda *args, **kwargs: None)
+        setattr(module, helper or _BIDIRECTIONAL_MASK_BUILDERS[0], lambda *args, **kwargs: None)
     sys.modules[module_name] = module
 
     model_cls = type("Model", (), {})
@@ -43,9 +55,7 @@ def causal_vlm(request):
     sys.modules.pop(name, None)
 
 
-@pytest.mark.parametrize(
-    "media_kwarg", ["pixel_values", "pixel_values_videos", "input_features"]
-)
+@pytest.mark.parametrize("media_kwarg", ["pixel_values", "pixel_values_videos", "input_features"])
 def test_media_request_on_gemma_uses_dynamic_cache(gemma_like, media_kwarg):
     assert _needs_bidirectional_multimodal_mask(gemma_like, {media_kwarg: object()})
 
@@ -75,7 +85,7 @@ def test_either_mask_builder_gates_the_guard(request, helper):
     """The two names span transformers 5.10 to current, so either one alone has
     to be enough."""
     name = f"_fake_helper_{request.node.name}"
-    model = _make_model(name, True, helper=helper)
+    model = _make_model(name, True, helper = helper)
     try:
         assert _needs_bidirectional_multimodal_mask(model, {"pixel_values": object()})
     finally:
@@ -83,17 +93,150 @@ def test_either_mask_builder_gates_the_guard(request, helper):
 
 
 def test_real_gemma_modules_expose_the_helper():
-    """Pin the upstream symbols the guard keys on, so a rename is caught here."""
-    pytest.importorskip("transformers")
+    """Pin the upstream symbols the guard keys on, so a rename is caught here.
+
+    These helpers landed in transformers 5.10. Before that neither name exists
+    (measured on 4.57.6 and 5.5.0), the guard is inert by design, and Gemma keeps
+    the static path it always had, so there is nothing to pin.
+    """
+    transformers = pytest.importorskip("transformers")
+    from packaging.version import InvalidVersion, Version
+
+    try:
+        new_enough = Version(transformers.__version__) >= Version(_FIRST_VERSION_WITH_BLOCK_MASK)
+    except InvalidVersion:
+        pytest.skip(f"cannot order version {transformers.__version__!r}")
+    if not new_enough:
+        pytest.skip(f"no block mask helper before transformers {_FIRST_VERSION_WITH_BLOCK_MASK}")
+
     seen = False
     for name in ("gemma3", "gemma4", "gemma4_unified"):
         try:
-            module = __import__(
-                f"transformers.models.{name}.modeling_{name}", fromlist=["x"]
-            )
+            module = __import__(f"transformers.models.{name}.modeling_{name}", fromlist = ["x"])
         except Exception:
             continue
         seen = True
         assert any(hasattr(module, h) for h in _BIDIRECTIONAL_MASK_BUILDERS), name
     if not seen:
         pytest.skip("no Gemma multimodal module in this transformers version")
+
+
+def test_causal_vlms_never_expose_a_mask_builder():
+    """The other half of the gate: these must stay on the static path on every
+    version, so neither name may appear on them."""
+    pytest.importorskip("transformers")
+    for name in ("qwen2_vl", "llava", "paligemma"):
+        try:
+            module = __import__(f"transformers.models.{name}.modeling_{name}", fromlist = ["x"])
+        except Exception:
+            continue
+        assert not any(hasattr(module, h) for h in _BIDIRECTIONAL_MASK_BUILDERS), name
+
+
+class _Cfg:
+    def __init__(self, bidir):
+        self.use_bidirectional_attention = bidir
+
+    def get_text_config(self):
+        return self
+
+
+def _gemma4_shaped(module, bidir):
+    """A model whose create_masks_for_generate takes mm_token_type_ids, which is
+    the Gemma 4 form and the one upstream gates on the config value."""
+
+    class Model:
+        config = _Cfg(bidir)
+
+        @staticmethod
+        def create_masks_for_generate(
+            config,
+            inputs_embeds,
+            attention_mask,
+            past_key_values,
+            position_ids,
+            mm_token_type_ids = None,
+            **kwargs,
+        ):
+            return None
+
+    Model.__module__ = module.__name__
+    return Model()
+
+
+def _gemma3_shaped(module):
+    """Gemma 3 takes token_type_ids and overlays regardless of the config flag,
+    which it sets to False."""
+
+    class Model:
+        config = _Cfg(False)
+
+        @staticmethod
+        def create_masks_for_generate(
+            config,
+            inputs_embeds,
+            attention_mask,
+            past_key_values,
+            position_ids,
+            token_type_ids = None,
+            **kwargs,
+        ):
+            return None
+
+    Model.__module__ = module.__name__
+    return Model()
+
+
+def test_causal_gemma4_variant_keeps_the_static_cache(gemma_like):
+    """E2B / E4B leave use_bidirectional_attention None, so upstream builds no
+    overlay and they must not lose the compiled path."""
+    module = sys.modules[type(gemma_like).__module__]
+    assert not _needs_bidirectional_multimodal_mask(
+        _gemma4_shaped(module, None), {"pixel_values": object()}
+    )
+
+
+def test_vision_gemma4_variant_is_gated(gemma_like):
+    module = sys.modules[type(gemma_like).__module__]
+    assert _needs_bidirectional_multimodal_mask(
+        _gemma4_shaped(module, "vision"), {"pixel_values": object()}
+    )
+
+
+def test_gemma3_is_gated_despite_the_flag_being_false(gemma_like):
+    module = sys.modules[type(gemma_like).__module__]
+    assert _needs_bidirectional_multimodal_mask(_gemma3_shaped(module), {"pixel_values": object()})
+
+
+def test_precomputed_embeds_with_media_tokens_are_gated(gemma_like):
+    """inputs_embeds carries no media kwarg; the token types are the signal."""
+    module = sys.modules[type(gemma_like).__module__]
+    model = _gemma4_shaped(module, "vision")
+    ids = torch.tensor([[0, 0, 1, 1, 0]])
+    assert _needs_bidirectional_multimodal_mask(model, {"mm_token_type_ids": ids})
+
+
+def test_text_only_token_types_keep_the_static_cache(gemma_like):
+    """The processor emits mm_token_type_ids for text-only prompts too, all
+    zeros, so presence alone must not cost the static path."""
+    module = sys.modules[type(gemma_like).__module__]
+    model = _gemma4_shaped(module, "vision")
+    ids = torch.zeros(1, 5, dtype = torch.long)
+    assert not _needs_bidirectional_multimodal_mask(model, {"mm_token_type_ids": ids})
+
+
+def test_gemma3_token_type_ids_are_read(gemma_like):
+    module = sys.modules[type(gemma_like).__module__]
+    model = _gemma3_shaped(module)
+    assert _needs_bidirectional_multimodal_mask(
+        model, {"token_type_ids": torch.tensor([[0, 1, 0]])}
+    )
+    assert not _needs_bidirectional_multimodal_mask(
+        model, {"token_type_ids": torch.zeros(1, 3, dtype = torch.long)}
+    )
+
+
+def test_non_tensor_token_types_do_not_raise(gemma_like):
+    module = sys.modules[type(gemma_like).__module__]
+    model = _gemma4_shaped(module, "vision")
+    assert not _needs_bidirectional_multimodal_mask(model, {"mm_token_type_ids": "not a tensor"})

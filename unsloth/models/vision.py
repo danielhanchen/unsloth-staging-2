@@ -116,7 +116,8 @@ from ..device_type import (
 
 # torch.nn.RMSNorm only exists on torch >= 2.4.
 _NORM_MODULE_TYPES = tuple(
-    t for t in (getattr(torch.nn, "LayerNorm", None), getattr(torch.nn, "RMSNorm", None))
+    t
+    for t in (getattr(torch.nn, "LayerNorm", None), getattr(torch.nn, "RMSNorm", None))
     if t is not None
 )
 
@@ -588,32 +589,74 @@ except:
 
 
 _MEDIA_GENERATE_KWARGS = ("pixel_values", "pixel_values_videos", "input_features")
-# Either name means the module overlays a bidirectional block on the causal mask.
-# `get_block_sequence_ids_for_mask` covers transformers 5.10 onwards,
-# `create_masks_for_vision_model` was added in 5.17; keep both so the guard does
-# not go inert on either side of that change.
+# Either name marks a bidirectional block overlay: the first exists from
+# transformers 5.10, the second from 5.17. Keep both or the guard goes inert.
 _BIDIRECTIONAL_MASK_BUILDERS = (
     "get_block_sequence_ids_for_mask",
     "create_masks_for_vision_model",
 )
+# Gemma 3 names it token_type_ids, Gemma 4 mm_token_type_ids.
+_TOKEN_TYPE_KWARGS = ("mm_token_type_ids", "token_type_ids")
+
+
+def _overlay_is_configured(model):
+    """Mirror upstream's own condition for building the overlay.
+
+    The two families disagree: Gemma 4 only overlays when the text config says
+    `"vision"` (E2B / E4B leave it None and are causal), while Gemma 3 has no
+    such field, sets it False, and overlays anyway off `token_type_ids`. Tell
+    them apart by which token-type argument the model's own
+    `create_masks_for_generate` takes.
+    """
+    builder = getattr(type(model), "create_masks_for_generate", None)
+    if builder is None:
+        return True
+    try:
+        params = inspect.signature(builder).parameters
+    except (TypeError, ValueError):
+        return True
+    if "mm_token_type_ids" not in params:
+        return True
+    config = getattr(model, "config", None)
+    text_config = config.get_text_config() if hasattr(config, "get_text_config") else config
+    return getattr(text_config, "use_bidirectional_attention", None) == "vision"
+
+
+def _has_media_token_types(kwargs):
+    """Media markers in the token-type ids, which is what upstream keys on.
+
+    Needed for `inputs_embeds` requests, where no raw media kwarg is present.
+    The tensor is emitted for text-only prompts too, so test the values: any
+    non-zero entry is a media token.
+    """
+    for name in _TOKEN_TYPE_KWARGS:
+        ids = kwargs.get(name)
+        if ids is None:
+            continue
+        try:
+            if bool((ids != 0).any()):
+                return True
+        except (AttributeError, TypeError, RuntimeError):
+            continue
+    return False
 
 
 def _needs_bidirectional_multimodal_mask(model, kwargs):
-    """True when this request carries media for a model whose image/audio tokens
-    attend bidirectionally inside their block.
-
-    A static cache makes transformers skip mask materialisation at prefill and
-    rely on `is_causal`, which silently drops that block overlay, so the media
-    tokens end up causal. Gemma 3 / Gemma 4 / Gemma 4 unified all build the
-    overlay; models without it (Qwen2-VL, Llava, PaliGemma) are causal anyway
-    and stay on the static path.
+    """True when this request carries media and the model overlays a
+    bidirectional block on the causal mask (Gemma 3 / 4). A static cache drops
+    that overlay, leaving media tokens causal; Qwen2-VL, Llava and PaliGemma
+    have no overlay and stay on the static path.
     """
-    if not any(kwargs.get(name) is not None for name in _MEDIA_GENERATE_KWARGS):
-        return False
     module = sys.modules.get(type(model).__module__, None)
     if module is None:
         return False
-    return any(hasattr(module, name) for name in _BIDIRECTIONAL_MASK_BUILDERS)
+    if not any(hasattr(module, name) for name in _BIDIRECTIONAL_MASK_BUILDERS):
+        return False
+    if not _overlay_is_configured(model):
+        return False
+    if any(kwargs.get(name) is not None for name in _MEDIA_GENERATE_KWARGS):
+        return True
+    return _has_media_token_types(kwargs)
 
 
 def _uses_flash_attention_for_generation(config):
@@ -879,9 +922,8 @@ def unsloth_base_fast_generate(self, *args, **kwargs):
                 cache_implementation = "static"
     if do_bfloat16_mixed_precision:
         cache_implementation = None
-    # A static cache drops the bidirectional image/audio block mask at prefill, so
-    # media tokens attend causally and spatial grounding degrades (#6028). Text-only
-    # generation is causal anyway and keeps the static path.
+    # A static cache drops the media block mask at prefill (#6028); text-only
+    # is causal anyway and keeps the static path.
     if cache_implementation is not None and _needs_bidirectional_multimodal_mask(self, kwargs):
         cache_implementation = None
 
@@ -1739,10 +1781,8 @@ class FastBaseModel:
                     name.endswith(("norm", "norm1", "norm2", "norm3", "norm4"))
                     or "layernorm" in name
                     or "layer_norm" in name
-                    # Name alone misses norms named after their position, and
-                    # upcasting only some of a block's norms leaves the rest in
-                    # 16 bit on the same chain. Gemma 4's embed_vision has
-                    # pos_norm (matched) beside patch_ln1 / patch_ln2 (not).
+                    # Name alone splits a block: Gemma 4's embed_vision has
+                    # pos_norm matched beside patch_ln1 / patch_ln2 unmatched.
                     or isinstance(module, _NORM_MODULE_TYPES)
                 ) and hasattr(module, "weight"):
                     module._pre_set_compute_dtype = torch.float32
