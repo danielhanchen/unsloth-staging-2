@@ -39,6 +39,12 @@ jobs:
           python -m pip install typer rich pydantic pyyaml nest-asyncio structlog click
           # Released unsloth_zoo predates UNSLOTH_ALLOW_CPU and raises on a GPU-less host.
           python -m pip install --no-deps git+https://github.com/unslothai/unsloth-zoo
+          # --no-deps on purpose: unsloth_zoo pins transformers<=5.5.0, which is
+          # older than the versions this guard needs. Install its pure-python
+          # deps by hand instead, skipping triton / torchao / mlx.
+          python -m pip install datasets sentencepiece tqdm psutil numpy protobuf \
+            huggingface_hub hf_transfer pillow regex msgspec typing_extensions \
+            filelock packaging tyro trl
       - name: Guard logic, no unsloth import (AST-loaded from the real source)
         run: python tests/version_matrix_check.py --skip-peft --unsloth-path .
       - name: Cache selection and norm upcast tests
