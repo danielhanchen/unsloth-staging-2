@@ -37,16 +37,19 @@ def _load_guard_from_source(unsloth_path):
 
     src = open(os.path.join(unsloth_path, "unsloth", "models", "vision.py")).read()
     tree = ast.parse(src)
-    wanted = {"_MEDIA_GENERATE_KWARGS", "_BIDIRECTIONAL_MASK_BUILDERS",
-              "_needs_bidirectional_multimodal_mask"}
+    wanted = {"_MEDIA_GENERATE_KWARGS", "_MEDIA_TOKEN_TYPES", "_TOKEN_TYPE_KWARGS",
+              "_BIDIRECTIONAL_MASK_BUILDERS", "_overlay_is_configured",
+              "_has_media_token_types", "_needs_bidirectional_multimodal_mask"}
     picked = [
         node for node in tree.body
         if (isinstance(node, ast.FunctionDef) and node.name in wanted)
         or (isinstance(node, ast.Assign)
             and any(getattr(t, "id", None) in wanted for t in node.targets))
     ]
-    assert len(picked) == 3, f"expected 3 guard definitions, found {len(picked)}"
-    ns = {"sys": sys}
+    assert len(picked) == len(wanted), (
+        f"expected {len(wanted)} guard definitions, found {len(picked)}")
+    import inspect as _inspect
+    ns = {"sys": sys, "inspect": _inspect}
     exec(compile(ast.Module(body=picked, type_ignores=[]), "vision.py", "exec"), ns)
     return ns["_needs_bidirectional_multimodal_mask"], ns["_BIDIRECTIONAL_MASK_BUILDERS"]
 
