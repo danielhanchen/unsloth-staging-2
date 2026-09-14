@@ -2,6 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { apiUrl } from "@/lib/api-base";
+import { setHfEndpoints } from "@/lib/hf-endpoint";
 import {
   isDetectionDeferred,
   isProvisionalVerdict,
@@ -41,6 +42,12 @@ interface PlatformState {
   cloudflareUrl: string | null;
   serverUrl: string | null;
   secure: boolean;
+  // Hub endpoints the backend routes through (HF_ENDPOINT / HF_DATASETS_SERVER
+  // env vars), mirrored here so frontend Hub calls hit the same host the
+  // backend uses. Defaults until /api/health answers; the backend value wins
+  // on every page load.
+  hfEndpoint: string;
+  hfDatasetsServer: string;
   fetched: boolean;
   // Last verdict came from a deferred reply (torch-warm kill switch): nothing settles
   // until a first-use operation detects, so the sidebar polls on this.
@@ -77,6 +84,8 @@ export const usePlatformStore = create<PlatformState>()((_, get) => ({
   cloudflareUrl: null,
   serverUrl: null,
   secure: false,
+  hfEndpoint: "https://huggingface.co",
+  hfDatasetsServer: "https://datasets-server.huggingface.co",
   fetched: false,
   detectionDeferred: false,
   isChatOnly: () => get().chatOnly,
@@ -165,13 +174,24 @@ export async function fetchDeviceType(options?: {
         cloudflare_url?: string | null;
         server_url?: string | null;
         secure?: boolean;
+        hf_endpoint?: string;
+        hf_datasets_server?: string;
       };
       // Once the store holds an authoritative (server-reported) platform, a non-forced response
       // must not overwrite it. It may be an unauthenticated fallback, or an earlier authenticated
       // request that resolved after a later forced refresh already picked up device_type and the
       // tunnel fields; writing either would reset device type or null the tunnel fields. Forced
       // refreshes are explicit re-reads, so they still write.
+      // Endpoint routing is reported to unauthenticated callers and is idempotent, so it
+      // is applied before the authoritative-platform guard below. A mirror deployment whose
+      // first authoritative reply already landed would otherwise never route its Hub calls.
+      setHfEndpoints(data.hf_endpoint, data.hf_datasets_server);
       if (shouldKeepAuthoritativePlatform(options?.force)) {
+        usePlatformStore.setState({
+          hfEndpoint: data.hf_endpoint ?? usePlatformStore.getState().hfEndpoint,
+          hfDatasetsServer:
+            data.hf_datasets_server ?? usePlatformStore.getState().hfDatasetsServer,
+        });
         return usePlatformStore.getState().deviceType;
       }
       const previous = usePlatformStore.getState();
@@ -204,6 +224,10 @@ export async function fetchDeviceType(options?: {
         cloudflareUrl: data.cloudflare_url ?? null,
         serverUrl: data.server_url ?? null,
         secure: data.secure ?? false,
+        // Older backends carry neither field; keep whatever the store already
+        // holds instead of resetting a mirror to the default.
+        hfEndpoint: data.hf_endpoint ?? previous.hfEndpoint,
+        hfDatasetsServer: data.hf_datasets_server ?? previous.hfDatasetsServer,
         fetched: data.device_type !== undefined || keepPlatform,
         detectionDeferred: isDetectionDeferred(data),
       });

@@ -1820,6 +1820,137 @@ fn webview_cache_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
         .build()
 }
 
+/// Mirror endpoints from the environment, normalised the same way the backend's
+/// `hf_endpoint_url()` does it: scheme added when missing, trailing slash
+/// stripped. Blank values are ignored so an unset mirror changes nothing.
+fn configured_hf_endpoints() -> Vec<String> {
+    ["HF_ENDPOINT", "HF_DATASETS_SERVER"]
+        .into_iter()
+        .filter_map(|key| std::env::var(key).ok())
+        .map(|raw| raw.trim().to_string())
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| {
+            let with_scheme = if raw.contains("://") { raw } else { format!("https://{raw}") };
+            with_scheme.trim_end_matches('/').to_string()
+        })
+        .filter(|endpoint| is_usable_csp_source(endpoint))
+        .map(|endpoint| csp_origin_of(&endpoint))
+        .collect()
+}
+
+/// Reduce an endpoint to scheme://host[:port] for use as a CSP source.
+///
+/// A host-source carrying a path is matched *exactly* unless the path ends in a
+/// solidus (CSP3 6.7.2.7), so a path-prefixed mirror listed verbatim allows that
+/// one URL and blocks every request beneath it. The path belongs in the request
+/// URL, not the policy. Mirrors `utils/hf_endpoint.py::csp_connect_sources`.
+fn csp_origin_of(endpoint: &str) -> String {
+    match endpoint.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            format!("{scheme}://{authority}")
+        }
+        None => endpoint.to_string(),
+    }
+}
+
+/// A CSP source list is whitespace-separated and semicolon-delimited, so an
+/// endpoint carrying either would add sources or whole directives instead of one
+/// origin. Mirrors the backend's `utils/hf_endpoint.py::_sanitize`, so the webview
+/// policy and `/api/health` never disagree about what counts as configured.
+fn is_usable_csp_source(endpoint: &str) -> bool {
+    if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
+        return false;
+    }
+    if endpoint
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control() || matches!(c, ';' | ',' | '\'' | '"' | '\\'))
+    {
+        return false;
+    }
+    let authority = match endpoint.split_once("://") {
+        Some((_, rest)) => rest,
+        None => return false,
+    };
+    // No credentials, query or fragment, and a non-empty host.
+    let host = authority
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    if host.is_empty() || host.contains('@') || authority.contains('?') || authority.contains('#') {
+        return false;
+    }
+    // "*" would reach the policy as "https://*", a source that allows EVERY https
+    // origin -- the opposite of what the policy is for.
+    if host.contains('*') {
+        return false;
+    }
+    // A scheme-less value keeps everything before the first ':' as the host, so
+    // "javascript:alert(1)" arrives here as "https://javascript:alert(1)" -- shaped
+    // like a URL, with nonsense for a port.
+    match host.rsplit_once(':') {
+        // IPv6 literals end in ']' and carry no port in that position.
+        Some((_, port)) if !host.ends_with(']') => {
+            !port.is_empty() && port.chars().all(|c| c.is_ascii_digit())
+        }
+        _ => true,
+    }
+}
+
+/// Append `sources` to the policy's `connect-src` directive, skipping sources
+/// already listed. The directive is matched on its first token (case-blind) so
+/// a hostname containing "connect-src" can never match. Leaves the policy
+/// untouched (and returns false) when there is no `connect-src` directive.
+fn append_connect_sources(policy: &mut String, sources: &[String]) -> bool {
+    let mut appended = false;
+    let rebuilt: Vec<String> = policy
+        .split(';')
+        .map(|directive| directive.trim())
+        .filter(|directive| !directive.is_empty())
+        .map(|directive| {
+            let is_connect_src = directive
+                .split_whitespace()
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("connect-src"));
+            if !is_connect_src || appended {
+                return directive.to_string();
+            }
+            let existing: Vec<&str> = directive.split_whitespace().collect();
+            let mut tokens = existing.clone();
+            for source in sources {
+                if !existing.iter().any(|token| *token == source.as_str()) {
+                    tokens.push(source);
+                }
+            }
+            appended = true;
+            tokens.join(" ")
+        })
+        .collect();
+    if appended {
+        // Same "; " shape the tauri.conf.json policy is written in; the header
+        // is machine-read either way, this just keeps diffs readable.
+        *policy = rebuilt.join("; ");
+    }
+    appended
+}
+
+/// tauri.conf.json's static CSP only allows the official Hub hosts, so a
+/// mirrored HF_ENDPOINT / HF_DATASETS_SERVER would have the webview block the
+/// frontend's Hub calls. Tauri builds the CSP header from the Context config
+/// on every webview asset request, so appending the configured endpoints here
+/// covers the statically declared window too.
+fn extend_csp_with_hf_endpoints<R: tauri::Runtime>(context: &mut tauri::Context<R>) {
+    let endpoints = configured_hf_endpoints();
+    if endpoints.is_empty() {
+        return;
+    }
+    if let Some(tauri::utils::config::Csp::Policy(policy)) =
+        context.config_mut().app.security.csp.as_mut()
+    {
+        append_connect_sources(policy, &endpoints);
+    }
+}
+
 fn main() {
     // Must precede any Xlib call: GTK3 never calls XInitThreads and this
     // process drives X from several threads. See x11_threads for the crash.
@@ -1849,7 +1980,8 @@ fn main() {
     }
     windows_job::initialize();
 
-    let context = tauri::generate_context!();
+    let mut context = tauri::generate_context!();
+    extend_csp_with_hf_endpoints(&mut context);
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -2063,6 +2195,102 @@ mod tests {
         file.flush().unwrap();
         assert_eq!(fs::read_to_string(&rotated_path).unwrap(), "bbbbcccccccccc");
         assert_eq!(fs::read_to_string(&log_path).unwrap(), "dddd");
+    }
+
+    #[test]
+    fn connect_sources_appended_after_existing_directive() {
+        let mut policy = "default-src 'self'; connect-src 'self' https://huggingface.co; img-src 'self' data:".to_string();
+        assert!(append_connect_sources(
+            &mut policy,
+            &["https://hf-mirror.com".to_string(), "https://ds.example.com".to_string()],
+        ));
+        assert_eq!(
+            policy,
+            "default-src 'self'; connect-src 'self' https://huggingface.co https://hf-mirror.com https://ds.example.com; img-src 'self' data:",
+        );
+    }
+
+    #[test]
+    fn already_listed_sources_are_not_duplicated() {
+        let mut policy = "connect-src 'self' https://huggingface.co".to_string();
+        assert!(append_connect_sources(&mut policy, &["https://huggingface.co".to_string()]));
+        assert_eq!(policy, "connect-src 'self' https://huggingface.co");
+    }
+
+    #[test]
+    fn policy_without_connect_src_is_left_untouched() {
+        let mut policy = "default-src 'self'; img-src 'self' data:".to_string();
+        assert!(!append_connect_sources(&mut policy, &["https://hf-mirror.com".to_string()]));
+        assert_eq!(policy, "default-src 'self'; img-src 'self' data:");
+    }
+
+    #[test]
+    fn hostname_containing_directive_name_cannot_match() {
+        // First token of the directive is "connect-src.evil.com", not the
+        // directive itself, so the policy must stay untouched.
+        let mut policy = "connect-src 'self'; img-src connect-src.evil.com".to_string();
+        assert!(append_connect_sources(&mut policy, &["https://hf-mirror.com".to_string()]));
+        assert_eq!(policy, "connect-src 'self' https://hf-mirror.com; img-src connect-src.evil.com");
+    }
+
+    #[test]
+    fn a_path_prefixed_mirror_is_reduced_to_its_origin() {
+        // Listing the path verbatim would allow exactly that one URL and block
+        // every request beneath it, in every browser.
+        assert_eq!(csp_origin_of("https://hub.internal/hf"), "https://hub.internal");
+        assert_eq!(
+            csp_origin_of("https://hub.internal:8443/hf/v2"),
+            "https://hub.internal:8443"
+        );
+        assert_eq!(csp_origin_of("https://hf-mirror.com"), "https://hf-mirror.com");
+        assert_eq!(csp_origin_of("http://localhost:8080"), "http://localhost:8080");
+    }
+
+    #[test]
+    fn a_plain_https_origin_is_a_usable_csp_source() {
+        assert!(is_usable_csp_source("https://hf-mirror.com"));
+        assert!(is_usable_csp_source("http://localhost:8080"));
+        assert!(is_usable_csp_source("https://hub.internal:8443/hf"));
+    }
+
+    #[test]
+    fn an_endpoint_that_could_forge_a_directive_is_rejected() {
+        // Each of these would add a source or a whole directive rather than one
+        // origin, silently widening the policy the webview enforces.
+        for hostile in [
+            "https://hf-mirror.com; script-src *",
+            "https://hf-mirror.com *",
+            "https://hf-mirror.com\nscript-src *",
+            "https://hf-mirror.com\r\nscript-src *",
+            "https://hf-mirror.com\tfoo",
+            "https://hf-mirror.com,https://evil.com",
+            "https://hf-mirror.com'",
+        ] {
+            assert!(!is_usable_csp_source(hostile), "should reject {hostile:?}");
+        }
+    }
+
+    #[test]
+    fn a_non_http_or_hostless_endpoint_is_rejected() {
+        for bad in [
+            "javascript:alert(1)",
+            "file:///etc/passwd",
+            "data:text/html,x",
+            "ftp://hf-mirror.com",
+            "https://",
+            "https://user:pass@hf-mirror.com",
+            "https://hf-mirror.com?x=1",
+            "https://hf-mirror.com#f",
+            // Scheme-less input that configured_hf_endpoints prefixes with https://.
+            "https://javascript:alert(1)",
+            "https://hf-mirror.com:",
+            "https://hf-mirror.com:80x",
+            // Would reach connect-src as a wildcard allowing every https origin.
+            "https://*",
+            "https://*.evil.com",
+        ] {
+            assert!(!is_usable_csp_source(bad), "should reject {bad:?}");
+        }
     }
 
     #[test]
