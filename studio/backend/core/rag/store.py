@@ -673,9 +673,10 @@ def search_dense(
         widen: list[str] = []
         for s in pending:
             fetch = fetches[s]
+            # SQLite < 3.41 does not pass LIMIT to vec0's KNN planner; bind k explicitly.
             rows = conn.execute(
                 "SELECT chunk_id, distance FROM chunks_vec "
-                "WHERE scope=? AND embedding MATCH ? ORDER BY distance LIMIT ?",
+                "WHERE scope=? AND embedding MATCH ? AND k=? ORDER BY distance",
                 (s, _f32(vector), fetch),
             ).fetchall()
             kept[s] = _drop_incompatible(
@@ -694,6 +695,8 @@ def search_dense(
 
 
 # Past this many nearest neighbours the scope is effectively another embedder's, and a re-upload is the answer.
+# 4096 is also vec0's own ceiling ("k value in knn query too large ... the limit is 4096"), so raising this
+# would turn the widened query into an error rather than a slower search.
 _MAX_DENSE_FETCH = 4096
 # One id per bound parameter, kept under the oldest SQLITE_MAX_VARIABLE_NUMBER.
 _ID_BATCH = 900
