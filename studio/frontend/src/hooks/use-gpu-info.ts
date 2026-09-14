@@ -2,6 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { useEffect, useMemo, useState } from "react";
+import { normalizeDenseQuantSchemes } from "@/lib/dense-quant-schemes";
 import {
   type GpuIndexKind,
   type PinnableGpuContext,
@@ -46,6 +47,11 @@ export interface GpuInfo {
    * GPU-less one, because "which runtimes can this host place" is exactly the question a host
    * with no usable GPU has to answer. Empty until system info arrives. */
   backend: string;
+  /** Backend-reported dense quant capability. False until system info arrives. */
+  denseQuantSupported: boolean;
+  /** The dense quant schemes the backend says this host can run, best first ("fp8", "int8").
+   *  Empty until system info arrives and on a backend too old to report the field. */
+  denseQuantSchemes: readonly string[];
   name: string;
   memoryTotalGb: number;
   memorySharedGb: number;
@@ -81,6 +87,8 @@ const DEFAULT_GPU: GpuInfo = {
   sharedMemory: false,
   unifiedMemory: false,
   backend: "",
+  denseQuantSupported: false,
+  denseQuantSchemes: [],
   name: "Unknown",
   memoryTotalGb: 0,
   memorySharedGb: 0,
@@ -106,6 +114,8 @@ function toGpuInfo(
   // path: unified-memory math still needs a RAM budget to work with.
   const base = {
     backend: data?.device_backend ?? "",
+    denseQuantSupported: data?.dense_quant_supported === true,
+    denseQuantSchemes: normalizeDenseQuantSchemes(data?.dense_quant_schemes),
     cpuCore: data?.cpu?.physical_count ?? 0,
     cpuThread: data?.cpu?.logical_count ?? 0,
     systemRamAvailableGb: data?.memory?.available_gb ?? 0,
