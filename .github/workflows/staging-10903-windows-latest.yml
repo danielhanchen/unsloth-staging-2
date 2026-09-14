@@ -33,6 +33,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
           python -m pip install "transformers>=5.10" peft accelerate pytest unsloth_zoo
+          # unsloth's own declared runtime deps; without these `import unsloth` fails.
+          python -m pip install typer rich pydantic pyyaml nest-asyncio structlog click
+      - name: Guard logic, no unsloth import (AST-loaded from the real source)
+        run: python tests/version_matrix_check.py --skip-peft --unsloth-path .
       - name: Cache selection and norm upcast tests
         run: PYTHONPATH=. python -m pytest tests/ -q --tb=short
       - name: Guard gates only the bidirectional families
