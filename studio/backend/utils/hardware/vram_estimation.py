@@ -216,8 +216,7 @@ def extract_arch_config(hf_config) -> Optional[ModelArchConfig]:
     text_config = getattr(hf_config, "text_config", None) or hf_config
     quantization_config = getattr(hf_config, "quantization_config", None) or {}
     if not isinstance(quantization_config, dict):
-        to_dict = getattr(quantization_config, "to_dict", None)
-        quantization_config = to_dict() if to_dict else getattr(quantization_config, "__dict__", {})
+        quantization_config = getattr(quantization_config, "to_dict", lambda: {})()
     quant_4bit_factor = (
         DOUBLE_QUANT_4BIT_FACTOR
         if quantization_config.get("bnb_4bit_use_double_quant", False)
