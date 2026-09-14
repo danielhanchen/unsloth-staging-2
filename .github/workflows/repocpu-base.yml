@@ -1,0 +1,83 @@
+name: "repo-cpu-tests pr-10815-repocpu-base"
+on:
+  push:
+    branches: ["pr-10815-repocpu-base"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  repo-cpu-tests:
+    name: Repo tests (CPU)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install uv
+        run: pip install uv
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r studio/backend/requirements/studio.txt
+          pip install \
+            python-multipart aiofiles sqlalchemy cryptography psutil \
+            pyyaml jinja2 mammoth unpdf requests typer \
+            'numpy<3' pytest pytest-asyncio pytest-xdist httpx
+          pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple \
+            'torch>=2.4,<2.11' 'torchvision<0.26' 'torchaudio<2.11'
+          pip install 'transformers>=4.51,<5.5'
+          pip install 'bitsandbytes>=0.45'
+          for attempt in 1 2 3; do
+            if pip install "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo"; then break; fi
+            [ "$attempt" -eq 3 ] && { echo "::error::unsloth_zoo install failed"; exit 1; }
+            sleep $((5 * attempt))
+          done
+          pip install -e . --no-deps
+      - name: Install the pinned ruff
+        run: |
+          pin="$(python -c 'import sys; sys.path.insert(0, "scripts"); import run_ruff_format as r; print(r.pinned_ruff_version(r.CONFIG.read_text(encoding = "utf-8")) or "")')"
+          if [ -z "$pin" ]; then echo "::error::no pinned ruff"; exit 1; fi
+          pip install "ruff==$pin"
+      - name: Repo tests (CPU, auto-discovered)
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: |
+          python -m pytest tests/ -q --tb=short -n 4 \
+            --ignore=tests/qlora \
+            --ignore=tests/saving \
+            --ignore=tests/utils \
+            --ignore=tests/sh \
+            --ignore=tests/studio/load_freeze \
+            --ignore=tests/studio/test_hardware_dispatch_matrix.py \
+            --ignore=tests/studio/test_is_mlx_dispatch_gate.py \
+            --ignore=tests/studio/test_xpu_spoof_pipeline.py \
+            --ignore=tests/studio/test_mlx_context_platform_matrix.py \
+            --ignore=tests/vllm_compat \
+            --ignore=tests/version_compat \
+            -m 'not server and not e2e' \
+            --deselect tests/test_model_registry.py::test_model_registration \
+            --deselect tests/test_model_registry.py::test_all_model_registration
+      - name: Hardware-spoof tests (state-sensitive, run in isolation)
+        env:
+          PYTHONPATH: ${{ github.workspace }}/studio
+          UNSLOTH_COMPILE_DISABLE: '1'
+        run: |
+          python -m pytest -q --tb=short \
+            tests/studio/test_hardware_dispatch_matrix.py \
+            tests/studio/test_is_mlx_dispatch_gate.py \
+            tests/studio/test_xpu_spoof_pipeline.py \
+            tests/studio/test_mlx_context_platform_matrix.py
