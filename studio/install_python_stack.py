@@ -17,6 +17,7 @@ import glob
 import importlib
 import importlib.util
 import json
+import locale
 import os
 import platform
 import re
@@ -547,8 +548,8 @@ def _pytorch_whl_leaf_url(leaf: str) -> "str | None":
 
     No URL shape pins a query-auth mirror -- pip joins the project name as text, so the token
     swallows either the leaf or the name (see _warn_query_index_unusable). Constructing one
-    anyway is worse than declining: --index-url makes _install_env_for_cmd strip pip.conf and
-    ~/.netrc, the only channel that can carry that credential.
+    anyway is worse than declining: --index-url makes _install_env_for_cmd strip pip.conf's
+    index keys and ~/.netrc, the only channel that can carry that credential.
     """
     if "?" in _PYTORCH_WHL_BASE or "#" in _PYTORCH_WHL_BASE:
         _warn_query_index_unusable(_PYTORCH_WHL_BASE)
@@ -7296,7 +7297,31 @@ def _build_uv_cmd(args: tuple[str, ...]) -> list[str]:
     _tb = os.environ.get("UV_TORCH_BACKEND", "")
     if _tb and not _is_pinned_index_cmd(cmd):
         cmd.append(f"--torch-backend={_tb}")
+    cmd.extend(_uv_only_binary_args(cmd))
     return cmd
+
+
+def _uv_only_binary_args(cmd: "list[str]") -> "list[str]":
+    """The operator's only-binary, as uv flags, for a pinned command.
+
+    uv reads neither pip.conf nor PIP_ONLY_BINARY, and a pinned command runs with
+    UV_NO_CONFIG=1 since a discovered uv.toml outranks the CLI pin (#6898), so the
+    environment alone leaves the policy unenforced on the leg that runs. Measured on uv
+    0.10.7: a pinned install builds the sdist with PIP_ONLY_BINARY=:all: set and refuses it
+    given --only-binary. Pinned only: others keep their config file and uv applies it.
+    """
+    if not _is_pinned_index_cmd(cmd):
+        return []
+    # Read it off the env this very command will run with, not by asking again: two reads
+    # can disagree if the first fails and the second succeeds, which would put the policy
+    # in the environment while leaving it off the argv that decides.
+    value = (_install_env_for_cmd(cmd) or {}).get("PIP_ONLY_BINARY", "")
+    args: list[str] = []
+    # Repeatable rather than comma joined, which is the spelling uv takes (pip takes both).
+    for part in value.split(","):
+        if part.strip():
+            args.extend(["--only-binary", part.strip()])
+    return args
 
 
 # uv ranks --index-url LOWEST, so inherited index vars defeat a pinned repair; neutralise them.
@@ -7322,42 +7347,98 @@ def _is_pinned_index_cmd(cmd: "list[str] | tuple[str, ...]") -> bool:
     return any(arg in ("--index-url", "--default-index") for arg in cmd)
 
 
-# Restrictive policy a pinned install must not inherit from the ENVIRONMENT. The pinned
-# branch neutralises the config FILES (UV_NO_CONFIG=1 + PIP_CONFIG_FILE=devnull), but an
-# env var outranks a config file, so a hardened shell could still fail a torch repair the
-# pin was supposed to make deterministic (#8530).
-_PM_POLICY_ENV_VARS = (
-    "UV_NO_BUILD",
-    "UV_NO_BUILD_PACKAGE",
-    "UV_NO_BINARY",
-    "UV_NO_BINARY_PACKAGE",
+# Unsatisfiable, not relaxed: every requirements file we ship is unhashed, so
+# require-hashes can only abort (#8530). Env beats config, so the variables go too.
+_PM_HASH_ENV_VARS = (
     "UV_REQUIRE_HASHES",
-    "UV_EXCLUDE_NEWER",
-    "PIP_ONLY_BINARY",
-    "PIP_NO_BINARY",
     "PIP_REQUIRE_HASHES",
 )
 
+# no-binary would FORCE a source build of a pinned wheel: clearing it is less build-time
+# execution, not more. UV_EXCLUDE_NEWER because only uv reads it, so honouring it on the uv
+# leg alone would let the pip fallback install past the cutoff.
+_PM_FORCE_SOURCE_ENV_VARS = (
+    "UV_NO_BINARY",
+    "UV_NO_BINARY_PACKAGE",
+    "PIP_NO_BINARY",
+    "UV_EXCLUDE_NEWER",
+)
+
+# PIP_ONLY_BINARY stays in force: the pinned indexes serve wheels, so it costs the pin
+# nothing. Measured on uv 0.10.7, UV_NO_BUILD / UV_NO_BINARY / UV_ONLY_BINARY are not uv
+# environment variables at all, so no uv.toml no-build can reach a pinned command.
+
 
 def _relaxed_pip_policy_env(cmd: "list[str]") -> "dict[str, str]":
-    """Overrides that stop a hardened user pip config failing the installer's own pip.
+    """Hash mode off for one pip install / download / wheel, and nothing else relaxed.
 
-    Empty for anything that is not a `pip install` / `pip download` / `pip wheel` this
-    module drives, every `uv` command included, so the "non-pinned installs inherit the
-    caller env unchanged" contract holds on a machine with no hostile pip config.
-    `wheel` is in that set because the duplicate-metadata repair stages its replacement
-    with `pip wheel`, where require-hashes applies exactly as it does to install: an
-    unpinned name is rejected before anything is built, so the repair would abort on a
-    hardened machine and leave the conflict it exists to remove.
-
-    `require-hashes = true` makes pip reject any requirement without a --hash, which is
-    every requirements file we ship; that is what took the pip FALLBACK down in #8530
-    once uv had failed. pip applies env vars AFTER config files, so PIP_REQUIRE_HASHES=0
-    overrides it while pip.conf's index-url, trusted-host, cert and proxy stay in force.
+    pip applies env vars AFTER config files, so this wins while pip.conf's index-url, cert,
+    proxy and only-binary stay in force; the wheel-less requirements go through the
+    package-scoped --no-binary in _sdist_only_build_args(). `wheel` is in the set because
+    the duplicate-metadata repair stages with it, and require-hashes rejects that too
+    (#8530).
     """
-    if cmd[:1] == ["uv"] or not any(arg in ("install", "download", "wheel") for arg in cmd):
+    if not _is_pip_subcommand(cmd, ("install", "download", "wheel")):
         return {}
     return {"PIP_REQUIRE_HASHES": "0"}
+
+
+def _executable_stem(path: str) -> str:
+    """argv[0] as a bare program name, on either platform's spelling.
+
+    Both separators, because os.path.basename does not split a backslash off-Windows and
+    the same argv reaches here from a Windows host, a test, or WSL interop.
+    """
+    leaf = re.split(r"[\\/]", path)[-1]
+    return leaf.split(".")[0].lower()
+
+
+def _is_pip_subcommand(cmd: "list[str]", subcommands: "tuple[str, ...]") -> bool:
+    """True when ``cmd`` is a pip invocation whose SUBCOMMAND is one of ``subcommands``.
+
+    Structural, so the relaxation cannot ride along on a requirements path, a package
+    named ``wheel``, or a uv command that merely contains the word.
+    """
+    args = list(cmd)
+    if args[:1] == ["uv"]:
+        return False
+    if len(args) >= 3 and args[1] == "-m" and args[2] in ("pip", "pip3"):
+        args = args[3:]
+    elif args and _executable_stem(args[0]) in ("pip", "pip3"):
+        args = args[1:]
+    else:
+        return False
+    # The first token that NAMES a subcommand, not the first without a dash:
+    # `pip --cache-dir /tmp/c install x` puts a bare path before it.
+    for arg in args:
+        if arg in _PIP_SUBCOMMANDS:
+            return arg in subcommands
+    return False
+
+
+# pip 26.2 `pip --help`; only marks where the options stop, so a missing future one is free.
+_PIP_SUBCOMMANDS = frozenset(
+    (
+        "install",
+        "download",
+        "uninstall",
+        "freeze",
+        "inspect",
+        "list",
+        "show",
+        "check",
+        "config",
+        "search",
+        "cache",
+        "index",
+        "wheel",
+        "hash",
+        "completion",
+        "debug",
+        "help",
+        "lock",
+    )
+)
 
 
 def _uv_is_offline() -> bool:
@@ -7517,13 +7598,16 @@ def _pip_config_without_sources(directory: str) -> str:
             [sys.executable, "-m", "pip", "config", "list"],
             stdout = subprocess.PIPE,
             stderr = subprocess.DEVNULL,
+            # Dictate the child's encoding; see _decode_pip_output for why sniffing it
+            # afterwards does not work. A non-ASCII cert path must survive this read.
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8"},
             **_windows_hidden_subprocess_kwargs(),
         )
     except OSError:
         result = None
     sections: dict[str, list[tuple[str, str]]] = {}
     if result is not None and result.returncode == 0:
-        for line in (result.stdout or b"").decode("utf-8", "replace").splitlines():
+        for line in _decode_pip_output(result.stdout or b"").splitlines():
             name, separator, raw = line.partition("=")
             if not separator or name.startswith(":env:"):
                 continue
@@ -7652,13 +7736,13 @@ def _install_env_for_cmd(cmd: "list[str]") -> "dict[str, str] | None":
     """Return an env with the uv index vars stripped for a pinned-index install.
 
     None (inherit env) when the command does NOT pin an index, so ordinary installs honour
-    the user's mirror. For pinned commands, the uv index/backend vars are removed,
-    UV_NO_CONFIG=1 set (a discovered uv.toml outranks the CLI pin), and PIP_CONFIG_FILE
-    pointed at os.devnull for the pip fallback. Mirrors install.sh's gate (#6898).
+    the user's mirror. Pinned ones also get UV_NO_CONFIG=1, since a discovered uv.toml
+    outranks the CLI pin (#6898), and no blanket amnesty from the operator's policy: only
+    the hash and no-binary variables go, for the reasons at their definitions.
 
-    A non-pinned `pip` command also gets hash-required mode switched off, the one
-    relaxation with no command-line equivalent; the wheel-less requirements go through
-    the package-scoped --no-binary in _sdist_only_build_args() instead.
+    PIP_CONFIG_FILE stays at os.devnull, the ONLY way to stop a site or global pip.conf
+    contributing (measured on pip 26.2: naming a real file suppresses the per-user file
+    alone). What that removes is put back key by key by _pinned_pip_config_overrides().
     """
     if not _is_pinned_index_cmd(cmd):
         relaxed = _relaxed_pip_policy_env(cmd)
@@ -7670,11 +7754,168 @@ def _install_env_for_cmd(cmd: "list[str]") -> "dict[str, str] | None":
     env = os.environ.copy()
     for name in _UV_INDEX_ENV_VARS:
         env.pop(name, None)
-    for name in _PM_POLICY_ENV_VARS:
+    for name in _PM_HASH_ENV_VARS + _PM_FORCE_SOURCE_ENV_VARS:
         env.pop(name, None)
+    # Both config files go for the pin, so re-assert what they carried that it does not
+    # conflict with, from the section belonging to THIS command.
+    for name, value in _pinned_pip_config_overrides(_pip_subcommand_of(cmd)).items():
+        # Not setdefault: pip ignores an EMPTY environment value and falls through to the
+        # config file (verified with `pip config debug`), which devnull has just removed.
+        if not env.get(name):
+            env[name] = value
     env["UV_NO_CONFIG"] = "1"
     env["PIP_CONFIG_FILE"] = os.devnull
     return env
+
+
+# What devnull must not take with it: transport, without which a private index cannot be
+# reached, plus only-binary. An ALLOWLIST: a config file holds options for any subcommand.
+# Absent on purpose: the source keys, no-binary and require-hashes.
+_PINNED_PIP_CONFIG_KEEP_KEYS = (
+    "cert",
+    "client-cert",
+    "proxy",
+    "trusted-host",
+    "timeout",
+    "retries",
+    "keyring-provider",
+    "only-binary",
+)
+
+# pip config is per subcommand: measured on pip 26.2, `[download] no-index` stops a
+# `pip download` and leaves `pip install` alone. A PIP_ variable is command-wide, so the
+# only faithful translation reads `[global]` plus the section for the command being run.
+# A uv command defaults to install, since the PIP_ vars only reach its pip fallback.
+_PINNED_PIP_CONFIG_GLOBAL_SECTION = "global"
+_PINNED_PIP_CONFIG_DEFAULT_SECTION = "install"
+
+# Keys pip reads as a LIST, and the separator each is spelled with in the environment.
+# Only these: elsewhere the newline `pip config list` renders is part of one value, and
+# collapsing it would corrupt a path like `C:\Program  Files\ca.pem`.
+_PINNED_PIP_CONFIG_SEPARATORS = {"trusted-host": " ", "only-binary": ","}
+
+# ...and of those, the one pip ACCUMULATES across sections instead of overriding. Asked of
+# pip 26.2's parser with both sections set, `trusted_hosts` holds the install value alone
+# (assigned per section) while `format_control` holds both (a callback that mutates in
+# place). Accumulating trusted-host would re-trust a host install dropped, a TLS decision.
+_PINNED_PIP_CONFIG_ACCUMULATING = frozenset({"only-binary"})
+
+_PINNED_PIP_CONFIG_LISTING: "bytes | None" = None
+
+# Failures are NOT memoised, so a transient miss cannot cost the operator their cert and
+# proxy for the whole run, and a venv that has no pip YET can answer once it does. Only the
+# expensive failure is budgeted: a hang would otherwise pay the timeout once per pinned
+# command. A fast failure costs milliseconds and stays freely retryable.
+_PINNED_PIP_CONFIG_TIMEOUT = 30
+_PINNED_PIP_CONFIG_ATTEMPTS = 2
+
+
+def _pip_subcommand_of(cmd: "list[str]") -> str:
+    """The pip subcommand ``cmd`` runs, or the default when it is not a pip command."""
+    for name in ("install", "download", "wheel"):
+        if _is_pip_subcommand(cmd, (name,)):
+            return name
+    return _PINNED_PIP_CONFIG_DEFAULT_SECTION
+
+
+def _pinned_pip_config_overrides(
+    subcommand: str = _PINNED_PIP_CONFIG_DEFAULT_SECTION,
+) -> "dict[str, str]":
+    """pip's configured transport and binary policy, as PIP_ environment variables.
+
+    ONLY a successful read is memoised, or a transient miss would cost the operator their
+    cert and proxy for the rest of the run, and a venv with no pip yet could never answer
+    once it has one. A HANG is budgeted instead, so a wedged pip costs the run one timeout
+    budget rather than one per pinned command. Empty when pip cannot answer, the normal
+    case early in a fresh venv. `:env:` rows are skipped: the child inherits those.
+    """
+    global _PINNED_PIP_CONFIG_LISTING, _PINNED_PIP_CONFIG_ATTEMPTS
+    if _PINNED_PIP_CONFIG_LISTING is not None:
+        return _parse_pinned_pip_config(_PINNED_PIP_CONFIG_LISTING, subcommand)
+    if _PINNED_PIP_CONFIG_ATTEMPTS <= 0:
+        return {}
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "pip", "config", "list"],
+            stdout = subprocess.PIPE,
+            stderr = subprocess.DEVNULL,
+            # Dictate the child's encoding; see _decode_pip_output. Guessing loses a
+            # non-ASCII cert path, and pip then fails rather than dropping the setting.
+            env = {**os.environ, "PYTHONIOENCODING": "utf-8"},
+            timeout = _PINNED_PIP_CONFIG_TIMEOUT,
+            **_windows_hidden_subprocess_kwargs(),
+        )
+    except subprocess.TimeoutExpired:
+        _PINNED_PIP_CONFIG_ATTEMPTS -= 1
+        return {}
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if result.returncode != 0:
+        return {}
+    _PINNED_PIP_CONFIG_LISTING = result.stdout or b""
+    return _parse_pinned_pip_config(_PINNED_PIP_CONFIG_LISTING, subcommand)
+
+
+def _decode_pip_output(raw: bytes) -> str:
+    r"""`pip config list` bytes as text.
+
+    The child is told to write UTF-8 (see PYTHONIOENCODING above). The fallback covers a
+    listing produced some other way, a pip old enough to ignore that variable among them,
+    where the locale codec is the child's encoding since both share a locale. Sniffing
+    replaces neither: cp1252 bytes can form valid UTF-8, so it is not recoverable after.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(locale.getpreferredencoding(False), "replace")
+
+
+def _parse_pinned_pip_config(
+    stdout: bytes, subcommand: str = _PINNED_PIP_CONFIG_DEFAULT_SECTION
+) -> "dict[str, str]":
+    """`pip config list` output, filtered to the allowlist, as PIP_ variables.
+
+    Reads `[global]` plus `[<subcommand>]`, the two sections pip itself would apply to that
+    command, with the command section winning. Resolved by position rather than by the
+    order the listing prints in. An unparseable line is skipped, never fatal.
+    """
+    sections = (_PINNED_PIP_CONFIG_GLOBAL_SECTION, subcommand)
+    found: dict[str, dict[str, str]] = {}
+    for line in _decode_pip_output(stdout).splitlines():
+        name, separator, raw = line.partition("=")
+        if not separator or name.startswith(":env:"):
+            continue
+        section, _, option = name.strip().rpartition(".")
+        if section not in sections:
+            continue
+        if option not in _PINNED_PIP_CONFIG_KEEP_KEYS:
+            continue
+        try:
+            value = ast.literal_eval(raw.strip())
+        except (ValueError, SyntaxError):
+            continue
+        separator_for_key = _PINNED_PIP_CONFIG_SEPARATORS.get(option)
+        if separator_for_key is None:
+            text = str(value).strip()
+        else:
+            text = separator_for_key.join(str(value).split())
+        if text:
+            found.setdefault(option, {})[section] = text
+    overrides: dict[str, str] = {}
+    for option, by_section in found.items():
+        separator_for_key = _PINNED_PIP_CONFIG_SEPARATORS.get(option)
+        present = [by_section[name] for name in sections if name in by_section]
+        if option not in _PINNED_PIP_CONFIG_ACCUMULATING:
+            value = present[-1]  # the command's section overrides global
+        else:
+            # Accumulates across sections, and pip applies the entries IN ORDER, so a
+            # re-add outranks the `:none:` that empties the set. Measured on pip 26.2:
+            # [global] a,b plus [install] :none:,a keeps a. Deduplicating left `:none:`
+            # last instead, letting a pinned install build the forbidden sdist.
+            parts = [part for chunk in present for part in chunk.split(separator_for_key) if part]
+            value = separator_for_key.join(parts)
+        overrides[f"PIP_{option.upper().replace('-', '_')}"] = value
+    return overrides
 
 
 def pip_install_try(
