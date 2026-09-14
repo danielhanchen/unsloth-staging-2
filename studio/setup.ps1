@@ -4841,9 +4841,8 @@ $UseUv = $false
 if (Get-Command uv -ErrorAction SilentlyContinue) {
     $UseUv = $true
 } elseif ((Get-UvInstallDir) -and (Test-Path -LiteralPath (Join-Path (Get-UvInstallDir) "uv.exe"))) {
-    # Already installed, just not on this process's PATH: the install writes uv.exe here and
-    # prepends the user registry PATH, which an update inheriting its parent's PATH never sees,
-    # so every update re-downloaded it.
+    # Already installed, just not on this process's PATH. The install prepends the user registry
+    # PATH, which an update inheriting its parent's PATH never sees, so every update re-downloaded it.
     $env:PATH = (Get-UvInstallDir) + ";" + $env:PATH
     $UseUv = $true
 } elseif (-not $StageRoot) {
@@ -4865,10 +4864,10 @@ if (Get-Command uv -ErrorAction SilentlyContinue) {
         # Re-activate venv since Refresh-Environment rebuilds PATH from
         # registry and drops the venv's Scripts directory
         Enter-StudioVenv
-        # Refresh-Environment rebuilds PATH from the registry, and the user-PATH prepend does
-        # not always land there (UV_NO_MODIFY_PATH, UV_UNMANAGED_INSTALL, a runner that pins its
-        # own environment). Without this the installing run falls back to pip and records a
-        # manifest with no uv_version, which the next run rewrites.
+        # Refresh-Environment rebuilds PATH from the registry, where the user-PATH prepend does
+        # not always land (UV_NO_MODIFY_PATH, UV_UNMANAGED_INSTALL, a runner pinning its own
+        # environment). Without this the installing run falls back to pip and writes a manifest
+        # with no uv_version, which the next run rewrites.
         $uvDir = Get-UvInstallDir
         if ($uvDir -and (Test-Path -LiteralPath (Join-Path $uvDir "uv.exe"))) {
             $env:PATH = $uvDir + ";" + $env:PATH
@@ -4952,9 +4951,8 @@ function Fast-Download {
 # ── Check if Python deps need updating ──
 # Compare installed package version against PyPI latest.
 # Skip all Python dependency work if versions match (fast update path).
-# Does the venv on disk claim, and prove, a finished install? One implementation for the
-# incomplete-install guard (forces the pass on no) and the offline rule (keeps the fast path on
-# yes), so they cannot disagree about "complete".
+# Does the venv prove a finished install? One implementation for the incomplete-install guard
+# and the offline rule, so they cannot disagree about "complete".
 function Test-StudioInstallVerified {
     try {
         & python -c "
@@ -4986,16 +4984,15 @@ function Test-UvOfflineRequested {
 }
 
 function Invoke-FastPathEscapes {
-    # Every reason an "up to date" package is still not a working install. Both callers that can
-    # keep the fast path run it, so an offline skip meets the online bar. Test-StudioInstallVerified
-    # and the AMD/ROCm probe stay out (each caller words them differently). A plain assignment in a
-    # function is LOCAL, so the flag is copied in and published once on the way out.
+    # Every reason an "up to date" package is still not a working install. Both fast-path callers
+    # run it, so an offline skip meets the online bar. Test-StudioInstallVerified and the AMD/ROCm
+    # probe stay out: each caller words them differently. A plain assignment in a function is LOCAL,
+    # so the flag is copied in and published once on the way out.
     $SkipPythonDeps = $script:SkipPythonDeps
 
-    # The documented escape hatch, first: install_python_stack.py honours UNSLOTH_STUDIO_FULL_DEPS
-    # but is never invoked once the version compare skips, so it did nothing for exactly the "up to
-    # date" and broken install it exists for. Inline so the tests can slice this function out whole;
-    # the values are Test-UvOfflineRequested's.
+    # The documented escape hatch, first: install_python_stack.py honours
+    # UNSLOTH_STUDIO_FULL_DEPS but never runs once the version compare skips, so it did nothing
+    # for exactly the up-to-date broken install it exists for.
     $_fullDepsRequested = "$($env:UNSLOTH_STUDIO_FULL_DEPS)".Trim()
     if (@('1', 'true', 'yes', 'on') -contains $_fullDepsRequested.ToLowerInvariant()) {
         substep "UNSLOTH_STUDIO_FULL_DEPS is set -- forcing dependency pass..." "Cyan"
@@ -5022,9 +5019,8 @@ sys.exit(0 if (major, minor) >= (4, 14) else 1)
         substep "anyio >=4.14 found (#6483) -- forcing dependency pass to repair..." "Cyan"
         $SkipPythonDeps = $false
     }
-    # As setup.sh: a pre-pin tokenizers the installed transformers rejects takes down every `import
-    # transformers` while $_PkgName is current. Ask the metadata, not the broken import; an
-    # unreadable half exits 1 and changes nothing.
+    # As setup.sh: a pre-pin tokenizers the installed transformers rejects breaks every `import
+    # transformers` while $_PkgName is current. Ask the metadata, not the broken import.
     $_tokenizersBad = $false
     try {
         & python -c "
@@ -5072,9 +5068,9 @@ sys.exit(0 if installed is not None and required is not None and installed >= re
             $SkipPythonDeps = $false
         }
     }
-    # ...and for an Intel GPU, or a CPU wheel stays forever. Both escapes reach the XPU install and
-    # its remediations, gated on $XpuIndexUrl, so $_xpuIsReachable holds them back where a pin or
-    # no-torch mode sends this host elsewhere and they would re-fire forever.
+    # ...and for an Intel GPU, or a CPU wheel stays forever. Both escapes reach the XPU install,
+    # gated on $XpuIndexUrl, so $_xpuIsReachable holds them back where a pin or no-torch mode
+    # sends this host elsewhere and they would re-fire forever.
     $_pinLeafNow = Get-TorchIndexLeaf (Get-PinnedTorchIndexUrl)
     $_xpuIsReachable = (-not $NoTorchMode) -and ((-not $_pinLeafNow) -or ($_pinLeafNow -eq "xpu"))
     if ($script:IsIntelXpu -and $SkipPythonDeps -and $_xpuIsReachable) {
@@ -5086,8 +5082,8 @@ sys.exit(0 if installed is not None and required is not None and installed >= re
         }
     }
     # The installed wheel as well as the scan: an explicit xpu pin on a mixed NVIDIA + Intel box
-    # ends up on XPU with $script:IsIntelXpu false, and would fast-path past the bitsandbytes floor
-    # and Triton replacement forever.
+    # ends up on XPU with $script:IsIntelXpu false, fast-pathing past the bitsandbytes floor and
+    # the Triton replacement forever.
     if ($SkipPythonDeps -and $_xpuIsReachable -and ($script:IsIntelXpu -or $installedTorchTag -eq "xpu")) {
         $_xpuDepsCode = "import importlib.metadata as m; " +
             "print('BNB=' + next((d.version for d in m.distributions() " +
@@ -5160,10 +5156,10 @@ sys.exit(2 if conflict else (0 if version else 1))
     } elseif ($InstalledVer -and $LatestVer) {
         substep "$_PkgName $InstalledVer -> $LatestVer available, updating..."
     } elseif (-not $LatestVer) {
-        # PyPI unreachable: updating to be safe stays the default (a blip, and a warm-cache pass is
-        # cheap). UV_OFFLINE is not a blip: every install in that pass can only fail, so a verified
-        # tree is kept, on the incomplete-install guard's own evidence, and then held to the same
-        # escapes as the up-to-date branch (a verified tree can still be below the floor).
+        # PyPI unreachable: updating to be safe stays the default, since it is usually a blip.
+        # UV_OFFLINE is not a blip, so a verified tree is kept instead, on the incomplete-install
+        # guard's evidence and held to the up-to-date branch's escapes (it can still be below the
+        # floor).
         if ($InstalledVer -and (Test-UvOfflineRequested) -and (Test-StudioInstallVerified)) {
             substep "PyPI is unreachable and UV_OFFLINE is set -- keeping the verified install"
             $SkipPythonDeps = $true
@@ -5175,8 +5171,7 @@ sys.exit(2 if conflict else (0 if version else 1))
     }
 
     # A current package can still have CPU torch on an AMD host. After the chain and gated on the
-    # flag, as setup.sh keeps it, so it covers the UV_OFFLINE branch too; a probe whose answer
-    # cannot change a forced pass is skipped.
+    # flag, as setup.sh keeps it, so it covers the UV_OFFLINE branch too.
     if ($SkipPythonDeps) {
         # ...but not if an AMD GPU is present and installed PyTorch is CPU-only
         # (host predates ROCm-wheel support, or GPU added later): the fast "up to
@@ -5411,12 +5406,15 @@ if ($ROCmIndexUrl) {
     # As the XPU and CPU arms: force only when the resident torch is not this family, the pin moved
     # or the import failed. Unconditional --force-reinstall re-resolved the trio every update.
     $rocmForce = @()
+    # The same escape hatch the Python pass honours, in the same spellings: a skip nobody can turn
+    # off is a bug nobody can work around, and this arm is reached before the pass runs.
+    if (@("1", "true", "yes", "on") -contains "$($env:UNSLOTH_STUDIO_FULL_DEPS)".Trim().ToLowerInvariant()) { $rocmForce = @("--force-reinstall") }
     if ($installedTorchTag -ne "rocm") { $rocmForce = @("--force-reinstall") }
     if ($script:PinChangedForceReinstall) { $rocmForce = @("--force-reinstall") }
     if ($script:TorchImportDefinitivelyFailed) { $rocmForce = @("--force-reinstall") }
-    # +rocm names the family, not the architecture: a changed UNSLOTH_ROCM_GFX_ARCH or replaced card
-    # moves $ROCmIndexUrl while the trio still satisfies its pins, so the index a trio came from is
-    # recorded; another index, or no record, takes the reinstall.
+    # +rocm names the family, not the architecture: a changed UNSLOTH_ROCM_GFX_ARCH or replaced
+    # card moves $ROCmIndexUrl while the trio still satisfies its pins, so the index it came from
+    # is recorded. Another index, or no record, takes the reinstall.
     $script:RocmIndexRecord = Join-Path $VenvDir ".unsloth-rocm-index"
     $_rocmIndexIdentity = Get-IndexIdentity $ROCmIndexUrl
     $_recordedRocmIndex = ""
@@ -5432,13 +5430,12 @@ if ($ROCmIndexUrl) {
         $rocmForce = @("--force-reinstall")
     }
     if ($installedTorchTag -eq "rocm" -and $rocmForce.Count -eq 0 -and $VenvPyExe -and (Test-Path -LiteralPath $VenvPyExe)) {
-        # torch alone names the family: a companion re-resolved from PyPI (no local tag, or +cpu /
-        # +cuNNN) satisfies its pin without linking ROCm and the pinned install leaves it. AMD tags
-        # all three +rocm; community wheels carry a git hash. Payload too: a dist-info without its
-        # package, or a RECORD row gone or resized, is damage the pinned install would not repair.
-        # RECORD rows, not Distribution.files (3.13 filters to existing files); bytecode left out.
-        # No answer forces the trio. Only the companions the trio installs: Windows on ARM has no
-        # torchaudio, so a leftover one there is not a repairable mismatch.
+        # torch alone names the family: a companion re-resolved from PyPI (+cpu, +cuNNN or no
+        # tag) satisfies its pin without linking ROCm, and the pinned install leaves it. AMD tags
+        # all three +rocm. Payload too, since a dist-info without its package or a RECORD row gone
+        # or resized is damage the pinned install would not repair; rows, not Distribution.files
+        # (3.13 filters to existing files), bytecode left out. No answer forces the trio. Only the
+        # companions the trio installs: Windows on ARM has no torchaudio to repair.
         $_companionNames = if ($WinArm64NoAudio) { "('torchvision',)" } else { "('torchvision', 'torchaudio')" }
         $_companionProbe = Invoke-BoundedPythonProbe -PythonExe $VenvPyExe -Code "import csv, io, importlib.util as u, importlib.metadata as m, os; out = []`nfor n in $($_companionNames):`n    try:`n        d = m.distribution(n)`n    except m.PackageNotFoundError:`n        continue`n    v = d.version`n    if u.find_spec(n) is None:`n        out.append(n + '==' + v + ' (payload missing)')`n        continue`n    rec = d.read_text('RECORD')`n    damaged = not rec`n    for row in csv.reader(io.StringIO(rec or '')):`n        if damaged or len(row) < 3 or not row[0] or row[0].endswith('.pyc') or not row[2]:`n            continue`n        try:`n            damaged = os.stat(d.locate_file(row[0])).st_size != int(row[2])`n        except (OSError, ValueError):`n            damaged = True`n    if damaged:`n        out.append(n + '==' + v + ' (payload damaged)')`n        continue`n    t = (v.split('+', 1) + [''])[1].lower()`n    if not t or t.startswith('cpu') or t.startswith('cu') or t.startswith('xpu'):`n        out.append(n + '==' + v)`nprint(' '.join(out))"
         $_companionMismatch = if ($_companionProbe.Ok) { $_companionProbe.Output.Trim() } else { "probe did not answer" }
@@ -5918,15 +5915,11 @@ function Test-TargetPackageVersion {
     return $false
 }
 
-# The pins, once, audited by install_manifest.sidecar_is_current and installed by Install-T5Sidecar;
-# mirrors _SIDECAR_COMMON_PINS in setup.sh. Every name must be one the audit can reach (a package
-# directory, or the RECORD's top-level names: six.py, PIL), or it reads stale forever and every
-# update refetches the sidecar. tiktoken is not a pin: its install is optional, so a sidecar without
-# it is finished; Repair-SidecarTiktoken retries it alone.
+# Audited AND installed from here; mirrors _SIDECAR_COMMON_PINS in setup.sh. A name the audit
+# cannot reach on disk reads stale forever.
 $SidecarCommonPins = @("huggingface_hub==1.8.0", "hf_xet==1.4.2")
 
-# Mirror of setup.sh's fast_install_sidecar: an inherited UV_OVERRIDE naming huggingface_hub would
-# replace the exact pin, the audit would reject it, and every setup would rebuild.
+# Mirrors fast_install_sidecar: an inherited UV_OVERRIDE would replace the pin and force rebuilds.
 function Fast-Install-Sidecar {
     param([Parameter(ValueFromRemainingArguments=$true)]$Args_)
     $savedOverride = $env:UV_OVERRIDE
@@ -5939,10 +5932,7 @@ function Fast-Install-Sidecar {
 }
 
 function Remove-SidecarTiktoken {
-    # A failed tiktoken install's remnants shadow a working ambient copy from ahead of
-    # site-packages, and being unpinned nothing else clears them. Every entry the wheel owns, as the
-    # runtime's _remove_optional_remnants. $false when one would not go (held open, an ACL): the
-    # caller then retires the whole sidecar, which the predicate would still call current.
+    # Remnants of a failed tiktoken install shadow the ambient copy and nothing else clears them.
     param([Parameter(Mandatory = $true)][string]$TargetDir)
     foreach ($name in @("tiktoken", "tiktoken_ext", "tiktoken.libs")) {
         $entry = Join-Path $TargetDir $name
@@ -5958,7 +5948,6 @@ function Remove-SidecarTiktoken {
 }
 
 function Retire-SidecarAfterFailedTiktoken {
-    # Part of tiktoken remains: the sidecar goes, best effort; the runtime withholds the rest.
     param(
         [Parameter(Mandatory = $true)][string]$TargetDir,
         [Parameter(Mandatory = $true)][string]$DirName
@@ -5977,11 +5966,8 @@ function Repair-SidecarTiktoken {
     if ($script:OfflineFastPath) { return }
     # And under UV_OFFLINE without the fast path: the pip fallback would reach for the network.
     if (Test-UvOfflineRequested) { return }
-    # The payload AND a complete dist-info (RECORD is written last), as _sidecar_top_up_tiktoken and
-    # the runtime check: an interrupted install leaves either without the other, the predicate
-    # accepts both, and a weaker check would skip this top-up while Qwen tokenizers fail. A
-    # recordless dist-info goes first: uv cannot uninstall it and importlib.metadata may keep
-    # answering it.
+    # Payload AND dist-info (RECORD is written last): an interrupted install leaves one without the
+    # other. A recordless dist-info goes first; uv cannot uninstall it, metadata still reads it.
     Get-ChildItem -LiteralPath $TargetDir -Directory -Filter "tiktoken-*.dist-info" -ErrorAction SilentlyContinue |
         Where-Object { -not (Test-Path -LiteralPath (Join-Path $_.FullName "RECORD") -PathType Leaf) } |
         ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
@@ -5989,11 +5975,12 @@ function Repair-SidecarTiktoken {
         Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "RECORD") -PathType Leaf })
     $payload = Join-Path $TargetDir "tiktoken"
     if ($present.Count -gt 0 -and (Test-Path -LiteralPath (Join-Path $payload "__init__.py") -PathType Leaf)) { return }
-    # Not present, so every tiktoken dist-info here describes a missing or damaged payload and goes
-    # before the install: --upgrade lands the new dist-info beside the old one.
+    # Dropping the metadata is what makes uv reinstall instead of calling the pin satisfied.
     Get-ChildItem -LiteralPath $TargetDir -Directory -Filter "tiktoken-*.dist-info" -ErrorAction SilentlyContinue |
         ForEach-Object { Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue }
-    # --upgrade: a --target install without it keeps a damaged tiktoken\ under fresh metadata.
+    # Cleared first: an install that runs no native command would retire the sidecar on a stale
+    # nonzero (unresolvable uv is non-terminating under "Continue").
+    $global:LASTEXITCODE = 0
     $output = Fast-Install-Sidecar --target $TargetDir --no-deps --upgrade tiktoken 2>&1 | Out-String
     if ($LASTEXITCODE -ne 0) {
         if (Remove-SidecarTiktoken -TargetDir $TargetDir) {
@@ -6005,8 +5992,7 @@ function Repair-SidecarTiktoken {
 }
 
 function Test-SidecarCurrent {
-    # One predicate for both shells (install_manifest.py): the shell reimplementation called a
-    # half-written sidecar with a transformers 5.3.0 METADATA "current".
+    # One predicate for both shells: the shell reimplementation called a half-written sidecar current.
     param(
         [Parameter(Mandatory = $true)][string]$TargetDir,
         [Parameter(Mandatory = $true)][string]$Version
@@ -6018,13 +6004,16 @@ function Test-SidecarCurrent {
     }
     $pins = @("transformers==$Version") + $SidecarCommonPins
     $out = ""
-    # A bounded process, not a native command: the shim cannot interrupt a stalled RECORD read (a
-    # wedged mount), and a native nonzero exit ("stale") terminates under
-    # $PSNativeCommandUseErrorActionPreference. The argv travels base64-encoded so quotes and
-    # backslashes cannot break -c. A timeout reads as stale, and the rebuild follows.
+    # A bounded process, not a native command: a native nonzero exit terminates under
+    # $PSNativeCommandUseErrorActionPreference. argv is base64 so quoting cannot break -c, and the
+    # venv interpreter comes first, as in setup.sh: a PATH `python` can be the Store alias stub.
     $pythonExe = $null
     $probe = $null
-    try { $pythonExe = (Get-Command python -ErrorAction Stop).Source } catch { $pythonExe = $null }
+    if ($VenvPyExe -and (Test-Path -LiteralPath $VenvPyExe -PathType Leaf)) {
+        $pythonExe = $VenvPyExe
+    } else {
+        try { $pythonExe = (Get-Command python -ErrorAction Stop).Source } catch { $pythonExe = $null }
+    }
     if ($pythonExe) {
         $argv = (@($shim, "sidecar", $TargetDir) + $pins) -join [char]0
         $encoded = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($argv))
@@ -6036,19 +6025,18 @@ function Test-SidecarCurrent {
             $out = ([string]$probe.Output).Trim()
         }
     }
-    # The marker, not the exit code alone: an install_manifest.py predating the shim exits 0
-    # silently.
     if ($out -eq "sidecar: current") { return $true }
     if ($out -like "sidecar:*") {
-        if ($script:UnslothVerbose) { substep "sidecar $TargetDir`: $($out.Substring(9))" }
+        # A regex, not Substring: `-like` matches the bare marker too and Substring would throw.
+        if ($script:UnslothVerbose) { substep "sidecar $TargetDir`: $($out -replace '^sidecar:\s*', '')" }
         return $false
     }
-    # No marker and a failure: the audit died, which is not the legacy silent exit 0. Stale.
+    # A failure with no marker is a dead audit, not the legacy silent exit 0.
     if ($null -ne $probe -and -not $probe.Ok) {
         if ($script:UnslothVerbose) { substep "sidecar $TargetDir`: audit failed" }
         return $false
     }
-    # An old shim (clean, silent exit 0): fall back to the version grep this replaced.
+    # An old shim exits 0 silently: fall back to the grep this replaced.
     return (Test-TargetPackageVersion -TargetDir $TargetDir -PackageName "transformers" -ExpectedVersion $Version)
 }
 
@@ -6065,7 +6053,8 @@ function Install-T5Sidecar {
     if (Test-Path -LiteralPath $TargetDir) { Remove-Item -LiteralPath $TargetDir -Recurse -Force }
     [System.IO.Directory]::CreateDirectory($TargetDir) | Out-Null
     Mark-StudioOwned -Path $TargetDir
-    foreach ($pkg in @("transformers==$Version", "huggingface_hub==1.8.0", "hf_xet==1.4.2")) {
+    # From $SidecarCommonPins, not a copy: a pin demanded but never installed reads stale forever.
+    foreach ($pkg in @("transformers==$Version") + $SidecarCommonPins) {
         if ($script:UnslothVerbose) {
             Fast-Install-Sidecar --target $TargetDir --no-deps $pkg
             $t5PkgExit = $LASTEXITCODE
@@ -6099,19 +6088,15 @@ function Install-T5Sidecar {
     step "transformers" "$Version pre-installed"
 }
 
-# Per tier: the old single flag (with its `-not $SkipPythonDeps` clause) rebuilt all three sidecars
-# on every update that touched the dependency pass, 60-90 s on Windows for nothing.
 $_NeedT5_530 = $false
 $_NeedT5_550 = $false
 $_NeedT5_510 = $false
-# Under the offline keep, and under UV_OFFLINE without it: the migration is a wipe followed by three
-# rebuilds from a cache that may be cold, and the legacy tree is the only sidecar.
+# The migration is a wipe and three rebuilds from a cache that may be cold, and the legacy tree is
+# the only sidecar, so under UV_OFFLINE it waits for the next online update.
 if ((Test-Path -LiteralPath $VenvT5Legacy) -and ($script:OfflineFastPath -or (Test-UvOfflineRequested))) {
-    # The migration is a wipe followed by three rebuilds; left for the next online update.
     substep "legacy transformers sidecar left in place -- UV_OFFLINE is set, migration waits for the next online update" "Yellow"
 } elseif (Test-Path -LiteralPath $VenvT5Legacy) {
-    # Legacy layout, migrate. A staged run's tiered venvs may never be activated, so the live legacy
-    # one is removed by the live update, not here.
+    # Legacy layout. A staged run's venvs may never be activated, so only the live update migrates.
     if (-not $StageRoot) {
         Assert-StudioOwnedOrAbsent -Path $VenvT5Legacy -Label "legacy transformers sidecar venv"
         Remove-Item -LiteralPath $VenvT5Legacy -Recurse -Force
@@ -6123,10 +6108,10 @@ if ((Test-Path -LiteralPath $VenvT5Legacy) -and ($script:OfflineFastPath -or (Te
 if (-not (Test-SidecarCurrent -TargetDir $VenvT5_530Dir -Version "5.3.0")) { $_NeedT5_530 = $true }
 if (-not (Test-SidecarCurrent -TargetDir $VenvT5_550Dir -Version "5.5.0")) { $_NeedT5_550 = $true }
 if (-not (Test-SidecarCurrent -TargetDir $VenvT5_510Dir -Version "5.10.2")) { $_NeedT5_510 = $true }
-# Under the offline keep a sidecar rebuild (a wipe and four fetches, with a pip fallback that
-# reaches the network) is left for the next online update; the runtime self-heal covers a missing
-# tier meanwhile. Mirrors setup.sh's _OFFLINE_FAST_PATH guard. A deferred tier keeps its own flag so
-# the status line does not call it "current".
+# A sidecar rebuild is a wipe and four fetches, through a pip fallback that reaches the network,
+# so under the offline keep it waits for the next online update; the runtime self-heal covers a
+# missing tier meanwhile. Mirrors setup.sh. A deferred tier keeps its own flag so it is not
+# reported "current".
 $_DeferT5_530 = $false
 $_DeferT5_550 = $false
 $_DeferT5_510 = $false
