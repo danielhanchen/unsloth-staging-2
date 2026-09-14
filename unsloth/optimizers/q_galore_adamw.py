@@ -201,6 +201,8 @@ class QGaLoreAdamW8bit(Optimizer2State):
                     # dequantizes before the next forward pass.
                     p.data = torch.empty(1, dtype = p.data.dtype, device = p.data.device)
 
+                state["step"] += 1
+
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 

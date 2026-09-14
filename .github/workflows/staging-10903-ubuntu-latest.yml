@@ -1,0 +1,57 @@
+name: "staging-10903 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-10903-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_ZOO_DISABLE_GPU_INIT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install CPU deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "transformers>=5.10" peft accelerate pytest unsloth_zoo
+      - name: Cache selection and norm upcast tests
+        run: PYTHONPATH=. python -m pytest tests/ -q --tb=short
+      - name: Guard gates only the bidirectional families
+        run: |
+          PYTHONPATH=. python - <<'PY'
+          import importlib, sys
+          from unsloth.models.vision import (
+              _BIDIRECTIONAL_MASK_BUILDERS, _needs_bidirectional_multimodal_mask)
+          bad = []
+          for name in ("gemma3", "gemma4", "gemma4_unified", "qwen2_vl", "llava", "paligemma"):
+              try:
+                  mod = importlib.import_module(f"transformers.models.{name}.modeling_{name}")
+              except Exception:
+                  continue
+              gated = any(hasattr(mod, b) for b in _BIDIRECTIONAL_MASK_BUILDERS)
+              print(f"{name}: gated={gated}")
+              if name in ("qwen2_vl", "llava", "paligemma") and gated:
+                  bad.append(name)
+          if bad:
+              sys.exit(f"causal VLMs must never be gated: {bad}")
+          print("OK: causal VLMs keep the static cache path")
+          PY
