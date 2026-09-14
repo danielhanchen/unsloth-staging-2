@@ -3,12 +3,14 @@
 
 import { useEffect, useState } from "react";
 
+import { usePlatformStore } from "@/config/env";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { getHfDatasetsServerBase } from "@/lib/hf-endpoint";
 import { toast } from "@/lib/toast";
 import { cn } from "@/lib/utils";
 
@@ -24,12 +26,17 @@ import {
 const _previewCache = new Map<string, Promise<string[]>>();
 
 async function fetchPreviews(repo: string): Promise<string[]> {
-  const cached = _previewCache.get(repo);
+  // Keyed by server as well as repo: the configured one can arrive after the
+  // first fetch, and an empty result cached against the default would otherwise
+  // never be retried against the mirror.
+  const base = getHfDatasetsServerBase();
+  const cacheKey = `${base}::${repo}`;
+  const cached = _previewCache.get(cacheKey);
   if (cached) return cached;
   const p = (async () => {
     try {
       const res = await fetch(
-        `https://datasets-server.huggingface.co/first-rows?dataset=${encodeURIComponent(
+        `${base}/first-rows?dataset=${encodeURIComponent(
           repo,
         )}&config=default&split=train`,
       );
@@ -51,7 +58,7 @@ async function fetchPreviews(repo: string): Promise<string[]> {
       return [];
     }
   })();
-  _previewCache.set(repo, p);
+  _previewCache.set(cacheKey, p);
   return p;
 }
 
@@ -62,6 +69,9 @@ export function shortExampleLabel(label: string): string {
 
 function ExamplePreviews({ repo }: { repo: string }) {
   const [urls, setUrls] = useState<string[] | null>(null);
+  // In the effect identity: a server arriving after this mounts changes the
+  // cache key, and without this nothing would ask for the previews again.
+  const hfDatasetsServer = usePlatformStore((s) => s.hfDatasetsServer);
   useEffect(() => {
     let cancelled = false;
     void fetchPreviews(repo).then((u) => {
@@ -70,7 +80,7 @@ function ExamplePreviews({ repo }: { repo: string }) {
     return () => {
       cancelled = true;
     };
-  }, [repo]);
+  }, [repo, hfDatasetsServer]);
 
   if (!urls || urls.length === 0) return null;
   return (

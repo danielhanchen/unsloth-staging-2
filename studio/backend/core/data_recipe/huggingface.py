@@ -49,6 +49,7 @@ def publish_recipe_dataset(
     description: str,
     hf_token: str | None = None,
     private: bool = False,
+    link_endpoint: str | None = None,
 ) -> str:
     hf_token = account_hf_token(hf_token)
     dataset_path = _resolve_recipe_artifact_path(artifact_path)
@@ -118,6 +119,11 @@ def publish_recipe_dataset(
             builder_config_path = builder_config_path,
         )
 
-        return f"https://huggingface.co/datasets/{repo_id}"
+        from utils.hf_endpoint import get_hf_endpoint
+
+        # The upload went to get_hf_endpoint(); this URL is for the browser, and a
+        # loopback mirror is not the same host there. The caller passes the endpoint
+        # its client can actually reach, which for a remote client is the public one.
+        return f"{link_endpoint or get_hf_endpoint()}/datasets/{repo_id}"
     except HuggingFaceHubClientUploadError as exc:
         raise RecipeDatasetPublishError(str(exc)) from exc

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { getHfDatasetsServerBase, getHfEndpoint } from "@/lib/hf-endpoint";
 import { LruMap } from "./lru-map";
 import { fetchWithTimeout } from "./network";
 import { fingerprintToken } from "./token-fingerprint";
@@ -212,14 +213,16 @@ export function fetchDatasetSize(
     typeof tokenOrSignal === "string" ? tokenOrSignal : undefined;
   const resolvedSignal =
     signal ?? (typeof tokenOrSignal === "string" ? undefined : tokenOrSignal);
-  const cacheKey = `${repoId}::${fingerprintToken(resolvedToken)}`;
+  // The server is part of the key: a 404 cached against the official host would
+  // otherwise be reused for 24 hours after a mirror arrives from /api/health.
+  const cacheKey = `${getHfDatasetsServerBase()}::${repoId}::${fingerprintToken(resolvedToken)}`;
   return fetchCachedSize<DatasetSizeInfo>(
     cacheKey,
     datasetCache,
     datasetInflight,
     async (signal) => {
       const res = await fetchWithTimeout(
-        `https://datasets-server.huggingface.co/size?dataset=${encodeURIComponent(repoId)}`,
+        `${getHfDatasetsServerBase()}/size?dataset=${encodeURIComponent(repoId)}`,
         {
           signal,
           headers: resolvedToken
@@ -310,7 +313,9 @@ export function fetchModelSize(
   token?: string,
   signal?: AbortSignal,
 ): Promise<ModelSizeInfo | null> {
-  const cacheKey = `${repoId}::${fingerprintToken(token)}`;
+  // Endpoint in the key: a model 404 is cached permanently for the session, and
+  // a hit carries a download size that differs between hosts.
+  const cacheKey = `${getHfEndpoint()}::${repoId}::${fingerprintToken(token)}`;
   return fetchCachedSize<ModelSizeInfo>(
     cacheKey,
     modelCache,
@@ -318,7 +323,7 @@ export function fetchModelSize(
     async (signal) => {
       const path = repoId.split("/").map(encodeURIComponent).join("/");
       const res = await fetchWithTimeout(
-        `https://huggingface.co/api/models/${path}?blobs=true`,
+        `${getHfEndpoint()}/api/models/${path}?blobs=true`,
         {
           signal,
           headers: token ? { Authorization: `Bearer ${token}` } : undefined,

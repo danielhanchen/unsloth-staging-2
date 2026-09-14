@@ -4,6 +4,7 @@
 import { LruMap } from "@/features/hub/lib/lru-map";
 import { fetchWithTimeout } from "@/features/hub/lib/network";
 import { fingerprintToken } from "@/features/hub/lib/token-fingerprint";
+import { getHfEndpoint } from "@/lib/hf-endpoint";
 import { defaultUrlTransform, type UrlTransform } from "streamdown";
 
 export type ReadmeKind = "model" | "dataset";
@@ -38,7 +39,7 @@ export function readmeBaseUrl(
   kind: ReadmeKind,
   branch: "main" | "master" = "main",
 ): string {
-  return `https://huggingface.co/${readmePrefix(kind)}${repoId}/resolve/${branch}/`;
+  return `${getHfEndpoint()}/${readmePrefix(kind)}${repoId}/resolve/${branch}/`;
 }
 
 async function fetchReadmeOnce(
@@ -52,7 +53,11 @@ async function fetchReadmeOnce(
   let transient = false;
   for (const branch of ["main", "master"] as const) {
     try {
-      const url = `https://huggingface.co/${prefix}${repoId}/raw/${branch}/README.md`;
+      // /resolve, not /raw: /raw is a huggingface.co web route a mirror need
+      // not serve, while /resolve is what hf_hub_url builds (and what
+      // transformers_version.py::_hf_raw_url already uses). Same bytes on
+      // huggingface.co, and README.md is never LFS.
+      const url = `${getHfEndpoint()}/${prefix}${repoId}/resolve/${branch}/README.md`;
       const res = await fetchWithTimeout(
         url,
         {
@@ -80,7 +85,10 @@ export function fetchReadme(
   kind: ReadmeKind = "model",
   token: string | null = null,
 ): Promise<FetchedReadme | null> {
-  const key = `${kind}::${repoId}::${fingerprintToken(token)}`;
+  // Endpoint in the key: a successful card is cached with no expiry, so one
+  // fetched from the default host before /api/health reported the mirror would
+  // be shown for the rest of the session without the mirror ever being asked.
+  const key = `${getHfEndpoint()}::${kind}::${repoId}::${fingerprintToken(token)}`;
   const cached = cache.get(key);
   if (cached && Date.now() < cached.staleAt) return cached.promise;
 
