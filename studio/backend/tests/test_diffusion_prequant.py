@@ -84,6 +84,18 @@ def test_prequant_repo_filename_convention():
     )
     assert prequant_repo_filename("org/Some-Model-quantized", "fp8") == "Some-Model-FP8.pt"
     assert prequant_repo_filename("org/PlainRepo", "int8") == "PlainRepo-INT8.pt"
+    assert (
+        prequant_repo_filename("unsloth/Wan2.2-TI2V-5B-NVFP4", "nvfp4") == "Wan2.2-TI2V-5B-NVFP4.pt"
+    )
+    assert prequant_repo_filename("unsloth/Model-MXFP8", "mxfp8") == "Model-MXFP8.pt"
+    assert (
+        prequant_repo_filename("unsloth/Wan2.2-T2V-A14B-NVFP4", "nvfp4", component = "transformer_2")
+        == "Wan2.2-T2V-A14B-transformer_2-NVFP4.pt"
+    )
+    assert (
+        prequant_repo_filename("unsloth/Wan2.2-T2V-A14B-NVFP4", "nvfp4", component = "transformer")
+        == "Wan2.2-T2V-A14B-NVFP4.pt"
+    )
 
 
 def test_resolve_variant_base_picks_variant_repo():
@@ -289,6 +301,186 @@ def test_usable_source_repo_unaffected_by_allowlist(monkeypatch, restricted_load
     assert src is not None and src.kind == "repo" and src.location == "org/hosted-fp8"
 
 
+_UINT8 = object()  # the stub torch's uint8, so the fingerprint's dtype view is a no-op here
+
+
+class _Bytes:
+    """Enough of a tensor for the fingerprint: it views the payload as uint8 and hashes it."""
+
+    dtype = _UINT8
+
+    def __init__(self, payload):
+        self._payload = payload
+
+    def detach(self):
+        return self
+
+    def contiguous(self):
+        return self
+
+    def dim(self):
+        return 1
+
+    def view(self, dtype):
+        return self
+
+    def cpu(self):
+        return self
+
+    def numpy(self):
+        import numpy as np
+        return np.frombuffer(self._payload, dtype = np.uint8)
+
+
+class Float8Tensor:
+    """A quantized fp8 weight as far as this module is concerned: the class NAME is the key, for the
+    fingerprint's payload table and for the activation-floor check that has to tell an fp8 weight
+    apart from the 4-bit ones beside it in a policy checkpoint."""
+
+    def __init__(
+        self,
+        qdata = b"",
+        hp_value_lb = 1e-12,
+    ):
+        self.qdata = _Bytes(qdata)
+        self.scale = _Bytes(b"scale")
+        self.act_quant_kwargs = types.SimpleNamespace(hp_value_lb = hp_value_lb)
+
+
+class NVFP4Tensor:
+    """The other half of a per-layer policy checkpoint: 4-bit weights sitting in the same state dict."""
+
+    def __init__(self, qdata = b""):
+        self.qdata = _Bytes(qdata)
+        self.scale = _Bytes(b"scale")
+        self.act_quant_kwargs = types.SimpleNamespace(scale_dtype = "float8_e4m3fn")
+
+
+class _Recorder:
+    """A logger that keeps what it was told, so a refusal can be asserted to NAME the weight."""
+
+    def __init__(self):
+        self.lines: list = []
+
+    def _record(self, msg, *args):
+        self.lines.append(msg % args if args else msg)
+
+    debug = info = warning = error = _record
+
+    @property
+    def text(self):
+        return "\n".join(self.lines)
+
+
+def _fingerprinted_ckpt(payloads, *, recorded = None):
+    """A checkpoint whose state dict holds ``payloads`` and whose metadata fingerprints them."""
+    from core.inference.diffusion_prequant import packed_weight_fingerprint
+
+    state_dict = {fqn: Float8Tensor(data) for fqn, data in payloads.items()}
+    ckpt = _good_ckpt()
+    ckpt["state_dict"] = state_dict
+    ckpt["metadata"]["fingerprint"] = recorded or packed_weight_fingerprint(state_dict)
+    return ckpt
+
+
+def test_a_flipped_byte_in_a_packed_weight_is_refused_and_named(monkeypatch, tmp_path):
+    good = _fingerprinted_ckpt(
+        {"blocks.0.attn1.to_q.weight": b"q0", "blocks.1.attn1.to_q.weight": b"q1"}
+    )
+    logger = _Recorder()
+    assert _load(monkeypatch, tmp_path, good, logger = logger) is not None
+    corrupt = _fingerprinted_ckpt(
+        {"blocks.0.attn1.to_q.weight": b"q0", "blocks.1.attn1.to_q.weight": b"q1"}
+    )
+    corrupt["state_dict"]["blocks.1.attn1.to_q.weight"].qdata = _Bytes(b"Q1")
+    logger = _Recorder()
+    assert _load(monkeypatch, tmp_path, corrupt, logger = logger) is None
+    assert "blocks.1.attn1.to_q.weight" in logger.text
+    assert "blocks.0.attn1.to_q.weight" not in logger.text
+
+
+def test_a_checkpoint_without_a_fingerprint_block_still_loads(monkeypatch, tmp_path):
+    ckpt = _good_ckpt()
+    ckpt["state_dict"] = {"blocks.0.attn1.to_q.weight": Float8Tensor(b"q0")}
+    assert _load(monkeypatch, tmp_path, ckpt) is not None
+    ckpt["metadata"]["fingerprint"] = {"algo": "md5-packed-v1", "count": 0, "modules": {}}
+    assert _load(monkeypatch, tmp_path, ckpt) is not None
+
+
+def test_the_fingerprint_mode_env_picks_how_much_is_checked(monkeypatch, tmp_path):
+    from core.inference.diffusion_prequant import (
+        FINGERPRINT_MODE_ENV,
+        _fingerprint_sampled,
+    )
+
+    sampled = [f"blocks.{i}.attn1.to_q.weight" for i in range(64)]
+    checked = [fqn for fqn in sampled if _fingerprint_sampled(fqn)]
+    assert 0 < len(checked) < len(sampled)
+    assert checked == [fqn for fqn in sampled if _fingerprint_sampled(fqn)]
+
+    payloads = {fqn: fqn.encode("utf-8") for fqn in sampled}
+    corrupt = _fingerprinted_ckpt(payloads)
+    missed = next(fqn for fqn in sampled if not _fingerprint_sampled(fqn))
+    corrupt["state_dict"][checked[0]].qdata = _Bytes(b"flipped")
+    monkeypatch.setenv(FINGERPRINT_MODE_ENV, "sample")
+    assert _load(monkeypatch, tmp_path, corrupt) is None
+    only_missed = _fingerprinted_ckpt(payloads)
+    only_missed["state_dict"][missed].qdata = _Bytes(b"flipped")
+    assert _load(monkeypatch, tmp_path, only_missed) is not None
+    monkeypatch.setenv(FINGERPRINT_MODE_ENV, "full")
+    assert _load(monkeypatch, tmp_path, only_missed) is None
+    monkeypatch.setenv(FINGERPRINT_MODE_ENV, "off")
+    assert _load(monkeypatch, tmp_path, only_missed) is not None
+    monkeypatch.setenv(FINGERPRINT_MODE_ENV, "sometimes")
+    assert _load(monkeypatch, tmp_path, only_missed) is None
+
+
+class _CountedBytes(_Bytes):
+    """A payload that records the fqn whose bytes were actually read."""
+
+    def __init__(self, fqn, payload, hashed):
+        super().__init__(payload)
+        self._fqn = fqn
+        self._hashed = hashed
+
+    def numpy(self):
+        self._hashed.append(self._fqn)
+        return super().numpy()
+
+
+def test_a_class_whose_payload_slots_all_read_none_is_not_fingerprinted():
+    # A torchao release that keeps the class name and renames every payload attribute must read as uncovered, not as the md5 of an empty stream (the same digest for every weight).
+    from core.inference.diffusion_prequant import packed_weight_fingerprint
+
+    renamed = Float8Tensor(b"q0")
+    renamed.qdata = None
+    renamed.scale = None
+    fingerprint = packed_weight_fingerprint({"blocks.0.attn1.to_q.weight": renamed})
+    assert fingerprint["modules"] == {}
+    assert fingerprint["skipped"] == ["blocks.0.attn1.to_q.weight"]
+    assert fingerprint["count"] == 0
+
+
+def test_sample_mode_hashes_only_the_weights_it_compares(monkeypatch, tmp_path):
+    from core.inference.diffusion_prequant import FINGERPRINT_MODE_ENV, _fingerprint_sampled
+
+    fqns = [f"blocks.{i}.attn1.to_q.weight" for i in range(64)]
+    ckpt = _fingerprinted_ckpt({fqn: fqn.encode("utf-8") for fqn in fqns})
+    hashed: list = []
+    for fqn, tensor in ckpt["state_dict"].items():
+        tensor.qdata = _CountedBytes(fqn, fqn.encode("utf-8"), hashed)
+        tensor.scale = _CountedBytes(fqn, b"scale", hashed)
+    monkeypatch.setenv(FINGERPRINT_MODE_ENV, "sample")
+    assert _load(monkeypatch, tmp_path, ckpt) is not None
+    assert sorted(set(hashed)) == sorted(fqn for fqn in fqns if _fingerprint_sampled(fqn))
+
+
+def test_a_build_that_recognises_no_quantized_weight_loads_unverified(monkeypatch, tmp_path):
+    ckpt = _fingerprinted_ckpt({"blocks.0.attn1.to_q.weight": b"q0"})
+    ckpt["state_dict"] = {"blocks.0.attn1.to_q.weight": object()}
+    assert _load(monkeypatch, tmp_path, ckpt) is not None
+
+
 # ── load_prequantized_transformer ────────────────────────────────────────────────
 class _FakeTransformer:
     calls: dict = {}
@@ -367,6 +559,7 @@ def _stub_torch_accelerate(
         seen["safe_globals"] = list(entries)
 
     torch.load = _load
+    torch.uint8 = _UINT8
     # A stub without this namespace would let a regression to an unrestricted load pass silently.
     torch.serialization = types.SimpleNamespace(add_safe_globals = _add_safe_globals)
     monkeypatch.setitem(sys.modules, "torch", torch)
@@ -400,6 +593,8 @@ def _load(
     exists = True,
     allow_local = True,
     fast_accum = None,
+    component = None,
+    logger = None,
 ):
     _FakeTransformer.calls = {}
     _stub_torch_accelerate(monkeypatch, ckpt, load_raises = load_raises)
@@ -421,7 +616,8 @@ def _load(
         hf_token = None,
         scheme = scheme,
         fast_accum = fast_accum,
-        logger = None,
+        component = component,
+        logger = logger,
     )
 
 
@@ -575,6 +771,38 @@ def test_load_require_bf16_nvfp4_true_is_none(monkeypatch, tmp_path):
     ckpt = _good_ckpt(scheme = "nvfp4")
     ckpt["metadata"]["require_bf16"] = True
     assert _load(monkeypatch, tmp_path, ckpt, scheme = "nvfp4") is None
+
+
+def test_load_require_divisible_mismatch_is_none(monkeypatch, tmp_path):
+    ckpt = _good_ckpt(scheme = "fp8")
+    ckpt["metadata"]["require_divisible"] = 0
+    assert _load(monkeypatch, tmp_path, ckpt, scheme = "fp8") is None
+
+
+def test_load_require_divisible_match_ok(monkeypatch, tmp_path):
+    ckpt = _good_ckpt(scheme = "fp8")
+    ckpt["metadata"]["require_divisible"] = 16
+    assert _load(monkeypatch, tmp_path, ckpt, scheme = "fp8") is not None
+
+
+def test_load_require_divisible_absent_is_accepted(monkeypatch, tmp_path):
+    ckpt = _good_ckpt(scheme = "fp8")
+    assert "require_divisible" not in ckpt["metadata"]
+    assert _load(monkeypatch, tmp_path, ckpt, scheme = "fp8") is not None
+
+
+def test_load_component_mismatch_is_none(monkeypatch, tmp_path):
+    ckpt = _good_ckpt()
+    ckpt["metadata"]["component"] = "transformer_2"
+    assert _load(monkeypatch, tmp_path, ckpt, component = "transformer") is None
+    assert _load(monkeypatch, tmp_path, ckpt, component = "transformer_2") is not None
+
+
+def test_load_component_absent_is_accepted(monkeypatch, tmp_path):
+    ckpt = _good_ckpt()
+    assert _load(monkeypatch, tmp_path, ckpt, component = "transformer") is not None
+    ckpt["metadata"]["component"] = "transformer_2"
+    assert _load(monkeypatch, tmp_path, ckpt) is not None
 
 
 def test_resolve_checkpoint_path_expands_user(monkeypatch, tmp_path):
@@ -1837,25 +2065,18 @@ def test_load_is_dropped_when_the_padding_cannot_be_proven(monkeypatch, tmp_path
 # ── fp8 activation scale floor ──────────────────────────────────────────────────
 
 
-class _FakeFp8Tensor:
-    """Stands in for a torchao Float8Tensor: only act_quant_kwargs.hp_value_lb is read."""
-
-    def __init__(self, hp_value_lb):
-        self.act_quant_kwargs = types.SimpleNamespace(hp_value_lb = hp_value_lb)
-
-
 def test_an_fp8_checkpoint_without_the_activation_floor_is_rejected():
     # A checkpoint built before activation_value_lb bakes hp_value_lb=None into every quantised
     # tensor, and stays broken however it is loaded: torchao's per-row activation quantiser divides
     # by the row amax, so qwen's all-zero text rows give scale 0 and NaN. The metadata checks around
     # this one all accept an absent field for back-compat, which is exactly wrong here, so the floor
     # is read off the TENSORS instead. Measured: 412 of 512 rows non-finite without it, 0 with it.
-    floored = {"blocks.0.attn.to_q.weight": _FakeFp8Tensor(1e-12)}
-    unfloored = {"blocks.0.attn.to_q.weight": _FakeFp8Tensor(None)}
+    floored = {"blocks.0.attn.to_q.weight": Float8Tensor(hp_value_lb = 1e-12)}
+    unfloored = {"blocks.0.attn.to_q.weight": Float8Tensor(hp_value_lb = None)}
     assert pq._fp8_activation_floor_present(floored, None) is True
     assert pq._fp8_activation_floor_present(unfloored, None) is False
     # Zero is not a floor either: it is what an unclamped amax divide produces.
-    assert pq._fp8_activation_floor_present({"w": _FakeFp8Tensor(0.0)}, None) is False
+    assert pq._fp8_activation_floor_present({"w": Float8Tensor(hp_value_lb = 0.0)}, None) is False
 
 
 def test_the_floor_check_ignores_dense_and_unreadable_state_dicts():
@@ -1865,3 +2086,197 @@ def test_the_floor_check_ignores_dense_and_unreadable_state_dicts():
     assert pq._fp8_activation_floor_present({"w": object()}, None) is True
     assert pq._fp8_activation_floor_present(None, None) is True
     assert pq._fp8_activation_floor_present({}, None) is True
+
+
+def _policy_meta(
+    policy = None,
+    *,
+    base = "Tongyi-MAI/Z-Image-Turbo",
+    family = "z-image",
+    **overrides,
+):
+    """A checkpoint metadata dict declaring the z-image policy, with fields overridable."""
+    from core.inference.diffusion_nvfp4_policy import (
+        NVFP4_POLICY_KEY,
+        ZIMAGE_F8MOD_TOQ34,
+        policy_metadata,
+    )
+
+    policy = policy or ZIMAGE_F8MOD_TOQ34
+    assignment = {f"layers.{i}.attention.to_q": "nvfp4" for i in range(34)}
+    assignment.update({f"layers.{i}.feed_forward.w1": "fp8" for i in range(237)})
+    assignment.update({f"t_embedder.mlp.{i}": "bf16" for i in range(5)})
+    block = dict(policy_metadata(policy, assignment)[NVFP4_POLICY_KEY])
+    block.update(overrides)
+    return {
+        "scheme": "nvfp4",
+        "base_model_id": base,
+        "family": family,
+        # Stamped by the builder for a policy build too: the fp8 half runs the same per-row kernels.
+        "fp8_granularity": "per_row",
+        NVFP4_POLICY_KEY: block,
+    }
+
+
+def test_the_format_tag_follows_the_policy_and_refuses_to_carry_two_claims():
+    from core.inference.diffusion_convrot import rotation_metadata
+
+    assert pq.prequant_format_for({"scheme": "nvfp4"}) == pq.PREQUANT_FORMAT
+    assert pq.prequant_format_for(_policy_meta()) == pq.PREQUANT_FORMAT_POLICY
+    assert pq.PREQUANT_FORMAT_POLICY not in (pq.PREQUANT_FORMAT, pq.PREQUANT_FORMAT_ROTATED)
+    both = {**_policy_meta(), **rotation_metadata(128, ["layers.0.attention.to_q"])}
+    with pytest.raises(ValueError, match = "both"):
+        pq.prequant_format_for(both)
+
+
+@pytest.mark.parametrize(
+    ("fmt", "declared", "ok"),
+    [
+        (pq.PREQUANT_FORMAT_POLICY, True, True),
+        (pq.PREQUANT_FORMAT, False, True),
+        (pq.PREQUANT_FORMAT, True, False),
+        (pq.PREQUANT_FORMAT_ROTATED, True, False),
+        (pq.PREQUANT_FORMAT_POLICY, False, False),
+    ],
+)
+def test_the_validator_enforces_the_format_policy_biconditional(fmt, declared, ok):
+    meta = _policy_meta() if declared else {"scheme": "nvfp4"}
+    assert pq._validate_policy(fmt, meta, "nvfp4", None) is ok
+
+
+def test_a_policy_declaration_this_build_cannot_reproduce_is_refused():
+    from core.inference.diffusion_nvfp4_policy import NVFP4_POLICY_KEY
+
+    fmt = pq.PREQUANT_FORMAT_POLICY
+    assert pq._validate_policy(fmt, _policy_meta(), "nvfp4", None) is True
+    assert pq._validate_policy(fmt, _policy_meta(kind = "v2"), "nvfp4", None) is False
+    assert pq._validate_policy(fmt, _policy_meta(nvfp4_fqns = []), "nvfp4", None) is False
+    assert pq._validate_policy(fmt, _policy_meta(), "fp8", None) is False
+    assert pq._validate_policy(fmt, _policy_meta(base = "some/other-dit"), "nvfp4", None) is False
+    assert pq._validate_policy(fmt, _policy_meta(family = "flux.1"), "nvfp4", None) is False
+    assert pq._validate_policy(fmt, _policy_meta(policy_version = 2), "nvfp4", None) is False
+    assert pq._validate_policy(fmt, _policy_meta(policy_id = "qwen_p02_v1"), "nvfp4", None) is False
+    drifted = _policy_meta()
+    drifted[NVFP4_POLICY_KEY]["counts"] = {"nvfp4": 34, "fp8": 236, "bf16": 6}
+    assert pq._validate_policy(fmt, drifted, "nvfp4", None) is False
+
+
+def test_a_policy_checkpoint_is_validated_end_to_end():
+    logger = _Recorder()
+    ckpt = {
+        "format": pq.PREQUANT_FORMAT_POLICY,
+        "metadata": _policy_meta(),
+        "state_dict": {"weight": object()},
+    }
+    assert pq._validate_checkpoint(ckpt, "nvfp4", "Tongyi-MAI/Z-Image-Turbo", logger) is True
+    ckpt["format"] = pq.PREQUANT_FORMAT
+    assert pq._validate_checkpoint(ckpt, "nvfp4", "Tongyi-MAI/Z-Image-Turbo", logger) is False
+    assert "v3" in logger.text
+
+
+def test_the_fp8_invariants_cover_the_fp8_half_of_a_policy_checkpoint():
+    # A policy artifact is declared nvfp4 and is mostly Float8Tensor, so the per-row granularity and the activation floor decide whether ITS fp8 layers render or go black. Gating both on scheme == fp8 skipped every one of them.
+    logger = _Recorder()
+    ckpt = {
+        "format": pq.PREQUANT_FORMAT_POLICY,
+        "metadata": _policy_meta(),
+        "state_dict": {
+            "layers.0.attention.to_q.weight": NVFP4Tensor(b"q4"),
+            "layers.0.feed_forward.w1.weight": Float8Tensor(hp_value_lb = 1e-12),
+        },
+    }
+    base = "Tongyi-MAI/Z-Image-Turbo"
+    assert pq._validate_checkpoint(ckpt, "nvfp4", base, logger) is True
+    unfloored = dict(ckpt)
+    unfloored["state_dict"] = dict(ckpt["state_dict"])
+    unfloored["state_dict"]["layers.0.feed_forward.w1.weight"] = Float8Tensor(hp_value_lb = None)
+    assert pq._validate_checkpoint(unfloored, "nvfp4", base, logger) is False
+    per_tensor = dict(ckpt)
+    per_tensor["metadata"] = _policy_meta()
+    per_tensor["metadata"]["fp8_granularity"] = "per_tensor"
+    assert pq._validate_checkpoint(per_tensor, "nvfp4", base, logger) is False
+
+
+def test_the_floor_check_skips_the_4_bit_weights_beside_the_fp8_ones():
+    mixed = {
+        "layers.0.attention.to_q.weight": NVFP4Tensor(b"q4"),
+        "layers.0.feed_forward.w1.weight": Float8Tensor(hp_value_lb = 1e-12),
+    }
+    assert pq._fp8_activation_floor_present(mixed, None) is True
+    mixed["layers.0.feed_forward.w1.weight"] = Float8Tensor(hp_value_lb = None)
+    assert pq._fp8_activation_floor_present(mixed, None) is False
+    assert pq._fp8_activation_floor_present({"w": NVFP4Tensor()}, None) is True
+
+
+def test_pinning_the_fp8_kernel_leaves_the_4_bit_weights_alone(monkeypatch):
+    _stub_kernel_preference(monkeypatch)
+    sd = {
+        "layers.0.attention.to_q.weight": NVFP4Tensor(b"q4"),
+        "layers.0.feed_forward.w1.weight": _FakeFp8Weight(_FakeKernelPreference.AUTO),
+    }
+    assert pq._pin_kernel_preference(sd, logger = None) == 1
+    assert not hasattr(sd["layers.0.attention.to_q.weight"], "kernel_preference")
+
+
+def test_an_nvfp4_install_must_be_able_to_open_the_fp8_weights_too():
+    required = pq._SCHEME_REQUIRED_GLOBALS["nvfp4"]
+    assert pq._SCHEME_REQUIRED_GLOBALS["fp8"] <= required
+    assert "torchao.prototype.mx_formats.nvfp4_tensor.NVFP4Tensor" in required
+
+
+def test_the_checkpoint_is_released_before_the_device_copy(monkeypatch, tmp_path):
+    """The CPU checkpoint must be unreferenced by the time ``.to(device)`` allocates.
+
+    ``assign = True`` gives the module the checkpoint's own tensors, so ckpt/state_dict hold only a
+    second reference to them. On a unified-memory host (DGX Spark) the host copy and the device copy
+    are the same physical memory, so keeping that reference across the move doubles the transient
+    peak the artifact-sized admission check was told to expect.
+    """
+    import weakref
+
+    seen: dict = {}
+
+    class _StateDict(dict):
+        """A weak-referenceable state dict: plain dicts cannot be weakly referenced."""
+
+    class _ReleaseProbe(_FakeTransformer):
+        def load_state_dict(
+            self,
+            sd,
+            strict = True,
+            assign = False,
+        ):
+            _FakeTransformer.calls["load_state_dict"] = {"strict": strict, "assign": assign}
+            seen["state_dict"] = weakref.ref(sd)
+
+        def to(self, device):
+            seen["alive_at_move"] = seen["state_dict"]() is not None
+            return super().to(device)
+
+    _FakeTransformer.calls = {}
+    _stub_torch_accelerate(monkeypatch, None)
+    # Built per call so the stub itself holds no reference: what stays alive is what the loader kept.
+    monkeypatch.setattr(
+        pq,
+        "_torch_load_prequant",
+        lambda path, **kwargs: {
+            "format": PREQUANT_FORMAT,
+            "metadata": {"scheme": "int8", "base_model_id": "Tongyi-MAI/Z-Image-Turbo"},
+            "state_dict": _StateDict(weight = object()),
+        },
+    )
+    monkeypatch.setenv(pq.ALLOW_LOCAL_PREQUANT_PATH_ENV, str(tmp_path))
+    path = tmp_path / "ckpt.pt"
+    path.write_bytes(b"x")
+
+    out = load_prequantized_transformer(
+        _ReleaseProbe,
+        "Tongyi-MAI/Z-Image-Turbo",
+        PrequantSource(kind = "path", location = str(path), filename = None),
+        device = "cuda",
+        dtype = "bfloat16",
+        scheme = "int8",
+    )
+
+    assert out is not None
+    assert seen["alive_at_move"] is False
