@@ -1742,14 +1742,31 @@ exit 1
     # True for a name uv itself creates: <kind>-v<N>, whole suffix numeric. `archive-v0.backup`
     # is not uv's. Mirrors _uv_is_bucket_name, suffix from the LAST `-v` included.
     function Test-StudioUvBucketName {
-        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name)
-        $at = $Name.LastIndexOf("-v")
+        param(
+            [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Name,
+            # Off by default, so only the write probe folds, and only where it measured a
+            # folding directory. Warmth stays exact-case like install.sh's lowercase globs:
+            # counting bytes under `Archive-V0` that uv will not find at `archive-v0` picks a
+            # cache that cannot serve them, where missing them only costs a fallback.
+            [switch]$Fold
+        )
+        # Whole name, not just the kind, since the `-v` marker varies with it. Invariant, or a
+        # Turkish locale maps I to a dotless one and `flat-Index-v4` escapes.
+        $lower = if ($Fold) { $Name.ToLowerInvariant() } else { $Name }
+        $at = $lower.LastIndexOf("-v")
         if ($at -lt 0) { return $false }
-        $suffix = $Name.Substring($at + 2)
+        $suffix = $lower.Substring($at + 2)
         if ([string]::IsNullOrEmpty($suffix)) { return $false }
         # \A and \z, not ^ and $: in .NET `$` also matches before a final newline, so
         # `archive-v1<LF>` passed here while the sh helper rejected it.
-        return ($suffix -match '\A[0-9]+\z')
+        if (-not ($suffix -match '\A[0-9]+\z')) { return $false }
+        # And the KIND has to be one uv creates. A read-only `unused-v999` sitting beside a warm
+        # cache is not uv's to write, but it condemned the whole cache, so the install
+        # redownloaded what it already had and an offline one failed outright. Every CacheBucket
+        # in uv 0.12.1, $UvPinnedVersion below; keep in step with install.sh on a pin bump.
+        return ($lower.Substring(0, $at) -in @(
+            "archive", "binaries", "builds", "built-wheels", "environments", "flat-index",
+            "git", "interpreter", "osv", "python", "sdists", "simple", "wheels"))
     }
 
     # Readable is not usable: uv writes CACHEDIR.TAG into the root and renames distributions
@@ -1760,13 +1777,26 @@ exit 1
         param([Parameter(Mandatory = $true)][string]$Cache)
         $probeDirs = [System.Collections.Generic.List[string]]::new()
         $probeDirs.Add($Cache)
+        # Does THIS directory fold case? Windows does unless fsutil setCaseSensitiveInfo was
+        # applied to it, which is how a WSL-created tree behaves, so the OS name answers this no
+        # better than uname does on POSIX. Measured with a directory we make ourselves, the same
+        # way _uv_cache_is_writable does, because an existing `Python-V0` beside `python-v0` is
+        # one entry when the directory folds and two when it does not.
+        $fold = $false
+        $probeRoot = Join-Path $Cache (".unsloth-case-probe." +
+            [guid]::NewGuid().ToString("N").Substring(0, 8) + "-A")
+        try {
+            [System.IO.Directory]::CreateDirectory($probeRoot) | Out-Null
+            $fold = [System.IO.Directory]::Exists($probeRoot.Substring(0, $probeRoot.Length - 1) + "a")
+        } catch { }
+        Remove-Item -LiteralPath $probeRoot -Force -Recurse -ErrorAction SilentlyContinue
         try {
             foreach ($entry in [System.IO.Directory]::GetFileSystemEntries($Cache)) {
                 $name = [System.IO.Path]::GetFileName($entry)
                 # Only where a BUCKET should be. Anything else up here is not uv's to write,
                 # and a cache-dir on a mount point has a root-owned lost+found that must not
                 # condemn it.
-                if (-not (Test-StudioUvBucketName -Name $name)) { continue }
+                if (-not (Test-StudioUvBucketName -Name $name -Fold:$fold)) { continue }
                 # A file, or a link dangling or not, is an existing path to uv's own create,
                 # which answers "already exists", so uv refuses it.
                 if (-not [System.IO.Directory]::Exists($entry)) { return $false }
@@ -1796,6 +1826,8 @@ exit 1
         try {
             $buckets = Get-ChildItem -LiteralPath $Cache -Directory -Force -ErrorAction Stop |
                 Where-Object {
+                    # No -Fold: warmth is exact-case, so every name here is already lowercase
+                    # and LastIndexOf being case-sensitive cannot miss the marker.
                     (Test-StudioUvBucketName -Name $_.Name) -and
                     ($_.Name.Substring(0, $_.Name.LastIndexOf("-v")) -in
                         @("archive", "builds", "built-wheels", "wheels", "sdists"))
