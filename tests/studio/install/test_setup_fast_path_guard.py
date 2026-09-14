@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import pathlib
 import re
+import sys
 
 import pytest
 
@@ -270,7 +271,7 @@ def test_the_two_callers_share_one_definition_of_complete(script: pathlib.Path):
         else "_setup_install_is_verified() {"
     )
     assert helper in text
-    assert text.count("install_manifest.verify_install(deep = True)") == 1, (
+    assert text.count("install_manifest.verify_install(**deep)") == 1, (
         f"{script.name} has more than one deep verify; the offline rule and the "
         "incomplete-install guard must ask the same question"
     )
@@ -326,7 +327,7 @@ def test_the_offline_fast_path_never_wipes_a_sidecar():
         < guard_sh
         < sh.index('if [ "$_NEED_T5_530" = true ]; then')
     )
-    assert 'eval "_NEED_T5_$1=false"' in sh[guard_sh : guard_sh + 900]
+    assert 'eval "_NEED_T5_$_ofp_key=false"' in sh[guard_sh : guard_sh + 900]
     keep_ps1 = ps1.index("keeping the verified install")
     assert "$script:OfflineFastPath = $true" in ps1[keep_ps1 : keep_ps1 + 400]
     guard_ps1 = ps1.index("if ($script:OfflineFastPath) {\n    foreach ($tier in")
@@ -372,7 +373,7 @@ def test_uv_offline_without_the_fast_path_still_keeps_an_existing_sidecar():
     # list (a space in the Studio home would split it).
     assert '[ -d "$' not in block_sh.split("for _ofp in", 1)[1].split("done", 1)[0]
     assert "$VENV_T5_530_DIR" not in block_sh.split("for _ofp in", 1)[1].split("\n", 1)[0]
-    assert 'eval "_NEED_T5_$1=false"' in block_sh and 'eval "_DEFER_T5_$1=true"' in block_sh
+    assert 'eval "_NEED_T5_$_ofp_key=false"' in block_sh and 'eval "_DEFER_T5_$_ofp_key=true"' in block_sh
     offline_ps1 = ps1.index("if (-not $script:OfflineFastPath -and (Test-UvOfflineRequested)) {")
     assert (
         ps1.index("Test-SidecarCurrent -TargetDir $VenvT5_510Dir")
@@ -424,3 +425,33 @@ def test_the_windows_uv_probe_looks_where_the_pinned_installer_put_uv():
         "after installing uv, setup.ps1 relies on Refresh-Environment alone; it rebuilds PATH "
         "from a registry the pinned installer never edits, so that run falls back to pip"
     )
+
+
+@pytest.mark.parametrize(
+    "module_src, expected",
+    [
+        ("def verify_install(deep = False): return {'ok': True}", 0),
+        ("def verify_install(deep = False): return {'ok': False}", 1),
+        # The hole this replaced: `except TypeError` also caught one raised INSIDE a deep
+        # verify, and retried without the payload scan, so real damage read as verified.
+        ("def verify_install(deep = False): raise TypeError('inside')", 1),
+        ("def verify_install(): return {'ok': True}", 0),  # older tree, no such keyword
+        ("def verify_install(): return {'ok': False}", 1),
+    ],
+)
+def test_the_deep_verify_only_degrades_on_a_tree_that_lacks_the_keyword(
+    tmp_path, module_src, expected
+):
+    import subprocess
+
+    probe = re.search(
+        r'"\$VENV_DIR/bin/python" -c "\n(import os, sys\n.*?)" "\$SCRIPT_DIR"',
+        SETUP_SH.read_text(encoding = "utf-8"),
+        re.S,
+    )
+    assert probe, "the verify probe moved; this test is reading the wrong block"
+    (tmp_path / "install_manifest.py").write_text(module_src + "\n", encoding = "utf-8")
+    result = subprocess.run(
+        [sys.executable, "-c", probe.group(1), str(tmp_path)], capture_output = True
+    )
+    assert result.returncode == expected, result.stderr.decode()
