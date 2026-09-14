@@ -4971,7 +4971,9 @@ import inspect
 # also swallowed one raised inside verify_install, and retried shallow on real damage.
 deep = {'deep': True} if 'deep' in inspect.signature(install_manifest.verify_install).parameters else {}
 sys.exit(0 if install_manifest.verify_install(**deep)['ok'] else 1)
-" "$PSScriptRoot" 2>$null
+" "$PSScriptRoot" 2>$null | Out-Null
+        # Out-Null, not just 2>$null: an unassigned native call leaves stdout in the
+        # success stream, so `return $false` came back as @("...", $false), which is truthy.
         return ($LASTEXITCODE -eq 0)
     } catch { return $false }
 }
@@ -5047,7 +5049,9 @@ sys.exit(0 if windows and installed not in windows[0] else 1)
     # If the desktop app specifies a minimum required backend version and the installed
     # package is older than that requirement, force the dependency pass to upgrade it.
     if ($env:UNSLOTH_DESKTOP_BACKEND_VERSION) {
-        $_desktopVerBad = $false
+        # Cleared only on a confirmed exit 0, mirroring setup.sh's `if !`: an invocation that
+        # throws left it false, so an install under the floor kept the fast path.
+        $_desktopVerBad = $true
         try {
             & python -c "
 import re, sys
@@ -5060,8 +5064,8 @@ except ImportError:
 installed = parse_v(sys.argv[1])
 required = parse_v(sys.argv[2])
 sys.exit(0 if installed is not None and required is not None and installed >= required else 1)
-" "$InstalledVer" "$env:UNSLOTH_DESKTOP_BACKEND_VERSION" 2>$null
-            if ($LASTEXITCODE -ne 0) { $_desktopVerBad = $true }
+" "$InstalledVer" "$env:UNSLOTH_DESKTOP_BACKEND_VERSION" 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { $_desktopVerBad = $false }
         } catch {}
         if ($_desktopVerBad) {
             substep "$_PkgName $InstalledVer < $env:UNSLOTH_DESKTOP_BACKEND_VERSION (required by desktop app) -- forcing dependency pass to update..." "Cyan"
