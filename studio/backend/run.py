@@ -2035,7 +2035,6 @@ def _terminal_password_gate(
 
     from auth import hashing as _auth_hashing
     from auth import storage as _auth_storage
-    from auth import terminal_prompt as _terminal_prompt
     from auth.bootstrap_timeout import (
         bootstrap_timeout_seconds,
         should_arm_bootstrap_timeout,
@@ -2135,14 +2134,9 @@ def _terminal_password_gate(
     )
     if changed is True:
         return True, True
-    if tunnel_will_start:
+    if changed is False or tunnel_will_start:
+        # Ctrl+C / EOF is an explicit refusal for any reachable UI launch.
         return False, False
-    # Ctrl+C / EOF is a refusal, but only a module that reports the deadline as
-    # None can tell the two apart; an older one folds both into False, where
-    # reading refusal would stop the detached-pty launch (`docker run -dt`).
-    if changed is False and getattr(_terminal_prompt, "UNATTENDED_RETURNS_NONE", False):
-        return False, False
-    # Only the unattended raw bind keeps the historical startup behavior.
     # Which is sometimes NO protection: UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT=0 never
     # arms the deadline, so say what will actually happen rather than promise a
     # shutdown -- that is the one sentence an operator acts on.
