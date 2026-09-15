@@ -29553,6 +29553,35 @@ class LlamaCppBackend:
             return []
 
     @staticmethod
+    def _tree_kill_surviving_process(pid) -> bool:
+        """Last resort for a server still alive after terminate. True when it is gone.
+
+        ``owner_verified``: this is reached holding the Popen that spawned the pid, so
+        ownership is not in question even when the start time behind the lifetime
+        record can no longer be read.
+        """
+        if not _is_signalable_pid(pid):
+            return False
+        try:
+            from utils.process_lifetime import pid_is_running, terminate_pid
+        except Exception:
+            return False
+        try:
+            terminate_pid(pid, timeout = 5.0, owner_verified = True)
+        except Exception as e:
+            logger.warning(f"Could not terminate surviving llama-server {pid}: {e}")
+        try:
+            gone = not pid_is_running(pid)
+        except Exception:
+            return False
+        if not gone:
+            logger.warning(
+                f"llama-server {pid} is still running after a tree kill; "
+                "keeping its record so the next launch can reap it"
+            )
+        return gone
+
+    @staticmethod
     def _terminate_descendants(collected):
         """The diffusion shim's visual server, and anything else it started."""
         if not collected:
@@ -29719,6 +29748,21 @@ class LlamaCppBackend:
             # identity, so a recycled pid is never signalled either way.
             _killed_pid = getattr(self._process, "pid", None)
             _exited = getattr(self._process, "poll", lambda: None)() is not None
+            # The tree kill below tells the reaper the owner is known, which waives the
+            # "cannot prove this pid is still our child" refusal. That waiver is only
+            # true while we hold the handle that spawned the pid, so it is spent on a
+            # real child and nothing else: a stand-in _process carrying a pid and no
+            # poll() (tests use one to mean "a server is loaded", and one of them holds
+            # this process's own pid) reads as "still running" through no fault of its
+            # own, and signalling that number would take down whoever holds it now.
+            _owns_child = terminable and callable(getattr(self._process, "poll", None))
+            if _owns_child and _killed_pid is not None and not _exited:
+                # The terminate above is all Popen offers, and on Windows that is
+                # TerminateProcess on the leader alone: a server that ignored it, or
+                # that the escalation could not reach, is still holding the model's
+                # mapping. taskkill /T /F is the only handle left on it there, and
+                # nothing on this path used to reach for it (#9790).
+                _exited = self._tree_kill_surviving_process(_killed_pid)
             if _killed_pid is not None and _exited:
                 try:
                     from utils.process_lifetime import forget_pid
@@ -29726,7 +29770,13 @@ class LlamaCppBackend:
                 except Exception:
                     pass
             self._process = None
-            self._clear_server_pid()
+            # Same rule as the lifetime record above: the pidfile is the next launch's
+            # only handle on a server that outlived this kill, so it is removed once the
+            # exit is confirmed and not merely attempted. Without a child handle there is
+            # no exit to confirm and nothing was signalled, so the pidfile is dropped as
+            # it always was rather than kept forever by a stand-in that cannot answer.
+            if _killed_pid is None or _exited or not _owns_child:
+                self._clear_server_pid()
             # Clear healthy so a /load during the replacement's warm-up can't
             # short-circuit against the previous server's health (#5401).
             self._healthy = False
