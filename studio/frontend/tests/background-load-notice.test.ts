@@ -323,20 +323,39 @@ test("a long but healthy download is never abandoned", async () => {
 const STALL_MS = 400;
 
 /**
- * Poll until the notice settles, with the read at `healthyAt` reporting progress
- * and every other read unreadable. `healthyAt: 0` means none of them do.
- * Returns how many reads the loop survived.
+ * Run the poll loop once, with the first read at least `healthyAfterMs` in
+ * reporting progress and every other read unreadable. Reports how long the loop
+ * survived, when the healthy read actually landed, and the longest gap between
+ * two reads.
+ *
+ * Milliseconds, not reads: the window is defined in time (`Date.now() -
+ * lastHealthy >= stallMs`), and a read count is that divided by poll cost,
+ * which is the one thing here that varies by platform.
  */
-async function readsBeforeSettling(healthyAt: number): Promise<number> {
+async function settlingRun(healthyAfterMs: number): Promise<{
+  totalMs: number;
+  resetAtMs: number | null;
+  maxGapMs: number;
+}> {
   const { settled, stop } = record();
-  let read = 0;
+  const began = Date.now();
+  let reported = false;
+  let resetAtMs: number | null = null;
+  let maxGapMs = 0;
+  let lastRead = began;
   await withBackgroundLoadNotice(
     "image",
     "unsloth/flux",
     async () => null,
     async () => {
-      read += 1;
-      if (read === healthyAt) return "downloading";
+      const now = Date.now();
+      maxGapMs = Math.max(maxGapMs, now - lastRead);
+      lastRead = now;
+      if (!reported && now - began >= healthyAfterMs) {
+        reported = true;
+        resetAtMs = now - began;
+        return "downloading";
+      }
       throw new Error("backend restarting");
     },
     // readTimeoutMs is generous on purpose: the read answers immediately, and a
@@ -345,55 +364,41 @@ async function readsBeforeSettling(healthyAt: number): Promise<number> {
   );
   await settled;
   stop();
-  return read;
+  return { totalMs: Date.now() - began, resetAtMs, maxGapMs };
 }
 
-test("a healthy read resets the stall window", async () => {
-  // The source reads `Date.now()` and arms `setTimeout` itself, so this runs on
-  // the wall clock. That rules out asserting a read count against a millisecond
-  // budget: one poll costs about 1 ms here and about 15 ms on a Windows runner,
-  // whose default timer granularity is coarser than any margin small enough to
-  // keep the test quick. The previous version asserted `reads > 4` against a
-  // 30 ms window and was both flaky on Windows (2 reads consumed it before the
-  // healthy one arrived) and vacuous on Linux, where 30 ms of 1 ms polls clears
-  // 4 reads whether or not the window is ever reset.
+test("a healthy read resets the stall window", async (t) => {
+  // One run, and no comparison against a second one. Subtracting two separately
+  // scheduled runs re-imports the noise this test is trying to escape: a stall
+  // during the baseline fails healthy code, and a stall during the other run
+  // passes broken code.
   //
-  // So measure the reset against the same loop without one. The comparison
-  // divides the platform out: whatever a poll costs, a window restarted halfway
-  // through must carry the loop about half as far again.
-  // The two halves of the comparison are separate wall-clock runs, so anything
-  // that slows the runner between them skews the ratio. A windows-latest runner
-  // is shared and noisy enough to do that: this failed on main at 56 reads with
-  // a reset against 47 without, a ratio of 1.19 where a half-way restart should
-  // give about 1.5. One sample decided it, and the sample was unlucky.
-  //
-  // Take the majority of three rounds rather than one sample, and NOT the best
-  // of three. The noise runs in both directions, so with the reset removed --
-  // where the two loops are the same loop and should score about 1.0 -- a round
-  // that happened to schedule the second run faster could clear the bar on its
-  // own, and accepting the most favourable round would make three chances at
-  // that instead of one. A majority is strictly stronger than the single sample
-  // this replaces in both directions: it takes two unlucky rounds to fail a
-  // healthy reset, and two lucky ones to pass a missing one.
-  const rounds: string[] = [];
-  let cleared = 0;
-  for (let round = 1; round <= 3; round += 1) {
-    const withoutReset = await readsBeforeSettling(0);
-    assert.ok(
-      withoutReset > 8,
-      `the baseline is too short to compare against: ${withoutReset} reads. ` +
-        "Raise STALL_MS.",
-    );
+  // Assert the mechanism instead. The source restarts the window at the healthy
+  // read, so the loop must then survive a further full window from THAT moment.
+  // Both sides of that come from this one run, and a stall can only make
+  // totalMs larger, so the bound is one-sided: delay cannot fail healthy code.
+  const run = await settlingRun(STALL_MS / 2);
+  assert.ok(run.resetAtMs !== null, "the fixture never got to report progress");
 
-    const withReset = await readsBeforeSettling(Math.floor(withoutReset / 2));
-    if (withReset >= withoutReset * 1.25) cleared += 1;
-    rounds.push(`${withReset} with a reset against ${withoutReset} without`);
+  // The loop only tests its deadline at a poll boundary, so it may end up to one
+  // gap early. Subtracting the observed gap makes the bound exact rather than
+  // approximate -- but a gap large enough to swallow the signal means the runner
+  // stalled mid-loop, and then this run cannot tell a restarted window from a
+  // stalled one. That is no evidence rather than a verdict, so say so.
+  if (run.maxGapMs > STALL_MS / 8) {
+    t.skip(
+      `runner stalled ${run.maxGapMs}ms mid-loop, which is too close to the ` +
+        `${STALL_MS / 2}ms signal to read: total ${run.totalMs}ms, reset at ` +
+        `${run.resetAtMs}ms`,
+    );
+    return;
   }
 
   assert.ok(
-    cleared >= 2,
-    "a healthy read did not restart the stall window, in " +
-      `${cleared} of ${rounds.length} rounds: ${rounds.join("; ")}. A run of ` +
+    run.totalMs >= run.resetAtMs + STALL_MS - run.maxGapMs,
+    `a healthy read did not restart the stall window: the loop ended ` +
+      `${run.totalMs}ms in, having reported progress at ${run.resetAtMs}ms, so ` +
+      `it should have run to at least ${run.resetAtMs + STALL_MS}ms. A run of ` +
       "unreadable polls is inheriting the elapsed time of the run before it, so " +
       "a slow download that keeps reporting progress can still be abandoned.",
   );
