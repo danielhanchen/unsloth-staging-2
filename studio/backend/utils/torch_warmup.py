@@ -363,6 +363,121 @@ def _clear_finished_warm_locked() -> None:
     _status.pop("seconds", None)
 
 
+DIFFUSERS_PREWARM_DISABLE_ENV_VAR = "UNSLOTH_STUDIO_DISABLE_DIFFUSERS_PREWARM"
+
+# The catalog's own task identifiers, which _build_index compares with ==. Anything else
+# (a friendly "image"/"video") silently builds an empty index and reads as "no models here",
+# so the gate would refuse forever. Pinned against the catalog by test_diffusers_prewarm.py.
+_MEDIA_PREWARM_TASKS = ("text-to-image", "text-to-video")
+
+_diffusers_prewarm_lock = threading.Lock()
+_diffusers_prewarmed = False
+
+
+def _a_local_model_would_load_through_diffusers() -> bool:
+    """Whether any indexed media model would actually load through DIFFUSERS on this host.
+
+    Presence alone is the wrong question. A CPU or MPS host with a runnable native binary, or
+    any host with ``UNSLOTH_DIFFUSION_ENGINE=sd_cpp``, routes a supported GGUF to sd.cpp, which
+    imports no diffusers at all -- so prewarming there would add ~316 MB to exactly the
+    low-memory installs that can least afford it, and it would never be reclaimed by a load.
+
+    ``predict_engine`` is the same predicate selection and the download planner use, and it is
+    documented to activate nothing and install nothing, so asking it here cannot perturb a
+    resident model. A non-GGUF pick short-circuits it: only a GGUF can go native.
+
+    The family comes from ``detected_image_family``, the resolver the listing and locality
+    routes already share, rather than ``detect_family`` on the id: a local GGUF can carry its
+    family only in the FILENAME (``/models/custom/model.gguf`` holding ``z-image``), which
+    ``detect_family`` cannot see, and treating that as unknown would prewarm on exactly the
+    sd.cpp host this gate exists to spare."""
+    from core.inference.diffusion_engine_router import (  # noqa: PLC0415
+        ENGINE_DIFFUSERS,
+        predict_engine,
+    )
+    from core.inference.media_locality import detected_image_family  # noqa: PLC0415
+    from core.inference.media_model_index import (  # noqa: PLC0415
+        available_media_model_ids,
+        resolve_local_media_model,
+    )
+
+    for task in _MEDIA_PREWARM_TASKS:
+        for model_id in available_media_model_ids(task):
+            pick = resolve_local_media_model(model_id, task = task)
+            if pick is None:
+                continue
+            if (pick.model_kind or ("gguf" if pick.gguf_filename else None)) != "gguf":
+                return True  # only a GGUF can go native
+            family = detected_image_family(pick)
+            if family is None:
+                return True  # unknown family: diffusers is where the load would land
+            if predict_engine(family, model_kind = "gguf") == ENGINE_DIFFUSERS:
+                return True
+    return False
+
+
+def prewarm_diffusers_if_image_models_exist() -> bool:
+    """Import diffusers off the first image load. True iff this call did the import.
+
+    Measured on this stack, the first diffusion load pays roughly 5.3s of pure import before it
+    touches a weight: ``diffusers`` 1.6s, ``diffusers.hooks`` 2.4s and the pipeline classes 1.3s,
+    for about 316 MB. None of it depends on which model was picked, so it is the same cost every
+    first load in a fresh process, and all of it can be paid earlier by a thread nobody is
+    waiting on.
+
+    Gated on the install actually having a local image or video model, which is the whole point:
+    a chat-only or training-only user never pays the 316 MB. The gate itself is stdlib only (it
+    does not import torch or diffusers) and its index is cached and needed by the Images page
+    anyway, so building it here is work moved earlier rather than work added.
+
+    Called from the POST-warm worker, after ``join_background_warm()``, so it cannot delay any
+    coordinated warm stage or the socket bind. Concurrency was measured rather than assumed: 4 to
+    8 threads importing diffusers submodules together failed 0 of 16 trials, with and without
+    dynamo already imported, because these are ordinary package imports that CPython's per module
+    lock serialises, unlike the dynamo/inductor cycle in #10350.
+
+    Never fatal, and opt out with ``UNSLOTH_STUDIO_DISABLE_DIFFUSERS_PREWARM=1``."""
+    global _diffusers_prewarmed
+    if _diffusers_prewarmed:
+        return False
+    if os.environ.get(DIFFUSERS_PREWARM_DISABLE_ENV_VAR) == "1":
+        return False
+    with _diffusers_prewarm_lock:
+        if _diffusers_prewarmed:
+            return False
+        try:
+            if not _a_local_model_would_load_through_diffusers():
+                # Nothing diffusers would serve, so the import is pure cost. Not latched: a
+                # model downloaded later should let the next lifespan reconsider.
+                logger.debug("diffusers prewarm skipped: no local model routes to diffusers")
+                return False
+        except Exception as exc:  # noqa: BLE001 -- a gate that cannot answer means skip, not crash
+            logger.debug("diffusers prewarm gate unavailable: %r", exc)
+            return False
+
+        started = time.perf_counter()
+        try:
+            import diffusers  # noqa: F401, PLC0415
+            import diffusers.hooks  # noqa: F401, PLC0415
+
+            # diffusers hard-codes _tqdm_active = True at import and honours no env var, so a
+            # prewarm that skipped this would let "Loading pipeline components..." draw straight
+            # onto the structlog stream, mid-record. The load path calls the same helper; it is
+            # idempotent and cheap.
+            from loggers.config import quiet_third_party_progress_bars  # noqa: PLC0415
+
+            quiet_third_party_progress_bars()
+        except Exception as exc:  # noqa: BLE001 -- the load path imports it again and will report
+            logger.debug("diffusers prewarm skipped: %r", exc)
+            return False
+        _diffusers_prewarmed = True
+        logger.info(
+            "diffusers prewarmed in %.0fms; the first image load skips that import",
+            (time.perf_counter() - started) * 1000,
+        )
+        return True
+
+
 def warm_status() -> dict:
     """Snapshot of the warm for diagnostics and tests."""
     return {
