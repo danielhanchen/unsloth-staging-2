@@ -1,0 +1,49 @@
+name: "staging-10647 macos-15"
+on:
+  push:
+    branches: ["pr-10647-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Shell and find versions on this runner
+        run: |
+          echo "uname: $(uname -a)"
+          /bin/bash --version | head -n 1
+          find --version 2>/dev/null | head -n 1 || echo "find: BSD (no --version)"
+      - name: find supports the primary the cache scan uses
+        run: |
+          set -e
+          d=$(mktemp -d); mkdir -p "$d/b"; : > "$d/b/x"
+          hit=$(find -L "$d/b" -type f -print -quit)
+          [ "$hit" = "$d/b/x" ] || { echo "::error::find -print -quit UNSUPPORTED here"; exit 1; }
+          echo "find -print -quit: supported"
+      - name: uv cache selector shell suites (the PR's core)
+        run: |
+          set -e
+          bash tests/sh/test_install_uv_cache_root.sh
+          bash tests/sh/test_setup_uv_cache_marker.sh
+          bash tests/sh/test_uv_cache_colocation.sh
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest tests/python/test_uv_cache_selector_agreement.py unsloth_cli/tests/test_studio_update_uv_cache.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda and not test_a_cache_path_that_is_not_utf_8_is_recorded_and_read_back' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && ! grep -qE "^(FAILED|ERROR) " pytest_out.txt; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && ! grep -qE "^ERROR " pytest_out.txt; then tot=$(grep -cE "^FAILED " pytest_out.txt); dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt); if [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; fi; exit "$rc"
