@@ -91,11 +91,12 @@ jobs:
             -DGGML_BACKEND_DL=ON `
             -DGGML_CPU=OFF `
             -DGGML_CUDA=ON `
+            -DGGML_CUDA_CUB_3DOT2=ON `
             -DLLAMA_BUILD_TESTS=OFF `
             -DLLAMA_BUILD_EXAMPLES=OFF `
             -DLLAMA_BUILD_TOOLS=OFF `
             -DLLAMA_BUILD_SERVER=OFF `
-            -DCMAKE_CUDA_ARCHITECTURES="120"
+            -DCMAKE_CUDA_ARCHITECTURES="120;121"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build ggml-cuda
