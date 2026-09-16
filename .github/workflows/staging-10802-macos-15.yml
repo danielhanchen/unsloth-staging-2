@@ -27,6 +27,27 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Node tests
+      - name: Install frontend deps
         working-directory: studio/frontend
-        run: node --experimental-strip-types --test tests/research-open-run.test.ts
+        run: npm ci --no-fund --no-audit
+      - name: Node tests (head, full suite)
+        working-directory: studio/frontend
+        run: npm test
+  base:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          repository: unslothai/unsloth
+          ref: "a76c38c4ab495cf7c6a9cf8cef09f4fec9a06121"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+      - name: Node tests (merge-base arm, full suite)
+        working-directory: studio/frontend
+        run: npm test
