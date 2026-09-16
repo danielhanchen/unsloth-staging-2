@@ -198,16 +198,19 @@ def _split_ternary(expression: str, guards: tuple = ()) -> list:
     while expression.startswith("(") and _balanced(expression, 0) == expression[1:-1]:
         expression = expression[1:-1].strip()
 
+    # Scanned on a copy with literal contents blanked: a `?` or a `:` inside a message is a
+    # character, not an operator, and `_outside_literals` keeps the offsets aligned.
+    scan = _outside_literals(expression)
     depth, question = 0, -1
     index = 0
     while index < len(expression):
-        char = expression[index]
+        char = scan[index]
         if char in "([{":
             depth += 1
         elif char in ")]}":
             depth -= 1
         elif depth == 0 and char == "?":
-            following = expression[index + 1 : index + 2]
+            following = scan[index + 1 : index + 2]
             if following in ("?", "."):
                 index += 2
                 continue
@@ -220,36 +223,35 @@ def _split_ternary(expression: str, guards: tuple = ()) -> list:
     # An unparenthesised nested ternary in the true arm owns the next colon, so count `?` here
     # too: taking the first one at bracket depth 0 cuts `a ? b ? c : d : e` into `a ? b` and
     # `d : e`, and a field named anywhere in that second blob would look like every arm reading it.
-    inner = guards + (expression[:question],)
+    condition = expression[:question]
     depth, nested = 0, 0
     index = question + 1
     while index < len(expression):
-        char = expression[index]
+        char = scan[index]
         if char in "([{":
             depth += 1
         elif char in ")]}":
             depth -= 1
         elif depth == 0 and char == "?":
-            if expression[index + 1 : index + 2] in ("?", "."):
+            if scan[index + 1 : index + 2] in ("?", "."):
                 index += 2
                 continue
             nested += 1
         elif depth == 0 and char == ":":
             if not nested:
-                return _split_ternary(expression[question + 1 : index], inner) + _split_ternary(
-                    expression[index + 1 :], inner
-                )
+                # Which way the branch fell matters: only one direction of `budget === -1`
+                # says the budget is -1 there.
+                return _split_ternary(
+                    expression[question + 1 : index], guards + ((condition, True),)
+                ) + _split_ternary(expression[index + 1 :], guards + ((condition, False),))
             nested -= 1
         index += 1
-    return [(expression[question + 1 :].strip(), inner)]
+    return [(expression[question + 1 :].strip(), guards + ((condition, True),))]
 
 
 def _without_comments(source: str) -> str:
-    """`//` and `/* */` removed, leaving string literals alone.
-
-    A comment is not part of the value an arm returns, so two arms that differ only by one are
-    the same expression and the condition between them steers nothing.
-    """
+    """`//` and `/* */` removed, string literals left alone: a comment is not part of an arm's
+    value, so two arms differing only by one are the same expression."""
     out, index, quote = [], 0, None
     while index < len(source):
         char = source[index]
@@ -286,9 +288,9 @@ _FUNCTION_BODY_OPENS = re.compile(r"=>\s*\{|\bfunction\b[^(){};]*\([^()]*\)\s*\{
 def _nested_function_spans(block: str) -> list:
     """Where functions declared inside this block begin and end.
 
-    Only these are another scope. An `if` or a `for` body is the selector's own, so excluding
-    by brace depth alone would drop `if (s.enabled) { return s.other; }` and read a selector
-    that can return something else entirely as though it always returned the field.
+    Only these are another scope: an `if` or `for` body is the selector's own, so excluding by
+    brace depth alone would read `if (s.enabled) { return s.other; }` as always returning the
+    field.
     """
     spans, index = [], 0
     while True:
@@ -311,13 +313,191 @@ def _nested_function_spans(block: str) -> list:
             return spans
 
 
-def _own_scope_returns(block: str) -> list:
-    """The `return` expressions belonging to this block, not to a function nested in it.
+def _statement_start(head: str) -> int:
+    """Where the statement `head` ends inside began.
 
-    A helper declared inside a selector returns its own value, which is not what zustand
-    compares, so counting it would reject `{ function n(v) { return v ?? -1; } return
-    n(s.field); }` for reading the field through a helper.
+    Only a depth-zero delimiter ends a statement: a `for (let i = 0; i < n; i++)` header carries
+    semicolons of its own, and taking one as the boundary hides the `for` from the caller.
     """
+    depth, boundary = 0, -1
+    for index, char in enumerate(head):
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+            if depth == 0 and char == "}":
+                boundary = index
+        elif depth == 0 and char == ";":
+            boundary = index
+    return boundary + 1
+
+
+def _consume_statement(block: str, index: int):
+    """The statement starting at `index`, and where the one after it starts.
+
+    Brace-bodied forms end at their closing brace, everything else at its own `;`, so a helper
+    declared mid-block does not swallow the return that follows it.
+    """
+    while index < len(block) and block[index].isspace():
+        index += 1
+    if index >= len(block):
+        return "", len(block)
+    if block[index] == "{":
+        # _balanced answers the text between the braces, so the span is two characters longer.
+        body = _balanced(block, index, "{", "}")
+        end = index + len(body) + 2
+        return block[index:end], end
+    keyword = re.match(r"\b(if|for|while|switch|catch|try|else|function)\b", block[index:])
+    if keyword is not None:
+        cursor = index + keyword.end()
+        while cursor < len(block) and block[cursor] != "(" and block[cursor] != "{":
+            cursor += 1
+        if cursor < len(block) and block[cursor] == "(":
+            cursor += len(_balanced(block, cursor, "(", ")")) + 2
+        if keyword.group(1) == "if":
+            _, cursor = _consume_statement(block, cursor)
+            tail = block[cursor:]
+            following = re.match(r"\s*\belse\b", tail)
+            if following is not None:
+                _, cursor = _consume_statement(block, cursor + following.end())
+            return block[index:cursor], cursor
+        _, cursor = _consume_statement(block, cursor)
+        return block[index:cursor], cursor
+    depth = 0
+    for cursor in range(index, len(block)):
+        char = block[cursor]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif depth == 0 and char == ";":
+            return block[index : cursor + 1], cursor + 1
+    return block[index:], len(block)
+
+
+def _labels_at_top_level(body: str) -> list:
+    """Where each `case`/`default` arm of this switch body starts.
+
+    Only labels at the body's own bracket depth. A nested switch has labels of its own, and
+    counting them splits the outer arms mid-brace, which leaves slices `_balanced` cannot read.
+    """
+    scan = _outside_literals(body)
+    depth, ends = 0, []
+    for match in re.finditer(r"[(\[{}\])]|\b(?:case\b[^:]*|default\s*):", scan):
+        token = match.group(0)
+        if token in "([{":
+            depth += 1
+        elif token in ")]}":
+            depth -= 1
+        elif depth == 0:
+            ends.append(match.end())
+    return ends
+
+
+def _switch_always_returns(statement: str) -> bool:
+    """An exhaustive `switch` whose every case returns.
+
+    Without a `default:` the switch can match nothing and fall past its own closing brace, so
+    only a defaulted one can carry every path. A case that does not return falls through to the
+    next, which is why an empty one is allowed and a `break` is not: `break` leaves the switch
+    with no value.
+    """
+    body = statement[statement.index("{") :] if "{" in statement else ""
+    if not body:
+        return False
+    body = _balanced(body, 0, "{", "}")
+    labels = _labels_at_top_level(body)
+    scan = _outside_literals(body)
+    # The `default:` has to be one of THIS switch's labels. A nested switch can carry one of its
+    # own, and reading that as exhaustiveness lets a value matching no outer case fall straight
+    # past the closing brace.
+    if not any(re.search(r"\bdefault\s*:\s*$", scan[:end]) for end in labels):
+        return False
+    if not labels:
+        return False
+    for position, start in enumerate(labels):
+        end = labels[position + 1] if position + 1 < len(labels) else len(body)
+        arm = re.sub(r"\b(?:case\b[^:]*|default\s*):\s*$", "", body[start:end]).strip()
+        # A `break` leaves the switch carrying no value, so that path reaches no return.
+        if _breaks_out(arm):
+            return False
+        if _block_always_returns(arm):
+            continue
+        # Anything else falls into the next label, empty or not: fall-through is not a property
+        # of empty arms, it is what any arm does when it neither returns nor breaks. The next
+        # label is then the one that has to carry it, and a last label has none to fall into.
+        if position + 1 == len(labels):
+            return False
+    return True
+
+
+def _breaks_out(arm: str) -> bool:
+    """A `break` belonging to this arm, rather than to a loop or switch nested in it.
+
+    Bracket depth is the wrong test. `if (stop) { break; }` sits inside braces and still leaves
+    the switch, so only the statements that can absorb a `break` of their own are skipped: a
+    loop, a nested switch, and a function body.
+    """
+    scan = _outside_literals(arm)
+    absorbing = [
+        (match.start(), _consume_statement(scan, match.start())[1])
+        for match in re.finditer(r"\b(?:for|while|do|switch)\b", scan)
+    ]
+    absorbing += _nested_function_spans(scan)
+    return any(
+        not any(begin <= match.start() < end for begin, end in absorbing)
+        for match in re.finditer(r"\bbreak\b", scan)
+    )
+
+
+def _block_always_returns(block: str) -> bool:
+    """Does every path out of this block go through a `return`?
+
+    A block that can fall off the end returns `undefined`, and a selector doing that holds
+    `undefined` steady while the field moves, so the caller has to score that path too. Walking
+    the block's own statements is what makes an exhaustive `if`/`else` count: it returns on every
+    path, and reading only for a trailing unconditional return would invent a fall-through for it.
+
+    A loop never counts. Its body may not run at all, so `for (...) return x;` falls through.
+    """
+    index = 0
+    while index < len(block):
+        statement, index = _consume_statement(block, index)
+        stripped = statement.strip()
+        if not stripped:
+            break
+        if re.match(r"\breturn\b", stripped):
+            return True
+        if stripped.startswith("{") and _block_always_returns(_balanced(stripped, 0, "{", "}")):
+            return True
+        if re.match(r"\bswitch\b", stripped) and _switch_always_returns(stripped):
+            return True
+        branch = re.match(r"\bif\b\s*", stripped)
+        if branch is None:
+            continue
+        cursor = branch.end()
+        cursor += len(_balanced(stripped, cursor, "(", ")")) + 2
+        taken, cursor = _consume_statement(stripped, cursor)
+        following = re.match(r"\s*\belse\b", stripped[cursor:])
+        if following is None:
+            continue
+        missed, _ = _consume_statement(stripped, cursor + following.end())
+        if _arm_always_returns(taken) and _arm_always_returns(missed):
+            return True
+    return False
+
+
+def _arm_always_returns(arm: str) -> bool:
+    """One branch of an `if`, braced or not, seen as a block."""
+    arm = arm.strip()
+    if arm.startswith("{"):
+        arm = _balanced(arm, 0, "{", "}")
+    return _block_always_returns(arm)
+
+
+def _own_scope_returns(block: str) -> list:
+    """The `return` expressions of this block, not of a function nested in it: a helper returns
+    its own value, which is not what zustand compares."""
     nested = _nested_function_spans(block)
     out = []
     for match in re.finditer(r"\breturn\b", block):
@@ -333,16 +513,28 @@ def _own_scope_returns(block: str) -> list:
     return out
 
 
+# A backslash escapes the next character, so a quote carrying one is not the end of the token.
+_STRING_BODY = r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\""
+_STRING_LITERAL = re.compile(_STRING_BODY)
+
+
 def _normalised(expression: str) -> str:
     """Whitespace out and `s["x"]` written as `s.x`, so one access has one spelling.
 
-    Two arms are only interchangeable if they are the same expression, and the comparison is
-    textual: without this, `s.other` and `s["other"]` read as a choice the guard steers, when
-    the selector returns the same store value either way.
+    Arms are compared textually, so `s.other` and `s["other"]` must not read as a choice. Only
+    whitespace between tokens goes: inside a literal it is part of the value, and stripping it
+    would let a guard pinning `"a b"` match an arm returning `"ab"`.
+
+    The trailing comma of the useChatRuntimeStore() argument rides along on the last arm, and
+    an arm differing from its twin only by that comma is the same expression.
     """
-    # The trailing comma of the useChatRuntimeStore() argument rides along on the last arm, and
-    # an arm that differs from its twin only by that comma is the same expression.
-    collapsed = re.sub(r"\s+", "", expression).rstrip(",;")
+    pieces, last = [], 0
+    for match in _STRING_LITERAL.finditer(expression):
+        pieces.append(re.sub(r"\s+", "", expression[last : match.start()]))
+        pieces.append(match.group(0))
+        last = match.end()
+    pieces.append(re.sub(r"\s+", "", expression[last:]))
+    collapsed = "".join(pieces).rstrip(",;")
     return re.sub(r"\[['\"]([A-Za-z_$][\w$]*)['\"]\]", r".\1", collapsed)
 
 
@@ -351,22 +543,208 @@ def _selector_signature(selector: str, field: str):
 
     A destructured parameter is the other way to write the same subscription, so
     `({ reasoningBudget }) => reasoningBudget` and `({ reasoningBudget: budget }) => budget`
-    are read through their local name. Returns (0, None) when the parameter is neither shape,
+    are read through their local name. Returns (0, None, None) when the parameter is neither shape,
     or when a destructuring does not take the field at all.
     """
     plain = re.match(r"\s*\(?\s*([A-Za-z_$][\w$]*)\s*\)?\s*(?::[^=]*)?=>", selector)
     if plain is not None:
-        return plain.end(), re.compile(rf"\b{re.escape(plain.group(1))}\.{field}\b")
+        access = rf"{re.escape(plain.group(1))}\.{field}"
+        return plain.end(), re.compile(rf"\b{access}\b"), access
 
     destructured = re.match(r"\s*\(?\s*\{([^}]*)\}\s*\)?\s*(?::[^=]*)?=>", selector)
     if destructured is None:
-        return 0, None
+        return 0, None, None
     for entry in destructured.group(1).split(","):
         name, _, alias = entry.partition(":")
         if name.strip() == field:
             local = alias.strip() or field
-            return destructured.end(), re.compile(rf"\b{re.escape(local)}\b")
-    return 0, None
+            access = re.escape(local)
+            return destructured.end(), re.compile(rf"\b{access}\b"), access
+    return 0, None, None
+
+
+_NUMBER = r"-?(?:0[xXbBoO][\da-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)"
+# The trailing guard matters as much as the pattern: without it `1e3` matches as `1`, and a
+# pin to 1000 reads as a pin to 1.
+_LITERAL = rf"(?:null|undefined|true|false|{_NUMBER}|{_STRING_BODY})(?![\w$.])"
+
+
+def _outside_literals(expression: str) -> str:
+    """`expression` with the contents of quoted literals blanked out.
+
+    Operators are read by searching the text, and a message is text too: `msg === "a!b"` carries
+    a `!` that is part of a value, not a negation, and a selector returning the field unchanged
+    must not be refused for what its strings happen to spell.
+    """
+    out, last = [], 0
+    for match in _STRING_LITERAL.finditer(expression):
+        out.append(expression[last : match.start()])
+        out.append(match.group(0)[0] + " " * (len(match.group(0)) - 2) + match.group(0)[-1])
+        last = match.end()
+    out.append(expression[last:])
+    return "".join(out)
+
+
+def _unwrapped(expression: str) -> str:
+    """`expression` with redundant outer parentheses removed.
+
+    Parenthesising a comparison does not change it, and a contract test a legal reformatting
+    breaks says nothing about what it guards. Only a pair wrapping the whole expression goes:
+    the outer `(` of `(budget === -1) === false` does not close at the end, so it stays.
+    """
+    while expression.startswith("(") and expression.endswith(")"):
+        depth = 0
+        for index, char in enumerate(expression):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+        if index != len(expression) - 1:
+            break
+        expression = expression[1:-1].strip()
+    return expression
+
+
+def _top_level_conjuncts(guard: str) -> list:
+    """`guard` split on the `&&` operators that are not inside brackets."""
+    parts, depth, start = [], 0, 0
+    # Bracket and `&&` positions are read off the blanked copy, for the same reason `!` and `||`
+    # are: a quoted literal can spell any of them without being one.
+    scan = _outside_literals(guard)
+    index = 0
+    while index < len(guard):
+        char = scan[index]
+        if char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif depth == 0 and scan.startswith("&&", index):
+            parts.append(guard[start:index])
+            index += 2
+            start = index
+            continue
+        index += 1
+    parts.append(guard[start:])
+    return [part.strip() for part in parts if part.strip()]
+
+
+_STRING_ESCAPES = {
+    "n": "\n", "r": "\r", "t": "\t", "b": "\b", "f": "\f", "v": "\v", "0": "\0",
+}
+
+
+def _decoded(text: str) -> str:
+    """A string literal's body as the runtime string it denotes.
+
+    `"\\x61"` and `"a"` are one value, so comparing the source would refuse a selector for
+    spelling a character differently. An unrecognised escape stands for the character itself,
+    which is what JavaScript does.
+    """
+    out, index = [], 0
+    while index < len(text):
+        char = text[index]
+        if char != "\\" or index + 1 >= len(text):
+            out.append(char)
+            index += 1
+            continue
+        marker = text[index + 1]
+        if marker == "x" and re.fullmatch(r"[0-9a-fA-F]{2}", text[index + 2 : index + 4]):
+            out.append(chr(int(text[index + 2 : index + 4], 16)))
+            index += 4
+        elif marker == "u" and text[index + 2 : index + 3] == "{":
+            close = text.find("}", index + 3)
+            digits = text[index + 3 : close] if close != -1 else ""
+            if close != -1 and re.fullmatch(r"[0-9a-fA-F]+", digits):
+                out.append(chr(int(digits, 16)))
+                index = close + 1
+            else:
+                out.append(marker)
+                index += 2
+        elif marker == "u" and re.fullmatch(r"[0-9a-fA-F]{4}", text[index + 2 : index + 6]):
+            out.append(chr(int(text[index + 2 : index + 6], 16)))
+            index += 6
+        else:
+            out.append(_STRING_ESCAPES.get(marker, marker))
+            index += 2
+    return "".join(out)
+
+
+def _literal_value(text: str):
+    """What a literal denotes, so equivalent spellings compare equal.
+
+    `0x10` and `16` are one value, as are `1e3` and `1000`, and `'x'` and `"x"`. Comparing the
+    source instead would fail a selector for rewriting a literal, which is the reformatting this
+    test exists to survive. A token that is not a literal answers itself, so it can only match
+    another copy of the same text.
+    """
+    text = text.strip()
+    if re.fullmatch(_NUMBER, text):
+        try:
+            return float(int(text, 0))
+        except ValueError:
+            return float(text)
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in "'\"":
+        return ("string", _decoded(text[1:-1]))
+    return text
+
+
+def _pinned_literal(guard: str, taken: bool, access: str, field: str):
+    """The one value `field` can hold on this branch, or None if the branch does not fix it.
+
+    `budget === -1` taken true says the budget is -1 there, and `budget !== null` taken false says
+    it is null. `budget > 0` fixes nothing: every budget above zero reaches the same result.
+
+    The comparison has to be against the field read off the selector's own parameter: asking
+    separately whether the guard names the field and whether something is compared to a literal
+    lets the two answers come from different operands.
+    """
+    # Guards arrive normalised, so there is no whitespace to allow for. The bounds matter:
+    # without them `s.reasoningBudget` matches inside `defaults.reasoningBudget`, and a
+    # statement about another object reads as one about the store.
+    start, end = r"(?<![\w$.])", r"(?![\w$])"
+    bound = rf"{start}{access}{end}"
+    # Strict only: `==` relates a class of values to one literal, so the branch is not a
+    # single-value path. `msg == 0` is taken by both "" and "0".
+    equal = rf"(?:{bound}===({_LITERAL})|({_LITERAL})==={bound})"
+    unequal = rf"(?:{bound}!==({_LITERAL})|({_LITERAL})!=={bound})"
+
+    # Under `!` a comparison says the opposite of what it reads, so a logical not is refused
+    # rather than interpreted.
+    # No blanket search for `!` or `||`. Requiring the comparison to match a top-level conjunct
+    # end to end already excludes both: a negated or disjoined comparison is not a conjunct
+    # equal to itself. Rejecting on the operator anywhere in the guard threw out unrelated
+    # conditions too, so `budget === -1 && !disabled` was refused for the `!`.
+    def _separates(literal: str) -> bool:
+        """`===` tells this literal apart from every other value.
+
+        Zero is the exception: `budget === 0` is satisfied by -0 as well, so the branch holds
+        two values. zustand compares with Object.is, which does tell them apart, so an arm
+        returning 0 there is stale for a -0 to 0 change. The preset normaliser reaches -0
+        through Math.trunc, so this is a value the store really can hold.
+        """
+        value = _literal_value(literal)
+        return not (isinstance(value, float) and value == 0.0)
+
+    if taken:
+        # The comparison has to BE a conjunct, not merely occur inside one: an inner equality can
+        # be fed to another operator, and `(budget === -1) === false` is taken for every value
+        # except -1.
+        # Unwrapped first: a conjunction wrapped whole keeps its `&&` above depth zero, so the
+        # guard would never be split and the pin inside it never seen.
+        for conjunct in _top_level_conjuncts(_unwrapped(guard)):
+            match = re.fullmatch(equal, _unwrapped(conjunct))
+            if match is not None:
+                found = match.group(1) or match.group(2)
+                return found if _separates(found) else None
+        return None
+    # Negating the guard only pins the field when the guard is that comparison and nothing else.
+    match = re.fullmatch(unequal, _unwrapped(guard))
+    if match is None:
+        return None
+    found = match.group(1) or match.group(2)
+    return found if _separates(found) else None
 
 
 def _selector_reads(selector: str, field: str) -> bool:
@@ -375,24 +753,22 @@ def _selector_reads(selector: str, field: str) -> bool:
     Zustand re-renders on the RESULT, not on a property the selector happened to touch, so one
     that tests `s.<field>` and returns something else either way tracks nothing. A result the
     field does not appear in still counts when the field decides whether it is returned at all,
-    as in `s.<field> != null ? s.<field> : null`. The parameter name comes from the signature
+    as in `s.<field> !== null ? s.<field> : null`. The parameter name comes from the signature
     rather than being assumed to be `s`.
     """
 
     selector = _without_comments(selector)
-    signature, read = _selector_signature(selector, field)
+    signature, read, access = _selector_signature(selector, field)
     if read is None:
         return False
     body = selector[signature:].strip()
     if body.startswith("{"):
-        # A block body returns what it returns; a statement that reads the field and drops it
-        # hands zustand the same value every time. Nothing to return is nothing to compare, so
-        # a body whose returns cannot be found is rejected rather than read as its own text.
+        # What a block returns, not what it reads: a statement that drops the field hands
+        # zustand the same value every time.
         block = _balanced(body, 0, "{", "}")
-        # Inline plain bindings, so naming the value before returning it stays a refactor:
-        # `const v = s.budget; return v ? ... : ...` reads the field through `v`.
-        # Brace-free right-hand sides only. A binding whose value is itself a function has a `;`
-        # inside its body, so a looser capture would cut it mid-body and substitute the pieces.
+        # Inline plain bindings, so naming a value before returning it stays a refactor.
+        # Brace-free right-hand sides only: a function-valued binding has a `;` in its body, and
+        # a looser capture would cut it mid-body.
         for name, expression in re.findall(r"\b(?:const|let)\s+(\w+)\s*=\s*([^;{}]+);", block):
             block = re.sub(rf"\b{re.escape(name)}\b", f"({expression})", block)
         results = [
@@ -400,25 +776,31 @@ def _selector_reads(selector: str, field: str) -> bool:
             for expression in _own_scope_returns(block)
             for result in _split_ternary(expression)
         ]
+        if results and not _block_always_returns(block):
+            # The fall-through path, which returns undefined and tracks nothing.
+            results.append(("undefined", ()))
     else:
         results = _split_ternary(body)
     if not results:
         return False
     results = [
-        (_normalised(result), tuple(_normalised(guard) for guard in guards))
+        (_normalised(result), tuple((_normalised(guard), taken) for guard, taken in guards))
         for result, guards in results
     ]
-    if all(read.search(result) for result, _ in results):
-        return True
-    # Some arm has to return the field. A condition alone cannot carry the subscription: it only
-    # says which arm is taken, so `s.budget > 0 ? s.other : null` holds the same result while the
-    # budget moves from 1 to 2 and the sheet never re-renders. Where one arm does return it, a
-    # guard naming the field can still account for the others, which is how
-    # `s.budget != null ? s.budget : null` stays a subscription.
-    if not any(read.search(result) for result, _ in results):
-        return False
+    # Every path either returns the field, or is reachable for only one value of it. Merely
+    # mentioning the field carries no path: `s.budget > 0 ? s.other : null` holds the same result
+    # while the budget moves from 1 to 2. Only a comparison pinning the field to a literal on the
+    # branch taken makes a constant result honest, and only when the constant IS the pinned
+    # value: `s.budget === -1 ? 0 : s.budget` returns 0 for a budget of -1 and for a budget of 0
+    # alike, so the supported -1 to 0 change produces no change at all.
     return all(
-        read.search(result) or any(read.search(guard) for guard in guards)
+        read.search(result)
+        or any(
+            _pinned_literal(guard, taken, access, field) is not None
+            and _literal_value(_pinned_literal(guard, taken, access, field))
+            == _literal_value(result)
+            for guard, taken in guards
+        )
         for result, guards in results
     )
 
@@ -450,13 +832,102 @@ SELECTOR_CASES = [
     ("(s) => (s.reasoningBudget)", True),
     ("(s) => s.reasoningBudget ?? s.fallback", True),
     ("(s) => formatBudget(s.reasoningBudget)", True),
-    # A constant arm the field itself decides between still moves when the field moves.
-    ("(s) => s.reasoningBudget != null ? s.reasoningBudget : null", True),
+    # Loose comparison pins nothing: `!= null` is false for null and for undefined alike, so
+    # the null arm is returned for two distinct field values.
+    ("(s) => s.reasoningBudget != null ? s.reasoningBudget : null", False),
+    ("(s) => s.reasoningBudget !== null ? s.reasoningBudget : null", True),
+    ("(s) => s.reasoningBudget == 0 ? 0 : s.reasoningBudget", False),
     # Steering between arms is not tracking: the result is the same for every non-null
     # budget, so the sheet never re-renders on a change between two of them.
-    ("(s) => s.reasoningBudget != null ? s.other : null", False),
+    ("(s) => s.reasoningBudget !== null ? s.other : null", False),
+    # Whitespace inside a literal is part of the value: "a b" and "ab" are two messages.
+    ('(s) => s.reasoningBudget === "a b" ? "ab" : s.reasoningBudget', False),
+    ('(s) => s.reasoningBudget === "a b" ? "a b" : s.reasoningBudget', True),
     ("(s) => s.reasoningBudget > 0 ? s.other : null", False),
+    # The literal has to be compared against the field, not merely to sit in the same guard.
+    ('(s) => s.reasoningBudget > 0 && s.mode === "x" ? s.other : s.reasoningBudget', False),
+    ('(s) => s.reasoningBudget === -1 && s.mode === "x" ? -1 : s.reasoningBudget', True),
+    ('(s) => s.reasoningBudget === -1 || s.mode === "x" ? -1 : s.reasoningBudget', False),
+    ('(s) => s.reasoningBudget !== null && s.mode === "x" ? s.reasoningBudget : null', False),
+    # The comparison must be on the field read off the selector's own parameter.
+    ("(s) => defaults.reasoningBudget === -1 ? -1 : s.reasoningBudget", False),
+    ("(s) => -1 === s.reasoningBudgetExtra ? -1 : s.reasoningBudget", False),
+    ("(s) => -1 === s.reasoningBudget ? -1 : s.reasoningBudget", True),
+    # A negated condition beside the pin is an ordinary extra condition, not a negated pin.
+    ("(s) => s.reasoningBudget === -1 && !s.disabled ? -1 : s.reasoningBudget", True),
+    # A comparison under `!` says the opposite of what it reads.
+    ("(s) => !(s.reasoningBudget === -1) ? -1 : s.reasoningBudget", False),
+    # The literal has to be read whole. Half of `1e3` is `1`, and a pin to 1000 that reads as
+    # a pin to 1 accepts an arm returning 1 for a budget of 1000.
+    ("(s) => s.reasoningBudget === 1e3 ? 1 : s.reasoningBudget", False),
+    ("(s) => s.reasoningBudget === 1e3 ? 1e3 : s.reasoningBudget", True),
+    ("(s) => s.reasoningBudget === 0x10 ? 0x10 : s.reasoningBudget", True),
+    # Pins compare by value: rewriting a literal is a reformatting, not a change of meaning.
+    ("(s) => s.reasoningBudget === 0x10 ? 16 : s.reasoningBudget", True),
+    ("(s) => s.reasoningBudget === 1e3 ? 1000 : s.reasoningBudget", True),
+    ("(s) => s.reasoningBudget === 'x' ? \"x\" : s.reasoningBudget", True),
+    # `===` cannot separate -0 from 0, but zustand's Object.is can, so zero pins nothing.
+    ("(s) => s.reasoningBudget === -0 ? 0 : s.reasoningBudget", False),
+    ("(s) => s.reasoningBudget === 0 ? 0 : s.reasoningBudget", False),
+    # A `:` or a `?` inside a message is a character, not a ternary operator.
+    ('(s) => s.reasoningBudget === "a:b" ? "a:b" : s.reasoningBudget', True),
+    ('(s) => s.reasoningBudget === "a?b" ? "a?b" : s.reasoningBudget', True),
+    # An escape spells a character; `"\\x61"` and `"a"` are one value.
+    ('(s) => s.reasoningBudget === "\\x61" ? "a" : s.reasoningBudget', True),
+    ('(s) => s.reasoningBudget === "\\u0061" ? "a" : s.reasoningBudget', True),
+    ('(s) => s.reasoningBudget === "\\x61" ? "b" : s.reasoningBudget', False),
+    # An escaped quote is a character in the message, not the end of the literal.
+    ('(s) => s.reasoningBudget === "a\\"b" ? "a\\"b" : s.reasoningBudget', True),
+    ('(s) => s.reasoningBudget === "a\\"b" ? "ab" : s.reasoningBudget', False),
+    # Distinct values stay distinct, whatever they are spelled with.
+    ("(s) => s.reasoningBudget === null ? undefined : s.reasoningBudget", False),
+    ("(s) => s.reasoningBudget === true ? 1 : s.reasoningBudget", False),
+    # A pinned arm has to return the value the field holds there, or it collides: -1 becoming 0
+    # returns 0 both before and after.
+    ("(s) => s.reasoningBudget === -1 ? 0 : s.reasoningBudget", False),
+    ("({ reasoningBudget: b }) => b === -1 ? -1 : b", True),
+    # A guard cannot rescue a subpath it does not pin: `enabled` false holds s.other steady.
+    ("(s) => s.reasoningBudget !== null ? (s.enabled ? s.reasoningBudget : s.other) : null", False),
+    # Falling off the end of a block returns undefined, which tracks nothing.
+    ("(s) => { if (s.enabled) return s.reasoningBudget; }", False),
+    # An exhaustive if/else returns on every path, so there is no fall-through to invent.
+    ("(s) => { if (s.enabled) return s.reasoningBudget; else return s.reasoningBudget; }", True),
+    (
+        "(s) => { if (s.enabled) { return s.reasoningBudget; } "
+        "else { return s.reasoningBudget; } }",
+        True,
+    ),
+    ("(s) => { if (s.enabled) return s.reasoningBudget; else return s.other; }", False),
+    # `else` binds to the nearest `if`, so the outer one is not exhaustive here.
+    (
+        "(s) => { if (s.a) { if (s.b) return s.reasoningBudget; } "
+        "else return s.reasoningBudget; }",
+        False,
+    ),
+    (
+        "(s) => { if (s.a) { if (s.b) return s.reasoningBudget; else return s.reasoningBudget; } "
+        "else return s.reasoningBudget; }",
+        True,
+    ),
+    # A loop body may never run, so it is not a path that always returns.
+    ("(s) => { while (s.on) return s.reasoningBudget; }", False),
+    ("(s) => { { return s.reasoningBudget; } }", True),
+    ("(s) => { if (s.enabled) { return s.reasoningBudget; } return s.reasoningBudget; }", True),
     ("(s) => s.reasoningBudget === -1 ? -1 : s.reasoningBudget", True),
+    # An operator inside a literal is part of a value: a message may spell `!` or `||`.
+    ('(s) => s.reasoningBudget === "a!b" ? "a!b" : s.reasoningBudget', True),
+    ('(s) => s.reasoningBudget === "a||b" ? "a||b" : s.reasoningBudget', True),
+    ('(s) => s.reasoningBudget === "a&&b" ? "x" : s.reasoningBudget', False),
+    # Wrapping the whole conjunction keeps its `&&` above depth zero until the guard is unwrapped.
+    ("(s) => (s.reasoningBudget === -1 && s.enabled) ? -1 : s.reasoningBudget", True),
+    ("(s) => (s.reasoningBudget === -1 || s.enabled) ? -1 : s.reasoningBudget", False),
+    # Parenthesising a comparison, or the value it pins to, is a reformatting and nothing more.
+    ("(s) => (s.reasoningBudget === -1) ? -1 : s.reasoningBudget", True),
+    ("(s) => s.reasoningBudget === -1 ? (-1) : s.reasoningBudget", True),
+    ("(s) => ((s.reasoningBudget === -1)) ? -1 : s.reasoningBudget", True),
+    # Nor when the negation is spelled as a second comparison: this arm is taken for every
+    # budget except -1, so it pins nothing, and the outer pair is not redundant.
+    ("(s) => (s.reasoningBudget === -1) === false ? -1 : s.reasoningBudget", False),
     # Read but not returned: zustand compares results, so these subscribe to something else.
     ("(s) => s.enabled ? s.reasoningBudget : s.fallback", False),
     ("(s) => s.mode === 'x' ? (s.on ? s.reasoningBudget : s.q) : s.reasoningBudget", False),
@@ -471,13 +942,80 @@ SELECTOR_CASES = [
     ("(s) => s.reasoningBudget ? (s.on ? null : null) : null", False),
     # Block bodies: what is returned, not what is mentioned on the way there.
     ("(s) => { return s.reasoningBudget; }", True),
-    ("(s) => { const v = s.reasoningBudget; return v ? s.reasoningBudget : -1; }", True),
+    # A truthiness test pins nothing: a budget of 0 and a budget of null both land on -1.
+    ("(s) => { const v = s.reasoningBudget; return v ? s.reasoningBudget : -1; }", False),
+    (
+        "(s) => { const v = s.reasoningBudget; return v ? s.reasoningBudget : s.reasoningBudget; }",
+        True,
+    ),
     ("(s) => { void s.reasoningBudget; return null; }", False),
     ("(s) => { s.reasoningBudget; }", False),
     # A control block is the selector's own scope; a function declared inside it is not.
     ("(s) => { if (s.enabled) { return s.other; } return s.reasoningBudget; }", False),
     ("(s) => { if (s.enabled) { return s.reasoningBudget; } return s.reasoningBudget; }", True),
     ("(s) => { for (const x of s.list) { return s.other; } return s.reasoningBudget; }", False),
+    # A defaulted switch whose every arm returns the field leaves no path to undefined.
+    (
+        '(s) => { switch (s.mode) { case "x": return s.reasoningBudget; '
+        "default: return s.reasoningBudget; } }",
+        True,
+    ),
+    ('(s) => { switch (s.mode) { case "x": default: return s.reasoningBudget; } }', True),
+    # A nested switch has labels of its own; they belong to it, not to the outer arm list.
+    (
+        '(s) => { switch (s.mode) { case "x": switch (s.sub) { default: return s.reasoningBudget; } '
+        "default: return s.reasoningBudget; } }",
+        True,
+    ),
+    # Fall-through is what any arm does when it neither returns nor breaks, empty or not.
+    (
+        '(s) => { switch (s.mode) { case "x": sideEffect(); case "y": return s.reasoningBudget; '
+        "default: return s.reasoningBudget; } }",
+        True,
+    ),
+    (
+        '(s) => { switch (s.mode) { case "x": sideEffect(); default: return s.reasoningBudget; } }',
+        True,
+    ),
+    (
+        '(s) => { switch (s.mode) { default: return s.reasoningBudget; case "x": sideEffect(); } }',
+        False,
+    ),
+    # A nested switch's `default:` is not the outer switch's: a mode matching no outer case
+    # still falls past the closing brace.
+    (
+        '(s) => { switch (s.mode) { case "x": switch (s.sub) { default: return s.reasoningBudget; } } }',
+        False,
+    ),
+    # A `break` in a plain block still leaves the switch; one inside a loop belongs to the loop.
+    (
+        '(s) => { switch (s.mode) { case "x": if (s.stop) { break; } return s.reasoningBudget; '
+        "default: return s.reasoningBudget; } }",
+        False,
+    ),
+    (
+        '(s) => { switch (s.mode) { case "x": for (;;) { break; } return s.reasoningBudget; '
+        "default: return s.reasoningBudget; } }",
+        True,
+    ),
+    # An empty LAST label has nothing to fall into, so that value leaves the switch.
+    ('(s) => { switch (s.mode) { default: return s.reasoningBudget; case "x": } }', False),
+    # Undefaulted: a mode matching nothing falls past the switch and returns undefined.
+    ('(s) => { switch (s.mode) { case "x": return s.reasoningBudget; } }', False),
+    # `break` leaves the switch with no value, which is the fall-through again.
+    ('(s) => { switch (s.mode) { case "x": break; default: return s.reasoningBudget; } }', False),
+    (
+        '(s) => { switch (s.mode) { case "x": return s.other; default: return s.reasoningBudget; } }',
+        False,
+    ),
+    # A loop header's own semicolons do not end a statement: an empty list falls through to
+    # undefined, so the loop body is not an unconditional return.
+    ("(s) => { for (let i = 0; i < s.list.length; i++) return s.reasoningBudget; }", False),
+    (
+        "(s) => { for (let i = 0; i < s.list.length; i++) return s.reasoningBudget; "
+        "return s.reasoningBudget; }",
+        True,
+    ),
     ("(s) => { const f = (v) => { return v; }; return f(s.reasoningBudget); }", True),
     ("(s) => s.reasoningBudgetMessage", False),
     ("(s) => s.reasoningBudgets", False),
