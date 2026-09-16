@@ -1,0 +1,135 @@
+name: WoA CUDA cross-compile probe
+
+# Staging-only probe: proves that ggml-cuda for Windows ARM64 cross-compiles on
+# an x64 runner with the CUDA 13.4 ARM64 toolkit, before proposing the leg in
+# unslothai/llama.cpp. Not part of any release path.
+
+on:
+  push:
+    branches: [woa-cuda-probe]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: ggml-cuda windows/arm64
+    runs-on: windows-2022
+    timeout-minutes: 180
+
+    steps:
+      - name: Clone llama.cpp
+        shell: bash
+        run: |
+          set -eux
+          git clone --depth 1 https://github.com/unslothai/llama.cpp.git src
+          cd src
+          git log -1 --oneline
+          test -f cmake/arm64-windows-msvc-cuda.cmake
+
+      - name: Install Ninja
+        shell: pwsh
+        run: |
+          (Get-Command ninja.exe -ErrorAction Stop).Source
+          ninja --version
+
+      - name: Setup MSVC (amd64_arm64)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756  # v1
+        with:
+          arch: amd64_arm64
+
+      - name: Install CUDA toolkit 13.4 (x86_64 host, arm64 target)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pool = 'https://packages.nvidia.com/bin-archive/pool'
+          $guid = '5B515474-7E78-11F1-8656-C51E4F4B317F'
+          $components = @(
+            "windows-x86_64/$guid/cccl-windows-x86_64-13.3.4.1.2-archive",
+            "windows-x86_64/$guid/cuda_crt-windows-x86_64-13.4.46-archive",
+            "windows-x86_64/$guid/cuda_nvcc-windows-x86_64-13.4.46-archive",
+            "windows-x86_64/$guid/libnvvm-windows-x86_64-13.4.46-archive",
+            "windows-arm64/$guid/cuda_cudart-windows-arm64-13.4.46-archive",
+            "windows-arm64/$guid/libcublas-windows-arm64-13.7.0.10-archive"
+          )
+          $prefix = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4'
+          $stage = Join-Path $env:RUNNER_TEMP 'cuda-redist'
+          New-Item -ItemType Directory -Force -Path $prefix, $stage | Out-Null
+          foreach ($c in $components) {
+            $name = Split-Path $c -Leaf
+            $zip = Join-Path $stage "$name.zip"
+            curl.exe -fsSL --retry 3 -o $zip "$pool/$c.zip"
+            if ($LASTEXITCODE -ne 0) { throw "download failed: $c" }
+            tar.exe -xf $zip -C $stage
+            if ($LASTEXITCODE -ne 0) { throw "extract failed: $name" }
+            robocopy (Join-Path $stage $name) $prefix /E /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "copy failed: $name ($LASTEXITCODE)" }
+          }
+          "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CUDA_PATH=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "CUDA_PATH_V13_4=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          exit 0
+
+      - name: Show what the toolkit ships
+        shell: pwsh
+        run: |
+          nvcc --version
+          Get-ChildItem "$env:CUDA_PATH\lib" | Select-Object -ExpandProperty Name
+          Get-ChildItem "$env:CUDA_PATH\lib\arm64" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          Get-ChildItem "$env:CUDA_PATH\bin" -Filter '*.dll' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name
+          "VCToolsInstallDir=$env:VCToolsInstallDir"
+
+      - name: Configure
+        shell: pwsh
+        working-directory: src
+        run: |
+          cmake -S . -B build -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake `
+            -DGGML_NATIVE=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU=OFF `
+            -DGGML_CUDA=ON `
+            -DLLAMA_BUILD_TESTS=OFF `
+            -DLLAMA_BUILD_EXAMPLES=OFF `
+            -DLLAMA_BUILD_TOOLS=OFF `
+            -DLLAMA_BUILD_SERVER=OFF `
+            -DCMAKE_CUDA_ARCHITECTURES="120"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build ggml-cuda
+        shell: pwsh
+        working-directory: src
+        run: |
+          cmake --build build --config Release -j 3 --target ggml-cuda
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Check the machine type of everything we produced
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $found = 0
+          Get-ChildItem -Recurse -Path src\build -Include *.dll, *.exe | ForEach-Object {
+            $fs = [System.IO.File]::OpenRead($_.FullName)
+            try {
+              $br = New-Object System.IO.BinaryReader($fs)
+              $fs.Position = 0x3C
+              $off = $br.ReadInt32()
+              $fs.Position = $off + 4
+              $machine = $br.ReadUInt16()
+            } finally { $fs.Dispose() }
+            "{0}: machine 0x{1:X4}" -f $_.Name, $machine
+            if ($_.Name -eq 'ggml-cuda.dll') {
+              $found = 1
+              if ($machine -ne 0xAA64) { throw "ggml-cuda.dll is machine 0x$('{0:X4}' -f $machine), not ARM64" }
+            }
+          }
+          if (-not $found) { throw "no ggml-cuda.dll was produced" }
+
+      - name: Upload ggml-cuda.dll
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: ggml-cuda-windows-arm64
+          path: src/build/bin/ggml-cuda.dll
+          if-no-files-found: error
