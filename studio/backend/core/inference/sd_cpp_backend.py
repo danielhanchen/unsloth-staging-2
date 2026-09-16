@@ -348,7 +348,17 @@ def sd_cpp_lists_accelerator_device(binary: Optional[str]) -> bool:
     """
     if not binary:
         return False
-    verdict = sd_cpp_accelerator_device_verdict(binary)
+    return accelerator_verdict_keeps_gpu(sd_cpp_accelerator_device_verdict(binary))
+
+
+def accelerator_verdict_keeps_gpu(verdict: Optional[bool]) -> bool:
+    """The conservative collapse ``sd_cpp_lists_accelerator_device`` applies, as a function of a
+    verdict already in hand: "could not tell" keeps the GPU, because an unreadable probe is not
+    evidence that the accelerator is missing.
+
+    Split out so the rule lives in ONE place. A caller that needs the raw verdict for a second
+    question (the H3 load needs it to tell "enumerates the CPU only" from "could not be asked at
+    all") would otherwise re-implement the collapse beside it and the two could drift."""
     return True if verdict is None else verdict
 
 
@@ -547,6 +557,409 @@ def _note_failed_upgrade(accelerator: str) -> None:
         _failed_accelerator_upgrades.add(_installer_module().accelerator_class(accelerator))
     except Exception:  # noqa: BLE001
         pass
+
+
+# The accelerator to try when the one a host asks for cannot be made to run there, and nothing else.
+#
+# A ROCm sd.cpp prebuilt is published for one generic ROCm target, not per gfx arch, so a card whose
+# hipBLAS that build carries no kernels for cannot start it at all: sd-cli dies in hipblasSetStream
+# with CUBLAS_STATUS_INVALID_VALUE on gfx1201 (#9278) and never gets past tensor loading on gfx1100
+# (#8814). Vulkan runs on both of those cards, the installer already resolves a "vulkan" asset for
+# Linux and Windows alike, and the alternative on this path is the CPU build. So Vulkan is the rung
+# between "the ROCm build does not work here" and "give up on the GPU".
+#
+# One-way and one-deep on purpose: nothing falls back FROM Vulkan (the CPU rung below it already
+# exists), and no other accelerator has a broken-per-arch story to fall back from. CUDA either
+# works or the host has no CUDA asset at all, which the CPU rung has always handled.
+_ACCELERATOR_FALLBACK: dict[str, str] = {"rocm": "vulkan"}
+
+
+def sd_cpp_vulkan_fallback_enabled() -> bool:
+    """Whether the ROCm -> Vulkan rung may be taken. ``UNSLOTH_DIFFUSION_SD_CPP_VULKAN_FALLBACK=0``
+    turns it off for a host that would rather see the ROCm failure than be moved to Vulkan."""
+    raw = (os.environ.get("UNSLOTH_DIFFUSION_SD_CPP_VULKAN_FALLBACK", "auto") or "").strip().lower()
+    return raw not in ("0", "off", "false", "no")
+
+
+def fallback_accelerator_for(accelerator: Optional[str]) -> Optional[str]:
+    """The accelerator to try after ``accelerator`` could not be made to run, or None.
+
+    None whenever there is no next rung, the knob is off, or the answer would be the accelerator
+    that was already asked for, so a caller can ladder on this without special-casing any of them.
+    """
+    if not sd_cpp_vulkan_fallback_enabled():
+        return None
+    try:
+        want = _installer_module().accelerator_class(accelerator)
+    except Exception:  # noqa: BLE001 -- cannot classify it, so there is no rung to take
+        want = (accelerator or "").strip().lower()
+    nxt = _ACCELERATOR_FALLBACK.get(want)
+    return nxt if nxt and nxt != want else None
+
+
+# Accelerators whose BUILD could not be run on this host, as distinct from _failed_accelerator_upgrades
+# above, which is about an install that could not be fetched. Persisted as well as memoised: a ROCm
+# build that crashes mid-render (#9278 crashes after tensor loading, minutes in) would otherwise be
+# selected again by the very next load, and again after a restart, because nothing about the install
+# is wrong -- the asset is present, correct for "rocm", and simply does not run on this card.
+#
+# The record is NOT a bare set of accelerator names. A name alone outlives the thing it is a fact
+# about: the claim being stored is "THIS sd.cpp build cannot drive THESE cards through THIS runtime",
+# and a driver upgrade, a new card or a new bundle all make it stale while the name stays the same.
+# So each entry carries the fingerprint it was observed under and is dropped once that provably
+# changes; see _accelerator_fingerprint and _fingerprint_still_applies.
+_ACCELERATOR_RUNTIME_FAILURES_KEY = "sd_cpp_accelerator_runtime_failures"
+# accelerator class -> record dict, the in-process mirror of the persisted map.
+_accelerator_runtime_failures: dict[str, dict] = {}
+
+# How many AMBIGUOUS failures it takes to divert a host. A decisive one is enough on its own; see
+# _ACCELERATOR_RUNTIME_FAILURE_MARKERS below for which is which. Two rather than one because the
+# ambiguous markers name a GPU fault without proving the BUILD is the cause, and the cost of being
+# wrong is a working ROCm installation bypassed until someone finds the reset.
+_AMBIGUOUS_FAILURE_STRIKES = 2
+
+
+def _accelerator_class_of(accelerator: Optional[str]) -> str:
+    try:
+        return _installer_module().accelerator_class(accelerator)
+    except Exception:  # noqa: BLE001 -- the raw string is close enough for a preference note
+        return (accelerator or "").strip().lower()
+
+
+def _accelerator_fingerprint() -> dict:
+    """What the note is a fact ABOUT: the sd.cpp bundle, the GPU runtime and the cards themselves.
+
+    Every component is optional and every one is gathered from something already resolved or
+    already cached, so this adds no probe to the load path. A component that cannot be read is
+    recorded as None rather than omitted, so "we could not tell" is distinguishable from "it was
+    not part of the fingerprint when this was written".
+
+    Never raises. A fingerprint that cannot be built at all is ``{}``, which
+    ``_fingerprint_still_applies`` treats as "cannot tell", i.e. the record keeps applying.
+    """
+    fp: dict = {"bundle": None}
+    try:
+        record = _installer_module().read_install_record(managed_install_root())
+        if isinstance(record, dict):
+            # The release the managed tree came from, read LIVE rather than memoised: a new bundle
+            # is a new build, an install can land inside the life of this process, and a new build
+            # is exactly the thing that can start working on a card the old one could not serve.
+            tag = record.get("tag")
+            fp["bundle"] = str(tag) if tag else None
+    except Exception:  # noqa: BLE001 -- no bundle component, not a failure
+        pass
+    fp.update(_host_fingerprint())
+    return fp
+
+
+# The half of the fingerprint that cannot change inside one process: the GPU runtime this
+# interpreter is bound to and the cards the OS enumerates. Memoised because the fingerprint is
+# consulted on EVERY load through accelerator_runtime_failed, and the inventory read behind it is
+# the one that can schedule a background probe. Cleared by _reset_host_fingerprint for tests.
+_HOST_FINGERPRINT_MEMO: Optional[dict] = None
+
+
+def _reset_host_fingerprint() -> None:
+    """Drop the memoised host half. For tests, and for anything that knows the host changed."""
+    global _HOST_FINGERPRINT_MEMO
+    _HOST_FINGERPRINT_MEMO = None
+
+
+def _host_fingerprint() -> dict:
+    """``{"runtime": ..., "gpus": ...}``, computed once per process. Never raises."""
+    global _HOST_FINGERPRINT_MEMO
+    if _HOST_FINGERPRINT_MEMO is not None:
+        return dict(_HOST_FINGERPRINT_MEMO)
+    fp: dict = {"runtime": None, "gpus": None}
+    try:
+        import torch  # noqa: PLC0415 -- already imported by the backend; local to keep this cheap
+
+        # torch.version.hip is the ROCm userspace/runtime this process is bound to. It moves when
+        # the user upgrades ROCm, which is the single most likely way a previously unusable card
+        # becomes usable, and it needs no subprocess and no driver call to read.
+        runtime = getattr(torch.version, "hip", None) or getattr(torch.version, "cuda", None)
+        fp["runtime"] = str(runtime) if runtime else None
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from utils.hardware.hardware import get_physical_gpu_inventory
+
+        # Non-blocking, the same call the request path uses: on a load path a wedged driver must
+        # never stall this, and a cold cache answering "unknown" simply leaves this component None.
+        # The cards the OS enumerates are the right grain, since swapping the card is the other way
+        # a note stops being true.
+        inventory = get_physical_gpu_inventory(block = False)
+        if not (inventory or {}).get("unknown"):
+            names = sorted(
+                str(d.get("name"))
+                for d in ((inventory or {}).get("devices") or [])
+                if isinstance(d, dict) and d.get("name")
+            )
+            fp["gpus"] = names or None
+    except Exception:  # noqa: BLE001
+        pass
+    _HOST_FINGERPRINT_MEMO = dict(fp)
+    return fp
+
+
+def _fingerprint_still_applies(stored: Optional[dict], current: Optional[dict]) -> bool:
+    """Whether a record written under ``stored`` still speaks for a host fingerprinted ``current``.
+
+    A component invalidates the record only when BOTH sides are known and they DIFFER. Unknown on
+    either side counts as matching, deliberately: the components are best-effort reads, and a probe
+    that intermittently answers "unknown" would otherwise make the host flip between ROCm and Vulkan
+    from load to load, which is worse than either answer. The direction that matters is that a real,
+    observed change in driver, bundle or cards does retire the record.
+    """
+    if not isinstance(stored, dict) or not isinstance(current, dict):
+        return True
+    for key in ("bundle", "runtime", "gpus"):
+        was, now = stored.get(key), current.get(key)
+        if was in (None, "", []) or now in (None, "", []):
+            continue
+        if was != now:
+            return False
+    return True
+
+
+def _normalise_failure_record(key: str, value: object) -> Optional[dict]:
+    """One persisted entry in the shape the readers expect, or None when it is unusable.
+
+    Tolerates the bare-list shape an early build of this feature wrote, reading it as one decisive
+    strike with no fingerprint, which is what it meant. Never raises.
+    """
+    if value is True:
+        return {"strikes": _AMBIGUOUS_FAILURE_STRIKES, "proven": True, "fingerprint": {}}
+    if not isinstance(value, dict):
+        return None
+    try:
+        strikes = int(value.get("strikes", 0) or 0)
+    except (TypeError, ValueError):
+        strikes = 0
+    fingerprint = value.get("fingerprint")
+    return {
+        "strikes": max(strikes, 0),
+        "proven": bool(value.get("proven", False)),
+        "fingerprint": fingerprint if isinstance(fingerprint, dict) else {},
+    }
+
+
+def _stored_accelerator_runtime_failures() -> dict[str, dict]:
+    """The persisted map, or an empty one. Never raises: a store this cannot read only costs the
+    preference, and refusing the load over it would be worse than the failure it is avoiding."""
+    try:
+        from storage.studio_db import get_app_setting
+        from utils.account_context import OWNER, run_as
+
+        # Owner-scoped, like every other host-level preference: which sd.cpp build runs on this
+        # machine is a fact about the machine, not about whoever happens to be generating.
+        stored = run_as(OWNER, get_app_setting, _ACCELERATOR_RUNTIME_FAILURES_KEY, None)
+    except Exception:  # noqa: BLE001
+        return {}
+    if isinstance(stored, str):
+        # A string is tolerated because the value is written through a JSON column: a row saved by
+        # a caller that pre-serialised it reads back as the text of a mapping, not a mapping.
+        try:
+            import json
+            stored = json.loads(stored)
+        except ValueError:
+            return {}
+    if isinstance(stored, (list, tuple, set)):
+        # The shape an early build of this feature wrote: a plain list of accelerator names.
+        stored = {str(item).strip().lower(): True for item in stored if str(item).strip()}
+    if not isinstance(stored, dict):
+        return {}
+    out: dict[str, dict] = {}
+    for key, value in stored.items():
+        name = str(key).strip().lower()
+        record = _normalise_failure_record(name, value) if name else None
+        if record is not None:
+            out[name] = record
+    return out
+
+
+def _persist_accelerator_runtime_failures(records: dict[str, dict]) -> None:
+    """Write the map back. Never raises: the in-process mirror still holds for this run."""
+    try:
+        from storage.studio_db import upsert_app_settings
+        from utils.account_context import OWNER, run_as
+        run_as(OWNER, upsert_app_settings, {_ACCELERATOR_RUNTIME_FAILURES_KEY: records})
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("could not persist the sd.cpp accelerator failure notes: %s", exc)
+
+
+def note_accelerator_runtime_failure(accelerator: Optional[str], *, proven: bool = True) -> None:
+    """Record that the ``accelerator`` sd.cpp build could not be run on this host.
+
+    Only ever records for an accelerator that has a rung below it: noting one with no fallback
+    would persist a row nothing reads, and noting "cpu" would be a claim that the host cannot run
+    stable-diffusion.cpp at all, which no failure here establishes.
+
+    ``proven`` is the difference between evidence and suspicion. The load path passes True because
+    it has ENUMERATED the answer: the host's own build could not be asked for its devices and the
+    fallback build listed one. A decisive sd-cli message passes True for the same reason, the
+    message names the build having no code for the card. An ambiguous message passes False, and
+    those only divert the host once ``_AMBIGUOUS_FAILURE_STRIKES`` of them have been seen under one
+    fingerprint, so a single transient GPU fault never moves a working installation.
+
+    A record observed under a different fingerprint is REPLACED rather than added to: the strikes
+    counted against the old driver or the old bundle are not evidence about the new one.
+    """
+    klass = _accelerator_class_of(accelerator)
+    if not klass or klass not in _ACCELERATOR_FALLBACK:
+        return
+    fingerprint = _accelerator_fingerprint()
+    records = _stored_accelerator_runtime_failures()
+    records.update({k: v for k, v in _accelerator_runtime_failures.items() if k not in records})
+    previous = records.get(klass)
+    if previous is not None and not _fingerprint_still_applies(
+        previous.get("fingerprint"), fingerprint
+    ):
+        previous = None
+    strikes = (previous or {}).get("strikes", 0) + 1
+    record = {
+        "strikes": strikes,
+        "proven": bool(proven) or bool((previous or {}).get("proven", False)),
+        "fingerprint": fingerprint,
+    }
+    if previous == record:
+        return
+    records[klass] = record
+    _accelerator_runtime_failures[klass] = record
+    _persist_accelerator_runtime_failures(records)
+
+
+def _record_diverts(record: Optional[dict], fingerprint: Optional[dict] = None) -> bool:
+    """Whether one record is enough to move this host off its own accelerator."""
+    if not isinstance(record, dict):
+        return False
+    if not _fingerprint_still_applies(
+        record.get("fingerprint"),
+        _accelerator_fingerprint() if fingerprint is None else fingerprint,
+    ):
+        return False
+    if record.get("proven"):
+        return True
+    return int(record.get("strikes", 0) or 0) >= _AMBIGUOUS_FAILURE_STRIKES
+
+
+def accelerator_runtime_failed(accelerator: Optional[str]) -> bool:
+    """Whether the ``accelerator`` build is already known not to run on this host, under a
+    fingerprint that still describes this host."""
+    klass = _accelerator_class_of(accelerator)
+    if not klass:
+        return False
+    fingerprint = _accelerator_fingerprint()
+    if _record_diverts(_accelerator_runtime_failures.get(klass), fingerprint):
+        return True
+    return _record_diverts(_stored_accelerator_runtime_failures().get(klass), fingerprint)
+
+
+def accelerator_runtime_failure_state() -> dict:
+    """What the settings route reports: every record, whether it is currently diverting the host,
+    and the fingerprint it was taken under. Read-only and never raises."""
+    fingerprint = _accelerator_fingerprint()
+    records = _stored_accelerator_runtime_failures()
+    records.update(_accelerator_runtime_failures)
+    out = []
+    for klass in sorted(records):
+        record = records[klass]
+        out.append(
+            {
+                "accelerator": klass,
+                "fallback": _ACCELERATOR_FALLBACK.get(klass),
+                "strikes": int(record.get("strikes", 0) or 0),
+                "proven": bool(record.get("proven", False)),
+                "diverting": _record_diverts(record, fingerprint),
+                "stale": not _fingerprint_still_applies(record.get("fingerprint"), fingerprint),
+            }
+        )
+    return {
+        "records": out,
+        "enabled": sd_cpp_vulkan_fallback_enabled(),
+        "diverting": any(r["diverting"] for r in out),
+    }
+
+
+def clear_accelerator_runtime_failures() -> None:
+    """Forget every note, so the next load tries the host's own accelerator again. This is what a
+    driver update or a new card is: the note is about a build on a host, and both of those change
+    the host.
+
+    Reached from the settings route (``DELETE /settings/diffusion-accelerator-fallback``), which is
+    the point: a preference that outlives the condition that set it has to have a way back that is
+    not "edit the application database". Clearing BOTH halves matters, since the in-process mirror
+    would otherwise keep diverting this process after the persisted record is gone."""
+    _accelerator_runtime_failures.clear()
+    _persist_accelerator_runtime_failures({})
+
+
+# What sd-cli prints when the GPU BACKEND it was built against cannot serve this card, as opposed to
+# the ordinary run-time failures (a bad prompt, a missing file, an out-of-memory) that say nothing
+# about the build. Lower-cased substrings, matched against the tail of the output sd-cli exited on,
+# which ``SdCppEngine._run`` puts in the RuntimeError it raises.
+#
+# DECISIVE: the message names the build having no code for this card, which is the defect itself.
+# The first two are #9278 verbatim ("CUBLAS_STATUS_INVALID_VALUE at hipblasSetStream"); the
+# kernel-image ones are what a generic ROCm build does on a gfx target it carries no code objects
+# for. One of these is enough to divert the host.
+_ACCELERATOR_DECISIVE_FAILURE_MARKERS: tuple[str, ...] = (
+    "hipblassetstream",
+    "cublas_status_invalid_value",
+    "hiperrornobinaryforgpu",
+    "no kernel image is available",
+    "invalid device function",
+)
+
+# AMBIGUOUS: the message names a GPU fault without establishing that the BUILD is the cause. #9278
+# with offload enabled reports "unspecified launch failure" out of ggml_cuda_mul_mat_q, so these do
+# belong here, but the same strings come out of a wedged queue, a driver reset, a VRAM exhaustion
+# mid-render and a card another process is mistreating. They are counted, not acted on, and it takes
+# _AMBIGUOUS_FAILURE_STRIKES of them under ONE fingerprint before a host is moved.
+_ACCELERATOR_AMBIGUOUS_FAILURE_MARKERS: tuple[str, ...] = (
+    "unspecified launch failure",
+    "hip error",
+    "rocm error",
+)
+
+# Deliberately in neither list: sd.cpp's "Cannot set backend to CK" warning, which is printed by
+# builds that then go on to render perfectly well.
+_ACCELERATOR_RUNTIME_FAILURE_MARKERS: tuple[str, ...] = (
+    _ACCELERATOR_DECISIVE_FAILURE_MARKERS + _ACCELERATOR_AMBIGUOUS_FAILURE_MARKERS
+)
+
+
+def output_shows_accelerator_failure(text: Optional[str]) -> bool:
+    """True when sd-cli output names a failure of the GPU BUILD rather than of the request.
+
+    Conservative: an unrecognised failure returns False, so a transient error, a bad argument or an
+    out-of-memory never persists a preference away from the host's own accelerator."""
+    if not text:
+        return False
+    lowered = str(text).lower()
+    return any(marker in lowered for marker in _ACCELERATOR_RUNTIME_FAILURE_MARKERS)
+
+
+def output_shows_decisive_accelerator_failure(text: Optional[str]) -> bool:
+    """True when the output names the BUILD having no code for this card, as opposed to naming a
+    GPU fault whose cause it does not establish. Only these divert a host on one occurrence."""
+    if not text:
+        return False
+    lowered = str(text).lower()
+    return any(marker in lowered for marker in _ACCELERATOR_DECISIVE_FAILURE_MARKERS)
+
+
+def preferred_accelerator(accelerator: Optional[str]) -> str:
+    """``accelerator``, or its fallback when this host has already been shown it cannot run it.
+
+    Applied at the TOP of an ensure ladder, so a host that has seen the ROCm build crash does not
+    pay for installing and probing it again on every later load. Returns the input unchanged
+    whenever there is no note, no rung, or the knob is off."""
+    klass = _accelerator_class_of(accelerator) or (accelerator or "auto")
+    nxt = fallback_accelerator_for(klass)
+    if nxt and accelerator_runtime_failed(klass):
+        return nxt
+    return accelerator or "auto"
 
 
 def _incomplete_tree_replacement(exc: BaseException) -> bool:
@@ -1076,10 +1489,19 @@ class SdCppDiffusionBackend:
     @staticmethod
     def _resolved_accelerator() -> str:
         """The installer accelerator this host's device target resolves to (cpu / cuda / rocm /
-        vulkan). Lazy import avoids an import cycle with the engine router."""
+        vulkan). Lazy import avoids an import cycle with the engine router.
+
+        Through ``preferred_accelerator``, so a host already shown it cannot run the build for its
+        own accelerator is not handed it again. HERE rather than at the four call sites below
+        (``_resolve_engine``, ``_resolve_backend``, ``_upgrade_server_after_teardown`` and the
+        mid-load re-resolve), because those four have to agree: ``_accelerator_changed`` in the
+        deferred upgrade compares the
+        installed tree against this answer, so a call site that skipped the preference would read
+        the Vulkan tree the other two installed as the wrong accelerator and reinstall ROCm over it
+        on every load."""
         from core.inference.diffusion_engine_router import _install_accelerator_for
-        return _install_accelerator_for(
-            getattr(resolve_diffusion_device_target(), "backend", "cpu")
+        return preferred_accelerator(
+            _install_accelerator_for(getattr(resolve_diffusion_device_target(), "backend", "cpu"))
         )
 
     def _resolve_engine(self) -> SdCppEngine:
