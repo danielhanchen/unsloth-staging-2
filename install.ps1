@@ -2530,7 +2530,12 @@ exit 1
             # The interpreter's own directory: it exists, since the executable inside it just
             # passed Test-Path. Not $PSScriptRoot, which is empty under `irm | iex` (no script
             # file), and not the temp directory, which this installer relocates.
-            $probeDir = [System.IO.Path]::GetDirectoryName($candidate)
+            # Split-Path, not [System.IO.Path]::GetDirectoryName. Measured: Constrained Language
+            # Mode refuses method calls on System.IO.Path, and it threw here rather than returning
+            # null, so the whole ladder failed on exactly the hosts it exists for. Cmdlets stay
+            # available there. Same reason for Split-Path -IsAbsolute below and the [int] cast in
+            # the process image table.
+            $probeDir = Split-Path -Parent $candidate
             if ([string]::IsNullOrWhiteSpace($probeDir)) { continue }
             $probe = Invoke-StudioEarlyPython -Exe $candidate -Path $probeDir
             if (-not [string]::IsNullOrWhiteSpace($probe)) {
@@ -2760,7 +2765,7 @@ exit 1
         if ([string]::IsNullOrWhiteSpace($answer)) { return $null }
         # A relative answer is not an identity, and a path that does not exist cannot be the
         # resolution of one that does.
-        if (-not [System.IO.Path]::IsPathRooted($answer)) { return $null }
+        if (-not (Split-Path -IsAbsolute $answer)) { return $null }
         if (-not (Test-Path -LiteralPath $answer)) { return $null }
         return $answer
     }
@@ -2781,7 +2786,11 @@ exit 1
     function Invoke-StudioPythonShellIconRefresh {
         param([string[]]$Paths = @())
         if (-not ($env:OS -eq "Windows_NT")) { return $false }
-        $exe = Get-StudioEarlyPython
+        # Inside the try, not above it. Discovery can throw, and this function promises it never
+        # does; the caller's own catch happened to cover it, but the promise was still false.
+        try {
+            $exe = Get-StudioEarlyPython
+        } catch { return $false }
         if (-not $exe) { return $false }
         # SHCNE_UPDATEITEM 0x00002000 with SHCNF_PATHW 0x0005 per shortcut, then SHCNE_ASSOCCHANGED
         # 0x08000000 as the global broadcast. Same two calls, same order, same constants as the
@@ -5583,8 +5592,8 @@ exit 0
             if ($split -lt 1) { continue }
             $pidText = $line.Substring(0, $split)
             $path = $line.Substring($split + 1)
-            $parsed = 0
-            if (-not [int]::TryParse($pidText, [ref]$parsed)) { continue }
+            if ($pidText -notmatch '^\d+$') { continue }
+            $parsed = [int]$pidText
             if (-not [string]::IsNullOrWhiteSpace($path)) { $table[$parsed] = $path }
         }
         if ($table.Count -eq 0) { return $null }
