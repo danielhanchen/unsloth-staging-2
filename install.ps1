@@ -2481,6 +2481,166 @@ exit 1
         return $current
     }
 
+    # An interpreter to answer path questions with, found WITHOUT installing one.
+    #
+    # Python resolves a path the same way the native helper does: os.path.realpath on Windows
+    # calls GetFinalPathNameByHandleW, so it follows junctions, symlinks and SUBST drives, expands
+    # 8.3 names and reports the stored casing. That matters twice over, because
+    # unsloth_cli/_studio_runtime_gate.py computes the runtime lock name from os.path.realpath
+    # too: an answer from here agrees with the running Unsloth by construction rather than by two
+    # implementations happening to match.
+    #
+    # Finding one must not mutate anything, because this runs before the install lock is taken.
+    # Get-Command and Test-Path only, never Install-PythonFromPythonOrg, and never the full
+    # Find-CompatiblePython, which is defined thousands of lines below this point anyway.
+    $script:StudioEarlyPythonProbed = $false
+    $script:StudioEarlyPython = $null
+
+    function Get-StudioEarlyPython {
+        if ($script:StudioEarlyPythonProbed) { return $script:StudioEarlyPython }
+        $script:StudioEarlyPythonProbed = $true
+        # Same kill switch shape as UNSLOTH_NVIDIA_LIBRARY_PROBE: a host where spawning an
+        # interpreter is unwelcome, or a support case that needs the old behaviour back, sets this
+        # to 0 and the ladder falls through to the lexical resolver exactly as it did before.
+        if ("$($env:UNSLOTH_EARLY_PYTHON_PROBE)".Trim() -eq "0") { return $null }
+        $candidates = @()
+        # A previous install's own interpreter first: it is the one this installer chose last
+        # time, and reaching it through $VenvDir means an alias of the root resolves to the same
+        # file without anyone canonicalising anything. $VenvDir is not set yet on the earliest
+        # calls, so read it defensively rather than assuming.
+        $venvDirValue = $null
+        try { $venvDirValue = Get-Variable -Name VenvDir -ValueOnly -ErrorAction SilentlyContinue } catch {}
+        if (-not [string]::IsNullOrWhiteSpace($venvDirValue)) {
+            $candidates += (Join-Path $venvDirValue "Scripts\python.exe")
+            $candidates += (Join-Path $venvDirValue "bin/python3")
+        }
+        foreach ($name in @("python3", "python")) {
+            try {
+                foreach ($cmd in @(Get-Command $name -All -CommandType Application -ErrorAction SilentlyContinue)) {
+                    if ($cmd -and $cmd.Source) { $candidates += $cmd.Source }
+                }
+            } catch {}
+        }
+        foreach ($candidate in $candidates) {
+            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+            # The probe IS a realpath call, so an interpreter that cannot answer one is rejected
+            # here rather than passing a check and failing later. Python 2 fails it too, since its
+            # Windows realpath does not follow links.
+            # The interpreter's own directory: it exists, since the executable inside it just
+            # passed Test-Path. Not $PSScriptRoot, which is empty under `irm | iex` (no script
+            # file), and not the temp directory, which this installer relocates.
+            $probeDir = [System.IO.Path]::GetDirectoryName($candidate)
+            if ([string]::IsNullOrWhiteSpace($probeDir)) { continue }
+            $probe = Invoke-StudioEarlyPython -Exe $candidate -Path $probeDir
+            if (-not [string]::IsNullOrWhiteSpace($probe)) {
+                $script:StudioEarlyPython = $candidate
+                return $candidate
+            }
+        }
+        return $null
+    }
+
+    # os.path.realpath in a bounded child. Null on anything other than a clean answer, because
+    # every caller already treats "no exact answer" as "use the lexical one".
+    function Invoke-StudioEarlyPython {
+        param(
+            [Parameter(Mandatory = $true)][string]$Exe,
+            [Parameter(Mandatory = $true)][string]$Path,
+            [int]$TimeoutMs = 10000
+        )
+        # -I isolates the run from PYTHONPATH, a sitecustomize and the user site directory, so a
+        # broken environment cannot change the answer. studio/setup.sh runs nvidia_probe.py the
+        # same way.
+        # Deliberately the SAME expression unsloth_cli/_studio_runtime_gate.py's
+        # _resolved_windows_path uses, Path(...).resolve(strict = False), not os.path.realpath.
+        # The two agree today, but this string is hashed into a lock name that the running
+        # Unsloth derives from that function, so matching the expression removes a whole class of
+        # divergence rather than relying on two spellings staying equivalent.
+        #
+        # Written as UTF-8 bytes rather than through print, and read back as UTF-8 below. Windows
+        # PowerShell 5.1 decodes a child's stdout with the console codepage, which mangles every
+        # non-ASCII character in a path and would silently produce a different hash from the one
+        # the Python side computes.
+        # strict=True, unlike the gate's strict=False, and the difference is deliberate. For any
+        # path that genuinely resolves the two return the same string, so the byte-identity above
+        # holds for every valid input. They part company on a symlink loop or a dangling
+        # component, where strict=False returns the path UNRESOLVED rather than raising. That
+        # string is not an identity, and this rung's whole contract is that an answer is exact, so
+        # handing one back would let a caller treat an unresolved path as vouched for and decide
+        # two paths are different when it cannot know. Raising means null here and the lexical
+        # fallback with Exact = $false, which fails closed.
+        #
+        # Test-Path is not enough on its own: it returns true for the loop's own symlink.
+        # The version gate is load-bearing, not hygiene. Before 3.8, Windows path resolution did
+        # not follow junctions or symlinks, so an older interpreter would hand back the ALIAS
+        # spelling and this rung would mark it exact. Test-StudioPathEqual would then read an
+        # alias and its target as definitively different instead of taking both runtime locks,
+        # which is permission to install over a live managed environment. The probe cannot catch
+        # it either, since it only resolves the interpreter's own ordinary directory. Refusing
+        # the interpreter outright is the honest answer: the ladder falls through to lexical and
+        # Exact stays false.
+        $script = "import pathlib,sys" + [char]10 +
+                  "sys.exit(2) if sys.version_info < (3,8) else None" + [char]10 +
+                  "sys.stdout.buffer.write(str(pathlib.Path(sys.argv[1]).resolve(strict=True)).encode('utf-8'))"
+        $proc = $null
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $Exe
+            # ArgumentList is .NET Core only. Windows PowerShell 5.1, which is the host the
+            # desktop installer launches, gets ProcessStartInfo from .NET Framework where the
+            # property does not exist, so .Add() throws, the catch below returns null and every
+            # candidate is rejected: the rung would never work on the primary Windows host while
+            # looking perfectly healthy. Branch on the property rather than assume it.
+            $argv = @("-I", "-c", $script, $Path)
+            if ($null -ne $psi.PSObject.Properties["ArgumentList"]) {
+                foreach ($a in $argv) { $null = $psi.ArgumentList.Add($a) }
+            } else {
+                # Quote for CommandLineToArgvW. The script carries no double quote by
+                # construction and a Windows path cannot contain one, so only two things matter:
+                # wrap each argument, and double any run of trailing backslashes, since
+                # "C:\dir\" would otherwise escape its own closing quote.
+                $psi.Arguments = (@($argv | ForEach-Object {
+                    '"' + ($_ -replace '(\\+)$', '$1$1') + '"'
+                }) -join ' ')
+            }
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            # Without this, 5.1 decodes the child's bytes with the console codepage and a path
+            # containing any non-ASCII character comes back corrupted. The corruption is silent:
+            # the string still looks like a path, and it is what gets hashed into a lock name.
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.CreateNoWindow = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $stdout = $proc.StandardOutput.ReadToEndAsync()
+            $null = $proc.StandardError.ReadToEndAsync()
+            if (-not $proc.WaitForExit($TimeoutMs)) {
+                try { $proc.Kill() } catch {}
+                return $null
+            }
+            if ($proc.ExitCode -ne 0) { return $null }
+            $answer = "$($stdout.Result)".Trim()
+            if ([string]::IsNullOrWhiteSpace($answer)) { return $null }
+            # A relative answer is not an identity, and a path that does not exist cannot be the
+            # resolution of one that does.
+            if (-not [System.IO.Path]::IsPathRooted($answer)) { return $null }
+            if (-not (Test-Path -LiteralPath $answer)) { return $null }
+            return $answer
+        } catch {
+            return $null
+        } finally {
+            if ($proc) { try { $proc.Dispose() } catch {} }
+        }
+    }
+
+    function Get-StudioPythonFinalPath {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        $exe = Get-StudioEarlyPython
+        if (-not $exe) { return $null }
+        return (Invoke-StudioEarlyPython -Exe $exe -Path $Path)
+    }
+
     # Exact = $true means the native resolver answered, so the string is what it
     # always was. Callers keying a lock on it use that to judge an inequality.
     function Resolve-StudioFinalPathInfo {
@@ -2522,6 +2682,16 @@ exit 1
                     Write-StudioLine "[WARN] Could not resolve a path with the native helper; continuing with the PowerShell resolver." -ForegroundColor Yellow
                 }
             }
+        }
+        if ([string]::IsNullOrEmpty($resolved)) {
+            # Strictly additive: this rung only runs where the native one already gave up, so a
+            # host that resolves natively today behaves exactly as it did. Where it answers, the
+            # identity is exact for the same reason the native one is, os.path.realpath being
+            # GetFinalPathNameByHandleW on Windows, so Exact = $true is earned rather than
+            # assumed. Where there is no usable interpreter it returns null and the lexical
+            # fallback below runs, which is today's behaviour unchanged.
+            $resolved = Get-StudioPythonFinalPath -Path $existingPath
+            if (-not [string]::IsNullOrWhiteSpace($resolved)) { $exact = $true }
         }
         if ([string]::IsNullOrEmpty($resolved)) {
             $resolved = Get-StudioLexicalPath -Path $existingPath
@@ -2696,6 +2866,13 @@ exit 1
     # The emptiness test is inline, not Test-DirectoryHasEntries, which is defined below this
     # function's first caller: the name error would land in the catch and skip the claim in
     # silence. An unreadable root counts as occupied, so failure means "do not claim".
+    # Defined here, above its earliest reader, not beside the lock functions that also use it.
+    # Write-StudioRootOwnerMarker filters this name out of its emptiness test, and it runs
+    # thousands of lines before the lock helpers; a $null here would filter nothing and quietly
+    # restore the bug the filter exists to prevent. Same hazard the comment above describes for
+    # Test-DirectoryHasEntries, and it fails just as silently.
+    $script:StudioInstallLockFileName = ".unsloth-install.lock"
+
     function Write-StudioRootOwnerMarker {
         param([Parameter(Mandatory = $true)][string]$Root)
         try {
@@ -2706,7 +2883,14 @@ exit 1
             if (Test-Path -LiteralPath $Root) {
                 $occupied = $true
                 try {
+                    # The install lock's own file does not count as occupancy. Enter-StudioInstallLock
+                    # creates it in this very root before anything else runs, so counting it would
+                    # make a fresh env-mode root look like somebody else's directory and refuse the
+                    # claim. An install that then died before the venv marker at
+                    # Write-StudioVenvOwnerMarker would leave a root the uninstaller does not
+                    # recognise, which is the opposite of what the marker is for.
                     $occupied = @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction Stop |
+                        Where-Object { $_.Name -ne $script:StudioInstallLockFileName } |
                         Select-Object -First 1).Count -gt 0
                 } catch { $occupied = $true }
                 $claimable = (
@@ -4882,6 +5066,110 @@ exit 0
         try { $Mutex.ReleaseMutex() } catch {} finally { $Mutex.Dispose() }
     }
 
+    # The install lock, held as a mutex AND a file, because the two exclude different things.
+    #
+    # The mutex is named from a hash of the resolved path, so when the resolver cannot give an
+    # exact answer two spellings of one directory (a junction and its target, an 8.3 name and its
+    # long form) produce different names and fail to exclude each other, exactly as
+    # Get-StudioPathHash says above. A file inside the destination has no such problem: every
+    # alias reaches the same file because the filesystem resolves the alias, so no canonicalisation
+    # is involved at all.
+    #
+    # Both are taken rather than swapping one for the other. The mutex is what an already-released
+    # installer uses, and dropping it would mean a new run and an old run no longer see each other
+    # during an upgrade. Holding both can only exclude more than either alone.
+
+    function Enter-StudioInstallLock {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        $mutex = Enter-StudioInstallMutex -Path $Path
+        if ($null -eq $mutex) { return $null }
+        $stream = $null
+        try {
+            # Idempotent and race-safe: concurrent creators both succeed, and only one of them
+            # goes on to open the file exclusively below. Throwing here (no permission, a file
+            # where the directory should be) surfaces as the caller's install-lock error, which
+            # is a clearer place to fail than the first write further down.
+            $existedBefore = [System.IO.Directory]::Exists($Path)
+            $null = [System.IO.Directory]::CreateDirectory($Path)
+            $lockPath = Join-Path $Path $script:StudioInstallLockFileName
+            # A link planted at the lock path is not a lock, it is a way to point our exclusive
+            # handle at somebody else's file: File.Open follows it, so the target would be held
+            # open with FileShare.None for the whole install even though nothing is written to it.
+            # Remove the link itself, never its target, then let the open below create a real
+            # file. Get-Item -Force rather than Test-Path, which follows a dangling link and
+            # answers false; Write-StudioRootOwnerMarker guards the same hazard the same way.
+            try {
+                $existingLock = Get-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+                if ($existingLock -and
+                    ($existingLock.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    Remove-Item -LiteralPath $lockPath -Force -ErrorAction Stop
+                }
+            } catch {}
+            try {
+                $stream = [System.IO.File]::Open(
+                    $lockPath,
+                    [System.IO.FileMode]::OpenOrCreate,
+                    [System.IO.FileAccess]::ReadWrite,
+                    [System.IO.FileShare]::None)
+            } catch [System.IO.IOException] {
+                # Only a sharing or lock violation means "another installer holds it". Anything
+                # else, a transient storage fault or a network share dropping out, is a real
+                # failure and must not be reported as a concurrent install: that hides the fault
+                # and sends the user looking for a second installer that does not exist.
+                # HResult's low 16 bits carry the Win32 code on Windows: 32 is
+                # ERROR_SHARING_VIOLATION and 33 is ERROR_LOCK_VIOLATION. Off Windows .NET
+                # implements FileShare with flock and reports the errno instead, 11 for
+                # EAGAIN/EWOULDBLOCK, which is what the test suite exercises on Linux. Measured
+                # rather than assumed, because the first version of this check only knew the
+                # Windows codes and turned every real conflict on Linux into a rethrow.
+                #
+                # A directory sitting where the lock file should be raises
+                # UnauthorizedAccessException, not IOException, so it is never caught here and
+                # already reaches the caller as the failure it is.
+                $code = $_.Exception.HResult -band 0xFFFF
+                if ($code -ne 32 -and $code -ne 33 -and $code -ne 11) { throw }
+                if ($stream) { $stream.Dispose() }
+                Exit-StudioInstallMutex -Mutex $mutex
+                return $null
+            }
+            # Nothing is written to the handle on purpose. Holding it open exclusively IS the
+            # lock, and writing would be actively unsafe: File.Open follows a symbolic or hard
+            # link, so a `.unsloth-install.lock` planted in the destination by another user would
+            # have its TARGET truncated merely by starting the installer. That matters most for a
+            # shared or custom root under an elevated install, which is exactly where a planted
+            # link is plausible. Write-StudioRootOwnerMarker already guards the same hazard the
+            # same way; this follows it rather than inventing a second answer.
+            # Taking the lock is now the first thing that can create the root, earlier than
+            # anything else writes to it. scripts/uninstall.ps1's _IsStudioRoot reads exactly this
+            # marker so "a partial install identifies itself instead of being guessed at"; without
+            # it, a run that died between here and the first real write would leave a root the
+            # uninstaller refuses to remove as somebody else's.
+            #
+            # Only when this call created the directory. A UNSLOTH_STUDIO_HOME pointed at a
+            # directory the user already had must never be claimed, or uninstall would delete it.
+            if (-not $existedBefore) {
+                try {
+                    [System.IO.File]::WriteAllText((Join-Path $Path ".unsloth-studio-owned"), "")
+                } catch {}
+            }
+            return [pscustomobject]@{ Mutex = $mutex; Stream = $stream; Path = $lockPath }
+        } catch {
+            if ($stream) { try { $stream.Dispose() } catch {} }
+            Exit-StudioInstallMutex -Mutex $mutex
+            throw
+        }
+    }
+
+    function Exit-StudioInstallLock {
+        param($Lock)
+        if ($null -eq $Lock) { return }
+        # Closing the handle IS the release, so a process that dies holding it leaves nothing to
+        # clean up: Windows closes the handle for us. The file itself is left in place on purpose,
+        # since deleting it would race another installer that has just opened it.
+        if ($Lock.Stream) { try { $Lock.Stream.Dispose() } catch {} }
+        Exit-StudioInstallMutex -Mutex $Lock.Mutex
+    }
+
     function Test-StudioProtectedPathMatch {
         param(
             [Parameter(Mandatory = $true)][string]$Candidate,
@@ -5087,12 +5375,12 @@ exit 0
         }
     }
     try {
-        $studioInstallMutex = Enter-StudioInstallMutex -Path $StudioHome
+        $studioInstallLock = Enter-StudioInstallLock -Path $StudioHome
     } catch {
         Write-StudioLine "[ERROR] Could not create the Unsloth install lock: $($_.Exception.Message)" -ForegroundColor Red
         return (Exit-InstallFailure "Could not create the Unsloth install lock")
     }
-    if ($null -eq $studioInstallMutex) {
+    if ($null -eq $studioInstallLock) {
         Write-StudioLine "[ERROR] Another Unsloth Studio install or repair is already running." -ForegroundColor Red
         Write-StudioLine "        Wait for it to finish, then re-run install.ps1." -ForegroundColor Yellow
         return (Exit-InstallFailure "Another Unsloth Studio install or repair is already running")
@@ -9687,7 +9975,7 @@ sys.exit(2 if conflict else (0 if installed else 1))
         for ($i = $studioRuntimeMutexes.Count - 1; $i -ge 0; $i--) {
             Exit-StudioInstallMutex -Mutex $studioRuntimeMutexes[$i]
         }
-        Exit-StudioInstallMutex -Mutex $studioInstallMutex
+        Exit-StudioInstallLock -Lock $studioInstallLock
         # Matters for `irm | iex`, where these are the user's own session variables.
         Restore-StudioTempEnvironment
     }
