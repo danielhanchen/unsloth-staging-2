@@ -1658,6 +1658,19 @@ class ResearchSupervisor:
             )
         if inference.get("topP") is not None:
             payload["top_p"] = inference["topP"]
+        if inference.get("providerType") in ("deepseek", "huggingface", "qwen", "mistral"):
+            # These providers forward reasoning fields verbatim, and a strict upstream rejects one the model lacks.
+            # Mistral documents reasoning_effort for mistral-small-latest and mistral-medium-3-5 only, so the
+            # planner opt-out must not reach mistral-large and the other non-reasoning models.
+            if inference.get("supportsReasoning") is False:
+                enable_thinking = None
+                inference = {
+                    key: value
+                    for key, value in inference.items()
+                    if key not in ("enableThinking", "reasoningEffort")
+                }
+            elif enable_thinking is False and inference.get("supportsReasoningOff") is False:
+                enable_thinking = None
         if enable_thinking is not None:
             payload["enable_thinking"] = enable_thinking
         elif inference.get("enableThinking") is not None:
