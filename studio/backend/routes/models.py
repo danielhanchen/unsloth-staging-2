@@ -179,7 +179,11 @@ backend_path = Path(__file__).parent.parent.parent
 if str(backend_path) not in sys.path:
     sys.path.insert(0, str(backend_path))
 
-from auth.authentication import allow_ambient_hf_token, get_current_subject
+from auth.authentication import (
+    allow_ambient_hf_token,
+    authenticated_via_api_key,
+    get_current_subject,
+)
 from hub.dependencies import get_hf_token, get_request_hf_token
 from hub.utils.hf_tokens import (
     HfTokenArg,
@@ -189,10 +193,30 @@ from hub.utils.hf_tokens import (
     is_anonymous,
     normalize_token,
 )
+from hub.utils.host_paths import (
+    redact_host_paths,
+    redact_inventory_host_paths,
+    resolve_host_path_reference,
+    scrub_paths,
+)
 from utils.utils import anonymous_and_offline
 
 
-_UNAUTHORIZED_OFFLINE = "This request cannot be authorized without network access."
+# Says both halves, because with the local cache no longer gated on reaching the Hub, this is
+# what reaching here means: the credential could not be established AND the repo is not on this
+# disk. The earlier wording sent operators looking for a credential problem that was not there.
+_UNAUTHORIZED_OFFLINE = (
+    "This request cannot be authorized without network access, and this repository is not in "
+    "the local cache."
+)
+
+# Reached when the operator's disk could answer this read and this caller may not. Says which of
+# the two it is: "unauthorized" alone reads as a broken credential, and the repository refusing
+# this caller is not the same thing as the caller having sent the wrong token.
+_UNAUTHORIZED_CACHED_MODEL = (
+    "This model is cached on this host, but this repository does not authorize this caller to "
+    "read it."
+)
 
 
 def _resolve_hub_token(header_token: HfTokenArg, query_token: Optional[str]) -> HfTokenArg:
@@ -1141,8 +1165,14 @@ async def list_local_models(
         default = "./models", description = "Directory to scan for local model folders"
     ),
     current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
 ):
-    """List local model candidates from the models dir, HF caches, LM Studio, Hermes, Ollama."""
+    """List local model candidates from the models dir, HF caches, LM Studio, Hermes, Ollama.
+
+    Redacted for an API-key caller exactly as ``/api/hub/local`` is. This router is the
+    compatibility mirror of that one and answers the same scan roots, so leaving it alone
+    would let a caller recover from here the layout the other route hides.
+    """
     # Resolve all scan directories up front.
     sources = _compat_local_inventory_sources()
     hf_cache_dir = sources.hf_cache_dir
@@ -1180,12 +1210,15 @@ async def list_local_models(
         models = await _shared_compat_local_inventory_scan(models_root, sources)
         if account_access.managed_account():
             models = await asyncio.to_thread(account_access.filter_model_rows, models)
-        return LocalModelListResponse(
-            models_dir = str(models_root),
-            hf_cache_dir = str(hf_cache_dir),
-            lmstudio_dirs = [str(d) for d in lm_dirs],
-            hermes_dirs = [str(d) for d in sources.hermes_dirs],
-            models = models,
+        return redact_inventory_host_paths(
+            LocalModelListResponse(
+                models_dir = str(models_root),
+                hf_cache_dir = str(hf_cache_dir),
+                lmstudio_dirs = [str(d) for d in lm_dirs],
+                hermes_dirs = [str(d) for d in sources.hermes_dirs],
+                models = models,
+            ),
+            via_api_key = via_api_key,
         )
     except Exception as e:
         raise log_and_http_error(
@@ -1198,21 +1231,33 @@ async def list_local_models(
 
 
 @router.get("/scan-folders")
-async def get_scan_folders(current_subject: str = Depends(get_current_subject)):
-    """List all registered custom model scan folders."""
+async def get_scan_folders(
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
+):
+    """List all registered custom model scan folders. Redacted like ``/api/hub/scan-folders``."""
     from storage.studio_db import list_scan_folders
 
     folders = list_scan_folders()
     # Opening the dialog is how a fixed folder clears, so recheck the bad ones.
     await asyncio.to_thread(refresh_failed_scan_folders, folders)
-    return {"folders": annotate_scan_folders(folders)}
+    return redact_inventory_host_paths(
+        {"folders": annotate_scan_folders(folders)}, via_api_key = via_api_key
+    )
 
 
 @router.post("/scan-folders", response_model = ScanFolderInfo, status_code = 201)
 async def add_scan_folder_endpoint(
-    body: AddScanFolderRequest, current_subject: str = Depends(get_current_subject)
+    body: AddScanFolderRequest,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
 ):
-    """Register a new directory to scan for local models."""
+    """Register a new directory to scan for local models. Redacted like the GET above.
+
+    The listing routes hide the normalized absolute path, and this one handed it straight
+    back: submitting a relative directory such as ``.`` and reading the answer recovered the
+    server's working directory, which is the boundary both listings enforce.
+    """
     if account_access.managed_account():
         body = body.model_copy(update = {"path": account_access.private_directory(body.path, "")})
     from storage.studio_db import add_scan_folder_with_status
@@ -1228,7 +1273,7 @@ async def add_scan_folder_endpoint(
         from core.inference.local_model_resolver import invalidate_index, warm_index_soon
         await asyncio.to_thread(invalidate_index)
         warm_index_soon()
-    return folder
+    return redact_inventory_host_paths(folder, via_api_key = via_api_key)
 
 
 @router.delete("/scan-folders/{folder_id}")
@@ -2186,8 +2231,20 @@ async def get_model_config(
     header_hf_token: Optional[str] = Depends(get_hf_token),
     allow_ambient_token: bool = Depends(allow_ambient_hf_token),
     current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
 ):
     """Get configuration for a specific model (wraps load_model_defaults)."""
+    # An inventory listing shows a filesystem-backed row to an API-key caller under an opaque
+    # `ref:` handle, and that caller hands the handle straight back here. Without this the
+    # handle is read as a Hugging Face id and the row cannot be inspected at all, which makes
+    # a row that was advertised as actionable not actionable. Resolved through the same helper
+    # the load, validate and train schemas use, so nothing about authorization moves: the
+    # resolved path goes through every check below that a path named directly goes through.
+    from models.inference import resolve_inventory_handle
+
+    model_name = resolve_inventory_handle(model_name)
+    if local_path:
+        local_path = resolve_inventory_handle(local_path)
     if local_path:
         if account_access.managed_account():
             await asyncio.to_thread(account_access.require_model_access, local_path)
@@ -2215,7 +2272,9 @@ async def get_model_config(
         ):
             # Inside the context, not before: the guard forces offline itself when the hub
             # is unreachable, and every probe below then resolves from disk.
-            if anonymous_and_offline(hf_token) and not is_local_path(model_name):
+            if not is_local_path(model_name) and anonymous_and_offline(
+                hf_token, repo_id = canonical_model_repo_id(model_name)
+            ):
                 raise HTTPException(status_code = 404, detail = _UNAUTHORIZED_OFFLINE)
             if not is_local_path(model_name):
                 resolved = resolve_cached_repo_id_case(model_name)
@@ -2316,7 +2375,26 @@ async def get_model_config(
 
     try:
         # Off the loop: the guard blocks on DNS + HEAD + TCP, stalling every other request.
-        return await asyncio.to_thread(_resolve, model_name)
+        # The answer carries the handle back rather than the path it stood for: the details
+        # are built out of what was asked for, so a caller who may not see host paths would
+        # otherwise read the path out of the very lookup it performed with the reference.
+        # Restored first, then redacted. The restoration puts back the handle the CALLER
+        # sent; the redaction covers a second path the caller never named -- a LoRA whose
+        # `base_model_name_or_path` is another absolute local path, which this lookup reports
+        # verbatim, so the ordinary config lookup handed back host layout the caller only had
+        # one reference for.
+        # `echo` is the identifier the CALLER named. The details are built out of it, so
+        # referencing it would compute a reference for any string the caller chooses, and
+        # since the reference is one stable HMAC for the life of the process that is an
+        # online oracle confirming every other reference they hold: guess a home directory
+        # and a cache root, ask about it here, and a matching reference confirms the guess.
+        # Handed back as written instead, which tells the caller only what they typed.
+        from hub.utils.host_paths import redact_host_paths, restore_inventory_handles
+        return redact_host_paths(
+            restore_inventory_handles(await asyncio.to_thread(_resolve, model_name)),
+            via_api_key = via_api_key,
+            echo = (model_name,),
+        )
 
     except HTTPException:
         raise
@@ -2363,6 +2441,20 @@ async def scan_model_remote_code(
     POST (not GET) so the ``hf_token`` for gated repos travels in the body and
     never lands in a URL, browser history, or access log.
     """
+    # Same handle resolution as the config route, and for a sharper reason: a local model that
+    # needs remote-code review cannot be approved at all if the scan cannot see it, so the
+    # pinning fingerprint the load checks is never produced. Before the access checks, so they
+    # run on the path rather than on the reference.
+    from models.inference import resolve_inventory_handle
+
+    model_name = resolve_inventory_handle(model_name)
+    model_local_path = resolve_inventory_handle(model_local_path) if model_local_path else None
+    model_snapshot_path = (
+        resolve_inventory_handle(model_snapshot_path) if model_snapshot_path else None
+    )
+    model_snapshot_repo_id = (
+        resolve_inventory_handle(model_snapshot_repo_id) if model_snapshot_repo_id else None
+    )
     if account_access.managed_account():
         for ref in (model_name, model_local_path, model_snapshot_path, model_snapshot_repo_id):
             if isinstance(ref, str) and ref:
@@ -2373,7 +2465,9 @@ async def scan_model_remote_code(
     hf_token = hf_token_arg(hf_token, allow_ambient_token = allow_ambient_token)
     # Offline the scanner's hf_hub_download calls resolve config.json and the repo's
     # Python out of the cache, and the response carries source snippets.
-    if anonymous_and_offline(hf_token) and not is_local_path(model_name):
+    if not is_local_path(model_name) and anonymous_and_offline(
+        hf_token, repo_id = canonical_model_repo_id(model_name)
+    ):
         raise HTTPException(status_code = 404, detail = _UNAUTHORIZED_OFFLINE)
     try:
         from utils.security import (
@@ -2425,7 +2519,7 @@ async def scan_model_remote_code(
         ):
             raise HTTPException(
                 status_code = 404,
-                detail = "This model is not available to an unauthorized caller.",
+                detail = _UNAUTHORIZED_CACHED_MODEL,
             )
         scan_target = model_name
         exact_snapshot_path = (
@@ -2515,7 +2609,7 @@ async def scan_model_remote_code(
             ):
                 raise HTTPException(
                     status_code = 404,
-                    detail = "This model is not available to an unauthorized caller.",
+                    detail = _UNAUTHORIZED_CACHED_MODEL,
                 )
             if _target not in consent_load_subdirs:
                 security_targets.append(_target)
@@ -2567,7 +2661,7 @@ async def scan_model_remote_code(
                 ):
                     raise HTTPException(
                         status_code = 404,
-                        detail = "This model is not available to an unauthorized caller.",
+                        detail = _UNAUTHORIZED_CACHED_MODEL,
                     )
                 external_refs.append(_ext)
                 _mark_scan_created(_ext)
@@ -2615,7 +2709,11 @@ async def scan_model_remote_code(
             payload["approvable"] = False
             payload["requires_trust_remote_code"] = True
             payload["error_kind"] = "malware_blocked"
-        return payload
+        # The findings quote paths inside the model directory, so the answer goes back through
+        # the request's handle table for the same reason the config route does.
+        from hub.utils.host_paths import restore_inventory_handles
+
+        return restore_inventory_handles(payload)
     except HTTPException:
         raise
     except Exception as e:
@@ -4338,14 +4436,18 @@ async def get_gguf_download_progress(
     expected_bytes: int = Query(0, description = "Expected total download size in bytes"),
     hf_token: HfTokenArg = Depends(get_request_hf_token),
     current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
 ):
     """Compatibility route backed by the shared multi-cache progress service."""
     from hub.services.models import downloads
-    return await downloads.get_gguf_download_progress_response(
-        repo_id,
-        variant = variant,
-        expected_bytes = expected_bytes,
-        hf_token = hf_token,
+    return redact_host_paths(
+        await downloads.get_gguf_download_progress_response(
+            repo_id,
+            variant = variant,
+            expected_bytes = expected_bytes,
+            hf_token = hf_token,
+        ),
+        via_api_key = via_api_key,
     )
 
 
@@ -4362,10 +4464,18 @@ async def get_download_progress(
     repo_id: str = Query(..., description = "HuggingFace repo ID"),
     hf_token: HfTokenArg = Depends(get_request_hf_token),
     current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
 ):
-    """Compatibility route backed by the shared multi-cache progress service."""
+    """Compatibility route backed by the shared multi-cache progress service.
+
+    The progress payload names the cache directory it measured, so it takes the caller class
+    like its ``/api/hub`` twin.
+    """
     from hub.services.models import downloads
-    return await downloads.get_download_progress_response(repo_id, hf_token = hf_token)
+    return redact_host_paths(
+        await downloads.get_download_progress_response(repo_id, hf_token = hf_token),
+        via_api_key = via_api_key,
+    )
 
 
 def _repo_in_any_hf_cache(model_name: str) -> bool:
@@ -4711,13 +4821,18 @@ def _preferred_gguf_copy(
 
 
 @router.get("/cached-gguf")
-async def list_cached_gguf(current_subject: str = Depends(get_current_subject)):
+async def list_cached_gguf(
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
+):
     """List GGUF repos downloaded to HF cache, legacy Unsloth cache, and HF default cache."""
     try:
         # Off the loop: the filter can probe the Hub per ungranted repo.
-        return {"cached": await asyncio.to_thread(cached_gguf_rows)}
+        return redact_host_paths(
+            {"cached": await asyncio.to_thread(cached_gguf_rows)}, via_api_key = via_api_key
+        )
     except Exception as e:
-        logger.error(f"Error listing cached GGUF repos: {e}", exc_info = True)
+        logger.error("Error listing cached GGUF repos: %s", scrub_paths(e), exc_info = True)
         return {"cached": []}
 
 
@@ -4818,13 +4933,16 @@ def _cached_repo_partial(
 async def list_cached_models(
     current_subject: str = Depends(get_current_subject),
     hf_token: HfTokenArg = Depends(get_request_hf_token),
+    via_api_key: bool = Depends(authenticated_via_api_key),
 ):
     """List non-GGUF model repos downloaded to HF cache, legacy Unsloth cache, and HF default cache."""
     try:
         # Off the loop: the filter can probe the Hub per ungranted repo.
-        return {"cached": await asyncio.to_thread(cached_model_rows)}
+        return redact_host_paths(
+            {"cached": await asyncio.to_thread(cached_model_rows)}, via_api_key = via_api_key
+        )
     except Exception as e:
-        logger.error(f"Error listing cached models: {e}", exc_info = True)
+        logger.error("Error listing cached models: %s", scrub_paths(e), exc_info = True)
         return {"cached": []}
 
 
@@ -5092,7 +5210,14 @@ async def delete_cached_model(
     account_access.require_installation_owner()
     from hub.services.models import deletion
 
-    return await deletion.delete_cached_model_response(repo_id, variant, hf_token, cache_path)
+    # Same resolution as the hub route this is the compatibility alias for. The listing
+    # answers an API-key caller with `cache_ref` where a browser session gets `cache_path`,
+    # so the reference is the only identifier such a caller has for one specific copy;
+    # without this, naming the row it was shown returned "Invalid cache_path" and omitting
+    # it acted on the active root, which on a multi-root host is a different copy.
+    return await deletion.delete_cached_model_response(
+        repo_id, variant, hf_token, resolve_host_path_reference(cache_path) or cache_path
+    )
 
 
 def _resolve_cached_model_path(repo_id: str, variant: Optional[str]) -> Path:

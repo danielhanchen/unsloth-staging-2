@@ -32,7 +32,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile
 
-from auth.authentication import get_current_subject, request_admitted_without_credential
+from auth.authentication import (
+    authenticated_via_api_key,
+    get_current_subject,
+    request_admitted_without_credential,
+)
 from core.inference.model_ids import public_model_id
 from hub.dependencies import get_hf_token
 from hub.services.models import account_access
@@ -228,9 +232,24 @@ async def video_download_plan(
 @router.post("/video/load", response_model = VideoStatusResponse)
 @account_access.gpu_busy_route
 async def load_video_model(
-    request: VideoLoadRequest, current_subject: str = Depends(get_current_subject)
+    request: VideoLoadRequest,
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
 ):
-    return await load_video_model_gated(request, current_subject, user_initiated = True)
+    # The status this answers with describes whatever is resident, which on a second load is
+    # still the PREVIOUS model: a path an earlier request resolved, so the request context has
+    # no handle to put back for it and the response would hand the caller the absolute path it
+    # was never shown. Restore first, so the reference the caller just sent comes back as the
+    # reference it sent, then redact, which turns anything left over into the same opaque
+    # reference `GET /video/status` gives. Done in the route rather than in the gated body
+    # below, because the internal callers of that body are not serving an API-key request.
+    from hub.utils.host_paths import redact_host_paths, restore_inventory_handles
+    return redact_host_paths(
+        restore_inventory_handles(
+            await load_video_model_gated(request, current_subject, user_initiated = True)
+        ),
+        via_api_key = via_api_key,
+    )
 
 
 async def load_video_model_gated(
@@ -254,6 +273,18 @@ async def load_video_model_gated(
         request = request.model_copy(
             update = {"hf_token": account_access.account_hf_token(request.hf_token)}
         )
+    # Same as the image load, and decided at entry for the same reason: `begin_load` runs the
+    # slow load on a daemon thread and returns at once, so this request has no after-the-fetch
+    # moment to compare against. A repo already in the cache is not one this load will fetch,
+    # and recording it withholds an ordinary public model from every tokenless offline caller.
+    from routes.inference import (
+        _note_load_fetched_with_a_request_token,
+        _repo_is_in_the_hub_cache,
+    )
+
+    for _ref in (request.model_path, request.base_repo):
+        if _ref and _repo_is_in_the_hub_cache(_ref) is not True:
+            _note_load_fetched_with_a_request_token(_ref, request.hf_token)
     from core.inference.diffusion import resolve_local_single_file
     from core.inference.diffusion_device import (
         resolve_diffusion_device_target,
@@ -674,20 +705,31 @@ async def cancel_video_generation(current_subject: str = Depends(get_current_sub
 
 
 @router.get("/video/status", response_model = VideoStatusResponse)
-async def video_status(current_subject: str = Depends(get_current_subject)):
+async def video_status(
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
+):
     if account_access.resident_hidden("video"):
         return account_access.hidden_resident_response()
     from core.inference.video import get_video_backend
+    from hub.utils.host_paths import redact_host_paths
 
     status_dict = get_video_backend().status()
     if account_access.resident_hidden("video", status_dict.get("repo_id")):
         return account_access.hidden_resident_response()
-    return VideoStatusResponse(**status_dict)
+    # A load started from an inventory reference records the resolved path, and this route
+    # answers long after the request that resolved it has ended, so the reference cannot be
+    # put back from the request context. The redactor hands back the same opaque reference
+    # instead, which is what the caller sent and what it can send again.
+    return redact_host_paths(VideoStatusResponse(**status_dict), via_api_key = via_api_key)
 
 
 @router.post("/video/unload", response_model = VideoStatusResponse)
 @account_access.gpu_busy_route
-async def unload_video_model(current_subject: str = Depends(get_current_subject)):
+async def unload_video_model(
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
+):
     account_access.require_resident_control("video")
     from core.inference.gpu_arbiter import VIDEO, release_if
     from core.inference.video import get_video_backend
@@ -706,7 +748,14 @@ async def unload_video_model(current_subject: str = Depends(get_current_subject)
         VIDEO,
         lambda: not backend.loading_repo_ids() and not backend.status()["loaded"],
     )
-    return VideoStatusResponse(**status_dict)
+    # An unload answers with the state it left behind, which still names the model it just
+    # dropped, so it is the same disclosure the load route has and gets the same treatment.
+    from hub.utils.host_paths import redact_host_paths, restore_inventory_handles
+
+    return redact_host_paths(
+        restore_inventory_handles(VideoStatusResponse(**status_dict)),
+        via_api_key = via_api_key,
+    )
 
 
 @router.get("/video/gallery", response_model = VideoGalleryListResponse)

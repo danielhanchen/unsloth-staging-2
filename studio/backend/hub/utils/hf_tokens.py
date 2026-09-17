@@ -6,9 +6,13 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import logging
 import threading
 import time
 from typing import Literal, MutableMapping, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 HfTokenArg = Optional[Union[str, Literal[False]]]
 
@@ -109,11 +113,91 @@ _REPO_ACCESS_TTL_S = 60.0
 # Says nothing about the credential. MUST exceed the probe timeout or every caller re-stalls.
 _REPO_ACCESS_UNREACHABLE_TTL_S = 30.0
 _REPO_ACCESS_CACHE_MAX = 1024
-_repo_access_cache: dict[tuple[str, str, str], tuple[float, bool]] = {}
+# ``None`` is a THIRD value here, not a miss: "the Hub could not be asked". It is memoized so
+# a dead endpoint is not re-dialled per call, and memoized as unknown rather than as False so
+# the 30 s window resolves locally on every call instead of holding a denial the Hub never
+# gave -- a download finishing inside the window takes effect at once, and a recovered Hub is
+# re-probed when it expires. ``_CACHE_MISS`` is what absence looks like.
+_repo_access_cache: dict[tuple[str, str, str], tuple[float, Optional[bool]]] = {}
+_CACHE_MISS = object()
 _repo_access_lock = threading.Lock()
 # One probe per key: the probe runs outside _repo_access_lock, so a cold key would
 # otherwise open a connection per caller.
 _repo_access_inflight: dict[tuple[str, str, str], threading.Lock] = {}
+
+# An answered NO outlives the verdict cache, and only an unaskable Hub ever reads it.
+#
+# Unaskable resolves against the disk, which is right for an offline operator and wrong as a
+# way to overturn a refusal that has already been given: 429 and 5xx are unaskable, they are
+# reachable from outside (a burst of probes rate-limits this host's own endpoint), and the
+# 60 s verdict cache means a caller the Hub refused a minute ago is one outage away from the
+# operator's cached copy of the repo. So a denial is remembered for longer than it is cached,
+# and while it is remembered "could not ask" answers no rather than reading the disk.
+#
+# Not a lockout: a Hub that answers again replaces it (an answered True is memoized as usual
+# and the memory is dropped), and a repo that was never refused has nothing here, so an
+# air-gapped host, a Hub outage and a mirror without /auth-check are unaffected. Keyed exactly
+# like the verdict cache, so it says nothing about any other credential.
+#
+# It has NO time limit, on purpose. A clock-based expiry hands the denial back on the one input
+# the caller controls: wait it out, ask again while the Hub is unaskable, and _resolve_unaskable
+# authorizes locally on the strength of the operator's disk -- for a credential the Hub refused,
+# with nothing having changed but the time. Only an affirmative answer is evidence that the
+# refusal no longer holds, so only an affirmative answer clears it. The size cap below is what
+# bounds the table, and the entries are recorded in insertion order so the cap evicts the
+# oldest refusal rather than an arbitrary one.
+#
+# Eviction is a hole in exactly the same way an expiry is: forget a refusal and the credential
+# it was given against reads as never refused, so the next unaskable probe resolves it against
+# the operator's disk. A caller that can make the Hub refuse it can drive that, since a route
+# taking a repo id refuses one key per id it has never been granted. So the table is bounded by
+# its OWN cap rather than sharing the verdict cache's, and losing an entry is remembered: past
+# that point "the Hub could not be asked" stops meaning "read the disk" for every key, because
+# this can no longer say which refusals it has forgotten. Fail closed, and only for the offline
+# fallback -- an answered Hub, a public repo and a host that never collected a refusal are all
+# untouched, and an air-gapped host never records one in the first place.
+_DENIAL_MEMORY_MAX = 8192
+_denied_repo_access: dict[tuple[str, str, str], float] = {}
+_denial_memory_is_complete = True
+
+
+def _remember_denial(key: tuple[str, str, str], now: float) -> None:
+    global _denial_memory_is_complete
+    with _repo_access_lock:
+        # Re-insert at the end so a refusal that is still being re-asked is not the first to be
+        # evicted. The stored time is the eviction order only; it never expires the entry.
+        _denied_repo_access.pop(key, None)
+        while len(_denied_repo_access) >= _DENIAL_MEMORY_MAX:
+            _denied_repo_access.pop(next(iter(_denied_repo_access)), None)
+            _denial_memory_is_complete = False
+        _denied_repo_access[key] = now
+
+
+def _denial_memory_lost_an_entry() -> bool:
+    """Whether a refusal this host was given has been dropped to keep the table bounded."""
+    with _repo_access_lock:
+        return not _denial_memory_is_complete
+
+
+def _forget_denial(key: tuple[str, str, str]) -> None:
+    with _repo_access_lock:
+        _denied_repo_access.pop(key, None)
+
+
+def _denial_is_remembered(key: tuple[str, str, str]) -> bool:
+    with _repo_access_lock:
+        return key in _denied_repo_access
+
+
+def _with_remembered_denial(key: tuple[str, str, str], verdict: Optional[bool]) -> Optional[bool]:
+    """A verdict of "could not ask" reads as the last answer the Hub gave, if it was no.
+
+    Once a refusal has been evicted, no key can claim it was never refused, so an unaskable
+    Hub answers no for all of them rather than falling back to the operator's disk.
+    """
+    if verdict is None and (_denial_is_remembered(key) or _denial_memory_lost_an_entry()):
+        return False
+    return verdict
 
 
 class _ProbeTimedOut(Exception):
@@ -137,6 +221,31 @@ _UNREACHABLE_EXC_NAMES = frozenset(
 _UNREACHABLE_PACKAGES = frozenset({"requests", "httpx", "urllib3"})
 
 
+# An ANSWER of no, as opposed to a failure to get one. Hub raises these by class; the names
+# are matched rather than imported so a version that drops or moves one cannot turn a denial
+# into "could not ask". DisabledRepoError is a deliberate refusal too.
+_DENIAL_EXC_NAMES = frozenset(
+    {
+        "RepositoryNotFoundError",
+        "GatedRepoError",
+        "DisabledRepoError",
+        "RevisionNotFoundError",
+    }
+)
+# 401/403 are the credential being rejected. 410 is a repo withdrawn, 451 one blocked: both
+# answered. Every other status -- 404 with no HF error code, 405, 429, 5xx -- is the endpoint
+# failing to answer the question we asked.
+#
+# Measured against the live endpoint rather than assumed, because the whole split rests on it:
+#   public model or dataset            -> 200
+#   gated model, no credential         -> 401  X-Error-Code: GatedRepo
+#   private or nonexistent repo        -> 401  (no error code)
+#   /auth-check on a path that is not a route -> 404, generic HTML, no error code
+# So huggingface.co never answers 404 ABOUT A REPO: a bare 404 means this endpoint has no
+# /auth-check, which is the HF_ENDPOINT mirror case, and is not a statement about the caller.
+_DENIAL_STATUSES = frozenset({401, 403, 410, 451})
+
+
 def _is_probe_timeout(exc: BaseException) -> bool:
     """Could not ask, as opposed to asked and told no. Named for its original narrow case."""
     for cls in type(exc).__mro__:
@@ -154,10 +263,18 @@ def _is_probe_timeout(exc: BaseException) -> bool:
 
 
 def reset_repo_access_cache() -> None:
-    """Drop memoized Hub access answers. Tests only."""
+    """Drop memoized Hub access answers. Tests only.
+
+    The remembered denials go with them: they outlive the verdict cache on purpose, so a test
+    that only cleared the cache would carry one test's refusal into the next one's unaskable
+    probe.
+    """
+    global _denial_memory_is_complete
     with _repo_access_lock:
         _repo_access_cache.clear()
         _repo_access_inflight.clear()
+        _denied_repo_access.clear()
+        _denial_memory_is_complete = True
 
 
 def cache_reads_authorized(
@@ -177,9 +294,14 @@ def cache_reads_authorized(
     which a public repo answers 200 for any string; it discriminates on private and gated
     repos, which is where the cached reads are.
 
-    Offline, an explicit token is denied without a memoized probe (fail closed) while ambient
-    ``None`` still reads. ``offline`` is the CALLER's own flag: without it a cache-only
-    request put its token on the wire and could stall for the probe timeout first.
+    Three outcomes, not two. A Hub that ANSWERED no still denies, which is the whole of the
+    boundary this gate exists for. A Hub that could not be ASKED -- ``HF_HUB_OFFLINE``, the
+    caller's own cache-only ``offline``, a connection refused, a timeout, a 5xx, a 429, or an
+    ``HF_ENDPOINT`` mirror with no /auth-check route -- is not an answer, and turning it into
+    a denial made a purely LOCAL question ("is this repo on my disk") depend on reaching
+    huggingface.co: an operator offline with a fully downloaded model was told it was
+    unavailable. Unaskable therefore falls back to the local fact, on disk or not, which is
+    the question actually being asked; see ``_resolve_unaskable``.
     """
     if is_anonymous(hf_token):
         return False
@@ -200,7 +322,10 @@ def cache_reads_authorized(
         # Unvalidated in the URL, so probing puts the caller's path on the wire with their
         # bearer token, for an answer that can only be no.
         return False
-    return _explicit_token_reaches_repo(repo, hf_token, repo_type, offline = offline)
+    verdict = _explicit_token_reaches_repo(repo, hf_token, repo_type, offline = offline)
+    if verdict is None:
+        return _resolve_unaskable(repo, repo_type, token = hf_token)
+    return verdict
 
 
 def public_cache_read_authorized(
@@ -212,13 +337,19 @@ def public_cache_read_authorized(
     """Whether serving *repo_id* from the cache to a caller with NO credential leaks anything.
 
     The sentinel can never authorize itself, which is right for a private repo and wrong for
-    a public one. An unauthenticated /auth-check is exactly that difference. Fail closed when
-    it cannot be asked.
+    a public one. An unauthenticated /auth-check is exactly that difference.
+
+    Failing closed when it cannot be asked is what made every anonymous caller on an offline
+    host lose its own downloaded public models, so the unaskable case resolves against the
+    disk here too, on the same rule as ``cache_reads_authorized``.
     """
     repo = (repo_id or "").strip()
     if not repo or _is_local_path(repo):
         return False
-    return _explicit_token_reaches_repo(repo, None, repo_type, offline = offline)
+    verdict = _explicit_token_reaches_repo(repo, None, repo_type, offline = offline)
+    if verdict is None:
+        return _resolve_unaskable(repo, repo_type, token = None)
+    return verdict
 
 
 def cached_read_refused(
@@ -241,6 +372,9 @@ def cached_read_refused(
     "May not read it" is not "cannot authorize itself", which is where the sentinel sits: a
     public repo is one it was always entitled to read. Asked here so every reader shares the
     rule; the dataset preview used to be the only one asking.
+
+    Both questions below resolve an unaskable Hub against the disk rather than denying, so a
+    reader behind this gate keeps working offline. Only a Hub that answered no refuses.
     """
     if not is_cached():
         return False
@@ -261,6 +395,418 @@ def _is_local_path(repo_id: str) -> bool:
         return False
 
 
+def _ambient_hf_token() -> "tuple[bool, Optional[str]]":
+    """``(known, token)``: the credential THIS HOST downloads with.
+
+    ``huggingface_hub.get_token()`` is the authority. It is what every download in this
+    process resolves, so it covers the env aliases, the OIDC exchange and the token file
+    together, and asking it is the only way to be sure the answer matches what actually
+    populated the cache.
+
+    THREE outcomes, not two, and the third is the one that matters. ``(True, "hf_...")`` the
+    host has this credential; ``(True, None)`` the Hub library says the host has none;
+    ``(False, None)`` the question could not be answered here. Collapsing the third into
+    "this host has no credential" is a fail-open: the token file could hold one this process
+    could not read, and a credential-less caller would then be told the cache contains
+    nothing it lacks permission for. Unknown therefore authorizes nobody.
+
+    The env keys are the fallback for a hub too old to export ``get_token``, and finding one
+    there IS an answer; finding none is not, because the token file is the source that
+    fallback cannot see.
+
+    Not memoized. It is read only inside the unaskable branch, an operator can revoke or set
+    a token at any moment, and a memo would decide authorization from a credential the host
+    no longer has.
+    """
+    get_token = None
+    try:
+        from huggingface_hub import get_token as _get_token
+        get_token = _get_token
+    except Exception:
+        get_token = None
+    if get_token is not None:
+        try:
+            token = get_token()
+        except Exception:
+            # Asked and not answered. Not the same as "there is none".
+            return (False, None)
+        if isinstance(token, str) and token.strip():
+            return (True, token.strip())
+        return (True, None)
+    import os
+
+    for key in _HF_TOKEN_ENV_KEYS:
+        if key == "HF_OIDC_RESOURCE":
+            # Names a token rather than holding one, so it cannot be compared to a caller's.
+            continue
+        value = os.environ.get(key)
+        if isinstance(value, str) and value.strip():
+            return (True, value.strip())
+    return (False, None)
+
+
+def _saved_studio_hf_token() -> "tuple[bool, Optional[str]]":
+    """``(known, token)``: the HF credential the Studio UI saves and downloads with.
+
+    Separate from ``_ambient_hf_token`` because it is a separate store and neither can see
+    the other. Settings writes this one into the encrypted credential store
+    (``credential_secrets.save_hf_token``); nothing writes it to the token file or to
+    ``HF_TOKEN``, so ``huggingface_hub.get_token()`` does not return it, and the UI hands it
+    back on each request in ``X-Unsloth-HF-Token`` rather than relying on ambient pickup.
+
+    It is therefore just as much "the credential this host's cache was filled with" as the
+    ambient one, and on the ordinary Studio install it is the ONLY one. Same three outcomes
+    and the same reason for the third: an unreadable store (locked database, missing
+    encryption key) is not "the host has no credential", and collapsing it into one would
+    hand a credential-less caller a cache that may hold private bytes.
+
+    Not memoized, for the reason ``_ambient_hf_token`` is not: the operator can save, rotate
+    or clear this token at any moment from Settings.
+    """
+    try:
+        from storage import credential_secrets
+    except Exception:
+        # The store exists in every Studio install; failing to import it is an unanswered
+        # question about this host, not an answer.
+        return (False, None)
+    try:
+        token = credential_secrets.get_hf_token()
+    except Exception:
+        return (False, None)
+    if isinstance(token, str) and token.strip():
+        return (True, token.strip())
+    # None has two meanings here and only one of them is an answer. `get_secret` returns it
+    # both for an absent row and for a row it could not decrypt -- a lost or rotated
+    # encryption key, corrupted ciphertext, a format a newer build wrote -- and reading the
+    # second as "this host holds no credential" is a fail-open: the credential-less branch
+    # of `_caller_populated_the_cache` would then hand an API-key caller a cache that may
+    # hold whatever that unreadable token downloaded.
+    try:
+        stored = credential_secrets.hf_token_row_exists()
+    except Exception:
+        return (False, None)
+    if stored:
+        return (False, None)
+    return (True, None)
+
+
+def _host_hf_credentials() -> "tuple[bool, tuple]":
+    """``(known, tokens)``: every HF credential this host holds, from both stores.
+
+    ``known`` is the AND of the two: if either store could not be read, the host's credential
+    set is not established and nobody is authorized, on either branch.
+    """
+    ambient_known, ambient = _ambient_hf_token()
+    saved_known, saved = _saved_studio_hf_token()
+    if not (ambient_known and saved_known):
+        return (False, ())
+    return (True, tuple(value for value in (ambient, saved) if value))
+
+
+# Repos this host fetched with a credential it does not hold. The download route accepts a
+# ONE-OFF `X-Unsloth-HF-Token` and hands it to the downloader without saving it anywhere, so
+# a private repo can be sitting in the cache of a host whose credential set is empty -- and
+# the tokenless branch below reads an empty credential set as "everything here was public
+# when it was downloaded". That inference is only sound if no such download ever happened,
+# so the ones that did are recorded, per repo, at the moment they are started.
+_REQUEST_TOKEN_REPOS_SETTING_KEY = "hub_repos_fetched_with_a_request_token"
+
+
+def _request_token_repo_key(repo_id: str, repo_type: Optional[str]) -> str:
+    """The record's key, case-folded like everything else that identifies a repo here.
+
+    The authorization cache and `iter_repo_cache_dirs` both compare repo ids
+    case-insensitively, so a download recorded as `Org/Private` and later asked for as
+    `org/private` would miss the record while the disk lookup succeeded -- which is the
+    tokenless caller being authorized for the private repo.
+    """
+    return f"{(repo_type or 'model').strip().lower()}:{repo_id.strip().lower()}"
+
+
+def _as_owner(call, *args, **kwargs):
+    """Run a settings read or write as the owner, the way every installation-wide setting is.
+
+    A managed account's own row is not the host's record, and this one is about the host.
+    """
+    from utils.account_context import OWNER, is_owner_context, run_as
+
+    if is_owner_context():
+        return call(*args, **kwargs)
+    return run_as(OWNER, call, *args, **kwargs)
+
+
+def note_repo_fetched_with_a_request_token(
+    token: HfTokenArg,
+    repo_id: str,
+    repo_type: Optional[str] = "model",
+) -> None:
+    """Record that *repo_id* was fetched under a credential at all.
+
+    Called at the start of a download. The read side consults this map on ONE branch: the
+    host's credential set is empty NOW and the caller presents none. "Empty now" says nothing
+    about what the host held when the bytes were fetched, so a download made under the
+    operator's OWN credential is recorded too. Skipping those is what let an operator
+    download a private repo with a saved or ambient token, delete that token, and leave a
+    cache a credential-less API-key caller is authorized for as soon as the Hub is unaskable.
+
+    ``token is None`` is the ambient path, and huggingface_hub resolves ``HF_TOKEN`` and the
+    token file implicitly for it, so it is a credentialed fetch whenever the host holds one.
+    A host that holds none really did fetch anonymously and records nothing -- that is the
+    tokenless offline install this fallback exists for, and its cache must stay readable. A
+    credential set that cannot be read records, because the fetch cannot be shown to have
+    been anonymous and an absent record authorizes.
+
+    The cost is one-sided by choice: a PUBLIC repo fetched under a credential that is later
+    removed is recorded too, and is then withheld from a tokenless offline caller. Recording
+    is already the behaviour for a public repo fetched with a foreign one-off token, and an
+    over-broad record withholds bytes the caller can still fetch from the Hub, where a
+    missing one hands over a private repo.
+
+    Never raises. A record that could not be written is a record that is not there, and the
+    read side treats an unreadable store as "cannot say", which refuses.
+    """
+    if is_anonymous(token) or not repo_id:
+        return
+    if token is not None and (not isinstance(token, str) or not token):
+        return
+    try:
+        if token is None:
+            known, host_tokens = _host_hf_credentials()
+            if known and not host_tokens:
+                return
+        from storage.studio_db import upsert_app_setting_map_entry
+
+        key = _request_token_repo_key(repo_id, repo_type)
+        recorded = _recorded_request_token_repos()
+        if isinstance(recorded, dict):
+            # Already known: the map is a SET of repos, so re-writing it says nothing and
+            # every write rewrites the whole JSON value.
+            if key in recorded:
+                return
+            # Bounded, because the repo id comes from the caller. Past the cap nothing more is
+            # added; the read side answers "cannot say" for a repo it does not find in a full
+            # map, which refuses the tokenless offline fallback rather than serving a repo
+            # whose provenance may be the entry that did not fit.
+            if len(recorded) >= _REQUEST_TOKEN_REPOS_MAX:
+                logger.debug("the request-token provenance map is full; not recording %s", key)
+                return
+        _as_owner(
+            upsert_app_setting_map_entry,
+            _REQUEST_TOKEN_REPOS_SETTING_KEY,
+            key,
+            {"at": time.time()},
+        )
+    except Exception:  # noqa: BLE001 -- a download must never fail on its own bookkeeping
+        logger.debug("could not record the credential a download used", exc_info = True)
+
+
+_REQUEST_TOKEN_REPOS_MAX = 4096
+
+
+def _recorded_request_token_repos() -> "Optional[dict]":
+    """The provenance map as stored, ``{}`` when the store holds none, ``None`` when it could
+    not be read or is not a map."""
+    try:
+        from storage.studio_db import get_app_setting
+        recorded = _as_owner(get_app_setting, _REQUEST_TOKEN_REPOS_SETTING_KEY, None)
+    except Exception:  # noqa: BLE001
+        return None
+    if recorded is None:
+        return {}
+    return recorded if isinstance(recorded, dict) else None
+
+
+def _repo_was_fetched_with_a_request_token(
+    repo_id: Optional[str], repo_type: Optional[str]
+) -> Optional[bool]:
+    """True / False / ``None`` for "the record could not be read"."""
+    if not repo_id:
+        return None
+    recorded = _recorded_request_token_repos()
+    if recorded is None:
+        return None
+    if _request_token_repo_key(repo_id, repo_type) in recorded:
+        return True
+    if len(recorded) >= _REQUEST_TOKEN_REPOS_MAX:
+        # The map stopped taking entries at the cap, so "not in it" no longer means "not
+        # fetched with one": a repo that was may be the entry that did not fit. Cannot say.
+        return None
+    return False
+
+
+def _caller_populated_the_cache(
+    token: Optional[str],
+    *,
+    repo_id: Optional[str] = None,
+    repo_type: Optional[str] = None,
+) -> bool:
+    """Whether this caller's credential is the one this host's cache was filled with.
+
+    This is the whole safety of the unaskable fallback. "The repo is on this disk" is a
+    fact about the OPERATOR, not about the caller asking, so resolving an unanswerable
+    probe against disk presence for any caller at all hands a second principal the
+    operator's private downloads: a holder of a valid Studio API key with no permission to
+    that HF repo gets it the moment the Hub is offline, times out, 429s, 5xx's or sits
+    behind an ``HF_ENDPOINT`` mirror with no /auth-check route. So presence only decides the
+    question for a caller that could have produced it.
+
+    A caller with an explicit token qualifies when that token is one the HOST holds: the
+    operator's own credential, the one the bytes were fetched with. Nothing is leaked to it
+    that it could not fetch from the Hub itself.
+
+    BOTH stores count, and which one matters depends on how Studio was set up. The ambient
+    credential (``get_token()``: token file, env aliases, OIDC) is the CLI operator's. The
+    Studio UI's is saved in the encrypted credential store and replayed in
+    ``X-Unsloth-HF-Token``; it never reaches ``get_token()``. Comparing only against the
+    ambient one refuses the ordinary UI case outright, where the operator saved a token in
+    Settings, downloaded a private model with it, and configured nothing globally: the
+    caller presents the very credential that filled the cache and is told it is not the
+    host's. That is the offline flow this gate exists to keep working.
+
+    A caller with NO credential qualifies only when the host holds NO credential in either
+    store. Then nothing in the cache can have been fetched under a credential this caller
+    lacks, so everything in it was public when it was downloaded. That is the ordinary
+    install: most hosts never configure an HF token, which is exactly the offline operator
+    this PR exists for. On a host that DOES hold one, a credential-less caller is refused,
+    because a private repo could be sitting in that cache.
+
+    Two DIFFERENT held credentials refuse everyone. "One of the host's credentials" is only
+    a stand-in for "the credential the bytes were fetched with" while there is one of them;
+    with an ambient token and a different saved token, either could have filled the cache,
+    and on a managed install the two are different principals. Rather than authorize the
+    holder of one for repos the other downloaded, the fallback shuts.
+
+    History is not inferred from the credential set, because it cannot be: "the host holds
+    this credential now" says nothing about what it held when the bytes were fetched, and an
+    operator who downloads a private repo and then DELETES every credential would otherwise
+    leave a cache a credential-less caller is authorized for. So provenance is recorded at
+    download time instead -- every credentialed fetch, not only a foreign one-off token --
+    and the empty-credential branch consults it rather than standing alone. What the record
+    cannot cover is a cache filled before it existed; those entries read as "never recorded",
+    which authorizes. Failing closed on them instead would refuse the tokenless offline
+    install its own cache on first upgrade, which is the case this whole path exists for.
+
+    Compared with ``compare_digest`` rather than ``==``: the comparison is on a secret, and
+    an early-exit compare over a repeated request is a timing oracle for it. Every held
+    credential is compared, without short-circuiting on a match, so the time taken does not
+    report WHICH store answered.
+    """
+    known, host_tokens = _host_hf_credentials()
+    if not known:
+        # Could not be established. Authorize nobody rather than guess, on either branch:
+        # guessing "no credential" hands the cache to a caller with none, and guessing
+        # "some credential" is not a value a caller's token can be compared against.
+        return False
+    if token is None:
+        if host_tokens:
+            return False
+        # An empty credential set means nothing in the cache NEEDED one -- unless a download
+        # was run with a one-off request token, which the host never keeps. Those repos are
+        # recorded, and a record that cannot be read answers nobody.
+        return _repo_was_fetched_with_a_request_token(repo_id, repo_type) is False
+    if not isinstance(token, str) or not token or not host_tokens:
+        return False
+    if len({held for held in host_tokens}) > 1:
+        # Two DIFFERENT credentials on one host: an ambient one the operator uses from the
+        # CLI and a different one saved in Studio's settings by whoever is using the UI.
+        # Either could have filled the cache and nothing here can tell which, so matching
+        # one of them says nothing about the repo on disk -- and on a managed install the
+        # two belong to different principals, which is exactly when saying otherwise hands
+        # one of them the other's private downloads. Unknown authorizes nobody. The host
+        # that holds a single credential, which is every ordinary install, is unaffected.
+        return False
+    matched = False
+    for held in host_tokens:
+        if hmac.compare_digest(token, held):
+            matched = True
+    return matched
+
+
+def _resolve_unaskable(repo_id: str, repo_type: str, *, token: Optional[str]) -> bool:
+    """What an UNASKABLE Hub means for a cache read. Never called for an answered probe.
+
+    The gate above guards one thing: reading the repo the operator already has on this host.
+    So when huggingface.co cannot be reached at all, the question left over is entirely
+    local, and the local fact decides it -- BUT only for a caller that fact is about.
+
+    Not this caller's cache -> refused, whatever is on disk. See
+    ``_caller_populated_the_cache``: disk presence is a fact about the operator, and
+    letting it answer for a second principal is how "could not ask" becomes "here is the
+    operator's private repo".
+
+    This caller's cache, on disk -> authorized. The bytes are already here; the operator
+    downloaded them with this very credential, and making "can I see my own downloaded
+    model" contingent on a round trip to huggingface.co is what broke offline hosts,
+    air-gapped installs, Hub outages and ``HF_ENDPOINT`` mirrors that never implemented the
+    undocumented /auth-check route.
+
+    Not on disk -> refused, which costs nothing (there is nothing cached to serve) and keeps
+    the gate shut for a caller trying to make the backend go and fetch something.
+
+    A Hub that ANSWERS no is untouched by this, which is the boundary the gate was added for:
+    online, an API key that cannot reach a private repo is still refused the operator's
+    cached copy of it.
+    """
+    if not _caller_populated_the_cache(token, repo_id = repo_id, repo_type = repo_type):
+        return False
+    return _repo_present_on_disk(repo_id, repo_type)
+
+
+def _repo_present_on_disk(repo_id: str, repo_type: str) -> bool:
+    """Whether *repo_id* is already materialised in one of this host's HF caches.
+
+    Purely local by construction -- a directory walk, no import of anything that dials out --
+    because it is the fallback for "the network is not available" and is reached on every
+    call inside the unreachable window, so it must neither block nor be memoized (a download
+    completing has to take effect immediately).
+
+    Deliberately ``repo_cache_has_usable_snapshot`` and not "a repo directory exists": an
+    interrupted download leaves the directory with no consumable snapshot under it. A dataset
+    also counts when only the ``datasets`` PREPARED cache holds it, since that is what backs
+    a preview and it is a different tree from the hub snapshot.
+
+    Asked only after a readable listing has actually FOUND a cache dir filed under this repo.
+    That ordering is the whole safety of it: ``repo_cache_has_usable_snapshot`` answers True
+    when any cache root could not be enumerated, which is right where True means "do not
+    delete this" and would here mean every repo is present on a host with one unreadable
+    root (a hub cache owned by another user, a stale network mount). Not finding anything is
+    not the same as not being able to look, and neither one is presence.
+    """
+    try:
+        from hub.utils.hf_cache_state import (
+            iter_repo_cache_dirs,
+            repo_cache_has_usable_snapshot,
+        )
+    except Exception:
+        # Cannot establish the local fact -> no local authorization. Deny, do not guess.
+        return False
+    # The two trees are independent evidence, so the hub answer is COMBINED with the prepared
+    # one rather than returned in place of it. A dataset can have a perfectly good prepared
+    # cache and a hub repo directory with nothing usable under it -- a pruned snapshot, an
+    # interrupted refetch that left only boilerplate -- and returning on the hub answer alone
+    # refused a preview the prepared cache can serve in full, which is the offline case this
+    # fallback exists for. Not being able to look at the hub tree is not absence either, and
+    # it says nothing at all about the prepared one, so that path falls through here too.
+    try:
+        if any(True for _dir in iter_repo_cache_dirs(repo_type, repo_id)):
+            if bool(repo_cache_has_usable_snapshot(repo_type, repo_id)):
+                return True
+    except Exception:
+        import logging
+        logging.getLogger(__name__).debug(
+            "Could not check the local cache for '%s'", repo_id, exc_info = True
+        )
+        if repo_type != "dataset":
+            return False
+    if repo_type != "dataset":
+        return False
+    try:
+        from hub.utils.dataset_cache import latest_processed_dataset_cache_path
+        return latest_processed_dataset_cache_path(repo_id) is not None
+    except Exception:
+        return False
+
+
 def _hub_offline() -> bool:
     try:
         from utils.utils import hf_env_offline
@@ -274,11 +820,17 @@ def _hub_offline() -> bool:
         return False
 
 
-def _cached_repo_access(key: tuple[str, str, str], now: float) -> Optional[bool]:
+def _cached_repo_access(key: tuple[str, str, str], now: float):
+    """The memoized verdict, or ``_CACHE_MISS``.
+
+    Not ``Optional[bool]``: ``None`` is now a verdict of its own ("could not be asked"), so a
+    miss needs a value no verdict can take. Returning ``None`` for both re-probed a dead
+    endpoint on every call, which is the stall the short TTL exists to prevent.
+    """
     cached = _repo_access_cache.get(key)
     if cached is not None and cached[0] > now:
         return cached[1]
-    return None
+    return _CACHE_MISS
 
 
 def _explicit_token_reaches_repo(
@@ -286,7 +838,8 @@ def _explicit_token_reaches_repo(
     token: Optional[str],
     repo_type: str,
     offline: bool = False,
-) -> bool:
+) -> Optional[bool]:
+    """``True`` reachable, ``False`` the Hub said no, ``None`` the Hub could not be asked."""
     # None asks the public question, under its own key: a public repo answers 200 for every
     # token, so a shared key would let any string claim that verdict.
     key = (
@@ -295,32 +848,54 @@ def _explicit_token_reaches_repo(
         hashlib.sha256(token.encode()).hexdigest()[:16] if token else "anonymous",
     )
     cached = _cached_repo_access(key, time.monotonic())
-    if cached is not None:
-        return cached
+    if cached is not _CACHE_MISS:
+        return _with_remembered_denial(key, cached)  # type: ignore[arg-type]
     if offline or _hub_offline():
-        return False
+        # Not a verdict and not memoized: declared offline says nothing about the credential,
+        # and a memo would then outlive the moment the network comes back.
+        return _with_remembered_denial(key, None)
 
     with _inflight_lock(key):
         cached = _cached_repo_access(key, time.monotonic())
-        if cached is not None:
-            return cached
-        started = time.monotonic()
+        if cached is not _CACHE_MISS:
+            return _with_remembered_denial(key, cached)  # type: ignore[arg-type]
         try:
             allowed = _probe_repo_access(repo_id, token, repo_type)
-            timed_out = False
         except _ProbeTimedOut:
-            allowed = False
-            timed_out = True
+            allowed = None
+        except Exception:
+            # The gate's own failure is a failure to ASK, not an answer. Escaping here would
+            # 500 the route; returning False would deny a repo that is already on this disk.
+            import logging
+            logging.getLogger(__name__).debug(
+                "Repo access probe for '%s' raised", repo_id, exc_info = True
+            )
+            allowed = None
         # AFTER the probe: `start + TTL` memoizes an expired entry when the Hub stalls.
         finished = time.monotonic()
-        if not timed_out:
-            timed_out = not allowed and (finished - started) >= _REPO_ACCESS_PROBE_TIMEOUT_S
-        expiry = finished + (_REPO_ACCESS_UNREACHABLE_TTL_S if timed_out else _REPO_ACCESS_TTL_S)
+        # No elapsed-time rewrite of the verdict. Giving up is recognised by CLASS and by
+        # STATUS, not by the clock: every timeout, connect error, proxy failure and transport
+        # error already arrives here as None, and the only way `allowed` is False is a
+        # classified denial (401, 403, 410, 451, an HF-coded 404, or one of the denial
+        # exception classes). Elapsed time cannot tell one of those apart from a slow one --
+        # the budget covers the cold `huggingface_hub` import and a distant mirror as well as
+        # the request -- and rewriting it to None discarded the Hub's explicit refusal. With
+        # no denial remembered, a caller presenting the host's stored but revoked token then
+        # passed the caller-populated-the-cache test and was served the private repo.
+        expiry = finished + (
+            _REPO_ACCESS_UNREACHABLE_TTL_S if allowed is None else _REPO_ACCESS_TTL_S
+        )
         with _repo_access_lock:
             if len(_repo_access_cache) >= _REPO_ACCESS_CACHE_MAX:
                 _evict_repo_access_locked()
             _repo_access_cache[key] = (expiry, allowed)
-    return allowed
+        # Only an answer moves the memory. An unaskable Hub leaves whatever the last answer
+        # was, which is the whole point of keeping it.
+        if allowed is False:
+            _remember_denial(key, finished)
+        elif allowed is True:
+            _forget_denial(key)
+    return _with_remembered_denial(key, allowed)
 
 
 def _evict_repo_access_locked() -> None:
@@ -385,7 +960,44 @@ def _same_probe_target(answered: str, asked: str) -> bool:
         return False
 
 
-def _probe_repo_access(repo_id: str, token: Optional[str], repo_type: str) -> bool:
+def _probe_answer_from_exception(exc: BaseException, response = None) -> Optional[bool]:
+    """``False`` when the Hub answered no, ``None`` when it failed to answer at all.
+
+    The old blanket ``except -> False`` is what made an offline host, a Hub outage, a rate
+    limit and a mirror without the route indistinguishable from a rejected credential.
+    """
+    if _is_probe_timeout(exc):
+        return None
+    for cls in type(exc).__mro__:
+        if cls.__name__ in _DENIAL_EXC_NAMES:
+            return False
+    status = getattr(response, "status_code", None)
+    if not isinstance(status, int):
+        # hub attaches the response to HfHubHTTPError; a plain httpx error carries it too.
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int):
+        if status in _DENIAL_STATUSES:
+            return False
+        if status == 404 and _has_hf_error_code(response):
+            # HF's own "no such repo for you". A mirror with no /auth-check route sends a
+            # bare 404 instead, which is not an answer about the repo.
+            return False
+    return None
+
+
+def _has_hf_error_code(response) -> bool:
+    try:
+        headers = getattr(response, "headers", None)
+        if headers is None:
+            return False
+        return bool(headers.get("X-Error-Code"))
+    except Exception:
+        return False
+
+
+def _probe_repo_access(repo_id: str, token: Optional[str], repo_type: str) -> Optional[bool]:
+    """``True`` reachable, ``False`` the Hub answered no, ``None`` it could not be asked."""
+    response = None
     try:
         from huggingface_hub import constants
         from huggingface_hub.utils import build_hf_headers, get_session, hf_raise_for_status
@@ -408,24 +1020,27 @@ def _probe_repo_access(repo_id: str, token: Optional[str], repo_type: str) -> bo
             headers = build_hf_headers(token = token if token else False),
             timeout = _REPO_ACCESS_PROBE_TIMEOUT_S,
         )
-        hf_raise_for_status(response)
-        # hf_raise_for_status passes 3xx: without this a bare 307 reads as authorized.
-        if 300 <= getattr(response, "status_code", 0) < 400:
-            return False
+        # hf_raise_for_status passes 3xx: without this a bare 307 reads as authorized. It is
+        # not a denial either -- a legacy alias redirects, and so does a captive proxy -- so
+        # it is "nobody answered for this repo" and resolves locally.
+        if 300 <= (getattr(response, "status_code", 0) or 0) < 400:
+            return None
         # And get_session DOES follow them (httpx.Client(follow_redirects=True)), so the
         # check above never fires: a redirect to a login page returns an approving 200 for
         # somewhere else. Only the repo we asked about may answer for it.
         if getattr(response, "history", None):
-            return False
+            return None
         # Belt and braces for a client that does not record history. Compared on parts, not
         # as strings: httpx canonicalises response.url (lower-cases the host, drops an
         # explicit :443) while the configured HF_ENDPOINT keeps its spelling, so a raw
         # comparison denied every mirror written as HF-MIRROR.example or with the port.
         final_url = getattr(response, "url", None)
         if final_url is not None and not _same_probe_target(str(final_url), path):
-            return False
+            return None
+        # Last, so the checks above see the response rather than an exception built from it.
+        hf_raise_for_status(response)
         return True
     except Exception as exc:
         if _is_probe_timeout(exc):
             raise _ProbeTimedOut from exc
-        return False
+        return _probe_answer_from_exception(exc, response)
