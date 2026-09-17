@@ -4933,13 +4933,86 @@ def test_gguf_textual_fallback_caps_distinct_tool_calls_per_turn(monkeypatch):
         backend.generate_chat_completion_with_tools(
             messages = [{"role": "user", "content": "go"}],
             tools = [{"type": "function", "function": {"name": f"t{i}"}} for i in range(n)],
-            max_tool_iterations = 1,
+            max_tool_iterations = 2,
         )
     )
 
     assert len(calls) == _MAX_TOOL_CALLS_PER_TURN, [c[0] for c in calls]
     # The cap keeps the first calls in order (no reordering / drop of leading ones).
     assert [c[0] for c in calls] == [f"t{i}" for i in range(_MAX_TOOL_CALLS_PER_TURN)]
+    (notice,) = [
+        m for m in payloads[1]["messages"] if "more tool call(s)" in (m.get("content") or "")
+    ]
+    assert notice["role"] == "user"
+    assert notice["content"].startswith("4 more tool call(s)")
+    for i in range(_MAX_TOOL_CALLS_PER_TURN, n):
+        assert f"t{i} " in notice["content"]
+
+
+def test_gguf_textual_fallback_over_cap_notice_is_not_folded_into_tool_result(monkeypatch):
+    from core.inference.llama_cpp import _MAX_TOOL_CALLS_PER_TURN
+
+    def _call(i):
+        return '<tool_call>{"name":"web_search","arguments":{"query":"q%d"}}</tool_call>' % i
+
+    streams = [
+        [_sse({"content": _call(0)}), _done()],
+        [
+            _sse({"content": "".join(_call(i) for i in range(_MAX_TOOL_CALLS_PER_TURN + 2))}),
+            _done(),
+        ],
+        [_sse({"content": "done"}), _done()],
+    ]
+    backend, payloads = _backend_and_payloads(monkeypatch, streams)
+    _record_tool_calls(monkeypatch, "OK")
+
+    list(
+        backend.generate_chat_completion_with_tools(
+            messages = [{"role": "user", "content": "go"}],
+            tools = [{"type": "function", "function": {"name": "web_search"}}],
+            max_tool_iterations = 3,
+        )
+    )
+
+    last = payloads[2]["messages"][-1]
+    assert last["role"] == "user"
+    assert "2 more tool call(s)" in last["content"]
+    assert not any(
+        "more tool call(s)" in (m.get("content") or "")
+        for m in payloads[2]["messages"]
+        if m.get("role") == "tool"
+    )
+
+
+def test_gguf_textual_fallback_over_cap_on_last_turn_does_not_ask_for_retry(monkeypatch):
+    from core.inference.llama_cpp import _MAX_TOOL_CALLS_PER_TURN
+    from core.inference.tool_call_parser import BUDGET_EXHAUSTED_NUDGE
+
+    blocks = "".join(
+        '<tool_call>{"name":"web_search","arguments":{"query":"q%d"}}</tool_call>' % i
+        for i in range(_MAX_TOOL_CALLS_PER_TURN + 2)
+    )
+    streams = [[_sse({"content": blocks}), _done()], [_sse({"content": "done"}), _done()]]
+    backend, payloads = _backend_and_payloads(monkeypatch, streams)
+    _record_tool_calls(monkeypatch, "OK")
+
+    list(
+        backend.generate_chat_completion_with_tools(
+            messages = [{"role": "user", "content": "go"}],
+            tools = [{"type": "function", "function": {"name": "web_search"}}],
+            max_tool_iterations = 1,
+        )
+    )
+
+    messages = payloads[1]["messages"]
+    last = messages[-1]
+    assert last["role"] == "tool"
+    assert "2 more tool call(s)" in last["content"]
+    assert BUDGET_EXHAUSTED_NUDGE in last["content"]
+    assert not any("Call them again" in (m.get("content") or "") for m in messages)
+    assert not any(
+        a.get("role") == "user" and b.get("role") == "user" for a, b in zip(messages, messages[1:])
+    )
 
 
 def test_gguf_textual_fallback_collapses_duplicate_tool_calls(monkeypatch):
