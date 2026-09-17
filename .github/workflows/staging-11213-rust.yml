@@ -49,10 +49,10 @@ jobs:
         shell: bash
         run: |
           cat > probe.py <<'EOF'
-          import socket, time, sys
+          import socket, time, statistics
 
           def closed_port():
-              for c in range(20200, 20320):
+              for c in range(20200, 20400):
                   s = socket.socket()
                   try:
                       s.bind(("127.0.0.1", c)); s.close(); return c
@@ -60,27 +60,31 @@ jobs:
                       s.close()
               raise SystemExit("no free port")
 
-          port = closed_port()
-          print(f"probing closed loopback port {port}", flush=True)
-          for budget in (0.25, 0.5, 1.0, 2.0, 5.0, 10.0):
-              s = socket.socket(); s.settimeout(budget)
+          # How long does a REFUSAL actually take, with a budget generous enough to always get one.
+          times, kinds = [], []
+          for rep in range(12):
+              port = closed_port()
+              s = socket.socket(); s.settimeout(30.0)
               t = time.perf_counter()
               try:
-                  s.connect(("127.0.0.1", port)); out = "ACCEPTED"
+                  s.connect(("127.0.0.1", port)); kind = "ACCEPTED"
               except socket.timeout:
-                  out = "TIMEOUT (no answer)"
+                  kind = "TIMEOUT"
               except OSError as e:
-                  out = f"OSError errno={e.errno} winerror={getattr(e,'winerror',None)} msg={e}"
+                  kind = f"refused(errno={e.errno})"
               el = (time.perf_counter() - t) * 1000
-              print(f"budget={budget:>5}s -> {out} after {el:8.1f}ms", flush=True)
               s.close()
+              times.append(el); kinds.append(kind)
+              print(f"rep {rep:>2} port {port}: {kind} after {el:8.1f}ms", flush=True)
 
-          # Does a listener on the same port answer instantly, proving loopback itself is not filtered?
+          print(f"KINDS {sorted(set(kinds))}", flush=True)
+          print(f"REFUSAL_MS min={min(times):.1f} median={statistics.median(times):.1f} "
+                f"max={max(times):.1f} n={len(times)}", flush=True)
+
           srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
           live = srv.getsockname()[1]
-          c = socket.socket(); c.settimeout(2.0)
-          t = time.perf_counter()
-          c.connect(("127.0.0.1", live))
-          print(f"control: live listener on {live} accepted after {(time.perf_counter()-t)*1000:.1f}ms", flush=True)
+          c = socket.socket(); c.settimeout(5.0)
+          t = time.perf_counter(); c.connect(("127.0.0.1", live))
+          print(f"control: live listener accepted after {(time.perf_counter()-t)*1000:.1f}ms", flush=True)
           EOF
           python probe.py
