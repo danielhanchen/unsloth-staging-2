@@ -25,4 +25,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Probe the closed-port classification
         working-directory: studio/src-tauri
-        run: cargo test --bin unsloth-studio commands::tests:: -- --nocapture --test-threads=1
+        run: "cargo test --bin unsloth-studio commands::tests:: -- --nocapture --test-threads=1"
