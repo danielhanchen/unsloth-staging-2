@@ -2516,8 +2516,14 @@ exit 1
         }
         foreach ($name in @("python3", "python")) {
             try {
-                foreach ($cmd in @(Get-Command $name -All -CommandType Application -ErrorAction SilentlyContinue)) {
-                    if ($cmd -and $cmd.Source) { $candidates += $cmd.Source }
+                # Select-Object, not $cmd.Source. Constrained Language Mode permits property
+                # reads only on its allowed type list, and CommandInfo is not on it, so the
+                # direct spelling throws on exactly the hosts this ladder exists for. Reading it
+                # through a cmdlet keeps the access inside compiled code, where CLM does not
+                # reach. Same reason for every other Select-Object -ExpandProperty below.
+                foreach ($source in @(Get-Command $name -All -CommandType Application -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)) {
+                    if ($source) { $candidates += $source }
                 }
             } catch {}
         }
@@ -2530,11 +2536,11 @@ exit 1
             # The interpreter's own directory: it exists, since the executable inside it just
             # passed Test-Path. Not $PSScriptRoot, which is empty under `irm | iex` (no script
             # file), and not the temp directory, which this installer relocates.
-            # Split-Path, not [System.IO.Path]::GetDirectoryName. Measured: Constrained Language
-            # Mode refuses method calls on System.IO.Path, and it threw here rather than returning
-            # null, so the whole ladder failed on exactly the hosts it exists for. Cmdlets stay
-            # available there. Same reason for Split-Path -IsAbsolute below and the [int] cast in
-            # the process image table.
+            # Split-Path, not [System.IO.Path]::GetDirectoryName. System.IO.Path is not on
+            # Constrained Language Mode's allowed-type list, so the static call throws rather
+            # than returning null, and the whole ladder failed on exactly the hosts it exists
+            # for. Cmdlets stay available there. Same reason for Split-Path -IsAbsolute below
+            # and for the cast in the process image table.
             $probeDir = Split-Path -Parent $candidate
             if ([string]::IsNullOrWhiteSpace($probeDir)) { continue }
             $probe = Invoke-StudioEarlyPython -Exe $candidate -Path $probeDir
@@ -2666,13 +2672,19 @@ exit 1
             # line out of -ArgumentList, and a -c body carrying newlines and quotes cannot survive
             # that intact. A file path is one plain token, so the two launchers run the same
             # program rather than nearly the same one.
-            $scriptFile = New-TemporaryFile
-            $outFile = New-TemporaryFile
-            $errFile = New-TemporaryFile
+            # Plain strings, not New-TemporaryFile. That cmdlet hands back a FileInfo, and
+            # reading a path off it is a property read on a type Constrained Language Mode does
+            # not allow, so every path below would have thrown on a locked-down host. [guid] and
+            # [string] are both on the allowed list, and Join-Path is a cmdlet.
+            $tempRoot = if ($env:TEMP) { $env:TEMP } elseif ($env:TMPDIR) { $env:TMPDIR } else { "/tmp" }
+            $stem = Join-Path $tempRoot ("unsloth-early-" + [guid]::NewGuid().ToString("N"))
+            $scriptFile = "$stem.py"
+            $outFile = "$stem.out"
+            $errFile = "$stem.err"
             # UTF-8 both ways. The interpreter writes its answer as UTF-8 bytes, so reading it
             # back any other way corrupts every non-ASCII path exactly as the console codepage
             # would, and silently: the string still looks like a path.
-            Set-Content -LiteralPath $scriptFile.FullName -Value $Script -Encoding UTF8 -NoNewline
+            Set-Content -LiteralPath $scriptFile -Value $Script -Encoding UTF8 -NoNewline
             # Quoted here, not handed to -ArgumentList as an array: Start-Process joins that
             # array with spaces and quotes nothing, so a path containing a space arrives as two
             # arguments. Same rule as the other launcher's 5.1 branch, and for the same reason:
@@ -2681,11 +2693,11 @@ exit 1
             # -I -S, the same pair as the primary launcher. These two are asserted to return the
             # same string byte for byte, and a sitecustomize running in one of them but not the
             # other is exactly the kind of difference that assertion exists to catch.
-            $argv = (@(@("-I", "-S", $scriptFile.FullName) + $ScriptArgs | ForEach-Object {
+            $argv = (@(@("-I", "-S", $scriptFile) + $ScriptArgs | ForEach-Object {
                 '"' + ($_ -replace '(\\+)$', '$1$1') + '"'
             }) -join ' ')
             $proc = Start-Process -FilePath $Exe -ArgumentList $argv -NoNewWindow -PassThru `
-                -RedirectStandardOutput $outFile.FullName -RedirectStandardError $errFile.FullName
+                -RedirectStandardOutput $outFile -RedirectStandardError $errFile
             if (-not $proc) { return $null }
             # Wait-Process takes whole seconds, so round up: a sub-second bound must not become a
             # zero-second one, which returns immediately and kills a healthy interpreter.
@@ -2716,15 +2728,19 @@ exit 1
                 Stop-Process -InputObject $proc -Force -ErrorAction SilentlyContinue
                 return $null
             }
-            if ($proc.ExitCode -ne 0) { return $null }
-            $answer = Get-Content -LiteralPath $outFile.FullName -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+            # Select-Object, not $proc.ExitCode: System.Diagnostics.Process is not an allowed
+            # type under Constrained Language Mode either, so the direct read throws on the very
+            # hosts the primary launcher already could not serve.
+            $exitCode = $proc | Select-Object -ExpandProperty ExitCode -ErrorAction SilentlyContinue
+            if ($null -eq $exitCode -or $exitCode -ne 0) { return $null }
+            $answer = Get-Content -LiteralPath $outFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
             if ($null -eq $answer) { return "" }
             return (Remove-StudioTrailingNewline -Text ([string]$answer))
         } catch {
             return $null
         } finally {
             foreach ($f in @($scriptFile, $outFile, $errFile)) {
-                if ($f) { Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue }
+                if ($f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
             }
         }
     }
@@ -2765,6 +2781,9 @@ exit 1
         if ([string]::IsNullOrWhiteSpace($answer)) { return $null }
         # A relative answer is not an identity, and a path that does not exist cannot be the
         # resolution of one that does.
+        # Split-Path -IsAbsolute, not [System.IO.Path]::IsPathRooted, for the allowed-type
+        # reason above. This one guards the path the final-path resolver returns, so the static
+        # call would have thrown right where the ladder is meant to answer.
         if (-not (Split-Path -IsAbsolute $answer)) { return $null }
         if (-not (Test-Path -LiteralPath $answer)) { return $null }
         return $answer
@@ -2961,9 +2980,21 @@ exit 1
             $envOverride = (Join-Path $env:USERPROFILE $envOverride.Substring(1).TrimStart('/','\'))
         }
         try {
+            # Recorded BEFORE the create, because this is the only moment anyone can still tell.
+            # Enter-StudioInstallLock decides whether to claim the root by asking whether the
+            # directory existed when it ran, and it runs thousands of lines below here, by which
+            # point this create has already made the answer yes for every env-mode root. Its
+            # ownership branch would therefore never fire for exactly the roots it was written
+            # for, and a run that died between taking the lock and the later marker write would
+            # leave a directory holding only the lock file, which scripts/uninstall.ps1's
+            # _IsStudioRoot does not recognise and so refuses to clean up.
+            $script:StudioEnvRootPath = $envOverride
+            $script:StudioEnvRootExisted = [System.IO.Directory]::Exists($envOverride)
             # .NET API: New-Item -Path treats brackets as wildcards (no -LiteralPath on PS 5.1).
             [System.IO.Directory]::CreateDirectory($envOverride) | Out-Null
             $StudioHome = (Resolve-Path -LiteralPath $envOverride).Path
+            # Re-recorded against the resolved spelling, which is what the lock is handed.
+            $script:StudioEnvRootPath = $StudioHome
         } catch {
             Write-StudioLine "ERROR: $envOverrideVar=$envOverride cannot be created or accessed." -ForegroundColor Red
             # Same as the --tauri rejection above: still before the lock finally.
@@ -3100,8 +3131,31 @@ exit 1
             # Get-Item -Force, not Test-Path: the latter follows a dangling link and answers
             # false, after which WriteAllText follows the link and writes outside the root.
             Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
-            if (Get-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue) { return }
-            [System.IO.File]::WriteAllText($marker, "")
+            # CreateNew, not a check followed by a write. The check-then-write pair above left a
+            # window: the entry is confirmed absent, and a user who can write to this root plants
+            # a link at the name before the write lands, which then truncates the link's target.
+            # CreateNew fails if anything is already at the name, so the test and the creation are
+            # one operation and there is no window to aim at.
+            #
+            # Residual, stated rather than implied away: this closes the truncation, not every
+            # form of following. A link planted at the name makes CreateNew fail, which is the
+            # answer we want, but a DANGLING one is followed and an empty file is created at its
+            # target. That creates a zero-byte file somewhere; it cannot destroy an existing one,
+            # which is the hazard being guarded. Opening with FILE_FLAG_OPEN_REPARSE_POINT is the
+            # complete answer and .NET does not expose it here.
+            $markerStream = $null
+            try {
+                $markerStream = [System.IO.File]::Open($marker,
+                    [System.IO.FileMode]::CreateNew,
+                    [System.IO.FileAccess]::Write,
+                    [System.IO.FileShare]::None)
+            } catch {
+                # Something is at the name, or the root refuses the write. No marker is fine; the
+                # venv writes its own later.
+                return
+            } finally {
+                if ($markerStream) { try { $markerStream.Dispose() } catch {} }
+            }
         } catch { }
     }
 
@@ -5289,6 +5343,14 @@ exit 0
             # where the directory should be) surfaces as the caller's install-lock error, which
             # is a clearer place to fail than the first write further down.
             $existedBefore = [System.IO.Directory]::Exists($Path)
+            # An env-mode root is created where the override is read, thousands of lines above
+            # this, so by the time the lock runs it always exists and the check just above would
+            # answer yes for every one of them. That site records what it found; prefer its
+            # answer when it is speaking about this same directory.
+            if ($script:StudioEnvRootPath -and
+                $script:StudioEnvRootPath.Equals($Path, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $existedBefore = $script:StudioEnvRootExisted
+            }
             $null = [System.IO.Directory]::CreateDirectory($Path)
             $lockPath = Join-Path $Path $script:StudioInstallLockFileName
             # A link planted at the lock path is not a lock, it is a way to point our exclusive
@@ -5297,13 +5359,30 @@ exit 0
             # Remove the link itself, never its target, then let the open below create a real
             # file. Get-Item -Force rather than Test-Path, which follows a dangling link and
             # answers false; Write-StudioRootOwnerMarker guards the same hazard the same way.
+            $existingLock = $null
             try {
                 $existingLock = Get-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
-                if ($existingLock -and
-                    ($existingLock.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            } catch { $existingLock = $null }
+            if ($existingLock -and
+                ($existingLock.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                # A detected link that will NOT go must stop the install, not be shrugged off.
+                #
+                # The removal used to sit under an empty catch, so on a root where the link can be
+                # inspected but not deleted the run carried straight on into File.Open, which
+                # follows it. If the target happened to be zero bytes it also passed the length
+                # check below, and the installer then held an unrelated file with FileShare.None
+                # for the whole install: precisely the denial of service this removal exists to
+                # prevent, reached by the path meant to prevent it.
+                #
+                # The throw is caught by the outer handler, which drops the mutex and rethrows, so
+                # the caller reports a lock-creation failure rather than a phantom second
+                # installer.
+                try {
                     Remove-Item -LiteralPath $lockPath -Force -ErrorAction Stop
+                } catch {
+                    throw "A link is planted at the install lock path $lockPath and cannot be removed."
                 }
-            } catch {}
+            }
             # The attributes check above cannot see a HARD link. A hard link is a second
             # directory entry for an existing file, not a reparse point, so it carries no
             # attribute to test and File.Open follows it just the same: the target would be held
@@ -5355,23 +5434,75 @@ exit 0
                     Exit-StudioInstallMutex -Mutex $mutex
                     return $null
                 }
-                if ($stream.Length -eq 0) { break }
+                # The reparse test above ran on the PATHNAME, before this open, so on a root
+                # another user can write to, a symbolic link can be swapped in between the two.
+                # The Length test below catches every planted target that has bytes in it; a
+                # target that is itself zero bytes does not, and the install would then hold
+                # somebody else's sentinel with FileShare.None for its whole duration.
+                #
+                # Re-read the entry now the handle is held and refuse if it became a link. This
+                # narrows the window rather than closing it: closing it needs the handle's own
+                # identity, which means FILE_FLAG_OPEN_REPARSE_POINT and
+                # GetFileInformationByHandle, and removing native imports is the point of this
+                # workstream. The residual is a zero-byte denial of service on a root that is
+                # already writable by another user, which the root owner marker refuses first.
+                if ($stream.Length -eq 0) {
+                    $entry = $null
+                    try { $entry = Get-Item -LiteralPath $lockPath -Force -ErrorAction Stop } catch { $entry = $null }
+                    if ($entry -and (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                        $stream.Dispose()
+                        $stream = $null
+                        throw "A link was planted at the install lock path $lockPath while it was being opened."
+                    }
+                    break
+                }
                 if ($repaired) {
                     # A file this run just created cannot be non-empty, so reaching here means the
                     # path is not behaving like a file at all. Fail loudly instead of looping.
                     throw "The install lock file at $lockPath is not empty after being replaced."
                 }
-                # Drop the handle before removing the entry, then let the reopen create a real
-                # file. Removing a hard link deletes only that directory entry and never the
-                # target's data, the same property the reparse removal above relies on.
+                # Drop the handle, then move the entry ASIDE rather than delete it, and let the
+                # reopen create a real file at the freed name.
+                #
+                # Deleting was wrong for one case. A planted hard link loses only its own
+                # directory entry, which is why deleting looked safe, but an ORDINARY non-empty
+                # file at this name that is its own only link loses its contents, and it loses
+                # them merely because somebody started the installer. Nothing this installer
+                # writes can produce such a file, so it is not ours to destroy.
+                #
+                # Refusing instead would hand the other case back: a hard link planted here would
+                # then block every install rather than being repaired, which is the denial of
+                # service the length check exists to prevent. There is no cheap way to tell the
+                # two apart, since the discriminator is the link count and .NET does not expose
+                # it here. A rename needs no discrimination: the planted link leaves the lock
+                # path either way, and the ordinary file keeps its bytes under a name that says
+                # what happened to it.
                 $stream.Dispose()
                 $stream = $null
+                $displaced = "$lockPath.displaced-" + (Get-Date -Format "yyyyMMddHHmmss") +
+                    "-" + [guid]::NewGuid().ToString("N").Substring(0, 8)
                 try {
-                    Remove-Item -LiteralPath $lockPath -Force -ErrorAction Stop
+                    Move-Item -LiteralPath $lockPath -Destination $displaced -Force -ErrorAction Stop
                 } catch {
-                    # Another process holding the entry with FileShare.None is what makes this
-                    # fail, so this is "busy", not a fault to swallow and carry on from.
+                    # Only a sharing or lock violation means "another installer holds it". A
+                    # read-only directory, an ACL that forbids renaming, a policy block or a
+                    # storage fault are none of those, and reporting them as a concurrent install
+                    # sends the user hunting for a second installer that does not exist. Same
+                    # discrimination, and the same Win32 and errno codes, as the open below.
+                    #
+                    # The code is dug out of the exception chain because a cmdlet failure arrives
+                    # wrapped: the IOException that carries the HResult is not always the outermost.
+                    $mvCode = 0
+                    $mvEx = $_.Exception
+                    while ($mvEx) {
+                        if ($mvEx -is [System.IO.IOException]) {
+                            $mvCode = $mvEx.HResult -band 0xFFFF
+                            break
+                        }
+                        $mvEx = $mvEx.InnerException
+                    }
                     Exit-StudioInstallMutex -Mutex $mutex
+                    if ($mvCode -ne 32 -and $mvCode -ne 33 -and $mvCode -ne 11) { throw }
                     return $null
                 }
                 $repaired = $true
@@ -5613,8 +5744,16 @@ exit 0
             if ($split -lt 1) { continue }
             $pidText = $line.Substring(0, $split)
             $path = $line.Substring($split + 1)
-            if ($pidText -notmatch '^\d+$') { continue }
-            $parsed = [int]$pidText
+            # A -match and a cast, not [int]::TryParse. Constrained Language Mode does not
+            # permit casting to [ref] at all, so the TryParse spelling throws on the hosts this
+            # rung exists for, and the whole table comes back empty. The regex is anchored, and
+            # the cast is wrapped: PowerShell's [int] throws on a non-numeric string rather than
+            # returning zero, and throws again on one too large for an int, which a pid from a
+            # hostile or corrupted listing could be.
+            if ($pidText -notmatch '^\s*\d+\s*$') { continue }
+            $parsed = 0
+            try { $parsed = [int]$pidText } catch { continue }
+            if ($parsed -le 0) { continue }
             if (-not [string]::IsNullOrWhiteSpace($path)) { $table[$parsed] = $path }
         }
         if ($table.Count -eq 0) { return $null }
