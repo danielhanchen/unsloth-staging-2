@@ -34,3 +34,53 @@ jobs:
       - name: Probe the closed-port classification
         working-directory: studio/src-tauri
         run: "cargo test --bin unsloth-studio commands::tests:: -- --nocapture --test-threads=1"
+  connect_latency:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: How long does a closed loopback port take to refuse
+        shell: bash
+        run: |
+          cat > probe.py <<'EOF'
+          import socket, time, sys
+
+          def closed_port():
+              for c in range(20200, 20320):
+                  s = socket.socket()
+                  try:
+                      s.bind(("127.0.0.1", c)); s.close(); return c
+                  except OSError:
+                      s.close()
+              raise SystemExit("no free port")
+
+          port = closed_port()
+          print(f"probing closed loopback port {port}", flush=True)
+          for budget in (0.25, 0.5, 1.0, 2.0, 5.0, 10.0):
+              s = socket.socket(); s.settimeout(budget)
+              t = time.perf_counter()
+              try:
+                  s.connect(("127.0.0.1", port)); out = "ACCEPTED"
+              except socket.timeout:
+                  out = "TIMEOUT (no answer)"
+              except OSError as e:
+                  out = f"OSError errno={e.errno} winerror={getattr(e,'winerror',None)} msg={e}"
+              el = (time.perf_counter() - t) * 1000
+              print(f"budget={budget:>5}s -> {out} after {el:8.1f}ms", flush=True)
+              s.close()
+
+          # Does a listener on the same port answer instantly, proving loopback itself is not filtered?
+          srv = socket.socket(); srv.bind(("127.0.0.1", 0)); srv.listen(1)
+          live = srv.getsockname()[1]
+          c = socket.socket(); c.settimeout(2.0)
+          t = time.perf_counter()
+          c.connect(("127.0.0.1", live))
+          print(f"control: live listener on {live} accepted after {(time.perf_counter()-t)*1000:.1f}ms", flush=True)
+          EOF
+          python probe.py
