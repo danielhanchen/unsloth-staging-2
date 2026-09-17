@@ -96,6 +96,12 @@ _FINAL_PATH_CHAIN = (
     "Get-StudioNativeFinalPath",
     "Resolve-StudioLinkTarget",
     "Get-StudioSubstTarget",
+    "Get-StudioEarlyPython",
+    "Invoke-StudioEarlyPythonScript",
+    "Invoke-StudioEarlyPythonScriptViaCmdlets",
+    "Remove-StudioTrailingNewline",
+    "Invoke-StudioEarlyPython",
+    "Get-StudioPythonFinalPath",
     "Get-StudioLexicalPath",
     "Resolve-StudioFinalPathInfo",
     "Get-StudioFinalPath",
@@ -131,6 +137,12 @@ def _mutex_helpers(source: str) -> str:
             "Get-StudioNativeFinalPath",
             "Resolve-StudioLinkTarget",
             "Get-StudioSubstTarget",
+            "Get-StudioEarlyPython",
+            "Invoke-StudioEarlyPythonScript",
+            "Invoke-StudioEarlyPythonScriptViaCmdlets",
+            "Remove-StudioTrailingNewline",
+            "Invoke-StudioEarlyPython",
+            "Get-StudioPythonFinalPath",
             "Get-StudioLexicalPath",
             "Resolve-StudioFinalPathInfo",
             "Get-StudioFinalPath",
@@ -168,11 +180,18 @@ def _process_helpers(source: str) -> str:
             "Get-StudioNativeFinalPath",
             "Resolve-StudioLinkTarget",
             "Get-StudioSubstTarget",
+            "Get-StudioEarlyPython",
+            "Invoke-StudioEarlyPythonScript",
+            "Invoke-StudioEarlyPythonScriptViaCmdlets",
+            "Remove-StudioTrailingNewline",
+            "Invoke-StudioEarlyPython",
+            "Get-StudioPythonFinalPath",
             "Get-StudioLexicalPath",
             "Resolve-StudioFinalPathInfo",
             "Get-StudioFinalPath",
             "Test-StudioProtectedPathMatch",
             "Initialize-StudioProcessImageNativeType",
+            "Get-StudioPythonProcessImageTable",
             "Get-StudioNativeProcessImagePath",
             "Get-StudioProcessImagePath",
             "Get-RunningStudioVenvProcesses",
@@ -866,7 +885,7 @@ def test_runtime_path_hash_is_defined_before_custom_root_lock_uses_it():
 
 def test_guard_and_mutex_precede_rollback_and_release_after_restore():
     source = INSTALL_PS1.read_text(encoding = "utf-8")
-    acquire = source.index("$studioInstallMutex = Enter-StudioInstallMutex -Path $StudioHome")
+    acquire = source.index("$studioInstallLock = Enter-StudioInstallLock -Path $StudioHome")
     root_match = source.index("$studioTauriRootMatch =", acquire)
     managed_root = source.index("$studioUsesTauriManagedRoot =", root_match)
     runtime_lock_needed = source.index("$studioNeedsRuntimeLock =", managed_root)
@@ -890,7 +909,9 @@ def test_guard_and_mutex_precede_rollback_and_release_after_restore():
     prompt = source.index("Start Unsloth Studio now?", restore)
     autostart = source.index("Start-Process -FilePath $VenvPython", prompt)
     release_runtime = source.rindex("Exit-StudioInstallMutex -Mutex $studioRuntimeMutexes[$i]")
-    release_install = source.rindex("Exit-StudioInstallMutex -Mutex $studioInstallMutex")
+    # The install lock is a mutex AND a file now; the runtime locks above are still plain mutexes,
+    # which is why only this one changed spelling. The ordering contract is unchanged.
+    release_install = source.rindex("Exit-StudioInstallLock -Lock $studioInstallLock")
     wait_for_exit = source.rindex("$studioAutoStartProcess.WaitForExit()")
 
     assert (
@@ -1116,7 +1137,13 @@ def test_the_extracted_helpers_can_call_everything_they_call(helpers):
     provided = set(re.findall(r"^    function ([\w-]+) \{", extracted, flags = re.M))
     assert provided, "the helper extraction produced nothing"
 
-    called = set(re.findall(r"(?<![\w-])([A-Z][\w]*-[\w-]+)", extracted))
+    # Comments first: a function named in prose is not a call, and treating it as one forces the
+    # extraction list to grow to satisfy a mention rather than a dependency. Same reason
+    # tests/python/test_uv_requirements_path_space.py drops comment lines before asserting.
+    # Whole-line comments only, since a trailing # inside a string literal is not a comment and
+    # cutting there would hide real calls.
+    code = "\n".join(line for line in extracted.splitlines() if not line.lstrip().startswith("#"))
+    called = set(re.findall(r"(?<![\w-])([A-Z][\w]*-[\w-]+)", code))
     missing = sorted((called & installer_functions) - provided)
     assert not missing, (
         f"{helpers.__name__} extracts functions that call {missing}, which the "
