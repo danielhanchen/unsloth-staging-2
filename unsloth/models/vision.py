@@ -559,6 +559,9 @@ VLLM_SUPPORTED_VLM = [
     # Qwen3.5 ships as Qwen3_5ForConditionalGeneration with a vision_config, so it
     # reaches this gate even for the text-only checkpoints.
     "qwen3_5",
+    # The MoE checkpoints report qwen3_5_moe, which the exact-membership gate below does
+    # not reach via "qwen3_5".
+    "qwen3_5_moe",
 ]
 VLLM_NON_LORA_VLM = [
     "mllama",
