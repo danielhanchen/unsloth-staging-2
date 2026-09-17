@@ -1019,6 +1019,34 @@ def append_deferred_nudges(conversation: list, msgs: Sequence[dict]) -> None:
         conversation.append({"role": "user", "content": deferred_nudge_text(msgs)})
 
 
+def tool_call_limit_nudge(
+    tool_calls: Sequence[Mapping[str, Any]],
+    limit: int,
+    *,
+    final: bool = False,
+) -> dict:
+    described = []
+    for tool_call in tool_calls:
+        function = tool_call.get("function") or {}
+        arguments = function.get("arguments", {})
+        if not isinstance(arguments, str):
+            arguments = canonical_arguments_text(arguments)
+        described.append(f"{function.get('name', '')} {arguments}")
+    follow_up = (
+        "Do not describe results you did not receive."
+        if final
+        else "Call them again if you still need their results, and do not describe results "
+        "you did not receive."
+    )
+    return {
+        "role": "user",
+        "content": (
+            f"{len(tool_calls)} more tool call(s) in this batch were not executed because "
+            f"at most {limit} tool calls run per turn: {'; '.join(described)}. {follow_up}"
+        ),
+    }
+
+
 def _tool_name_from_schema(tool: Mapping[str, Any]) -> str:
     function = tool.get("function")
     if not isinstance(function, Mapping):
