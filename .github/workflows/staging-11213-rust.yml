@@ -23,6 +23,14 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # tauri::generate_context! reads frontendDist (../frontend/dist) at COMPILE time, so
+      # the bundle has to exist before cargo touches the crate, even for a unit test run.
+      - name: Frontend build
+        working-directory: studio/frontend
+        run: npm ci && npm run build
       - name: Probe the closed-port classification
         working-directory: studio/src-tauri
         run: "cargo test --bin unsloth-studio commands::tests:: -- --nocapture --test-threads=1"
