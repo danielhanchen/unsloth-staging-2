@@ -2542,6 +2542,373 @@ exit 1
         return $current
     }
 
+    # An interpreter to answer path questions with, found WITHOUT installing one.
+    #
+    # Python resolves a path the same way the native helper does: os.path.realpath on Windows
+    # calls GetFinalPathNameByHandleW, so it follows junctions, symlinks and SUBST drives, expands
+    # 8.3 names and reports the stored casing. That matters twice over, because
+    # unsloth_cli/_studio_runtime_gate.py computes the runtime lock name from os.path.realpath
+    # too: an answer from here agrees with the running Unsloth by construction rather than by two
+    # implementations happening to match.
+    #
+    # Finding one must not mutate anything, because this runs before the install lock is taken.
+    # Get-Command and Test-Path only, never Install-PythonFromPythonOrg, and never the full
+    # Find-CompatiblePython, which is defined thousands of lines below this point anyway.
+    $script:StudioEarlyPythonProbed = $false
+    $script:StudioEarlyPython = $null
+
+    function Get-StudioEarlyPython {
+        if ($script:StudioEarlyPythonProbed) { return $script:StudioEarlyPython }
+        $script:StudioEarlyPythonProbed = $true
+        # Same kill switch shape as UNSLOTH_NVIDIA_LIBRARY_PROBE: a host where spawning an
+        # interpreter is unwelcome, or a support case that needs the old behaviour back, sets this
+        # to 0 and the ladder falls through to the lexical resolver exactly as it did before.
+        if ("$($env:UNSLOTH_EARLY_PYTHON_PROBE)".Trim() -eq "0") { return $null }
+        $candidates = @()
+        # A previous install's own interpreter first: it is the one this installer chose last
+        # time, and reaching it through $VenvDir means an alias of the root resolves to the same
+        # file without anyone canonicalising anything. $VenvDir is not set yet on the earliest
+        # calls, so read it defensively rather than assuming.
+        $venvDirValue = $null
+        try { $venvDirValue = Get-Variable -Name VenvDir -ValueOnly -ErrorAction SilentlyContinue } catch {}
+        if (-not [string]::IsNullOrWhiteSpace($venvDirValue)) {
+            $candidates += (Join-Path $venvDirValue "Scripts\python.exe")
+            $candidates += (Join-Path $venvDirValue "bin/python3")
+        }
+        foreach ($name in @("python3", "python")) {
+            try {
+                # Select-Object, not $cmd.Source. Constrained Language Mode permits property
+                # reads only on its allowed type list, and CommandInfo is not on it, so the
+                # direct spelling throws on exactly the hosts this ladder exists for. Reading it
+                # through a cmdlet keeps the access inside compiled code, where CLM does not
+                # reach. Same reason for every other Select-Object -ExpandProperty below.
+                foreach ($source in @(Get-Command $name -All -CommandType Application -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue)) {
+                    if ($source) { $candidates += $source }
+                }
+            } catch {}
+        }
+        foreach ($candidate in $candidates) {
+            if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+            if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) { continue }
+            # The probe IS a realpath call, so an interpreter that cannot answer one is rejected
+            # here rather than passing a check and failing later. Python 2 fails it too, since its
+            # Windows realpath does not follow links.
+            # The interpreter's own directory: it exists, since the executable inside it just
+            # passed Test-Path. Not $PSScriptRoot, which is empty under `irm | iex` (no script
+            # file), and not the temp directory, which this installer relocates.
+            # Split-Path, not [System.IO.Path]::GetDirectoryName. System.IO.Path is not on
+            # Constrained Language Mode's allowed-type list, so the static call throws rather
+            # than returning null, and the whole ladder failed on exactly the hosts it exists
+            # for. Cmdlets stay available there. Same reason for Split-Path -IsAbsolute below
+            # and for the cast in the process image table.
+            $probeDir = Split-Path -Parent $candidate
+            if ([string]::IsNullOrWhiteSpace($probeDir)) { continue }
+            $probe = Invoke-StudioEarlyPython -Exe $candidate -Path $probeDir
+            if (-not [string]::IsNullOrWhiteSpace($probe)) {
+                $script:StudioEarlyPython = $candidate
+                return $candidate
+            }
+        }
+        return $null
+    }
+
+    # The two launchers below must return the same string for the same child, or a caller is
+    # reading one of two subtly different programs depending on the host's language mode.
+    # They differ in exactly one way: Start-Process's redirection appends a trailing newline the
+    # child did not write. Measured, not assumed. Neither current caller can see it, since each
+    # trims or splits, but that is luck rather than a contract, so both ends are normalised here.
+    function Remove-StudioTrailingNewline {
+        param([string]$Text)
+        if ($null -eq $Text) { return $Text }
+        # Two normalisations, and the name undersells both, so they are written down.
+        #
+        # 1. CRLF is folded to LF. The two launchers otherwise disagree and the contract that
+        #    they are interchangeable is false. Measured: a child writing the bytes 61 0d 0a 62
+        #    comes back as 61 0d 0a 62 through the ProcessStartInfo launcher and as 61 0a 62
+        #    through the cmdlet launcher, whose redirection goes through a file.
+        # 2. EVERY trailing newline is removed, not one. .NET's $ matches before a final \n as
+        #    well as at the end, so -replace strips each of them: "a\n\n" measures as "a". That
+        #    is deliberate rather than tolerated. Start-Process redirection appends a newline the
+        #    child never wrote while the ProcessStartInfo launcher does not, so removing exactly
+        #    one would leave the two disagreeing whenever the child's own output ends in a
+        #    newline, which is the ordinary case for print().
+        #
+        # The cost is that a payload whose meaningful content ends in blank lines cannot be
+        # carried through here. No consumer does: the path resolver returns one line, the icon
+        # refresh compares a single token, and the process table splits on newlines and ignores
+        # empty entries. A future consumer that needs trailing blank lines must not use this.
+        return (($Text -replace "\r\n", "`n") -replace "\n$", "")
+    }
+
+    # Run a script in a bounded child and return its stdout, or $null on anything other than a
+    # clean exit. The generic half, shared by every early-Python rung.
+    #
+    # Two launchers, because the first does not work on the hosts these rungs exist for.
+    # Constrained Language Mode allows methods only on a small set of core types, and
+    # System.Diagnostics.Process is not among them: both "New-Object ProcessStartInfo" and
+    # [Process]::Start are refused there. Measured, not assumed. Since CLM is one of the two
+    # policies that also block defining a type at runtime, a launcher that only works outside CLM
+    # would miss half the population the ladder is for. Start-Process, Wait-Process and
+    # Get-Content are cmdlets and stay available, so the fallback is built from those.
+    #
+    # The first launcher stays first because it needs no temporary files and no second write of
+    # the script. The fallback is reached by the catch, so a host that merely fails to start the
+    # process once does not silently lose the answer either.
+    function Invoke-StudioEarlyPythonScript {
+        param(
+            [Parameter(Mandatory = $true)][string]$Exe,
+            [Parameter(Mandatory = $true)][string]$Script,
+            [string[]]$ScriptArgs = @(),
+            [int]$TimeoutMs = 10000
+        )
+        $proc = $null
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $Exe
+            # -I and -S. Isolated mode covers PYTHONPATH and the user site directory, but it
+            # implies -E, -P and -s and NOT -S, so site is still imported and a system-level
+            # sitecustomize still runs before the script below. Measured rather than assumed:
+            # under -I alone sys.flags.no_site is 0. On a corporate host that sitecustomize is
+            # instrumentation, and each thing it can do breaks a different caller of this runner:
+            # printing to stdout corrupts the single line read back, hanging burns the timeout on
+            # a working interpreter, and patching a stdlib module would let an influenced answer
+            # be taken as authoritative. Nothing routed through here needs site-packages.
+            $argv = @("-I", "-S", "-c", $Script) + $ScriptArgs
+            # ArgumentList is .NET Core only. Windows PowerShell 5.1, the host the desktop
+            # installer launches, gets ProcessStartInfo from .NET Framework where the property
+            # does not exist, so .Add() would throw and the catch below would reject every
+            # candidate while looking perfectly healthy.
+            if ($null -ne $psi.PSObject.Properties["ArgumentList"]) {
+                foreach ($a in $argv) { $null = $psi.ArgumentList.Add($a) }
+            } else {
+                # Quote for CommandLineToArgvW. The scripts here carry no double quote by
+                # construction and a Windows path cannot contain one, so only two things matter:
+                # wrap each argument, and double any run of trailing backslashes, since
+                # "C:\dir\" would otherwise escape its own closing quote.
+                $psi.Arguments = (@($argv | ForEach-Object {
+                    '"' + ($_ -replace '(\\+)$', '$1$1') + '"'
+                }) -join ' ')
+            }
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            # Without this, 5.1 decodes the child's bytes with the console codepage and any
+            # non-ASCII character comes back corrupted. The corruption is silent: a path still
+            # looks like a path, and it is what gets hashed into a lock name.
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.CreateNoWindow = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $stdout = $proc.StandardOutput.ReadToEndAsync()
+            $null = $proc.StandardError.ReadToEndAsync()
+            # A wedged interpreter must not wedge an installer that has not taken its lock yet.
+            if (-not $proc.WaitForExit($TimeoutMs)) {
+                try { $proc.Kill() } catch {}
+                return $null
+            }
+            if ($proc.ExitCode -ne 0) { return $null }
+            return (Remove-StudioTrailingNewline -Text "$($stdout.Result)")
+        } catch {
+            return (Invoke-StudioEarlyPythonScriptViaCmdlets -Exe $Exe -Script $Script -ScriptArgs $ScriptArgs -TimeoutMs $TimeoutMs)
+        } finally {
+            if ($proc) { try { $proc.Dispose() } catch {} }
+        }
+    }
+
+    # The Constrained Language Mode launcher. Cmdlets only: no .NET method call, no New-Object,
+    # no type literal, because all four are refused there.
+    function Invoke-StudioEarlyPythonScriptViaCmdlets {
+        param(
+            [Parameter(Mandatory = $true)][string]$Exe,
+            [Parameter(Mandatory = $true)][string]$Script,
+            [string[]]$ScriptArgs = @(),
+            [int]$TimeoutMs = 10000
+        )
+        $scriptFile = $null
+        $outFile = $null
+        $errFile = $null
+        $proc = $null
+        try {
+            # The script goes to a file rather than through -c. Start-Process builds one command
+            # line out of -ArgumentList, and a -c body carrying newlines and quotes cannot survive
+            # that intact. A file path is one plain token, so the two launchers run the same
+            # program rather than nearly the same one.
+            # Plain strings, not New-TemporaryFile. That cmdlet hands back a FileInfo, and
+            # reading a path off it is a property read on a type Constrained Language Mode does
+            # not allow, so every path below would have thrown on a locked-down host. [guid] and
+            # [string] are both on the allowed list, and Join-Path is a cmdlet.
+            $tempRoot = if ($env:TEMP) { $env:TEMP } elseif ($env:TMPDIR) { $env:TMPDIR } else { "/tmp" }
+            $stem = Join-Path $tempRoot ("unsloth-early-" + [guid]::NewGuid().ToString("N"))
+            $scriptFile = "$stem.py"
+            $outFile = "$stem.out"
+            $errFile = "$stem.err"
+            # UTF-8 both ways. The interpreter writes its answer as UTF-8 bytes, so reading it
+            # back any other way corrupts every non-ASCII path exactly as the console codepage
+            # would, and silently: the string still looks like a path.
+            Set-Content -LiteralPath $scriptFile -Value $Script -Encoding UTF8 -NoNewline
+            # Quoted here, not handed to -ArgumentList as an array: Start-Process joins that
+            # array with spaces and quotes nothing, so a path containing a space arrives as two
+            # arguments. Same rule as the other launcher's 5.1 branch, and for the same reason:
+            # wrap each argument, and double any run of trailing backslashes, since "C:\dir\"
+            # would otherwise escape its own closing quote.
+            # -I -S, the same pair as the primary launcher. These two are asserted to return the
+            # same string byte for byte, and a sitecustomize running in one of them but not the
+            # other is exactly the kind of difference that assertion exists to catch.
+            $argv = (@(@("-I", "-S", $scriptFile) + $ScriptArgs | ForEach-Object {
+                '"' + ($_ -replace '(\\+)$', '$1$1') + '"'
+            }) -join ' ')
+            $proc = Start-Process -FilePath $Exe -ArgumentList $argv -NoNewWindow -PassThru `
+                -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+            if (-not $proc) { return $null }
+            # Wait-Process takes whole seconds, so round up: a sub-second bound must not become a
+            # zero-second one, which returns immediately and kills a healthy interpreter.
+            #
+            # Arithmetic and a cast, not [math]::Ceiling. System.Math is not among the types
+            # Constrained Language Mode allows method calls on, so Ceiling throws there, and this
+            # is the one function in the file that exists to run under exactly that policy.
+            # Measured: it blocks. This rounds up and never to zero, and being a second generous
+            # on a bound this coarse costs nothing.
+            # Ceiling, done with integer arithmetic rather than the +999 idiom.
+            #
+            # That idiom is a C integer-DIVISION trick and PowerShell's / is floating point, so
+            # [int] rounds to nearest instead of truncating and every exact multiple gains a
+            # second: measured, 10000 became 11 and 20000 became 21. Wait-Process then waited a
+            # second longer than the caller asked, so the two launchers did not share a deadline.
+            #
+            # [math]::Ceiling is the obvious spelling and Constrained Language Mode refuses it,
+            # which is the whole reason this launcher exists. % and / are operators and the [int]
+            # cast is permitted there, both measured on a constrained runspace.
+            $seconds = ($TimeoutMs - ($TimeoutMs % 1000)) / 1000
+            if (($TimeoutMs % 1000) -ne 0) { $seconds = $seconds + 1 }
+            $seconds = [int]$seconds
+            if ($seconds -lt 1) { $seconds = 1 }
+            $timedOut = $false
+            Wait-Process -InputObject $proc -Timeout $seconds -ErrorAction SilentlyContinue -ErrorVariable waitError
+            if ($waitError) { $timedOut = $true }
+            if ($timedOut) {
+                Stop-Process -InputObject $proc -Force -ErrorAction SilentlyContinue
+                return $null
+            }
+            # Select-Object, not $proc.ExitCode: System.Diagnostics.Process is not an allowed
+            # type under Constrained Language Mode either, so the direct read throws on the very
+            # hosts the primary launcher already could not serve.
+            $exitCode = $proc | Select-Object -ExpandProperty ExitCode -ErrorAction SilentlyContinue
+            if ($null -eq $exitCode -or $exitCode -ne 0) { return $null }
+            $answer = Get-Content -LiteralPath $outFile -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+            if ($null -eq $answer) { return "" }
+            return (Remove-StudioTrailingNewline -Text ([string]$answer))
+        } catch {
+            return $null
+        } finally {
+            foreach ($f in @($scriptFile, $outFile, $errFile)) {
+                if ($f) { Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue }
+            }
+        }
+    }
+
+    # A path resolved in a bounded child. Null on anything other than a clean answer, because
+    # every caller already treats "no exact answer" as "use the lexical one".
+    function Invoke-StudioEarlyPython {
+        param(
+            [Parameter(Mandatory = $true)][string]$Exe,
+            [Parameter(Mandatory = $true)][string]$Path,
+            [int]$TimeoutMs = 10000
+        )
+        # Deliberately the same expression unsloth_cli/_studio_runtime_gate.py's
+        # _resolved_windows_path uses, Path(...).resolve(...), not os.path.realpath. The two agree
+        # today, but this string is hashed into a lock name the running Unsloth derives from that
+        # function, so matching the expression removes a class of divergence rather than relying
+        # on two spellings staying equivalent.
+        #
+        # strict=True, unlike the gate's strict=False, and the difference is deliberate. For any
+        # path that genuinely resolves the two return the same string, so that byte-identity
+        # holds for every valid input. They part company on a symlink loop or a dangling
+        # component, where strict=False returns the path UNRESOLVED rather than raising. That is
+        # not an identity, and this rung's contract is that an answer is exact, so returning one
+        # would let a caller decide two paths are different when it cannot know. Raising means
+        # the lexical fallback with Exact = $false, which fails closed. Test-Path alone is not
+        # enough: it is true for the loop's own symlink.
+        #
+        # The version gate is load-bearing. Before 3.8, Windows path resolution did not follow
+        # junctions or symlinks, so an older interpreter would return the ALIAS spelling and this
+        # rung would mark it exact. Test-StudioPathEqual would then read an alias and its target
+        # as definitively different instead of taking both runtime locks, which is permission to
+        # install over a live managed environment. The probe cannot catch it, since it only
+        # resolves the interpreter's own ordinary directory, so the interpreter is refused here.
+        $script = "import pathlib,sys" + [char]10 +
+                  "sys.exit(2) if sys.version_info < (3,8) else None" + [char]10 +
+                  "sys.stdout.buffer.write(str(pathlib.Path(sys.argv[1]).resolve(strict=True)).encode('utf-8'))"
+        $answer = "$(Invoke-StudioEarlyPythonScript -Exe $Exe -Script $script -ScriptArgs @($Path) -TimeoutMs $TimeoutMs)".Trim()
+        if ([string]::IsNullOrWhiteSpace($answer)) { return $null }
+        # A relative answer is not an identity, and a path that does not exist cannot be the
+        # resolution of one that does.
+        # Split-Path -IsAbsolute, not [System.IO.Path]::IsPathRooted, for the allowed-type
+        # reason above. This one guards the path the final-path resolver returns, so the static
+        # call would have thrown right where the ladder is meant to answer.
+        if (-not (Split-Path -IsAbsolute $answer)) { return $null }
+        if (-not (Test-Path -LiteralPath $answer)) { return $null }
+        return $answer
+    }
+
+    function Get-StudioPythonFinalPath {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        $exe = Get-StudioEarlyPython
+        if (-not $exe) { return $null }
+        return (Invoke-StudioEarlyPython -Exe $exe -Path $Path)
+    }
+
+    # Tell Explorer a shortcut was rewritten, through a child interpreter. Used only where the
+    # type cannot be defined in this shell, which is where the refresh silently did not happen
+    # before. Returns $true when the child reported success.
+    #
+    # Cosmetic either way: the worst case is a stale icon on a shortcut that works. Nothing here
+    # may fail the install, so every path returns rather than throws.
+    function Invoke-StudioPythonShellIconRefresh {
+        param([string[]]$Paths = @(), [string]$Exe = "")
+        if (-not ($env:OS -eq "Windows_NT")) { return $false }
+        # The kill switch first, and before the caller's interpreter rather than only inside
+        # discovery. UNSLOTH_EARLY_PYTHON_PROBE=0 means "do not spawn an interpreter on this
+        # host", which is a statement about the host and not about how the path was obtained.
+        # Get-StudioEarlyPython honours it, so routing around discovery to fix the fresh-install
+        # case also routed around the switch, and a host that had opted out got a child process
+        # anyway. The refresh is cosmetic, so opting out costs a stale icon and nothing else.
+        if ("$($env:UNSLOTH_EARLY_PYTHON_PROBE)".Trim() -eq "0") { return $false }
+        # The caller's interpreter wins over discovery, and on the fresh-install case it is the
+        # only one that works. Get-StudioEarlyPython latches its answer on first use, and its
+        # first use is the install lock, which runs before Python is installed. On a host that
+        # had none, that call caches $null for the rest of the run, so by the time shortcuts are
+        # written the managed interpreter exists and this would still decline: exactly the
+        # first-install-under-CLM case the rung was added for. New-StudioShortcuts has already
+        # confirmed its own path exists and resolved it, so there is nothing left to check here.
+        $exe = $Exe
+        if ([string]::IsNullOrWhiteSpace($exe)) {
+            # Inside the try, not above it. Discovery can throw, and this function promises it
+            # never does; the caller's own catch happened to cover it, but the promise was still
+            # false.
+            try {
+                $exe = Get-StudioEarlyPython
+            } catch { return $false }
+        }
+        if (-not $exe) { return $false }
+        # SHCNE_UPDATEITEM 0x00002000 with SHCNF_PATHW 0x0005 per shortcut, then SHCNE_ASSOCCHANGED
+        # 0x08000000 as the global broadcast. Same two calls, same order, same constants as the
+        # rung above: the per-item notification is the one that matters, because the global
+        # broadcast misses a same-name .lnk that was rewritten in place.
+        $script = "import ctypes,sys" + [char]10 +
+            "from ctypes import wintypes" + [char]10 +
+            "s32=ctypes.WinDLL('shell32',use_last_error=True)" + [char]10 +
+            "s32.SHChangeNotify.restype=None" + [char]10 +
+            "s32.SHChangeNotify.argtypes=[wintypes.LONG,wintypes.UINT,wintypes.LPCWSTR,wintypes.LPCWSTR]" + [char]10 +
+            "for p in sys.argv[1:]:" + [char]10 +
+            "    s32.SHChangeNotify(0x00002000,0x0005,p,None)" + [char]10 +
+            "s32.SHChangeNotify(0x08000000,0,None,None)" + [char]10 +
+            "sys.stdout.write('ok')"
+        try {
+            $answer = Invoke-StudioEarlyPythonScript -Exe $exe -Script $script -ScriptArgs $Paths -TimeoutMs 10000
+        } catch { return $false }
+        return ("$answer".Trim() -eq "ok")
+    }
+
     # Exact = $true means the native resolver answered, so the string is what it
     # always was. Callers keying a lock on it use that to judge an inequality.
     function Resolve-StudioFinalPathInfo {
@@ -2583,6 +2950,16 @@ exit 1
                     Write-StudioLine "[WARN] Could not resolve a path with the native helper; continuing with the PowerShell resolver." -ForegroundColor Yellow
                 }
             }
+        }
+        if ([string]::IsNullOrEmpty($resolved)) {
+            # Strictly additive: this rung only runs where the native one already gave up, so a
+            # host that resolves natively today behaves exactly as it did. Where it answers, the
+            # identity is exact for the same reason the native one is, os.path.realpath being
+            # GetFinalPathNameByHandleW on Windows, so Exact = $true is earned rather than
+            # assumed. Where there is no usable interpreter it returns null and the lexical
+            # fallback below runs, which is today's behaviour unchanged.
+            $resolved = Get-StudioPythonFinalPath -Path $existingPath
+            if (-not [string]::IsNullOrWhiteSpace($resolved)) { $exact = $true }
         }
         if ([string]::IsNullOrEmpty($resolved)) {
             $resolved = Get-StudioLexicalPath -Path $existingPath
@@ -2664,9 +3041,21 @@ exit 1
             $envOverride = (Join-Path $env:USERPROFILE $envOverride.Substring(1).TrimStart('/','\'))
         }
         try {
+            # Recorded BEFORE the create, because this is the only moment anyone can still tell.
+            # Enter-StudioInstallLock decides whether to claim the root by asking whether the
+            # directory existed when it ran, and it runs thousands of lines below here, by which
+            # point this create has already made the answer yes for every env-mode root. Its
+            # ownership branch would therefore never fire for exactly the roots it was written
+            # for, and a run that died between taking the lock and the later marker write would
+            # leave a directory holding only the lock file, which scripts/uninstall.ps1's
+            # _IsStudioRoot does not recognise and so refuses to clean up.
+            $script:StudioEnvRootPath = $envOverride
+            $script:StudioEnvRootExisted = [System.IO.Directory]::Exists($envOverride)
             # .NET API: New-Item -Path treats brackets as wildcards (no -LiteralPath on PS 5.1).
             [System.IO.Directory]::CreateDirectory($envOverride) | Out-Null
             $StudioHome = (Resolve-Path -LiteralPath $envOverride).Path
+            # Re-recorded against the resolved spelling, which is what the lock is handed.
+            $script:StudioEnvRootPath = $StudioHome
         } catch {
             Write-StudioLine "ERROR: $envOverrideVar=$envOverride cannot be created or accessed." -ForegroundColor Red
             # Same as the --tauri rejection above: still before the lock finally.
@@ -2757,6 +3146,13 @@ exit 1
     # The emptiness test is inline, not Test-DirectoryHasEntries, which is defined below this
     # function's first caller: the name error would land in the catch and skip the claim in
     # silence. An unreadable root counts as occupied, so failure means "do not claim".
+    # Defined here, above its earliest reader, not beside the lock functions that also use it.
+    # Write-StudioRootOwnerMarker filters this name out of its emptiness test, and it runs
+    # thousands of lines before the lock helpers; a $null here would filter nothing and quietly
+    # restore the bug the filter exists to prevent. Same hazard the comment above describes for
+    # Test-DirectoryHasEntries, and it fails just as silently.
+    $script:StudioInstallLockFileName = ".unsloth-install.lock"
+
     function Write-StudioRootOwnerMarker {
         param([Parameter(Mandatory = $true)][string]$Root)
         try {
@@ -2767,7 +3163,14 @@ exit 1
             if (Test-Path -LiteralPath $Root) {
                 $occupied = $true
                 try {
+                    # The install lock's own file does not count as occupancy. Enter-StudioInstallLock
+                    # creates it in this very root before anything else runs, so counting it would
+                    # make a fresh env-mode root look like somebody else's directory and refuse the
+                    # claim. An install that then died before the venv marker at
+                    # Write-StudioVenvOwnerMarker would leave a root the uninstaller does not
+                    # recognise, which is the opposite of what the marker is for.
                     $occupied = @(Get-ChildItem -LiteralPath $Root -Force -ErrorAction Stop |
+                        Where-Object { $_.Name -ne $script:StudioInstallLockFileName } |
                         Select-Object -First 1).Count -gt 0
                 } catch { $occupied = $true }
                 $claimable = (
@@ -2789,8 +3192,31 @@ exit 1
             # Get-Item -Force, not Test-Path: the latter follows a dangling link and answers
             # false, after which WriteAllText follows the link and writes outside the root.
             Remove-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
-            if (Get-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue) { return }
-            [System.IO.File]::WriteAllText($marker, "")
+            # CreateNew, not a check followed by a write. The check-then-write pair above left a
+            # window: the entry is confirmed absent, and a user who can write to this root plants
+            # a link at the name before the write lands, which then truncates the link's target.
+            # CreateNew fails if anything is already at the name, so the test and the creation are
+            # one operation and there is no window to aim at.
+            #
+            # Residual, stated rather than implied away: this closes the truncation, not every
+            # form of following. A link planted at the name makes CreateNew fail, which is the
+            # answer we want, but a DANGLING one is followed and an empty file is created at its
+            # target. That creates a zero-byte file somewhere; it cannot destroy an existing one,
+            # which is the hazard being guarded. Opening with FILE_FLAG_OPEN_REPARSE_POINT is the
+            # complete answer and .NET does not expose it here.
+            $markerStream = $null
+            try {
+                $markerStream = [System.IO.File]::Open($marker,
+                    [System.IO.FileMode]::CreateNew,
+                    [System.IO.FileAccess]::Write,
+                    [System.IO.FileShare]::None)
+            } catch {
+                # Something is at the name, or the root refuses the write. No marker is fine; the
+                # venv writes its own later.
+                return
+            } finally {
+                if ($markerStream) { try { $markerStream.Dispose() } catch {} }
+            }
         } catch { }
     }
 
@@ -4609,7 +5035,18 @@ exit 0
                         }
                         # SHCNE_ASSOCCHANGED (0x08000000) global refresh (belt-and-suspenders)
                         [UnslothShellIconRefresh]::SHChangeNotify(0x08000000, 0, $null, [System.IntPtr]::Zero)
-                    } catch {}
+                    } catch {
+                        # Reached where the type cannot be defined in this shell, which is every
+                        # host under Constrained Language Mode or WDAC Dynamic Code Security.
+                        # Before this the refresh simply did not happen there and the icon stayed
+                        # stale until something else invalidated Explorer's cache. Same two
+                        # notifications through a child interpreter instead. Still cosmetic, and
+                        # still unable to fail the install.
+                        try {
+                            $null = Invoke-StudioPythonShellIconRefresh `
+                                -Paths $createdShortcutPaths -Exe $ManagedPythonPath
+                        } catch {}
+                    }
                     if ($firstInstall -or $iconChanged) {
                         try { & "$env:SystemRoot\System32\ie4uinit.exe" -ClearIconCache 2>$null } catch {}
                         try { & "$env:SystemRoot\System32\ie4uinit.exe" -show 2>$null } catch {}
@@ -4943,6 +5380,247 @@ exit 0
         try { $Mutex.ReleaseMutex() } catch {} finally { $Mutex.Dispose() }
     }
 
+    # The install lock, held as a mutex AND a file, because the two exclude different things.
+    #
+    # The mutex is named from a hash of the resolved path, so when the resolver cannot give an
+    # exact answer two spellings of one directory (a junction and its target, an 8.3 name and its
+    # long form) produce different names and fail to exclude each other, exactly as
+    # Get-StudioPathHash says above. A file inside the destination has no such problem: every
+    # alias reaches the same file because the filesystem resolves the alias, so no canonicalisation
+    # is involved at all.
+    #
+    # Both are taken rather than swapping one for the other. The mutex is what an already-released
+    # installer uses, and dropping it would mean a new run and an old run no longer see each other
+    # during an upgrade. Holding both can only exclude more than either alone.
+
+    function Enter-StudioInstallLock {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        $mutex = Enter-StudioInstallMutex -Path $Path
+        if ($null -eq $mutex) { return $null }
+        $stream = $null
+        try {
+            # Idempotent and race-safe: concurrent creators both succeed, and only one of them
+            # goes on to open the file exclusively below. Throwing here (no permission, a file
+            # where the directory should be) surfaces as the caller's install-lock error, which
+            # is a clearer place to fail than the first write further down.
+            $existedBefore = [System.IO.Directory]::Exists($Path)
+            # An env-mode root is created where the override is read, thousands of lines above
+            # this, so by the time the lock runs it always exists and the check just above would
+            # answer yes for every one of them. That site records what it found; prefer its
+            # answer when it is speaking about this same directory.
+            if ($script:StudioEnvRootPath -and
+                $script:StudioEnvRootPath.Equals($Path, [System.StringComparison]::OrdinalIgnoreCase)) {
+                $existedBefore = $script:StudioEnvRootExisted
+            }
+            $null = [System.IO.Directory]::CreateDirectory($Path)
+            $lockPath = Join-Path $Path $script:StudioInstallLockFileName
+            # A link planted at the lock path is not a lock, it is a way to point our exclusive
+            # handle at somebody else's file: File.Open follows it, so the target would be held
+            # open with FileShare.None for the whole install even though nothing is written to it.
+            # Remove the link itself, never its target, then let the open below create a real
+            # file. Get-Item -Force rather than Test-Path, which follows a dangling link and
+            # answers false; Write-StudioRootOwnerMarker guards the same hazard the same way.
+            $existingLock = $null
+            try {
+                $existingLock = Get-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+            } catch { $existingLock = $null }
+            if ($existingLock -and
+                ($existingLock.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+                # A detected link that will NOT go must stop the install, not be shrugged off.
+                #
+                # The removal used to sit under an empty catch, so on a root where the link can be
+                # inspected but not deleted the run carried straight on into File.Open, which
+                # follows it. If the target happened to be zero bytes it also passed the length
+                # check below, and the installer then held an unrelated file with FileShare.None
+                # for the whole install: precisely the denial of service this removal exists to
+                # prevent, reached by the path meant to prevent it.
+                #
+                # The throw is caught by the outer handler, which drops the mutex and rethrows, so
+                # the caller reports a lock-creation failure rather than a phantom second
+                # installer.
+                try {
+                    Remove-Item -LiteralPath $lockPath -Force -ErrorAction Stop
+                } catch {
+                    throw "A link is planted at the install lock path $lockPath and cannot be removed."
+                }
+            }
+            # The attributes check above cannot see a HARD link. A hard link is a second
+            # directory entry for an existing file, not a reparse point, so it carries no
+            # attribute to test and File.Open follows it just the same: the target would be held
+            # with FileShare.None for the whole install, which is the denial of service the
+            # reparse removal exists to prevent. The discriminator is the opened stream's own
+            # Length. Nothing is ever written to this lock file, so ours is always zero bytes,
+            # while any planted alias to a file worth denying access to is not. Reading it from
+            # the handle rather than from the directory entry also closes the window between the
+            # check above and this open, which an attacker controls.
+            #
+            # At most one repair, and the reopen is CreateNew rather than OpenOrCreate. That is
+            # what keeps two installers that spell the destination differently (the mutex only
+            # serialises identical spellings) from each ending up holding a different file: if
+            # somebody re-created the entry between the removal and the reopen, CreateNew fails
+            # instead of silently handing out a second lock, and the run reports a busy lock.
+            $repaired = $false
+            while ($true) {
+                if ($repaired) { $mode = [System.IO.FileMode]::CreateNew }
+                else { $mode = [System.IO.FileMode]::OpenOrCreate }
+                try {
+                    $stream = [System.IO.File]::Open(
+                        $lockPath,
+                        $mode,
+                        [System.IO.FileAccess]::ReadWrite,
+                        [System.IO.FileShare]::None)
+                } catch [System.IO.IOException] {
+                    # Only a sharing or lock violation means "another installer holds it". Anything
+                    # else, a transient storage fault or a network share dropping out, is a real
+                    # failure and must not be reported as a concurrent install: that hides the fault
+                    # and sends the user looking for a second installer that does not exist.
+                    # HResult's low 16 bits carry the Win32 code on Windows: 32 is
+                    # ERROR_SHARING_VIOLATION and 33 is ERROR_LOCK_VIOLATION. Off Windows .NET
+                    # implements FileShare with flock and reports the errno instead, 11 for
+                    # EAGAIN/EWOULDBLOCK, which is what the test suite exercises on Linux. Measured
+                    # rather than assumed, because the first version of this check only knew the
+                    # Windows codes and turned every real conflict on Linux into a rethrow.
+                    #
+                    # 80 ERROR_FILE_EXISTS, 183 ERROR_ALREADY_EXISTS and 17 EEXIST are how the
+                    # CreateNew reopen reports losing that race, and mean the same thing to the
+                    # caller: somebody else has the lock, come back later.
+                    #
+                    # A directory sitting where the lock file should be raises
+                    # UnauthorizedAccessException, not IOException, so it is never caught here and
+                    # already reaches the caller as the failure it is.
+                    $code = $_.Exception.HResult -band 0xFFFF
+                    $lost = $repaired -and ($code -eq 80 -or $code -eq 183 -or $code -eq 17)
+                    if (-not $lost -and $code -ne 32 -and $code -ne 33 -and $code -ne 11) { throw }
+                    if ($stream) { $stream.Dispose() }
+                    Exit-StudioInstallMutex -Mutex $mutex
+                    return $null
+                }
+                # The reparse test above ran on the PATHNAME, before this open, so on a root
+                # another user can write to, a symbolic link can be swapped in between the two.
+                # The Length test below catches every planted target that has bytes in it; a
+                # target that is itself zero bytes does not, and the install would then hold
+                # somebody else's sentinel with FileShare.None for its whole duration.
+                #
+                # Re-read the entry now the handle is held and refuse if it became a link. This
+                # narrows the window rather than closing it: closing it needs the handle's own
+                # identity, which means FILE_FLAG_OPEN_REPARSE_POINT and
+                # GetFileInformationByHandle, and removing native imports is the point of this
+                # workstream. The residual is a zero-byte denial of service on a root that is
+                # already writable by another user, which the root owner marker refuses first.
+                if ($stream.Length -eq 0) {
+                    $entry = $null
+                    try { $entry = Get-Item -LiteralPath $lockPath -Force -ErrorAction Stop } catch { $entry = $null }
+                    if ($entry -and (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0)) {
+                        $stream.Dispose()
+                        $stream = $null
+                        throw "A link was planted at the install lock path $lockPath while it was being opened."
+                    }
+                    break
+                }
+                if ($repaired) {
+                    # A file this run just created cannot be non-empty, so reaching here means the
+                    # path is not behaving like a file at all. Fail loudly instead of looping.
+                    throw "The install lock file at $lockPath is not empty after being replaced."
+                }
+                # Drop the handle, then move the entry ASIDE rather than delete it, and let the
+                # reopen create a real file at the freed name.
+                #
+                # Deleting was wrong for one case. A planted hard link loses only its own
+                # directory entry, which is why deleting looked safe, but an ORDINARY non-empty
+                # file at this name that is its own only link loses its contents, and it loses
+                # them merely because somebody started the installer. Nothing this installer
+                # writes can produce such a file, so it is not ours to destroy.
+                #
+                # Refusing instead would hand the other case back: a hard link planted here would
+                # then block every install rather than being repaired, which is the denial of
+                # service the length check exists to prevent. There is no cheap way to tell the
+                # two apart, since the discriminator is the link count and .NET does not expose
+                # it here. A rename needs no discrimination: the planted link leaves the lock
+                # path either way, and the ordinary file keeps its bytes under a name that says
+                # what happened to it.
+                $stream.Dispose()
+                $stream = $null
+                $displaced = "$lockPath.displaced-" + (Get-Date -Format "yyyyMMddHHmmss") +
+                    "-" + [guid]::NewGuid().ToString("N").Substring(0, 8)
+                try {
+                    Move-Item -LiteralPath $lockPath -Destination $displaced -Force -ErrorAction Stop
+                } catch {
+                    # Only a sharing or lock violation means "another installer holds it". A
+                    # read-only directory, an ACL that forbids renaming, a policy block or a
+                    # storage fault are none of those, and reporting them as a concurrent install
+                    # sends the user hunting for a second installer that does not exist. Same
+                    # discrimination, and the same Win32 and errno codes, as the open below.
+                    #
+                    # The code is dug out of the exception chain because a cmdlet failure arrives
+                    # wrapped: the IOException that carries the HResult is not always the outermost.
+                    $mvCode = 0
+                    $mvEx = $_.Exception
+                    while ($mvEx) {
+                        if ($mvEx -is [System.IO.IOException]) {
+                            $mvCode = $mvEx.HResult -band 0xFFFF
+                            break
+                        }
+                        $mvEx = $mvEx.InnerException
+                    }
+                    Exit-StudioInstallMutex -Mutex $mutex
+                    if ($mvCode -ne 32 -and $mvCode -ne 33 -and $mvCode -ne 11) { throw }
+                    return $null
+                }
+                $repaired = $true
+            }
+            # Residual, stated plainly rather than implied away: a hard link to a genuinely EMPTY
+            # file is indistinguishable from our own lock file and is used as the lock. Nothing is
+            # written to it, so no data is lost and the only thing denied for the length of the
+            # install is access to a zero-byte file. That is not worth a canonicalisation
+            # apparatus, and it is not the hazard the reparse and length checks are here for.
+            # Nothing is written to the handle on purpose. Holding it open exclusively IS the
+            # lock, and writing would be actively unsafe: File.Open follows a symbolic or hard
+            # link, so a `.unsloth-install.lock` planted in the destination by another user would
+            # have its TARGET truncated merely by starting the installer. That matters most for a
+            # shared or custom root under an elevated install, which is exactly where a planted
+            # link is plausible. Write-StudioRootOwnerMarker already guards the same hazard the
+            # same way; this follows it rather than inventing a second answer.
+            # Taking the lock is now the first thing that can create the root, earlier than
+            # anything else writes to it. scripts/uninstall.ps1's _IsStudioRoot reads exactly this
+            # marker so "a partial install identifies itself instead of being guessed at"; without
+            # it, a run that died between here and the first real write would leave a root the
+            # uninstaller refuses to remove as somebody else's.
+            #
+            # Only when this call created the directory. A UNSLOTH_STUDIO_HOME pointed at a
+            # directory the user already had must never be claimed, or uninstall would delete it.
+            #
+            # Through Write-StudioRootOwnerMarker rather than a WriteAllText here. The paragraph
+            # above says File.Open follows a planted link, and a bare WriteAllText follows one
+            # just the same: a root whose inherited permissions let another user write to it can
+            # have a `.unsloth-studio-owned` link planted between the directory being created and
+            # this line, and the write would truncate its target under the installer's rights.
+            # The helper already removes the entry and confirms its absence before writing, with
+            # Get-Item -Force so a dangling link is not mistaken for nothing there. Reusing it is
+            # the point; a second copy of that sequence is a second thing to get wrong.
+            #
+            # Its occupancy test does not refuse this root: it filters the install lock file by
+            # name, and the lock file is the only entry a root created by this call can hold.
+            if (-not $existedBefore) {
+                Write-StudioRootOwnerMarker -Root $Path
+            }
+            return [pscustomobject]@{ Mutex = $mutex; Stream = $stream; Path = $lockPath }
+        } catch {
+            if ($stream) { try { $stream.Dispose() } catch {} }
+            Exit-StudioInstallMutex -Mutex $mutex
+            throw
+        }
+    }
+
+    function Exit-StudioInstallLock {
+        param($Lock)
+        if ($null -eq $Lock) { return }
+        # Closing the handle IS the release, so a process that dies holding it leaves nothing to
+        # clean up: Windows closes the handle for us. The file itself is left in place on purpose,
+        # since deleting it would race another installer that has just opened it.
+        if ($Lock.Stream) { try { $Lock.Stream.Dispose() } catch {} }
+        Exit-StudioInstallMutex -Mutex $Lock.Mutex
+    }
+
     function Test-StudioProtectedPathMatch {
         param(
             [Parameter(Mandatory = $true)][string]$Candidate,
@@ -5077,6 +5755,72 @@ exit 0
 
     $script:StudioProcessImageTable = $null
     $script:StudioProcessImageWarned = $false
+    # PID to image path for every process this session can see, read once through ctypes in a
+    # bounded child. $null when there is no usable interpreter or the child cannot answer, which
+    # leaves the WMI rung below exactly as it was.
+    #
+    # ctypes rather than defining the type in PowerShell: the Windows call is identical, but the
+    # work happens in a child interpreter, outside the script text that is classified in full
+    # before it runs.
+    $script:StudioPythonProcessImageTable = $null
+    $script:StudioPythonProcessImageProbed = $false
+
+    function Get-StudioPythonProcessImageTable {
+        $exe = Get-StudioEarlyPython
+        if (-not $exe) { return $null }
+        # Only Windows has QueryFullProcessImageNameW. Elsewhere this rung has nothing to add over
+        # Get-Process, so it declines rather than pretending.
+        if (-not ($env:OS -eq "Windows_NT")) { return $null }
+        $probe = "import ctypes,sys" + [char]10 +
+            "from ctypes import wintypes" + [char]10 +
+            "k32=ctypes.WinDLL('kernel32',use_last_error=True)" + [char]10 +
+            "psapi=ctypes.WinDLL('psapi',use_last_error=True)" + [char]10 +
+            "k32.OpenProcess.restype=wintypes.HANDLE" + [char]10 +
+            "k32.OpenProcess.argtypes=[wintypes.DWORD,wintypes.BOOL,wintypes.DWORD]" + [char]10 +
+            "k32.CloseHandle.argtypes=[wintypes.HANDLE]" + [char]10 +
+            "k32.QueryFullProcessImageNameW.argtypes=[wintypes.HANDLE,wintypes.DWORD,wintypes.LPWSTR,ctypes.POINTER(wintypes.DWORD)]" + [char]10 +
+            "n=1024" + [char]10 +
+            "while True:" + [char]10 +
+            "    a=(wintypes.DWORD*n)();b=wintypes.DWORD()" + [char]10 +
+            "    if not psapi.EnumProcesses(ctypes.byref(a),ctypes.sizeof(a),ctypes.byref(b)): sys.exit(3)" + [char]10 +
+            "    if b.value < ctypes.sizeof(a): break" + [char]10 +
+            "    n*=2" + [char]10 +
+            "out=[]" + [char]10 +
+            "for pid in a[:b.value//ctypes.sizeof(wintypes.DWORD)]:" + [char]10 +
+            "    if not pid: continue" + [char]10 +
+            "    h=k32.OpenProcess(0x1000,False,pid)" + [char]10 +
+            "    if not h: continue" + [char]10 +
+            "    try:" + [char]10 +
+            "        buf=ctypes.create_unicode_buffer(32768);sz=wintypes.DWORD(32768)" + [char]10 +
+            "        if k32.QueryFullProcessImageNameW(h,0,buf,ctypes.byref(sz)): out.append(str(pid)+'|'+buf.value)" + [char]10 +
+            "    finally:" + [char]10 +
+            "        k32.CloseHandle(h)" + [char]10 +
+            "sys.stdout.buffer.write('\n'.join(out).encode('utf-8'))"
+        $raw = Invoke-StudioEarlyPythonScript -Exe $exe -Script $probe -TimeoutMs 20000
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+        $table = @{}
+        foreach ($line in ($raw -split "`r?`n")) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            $split = $line.IndexOf('|')
+            if ($split -lt 1) { continue }
+            $pidText = $line.Substring(0, $split)
+            $path = $line.Substring($split + 1)
+            # A -match and a cast, not [int]::TryParse. Constrained Language Mode does not
+            # permit casting to [ref] at all, so the TryParse spelling throws on the hosts this
+            # rung exists for, and the whole table comes back empty. The regex is anchored, and
+            # the cast is wrapped: PowerShell's [int] throws on a non-numeric string rather than
+            # returning zero, and throws again on one too large for an int, which a pid from a
+            # hostile or corrupted listing could be.
+            if ($pidText -notmatch '^\s*\d+\s*$') { continue }
+            $parsed = 0
+            try { $parsed = [int]$pidText } catch { continue }
+            if ($parsed -le 0) { continue }
+            if (-not [string]::IsNullOrWhiteSpace($path)) { $table[$parsed] = $path }
+        }
+        if ($table.Count -eq 0) { return $null }
+        return $table
+    }
+
     function Get-StudioProcessImagePath {
         param([Parameter(Mandatory = $true)][int]$ProcessId)
         if (Initialize-StudioProcessImageNativeType) {
@@ -5097,6 +5841,34 @@ exit 0
                 if (-not [string]::IsNullOrWhiteSpace($process.Path)) { return $process.Path }
             } catch {}
         }
+        # Python, before WMI, and for the reason the native rung exists at all: ctypes can call
+        # QueryFullProcessImageNameW with PROCESS_QUERY_LIMITED_INFORMATION, which is granted
+        # where the PROCESS_VM_READ that MainModule needs is refused, and it does not need WMI.
+        # Without something in this slot a host with a broken WMI repository finds NO running
+        # processes and overwrites a venv Unsloth has open, which is the failure the comment above
+        # this ladder describes.
+        #
+        # Batched, one child for the whole run, because Get-RunningStudioVenvProcesses calls this
+        # once per process on the machine and a child process each time would be far slower than
+        # the WMI rung it sits in front of.
+        if (-not $script:StudioPythonProcessImageProbed) {
+            $script:StudioPythonProcessImageProbed = $true
+            $script:StudioPythonProcessImageTable = Get-StudioPythonProcessImageTable
+        }
+        if ($script:StudioPythonProcessImageTable -and
+            $script:StudioPythonProcessImageTable.ContainsKey($ProcessId)) {
+            return $script:StudioPythonProcessImageTable[$ProcessId]
+        }
+        # Freshness, which both table rungs share and neither used to state.
+        #
+        # Each is a snapshot taken once per run and keyed only by PID, so if a process exits and
+        # Windows reuses its PID, the answer describes the process that is gone. It is recorded
+        # here rather than fixed because the fix is the thing these rungs exist to avoid: asking
+        # per process instead of once. The consumer is Get-RunningStudioVenvProcesses, which asks
+        # about PIDs it enumerated moments earlier in the same run, so the window is short.
+        #
+        # This rung deliberately matches the WMI rung below rather than inventing a second
+        # contract; an audit read the ctypes snapshot as a new staleness, and it is not one.
         # Queried once per run, not once per process: this is the slow rung.
         if ($null -eq $script:StudioProcessImageTable) {
             $script:StudioProcessImageTable = @{}
@@ -5148,12 +5920,12 @@ exit 0
         }
     }
     try {
-        $studioInstallMutex = Enter-StudioInstallMutex -Path $StudioHome
+        $studioInstallLock = Enter-StudioInstallLock -Path $StudioHome
     } catch {
         Write-StudioLine "[ERROR] Could not create the Unsloth install lock: $($_.Exception.Message)" -ForegroundColor Red
         return (Exit-InstallFailure "Could not create the Unsloth install lock")
     }
-    if ($null -eq $studioInstallMutex) {
+    if ($null -eq $studioInstallLock) {
         Write-StudioLine "[ERROR] Another Unsloth Studio install or repair is already running." -ForegroundColor Red
         Write-StudioLine "        Wait for it to finish, then re-run install.ps1." -ForegroundColor Yellow
         return (Exit-InstallFailure "Another Unsloth Studio install or repair is already running")
@@ -9748,7 +10520,7 @@ sys.exit(2 if conflict else (0 if installed else 1))
         for ($i = $studioRuntimeMutexes.Count - 1; $i -ge 0; $i--) {
             Exit-StudioInstallMutex -Mutex $studioRuntimeMutexes[$i]
         }
-        Exit-StudioInstallMutex -Mutex $studioInstallMutex
+        Exit-StudioInstallLock -Lock $studioInstallLock
         # Matters for `irm | iex`, where these are the user's own session variables.
         Restore-StudioTempEnvironment
     }
