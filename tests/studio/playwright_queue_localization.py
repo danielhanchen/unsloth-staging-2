@@ -39,7 +39,7 @@ def seed(
     locale = "en",
     shortcut = "enter",
 ):
-    page.goto(base + PAGE, wait_until = "domcontentloaded", timeout = NAV_TIMEOUT_MS)
+    page.goto(base + PAGE)
     page.evaluate(
         """([locale, shortcut]) => {
             localStorage.setItem("unsloth_locale", locale);
