@@ -1,0 +1,36 @@
+name: "staging-11213 rust windows"
+on:
+  push:
+    branches: ["pr-11213-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  rust:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      # tauri::generate_context! reads frontendDist (../frontend/dist) at COMPILE time, so
+      # the bundle has to exist before cargo touches the crate, even for a unit test run.
+      - name: Frontend build
+        working-directory: studio/frontend
+        run: npm ci && npm run build
+      - name: Probe the closed-port classification
+        working-directory: studio/src-tauri
+        run: "cargo test --bin unsloth-studio commands::tests:: -- --nocapture --test-threads=1"
