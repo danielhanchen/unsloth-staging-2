@@ -1,0 +1,136 @@
+name: "sim-11248 windows sweep ownership"
+on:
+  push:
+    branches: ["pr-11248-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  sweep:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [pwsh, powershell]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: the shipped sweep, run on real NTFS
+        run: |
+          $ErrorActionPreference = "Stop"
+          "shell: $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
+          $src = (Get-Content -Raw studio/setup.ps1) -replace "`r`n", "`n"
+          $start = $src.IndexOf('    $_venvParent = Split-Path -Parent $VenvDir')
+          if ($start -lt 0) { throw "sweep not found" }
+          $sweep = $src.Substring($start, $src.IndexOf("`n`n", $start) - $start)
+
+          function New-Case {
+            param($Home, $Name, [switch]$WithVenvCfg, [switch]$WithStaleMarker, [switch]$Foreign)
+            $d = Join-Path $Home $Name
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            if ($WithVenvCfg) { Set-Content -LiteralPath (Join-Path $d "pyvenv.cfg") -Value "home = C:\" }
+            if ($WithStaleMarker) { Set-Content -LiteralPath (Join-Path $d ".unsloth-studio-stale") -Value "" }
+            if ($Foreign) { Set-Content -LiteralPath (Join-Path $d "holiday-photos.txt") -Value "not unsloth" }
+            return $d
+          }
+
+          function Invoke-Sweep {
+            param($Home, $Venv, [bool]$Custom)
+            $script = Join-Path $env:RUNNER_TEMP ("sweep-" + [guid]::NewGuid().ToString("N") + ".ps1")
+            $pre = @(
+              "`$VenvDir = '$Venv'"
+              "`$StudioHome = '$Home'"
+              "`$StudioHomeIsCustom = `$$($Custom.ToString().ToLower())"
+              "`$StudioOwnedMarker = '.unsloth-studio-owned'"
+              "`$StudioStaleMarker = '.unsloth-studio-stale'"
+              "function Test-UnslothCmdShimFile { param(`$Path) return `$false }"
+              "function substep { param([string]`$Message, [string]`$Color = 'DarkGray') Write-Output `"  substep: `$Message`" }"
+            ) -join "`n"
+            Set-Content -LiteralPath $script -Value ($pre + "`n" + $sweep + "`n")
+            & (Get-Process -Id $PID).Path -NoProfile -File $script
+          }
+
+          # --- default home: what must go and what must stay
+          $home1 = Join-Path $env:RUNNER_TEMP ("home-" + [guid]::NewGuid().ToString("N"))
+          $venv1 = Join-Path $home1 "unsloth_studio"
+          New-Item -ItemType Directory -Force -Path $venv1 | Out-Null
+          $ours      = New-Case -Home $home1 -Name "unsloth_studio.stale-20260101000000-999999" -WithVenvCfg
+          $suffixed  = New-Case -Home $home1 -Name "unsloth_studio.stale-20260101000000-999999-1" -WithVenvCfg
+          $stamped   = New-Case -Home $home1 -Name "unsloth_studio.stale-20260101000001-999999" -WithStaleMarker
+          $shaped    = New-Case -Home $home1 -Name "unsloth_studio.stale-20260101000002-999999" -Foreign
+          $backup    = New-Case -Home $home1 -Name "unsloth_studio.stale-backup" -Foreign
+          $livePid   = New-Case -Home $home1 -Name "unsloth_studio.stale-20260101000003-$PID" -WithVenvCfg
+          Invoke-Sweep -Home $home1 -Venv $venv1 -Custom $false
+          "abandoned copy with pyvenv.cfg swept : " + (-not (Test-Path -LiteralPath $ours))
+          "collision-suffixed copy swept        : " + (-not (Test-Path -LiteralPath $suffixed))
+          "copy known only by the marker swept  : " + (-not (Test-Path -LiteralPath $stamped))
+          "name-shaped foreign dir SPARED       : " + (Test-Path -LiteralPath $shaped)
+          "user's .stale-backup SPARED          : " + (Test-Path -LiteralPath $backup)
+          "live owner's copy swept (own pid)    : " + (-not (Test-Path -LiteralPath $livePid))
+          "the live venv is untouched           : " + (Test-Path -LiteralPath $venv1)
+
+          # --- custom home with nothing that says it is ours
+          $home2 = Join-Path $env:RUNNER_TEMP ("custom-" + [guid]::NewGuid().ToString("N"))
+          $venv2 = Join-Path $home2 "unsloth_studio"
+          New-Item -ItemType Directory -Force -Path $venv2 | Out-Null
+          $litter = New-Case -Home $home2 -Name "unsloth_studio.stale-20260101000000-999999" -WithVenvCfg
+          Invoke-Sweep -Home $home2 -Venv $venv2 -Custom $true
+          "unclaimable custom root left alone   : " + (Test-Path -LiteralPath $litter)
+          Set-Content -LiteralPath (Join-Path $venv2 ".unsloth-studio-owned") -Value ""
+          Invoke-Sweep -Home $home2 -Venv $venv2 -Custom $true
+          "control, once marked ours, swept     : " + (-not (Test-Path -LiteralPath $litter))
+
+      - name: the rename takes a suffix when the destination is taken
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:RUNNER_TEMP ("rn-" + [guid]::NewGuid().ToString("N"))
+          $venv = Join-Path $root "unsloth_studio"
+          New-Item -ItemType Directory -Force -Path $venv | Out-Null
+          $_venvParent = $root
+          $_venvLeaf = "unsloth_studio"
+          $_staleStamp = Get-Date -Format 'yyyyMMddHHmmss'
+          # Pre-take the name this run would generate, the way a copy whose delete failed does.
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "$_venvLeaf.stale-$_staleStamp-$PID") | Out-Null
+          $_staleLeaf = "$_venvLeaf.stale-$_staleStamp-$PID"
+          $_staleTry = 0
+          while ((Test-Path -LiteralPath (Join-Path $_venvParent $_staleLeaf)) -and $_staleTry -lt 64) {
+            $_staleTry++
+            $_staleLeaf = "$_venvLeaf.stale-$_staleStamp-$PID-$_staleTry"
+          }
+          Rename-Item -LiteralPath $venv -NewName $_staleLeaf -ErrorAction Stop
+          "destination chosen: $_staleLeaf"
+          "rename succeeded over a taken name: " + (Test-Path -LiteralPath (Join-Path $root $_staleLeaf))
+          "the pre-existing copy is untouched: " + (Test-Path -LiteralPath (Join-Path $root "$_venvLeaf.stale-$_staleStamp-$PID"))
+
+      - name: the helper refuses a hint that names nothing
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content -Raw studio/setup.ps1
+          $m = [regex]::Match($src, '(?s)function Get-SetupHostInterpreterInVenv \{.*?\n\}\n')
+          $helper = Join-Path $env:RUNNER_TEMP "helper2.ps1"
+          Set-Content -LiteralPath $helper -Value ($m.Value + "`n" + 'Get-SetupHostInterpreterInVenv -VenvDir $args[0]' + "`n")
+          $root = Join-Path $env:RUNNER_TEMP ("hint-" + [guid]::NewGuid().ToString("N"))
+          $venv = Join-Path $root "unsloth_studio"
+          & python -m venv $venv
+          $py = Join-Path $venv "Scripts\python.exe"
+          $shell = (Get-Process -Id $PID).Path
+          $env:UNSLOTH_SETUP_HOST_PYTHON = (Join-Path $venv "Scripts\python-that-was-deleted.exe")
+          "hint naming a deleted file -> " + ((& $shell -NoProfile -File $helper $venv) | Out-String).Trim()
+          $env:UNSLOTH_SETUP_HOST_PYTHON = (Join-Path $venv "Scripts")
+          "hint naming a directory    -> " + ((& $shell -NoProfile -File $helper $venv) | Out-String).Trim()
+          $env:UNSLOTH_SETUP_HOST_PYTHON = $py
+          "control, the real python   -> " + ((& $shell -NoProfile -File $helper $venv) | Out-String).Trim()

@@ -1,0 +1,41 @@
+name: "sim-11248 windows base arm"
+on:
+  push:
+    branches: ["pr-11248-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  base:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: 16408b25fdef12133be49e117cdd5f9a3382cb3a
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - name: the test files that exist at the PR merge base, same filter
+        run: |
+          ls -l tests/studio/install/test_windows_torch_flavor_invariant.py tests/test_studio_install_workspace_guard.py
+          test -e unsloth_cli/tests/test_studio_update_host_python.py && echo "host-python test EXISTS at base" || echo "host-python test is new in the PR (expected)"
+          PYTHONPATH=studio/backend python -m pytest tests/studio/install/test_windows_torch_flavor_invariant.py tests/test_studio_install_workspace_guard.py -q --tb=no -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > base_out.txt 2>&1 || true
+          echo "--- failure set at base ---"
+          grep -E '^FAILED ' base_out.txt | sed 's/ - .*//' | sort || true
+          echo "--- summary ---"
+          tail -3 base_out.txt

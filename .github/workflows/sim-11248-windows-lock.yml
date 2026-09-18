@@ -1,0 +1,136 @@
+name: "sim-11248 windows lock differential"
+on:
+  push:
+    branches: ["pr-11248-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  lock:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [pwsh, powershell]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: host
+        run: |
+          "shell: $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
+          "os   : " + (Get-CimInstance Win32_OperatingSystem).Caption + " " + (Get-CimInstance Win32_OperatingSystem).Version
+
+      - name: BASE arm -- Remove-Item -Recurse over a venv whose python.exe is running
+        run: |
+          $ErrorActionPreference = "Continue"
+          $root = Join-Path $env:RUNNER_TEMP ("base-" + [guid]::NewGuid().ToString("N"))
+          $venv = Join-Path $root "unsloth_studio"
+          & python -m venv $venv
+          $py = Join-Path $venv "Scripts\python.exe"
+          "files before: " + @(Get-ChildItem -LiteralPath $venv -Recurse -Force -File).Count
+          # A script file, not -c: Start-Process does not quote an argument containing a space,
+          # so `-c "import time; time.sleep(600)"` reaches python as several words and it exits
+          # on a SyntaxError, leaving nothing holding the image (observed).
+          $sleeper = Join-Path $env:RUNNER_TEMP "sleeper.py"
+          Set-Content -LiteralPath $sleeper -Value "import time`ntime.sleep(600)"
+          $held = Start-Process -FilePath $py -ArgumentList $sleeper -PassThru
+          Start-Sleep -Seconds 5
+          "held process alive: " + (-not $held.HasExited) + " (pid $($held.Id))"
+          "held process image: " + (Get-Process -Id $held.Id -ErrorAction SilentlyContinue).Path
+          try {
+            Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction Stop
+            "BASE delete: SUCCEEDED (no lock observed)"
+          } catch {
+            "BASE delete: FAILED -- $($_.Exception.Message)"
+          }
+          $after = if (Test-Path -LiteralPath $venv) { @(Get-ChildItem -LiteralPath $venv -Recurse -Force -File).Count } else { 0 }
+          "files after : $after"
+          "python.exe still there: " + (Test-Path -LiteralPath $py)
+          $cli = Join-Path $venv "Lib\site-packages"
+          "Lib\site-packages still there: " + (Test-Path -LiteralPath $cli)
+          Stop-Process -Id $held.Id -Force -ErrorAction SilentlyContinue
+
+      - name: HEAD arm -- Rename-Item over a venv whose python.exe is running
+        run: |
+          $ErrorActionPreference = "Continue"
+          $root = Join-Path $env:RUNNER_TEMP ("head-" + [guid]::NewGuid().ToString("N"))
+          $venv = Join-Path $root "unsloth_studio"
+          & python -m venv $venv
+          $py = Join-Path $venv "Scripts\python.exe"
+          $before = @(Get-ChildItem -LiteralPath $venv -Recurse -Force -File).Count
+          "files before: $before"
+          $sleeper = Join-Path $env:RUNNER_TEMP "sleeper.py"
+          Set-Content -LiteralPath $sleeper -Value "import time`ntime.sleep(600)"
+          $held = Start-Process -FilePath $py -ArgumentList $sleeper -PassThru
+          Start-Sleep -Seconds 5
+          "held process alive: " + (-not $held.HasExited) + " (pid $($held.Id))"
+          $stale = "unsloth_studio.stale-$(Get-Date -Format 'yyyyMMddHHmmss')-$PID"
+          try {
+            Rename-Item -LiteralPath $venv -NewName $stale -ErrorAction Stop
+            "HEAD rename: SUCCEEDED"
+          } catch {
+            "HEAD rename: FAILED -- $($_.Exception.Message)"
+          }
+          $moved = Join-Path $root $stale
+          "original path still present: " + (Test-Path -LiteralPath $venv)
+          if (Test-Path -LiteralPath $moved) {
+            "files in moved copy: " + @(Get-ChildItem -LiteralPath $moved -Recurse -Force -File).Count
+          }
+          try {
+            Remove-Item -LiteralPath $moved -Recurse -Force -ErrorAction Stop
+            "best-effort delete of the moved copy: SUCCEEDED"
+          } catch {
+            "best-effort delete of the moved copy: FAILED (expected while the exe runs) -- $($_.Exception.Message)"
+          }
+          "moved copy leftover: " + (Test-Path -LiteralPath $moved)
+          Stop-Process -Id $held.Id -Force -ErrorAction SilentlyContinue
+
+      - name: The shipped helper, launched for real from a venv python.exe
+        run: |
+          $ErrorActionPreference = "Stop"
+          $src = Get-Content -Raw studio/setup.ps1
+          $m = [regex]::Match($src, '(?s)function Get-SetupHostInterpreterInVenv \{.*?\n\}\n')
+          if (-not $m.Success) { "helper ABSENT in this checkout (base behaviour)"; exit 0 }
+          $helper = Join-Path $env:RUNNER_TEMP "helper.ps1"
+          $root = Join-Path $env:RUNNER_TEMP ("probe-" + [guid]::NewGuid().ToString("N"))
+          $venv = Join-Path $root "unsloth_studio"
+          & python -m venv $venv
+          $py = Join-Path $venv "Scripts\python.exe"
+          $body = $m.Value + "`n" + 'Get-SetupHostInterpreterInVenv -VenvDir $args[0]' + "`n"
+          Set-Content -LiteralPath $helper -Value $body
+          $shell = (Get-Process -Id $PID).Path
+          # no hint: the answer can only come from the Win32_Process walk, with the venv python as our parent
+          Remove-Item Env:UNSLOTH_SETUP_HOST_PYTHON -ErrorAction SilentlyContinue
+          $driver = Join-Path $env:RUNNER_TEMP "driver.py"
+          Set-Content -LiteralPath $driver -Value "import subprocess, sys`nprint(subprocess.run([sys.argv[1], '-NoProfile', '-File', sys.argv[2], sys.argv[3]], capture_output=True, text=True).stdout.strip())"
+          "walk (launched from venv python) -> " + (& $py $driver $shell $helper $venv)
+          $env:UNSLOTH_SETUP_HOST_PYTHON = $py
+          "hint inside   -> " + (& $shell -NoProfile -File $helper $venv)
+          $env:UNSLOTH_SETUP_HOST_PYTHON = (Get-Command python).Source
+          "hint outside  -> " + ((& $shell -NoProfile -File $helper $venv) | Out-String).Trim()
+          Remove-Item Env:UNSLOTH_SETUP_HOST_PYTHON -ErrorAction SilentlyContinue
+          "no hint, plain shell -> " + ((& $shell -NoProfile -File $helper $venv) | Out-String).Trim()
+
+      - name: The shipped .ps1 decision test
+        run: |
+          $ErrorActionPreference = "Continue"
+          if (Test-Path tests/studio/test_amd_venv_repair_loop.ps1) {
+            & $((Get-Process -Id $PID).Path) -NoProfile -File tests/studio/test_amd_venv_repair_loop.ps1
+            "exit code: $LASTEXITCODE"
+          } else {
+            "test file absent"
+          }
