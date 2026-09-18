@@ -30,4 +30,4 @@ jobs:
       # scoping as the PR arm, restricted to the one file that exists on both sides. If
       # TestProgressStepCountMatchesTotal fails HERE too, the 17 failures on the PR arm are
       # this runner and not the PR; if it passes here, they are the PR and must be fixed.
-      - run: PYTHONPATH=studio/backend python -m pytest tests/studio/install/test_rocm_support.py -q --tb=short -k 'TestProgressStepCountMatchesTotal'
+      - run: PYTHONPATH=studio/backend python -m pytest tests/studio/install/test_rocm_support.py -q --tb=short -k 'TestProgressStepCountMatchesTotal or TestWindowsRocmTorchaoGuard'
