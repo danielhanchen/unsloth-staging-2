@@ -27,6 +27,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci --ignore-scripts --no-fund --no-audit
       - name: Node tests
         working-directory: studio/frontend
         run: node --experimental-strip-types --test tests/hf-cache-gguf-metadata.test.ts tests/model-picker-partial-downloads.test.ts tests/picker-license-openness.test.ts tests/picker-model-guides.test.ts tests/picker-model-info-adapter.test.ts tests/picker-model-info-facts.test.ts tests/picker-model-info-local-facts.test.ts tests/picker-model-info-probe.test.ts tests/picker-model-info-wiring.test.ts
