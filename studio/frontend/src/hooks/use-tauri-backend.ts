@@ -178,6 +178,11 @@ export function useTauriBackend() {
   // Whether the repair in flight was asked to skip straight to the installer. Read back by
   // approveElevation, which restarts the repair after the system packages land.
   const forcedRepairRef = useRef(false);
+  // One preflight and one repair at a time. Retry runs the preflight, a stale verdict starts a
+  // repair, and five clicks two seconds apart used to fan out into five of each: the Rust side
+  // saw them as five repairs racing for one installer.
+  const preflightInFlightRef = useRef(false);
+  const repairInFlightRef = useRef(false);
   const [tauriEventsReady, setTauriEventsReady] = useState(!isTauri);
   // Read through rather than mirrored into state: the app-closing listener is registered
   // inside the long event effect below, which cannot reach a setState from this render.
@@ -303,10 +308,24 @@ export function useTauriBackend() {
       setBackendStatus("stopped");
       return;
     }
+    if (preflightInFlightRef.current) return;
+    preflightInFlightRef.current = true;
+    // Whether THIS call still owns the flag. Released once below and once in the finally, and by
+    // then a later call may hold it: clearing it unowned would let a third preflight through.
+    let ownsPreflight = true;
+    const releasePreflight = () => {
+      if (!ownsPreflight) return;
+      ownsPreflight = false;
+      preflightInFlightRef.current = false;
+    };
     try {
       const { invoke } = await import("@tauri-apps/api/core");
 
       const preflight = await invoke<DesktopPreflightResult>("desktop_preflight");
+      // The probe is what this guards; the arms below are re-entrant already (startingRef,
+      // repairInFlightRef). Held any longer, a Retry offered by server-start-timeout from inside
+      // startManagedServer's 500 ms port poll clears the error and then returns on the flag.
+      releasePreflight();
       switch (preflight.disposition) {
         case "attached_ready": {
           if (!preflight.port) {
@@ -369,6 +388,8 @@ export function useTauriBackend() {
       }
     } catch (e) {
       setBackendError(String(e));
+    } finally {
+      releasePreflight();
     }
   }
 
@@ -427,6 +448,27 @@ export function useTauriBackend() {
   // manual repair turns it on: an update reuses the environment it finds, so a venv whose
   // PyTorch was replaced by a CPU-only wheel comes back from one still CPU-only.
   async function startRepair(options?: { forceInstaller?: boolean }) {
+    if (repairInFlightRef.current) return;
+    repairInFlightRef.current = true;
+    // Same ownership rule as the preflight flag: handed to runRepair so it can release the moment
+    // the native repair returns, and a no-op afterwards so this call cannot clear a later one's.
+    let ownsRepair = true;
+    const releaseRepair = () => {
+      if (!ownsRepair) return;
+      ownsRepair = false;
+      repairInFlightRef.current = false;
+    };
+    try {
+      await runRepair(options, releaseRepair);
+    } finally {
+      releaseRepair();
+    }
+  }
+
+  async function runRepair(
+    options?: { forceInstaller?: boolean },
+    releaseRepair: () => void = () => {},
+  ) {
     const forceInstaller = options?.forceInstaller ?? false;
     // Survives the elevation round trip: approveElevation resumes by calling this again.
     forcedRepairRef.current = forceInstaller;
@@ -445,6 +487,9 @@ export function useTauriBackend() {
     const { invoke } = await import("@tauri-apps/api/core");
     try {
       await invoke("start_managed_repair", { forceInstaller });
+      // The repair itself is done here; what follows is an ordinary start. Held across that,
+      // a Retry offered by server-start-timeout would be swallowed after clearing the error.
+      releaseRepair();
 
       setBackendStatus("starting");
       elevationResumeRef.current = null;
