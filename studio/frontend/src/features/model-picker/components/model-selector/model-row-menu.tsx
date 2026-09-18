@@ -56,6 +56,8 @@ interface ModelRowMenuInfo {
   repoId: string;
   /** Quant whose local header to read, when the row names one. */
   variant?: string | null;
+  /** Probe headers only for downloaded GGUFs. */
+  hasLocalGguf?: boolean;
 }
 
 interface ModelRowMenuUpdate {
@@ -319,6 +321,7 @@ export function ModelRowMenu({
         <ModelInfoDialog
           repoId={info.repoId}
           variant={info.variant}
+          hasLocalGguf={info.hasLocalGguf}
           open={infoOpen}
           onOpenChange={setInfoOpen}
         />

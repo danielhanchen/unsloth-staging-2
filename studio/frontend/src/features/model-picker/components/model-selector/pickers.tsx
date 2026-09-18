@@ -2174,7 +2174,9 @@ function GgufVariantExpander({
                       : { repoId, variant: v.quant }
                   }
                   info={
-                    isLocalPath ? undefined : { repoId, variant: v.quant }
+                    isLocalPath
+                      ? undefined
+                      : { repoId, variant: v.quant, hasLocalGguf: v.downloaded }
                   }
                   pin={
                     allowPin && v.downloaded
@@ -3121,6 +3123,14 @@ export function HubModelPicker({
           .map((c) => c.repo_id.toLowerCase()),
       ),
     [cachedGguf, cachedModels],
+  );
+
+  const downloadedGgufSet = useMemo(
+    () =>
+      new Set(
+        cachedGguf.filter((c) => !c.partial).map((c) => c.repo_id.toLowerCase()),
+      ),
+    [cachedGguf],
   );
 
   // The torn ones, kept apart so a Hub row can mark a partial rather than show it as complete
@@ -5148,7 +5158,11 @@ export function HubModelPicker({
           <ModelRowMenu
             ariaLabel={`More options for ${entry.repoId} ${entry.quant}`}
             cachePath={{ repoId: entry.repoId, variant: entry.quant }}
-            info={{ repoId: entry.repoId, variant: entry.quant }}
+            info={{
+              repoId: entry.repoId,
+              variant: entry.quant,
+              hasLocalGguf: true,
+            }}
             pin={{
               pinned: true,
               pinLabel: "Pin to top",
@@ -5278,7 +5292,11 @@ export function HubModelPicker({
           <ModelRowMenu
             ariaLabel={`More options for ${c.repo_id} ${variant.quant}`}
             cachePath={{ repoId: c.repo_id, variant: variant.quant }}
-            info={{ repoId: c.repo_id, variant: variant.quant }}
+            info={{
+              repoId: c.repo_id,
+              variant: variant.quant,
+              hasLocalGguf: isDownloaded,
+            }}
             pin={{
               pinned: isPinned,
               pinLabel: "Pin to top",
@@ -6678,7 +6696,12 @@ export function HubModelPicker({
                               <span className={ROW_ACTIONS_CLASS}>
                                 <ModelRowMenu
                                   ariaLabel={`More options for ${id}`}
-                                  info={{ repoId: id }}
+                                  info={{
+                                    repoId: id,
+                                    hasLocalGguf: downloadedGgufSet.has(
+                                      id.toLowerCase(),
+                                    ),
+                                  }}
                                 />
                               </span>
                             </div>
@@ -6816,7 +6839,12 @@ export function HubModelPicker({
                             <span className={ROW_ACTIONS_CLASS}>
                               <ModelRowMenu
                                 ariaLabel={`More options for ${id}`}
-                                info={{ repoId: id }}
+                                info={{
+                                  repoId: id,
+                                  hasLocalGguf: downloadedGgufSet.has(
+                                    id.toLowerCase(),
+                                  ),
+                                }}
                               />
                             </span>
                           </div>
@@ -6949,7 +6977,12 @@ export function HubModelPicker({
                               <span className={ROW_ACTIONS_CLASS}>
                                 <ModelRowMenu
                                   ariaLabel={`More options for ${id}`}
-                                  info={{ repoId: id }}
+                                  info={{
+                                    repoId: id,
+                                    hasLocalGguf: downloadedGgufSet.has(
+                                      id.toLowerCase(),
+                                    ),
+                                  }}
                                 />
                               </span>
                             </div>
