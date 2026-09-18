@@ -1,0 +1,32 @@
+name: "staging-11033 windows-latest"
+on:
+  push:
+    branches: ["pr-11033-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Node tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test tests/hf-cache-gguf-metadata.test.ts tests/model-picker-partial-downloads.test.ts tests/picker-license-openness.test.ts tests/picker-model-guides.test.ts tests/picker-model-info-adapter.test.ts tests/picker-model-info-facts.test.ts tests/picker-model-info-local-facts.test.ts tests/picker-model-info-probe.test.ts tests/picker-model-info-wiring.test.ts
