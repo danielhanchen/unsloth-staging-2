@@ -30,9 +30,11 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
-      - name: same three test files, same filter, at the PR merge base
+      - name: the test files that exist at the PR merge base, same filter
         run: |
-          PYTHONPATH=studio/backend python -m pytest tests/studio/install/test_windows_torch_flavor_invariant.py tests/test_studio_install_workspace_guard.py unsloth_cli/tests/test_studio_update_host_python.py -q --tb=no -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > base_out.txt 2>&1 || true
+          ls -l tests/studio/install/test_windows_torch_flavor_invariant.py tests/test_studio_install_workspace_guard.py
+          test -e unsloth_cli/tests/test_studio_update_host_python.py && echo "host-python test EXISTS at base" || echo "host-python test is new in the PR (expected)"
+          PYTHONPATH=studio/backend python -m pytest tests/studio/install/test_windows_torch_flavor_invariant.py tests/test_studio_install_workspace_guard.py -q --tb=no -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > base_out.txt 2>&1 || true
           echo "--- failure set at base ---"
           grep -E '^FAILED ' base_out.txt | sed 's/ - .*//' | sort || true
           echo "--- summary ---"
