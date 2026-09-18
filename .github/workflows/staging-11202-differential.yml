@@ -66,3 +66,4 @@ jobs:
         working-directory: studio/frontend
         continue-on-error: true
         run: npm run build
+# re-trigger: deps install added

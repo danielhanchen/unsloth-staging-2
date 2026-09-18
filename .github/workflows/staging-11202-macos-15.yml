@@ -33,3 +33,4 @@ jobs:
       - name: Node tests
         working-directory: studio/frontend
         run: node --experimental-strip-types --test tests/new-chat-doc-upload-materialization.test.ts tests/new-chat-doc-upload-wiring.test.ts
+# re-trigger: deps install added
