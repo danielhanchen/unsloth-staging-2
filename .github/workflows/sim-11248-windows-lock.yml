@@ -29,6 +29,11 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: host
+        run: |
+          "shell: $($PSVersionTable.PSVersion) $($PSVersionTable.PSEdition)"
+          "os   : " + (Get-CimInstance Win32_OperatingSystem).Caption + " " + (Get-CimInstance Win32_OperatingSystem).Version
+
       - name: BASE arm -- Remove-Item -Recurse over a venv whose python.exe is running
         run: |
           $ErrorActionPreference = "Continue"
@@ -37,8 +42,15 @@ jobs:
           & python -m venv $venv
           $py = Join-Path $venv "Scripts\python.exe"
           "files before: " + @(Get-ChildItem -LiteralPath $venv -Recurse -Force -File).Count
-          $held = Start-Process -FilePath $py -ArgumentList "-c", "import time; time.sleep(600)" -PassThru
-          Start-Sleep -Seconds 3
+          # A script file, not -c: Start-Process does not quote an argument containing a space,
+          # so `-c "import time; time.sleep(600)"` reaches python as several words and it exits
+          # on a SyntaxError, leaving nothing holding the image (observed).
+          $sleeper = Join-Path $env:RUNNER_TEMP "sleeper.py"
+          Set-Content -LiteralPath $sleeper -Value "import time`ntime.sleep(600)"
+          $held = Start-Process -FilePath $py -ArgumentList $sleeper -PassThru
+          Start-Sleep -Seconds 5
+          "held process alive: " + (-not $held.HasExited) + " (pid $($held.Id))"
+          "held process image: " + (Get-Process -Id $held.Id -ErrorAction SilentlyContinue).Path
           try {
             Remove-Item -LiteralPath $venv -Recurse -Force -ErrorAction Stop
             "BASE delete: SUCCEEDED (no lock observed)"
@@ -61,8 +73,11 @@ jobs:
           $py = Join-Path $venv "Scripts\python.exe"
           $before = @(Get-ChildItem -LiteralPath $venv -Recurse -Force -File).Count
           "files before: $before"
-          $held = Start-Process -FilePath $py -ArgumentList "-c", "import time; time.sleep(600)" -PassThru
-          Start-Sleep -Seconds 3
+          $sleeper = Join-Path $env:RUNNER_TEMP "sleeper.py"
+          Set-Content -LiteralPath $sleeper -Value "import time`ntime.sleep(600)"
+          $held = Start-Process -FilePath $py -ArgumentList $sleeper -PassThru
+          Start-Sleep -Seconds 5
+          "held process alive: " + (-not $held.HasExited) + " (pid $($held.Id))"
           $stale = "unsloth_studio.stale-$(Get-Date -Format 'yyyyMMddHHmmss')-$PID"
           try {
             Rename-Item -LiteralPath $venv -NewName $stale -ErrorAction Stop
