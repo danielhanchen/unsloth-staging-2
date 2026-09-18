@@ -27,6 +27,9 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
       - name: Node tests
         working-directory: studio/frontend
         run: node --experimental-strip-types --test tests/new-chat-doc-upload-materialization.test.ts tests/new-chat-doc-upload-wiring.test.ts
