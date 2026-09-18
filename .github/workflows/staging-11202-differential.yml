@@ -1,0 +1,68 @@
+name: "staging-11202-differential"
+on:
+  push:
+    branches: ["pr-11202-xplat-ci"]
+    paths:
+      - '.github/workflows/staging-11202-differential.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  # The FULL studio/frontend suite on both arms and all three OSes, so "nothing else
+  # broke" is measured rather than asserted, and the base arm exists (a differential
+  # without one is VOID). The scoped staging-11202-<os> workflows only run the PR's own
+  # new test file, which cannot answer either question.
+  suite:
+    name: "${{ matrix.arm }} / ${{ matrix.os }}"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+        arm: [base, head]
+        include:
+          - arm: base
+            ref: 6a5ab1f389f2a7a6a509150fa1b87a91c5044d53
+          - arm: head
+            ref: ''
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ matrix.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+      - name: Full frontend suite
+        id: suite
+        working-directory: studio/frontend
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee suite.log
+      - name: Counts
+        working-directory: studio/frontend
+        run: |
+          echo "=== ${{ matrix.arm }} / ${{ matrix.os }} ==="
+          grep -E '^. (tests|pass|fail|cancelled|skipped|todo) ' suite.log || true
+          echo "--- failing test names ---"
+          grep -E '^not ok |^. failing tests:' -A2 suite.log | head -100 || true
+      - name: Typecheck
+        working-directory: studio/frontend
+        continue-on-error: true
+        run: npm run typecheck
+      - name: Build
+        working-directory: studio/frontend
+        continue-on-error: true
+        run: npm run build
