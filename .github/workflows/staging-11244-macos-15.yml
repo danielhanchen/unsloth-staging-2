@@ -1,0 +1,35 @@
+name: "staging-11244 macos-15"
+on:
+  push:
+    branches: ["pr-11244-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci
+      - name: Node tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test tests/account-settings-ui.test.ts tests/effective-profile.test.ts
