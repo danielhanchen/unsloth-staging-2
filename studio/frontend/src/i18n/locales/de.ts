@@ -249,7 +249,7 @@ export const de = {
   settings: {
     accounts: {
       title: "Konten",
-      description: "Private Studio-Konten anlegen. Neue Nutzer melden sich mit einem einmaligen Einrichtungscode an und wählen ein Passwort.",
+      description: "Private Unsloth-Konten anlegen. Neue Nutzer melden sich mit einem einmaligen Einrichtungscode an und wählen ein Passwort.",
       username: "Benutzername",
       create: "Konto anlegen",
       setupCode: "Einrichtungscode",

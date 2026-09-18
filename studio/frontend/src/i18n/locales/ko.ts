@@ -245,7 +245,7 @@ export const ko = {
   settings: {
     accounts: {
       title: "계정",
-      description: "개별 Studio 계정을 만듭니다. 새 사용자는 일회용 설정 코드로 로그인한 뒤 비밀번호를 정합니다.",
+      description: "개별 Unsloth 계정을 만듭니다. 새 사용자는 일회용 설정 코드로 로그인한 뒤 비밀번호를 정합니다.",
       username: "사용자 이름",
       create: "계정 만들기",
       setupCode: "설정 코드",

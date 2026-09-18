@@ -243,7 +243,7 @@ export const zhCN = {
   settings: {
     accounts: {
       title: "账户",
-      description: "创建独立的 Studio 账户。新用户使用一次性设置码登录并设置密码。",
+      description: "创建独立的 Unsloth 账户。新用户使用一次性设置码登录并设置密码。",
       username: "用户名",
       create: "创建账户",
       setupCode: "设置码",

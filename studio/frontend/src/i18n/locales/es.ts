@@ -248,7 +248,7 @@ export const es = {
   settings: {
     accounts: {
       title: "Cuentas",
-      description: "Crea cuentas privadas de Studio. Los nuevos usuarios inician sesión con un código de configuración de un solo uso y eligen una contraseña.",
+      description: "Crea cuentas privadas de Unsloth. Los nuevos usuarios inician sesión con un código de configuración de un solo uso y eligen una contraseña.",
       username: "Nombre de usuario",
       create: "Crear cuenta",
       setupCode: "Código de configuración",

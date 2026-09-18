@@ -250,7 +250,7 @@ export const en = {
   settings: {
     accounts: {
       title: "Accounts",
-      description: "Create private Studio accounts. New users sign in with a one-time setup code and choose a password.",
+      description: "Create private Unsloth accounts. New users sign in with a one-time setup code and choose a password.",
       username: "Username",
       create: "Create account",
       createDescription: "Share a setup code so they can choose their own password.",

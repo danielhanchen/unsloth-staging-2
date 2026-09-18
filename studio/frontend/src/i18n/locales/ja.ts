@@ -247,7 +247,7 @@ export const ja = {
   settings: {
     accounts: {
       title: "アカウント",
-      description: "個別の Studio アカウントを作成します。新しいユーザーは一度きりのセットアップコードでサインインし、パスワードを設定します。",
+      description: "個別の Unsloth アカウントを作成します。新しいユーザーは一度きりのセットアップコードでサインインし、パスワードを設定します。",
       username: "ユーザー名",
       create: "アカウントを作成",
       setupCode: "セットアップコード",

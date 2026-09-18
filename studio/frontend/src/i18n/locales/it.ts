@@ -213,7 +213,7 @@ export const it = {
   settings: {
     accounts: {
       title: "Account",
-      description: "Crea account Studio privati. I nuovi utenti accedono con un codice di configurazione monouso e scelgono una password.",
+      description: "Crea account Unsloth privati. I nuovi utenti accedono con un codice di configurazione monouso e scelgono una password.",
       username: "Nome utente",
       create: "Crea account",
       setupCode: "Codice di configurazione",
