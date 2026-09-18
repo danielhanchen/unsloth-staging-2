@@ -122,6 +122,7 @@ export function ModelRowMenu({
   );
   const [updateOpen, setUpdateOpen] = useState(false);
   const [infoOpen, setInfoOpen] = useState(false);
+  const menuTriggerRef = useRef<HTMLButtonElement>(null);
 
   // Refresh the caller when this repo+variant's managed update completes.
   const onUpdatedRef = useRef(update?.onUpdated);
@@ -194,6 +195,7 @@ export function ModelRowMenu({
       <DropdownMenu>
         <DropdownMenuTrigger asChild={true}>
           <button
+            ref={menuTriggerRef}
             type="button"
             onClick={(e) => e.stopPropagation()}
             aria-label={ariaLabel}
@@ -324,6 +326,10 @@ export function ModelRowMenu({
           hasLocalGguf={info.hasLocalGguf}
           open={infoOpen}
           onOpenChange={setInfoOpen}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            menuTriggerRef.current?.focus();
+          }}
         />
       )}
 
