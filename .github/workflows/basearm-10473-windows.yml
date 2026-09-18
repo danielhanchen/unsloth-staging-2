@@ -30,4 +30,4 @@ jobs:
       # reports 67 failures here; this says how many of them main already has. PR 10473 does
       # not add this file, it edits 45 lines of it, so only a side-by-side count separates
       # "the PR broke Windows" from "this file was never Windows-clean".
-      - run: PYTHONPATH=studio/backend python -m pytest tests/studio/install/test_rocm_support.py -q --tb=line
+      - run: PYTHONPATH=studio/backend python -m pytest tests/studio/install/test_rocm_support.py studio/backend/tests/test_install_resolve_prebuilt.py -q --tb=line
