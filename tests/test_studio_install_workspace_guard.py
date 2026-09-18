@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -246,10 +248,10 @@ def test_install_ps1_sentinel_uses_pathtype_leaf():
 
 
 def test_setup_ps1_stale_venv_has_env_mode_guard():
-    """setup.ps1 stale-venv branch must gate Remove-Item $VenvDir on a custom-root Unsloth sentinel."""
+    """setup.ps1 stale-venv branch must gate the venv replacement on a custom-root Unsloth sentinel."""
     src = SETUP_PS1.read_text(encoding = "utf-8")
     idx = src.index("Stale venv detected")
-    block = src[idx : idx + 1500]
+    block = src[idx : idx + 2500]
     assert (
         "$StudioHomeIsCustom" in block
     ), "setup.ps1 stale-venv branch must gate on $StudioHomeIsCustom"
@@ -261,8 +263,203 @@ def test_setup_ps1_stale_venv_has_env_mode_guard():
     ), "setup.ps1 stale-venv guard must check bin\\unsloth.exe with -PathType Leaf"
     # The guard must fire BEFORE the destructive call.
     guard_idx = block.index("$StudioHomeIsCustom")
-    rm_idx = block.index("Remove-Item -LiteralPath $VenvDir")
-    assert guard_idx < rm_idx, "custom-root guard must precede Remove-Item -LiteralPath $VenvDir"
+    rm_idx = block.index("Rename-Item -LiteralPath $VenvDir")
+    assert guard_idx < rm_idx, "custom-root guard must precede Rename-Item -LiteralPath $VenvDir"
+
+
+def test_setup_ps1_stale_venv_is_moved_aside_not_deleted_in_place():
+    """A rename takes the whole tree or fails and leaves it intact. Remove-Item -Recurse deletes up
+    to the first locked file, and a venv locked by its own running python.exe came out of it with
+    Lib\\ emptied, no unsloth_cli, and Scripts\\python.exe still there: nothing could start or
+    update it afterwards."""
+    src = SETUP_PS1.read_text(encoding = "utf-8")
+    idx = src.index("Stale venv detected")
+    block = src[idx : src.index("if (-not (Test-Path -LiteralPath $VenvDir))", idx)]
+    assert (
+        "Remove-Item -LiteralPath $VenvDir" not in block
+    ), "the stale venv must not be deleted in place"
+    rename = block.index("Rename-Item -LiteralPath $VenvDir")
+    remove = block.index("Remove-Item -LiteralPath $_staleDir")
+    assert rename < remove, "the moved copy is what gets deleted"
+    # Same message as before, so the desktop's update/repair reporting keys on nothing new.
+    assert "Could not remove the stale environment at $VenvDir" in block
+
+
+def test_setup_ps1_direct_update_from_inside_the_venv_repairs_in_place():
+    """`unsloth studio update` runs setup.ps1 from the venv's own python.exe, which Windows will
+    not delete while it runs, so that run takes the installer's in-place reinstall route rather
+    than the wipe. A setup.ps1 run by hand from a checkout keeps the full rebuild."""
+    src = SETUP_PS1.read_text(encoding = "utf-8")
+    start = src.index(
+        "if ($shouldRebuild -and -not $InstallerManagedSetup) {\n"
+        "        $_hostPy = Get-SetupHostInterpreterInVenv -VenvDir $VenvDir"
+    )
+    block = src[start : src.index("\n    }\n", start)]
+    assert "$script:PinChangedForceReinstall = $true" in block
+    assert "$shouldRebuild = $false" in block
+    assert start < src.index(
+        "Stale venv detected ($reason) -- rebuilding"
+    ), "the in-place route must be chosen before the rebuild branch runs"
+
+
+def test_setup_ps1_direct_update_in_place_route_is_the_last_escape():
+    """The in-place route's condition is true for EVERY stale direct update -- the desktop always
+    runs setup from inside the venv -- so it has to be the last escape tested or it consumes
+    $shouldRebuild before the narrower ones are reached and they can never fire.
+
+    The nvidia-smi guard is the one that makes this load-bearing rather than tidy. It also
+    publishes $script:PreservedInstallerTorchTag, which is what keeps the index selection on the
+    cu* arm. Ordered ahead of it, the in-place route leaves that tag unset while setting
+    $script:PinChangedForceReinstall, and the pair force-installs a CPU wheel over the working
+    cu* venv the guard exists to protect (#9857)."""
+    src = SETUP_PS1.read_text(encoding = "utf-8")
+    in_place = src.index(
+        "if ($shouldRebuild -and -not $InstallerManagedSetup) {\n"
+        "        $_hostPy = Get-SetupHostInterpreterInVenv -VenvDir $VenvDir"
+    )
+    nvidia_guard = src.index("nvidia-smi did not answer, but this venv holds a")
+    assert nvidia_guard < in_place, (
+        "the nvidia-smi cu* preservation guard must be tested BEFORE the in-place route, "
+        "or a silent nvidia-smi probe downgrades a working cu* venv to CPU torch"
+    )
+    # Every other escape that can clear $shouldRebuild on a direct update belongs ahead of it too.
+    for earlier in (
+        "Keeping the installed Intel XPU environment",
+        "Torch-index pin changed",
+        "CUDA family $installedTorchTag does not cover this host",
+    ):
+        assert (
+            src.index(earlier) < in_place
+        ), f"{earlier!r} must be tested before the in-place route"
+
+
+def test_setup_ps1_stale_sweep_runs_outside_the_rebuild_branch():
+    """The sweep collects leftovers from an earlier move-aside whose delete a lock cut short. Inside
+    the rebuild branch it would never run for the install that needs it most: one that renamed a
+    venv aside, failed to delete the copy, and thereafter always takes an in-place route."""
+    src = SETUP_PS1.read_text(encoding = "utf-8")
+    sweep = src.index("$_staleShape = ")
+    rebuild = src.index("Stale venv detected ($reason) -- rebuilding")
+    assert sweep < rebuild, "the stale-venv sweep must run whether or not this run rebuilds"
+    # Running ahead of the custom-root guard, the sweep cannot lean on it: it has to establish on
+    # its own that a directory is our litter, the way install.ps1's rollback sweep does.
+    block = src[sweep : src.index("if ($shouldRebuild) {", sweep)]
+    assert "ReparsePoint" in block, "the sweep must refuse reparse points"
+    assert "Get-Process -Id $_ownerPid" in block, "the sweep must spare a live owner's rescue copy"
+    assert "[0-9]{14}-([0-9]+)$" in block, "the sweep must only match the generated name shape"
+    # A second rebuild inside the same second must not collide on the destination name.
+    stale_leaf = src[src.index("$_staleLeaf = ") : src.index("\n", src.index("$_staleLeaf = "))]
+    assert "$PID" in stale_leaf, f"stale destination needs a per-process suffix, got {stale_leaf!r}"
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason = "needs pwsh")
+def test_setup_ps1_stale_sweep_only_removes_its_own_litter(tmp_path):
+    """Runs the shipped sweep, rather than reading it. The wildcard it enumerates under would
+    happily match a user's own `unsloth_studio.stale-backup`, and the sweep runs ahead of the
+    custom-root guard, so nothing downstream would stop it."""
+    src = SETUP_PS1.read_text(encoding = "utf-8")
+    start = src.index("    $_venvParent = Split-Path -Parent $VenvDir")
+    sweep = src[start : src.index("\n\n", start)]
+
+    home = tmp_path / "studio"
+    venv = home / "unsloth_studio"
+    (venv / "Lib").mkdir(parents = True)
+    dead_pid = 999999  # no such process; this copy is ours and abandoned
+    ours = home / f"unsloth_studio.stale-20260101000000-{dead_pid}"
+    theirs = home / "unsloth_studio.stale-backup"
+    live = home / f"unsloth_studio.stale-20260101000000-{os.getpid()+0}"
+    for d in (ours, theirs, live):
+        d.mkdir()
+    # `live` names this pytest process, which is alive, so it stands in for a concurrent setup's
+    # rescue copy. Our own $PID inside pwsh differs, so the sweep sees a live foreign owner.
+    script = tmp_path / "sweep.ps1"
+    script.write_text(f'$VenvDir = "{venv.as_posix()}"\n' + sweep + "\n", encoding = "utf-8")
+    subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(script)],
+        check = True,
+        capture_output = True,
+    )
+
+    assert not ours.exists(), "an abandoned copy in the generated name shape must be swept"
+    assert theirs.exists(), "a directory outside the generated name shape must be left alone"
+    assert live.exists(), "a copy whose owning process is still alive must be left alone"
+    assert venv.exists(), "the sweep must never touch the live venv"
+
+
+def _extract_setup_ps1_function(name: str) -> str:
+    src = SETUP_PS1.read_text(encoding = "utf-8")
+    m = re.search(rf"^function {re.escape(name)} \{{.*?\n\}}\n", src, re.DOTALL | re.MULTILINE)
+    assert m, f"setup.ps1 function {name} not found"
+    return m.group(0)
+
+
+@pytest.mark.skipif(shutil.which("pwsh") is None, reason = "needs pwsh")
+class TestSetupHostInterpreterInVenv:
+    """The shipped helper, run for real: the CLI's hint, a foreign interpreter, and (on Windows)
+    the process walk that finds a venv python.exe above setup when no hint was passed."""
+
+    @pytest.fixture
+    def probe(self, tmp_path):
+        venv = tmp_path / "unsloth_studio"
+        subprocess.run(
+            [sys.executable, "-m", "venv", "--without-pip", str(venv)],
+            check = True,
+            capture_output = True,
+        )
+        script = tmp_path / "probe.ps1"
+        script.write_text(
+            _extract_setup_ps1_function("Get-SetupHostInterpreterInVenv")
+            + "$r = Get-SetupHostInterpreterInVenv -VenvDir $args[0]\n"
+            + "if ($r) { Write-Output \"RESULT=$r\" } else { Write-Output 'RESULT=<null>' }\n",
+            encoding = "utf-8",
+        )
+
+        def run(hint: str | None = None, launcher: str | None = None) -> str:
+            env = {k: v for k, v in os.environ.items() if k != "UNSLOTH_SETUP_HOST_PYTHON"}
+            if hint is not None:
+                env["UNSLOTH_SETUP_HOST_PYTHON"] = hint
+            cmd = [
+                "pwsh",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(script),
+                str(venv),
+            ]
+            if launcher is not None:
+                # setup.ps1's real parent: a python that subprocess-runs PowerShell, as the CLI does.
+                cmd = [
+                    launcher,
+                    "-c",
+                    "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))",
+                    *cmd,
+                ]
+            out = subprocess.run(cmd, env = env, text = True, capture_output = True, timeout = 120)
+            assert out.returncode == 0, out.stdout + out.stderr
+            return out.stdout.strip().splitlines()[-1]
+
+        return venv, run
+
+    @staticmethod
+    def _venv_python(venv: Path) -> Path:
+        return venv / "Scripts" / "python.exe" if os.name == "nt" else venv / "bin" / "python"
+
+    def test_the_cli_hint_names_the_venv_interpreter(self, probe):
+        venv, run = probe
+        inside = str(self._venv_python(venv))
+        assert run(hint = inside) == f"RESULT={inside}"
+
+    def test_an_interpreter_outside_the_venv_is_not_reported(self, probe):
+        _venv, run = probe
+        assert run(hint = sys.executable) == "RESULT=<null>"
+        assert run() == "RESULT=<null>"
+
+    @pytest.mark.skipif(os.name != "nt", reason = "the process walk reads Win32_Process")
+    def test_a_venv_python_parent_is_found_without_the_hint(self, probe):
+        venv, run = probe
+        inside = self._venv_python(venv)
+        assert run(launcher = str(inside)) == f"RESULT={inside}"
 
 
 def test_setup_sh_prebuilt_llama_cpp_has_ownership_guard():

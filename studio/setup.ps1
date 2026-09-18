@@ -187,6 +187,45 @@ function Exit-SetupFailure {
     exit $Code
 }
 
+# The interpreter this setup was launched from, when it lives inside $VenvDir; $null otherwise.
+# `unsloth studio update` names its own sys.executable as UNSLOTH_SETUP_HOST_PYTHON; the process
+# walk covers an older CLI and any wrapper that runs the venv's python.exe by hand. Windows keeps
+# a running image undeletable, so a stale-venv wipe issued from inside the venv guts Lib\ and
+# then fails on Scripts\python.exe: callers repair such an environment in place instead.
+function Get-SetupHostInterpreterInVenv {
+    param([Parameter(Mandatory = $true)][string]$VenvDir)
+    $root = $null
+    # DirectorySeparatorChar, not a literal '\': .NET on Linux and macOS returns '/'-separated
+    # paths from GetFullPath and treats '\' as an ordinary filename character, so a hardcoded
+    # backslash builds a prefix no candidate can match and the helper answers $null for every
+    # input. Only Windows runs this script for real, but the shipped pwsh tests run everywhere.
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    try { $root = [System.IO.Path]::GetFullPath($VenvDir).TrimEnd('\', '/') + $sep } catch { return $null }
+    $inside = {
+        param([string]$Candidate)
+        if ([string]::IsNullOrWhiteSpace($Candidate)) { return $false }
+        try { $full = [System.IO.Path]::GetFullPath($Candidate) } catch { return $false }
+        return $full.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)
+    }
+    if (& $inside $env:UNSLOTH_SETUP_HOST_PYTHON) { return $env:UNSLOTH_SETUP_HOST_PYTHON }
+    try {
+        $byPid = @{}
+        foreach ($row in @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop)) {
+            $byPid[[int]$row.ProcessId] = $row
+        }
+        $cur = [int]$PID
+        # Bounded: ParentProcessId can name a reused id once the real parent is gone.
+        for ($hop = 0; $hop -lt 8 -and $byPid.ContainsKey($cur); $hop++) {
+            $row = $byPid[$cur]
+            if (& $inside $row.ExecutablePath) { return $row.ExecutablePath }
+            $parent = [int]$row.ParentProcessId
+            if ($parent -le 0 -or $parent -eq $cur) { break }
+            $cur = $parent
+        }
+    } catch { }
+    return $null
+}
+
 # Detect if running from pip install (no frontend/ dir in studio)
 $FrontendDir = Join-Path $ScriptDir "frontend"
 $OxcValidatorDir = Join-Path $ScriptDir "backend\core\data_recipe\oxc-validator"
@@ -6127,6 +6166,58 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
         $script:PreservedInstallerTorchTag = $installedTorchTag
     }
 
+    # A direct `unsloth studio update` has the same shape as the installer-managed case: the CLI is
+    # this script's parent and runs from the venv's own python.exe, which Windows will not delete
+    # while it runs. The wipe below therefore emptied Lib\ and stopped at Scripts\python.exe,
+    # leaving a venv with no unsloth_cli, no rollback copy, and a desktop whose update AND repair
+    # both start from that interpreter (#11247).
+    # Detected rather than assumed: setup.ps1 run by hand from a checkout has no interpreter inside
+    # the venv and keeps the full rebuild.
+    # LAST of the direct-update escapes, and that placement is load-bearing. This block's condition
+    # is true for every stale direct update -- the desktop always runs setup from inside the venv --
+    # so ahead of the narrower escapes it would consume $shouldRebuild before they were tested and
+    # they could never fire. The nvidia-smi guard above is the one that matters: it ALSO publishes
+    # $script:PreservedInstallerTorchTag, and without it the index selection rescans, sees no
+    # NVIDIA, and pairs the $PinChangedForceReinstall set here with the /cpu arm -- force-installing
+    # a CPU wheel over the working cu* venv that guard exists to protect (#9857).
+    if ($shouldRebuild -and -not $InstallerManagedSetup) {
+        $_hostPy = Get-SetupHostInterpreterInVenv -VenvDir $VenvDir
+        if ($_hostPy) {
+            substep "Environment does not match this host ($reason) -- reinstalling PyTorch in place." "Yellow"
+            substep "setup is running from $_hostPy, which cannot be replaced while it runs." "DarkGray"
+            $script:PinChangedForceReinstall = $true
+            $shouldRebuild = $false
+        }
+    }
+
+    # Sweep leftovers from an earlier move-aside whose delete a lock cut short. Outside the rebuild
+    # branch on purpose: an install that renames a venv aside, fails to delete the copy, and
+    # thereafter always takes an in-place route would never reach a sweep that lived inside the
+    # branch, and a multi-GB venv would sit there for good.
+    #
+    # Validated the way install.ps1 validates its own rollback sweep
+    # (Test-StudioVenvRollbackMustBePreserved), and for the same reasons. "$_venvLeaf.stale-*" is a
+    # wildcard, not a proof of ownership: a user's own unsloth_studio.stale-backup would match it,
+    # and this sweep runs ahead of the custom-root guard below, so that guard cannot cover it.
+    # Three refusals: anything outside the exact generated timestamp-PID shape, a reparse point,
+    # and a copy whose owning process is still alive -- that last one is a concurrent setup's
+    # rescue copy, not our litter.
+    $_venvParent = Split-Path -Parent $VenvDir
+    $_venvLeaf = Split-Path -Leaf $VenvDir
+    $_staleShape = '^' + [regex]::Escape($_venvLeaf) + '\.stale-[0-9]{14}-([0-9]+)$'
+    # [regex]::Match rather than -notmatch plus $Matches: which of -match and -notmatch fills
+    # $Matches, and on which result, is exactly the kind of thing that differs between Windows
+    # PowerShell 5.1 and 7.x, and this reads a capture group to decide what to delete.
+    foreach ($_old in @(Get-ChildItem -LiteralPath $_venvParent -Directory -Force -ErrorAction SilentlyContinue)) {
+        $_staleMatch = [regex]::Match($_old.Name, $_staleShape)
+        if (-not $_staleMatch.Success) { continue }
+        if (($_old.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { continue }
+        $_ownerPid = 0
+        if (-not [int]::TryParse($_staleMatch.Groups[1].Value, [ref]$_ownerPid)) { continue }
+        if ($_ownerPid -ne $PID -and $null -ne (Get-Process -Id $_ownerPid -ErrorAction SilentlyContinue)) { continue }
+        Remove-Item -LiteralPath $_old.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     if ($shouldRebuild) {
         substep "Stale venv detected ($reason) -- rebuilding..." "Yellow"
         # why: mirror install.ps1 env-mode guard so an update against a custom
@@ -6146,12 +6237,25 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
             Write-StudioLine "        Move it aside or choose an empty UNSLOTH_STUDIO_HOME before re-running." -ForegroundColor Yellow
             Exit-SetupFailure "$VenvDir is not an Unsloth Studio environment"
         }
+        # Moved aside, then deleted: a rename takes the whole tree or fails and leaves it intact,
+        # where Remove-Item -Recurse deletes up to the first locked file and leaves an environment
+        # that can neither start nor update itself. The moved copy goes best-effort; whatever a
+        # lock keeps behind is swept at the top of the next run.
+        # The pid joins the timestamp so two rebuilds inside the same second cannot collide on the
+        # destination and fail the rename on a name that is merely already taken.
+        $_staleLeaf = "$_venvLeaf.stale-$(Get-Date -Format 'yyyyMMddHHmmss')-$PID"
         try {
-            Remove-Item -LiteralPath $VenvDir -Recurse -Force -ErrorAction Stop
+            Rename-Item -LiteralPath $VenvDir -NewName $_staleLeaf -ErrorAction Stop
         } catch {
-            Write-StudioLine "   [ERROR] Could not remove stale venv: $($_.Exception.Message)" -ForegroundColor Red
-            Write-StudioLine "           Close any running Unsloth/Python processes and re-run setup." -ForegroundColor Red
+            Write-StudioLine "   [ERROR] Could not move the stale venv aside: $($_.Exception.Message)" -ForegroundColor Red
+            Write-StudioLine "           The environment was left as it was. Close any running Unsloth/Python processes and re-run setup." -ForegroundColor Red
             Exit-SetupFailure "Could not remove the stale environment at $VenvDir"
+        }
+        $_staleDir = Join-Path $_venvParent $_staleLeaf
+        try {
+            Remove-Item -LiteralPath $_staleDir -Recurse -Force -ErrorAction Stop
+        } catch {
+            substep "Could not fully remove the old environment ($($_.Exception.Message)); left at $_staleDir for the next run to sweep." "Yellow"
         }
     }
 }
