@@ -39,8 +39,8 @@ jobs:
           $sweep = $src.Substring($start, $src.IndexOf("`n`n", $start) - $start)
 
           function New-Case {
-            param($Home, $Name, [switch]$WithVenvCfg, [switch]$WithStaleMarker, [switch]$Foreign)
-            $d = Join-Path $Home $Name
+            param($RootDir, $Name, [switch]$WithVenvCfg, [switch]$WithStaleMarker, [switch]$Foreign)
+            $d = Join-Path $RootDir $Name
             New-Item -ItemType Directory -Force -Path $d | Out-Null
             if ($WithVenvCfg) { Set-Content -LiteralPath (Join-Path $d "pyvenv.cfg") -Value "home = C:\" }
             if ($WithStaleMarker) { Set-Content -LiteralPath (Join-Path $d ".unsloth-studio-stale") -Value "" }
@@ -49,11 +49,11 @@ jobs:
           }
 
           function Invoke-Sweep {
-            param($Home, $Venv, [bool]$Custom)
+            param($RootDir, $Venv, [bool]$Custom)
             $script = Join-Path $env:RUNNER_TEMP ("sweep-" + [guid]::NewGuid().ToString("N") + ".ps1")
             $pre = @(
               "`$VenvDir = '$Venv'"
-              "`$StudioHome = '$Home'"
+              "`$StudioHome = '$RootDir'"
               "`$StudioHomeIsCustom = `$$($Custom.ToString().ToLower())"
               "`$StudioOwnedMarker = '.unsloth-studio-owned'"
               "`$StudioStaleMarker = '.unsloth-studio-stale'"
@@ -68,13 +68,13 @@ jobs:
           $home1 = Join-Path $env:RUNNER_TEMP ("home-" + [guid]::NewGuid().ToString("N"))
           $venv1 = Join-Path $home1 "unsloth_studio"
           New-Item -ItemType Directory -Force -Path $venv1 | Out-Null
-          $ours      = New-Case -Home $home1 -Name "unsloth_studio.stale-20260101000000-999999" -WithVenvCfg
-          $suffixed  = New-Case -Home $home1 -Name "unsloth_studio.stale-20260101000000-999999-1" -WithVenvCfg
-          $stamped   = New-Case -Home $home1 -Name "unsloth_studio.stale-20260101000001-999999" -WithStaleMarker
-          $shaped    = New-Case -Home $home1 -Name "unsloth_studio.stale-20260101000002-999999" -Foreign
-          $backup    = New-Case -Home $home1 -Name "unsloth_studio.stale-backup" -Foreign
-          $livePid   = New-Case -Home $home1 -Name "unsloth_studio.stale-20260101000003-$PID" -WithVenvCfg
-          Invoke-Sweep -Home $home1 -Venv $venv1 -Custom $false
+          $ours      = New-Case -RootDir $home1 -Name "unsloth_studio.stale-20260101000000-999999" -WithVenvCfg
+          $suffixed  = New-Case -RootDir $home1 -Name "unsloth_studio.stale-20260101000000-999999-1" -WithVenvCfg
+          $stamped   = New-Case -RootDir $home1 -Name "unsloth_studio.stale-20260101000001-999999" -WithStaleMarker
+          $shaped    = New-Case -RootDir $home1 -Name "unsloth_studio.stale-20260101000002-999999" -Foreign
+          $backup    = New-Case -RootDir $home1 -Name "unsloth_studio.stale-backup" -Foreign
+          $livePid   = New-Case -RootDir $home1 -Name "unsloth_studio.stale-20260101000003-$PID" -WithVenvCfg
+          Invoke-Sweep -RootDir $home1 -Venv $venv1 -Custom $false
           "abandoned copy with pyvenv.cfg swept : " + (-not (Test-Path -LiteralPath $ours))
           "collision-suffixed copy swept        : " + (-not (Test-Path -LiteralPath $suffixed))
           "copy known only by the marker swept  : " + (-not (Test-Path -LiteralPath $stamped))
@@ -87,11 +87,11 @@ jobs:
           $home2 = Join-Path $env:RUNNER_TEMP ("custom-" + [guid]::NewGuid().ToString("N"))
           $venv2 = Join-Path $home2 "unsloth_studio"
           New-Item -ItemType Directory -Force -Path $venv2 | Out-Null
-          $litter = New-Case -Home $home2 -Name "unsloth_studio.stale-20260101000000-999999" -WithVenvCfg
-          Invoke-Sweep -Home $home2 -Venv $venv2 -Custom $true
+          $litter = New-Case -RootDir $home2 -Name "unsloth_studio.stale-20260101000000-999999" -WithVenvCfg
+          Invoke-Sweep -RootDir $home2 -Venv $venv2 -Custom $true
           "unclaimable custom root left alone   : " + (Test-Path -LiteralPath $litter)
           Set-Content -LiteralPath (Join-Path $venv2 ".unsloth-studio-owned") -Value ""
-          Invoke-Sweep -Home $home2 -Venv $venv2 -Custom $true
+          Invoke-Sweep -RootDir $home2 -Venv $venv2 -Custom $true
           "control, once marked ours, swept     : " + (-not (Test-Path -LiteralPath $litter))
 
       - name: the rename takes a suffix when the destination is taken
