@@ -1,0 +1,33 @@
+name: "basearm-10473 ubuntu-latest"
+on:
+  push:
+    branches: ["pr-10473-basearm-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      # The base arm: PURE upstream main, no PR 10473 merged. Same runner, same deps, same
+      # scoping as the PR arm, restricted to the one file that exists on both sides. If
+      # TestProgressStepCountMatchesTotal fails HERE too, the 17 failures on the PR arm are
+      # this runner and not the PR; if it passes here, they are the PR and must be fixed.
+      - run: PYTHONPATH=studio/backend python -m pytest tests/studio/install/test_rocm_support.py -q --tb=short -k 'TestProgressStepCountMatchesTotal'
