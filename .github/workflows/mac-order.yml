@@ -1,0 +1,28 @@
+name: mac order detail
+on:
+  push:
+    branches: [pr-11209-xplat-ci]
+  workflow_dispatch:
+jobs:
+  order:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - name: The same five files together, full tracebacks
+        run: |
+          PYTHONPATH=studio/backend python -m pytest \
+            studio/backend/tests/test_account_tool_confinement.py \
+            studio/backend/tests/test_bootstrap_banner_password_visibility.py \
+            studio/backend/tests/test_bypass_permissions.py \
+            studio/backend/tests/test_sandbox_files_and_storage_roots.py \
+            studio/backend/tests/test_tool_output_streaming.py \
+            --tb=long -rf -q -k "missing_path_hint or grandchild or streaming or cancel" || true
+      - name: Only test_tool_output_streaming, whole file
+        run: |
+          PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_tool_output_streaming.py \
+            --tb=long -rf -q || true
