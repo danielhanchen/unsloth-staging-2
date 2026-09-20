@@ -27,6 +27,12 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci
       - name: Node tests
         working-directory: studio/frontend
         run: node --experimental-strip-types --test tests/research-open-run.test.ts
+      - name: Full frontend suite
+        working-directory: studio/frontend
+        run: npm test
