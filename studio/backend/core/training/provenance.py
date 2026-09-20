@@ -195,7 +195,7 @@ def _snapshot_declares_quantization(snapshot: Path) -> bool:
 
 
 def _resolved_model_snapshot_file(snapshot: Path, path: Path) -> Optional[Path]:
-    from hub.utils.hf_cache_state import same_existing_path
+    from hub.utils.hf_cache_state import same_existing_path, trusted_blob_roots
 
     try:
         snapshot = snapshot.resolve(strict = True)
@@ -208,8 +208,7 @@ def _resolved_model_snapshot_file(snapshot: Path, path: Path) -> Optional[Path]:
         return None
     if not resolved.is_file() or not (
         resolved.is_relative_to(snapshot)
-        or resolved.is_relative_to(repo_dir / "blobs")
-        or resolved.is_relative_to(repo_dir.parent / "blobs")
+        or any(resolved.is_relative_to(root) for root in trusted_blob_roots(repo_dir))
     ):
         return None
     try:

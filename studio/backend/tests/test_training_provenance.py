@@ -635,8 +635,24 @@ def test_exact_model_snapshot_accepts_own_blob_symlink(tmp_path):
     assert exact_model_snapshot_path(str(snapshot), "org/model") == str(snapshot.resolve())
 
 
-def _shared_store_blob_symlink(repo: Path, link: Path, payload: bytes) -> Path:
+def _mark_shared_store(cache_root: Path) -> Path:
+    """Write the ownership marker hub puts at the root of a store it created.
+
+    Without it the directory is just a folder named ``blobs``, and a fixture that omits it
+    proves acceptance of any such folder rather than of hub's store.
+    """
+    store = cache_root / "blobs"
+    store.mkdir(parents = True, exist_ok = True)
+    (store / ".huggingface-shared-blobs").write_text("1\n")
+    return store
+
+
+def _shared_store_blob_symlink(
+    repo: Path, link: Path, payload: bytes, *, marked: bool = True
+) -> Path:
     sha = "c791637d" * 8
+    if marked:
+        _mark_shared_store(repo.parent)
     shared = repo.parent / "blobs" / sha[:2] / sha
     shared.parent.mkdir(parents = True, exist_ok = True)
     shared.write_bytes(payload)
@@ -653,6 +669,37 @@ def test_exact_model_snapshot_accepts_hub_shared_blob_store(tmp_path):
     _shared_store_blob_symlink(snapshot.parent.parent, snapshot / "model.safetensors", b"weights")
 
     assert exact_model_snapshot_path(str(snapshot), "org/model") == str(snapshot.resolve())
+
+
+def test_exact_model_snapshot_rejects_unmarked_blobs_dir(tmp_path):
+    """A folder called ``blobs`` beside the repo is not hub's shared store.
+
+    Only hub creates that store, and it marks what it created. Trusting the name alone would
+    make every readable file under it attestable, which is a wider set than the cache ever holds.
+    """
+    snapshot = _model_snapshot(tmp_path, "org/model", "unmarked", weights = False)
+    _shared_store_blob_symlink(
+        snapshot.parent.parent, snapshot / "model.safetensors", b"weights", marked = False
+    )
+
+    assert exact_model_snapshot_path(str(snapshot), "org/model") is None
+
+
+def test_exact_model_snapshot_rejects_symlinked_shared_store(tmp_path):
+    """A ``blobs`` leaf that is itself a symlink is not a store hub owns.
+
+    ``is_shared_blobs_dir`` lstats the leaf, so hub never adopts one and never publishes into
+    it. Sizing asks the same question, so the two cannot disagree and leave a model whose size
+    displays but whose run will not resume.
+    """
+    snapshot = _model_snapshot(tmp_path, "org/model", "relocated", weights = False)
+    elsewhere = tmp_path / "another-volume"
+    elsewhere.mkdir()
+    (tmp_path / "blobs").symlink_to(elsewhere)
+    (elsewhere / ".huggingface-shared-blobs").write_text("1\n")
+    _shared_store_blob_symlink(snapshot.parent.parent, snapshot / "model.safetensors", b"weights")
+
+    assert exact_model_snapshot_path(str(snapshot), "org/model") is None
 
 
 @pytest.mark.parametrize("target", ["outside-cache", "other-repo-blobs"])
@@ -889,6 +936,31 @@ def test_loaded_hub_dataset_accepts_hub_shared_blob_store(tmp_path):
 
     assert attest_loaded_dataset("org/dataset", loaded) == (str(snapshot.resolve()), None)
     assert exact_dataset_snapshot_path(str(snapshot), "org/dataset") == str(snapshot.resolve())
+
+
+@pytest.mark.parametrize("target", ["outside-cache", "other-repo-blobs", "unmarked-blobs"])
+def test_loaded_hub_dataset_rejects_blob_symlink_escaping_repo(
+    tmp_path, tmp_path_factory, target
+):
+    """The dataset predicate was widened exactly as the model one was, so it is bounded the same."""
+    repo = tmp_path / "datasets--org--dataset"
+    snapshot = repo / "snapshots" / "dataset-commit"
+    snapshot.mkdir(parents = True)
+    if target == "unmarked-blobs":
+        _shared_store_blob_symlink(repo, snapshot / "train.parquet", b"dataset", marked = False)
+    else:
+        if target == "outside-cache":
+            escaped = tmp_path_factory.mktemp("elsewhere") / "blobs" / "c7" / "train.parquet"
+        else:
+            escaped = tmp_path / "datasets--org--other" / "blobs" / "train.parquet"
+        escaped.parent.mkdir(parents = True)
+        escaped.write_bytes(b"dataset")
+        repo_blob = repo / "blobs" / "dataset-blob"
+        repo_blob.parent.mkdir(parents = True)
+        repo_blob.symlink_to(escaped)
+        (snapshot / "train.parquet").symlink_to(os.path.relpath(repo_blob, snapshot))
+
+    assert exact_dataset_snapshot_path(str(snapshot), "org/dataset") is None
 
 
 def test_loaded_hub_dataset_rejects_local_source_symlink_outside_repo(tmp_path):

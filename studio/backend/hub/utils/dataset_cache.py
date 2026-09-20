@@ -20,6 +20,7 @@ from hub.utils.hf_cache_state import (
     iter_repo_cache_dirs,
     ref_snapshot_dir,
     same_existing_path,
+    trusted_blob_roots,
     validated_repo_cache_path,
 )
 from utils.paths.path_utils import drop_appledouble_metadata, is_appledouble_metadata
@@ -279,8 +280,7 @@ def resolved_dataset_snapshot_file(snapshot: str | Path, source_path: str) -> Op
         return None
     if not resolved.is_file() or not (
         resolved.is_relative_to(snapshot_path)
-        or resolved.is_relative_to(repo_dir / "blobs")
-        or resolved.is_relative_to(repo_dir.parent / "blobs")
+        or any(resolved.is_relative_to(root) for root in trusted_blob_roots(repo_dir))
     ):
         return None
     try:

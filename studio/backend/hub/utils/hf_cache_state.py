@@ -142,6 +142,59 @@ def same_existing_path(first: Path, second: Path) -> bool:
         return False
 
 
+SHARED_BLOBS_MARKER_NAME = ".huggingface-shared-blobs"
+
+
+def _resolved_existing_dir(path: Path) -> Optional[Path]:
+    try:
+        return path.resolve(strict = True) if path.is_dir() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _is_hub_shared_blobs_dir(path: Path) -> bool:
+    """Is this huggingface_hub's own cache-wide shared blob store, not just a folder called ``blobs``?
+
+    Read from upstream rather than reimplemented: hub validates an ownership marker AND its
+    layout version, and a later hub may bump that version, so asking the installed hub keeps
+    us in step with the cache it actually writes. The literal marker check is the fallback for
+    a hub too old to export the helper -- such a hub also never creates the store, so the
+    fallback answers False and the caller behaves exactly as it did before 1.32.
+    """
+    try:
+        from huggingface_hub.utils._shared_blobs import is_shared_blobs_dir
+        return bool(is_shared_blobs_dir(path))
+    except Exception:
+        pass
+    try:
+        return path.is_dir() and (path / SHARED_BLOBS_MARKER_NAME).is_file()
+    except (OSError, ValueError):
+        return False
+
+
+def trusted_blob_roots(repo_dir: Path) -> tuple[Path, ...]:
+    """Resolved directories a file inside ``repo_dir``'s snapshot may legitimately resolve into.
+
+    The repo's own ``blobs``, plus huggingface_hub 1.32's cache-wide shared Xet store at
+    ``<cache_root>/blobs``: 1.32 turned each repo's ``blobs/<etag>`` into a symlink into that
+    store, so a weight file resolves outside its repo folder without leaving the cache.
+
+    Both roots are RESOLVED, because callers compare them against a fully resolved candidate.
+    Comparing against a literal path silently rejects the very files it is meant to admit when
+    a ``blobs`` leaf is a symlink, which is how a big shared store ends up on another volume.
+    """
+    roots: list[Path] = []
+    own = _resolved_existing_dir(repo_dir / "blobs")
+    if own is not None:
+        roots.append(own)
+    shared = repo_dir.parent / "blobs"
+    if _is_hub_shared_blobs_dir(shared):
+        resolved_shared = _resolved_existing_dir(shared)
+        if resolved_shared is not None and resolved_shared not in roots:
+            roots.append(resolved_shared)
+    return tuple(roots)
+
+
 def hf_cache_root(
     *,
     create: bool = False,

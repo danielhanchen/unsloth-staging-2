@@ -39,8 +39,16 @@ def _link_through_repo_blob(snapshot: Path, name: str, target: Path) -> None:
     (snapshot / name).symlink_to(os.path.relpath(repo_blob, snapshot))
 
 
+def _mark_shared_store(cache_root: Path) -> None:
+    """The ownership marker hub writes at the root of a store it created."""
+    store = cache_root / "blobs"
+    store.mkdir(parents = True, exist_ok = True)
+    (store / ".huggingface-shared-blobs").write_text("1\n")
+
+
 def test_model_size_counts_weights_in_the_hub_shared_blob_store(tmp_path):
     snapshot = _snapshot(tmp_path, "org/model")
+    _mark_shared_store(tmp_path)
     sha = "8788269b" * 8
     shared = tmp_path / "blobs" / sha[:2] / sha
     shared.parent.mkdir(parents = True)
@@ -48,6 +56,38 @@ def test_model_size_counts_weights_in_the_hub_shared_blob_store(tmp_path):
     _link_through_repo_blob(snapshot, "model.safetensors", shared)
 
     assert models_route._get_snapshot_model_size_bytes(str(snapshot)) == len(WEIGHTS)
+
+
+def test_model_size_ignores_a_weight_under_an_unmarked_blobs_dir(tmp_path):
+    """Sizing trusts the same roots attestation does, so a bare ``blobs`` folder is not one."""
+    snapshot = _snapshot(tmp_path, "org/model")
+    sha = "8788269b" * 8
+    unmarked = tmp_path / "blobs" / sha[:2] / sha
+    unmarked.parent.mkdir(parents = True)
+    unmarked.write_bytes(WEIGHTS)
+    _link_through_repo_blob(snapshot, "model.safetensors", unmarked)
+
+    assert models_route._get_snapshot_model_size_bytes(str(snapshot)) is None
+
+
+def test_model_size_ignores_a_weight_in_a_symlinked_shared_store(tmp_path):
+    """Sizing and attestation answer the same question about a symlinked ``blobs`` leaf.
+
+    Before, sizing accepted it and attestation did not, so the model reported a size while its
+    run stayed unresumable and said the revision was not attested.
+    """
+    snapshot = _snapshot(tmp_path, "org/model")
+    elsewhere = tmp_path / "another-volume"
+    elsewhere.mkdir()
+    (tmp_path / "blobs").symlink_to(elsewhere)
+    (elsewhere / ".huggingface-shared-blobs").write_text("1\n")
+    sha = "8788269b" * 8
+    shared = elsewhere / sha[:2] / sha
+    shared.parent.mkdir(parents = True)
+    shared.write_bytes(WEIGHTS)
+    _link_through_repo_blob(snapshot, "model.safetensors", shared)
+
+    assert models_route._get_snapshot_model_size_bytes(str(snapshot)) is None
 
 
 def test_model_size_still_counts_a_weight_in_the_repos_own_blobs(tmp_path):

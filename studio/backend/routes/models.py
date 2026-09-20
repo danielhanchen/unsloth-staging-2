@@ -2081,14 +2081,12 @@ def _get_snapshot_model_size_bytes(snapshot_path: str) -> Optional[int]:
         repo_dir = snapshots_dir.parent.resolve(strict = True)
         if not snapshot.is_dir() or snapshots_dir.name != "snapshots" or not repo_dir.is_dir():
             return None
-        blobs_dir = repo_dir / "blobs"
-        resolved_blobs_dir = blobs_dir.resolve(strict = True) if blobs_dir.is_dir() else None
-        # hub 1.x keeps one content-addressed blob store per cache root and links each repo's
-        # blobs into it, so a weight file resolves outside the repo without leaving the cache.
-        shared_blobs_dir = repo_dir.parent / "blobs"
-        resolved_shared_blobs_dir = (
-            shared_blobs_dir.resolve(strict = True) if shared_blobs_dir.is_dir() else None
-        )
+        # The repo's own blobs, plus hub 1.32's cache-wide shared store: it links each repo's
+        # blobs into one content-addressed folder per cache root, so a weight file resolves
+        # outside the repo without leaving the cache. Same roots the attestation check trusts.
+        from hub.utils.hf_cache_state import trusted_blob_roots
+
+        blob_roots = trusted_blob_roots(repo_dir)
     except (OSError, RuntimeError, ValueError):
         return None
 
@@ -2114,8 +2112,7 @@ def _get_snapshot_model_size_bytes(snapshot_path: str) -> Optional[int]:
                     if not candidate.is_file():
                         continue
                     if not candidate.is_relative_to(snapshot) and not any(
-                        blob_root is not None and candidate.is_relative_to(blob_root)
-                        for blob_root in (resolved_blobs_dir, resolved_shared_blobs_dir)
+                        candidate.is_relative_to(blob_root) for blob_root in blob_roots
                     ):
                         continue
                     total += candidate.stat().st_size
