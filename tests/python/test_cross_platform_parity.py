@@ -1516,3 +1516,494 @@ class TestInstallUvCacheRootParity:
         assert "Set-StudioUvCacheForLaunch" in source
         assert "Set-Item -LiteralPath Env:UV_CACHE_DIR -Value $PreviousValue" in source
         assert "Remove-Item -LiteralPath Env:UV_CACHE_DIR" in source
+
+
+class TestOffVolumeCacheNoticeParity:
+    """The notice for a cache that could not be co-located has to name a remedy that exists,
+    and the same one on both installers. A caller's own UV_CACHE_DIR wins in the selector and
+    returns before --isolated-uv-cache is read at all, so naming that flag to a custom-cache
+    user sends them back for a byte-identical run that prints the notice again (#11313)."""
+
+    @pytest.mark.parametrize(
+        "path, mode_test",
+        [
+            (INSTALL_SH, '[ "${_UV_CACHE_MODE:-}" = custom ]'),
+            (INSTALL_PS1, '$script:StudioUvCacheMode -eq "custom"'),
+        ],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_custom_cache_is_not_told_to_pass_a_flag_it_ignores(self, path, mode_test):
+        text = path.read_text(encoding = "utf-8")
+        assert mode_test in text, f"{path.name} does not vary the remedy by cache mode"
+        assert (
+            "unset UV_CACHE_DIR" in text
+        ), f"{path.name} does not tell a custom-cache user what would change the answer"
+
+    def test_windows_still_records_the_finding_for_the_rollback_warning(self):
+        # Windows only. install.sh dropped its twin of this flag once _dir_size_kb learned to
+        # count blocks the tree actually owns, which answers the same question and answers it
+        # for a tree built by a previous run rather than for this one. The Windows estimate
+        # sums every file with no link count available, so there the gate still does work.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert text.count("$script:StudioRollbackCostsFullSize") >= 2
+        assert "_ROLLBACK_COSTS_FULL_SIZE" not in INSTALL_SH.read_text(
+            encoding = "utf-8"
+        ), "install.sh carries a mode flag nothing reads"
+
+
+class TestWindowsMountPointVolumes:
+    """A Windows volume can be mounted at a DIRECTORY rather than a drive letter. GetPathRoot
+    reduces C:\\studio to C:\\, so DriveInfo answers for the host drive and two paths on
+    different mounted volumes compare equal on their root: the rollback-space warning is then
+    suppressed or falsely emitted, and the cross-volume cache notice never fires. Win32_Volume
+    lists mount points by the path they are mounted at. Pinned by text because no host in CI
+    has a directory mount point to exercise (#11313)."""
+
+    def test_free_space_asks_the_mounted_volume_first(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert "Win32_Volume" in text, "install.ps1 does not consult the mount-point view"
+        helper = text.split("function Get-StudioFreeSpaceBytes", 1)[1].split(
+            "function Get-StudioTreeSizeBytes", 1
+        )[0]
+        assert (
+            "Get-StudioMountedVolume" in helper
+        ), "Get-StudioFreeSpaceBytes falls straight through to the drive root"
+        assert "DriveInfo" in helper, "the drive-root fallback was dropped"
+
+    def test_same_volume_compares_identity_not_root(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Test-StudioSameVolume", 1)[1].split("\n    }", 1)[0]
+        # DeviceID is the volume GUID. The mount path is not identity: one volume can be
+        # mounted in several places.
+        assert "DeviceID" in helper, "Test-StudioSameVolume still compares only the drive root"
+
+    def test_the_probe_is_gated_on_windows(self):
+        # CimCmdlets ships only on Windows, and this helper is reached on every platform.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Get-StudioMountedVolume", 1)[1].split("\n    }", 1)[0]
+        assert (
+            "$IsWindows" in helper and "Windows_NT" in helper
+        ), "Get-StudioMountedVolume would call Get-CimInstance off Windows"
+
+
+class TestDiskFullDiagnosisReachesTauri:
+    """The desktop installer and its Repair flow run with --tauri, and there the only thing the
+    UI and its logs ever see is the message handed to the ERROR_DEFAULT marker. A disk-full
+    diagnosis printed beside that message is one the desktop user never reads, which is the
+    scenario #11313 was reported from."""
+
+    def test_shell_folds_the_diagnosis_into_the_marker(self):
+        text = INSTALL_SH.read_text(encoding = "utf-8")
+        assert (
+            'tauri_log "ERROR_DEFAULT" "studio setup failed (exit code $_SETUP_EXIT)$_fail_suffix"'
+            in text
+        ), "install.sh keeps the disk-full diagnosis out of the Tauri message"
+
+    def test_windows_folds_the_diagnosis_into_the_failure_message(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert (
+            'Exit-InstallFailure "unsloth studio setup failed (exit code $setupExit)$_failSuffix"'
+            in text
+        ), "install.ps1 keeps the disk-full diagnosis out of the Tauri message"
+
+    def test_windows_measures_in_both_modes(self):
+        # The probe must sit OUTSIDE the non-Tauri console branch, or --tauri never measures.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        block = text.split("if ($setupExit -ne 0) {", 1)[1].split("Clear-TauriInstallError", 1)[0]
+        probe = block.index("$_failFree = Get-StudioFreeSpaceBytes")
+        guard = block.index("if (-not $TauriMode) {")
+        assert (
+            probe < guard
+        ), "the free-space probe runs only in the non-Tauri branch, so --tauri never measures"
+
+
+class TestDiskFullRemedyIsNotTheFlagAlreadyGiven:
+    """A run that already passed --no-rollback and still ran out of space must not be told to
+    re-run with --no-rollback: that copy was discarded before the install began, so the re-run
+    fails identically. Same rule as the pre-move space warning, at the other end of the install."""
+
+    @pytest.mark.parametrize(
+        "path, flag",
+        [
+            (INSTALL_SH, '[ "${_NO_ROLLBACK:-false}" = true ]'),
+            (INSTALL_PS1, "if ($script:StudioNoRollback)"),
+        ],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_the_remedy_varies_on_the_flag(self, path, flag):
+        text = path.read_text(encoding = "utf-8")
+        block = text.split("is very likely the cause", 1)[0][-1400:]
+        assert flag in block, f"{path.name} gives the same remedy whether or not the flag is set"
+
+    @pytest.mark.parametrize(
+        "path",
+        [INSTALL_SH, INSTALL_PS1],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_the_already_discarded_case_says_so(self, path):
+        text = path.read_text(encoding = "utf-8")
+        assert (
+            "already discarded by --no-rollback" in text
+        ), f"{path.name} does not tell an opted-out run that there is nothing left to reclaim"
+
+
+class TestNoCacheStillCostsAFullEnvironment:
+    """uv's --no-cache / UV_NO_CACHE gives uv a TEMPORARY cache it discards when the command
+    ends (docs.astral.sh/uv/concepts/cache: "a temporary cache directory if --no-cache was
+    requested"). Nothing the old environment's files could be shared with survives the install,
+    so keeping that tree costs its full size and the rollback-space warning has to fire even
+    though the cache path looks co-located. Windows only: install.sh answers the same question
+    by measuring blocks the tree owns, which does not depend on what mode THIS run picked."""
+
+    @pytest.mark.parametrize(
+        "path, probe",
+        [
+            (INSTALL_PS1, "Test-StudioUvNoCache"),
+        ],
+        ids = ["install.ps1"],
+    )
+    def test_no_cache_sets_the_full_size_flag(self, path, probe):
+        # Sliced on the block, not on a character window around a message: a window silently
+        # stops covering what it was written for as soon as anything is inserted above it.
+        text = path.read_text(encoding = "utf-8")
+        block = text.split("Set-StudioUvCacheEnvironment -StudioRoot", 1)[1].split(
+            "Bytecode compilation", 1
+        )[0]
+        flag = "StudioRollbackCostsFullSize"
+        assert probe in block, f"{path.name} does not consider no-cache mode before gating"
+        assert flag in block, f"{path.name} does not set the full-size flag for no-cache mode"
+
+
+class TestVolumeLookupsResolveLinks:
+    """Test-StudioSameVolume canonicalises because junctions and symlinks lie about which volume
+    a path is on. The free-space side has to as well, or a studio home behind a junction (or
+    under a junctioned profile) is measured on the link's host drive rather than the volume that
+    will hold the environment, suppressing or falsely emitting both disk warnings (#11313)."""
+
+    def test_both_volume_lookups_go_through_the_resolver(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert "function Resolve-StudioVolumeQueryPath" in text
+        for name, end in (
+            ("function Get-StudioMountedVolume", "function Get-StudioFreeSpaceBytes"),
+            ("function Get-StudioFreeSpaceBytes", "function Get-StudioTreeSizeBytes"),
+        ):
+            helper = text.split(name, 1)[1].split(end, 1)[0]
+            assert (
+                "Resolve-StudioVolumeQueryPath" in helper
+            ), f"{name} asks the lexical path, which a junction answers for the wrong volume"
+
+    def test_the_driveinfo_fallback_uses_the_resolved_path(self):
+        # The fallback is the path that runs off Windows and wherever CIM cannot answer.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Get-StudioFreeSpaceBytes", 1)[1].split(
+            "function Get-StudioTreeSizeBytes", 1
+        )[0]
+        assert (
+            "GetFullPath($queryPath)" in helper
+        ), "the DriveInfo fallback still measures the unresolved path"
+
+
+class TestNoRollbackDoesNotNarrowDeviceDetection:
+    """Opting out of the rollback copy must cost disk, never hardware. The Intel scan rescues an
+    adapter WMI cannot classify by asking the PREVIOUS environment's torch whether XPU works,
+    because the replacement venv has no torch yet; discarding that tree without taking the
+    verdict first routes an Arc machine to CPU wheels (#11313)."""
+
+    def test_the_verdict_is_taken_before_the_tree_is_deleted(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        discard = text.split("if ($script:StudioNoRollback) {", 1)[1].split(
+            'substep "previous environment discarded', 1
+        )[0]
+        probe = discard.index("Invoke-BoundedPythonProbe")
+        removal = discard.index("Remove-StudioVenvTreeWithRetry")
+        assert probe < removal, "the tree is deleted before its XPU verdict is taken"
+
+    def test_the_scan_reads_the_preserved_verdict(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert "$script:StudioPreservedXpuVerdict" in text
+        scan = text.split("$_xpuProbePy = $VenvPython", 1)[0][-900:]
+        assert (
+            "$script:StudioPreservedXpuVerdict" in scan
+        ), "the Intel scan never consults the verdict taken before the discard"
+
+    def test_the_probe_is_defined_before_the_rollback_that_calls_it(self):
+        # PowerShell binds a function when the statement defining it runs, so a helper defined
+        # after its caller is CommandNotFoundException at the call.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert text.index("function Invoke-BoundedPythonProbe") < text.index(
+            "function Start-StudioVenvRollback"
+        ), "Invoke-BoundedPythonProbe is defined after the function that calls it"
+
+
+class TestTheVolumeQueryIsBounded:
+    """install.ps1 documents, in Invoke-BoundedVideoControllerScan, that a CIM query can block
+    forever on a degraded WMI repository and that -ErrorAction and try/catch do not bound it.
+    The Win32_Volume lookup runs on every Windows install before the venv exists and only decides
+    the wording of a disk warning, so it takes the same treatment (#11313)."""
+
+    def test_it_runs_out_of_process_with_a_deadline(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Get-StudioVolumeList", 1)[1].split(
+            "function Get-StudioMountedVolume", 1
+        )[0]
+        assert (
+            "Start-Job" in helper and "Wait-Job" in helper and "-Timeout" in helper
+        ), "the Win32_Volume query is not bounded by a wall-clock deadline"
+        assert "Stop-Job" in helper, "a query past its deadline is never killed"
+
+    def test_nothing_queries_win32_volume_unbounded(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Get-StudioVolumeList", 1)[1].split(
+            "function Get-StudioMountedVolume", 1
+        )[0]
+        # Exactly one call site, and it is the bounded one.
+        assert (
+            text.count("Win32_Volume") == helper.count("Win32_Volume") + 1
+        ), "Win32_Volume is queried somewhere other than the bounded helper"
+
+    def test_the_answer_is_taken_once(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert (
+            "$script:StudioVolumeList = $null" in text
+        ), "the cached volume list is never reset, so `irm | iex` reuses a previous run's answer"
+
+
+class TestFreeSpaceIsNeverServedFromTheCache:
+    """The volume list is cached so a degraded WMI repository is paid for once, but FreeSpace in
+    a cached row is a snapshot. The failure handler asks after setup has consumed the disk, so a
+    number taken before the environment was built reports room that is gone and misses the
+    disk-full diagnosis this change exists to add (#11313)."""
+
+    def test_the_free_space_caller_asks_for_a_fresh_answer(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Get-StudioFreeSpaceBytes", 1)[1].split(
+            "function Get-StudioTreeSizeBytes", 1
+        )[0]
+        assert "-Fresh" in helper, "free space is served from a snapshot taken earlier in the run"
+
+    def test_the_identity_callers_do_not(self):
+        # Mount paths and volume GUIDs do not move during an install, so those keep the cache.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Test-StudioSameVolume", 1)[1].split("\n    }", 1)[0]
+        assert (
+            "-Fresh" not in helper
+        ), "the identity comparison re-queries WMI, which the cache exists to avoid"
+
+
+class TestVolumeLookupRefusesToGuess:
+    """Get-StudioFinalPath strips the \\\\?\\ prefix unconditionally and deliberately, so a volume
+    with no drive letter comes back as Volume{GUID}\\..., which is not rooted. GetFullPath would
+    anchor that to the current directory and match a volume that has nothing to do with the
+    install, which is worse than answering nothing (#11313)."""
+
+    def test_the_matcher_rejects_an_unrooted_path(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Select-StudioVolumeForPath", 1)[1].split(
+            "function Get-StudioVolumeList", 1
+        )[0]
+        assert "IsPathRooted" in helper, "the matcher anchors an unrooted path to the CWD"
+
+    def test_the_resolver_keeps_the_caller_path_when_resolution_is_unrooted(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Resolve-StudioVolumeQueryPath", 1)[1].split("\n    }", 1)[0]
+        assert (
+            "IsPathRooted" in helper
+        ), "the resolver hands on an unrooted result instead of the caller's own path"
+
+
+class TestRemovalIsConfirmedWithLinkAwareSemantics:
+    """Test-Path follows a Windows directory reparse point, so a dangling one that could not be
+    unlinked reads as absent and the retry helper reports a removal that did not happen. Its
+    callers act on that: the --no-rollback discard clears the rollback state and says the
+    environment is gone (#11313)."""
+
+    def test_the_retry_helper_uses_the_link_aware_check(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Remove-StudioVenvTreeWithRetry", 1)[1].split(
+            "\n    function ", 1
+        )[0]
+        assert (
+            "Test-StudioPathPresent" in helper
+        ), "the retry helper confirms removal with Test-Path, which a dangling link fools"
+        assert "if (-not (Test-Path -LiteralPath $Path))" not in helper
+
+
+class TestArm64MigrationDoesNotPromiseWhatTheFlagDeletes:
+    """The Windows-on-ARM rebuild tells the user the ARM64 environment is kept as
+    unsloth_studio.arm64.* so extra packages can be recovered. When no rollback has started yet
+    the migration calls Start-StudioVenvRollback itself, and under --no-rollback that call
+    discards, so the promise has to be gated on the flag and not only on an earlier discard."""
+
+    def test_the_promise_is_gated_on_the_flag_too(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        gate = text.split("the ARM64 environment is kept under", 1)[0][-400:]
+        assert (
+            "$script:StudioNoRollback" in gate
+        ), "the retention promise is printed on a run whose next call deletes the tree"
+
+    def test_a_discard_inside_the_migration_is_reported(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        arm = text.split("Start-StudioVenvRollback -ExistingDir $VenvDir\n                if (", 1)
+        assert len(arm) == 2, "the migration does not check what its own rollback call did"
+        assert "discarded by --no-rollback rather than kept" in arm[1][:900]
+
+
+class TestNoRollbackNeverPromisesAKeptCopy:
+    """Every message printed before a call that may discard has to vary on the flag. Three sites
+    promised a recoverable copy and then deleted it: the ordinary reinstall, the ARM64 mismatch
+    rebuild, and the Windows-on-ARM native-CUDA migration rebuild (#11313)."""
+
+    @pytest.mark.parametrize(
+        "path, flag",
+        [
+            (INSTALL_SH, '[ "${_NO_ROLLBACK:-false}" = true ]'),
+            (INSTALL_PS1, "if ($script:StudioNoRollback)"),
+        ],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_the_reinstall_message_varies(self, path, flag):
+        text = path.read_text(encoding = "utf-8")
+        before = text.split("preserving existing environment for rollback", 1)[0][-500:]
+        assert flag in before, f"{path.name} promises a rollback copy it may be about to discard"
+
+    def test_the_woa_migration_message_varies(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        before = text.split("the previous one is kept for rollback", 1)[0][-600:]
+        assert (
+            "$script:StudioNoRollback" in before
+        ), "the Windows-on-ARM migration rebuild promises a copy --no-rollback deletes"
+
+    def test_every_rollback_call_site_was_audited(self):
+        # If a fourth call site appears, this fails and the promise above it has to be checked.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert text.count("Start-StudioVenvRollback -ExistingDir") == 3
+
+
+class TestCopyLinkModeCostsAFullEnvironment:
+    """UV_LINK_MODE=copy makes uv copy from the cache even on one filesystem, so the old
+    environment shares nothing and keeping it costs its full size. clone reflinks, hardlink
+    links and symlink points at the cache; copy is the only mode that does not share (#11313).
+    Windows only, for the same reason as the no-cache gate: install.sh measures instead."""
+
+    @pytest.mark.parametrize(
+        "path, var",
+        [
+            (INSTALL_PS1, "$env:UV_LINK_MODE"),
+        ],
+        ids = ["install.ps1"],
+    )
+    def test_the_link_mode_is_considered(self, path, var):
+        text = path.read_text(encoding = "utf-8")
+        assert var in text, f"{path.name} infers sharing from volume identity alone"
+        flag = "StudioRollbackCostsFullSize"
+        window = text.split(var, 1)[1][:600]
+        assert flag in window, f"{path.name} reads the link mode without acting on it"
+
+
+class TestSymlinkModeCrossesFilesystemsFreely:
+    """UV_LINK_MODE=symlink points the venv at the cache instead of materialising it, and a
+    symlink crosses a filesystem boundary happily. The off-volume reasoning is therefore the
+    wrong story under that mode: nothing is copied, the old environment goes on sharing the
+    cache, and both the copy notice and the low-space warning would name a cost that does not
+    exist and an opt-out that frees nothing (#11313)."""
+
+    @pytest.mark.parametrize(
+        "path, test",
+        [
+            (INSTALL_SH, '[ "$_wov_mode" = symlink ]'),
+            (INSTALL_PS1, '$_linkMode -eq "symlink"'),
+        ],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_symlink_mode_skips_the_off_volume_path(self, path, test):
+        text = path.read_text(encoding = "utf-8")
+        assert test in text, f"{path.name} treats symlink mode as if uv were copying"
+
+
+class TestTheSizeEstimateAsksWhatWouldBeFreed:
+    """A venv whose wheels are hardlinked to a cache that outlives the install shares those
+    blocks, so deleting it frees none of them. st_nlink answers that directly, and for every
+    reason the sharing might exist, which the current run's cache and link modes cannot: they
+    describe this run, and the tree was built by a previous one (#11313)."""
+
+    def test_the_shell_counts_only_unlinked_blocks(self):
+        text = INSTALL_SH.read_text(encoding = "utf-8")
+        helper = text.split("_dir_size_kb() {", 1)[1].split("\n}\n", 1)[0]
+        assert "-links 1" in helper, "the estimate bills blocks a discard would not free"
+        assert "du -sk" in helper, "the fallback for a find without -links was dropped"
+
+    def test_the_device_lookup_follows_the_link(self):
+        # stat reports the link's own device without -L, so a symlinked cache or studio home
+        # answers for the wrong filesystem in either direction.
+        text = INSTALL_SH.read_text(encoding = "utf-8")
+        helper = text.split("_path_device_id() {", 1)[1].split("\n}\n", 1)[0]
+        assert "stat -L -c %d" in helper and "stat -L -f %d" in helper
+
+    def test_the_windows_limit_is_written_down(self):
+        # Not fixed there: a link count per file is GetFileInformationByHandle and a P/Invoke per
+        # file. Over-counting costs a line of advice, never an install, but it must be stated.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        before = text.split("function Get-StudioTreeSizeBytes", 1)[0][-900:]
+        assert "hardlinked" in before and "Known limit" in before
+
+
+class TestWindowsJudgesTheTreeNotTheRun:
+    """The tree about to be kept was built by a PREVIOUS run, so this run's cache and link modes
+    cannot say whether it owns its blocks: an environment built under UV_NO_CACHE or copy mode,
+    reinstalled against a fresh co-located cache, still owns everything it copied. install.sh
+    answers by counting blocks with st_nlink == 1; Windows has no per-file link count short of a
+    P/Invoke per file, so it reads the marker the previous run left behind (#11313)."""
+
+    def test_the_gate_consults_the_previous_cache(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert "function Test-StudioPreviousCacheIsGone" in text
+        assert (
+            "$script:StudioUvMarkerPrevious"
+            in text.split("function Test-StudioPreviousCacheIsGone", 1)[1].split("\n    }", 1)[0]
+        ), "the helper does not read the previous run's marker"
+
+    def test_the_rollback_gate_uses_it(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        before = text.split("if ((-not $script:StudioNoRollback) -and", 1)[0][-700:]
+        assert (
+            "Test-StudioPreviousCacheIsGone" in before
+        ), "the rollback warning still decides from this run's cache mode alone"
+
+    def test_a_cache_emptied_in_place_counts_as_gone(self):
+        """`uv cache clean` empties the directory and leaves it standing, so existence alone
+        reads an empty cache as one the old tree still shares blocks with."""
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        body = text.split("function Test-StudioPreviousCacheIsGone", 1)[1].split("\n    }", 1)[0]
+        assert "Get-ChildItem" in body, "the helper never looks inside the cache it found"
+
+    def test_the_building_run_records_what_it_knew(self):
+        """A cache path says where the cache was, never whether anything was linked into it.
+        UV_LINK_MODE=copy leaves a tree that owns every block beside a cache that is present and
+        co-located, which no amount of inspecting that path can distinguish from sharing."""
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert "function Write-StudioVenvCacheShareStamp" in text
+        assert "function Test-StudioTreeOwnsItsBlocks" in text
+        commit = text.split("$script:StudioInstallCommitted = $true", 1)[1][:600]
+        assert (
+            "Write-StudioVenvCacheShareStamp" in commit
+        ), "the commit does not record this run's verdict for the next one"
+
+    def test_the_stamp_records_this_run_and_not_the_old_tree(self):
+        """The flag describes the environment being built now and the commit stamps it onto that
+        environment. Folding the old tree's verdict into it would make this run record a fact
+        about a different tree, and the next reinstall would warn about one that was hardlinked."""
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        gate = text.split("function Start-StudioVenvRollback", 1)[1].split(
+            "if ((-not $script:StudioNoRollback)", 1
+        )[0]
+        assert (
+            "$script:StudioRollbackCostsFullSize =" not in gate
+        ), "the rollback gate still writes this run's verdict from the old tree's"
+
+    def test_the_recorded_verdict_outranks_the_inferred_one(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        before = text.split("if ((-not $script:StudioNoRollback) -and", 1)[0][-900:]
+        owns = before.rfind("Test-StudioTreeOwnsItsBlocks")
+        marker = before.rfind("Test-StudioPreviousCacheIsGone")
+        assert owns != -1, "the gate never reads the stamp"
+        assert owns < marker, "the inferred answer is consulted before the recorded one"

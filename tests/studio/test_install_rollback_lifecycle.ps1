@@ -24,7 +24,10 @@ $subjectNames = @(
     "Remove-StaleStudioVenvRollbacks",
     "Restore-StudioVenvRollback",
     "Complete-StudioVenvRollback",
-    "Restore-StudioUvCacheMarker"
+    "Restore-StudioUvCacheMarker",
+    # Not called by the rollback helpers: it is the cross-volume cache notice that
+    # calls it, and the rollback space warning is now gated on what it decides.
+    "Test-StudioSameVolume"
 )
 
 $definitions = @{}
@@ -84,6 +87,7 @@ function Write-StudioLine { param([string]$Message, [string]$ForegroundColor) Wr
 # not recognized" inside whichever case happened to reach it first. The closure above
 # makes an install.ps1-defined callee unreachable by construction; this catches the rest,
 # including a helper that calls a sink this file forgot to stub.
+$windowsOnlyCommands = @("Get-CimInstance")
 $unresolved = [System.Collections.Generic.List[string]]::new()
 foreach ($name in $extracted) {
     foreach ($call in $definitions[$name].Body.FindAll({ param($n)
@@ -91,6 +95,11 @@ foreach ($name in $extracted) {
     }, $true)) {
         $callee = $call.GetCommandName()
         if (-not $callee) { continue }
+        # CimCmdlets ships only on Windows and Get-StudioMountedVolume guards its one call.
+        # Keyed on the command being absent, not the platform: $env:OS can say Windows on a host
+        # whose PowerShell has no CimCmdlets, and on a real runner the name is checked as usual.
+        if ($windowsOnlyCommands -contains $callee -and
+            -not (Get-Command -Name $callee -ErrorAction SilentlyContinue)) { continue }
         if (-not (Get-Command -Name $callee -ErrorAction SilentlyContinue)) {
             $unresolved.Add("$callee (called by $name)")
         }
@@ -188,6 +197,428 @@ try {
         Microsoft.PowerShell.Management\Remove-Item -LiteralPath Function:\Remove-Item -Force
     }
     Check "locked rollback deletion retries" ($removed -and $script:removeAttempts -eq 3)
+
+    Write-Host "--no-rollback discards the old environment instead of keeping a copy (#11313)"
+    # The rename still has to happen -- uv creates only into a path that is absent or empty -- so
+    # what the flag changes is what survives it, not whether there is one.
+    foreach ($case in @(
+            @{ Label = "default"; Flag = $false; ExpectCopy = $true },
+            @{ Label = "--no-rollback"; Flag = $true; ExpectCopy = $false })) {
+        [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+        Reset-RollbackState $VenvDir
+        $script:StudioNoRollback = $case.Flag
+        Start-StudioVenvRollback -ExistingDir $VenvDir
+        $copies = @(Get-ChildItem -LiteralPath $StudioHome -Directory -Filter "unsloth_studio.rollback.*" -ErrorAction SilentlyContinue)
+        Check "$($case.Label): rollback copy kept = $($case.ExpectCopy)" (($copies.Count -gt 0) -eq $case.ExpectCopy)
+        Check "$($case.Label): the old environment was moved aside" (-not (Test-Path -LiteralPath $VenvDir))
+        if (-not $case.ExpectCopy) {
+            # Cleared before the delete, exactly as the commit path does: an interrupt must not be
+            # handed a backup that is already half gone.
+            Check "--no-rollback clears the restore state" (
+                (-not $script:StudioVenvRollbackActive) -and ($null -eq $script:StudioVenvRollbackDir))
+            # And the restore must then be a no-op rather than a failure.
+            $restoreThrew = $false
+            try { Restore-StudioVenvRollback } catch { $restoreThrew = $true }
+            Check "--no-rollback leaves nothing for the restore to do" (
+                (-not $restoreThrew) -and (-not (Test-Path -LiteralPath $VenvDir)))
+        }
+        foreach ($c in $copies) { Microsoft.PowerShell.Management\Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    $script:StudioNoRollback = $false
+
+    Write-Host "--no-rollback tells the ARM64 migration the tree is gone (#11313)"
+    # The migration branch reads the rollback state. "Inactive" means "not moved aside yet", so
+    # without a separate discarded flag it called Start-StudioVenvRollback on a directory
+    # --no-rollback had deleted, threw, and exited having already destroyed the environment.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    Reset-RollbackState $VenvDir
+    $script:StudioVenvRollbackDiscarded = $false
+    $script:StudioNoRollback = $true
+    Start-StudioVenvRollback -ExistingDir $VenvDir
+    Check "--no-rollback records that the tree was discarded" ($script:StudioVenvRollbackDiscarded)
+    Check "and the tree really is gone" (-not (Test-Path -LiteralPath $VenvDir))
+    # Replay the branch's own decision: neither the "already moved aside" nor the "move it" arm.
+    $wouldMove = (-not $script:StudioVenvRollbackDiscarded) -and (-not $script:StudioVenvRollbackActive)
+    Check "the migration would not try to move a tree that is gone" (-not $wouldMove)
+    # Where no rollback has started the migration calls Start-StudioVenvRollback itself, and
+    # under --no-rollback that DISCARDS after the retention message has printed. Re-checking the
+    # gate here would test this file (it is pinned by text in the parity suite); what is drivable
+    # is that nothing may be marked preserved once the tree is gone.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    Reset-RollbackState $VenvDir
+    $script:StudioVenvRollbackDiscarded = $false
+    $script:StudioVenvRollbackPreserve = $false
+    $script:StudioNoRollback = $true
+    Start-StudioVenvRollback -ExistingDir $VenvDir
+    Check "a discard inside the migration is not marked as a preserved tree" (
+        $script:StudioVenvRollbackDiscarded -and -not $script:StudioVenvRollbackPreserve)
+    $script:StudioNoRollback = $false
+    $script:StudioVenvRollbackDiscarded = $false
+
+    # The ordinary path must still report "not discarded", or the migration would skip a tree
+    # that is genuinely sitting there waiting to be kept.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    Reset-RollbackState $VenvDir
+    Start-StudioVenvRollback -ExistingDir $VenvDir
+    Check "the ordinary path does not claim the tree was discarded" (-not $script:StudioVenvRollbackDiscarded)
+    Check "and it is still there to be kept" ($null -ne $script:StudioVenvRollbackDir -and (Test-Path -LiteralPath $script:StudioVenvRollbackDir))
+    foreach ($c in @(Get-ChildItem -LiteralPath $StudioHome -Directory -Filter "unsloth_studio.rollback.*" -ErrorAction SilentlyContinue)) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "the volume helpers degrade to the drive root where mount points cannot be read"
+    # Both helpers ask Win32_Volume first, and that view exists only on Windows, so what is
+    # checkable off it is the fallback: "cannot tell" rather than a throw, with the drive-root
+    # logic still answering. The mount-point case is pinned by text in the parity suite.
+    $probed = $null
+    $probeThrew = $false
+    try { $probed = Get-StudioMountedVolume -Path $StudioHome } catch { $probeThrew = $true }
+    Check "the mount-point probe never throws" (-not $probeThrew)
+    if ($IsWindows -or $env:OS -eq "Windows_NT") {
+        # On Windows it answers for real, or legitimately nothing where CIM is unavailable to
+        # this account. What it must never do is throw or return something callers cannot read.
+        Check "on Windows the probe answers a volume or nothing, never something unusable" (
+            $null -eq $probed -or $null -ne $probed.Name)
+    } else {
+        Check "off Windows the probe answers nothing" ($null -eq $probed)
+    }
+    Check "and an empty path is not an error" ($null -eq (Get-StudioMountedVolume -Path ""))
+    # The WMI answer is advisory and runs before the venv exists, so it must be bounded and taken
+    # once. A degraded repository is what the bound is for; what is checkable here is that the
+    # call returns rather than hanging, never throws, and is not repeated.
+    $script:StudioVolumeList = $null
+    $listThrew = $false
+    $t0 = [System.Diagnostics.Stopwatch]::StartNew()
+    try { $null = Get-StudioVolumeList } catch { $listThrew = $true }
+    $firstMs = $t0.ElapsedMilliseconds
+    Check "the volume query returns rather than hanging" (-not $listThrew -and $firstMs -lt 60000)
+    $t0.Restart()
+    $null = Get-StudioVolumeList
+    Check "and is answered from the cache the second time" ($t0.ElapsedMilliseconds -lt $firstMs + 50)
+    Check "a query that answered nothing still caches an answer" (
+        $null -ne $script:StudioVolumeList)
+    # The cache holds identity, which does not move during an install. It must NOT answer the
+    # free-space question: the failure handler asks after setup has eaten the disk, and a number
+    # snapshotted before the environment was built reports room that is gone.
+    $script:StudioVolumeList = @([pscustomobject]@{ Name = "sentinel"; DeviceID = "sentinel"; FreeSpace = 1 })
+    $null = Get-StudioVolumeList
+    Check "the cached list is reused when only identity is wanted" (
+        @(Get-StudioVolumeList)[0].DeviceID -eq "sentinel")
+    $null = Get-StudioVolumeList -Fresh
+    Check "asking for a fresh answer replaces the cached one" (
+        @($script:StudioVolumeList | Where-Object { $_.DeviceID -eq "sentinel" }).Count -eq 0)
+    $script:StudioVolumeList = $null
+    # A link must be measured as the volume it points at. On one filesystem both numbers agree,
+    # so what this proves is that resolution happens and costs nothing: a helper that threw, or
+    # answered $null through a link, takes the warning down with it. The cross-volume case needs
+    # a second volume and a junction, which no host this suite runs on has.
+    $linkTarget = Join-Path $StudioHome "link-target"
+    [System.IO.Directory]::CreateDirectory($linkTarget) | Out-Null
+    $linkPath = Join-Path $StudioHome "link"
+    $linkMade = $true
+    try { New-Item -ItemType SymbolicLink -Path $linkPath -Target $linkTarget -ErrorAction Stop | Out-Null }
+    catch { $linkMade = $false }
+    if ($linkMade) {
+        # Within a tolerance, not equal: free space on a live filesystem moves between two
+        # calls, and an exact comparison fails for that reason rather than for this one.
+        $viaLink = Get-StudioFreeSpaceBytes -Path $linkPath
+        $viaTarget = Get-StudioFreeSpaceBytes -Path $linkTarget
+        Check "free space through a link is the target's volume, not some other one" (
+            $null -ne $viaLink -and $null -ne $viaTarget -and $viaLink -gt 0 -and
+            [math]::Abs($viaLink - $viaTarget) -lt ([math]::Max($viaLink, $viaTarget) * 0.01))
+        Check "a link and its target are one volume" (
+            Test-StudioSameVolume -PathA $linkPath -PathB $linkTarget)
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $linkPath -Force -ErrorAction SilentlyContinue
+    } else {
+        # Windows needs Developer Mode or elevation to create one; not a failure of the code.
+        Write-Host "  SKIP  this host will not create a symbolic link"
+    }
+    $freeHere = Get-StudioFreeSpaceBytes -Path $StudioHome
+    Check "free space still comes back from the fallback" ($null -ne $freeHere -and $freeHere -gt 0)
+    Check "a path and its own child are still one volume" (
+        Test-StudioSameVolume -PathA $StudioHome -PathB (Join-Path $StudioHome "child"))
+
+    Write-Host "picking the volume that holds a path, including a directory mount point"
+    # Volume list supplied rather than read from CIM, so these run on a host with no mount
+    # points. Both sides come from one GetFullPath call: on Windows a rooted path with no drive
+    # picks up the current drive, so names built from a bare separator match nothing there.
+    $sep = [System.IO.Path]::DirectorySeparatorChar
+    $mountPath = [System.IO.Path]::GetFullPath("${sep}studio")
+    $otherPath = [System.IO.Path]::GetFullPath("${sep}studiofoo")
+    $elsePath  = [System.IO.Path]::GetFullPath("${sep}elsewhere${sep}x")
+    $rootVol  = [pscustomobject]@{ Name = [System.IO.Path]::GetPathRoot($mountPath); DeviceID = "root";  FreeSpace = 1GB }
+    $mountVol = [pscustomobject]@{ Name = "$mountPath$sep";                          DeviceID = "mount"; FreeSpace = 2GB }
+    $otherVol = [pscustomobject]@{ Name = "$otherPath$sep";                          DeviceID = "other"; FreeSpace = 3GB }
+    $vols = @($rootVol, $mountVol, $otherVol)
+    Check "a path under a mount point picks the mounted volume" (
+        (Select-StudioVolumeForPath -Path (Join-Path $mountPath "cache") -Volumes $vols).DeviceID -eq "mount")
+    # The regression this section exists for: the mount point itself has no trailing separator.
+    Check "the mount point itself picks the mounted volume, not the drive root" (
+        (Select-StudioVolumeForPath -Path $mountPath -Volumes $vols).DeviceID -eq "mount")
+    Check "a sibling whose name merely starts the same does not match it" (
+        (Select-StudioVolumeForPath -Path $otherPath -Volumes $vols).DeviceID -eq "other")
+    Check "a path under neither falls to the root volume" (
+        (Select-StudioVolumeForPath -Path $elsePath -Volumes $vols).DeviceID -eq "root")
+    # A volume with no drive letter resolves to Volume{GUID}\..., which is not rooted; anchoring
+    # that to the current directory would match whatever volume the installer happens to be run
+    # from. No answer is the honest one.
+    Check "an unrooted path matches no volume at all" (
+        $null -eq (Select-StudioVolumeForPath -Path "Volume{00000000-0000-0000-0000-000000000000}" -Volumes $vols))
+    Check "nothing to choose from is not an error" (
+        $null -eq (Select-StudioVolumeForPath -Path $mountPath -Volumes @()))
+    Check "an empty path chooses nothing" (
+        $null -eq (Select-StudioVolumeForPath -Path "" -Volumes $vols))
+
+    Write-Host "the free-space warning names both figures and the opt-out, and never aborts"
+    # Stub the two measurements rather than filling a real disk.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    foreach ($case in @(
+            @{ Label = "less free than the venv needs"; Free = 512MB; Expect = $true },
+            @{ Label = "plenty of room"; Free = 100GB; Expect = $false },
+            @{ Label = "unmeasurable free space"; Free = $null; Expect = $false })) {
+        $script:warnLines = @()
+        function Write-StudioLine { param([string]$Message, [string]$ForegroundColor) $script:warnLines += $Message }
+        function Get-StudioTreeSizeBytes { param([string]$Path) return 1GB }
+        $script:caseFree = $case.Free
+        function Get-StudioFreeSpaceBytes { param([string]$Path) return $script:caseFree }
+        $threw = $false
+        try { Write-StudioRollbackSpaceWarning -ExistingDir $VenvDir } catch { $threw = $true }
+        $joined = ($script:warnLines -join "`n")
+        Check "$($case.Label): never throws" (-not $threw)
+        Check "$($case.Label): warning present = $($case.Expect)" (($joined -match 'needs about 1024 MB') -eq $case.Expect)
+        if ($case.Expect) {
+            Check "$($case.Label): names the free space too" ($joined -match '512 MB free')
+            Check "$($case.Label): names the opt-out" ($joined -match 'UNSLOTH_INSTALL_NO_ROLLBACK=1')
+        }
+    }
+    Write-Host "--no-rollback costs disk, never hardware (#11313)"
+    # The Intel scan rescues an adapter WMI cannot classify by asking the PREVIOUS environment's
+    # torch whether XPU works. Discarding that tree without taking the verdict first routes an
+    # Arc machine to CPU wheels for having opted out of a rollback copy.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.Directory]::CreateDirectory((Join-Path $VenvDir "Scripts")) | Out-Null
+    # Stands in for the interpreter: the probe is bounded and reads stdout, so what it runs only
+    # has to print True the way torch.xpu.is_available() would on an Arc machine.
+    $fakePy = Join-Path (Join-Path $VenvDir "Scripts") "python.exe"
+    if ($IsWindows -or $env:OS -eq "Windows_NT") {
+        Set-Content -LiteralPath $fakePy -Value "@echo True"
+    } else {
+        Set-Content -LiteralPath $fakePy -Value "#!/bin/sh`necho True"
+        & chmod +x $fakePy
+    }
+    Reset-RollbackState $VenvDir
+    $script:StudioPreservedXpuVerdict = $false
+    $script:StudioNoRollback = $true
+    $script:StudioRollbackCostsFullSize = $true
+    $xpuThrew = $false
+    try { Start-StudioVenvRollback -ExistingDir $VenvDir } catch { $xpuThrew = $true }
+    Check "taking the XPU verdict never costs the discard" (-not $xpuThrew)
+    if ($IsWindows -or $env:OS -eq "Windows_NT") {
+        # A .exe that is really a batch file will not start on Windows, so only the POSIX arm
+        # can drive the probe end to end; here the assertion is that it is attempted and safe.
+        Write-Host "  SKIP  the stand-in interpreter cannot be executed on this platform"
+    } else {
+        Check "the XPU verdict survives the environment being discarded" (
+            $script:StudioPreservedXpuVerdict)
+    }
+    Check "and the environment really was discarded" (-not (Test-Path -LiteralPath $VenvDir))
+    $script:StudioPreservedXpuVerdict = $false
+    $script:StudioNoRollback = $false
+    foreach ($c in @(Get-ChildItem -LiteralPath $StudioHome -Directory -Filter "unsloth_studio.rollback.*" -ErrorAction SilentlyContinue)) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "the tree that is kept is judged by the cache it was built against (#11313)"
+    # The tree was built by a previous run, so this run's cache mode cannot say whether it owns
+    # its blocks; the previous run's marker can, since uv hardlinks only within one volume.
+    $prevCache = Join-Path $StudioHome "prev-cache"
+    [System.IO.Directory]::CreateDirectory($prevCache) | Out-Null
+    # With something in it: an empty cache shares nothing, which the emptied-in-place case below
+    # asserts, so a bare directory would not be the "still here" fixture this check needs.
+    [System.IO.File]::WriteAllText((Join-Path $prevCache "wheel"), "x")
+    $script:StudioUvMarkerPrevious = $prevCache
+    Check "a previous cache still here, on this volume, reads as shared" (
+        -not (Test-StudioPreviousCacheIsGone))
+    $script:StudioUvMarkerPrevious = Join-Path $StudioHome "prev-cache-that-was-deleted"
+    Check "a previous cache that is gone means the tree owns its blocks" (
+        Test-StudioPreviousCacheIsGone)
+    # No marker at all is the first install or an older layout: unknown answers shared, which is
+    # the quiet direction every other helper here takes.
+    $script:StudioUvMarkerPrevious = $null
+    Check "no previous marker is not a reason to warn" (-not (Test-StudioPreviousCacheIsGone))
+    $script:StudioUvMarkerPrevious = "   "
+    Check "and neither is a blank one" (-not (Test-StudioPreviousCacheIsGone))
+    # uv cache clean empties the directory and leaves it standing, and an empty cache shares
+    # nothing with the tree that was built against it.
+    $script:StudioUvMarkerPrevious = $prevCache
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath (Join-Path $prevCache "wheel") -Force -ErrorAction SilentlyContinue
+    Check "a previous cache emptied in place reads as gone" (Test-StudioPreviousCacheIsGone)
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $prevCache -Recurse -Force -ErrorAction SilentlyContinue
+    # Left pointing at a path that no longer exists, every later scenario would read as "the tree
+    # owns its blocks" and warn.
+    $script:StudioUvMarkerPrevious = $null
+
+    Write-Host "what the previous run recorded beats what this one can infer"
+    # The marker says where the cache was, never whether anything was linked into it: a run under
+    # UV_LINK_MODE=copy leaves a tree owning every block beside a cache that reads as shared. The
+    # stamp is that run's own verdict, written beside the tree it built.
+    $stampTree = Join-Path $StudioHome "stamped-tree"
+    [System.IO.Directory]::CreateDirectory($stampTree) | Out-Null
+    Check "no stamp is no answer, not a wrong one" (
+        $null -eq (Test-StudioTreeOwnsItsBlocks -Path $stampTree))
+    $script:StudioRollbackCostsFullSize = $true
+    Write-StudioVenvCacheShareStamp -VenvPath $stampTree
+    Check "a run that owned its blocks says so" (
+        $true -eq (Test-StudioTreeOwnsItsBlocks -Path $stampTree))
+    $script:StudioRollbackCostsFullSize = $false
+    Write-StudioVenvCacheShareStamp -VenvPath $stampTree
+    Check "and a run that shared them says that instead" (
+        $false -eq (Test-StudioTreeOwnsItsBlocks -Path $stampTree))
+    [System.IO.File]::WriteAllText((Join-Path $stampTree (Get-StudioVenvShareStampName)), "something else")
+    Check "an unreadable value is no answer either" (
+        $null -eq (Test-StudioTreeOwnsItsBlocks -Path $stampTree))
+    Check "a tree that is not there is no answer either" (
+        $null -eq (Test-StudioTreeOwnsItsBlocks -Path (Join-Path $StudioHome "never-existed")))
+    Check "writing a stamp into a tree that is not there is not an error" (
+        $null -eq (Write-StudioVenvCacheShareStamp -VenvPath (Join-Path $StudioHome "never-existed")))
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $stampTree -Recurse -Force -ErrorAction SilentlyContinue
+
+    Write-Host "the warning and the discard message both tell the truth under --no-rollback"
+    # Two things the rollback gets wrong without them, and install.sh is gated identically: the
+    # warning's payload is the opt-out's name, so printing it to someone who passed that flag
+    # advises an action already taken; and a delete that failed frees nothing, so reporting it as
+    # discarded promises space that is still occupied.
+    function Get-StudioTreeSizeBytes { param([string]$Path) return 1GB }
+    function Get-StudioFreeSpaceBytes { param([string]$Path) return 512MB }
+    $script:said = @()
+    function substep { param([string]$Message, [string]$Color) $script:said += $Message }
+    function Write-StudioLine { param([string]$Message, [string]$ForegroundColor) $script:said += $Message }
+
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    Reset-RollbackState $VenvDir
+    $script:StudioNoRollback = $true
+    # Off-volume, so the only thing keeping the warning quiet here is the flag.
+    $script:StudioRollbackCostsFullSize = $true
+    Start-StudioVenvRollback -ExistingDir $VenvDir
+    $joined = ($script:said -join "`n")
+    Check "--no-rollback does not advise the flag it was already given" (
+        $joined -notmatch 'needs about')
+    Check "--no-rollback still reports the discard" ($joined -match 'discarded \(--no-rollback\)')
+
+    # And with the cache on this volume the warning is wrong even without the flag: uv hardlinks
+    # every wheel within one filesystem, so the old tree shares its blocks with the cache and
+    # keeping it costs metadata, while summing each file's length still bills all of them.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    Reset-RollbackState $VenvDir
+    $script:StudioNoRollback = $false
+    $script:StudioRollbackCostsFullSize = $false
+    $script:said = @()
+    Start-StudioVenvRollback -ExistingDir $VenvDir
+    $joined = ($script:said -join "`n")
+    Check "a co-located cache does not warn about space the rollback does not take" (
+        $joined -notmatch 'needs about')
+    Check "and the rollback copy is still kept" ($script:StudioVenvRollbackActive)
+    foreach ($c in @(Get-ChildItem -LiteralPath $StudioHome -Directory -Filter "unsloth_studio.rollback.*" -ErrorAction SilentlyContinue)) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # Same co-located cache, same quiet inference, but the tree itself says it was built without
+    # linking. The whole point of the stamp is that this run warns where the one above did not.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir (Get-StudioVenvShareStampName)), "owned")
+    Reset-RollbackState $VenvDir
+    $script:StudioNoRollback = $false
+    $script:StudioRollbackCostsFullSize = $false
+    $script:StudioUvMarkerPrevious = $StudioHome
+    $script:said = @()
+    Start-StudioVenvRollback -ExistingDir $VenvDir
+    $joined = ($script:said -join "`n")
+    Check "a tree that recorded no linking warns despite a co-located cache" (
+        $joined -match 'needs about')
+    $script:StudioUvMarkerPrevious = $null
+    foreach ($c in @(Get-ChildItem -LiteralPath $StudioHome -Directory -Filter "unsloth_studio.rollback.*" -ErrorAction SilentlyContinue)) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # And the other direction: this run copying its own wheels says nothing about a tree that was
+    # hardlinked when it was built, so a recorded "shared" settles it whatever this run is doing.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir (Get-StudioVenvShareStampName)), "shared")
+    Reset-RollbackState $VenvDir
+    $script:StudioNoRollback = $false
+    $script:StudioRollbackCostsFullSize = $true
+    $script:said = @()
+    Start-StudioVenvRollback -ExistingDir $VenvDir
+    Check "a tree recorded as shared is not billed for this run's copy mode" (
+        ($script:said -join "`n") -notmatch 'needs about')
+    # The flag still describes the environment being built now, so the commit can stamp it.
+    Check "and this run's own verdict survives the rollback unchanged" (
+        $script:StudioRollbackCostsFullSize)
+    foreach ($c in @(Get-ChildItem -LiteralPath $StudioHome -Directory -Filter "unsloth_studio.rollback.*" -ErrorAction SilentlyContinue)) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $script:StudioNoRollback = $true
+    $script:StudioRollbackCostsFullSize = $true
+
+    # A tree the retry helper could not remove. It shadows the extracted definition, so
+    # Start-StudioVenvRollback resolves to this one at call time.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    Reset-RollbackState $VenvDir
+    $script:said = @()
+    function Remove-StudioVenvTreeWithRetry { param([string]$Path, [string]$Label) return $false }
+    try {
+        $discardThrew = $false
+        try { Start-StudioVenvRollback -ExistingDir $VenvDir } catch { $discardThrew = $true }
+    } finally {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath Function:\Remove-StudioVenvTreeWithRetry -Force
+    }
+    $joined = ($script:said -join "`n")
+    Check "a discard that could not delete never aborts the install" (-not $discardThrew)
+    Check "a discard that could not delete does not claim success" (
+        $joined -notmatch 'discarded \(--no-rollback\)')
+    # A dangling directory reparse point that cannot be unlinked: Test-Path follows the link and
+    # calls it absent, so the retry helper would report a removal that did not happen and the
+    # discard above would clear the rollback state and say the environment was gone.
+    $danglingRoot = Join-Path $StudioHome "dangling"
+    [System.IO.Directory]::CreateDirectory($danglingRoot) | Out-Null
+    $danglingTarget = Join-Path $danglingRoot "gone"
+    [System.IO.Directory]::CreateDirectory($danglingTarget) | Out-Null
+    $danglingLink = Join-Path $danglingRoot "link"
+    $danglingMade = $true
+    try { New-Item -ItemType SymbolicLink -Path $danglingLink -Target $danglingTarget -ErrorAction Stop | Out-Null }
+    catch { $danglingMade = $false }
+    if ($danglingMade) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $danglingTarget -Recurse -Force
+        # Only the first half is checkable here: measured on this host, Test-Path does NOT follow
+        # a dangling symlink on Linux and answers True, so the divergence the retry helper guards
+        # against is a Windows directory reparse point and is not reproduced anywhere available.
+        # What holds on every platform is that the helper the retry now uses sees the link.
+        Check "a dangling link is reported as present" (Test-StudioPathPresent -Path $danglingLink)
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $danglingLink -Force -ErrorAction SilentlyContinue
+    } else {
+        Write-Host "  SKIP  this host will not create a symbolic link"
+    }
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $danglingRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+    Check "a discard that could not delete names the path left on disk" (
+        $joined -match [regex]::Escape($StudioHome) -and $joined -match 'unsloth_studio\.rollback\.')
+    $script:StudioNoRollback = $false
+    foreach ($c in @(Get-ChildItem -LiteralPath $StudioHome -Directory -Filter "unsloth_studio.rollback.*" -ErrorAction SilentlyContinue)) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    function substep { param([string]$Message, [string]$Color) }
+    function Write-StudioLine { param([string]$Message, [string]$ForegroundColor) Write-Host $Message }
 } finally {
     if (Test-Path -LiteralPath $StudioHome) {
         Microsoft.PowerShell.Management\Remove-Item -LiteralPath $StudioHome -Recurse -Force

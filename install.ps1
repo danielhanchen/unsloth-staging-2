@@ -7,8 +7,9 @@
 #
 # The web entry point cannot forward arguments, so it takes options as environment variables set
 # beforehand (UNSLOTH_NO_TORCH, UNSLOTH_SKIP_AUTOSTART, UNSLOTH_ISOLATE_UV_CACHE,
-# UNSLOTH_PYTHON, UNSLOTH_STUDIO_HOME); a local run takes the equivalent flags
-# (--no-torch, --skip-autostart, --isolated-uv-cache, --python, --local).
+# UNSLOTH_INSTALL_NO_ROLLBACK, UNSLOTH_PYTHON, UNSLOTH_STUDIO_HOME); a local run takes the
+# equivalent flags (--no-torch, --skip-autostart, --isolated-uv-cache, --no-rollback,
+# --python, --local).
 #
 # Install dir priority: UNSLOTH_STUDIO_HOME > STUDIO_HOME (alias) > $USERPROFILE\.unsloth\studio
 #
@@ -1924,6 +1925,20 @@ function Install-UnslothStudio {
     $SkipTorch = $false
     $SkipAutostart = $false
     $IsolateUvCache = $false
+    # Script-scoped: Start-StudioVenvRollback reads it, and tests/studio/test_install_rollback_lifecycle.ps1
+    # extracts that function on its own.
+    $script:StudioNoRollback = $false
+    # Set later by the cross-volume cache notice and read later still by Start-StudioVenvRollback.
+    # Initialised here rather than beside the other rollback state, which is reset AFTER that
+    # notice runs and would therefore clear it. Under `irm | iex` the script scope IS the caller's
+    # session, so a stale value from a previous run has to be cleared somewhere.
+    $script:StudioRollbackCostsFullSize = $false
+    # Bounded WMI answer, taken at most once per run. Reset here for the same reason as the rest
+    # of this block: under `irm | iex` the script scope IS the caller's session.
+    $script:StudioVolumeList = $null
+    # Set by the --no-rollback discard when the environment it is about to delete reports XPU,
+    # read by the Intel scan once that tree is gone.
+    $script:StudioPreservedXpuVerdict = $false
     $ShortcutsOnly = $false
     $WithLlamaCppDir = ""
     $argList = $args
@@ -1933,6 +1948,7 @@ function Install-UnslothStudio {
             "--tauri"    { $TauriMode = $true }
             "--no-torch" { $SkipTorch = $true }
             "--isolated-uv-cache" { $IsolateUvCache = $true }
+            "--no-rollback" { $script:StudioNoRollback = $true }
             "--verbose"  { $script:UnslothVerbose = $true }
             "-v"         { $script:UnslothVerbose = $true }
             "--shortcuts-only" { $ShortcutsOnly = $true }
@@ -1959,6 +1975,7 @@ function Install-UnslothStudio {
     if ($env:UNSLOTH_NO_TORCH -in @('1', 'true', 'yes', 'on')) { $SkipTorch = $true }
     if ($env:UNSLOTH_SKIP_AUTOSTART -in @('1', 'true', 'yes', 'on')) { $SkipAutostart = $true }
     if ($env:UNSLOTH_ISOLATE_UV_CACHE -in @('1', 'true', 'yes', 'on')) { $IsolateUvCache = $true }
+    if ($env:UNSLOTH_INSTALL_NO_ROLLBACK -in @('1', 'true', 'yes', 'on')) { $script:StudioNoRollback = $true }
 
     if ($script:UnslothVerbose) {
         $env:UNSLOTH_VERBOSE = '1'
@@ -2745,6 +2762,155 @@ exit 1
     function Get-StudioFinalPath {
         param([Parameter(Mandatory = $true)][string]$Path)
         return (Resolve-StudioFinalPathInfo -Path $Path).Path
+    }
+
+    # Disk arithmetic for the rollback copy and the uv cache (#11313), answering $null rather than
+    # guessing: a number this cannot produce is a warning it does not print. Above
+    # Set-StudioUvCacheEnvironment's call site, since a nested function does not exist until its
+    # defining statement has run.
+    # A Windows volume can be mounted at a DIRECTORY, and then the drive root is the wrong answer:
+    # GetPathRoot reduces C:\studio to C:\, so two paths on different volumes compare equal.
+    # Win32_Volume lists mount points by the path they are mounted at, so the longest Name that
+    # prefixes a path names the volume really holding it; anywhere CIM cannot answer, callers fall
+    # back to the drive-root logic, which is right for a lettered volume.
+    # Known limit: Name exposes ONE access path, so a volume reached through a second one falls
+    # back to the drive root, the pre-existing answer. Closing it needs a Win32_MountPoint join on
+    # every install, for a diagnostic. Split out so the matching is testable without a mount point.
+    function Select-StudioVolumeForPath {
+        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path,
+              [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Volumes)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+        # Unrooted means GetFullPath would anchor it to the current directory and invent a match
+        # on whichever volume that happens to be. No answer is the honest one.
+        if (-not [System.IO.Path]::IsPathRooted($Path)) { return $null }
+        $full = [System.IO.Path]::GetFullPath($Path)
+        # Name carries a trailing separator and GetFullPath does not, so a path that IS the mount
+        # point would miss its own volume. Appending one also keeps C:\studiofoo from matching a
+        # volume mounted at C:\studio.
+        if (-not $full.EndsWith([System.IO.Path]::DirectorySeparatorChar)) {
+            $full += [System.IO.Path]::DirectorySeparatorChar
+        }
+        $best = $null
+        foreach ($vol in $Volumes) {
+            if (-not $vol -or -not $vol.Name) { continue }
+            if (-not $full.StartsWith($vol.Name, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+            if ((-not $best) -or $vol.Name.Length -gt $best.Name.Length) { $best = $vol }
+        }
+        return $best
+    }
+
+    # Junctions and symlinks lie about which volume a path is on, so a studio home behind one is
+    # otherwise measured on the link's host drive. The lexical fallback keeps a resolver that
+    # cannot answer from costing the caller its measurement entirely.
+    function Resolve-StudioVolumeQueryPath {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        try {
+            $final = Get-StudioFinalPath -Path $Path
+            # Get-StudioFinalPath strips \\?\ deliberately, so a volume with no drive letter comes
+            # back as Volume{GUID}\..., which is NOT rooted: GetFullPath would then anchor it to
+            # the current directory and name an unrelated volume. Keep the caller's own path.
+            if ($final -and [System.IO.Path]::IsPathRooted($final)) { return $final }
+            return $Path
+        } catch { return $Path }
+    }
+
+    # Bounded out of process, as Invoke-BoundedVideoControllerScan documents: a degraded WMI
+    # repository blocks a CIM query indefinitely, and neither -ErrorAction nor try/catch bounds a
+    # query that never returns. Cached, timeouts included, so a broken repository costs once.
+    # -Fresh for callers that want the NUMBER: FreeSpace in a cached row is a snapshot, and the
+    # failure handler asks after setup has consumed the disk, where a stale row reads as having
+    # room and misses the disk-full diagnosis. Mount paths do not move, so those callers cache.
+    function Get-StudioVolumeList {
+        param([switch]$Fresh)
+        if (-not $Fresh -and $null -ne $script:StudioVolumeList) { return $script:StudioVolumeList }
+        $script:StudioVolumeList = @()
+        $job = $null
+        try {
+            $job = Start-Job -ScriptBlock {
+                Get-CimInstance -ClassName Win32_Volume -ErrorAction SilentlyContinue |
+                    Select-Object Name, DeviceID, FreeSpace
+            }
+            if (Wait-Job -Job $job -Timeout 15) {
+                $script:StudioVolumeList = @(Receive-Job -Job $job -ErrorAction SilentlyContinue |
+                    Where-Object { $_ -and $_.Name })
+            } else {
+                Stop-Job -Job $job -ErrorAction SilentlyContinue
+            }
+        } catch {
+        } finally {
+            if ($job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+        }
+        return $script:StudioVolumeList
+    }
+
+    function Get-StudioMountedVolume {
+        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path,
+              [switch]$Fresh)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+        if (-not ($IsWindows -or $env:OS -eq "Windows_NT")) { return $null }
+        try {
+            return (Select-StudioVolumeForPath -Path (Resolve-StudioVolumeQueryPath -Path $Path) `
+                -Volumes (Get-StudioVolumeList -Fresh:$Fresh))
+        } catch { return $null }
+    }
+
+    # GetPathRoot on a path that does not exist yet still names the volume it would be created on.
+    function Get-StudioFreeSpaceBytes {
+        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+        $queryPath = Resolve-StudioVolumeQueryPath -Path $Path
+        # -Fresh: this is the caller that wants a number, and a stale one is worse than none.
+        $mounted = Get-StudioMountedVolume -Path $queryPath -Fresh
+        if ($mounted -and $null -ne $mounted.FreeSpace) { return [int64]$mounted.FreeSpace }
+        try {
+            # The fallback needs the resolved path too: DriveInfo on the lexical one answers for
+            # the drive the junction lives on, not the drive it points at.
+            $root = [System.IO.Path]::GetPathRoot([System.IO.Path]::GetFullPath($queryPath))
+            if (-not $root) { return $null }
+            return ([System.IO.DriveInfo]::new($root)).AvailableFreeSpace
+        } catch { return $null }
+    }
+
+    # Known limit: this sums every file, so a tree hardlinked to a surviving cache is billed for
+    # blocks a discard would not free. install.sh asks st_nlink and counts only what the tree
+    # owns; on Windows that is a P/Invoke per file across tens of thousands. Over-counting costs
+    # a line of advice, never a failed install, so it stays until it is worth that cost.
+    function Get-StudioTreeSizeBytes {
+        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+        try {
+            if (-not (Test-Path -LiteralPath $Path)) { return $null }
+            $total = 0
+            foreach ($f in (Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue)) {
+                $total += $f.Length
+            }
+            return $total
+        } catch { return $null }
+    }
+
+    # Junctions and symlinks lie about which volume a path is on, so canonicalise first. Unknown
+    # answers $true -- "same volume" is the quiet case, and a guess must not invent a warning.
+    function Test-StudioSameVolume {
+        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$PathA,
+              [Parameter(Mandatory = $true)][AllowEmptyString()][string]$PathB)
+        # Unknown answers "same volume", because same volume is the quiet case.
+        if ([string]::IsNullOrWhiteSpace($PathA) -or [string]::IsNullOrWhiteSpace($PathB)) { return $true }
+        try {
+            $fullA = Get-StudioFinalPath -Path $PathA
+            $fullB = Get-StudioFinalPath -Path $PathB
+            # Volume identity first, so two directory mount points under one drive letter are not
+            # read as one volume. DeviceID is the volume GUID, which is the identity; the mount
+            # path is not, since one volume can be mounted in several places.
+            $volA = Get-StudioMountedVolume -Path $fullA
+            $volB = Get-StudioMountedVolume -Path $fullB
+            if ($volA -and $volB -and $volA.DeviceID -and $volB.DeviceID) {
+                return ($volA.DeviceID -eq $volB.DeviceID)
+            }
+            $a = [System.IO.Path]::GetPathRoot($fullA)
+            $b = [System.IO.Path]::GetPathRoot($fullB)
+            if (-not $a -or -not $b) { return $true }
+            return ($a -eq $b)
+        } catch { return $true }
     }
 
     # Custom Unsloth roots are not supported with --tauri (the desktop app uses
@@ -6849,6 +7015,44 @@ exit 0
     # installer is a command-not-found.
     Write-StudioRootOwnerMarker -Root $StudioHome
     Set-StudioUvCacheEnvironment -StudioRoot $StudioHome -Isolated $IsolateUvCache -UvExecutable $script:UvExe
+    # Outside the selector, whose ranking is pinned across four implementations
+    # (tests/python/test_uv_cache_selector_agreement.py) and deliberately NOT reordered to prefer
+    # a co-located cache. What is added is saying what the winner costs: across a volume boundary
+    # uv copies every wheel instead of hardlinking, making the new environment a second full copy,
+    # which is the whole of the "a reinstall doubles the disk" report (#11313). Guarded like
+    # Start-StudioVenvRollback's twin: advice that cannot be produced must not cost the install.
+    try {
+        # UV_NO_CACHE hands uv a temporary cache discarded when the command ends, so nothing
+        # survives for the old tree to share and keeping it costs full size; no notice, since
+        # where the cache sits is not the problem. `copy` is the only link mode that shares no
+        # blocks (clone reflinks, hardlink links, symlink points at the cache), and it is checked
+        # before the branches below because the cross-volume notice may apply as well.
+        $_linkMode = if ($env:UV_LINK_MODE) { $env:UV_LINK_MODE.Trim().ToLowerInvariant() } else { "" }
+        if ($_linkMode -eq "copy") {
+            $script:StudioRollbackCostsFullSize = $true
+        }
+        if (Test-StudioUvNoCache) {
+            $script:StudioRollbackCostsFullSize = $true
+        } elseif ($_linkMode -eq "symlink") {
+            # A symlink crosses a volume boundary happily, so the copy story below does not apply:
+            # the venv holds links into the cache wherever it is and the old environment goes on
+            # sharing it. install.sh exempts its twin the same way.
+        } elseif ($env:UV_CACHE_DIR -and -not (Test-StudioSameVolume -PathA $env:UV_CACHE_DIR -PathB $StudioHome)) {
+            # Read by Start-StudioVenvRollback, which runs later: the cost its own warning
+            # describes is only real across this boundary.
+            $script:StudioRollbackCostsFullSize = $true
+            # A caller's own UV_CACHE_DIR wins in Set-StudioUvCacheEnvironment and returns before
+            # -Isolated is ever read, so naming that flag here sends the user back for a
+            # byte-identical run that prints this same line again. install.sh varies its twin the
+            # same way.
+            $remedy = if ($script:StudioUvCacheMode -eq "custom") {
+                "unset UV_CACHE_DIR, or point it at a path on the same volume, to keep the cache beside the environment"
+            } else {
+                "use --isolated-uv-cache to keep the cache beside the environment"
+            }
+            step "uv cache" "$($env:UV_CACHE_DIR) is on a different volume from $StudioHome, so wheels are copied into the venv rather than hardlinked, costing extra disk; $remedy" "Yellow"
+        }
+    } catch { }
 
     # Bytecode compilation can exceed uv's 60s default on slow machines ("0" disables).
     if (-not $env:UV_COMPILE_BYTECODE_TIMEOUT) {
@@ -6877,6 +7081,9 @@ exit 0
     # The existing interpreter's platform tag, read before any rollback move takes it away.
     $script:PrevVenvPlatformTag = $null
     $script:StudioVenvRollbackActive = $false
+    # Set only by --no-rollback, so a branch that needs the previous tree can tell
+    # "already deleted on purpose" from "not moved aside yet".
+    $script:StudioVenvRollbackDiscarded = $false
     $script:StudioVenvRollbackPartial = $false
     # Reset per run: under `irm | iex` the script scope IS the caller's session.
     $script:PrevTorchVer = ""
@@ -6974,6 +7181,120 @@ exit 0
         return ($null -ne (Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue))
     }
 
+    # Did the tree about to be moved aside keep its own copy of everything? It did if the cache it
+    # was built against is gone or was on another volume, since uv can only hardlink within one.
+    # $script:StudioUvMarkerPrevious is the marker's value before this run overwrote it, which is
+    # the previous run's cache; unknown answers "shared", the quiet direction used throughout.
+    function Test-StudioPreviousCacheIsGone {
+        $previous = $script:StudioUvMarkerPrevious
+        if ([string]::IsNullOrWhiteSpace($previous)) { return $false }
+        try {
+            $previous = ([string]$previous).Trim()
+            if (-not (Test-StudioPathPresent -Path $previous)) { return $true }
+            # uv cache clean empties the directory and leaves it standing, and an empty cache
+            # shares nothing. Any entry counts; uv's internal layout would rot as an assertion.
+            $hasContent = $null
+            try {
+                $hasContent = $null -ne (Get-ChildItem -LiteralPath $previous -Force `
+                    -ErrorAction SilentlyContinue | Select-Object -First 1)
+            } catch { $hasContent = $null }
+            if ($false -eq $hasContent) { return $true }
+            return (-not (Test-StudioSameVolume -PathA $previous -PathB $StudioHome))
+        } catch { return $false }
+    }
+
+    # What the run that BUILT a tree knew about its own linking, written beside the tree at commit
+    # and read back by the next run: a cache path that still exists says nothing about whether
+    # anything was ever linked into it, so UV_LINK_MODE=copy would otherwise look like sharing.
+    # install.sh needs no equivalent because st_nlink measures this exactly; Windows has no
+    # per-file link count without a P/Invoke, and fsutil requires elevation this must not ask for.
+    # A function, not a script variable, so a call-graph extraction picks the name up with them.
+    function Get-StudioVenvShareStampName { return ".unsloth-cache-linked" }
+
+    function Write-StudioVenvCacheShareStamp {
+        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$VenvPath)
+        if ([string]::IsNullOrWhiteSpace($VenvPath)) { return }
+        try {
+            if (-not (Test-Path -LiteralPath $VenvPath -PathType Container -ErrorAction SilentlyContinue)) { return }
+            $stamp = Join-Path $VenvPath (Get-StudioVenvShareStampName)
+            # The run that is committing has already decided this for itself.
+            $value = if ($script:StudioRollbackCostsFullSize) { "owned" } else { "shared" }
+            Remove-Item -LiteralPath $stamp -Force -ErrorAction SilentlyContinue
+            if ($null -ne (Get-Item -LiteralPath $stamp -Force -ErrorAction SilentlyContinue)) { return }
+            Set-Content -LiteralPath $stamp -Value $value -Encoding utf8 -ErrorAction SilentlyContinue
+        } catch { }
+    }
+
+    # $true owns its blocks, $false shares them, $null nothing recorded. Three states on purpose:
+    # the caller must be able to tell "measured as sharing" from "no measurement", because only
+    # the second should fall through to the marker comparison.
+    function Test-StudioTreeOwnsItsBlocks {
+        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+        try {
+            $stamp = Join-Path $Path (Get-StudioVenvShareStampName)
+            if (-not (Test-Path -LiteralPath $stamp -PathType Leaf -ErrorAction SilentlyContinue)) { return $null }
+            $value = Get-Content -LiteralPath $stamp -Raw -Encoding UTF8 -ErrorAction SilentlyContinue
+            if ($null -eq $value) { return $null }
+            $value = ([string]$value).Trim().ToLowerInvariant()
+            if ($value -eq "owned") { return $true }
+            if ($value -eq "shared") { return $false }
+            return $null
+        } catch { return $null }
+    }
+
+    function Write-StudioRollbackSpaceWarning {
+        param([Parameter(Mandatory = $true)][string]$ExistingDir)
+        $size = Get-StudioTreeSizeBytes -Path $ExistingDir
+        $free = Get-StudioFreeSpaceBytes -Path $StudioHome
+        if ($null -eq $size -or $null -eq $free) { return }
+        if ($free -ge $size) { return }
+        $sizeMb = [math]::Round($size / 1MB)
+        $freeMb = [math]::Round($free / 1MB)
+        Write-StudioLine "[WARN] Keeping the previous environment for rollback needs about $sizeMb MB, and $StudioHome has $freeMb MB free." -ForegroundColor Yellow
+        Write-StudioLine "       The install continues. If it runs out of space, re-run with --no-rollback (or UNSLOTH_INSTALL_NO_ROLLBACK=1) to discard the old environment instead of keeping it." -ForegroundColor Yellow
+    }
+
+    # A wedged torch import or a hanging Intel driver init -- what the XPU probes below exist to
+    # detect -- would block a bare `& python -c ...` forever. ProcessStartInfo, not &, so stderr
+    # cannot trip $ErrorActionPreference; BOTH streams drain async so a noisy import cannot
+    # deadlock on a full pipe; WaitForExit bounds the wait and kills the child. Every failure
+    # (timeout, crash, exception) reads as .Ok = $false; .Error carries WHICH one, since stderr
+    # used to be drained and discarded, leaving a driver-level DLL load error and a missing torch
+    # indistinguishable. Defined above the Intel scan: PowerShell binds a function when it runs.
+    function Invoke-BoundedPythonProbe {
+        param([string]$PythonExe, [string]$Code, [int]$TimeoutSec = 30)
+        $result = [pscustomobject]@{ Ok = $false; Output = ""; Error = "" }
+        if (-not $PythonExe -or -not $Code) { return $result }
+        try {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $PythonExe
+            $psi.Arguments = "-c `"$Code`""
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $errTask = $proc.StandardError.ReadToEndAsync()
+            if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
+                try { $proc.Kill() } catch {}
+                # Synthesised, not read back: waiting on the reader tasks of a wedged child
+                # would reintroduce the hang this helper exists to bound.
+                $result.Error = "python did not answer within $TimeoutSec seconds"
+                return $result
+            }
+            $result.Output = $outTask.GetAwaiter().GetResult()
+            # Kept, not discarded: the only place a failed probe's OSError / WinError text exists.
+            $result.Error = $errTask.GetAwaiter().GetResult()
+            $result.Ok = ($proc.ExitCode -eq 0)
+            return $result
+        } catch {
+            $result.Error = $_.Exception.Message
+            return $result
+        }
+    }
+
     function Start-StudioVenvRollback {
         param([Parameter(Mandatory = $true)][string]$ExistingDir)
         $stamp = Get-Date -Format "yyyyMMddHHmmss"
@@ -6989,6 +7310,23 @@ exit 0
         $script:StudioVenvRollbackTarget = $ExistingDir
         $script:StudioVenvRollbackActive = $true
         $script:StudioVenvRollbackPartial = $false
+        # Keeping the old tree costs its full size only if it owns its blocks, which is decided by
+        # the cache the run that BUILT it linked against, not the one this run picked (#11313).
+        # The whole block is advice and runs under "Stop" immediately before the rename, so it is
+        # guarded: advice that cannot be produced must not cost the install.
+        try {
+            # A local: $script:StudioRollbackCostsFullSize describes the environment being built
+            # now, and the commit stamps it onto that environment for the next run to read.
+            # The stamp settles it; this run's mode only stands in where nothing was recorded.
+            # No warning under --no-rollback, which would advise a flag the caller already passed.
+            $owns = Test-StudioTreeOwnsItsBlocks -Path $ExistingDir
+            if ($null -eq $owns) {
+                $owns = $script:StudioRollbackCostsFullSize -or (Test-StudioPreviousCacheIsGone)
+            }
+            if ((-not $script:StudioNoRollback) -and $owns) {
+                Write-StudioRollbackSpaceWarning -ExistingDir $ExistingDir
+            }
+        } catch { }
         # Publish the rollback state before the atomic rename so interruption
         # cannot land after Move-Item but before cleanup knows where the old venv went.
         try {
@@ -7020,6 +7358,44 @@ exit 0
             }
             throw
         }
+        # --no-rollback / UNSLOTH_INSTALL_NO_ROLLBACK: drop the old environment now instead of at
+        # commit, for the disk-constrained cross-volume case. The rename still happens first, so
+        # uv never builds into an occupied path. Clearing the state before the delete is what the
+        # commit path does too: an interrupt must not restore a half-deleted backup.
+        if ($script:StudioNoRollback) {
+            $discard = $script:StudioVenvRollbackDir
+            # The Intel scan later rescues an adapter WMI cannot classify by asking the PREVIOUS
+            # environment's torch whether XPU works, because the replacement has no torch yet.
+            # Deleting that tree here would take the only interpreter that can answer with it,
+            # and the machine would be routed to CPU wheels for having opted out of a rollback
+            # copy. Opting out must cost disk, never hardware, so the verdict is taken first and
+            # the scan reads it instead. Wrapped: this runs under the installer's "Stop", and a
+            # probe that cannot run must not cost the rename.
+            try {
+                $_discardPy = Join-Path $discard "Scripts\python.exe"
+                if (Test-Path -LiteralPath $_discardPy -ErrorAction SilentlyContinue) {
+                    $_discardXpu = Invoke-BoundedPythonProbe -PythonExe $_discardPy `
+                        -Code 'import torch; print(torch.xpu.is_available())'
+                    if ($_discardXpu.Ok -and $_discardXpu.Output -match '(?m)^\s*True\s*$') {
+                        $script:StudioPreservedXpuVerdict = $true
+                    }
+                }
+            } catch { }
+            $script:StudioVenvRollbackActive = $false
+            $script:StudioVenvRollbackDir = $null
+            # Distinct from "never started". Inactive alone cannot tell the two apart, and the
+            # ARM64 migration below reads it to decide whether it still has a tree to move.
+            $script:StudioVenvRollbackDiscarded = $true
+            # The helper already names the reason it could not delete. What it must not do is
+            # report success anyway: a tree left behind by an open handle, a reparse point or a
+            # long path frees none of the space this flag exists to free.
+            if (Remove-StudioVenvTreeWithRetry -Path $discard -Label "previous environment") {
+                substep "previous environment discarded (--no-rollback); a failed install cannot be undone"
+            } else {
+                substep "it is no longer used for rollback; remove $discard by hand to reclaim the space." "Yellow"
+            }
+            return
+        }
         substep "previous environment preserved for rollback"
     }
 
@@ -7035,7 +7411,11 @@ exit 0
             } catch {
                 $lastError = $_.Exception.Message
             }
-            if (-not (Test-Path -LiteralPath $Path)) { return $true }
+            # Test-StudioPathPresent, not Test-Path: Test-Path follows a directory reparse
+            # point, so a dangling one that could not be unlinked reads as absent and this
+            # would report a removal that did not happen. Its callers act on that -- the
+            # --no-rollback discard clears the rollback state and says the environment is gone.
+            if (-not (Test-StudioPathPresent -Path $Path)) { return $true }
             if ($attempt -lt 3) { Start-Sleep -Milliseconds (250 * $attempt) }
         }
         Write-StudioLine "[WARN] Could not remove $Label at $Path" -ForegroundColor Yellow
@@ -7192,6 +7572,9 @@ exit 0
         # and still commits.
         $script:StudioInstallCommitted = $true
         $script:StudioUvMarkerSaved = $false
+        # After the commit flag, never before it: this is a note for the NEXT run and nothing it
+        # can do is worth disturbing a commit that has already succeeded.
+        try { Write-StudioVenvCacheShareStamp -VenvPath $VenvDir } catch { }
         if (-not $script:StudioVenvRollbackActive) { return }
         $backup = $script:StudioVenvRollbackDir
         # The replacement is committed. Disable restoration before deleting the
@@ -7296,8 +7679,14 @@ exit 0
         if ((Get-HostMachineArch) -eq "arm64" -and (Test-Path -LiteralPath $VenvPython -PathType Leaf)) {
             $script:PrevVenvPlatformTag = Get-PythonPlatformTag $VenvPython
         }
-        # New layout already exists -- replace only after preserving rollback copy.
-        substep "preserving existing environment for rollback..."
+        # New layout already exists -- replace only after preserving rollback copy, unless the
+        # caller asked for no copy at all, in which case this line would be contradicted by the
+        # "discarded" one Start-StudioVenvRollback prints a moment later.
+        if ($script:StudioNoRollback) {
+            substep "moving the existing environment aside..."
+        } else {
+            substep "preserving existing environment for rollback..."
+        }
         try {
             Start-StudioVenvRollback -ExistingDir $VenvDir
         } catch {
@@ -7373,10 +7762,23 @@ exit 0
         # anything the user pip-installed there is not reinstalled. The old tree is kept
         # under $StudioHome as unsloth_studio.arm64.* rather than deleted with the ordinary
         # rollback, so it can still be read: $script:StudioVenvRollbackPreserve below.
-        substep "the ARM64 environment is kept under $StudioHome as unsloth_studio.arm64.*;" "Yellow"
-        substep "re-install any extra packages you had added to it, or set UNSLOTH_ALLOW_ARM64_PYTHON=1 to keep it." "Yellow"
+        # Only when there is a tree to keep. Under --no-rollback it is either already gone or
+        # about to be, and the arms below say which; printing this as well leaves the user
+        # looking for an unsloth_studio.arm64.* that was never written, and told that packages
+        # they are about to lose are recoverable.
+        if (-not ($script:StudioVenvRollbackDiscarded -or $script:StudioNoRollback)) {
+            substep "the ARM64 environment is kept under $StudioHome as unsloth_studio.arm64.*;" "Yellow"
+            substep "re-install any extra packages you had added to it, or set UNSLOTH_ALLOW_ARM64_PYTHON=1 to keep it." "Yellow"
+        }
         try {
-            if ($script:StudioVenvRollbackActive) {
+            if ($script:StudioVenvRollbackDiscarded) {
+                # --no-rollback already deleted it. There is nothing to move and nothing to
+                # keep, and calling Start-StudioVenvRollback here would try to rename a
+                # directory that is gone, throw, and take the whole migration out through
+                # Exit-InstallFailure -- after the environment had already been destroyed.
+                substep "the previous ARM64 environment was discarded by --no-rollback, so there is" "Yellow"
+                substep "nothing to copy packages out of; the x64 environment is built fresh." "Yellow"
+            } elseif ($script:StudioVenvRollbackActive) {
                 # The ordinary reinstall already moved this environment aside; a second
                 # Start-StudioVenvRollback would try to move a directory that is no longer
                 # there and throw, taking every architecture migration out through
@@ -7385,9 +7787,18 @@ exit 0
                 $script:StudioVenvRollbackPreserve = $true
             } else {
                 Start-StudioVenvRollback -ExistingDir $VenvDir
-                # After the move, so a rollback that never started cannot leave the flag set
-                # for some later unrelated rollback to act on.
-                $script:StudioVenvRollbackPreserve = $true
+                if ($script:StudioVenvRollbackDiscarded) {
+                    # --no-rollback discarded it inside that call, so there is no tree to
+                    # preserve and setting the flag would mark one that does not exist. The
+                    # user asked for no old environments kept and that is what they get; say
+                    # so here, where a moment ago the message promised the opposite.
+                    substep "the previous ARM64 environment was discarded by --no-rollback rather than kept;" "Yellow"
+                    substep "the x64 environment is built fresh, and extra packages are not recoverable." "Yellow"
+                } else {
+                    # After the move, so a rollback that never started cannot leave the flag set
+                    # for some later unrelated rollback to act on.
+                    $script:StudioVenvRollbackPreserve = $true
+                }
             }
         } catch {
             Write-StudioLine "[ERROR] Could not move the ARM64 environment aside: $($_.Exception.Message)" -ForegroundColor Red
@@ -7421,7 +7832,14 @@ exit 0
         if ($_woaMigPlatform -ne "win-arm64") {
             $_woaMigLabel = if ($_woaMigPlatform) { $_woaMigPlatform } else { "unknown" }
             substep "windows on arm: the migrated environment is $_woaMigLabel, not win-arm64 --" "Yellow"
-            substep "rebuilding it as ARM64; the previous one is kept for rollback." "Yellow"
+            # Varied, not printed flat: the call below discards under --no-rollback, and telling
+            # the user the previous environment is recoverable when it is about to be deleted is
+            # the same promise the ARM64 mismatch branch above already had to stop making.
+            if ($script:StudioNoRollback) {
+                substep "rebuilding it as ARM64; --no-rollback discards the previous one rather than keeping it." "Yellow"
+            } else {
+                substep "rebuilding it as ARM64; the previous one is kept for rollback." "Yellow"
+            }
             try {
                 Start-StudioVenvRollback -ExistingDir $VenvDir
                 # Left set, the install step below would --no-deps into an empty venv.
@@ -8629,47 +9047,6 @@ exit 0
     # true on unmapped arches too, and those install CPU torch.
     $AmdHasGpuWheels = [bool]($ROCmGfxArch -and $archFamilyMap.ContainsKey($ROCmGfxArch))
 
-    # ── Bounded "ask the venv python" probe ──
-    # A wedged torch import or a hanging Intel driver init -- what the XPU probes below exist to
-    # detect -- would block a bare `& python -c ...` forever. ProcessStartInfo, not &, so stderr
-    # cannot trip $ErrorActionPreference; BOTH streams drain async so a noisy import cannot
-    # deadlock on a full pipe; WaitForExit bounds the wait and kills the child. Every failure
-    # (timeout, crash, exception) reads as .Ok = $false; .Error carries WHICH one, since stderr
-    # used to be drained and discarded, leaving a driver-level DLL load error and a missing torch
-    # indistinguishable. Defined above the Intel scan: PowerShell binds a function when it runs.
-    function Invoke-BoundedPythonProbe {
-        param([string]$PythonExe, [string]$Code, [int]$TimeoutSec = 30)
-        $result = [pscustomobject]@{ Ok = $false; Output = ""; Error = "" }
-        if (-not $PythonExe -or -not $Code) { return $result }
-        try {
-            $psi = New-Object System.Diagnostics.ProcessStartInfo
-            $psi.FileName = $PythonExe
-            $psi.Arguments = "-c `"$Code`""
-            $psi.RedirectStandardOutput = $true
-            $psi.RedirectStandardError = $true
-            $psi.UseShellExecute = $false
-            $psi.CreateNoWindow = $true
-            $proc = [System.Diagnostics.Process]::Start($psi)
-            $outTask = $proc.StandardOutput.ReadToEndAsync()
-            $errTask = $proc.StandardError.ReadToEndAsync()
-            if (-not $proc.WaitForExit($TimeoutSec * 1000)) {
-                try { $proc.Kill() } catch {}
-                # Synthesised, not read back: waiting on the reader tasks of a wedged child
-                # would reintroduce the hang this helper exists to bound.
-                $result.Error = "python did not answer within $TimeoutSec seconds"
-                return $result
-            }
-            $result.Output = $outTask.GetAwaiter().GetResult()
-            # Kept, not discarded: the only place a failed probe's OSError / WinError text exists.
-            $result.Error = $errTask.GetAwaiter().GetResult()
-            $result.Ok = ($proc.ExitCode -eq 0)
-            return $result
-        } catch {
-            $result.Error = $_.Exception.Message
-            return $result
-        }
-    }
-
     # Bounded Win32_VideoController scan: the query can block forever on a degraded WMI
     # repository, -ErrorAction only suppresses reported errors, and -OperationTimeoutSec is not
     # enforced for the local COM session this uses, so out of process with a wall-clock kill is
@@ -8784,6 +9161,13 @@ exit 0
         # A rerun has already moved the old venv to $script:StudioVenvRollbackDir and put an
         # empty one in its place, so probing $VenvPython would ask an interpreter with no torch.
         # Ask the preserved environment instead -- that is the migrated runtime this rescues.
+        # --no-rollback deleted that environment, so the answer was taken before it went. Same
+        # verdict, same effect: opting out of the rollback copy must not narrow the device set.
+        if ($script:StudioPreservedXpuVerdict) {
+            $HasIntelGpu = $true
+            $script:IsIntelXpu = $true
+            if (-not $IntelGpuLabel) { $IntelGpuLabel = "Intel GPU (detected by PyTorch XPU)" }
+        }
         $_xpuProbePy = $VenvPython
         if ($script:StudioVenvRollbackDir) {
             $_rollbackPy = Join-Path $script:StudioVenvRollbackDir "Scripts\python.exe"
@@ -10498,10 +10882,33 @@ sys.exit(2 if conflict else (0 if installed else 1))
     }
     Remove-Item Env:UNSLOTH_KEPT_TORCH -ErrorAction SilentlyContinue
     if ($setupExit -ne 0) {
+        # A full disk surfaces here as nothing but an exit code (#11313), so ask the volume and
+        # name it; below 64 MB nothing useful unpacks, making it the cause rather than a
+        # coincidence. Measured under --tauri too, where nothing reaches the UI except the single
+        # line Exit-InstallFailure hands to Write-TauriLog, so the diagnosis rides on that.
+        $_failFree = Get-StudioFreeSpaceBytes -Path $StudioHome
+        $_failSuffix = ""
+        $_failRemedy = ""
+        if ($null -ne $_failFree -and $_failFree -lt 64MB) {
+            $_failMb = [math]::Round($_failFree / 1MB)
+            # Naming the opt-out to someone who already used it describes a re-run that fails
+            # the same way: that copy was discarded before the install began, so there is
+            # nothing left here for the installer to give back. install.sh gates its twin too.
+            $_failRemedy = if ($script:StudioNoRollback) {
+                "Free some space and re-run. The previous environment was already discarded by --no-rollback, so the installer has nothing further of its own to reclaim."
+            } else {
+                "Free some space and re-run. --no-rollback (UNSLOTH_INSTALL_NO_ROLLBACK=1) drops the previous environment instead of keeping a copy of it during the install."
+            }
+            $_failSuffix = ": $StudioHome has only $_failMb MB free, so the disk is full, which is very likely the cause. $_failRemedy"
+        }
         if (-not $TauriMode) {
             Write-StudioLine "[ERROR] unsloth studio setup failed (exit code $setupExit)" -ForegroundColor Red
+            if ($_failSuffix) {
+                Write-StudioLine "        $StudioHome has only $_failMb MB free -- the disk is full, which is very likely the cause." -ForegroundColor Red
+                Write-StudioLine "        $_failRemedy" -ForegroundColor Red
+            }
         }
-        return (Exit-InstallFailure "unsloth studio setup failed (exit code $setupExit)" $setupExit)
+        return (Exit-InstallFailure "unsloth studio setup failed (exit code $setupExit)$_failSuffix" $setupExit)
     }
     Clear-TauriInstallError "studio setup completed"
 
