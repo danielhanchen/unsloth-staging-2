@@ -188,6 +188,162 @@ try {
         Microsoft.PowerShell.Management\Remove-Item -LiteralPath Function:\Remove-Item -Force
     }
     Check "locked rollback deletion retries" ($removed -and $script:removeAttempts -eq 3)
+
+    Write-Host "--no-rollback discards the old environment instead of keeping a copy (#11313)"
+    # The rename still has to happen -- uv creates only into a path that is absent or empty -- so
+    # what the flag changes is what survives it, not whether there is one.
+    foreach ($case in @(
+            @{ Label = "default"; Flag = $false; ExpectCopy = $true },
+            @{ Label = "--no-rollback"; Flag = $true; ExpectCopy = $false })) {
+        [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+        [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+        Reset-RollbackState $VenvDir
+        $script:StudioNoRollback = $case.Flag
+        Start-StudioVenvRollback -ExistingDir $VenvDir
+        $copies = @(Get-ChildItem -LiteralPath $StudioHome -Directory -Filter "unsloth_studio.rollback.*" -ErrorAction SilentlyContinue)
+        Check "$($case.Label): rollback copy kept = $($case.ExpectCopy)" (($copies.Count -gt 0) -eq $case.ExpectCopy)
+        Check "$($case.Label): the old environment was moved aside" (-not (Test-Path -LiteralPath $VenvDir))
+        if (-not $case.ExpectCopy) {
+            # Cleared before the delete, exactly as the commit path does: an interrupt must not be
+            # handed a backup that is already half gone.
+            Check "--no-rollback clears the restore state" (
+                (-not $script:StudioVenvRollbackActive) -and ($null -eq $script:StudioVenvRollbackDir))
+            # And the restore must then be a no-op rather than a failure.
+            $restoreThrew = $false
+            try { Restore-StudioVenvRollback } catch { $restoreThrew = $true }
+            Check "--no-rollback leaves nothing for the restore to do" (
+                (-not $restoreThrew) -and (-not (Test-Path -LiteralPath $VenvDir)))
+        }
+        foreach ($c in $copies) { Microsoft.PowerShell.Management\Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+    $script:StudioNoRollback = $false
+
+    Write-Host "--no-rollback tells the ARM64 migration the tree is gone (#11313)"
+    # The migration branch decides what to do from the rollback state. Before this was tracked
+    # separately, --no-rollback left it merely "inactive", which that branch reads as "not moved
+    # aside yet", so it called Start-StudioVenvRollback on a directory --no-rollback had already
+    # deleted. Move-Item threw and the install exited through Exit-InstallFailure, having already
+    # destroyed the environment. The flag has to distinguish discarded from never-started.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    Reset-RollbackState $VenvDir
+    $script:StudioVenvRollbackDiscarded = $false
+    $script:StudioNoRollback = $true
+    Start-StudioVenvRollback -ExistingDir $VenvDir
+    Check "--no-rollback records that the tree was discarded" ($script:StudioVenvRollbackDiscarded)
+    Check "and the tree really is gone" (-not (Test-Path -LiteralPath $VenvDir))
+    # Replay the migration branch's own decision with that state. It must take neither the
+    # "already moved aside" arm nor the "move it now" arm.
+    $wouldMove = (-not $script:StudioVenvRollbackDiscarded) -and (-not $script:StudioVenvRollbackActive)
+    Check "the migration would not try to move a tree that is gone" (-not $wouldMove)
+    $script:StudioNoRollback = $false
+    $script:StudioVenvRollbackDiscarded = $false
+
+    # The ordinary path must still report "not discarded", or the migration would skip a tree
+    # that is genuinely sitting there waiting to be kept.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    Reset-RollbackState $VenvDir
+    Start-StudioVenvRollback -ExistingDir $VenvDir
+    Check "the ordinary path does not claim the tree was discarded" (-not $script:StudioVenvRollbackDiscarded)
+    Check "and it is still there to be kept" ($null -ne $script:StudioVenvRollbackDir -and (Test-Path -LiteralPath $script:StudioVenvRollbackDir))
+    foreach ($c in @(Get-ChildItem -LiteralPath $StudioHome -Directory -Filter "unsloth_studio.rollback.*" -ErrorAction SilentlyContinue)) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Host "the free-space warning names both figures and the opt-out, and never aborts"
+    # Stub the two measurements rather than filling a real disk.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    foreach ($case in @(
+            @{ Label = "less free than the venv needs"; Free = 512MB; Expect = $true },
+            @{ Label = "plenty of room"; Free = 100GB; Expect = $false },
+            @{ Label = "unmeasurable free space"; Free = $null; Expect = $false })) {
+        $script:warnLines = @()
+        function Write-StudioLine { param([string]$Message, [string]$ForegroundColor) $script:warnLines += $Message }
+        function Get-StudioTreeSizeBytes { param([string]$Path) return 1GB }
+        $script:caseFree = $case.Free
+        function Get-StudioFreeSpaceBytes { param([string]$Path) return $script:caseFree }
+        $threw = $false
+        try { Write-StudioRollbackSpaceWarning -ExistingDir $VenvDir } catch { $threw = $true }
+        $joined = ($script:warnLines -join "`n")
+        Check "$($case.Label): never throws" (-not $threw)
+        Check "$($case.Label): warning present = $($case.Expect)" (($joined -match 'needs about 1024 MB') -eq $case.Expect)
+        if ($case.Expect) {
+            Check "$($case.Label): names the free space too" ($joined -match '512 MB free')
+            Check "$($case.Label): names the opt-out" ($joined -match 'UNSLOTH_INSTALL_NO_ROLLBACK=1')
+        }
+    }
+    Write-Host "the warning and the discard message both tell the truth under --no-rollback"
+    # Two things Start-StudioVenvRollback gets wrong if it is written without them, and install.sh
+    # is gated identically: the warning's payload is the name of the opt-out, so printing it to
+    # someone who already passed that flag advises an action they have taken; and a delete that
+    # could not remove the tree frees none of the space the flag exists to free, so reporting it
+    # as discarded promises the user something that is still on their disk.
+    function Get-StudioTreeSizeBytes { param([string]$Path) return 1GB }
+    function Get-StudioFreeSpaceBytes { param([string]$Path) return 512MB }
+    $script:said = @()
+    function substep { param([string]$Message, [string]$Color) $script:said += $Message }
+    function Write-StudioLine { param([string]$Message, [string]$ForegroundColor) $script:said += $Message }
+
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    Reset-RollbackState $VenvDir
+    $script:StudioNoRollback = $true
+    # Off-volume, so the only thing keeping the warning quiet here is the flag.
+    $script:StudioUvCacheOffVolume = $true
+    Start-StudioVenvRollback -ExistingDir $VenvDir
+    $joined = ($script:said -join "`n")
+    Check "--no-rollback does not advise the flag it was already given" (
+        $joined -notmatch 'needs about')
+    Check "--no-rollback still reports the discard" ($joined -match 'discarded \(--no-rollback\)')
+
+    # And with the cache on this volume the warning is wrong even without the flag: uv hardlinks
+    # every wheel within one filesystem, so the old tree shares its blocks with the cache and
+    # keeping it costs metadata, while summing each file's length still bills all of them.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    Reset-RollbackState $VenvDir
+    $script:StudioNoRollback = $false
+    $script:StudioUvCacheOffVolume = $false
+    $script:said = @()
+    Start-StudioVenvRollback -ExistingDir $VenvDir
+    $joined = ($script:said -join "`n")
+    Check "a co-located cache does not warn about space the rollback does not take" (
+        $joined -notmatch 'needs about')
+    Check "and the rollback copy is still kept" ($script:StudioVenvRollbackActive)
+    foreach ($c in @(Get-ChildItem -LiteralPath $StudioHome -Directory -Filter "unsloth_studio.rollback.*" -ErrorAction SilentlyContinue)) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    $script:StudioNoRollback = $true
+    $script:StudioUvCacheOffVolume = $true
+
+    # A tree the retry helper could not remove. It shadows the extracted definition, so
+    # Start-StudioVenvRollback resolves to this one at call time.
+    [System.IO.Directory]::CreateDirectory($VenvDir) | Out-Null
+    [System.IO.File]::WriteAllText((Join-Path $VenvDir "generation"), "old")
+    Reset-RollbackState $VenvDir
+    $script:said = @()
+    function Remove-StudioVenvTreeWithRetry { param([string]$Path, [string]$Label) return $false }
+    try {
+        $discardThrew = $false
+        try { Start-StudioVenvRollback -ExistingDir $VenvDir } catch { $discardThrew = $true }
+    } finally {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath Function:\Remove-StudioVenvTreeWithRetry -Force
+    }
+    $joined = ($script:said -join "`n")
+    Check "a discard that could not delete never aborts the install" (-not $discardThrew)
+    Check "a discard that could not delete does not claim success" (
+        $joined -notmatch 'discarded \(--no-rollback\)')
+    Check "a discard that could not delete names the path left on disk" (
+        $joined -match [regex]::Escape($StudioHome) -and $joined -match 'unsloth_studio\.rollback\.')
+    $script:StudioNoRollback = $false
+    foreach ($c in @(Get-ChildItem -LiteralPath $StudioHome -Directory -Filter "unsloth_studio.rollback.*" -ErrorAction SilentlyContinue)) {
+        Microsoft.PowerShell.Management\Remove-Item -LiteralPath $c.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    function substep { param([string]$Message, [string]$Color) }
+    function Write-StudioLine { param([string]$Message, [string]$ForegroundColor) Write-Host $Message }
 } finally {
     if (Test-Path -LiteralPath $StudioHome) {
         Microsoft.PowerShell.Management\Remove-Item -LiteralPath $StudioHome -Recurse -Force
