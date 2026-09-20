@@ -1,0 +1,59 @@
+# Review-only staging workflow for unslothai/unsloth#11276.
+# Native Safari is the one engine the PR's Chromium driver cannot reach, and WebKit under
+# Playwright is not Safari. This asserts the toast's grid actions row on the browser that
+# actually ships to Mac users.
+
+name: Model-load notice, native Safari
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'tests/studio/selenium_model_load_safari.py'
+      - 'studio/frontend/tests/fixtures/_tmp-safari/**'
+
+permissions:
+  contents: read
+
+jobs:
+  safari:
+    name: Model-load notice (native Safari)
+    runs-on: macos-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm ci --ignore-scripts --no-fund --no-audit
+
+      - name: Install selenium
+        run: python -m pip install --disable-pip-version-check selenium
+
+      - name: Enable Safari remote automation
+        run: sudo safaridriver --enable
+
+      - name: Model-load notification on native Safari
+        run: python tests/studio/selenium_model_load_safari.py
+
+      - name: Upload report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: model-load-safari
+          path: temp/model-load-safari
+          retention-days: 3
+          if-no-files-found: warn
