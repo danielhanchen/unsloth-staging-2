@@ -93,6 +93,15 @@ export function useChatProjects(): {
       if (!cancelled && !projectsLoaded) setIsLoading(true);
       try {
         await loadProjects(force, followUpIfPending);
+      } catch (error) {
+        // Every caller below is `void refresh(...)`, so nobody is listening: an unexpected
+        // failure here becomes an unhandled rejection rather than a handled error. That stayed
+        // invisible while only the sidebar and the projects page mounted this hook, because both
+        // run where the projects route answers. A chat image mounts it too, once per image, so a
+        // route that 404s turned one failure into one rejection per rendered image. The cached
+        // rows are left as they are and the caller reads `hasLoaded`; a project that cannot be
+        // read is the same to a reader as a project that is not there yet.
+        console.debug("Could not refresh the project list", error);
       } finally {
         if (!cancelled) {
           setHasLoaded(true);
@@ -119,8 +128,11 @@ export function useChatProjects(): {
   return { projects, isLoading, hasLoaded };
 }
 
-export async function createChatProject(name: string): Promise<ProjectRecord> {
-  return createStoredChatProject(name);
+export async function createChatProject(
+  name: string,
+  workspace?: { nativePathLease: string },
+): Promise<ProjectRecord> {
+  return createStoredChatProject(name, workspace);
 }
 
 export async function renameChatProject(
@@ -137,6 +149,20 @@ export async function updateChatProjectInstructions(
   instructions: string,
 ): Promise<void> {
   await updateStoredChatProject(projectId, { instructions: instructions.trim() });
+}
+
+export async function setChatProjectWorkspace(
+  projectId: string,
+  workspace:
+    | { kind: "managed" }
+    | { kind: "external"; nativePathLease: string },
+): Promise<void> {
+  await updateStoredChatProject(projectId, {
+    workspaceKind: workspace.kind,
+    ...(workspace.kind === "external"
+      ? { nativePathLease: workspace.nativePathLease }
+      : {}),
+  });
 }
 
 export async function deleteChatProject(
