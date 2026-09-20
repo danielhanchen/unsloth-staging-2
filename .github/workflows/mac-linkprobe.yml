@@ -1,0 +1,19 @@
+name: mac linkprobe
+on:
+  push:
+    branches: [pr-11209-xplat-ci]
+  workflow_dispatch:
+jobs:
+  link:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - name: Seatbelt hard-link and canary controls, named individually
+        run: |
+          PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_sandbox_macos.py \
+            -v -rs -k "hard_link or home_is_unreadable or profile_compiles"
