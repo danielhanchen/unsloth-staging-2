@@ -259,3 +259,159 @@ def test_concurrent_distinct_calls_route_their_own_decisions():
 def test_rejected_message_is_user_facing_text():
     assert isinstance(TOOL_REJECTED_MESSAGE, str)
     assert TOOL_REJECTED_MESSAGE.strip()
+
+
+# ── Durable runs park the gate instead of auto-denying on timeout ───────
+# A durable run's cancel_event is never set on a browser disconnect, so a pending
+# approval must keep waiting for the returning session (resolved by id) rather than
+# silently denying at the 3600s ceiling. An explicit Stop still denies: setting the
+# event wins over parking.
+
+
+def test_durable_approval_parks_past_timeout():
+    """A durable gate waits past its timeout for the session to return, not deny."""
+    cancel = threading.Event()
+    cancel.durable = True
+    aid = new_approval_id()
+    w = _Waiter("sess", aid, cancel_event = cancel, timeout = 0.2).start()
+    # The short ceiling has long passed; the gate must still be parked, not auto-denied.
+    time.sleep(0.6)
+    assert _has_pending(aid), "durable gate must park past its timeout, not auto-deny"
+    assert resolve_tool_decision(aid, "allow", session_id = "sess") is True
+    assert w.join(timeout = 3.0) == "allow"
+
+
+def test_durable_cancel_still_denies():
+    """An explicit Stop (cancel_event set) denies even when the run is durable."""
+    cancel = threading.Event()
+    cancel.durable = True
+    aid = new_approval_id()
+    w = _Waiter("sess", aid, cancel_event = cancel).start()
+    cancel.set()
+    assert w.join(timeout = 3.0) == "deny"
+    assert _wait_until(lambda: not _has_pending(aid))
+
+
+def test_an_unanswered_park_is_released_by_the_settles_cancel_not_a_ceiling():
+    """The sweeper's settle-cancel releases a park that the park timeout has not yet reached.
+
+    At 0.6s the default park timeout (300s) has not elapsed, so the only thing that can release
+    the gate is an external cancel — exactly what ``supervisor.cancel()`` does after
+    ``reconcile_runs`` settles a lease-expired run. The parked gate must deny and pop its own
+    slot, so the reservation unwinds.
+    """
+    cancel = threading.Event()
+    cancel.durable = True
+    aid = new_approval_id()
+    w = _Waiter("sess", aid, cancel_event = cancel, timeout = 0.2).start()
+    # Well within the park timeout (300s default); only an external cancel can release now.
+    time.sleep(0.6)
+    assert _has_pending(aid), "the park has not timed out yet; only cancel releases it"
+    cancel.set()  # what reconcile_runs' settle does to a lease-expired run
+    assert w.join(timeout = 3.0) == "deny", "the settle's cancel must read as deny"
+    assert _wait_until(lambda: not _has_pending(aid)), "the slot must be popped on release"
+
+
+def test_durable_park_denies_at_park_timeout(monkeypatch):
+    """A durable park denies at the park timeout so an unattended agent adapts and continues.
+
+    This is the release path for agentic work where the user has left: the approval times out,
+    the model receives TOOL_REJECTED_MESSAGE, and the loop proceeds to the next step. The sweeper
+    remains a backstop for producers wedged before they reach wait_tool_decision.
+    """
+    monkeypatch.setattr(tool_approvals, "_PARK_TIMEOUT_S", 0.2)
+    cancel = threading.Event()
+    cancel.durable = True
+    aid = new_approval_id()
+    w = _Waiter("sess", aid, cancel_event = cancel).start()
+    # Park timeout (0.2s) has elapsed; the gate must deny on its own, no cancel needed.
+    time.sleep(0.6)
+    assert w.join(timeout = 3.0) == "deny", "the park timeout must release an unanswered approval"
+    assert _wait_until(lambda: not _has_pending(aid)), "the slot must be popped on timeout"
+
+
+# ── The park ceiling is configuration, and configuration must not be able to kill the backend ──
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("30", 30.0),
+        ("0", 0.0),
+        ("0.5", 0.5),
+        ("  45  ", 45.0),
+        # Anything unparseable, out of range, or nonsensical falls back rather than raising: this
+        # module is imported on the chat path, so a typo here would otherwise take the backend down
+        # at startup, and a stuck approval is the lesser failure.
+        ("5m", 300.0),
+        ("", 300.0),
+        ("   ", 300.0),
+        ("none", 300.0),
+        ("-1", 300.0),
+        ("nan", 300.0),
+        ("inf", 300.0),
+    ],
+)
+def test_the_park_ceiling_reads_the_env_without_ever_raising(monkeypatch, value, expected):
+    monkeypatch.setenv("UNSLOTH_STUDIO_TOOL_APPROVAL_TIMEOUT_S", value)
+    assert tool_approvals._park_timeout_from_env() == expected
+
+
+def test_an_unset_park_ceiling_is_the_documented_default(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_STUDIO_TOOL_APPROVAL_TIMEOUT_S", raising = False)
+    assert tool_approvals._park_timeout_from_env() == 300.0
+    assert tool_approvals._PARK_TIMEOUT_DEFAULT_S == 300.0
+
+
+def test_a_zero_ceiling_denies_at_the_first_poll_not_before_it(monkeypatch):
+    """The loop waits before it checks, so 0 is "autonomous", not "instant": a decision landing
+    inside the first 500ms still wins. The comment on _PARK_TIMEOUT_DEFAULT_S says so; this pins it,
+    because a reader who takes "denies immediately" literally would call the opposite a bug."""
+    monkeypatch.setattr(tool_approvals, "_PARK_TIMEOUT_S", 0.0)
+    cancel = threading.Event()
+    cancel.durable = True
+    aid = new_approval_id()
+    w = _Waiter("sess", aid, cancel_event = cancel).start()
+    time.sleep(0.05)
+    assert resolve_tool_decision(aid, "allow", session_id = "sess") is True
+    assert w.join(timeout = 3.0) == "allow"
+
+
+def test_a_returning_session_past_the_ceiling_cannot_resolve_its_own_approval(monkeypatch):
+    """What the user actually experiences at the ceiling: the call is already refused, and the
+    Approve they press on return has nothing left to resolve (the route turns this into a 404)."""
+    monkeypatch.setattr(tool_approvals, "_PARK_TIMEOUT_S", 0.2)
+    cancel = threading.Event()
+    cancel.durable = True
+    aid = new_approval_id()
+    w = _Waiter("sess", aid, cancel_event = cancel).start()
+    assert w.join(timeout = 3.0) == "deny"
+    assert resolve_tool_decision(aid, "allow", session_id = "sess") is False
+
+
+def test_a_pending_approval_reports_pending_and_a_decided_one_does_not():
+    """A reopened tab cannot tell a parked call from one the user already answered: both are saved
+    as a card with no result and an approval id, because the result only lands with tool_end. This
+    is the durable signal that separates them."""
+    approval_id = tool_approvals.new_approval_id()
+    slot = tool_approvals.begin_tool_decision("sess-a", approval_id)
+    assert tool_approvals.tool_decision_is_pending(approval_id, "sess-a") is True
+
+    assert tool_approvals.resolve_tool_decision(approval_id, "allow", session_id = "sess-a") is True
+    # Decided but not yet collected by the waiter: the window that would otherwise read as parked.
+    assert tool_approvals.tool_decision_is_pending(approval_id, "sess-a") is False
+
+    assert tool_approvals.wait_tool_decision(slot, approval_id, timeout = 30) == "allow"
+    # And gone once the waiter has popped its own slot.
+    assert tool_approvals.tool_decision_is_pending(approval_id, "sess-a") is False
+
+
+def test_the_pending_check_is_session_scoped_and_unguessable():
+    approval_id = tool_approvals.new_approval_id()
+    tool_approvals.begin_tool_decision("sess-a", approval_id)
+    assert tool_approvals.tool_decision_is_pending(approval_id, "sess-b") is False
+    assert tool_approvals.tool_decision_is_pending(approval_id, "sess-a") is True
+    # No id, no answer: this must never be a way to ask "is anything pending".
+    assert tool_approvals.tool_decision_is_pending("", "sess-a") is False
+    assert tool_approvals.tool_decision_is_pending(None, "sess-a") is False
+    assert tool_approvals.tool_decision_is_pending("not-a-real-id", "sess-a") is False
