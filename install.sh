@@ -1,5 +1,5 @@
 #!/bin/sh
-# Unsloth Studio Installer. Usage, supported options and the web one-liner live in the README under "Unsloth Studio (web UI)" and are deliberately not repeated here: this file ships inside the Linux desktop bundle, where a header rehearsing download-and-run command lines is the first thing a generic script classifier reads. A piped install takes options as environment variables after the pipe (UNSLOTH_NO_TORCH, UNSLOTH_SKIP_AUTOSTART, UNSLOTH_ISOLATE_UV_CACHE, UNSLOTH_PYTHON, UNSLOTH_STUDIO_HOME), because a bare `--no-torch` after the pipe would be read as an option to sh itself; a local run takes the equivalent flags (--no-torch, --isolated-uv-cache, --python, --local). Install dir priority: UNSLOTH_STUDIO_HOME > STUDIO_HOME > $HOME/.unsloth/studio
+# Unsloth Studio Installer. Usage, supported options and the web one-liner live in the README under "Unsloth Studio (web UI)" and are deliberately not repeated here: this file ships inside the Linux desktop bundle, where a header rehearsing download-and-run command lines is the first thing a generic script classifier reads. A piped install takes options as environment variables after the pipe (UNSLOTH_NO_TORCH, UNSLOTH_SKIP_AUTOSTART, UNSLOTH_ISOLATE_UV_CACHE, UNSLOTH_INSTALL_NO_ROLLBACK, UNSLOTH_PYTHON, UNSLOTH_STUDIO_HOME), because a bare `--no-torch` after the pipe would be read as an option to sh itself; a local run takes the equivalent flags (--no-torch, --isolated-uv-cache, --no-rollback, --python, --local). Install dir priority: UNSLOTH_STUDIO_HOME > STUDIO_HOME > $HOME/.unsloth/studio
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 set -e
@@ -39,6 +39,7 @@ _USER_PYTHON=""
 _NO_TORCH_FLAG=false
 _SKIP_AUTOSTART=false
 _ISOLATE_UV_CACHE=false
+_NO_ROLLBACK=false
 _VERBOSE=false
 _SHORTCUTS_ONLY=false
 _next_is_package=false
@@ -68,6 +69,7 @@ for arg in "$@"; do
         --python) _next_is_python=true ;;
         --no-torch) _NO_TORCH_FLAG=true ;;
         --isolated-uv-cache) _ISOLATE_UV_CACHE=true ;;
+        --no-rollback) _NO_ROLLBACK=true ;;
         --verbose|-v) _VERBOSE=true ;;
         --shortcuts-only) _SHORTCUTS_ONLY=true ;;
         --with-llama-cpp-dir) _next_is_llama_cpp_dir=true ;;
@@ -78,6 +80,7 @@ done
 case "${UNSLOTH_NO_TORCH:-}" in 1|true|TRUE|yes|YES|on|ON) _NO_TORCH_FLAG=true ;; esac
 case "${UNSLOTH_SKIP_AUTOSTART:-}" in 1|true|TRUE|yes|YES|on|ON) _SKIP_AUTOSTART=true ;; esac
 case "${UNSLOTH_ISOLATE_UV_CACHE:-}" in 1|true|TRUE|yes|YES|on|ON) _ISOLATE_UV_CACHE=true ;; esac
+case "${UNSLOTH_INSTALL_NO_ROLLBACK:-}" in 1|true|TRUE|yes|YES|on|ON) _NO_ROLLBACK=true ;; esac
 [ -z "$_USER_PYTHON" ] && [ -n "${UNSLOTH_PYTHON:-}" ] && _USER_PYTHON="$UNSLOTH_PYTHON"
 
 if [ "$_VERBOSE" = true ]; then
@@ -969,6 +972,26 @@ _configure_uv_cache() {
     esac
 }
 
+# Outside _configure_uv_cache, not inside it: the ranking is pinned across install.sh, install.ps1, studio/setup.sh and unsloth_cli/commands/studio.py (tests/python/test_uv_cache_selector_agreement.py), and tests/sh/test_install_uv_cache_root.sh extracts that one function and runs it on its own, so it stays exactly what those two pin. The ranking is therefore NOT reordered to prefer a co-located cache; what is added is saying what the winner costs. Across a filesystem boundary uv copies every wheel rather than hardlinking it, so the new environment is a second full copy rather than a handful of megabytes -- the whole of the "a reinstall doubles the disk" report (#11313).
+_warn_if_uv_cache_is_off_volume() {
+    # No persistent cache at all. --no-cache / UV_NO_CACHE hands uv a temporary cache it discards when the command ends, so there is nothing for the old environment's files to be shared with once the install is over and keeping that tree costs its full size. No notice for this one: where the cache sits is not what is wrong here.
+    if _uv_no_cache_requested; then
+        _ROLLBACK_COSTS_FULL_SIZE=true
+        return 0
+    fi
+    [ -n "${UV_CACHE_DIR:-}" ] || return 0
+    _same_volume "$UV_CACHE_DIR" "$STUDIO_HOME" && return 0
+    # Read by the rollback warning below: the cost it describes is only real across this boundary.
+    _ROLLBACK_COSTS_FULL_SIZE=true
+    # A caller's own UV_CACHE_DIR wins in _configure_uv_cache and returns before --isolated-uv-cache is ever read, so naming that flag here sends the user back for a byte-identical run that prints this same line again. Name the thing that would actually change the answer.
+    if [ "${_UV_CACHE_MODE:-}" = custom ]; then
+        _wov_remedy="unset UV_CACHE_DIR, or point it at a path on the same filesystem, to keep the cache beside the environment"
+    else
+        _wov_remedy="use --isolated-uv-cache to keep the cache beside the environment"
+    fi
+    step "uv cache" "$UV_CACHE_DIR is on a different filesystem from $STUDIO_HOME, so wheels are copied into the venv rather than hardlinked, costing extra disk; $_wov_remedy" "$C_WARN"
+}
+
 _prepare_studio_uv_cache_for_launch() {
     [ "${_UV_CACHE_MODE:-}" = shared ] || return 0
     # Only to a cache the backend can fill. shared is reachable exactly when the early block
@@ -1079,13 +1102,70 @@ _start_studio_venv_replacement() {
     _VENV_ROLLBACK_DIR="$_candidate"
     _VENV_ROLLBACK_TARGET="$_existing_dir"
     _VENV_ROLLBACK_ACTIVE=true
+    # The rename itself is free, but the new venv beside it is not: uv hardlinks a wheel only within one filesystem, so a cache on another volume makes every file a real copy and the install needs room for two whole environments (#11313). Say so before the space is gone, and never abort -- the estimate is a guess and being wrong must not cost a working install.
+    # `|| true` for the same reason install.ps1 wraps its twin: this is advice, and advice that cannot be produced must not cost the rename under `set -e` -- including in a harness that spliced this function without the helper.
+    # Two gates, both of which stop the warning from advising something that would not help.
+    # Not under --no-rollback: the warning exists to name the opt-out, so telling a user to re-run with the flag they already passed is noise, and the branch below discards that copy anyway.
+    # And only when keeping the old environment costs its own size: with a persistent cache on this volume uv hardlinks every wheel, so the old venv's blocks are shared with the cache and keeping it costs metadata rather than megabytes -- while `du` over the venv alone still bills each of those inodes in full and would recommend an opt-out that frees nothing. Set across a filesystem boundary, where uv copies instead, and under UV_NO_CACHE, where no cache outlives the install. Not knowing counts as shared, the quiet direction taken everywhere else here.
+    if [ "${_NO_ROLLBACK:-false}" != true ] && [ "${_ROLLBACK_COSTS_FULL_SIZE:-false}" = true ]; then
+        _warn_if_rollback_needs_space "$_existing_dir" || true
+    fi
     # Publish the rollback state before the atomic rename so a signal cannot land after mv but before the exit handlers know where the old venv went.
     if ! mv "$_existing_dir" "$_candidate"; then
         _VENV_ROLLBACK_ACTIVE=false
         _VENV_ROLLBACK_DIR=""
         return 1
     fi
+    # --no-rollback / UNSLOTH_INSTALL_NO_ROLLBACK: drop the old environment now instead of at commit, for the disk-constrained cross-volume case. The rename still happens first, so uv never builds into an occupied path. Clearing the state before the delete is what the commit path does too: a signal must not restore a half-deleted backup.
+    if [ "${_NO_ROLLBACK:-false}" = true ]; then
+        _VENV_ROLLBACK_ACTIVE=false
+        _VENV_ROLLBACK_DIR=""
+        rm -rf "$_candidate" 2>/dev/null || true
+        # -f exempts a missing path from the exit status, not a real unlink failure: an immutable entry, a busy mount point, a sticky-bit parent. Reporting "discarded" there promises space that was never freed, in the one situation this flag exists for. The state above stays cleared either way -- re-arming the rollback would hand an interrupt a half-deleted backup -- so say what is actually on disk.
+        if [ -e "$_candidate" ] || [ -L "$_candidate" ]; then
+            substep "could not discard the previous environment at $_candidate" "$C_WARN"
+            substep "it is no longer used for rollback; remove it by hand to reclaim the space." "$C_WARN"
+        else
+            substep "previous environment discarded (--no-rollback); a failed install cannot be undone"
+        fi
+        return 0
+    fi
     substep "previous environment preserved for rollback"
+}
+
+# du/df in KiB, printing nothing when the answer is not available: an estimate this warning cannot make is a warning it does not print.
+_dir_size_kb() {  # dir
+    [ -d "$1" ] || return 0
+    du -sk "$1" 2>/dev/null | awk 'NR == 1 { print $1 }'
+}
+
+_free_space_kb() {  # path
+    df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'
+}
+
+# Same volume? Compare the device the two paths live on. A path that does not exist yet is answered for by its nearest existing parent, which is the volume it would be created on.
+_same_volume() {  # a b
+    _sv_a="$1"
+    _sv_b="$2"
+    while [ -n "$_sv_a" ] && [ ! -e "$_sv_a" ]; do _sv_a=$(dirname "$_sv_a"); done
+    while [ -n "$_sv_b" ] && [ ! -e "$_sv_b" ]; do _sv_b=$(dirname "$_sv_b"); done
+    # Cannot tell: answer "same volume", which is the quiet direction and what install.ps1's Test-StudioSameVolume already does. Answering "different" would make an unreadable path print a cost warning nobody can act on.
+    [ -n "$_sv_a" ] && [ -n "$_sv_b" ] || return 0
+    _sv_da=$(df -P "$_sv_a" 2>/dev/null | awk 'NR == 2 { print $1 }')
+    _sv_db=$(df -P "$_sv_b" 2>/dev/null | awk 'NR == 2 { print $1 }')
+    [ -n "$_sv_da" ] && [ -n "$_sv_db" ] || return 0
+    [ "$_sv_da" = "$_sv_db" ]
+}
+
+# One line, before the move, naming both figures and the opt-out. Warn only: du over a tree full of hardlinks already counts shared blocks once, so the estimate is conservative, and a wrong guess must never stop an install that would have fitted.
+_warn_if_rollback_needs_space() {  # existing_dir
+    _wrs_existing="$1"
+    _wrs_size=$(_dir_size_kb "$_wrs_existing")
+    _wrs_free=$(_free_space_kb "$STUDIO_HOME")
+    [ -n "$_wrs_size" ] && [ -n "$_wrs_free" ] || return 0
+    [ "$_wrs_free" -lt "$_wrs_size" ] 2>/dev/null || return 0
+    echo "[WARN] Keeping the previous environment for rollback needs about $((_wrs_size / 1024)) MB, and $STUDIO_HOME has $((_wrs_free / 1024)) MB free." >&2
+    echo "       The install continues. If it runs out of space, re-run with --no-rollback (or UNSLOTH_INSTALL_NO_ROLLBACK=1) to discard the old environment instead of keeping it." >&2
 }
 
 # uv creates only into a path that is absent or an empty directory. Everything else is occupied, hidden entries and non-resolving symlinks included.
@@ -3464,6 +3544,7 @@ if ! command -v uv >/dev/null 2>&1 || ! _uv_version_ok uv; then
 fi
 
 _configure_uv_cache
+_warn_if_uv_cache_is_off_volume
 
 # ── Create venv (migrate old layout if possible, otherwise fresh) ──
 tauri_log "STEP" "Creating virtual environment"
@@ -7365,10 +7446,27 @@ fi
 # If setup.sh failed, report and exit now.
 if [ "$_SETUP_EXIT" -ne 0 ]; then
     echo ""
+    # A full disk surfaces here as nothing but an exit code, with the one "No space left on device" line buried in setup's output (#11313). Ask the filesystem directly and name it. Below 64 MiB nothing useful can be unpacked, so it is the cause rather than a coincidence.
+    # Folded into the ERROR_DEFAULT message as well, not only stderr: under --tauri the desktop app reads that message, so a diagnosis printed beside it is one the UI never shows. One line, because a marker is one line.
+    _fail_free_kb=$(_free_space_kb "$STUDIO_HOME")
+    _fail_suffix=""
+    if [ -n "$_fail_free_kb" ] && [ "$_fail_free_kb" -lt 65536 ] 2>/dev/null; then
+        # Naming the opt-out to someone who already used it describes a re-run that fails the same way: that copy was discarded before the install began, so there is nothing left here for the installer to give back.
+        if [ "${_NO_ROLLBACK:-false}" = true ]; then
+            _fail_remedy="Free some space and re-run. The previous environment was already discarded by --no-rollback, so the installer has nothing further of its own to reclaim."
+        else
+            _fail_remedy="Free some space and re-run. --no-rollback (UNSLOTH_INSTALL_NO_ROLLBACK=1) drops the previous environment instead of keeping a copy of it during the install."
+        fi
+        _fail_suffix=": $STUDIO_HOME has only $((_fail_free_kb / 1024)) MB free, so the disk is full, which is very likely the cause. $_fail_remedy"
+    fi
     if [ "$TAURI_MODE" = true ]; then
-        tauri_log "ERROR_DEFAULT" "studio setup failed (exit code $_SETUP_EXIT)"
+        tauri_log "ERROR_DEFAULT" "studio setup failed (exit code $_SETUP_EXIT)$_fail_suffix"
     else
         step "error" "studio setup failed (exit code $_SETUP_EXIT)" "$C_ERR"
+    fi
+    if [ -n "$_fail_suffix" ]; then
+        echo "       $STUDIO_HOME has only $((_fail_free_kb / 1024)) MB free -- the disk is full, which is very likely the cause." >&2
+        echo "       $_fail_remedy" >&2
     fi
     echo ""
     exit "$_SETUP_EXIT"
