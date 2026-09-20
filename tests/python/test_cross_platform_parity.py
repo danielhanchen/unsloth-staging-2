@@ -1516,3 +1516,160 @@ class TestInstallUvCacheRootParity:
         assert "Set-StudioUvCacheForLaunch" in source
         assert "Set-Item -LiteralPath Env:UV_CACHE_DIR -Value $PreviousValue" in source
         assert "Remove-Item -LiteralPath Env:UV_CACHE_DIR" in source
+
+
+class TestOffVolumeCacheNoticeParity:
+    """The notice for a cache that could not be co-located has to name a remedy that exists,
+    and the same one on both installers. A caller's own UV_CACHE_DIR wins in the selector and
+    returns before --isolated-uv-cache is read at all, so naming that flag to a custom-cache
+    user sends them back for a byte-identical run that prints the notice again (#11313)."""
+
+    @pytest.mark.parametrize(
+        "path, mode_test",
+        [
+            (INSTALL_SH, '[ "${_UV_CACHE_MODE:-}" = custom ]'),
+            (INSTALL_PS1, '$script:StudioUvCacheMode -eq "custom"'),
+        ],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_custom_cache_is_not_told_to_pass_a_flag_it_ignores(self, path, mode_test):
+        text = path.read_text(encoding = "utf-8")
+        assert mode_test in text, f"{path.name} does not vary the remedy by cache mode"
+        assert (
+            "unset UV_CACHE_DIR" in text
+        ), f"{path.name} does not tell a custom-cache user what would change the answer"
+
+    @pytest.mark.parametrize(
+        "path, flag",
+        [
+            (INSTALL_SH, "_ROLLBACK_COSTS_FULL_SIZE"),
+            (INSTALL_PS1, "$script:StudioRollbackCostsFullSize"),
+        ],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_the_finding_is_recorded_for_the_rollback_warning(self, path, flag):
+        # Keeping the old environment only costs its own size across a filesystem boundary:
+        # within one, uv hardlinks every wheel, so the tree shares its blocks with the cache.
+        text = path.read_text(encoding = "utf-8")
+        assert (
+            text.count(flag) >= 2
+        ), f"{path.name} should set {flag} at the notice and read it at the rollback warning"
+
+
+class TestWindowsMountPointVolumes:
+    """A Windows volume can be mounted at a DIRECTORY rather than a drive letter. GetPathRoot
+    reduces C:\\studio to C:\\, so DriveInfo answers for the host drive and two paths on
+    different mounted volumes compare equal on their root: the rollback-space warning is then
+    suppressed or falsely emitted, and the cross-volume cache notice never fires. Win32_Volume
+    lists mount points by the path they are mounted at. Pinned by text because no host in CI
+    has a directory mount point to exercise (#11313)."""
+
+    def test_free_space_asks_the_mounted_volume_first(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert "Win32_Volume" in text, "install.ps1 does not consult the mount-point view"
+        helper = text.split("function Get-StudioFreeSpaceBytes", 1)[1].split(
+            "function Get-StudioTreeSizeBytes", 1
+        )[0]
+        assert "Get-StudioMountedVolume" in helper, (
+            "Get-StudioFreeSpaceBytes falls straight through to the drive root"
+        )
+        assert "DriveInfo" in helper, "the drive-root fallback was dropped"
+
+    def test_same_volume_compares_identity_not_root(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Test-StudioSameVolume", 1)[1].split("\n    }", 1)[0]
+        # DeviceID is the volume GUID. The mount path is not identity: one volume can be
+        # mounted in several places.
+        assert "DeviceID" in helper, "Test-StudioSameVolume still compares only the drive root"
+
+    def test_the_probe_is_gated_on_windows(self):
+        # CimCmdlets ships only on Windows, and this helper is reached on every platform.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        helper = text.split("function Get-StudioMountedVolume", 1)[1].split("\n    }", 1)[0]
+        assert "$IsWindows" in helper and "Windows_NT" in helper, (
+            "Get-StudioMountedVolume would call Get-CimInstance off Windows"
+        )
+
+
+class TestDiskFullDiagnosisReachesTauri:
+    """The desktop installer and its Repair flow run with --tauri, and there the only thing the
+    UI and its logs ever see is the message handed to the ERROR_DEFAULT marker. A disk-full
+    diagnosis printed beside that message is one the desktop user never reads, which is the
+    scenario #11313 was reported from."""
+
+    def test_shell_folds_the_diagnosis_into_the_marker(self):
+        text = INSTALL_SH.read_text(encoding = "utf-8")
+        assert (
+            'tauri_log "ERROR_DEFAULT" "studio setup failed (exit code $_SETUP_EXIT)$_fail_suffix"'
+            in text
+        ), "install.sh keeps the disk-full diagnosis out of the Tauri message"
+
+    def test_windows_folds_the_diagnosis_into_the_failure_message(self):
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        assert (
+            'Exit-InstallFailure "unsloth studio setup failed (exit code $setupExit)$_failSuffix"'
+            in text
+        ), "install.ps1 keeps the disk-full diagnosis out of the Tauri message"
+
+    def test_windows_measures_in_both_modes(self):
+        # The probe must sit OUTSIDE the non-Tauri console branch, or --tauri never measures.
+        text = INSTALL_PS1.read_text(encoding = "utf-8")
+        block = text.split("if ($setupExit -ne 0) {", 1)[1].split("Clear-TauriInstallError", 1)[0]
+        probe = block.index("$_failFree = Get-StudioFreeSpaceBytes")
+        guard = block.index("if (-not $TauriMode) {")
+        assert probe < guard, (
+            "the free-space probe runs only in the non-Tauri branch, so --tauri never measures"
+        )
+
+
+class TestDiskFullRemedyIsNotTheFlagAlreadyGiven:
+    """A run that already passed --no-rollback and still ran out of space must not be told to
+    re-run with --no-rollback: that copy was discarded before the install began, so the re-run
+    fails identically. Same rule as the pre-move space warning, at the other end of the install."""
+
+    @pytest.mark.parametrize(
+        "path, flag",
+        [
+            (INSTALL_SH, '[ "${_NO_ROLLBACK:-false}" = true ]'),
+            (INSTALL_PS1, "if ($script:StudioNoRollback)"),
+        ],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_the_remedy_varies_on_the_flag(self, path, flag):
+        text = path.read_text(encoding = "utf-8")
+        block = text.split("is very likely the cause", 1)[0][-1400:]
+        assert flag in block, f"{path.name} gives the same remedy whether or not the flag is set"
+
+    @pytest.mark.parametrize(
+        "path",
+        [INSTALL_SH, INSTALL_PS1],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_the_already_discarded_case_says_so(self, path):
+        text = path.read_text(encoding = "utf-8")
+        assert "already discarded by --no-rollback" in text, (
+            f"{path.name} does not tell an opted-out run that there is nothing left to reclaim"
+        )
+
+
+class TestNoCacheStillCostsAFullEnvironment:
+    """uv's --no-cache / UV_NO_CACHE gives uv a TEMPORARY cache it discards when the command
+    ends (docs.astral.sh/uv/concepts/cache: "a temporary cache directory if --no-cache was
+    requested"). Nothing the old environment's files could be shared with survives the install,
+    so keeping that tree costs its full size and the rollback-space warning has to fire even
+    though the cache path looks co-located."""
+
+    @pytest.mark.parametrize(
+        "path, probe",
+        [
+            (INSTALL_SH, "_uv_no_cache_requested"),
+            (INSTALL_PS1, "Test-StudioUvNoCache"),
+        ],
+        ids = ["install.sh", "install.ps1"],
+    )
+    def test_no_cache_sets_the_full_size_flag(self, path, probe):
+        text = path.read_text(encoding = "utf-8")
+        flag = "_ROLLBACK_COSTS_FULL_SIZE" if path is INSTALL_SH else "StudioRollbackCostsFullSize"
+        window = text.split("is on a different", 1)[0][-1600:]
+        assert probe in window, f"{path.name} does not consider no-cache mode before gating"
+        assert flag in window, f"{path.name} does not set the full-size flag for no-cache mode"
