@@ -28,4 +28,15 @@ jobs:
         with:
           python-version: '3.12'
       - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - name: PowerShell rollback lifecycle
+        run: pwsh -NoProfile -File tests/studio/test_install_rollback_lifecycle.ps1
+      - name: Shell rollback lifecycle
+        run: |
+          if command -v dash >/dev/null 2>&1; then
+            bash tests/sh/test_install_rollback_lifecycle.sh
+          else
+            echo "dash is not present on this runner; the POSIX twin needs it"
+          fi
+      - name: uv cache co-location contract
+        run: bash tests/sh/test_uv_cache_colocation.sh
       - run: rc=0; PYTHONPATH=studio/backend python -m pytest tests/python/test_cross_platform_parity.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && ! grep -qE "^(FAILED|ERROR) " pytest_out.txt; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && ! grep -qE "^ERROR " pytest_out.txt; then tot=$(grep -cE "^FAILED " pytest_out.txt); dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt); if [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; fi; exit "$rc"
