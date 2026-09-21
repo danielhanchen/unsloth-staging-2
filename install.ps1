@@ -4136,20 +4136,74 @@ exit 1
         return $Text -replace '(https?://[^\s`#]+)#[^\s`]+', '$1#<redacted>'
     }
 
+    # Must answer as _respect_pm_policy() does in install.sh and install_python_stack.py.
+    # A hand-maintained duplicate of setup.ps1's copy, like the UNSLOTH_ENABLE_AMD_SMI pair;
+    # sits OUTSIDE the shared block above, so the sync script's contract does not cover it.
+    function Test-RespectPmPolicy {
+        # Trim the ASCII set only, matching _respect_pm_policy(): .Trim() also removes Unicode
+        # whitespace, which POSIX sh cannot portably, and a pasted non-breaking space then meant on
+        # here and off in install.sh. Unrecognised is off everywhere instead.
+        $value = [string][Environment]::GetEnvironmentVariable('UNSLOTH_RESPECT_PM_POLICY')
+        $ws = [char[]]@(' ', "`t", "`n", "`r", [char]11, [char]12)
+        return (@('1', 'true', 'yes', 'on') -contains $value.Trim($ws).ToLowerInvariant())
+    }
+
+    # uv reads no PIP_ variable and this script drives uv directly, so a pip-expressed hash
+    # requirement is restated once for the run. UV_REQUIRE_HASHES is uv's documented spelling
+    # of --require-hashes; an explicit uv value the operator set is left alone.
+    # The pip half of the same question, resolved the way pip itself resolves it: PIP_* outranks
+    # pip.conf, so an explicit variable is the answer and the files are never read. A hardened
+    # host is likelier to express this in pip.conf than in the environment, and the Python phase
+    # already reads it, so leaving it unread here let the shell phase run uv unhashed first.
+    # One `pip config list`, and only ever on a host that has already opted in.
+    function Test-PipPolicyRequiresHashes {
+        $off = @('', '0', 'false', 'no', 'off', 'n', 'f')
+        $raw = "$env:PIP_REQUIRE_HASHES".Trim()
+        if ($raw) { return (@('1', 't', 'true', 'y', 'yes', 'on') -contains $raw.ToLowerInvariant()) }
+        foreach ($exe in @('pip3', 'pip')) {
+            $found = Get-Command $exe -ErrorAction SilentlyContinue
+            if (-not $found) { continue }
+            $on = $false
+            try { $listing = & $found.Source config list 2>$null } catch { return $false }
+            foreach ($line in @($listing)) {
+                # Printed in load order, so a later entry -- including one that DISABLES it -- wins.
+                if ("$line" -match "^(global|install)\.require[-_]hashes\s*=\s*'?([^']*)'?\s*$") {
+                    $on = ($off -notcontains $Matches[2].Trim().ToLowerInvariant())
+                }
+            }
+            return $on
+        }
+        return $false
+    }
+
+    if ((Test-RespectPmPolicy) -and -not "$env:UV_REQUIRE_HASHES".Trim() -and
+        (Test-PipPolicyRequiresHashes)) {
+        $env:UV_REQUIRE_HASHES = '1'
+    }
+
     function Invoke-InstallCommand {
         param(
             [Parameter(Mandatory = $true)][ScriptBlock]$Command,
             [string]$Label = "install command"
         )
         # A pinned index must beat an inherited uv mirror (#6898); UV_NO_CONFIG=1 blocks uv.toml.
+        # Runs before install_python_stack.py, so the Python opt-out cannot cover it: under the
+        # opt-out the uv.toml binds this install too, and only the ADDITIVE vars go.
+        $respectPolicy = Test-RespectPmPolicy
         $savedUvIndex = $null
         if ($Command.ToString() -match '--default-index') {
             $savedUvIndex = @{}
-            foreach ($n in 'UV_DEFAULT_INDEX', 'UV_INDEX_URL', 'UV_INDEX', 'UV_EXTRA_INDEX_URL', 'UV_TORCH_BACKEND', 'UV_FIND_LINKS', 'UV_CONFIG_FILE', 'UV_NO_CONFIG') {
+            $scrub = @('UV_DEFAULT_INDEX', 'UV_INDEX_URL', 'UV_INDEX', 'UV_EXTRA_INDEX_URL', 'UV_TORCH_BACKEND', 'UV_FIND_LINKS', 'UV_CONFIG_FILE', 'UV_NO_CONFIG')
+            if ($respectPolicy) {
+                $scrub = @($scrub | Where-Object {
+                    @('UV_CONFIG_FILE', 'UV_NO_CONFIG', 'UV_FIND_LINKS') -notcontains $_
+                })
+            }
+            foreach ($n in $scrub) {
                 $savedUvIndex[$n] = [Environment]::GetEnvironmentVariable($n)
                 Remove-Item "Env:$n" -ErrorAction SilentlyContinue
             }
-            $env:UV_NO_CONFIG = '1'
+            if (-not $respectPolicy) { $env:UV_NO_CONFIG = '1' }
         }
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
@@ -4191,7 +4245,9 @@ exit 1
         } finally {
             $ErrorActionPreference = $prevEap
             if ($savedUvIndex) {
-                Remove-Item "Env:UV_NO_CONFIG" -ErrorAction SilentlyContinue
+                # Only clear what this function SET: under the opt-out UV_NO_CONFIG was
+                # neither saved nor overwritten, so removing it destroys the operator's own.
+                if (-not $respectPolicy) { Remove-Item "Env:UV_NO_CONFIG" -ErrorAction SilentlyContinue }
                 foreach ($n in $savedUvIndex.Keys) { if ($null -ne $savedUvIndex[$n]) { Set-Item "Env:$n" $savedUvIndex[$n] } }
             }
         }

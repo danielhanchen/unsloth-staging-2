@@ -206,12 +206,87 @@ _uv_download_markers() {
     '
 }
 
+# Must answer exactly as _respect_pm_policy() in studio/install_python_stack.py, strip and
+# all: on disagreement the shell half relaxes the policy while the Python half withholds,
+# and the operator gets neither the opt-out nor a clean default. Both spellings of the trim
+# are wrong in their own way: `tr -d` also collapses INTERNAL whitespace, making "t rue" the
+# true spelling here alone, and sed works a line at a time and cannot trim across a newline,
+# so "\n1" read as off while Python's .strip() made it on. Hence map-then-trim, which cannot
+# create a false positive because no allowlist entry contains a space.
+_respect_pm_policy() {
+    # Unset is everyone who has not opted in; answer it without paying two subprocesses.
+    case "${UNSLOTH_RESPECT_PM_POLICY:-}" in
+        "") return 1 ;;
+    esac
+    case "$(printf '%s' "$UNSLOTH_RESPECT_PM_POLICY" | tr '\n\r\t\013\014' '     ' | tr '[:upper:]' '[:lower:]' | sed 's/^ *//; s/ *$//')" in
+        1|true|yes|on) return 0 ;;
+    esac
+    return 1
+}
+
+# uv reads no PIP_ variable, and this script runs many uv commands directly, so a
+# pip-expressed hash requirement has to be restated ONCE for the whole run rather than per
+# command: the pinned arm below is not the only place uv is invoked. UV_REQUIRE_HASHES is
+# uv's documented spelling of --require-hashes. Never over a uv value the operator set.
+_carry_pip_policy_into_uv() {
+    _respect_pm_policy || return 0
+    [ -n "${UV_REQUIRE_HASHES:-}" ] && return 0
+    case "$(printf '%s' "${PIP_REQUIRE_HASHES:-}" | tr '[:upper:]' '[:lower:]')" in
+        1|t|true|y|yes|on) UV_REQUIRE_HASHES=1; export UV_REQUIRE_HASHES; return 0 ;;
+        "") ;;
+        # Any other explicit value is the operator DISABLING it for this run, and pip ranks
+        # the environment above its files, so the file is not consulted.
+        *) return 0 ;;
+    esac
+    # pip.conf is the likelier shape for a hardened host than the variable, and the Python
+    # phase already reads it. One `pip config list`, only ever on a host that has opted in,
+    # so the default path pays nothing. Any pip on PATH answers for the files, which are a
+    # property of the machine and the user rather than of a particular interpreter.
+    for _pm_pip in pip3 pip; do
+        command -v "$_pm_pip" >/dev/null 2>&1 || continue
+        if "$_pm_pip" config list 2>/dev/null \
+            | sed -n 's/^\(global\|install\)\.require[-_]hashes=//p' \
+            | tr -d "'\"" | tr '[:upper:]' '[:lower:]' \
+            | grep -qvE '^(0|false|no|off|n|f)?$'; then
+            UV_REQUIRE_HASHES=1; export UV_REQUIRE_HASHES
+        fi
+        break
+    done
+    unset _pm_pip
+    return 0
+}
+_carry_pip_policy_into_uv
+
+# Policy that binds uv and that pip cannot be told about. The Python twin is
+# _uv_only_policy_active(); a uv configuration file counts by PRESENCE, unparsed, because
+# whatever restriction it holds is precisely what a pip command will not see.
+_uv_only_policy_active() {
+    [ -n "${UV_REQUIRE_HASHES:-}" ] && return 0
+    [ -n "${UV_OFFLINE:-}" ] && return 0
+    [ -n "${UV_EXCLUDE_NEWER:-}" ] && return 0
+    [ -n "${UV_CONFIG_FILE:-}" ] && return 0
+    [ -f uv.toml ] && return 0
+    [ -f pyproject.toml ] && grep -q '\[tool\.uv\]' pyproject.toml 2>/dev/null && return 0
+    [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/uv/uv.toml" ] && return 0
+    return 1
+}
+
 run_install_cmd() {
     _label="$1"
     shift
     # For --default-index, clear inherited uv index vars so a uv.toml cannot outrank the CLI pin.
+    # Runs before install_python_stack.py, so the Python opt-out cannot cover it. Under the
+    # opt-out the config file and the wheelhouse stay (a uv.toml `no-index` makes find-links the
+    # only source uv is allowed); the ADDITIVE index vars still go, the pin being itself a
+    # provenance control (#6898).
     case " $* " in
-        *" --default-index "*) set -- env -u UV_DEFAULT_INDEX -u UV_INDEX_URL -u UV_INDEX -u UV_EXTRA_INDEX_URL -u UV_TORCH_BACKEND -u UV_FIND_LINKS -u UV_CONFIG_FILE UV_NO_CONFIG=1 "$@" ;;
+        *" --default-index "*)
+            if _respect_pm_policy; then
+                set -- env -u UV_DEFAULT_INDEX -u UV_INDEX_URL -u UV_INDEX -u UV_EXTRA_INDEX_URL -u UV_TORCH_BACKEND "$@"
+            else
+                set -- env -u UV_DEFAULT_INDEX -u UV_INDEX_URL -u UV_INDEX -u UV_EXTRA_INDEX_URL -u UV_TORCH_BACKEND -u UV_FIND_LINKS -u UV_CONFIG_FILE UV_NO_CONFIG=1 "$@"
+            fi
+            ;;
     esac
     if _is_verbose; then
         # Stream through the redactor; the rc file carries the exit code (no pipefail in sh).
@@ -353,6 +428,15 @@ _install_bnb_rocm() {
             _bnb_whl_url=""
             ;;
     esac
+    # Above the bootstrap, because ensurepip mutates the venv and a step that declines must
+    # leave it as found. This is the shell twin of pip_install_try(force_pip=True): pip is
+    # used here ON PURPOSE, so it reads no UV_ setting and no uv.toml, and under the opt-out
+    # installing a direct URL past a uv-only policy is the substitution that gate exists for.
+    if _respect_pm_policy && _uv_only_policy_active; then
+        substep "[SKIP] $_label needs pip, which your uv policy cannot reach" "$C_WARN"
+        substep "       unset UNSLOTH_RESPECT_PM_POLICY for one run to take it" "$C_WARN"
+        return 0
+    fi
     # uv rejects the pre-release wheel: filename version (1.33.7rc0) does not match metadata (0.50.x.dev0). pip accepts it, so bootstrap pip and use it.
     if ! "$_venv_py" -m pip --version >/dev/null 2>&1; then
         if ! run_maybe_quiet "$_venv_py" -m ensurepip --upgrade; then
