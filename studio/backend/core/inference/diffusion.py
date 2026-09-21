@@ -31,6 +31,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
+from core.inference.generate_outcomes import _retain_generate_failure
 from core._torchao_stub import (
     install_torchao_windows_rocm_stub,
     install_xformers_windows_rocm_stub,
@@ -6766,6 +6767,9 @@ class DiffusionBackend:
         controlnet: Optional[tuple[str, str, str, float, float, float]] = None,
         # load_identity() of the caller's status() read; refuse rather than run a different load (#9448)
         expected_load: Optional[LoadIdentity] = None,
+        # Client id for THIS request, echoed back beside a retained failure. Absent from
+        # an older client, which gets the pre-existing gallery probe.
+        attempt_id: Optional[str] = None,
     ) -> dict[str, Any]:
         import torch
         from PIL import Image
@@ -6786,6 +6790,13 @@ class DiffusionBackend:
                 # Publish an active (step 0) state before the slow pre-denoise setup so a reload mount probe does not
                 # read idle.
                 self._gen = _GenState(total_steps = steps)
+                # Cleared at the START, not only on success, so the retained reason can
+                # never be read as belonging to the run that is now in flight.
+                self._last_generate_error = None
+                # The id THIS request carried, kept with the reason: a post that never
+                # reached the backend started no run, so nothing carries its id, and a
+                # concurrent client's run carries its own.
+                self._last_generate_attempt = attempt_id
             try:
                 self._state_device_target(state)
                 # The local `state` ref keeps the pipe alive even if unload() nulls _state. Resolve the per-image
@@ -7258,6 +7269,19 @@ class DiffusionBackend:
                     # Create recipe.
                     "workflow": workflow,
                 }
+            except BaseException as exc:
+                # Kept so the idle progress below can still say WHY: once the POST is
+                # lost past the proxy window that poll is the client's only channel, and
+                # clearing _gen alone reported "not running" for a failure, which the
+                # settling path read as success. Raw; the route classifies it through
+                # _generate_failure_detail, so engine text never escapes from here.
+                # Both: the slot answers a client with no attempt id, and the
+                # per-attempt record survives the runs that follow this one.
+                self._last_generate_error = str(exc) or type(exc).__name__
+                _retain_generate_failure(attempt_id, self._last_generate_error)
+                raise
+            else:
+                self._last_generate_error = None
             finally:
                 with self._generation_cancel_lock:
                     if self._active_generate_cancel is cancel:
@@ -7278,6 +7302,12 @@ class DiffusionBackend:
                 "total_steps": 0,
                 "fraction": 0.0,
                 "eta_seconds": None,
+                # Idle is not the same as fine. Carried only while it is the LAST thing that
+                # happened: the next generation clears it on success.
+                "error": getattr(self, "_last_generate_error", None),
+                # WHICH attempt the reason belongs to, so a caller settling a LOST
+                # post can reject one that is not its own. None if no id was sent.
+                "generation_attempt": getattr(self, "_last_generate_attempt", None),
             }
         return {
             "active": True,
@@ -7285,6 +7315,9 @@ class DiffusionBackend:
             "total_steps": gen.total_steps,
             "fraction": gen.step / gen.total_steps,  # step is 1..total, never over 1.0
             "eta_seconds": gen.eta_seconds,
+            # WHOSE run this is: a caller settling a lost POST that never arrived
+            # would otherwise take a concurrent client's run going idle for its own.
+            "generation_attempt": getattr(self, "_last_generate_attempt", None),
         }
 
     def cancel_generate(self, expected_account: Optional[str] = None) -> bool:
