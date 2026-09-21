@@ -852,6 +852,145 @@ def test_chat_sidebar_rows_are_compact_without_vertical_padding():
     assert 'variant === "project" ? "pl-[39px]" : "pl-3"' in block
 
 
+def _operators(text: str) -> list[tuple[int, str]]:
+    """Positions of `?`, `:`, `&&` and `||` that are not inside a string or brackets.
+
+    Tailwind's own colons all sit inside a quoted class list or inside `[...]`, so depth and
+    quoting are the whole of it. `?.` and `??` are skipped: they are not this grammar.
+    """
+    found, depth, quoted, index = [], 0, False, 0
+    while index < len(text):
+        char = text[index]
+        if quoted:
+            if char == '"':
+                quoted = False
+            index += 1
+            continue
+        if char == '"':
+            quoted = True
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif depth == 0 and (text.startswith("&&", index) or text.startswith("||", index)):
+            found.append((index, text[index : index + 2]))
+            index += 2
+            continue
+        elif depth == 0 and char == "?" and text[index + 1 : index + 2] not in (".", "?"):
+            found.append((index, "?"))
+        elif depth == 0 and char == ":":
+            found.append((index, ":"))
+        index += 1
+    return found
+
+
+def _branches(argument: str) -> list[tuple[tuple[tuple[str, bool], ...], str]]:
+    """Every value one cn() argument can evaluate to, with the conditions that select it.
+
+    The conditions come back as (text, truth) so that two arguments branching on the SAME
+    expression cannot be combined into a state neither can be in. That matters here: the
+    row's touch gutters live in `showWorkSpinner ? undefined : "...pair..."` while the room
+    for the spinner case is stated in a different argument, also on `showWorkSpinner`. A
+    product that ignored the correlation would invent a row with neither.
+    """
+    text = argument.strip()
+    marks = _operators(text)
+    opened = next((index for index, (_, token) in enumerate(marks) if token == "?"), None)
+    if opened is not None:
+        nested, closed = 0, None
+        for index in range(opened + 1, len(marks)):
+            token = marks[index][1]
+            if token == "?":
+                nested += 1
+            elif token == ":":
+                if nested == 0:
+                    closed = marks[index][0]
+                    break
+                nested -= 1
+        assert closed is not None, f"unbalanced ternary in {argument!r}"
+        condition = " ".join(text[: marks[opened][0]].split())
+        taken = []
+        for part, truth in ((text[marks[opened][0] + 1 : closed], True), (text[closed + 1 :], False)):
+            taken += [
+                (((condition, truth),) + constraints, value) for constraints, value in _branches(part)
+            ]
+        return taken
+    short = [mark for mark in marks if mark[1] in ("&&", "||")]
+    if short:
+        # Left-associative, so the last operator is the outermost: `a && b && "x"` is one
+        # condition `a && b` carrying one value. Keeping the head whole rather than splitting
+        # it is what lets an identical head elsewhere correlate with this one.
+        cut, token = short[-1]
+        head = " ".join(text[:cut].split())
+        tail = text[cut + 2 :].strip()
+        if token == "&&":
+            return [(((head, True),), tail), (((head, False),), "undefined")]
+        return [(((head, True),), head), (((head, False),), tail)]
+    return [((), text)]
+
+
+def _values_are_readable(argument: str) -> bool:
+    """True when every value `argument` can evaluate to is a string literal or `undefined`.
+
+    Conditions are not values: in `a && "x"` and `c ? "x" : undefined` only the operands that
+    can BECOME the class string matter, so `a` and `c` may be anything.
+    """
+    return all(
+        value.strip() in ("", "undefined") or re.fullmatch(r'"[^"]*"', value.strip())
+        for _, value in _branches(argument)
+    )
+
+
+def _tokens(value: str) -> list[str]:
+    """The classes a branch value contributes, in order. `undefined` contributes none."""
+    value = value.strip()
+    return value.strip('"').split() if re.fullmatch(r'"[^"]*"', value) else []
+
+
+def _rendered_class_lists(arguments: list[str]) -> list[list[str]]:
+    """Every class list the builder can produce, in builder order, one per live branch.
+
+    Combinations that would need one condition to hold two truths at once are dropped, not
+    checked: they are not rows anyone can render.
+    """
+    lists: list[tuple[dict[str, bool], list[str]]] = [({}, [])]
+    for argument in arguments:
+        grown = []
+        for constraints, classes in lists:
+            for extra, value in _branches(argument):
+                merged = dict(constraints)
+                if any(merged.setdefault(name, truth) != truth for name, truth in extra):
+                    continue
+                grown.append((merged, classes + _tokens(value)))
+        lists = grown
+    return [classes for _, classes in lists]
+
+
+def _cn_arguments(body: str) -> list[str]:
+    """`body` split on top-level commas, ignoring those inside brackets or strings."""
+    parts, depth, quoted, current = [], 0, False, []
+    for char in body:
+        if quoted:
+            current.append(char)
+            if char == '"':
+                quoted = False
+            continue
+        if char == '"':
+            quoted = True
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(char)
+    if current:
+        parts.append("".join(current))
+    return [part for part in parts if part.strip()]
+
+
 def test_chat_sidebar_row_actions_visible_on_coarse_pointers():
     """unslothai/unsloth#7276: Recents chat kebab must be tappable on iPad."""
     sidebar_source = APP_SIDEBAR.read_text(encoding = "utf-8")
@@ -860,7 +999,183 @@ def test_chat_sidebar_row_actions_visible_on_coarse_pointers():
     block = sidebar_source.split("function renderChatSidebarItem", 1)[1].split("\n  function ", 1)[
         0
     ]
-    assert "[@media(pointer:coarse)]:pr-10" in block
+    # The split above bounds the block at the next top-level function, and a nested one inside
+    # renderChatSidebarItem ends it early. When #11373 added one, the block shrank to the
+    # signature and a comment, and every assertion below started reading an empty room. A
+    # truncated block must fail as a stale guard, not as a missing affordance.
+    assert len(block) > 2000, (
+        f"renderChatSidebarItem now yields only {len(block)} characters, so this guard is "
+        f"reading a fragment rather than the row. Widen the bound before trusting anything "
+        f"it says about the row's classes"
+    )
+    # Reserved room for the action on touch, where there is no hover to make it appear. The
+    # width is not a constant to pin: it was pr-10, and became pr-14 for project rows and
+    # pr-16 for recents when the row gained an action. What does not move is that the row
+    # already states how much room that action needs, in the padding it applies on HOVER. So
+    # the claim is that a coarse pointer gets at least the same gutter, whatever it is.
+    #
+    # Per VARIANT, not once for the block. The two rows carry their own paddings, so a single
+    # search over the whole function is satisfied by the project row on its own and would stay
+    # green while recents lost theirs, which is the half of #7276 that was actually reported.
+    #
+    # An earlier version of this worked out which padding WINS: last in cn order, across
+    # arguments, with conditional arguments applying only to their own branch and an
+    # important utility beating an ordinary one written after it. Every rule it gained was
+    # right and the next one was still missing, because that question is tailwind-merge plus
+    # the cascade and a test file should not hold a second copy of either.
+    #
+    # So it does not decide. Each variant's row states one hover gutter and one coarse
+    # padding, both written plainly, and the coarse one must be at least the hover one.
+    # Anything else, a second coarse padding anywhere in the row's own cn(), a variant
+    # qualifier, an importance marker, is refused as something this guard will not
+    # adjudicate. That is stricter than the framework and it is stricter LOUDLY, which is
+    # the half that matters: it cannot quietly approve a gutter nobody checked.
+    # The row's own builder, by name, and the classes are read only from inside it. Searching
+    # the whole function let the same verified pairs be moved to any other cn() call and
+    # still satisfy this, while the buttons that render carried no gutter at all.
+    builder = re.search(r"const buttonClass = cn\(", block)
+    assert builder, (
+        "renderChatSidebarItem no longer builds its row classes in a `const buttonClass = "
+        "cn(...)`, so this guard cannot tell which classes reach the row button"
+    )
+    depth, builder_end = 0, None
+    for index in range(builder.end() - 1, len(block)):
+        if block[index] == "(":
+            depth += 1
+        elif block[index] == ")":
+            depth -= 1
+            if depth == 0:
+                builder_end = index
+                break
+    assert builder_end is not None, "unbalanced `const buttonClass = cn(` in the sidebar"
+    assert re.search(r"className=\{buttonClass\}", block), (
+        "buttonClass is no longer applied to anything in renderChatSidebarItem, so checking "
+        "it says nothing about the row that renders"
+    )
+    # Comments first: they hold commas and prose, and splitting arguments around them turns
+    # a sentence into an unreadable "value".
+    row_classes = "\n".join(
+        re.sub(r"(?<!:)//.*$", "", line) for line in block[builder.end() : builder_end].splitlines()
+    )
+    # Every value the builder contributes has to be readable. An identifier holding a class
+    # string is invisible to a scan over quoted literals, so `cn(..., coarseOverride)` would
+    # make pr-0 effective while this guard went on reporting the gutter above it. Conditions
+    # may be anything; it is the VALUES that have to be literals or undefined.
+    unresolved = [
+        argument for argument in _cn_arguments(row_classes) if not _values_are_readable(argument)
+    ]
+    assert not unresolved, (
+        f"buttonClass is built from values this guard cannot read: {unresolved}. A class "
+        f"string held in an identifier can override the row's gutters without appearing "
+        f"here, so keep the row's classes as literals"
+    )
+
+    # Every class the builder can contribute, whichever way its conditions fall. Padding is
+    # read off these branches rather than off the literals, because a literal found anywhere
+    # in the builder says nothing about the rows that do not take it: moving the verified
+    # pair into `showWorkSpinner ? "...pair..." : undefined` leaves every ordinary row with
+    # no gutter at all while a scan over literals still finds it.
+    renderings = _rendered_class_lists(_cn_arguments(row_classes))
+    every_class = [cls for rendering in renderings for cls in rendering]
+    # Refused across the WHOLE builder, not just the row's own literal. What follows compares
+    # pr-N numbers and takes the last one to win, which is tailwind-merge's answer only while
+    # nothing here changes the same edge by another route or jumps the queue with `!`. A
+    # single `"!pr-0"` argument beats every coarse gutter below it and carries no marker that
+    # a search for coarse-pointer strings would find.
+    marked = [cls for cls in every_class if re.fullmatch(r"(?:\S*:)?!p\w*-\S+|(?:\S*:)?p\w*-\S+!", cls)]
+    assert not marked, (
+        f"buttonClass sets padding with an importance marker: {marked}. `!` beats an "
+        f"ordinary utility written after it, so which gutter the row ends up with stops "
+        f"being a question of order, and this guard will not adjudicate it"
+    )
+    shorthand = [
+        cls for cls in every_class if re.fullmatch(r"(?:\S*:)?(?:p|px|pe)-\S+", cls)
+    ]
+    assert not shorthand, (
+        f"buttonClass sets padding with a shorthand that also moves the right edge: "
+        f"{shorthand}. It overrides the pr-N gutters this guard compares, so state the "
+        f"row's padding with pr-N alone"
+    )
+    arbitrary = [
+        cls
+        for cls in every_class
+        if re.search(r"\[padding(?:-right)?:[^\]]*\]|(?<![\w-])p[rxe]?-\[[^\]]*\]", cls)
+    ]
+    assert not arbitrary, (
+        f"buttonClass sets its right padding through an arbitrary value: {arbitrary}. This "
+        f"guard compares pr-N gutters and will not work out how that interacts with them: "
+        f"state the touch padding as a pr-N utility"
+    )
+
+    # Everything below compares pr-N numbers, and tailwind-merge drops an earlier `pr-` for a
+    # later one whatever the later one's value is. `pr-px` is a real utility worth one pixel:
+    # it replaces the checked gutter and, being unnumbered, was read by nothing here. So any
+    # right padding the builder can contribute has to be a number this guard can compare.
+    unnumbered = [
+        cls
+        for cls in every_class
+        if re.fullmatch(r"(?:\S*:)?pr-\S+", cls)
+        and not re.fullmatch(r"(?:\S*:)?pr-\d+(?:\.\d+)?", cls)
+    ]
+    assert not unnumbered, (
+        f"buttonClass states a right padding this guard cannot compare: {unnumbered}. It "
+        f"still replaces the numeric gutters through tailwind-merge, so the comparison below "
+        f"would go on reporting a value that no longer renders"
+    )
+
+    coarse_prefix = r"\[@media\(pointer:coarse\)\]:"
+    for variant in ("project-chat-item", "recent-item"):
+        # Any qualified gutter for this variant, not the hover one alone: hover, an open menu
+        # and keyboard focus each state how much room the row's action needs, and each is a
+        # state a coarse pointer is permanently in, because there the action is always shown.
+        qualified = re.compile(rf"\S*/{re.escape(variant)}:pr-(\d+(?:\.\d+)?)$")
+        assert any(qualified.fullmatch(cls) for cls in every_class), (
+            f"no {variant} row left that widens its padding to make room for the action, so "
+            f"this guard can no longer tell whether the touch case is covered"
+        )
+        for rendering in renderings:
+            claimed = [
+                float(match.group(1))
+                for match in (qualified.fullmatch(cls) for cls in rendering)
+                if match
+            ]
+            # A rendering that states no gutter for this variant is not this variant's row.
+            if not claimed:
+                continue
+            touch = [
+                float(match.group(1))
+                for match in (
+                    re.fullmatch(coarse_prefix + r"pr-(\d+(?:\.\d+)?)", cls) for cls in rendering
+                )
+                if match
+            ]
+            plain = [
+                float(match.group(1))
+                for match in (re.fullmatch(r"pr-(\d+(?:\.\d+)?)", cls) for cls in rendering)
+                if match
+            ]
+            # Last one wins: same variant, so tailwind-merge keeps the later utility, and a
+            # coarse-pointer utility outranks an unqualified one whatever the order, since
+            # Tailwind emits variants after base and a media query adds no specificity.
+            reserved = touch[-1] if touch else (plain[-1] if plain else None)
+            needed = max(claimed)
+            # Zero on both sides satisfies the comparison and reserves nothing, which is the
+            # state this test was written against: the action has a width whatever the row
+            # says, so a row that claims no room for it has not passed, it has stopped
+            # claiming. The gutter's size is still not pinned here, only that there is one.
+            assert needed > 0, (
+                f"a {variant} row states its action gutter as {claimed}, so nothing reserves "
+                f"room for an action that still has a width. The comparison below is "
+                f"satisfied by zero against zero, which is the overlap this test exists to "
+                f"catch rather than a row that has been fixed (#7276)"
+            )
+            assert reserved is not None and reserved >= needed, (
+                f"a {variant} row reserves less room on a coarse pointer than it says its "
+                f"action needs: {reserved} against {needed}, on the row that renders as "
+                f"{rendering}. The action is always visible on touch, so it needs at least "
+                f"the room the hover, open-menu and focus cases already say it needs, or it "
+                f"sits over the title (#7276)"
+            )
     assert "sidebar-touch-reveal" in block
     # Coarse-pointer visibility must come after .sidebar-row-action { opacity-0 }.
     coarse_idx = css_source.index("@media (pointer: coarse)")
