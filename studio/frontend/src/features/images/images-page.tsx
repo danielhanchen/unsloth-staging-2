@@ -175,7 +175,13 @@ import {
 } from "./lib/generation-stop";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { useStagedDownload, type StagedDownloadEntry } from "@/features/hub/download-manager";
+import {
+  generationFailureForAttempt,
+  generationFailureWasLogged,
+  newGenerationAttemptId,
+} from "./lib/generation-failure";
 import { DiffusionTrainPanel } from "./train/diffusion-train-panel";
+import { viewLogsAction } from "@/features/settings/lib/view-logs-action";
 import {
   TrainBaseSelector,
   type TrainFamilyOption,
@@ -481,6 +487,10 @@ const SETTLE_MAX_FAILS = 5; // consecutive progress failures before calling the 
 async function settleLostGeneration(
   isCurrent: () => boolean,
   baseline: NewRecordProbeBaseline,
+  // This attempt's own id, as sent with the POST: a retained reason is only this
+  // attempt's if it carries the same id. Without the match a failure that happened
+  // elsewhere is reported and the gallery probe that would have said so is skipped.
+  attemptId: string | null,
 ): Promise<void> {
   const start = Date.now();
   let fails = 0;
@@ -489,15 +499,24 @@ async function settleLostGeneration(
     await new Promise((r) => setTimeout(r, SETTLE_POLL_MS));
     if (!isCurrent()) return;
     let idle = false;
+    let reported: string | null = null;
     try {
-      const p = await getGenerateProgress();
+      // Named, so the answer is about THIS generation: the engine's retained slot holds
+      // only the last run, and a queued client can start one before this poll comes round.
+      const p = await getGenerateProgress(attemptId);
       fails = 0;
+      reported = generationFailureForAttempt(p, attemptId);
       if (p.active) sawActive = true;
       else idle = true;
     } catch {
       fails += 1;
       if (fails >= SETTLE_MAX_FAILS) throw new Error("Lost connection to the image server.");
     }
+    // Outside the catch, so a reported reason is not counted as a transport failure. A
+    // run that failed after its POST was lost goes active-to-idle exactly like one that
+    // finished, so returning here read as success and could advance a batch past an
+    // output that never arrived. Already classified by the backend.
+    if (reported) throw new Error(reported);
     if (!idle) continue;
     if (sawActive) return;
     // Idle on the very first look: the run may have finished or never started, so a gallery
@@ -3480,10 +3499,14 @@ export function ImagesPage({
           galleryCache.hasMore,
           knownIds,
         );
+        // Minted here so it describes exactly one post: a retained reason carries the id
+        // of the run it came from, and a post that never arrived started nothing.
+        const attemptId = newGenerationAttemptId();
         let res: DiffusionGenerateResponse;
         try {
           res = await generateDiffusionImage({
             prompt: prompt.trim(),
+            attempt_id: attemptId,
             // Only send a negative prompt when guidance uses it, so the recipe does not record one the model ignored.
             negative_prompt: guidance > 0 ? negativePrompt.trim() || undefined : undefined,
             width: w,
@@ -3527,7 +3550,11 @@ export function ImagesPage({
           if (!(err instanceof GenerateResponseLostError)) throw err;
           // A record outside the baseline proves the request reached the backend. Taken per attempt, so
           // it reflects what the client could see when THIS post went out.
-          await settleLostGeneration(() => isMounted.current, probeBaseline);
+          await settleLostGeneration(
+            () => isMounted.current,
+            probeBaseline,
+            attemptId,
+          );
           if (!isMounted.current) break;
           await loadGallery();
           // loadGallery refreshes the module cache synchronously, so this run's records are folded in
@@ -3559,7 +3586,12 @@ export function ImagesPage({
           stopRequested: cancelRequested.current && cancelAcked.current,
         })
       )
-        toast.error(msg);
+        toast.error(msg, {
+          // Only when the server logged it: see generationFailureWasLogged.
+          action: generationFailureWasLogged(msg)
+            ? viewLogsAction("server")
+            : undefined,
+        });
     } finally {
       if (genPollTimer.current) clearInterval(genPollTimer.current);
       genPollTimer.current = null;

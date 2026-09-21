@@ -36,6 +36,11 @@ import { loadModelMemorySettings } from "@/features/settings/api/model-memory";
 import { loadVramBudgetSettings } from "@/features/settings/api/vram-budget";
 import { loadOpenAIAutoSwitchSettings } from "@/features/settings";
 import {
+  failureLogPath,
+  loadFailureLogFamily,
+  viewLogsAction,
+} from "@/features/settings/lib/view-logs-action";
+import {
   confirmTransformersUpgradeIfNeeded,
   useTransformersUpgradeDialogStore,
 } from "@/features/transformers-upgrade";
@@ -1876,6 +1881,7 @@ export function useChatModelRuntime() {
               force_cancel_active: forceCancelActive,
 
               force_reload: forceReload,
+            }, {
             });
             cpuFallbackReason = loadResponse.cpu_fallback_reason ?? null;
             mmprojFallbackReason = loadResponse.mmproj_fallback_reason ?? null;
@@ -2725,12 +2731,30 @@ export function useChatModelRuntime() {
           if (!abortCtrl.signal.aborted) {
             const message =
               err instanceof Error ? err.message : "Failed to load model";
+            // The backend's diagnostic (summary, runner tail, log path) arrived intact
+            // and was shown as an 8s toast TITLE: a wall of prose with no way back to it.
+            // First line as the title, the rest as the description, plus a log action.
+            const [summary, ...rest] = message.split("\n");
+            const detail = rest.join("\n").trim();
+            // The path the diagnostic names answers both halves: it pins the exact
+            // attempt even when a rollback load lands after it, and its ABSENCE says no
+            // runner of this attempt's ever wrote one (a Transformers or MLX load, or a
+            // failure before the launch), whose reason is in the current server log.
+            const runnerLogPath = failureLogPath(message);
+            const logsAction = viewLogsAction(
+              loadFailureLogFamily(isGguf, isDiffusion, runnerLogPath),
+              runnerLogPath,
+            );
             if (loadToastDismissedRef.current) {
-              toast.error(message);
+              toast.error(summary, {
+                description: detail || undefined,
+                action: logsAction,
+              });
             } else {
-              toast.error(message, {
+              toast.error(summary, {
                 id: toastId,
-                description: undefined,
+                description: detail || undefined,
+                action: logsAction,
                 cancel: undefined,
                 classNames: undefined,
                 closeButton: true,

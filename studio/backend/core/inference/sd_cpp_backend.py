@@ -29,6 +29,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Optional
 
+from core.inference.generate_outcomes import _retain_generate_failure
 from core.inference.diffusion_compat import flux2_inner_dim_for_pick
 from core.inference.diffusion_device import (
     resolve_diffusion_device_target,
@@ -3143,6 +3144,9 @@ class SdCppDiffusionBackend:
         controlnet: Optional[tuple[str, str, str, float, float, float]] = None,
         # load_identity() of the caller's status() read; refuse rather than run a different load (#9448)
         expected_load: Optional[LoadIdentity] = None,
+        # Client id for THIS request, echoed back beside a retained failure. Absent from
+        # an older client, which gets the pre-existing gallery probe.
+        attempt_id: Optional[str] = None,
     ) -> dict[str, Any]:
         import tempfile
 
@@ -3201,6 +3205,12 @@ class SdCppDiffusionBackend:
                 # Publish an active (step 0) state before the slow pre-generate setup so a reload probe does not read
                 # idle while this holds _generate_lock.
                 self._gen = _SdGen(total_steps = int(steps))
+                # Cleared at the START, so the retained reason is never read as this run's.
+                self._last_generate_error = None
+                # The id THIS request carried, kept with the reason: a post that never
+                # reached the backend started no run, so nothing carries its id, and a
+                # concurrent client's run carries its own.
+                self._last_generate_attempt = attempt_id
             try:
                 if seed is None:
                     seed = int.from_bytes(os.urandom(6), "big") & ((1 << 53) - 1)
@@ -3307,7 +3317,22 @@ class SdCppDiffusionBackend:
                     ),
                 }
             except SdCppCancelled as exc:
+                # Per attempt too, like the branch below: a cancel by an unload or
+                # a superseding load produced no image, so a client settling a lost POST
+                # must not read the transition to idle as success. The diffusers engine
+                # reaches its generic handler for this; this branch would be silent.
+                self._last_generate_error = DIFFUSION_CANCELLED_MSG
+                _retain_generate_failure(attempt_id, DIFFUSION_CANCELLED_MSG)
                 raise RuntimeError(DIFFUSION_CANCELLED_MSG) from exc
+            except BaseException as exc:
+                # See the diffusers engine: idle progress is the only channel left once the
+                # POST is lost, so the reason has to outlive _gen, and the per-attempt
+                # record has to outlive the runs after it. Raw; the route classifies.
+                self._last_generate_error = str(exc) or type(exc).__name__
+                _retain_generate_failure(attempt_id, self._last_generate_error)
+                raise
+            else:
+                self._last_generate_error = None
             finally:
                 self._gen = None
                 with self._lock:
@@ -3622,6 +3647,12 @@ class SdCppDiffusionBackend:
                 "total_steps": 0,
                 "fraction": 0.0,
                 "eta_seconds": None,
+                # Idle is not the same as fine. Only while it is the LAST thing that
+                # happened: the next generation clears it on success.
+                "error": getattr(self, "_last_generate_error", None),
+                # WHICH attempt the reason belongs to, so a caller settling a LOST
+                # post can reject one that is not its own. None if no id was sent.
+                "generation_attempt": getattr(self, "_last_generate_attempt", None),
             }
         return {
             "active": True,
@@ -3629,6 +3660,9 @@ class SdCppDiffusionBackend:
             "total_steps": gen.total_steps,
             "fraction": min(gen.step / gen.total_steps, 1.0),
             "eta_seconds": gen.eta_seconds,
+            # WHOSE run this is: a caller settling a lost POST that never arrived
+            # would otherwise take a concurrent client's run going idle for its own.
+            "generation_attempt": getattr(self, "_last_generate_attempt", None),
         }
 
     def cancel_generate(self, expected_account: Optional[str] = None) -> bool:

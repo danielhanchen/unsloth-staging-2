@@ -38918,6 +38918,20 @@ async def load_diffusion_model_gated(
 
 # Count of finished generations still writing their PNG/gallery records; generate-progress reports active while above 0. Mutated only on the event loop, so no lock.
 _diffusion_persist_active = 0
+# Which ATTEMPTS are in that window, so a named poll hears about its own records and nobody
+# else's. Same account-qualified key as the retained outcomes.
+_diffusion_persist_attempts: dict[str, int] = {}
+
+
+def _note_persisting_attempt(attempt_id, delta: int) -> None:
+    key = attempt_id if delta < 0 else attempt_id
+    if not key:
+        return
+    held = _diffusion_persist_attempts.get(key, 0) + delta
+    if held > 0:
+        _diffusion_persist_attempts[key] = held
+    else:
+        _diffusion_persist_attempts.pop(key, None)
 
 
 def generation_in_flight() -> bool:
@@ -38953,6 +38967,14 @@ def _generate_failure_detail(message: str) -> str:
     renderer aborts inside its own text encoder, and the page showed "Image generation failed."
     with nothing to act on. Naming the CLASS of failure keeps the message useful without echoing
     the engine's text, which can carry local paths and argv."""
+    from core.inference.diffusion_families import DIFFUSION_CANCELLED_MSG
+
+    # The cancellation sentinel is fixed text already, and the only reason a client must be
+    # able to tell apart from a failure: a POST that returns normally answers 409 with it and
+    # the page treats that as the requested outcome. Classified, it came back as the generic
+    # fallback, so a caller settling a LOST post toasted a failure for its own Stop.
+    if str(message or "") == DIFFUSION_CANCELLED_MSG:
+        return DIFFUSION_CANCELLED_MSG
     text = str(message or "").lower()
     for needles, detail in _GENERATE_FAILURE_CLASSES:
         if any(n in text for n in needles):
@@ -38997,6 +39019,7 @@ async def generate_diffusion_image(
                     backend.generate,
                     expected_load = expected_load,
                     prompt = request.prompt,
+                    attempt_id = request.attempt_id,
                     negative_prompt = request.negative_prompt,
                     width = request.width,
                     height = request.height,
@@ -39041,7 +39064,10 @@ async def generate_diffusion_image(
             raise HTTPException(status_code = 500, detail = _generate_failure_detail(msg))
         except Exception as exc:
             logger.error("diffusion.generate_failed: %s", exc, exc_info = True)
-            raise HTTPException(status_code = 500, detail = "Image generation failed.")
+            # Classified like the RuntimeError branch above: this one caught an OOM as a bare
+            # Exception and answered with the fallback, so the same failure named its cause or
+            # not depending on which class torch happened to raise.
+            raise HTTPException(status_code = 500, detail = _generate_failure_detail(str(exc)))
 
     # Persist each image with its full recipe. BOTH engines batch with a distinct seed per image, returned in ``seeds``, so each is individually reproducible.
     created_at = time.time()
@@ -39121,7 +39147,11 @@ async def generate_diffusion_image(
 
     # Hold generate-progress "active" across the persist so a reload mount probe cannot refresh the gallery before these records exist.
     global _diffusion_persist_active
+    from core.inference.generate_outcomes import attempt_scope_key
+
+    persisting_attempt = attempt_scope_key(request.attempt_id)
     _diffusion_persist_active += 1
+    _note_persisting_attempt(persisting_attempt, 1)
     try:
         with account_access.media_generation("diffusion"):
             records = await asyncio.to_thread(_persist)
@@ -39130,6 +39160,7 @@ async def generate_diffusion_image(
         raise HTTPException(status_code = 500, detail = "Failed to save the generated image.")
     finally:
         _diffusion_persist_active -= 1
+        _note_persisting_attempt(persisting_attempt, -1)
 
     return DiffusionGenerateResponse(images = [GalleryImage(**r) for r in records])
 
@@ -39531,13 +39562,40 @@ async def diffusion_load_progress(
 
 
 @studio_router.get("/images/generate-progress", response_model = DiffusionGenerateProgressResponse)
-async def diffusion_generate_progress(current_subject: str = Depends(get_current_subject)):
+async def diffusion_generate_progress(
+    attempt_id: Optional[str] = Query(
+        None,
+        max_length = 64,
+        pattern = r"^[A-Za-z0-9_-]+$",
+        description = "Answer about this attempt's own generation",
+    ),
+    current_subject: str = Depends(get_current_subject),
+):
+    from core.inference.diffusion_engine_router import get_active_diffusion_engine
+
+    # A caller asking about ITS OWN attempt is answered first, because the guards below hide
+    # whatever is running NOW: with managed accounts another account can start a generation
+    # between this caller's failure and its next poll, and the hidden idle response then
+    # reads as success to a client that had already seen its own run active. The key is
+    # account-qualified, so this can only ever answer about the caller's own attempt.
+    if attempt_id is not None:
+        from core.inference.generate_outcomes import generate_failure_for_attempt
+        retained = generate_failure_for_attempt(attempt_id)
+        if retained:
+            return DiffusionGenerateProgressResponse(
+                active = False,
+                step = 0,
+                total_steps = 0,
+                fraction = 0.0,
+                eta_seconds = None,
+                error = _generate_failure_detail(retained),
+                generation_attempt = attempt_id,
+            )
     if account_access.managed_account() and account_access.generation_is_foreign("diffusion"):
         return account_access.hidden_generate_progress_response(DiffusionGenerateProgressResponse)
     mine = account_access.generation_is_mine("diffusion")
     if not mine and account_access.resident_hidden("diffusion"):
         return account_access.hidden_generate_progress_response(DiffusionGenerateProgressResponse)
-    from core.inference.diffusion_engine_router import get_active_diffusion_engine
 
     if (
         not mine
@@ -39548,11 +39606,67 @@ async def diffusion_generate_progress(current_subject: str = Depends(get_current
     ):
         return account_access.hidden_generate_progress_response(DiffusionGenerateProgressResponse)
 
-    progress = get_active_diffusion_engine().generate_progress()
+    engine = get_active_diffusion_engine()
+    progress = engine.generate_progress()
+    # A caller that names its attempt is answered about THAT generation, however many have
+    # run since: the retained slot below holds only the last one, and a queued client can
+    # take the slot before a settling caller's next poll. Absent, the slot answers, which
+    # is what an older client gets.
+    if attempt_id is not None:
+        from core.inference.generate_outcomes import generate_failure_for_attempt
+
+        raw_error = generate_failure_for_attempt(attempt_id)
+        # Active is per attempt too, not just the reason. A generation running for someone
+        # else says nothing about this one, and a settling caller that counted it as its own
+        # treated that run going idle as its own success, skipping the gallery proof.
+        mine_is_running = bool(progress.get("active")) and (
+            progress.get("generation_attempt") == attempt_id
+        )
+        progress = {
+            **progress,
+            "error": raw_error,
+            "generation_attempt": attempt_id,
+            "active": mine_is_running,
+        }
+        if not mine_is_running:
+            # Another run's step counter is not this caller's progress either.
+            progress.update(step = 0, total_steps = 0, fraction = 0.0, eta_seconds = None)
+    if attempt_id is None and account_access.account_scope() is not None:
+        # A poll that names no attempt reads the ENGINE's slot, which is one per process and
+        # holds whoever ran last. On an installation with accounts that is someone else's
+        # failure: the guards above only hide a generation while it is ACTIVE, so once A's
+        # run has exited media_generation, B's unscoped poll was answered with A's reason.
+        # The keyed store is the authority, and it is account-qualified, so a reason this
+        # caller can look up is a reason this caller owns.
+        from core.inference.generate_outcomes import generate_failure_for_attempt
+        attributed = progress.get("generation_attempt")
+        if not (attributed and generate_failure_for_attempt(attributed)):
+            progress = {**progress, "error": None}
+    # Classified HERE, where every other client-visible generation message is built, so
+    # this stays the only place deciding what a caller may see and engine text with its
+    # local paths and argv never escapes.
+    raw_error = progress.get("error")
+    progress = {
+        **progress,
+        "error": _generate_failure_detail(raw_error) if raw_error else None,
+    }
+    # Only meaningful beside the reason it dates, and only its own sender can match it:
+    # without a reason there is nothing to attribute, and a concurrent client has no
+    # business reading which attempt last failed.
+    if not progress.get("error"):
+        progress.pop("generation_attempt", None)
     log_media_generation_progress("image", progress)
     # A finished generation still persisting its gallery record counts as active, so a reload probe keeps polling.
+    # Scoped for a named poll: someone else's records being written is not this attempt's
+    # activity, and counting it let a settling caller take the end of that window for its
+    # own success.
     if _diffusion_persist_active > 0 and not progress["active"]:
-        progress = {**progress, "active": True}
+        if attempt_id is None:
+            progress = {**progress, "active": True}
+        else:
+            from core.inference.generate_outcomes import attempt_scope_key
+            if _diffusion_persist_attempts.get(attempt_scope_key(attempt_id) or ""):
+                progress = {**progress, "active": True}
     return DiffusionGenerateProgressResponse(**progress)
 
 
@@ -39849,7 +39963,7 @@ async def _generate_openai_images(
                     detail = openai_error_body(str(exc), status = 400, param = "size"),
                 )
             logger.error("openai_images.generate_failed: %s", exc)
-            raise HTTPException(status_code = 500, detail = "Image generation failed.")
+            raise HTTPException(status_code = 500, detail = _generate_failure_detail(str(exc)))
 
     # A local-directory load puts the host path in repo_id and the monitor row goes out over
     # the tunnel, so the label gets the same path-free treatment as active_model.

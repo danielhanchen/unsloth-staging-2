@@ -153,6 +153,7 @@ import {
 } from "./reference-image-crop";
 import { ReferenceImageEditor } from "./reference-image-editor";
 import { type ReferenceMedia, ReferenceMediaPicker } from "./reference-picker";
+import { viewLogsAction } from "@/features/settings/lib/view-logs-action";
 import {
   defaultReferenceVideoTrim,
   H3_REFERENCE_MAX_SECONDS,
@@ -2263,7 +2264,8 @@ function VideoGenerator({
           } else if (p.phase === "failed") {
             const msg = p.error || "Video generation failed";
             // The user's own Cancel surfaces as the backend's cancelled sentinel; not an error.
-            if (!msg.toLowerCase().includes("cancelled")) toast.error(msg);
+            if (!msg.toLowerCase().includes("cancelled"))
+              toast.error(msg, { action: viewLogsAction("server") });
           }
           return;
         }
@@ -2333,7 +2335,8 @@ function VideoGenerator({
           // The other terminal phase, kept only until the next job: without this a reload after a failed
           // generation shows an idle page and loses the error.
           const msg = g.error || "Video generation failed";
-          if (!msg.toLowerCase().includes("cancelled")) toast.error(msg);
+          if (!msg.toLowerCase().includes("cancelled"))
+            toast.error(msg, { action: viewLogsAction("server") });
         }
       } catch {
         // Resume is best-effort; a failed probe just leaves the idle view.
