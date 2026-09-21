@@ -206,12 +206,40 @@ _uv_download_markers() {
     '
 }
 
+# Must answer exactly as _respect_pm_policy() in studio/install_python_stack.py, strip and
+# all: on disagreement the shell half relaxes the policy while the Python half withholds,
+# and the operator gets neither the opt-out nor a clean default. Both spellings of the trim
+# are wrong in their own way: `tr -d` also collapses INTERNAL whitespace, making "t rue" the
+# true spelling here alone, and sed works a line at a time and cannot trim across a newline,
+# so "\n1" read as off while Python's .strip() made it on. Hence map-then-trim, which cannot
+# create a false positive because no allowlist entry contains a space.
+_respect_pm_policy() {
+    # Unset is everyone who has not opted in; answer it without paying two subprocesses.
+    case "${UNSLOTH_RESPECT_PM_POLICY:-}" in
+        "") return 1 ;;
+    esac
+    case "$(printf '%s' "$UNSLOTH_RESPECT_PM_POLICY" | tr '\n\r\t\013\014' '     ' | tr '[:upper:]' '[:lower:]' | sed 's/^ *//; s/ *$//')" in
+        1|true|yes|on) return 0 ;;
+    esac
+    return 1
+}
+
 run_install_cmd() {
     _label="$1"
     shift
     # For --default-index, clear inherited uv index vars so a uv.toml cannot outrank the CLI pin.
+    # Runs before install_python_stack.py, so the Python opt-out cannot cover it. Under the
+    # opt-out the config file and the wheelhouse stay (a uv.toml `no-index` makes find-links the
+    # only source uv is allowed); the ADDITIVE index vars still go, the pin being itself a
+    # provenance control (#6898).
     case " $* " in
-        *" --default-index "*) set -- env -u UV_DEFAULT_INDEX -u UV_INDEX_URL -u UV_INDEX -u UV_EXTRA_INDEX_URL -u UV_TORCH_BACKEND -u UV_FIND_LINKS -u UV_CONFIG_FILE UV_NO_CONFIG=1 "$@" ;;
+        *" --default-index "*)
+            if _respect_pm_policy; then
+                set -- env -u UV_DEFAULT_INDEX -u UV_INDEX_URL -u UV_INDEX -u UV_EXTRA_INDEX_URL -u UV_TORCH_BACKEND "$@"
+            else
+                set -- env -u UV_DEFAULT_INDEX -u UV_INDEX_URL -u UV_INDEX -u UV_EXTRA_INDEX_URL -u UV_TORCH_BACKEND -u UV_FIND_LINKS -u UV_CONFIG_FILE UV_NO_CONFIG=1 "$@"
+            fi
+            ;;
     esac
     if _is_verbose; then
         # Stream through the redactor; the rc file carries the exit code (no pipefail in sh).
