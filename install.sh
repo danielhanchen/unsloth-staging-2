@@ -1,5 +1,5 @@
 #!/bin/sh
-# Unsloth Studio Installer. Usage, supported options and the web one-liner live in the README under "Unsloth Studio (web UI)" and are deliberately not repeated here: this file ships inside the Linux desktop bundle, where a header rehearsing download-and-run command lines is the first thing a generic script classifier reads. A piped install takes options as environment variables after the pipe (UNSLOTH_NO_TORCH, UNSLOTH_SKIP_AUTOSTART, UNSLOTH_ISOLATE_UV_CACHE, UNSLOTH_PYTHON, UNSLOTH_STUDIO_HOME), because a bare `--no-torch` after the pipe would be read as an option to sh itself; a local run takes the equivalent flags (--no-torch, --isolated-uv-cache, --python, --local). Install dir priority: UNSLOTH_STUDIO_HOME > STUDIO_HOME > $HOME/.unsloth/studio
+# Unsloth Studio Installer. Usage, supported options and the web one-liner live in the README under "Unsloth Studio (web UI)" and are deliberately not repeated here: this file ships inside the Linux desktop bundle, where a header rehearsing download-and-run command lines is the first thing a generic script classifier reads. A piped install takes options as environment variables after the pipe (UNSLOTH_NO_TORCH, UNSLOTH_SKIP_AUTOSTART, UNSLOTH_ISOLATE_UV_CACHE, UNSLOTH_INSTALL_NO_ROLLBACK, UNSLOTH_PYTHON, UNSLOTH_STUDIO_HOME), because a bare `--no-torch` after the pipe would be read as an option to sh itself; a local run takes the equivalent flags (--no-torch, --isolated-uv-cache, --no-rollback, --python, --local). Install dir priority: UNSLOTH_STUDIO_HOME > STUDIO_HOME > $HOME/.unsloth/studio
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 set -e
@@ -39,6 +39,7 @@ _USER_PYTHON=""
 _NO_TORCH_FLAG=false
 _SKIP_AUTOSTART=false
 _ISOLATE_UV_CACHE=false
+_NO_ROLLBACK=false
 _VERBOSE=false
 _SHORTCUTS_ONLY=false
 _next_is_package=false
@@ -68,6 +69,7 @@ for arg in "$@"; do
         --python) _next_is_python=true ;;
         --no-torch) _NO_TORCH_FLAG=true ;;
         --isolated-uv-cache) _ISOLATE_UV_CACHE=true ;;
+        --no-rollback) _NO_ROLLBACK=true ;;
         --verbose|-v) _VERBOSE=true ;;
         --shortcuts-only) _SHORTCUTS_ONLY=true ;;
         --with-llama-cpp-dir) _next_is_llama_cpp_dir=true ;;
@@ -78,6 +80,7 @@ done
 case "${UNSLOTH_NO_TORCH:-}" in 1|true|TRUE|yes|YES|on|ON) _NO_TORCH_FLAG=true ;; esac
 case "${UNSLOTH_SKIP_AUTOSTART:-}" in 1|true|TRUE|yes|YES|on|ON) _SKIP_AUTOSTART=true ;; esac
 case "${UNSLOTH_ISOLATE_UV_CACHE:-}" in 1|true|TRUE|yes|YES|on|ON) _ISOLATE_UV_CACHE=true ;; esac
+case "${UNSLOTH_INSTALL_NO_ROLLBACK:-}" in 1|true|TRUE|yes|YES|on|ON) _NO_ROLLBACK=true ;; esac
 [ -z "$_USER_PYTHON" ] && [ -n "${UNSLOTH_PYTHON:-}" ] && _USER_PYTHON="$UNSLOTH_PYTHON"
 
 if [ "$_VERBOSE" = true ]; then
@@ -1085,7 +1088,25 @@ _start_studio_venv_replacement() {
         _VENV_ROLLBACK_DIR=""
         return 1
     fi
+    # --no-rollback / UNSLOTH_INSTALL_NO_ROLLBACK: drop the old environment now instead of at commit, for the disk-constrained cross-volume case. The rename still happens first, so uv never builds into an occupied path. Clearing the state before the delete is what the commit path does too: a signal must not restore a half-deleted backup.
+    if [ "${_NO_ROLLBACK:-false}" = true ]; then
+        _VENV_ROLLBACK_ACTIVE=false
+        _VENV_ROLLBACK_DIR=""
+        rm -rf "$_candidate" 2>/dev/null || true
+        # -f exempts a missing path from the exit status, not a real unlink failure: an immutable entry, a busy mount point, a sticky-bit parent. Reporting "discarded" there promises space that was never freed, in the one situation this flag exists for. The state above stays cleared either way -- re-arming the rollback would hand an interrupt a half-deleted backup -- so say what is actually on disk.
+        if [ -e "$_candidate" ] || [ -L "$_candidate" ]; then
+            substep "could not discard the previous environment at $_candidate" "$C_WARN"
+            substep "it is no longer used for rollback; remove it by hand to reclaim the space." "$C_WARN"
+        else
+            substep "previous environment discarded (--no-rollback); a failed install cannot be undone"
+        fi
+        return 0
+    fi
     substep "previous environment preserved for rollback"
+}
+
+_free_space_kb() {  # path
+    df -Pk "$1" 2>/dev/null | awk 'NR == 2 { print $4 }'
 }
 
 # uv creates only into a path that is absent or an empty directory. Everything else is occupied, hidden entries and non-resolving symlinks included.
@@ -3495,8 +3516,12 @@ if [ -x "$VENV_DIR/bin/python" ] || _dir_has_entries "$VENV_DIR"; then
     # _run_bounded the fallback: without version.py it hits `import torch`, which can wedge.
     [ -n "$_PREV_TORCH_VER" ] || _PREV_TORCH_VER=$(_run_bounded "$VENV_DIR/bin/python" -c \
         "import torch; print(torch.__version__)" 2>/dev/null | tail -n 1 || true)
-    # New layout already exists — replace only after preserving rollback copy.
-    substep "preserving existing environment for rollback..."
+    # New layout already exists — replace only after preserving rollback copy, unless the caller asked for no copy at all, in which case this line would be contradicted by the "discarded" one _start_studio_venv_replacement prints a moment later. install.ps1 varies its twin the same way.
+    if [ "${_NO_ROLLBACK:-false}" = true ]; then
+        substep "moving the existing environment aside..."
+    else
+        substep "preserving existing environment for rollback..."
+    fi
     # A bare call still aborts under `set -e`, but shows only mv's own stderr. install.ps1 reports this step; say the same here and name the directory.
     if ! _start_studio_venv_replacement "$VENV_DIR"; then
         echo "ERROR: could not move $VENV_DIR aside to reinstall." >&2
@@ -7745,10 +7770,27 @@ fi
 # If setup.sh failed, report and exit now.
 if [ "$_SETUP_EXIT" -ne 0 ]; then
     echo ""
+    # A full disk surfaces here as nothing but an exit code, with the one "No space left on device" line buried in setup's output (#11313). Ask the filesystem directly and name it. Below 64 MiB nothing useful can be unpacked, so it is the cause rather than a coincidence.
+    # Folded into the ERROR_DEFAULT message as well, not only stderr: under --tauri the desktop app reads that message, so a diagnosis printed beside it is one the UI never shows. One line, because a marker is one line.
+    _fail_free_kb=$(_free_space_kb "$STUDIO_HOME")
+    _fail_suffix=""
+    if [ -n "$_fail_free_kb" ] && [ "$_fail_free_kb" -lt 65536 ] 2>/dev/null; then
+        # Naming the opt-out to someone who already used it describes a re-run that fails the same way: that copy was discarded before the install began, so there is nothing left here for the installer to give back.
+        if [ "${_NO_ROLLBACK:-false}" = true ]; then
+            _fail_remedy="Free some space and re-run. The previous environment was already discarded by --no-rollback, so the installer has nothing further of its own to reclaim."
+        else
+            _fail_remedy="Free some space and re-run. --no-rollback (UNSLOTH_INSTALL_NO_ROLLBACK=1) drops the previous environment instead of keeping a copy of it during the install."
+        fi
+        _fail_suffix=": $STUDIO_HOME has only $((_fail_free_kb / 1024)) MB free, so the disk is full, which is very likely the cause. $_fail_remedy"
+    fi
     if [ "$TAURI_MODE" = true ]; then
-        tauri_log "ERROR_DEFAULT" "studio setup failed (exit code $_SETUP_EXIT)"
+        tauri_log "ERROR_DEFAULT" "studio setup failed (exit code $_SETUP_EXIT)$_fail_suffix"
     else
         step "error" "studio setup failed (exit code $_SETUP_EXIT)" "$C_ERR"
+    fi
+    if [ -n "$_fail_suffix" ]; then
+        echo "       $STUDIO_HOME has only $((_fail_free_kb / 1024)) MB free -- the disk is full, which is very likely the cause." >&2
+        echo "       $_fail_remedy" >&2
     fi
     echo ""
     exit "$_SETUP_EXIT"
