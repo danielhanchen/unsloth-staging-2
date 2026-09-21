@@ -4485,6 +4485,23 @@ def _ensure_xpu_triton() -> None:
     if not generic or "xpu" not in spec.lower():
         return
 
+    if _respect_pm_policy():
+        # ABOVE _ensure_venv_pip(), which bootstraps pip into a seedless venv with an
+        # ensurepip run and a pip install: a decline that has already changed the venv is not
+        # a decline. Above the "replacing triton" line too, so the operator is not told the
+        # swap is happening and then told it is not. The swap is an optimisation, so it is
+        # skipped whole rather than leaving the venv with no triton, which no rerun repairs.
+        _safe_print(
+            _red(
+                f"   {_POLICY_OPT_OUT_ENV} is set and the XPU triton swap would have to "
+                f"remove generic triton {generic} before installing a wheel your policy "
+                f"may refuse, which no rerun could repair; leaving it in place -- it "
+                f"shadows torch XPU triton, so torch.compile will not use the XPU. Unset "
+                f"{_POLICY_OPT_OUT_ENV} for one run to take the swap."
+            )
+        )
+        return
+
     _safe_print(f"   replacing triton {generic} with {spec} (Intel XPU)")
     if not _ensure_venv_pip():
         _safe_print(
@@ -7620,12 +7637,36 @@ SDIST_ONLY_PACKAGES = (
 )
 
 
+# The installer sets aside a hardened host's pip/uv policy for its OWN dependency installs,
+# the shipped requirements being unhashed and a few wheel-less at any version (#8530). This
+# declines that: every relaxation withheld, the install failing on the first step the policy
+# forbids.
+_POLICY_OPT_OUT_ENV = "UNSLOTH_RESPECT_PM_POLICY"
+
+
+def _respect_pm_policy() -> bool:
+    """The operator asked for their own pip/uv policy to be left in force.
+
+    uv's boolish set, borrowed deliberately rather than inherited (this is an UNSLOTH_
+    variable, so _uv_env_flag() is not its reader), because one answer has to hold across
+    install.sh, install.ps1, setup.ps1 and here. An allowlist, so a typo lands on the
+    default rather than failing closed for this one control alone.
+    """
+    return os.environ.get(_POLICY_OPT_OUT_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def _sdist_only_build_args(*names: str) -> list[str]:
     """``--no-binary`` for each named wheel-less requirement, for uv and pip alike.
 
     Naming a package that the resolution never reaches is harmless (verified), so this
     is safe next to the NO_TORCH / Windows requirement filtering.
+
+    Empty under UNSLOTH_RESPECT_PM_POLICY: this exemption exists only to override a
+    user-level no-build / only-binary, so declining to override it IS the opt-out. One gate
+    covers both callers, the extras list and the ROCm arch-index exemption.
     """
+    if _respect_pm_policy():
+        return []
     args: list[str] = []
     for name in names:
         args += ["--no-binary", name]
@@ -8390,6 +8431,23 @@ def _repair_duplicate_core_metadata(
         ) or install_manifest.pip_backup_metadata_paths(name):
             duplicates.append((name, record_count))
 
+    # Decline with detection done and nothing touched yet. The repair rewrites METADATA and
+    # moves pip's backups aside before reinstalling, and that reinstall cannot satisfy
+    # require-hashes honestly: hashing the artifact we just fetched approves it with itself.
+    # Duplicate metadata is untidy; a venv with the core package uninstalled is not. Declining
+    # here rather than at the staging step because the finally below cannot run on a SIGKILL.
+    if duplicates and _respect_pm_policy():
+        _safe_print(
+            _red(
+                f"   {_POLICY_OPT_OUT_ENV} is set and repairing duplicate metadata for "
+                + ", ".join(name for name, _ in duplicates)
+                + " would have to reinstall it from a source your policy may refuse; "
+                "leaving it as found. Unset the variable for one run to repair it."
+            ),
+            file = sys.stderr,
+        )
+        return False
+
     repaired: list[str] = []
     staging_dirs: list[str] = []
     # One quarantine per package, discarded as soon as that package is back in place.
@@ -8772,7 +8830,12 @@ def _relaxed_pip_policy_env(cmd: "list[str]") -> "dict[str, str]":
     package-scoped --no-binary in _sdist_only_build_args(). `wheel` is in the set because
     the duplicate-metadata repair stages with it, and require-hashes rejects that too
     (#8530).
+
+    Empty under UNSLOTH_RESPECT_PM_POLICY: an operator who would rather the install stop
+    than proceed unhashed gets exactly that.
     """
+    if _respect_pm_policy():
+        return {}
     if not _is_pip_subcommand(cmd, ("install", "download", "wheel")):
         return {}
     return {"PIP_REQUIRE_HASHES": "0"}
@@ -9138,6 +9201,14 @@ def _install_env_for_cmd(cmd: "list[str]") -> "dict[str, str] | None":
     PIP_CONFIG_FILE stays at os.devnull, the ONLY way to stop a site or global pip.conf
     contributing (measured on pip 26.2: naming a real file suppresses the per-user file
     alone). What that removes is put back key by key by _pinned_pip_config_overrides().
+
+    Under UNSLOTH_RESPECT_PM_POLICY the pinned branch still strips the ADDITIVE index
+    variables (#6898 is not the operator's to reopen by accident) but keeps the policy ones,
+    leaves pip.conf readable and leaves uv's config discovery on. Discovery has to stay on:
+    UV_NO_CONFIG=1 makes a uv.toml `[pip] require-hashes = true` succeed, discarding the very
+    control the opt-out promises. The cost is symmetric and accepted: an `extra-index-url` in
+    that same pip.conf can still add a candidate source, which is why the default is the
+    opposite.
     """
     if not _is_pinned_index_cmd(cmd):
         relaxed = _relaxed_pip_policy_env(cmd)
@@ -9147,6 +9218,18 @@ def _install_env_for_cmd(cmd: "list[str]") -> "dict[str, str] | None":
         env.update(relaxed)
         return env
     env = os.environ.copy()
+    if _respect_pm_policy():
+        for name in _UV_INDEX_ENV_VARS:
+            # The four that carry policy rather than add a source: PIP_NO_INDEX and the
+            # config file, plus the two find-links, which are the ONLY permitted source once
+            # a config no-index is in force, so dropping them fails every offline install.
+            if name in ("UV_CONFIG_FILE", "PIP_NO_INDEX", "PIP_FIND_LINKS", "UV_FIND_LINKS"):
+                continue
+            env.pop(name, None)
+        # No _pinned_pip_config_overrides(): it re-asserts what PIP_CONFIG_FILE=devnull
+        # removed, devnull is never set here, and only-binary ACCUMULATES, so re-asserting
+        # would apply the same keys twice.
+        return env
     for name in _UV_INDEX_ENV_VARS:
         env.pop(name, None)
     for name in _PM_HASH_ENV_VARS + _PM_FORCE_SOURCE_ENV_VARS:
