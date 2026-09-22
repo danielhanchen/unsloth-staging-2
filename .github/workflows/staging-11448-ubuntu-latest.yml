@@ -1,7 +1,7 @@
 name: "staging-11448 ubuntu-latest"
 on:
   push:
-    branches: ["pr-11448-xplat-ci"]
+    branches: ["pr-11448-base-ci"]
     paths-ignore:
       - '**/*.md'
   workflow_dispatch:
