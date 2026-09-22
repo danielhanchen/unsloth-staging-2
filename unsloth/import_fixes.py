@@ -687,6 +687,370 @@ def fix_transformers5_bare_annotation_configs():
         logger.info(f"Unsloth: Failed patching PretrainedConfig ({e})")
 
 
+# Where the image helpers that `modeling_*.py` files reach for actually live.
+# Ordered so the image modules win: `resize` exists in image_transforms and is
+# the one a preprocessor means, and `transformers.utils` is last because it is
+# broad enough to shadow a name by accident.
+_IMAGE_PROCESSING_SYMBOL_HOMES = (
+    "transformers.image_transforms",
+    "transformers.image_utils",
+    "transformers.image_processing_utils",
+    "transformers.feature_extraction_utils",
+    "transformers.utils",
+)
+
+# Vision backbones whose image-processing module third-party remote code imports
+# as a namespace (`import ... as siglip2_ips`) and then reads helpers off.
+_IMAGE_PROCESSING_MODULES = (
+    "transformers.models.siglip2.image_processing_siglip2",
+    "transformers.models.siglip.image_processing_siglip",
+)
+
+_IMAGE_REEXPORT_FLAG = "_unsloth_legacy_image_reexports"
+
+# Names this fix bound onto a module, so the patch can be fully undone: the
+# forwarder caches each hit with setattr, and removing only __getattr__ would
+# leave those bindings behind.
+_IMAGE_REEXPORT_BOUND = "_unsloth_legacy_image_bound"
+
+# One name per module that transformers 5 stopped re-exporting, used to decide
+# whether this environment is affected at all.
+_IMAGE_REEXPORT_PROBE = "filter_out_non_signature_kwargs"
+
+# Set on the wrapper AND on the module. The wrapper's copy is the one the guard reads.
+_GET_CLASS_PATCH_FLAG = "_unsloth_patched_get_class_in_module"
+
+
+def _image_processing_reexports_are_missing(module):
+    """Is this module missing the helpers remote code expects on it?
+
+    Asked of the live module rather than of a transformers version, because the
+    re-export lists were trimmed per model over several releases and a version
+    window would mislabel builds that lost them early or kept them late.
+    """
+    return not hasattr(module, _IMAGE_REEXPORT_PROBE)
+
+
+def _image_reexports_are_installed(module):
+    """Are the live bindings ours, right now?
+
+    Asked of the FUNCTIONS rather than of a flag on the module, for the reason
+    spelled out in `_sdpa_mask_is_patched`: `importlib.reload` re-runs the module
+    body in the EXISTING namespace, so every name the source assigns goes back to
+    upstream while anything we merely added survives. Measured on
+    `image_processing_siglip2`: the module-level `__getattr__` survives a reload
+    because the source never assigns it, but `convert_image_to_patches` and
+    `pad_along_first_dim` do not, so the numpy dispatch is silently gone while the
+    flag that would gate reinstalling it is still True.
+
+    Both halves must be live, so a half-installed module re-runs.
+    """
+    if not getattr(getattr(module, "__getattr__", None), _IMAGE_REEXPORT_FLAG, False):
+        return False
+    for name in _LEGACY_NUMPY_IMAGE_HELPERS:
+        current = getattr(module, name, None)
+        if current is not None and not getattr(current, "_unsloth_numpy_dispatch", False):
+            return False
+    return True
+
+
+def _install_legacy_image_reexports(module_name):
+    """Resolve dropped image helpers off `module_name` from their current homes.
+
+    A module-level ``__getattr__`` (PEP 562) rather than a fixed list of names:
+    the set that was dropped differs per transformers release, and a list
+    written today would miss the next one. Only names transformers still
+    defines somewhere resolve, so a genuine typo in remote code keeps raising
+    ``AttributeError`` instead of turning into a confusing failure later.
+    """
+    try:
+        module = importlib.import_module(module_name)
+    except Exception:
+        return False
+    if _image_reexports_are_installed(module):
+        return False
+    # A surviving forwarder answers for every missing name, so the probe below would report
+    # the re-exports as present and bail with the numpy half still unpatched. Reinstall just
+    # that half: reload wiped only the names the module body assigns.
+    if getattr(getattr(module, "__getattr__", None), _IMAGE_REEXPORT_FLAG, False):
+        try:
+            _install_legacy_numpy_image_helpers(module)
+        except Exception as e:
+            logger.info(f"Unsloth: Skipping numpy image helper shim for {module_name} ({e})")
+        return True
+    if not _image_processing_reexports_are_missing(module):
+        return False
+
+    previous = getattr(module, "__getattr__", None)
+    bound = set()
+
+    def __getattr__(name):
+        # Dunders are looked up on the type for real modules; anything private
+        # is not a re-export, so leave both alone.
+        if not name.startswith("_"):
+            for home in _IMAGE_PROCESSING_SYMBOL_HOMES:
+                try:
+                    source = importlib.import_module(home)
+                except Exception:
+                    continue
+                if hasattr(source, name):
+                    value = getattr(source, name)
+                    # Bind it so later reads skip this lookup entirely.
+                    setattr(module, name, value)
+                    bound.add(name)
+                    return value
+        if previous is not None:
+            return previous(name)
+        raise AttributeError(f"module {module_name!r} has no attribute {name!r}")
+
+    # Keep the original reachable, so the patch can be tested and undone.
+    __getattr__.__wrapped__ = previous
+    # On the function, so the guard above survives a reload of the module.
+    setattr(__getattr__, _IMAGE_REEXPORT_FLAG, True)
+    module.__getattr__ = __getattr__
+    setattr(module, _IMAGE_REEXPORT_FLAG, True)
+    setattr(module, _IMAGE_REEXPORT_BOUND, bound)
+    # Names that still resolve never reach __getattr__, so the ones whose
+    # contract changed from numpy to torch are handled separately.
+    try:
+        _install_legacy_numpy_image_helpers(module)
+    except Exception as e:
+        logger.info(f"Unsloth: Skipping numpy image helper shim for {module_name} ({e})")
+    return True
+
+
+# Helpers transformers 5 KEPT on these modules but re-specified from numpy
+# (channel-last) to torch (channel-first). A module __getattr__ never fires for
+# a name that still resolves, so these need replacing rather than forwarding.
+# Phi-4-reasoning-vision-15B's modeling_phi4_visionr.py reaches both off the
+# siglip2 namespace at lines 347-348, having built numpy arrays at line 302, so
+# without this the class loads and then preprocessing fails:
+# "cannot reshape array of size 150528 into shape (224,14,16,0,16)".
+_IMAGE_REEXPORT_LEGACY_BOUND = "_unsloth_legacy_image_numpy_bound"
+
+
+def _legacy_convert_image_to_patches(image, patch_size):
+    """transformers 4.x semantics: (height, width, channels) numpy in."""
+    image_height, image_width, num_channels = image.shape
+    num_patches_height = image_height // patch_size
+    num_patches_width = image_width // patch_size
+    patched_image = image.reshape(
+        num_patches_height, patch_size, num_patches_width, patch_size, num_channels
+    )
+    patched_image = patched_image.transpose(0, 2, 1, 3, 4)
+    return patched_image.reshape(num_patches_height * num_patches_width, -1)
+
+
+def _legacy_pad_along_first_dim(
+    array,
+    target_length,
+    pad_value = 0,
+):
+    """transformers 4.x semantics: numpy in, numpy array and mask out."""
+    import numpy as np
+
+    current_length = array.shape[0]
+    padding_length = target_length - current_length
+    mask = np.ones((target_length,), dtype = np.int32)
+    if padding_length > 0:
+        paddings = [(0, padding_length)] + [(0, 0)] * (array.ndim - 1)
+        array = np.pad(array, paddings, mode = "constant", constant_values = pad_value)
+        mask[-padding_length:] = 0
+    return array, mask
+
+
+# The keyword the first argument goes by, per era. transformers renamed
+# pad_along_first_dim's first parameter from `array` to `tensor` when it moved
+# to torch, so a 4.x caller using the keyword form names something the current
+# implementation does not accept at all.
+_LEGACY_NUMPY_IMAGE_HELPERS = {
+    "convert_image_to_patches": (_legacy_convert_image_to_patches, ("image",)),
+    "pad_along_first_dim": (_legacy_pad_along_first_dim, ("array", "tensor")),
+}
+
+
+def _install_legacy_numpy_image_helpers(module):
+    """Dispatch the retained helpers on the argument type.
+
+    A numpy array takes the 4.x implementation, anything else (a torch tensor)
+    goes to whatever the module already had, so transformers' OWN
+    Siglip2ImageProcessor keeps calling the current code unchanged. Replacing
+    them outright would fix the remote checkpoint by breaking the model the
+    module is named after.
+    """
+    import numpy as np
+
+    bound = []
+    for name, (legacy, first_names) in _LEGACY_NUMPY_IMAGE_HELPERS.items():
+        current = getattr(module, name, None)
+        if current is None or getattr(current, "_unsloth_numpy_dispatch", False):
+            continue
+
+        def make(
+            current = current,
+            legacy = legacy,
+            first_names = first_names,
+        ):
+            @functools.wraps(current)
+            def dispatch(*args, **kwargs):
+                # The first argument may arrive positionally or under either
+                # era's keyword, so check all of them before deciding.
+                first = args[0] if args else None
+                if first is None:
+                    for key in first_names:
+                        if key in kwargs:
+                            first = kwargs[key]
+                            break
+                if isinstance(first, np.ndarray):
+                    # Normalise onto the 4.x keyword the legacy function names,
+                    # so a caller using the current era's spelling still works.
+                    if not args:
+                        for key in first_names[1:]:
+                            if key in kwargs:
+                                kwargs = dict(kwargs)
+                                kwargs[first_names[0]] = kwargs.pop(key)
+                                break
+                    return legacy(*args, **kwargs)
+                return current(*args, **kwargs)
+
+            dispatch.__wrapped__ = current
+            dispatch._unsloth_numpy_dispatch = True
+            return dispatch
+
+        setattr(module, name, make())
+        bound.append(name)
+    if bound:
+        setattr(module, _IMAGE_REEXPORT_LEGACY_BOUND, bound)
+    return bound
+
+
+def _remove_legacy_numpy_image_helpers(module):
+    for name in getattr(module, _IMAGE_REEXPORT_LEGACY_BOUND, ()):
+        current = getattr(module, name, None)
+        original = getattr(current, "__wrapped__", None)
+        if original is not None:
+            setattr(module, name, original)
+    try:
+        delattr(module, _IMAGE_REEXPORT_LEGACY_BOUND)
+    except AttributeError:
+        pass
+
+
+def _remove_legacy_image_reexports(module_name):
+    """Undo `_install_legacy_image_reexports`, including the cached bindings."""
+    module = sys.modules.get(module_name)
+    if module is None or not getattr(module, _IMAGE_REEXPORT_FLAG, False):
+        return False
+    _remove_legacy_numpy_image_helpers(module)
+    for name in getattr(module, _IMAGE_REEXPORT_BOUND, ()):  # drop cached hits
+        try:
+            delattr(module, name)
+        except AttributeError:
+            pass
+    previous = getattr(module.__getattr__, "__wrapped__", None)
+    if previous is None:
+        try:
+            del module.__getattr__
+        except AttributeError:
+            pass
+    else:
+        module.__getattr__ = previous
+    for attr in (_IMAGE_REEXPORT_FLAG, _IMAGE_REEXPORT_BOUND):
+        try:
+            delattr(module, attr)
+        except AttributeError:
+            pass
+    return True
+
+
+def _install_legacy_image_reexports_now():
+    """Patch every target module, importing the ones not yet loaded."""
+    patched = []
+    for module_name in _IMAGE_PROCESSING_MODULES:
+        try:
+            if _install_legacy_image_reexports(module_name):
+                patched.append(module_name.rsplit(".", 1)[-1])
+        except Exception as e:
+            logger.info(f"Unsloth: Skipping image re-export fix for {module_name} ({e})")
+    if patched:
+        logger.info(
+            "Unsloth: Restoring transformers 4.x image processing re-exports on "
+            + ", ".join(patched)
+        )
+    return patched
+
+
+def fix_transformers5_image_processing_reexports():
+    """Let remote-code image processors keep reading helpers off siglip modules.
+
+    transformers 5 stopped re-exporting the generic image helpers
+    (``filter_out_non_signature_kwargs``, ``resize``, ``to_numpy_array``,
+    ``ChannelDimension`` and friends) from each model's ``image_processing_*``
+    module. Remote code pinned to the 4.x layout does
+    ``import transformers.models.siglip2.image_processing_siglip2 as siglip2_ips``
+    and then uses ``@siglip2_ips.filter_out_non_signature_kwargs()`` at class
+    definition time, so the import raises ``AttributeError`` and the model
+    cannot be loaded at all. microsoft/Phi-4-reasoning-vision-15B is one such
+    checkpoint.
+
+    The helpers themselves were not removed, only the re-exports, so this
+    forwards attribute reads to wherever transformers keeps them now. No-op on
+    transformers 4.x, where the names are still there.
+
+    Applied when remote code is about to run rather than at import: plain
+    ``import transformers`` does not pull in the siglip2 image-processing
+    module, and importing it eagerly to patch it costs every user about three
+    seconds of PIL and torchvision setup for a checkpoint they may never load.
+    """
+    try:
+        import transformers
+        if Version(transformers.__version__) < Version("5.0.0"):
+            return
+        from transformers import dynamic_module_utils
+    except Exception as e:
+        logger.info(f"Unsloth: Skipping image processing re-export fix ({e})")
+        return
+
+    # Anything already imported can be fixed right now for free.
+    for module_name in _IMAGE_PROCESSING_MODULES:
+        if module_name in sys.modules:
+            try:
+                _install_legacy_image_reexports(module_name)
+            except Exception as e:
+                logger.info(f"Unsloth: Skipping image re-export fix for {module_name} ({e})")
+
+    # Asked of the live FUNCTION, not of the module flag: `importlib.reload` re-runs the
+    # module body in the existing namespace, so `get_class_in_module` goes back to upstream
+    # while any attribute we added survives. Gating on the flag would then refuse to re-wrap
+    # a module that is once again unpatched, which is the opposite of what an idempotence
+    # guard is for. Same reasoning as `_sdpa_mask_is_patched` below.
+    original = getattr(dynamic_module_utils, "get_class_in_module", None)
+    if original is None:
+        return
+    if getattr(original, _GET_CLASS_PATCH_FLAG, False):
+        return
+
+    @functools.wraps(original)
+    def get_class_in_module(*args, **kwargs):
+        # Runs immediately before a checkpoint's own modeling file is executed,
+        # which is the only place the missing re-exports are read.
+        try:
+            _install_legacy_image_reexports_now()
+        except Exception as e:
+            logger.info(f"Unsloth: image re-export fix skipped ({e})")
+        return original(*args, **kwargs)
+
+    # Keep the original reachable, so the patch can be tested and undone.
+    get_class_in_module.__wrapped__ = original
+    # On the function, so the guard above survives a reload of the module.
+    setattr(get_class_in_module, _GET_CLASS_PATCH_FLAG, True)
+    try:
+        dynamic_module_utils.get_class_in_module = get_class_in_module
+        setattr(dynamic_module_utils, _GET_CLASS_PATCH_FLAG, True)
+    except Exception as e:
+        logger.info(f"Unsloth: Failed patching get_class_in_module ({e})")
+
+
 _SDPA_MASK_PATCH_FLAG = "_unsloth_patched_sdpa_mask"
 
 
