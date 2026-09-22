@@ -284,6 +284,55 @@ _HYBRID_CONFIG_MARKERS = (
 )
 
 
+def _forward_accepts_packing_kwargs(model) -> bool:
+    """Can this model's forward be handed the packing metadata at all?
+
+    Padding-free batching flattens the batch and passes `packed_seq_lengths`
+    down to the model. A forward that neither names it nor collects **kwargs
+    raises TypeError on the first step, well after the trainer was built, so
+    ask the signature instead of the model name.
+    microsoft/Phi-4-reasoning-vision-15B is one such checkpoint:
+    Phi4ForCausalLMV.forward() got an unexpected keyword argument
+    'packed_seq_lengths'.
+
+    Answers True when the model cannot be inspected: refusing on an unreadable
+    signature would silently turn padding-free off for models that support it.
+    """
+    if model is None or isinstance(model, str):
+        return True
+    # Unwrap the adapter wrappers only. A PeftModel forwards **kwargs straight
+    # through, so asking the wrapper always answers yes while the checkpoint
+    # underneath is the one that raises. Stop at the checkpoint: descending
+    # further would reach the inner decoder, whose own forward may take
+    # **kwargs and answer for a model that does not.
+    target = model
+    for _ in range(4):
+        # PEFT's own unwrap only. `PreTrainedModel.base_model` is a property
+        # returning the inner decoder, whose forward usually does take
+        # **kwargs, so following it would answer for the wrong module.
+        unwrap = getattr(target, "get_base_model", None)
+        if not callable(unwrap):
+            break
+        try:
+            unwrapped = unwrap()
+        except Exception:
+            break
+        if unwrapped is None or unwrapped is target:
+            break
+        target = unwrapped
+
+    forward = getattr(target, "forward", None)
+    if forward is None:
+        return True
+    try:
+        parameters = inspect.signature(forward).parameters
+    except (TypeError, ValueError):
+        return True
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values()):
+        return True
+    return "packed_seq_lengths" in parameters
+
+
 def _is_hybrid_linear_attention_model(model) -> bool:
     """Detect models mixing linear-attention / state-space mixers (gated-delta,
     Mamba-style) with a causal conv1d, e.g. Qwen3.5 / Qwen3-Next. Packing and
@@ -980,6 +1029,7 @@ def _patch_sft_trainer_auto_packing(trl_module):
         )
 
         # Disable padding-free for VLMs / custom collators / blocklisted models
+        forward_rejects_packing = not _forward_accepts_packing_kwargs(model)
         blocked = (
             (data_collator is not None)
             or is_processor
@@ -989,6 +1039,7 @@ def _patch_sft_trainer_auto_packing(trl_module):
             or is_encoder_decoder
             or (is_hybrid and not hybrid_varlen_active)
             or (os.environ.get("UNSLOTH_RETURN_LOGITS", "0") == "1")
+            or forward_rejects_packing
         )
         requested_pack = bool(getattr(config_arg, "packing", False))
         if blocked:
@@ -1011,6 +1062,10 @@ def _patch_sft_trainer_auto_packing(trl_module):
                 reason = "hybrid linear-attention model"
             elif is_unsupported_model:
                 reason = f"unsupported model type(s): {', '.join(model_types)}"
+            elif forward_rejects_packing:
+                # Name the real blocker: otherwise this falls through to the
+                # UNSLOTH_RETURN_LOGITS branch and points at an unset flag.
+                reason = f"{type(model).__name__}.forward() does not accept packed_seq_lengths"
             elif data_collator is None:
                 # compute_metrics, preprocess_logits_for_metrics, for_inference() and the user can all set it, so
                 # name the flag and not a setter.
