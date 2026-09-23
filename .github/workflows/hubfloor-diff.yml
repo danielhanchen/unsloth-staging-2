@@ -44,7 +44,7 @@ jobs:
       # stuck: an env carrying hub 1.30.0 forward before the studio steps run.
       - name: seed stuck
         if: matrix.seed == 'stuck'
-        run: uv pip install -p "$PY" "huggingface_hub==1.30.0"
+        run: UV_OVERRIDE= uv pip install -p "$PY" "huggingface_hub==1.30.0" && "$PY" -c "import importlib.metadata as m; print('TRACE_SEED', m.version('huggingface_hub'))"
       # resident: diffusers main already installed by an earlier update, hub later left at 1.30.0.
       # The installer skips diffusers-main.txt when the build is resident, so only studio.txt runs.
       - name: seed resident
@@ -52,8 +52,9 @@ jobs:
         run: |
           UV_OVERRIDE= uv pip install -p "$PY" -r .staging/head/diffusers-main.txt
           UV_OVERRIDE= uv pip install -p "$PY" "huggingface_hub==1.30.0"
+          "$PY" -c "import importlib.metadata as m; print('TRACE_SEED', m.version('huggingface_hub'))"
       - name: studio.txt step (constrained)
-        run: uv pip install -p "$PY" -r $REQ/studio.txt -c $REQ/constraints.txt
+        run: uv pip install -p "$PY" -r $REQ/studio.txt -c $REQ/constraints.txt && "$PY" -c "import importlib.metadata as m; print('TRACE_STUDIO', m.version('huggingface_hub'))"
       - name: diffusers-main step (unconstrained, skipped when resident)
         if: matrix.seed != 'resident'
         run: uv pip install -p "$PY" -r $REQ/diffusers-main.txt
