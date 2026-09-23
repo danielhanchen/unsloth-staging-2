@@ -241,7 +241,12 @@ from unsloth_zoo.device_type import (
     DEVICE_COUNT,
     ALLOW_PREQUANTIZED_MODELS,
 )
-from .device_type import arch_lacks_bf16, hip_visible_archs
+from .device_type import (
+    arch_lacks_bf16,
+    arch_lacks_buffer_ops,
+    apply_gfx101x_triton_workaround,
+    hip_visible_archs,
+)
 
 from .import_fixes import (
     fix_transformers5_bare_annotation_configs,
@@ -441,6 +446,14 @@ elif DEVICE_TYPE == "xpu":
 elif DEVICE_TYPE == "npu":
     # No arm left the name unbound, so consumers fell back to their own False.
     SUPPORTS_BFLOAT16 = torch.npu.is_bf16_supported()
+
+# RDNA1 (gfx101x) and Triton's AMD buffer ops do not mix: the kernels compile, launch and
+# silently write nothing (see arch_lacks_buffer_ops). Triton reads the knob lazily, when it
+# compiles a kernel, and Inductor's cache does not key on it, so the knob and separate cache
+# directories have to be in place before the first compile; this is the earliest point that
+# knows which GPUs are visible (see apply_gfx101x_triton_workaround).
+if DEVICE_TYPE == "hip" and any(arch_lacks_buffer_ops(arch) for arch in hip_visible_archs()):
+    apply_gfx101x_triton_workaround()
 
 # For Gradio HF Spaces?
 # if "SPACE_AUTHOR_NAME" not in os.environ and "SPACE_REPO_NAME" not in os.environ:
