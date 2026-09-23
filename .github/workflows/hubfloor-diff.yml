@@ -1,0 +1,72 @@
+name: hub floor differential (PR 11625)
+on: [push, workflow_dispatch]
+jobs:
+  diff:
+    name: ${{ matrix.os }} py${{ matrix.py }} ${{ matrix.seed }} ${{ matrix.arm }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15, windows-latest]
+        py: ["3.10", "3.13"]
+        arm: [base, head]
+        seed: [stuck]
+        include:
+          - {os: ubuntu-latest, py: "3.13", arm: base, seed: fresh}
+          - {os: ubuntu-latest, py: "3.13", arm: head, seed: fresh}
+          - {os: macos-15, py: "3.13", arm: base, seed: fresh}
+          - {os: macos-15, py: "3.13", arm: head, seed: fresh}
+          - {os: windows-latest, py: "3.13", arm: base, seed: fresh}
+          - {os: windows-latest, py: "3.13", arm: head, seed: fresh}
+          - {os: ubuntu-latest, py: "3.13", arm: base, seed: resident}
+          - {os: ubuntu-latest, py: "3.13", arm: head, seed: resident}
+          - {os: macos-15, py: "3.13", arm: base, seed: resident}
+          - {os: macos-15, py: "3.13", arm: head, seed: resident}
+          - {os: windows-latest, py: "3.13", arm: base, seed: resident}
+          - {os: windows-latest, py: "3.13", arm: head, seed: resident}
+    defaults:
+      run:
+        shell: bash
+    env:
+      REQ: .staging/${{ matrix.arm }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: venv
+        run: |
+          uv venv -p ${{ matrix.py }} .venv
+          if [ "$RUNNER_OS" = Windows ]; then echo "PY=$PWD/.venv/Scripts/python.exe" >> $GITHUB_ENV; else echo "PY=$PWD/.venv/bin/python" >> $GITHUB_ENV; fi
+          if [ "$RUNNER_OS" = macOS ]; then echo "UV_OVERRIDE=$PWD/$REQ/overrides-darwin-arm64.txt" >> $GITHUB_ENV; fi
+      - name: torch (cpu)
+        run: |
+          if [ "$RUNNER_OS" = macOS ]; then uv pip install -p "$PY" torch torchvision; else uv pip install -p "$PY" torch torchvision --index-url https://download.pytorch.org/whl/cpu; fi
+      # stuck: an env carrying hub 1.30.0 forward before the studio steps run.
+      - name: seed stuck
+        if: matrix.seed == 'stuck'
+        run: uv pip install -p "$PY" "huggingface_hub==1.30.0"
+      # resident: diffusers main already installed by an earlier update, hub later left at 1.30.0.
+      # The installer skips diffusers-main.txt when the build is resident, so only studio.txt runs.
+      - name: seed resident
+        if: matrix.seed == 'resident'
+        run: |
+          UV_OVERRIDE= uv pip install -p "$PY" -r .staging/head/diffusers-main.txt
+          UV_OVERRIDE= uv pip install -p "$PY" "huggingface_hub==1.30.0"
+      - name: studio.txt step (constrained)
+        run: uv pip install -p "$PY" -r $REQ/studio.txt -c $REQ/constraints.txt
+      - name: diffusers-main step (unconstrained, skipped when resident)
+        if: matrix.seed != 'resident'
+        run: uv pip install -p "$PY" -r $REQ/diffusers-main.txt
+      - name: verdict
+        run: |
+          "$PY" - <<'PY'
+          import sys, importlib.metadata as md
+          print("RESULT_HUB", md.version("huggingface_hub"))
+          try:
+              import diffusers
+              from diffusers import QwenImage21Pipeline
+              print("RESULT_IMPORT OK diffusers", diffusers.__version__)
+          except Exception as e:
+              print("RESULT_IMPORT FAIL", type(e).__name__, e)
+              sys.exit(1)
+          PY
