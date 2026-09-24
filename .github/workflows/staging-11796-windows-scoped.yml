@@ -27,4 +27,4 @@ jobs:
       - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
       - run: python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: python -c "import os, sys, tempfile, pathlib; d = pathlib.Path(tempfile.mkdtemp()); (d / 'a').write_text('x'); os.link(d / 'a', d / 'b'); print('platform', sys.platform, 'hardlink nlink', os.stat(d / 'b').st_nlink)"
-      - run: cd studio/backend && python -m pytest hub/tests/test_snapshot_reuse.py tests/test_scoped_download_worker.py && python -m pytest tests/test_diffusion_backend.py -q --tb=short -k 'reusable_from_older_snapshot or does_not_count_a_file_an_older_snapshot_holds' -q --tb=short -rs
+      - run: cd studio/backend && r=0; python -m pytest hub/tests/test_snapshot_reuse.py -v --tb=short -rs || r=$?; python -m pytest tests/test_scoped_download_worker.py -q --tb=short -rs || r=$?; python -m pytest tests/test_diffusion_backend.py -q --tb=short -k 'reusable_from_older_snapshot or does_not_count_a_file_an_older_snapshot_holds' || r=$?; exit $r
