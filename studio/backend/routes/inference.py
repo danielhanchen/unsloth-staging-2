@@ -38901,6 +38901,44 @@ async def _selected_gpu_ordinal(gpu_ids, *, allow_ranking: bool = True) -> Optio
     )
 
 
+def _refuse_disabled_nvfp4_request(request: Any) -> None:
+    """400 a load or plan naming NVFP4 while the NVFP4 switch (``UNSLOTH_NVFP4_DIFFUSION``) is off.
+
+    First thing in every image and video load / plan route, ahead of the precision gates and their
+    opt-in silent fallback, so the request is refused outright, never swapped for another scheme,
+    and nothing is resolved, planned or fetched for it."""
+    from core.inference.diffusion_nvfp4_flag import refuse_disabled_nvfp4
+    try:
+        refuse_disabled_nvfp4(
+            transformer_quant = getattr(request, "transformer_quant", None),
+            text_encoder_quant = getattr(request, "text_encoder_quant", None),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code = 400, detail = str(exc))
+
+
+async def _refuse_disabled_nvfp4_checkpoint(request: Any) -> None:
+    """400 a load or plan whose model is itself an NVFP4 checkpoint while the NVFP4 switch is off.
+
+    The scheme gates above never see such a pick: it names no precision, it IS one. Runs after the
+    account checks, since it reads the local path or cached snapshot the request names."""
+    from core.inference.diffusion_nvfp4_flag import (
+        nvfp4_diffusion_enabled,
+        refuse_disabled_nvfp4_checkpoint,
+    )
+
+    if nvfp4_diffusion_enabled():
+        return
+    try:
+        await asyncio.to_thread(
+            refuse_disabled_nvfp4_checkpoint,
+            getattr(request, "model_path", None),
+            getattr(request, "base_repo", None),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code = 400, detail = str(exc))
+
+
 @studio_router.post("/images/download-plan", response_model = DiffusionDownloadPlanResponse)
 async def diffusion_download_plan(
     request: DiffusionLoadRequest, current_subject: str = Depends(get_current_subject)
@@ -38910,6 +38948,7 @@ async def diffusion_download_plan(
 
     Validates the same way /images/load does, so an unloadable pick fails here rather than
     after a multi-GB download."""
+    _refuse_disabled_nvfp4_request(request)
     if account_access.managed_account():
         await asyncio.to_thread(account_access.require_media_references, request)
     if account_access.managed_account():
@@ -38921,6 +38960,7 @@ async def diffusion_download_plan(
         request = request.model_copy(
             update = {"hf_token": account_access.account_hf_token(request.hf_token)}
         )
+    await _refuse_disabled_nvfp4_checkpoint(request)
     from core.inference.diffusion import (
         get_diffusion_backend,
         resolve_local_single_file,
@@ -38993,6 +39033,8 @@ async def diffusion_download_plan(
                     speed_mode = getattr(request, "speed_mode", None),
                     # Judged on the card this pick would load on, as the loader does.
                     gpu_ordinal = gpu_ordinal,
+                    repo_id = request.model_path,
+                    base_repo = request.base_repo,
                 )
             else:
                 _assert_native_precision_unset(
@@ -39049,9 +39091,13 @@ def _assert_native_precision_unset(
 
     Raises RuntimeError, which the route maps to 409 alongside the diffusers refusals."""
     from core.inference.diffusion_auto_policy import precision_fallback_allowed
+    from core.inference.diffusion_nvfp4_flag import refuse_disabled_nvfp4
     from core.inference.diffusion_precision import normalize_te_quant
     from core.inference.diffusion_transformer_quant import TQ_AUTO, normalize_transformer_quant
 
+    refuse_disabled_nvfp4(
+        transformer_quant = transformer_quant, text_encoder_quant = text_encoder_quant
+    )
     if precision_fallback_allowed():
         return
     pinned = normalize_transformer_quant(transformer_quant)
@@ -39112,6 +39158,7 @@ async def load_diffusion_model_gated(
     Media auto-switch awaits this rather than the route so the idle unload can tell an
     API-loaded pipeline from one the user picked on the Images page.
     """
+    _refuse_disabled_nvfp4_request(request)
     if account_access.managed_account():
         await asyncio.to_thread(account_access.require_media_references, request)
     account_access.require_idle_other_accounts()
@@ -39124,6 +39171,7 @@ async def load_diffusion_model_gated(
         request = request.model_copy(
             update = {"hf_token": account_access.account_hf_token(request.hf_token)}
         )
+    await _refuse_disabled_nvfp4_checkpoint(request)
     # Tested at ENTRY because `begin_load` returns before the worker moves a byte, so the only
     # fact available is that a repo ALREADY cached is not one this load will fetch. The WRITE is
     # deferred to the launch below, since the validation in between 400s without moving a byte.
@@ -39234,6 +39282,8 @@ async def load_diffusion_model_gated(
                 cpu_offload = bool(getattr(request, "cpu_offload", False)),
                 speed_mode = getattr(request, "speed_mode", None),
                 gpu_ordinal = gpu_ordinal,
+                repo_id = request.model_path,
+                base_repo = request.base_repo,
             )
         elif fam is not None and pending_name == ENGINE_SD_CPP:
             # The native engine accepts both knobs for interface parity and ignores them. It was
@@ -39307,6 +39357,8 @@ async def load_diffusion_model_gated(
                     cpu_offload = bool(getattr(request, "cpu_offload", False)),
                     speed_mode = getattr(request, "speed_mode", None),
                     gpu_ordinal = gpu_ordinal,
+                    repo_id = request.model_path,
+                    base_repo = request.base_repo,
                 )
 
         def _start_engine_load():

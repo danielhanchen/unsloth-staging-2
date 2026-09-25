@@ -26,6 +26,9 @@ bigger warm speedup. The compiled dequant is skipped under ``max`` (the regional
 it; a separate compiled dequant would break that graph). ``supports_torch_compile`` + bf16/CUDA
 checks gate regional compile.
 
+NVFP4 speed switches, all safe unset and read by their own modules: ``UNSLOTH_NVFP4_FAST_BIAS``,
+``UNSLOTH_NVFP4_FAST_DISPATCH``, ``UNSLOTH_NVFP4_ZERO_BUFFER``, ``UNSLOTH_NVFP4_BACKEND``.
+
 The flags this flips (TF32, cudnn.benchmark) are PROCESS-WIDE, so ``snapshot_backend_flags`` /
 ``restore_backend_flags`` let the caller restore prior values at unload, keeping a later ``off``
 load bit-identical. torch imported lazily.
@@ -34,6 +37,7 @@ load bit-identical. torch imported lazily.
 from __future__ import annotations
 
 import os
+import re
 import sys
 from functools import lru_cache
 from typing import Any, Optional
@@ -384,8 +388,9 @@ def compiled_shapes_are_static(pipe: Any, speed_mode: Optional[str]) -> bool:
 
     ``max`` compiles regional DiT blocks with automatic dynamic (static until a dimension changes, then one
     generalised graph; tracked by graph count, not shape) and U-Net whole-module is always static;
-    ``default`` DiT compiles dynamic=True (one artifact across shapes). The compile-cache layer
-    keys on this to re-save its bundle when a session hits an uncovered shape."""
+    ``default`` DiT compiles dynamic=True (one artifact across shapes) EXCEPT a stream-merging DiT,
+    static there (see ``_STREAM_MERGING_BLOCKS``). The compile-cache layer keys on this to re-save its
+    bundle when a session hits an uncovered shape."""
     mode = normalize_speed_mode(speed_mode)
     if mode == SPEED_MAX:
         # An auto-dynamic DiT generalises a dimension once and then reuses that graph for unseen values, so a new
@@ -393,9 +398,12 @@ def compiled_shapes_are_static(pipe: Any, speed_mode: Optional[str]) -> bool:
         return _denoiser_unet(pipe) is not None or not auto_dynamic_active(pipe)
     if mode != SPEED_DEFAULT:
         return False
-    # A torchao-quantised DiT compiles with automatic dynamic: its first shapes get their own artifacts.
-    return _denoiser_unet(pipe) is not None or any(
-        getattr(t, "_unsloth_auto_dynamic", False) for t in _denoiser_dits(pipe)
+    # A torchao-quantised DiT compiles with automatic dynamic: its first shapes get their own artifacts. A
+    # stream-merging DiT compiles static on this tier.
+    return (
+        _denoiser_unet(pipe) is not None
+        or any(getattr(t, "_unsloth_auto_dynamic", False) for t in _denoiser_dits(pipe))
+        or _dits_merge_streams(_denoiser_dits(pipe))
     )
 
 
@@ -410,6 +418,54 @@ def _denoiser_dits(pipe: Any) -> list:
         if m is not None and m not in dits:
             dits.append(m)
     return dits
+
+
+# Blocks MEASURED to raise inductor's CantSplit under dynamic = True (merged text+image streams);
+# ``dynamic = False`` is the only escape. Merging is necessary, not sufficient: measure before adding.
+_STREAM_MERGING_BLOCKS: frozenset[str] = frozenset({"FluxSingleTransformerBlock"})
+
+# Source match for the same cat; OFF by default since it over-flags.
+_STREAM_MERGE_DETECT_ENV = "UNSLOTH_STATIC_STREAM_MERGE_DETECT"
+_STREAM_MERGE_SOURCE = re.compile(
+    r"torch\.cat\(\s*\[\s*(?:encoder_hidden_states\s*,\s*hidden_states"
+    r"|hidden_states\s*,\s*encoder_hidden_states)\s*\]"
+)
+
+
+@lru_cache(maxsize = None)
+def _class_merges_streams(cls: type, broad: bool = False) -> bool:
+    """``broad`` is an argument, not an env read in the body, so the memo cannot outlive it."""
+    if cls.__name__ in _STREAM_MERGING_BLOCKS:
+        return True
+    if not broad:
+        return False
+    try:
+        import inspect  # noqa: PLC0415 - only reached under the opt-in broad sweep
+        source = inspect.getsource(cls.forward)
+    except Exception:  # noqa: BLE001 - no source (frozen / C ext) means fall back to the name list
+        return False
+    return bool(_STREAM_MERGE_SOURCE.search(source))
+
+
+def _dits_merge_streams(dits: list) -> bool:
+    broad = os.environ.get(_STREAM_MERGE_DETECT_ENV) == "1"
+    seen: set[type] = set()
+    for transformer in dits:
+        names = set(getattr(transformer, "_repeated_blocks", ()) or ())
+        if not names:
+            continue
+        try:
+            modules = list(transformer.named_modules())
+        except Exception:  # noqa: BLE001 - a probe, never a failed load
+            continue
+        for _name, sub in modules:
+            cls = type(sub)
+            if cls.__name__ not in names or cls in seen:
+                continue
+            seen.add(cls)
+            if _class_merges_streams(cls, broad):
+                return True
+    return False
 
 
 def _compile_repeated_blocks(
@@ -432,9 +488,16 @@ def _compile_repeated_blocks(
     # (Qwen-Image-2.1: 4-6s on about half of new prompts). Inductor's own cudagraph modes fail on the regional block --
     # "accessing tensor output of CUDAGraphs that has been overwritten" -- so the tier stays on -no-cudagraphs and the
     # capture is taken one level up, at the denoiser module.
+    # The one exception to "default is dynamic": see _STREAM_MERGING_BLOCKS. max keeps automatic dynamic for every DiT.
+    static_shapes = (not max_autotune) and _dits_merge_streams(dits)
+    if static_shapes and logger is not None:
+        logger.info(
+            "diffusion.speed: regional compile is static; this DiT merges the text and image streams "
+            "inside its repeated block and cannot be codegen'd with dynamic sequence lengths",
+        )
     kwargs: dict[str, Any] = {
         "fullgraph": not (cache_active or offload_active),
-        "dynamic": None if max_autotune else True,
+        "dynamic": None if max_autotune else (not static_shapes),
     }
     if max_autotune:
         kwargs["mode"] = "max-autotune-no-cudagraphs"
