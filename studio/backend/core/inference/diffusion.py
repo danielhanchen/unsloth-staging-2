@@ -129,6 +129,8 @@ from .diffusion_speed import (
     compile_eligible,
     compiled_shapes_are_static,
     dynamo_graph_count,
+    fp16_compile_explicit_only,
+    fp16_unet_offloaded,
     normalize_speed_mode,
     resolve_speed_mode,
     restore_backend_flags,
@@ -5477,6 +5479,7 @@ class DiffusionBackend:
                         and effective_speed == SPEED_OFF
                         and transformer_quant_engaged is None
                         and compile_eligible(target, is_gguf = False, family = fam)
+                        and not fp16_compile_explicit_only(target)
                     )
                     # Speed optims run BEFORE placement, so snapshot the global backend flags first for unload restore.
                     # The dense transformer quant above builds quiet configs, so it mutated none of these flags.
@@ -5553,8 +5556,12 @@ class DiffusionBackend:
                     self._raise_if_load_cancelled(_load_token)
                     # Pre-warmed torch.compile cache: a per-fingerprint inductor dir plus a bundle loaded before the
                     # first compiled forward pays the 25-58s compile once.
-                    if effective_speed in (SPEED_DEFAULT, SPEED_MAX) and compile_eligible(
-                        target, is_gguf = gguf_transformer, family = fam
+                    if (
+                        effective_speed in (SPEED_DEFAULT, SPEED_MAX)
+                        and compile_eligible(target, is_gguf = gguf_transformer, family = fam)
+                        and not fp16_unet_offloaded(
+                            target, pipe, offload_active = plan.offload_policy != OFFLOAD_NONE
+                        )
                     ):
                         compile_ctx = compile_cache.begin(
                             family = fam.name,
