@@ -204,6 +204,7 @@ from .diffusion_auto_policy import (
 )
 from .diffusion_transformer_quant import (
     TQ_AUTO,
+    TQ_INT8,
     DEFAULT_MIN_LINEAR_FEATURES,
     DenoiserView as _DenoiserView,
     dense_quant_blocker,
@@ -214,12 +215,19 @@ from .diffusion_transformer_quant import (
     denoiser_modules,
     explain_unusable_scheme,
     mark_source_precision,
+    native_int8_act,
+    native_offload_host,
+    native_quant_host,
+    native_quant_scheme,
+    NATIVE_OFFLOAD_SCHEMES,
+    NATIVE_QUANT_SCHEMES,
     normalize_transformer_quant,
     quantize_transformer,
     select_transformer_quant_scheme,
     stored_denoiser_precision,
     transformer_is_quantised,
 )
+from .diffusion_native_quant import native_quant_reason
 from utils.paths.path_utils import (
     any_not_appledouble_metadata,
     is_appledouble_metadata,
@@ -1784,6 +1792,26 @@ class DiffusionBackend:
                     f"{getattr(fam, 'denoiser_attr', 'unet')}, not a transformer, and the dense torchao schemes "
                     "do not cover it"
                 )
+            elif (
+                model_kind == "pipeline"
+                and pinned in NATIVE_QUANT_SCHEMES
+                and native_quant_host(target)
+            ):
+                if native_quant_scheme(target, pinned, family = getattr(fam, "name", None)) is None:
+                    reason = explain_unusable_scheme(getattr(fam, "name", None), pinned)
+            elif (
+                model_kind == "pipeline"
+                and pinned in NATIVE_OFFLOAD_SCHEMES
+                and _memory_request_forces_offload(memory_mode, cpu_offload)
+                and native_offload_host(target)
+            ):
+                if (
+                    native_quant_scheme(
+                        target, pinned, family = getattr(fam, "name", None), offload = True
+                    )
+                    is None
+                ):
+                    reason = explain_unusable_scheme(getattr(fam, "name", None), pinned)
             elif _memory_request_forces_offload(memory_mode, cpu_offload):
                 # Not a measurement: balanced and low_vram name their policy outright, and the legacy flag forces
                 # model offload. Offload hooks move modules with Module.to(), which torchao tensors do not survive, so
@@ -2480,6 +2508,8 @@ class DiffusionBackend:
             model_kind = resolve_model_kind(gguf_filename, model_kind),
             transformer_quant = transformer_quant,
             text_encoder_quant = text_encoder_quant,
+            memory_mode = memory_mode,
+            cpu_offload = cpu_offload,
             # An uncompiled torchao transformer loses to the bf16 it replaces, so 'eager' stays dense. Refusing
             # an explicit scheme here says so before the download.
             speed_mode = speed_mode,
@@ -4483,19 +4513,44 @@ class DiffusionBackend:
                 # visible, and into the refusal so it is actionable.
                 transformer_quant_decline: Optional[str] = None
                 transformer_quant_decline_status = RESOLVED_FELL_BACK
+                native_scheme = (
+                    native_quant_scheme(
+                        target, transformer_quant_pinned, family = getattr(fam, "name", None)
+                    )
+                    if kind == "pipeline"
+                    else None
+                )
+                native_offload_scheme = (
+                    native_quant_scheme(
+                        target,
+                        transformer_quant_pinned,
+                        family = getattr(fam, "name", None),
+                        offload = True,
+                    )
+                    if kind == "pipeline" and native_scheme is None
+                    else None
+                )
+                native_offload_forced = native_offload_scheme is not None and (
+                    _memory_request_forces_offload(memory_mode, cpu_offload)
+                )
                 if transformer_quant_pinned is not None and not dense_quant_supported_kind(kind):
                     transformer_quant_decline = dense_quant_unsupported_kind_reason(kind)
                     transformer_quant_decline_status = RESOLVED_UNSUPPORTED
-                elif transformer_quant_pinned is not None and not dense_transformer_supported(
-                    target
+                elif (
+                    transformer_quant_pinned is not None
+                    and native_scheme is None
+                    and not dense_transformer_supported(target)
                 ):
                     # Ask the helper rather than repeating its fallback: on ROCm and on the Windows
                     # torchao stub it knows a truer reason, and an AMD owner reading "needs a CUDA
                     # GPU" while holding a working GPU learns nothing about why it declined.
                     transformer_quant_decline = dense_transformer_unsupported_reason(target)
                     transformer_quant_decline_status = RESOLVED_UNSUPPORTED
-                elif transformer_quant_pinned is not None and (
-                    select_transformer_quant_scheme(
+                elif (
+                    transformer_quant_pinned is not None
+                    and native_scheme is None
+                    and not native_offload_forced
+                    and select_transformer_quant_scheme(
                         target, transformer_quant_pinned, family = getattr(fam, "name", None)
                     )
                     is None
@@ -5365,7 +5420,7 @@ class DiffusionBackend:
                         and kind == "pipeline"
                         and transformer_quant_engaged is None
                         and normalize_transformer_quant(transformer_quant) is not None
-                        and dense_transformer_supported(target)
+                        and (dense_transformer_supported(target) or native_scheme is not None)
                     ):
                         # from_pretrained widens a raw fp8/int8 checkpoint to bf16, erasing the one thing the blocker
                         # below reads, so recover it from the shard header (Ideogram's loader stamps its own).
@@ -5375,9 +5430,11 @@ class DiffusionBackend:
                         if source_precision is not None:
                             for _attr, denoiser in denoiser_modules(pipe):
                                 mark_source_precision(denoiser, source_precision)
-                        pipeline_quant_blocker = pipeline_quant_uncompilable or dense_quant_blocker(
-                            pipe
-                        )
+                        pipeline_quant_blocker = (
+                            None
+                            if native_scheme is not None or native_offload_scheme is not None
+                            else pipeline_quant_uncompilable
+                        ) or dense_quant_blocker(pipe)
                         if pipeline_quant_blocker is not None:
                             logger.info(
                                 "diffusion.transformer_quant: skipped (%s)", pipeline_quant_blocker
@@ -5388,7 +5445,7 @@ class DiffusionBackend:
                             # Re-plan against the quantised steady size. The build peak remains bf16.
                             bf16_plan = plan
                             if plan.offload_policy != OFFLOAD_NONE:
-                                preview_scheme = select_transformer_quant_scheme(
+                                preview_scheme = native_scheme or select_transformer_quant_scheme(
                                     target, transformer_quant, family = getattr(fam, "name", None)
                                 )
                                 # This in-memory rewrite needs no cache-space or hosted-checkpoint checks.
@@ -5424,7 +5481,19 @@ class DiffusionBackend:
                                             plan.offload_policy,
                                         )
                                         plan = replanned
-                            if plan.offload_policy != OFFLOAD_NONE:
+                            if (
+                                plan.offload_policy != OFFLOAD_NONE
+                                and native_scheme is None
+                                and native_offload_scheme is not None
+                            ):
+                                native_scheme = native_offload_scheme
+                                logger.info(
+                                    "diffusion.transformer_quant: %s runs torchao-free under the plan's '%s' "
+                                    "offload (torchao tensors reject the hooks' Module.to())",
+                                    native_scheme,
+                                    plan.offload_policy,
+                                )
+                            if plan.offload_policy != OFFLOAD_NONE and native_scheme is None:
                                 logger.info(
                                     "diffusion.transformer_quant: skipped (the memory plan picked '%s' "
                                     "offload, which moves the transformer via Module.to())",
@@ -5435,6 +5504,14 @@ class DiffusionBackend:
                                     "the transformer via Module.to(); torchao quantised tensors reject "
                                     "that. Pin a resident memory mode to combine the two"
                                 )
+                            elif native_scheme is None and pipeline_quant_uncompilable is not None:
+                                # Resident plan: torchao still needs the compile check skipped above.
+                                logger.info(
+                                    "diffusion.transformer_quant: skipped (%s)",
+                                    pipeline_quant_uncompilable,
+                                )
+                                transformer_quant_decline = pipeline_quant_uncompilable
+                                transformer_quant_decline_status = RESOLVED_UNSUPPORTED
                             else:
                                 if _has_active_lora(loras):
                                     # PEFT must wrap dense Linears before torchao converts their base layers.
@@ -5458,6 +5535,15 @@ class DiffusionBackend:
                                     )
                                 # Convert every denoiser so multi-branch pipelines use one precision.
                                 denoisers = denoiser_modules(pipe)
+                                native_kwargs = (
+                                    {
+                                        "offload": plan.offload_policy != OFFLOAD_NONE,
+                                        "act_int8": native_scheme == TQ_INT8
+                                        and native_int8_act(target),
+                                    }
+                                    if native_scheme is not None
+                                    else {}
+                                )
                                 engaged: list[str] = []
                                 for attr, _module in denoisers:
                                     scheme = quantize_transformer(
@@ -5469,6 +5555,7 @@ class DiffusionBackend:
                                         family = getattr(fam, "name", None),
                                         fast_accum = transformer_quant_fast_accum,
                                         logger = logger,
+                                        **native_kwargs,
                                     )
                                     if scheme is None:
                                         break
@@ -5533,8 +5620,12 @@ class DiffusionBackend:
                     # Effective speed: GGUF defaults to `default` (~2.2x, below the quant noise floor); dense stays
                     # bit-identical `off`.
                     effective_speed = resolve_speed_mode(speed_mode, is_gguf = kind == "gguf")
-                    # A torchao-quantized dense transformer must be compiled (eager is ~30x slower, losing to GGUF)
-                    if transformer_quant_engaged is not None and effective_speed == SPEED_OFF:
+                    # A torchao-quantized dense transformer must be compiled (eager is ~30x slower, losing to GGUF).
+                    if (
+                        transformer_quant_engaged is not None
+                        and native_scheme is None
+                        and effective_speed == SPEED_OFF
+                    ):
                         logger.info(
                             "diffusion.transformer_quant: forcing speed_mode=default "
                             "(quantized transformer must be compiled; eager is ~30x slower)"
@@ -5671,7 +5762,11 @@ class DiffusionBackend:
                         logger = logger,
                     )
                     self._raise_if_load_cancelled(_load_token)
-                    if transformer_quant_engaged is not None and not speed_applied.get("compiled"):
+                    if (
+                        transformer_quant_engaged is not None
+                        and native_scheme is None
+                        and not speed_applied.get("compiled")
+                    ):
                         # Compile could not engage: the quantized transformer runs eager, far slower than the GGUF it
                         # replaced
                         logger.warning(
@@ -5763,6 +5858,7 @@ class DiffusionBackend:
                                 "deferred" if speed_deferred else effective_speed,
                                 "quantized transformer requires compile"
                                 if transformer_quant_engaged is not None
+                                and native_scheme is None
                                 and normalize_speed_mode(speed_mode) in (None, SPEED_OFF)
                                 else "auto: exact eager for the first two images; "
                                 "the compile profile engages on the 3rd"
@@ -5788,6 +5884,10 @@ class DiffusionBackend:
                                     )
                                 )
                                 if transformer_quant_engaged is None
+                                else native_quant_reason(
+                                    getattr(pipe, "transformer", None), transformer_quant_engaged
+                                )
+                                if native_scheme is not None
                                 else f"seeded from the hosted checkpoint "
                                 f"{transformer_quant_artifact.split(':', 1)[1]}"
                                 if transformer_quant_artifact is not None
