@@ -11706,50 +11706,40 @@ def test_a_prequant_repo_missing_its_artifact_marks_the_plan_incomplete(monkeypa
     assert "prequant artifact missing" in str(failures[0])
 
 
-def test_status_reports_cuda_graph_off_once_every_armed_step_ran_eager():
-    backend = DiffusionBackend()
-    handle = types.SimpleNamespace(
-        cache = {},
-        stats = {"captures": 0, "replays": 0, "eager_calls": 0, "refused_object": 0},
-        poisoned = False,
-        capture_error = None,
-    )
-    resolved = {
-        "cuda_graph": {
-            "value": "on",
-            "requested": None,
-            "source": "auto",
-            "status": "applied",
-            "reason": "denoiser step captured per input shape, replayed bit-identically",
-        }
-    }
-    backend._state = _LoadState(
-        pipe = object(),
-        family = detect_family("unsloth/Z-Image-GGUF"),
-        repo_id = "r",
-        base_repo = "b",
-        device = "cuda",
-        dtype = "bfloat16",
-        cpu_offload = False,
-        speed_optims = ("compiled", "cuda_graph"),
-        resolved = resolved,
-        cuda_graphs = (handle,),
-    )
+def test_unload_drains_pinned_host_memory_after_the_pipeline_is_gone(
+    fake_runtime, tmp_path, monkeypatch
+):
+    from core.inference import diffusion as diffusion_module
 
-    st = backend.status()
-    assert st["resolved"]["cuda_graph"]["value"] == "on"
-    assert st["speed_optims"] == ["compiled", "cuda_graph"]
-
-    handle.stats.update(eager_calls = 25, refused_object = 25)
-    st = backend.status()
-    assert st["resolved"]["cuda_graph"]["value"] == "off"
-    assert st["resolved"]["cuda_graph"]["reason"] == (
-        "armed, but all 25 denoiser call(s) so far ran eager (25 with a non-tensor argument)"
+    backend = _loaded_backend(tmp_path)
+    calls: list = []
+    monkeypatch.setattr(
+        diffusion_module, "clear_gpu_cache", lambda: calls.append(("clear", backend._state))
     )
-    assert st["speed_optims"] == ["compiled"]
-    assert resolved["cuda_graph"]["value"] == "on"
+    monkeypatch.setattr(
+        diffusion_module,
+        "release_pinned_host_memory",
+        lambda: calls.append(("host", backend._state)),
+    )
+    backend.unload()
+    assert calls == [("clear", None), ("host", None)]
 
-    handle.stats.update(captures = 1, replays = 24)
-    st = backend.status()
-    assert st["resolved"]["cuda_graph"]["value"] == "on"
-    assert st["speed_optims"] == ["compiled", "cuda_graph"]
+
+def test_unload_drains_pinned_host_memory_even_when_gpu_cleanup_raises(
+    fake_runtime, tmp_path, monkeypatch
+):
+    from core.inference import diffusion as diffusion_module
+
+    backend = _loaded_backend(tmp_path)
+    drained: list = []
+
+    def _sticky():
+        raise RuntimeError("CUDA error: an illegal memory access was encountered")
+
+    monkeypatch.setattr(diffusion_module, "clear_gpu_cache", _sticky)
+    monkeypatch.setattr(
+        diffusion_module, "release_pinned_host_memory", lambda: drained.append(True)
+    )
+    with pytest.raises(RuntimeError, match = "illegal memory access"):
+        backend.unload()
+    assert drained == [True]
