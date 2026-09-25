@@ -25,6 +25,7 @@ from urllib.parse import quote, unquote
 
 from loggers import get_logger
 
+from core.inference.scan_incidents import note_scan_incident
 from hub.schemas.inventory import LocalModelInfo
 from hub.services.models.common import (
     _capabilities_for_format,
@@ -128,6 +129,9 @@ def _safe_is_file(path: Path) -> bool:
     try:
         return path.is_file()
     except OSError:
+        # False drops the manifest or the blob, which reads exactly like one that is not
+        # there, so the pass would publish as complete over a row it never got to see.
+        note_scan_incident(f"ollama path unreadable: {path}")
         return False
 
 
@@ -314,7 +318,12 @@ def _ollama_model_info_from_manifest(
     if manifest is None:
         try:
             manifest = json.loads(tag_file.read_text(encoding = "utf-8-sig"))
-        except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+        except OSError as e:
+            # Unreadable, not malformed: this manifest will parse once the file is
+            # readable again, so a miss from this pass is not a confirmed absence.
+            note_scan_incident(f"ollama manifest unreadable: {tag_file}")
+            return invalid_manifest(str(e))
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
             return invalid_manifest(str(e))
     if not isinstance(manifest, dict):
         return invalid_manifest("top level must be a JSON object")
@@ -330,7 +339,10 @@ def _ollama_model_info_from_manifest(
         if config_blob is not None and _safe_is_file(config_blob):
             try:
                 cfg = json.loads(config_blob.read_text(encoding = "utf-8-sig"))
-            except (json.JSONDecodeError, OSError, UnicodeDecodeError) as e:
+            except OSError as e:
+                note_scan_incident(f"ollama config blob unreadable: {config_blob}")
+                return invalid_manifest(f"config blob could not be read: {e}")
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
                 return invalid_manifest(f"config blob could not be parsed: {e}")
             if not isinstance(cfg, dict):
                 return invalid_manifest("config blob must be a JSON object")
@@ -552,6 +564,9 @@ def scan_ollama_dir(
                 return found
     except OSError as e:
         logger.warning("Error scanning Ollama directory %s: %s", ollama_dir, e)
+        # A partial list reads exactly like a complete one from outside, so say so for the
+        # caller that treats a miss as a confirmed absence.
+        note_scan_incident(f"ollama dir unreadable: {ollama_dir}")
     return found
 
 
