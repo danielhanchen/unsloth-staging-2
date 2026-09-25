@@ -338,10 +338,7 @@ export {
   removeChatThreadTombstones,
 } from "./utils/chat-thread-tombstones";
 export { emitChatAttachmentDeleted } from "./utils/chat-attachment-events";
-export {
-  forkCountFor,
-  subscribeForkCounts,
-} from "./utils/fork-count-store";
+export { forkCountFor, subscribeForkCounts } from "./utils/fork-count-store";
 export { resolveReasoningGroupDuration } from "./utils/reasoning-duration";
 export {
   reasoningFollowsPreference,
@@ -459,6 +456,9 @@ export {
   releaseTtsAudioUrl,
 } from "./adapters/studio-speech-synthesis-adapter";
 export { ChatSkillsDialog } from "./components/chat-skills-dialog";
+export { ChatAudioUploadMount } from "./components/chat-audio-upload-mount";
+export { useChatAudioUpload } from "./hooks/use-chat-audio-upload";
+export { currentDictationEntryMode } from "./utils/dictation-entry";
 export {
   SKILL_MENTION_PATTERN,
   listSkills,
