@@ -113,6 +113,7 @@ from .diffusion_memory import (
     raise_on_unified_memory_shortfall,
     reclaimable_snapshot_device_memory,
     reclaim_offload_host_memory,
+    release_pinned_host_memory,
     refine_memory_plan_for_components,
     settled_snapshot_device_memory,
     snapshot_device_memory,
@@ -7838,7 +7839,11 @@ class DiffusionBackend:
         self._cn_models.clear()
         self._state = None
         del state
-        clear_gpu_cache()
+        try:
+            clear_gpu_cache()
+        finally:
+            # finally: a sticky CUDA fault must not keep the pinned chunks locked.
+            release_pinned_host_memory()
 
     def status(self) -> dict[str, Any]:
         state = self._state
