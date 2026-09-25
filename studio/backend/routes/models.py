@@ -3629,8 +3629,8 @@ async def _read_native_context_length_bounded(model: str, is_local: bool) -> Opt
 
 
 def _read_native_context_length(repo_id: str, is_local: bool) -> Optional[int]:
-    """Native max context from a downloaded GGUF for this repo, or None. The value is identical across
-    quants, so one non-mmproj shard's header is enough. Never raises. Bounded by
+    """Native max context from a downloaded GGUF for this repo, or None. A file path reads that exact
+    quant; a directory reads one non-mmproj shard. Never raises. Bounded by
     ``_NATIVE_CONTEXT_READ_TIMEOUT_SECONDS``: this only pre-fills a context field on an already
     selectable row, so a dragging walk reports None rather than holding the variant listing open.
     Checked between files, and files already read stay cached, so a later request resumes."""
@@ -3652,7 +3652,8 @@ def _read_native_context_length(repo_id: str, is_local: bool) -> Optional[int]:
             if time.monotonic() >= deadline:
                 logger.debug("native context read for '%s' out of budget", repo_id)
                 return None
-            for f in _iter_gguf_paths(root, deadline):
+            paths = [root] if is_local and root.is_file() else _iter_gguf_paths(root, deadline)
+            for f in paths:
                 if time.monotonic() >= deadline:
                     logger.debug("native context read for '%s' out of budget", repo_id)
                     return None
@@ -3689,6 +3690,11 @@ def _resolve_quant_gguf(repo_id: str, quant: str, is_local: bool) -> tuple[Optio
 
             if not _is_valid_repo_id(repo_id):
                 return None, 0
+            from hub.utils.gguf_sources import cached_gguf_sources
+
+            source = cached_gguf_sources(repo_id).get((quant or "").strip().lower())
+            if source is not None:
+                return _resolve_quant_gguf(str(source.snapshot), quant, True)
             roots = []
             for entry in iter_repo_cache_dirs("model", repo_id):
                 snaps = entry / "snapshots"
@@ -4471,6 +4477,7 @@ async def get_gguf_variants(
     offline: bool = False,
     local_path: Optional[str] = None,
     hf_token: Optional[str] = Query(None, description = "HuggingFace token for private repos"),
+    include_cache_locations: bool = False,
     hf_token_header: HfTokenArg = Depends(get_request_hf_token),
     current_subject: str = Depends(get_current_subject),
     via_api_key: bool = Depends(authenticated_via_api_key),
@@ -4491,6 +4498,7 @@ async def get_gguf_variants(
             prefer_local_cache = prefer_local_cache,
             offline = offline,
             local_path = local_path,
+            include_cache_locations = include_cache_locations,
             hf_token = hf_token,
         )
         response = answer.response
@@ -4505,7 +4513,17 @@ async def get_gguf_variants(
         # not suppress from inside.
         if not answer.cache_authorized and not is_local_path(context_model):
             context_model = None
-        local = context_model is not None and is_local_path(context_model)
+        variant_sources = answer.variant_context_sources or {}
+        context_models = [
+            m for m in dict.fromkeys([context_model, *variant_sources.values()]) if m is not None
+        ]
+        context_values = await asyncio.gather(
+            *(
+                _read_native_context_length_bounded(model, is_local_path(model))
+                for model in context_models
+            )
+        )
+        context_lengths = dict(zip(context_models, context_values))
 
         # See the /hub twin: the identifier is resolved on the way in, so it has to be
         # referenced again on the way out.
@@ -4516,6 +4534,10 @@ async def get_gguf_variants(
                     GgufVariantDetail(
                         filename = v.filename,
                         quant = v.quant,
+                        cache_path = getattr(v, "cache_path", None),
+                        context_length = context_lengths.get(
+                            variant_sources.get(v.quant.lower(), context_model)
+                        ),
                         # A path-qualified key is not a label a picker can show; without this
                         # the row reads as its whole relative path.
                         display_label = getattr(v, "display_label", None),
@@ -4536,11 +4558,7 @@ async def get_gguf_variants(
                 ],
                 has_vision = response.has_vision,
                 default_variant = response.default_variant,
-                context_length = (
-                    await _read_native_context_length_bounded(context_model, local)
-                    if context_model is not None
-                    else None
-                ),
+                context_length = context_lengths.get(context_model),
                 resolved_locally = bool(getattr(response, "resolved_locally", False)),
                 dependencies_resolved = bool(getattr(response, "dependencies_resolved", False)),
                 loadable_variants = getattr(response, "loadable_variants", None),
@@ -5364,6 +5382,13 @@ def _resolve_cached_model_path(repo_id: str, variant: Optional[str]) -> Path:
         raise HTTPException(status_code = 404, detail = "Model not found in cache")
 
     if variant:
+        from hub.utils.gguf_sources import cached_gguf_sources
+
+        source = cached_gguf_sources(repo_id).get(variant.strip().lower())
+        if source is not None:
+            path = source.snapshot / source.variant.filename
+            if path.is_file():
+                return path
         want = (variant or "").strip()
         candidate_revisions = sorted(
             (rev for repo_info in matching_repos for rev in repo_info.revisions),
