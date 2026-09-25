@@ -10355,8 +10355,11 @@ def test_plan_memory_hands_the_planner_the_text_encoder_split(monkeypatch, tmp_p
     assert plan.estimates["companion_dense_mib"] == 200
     assert plan.estimates["text_encoder_dense_mib"] == 150
     assert plan.estimates["group_floor_streamed_te_mib"] == 2198
-    # The companions fit as they are, so the cheaper tier still wins and nothing streams.
-    assert plan.offload_policy == OFFLOAD_GROUP and plan.stream_text_encoders is False
+    # The transformer (300) fits beside the VAE once the encoders stream: 350 + 100 + 2048 = 2498 against the 2952
+    # budget. That beats streaming the transformer on every step, so it is the tier picked.
+    assert plan.estimates["resident_transformer_floor_mib"] == 2498
+    assert plan.offload_policy == OFFLOAD_GROUP
+    assert plan.stream_text_encoders is True and plan.stream_transformer is False
 
 
 def test_plan_memory_streams_the_text_encoders_instead_of_offloading_everything(
@@ -11704,3 +11707,508 @@ def test_a_prequant_repo_missing_its_artifact_marks_the_plan_incomplete(monkeypa
         failures
     ), "a configured prequant that is not in its repo left the plan calling itself complete"
     assert "prequant artifact missing" in str(failures[0])
+
+
+# ── pricing a hosted pre-cast text encoder ────────────────────────────────────
+# Qwen-Image-2.1 takes its fp8 Qwen3-VL from unsloth/Qwen-Image-2.1-FP8, not from the base repo, so the base-repo scans
+# read the 8.7 GiB encoder as nothing: a GGUF Q8_0 load planned 8938 MiB for 17.9 GiB of weights, picked group offload
+# with the encoder resident on a 16 GB card, and ran out of memory at the first image.
+
+
+def test_plan_memory_prices_the_hosted_precast_text_encoder(monkeypatch, tmp_path):
+    snapshot = _base_snapshot_with_sizes(
+        tmp_path, monkeypatch, {"vae/diffusion_pytorch_model.safetensors": 50}
+    )
+    target = _small_card(monkeypatch)
+    seen = {}
+
+    def _precast(
+        fam,
+        base,
+        tgt,
+        text_encoder_quant,
+        staged_dir = None,
+    ):
+        seen["quant"] = text_encoder_quant
+        return (2800, ("text_encoder",), True) if text_encoder_quant == "fp8" else None
+
+    monkeypatch.setattr(DiffusionBackend, "_precast_text_encoder_mib", staticmethod(_precast))
+
+    def _plan(**kw):
+        return DiffusionBackend()._plan_memory(
+            target,
+            None,
+            "bfl/base",
+            types.SimpleNamespace(name = "flux.1"),
+            None,
+            False,
+            kind = "gguf",
+            transformer_resident_override_mib = 300,
+            base_local_dir = str(snapshot),
+            **kw,
+        )
+
+    before = _plan()
+    # No scheme handed over: the previous sizing, VAE only.
+    assert before.estimates["companion_dense_mib"] == 50
+    assert before.estimates["text_encoder_dense_mib"] is None
+    after = _plan(text_encoder_quant = "fp8")
+    assert seen["quant"] == "fp8"
+    assert after.estimates["text_encoder_dense_mib"] == 2800
+    assert after.estimates["companion_dense_mib"] == 2850
+    assert after.estimates["model_dense_mib"] == 3150
+
+
+def test_plan_memory_prices_cached_dense_shards_over_a_cached_precast(monkeypatch, tmp_path):
+    # Swap, never add, but never below dense shards on disk either: a cached checkpoint can still fail to load (bad
+    # metadata, missing class, incompatible state dict) and assembly then opens those shards.
+    snapshot = _base_snapshot_with_sizes(
+        tmp_path,
+        monkeypatch,
+        {
+            "text_encoder/model.safetensors": 4000,
+            "vae/diffusion_pytorch_model.safetensors": 50,
+        },
+    )
+    target = _small_card(monkeypatch)
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_precast_text_encoder_mib",
+        staticmethod(lambda *a, **k: (2600, ("text_encoder",), True)),
+    )
+    plan = DiffusionBackend()._plan_memory(
+        target,
+        None,
+        "bfl/base",
+        types.SimpleNamespace(name = "flux.1"),
+        None,
+        False,
+        kind = "gguf",
+        transformer_resident_override_mib = 300,
+        base_local_dir = str(snapshot),
+        text_encoder_quant = "fp8",
+    )
+    assert plan.estimates["text_encoder_dense_mib"] == 4000
+    assert plan.estimates["companion_dense_mib"] == 4050
+    assert plan.estimates["model_dense_mib"] == 4350
+
+
+def test_cached_dense_shards_keep_the_24g_denoiser_resident(monkeypatch, tmp_path):
+    # Qwen-Image-2.1 Q8_0 on a 24 GB card with the dense Qwen3-VL shards left in the cache as well as the fp8
+    # checkpoint: pricing the dense encoder must not cost the resident-denoiser tier, which only streams encoders.
+    from core.inference import diffusion as dmod
+    from core.inference.diffusion_memory import OFFLOAD_GROUP, DeviceMemory
+
+    snapshot = _base_snapshot_with_sizes(
+        tmp_path,
+        monkeypatch,
+        {
+            "text_encoder/model.safetensors": 16689,
+            "vae/diffusion_pytorch_model.safetensors": 1288,
+        },
+    )
+    monkeypatch.setattr(
+        dmod,
+        "settled_snapshot_device_memory",
+        lambda t: DeviceMemory("cuda", "cuda", "discrete_vram", 23000, 24576),
+    )
+    monkeypatch.setattr(dmod, "estimate_image_runtime_mib", lambda **kw: 8192)
+    target = types.SimpleNamespace(device = "cuda", backend = "cuda", supports_model_cpu_offload = True)
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_precast_text_encoder_mib",
+        staticmethod(lambda *a, **k: (8959, ("text_encoder",), True)),
+    )
+    plan = DiffusionBackend()._plan_memory(
+        target,
+        None,
+        "bfl/base",
+        types.SimpleNamespace(name = "qwen-image"),
+        None,
+        False,
+        kind = "gguf",
+        transformer_resident_override_mib = 7650,
+        base_local_dir = str(snapshot),
+        text_encoder_quant = "fp8",
+    )
+    assert plan.estimates["text_encoder_dense_mib"] == 16689
+    assert plan.offload_policy == OFFLOAD_GROUP
+    assert plan.stream_transformer is False and plan.stream_text_encoders is True
+
+
+def _flux_like_plan(tmp_path, monkeypatch, precast):
+    # CLIP-L (235) stays dense; only the T5 folder is replaced by the pre-cast checkpoint.
+    snapshot = _base_snapshot_with_sizes(
+        tmp_path,
+        monkeypatch,
+        {
+            "text_encoder/model.safetensors": 235,
+            "text_encoder_2/model.safetensors": 4000,
+            "vae/diffusion_pytorch_model.safetensors": 50,
+        },
+    )
+    target = _small_card(monkeypatch)
+    monkeypatch.setattr(
+        DiffusionBackend, "_precast_text_encoder_mib", staticmethod(lambda *a, **k: precast)
+    )
+    return DiffusionBackend()._plan_memory(
+        target,
+        None,
+        "bfl/base",
+        types.SimpleNamespace(name = "flux.1"),
+        None,
+        False,
+        kind = "gguf",
+        transformer_resident_override_mib = 300,
+        base_local_dir = str(snapshot),
+        text_encoder_quant = "fp8",
+    )
+
+
+def test_plan_memory_swaps_only_the_encoder_the_precast_checkpoint_replaces(monkeypatch, tmp_path):
+    plan = _flux_like_plan(tmp_path, monkeypatch, (4200, ("text_encoder_2",), True))
+    assert plan.estimates["text_encoder_dense_mib"] == 235 + 4200
+    assert plan.estimates["companion_dense_mib"] == 50 + 235 + 4200
+
+
+def test_plan_memory_never_prices_an_uncached_precast_below_the_dense_shards(monkeypatch, tmp_path):
+    # Not cached yet: the load can still fall back to the dense T5 it scanned, so keep the larger figure.
+    plan = _flux_like_plan(tmp_path, monkeypatch, (2600, ("text_encoder_2",), False))
+    assert plan.estimates["text_encoder_dense_mib"] == 235 + 4000
+
+
+def test_plan_memory_leaves_a_callers_companion_override_alone(monkeypatch, tmp_path):
+    # A dense-quant candidate prices its own companions (already pre-cast scaled); the cache correction must not
+    # land on top of it.
+    target = _small_card(monkeypatch)
+    monkeypatch.setattr(
+        DiffusionBackend, "_precast_text_encoder_mib", staticmethod(lambda *a, **k: 2600)
+    )
+    plan = DiffusionBackend()._plan_memory(
+        target,
+        None,
+        "bfl/base",
+        types.SimpleNamespace(name = "flux.1"),
+        None,
+        False,
+        kind = "gguf",
+        transformer_resident_override_mib = 300,
+        companion_override_mib = 700,
+        text_encoder_override_mib = 600,
+        text_encoder_quant = "fp8",
+    )
+    assert plan.estimates["companion_dense_mib"] == 700
+    assert plan.estimates["text_encoder_dense_mib"] == 600
+
+
+def _q21_precast_cache(tmp_path, monkeypatch, *, mib):
+    """unsloth/Qwen-Image-2.1-FP8 cached under the live root, holding only the pre-cast encoder."""
+    live, _other = _split_cache_roots(tmp_path, monkeypatch)
+    repo = live / "models--unsloth--Qwen-Image-2.1-FP8"
+    rev = "b" * 40
+    (repo / "refs").mkdir(parents = True)
+    (repo / "refs" / "main").write_text(rev)
+    snap = repo / "snapshots" / rev
+    snap.mkdir(parents = True)
+    if mib:
+        with open(snap / "Qwen-Image-2.1-text_encoder-FP8.safetensors", "wb") as fh:
+            fh.truncate(mib * 1024 * 1024)
+    return snap
+
+
+def _bf16_cuda_target():
+    import torch
+    return types.SimpleNamespace(
+        device = "cuda", backend = "cuda", dtype = torch.bfloat16, supports_model_cpu_offload = True
+    )
+
+
+def test_precast_text_encoder_mib_reads_the_cached_checkpoint(monkeypatch, tmp_path):
+    from core.inference.diffusion_families import detect_family
+
+    fam = detect_family("Qwen/Qwen-Image-2.1")
+    assert fam is not None and fam.name == "qwen-image-2.1"
+    _q21_precast_cache(tmp_path, monkeypatch, mib = 8959)
+    target = _bf16_cuda_target()
+    assert DiffusionBackend._precast_text_encoder_mib(
+        fam, "Qwen/Qwen-Image-2.1", target, "fp8"
+    ) == (
+        8959,
+        ("text_encoder",),
+        True,
+    )
+    # Not a pre-cast pick: nothing to price.
+    assert (
+        DiffusionBackend._precast_text_encoder_mib(fam, "Qwen/Qwen-Image-2.1", target, None) is None
+    )
+    assert (
+        DiffusionBackend._precast_text_encoder_mib(fam, "Qwen/Qwen-Image-2.1", target, "none")
+        is None
+    )
+
+
+def test_precast_text_encoder_mib_prices_an_uncached_checkpoint_from_the_family_table(
+    monkeypatch, tmp_path
+):
+    from core.inference.diffusion_families import detect_family
+    from core.inference.diffusion_te_prequant import TE_PREQUANT_BUDGET_SCALE
+
+    fam = detect_family("Qwen/Qwen-Image-2.1")
+    _q21_precast_cache(tmp_path, monkeypatch, mib = 0)
+    got = DiffusionBackend._precast_text_encoder_mib(
+        fam, "Qwen/Qwen-Image-2.1", _bf16_cuda_target(), "fp8"
+    )
+    # The family table's 17.5 GB dense encoder at the pre-cast budget scale: an over-estimate of the 8.75 GiB file,
+    # flagged inexact so the planner never prices it below dense shards the load could still open.
+    assert got == (
+        int(17.5 * 1000**3 * TE_PREQUANT_BUDGET_SCALE) // (1024 * 1024),
+        ("text_encoder",),
+        False,
+    )
+    assert got[0] > 8959
+
+
+# ── a torchao denoiser kept resident while only the encoders stream ───────────
+
+
+def _resident_transformer(plan):
+    """``plan`` as the tier that keeps the denoiser resident and streams only the text encoders."""
+    return dataclasses.replace(
+        plan, offload_policy = "group", stream_text_encoders = True, stream_transformer = False
+    )
+
+
+def _record_placement(monkeypatch):
+    from core.inference import diffusion as dmod
+
+    placed: list = []
+
+    def _apply(pipe, plan, **kwargs):
+        placed.append(plan)
+        return plan.offload_policy, False
+
+    monkeypatch.setattr(dmod, "apply_memory_plan", _apply)
+    return placed
+
+
+def test_a_pipeline_quantises_where_only_the_encoders_stream(fake_runtime, tmp_path, monkeypatch):
+    """The quantised transformer fits once the encoders stream, so it is converted and placed once;
+    torchao weights only reject the per-forward hooks that stream the transformer itself."""
+    backend = DiffusionBackend()
+    calls = _stub_pipeline_dense_quant(backend, monkeypatch)
+    real_plan = DiffusionBackend._plan_memory
+
+    def _plan(self, *args, **kwargs):
+        plan = real_plan(self, *args, **kwargs)
+        if kwargs.get("transformer_resident_override_mib") is not None:
+            return _resident_transformer(plan)
+        return dataclasses.replace(plan, offload_policy = "group")
+
+    monkeypatch.setattr(DiffusionBackend, "_plan_memory", _plan)
+    placed = _record_placement(monkeypatch)
+    status = backend.load_pipeline(
+        "Qwen/Qwen-Image-2512",
+        model_kind = "pipeline",
+        transformer_quant = "fp8",
+        _base_local_dir = str(tmp_path),
+    )
+    assert len(calls) == 1
+    assert status["transformer_quant"] == "fp8"
+    assert status["offload_policy"] == "group"
+    assert placed and placed[-1].stream_transformer is False
+    backend.unload()
+
+
+def test_a_pipeline_quant_replan_prices_the_encoder_the_load_opens(
+    fake_runtime, tmp_path, monkeypatch
+):
+    """The in-place replan hands the planner the same encoder pricing as the other candidate
+    replans, not the dense family-table encoder."""
+    backend = DiffusionBackend()
+    _stub_pipeline_dense_quant(backend, monkeypatch)
+    priced = {"companion_override_mib": 1234, "text_encoder_override_mib": 567}
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_candidate_companion_overrides",
+        staticmethod(lambda *args, **kwargs: dict(priced)),
+    )
+    real_plan = DiffusionBackend._plan_memory
+    seen = []
+
+    def _plan(self, *args, **kwargs):
+        plan = real_plan(self, *args, **kwargs)
+        if kwargs.get("transformer_resident_override_mib") is not None:
+            seen.append(kwargs)
+            return _resident_transformer(plan)
+        return dataclasses.replace(plan, offload_policy = "group")
+
+    monkeypatch.setattr(DiffusionBackend, "_plan_memory", _plan)
+    _record_placement(monkeypatch)
+    backend.load_pipeline(
+        "Qwen/Qwen-Image-2512",
+        model_kind = "pipeline",
+        transformer_quant = "fp8",
+        _base_local_dir = str(tmp_path),
+    )
+    assert seen
+    assert seen[-1]["companion_override_mib"] == 1234
+    assert seen[-1]["text_encoder_override_mib"] == 567
+    backend.unload()
+
+
+def test_a_pipeline_whose_quantised_plan_still_streams_the_transformer_stays_dense(
+    fake_runtime, tmp_path, monkeypatch
+):
+    backend = DiffusionBackend()
+    calls = _stub_pipeline_dense_quant(backend, monkeypatch)
+    real_plan = DiffusionBackend._plan_memory
+
+    def _plan(self, *args, **kwargs):
+        return dataclasses.replace(real_plan(self, *args, **kwargs), offload_policy = "group")
+
+    monkeypatch.setattr(DiffusionBackend, "_plan_memory", _plan)
+    _record_placement(monkeypatch)
+    with pytest.raises(RuntimeError) as excinfo:
+        backend.load_pipeline(
+            "Qwen/Qwen-Image-2512",
+            model_kind = "pipeline",
+            transformer_quant = "fp8",
+            _base_local_dir = str(tmp_path),
+        )
+    assert calls == []
+    assert "Module.to()" in str(excinfo.value)
+
+
+def _gguf_candidate_backend(monkeypatch, tmp_path, *, initial_policy, candidate_plan):
+    """A GGUF load whose own plan is ``initial_policy`` and whose quantised candidate plans as
+    ``candidate_plan(real_plan)``. Returns the backend and the dense-load attempts."""
+    from core.inference import diffusion as dmod
+
+    backend = _cuda_backend(tmp_path, monkeypatch)
+    monkeypatch.setattr(dmod, "dense_transformer_supported", lambda target: True)
+    monkeypatch.setattr(
+        dmod, "select_transformer_quant_scheme", lambda target, mode, family = None: "int8"
+    )
+    monkeypatch.setattr(dmod, "usable_prequant_source", lambda fam, scheme, **kw: "prequant/path")
+    monkeypatch.setattr(
+        dmod,
+        "resolve_dense_quant_candidate",
+        lambda **kw: types.SimpleNamespace(
+            transient_transformer_mib = 7_000,
+            steady_transformer_mib = 7_000,
+            companions_mib = 18_000,
+            text_encoders_mib = 16_700,
+            prequant = True,
+        ),
+    )
+    orig_plan = DiffusionBackend._plan_memory
+
+    def spy_plan(
+        self,
+        *a,
+        transformer_resident_override_mib = None,
+        **k,
+    ):
+        real = orig_plan(
+            self, *a, transformer_resident_override_mib = transformer_resident_override_mib, **k
+        )
+        if transformer_resident_override_mib is None:
+            return dataclasses.replace(real, offload_policy = initial_policy)
+        return candidate_plan(real)
+
+    monkeypatch.setattr(DiffusionBackend, "_plan_memory", spy_plan)
+    attempted: list = []
+
+    def fake_dense_load(self, *a, **k):
+        attempted.append(k.get("allow_dense_fallback"))
+        raise RuntimeError("test: stop after reaching the fast path")
+
+    monkeypatch.setattr(DiffusionBackend, "_load_dense_quant_pipeline", fake_dense_load)
+    return backend, attempted
+
+
+def test_a_gguf_pick_builds_the_quant_where_only_the_encoders_stream(
+    fake_runtime, tmp_path, monkeypatch, allow_precision_fallback
+):
+    backend, attempted = _gguf_candidate_backend(
+        monkeypatch, tmp_path, initial_policy = "group", candidate_plan = _resident_transformer
+    )
+    _load_m(backend, tmp_path, transformer_quant = "int8")
+    assert attempted == [False]
+
+
+def test_a_gguf_pick_declines_the_quant_where_the_transformer_would_stream(
+    fake_runtime, tmp_path, monkeypatch, allow_precision_fallback
+):
+    backend, attempted = _gguf_candidate_backend(
+        monkeypatch,
+        tmp_path,
+        initial_policy = "group",
+        candidate_plan = lambda real: dataclasses.replace(real, offload_policy = "group"),
+    )
+    status = _load_m(backend, tmp_path, transformer_quant = "int8")
+    assert attempted == []
+    assert status["transformer_quant"] is None
+
+
+def test_a_resident_gguf_plan_sizes_the_prequant_that_replaces_it(
+    fake_runtime, tmp_path, monkeypatch, allow_precision_fallback
+):
+    """The GGUF fits resident, but the INT8 artifact that replaces it is bigger: it loads under its own
+    plan (here, encoders streamed) rather than the GGUF's."""
+    sized: list = []
+
+    def _candidate(real):
+        plan = _resident_transformer(real)
+        sized.append(plan)
+        return plan
+
+    backend, attempted = _gguf_candidate_backend(
+        monkeypatch, tmp_path, initial_policy = "none", candidate_plan = _candidate
+    )
+    placed = _record_placement(monkeypatch)
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_load_dense_quant_pipeline",
+        lambda self, *a, **k: attempted.append(k.get("allow_dense_fallback")) or (None, None),
+    )
+    _load_m(backend, tmp_path, transformer_quant = "int8")
+    assert sized, "the prequant was never sized"
+    assert attempted == [False]
+    assert placed[-1].offload_policy in ("none", "group")
+
+
+def test_a_resident_gguf_plan_declines_a_prequant_that_would_stream(
+    fake_runtime, tmp_path, monkeypatch, allow_precision_fallback
+):
+    backend, attempted = _gguf_candidate_backend(
+        monkeypatch,
+        tmp_path,
+        initial_policy = "none",
+        candidate_plan = lambda real: dataclasses.replace(real, offload_policy = "group"),
+    )
+    status = _load_m(backend, tmp_path, transformer_quant = "int8")
+    assert attempted == []
+    assert status["transformer_quant"] is None
+    assert (
+        "torchao tensors cannot be offloaded" in (status["resolved"]["transformer_quant"]["reason"])
+    )
+
+
+def test_candidate_overrides_price_the_encoder_the_load_opens(monkeypatch):
+    candidate = types.SimpleNamespace(companions_mib = 18_000, text_encoders_mib = 16_000)
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_precast_scaled_companions_mib",
+        staticmethod(lambda cand, fam, base, target, teq: 2_000 + int(16_000 * 0.65)),
+    )
+    overrides = DiffusionBackend._candidate_companion_overrides(candidate, None, "b", None, "fp8")
+    assert overrides == {"companion_override_mib": 12_400, "text_encoder_override_mib": 10_400}
+    # No split: the encoder term stays unknown, so the planner keeps its previous tiers.
+    bare = types.SimpleNamespace(companions_mib = 18_000, text_encoders_mib = 0)
+    assert (
+        DiffusionBackend._candidate_companion_overrides(bare, None, "b", None, None)[
+            "text_encoder_override_mib"
+        ]
+        == 0
+    )
