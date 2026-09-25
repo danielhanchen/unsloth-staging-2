@@ -78,6 +78,7 @@ from core.inference.llama_server_args import (
     _CACHE_RAM_FLAGS,
     _CTX_CHECKPOINTS_FLAGS,
     _DEVICE_FLAGS,
+    _FIT_FLAGS,
     _GPU_LAYER_FLAGS,
     _LAYER_OFFLOAD_FLAGS,
     _MOE_OFFLOAD_FLAGS,
@@ -86,6 +87,7 @@ from core.inference.llama_server_args import (
     _TENSOR_SPLIT_FLAGS,
     _effective_tensor_parallel,
     _flag_name,
+    _last_flag_value,
     _tensor_parallel_matches_loaded,
     LLAMA_CTX_CHECKPOINTS_DEFAULT,
     apply_load_mode_policy,
@@ -3821,8 +3823,47 @@ _VRAM_FLOOR_RESERVE_MIB = 512.0
 # ... default: 1024"): what the fallback fitter leaves when we pass nothing.
 _LLAMA_FIT_TARGET_DEFAULT_MIB = 1024.0
 
+# Windows + discrete NVIDIA: since driver 536.40 WDDM serves VRAM overflow from host RAM
+# instead of failing (unslothai/unsloth#11349), so match llama.cpp's own fit margin.
+_WINDOWS_SYSMEM_FALLBACK_RESERVE_MIB = _LLAMA_FIT_TARGET_DEFAULT_MIB
 
-def _vram_reserve_floor_mib(total_mib: float) -> float:
+# Post-start residency check: bound is weights + KV only (padded terms would flag healthy
+# loads); needs a >=10% and >=1 GiB shortfall to absorb co-tenant churn on the device delta.
+_RESIDENCY_SHORTFALL_RATIO = 0.90
+_RESIDENCY_SHORTFALL_MIN_BYTES = 1024 * 1024 * 1024
+
+# Direct spill signal (Task Manager's shared GPU memory; nvidia-smi on WDDM sees dedicated
+# only). 32 MiB: the Qwen3-VL-8B -c 65536 overshoot was ~74 MiB, so 1 GiB would miss it.
+_SHARED_USAGE_DELTA_MIN_BYTES = 32 * 1024 * 1024
+
+_SHARED_USAGE_TIMEOUT_S = 6
+_SHARED_USAGE_PS_COMMAND = (
+    "$ErrorActionPreference='Stop';"
+    "(Get-Counter -Counter '\\GPU Adapter Memory(*)\\Shared Usage',"
+    "'\\GPU Adapter Memory(*)\\Dedicated Usage').CounterSamples |"
+    " ForEach-Object { $_.Path.Split('\\')[-1] + '|' + $_.InstanceName + '=' +"
+    " [int64]$_.CookedValue }"
+)
+# Dedicated-usage readings share the dict with shared usage under this key prefix.
+_DEDICATED_USAGE_KEY = "dedicated|"
+
+# The per-executable driver setting is the only way to turn the fallback off.
+_VRAM_SPILL_ADVICE = (
+    "About {spilled} of this model appears to be running from shared system "
+    "memory over PCIe instead of GPU memory, which makes generation several times slower. Windows does this "
+    "instead of reporting out of memory. To fix it, either lower the context size{kv_hint}, "
+    "or open NVIDIA Control Panel -> Manage 3D "
+    "settings -> Program Settings, add {exe}, and set "
+    "'CUDA - Sysmem Fallback Policy' to 'Prefer No Sysmem Fallback' (the model must be "
+    "reloaded for that to take effect)."
+)
+
+
+# Cap at 1/8 of the card so the floor stays proportionate on small GPUs.
+_WINDOWS_SYSMEM_FALLBACK_MAX_FRACTION = 0.125
+
+
+def _vram_reserve_floor_mib(total_mib: float, *, sysmem_fallback: bool = False) -> float:
     """Smallest margin a card keeps: 512 MiB, or the default's own reserve if smaller.
 
     Capping it at the default keeps the budget monotonic. A flat 512 MiB would
@@ -3832,8 +3873,20 @@ def _vram_reserve_floor_mib(total_mib: float) -> float:
     context, the opposite of what the control promises. Capped, the reserve never
     rises with the fraction, and at or below the default the percentage term always
     wins, so an unset budget is untouched on every card size.
+
+    ``sysmem_fallback`` raises the floor (flat in ``frac``, so still monotonic) on hosts
+    whose driver spills an overshoot into system RAM; it overrides a 100% budget on purpose.
     """
-    return min(_VRAM_FLOOR_RESERVE_MIB, (1.0 - _CTX_FIT_VRAM_FRACTION) * total_mib)
+    floor = min(_VRAM_FLOOR_RESERVE_MIB, (1.0 - _CTX_FIT_VRAM_FRACTION) * total_mib)
+    if not sysmem_fallback:
+        return floor
+    return max(
+        floor,
+        min(
+            _WINDOWS_SYSMEM_FALLBACK_RESERVE_MIB,
+            _WINDOWS_SYSMEM_FALLBACK_MAX_FRACTION * total_mib,
+        ),
+    )
 
 
 def _vram_usable_mib(
@@ -3842,6 +3895,7 @@ def _vram_usable_mib(
     frac: float,
     *,
     pooled: bool = False,
+    sysmem_fallback: bool = False,
 ) -> float:
     """Free MiB one card offers a load at ``frac``, unclamped.
 
@@ -3850,13 +3904,22 @@ def _vram_usable_mib(
     is one device, including a probe reporting free memory with no total, which
     still has to keep a margin: there the free reading is the only scale available,
     and it agrees with the known-total form at the default.
+
+    ``sysmem_fallback``: see ``LlamaCppBackend._sysmem_fallback_risk()``; ``pooled``
+    ignores it since those MiB already paid a per-card reserve.
     """
     if total_mib and total_mib > 0:
-        reserve = max((1.0 - frac) * total_mib, _vram_reserve_floor_mib(total_mib))
+        reserve = max(
+            (1.0 - frac) * total_mib,
+            _vram_reserve_floor_mib(total_mib, sysmem_fallback = sysmem_fallback),
+        )
         return free_mib - reserve
     if pooled:
         return free_mib * frac
-    return min(free_mib * frac, free_mib - _vram_reserve_floor_mib(free_mib))
+    return min(
+        free_mib * frac,
+        free_mib - _vram_reserve_floor_mib(free_mib, sysmem_fallback = sysmem_fallback),
+    )
 
 
 def _active_vram_fraction() -> float:
@@ -7048,6 +7111,13 @@ class LlamaCppBackend:
         self._pending_variant_fallback: Optional[tuple[str, str]] = None
         # Set per launch by _record_carveout_advice; None on nearly every load.
         self._last_carveout_advice: Optional[dict] = None
+        # Full-GPU pin promise for _verify_vram_residency; None = check is a no-op.
+        self._pin_resident_floor_bytes: Optional[int] = None
+        self._pin_baseline_free_mib: Optional[dict[int, float]] = None
+        self._pin_gpu_indices: Optional[list[int]] = None
+        self._pin_baseline_shared_usage: Optional[dict[str, int]] = None
+        self._pin_kv_hint = True
+        self._pin_kv_layout: Optional[tuple] = None
         self._model_identifier: Optional[str] = None
         self._gguf_path: Optional[str] = None
         # Snapshot of the exact file(s) handed to the resident process. A local
@@ -9941,6 +10011,39 @@ class LlamaCppBackend:
         """
         backends = LlamaCppBackend._installed_ggml_backends(binary)
         return "vulkan" in backends and not backends.intersection({"cuda", "hip"})
+
+    # Keyed per binary: the planner asks once per candidate GPU subset.
+    _SYSMEM_FALLBACK_RISK: dict[Optional[str], bool] = {}
+
+    @staticmethod
+    def _sysmem_fallback_risk(binary: Optional[str] = None) -> bool:
+        """True when an over-budget allocation would be absorbed by host RAM, not refused.
+
+        Windows + CUDA build only. Discreteness needs no probe: integrated CUDA parts are
+        Linux-only, and get_device_properties would pin a ~700 MiB CUDA context.
+        """
+        if sys.platform != "win32":
+            return False
+        if binary is None:
+            try:
+                binary = LlamaCppBackend._find_llama_server_binary()
+            except Exception:  # noqa: BLE001 - classify with whatever the lib lookup resolves
+                binary = None
+        # Keyed by resolved path and build revision: runtimes switch, updates swap in place.
+        key = LlamaCppBackend._binary_revision(binary) or binary
+        cached = LlamaCppBackend._SYSMEM_FALLBACK_RISK.get(key)
+        if cached is not None:
+            return cached
+        try:
+            backends = LlamaCppBackend._installed_ggml_backends(binary)
+        except Exception as e:  # noqa: BLE001 - an unreadable lib dir is not a load failure
+            logger.debug("sysmem-fallback classification failed, keeping the base budget: %s", e)
+            return False  # not cached: a transient read error must not pin False forever
+        if not backends:
+            return False  # an unreadable dir scans empty; same rule, not cached
+        risk = "cuda" in backends
+        LlamaCppBackend._SYSMEM_FALLBACK_RISK[key] = risk
+        return risk
 
     @staticmethod
     def _active_gpu_visibility_mask() -> Optional[str]:
@@ -14463,6 +14566,301 @@ class LlamaCppBackend:
         if self._last_load_warning is None:
             self._last_load_warning = message
 
+    def _arm_residency_check(
+        self,
+        floor_bytes: Optional[int],
+        gpu_indices: Optional[Iterable[int]],
+        binary: Optional[str] = None,
+        cache_type_kv: Optional[str] = None,
+    ) -> None:
+        """Record what a full-GPU pin promised, for _verify_vram_residency to test.
+
+        The baseline is sampled right before spawn, not reused from the plan: a replaced
+        model's teardown would otherwise read as a spill.
+        """
+        self._pin_resident_floor_bytes = None
+        self._pin_baseline_free_mib = None
+        self._pin_baseline_shared_usage = None
+        self._pin_gpu_indices = None
+        self._pin_kv_hint = (cache_type_kv or "f16").strip().lower() in ("f16", "fp16", "")
+        self._pin_kv_layout = None
+        self._pin_exe = Path(binary).name if binary else "llama-server.exe"
+        if os.name != "nt":
+            return
+        if not floor_bytes or floor_bytes <= 0 or not gpu_indices:
+            return
+        # CUDA only: Vulkan has no sysmem fallback, and its ordinals are not NVML indices.
+        if not self._sysmem_fallback_risk(binary) or self._nvml_library() is None:
+            return
+        try:
+            integrated = self._integrated_cuda_gpu_ids()
+        except Exception:
+            integrated = set()
+        pinned = [int(i) for i in gpu_indices]
+        if not pinned or any(i in integrated for i in pinned):
+            return
+        self._pin_resident_floor_bytes = int(floor_bytes)
+        self._pin_gpu_indices = pinned
+
+    @staticmethod
+    def _shared_gpu_memory_bytes() -> Optional[dict[str, int]]:
+        """Per-adapter SHARED (host) GPU memory bytes; only a delta is meaningful. None on failure."""
+        if os.name != "nt":
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",  # 5.1 Desktop; pwsh is not present on Windows
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    _SHARED_USAGE_PS_COMMAND,
+                ],
+                capture_output = True,
+                text = True,
+                encoding = "utf-8",
+                errors = "replace",
+                timeout = _SHARED_USAGE_TIMEOUT_S,
+                env = child_env_without_native_path_secret(),
+                **_windows_hidden_subprocess_kwargs(),
+            )
+        except Exception as e:
+            logger.debug(f"Shared GPU memory counter failed: {e}")
+            return None
+        if result.returncode != 0:
+            # Localised Windows renames the counter.
+            logger.debug(
+                f"Shared GPU memory counter unavailable (rc={result.returncode}): "
+                f"{(result.stderr or '').strip()[:200]}"
+            )
+            return None
+        usage: dict[str, int] = {}
+        for line in (result.stdout or "").splitlines():
+            counter, _, sample = line.strip().partition("|")
+            name, _, value = sample.rpartition("=")
+            if not name:
+                continue
+            if counter.strip().lower() == "dedicated usage":
+                name = _DEDICATED_USAGE_KEY + name
+            try:
+                usage[name] = int(float(value))
+            except ValueError:
+                continue
+        return usage or None
+
+    @classmethod
+    def _shared_usage_growth_bytes(
+        cls,
+        before: Optional[dict[str, int]],
+        after: Optional[dict[str, int]],
+        n_adapters: Optional[int] = None,
+    ) -> Optional[int]:
+        """Shared growth on the adapters whose dedicated VRAM grew most (<= ``n_adapters``)."""
+        if not before or not after:
+            return None
+        common = set(before) & set(after)
+        loaded = [
+            key[len(_DEDICATED_USAGE_KEY) :]
+            for key in common
+            if key.startswith(_DEDICATED_USAGE_KEY)
+            and after[key] - before[key] >= _SHARED_USAGE_DELTA_MIN_BYTES
+        ]
+        loaded = sorted(
+            (i for i in loaded if i in common),
+            key = lambda i: after[_DEDICATED_USAGE_KEY + i] - before[_DEDICATED_USAGE_KEY + i],
+            reverse = True,
+        )[: n_adapters or None]
+        if not loaded:
+            return None
+        return sum(max(0, after[i] - before[i]) for i in loaded)
+
+    @staticmethod
+    def _argv_claims_full_offload(
+        argv: Optional[Sequence[str]], env: Optional[Mapping[str, str]] = None
+    ) -> bool:
+        """Whether this argv (after retry rungs rewrote it) still pins every layer; last-wins."""
+        if not argv:
+            return False
+        tokens = [str(t) for t in argv]
+        try:
+            ngl = _last_flag_value(tokens, _GPU_LAYER_FLAGS)
+            fit = _last_flag_value(tokens, _FIT_FLAGS)
+        except ValueError:
+            return False
+        if (ngl or "").strip() != "-1" or (
+            fit or ""
+        ).strip().lower() not in _LLAMA_ARG_FALSE_VALUES:
+            return False
+        # User extras follow the pin and may keep weights or KV on the host on purpose.
+        source_env = os.environ if env is None else env
+        return not (
+            _args_place_tensors_on_cpu(tokens)
+            or _env_places_tensors_on_cpu(source_env)
+            or _device_selection_is_cpu(tokens, source_env)
+            or not _kv_offload_from_args(tokens, source_env)
+        )
+
+    @staticmethod
+    def _kv_layout_of(argv: Optional[Sequence[str]]) -> tuple:
+        """(slot count, unified-KV tokens) as the argv sets them, for comparing spawns."""
+        tokens = [str(t) for t in argv or ()]
+        try:
+            slots = _last_flag_value(tokens, _PARALLEL_FLAGS)
+        except ValueError:
+            slots = None
+        unified = [
+            t
+            for t in tokens
+            if _flag_name(t) in {"-kvu", "--kv-unified", "-no-kvu", "--no-kv-unified"}
+        ]
+        return (slots, tuple(unified[-1:]))
+
+    def _sample_residency_baseline(
+        self,
+        argv: Optional[Sequence[str]] = None,
+        env: Optional[Mapping[str, str]] = None,
+    ) -> None:
+        """Read free VRAM on the pinned cards right before each spawn; disarm on any failure."""
+        pinned = self._pin_gpu_indices
+        if self._pin_resident_floor_bytes is None or not pinned:
+            return
+        if not self._argv_claims_full_offload(argv, env):
+            self._pin_resident_floor_bytes = None
+            self._pin_gpu_indices = None
+            self._pin_baseline_free_mib = None
+            self._pin_baseline_shared_usage = None
+            return
+        # The floor was priced for the first spawn's slot/KV layout; a changed retry is not.
+        layout = self._kv_layout_of(argv)
+        if self._pin_kv_layout is None:
+            self._pin_kv_layout = layout
+        elif layout != self._pin_kv_layout:
+            self._pin_resident_floor_bytes = None
+            self._pin_gpu_indices = None
+            self._pin_baseline_free_mib = None
+            self._pin_baseline_shared_usage = None
+            return
+        # A killed retry child frees VRAM asynchronously; do not book that as a shortfall.
+        self._wait_for_vram_settle(since_kill = getattr(self, "_last_kill_monotonic", 0.0))
+        # Overlap the counter read with nvidia-smi: cost is max, not sum.
+        _shared_box: dict[str, Optional[dict[str, int]]] = {}
+
+        def _read_shared():
+            try:
+                _shared_box["usage"] = self._shared_gpu_memory_bytes()
+            except Exception as e:
+                logger.debug(f"Shared GPU memory baseline failed: {e}")
+                _shared_box["usage"] = None
+
+        _shared_thread = threading.Thread(
+            target = _read_shared, daemon = True, name = "shared-usage-baseline"
+        )
+        _shared_thread.start()
+        try:
+            free_by_idx = {
+                int(idx): float(free_mib)
+                for idx, free_mib, _total in (self._get_gpu_memory() or ())
+            }
+        except Exception as e:
+            logger.debug(f"VRAM residency baseline probe failed: {e}")
+            self._pin_resident_floor_bytes = None
+            self._pin_gpu_indices = None
+            return
+        finally:
+            # Join before spawn so the baseline cannot become a post-spawn reading.
+            _shared_thread.join(_SHARED_USAGE_TIMEOUT_S)
+            self._pin_baseline_shared_usage = _shared_box.get("usage")
+        if any(i not in free_by_idx for i in pinned):
+            # A partial sum under-counts, and under-counting reads as a spill.
+            self._pin_resident_floor_bytes = None
+            self._pin_gpu_indices = None
+            return
+        self._pin_baseline_free_mib = {i: free_by_idx[i] for i in pinned}
+
+    def _verify_vram_residency(self) -> Optional[str]:
+        """Record and return a spill advisory, else None. Always disarms; never raises."""
+        floor = self._pin_resident_floor_bytes
+        baseline = self._pin_baseline_free_mib
+        baseline_shared = self._pin_baseline_shared_usage
+        kv_hint = getattr(self, "_pin_kv_hint", True)
+        self._pin_resident_floor_bytes = None
+        self._pin_baseline_free_mib = None
+        self._pin_baseline_shared_usage = None
+        self._pin_gpu_indices = None
+        if not floor or not baseline:
+            return None
+        try:
+            rows = list(self._get_gpu_memory() or ())
+            now = {int(idx): float(free_mib) for idx, free_mib, _total in rows}
+            totals = {int(idx): float(total or 0) for idx, _free, total in rows}
+        except Exception as e:
+            logger.debug(f"VRAM residency probe failed: {e}")
+            return None
+        if any(i not in now for i in baseline):
+            return None
+        used_mib = sum(baseline[i] - now[i] for i in baseline)
+        if used_mib <= 0:
+            return None
+        resident = used_mib * 1024 * 1024
+        shortfall = floor - resident
+
+        # Per-adapter counter is believed only when the device side also shows a shortfall.
+        try:
+            spilled = self._shared_usage_growth_bytes(
+                baseline_shared, self._shared_gpu_memory_bytes(), len(baseline)
+            )
+        except Exception as e:
+            logger.debug(f"Shared GPU memory read failed: {e}")
+            spilled = None
+        # WDDM spills only once dedicated VRAM is exhausted. Not ``shortfall > 0``: the delta
+        # also holds the CUDA context and compute buffers, which mask a small spill.
+        card_full = any(
+            now[i]
+            < (
+                _vram_reserve_floor_mib(totals[i], sysmem_fallback = True)
+                if totals.get(i, 0) > 0
+                else _WINDOWS_SYSMEM_FALLBACK_RESERVE_MIB
+            )
+            for i in baseline
+        )
+        direct_hit = spilled is not None and spilled >= _SHARED_USAGE_DELTA_MIN_BYTES and card_full
+        inferred_hit = (
+            resident < floor * _RESIDENCY_SHORTFALL_RATIO
+            and shortfall >= _RESIDENCY_SHORTFALL_MIN_BYTES
+        )
+        if not direct_hit and not inferred_hit:
+            logger.debug(
+                "VRAM residency ok: %.1f GB resident against a %.1f GB floor "
+                "(shared-usage growth: %s)",
+                resident / (1024**3),
+                floor / (1024**3),
+                "unavailable" if spilled is None else f"{spilled / (1024**2):.0f} MiB",
+            )
+            return None
+        if direct_hit:
+            logger.info(
+                "Shared GPU memory grew %.0f MiB across this load; treating the "
+                "%.1f GB shortfall as a host-RAM spill",
+                spilled / (1024**2),
+                shortfall / (1024**3),
+            )
+        amount = spilled if direct_hit else shortfall
+        message = _VRAM_SPILL_ADVICE.format(
+            spilled = (
+                f"{amount / (1024**3):.1f} GB"
+                if amount >= 1024**3
+                else f"{max(1, round(amount / (1024**2)))} MiB"
+            ),
+            kv_hint = " or set the KV cache to q8_0" if kv_hint else "",
+            exe = getattr(self, "_pin_exe", None) or "llama-server.exe",
+        )
+        if getattr(self, "_last_load_warning", None):
+            logger.warning(message)
+            self._amend_load_warning(" " + message)
+        else:
+            self._record_load_warning(message)
+        return message
+
     def _amend_load_warning(self, note: Optional[str]) -> None:
         """Append to the notice already recorded for this load, if there is one.
 
@@ -15022,6 +15420,43 @@ class LlamaCppBackend:
         )
 
     @staticmethod
+    def _cuda_context_overcommit_notice(
+        requested_ctx: int,
+        max_available_ctx: int,
+        cache_type_kv: Optional[str] = None,
+        *,
+        quantised_ctx_fits: bool = False,
+    ) -> Optional[str]:
+        """Advisory when a hand-set context exceeds what a discrete GPU holds (else None).
+
+        Metal refuses this (shared wired pool panics the machine); a discrete GPU offloads
+        layers to the CPU instead, so only warn.
+        ``quantised_ctx_fits`` is the caller's q8_0 pricing verdict, not a guess.
+        """
+        if requested_ctx <= 0 or max_available_ctx <= 0:
+            return None
+        if requested_ctx <= max_available_ctx:
+            return None
+        kv_hint = ""
+        if quantised_ctx_fits and (cache_type_kv or "f16").strip().lower() in (
+            "f16",
+            "fp16",
+            "",
+        ):
+            kv_hint = " Setting the KV cache to q8_0 makes this context fit without shortening it."
+        # Fires only after a --fit on or spill-plan hand-off: planned CPU offload on every OS.
+        cause = (
+            "The GPU cannot hold it, so layers will be moved to the CPU and generation "
+            f"will be slower. Lower the context to {max_available_ctx:,} or less, or "
+            "leave it on Auto."
+        )
+        return (
+            f"A context of {requested_ctx:,} tokens does not fit in this GPU's memory with "
+            f"this model. The largest that fits is {max_available_ctx:,} tokens. "
+            f"{cause}{kv_hint}"
+        )
+
+    @staticmethod
     def _unmeasured_context_notice(
         requested_ctx: int, cache_type_kv: Optional[str] = None
     ) -> Optional[str]:
@@ -15531,9 +15966,13 @@ class LlamaCppBackend:
 
         # Per-GPU usable budget: free minus the reserve when total is known, else
         # the legacy free*frac (also covers a total-0 two-column probe).
+        _sysmem_fallback = LlamaCppBackend._sysmem_fallback_risk()
+
         def _usable(idx: int, free_mib: int) -> float:
             t = total_by_idx.get(idx, 0) if total_by_idx else 0
-            usable = _vram_usable_mib(free_mib, t, usable_fraction)
+            usable = _vram_usable_mib(
+                free_mib, t, usable_fraction, sysmem_fallback = _sysmem_fallback
+            )
             return max(0.0, usable) if t > 0 else usable
 
         # Rank by usable budget (free - reserve), not raw free: a more-used large
@@ -16922,7 +17361,13 @@ class LlamaCppBackend:
             flat_mtp = mtp_engaged and mtp_overhead_fn is None
             budget_frac = _active_vram_fraction() - (_MTP_VRAM_RESERVE_FRAC if flat_mtp else 0.0)
         # Absolute reserve off total when known, else fraction-of-free; clamp >=0.
-        budget_mib = _vram_usable_mib(available_mib, total_mib or 0, budget_frac, pooled = pooled)
+        budget_mib = _vram_usable_mib(
+            available_mib,
+            total_mib or 0,
+            budget_frac,
+            pooled = pooled,
+            sysmem_fallback = LlamaCppBackend._sysmem_fallback_risk(),
+        )
         if total_mib is not None and total_mib > 0:
             budget_mib = max(0.0, budget_mib)
         budget_bytes = budget_mib * 1024 * 1024
@@ -20817,6 +21262,8 @@ class LlamaCppBackend:
         # direct callers (tests) with no load to inherit from, and once, not per GPU.
         _tp_frac = vram_fraction if vram_fraction is not None else _active_vram_fraction()
 
+        _tp_sysmem_fallback = LlamaCppBackend._sysmem_fallback_risk()
+
         def _usable(idx: int, free_mib: int) -> float:
             # Through the shared helper, so the floor reserve the ranking and the
             # layer path apply is charged here too. Tensor mode has no --fit valve,
@@ -20824,7 +21271,10 @@ class LlamaCppBackend:
             # offloading. Clamped on both branches, unlike _select_gpus: this pool
             # is summed, and one negative card must not fund another.
             t = total_by_idx.get(idx, 0) if total_by_idx else 0
-            return max(0.0, _vram_usable_mib(free_mib, t, _tp_frac))
+            return max(
+                0.0,
+                _vram_usable_mib(free_mib, t, _tp_frac, sysmem_fallback = _tp_sysmem_fallback),
+            )
 
         # Drop GPUs whose usable budget can't hold the per-device compute-graph
         # buffer; they'd OOM in tensor mode. Admitting on raw free would let a
@@ -21019,10 +21469,15 @@ class LlamaCppBackend:
             return False
 
         _tp_frac = vram_fraction if vram_fraction is not None else _active_vram_fraction()
+        # Must match the planner's floor, or this passes splits the planner rejected.
+        _tp_sysmem_fallback = LlamaCppBackend._sysmem_fallback_risk()
 
         def _usable(idx: int, free_mib: int) -> float:
             t = total_by_idx.get(idx, 0) if total_by_idx else 0
-            return max(0.0, _vram_usable_mib(free_mib, t, _tp_frac))
+            return max(
+                0.0,
+                _vram_usable_mib(free_mib, t, _tp_frac, sysmem_fallback = _tp_sysmem_fallback),
+            )
 
         free_by_idx = {idx: free for idx, free in gpus}
         # Fail closed on a device the survey does not cover. ``gpus`` is the set
@@ -23711,9 +24166,14 @@ class LlamaCppBackend:
                 # the slot from a memory warning on the one path that also raises the
                 # launched context. Flushed past those two, appending if one spoke.
                 _unmeasured_ctx_notice: Optional[str] = None
+                _cuda_ctx_notice: Optional[str] = None
+                _ctx_cap_fits = False
                 total_by_idx: dict[int, int] = {}
                 _gpu_mem: list[tuple[int, int, int]] = []
                 model_size = None  # set in the fit try; used by the APU RAM guard
+                # The fit try has arms that never set it.
+                mmproj_size = 0
+                _resident_floor_bytes: Optional[int] = None
                 _mtp_will_engage = False
                 _separate_draft_launches = False  # a sidecar displaces an embedded head
                 # "none" once the fit proves the load needs no demand paging, else None
@@ -23903,11 +24363,18 @@ class LlamaCppBackend:
                         )
                         _fit_target_delta_mib = (_CTX_FIT_VRAM_FRACTION - _vram_frac) * _scale
 
+                    _sysmem_fallback = self._sysmem_fallback_risk(binary)
+
                     def _gpu_usable(g, frac = _vram_frac):
                         # Callers pass the ACTIVE fraction so the ranking matches the
                         # budget the fit then tests, else mixed totals mis-order.
                         idx, free = g
-                        return _vram_usable_mib(free, total_by_idx.get(idx, 0), frac)
+                        return _vram_usable_mib(
+                            free,
+                            total_by_idx.get(idx, 0),
+                            frac,
+                            sysmem_fallback = _sysmem_fallback,
+                        )
 
                     def _pool_budget_mib(subset, frac):
                         # Sum each GPU's own usable budget. Pooling free and total
@@ -24297,6 +24764,7 @@ class LlamaCppBackend:
                         ctx: int,
                         n_gpus: int = 1,
                         slots: int = 0,
+                        cache_type: Optional[str] = None,
                     ) -> int:
                         # Context-linear compute-buffer growth (flash-attn KQ mask +
                         # attention scratch); the flat _compute_buffer_pipeline folded
@@ -24316,17 +24784,25 @@ class LlamaCppBackend:
                         return max(1, n_gpus) * self._compute_buffer_ctx_bytes(
                             ctx,
                             _ubatch_for_slots(slots) if slots else _effective_ubatch,
-                            _scratch_cache_type_kv,
+                            cache_type or _scratch_cache_type_kv,
                             layer_split = n_gpus > 1 and not _pipeline_parallel_off,
                             flash_attn = planned_flash_attn,
                             n_parallel = slots or n_parallel,
                         )
 
-                    def _cc_split_extra(ctx: int, slots: int = 0) -> int:
+                    def _cc_split_extra(
+                        ctx: int,
+                        slots: int = 0,
+                        cache_type: Optional[str] = None,
+                    ) -> int:
                         # Per-device step from the single-device rate to the split one,
                         # for the paths that must select GPUs before they know the
                         # count. 0 when llama.cpp declines pipeline parallelism.
-                        return max(0, _cc_bytes(ctx, 2, slots) // 2 - _cc_bytes(ctx, 1, slots))
+                        return max(
+                            0,
+                            _cc_bytes(ctx, 2, slots, cache_type) // 2
+                            - _cc_bytes(ctx, 1, slots, cache_type),
+                        )
 
                     # Layer-split compute buffer (one lump; tensor mode reserves it
                     # per device in _plan_tensor_parallel). Context-independent, so
@@ -25183,6 +25659,7 @@ class LlamaCppBackend:
                                     best_cap = max(best_cap, capped)
                             if best_cap > 0:
                                 max_available_ctx = best_cap
+                                _ctx_cap_fits = True
                             else:
                                 # Weights exceed 90% of every GPU subset, so no
                                 # context fits. Anchor the UI "safe zone" at the
@@ -25221,6 +25698,61 @@ class LlamaCppBackend:
                                 split_extra_bytes = _cc_split_extra(effective_ctx),
                             )
                             # No silent shrink: effective_ctx stays == requested_ctx.
+                            # use_fit = the pin failed; warn (Windows spills silently).
+                            # Else max_available_ctx is the Auto anchor, which does not fit either.
+                            # -nkvo keeps the cache on the host, so the priced overflow is not real.
+                            if (
+                                use_fit
+                                and _ctx_cap_fits
+                                and not _cuda_ctx_notice
+                                and _kv_offload_from_args(extra_args)
+                                and not _args_place_tensors_on_cpu(extra_args)
+                                and not _env_places_tensors_on_cpu()
+                                and not _device_selection_is_cpu(extra_args, os.environ)
+                                and not _extra_args_set_any_flag(extra_args, _GPU_LAYER_FLAGS)
+                            ):
+                                _q8_fits = False
+                                if planned_flash_attn and (
+                                    cache_type_kv or "f16"
+                                ).strip().lower() in (
+                                    "f16",
+                                    "fp16",
+                                    "",
+                                ):
+                                    _q8_kv = self._estimate_kv_cache_bytes(
+                                        effective_ctx,
+                                        "q8_0",
+                                        n_parallel = n_parallel,
+                                        swa_full = swa_full,
+                                        kv_unified = planned_kv_unified,
+                                        n_ubatch = _effective_ubatch,
+                                        flash_attn = planned_flash_attn,
+                                    )
+                                    if _q8_kv > 0:
+                                        _, _q8_use_fit = self._select_gpus_split_aware(
+                                            model_size_fit
+                                            + _q8_kv
+                                            + _mtp_bytes(effective_ctx)
+                                            + _cc_bytes(effective_ctx, cache_type = "q8_0"),
+                                            gpus,
+                                            usable_fraction = _pin_fraction,
+                                            total_by_idx = total_by_idx,
+                                            per_device_overhead_bytes = (
+                                                _pipeline_overhead_bytes
+                                                + _cc_bytes(effective_ctx, cache_type = "q8_0")
+                                            ),
+                                            min_gpus = _layer_min_gpus,
+                                            split_extra_bytes = _cc_split_extra(
+                                                effective_ctx, cache_type = "q8_0"
+                                            ),
+                                        )
+                                        _q8_fits = not _q8_use_fit
+                                _cuda_ctx_notice = self._cuda_context_overcommit_notice(
+                                    effective_ctx,
+                                    max_available_ctx,
+                                    cache_type_kv,
+                                    quantised_ctx_fits = _q8_fits,
+                                )
                         else:
                             # Auto context: prefer fewer GPUs, cap to fit. Same
                             # headroom threshold as _select_gpus (#5106). Rank by the
@@ -25806,6 +26338,27 @@ class LlamaCppBackend:
                         )
 
                     kv_cache_bytes = _kv_bytes(effective_ctx)
+                    # Weights + KV only: mmproj may be pinned to the host by the text-only
+                    # fallback, and a sometimes-resident term would cause false alarms.
+                    _resident_floor_bytes = max(
+                        0, (model_size or 0) - max(0, mmproj_size or 0)
+                    ) + max(0, kv_cache_bytes)
+                    if self._sysmem_fallback_risk(binary):
+                        # Host-only: untied token_embd and undrafting MTP blocks (_unified_need_now).
+                        _floor_layout = self._tensor_spill_layout(model_path, all_shards = True)
+                        if _floor_layout is not None and getattr(_floor_layout, "complete", True):
+                            if int(getattr(_floor_layout, "lm_head_bytes", 0) or 0):
+                                _resident_floor_bytes -= int(
+                                    getattr(_floor_layout, "token_embd_bytes", 0) or 0
+                                )
+                            if (
+                                not (_mtp_will_engage and not _separate_draft_launches)
+                                and self._nextn_predict_layers
+                            ):
+                                _resident_floor_bytes -= int(
+                                    getattr(_floor_layout, "excluded_block_bytes", 0) or 0
+                                )
+                            _resident_floor_bytes = max(0, _resident_floor_bytes)
                     # Everything the spill planner needs, snapshotted as plain ints
                     # where it is already evaluated.
                     _spill_inputs = {
@@ -26600,6 +27153,11 @@ class LlamaCppBackend:
                     # and offloads ~1 GB at --parallel 4 even though the model fits.
                     cmd.extend(["-ngl", "-1", "--fit", "off"])
                     fully_gpu_offloaded = True
+                    # Armed only here: spill plans, --fit and manual -ngl place weights on
+                    # the host deliberately; Metal has no device/host split.
+                    self._arm_residency_check(
+                        _resident_floor_bytes, gpu_indices, binary, cache_type_kv
+                    )
 
                 # Expose Prometheus /metrics for the engine-stats logger, only
                 # when the binary advertises it (older/custom binaries may not).
@@ -28752,6 +29310,8 @@ class LlamaCppBackend:
                             run_cmd,
                             supports_cache_ram = bool(server_caps.get("supports_cache_ram")),
                         )
+                        # After teardown of any replaced model; outside the spawn lock.
+                        self._sample_residency_baseline(run_cmd, env)
                         # Check with publication under one lock: a spawn either
                         # publishes first and the sweep kills it, or sees the flag
                         # and never starts. Across Popen only, never the wait.
@@ -29276,6 +29836,12 @@ class LlamaCppBackend:
                         self._amend_load_warning(" " + _unmeasured_ctx_notice)
                     else:
                         self._record_load_warning(_unmeasured_ctx_notice)
+
+                if _cuda_ctx_notice and use_fit:  # slot reduction may have re-pinned it
+                    if self._last_load_warning:
+                        self._amend_load_warning(" " + _cuda_ctx_notice)
+                    else:
+                        self._record_load_warning(_cuda_ctx_notice)
 
                 # LoadRequest carries this flag, so a stale rollback, an API caller or
                 # a swapped-out runtime can ask for a replay that never happened. Hold
@@ -30521,6 +31087,11 @@ class LlamaCppBackend:
                 logger.info(
                     f"llama-server ready on port {self._port} for model '{model_identifier}'"
                 )
+                # Sysmem fallback never crashes a rung. Here: after every respawn, before the response.
+                try:
+                    self._verify_vram_residency()
+                except Exception as e:  # advisory only; never fail a healthy load
+                    logger.debug(f"VRAM residency check failed: {e}")
                 # Poll llama-server /metrics -> vLLM-style engine_stats logs
                 # (only when the binary exposes /metrics).
                 if server_caps.get("supports_metrics"):
