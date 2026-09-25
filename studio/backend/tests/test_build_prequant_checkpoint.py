@@ -253,3 +253,69 @@ def test_the_recorded_base_must_be_the_canonical_id_not_just_the_same_tail(capsy
             assert fam.transformer_class in str(exc), exc
             continue
         assert rc != 2 or "is not" not in capsys.readouterr().out, accepted
+
+
+def _build_nvfp4(monkeypatch, tmp_path):
+    """Run the build on a tiny aligned + ragged dense model; returns (quantized names, metadata)."""
+    torch = pytest.importorskip("torch")
+    pytest.importorskip("torchao")
+    import torchao.quantization as tq
+
+    import core.inference.diffusion_transformer_quant as dtq
+
+    fam = detect_family("Tongyi-MAI/Z-Image-Turbo")
+    assert fam is not None
+
+    class _Dense(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.aligned = torch.nn.Linear(1024, 1024, dtype = torch.bfloat16)
+            self.ragged = torch.nn.Linear(1024, 1000, dtype = torch.bfloat16)
+
+        @classmethod
+        def from_pretrained(cls, *args, **kwargs):
+            return cls()
+
+        def to(self, *args, **kwargs):
+            return self
+
+    fake_diffusers = types.ModuleType("diffusers")
+    fake_diffusers.__version__ = "0"
+    setattr(fake_diffusers, fam.transformer_class, _Dense)
+    monkeypatch.setitem(sys.modules, "diffusers", fake_diffusers)
+
+    quantized = []
+
+    def _fake_quantize(model, config, filter_fn):
+        quantized.extend(n for n, m in model.named_modules() if n and filter_fn(m, n))
+
+    monkeypatch.setattr(tq, "quantize_", _fake_quantize)
+    monkeypatch.setattr(dtq, "_make_quant_config", lambda *a, **k: object())
+
+    build = _script()
+    out = tmp_path / "out.pt"
+    argv = ["--base", "b", "--family", fam.name, "--scheme", "nvfp4", "--out", str(out)]
+    assert build.main(argv) == 0
+    return quantized, torch.load(out, weights_only = False)["metadata"]
+
+
+def test_the_build_skips_ragged_linears_and_records_the_alignment_floor(monkeypatch, tmp_path):
+    """A build skips Linears off the GEMM tiling floor and stamps ``require_divisible``."""
+    import core.inference.diffusion_transformer_quant as dtq
+
+    quantized, meta = _build_nvfp4(monkeypatch, tmp_path)
+    assert quantized == ["aligned"]
+    assert meta["require_divisible"] == dtq.divisible_for_scheme("nvfp4") == 16
+
+
+def test_the_build_stamps_its_denoiser_so_it_cannot_load_as_the_second_expert(
+    monkeypatch, tmp_path
+):
+    """The build reads ``subfolder="transformer"``; published under a transformer_2 name, the loader must refuse it."""
+    from core.inference.diffusion_prequant import PREQUANT_FORMAT, _validate_checkpoint
+
+    _, meta = _build_nvfp4(monkeypatch, tmp_path)
+    assert meta["component"] == "transformer"
+    ckpt = {"format": PREQUANT_FORMAT, "metadata": {**meta, "base_model_id": ""}, "state_dict": {}}
+    assert _validate_checkpoint(ckpt, "nvfp4", "", None, component = "transformer")
+    assert not _validate_checkpoint(ckpt, "nvfp4", "", None, component = "transformer_2")
