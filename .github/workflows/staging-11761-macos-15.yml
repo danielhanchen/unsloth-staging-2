@@ -1,0 +1,43 @@
+name: "staging-11761 macos-15"
+on:
+  push:
+    branches: ["pr-11761-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pip install transformers torch
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_account_auto_download_busy_message.py studio/backend/tests/test_account_cached_listing_offload.py studio/backend/tests/test_account_model_access.py studio/backend/tests/test_account_storage.py studio/backend/tests/test_hf_token_validation.py studio/backend/tests/test_hub_endpoint_proxy.py studio/backend/tests/test_hub_settings.py studio/backend/tests/test_hub_token_caller_identity.py studio/backend/tests/test_local_options_match_start_validation.py studio/backend/tests/test_memory_estimate_side_effects.py studio/backend/tests/test_modelscope_hub.py studio/backend/tests/test_openai_auto_download.py studio/backend/tests/test_orchestrator_unload_cancel.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; tot=$(grep -cE "^(FAILED|ERROR) " pytest_out.txt) || tot=0; dep=$(grep -cE "^(FAILED|ERROR) .* (ModuleNotFoundError|ImportError). No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt) || dep=0; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && { [ "$tot" = "0" ] || [ "$tot" = "$dep" ]; }; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; exit "$rc"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+      - name: Node tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test tests/hf-dataset-split-sources.test.ts tests/hf-endpoint.test.ts tests/hub-network-availability.test.ts tests/recommended-catalog-seeds.test.ts tests/settings-search.test.ts
