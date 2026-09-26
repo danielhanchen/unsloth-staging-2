@@ -4705,6 +4705,75 @@ exit 1
         return $false
     }
 
+    # Pins the --local unsloth-zoo overlay to the commit main points at. No git, no
+    # network or no match keeps the bare URL: reproducibility, not a gate.
+    $script:ZooGitSpec = $null
+    $script:ZooGitLabel = $null
+    function Resolve-UnslothZooGitSpec {
+        if ($script:ZooGitSpec) { return }   # resolved once per run: the three call sites must agree
+        $zooUrl = 'unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo'
+        $script:ZooGitSpec = $zooUrl
+        $script:ZooGitLabel = 'main'
+        $probeEnv = @{}
+        foreach ($name in 'GIT_TERMINAL_PROMPT', 'GIT_ASKPASS', 'SSH_ASKPASS') {
+            $probeEnv[$name] = [Environment]::GetEnvironmentVariable($name, 'Process')
+        }
+        try {
+            $git = Get-Command git -ErrorAction SilentlyContinue
+            if (-not $git) { return }
+            # Git Credential Manager raises a window on a 401. Empty askpass rather
+            # than removed: git runs the first of GIT_ASKPASS, core.askPass,
+            # SSH_ASKPASS that is SET and reads an empty one as none.
+            $env:GIT_TERMINAL_PROMPT = '0'
+            $env:GIT_ASKPASS = ''
+            $env:SSH_ASKPASS = ''
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = $git.Source
+            # The full ref name, never the bare one: an ls-remote pattern matches the
+            # TAIL of a ref at slash boundaries, so `main` also matches
+            # refs/heads/archive/main, which sorts first and would pin another history.
+            # http.lowSpeed*: git abandons a transfer that stalls, so a remote that
+            # accepts and then says nothing ends the probe before the 20s wait below.
+            $psi.Arguments = '-c credential.helper= -c core.askPass= -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 ls-remote https://github.com/unslothai/unsloth-zoo refs/heads/main'
+            $psi.UseShellExecute = $false
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.CreateNoWindow = $true
+            $proc = [System.Diagnostics.Process]::Start($psi)
+            $outTask = $proc.StandardOutput.ReadToEndAsync()
+            $null = $proc.StandardError.ReadToEndAsync()
+            if (-not $proc.WaitForExit(20000)) {
+                try { $proc.Kill() } catch {}
+                return
+            }
+            if ($proc.ExitCode -ne 0) { return }
+            # Matched by exact ref name; ls-remote exits 0 even when nothing matched.
+            $sha = ''
+            foreach ($line in @("$($outTask.Result)" -split "`r?`n")) {
+                $parts = "$line".Trim() -split '\s+', 2
+                if ($parts.Count -eq 2 -and $parts[1].Trim() -eq 'refs/heads/main') {
+                    $sha = $parts[0]
+                    break
+                }
+            }
+            if ($sha -match '^[0-9a-f]{40}$') {
+                $script:ZooGitSpec = "$zooUrl@$sha"
+                $script:ZooGitLabel = "main ($($sha.Substring(0, 12)))"
+            }
+        } catch {
+            # unreachable remote, killed git, anything else: keep the bare URL
+        } finally {
+            # Restored exactly, including having been unset.
+            foreach ($name in @($probeEnv.Keys)) {
+                if ($null -eq $probeEnv[$name]) {
+                    Remove-Item "Env:$name" -ErrorAction SilentlyContinue
+                } else {
+                    Set-Item "Env:$name" $probeEnv[$name]
+                }
+            }
+        }
+    }
+
     # Print guidance; returns the failure reason as its only pipeline output, matching
     # Write-PathAccessDenied. Never suggests turning a security policy off: the fix is
     # for whoever owns the policy, and Unsloth already stopped needing the blocked file.
@@ -10224,8 +10293,9 @@ exit 0
                 Write-StudioLine "[ERROR] Failed to overlay local repo (exit code $overlayExit)" -ForegroundColor Red
                 return (Exit-InstallFailure "Failed to overlay local repo (exit code $overlayExit)" $overlayExit)
             }
-            substep "overlaying unsloth-zoo from git main..."
-            $zooOverlayExit = Invoke-InstallCommandRetry -Label "overlay unsloth-zoo (git main)" { & $script:UvExe pip install --python $VenvPython --no-deps --reinstall-package unsloth-zoo "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo" }
+            Resolve-UnslothZooGitSpec
+            substep "overlaying unsloth-zoo from git $($script:ZooGitLabel)..."
+            $zooOverlayExit = Invoke-InstallCommandRetry -Label "overlay unsloth-zoo (git $($script:ZooGitLabel))" { & $script:UvExe pip install --python $VenvPython --no-deps --reinstall-package unsloth-zoo $script:ZooGitSpec }
             if ($zooOverlayExit -ne 0) {
                 Write-StudioLine "[ERROR] Failed to overlay unsloth-zoo (exit code $zooOverlayExit)" -ForegroundColor Red
                 return (Exit-InstallFailure "Failed to overlay unsloth-zoo (exit code $zooOverlayExit)" $zooOverlayExit)
@@ -10512,8 +10582,9 @@ exit 0
                 Write-StudioLine "[ERROR] Failed to overlay local repo (exit code $overlayExit)" -ForegroundColor Red
                 return (Exit-InstallFailure "Failed to overlay local repo (exit code $overlayExit)" $overlayExit)
             }
-            substep "overlaying unsloth-zoo from git main..."
-            $zooOverlayExit = Invoke-InstallCommandRetry -Label "overlay unsloth-zoo (git main)" { & $script:UvExe pip install --python $VenvPython --no-deps --reinstall-package unsloth-zoo "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo" }
+            Resolve-UnslothZooGitSpec
+            substep "overlaying unsloth-zoo from git $($script:ZooGitLabel)..."
+            $zooOverlayExit = Invoke-InstallCommandRetry -Label "overlay unsloth-zoo (git $($script:ZooGitLabel))" { & $script:UvExe pip install --python $VenvPython --no-deps --reinstall-package unsloth-zoo $script:ZooGitSpec }
             if ($zooOverlayExit -ne 0) {
                 Write-StudioLine "[ERROR] Failed to overlay unsloth-zoo (exit code $zooOverlayExit)" -ForegroundColor Red
                 return (Exit-InstallFailure "Failed to overlay unsloth-zoo (exit code $zooOverlayExit)" $zooOverlayExit)
@@ -10535,8 +10606,9 @@ exit 0
                 Write-StudioLine "[ERROR] Failed to overlay local repo (exit code $overlayExit)" -ForegroundColor Red
                 return (Exit-InstallFailure "Failed to overlay local repo (exit code $overlayExit)" $overlayExit)
             }
-            substep "overlaying unsloth-zoo from git main..."
-            $zooOverlayExit = Invoke-InstallCommandRetry -Label "overlay unsloth-zoo (git main)" { & $script:UvExe pip install --python $VenvPython --no-deps --reinstall-package unsloth-zoo "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo" }
+            Resolve-UnslothZooGitSpec
+            substep "overlaying unsloth-zoo from git $($script:ZooGitLabel)..."
+            $zooOverlayExit = Invoke-InstallCommandRetry -Label "overlay unsloth-zoo (git $($script:ZooGitLabel))" { & $script:UvExe pip install --python $VenvPython --no-deps --reinstall-package unsloth-zoo $script:ZooGitSpec }
             if ($zooOverlayExit -ne 0) {
                 Write-StudioLine "[ERROR] Failed to overlay unsloth-zoo (exit code $zooOverlayExit)" -ForegroundColor Red
                 return (Exit-InstallFailure "Failed to overlay unsloth-zoo (exit code $zooOverlayExit)" $zooOverlayExit)
