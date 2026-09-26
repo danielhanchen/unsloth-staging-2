@@ -27,6 +27,10 @@ from core.inference.diffusion_memory import (
 QWEN21_GGUF = dict(model_dense_mib = 17_897, companion_dense_mib = 10_247, text_encoder_dense_mib = 8_959)
 ZIMAGE_BF16 = dict(model_dense_mib = 31_326, companion_dense_mib = 7_820, text_encoder_dense_mib = 7_629)
 FLUX1_BF16 = dict(model_dense_mib = 32_184, companion_dense_mib = 9_478, text_encoder_dense_mib = 9_318)
+QWEN21_GGUF_BF16_TE = dict(
+    model_dense_mib = 25_627, companion_dense_mib = 17_977, text_encoder_dense_mib = 16_689
+)
+LARGE_TE = dict(model_dense_mib = 19_288, companion_dense_mib = 12_288, text_encoder_dense_mib = 11_000)
 SDXL = dict(model_dense_mib = 13_235, companion_dense_mib = 13_232, text_encoder_dense_mib = 3_119)
 QWEN21_ACT = CalibratedImageActivation(
     text_encoder_mib = 1_498,
@@ -156,23 +160,27 @@ def test_more_vram_is_never_slower_and_never_slower_than_the_flat_plan(sizes, ac
 
 @pytest.mark.parametrize("max_speed", [False, True])
 @pytest.mark.parametrize("family", ["qwen-image-2.1", "flux.1", "flux.2-klein", "z-image"])
-@pytest.mark.parametrize("sizes", [QWEN21_GGUF, ZIMAGE_BF16, FLUX1_BF16])
-def test_a_transformer_taken_off_streaming_fits_beside_the_largest_canvas_denoise(
-    sizes, family, max_speed
-):
+@pytest.mark.parametrize(
+    "sizes", [QWEN21_GGUF, QWEN21_GGUF_BF16_TE, LARGE_TE, ZIMAGE_BF16, FLUX1_BF16]
+)
+def test_a_module_taken_off_streaming_fits_beside_its_own_phase(sizes, family, max_speed):
     act = calibrated_image_activation(family, max_speed = max_speed)
     transformer = sizes["model_dense_mib"] - sizes["companion_dense_mib"]
+    te = sizes["text_encoder_dense_mib"]
+    others = sizes["companion_dense_mib"] - te
     for step in range(4 * 8, 96 * 8 + 1):
         gib = step / 8
         flat = _plan(gib, sizes, None)
         plan = _plan(gib, sizes, act)
         if plan == flat or flat.offload_policy != OFFLOAD_GROUP or not flat.stream_transformer:
             continue
-        free = _card(gib).free_mib
-        assert transformer + act.max_canvas_mib + dm.DEFAULT_BASE_OVERHEAD_MIB <= free, (
-            gib,
-            plan.reasons,
-        )
+        free = _card(gib).free_mib - dm.DEFAULT_BASE_OVERHEAD_MIB
+        assert transformer + act.max_canvas_mib <= free, (gib, plan.reasons)
+        if plan.offload_policy == OFFLOAD_MODEL:
+            assert te + act.text_encoder_mib <= free and others + act.tiled_decode_mib <= free, (
+                gib,
+                plan.reasons,
+            )
 
 
 def test_a_largest_canvas_denoise_that_would_not_fit_keeps_the_transformer_off_the_resident_tiers():
@@ -238,6 +246,12 @@ def test_only_measured_families_are_calibrated():
     assert calibrated_image_activation("qwen-image-2.1") == calibrated_image_activation(
         "qwen-image-2.1", max_speed = True
     )
+
+
+def test_a_text_encoder_that_cannot_run_whole_keeps_streaming():
+    act = calibrated_image_activation("qwen-image-2.1", max_speed = False)
+    # 15 GB: the encoder fits the budget by weight, not with its own activations beside it
+    assert _plan(15, LARGE_TE, act) == _plan(15, LARGE_TE, None)
 
 
 def test_16gb_qwen_image_21_at_the_max_speed_tier_keeps_streaming_the_transformer():

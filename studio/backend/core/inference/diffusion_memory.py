@@ -1382,7 +1382,8 @@ def _calibrated_faster_tier(
     others = max(0, int(companion_dense_mib) - te)
     overhead = max(0, int(base_overhead_mib))
     budget = int(budget)
-    room = int(free_mib) - overhead - act.max_canvas_mib
+    free = int(free_mib) - overhead
+    room = free - act.max_canvas_mib
     if policy == OFFLOAD_NONE:
         flat_rank = 0
     elif policy == OFFLOAD_GROUP and not stream_transformer:
@@ -1393,8 +1394,15 @@ def _calibrated_faster_tier(
         flat_rank = 5
     else:
         return None
-    # leaving a streamed transformer puts the whole of it on the device beside the 2048 denoise
-    model_viable = max(transformer, te, others) <= budget and (flat_rank < 5 or transformer <= room)
+    # leaving streaming puts each whole module on the device beside its own phase, the transformer beside the 2048 denoise
+    model_viable = max(transformer, te, others) <= budget and (
+        flat_rank < 5
+        or (
+            transformer <= room
+            and te + act.text_encoder_mib <= free
+            and others + act.tiled_decode_mib <= free
+        )
+    )
     resident_streamed_te = te > 0 and transformer + others <= room
     candidates = (
         (
