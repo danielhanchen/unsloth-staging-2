@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/dialog";
 import { type TranslationKey, useT } from "@/i18n";
 import { isTauri } from "@/lib/api-base";
+import { useHubSource } from "@/lib/hf-endpoint";
 import { MicIcon } from "@/lib/mic-icon";
 import { cn } from "@/lib/utils";
 import { useUiSpaceScale } from "@/hooks/use-ui-space-scale";
@@ -54,6 +55,7 @@ import {
 import {
   SETTINGS_SEARCH_KEYWORDS,
   createSettingsSearchIndex,
+  renderedSearchEntries,
 } from "./settings-search";
 import {
   type SettingsTab,
@@ -296,6 +298,7 @@ export function SettingsDialog() {
   const t = useT();
   const isOwner = useIsAccountOwner();
   const stacked = useStackedLayout();
+  const hubSource = useHubSource();
   const visibleTabs = useMemo(() => TABS.filter((tab) => settingsTabVisible(tab.id, isOwner)), [isOwner]);
   const open = useSettingsDialogStore((s) => s.open);
   const requestedTab = useSettingsDialogStore((s) => s.activeTab);
@@ -334,7 +337,7 @@ export function SettingsDialog() {
     }
     return visibleTabs.map((tab) => {
       const tabLabel = t(tab.labelKey);
-      const entries = SETTINGS_SEARCH_INDEX[tab.id]
+      const entries = renderedSearchEntries(SETTINGS_SEARCH_INDEX, tab.id, hubSource)
         .filter((key) => {
           if (t(key).toLowerCase().includes(q)) {
             return true;
@@ -351,7 +354,7 @@ export function SettingsDialog() {
         tabMatches: tabLabel.toLowerCase().includes(q),
       };
     }).filter((r) => r.tabMatches || r.entries.length > 0);
-  }, [query, t, visibleTabs]);
+  }, [query, t, visibleTabs, hubSource]);
 
   const [pendingScroll, setPendingScroll] = useState<{
     tab: SettingsTab;
