@@ -1,0 +1,3 @@
+studio/backend/tests/test_saved_image_metadata_precision_contract.py
+studio/backend/tests/test_train_precision_scheme_contract.py
+studio/backend/tests/test_video_resolution_preset_contract.py
