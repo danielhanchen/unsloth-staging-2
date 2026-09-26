@@ -1393,7 +1393,8 @@ def _calibrated_faster_tier(
         flat_rank = 5
     else:
         return None
-    model_viable = max(transformer, te, others) <= budget
+    # leaving a streamed transformer puts the whole of it on the device beside the 2048 denoise
+    model_viable = max(transformer, te, others) <= budget and (flat_rank < 5 or transformer <= room)
     resident_streamed_te = te > 0 and transformer + others <= room
     candidates = (
         (

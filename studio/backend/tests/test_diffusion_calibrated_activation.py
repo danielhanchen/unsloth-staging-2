@@ -129,18 +129,19 @@ def test_whole_module_offload_untiles_when_the_resident_transformer_does_not_fit
 
 
 @pytest.mark.parametrize(
-    "sizes, act",
+    "sizes, act, strict",
     [
-        (QWEN21_GGUF, QWEN21_ACT),
-        (QWEN21_GGUF, SMALL_VAE_ACT),
-        (ZIMAGE_BF16, SMALL_VAE_ACT),
-        (FLUX1_BF16, SMALL_VAE_ACT),
-        (SDXL, SMALL_VAE_ACT),
-        (ZIMAGE_BF16, CalibratedImageActivation(1_000, 800, 30_000, 600, 1_000)),
-        (QWEN21_GGUF, CalibratedImageActivation(1_000, 800, 3_000, 600, 9_000)),
+        (QWEN21_GGUF, QWEN21_ACT, True),
+        (QWEN21_GGUF, SMALL_VAE_ACT, True),
+        (ZIMAGE_BF16, SMALL_VAE_ACT, True),
+        (FLUX1_BF16, SMALL_VAE_ACT, True),
+        (SDXL, SMALL_VAE_ACT, True),
+        (ZIMAGE_BF16, CalibratedImageActivation(1_000, 800, 30_000, 600, 1_000), True),
+        # a 2048 denoise too large to share the card with the transformer: the flat plan's own step stays
+        (QWEN21_GGUF, CalibratedImageActivation(1_000, 800, 3_000, 600, 9_000), False),
     ],
 )
-def test_more_vram_is_never_slower_and_never_slower_than_the_flat_plan(sizes, act):
+def test_more_vram_is_never_slower_and_never_slower_than_the_flat_plan(sizes, act, strict):
     last = None
     for step in range(4 * 8, 96 * 8 + 1):
         gib = step / 8
@@ -149,15 +150,37 @@ def test_more_vram_is_never_slower_and_never_slower_than_the_flat_plan(sizes, ac
         rank = _rank(plan, sizes)
         assert rank <= _rank(flat, sizes), (gib, plan.reasons)
         if last is not None:
-            assert rank <= last[1], (gib, last, plan.reasons)
+            assert rank <= last[1] or (not strict and plan == flat), (gib, last, plan.reasons)
         last = (gib, rank)
+
+
+@pytest.mark.parametrize("max_speed", [False, True])
+@pytest.mark.parametrize("family", ["qwen-image-2.1", "flux.1", "flux.2-klein", "z-image"])
+@pytest.mark.parametrize("sizes", [QWEN21_GGUF, ZIMAGE_BF16, FLUX1_BF16])
+def test_a_transformer_taken_off_streaming_fits_beside_the_largest_canvas_denoise(
+    sizes, family, max_speed
+):
+    act = calibrated_image_activation(family, max_speed = max_speed)
+    transformer = sizes["model_dense_mib"] - sizes["companion_dense_mib"]
+    for step in range(4 * 8, 96 * 8 + 1):
+        gib = step / 8
+        flat = _plan(gib, sizes, None)
+        plan = _plan(gib, sizes, act)
+        if plan == flat or flat.offload_policy != OFFLOAD_GROUP or not flat.stream_transformer:
+            continue
+        free = _card(gib).free_mib
+        assert transformer + act.max_canvas_mib + dm.DEFAULT_BASE_OVERHEAD_MIB <= free, (
+            gib,
+            plan.reasons,
+        )
 
 
 def test_a_largest_canvas_denoise_that_would_not_fit_keeps_the_transformer_off_the_resident_tiers():
     # a resident transformer holds the VAE too while it denoises, and a 2048 canvas cannot be tiled there
     act = CalibratedImageActivation(1_000, 800, 3_000, 600, 6_000)
-    for gib in (16, 17):
-        assert _plan(gib, QWEN21_GGUF, act).offload_policy == OFFLOAD_MODEL
+    # 16 GB: not even the transformer alone fits beside it, so the flat plan stands
+    assert _plan(16, QWEN21_GGUF, act) == _plan(16, QWEN21_GGUF, None)
+    assert _plan(17, QWEN21_GGUF, act).offload_policy == OFFLOAD_MODEL
     plan = _plan(18, QWEN21_GGUF, act)
     assert plan.offload_policy == OFFLOAD_GROUP and plan.stream_transformer is False
 
@@ -217,12 +240,12 @@ def test_only_measured_families_are_calibrated():
     )
 
 
-def test_16gb_qwen_image_21_at_the_max_speed_tier_offloads_whole_modules_untiled():
-    # max-autotune holds about 9.6 GB for a 2048 denoise, which a resident transformer could not add on a 16 GB card
+def test_16gb_qwen_image_21_at_the_max_speed_tier_keeps_streaming_the_transformer():
+    # max-autotune holds about 9.6 GB for a 2048 denoise, which an onloaded transformer could not add on a 16 GB card
     act = calibrated_image_activation("qwen-image-2.1", max_speed = True)
-    plan = _plan(16, QWEN21_GGUF, act)
+    assert _plan(16, QWEN21_GGUF, act) == _plan(16, QWEN21_GGUF, None)
+    plan = _plan(22, QWEN21_GGUF, act)
     assert plan.offload_policy == OFFLOAD_MODEL and plan.vae_tiling is False
-    assert plan == _plan(16, QWEN21_GGUF, act)
 
 
 def test_the_shipped_qwen_image_21_figures_never_stream_the_transformer_on_16gb():
