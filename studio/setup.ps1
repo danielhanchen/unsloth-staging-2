@@ -1812,11 +1812,156 @@ function Get-RocmPinStaleTags {
 # away, so "the HIP DLLs will not load", "torch is not installed" and "the import never came back"
 # all reached the caller as one silent False -- and one such caller deletes the environment over
 # that answer. Mirrors install.ps1's copy.
+function Get-CodeIntegrityBlockReason {
+    param([string]$Text)
+    # Mirrors studio/backend/utils/code_integrity.py, which classifies the same refusal for
+    # llama-server. Text only, because this side holds a probe's stderr rather than the
+    # exception object: the statuses are matched as Python printed them.
+    #
+    # Why it is worth classifying at all: a blocked DLL makes `import torch` fail exactly
+    # like a faulted driver does, so the rescue below told users with Smart App Control on
+    # to update a driver that was never the problem (#6588, #6648). The blocked files there
+    # are AMD's ROCm wheels, which nobody signs, so a reinstall cannot clear it either.
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    # NTSTATUS first: the most specific thing in the text, and the only one that names
+    # which refusal it was.
+    $statuses = [ordered]@{
+        "c0e90002" = "Smart App Control or an Application Control policy blocked the image"
+        "c0000428" = "the image failed code integrity validation (invalid or missing signature)"
+        "c0000602" = "the image was refused by a code integrity fail-fast"
+    }
+    foreach ($status in $statuses.Keys) {
+        if ($Text -imatch "0x$status\b") { return $statuses[$status] }
+    }
+    # Python surfaces the same refusals as OSError winerrors, which reach here as
+    # "[WinError 4551] ..." inside the traceback line.
+    $winerrors = [ordered]@{
+        "577"  = "Windows could not verify the digital signature of the image"
+        "1260" = "an Application Control policy blocked this program"
+        "4551" = "code integrity blocked the image"
+    }
+    foreach ($code in $winerrors.Keys) {
+        if ($Text -imatch "WinError\s+$code\b") { return $winerrors[$code] }
+    }
+    if ($Text -imatch "blocked by smart app control") { return "Smart App Control blocked this program" }
+    if (($Text -imatch "application control policy has blocked") -or ($Text -imatch "blocked by group policy")) {
+        return "an Application Control policy blocked this program"
+    }
+    # "Bad Image" on its own is deliberately not a block: a corrupt or half-written DLL
+    # prints it too, and there a reinstall IS the remedy. Same rule as the Python side.
+    return $null
+}
+
+function Get-ProbeFailureText {
+    # Everything a failed probe said, which is not only its stderr: when Windows refuses an
+    # image with a fail-fast (0xC0000602) it terminates python with that NTSTATUS, and the
+    # traceback that would have named it never gets written. Classifying stderr alone reads
+    # that as an ordinary failure and the rescue arm falls back to driver advice.
+    param($Probe)
+    if (-not $Probe) { return "" }
+    $text = [string]$Probe.Error
+    # A timeout's exit code is whatever Kill() left behind, which says nothing about the
+    # installation, and the caller already treats "never answered" as its own case.
+    if ($Probe.TimedOut) { return $text }
+    $code = $Probe.ExitCode
+    # Negative only: an NTSTATUS has the high bit set, so it arrives as a negative Int32,
+    # while python's own failures exit 1 or 2 and must not be dressed up as a status.
+    if ($null -ne $code -and $code -lt 0) {
+        # -band against a long first: [uint32] on a negative Int32 throws.
+        $status = [uint32]($code -band 0xFFFFFFFFL)
+        $text = ("{0}`nthe process was terminated with status 0x{1:x8}" -f $text, $status)
+    }
+    return $text
+}
+
+# The two statuses Windows also raises for a damaged or incompletely downloaded file, so
+# they do not establish a policy. Same set as _INVALID_HASH_REASONS in
+# studio/backend/utils/code_integrity.py, matched on the reason so the two cannot drift.
+$script:CodeIntegrityAmbiguousReasons = @(
+    "the image failed code integrity validation (invalid or missing signature)",
+    "Windows could not verify the digital signature of the image"
+)
+
+function Test-CodeIntegrityReasonIsAmbiguous {
+    param([string]$Reason)
+    if (-not $Reason) { return $false }
+    return ($script:CodeIntegrityAmbiguousReasons -contains $Reason)
+}
+
+# Same split as _ADMIN_POLICY_REASONS / _SMART_APP_CONTROL_REASONS in
+# studio/backend/utils/code_integrity.py: 0xC0E90002 is SAC or WDAC and proves neither,
+# so only these two reasons name which one to send the user to.
+$script:CodeIntegrityAdminPolicyReasons = @("an Application Control policy blocked this program")
+$script:CodeIntegritySmartAppControlReasons = @("Smart App Control blocked this program")
+
+function Write-CodeIntegrityTorchNotice {
+    param(
+        [string]$Reason,
+        # What setup does next, since this notice is emitted from paths that keep the
+        # environment, reinstall the wheels into it, and rebuild it outright.
+        [ValidateSet("kept", "reinstall", "replace", "rebuild")]
+        [string]$Action = "kept",
+        # False where no family answered: the rebuild path reaches this with a CPU wheel
+        # or no torch at all, and calling that a GPU build tells the user the wrong thing
+        # about a file that is already CPU-only.
+        [bool]$GpuBuild = $true
+    )
+    # Said once, in the three places the driver advice used to be.
+    if ($GpuBuild) {
+        substep "Windows refused part of the PyTorch GPU runtime: $Reason." "Yellow"
+    } else {
+        substep "Windows refused part of this environment's PyTorch runtime: $Reason." "Yellow"
+    }
+    if (Test-CodeIntegrityReasonIsAmbiguous -Reason $Reason) {
+        # Microsoft raises these for a file a policy will not accept AND for one that is
+        # damaged, and the error alone does not say which, so this must not rule out the
+        # reinstall that clears the damaged case.
+        substep "Windows reports this both for a file a code integrity policy will not accept and for one that is damaged or was downloaded incompletely, so the error alone does not say which." "Yellow"
+        if ($GpuBuild) {
+            substep "Reinstalling the GPU wheels replaces the files and clears the damaged case. If it fails again after that, it is a policy." "Yellow"
+        } else {
+            substep "Reinstalling the PyTorch wheels replaces the files and clears the damaged case. If it fails again after that, it is a policy." "Yellow"
+        }
+    } else {
+        substep "This is a Windows code integrity policy refusing unsigned files, not a driver fault or a damaged install, so reinstalling will not clear it." "Yellow"
+    }
+    # Which policy to go to, told apart the way the backend tells them apart: sending an
+    # AppLocker or WDAC case to Smart App Control is advice that cannot work, since turning
+    # SAC off does not touch an administrator policy.
+    if ($script:CodeIntegrityAdminPolicyReasons -contains $Reason) {
+        substep "This policy is set by whoever administers this device (AppLocker, WDAC or Group Policy) and can only be changed there, so ask them to allow the files. Turning off Smart App Control does not affect an administrator policy." "Yellow"
+    } elseif ($script:CodeIntegritySmartAppControlReasons -contains $Reason) {
+        substep "Smart App Control has no per-application exception; turning it off in Windows Security, under App and browser control, is the only local workaround." "Yellow"
+    } else {
+        substep "On a device you administer, Smart App Control is under Windows Security, App and browser control; on a managed device the policy belongs to whoever administers it." "Yellow"
+    }
+    # Not "CPU training is unaffected": this venv's own `import torch` is what just failed,
+    # so nothing in it runs, on any device, until the wheels load or are replaced.
+    if ($GpuBuild) {
+        substep "This environment holds a GPU build whose import Windows is refusing, so it cannot run on the CPU either. A separate CPU-only install is unaffected, and UNSLOTH_TORCH_INDEX_URL moves this one onto CPU wheels on purpose." "DarkGray"
+    } else {
+        substep "This environment's own import of PyTorch is what Windows refused, so nothing in it runs until those files load or are replaced. A separate install elsewhere is unaffected." "DarkGray"
+    }
+    switch ($Action) {
+        "reinstall" {
+            substep "Setup will reinstall the same wheels in place, which clears the damaged case; a policy will refuse them again the same way." "DarkGray"
+        }
+        "replace" {
+            substep "Setup will install the PyTorch build this host resolves to over this environment, so these files are replaced rather than reused." "DarkGray"
+        }
+        "rebuild" { substep "Setup will rebuild this environment." "DarkGray" }
+        default   { substep "The environment is kept as it is." "DarkGray" }
+    }
+}
+
 function Invoke-BoundedPythonProbe {
     param([string]$PythonExe, [string]$Code, [int]$TimeoutSec = 30)
     # TimedOut separates "never answered" from "answered with a failure": both leave Ok
     # false, only the second says anything about the installation.
-    $result = [pscustomobject]@{ Ok = $false; Output = ""; Error = ""; TimedOut = $false }
+    # ExitCode is kept as well as reduced to Ok: Windows can terminate a refused image with a
+    # raw code integrity NTSTATUS and no stderr at all, and then the exit code is the only
+    # thing the probe learned. $null means "never ran or never answered".
+    $result = [pscustomobject]@{ Ok = $false; Output = ""; Error = ""; TimedOut = $false; ExitCode = $null }
     if (-not $PythonExe -or -not $Code) { return $result }
     try {
         $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -1841,6 +1986,7 @@ function Invoke-BoundedPythonProbe {
         # Kept, not discarded: the only place a failed probe's OSError / WinError text exists, and
         # the caller decides what to do with the venv based on it.
         $result.Error = $errTask.GetAwaiter().GetResult()
+        $result.ExitCode = $proc.ExitCode
         $result.Ok = ($proc.ExitCode -eq 0)
         return $result
     } catch {
@@ -6401,12 +6547,23 @@ $installedTorchTag = $null
 # assigns it.
 $script:PinChangedForceReinstall = $false
 $script:TorchImportDefinitivelyFailed = $false
+# The classified refusal for THIS venv's torch, or $null. Read by the fast-path escapes,
+# which run long after the block that assigns it and never enter it on a fresh install.
+$script:TorchProbeBlockReason = $null
 if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode) {
     $VenvPyExe = Join-Path $VenvDir "Scripts\python.exe"
     $installedTorchTag = $null
     # Declared before the branch that assigns it: the failure message below reads its .Error, and
     # a venv with no python.exe never runs the probe at all.
     $_verProbe = $null
+    # Same, and for the same reason: the notice below reads it on a path the probe may
+    # never have run on.
+    $_probeBlockReason = $null
+    # Whether a rescue arm has something to say. Said after the pin and family comparison
+    # below, never inside the arm: that comparison can set PinChangedForceReinstall and
+    # replace the wheels, so a notice printed in the arm told the user the environment was
+    # kept immediately before setup changed it.
+    $_rescueNoticePending = $false
     $shouldRebuild = $false
     # Set when a stale venv under a pin is repaired in place (force-reinstall) not wiped.
     $script:PinChangedForceReinstall = $false
@@ -6417,6 +6574,37 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
         # import. An unreadable flavor -> rebuild.
         $_verProbe = Invoke-BoundedPythonProbe -PythonExe $VenvPyExe -Code 'import torch; print(torch.__version__)'
         $torchVer = $_verProbe.Output.Trim()
+        # A Windows policy refusing an unsigned GPU library is not a driver fault and not a
+        # broken wheel, and the three rescue arms below would otherwise say it was.
+        $_probeBlockReason = if ($_verProbe -and -not $_verProbe.Ok) {
+            Get-CodeIntegrityBlockReason -Text (Get-ProbeFailureText -Probe $_verProbe)
+        } else { $null }
+        # 0xC0000602 is the generic STATUS_FAIL_FAST_EXCEPTION: any native component can
+        # raise it, a corrupt DLL included, so an exit code carrying it and nothing else
+        # does not establish a policy. Suppressed rather than reclassified, which leaves
+        # the ordinary damaged-wheel repair in place instead of telling the user to go
+        # and change a Windows security setting. Text that says so on its own still
+        # counts, which keeps this in step with the backend classifier.
+        if ($_probeBlockReason -eq "the image was refused by a code integrity fail-fast" -and
+            -not (Get-CodeIntegrityBlockReason -Text $_verProbe.Error)) {
+            $_probeBlockReason = $null
+        }
+        # Carried for the fast-path escapes far below, which probe `import torch` again and
+        # would otherwise read a refusal as a CPU-only wheel.
+        $script:TorchProbeBlockReason = $_probeBlockReason
+        # The distinction all three arms need: Windows raises these two for a damaged file as
+        # well, so they do not settle the question and a reinstall may still clear it.
+        $_blockRulesOutDamage = $_probeBlockReason -and
+            -not (Test-CodeIntegrityReasonIsAmbiguous -Reason $_probeBlockReason)
+        # A probe that answered with a failure (not one that never answered) leaves a venv
+        # whose version.py still names a good wheel, and the matched install below would write
+        # a completion manifest over a half-written torch. Repair it in place instead.
+        $_willForceReinstall = $_verProbe -and -not $_verProbe.TimedOut -and -not $_blockRulesOutDamage
+        # The XPU and ROCm arms exist to STOP a driver fault being treated as a broken
+        # install (#8335, #7275), so they repair only the case the notice itself says a
+        # reinstall clears: an ambiguous code integrity status, which Windows also raises for
+        # a damaged download. No block reason there still means "keep it and blame the driver".
+        $_ambiguousBlockRepair = [bool]($_probeBlockReason -and $_willForceReinstall)
         if ($_verProbe.Ok -and $torchVer) {
             if ($torchVer -match '\+(cu\d+)') {
                 $installedTorchTag = $Matches[1]
@@ -6441,7 +6629,15 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
             # Trust the disk and warn about the driver; other families keep rebuilding.
             $installedTorchTag = "xpu"
             substep "PyTorch did not respond in time but this venv holds an XPU build -- keeping it." "Yellow"
-            substep "If training fails, update the Intel GPU compute driver." "Yellow"
+            if ($_probeBlockReason) {
+                $_rescueNoticePending = $true
+            } else {
+                substep "If training fails, update the Intel GPU compute driver." "Yellow"
+            }
+            if ($_ambiguousBlockRepair) {
+                $script:TorchImportDefinitivelyFailed = $true
+                substep "Windows may be refusing a damaged file rather than an unsigned one -- reinstalling the same wheels in place." "Yellow"
+            }
         } elseif (Test-VenvTorchIsRocm -VenvPath $VenvDir) {
             # Same rescue on the AMD side, and the one that has cost users whole installs: a
             # faulted Adrenalin or HIP runtime makes `import torch` raise at the DLL load or never
@@ -6450,16 +6646,29 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
             # so trust it and point at the driver instead (#8335, #7275).
             $installedTorchTag = "rocm"
             substep "PyTorch did not respond but this venv holds a ROCm build -- keeping it." "Yellow"
-            substep "If training fails, reboot and update the AMD Adrenalin / HIP SDK driver." "Yellow"
+            if ($_probeBlockReason) {
+                $_rescueNoticePending = $true
+            } else {
+                substep "If training fails, reboot and update the AMD Adrenalin / HIP SDK driver." "Yellow"
+            }
+            if ($_ambiguousBlockRepair) {
+                $script:TorchImportDefinitivelyFailed = $true
+                substep "Windows may be refusing a damaged file rather than an unsigned one -- reinstalling the same wheels in place." "Yellow"
+            }
         } elseif (Test-VenvTorchIsCuda -VenvPath $VenvDir) {
             # Without this the chain fell through with a NULL tag, so the no-wipe escape
             # below saw no cu* wheel to preserve. Keep the FAMILY, not a generic "cuda".
             $installedTorchTag = Get-VenvTorchCudaTag -VenvPath $VenvDir
             substep "PyTorch did not respond but this venv holds a $installedTorchTag build -- keeping it." "Yellow"
-            substep "If training fails, reboot and update the NVIDIA driver." "Yellow"
             # A half-written torch also leaves a +cu* version.py behind, and the matched
-            # install below would write a completion manifest over it. Force the reinstall.
-            if ($_verProbe -and -not $_verProbe.TimedOut) {
+            # install below would write a completion manifest over it. Force the reinstall
+            # ($_willForceReinstall, decided with the classification above).
+            if ($_probeBlockReason) {
+                $_rescueNoticePending = $true
+            } else {
+                substep "If training fails, reboot and update the NVIDIA driver." "Yellow"
+            }
+            if ($_willForceReinstall) {
                 $script:TorchImportDefinitivelyFailed = $true
                 substep "PyTorch failed to import rather than timing out -- reinstalling the same family in place." "Yellow"
             }
@@ -6630,18 +6839,25 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
     }
 
     $reason = $null
+    # Declared here because the notice it feeds is emitted after the guards below, which are
+    # what decide whether this rebuild is still a rebuild.
+    $_noticePending = $false
     if ($shouldRebuild) {
         $reason = if ($installedTorchTag) { "torch $installedTorchTag != required $expectedTorchTag" } else { "torch could not be imported" }
         # "torch could not be imported" covers a dead GPU driver, a half-written wheel and no torch
         # at all. Print what python actually said (the last stderr line is the exception), so a
         # WinError 126 reads as a driver problem instead of a broken install.
-        if ($_verProbe -and -not $_verProbe.Ok -and $_verProbe.Error) {
+        if ($_verProbe -and -not $_verProbe.Ok) {
             # No @(...)[0] around this: the guard above passes on a whitespace-only stderr,
             # Where-Object then drops every line, and [0] into the empty array that leaves is fatal
             # under a caller's Set-StrictMode. -Last 1 already yields one string or nothing.
-            $_probeErrLine = $_verProbe.Error -split "`r?`n" |
+            $_probeErrLine = (Get-ProbeFailureText -Probe $_verProbe) -split "`r?`n" |
                 Where-Object { $_.Trim() } | Select-Object -Last 1
             if ($_probeErrLine) { substep "PyTorch reported: $($_probeErrLine.Trim())" "DarkGray" }
+            # Not reclassified: it is the same probe the rescue arms read, and two
+            # classifications of one failure meant two notices on a rescued family the
+            # host comparison then called stale.
+            $_noticePending = [bool]$_probeBlockReason
         }
     }
 
@@ -6696,6 +6912,29 @@ if ((Test-Path -LiteralPath $VenvDir -PathType Container) -and -not $NoTorchMode
             $script:PinChangedForceReinstall = $true
             $shouldRebuild = $false
         }
+    }
+
+    # Said here rather than beside the "PyTorch reported:" line above, because the guards in
+    # between are what settle the repair: every installer-managed run and every direct
+    # `unsloth studio update` turns this rebuild into an in-place reinstall, and a notice that
+    # promised a rebuild would be describing a path setup no longer takes. The two guards that
+    # clear $shouldRebuild here both set $PinChangedForceReinstall, so "reinstall" is the only
+    # other outcome (the nvidia-smi keep needs an $installedTorchTag, which a torch that did not
+    # import never produced).
+    # ONE notice, chosen here, where the repair path is finally known. A rescued family the
+    # host comparison then calls stale reaches both paths, and two notices there contradicted
+    # each other ("kept as it is", then "reinstall the same wheels").
+    if ($_rescueNoticePending -or $_noticePending) {
+        # Last writer wins, in the order setup settles them: a rebuild outranks a pin change,
+        # which replaces the wheels with whatever this host resolves to rather than reinstalling
+        # the same ones, which outranks the in-place repair of a failed import.
+        $_noticeAction = "kept"
+        if ($script:TorchImportDefinitivelyFailed) { $_noticeAction = "reinstall" }
+        if ($script:PinChangedForceReinstall) { $_noticeAction = "replace" }
+        if ($shouldRebuild) { $_noticeAction = "rebuild" }
+        # Only the three rescue arms establish a family; the generic path is reached with a
+        # CPU-only wheel or none at all.
+        Write-CodeIntegrityTorchNotice -Reason $_probeBlockReason -Action $_noticeAction -GpuBuild $_rescueNoticePending
     }
 
     # Outside the rebuild branch: an install that moved a venv aside, failed to delete the copy and
@@ -7647,7 +7886,14 @@ sys.exit(2 if conflict else (0 if version else 1))
             $_rocmTorchProbe = Invoke-BoundedPythonProbe -PythonExe "python" `
                 -Code "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)"
             $_torchIsCpu = -not $_rocmTorchProbe.Ok
-            if ($_torchIsCpu) {
+            # A torch Windows is refusing cannot answer this question at all, and reading
+            # the refusal as "CPU-only" announced a ROCm reinstall of the very wheels the
+            # policy just blocked. A settled verdict is left alone; an ambiguous one is
+            # still repaired, which is the case a reinstall can clear.
+            if ($_torchIsCpu -and $script:TorchProbeBlockReason -and
+                -not (Test-CodeIntegrityReasonIsAmbiguous -Reason $script:TorchProbeBlockReason)) {
+                substep "Windows is refusing this environment's PyTorch ($script:TorchProbeBlockReason), so whether it is a ROCm build cannot be read from it -- leaving the wheels as they are." "Yellow"
+            } elseif ($_torchIsCpu) {
                 substep "AMD GPU ($script:ROCmGfxArch) detected but installed PyTorch is CPU-only -- reinstalling ROCm PyTorch" "Cyan"
                 $SkipPythonDeps = $false
             }
