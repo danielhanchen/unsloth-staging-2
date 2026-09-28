@@ -4,7 +4,11 @@ from pathlib import Path
 sys.path.insert(0, "studio")
 sys.path.insert(0, ".")
 import install_mxc_prebuilt as m
-from tests._shared.windows_console_stub import console_stub_bytes
+import importlib.util
+_spec = importlib.util.spec_from_file_location("stub", "tests/_shared/windows_console_stub.py")
+_stub = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_stub)
+console_stub_bytes = _stub.console_stub_bytes
 
 m._is_elevated = lambda: True
 d = Path(tempfile.mkdtemp()) / "O'Brien a b"
