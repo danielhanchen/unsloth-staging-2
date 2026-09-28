@@ -1,0 +1,73 @@
+name: PR 12167 / 12169 Windows proof
+on:
+  push:
+    branches: [proof-12167-12169]
+permissions:
+  contents: read
+jobs:
+  proof:
+    name: ${{ matrix.pr }} ${{ matrix.arm }} ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+        arm: [base, head]
+        pr: ['12167', '12169']
+        include:
+          - {arm: base, sha: 268b771b953ad88f9f402761a4e3743c8e3c24d1}
+          - {pr: '12167', arm: head, sha: d7b291ececa5276af9f50883a81612a5cc3fa073}
+          - {pr: '12169', arm: head, sha: fb7106e76420ac92d2fbfd1cc49ae28d40b79ebd}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: unslothai/unsloth
+          ref: ${{ matrix.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -U pip pytest typer pyyaml pydantic click rich tomli
+      - name: pytest
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        env:
+          PR: ${{ matrix.pr }}
+        run: |
+          if ($env:PR -eq '12167') {
+            $files = 'tests/python/test_windows_setup_output_encoding.py','tests/python/test_windows_studio_update_launcher.py','tests/studio/install/test_keep_install_backcompat_9979.py'
+          } else {
+            $files = 'tests/security/test_scan_packages.py'
+          }
+          python -m pytest -rA -s -p no:cacheprovider @files 2>&1 | Tee-Object pytest.log
+          $code = $LASTEXITCODE
+          Write-Host "PROOF_PYTEST_EXIT=$code"
+          Select-String -Path pytest.log -Pattern 'console_attached|^(PASSED|FAILED|SKIPPED|ERROR) ' | ForEach-Object { "ID " + $_.Line }
+          exit $code
+      - name: rollback lifecycle (pwsh)
+        if: ${{ !cancelled() && matrix.pr == '12167' }}
+        run: pwsh -NoProfile -File tests/studio/test_install_rollback_lifecycle.ps1
+      - name: Pester FindInstalledUv
+        if: ${{ !cancelled() && matrix.pr == '12167' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Get-Module -ListAvailable Pester | Where-Object Version -ge ([version]'5.5.0'))) {
+            Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
+          }
+          Import-Module Pester -MinimumVersion 5.5.0 -Force
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = 'tests/studio_setup_ps1/Studio.Setup.FindInstalledUv.Tests.ps1'
+          $cfg.Run.Exit = $true
+          $cfg.Run.Throw = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $cfg
+      - name: no renamed system binaries left behind
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $hits = Get-ChildItem $env:RUNNER_TEMP, $env:TEMP -Recurse -File -Include *.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.VersionInfo.CompanyName -like 'Microsoft*' -and $_.VersionInfo.OriginalFilename -and ($_.Name -ne $_.VersionInfo.OriginalFilename.Replace('.MUI','')) }
+          $hits | ForEach-Object { "RENAMED_SYSTEM_BINARY $($_.FullName) <- $($_.VersionInfo.OriginalFilename)" }
+          "RENAMED_COUNT=$(@($hits).Count)"
