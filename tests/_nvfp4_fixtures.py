@@ -221,14 +221,23 @@ def run_lora_case(path, arch, api, out_dir):
         opt.zero_grad(set_to_none = True)
         losses.append(loss.item())
     model.eval()
-    with torch.no_grad():
-        want = model(input_ids = ids).logits.float()
+
+    # The first eval calls recompile after training and can run eager meanwhile; compiled and eager bf16 LoRA
+    # rounding differ by ~0.3%, so compare settled forwards (logits are bit-identical with TORCHDYNAMO_DISABLE=1).
+    def settled(m):
+        with torch.no_grad():
+            for _ in range(3):
+                m(input_ids = ids)
+            return m(input_ids = ids).logits.float()
+
+    want = settled(model)
     model.save_pretrained(os.path.join(out_dir, "lora"))
     fresh, _ = Fast.from_pretrained(path, max_seq_length = 64, load_in_4bit = False, dtype = torch.bfloat16)
     fresh = PeftModel.from_pretrained(fresh, os.path.join(out_dir, "lora"))
     fresh.eval()
-    with torch.no_grad():
-        got = fresh(input_ids = ids).logits.float()
+    got = settled(fresh)
+    adapters = lambda m: {k.replace(".default", ""): v for k, v in m.state_dict().items() if "lora_" in k}
+    trained, reloaded = adapters(model), adapters(fresh)
     return {
         "losses": losses,
         "input_dtypes": sorted(set(seen)),
@@ -237,6 +246,7 @@ def run_lora_case(path, arch, api, out_dir):
         "lora_changed": not torch.equal(lora_b(), b0),
         "saved": sorted(os.listdir(os.path.join(out_dir, "lora"))),
         "reload_max_abs": (got - want).abs().max().item(),
+        "adapters_equal": trained.keys() == reloaded.keys() and all(torch.equal(trained[k], reloaded[k]) for k in trained),
         "peak_gb": torch.cuda.max_memory_allocated() / 2**30,
     }
 
