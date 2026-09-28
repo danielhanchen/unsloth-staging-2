@@ -18,7 +18,7 @@ jobs:
         pr: ['12167', '12169']
         include:
           - {arm: base, sha: 268b771b953ad88f9f402761a4e3743c8e3c24d1}
-          - {pr: '12167', arm: head, sha: 4c4f2b57afca33527d49def81d865e694fe6ccb0}
+          - {pr: '12167', arm: head, sha: 9493f9a3746f32ebc5cfea51f261c103cefbb17f}
           - {pr: '12169', arm: head, sha: fb7106e76420ac92d2fbfd1cc49ae28d40b79ebd}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -46,6 +46,15 @@ jobs:
           Write-Host "PROOF_PYTEST_EXIT=$code"
           Select-String -Path pytest.log -Pattern 'console_attached|^(PASSED|FAILED|SKIPPED|ERROR) ' | ForEach-Object { "ID " + $_.Line }
           exit $code
+      - name: dev-machine gate (GITHUB_ACTIONS unset)
+        if: ${{ !cancelled() && matrix.pr == '12167' }}
+        shell: pwsh
+        run: |
+          Remove-Item Env:GITHUB_ACTIONS -ErrorAction SilentlyContinue
+          python -m pytest -rs -p no:cacheprovider tests/python/test_windows_setup_output_encoding.py -k "console_less or redirected_stream" 2>&1 | Tee-Object gate.log
+          $probes = Get-ChildItem $env:TEMP -Recurse -Filter '*_console_less_probe.ps1' -ErrorAction SilentlyContinue
+          "PROBE_FILES_LEFT=$(@($probes).Count)"
+          "GATE_SKIPS=$(@(Select-String -Path gate.log -Pattern 'FreeConsole probe trips').Count)"
       - name: rollback lifecycle (pwsh)
         if: ${{ !cancelled() && matrix.pr == '12167' }}
         run: pwsh -NoProfile -File tests/studio/test_install_rollback_lifecycle.ps1
