@@ -5255,11 +5255,9 @@ def _posix_join(parts) -> str:
 
 
 def _shell_assignments(command: str, self_refs: str = "keep") -> "dict[str, str]":
-    """`NAME=value` bindings, last wins. *self_refs* says what `p=$p/auth` binds: "keep" leaves `$p`
-    as written; "prior" takes the earlier binding (`p=..; p=$p/auth` -> `../auth`) and keeps `$p` with
-    none, as the shell reads the inherited value; "drop" binds nothing instead, so a repeated pass
-    cannot grow it. Only the credential passes use the last two, since they only ADD detections: a
-    subshell's `(p=/tmp)` is no prior binding, and replacing text with it hid `$UNSLOTH_STUDIO_HOME`."""
+    """`NAME=value` bindings, last wins. `p=$p/x` under *self_refs*: "keep" as written; "prior" the
+    earlier binding, else `$p`; "drop" the earlier binding, else nothing (a repeated pass can't grow).
+    Only the additive credential passes resolve them: a subshell's `(p=/tmp)` is no prior binding."""
     env: "dict[str, str]" = {}
     for name, value in _SHELL_ASSIGN_RE.findall(command):
         own = re.compile(rf"\$(?:{name}\b|\{{!?{name}\b[^{{}}]*\}})")
@@ -5281,10 +5279,9 @@ def _expand_shell_assignments(
     self_refs: str = "keep",
     budget: "int | None" = None,
 ) -> str:
-    """Best-effort substitution of `NAME=value ... $NAME`, so a sensitive path split across an
-    assignment and an argument (p=/etc; cat $p/passwd) is still visible to the scan. Also applies
-    pattern replacement. Fail-open: only adds detections. Growing the text by more than *budget*
-    raises `_ExpansionTooLarge` mid-substitution: `y=$x$x...; z=$y$y...` built ~1 GB otherwise."""
+    """Best-effort substitution of `NAME=value ... $NAME` (p=/etc; cat $p/passwd) and pattern
+    replacement. Fail-open: only adds detections. Past *budget* growth raises `_ExpansionTooLarge`
+    mid-substitution (`y=$x$x...; z=$y$y...` built ~1 GB)."""
     env = _shell_assignments(command, self_refs)
     if not env:
         return command
@@ -5337,10 +5334,8 @@ def _expand_shell_assignments(
 
 
 def _shell_assignment_passes(command: str):
-    """`_expand_shell_assignments` passes while each changes the text. A chain of n names settles
-    within n.bit_length() passes; cycles (`a=$b b=$c c=$a`) and copies (`b=$a$a`) never settle,
-    hence the pass cap. A later pass outgrowing the size cap stops mid-substitution and yields None:
-    the pass it cut off can resolve the path, so the caller refuses rather than scanning it."""
+    """Expansion passes while each changes the text; n chained names settle in n.bit_length() passes,
+    cycles never do. A later pass past the size cap yields None: the caller refuses."""
     passes = len({name for name, _ in _SHELL_ASSIGN_RE.findall(command)}).bit_length() + 1
     limit = 4 * len(command) + _MAX_TERMINAL_SCAN_CHARS
     for index in range(passes):
