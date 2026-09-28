@@ -1,0 +1,23 @@
+name: detached spawn experiment
+on:
+  push:
+    branches: [proof-12167-12169]
+    paths: ['exp/**', '.github/workflows/exp.yml']
+permissions:
+  contents: read
+jobs:
+  exp:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - run: python exp/spawn_exp.py
+      - run: python -m pip install pytest; python -m pytest -q -s exp/test_spawn_under_pytest.py

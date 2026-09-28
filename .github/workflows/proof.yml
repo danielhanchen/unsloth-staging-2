@@ -2,6 +2,7 @@ name: PR 12167 / 12169 Windows proof
 on:
   push:
     branches: [proof-12167-12169]
+    paths: ['.github/workflows/proof.yml']
 permissions:
   contents: read
 jobs:
