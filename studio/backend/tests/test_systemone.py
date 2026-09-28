@@ -1192,3 +1192,320 @@ def test_fp16_overflow_reruns_in_fp32(monkeypatch, gpu_agent):
     logits, _ = laya_runtime._forward(agent, _items())
     assert calls == [torch.float16, torch.float32] and agent.dtype == torch.float32
     assert logits.tolist() == [[1.0, 0.5]]
+
+
+def _tiny_laya_encoder(tmp_path):
+    pytest.importorskip("torch")
+    from transformers import ModernBertConfig
+
+    config = ModernBertConfig(
+        vocab_size = 300,
+        hidden_size = 64,
+        intermediate_size = 96,
+        num_hidden_layers = 3,
+        num_attention_heads = 4,
+        pad_token_id = 0,
+        bos_token_id = 2,
+        eos_token_id = 1,
+        cls_token_id = 1,
+        sep_token_id = 1,
+        mask_token_id = 4,
+        global_attn_every_n_layers = 3,
+        local_attention = 16,
+    )
+    encoder_dir = tmp_path / "encoder"
+    config.save_pretrained(encoder_dir)
+    return str(encoder_dir), {"encoder": "tiny", "head_layers": 1, "act_costs": {"escalate": 0.5}}
+
+
+def test_skip_init_build_matches_laya_after_loading(tmp_path):
+    torch = pytest.importorskip("torch")
+    laya = laya_runtime._laya()
+    encoder_dir, cfg = _tiny_laya_encoder(tmp_path)
+    reference = laya.common.build_model(cfg, encoder_dir = encoder_dir).eval()
+    fast = laya_runtime._build_model(cfg, encoder_dir, laya.common.build_model).eval()
+    embedding = fast.encoder.get_input_embeddings()
+    assert embedding.num_embeddings == 300 and fast.encoder.config.vocab_size == 300
+    assert embedding.padding_idx == reference.encoder.get_input_embeddings().padding_idx
+    # laya loads strictly, so every parameter and persistent buffer comes from the checkpoint.
+    fast.load_state_dict(reference.state_dict(), strict = True)
+    ours = dict(fast.named_parameters()) | dict(fast.named_buffers())
+    theirs = dict(reference.named_parameters()) | dict(reference.named_buffers())
+    assert ours.keys() == theirs.keys()
+    # Includes the rotary inv_freq buffers, which the checkpoint does not carry.
+    assert any("inv_freq" in name for name in theirs)
+    assert all(torch.equal(ours[name], theirs[name]) for name in theirs)
+    assert repr(fast) == repr(reference)
+    assert fast.encoder.config.to_dict() == reference.encoder.config.to_dict()
+    ids = torch.randint(5, 300, (2, 20))
+    args = (
+        ids,
+        torch.ones_like(ids),
+        torch.tensor([[3, 7]] * 2),
+        torch.ones(2, 2, dtype = torch.bool),
+        torch.zeros(2, dtype = torch.long),
+    )
+    with torch.inference_mode():
+        assert torch.equal(fast(*args)[0], reference(*args)[0])
+
+
+def test_skip_init_embedding_is_built_in_the_serving_dtype(tmp_path):
+    torch = pytest.importorskip("torch")
+    laya = laya_runtime._laya()
+    encoder_dir, cfg = _tiny_laya_encoder(tmp_path)
+    fast = laya_runtime._build_model(cfg, encoder_dir, laya.common.build_model, torch.float16)
+    assert fast.encoder.get_input_embeddings().weight.dtype == torch.float16
+    assert fast.encoder.embeddings.norm.weight.dtype == torch.float32
+
+
+def test_build_without_an_encoder_dir_is_laya_own(tmp_path):
+    pytest.importorskip("torch")
+    sentinel = object()
+    calls = []
+
+    def original(cfg, encoder_dir = None):
+        calls.append(encoder_dir)
+        return sentinel
+
+    assert laya_runtime._build_model({}, None, original) is sentinel
+    assert laya_runtime._build_model({}, str(tmp_path / "missing"), original) is sentinel
+    assert calls == [None, str(tmp_path / "missing")]
+
+
+def test_fallback_build_releases_the_speculative_encoder(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    import gc
+
+    from transformers import ModernBertModel
+
+    encoder_dir, cfg = _tiny_laya_encoder(tmp_path)
+    # An input embedding that is not a plain nn.Embedding sends the build back to laya's own builder.
+    monkeypatch.setattr(ModernBertModel, "get_input_embeddings", lambda self: torch.nn.Identity())
+    gc.collect()
+    before = sum(isinstance(o, ModernBertModel) for o in gc.get_objects())
+    during = []
+
+    def original(cfg, encoder_dir = None):
+        during.append(sum(isinstance(o, ModernBertModel) for o in gc.get_objects()))
+        return "laya"
+
+    assert laya_runtime._build_model(cfg, encoder_dir, original) == "laya"
+    assert during == [before]
+
+
+def test_build_hook_is_restored_even_when_loading_fails(monkeypatch):
+    pytest.importorskip("torch")  # laya imports torch
+    laya = laya_runtime._laya()
+    original = laya.agent.build_model
+    seen = []
+
+    def boom(path, **kwargs):
+        seen.append(laya.agent.build_model is not original)
+        raise FileNotFoundError(path)
+
+    monkeypatch.setattr(laya, "load", boom)
+    with pytest.raises(FileNotFoundError):
+        laya_runtime._load_laya("missing", device = "cpu")
+    assert seen == [True] and laya.agent.build_model is original
+
+
+def test_high_special_token_ids_still_skip_the_embedding_init(tmp_path):
+    torch = pytest.importorskip("torch")
+    from transformers import ModernBertConfig
+
+    laya = laya_runtime._laya()
+    encoder_dir, cfg = _tiny_laya_encoder(tmp_path)
+    # ModernBERT-large puts its special tokens at the end of the vocabulary (pad 50283 of 50368).
+    config = ModernBertConfig.from_pretrained(encoder_dir)
+    config.pad_token_id, config.bos_token_id, config.eos_token_id = 297, 295, 296
+    config.cls_token_id, config.sep_token_id = 295, 296
+    config.save_pretrained(encoder_dir)
+    built = []
+    real_skip_init = torch.nn.utils.skip_init
+
+    def skip_init(*args, **kwargs):
+        built.append(args[1])
+        return real_skip_init(*args, **kwargs)
+
+    from transformers import AutoModel
+
+    real_from_config = AutoModel.from_config
+    placeholder_vocab = []
+
+    def from_config(config, **kwargs):
+        placeholder_vocab.append(config.vocab_size)
+        return real_from_config(config, **kwargs)
+
+    torch.nn.utils.skip_init, AutoModel.from_config = skip_init, from_config
+    try:
+        fast = laya_runtime._build_model(cfg, encoder_dir, laya.common.build_model).eval()
+    finally:
+        torch.nn.utils.skip_init, AutoModel.from_config = real_skip_init, real_from_config
+    # One row, not one past the highest special id: otherwise the embedding is still randomly initialised.
+    assert placeholder_vocab == [1]
+    reference = laya.common.build_model(cfg, encoder_dir = encoder_dir).eval()
+    assert built == [300]
+    assert (
+        fast.encoder.get_input_embeddings().padding_idx
+        == 297
+        == reference.encoder.get_input_embeddings().padding_idx
+    )
+    fast.load_state_dict(reference.state_dict(), strict = True)
+    assert repr(fast) == repr(reference)
+    assert fast.encoder.config.to_dict() == reference.encoder.config.to_dict()
+    ids = torch.randint(5, 300, (2, 20))
+    args = (
+        ids,
+        torch.ones_like(ids),
+        torch.tensor([[3, 7]] * 2),
+        torch.ones(2, 2, dtype = torch.bool),
+        torch.zeros(2, dtype = torch.long),
+    )
+    with torch.inference_mode():
+        assert torch.equal(fast(*args)[0], reference(*args)[0])
+
+
+def _tiny_decision_batch(
+    torch,
+    rows = 4,
+    tokens = 40,
+):
+    generator = torch.Generator().manual_seed(0)
+    lengths = [tokens, 23, 9, 31][:rows]
+    ids = torch.randint(5, 300, (rows, tokens), generator = generator)
+    mask = torch.zeros(rows, tokens, dtype = torch.long)
+    for row, length in enumerate(lengths):
+        mask[row, :length] = 1
+        ids[row, length:] = 297
+    counts = [2, 5, 1, 3][:rows]
+    positions = torch.zeros(rows, 5, dtype = torch.long)
+    markers = torch.zeros(rows, 5, dtype = torch.bool)
+    for row, count in enumerate(counts):
+        positions[row, :count] = torch.randperm(lengths[row], generator = generator)[:count]
+        markers[row, :count] = True
+    return ids, mask, positions, markers, torch.tensor([0, 1, 2, 1][:rows])
+
+
+@pytest.mark.parametrize("head_layers", [1, 2, 3])
+def test_marker_head_matches_laya_forward(tmp_path, head_layers):
+    torch = pytest.importorskip("torch")
+    laya = laya_runtime._laya()
+    encoder_dir, cfg = _tiny_laya_encoder(tmp_path)
+    torch.manual_seed(0)
+    model = laya.common.build_model(
+        {**cfg, "head_layers": head_layers}, encoder_dir = encoder_dir
+    ).eval()
+    assert laya_runtime._marker_head(model)
+    args = _tiny_decision_batch(torch)
+    with torch.inference_mode():
+        want = model(*args)[0]
+        got = laya_runtime._decision_logits(model, *args)
+        assert got.dtype == want.dtype == torch.float32
+        torch.testing.assert_close(got, want, atol = 1e-5, rtol = 1e-4)
+        # Without padding the mask is dropped altogether.
+        unpadded = [arg[:1] for arg in args]
+        torch.testing.assert_close(
+            laya_runtime._decision_logits(model, *unpadded, padded = False),
+            model(*unpadded)[0],
+            atol = 1e-5,
+            rtol = 1e-4,
+        )
+
+
+def test_models_without_laya_head_keep_their_own_forward(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    laya = laya_runtime._laya()
+    encoder_dir, cfg = _tiny_laya_encoder(tmp_path)
+    assert not laya_runtime._marker_head(
+        laya.common.build_model({**cfg, "head_layers": 0}, encoder_dir = encoder_dir)
+    )
+    model = laya.common.build_model(cfg, encoder_dir = encoder_dir)
+    model.scorer[2].approximate = "tanh"
+    assert not laya_runtime._marker_head(model)
+    model = laya.common.build_model(cfg, encoder_dir = encoder_dir)
+    monkeypatch.setenv("UNSLOTH_SYSTEMONE_FAST", "0")
+    assert not laya_runtime._marker_head(model)
+
+
+def test_collate_matches_laya():
+    torch = pytest.importorskip("torch")
+    collate_items = laya_runtime._laya().common.collate_items
+    items = [
+        {"ids": [2, 7, 9, 1], "markers": [1, 2], "qtype": 1},
+        {"ids": [2, 8, 1], "markers": [1], "qtype": 0},
+        {"ids": [2, 5, 6, 7, 8, 9, 1], "markers": [1, 3, 5, 6], "qtype": 2},
+    ]
+    want = collate_items([items], 297)
+    got = laya_runtime._collate(items, 297)
+    for name in laya_runtime._INPUTS:
+        assert got[name].dtype == want[name].dtype and torch.equal(got[name], want[name]), name
+
+
+def test_cuda_graphs_replay_the_eager_logits(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a CUDA GPU")
+    laya = laya_runtime._laya()
+    encoder_dir, cfg = _tiny_laya_encoder(tmp_path)
+    torch.manual_seed(0)
+    model = laya.common.build_model({**cfg, "head_layers": 2}, encoder_dir = encoder_dir).eval()
+    agent = SimpleNamespace(model = model, device = torch.device("cpu"), dtype = torch.float32)
+    monkeypatch.setattr(laya_runtime, "_precision", lambda device, fp16_checkpoint: (None, None))
+    laya_runtime._place(agent, torch.device("cuda"), False)
+    ids, mask, positions, markers, qtype = _tiny_decision_batch(torch, rows = 3, tokens = 40)
+    batch = dict(zip(laya_runtime._INPUTS, (ids, mask, positions, markers, qtype)))
+    graphed = laya_runtime._run_model(agent, batch).clone()
+    graphs = agent.__dict__["_unsloth_graphs"]
+    if graphs.broken:
+        # transformers 4.x: ModernBERT cannot be captured, so the model runs eagerly with the same logits.
+        import transformers
+
+        assert int(transformers.__version__.split(".")[0]) < 5
+        with torch.inference_mode():
+            reference = model(*(value.cuda() for value in batch.values()))[0]
+        torch.testing.assert_close(graphed, reference, atol = 1e-4, rtol = 1e-4)
+        return
+    assert list(graphs.graphs) == [(4, 64, 8)]
+    # The same padded bucket run eagerly: rows 3 -> 4 repeat row 0, tokens 40 -> 64 and options 5 -> 8 are masked.
+    padded = {
+        "input_ids": torch.zeros(4, 64, dtype = torch.long),
+        "attention_mask": torch.zeros(4, 64, dtype = torch.long),
+        "marker_pos": torch.zeros(4, 8, dtype = torch.long),
+        "marker_mask": torch.zeros(4, 8, dtype = torch.bool),
+        "qtype": torch.zeros(4, dtype = torch.long),
+    }
+    for name, value in batch.items():
+        if value.dim() == 1:
+            padded[name][:3] = value
+        else:
+            padded[name][:3, : value.shape[1]] = value
+        padded[name][3:] = padded[name][:1]
+    with torch.inference_mode():
+        eager = laya_runtime._decision_logits(
+            model, *(padded[name].cuda() for name in laya_runtime._INPUTS)
+        )
+    assert torch.equal(graphed, eager[:3, :5])
+    with torch.inference_mode():
+        reference = model(*(value.cuda() for value in batch.values()))[0]
+    torch.testing.assert_close(graphed, reference, atol = 1e-4, rtol = 1e-4)
+    # A second request with other contents replays the same graph.
+    batch["input_ids"] = torch.randint(5, 300, ids.shape)
+    with torch.inference_mode():
+        reference = model(*(value.cuda() for value in batch.values()))[0]
+    torch.testing.assert_close(
+        laya_runtime._run_model(agent, batch), reference, atol = 1e-4, rtol = 1e-4
+    )
+    assert len(graphs.graphs) == 1
+    # Moving or recasting the model drops the graphs that point at its old weights.
+    laya_runtime._place(agent, torch.device("cuda"), False)
+    assert "_unsloth_graphs" not in agent.__dict__
+    # Batches too large to be worth padding into a bucket run eagerly.
+    assert (
+        laya_runtime._CUDAGraphs(agent).run(
+            {"input_ids": torch.zeros(16, 1024), "marker_pos": torch.zeros(16, 2)}
+        )
+        is None
+    )
+    monkeypatch.setenv("UNSLOTH_SYSTEMONE_CUDA_GRAPHS", "0")
+    laya_runtime._run_model(agent, batch)
+    assert "_unsloth_graphs" not in agent.__dict__
