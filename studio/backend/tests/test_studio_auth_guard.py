@@ -1581,6 +1581,11 @@ _AMPLIFY = "x=" + "A" * 20 + "; y=" + "$x" * 20 + "; z=" + "$y" * 20 + "; "
         (_AMPLIFY + 'r=../..; q=$r; s=$q; cd "$s"; cat auth/auth.db', True),
         ("export PATH=$PATH:/usr/local/bin; echo ok", False),
         ("x=" + "A" * 500 + "; y=" + "$x" * 100 + "; z=" + "$y" * 100 + "; echo ok", True),
+        (
+            "(UNSLOTH_STUDIO_HOME=/tmp); UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME; "
+            'cat "$UNSLOTH_STUDIO_HOME/auth/auth.db"',
+            True,
+        ),
     ),
     ids = (
         "self-reference",
@@ -1594,6 +1599,7 @@ _AMPLIFY = "x=" + "A" * 20 + "; y=" + "$x" * 20 + "; z=" + "$y" * 20 + "; "
         "amplified",
         "path",
         "fan-out",
+        "subshell",
     ),
 )
 def test_assignment_expansion_settles(studio_home, monkeypatch, command, refused):

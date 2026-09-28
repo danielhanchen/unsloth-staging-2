@@ -5254,16 +5254,16 @@ def _posix_join(parts) -> str:
     return out
 
 
-def _shell_assignments(command: str, inherited: bool = True) -> "dict[str, str]":
-    """`NAME=value` bindings, last wins; a self-reference takes the prior binding (`p=..; p=$p/auth`
-    -> `../auth`), as the shell does. Substituting it into itself doubled `PATH=$PATH:/x` forever.
-    With no prior binding the shell reads the inherited value: *inherited* keeps the `$NAME` spelling
-    (erasing it hid `UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME; cat "$UNSLOTH_STUDIO_HOME/auth/auth.db"`),
-    otherwise it binds nothing, so a repeated pass cannot grow it."""
+def _shell_assignments(command: str, self_refs: str = "keep") -> "dict[str, str]":
+    """`NAME=value` bindings, last wins. *self_refs* says what `p=$p/auth` binds: "keep" leaves `$p`
+    as written; "prior" takes the earlier binding (`p=..; p=$p/auth` -> `../auth`) and keeps `$p` with
+    none, as the shell reads the inherited value; "drop" binds nothing instead, so a repeated pass
+    cannot grow it. Only the credential passes use the last two, since they only ADD detections: a
+    subshell's `(p=/tmp)` is no prior binding, and replacing text with it hid `$UNSLOTH_STUDIO_HOME`."""
     env: "dict[str, str]" = {}
     for name, value in _SHELL_ASSIGN_RE.findall(command):
         own = re.compile(rf"\$(?:{name}\b|\{{!?{name}\b[^{{}}]*\}})")
-        if (name in env or not inherited) and own.search(value):
+        if self_refs != "keep" and (name in env or self_refs == "drop") and own.search(value):
             value = own.sub(lambda _m: env.get(name, ""), value)
             # Repeated `a=$a$a` doubles; past any real path length the earlier binding stands.
             if len(value) > _MAX_PATH_SCAN_CHARS:
@@ -5278,14 +5278,14 @@ class _ExpansionTooLarge(Exception):
 
 def _expand_shell_assignments(
     command: str,
-    inherited: bool = True,
+    self_refs: str = "keep",
     budget: "int | None" = None,
 ) -> str:
     """Best-effort substitution of `NAME=value ... $NAME`, so a sensitive path split across an
     assignment and an argument (p=/etc; cat $p/passwd) is still visible to the scan. Also applies
     pattern replacement. Fail-open: only adds detections. Growing the text by more than *budget*
     raises `_ExpansionTooLarge` mid-substitution: `y=$x$x...; z=$y$y...` built ~1 GB otherwise."""
-    env = _shell_assignments(command, inherited)
+    env = _shell_assignments(command, self_refs)
     if not env:
         return command
     grown = 0
@@ -5346,7 +5346,9 @@ def _shell_assignment_passes(command: str):
     for index in range(passes):
         try:
             expanded = _expand_shell_assignments(
-                command, inherited = not index, budget = limit - len(command) if index else None
+                command,
+                self_refs = "drop" if index else "prior",
+                budget = limit - len(command) if index else None,
             )
         except _ExpansionTooLarge:
             yield None
