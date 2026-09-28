@@ -222,7 +222,7 @@ jobs:
           Write-Host "bundled install.ps1 matches $(git rev-parse --short HEAD) and is signed"
           Run-Installer $official
           if ((Installed) -ne $want) { Write-Host "::error::restore reports $(Installed), want $want"; exit 1 }
-          Write-Host "install over $want, then restore to $want: OK"
+          Write-Host "install over ${want}, then restore to ${want}: OK"
 
       - name: Stage and upload
         shell: pwsh
