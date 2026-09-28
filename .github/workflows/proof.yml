@@ -15,10 +15,10 @@ jobs:
       matrix:
         os: [windows-latest, windows-11-arm]
         arm: [base, head]
-        pr: ['12166']
+        pr: ['12178']
         include:
-          - {arm: base, sha: 268b771b953ad88f9f402761a4e3743c8e3c24d1}
-          - {pr: '12166', arm: head, sha: 8f5b413f183f3e33459bbacd51b9b368a13454fa}
+          - {arm: base, sha: be9e6afd9269f3b1b63fa7c657ba710fd911482a}
+          - {pr: '12178', arm: head, sha: 2cd84e6f96eae1defc01463a23dc15dbbdde7dc2}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -35,7 +35,17 @@ jobs:
         env:
           PR: ${{ matrix.pr }}
         run: |
-          if ($env:PR -eq '12166') {
+          if ($env:PR -eq '12178') {
+            $files = @('tests/python/test_windows_installer_concurrency_guard.py')
+            if (Test-Path 'tests/security/test_lint_av_shapes.py') { $files += 'tests/security/test_lint_av_shapes.py' }
+            python -m pytest -rA -s -p no:cacheprovider @files 2>&1 | Tee-Object pytest.log
+            $code = $LASTEXITCODE
+            Write-Host "PROOF_PYTEST_EXIT=$code"
+            Select-String -Path pytest.log -Pattern '^(PASSED|FAILED|SKIPPED|ERROR) ' | ForEach-Object { "ID " + $_.Line }
+            pwsh -NoProfile -File tests/studio/test_path_resolver_degrades.ps1
+            if ($LASTEXITCODE -ne 0) { $code = 1 }
+            exit $code
+          } elseif ($env:PR -eq '12166') {
             if (-not (Test-Path 'unsloth_cli/tests/test_ssl_keylog.py')) { 'NO_TEST_ON_THIS_ARM'; exit 0 }
             $files = @('unsloth_cli/tests/test_ssl_keylog.py')
           } elseif ($env:PR -eq '12167') {
