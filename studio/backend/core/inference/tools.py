@@ -4018,7 +4018,9 @@ def _references_studio_credential_here(
         # directory every later relative path opens from, and handing the unexpanded text to the cwd
         # walk read `$d` as a directory name and never moved.
         for expanded in _shell_assignment_passes(text):
-            if _references_studio_credential_here(expanded, workdir, _expanded = True):
+            if expanded is None or _references_studio_credential_here(
+                expanded, workdir, _expanded = True
+            ):
                 return True
     # A `cd` earlier in the command moves where every later relative path opens from.
     if workdir and ("cd" in text.lower() or "pushd" in text.lower()):
@@ -5252,13 +5254,16 @@ def _posix_join(parts) -> str:
     return out
 
 
-def _shell_assignments(command: str) -> "dict[str, str]":
+def _shell_assignments(command: str, inherited: bool = True) -> "dict[str, str]":
     """`NAME=value` bindings, last wins; a self-reference takes the prior binding (`p=..; p=$p/auth`
-    -> `../auth`), as the shell does. Substituting it into itself doubled `PATH=$PATH:/x` forever."""
+    -> `../auth`), as the shell does. Substituting it into itself doubled `PATH=$PATH:/x` forever.
+    With no prior binding the shell reads the inherited value: *inherited* keeps the `$NAME` spelling
+    (erasing it hid `UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME; cat "$UNSLOTH_STUDIO_HOME/auth/auth.db"`),
+    otherwise it binds nothing, so a repeated pass cannot grow it."""
     env: "dict[str, str]" = {}
     for name, value in _SHELL_ASSIGN_RE.findall(command):
         own = re.compile(rf"\$(?:{name}\b|\{{!?{name}\b[^{{}}]*\}})")
-        if own.search(value):
+        if (name in env or not inherited) and own.search(value):
             value = own.sub(lambda _m: env.get(name, ""), value)
             # Repeated `a=$a$a` doubles; past any real path length the earlier binding stands.
             if len(value) > _MAX_PATH_SCAN_CHARS:
@@ -5267,11 +5272,11 @@ def _shell_assignments(command: str) -> "dict[str, str]":
     return env
 
 
-def _expand_shell_assignments(command: str) -> str:
+def _expand_shell_assignments(command: str, inherited: bool = True) -> str:
     """Best-effort substitution of `NAME=value ... $NAME`, so a sensitive path split across an
     assignment and an argument (p=/etc; cat $p/passwd) is still visible to the scan. Also applies
     pattern replacement. Fail-open: only adds detections."""
-    env = _shell_assignments(command)
+    env = _shell_assignments(command, inherited)
     if not env:
         return command
 
@@ -5308,12 +5313,16 @@ def _expand_shell_assignments(command: str) -> str:
 def _shell_assignment_passes(command: str):
     """`_expand_shell_assignments` passes while each changes the text. A chain of n names settles
     within n.bit_length() passes; cycles (`a=$b b=$c c=$a`) and copies (`b=$a$a`) never settle,
-    hence the pass cap and the size cap."""
+    hence the pass cap. A later pass past the size cap yields None: the pass it cut off can resolve
+    the path, so the caller refuses rather than scanning it."""
     passes = len({name for name, _ in _SHELL_ASSIGN_RE.findall(command)}).bit_length() + 1
     limit = 4 * len(command) + _MAX_TERMINAL_SCAN_CHARS
     for index in range(passes):
-        expanded = _expand_shell_assignments(command)
-        if expanded == command or (index and len(expanded) > limit):
+        expanded = _expand_shell_assignments(command, inherited = not index)
+        if expanded == command:
+            return
+        if index and len(expanded) > limit:
+            yield None
             return
         yield expanded
         command = expanded

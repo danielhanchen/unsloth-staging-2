@@ -1564,6 +1564,7 @@ def test_a_shell_variable_supplying_the_cd_target(studio_home):
 
 
 _CHAIN = "; ".join(["v0=../.."] + [f"v{i}=$v{i - 1}" for i in range(1, 40)])
+_AMPLIFY = "x=" + "A" * 20 + "; y=" + "$x" * 20 + "; z=" + "$y" * 20 + "; "
 
 
 @pytest.mark.parametrize(
@@ -1571,13 +1572,27 @@ _CHAIN = "; ".join(["v0=../.."] + [f"v{i}=$v{i - 1}" for i in range(1, 40)])
     (
         ('echo "hb=$hb fl=$fl"', False),
         ("a=$b b=$c c=$a; echo " + "\\" * 30 + "x", False),
-        (" ".join(["a=X"] + [f"{b}=" + f"${a}" * 8 for a, b in zip("abcdefg", "bcdefgh")]), False),
+        (" ".join(["a=X"] + [f"{b}=" + f"${a}" * 8 for a, b in zip("abcdefg", "bcdefgh")]), True),
         (f"{_CHAIN}; r=$v39; r=$r/auth; cat $r/config.json", True),
         ("a=X; " + "a=$a$a; " * 40 + "echo $a", False),
         ("p=..; p=$p/..; p=$p/auth; sqlite3 $p/auth.db .dump", True),
         ("x=" + "A" * 1000 + "; : " + "$x " * 10 + "; r=../..; cat $r/auth/auth.db", True),
+        ('UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME; cat "$UNSLOTH_STUDIO_HOME/auth/auth.db"', True),
+        (_AMPLIFY + 'r=../..; q=$r; s=$q; cd "$s"; cat auth/auth.db', True),
+        ("export PATH=$PATH:/usr/local/bin; echo ok", False),
     ),
-    ids = ("self-reference", "cycle", "copies", "chain", "doubling", "rebound", "padded"),
+    ids = (
+        "self-reference",
+        "cycle",
+        "copies",
+        "chain",
+        "doubling",
+        "rebound",
+        "padded",
+        "inherited",
+        "amplified",
+        "path",
+    ),
 )
 def test_assignment_expansion_settles(studio_home, monkeypatch, command, refused):
     expand, calls = tools._expand_shell_assignments, []
