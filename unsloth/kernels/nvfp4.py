@@ -113,18 +113,37 @@ def nvfp4_dequantize(packed, scale, global_scale, dtype = torch.bfloat16):
     return _nvfp4_dequantize_torch(packed, scale, global_scale, dtype)
 
 
+# Opaque to torch.compile as whole matmuls: if the dequantized weight were a graph value, AOTAutograd would save it for
+# backward in every layer (3.6x the NVFP4 storage each), which is exactly the memory W4A16 exists to avoid.
+@_opaque_under_compile(
+    "nvfp4_matmul_fwd",
+    lambda X, packed, scale, global_scale: X.new_empty(X.shape[:-1] + (packed.shape[0],)),
+)
+def _nvfp4_matmul_fwd(
+    X: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor, global_scale: torch.Tensor
+) -> torch.Tensor:
+    return torch.matmul(X, nvfp4_dequantize(packed, scale, global_scale, X.dtype).t())
+
+
+@_opaque_under_compile(
+    "nvfp4_matmul_bwd",
+    lambda grad, packed, scale, global_scale: grad.new_empty(grad.shape[:-1] + (packed.shape[1] * 2,)),
+)
+def _nvfp4_matmul_bwd(
+    grad: torch.Tensor, packed: torch.Tensor, scale: torch.Tensor, global_scale: torch.Tensor
+) -> torch.Tensor:
+    return torch.matmul(grad, nvfp4_dequantize(packed, scale, global_scale, grad.dtype))
+
+
 class NVFP4Linear_matmul(torch.autograd.Function):
     @staticmethod
     def forward(ctx, X, packed, scale, global_scale, bias = None):
-        W = nvfp4_dequantize(packed, scale, global_scale, X.dtype)
-        output = torch.matmul(X, W.t())
-        del W
+        output = _nvfp4_matmul_fwd(X, packed, scale, global_scale)
         if bias is not None:
             output = output + bias
             # A float32 bias promotes; cast back only then (a no-op .to() aliases, zeroing dX under torch 2.11 compile).
             if output.dtype != X.dtype:
                 output = output.to(X.dtype)
-        # Only the packed tensors: saving the dense weight would cost 3.6x the NVFP4 storage per layer.
         ctx.save_for_backward(packed, scale, global_scale)
         ctx.bias_grad = bias is not None and bias.requires_grad
         ctx.dtype = X.dtype
@@ -135,8 +154,7 @@ class NVFP4Linear_matmul(torch.autograd.Function):
         packed, scale, global_scale = ctx.saved_tensors
         grad_X = None
         if ctx.needs_input_grad[0]:
-            W = nvfp4_dequantize(packed, scale, global_scale, grad_output.dtype)
-            grad_X = torch.matmul(grad_output, W)
+            grad_X = _nvfp4_matmul_bwd(grad_output, packed, scale, global_scale)
             if grad_X.dtype != ctx.dtype:
                 grad_X = grad_X.to(ctx.dtype)
         grad_bias = None
