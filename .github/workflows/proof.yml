@@ -15,10 +15,10 @@ jobs:
       matrix:
         os: [windows-latest, windows-11-arm]
         arm: [base, head]
-        pr: ['12169']
+        pr: ['12167', '12169']
         include:
           - {arm: base, sha: 268b771b953ad88f9f402761a4e3743c8e3c24d1}
-          - {pr: '12167', arm: head, sha: d7b291ececa5276af9f50883a81612a5cc3fa073}
+          - {pr: '12167', arm: head, sha: 4c4f2b57afca33527d49def81d865e694fe6ccb0}
           - {pr: '12169', arm: head, sha: fb7106e76420ac92d2fbfd1cc49ae28d40b79ebd}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
