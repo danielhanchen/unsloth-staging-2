@@ -1,0 +1,618 @@
+diff --git a/winsup/cygwin/fhandler/pipe.cc b/winsup/cygwin/fhandler/pipe.cc
+index 11ef78c..7fc42c8 100644
+--- a/winsup/cygwin/fhandler/pipe.cc
++++ b/winsup/cygwin/fhandler/pipe.cc
+@@ -800,8 +800,10 @@ fhandler_pipe::close (int flag)
+ 
+ #ifdef __MSYS__
+ #define PIPE_INTRO "\\\\.\\pipe\\msys-"
++#define PIPE_INTRO_LOCAL "\\\\.\\pipe\\LOCAL\\msys-"
+ #else
+ #define PIPE_INTRO "\\\\.\\pipe\\cygwin-"
++#define PIPE_INTRO_LOCAL "\\\\.\\pipe\\LOCAL\\cygwin-"
+ #endif
+ 
+ /* Create a pipe, and return handles to the read and write ends,
+@@ -827,8 +829,11 @@ fhandler_pipe::create (LPSECURITY_ATTRIBUTES sa_ptr, PHANDLE r, PHANDLE w,
+     psize = DEFAULT_PIPEBUFSIZE;
+ 
+   char pipename[MAX_PATH];
+-  size_t len = __small_sprintf (pipename, PIPE_INTRO "%S-",
+-				      &cygheap->installation_key);
++  /* An AppContainer may only create pipes below \\.\pipe\LOCAL\. */
++  size_t len = __small_sprintf (pipename, "%s%S-",
++				*appcontainer_pipe_prefix () ? PIPE_INTRO_LOCAL
++							     : PIPE_INTRO,
++				&cygheap->installation_key);
+   DWORD pipe_mode = PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS;
+   if (!name)
+     pipe_mode |= pipe_byte ? PIPE_TYPE_BYTE : PIPE_TYPE_MESSAGE;
+@@ -1064,7 +1069,8 @@ nt_create (LPSECURITY_ATTRIBUTES sa_ptr, HANDLE &r, HANDLE &w, DWORD psize,
+ 
+   UNICODE_STRING pipename;
+   WCHAR pipename_buf[MAX_PATH];
+-  size_t len = __small_swprintf (pipename_buf, L"%S-%u-",
++  size_t len = __small_swprintf (pipename_buf, L"%W%S-%u-",
++				 appcontainer_pipe_prefix (),
+ 				 &cygheap->installation_key,
+ 				 GetCurrentProcessId ());
+ 
+diff --git a/winsup/cygwin/fhandler/pty.cc b/winsup/cygwin/fhandler/pty.cc
+index 56cf624..b6d8992 100644
+--- a/winsup/cygwin/fhandler/pty.cc
++++ b/winsup/cygwin/fhandler/pty.cc
+@@ -3290,7 +3290,7 @@ fhandler_pty_master::setup ()
+ 				PIPE_WAIT | PIPE_TYPE_MESSAGE
+ 				| PIPE_READMODE_MESSAGE
+ 				| PIPE_REJECT_REMOTE_CLIENTS,
+-				1, 4096, 4096, 0, &sec_all_nih);
++				1, 4096, 4096, 0, sec_all_ac (false));
+   if (master_ctl == INVALID_HANDLE_VALUE)
+     {
+       errstr = "pty master control pipe";
+diff --git a/winsup/cygwin/fork.cc b/winsup/cygwin/fork.cc
+index 2aa5273..25b9c32 100644
+--- a/winsup/cygwin/fork.cc
++++ b/winsup/cygwin/fork.cc
+@@ -363,7 +363,7 @@ frok::parent (volatile char * volatile stack_here)
+       hchild = NULL;
+       /* cygwin1.dll may reuse the forking_progname buffer, even
+ 	 in case of failure: don't reuse forking_progname later */
+-      rc = CreateProcessW (forking_progname,	/* image to run */
++      rc = create_process_fixed_layout (forking_progname,	/* image to run */
+ 			   GetCommandLineW (),	/* Take same space for command
+ 						   line as in parent to make
+ 						   sure child stack is allocated
+diff --git a/winsup/cygwin/loadavg.cc b/winsup/cygwin/loadavg.cc
+index 63a1ece..52121a1 100644
+--- a/winsup/cygwin/loadavg.cc
++++ b/winsup/cygwin/loadavg.cc
+@@ -97,7 +97,7 @@ static bool load_init (void)
+ 	; /* Ignore missing counter, just use zero in later calculations */
+       }
+ 
+-    mutex = CreateMutex(&sec_all_nih, FALSE, "cyg.loadavg.mutex");
++    mutex = CreateMutex(sec_all_ac (false), FALSE, "cyg.loadavg.mutex");
+     if (!mutex) {
+       debug_printf("opening loadavg mutexfailed\n");
+       return false;
+diff --git a/winsup/cygwin/local_includes/security.h b/winsup/cygwin/local_includes/security.h
+index b31edfe..9071ea7 100644
+--- a/winsup/cygwin/local_includes/security.h
++++ b/winsup/cygwin/local_includes/security.h
+@@ -48,7 +48,7 @@ bool check_token_membership (PSID);
+ #define MAX_DACL_LEN(n) (sizeof (ACL) \
+ 		   + (n) * (sizeof (ACCESS_ALLOWED_ACE) - sizeof (DWORD) \
+ 			    + SECURITY_MAX_SID_SIZE))
+-#define SD_MIN_SIZE (sizeof (SECURITY_DESCRIPTOR) + MAX_DACL_LEN (1))
++#define SD_MIN_SIZE (sizeof (SECURITY_DESCRIPTOR) + MAX_DACL_LEN (2))
+ #define ACL_MAXIMUM_SIZE 65532	/* Yeah, right.  64K - sizeof (DWORD). */
+ #define SD_MAXIMUM_SIZE 65536
+ #define NO_SID ((PSID)NULL)
+@@ -379,6 +379,8 @@ extern cygpsid well_known_service_sid;
+ extern cygpsid well_known_authenticated_users_sid;
+ extern cygpsid well_known_this_org_sid;
+ extern cygpsid well_known_system_sid;
++extern cygpsid well_known_all_app_packages_sid;
++extern bool in_appcontainer ();
+ extern cygpsid well_known_local_service_sid;
+ extern cygpsid well_known_network_service_sid;
+ extern cygpsid well_known_builtin_sid;
+@@ -510,6 +512,17 @@ void set_cygwin_privileges (HANDLE token);
+ 
+ /* Various types of security attributes for use in Create* functions. */
+ extern SECURITY_ATTRIBUTES sec_none, sec_none_nih, sec_all, sec_all_nih;
++/* sec_all/sec_all_nih carry a NULL DACL, which other processes in the
++   same AppContainer cannot open; this returns an explicit DACL there. */
++extern PSECURITY_ATTRIBUTES sec_all_ac (bool inherit);
++/* CreateProcessW for Cygwin children, keeping the fixed memory layout
++   usable inside an AppContainer. */
++extern BOOL create_process_fixed_layout (LPCWSTR, LPWSTR,
++					 LPSECURITY_ATTRIBUTES,
++					 LPSECURITY_ATTRIBUTES, BOOL, DWORD,
++					 LPVOID, LPCWSTR, LPSTARTUPINFOW,
++					 LPPROCESS_INFORMATION);
++extern void relaunch_with_fixed_layout ();
+ extern SECURITY_ATTRIBUTES *__sec_user (PVOID, PSID, PSID,
+ 						  DWORD, BOOL);
+ 
+diff --git a/winsup/cygwin/local_includes/shared_info.h b/winsup/cygwin/local_includes/shared_info.h
+index 4316717..1a1ae44 100644
+--- a/winsup/cygwin/local_includes/shared_info.h
++++ b/winsup/cygwin/local_includes/shared_info.h
+@@ -87,6 +87,7 @@ void shared_destroy ();
+ 
+ HANDLE get_shared_parent_dir ();
+ HANDLE get_session_parent_dir ();
++PCWSTR appcontainer_pipe_prefix ();
+ char *shared_name (char *, const char *, int);
+ WCHAR *shared_name (WCHAR *, const WCHAR *, int);
+ void *open_shared (const WCHAR *, int, HANDLE&, DWORD,
+diff --git a/winsup/cygwin/mm/cygheap.cc b/winsup/cygwin/mm/cygheap.cc
+index 4a60995..4ffefa1 100644
+--- a/winsup/cygwin/mm/cygheap.cc
++++ b/winsup/cygwin/mm/cygheap.cc
+@@ -298,6 +298,10 @@ cygheap_init ()
+ 					       CYGHEAP_STORAGE_INITIAL
+ 					       - CYGHEAP_STORAGE_LOW,
+ 					       MEM_COMMIT, PAGE_READWRITE);
++      /* Inside an AppContainer a randomized allocation can occupy the
++	 fixed range; start over in a child with a fixed layout. */
++      if (!cygheap)
++	relaunch_with_fixed_layout ();
+       cygheap_max = (char *) cygheap + sizeof (*cygheap);
+       /* Default locale settings. */
+       cygheap->locale.mbtowc = __utf8_mbtowc;
+diff --git a/winsup/cygwin/mm/shared.cc b/winsup/cygwin/mm/shared.cc
+index 7977df3..96ab685 100644
+--- a/winsup/cygwin/mm/shared.cc
++++ b/winsup/cygwin/mm/shared.cc
+@@ -29,6 +29,211 @@ user_info NO_COPY *user_shared;
+ HANDLE NO_COPY cygwin_shared_h;
+ HANDLE NO_COPY cygwin_user_h;
+ 
++/* An AppContainer process may not create objects in the global
++   \BaseNamedObjects or \Sessions\BNOLINKS directories.  The Win32
++   named-object APIs redirect it to its own directory, but absolute NT paths
++   are not redirected, so build the path of that directory here.  Returns
++   false outside an AppContainer. */
++static bool
++appcontainer_object_dir (PWCHAR buf, ULONG session_id)
++{
++  HANDLE tok;
++  ULONG is_ac = 0, size;
++  bool ret = false;
++
++  if (!NT_SUCCESS (NtOpenProcessToken (NtCurrentProcess (), TOKEN_QUERY,
++				       &tok)))
++    return false;
++  if (NT_SUCCESS (NtQueryInformationToken (tok, TokenIsAppContainer, &is_ac,
++					   sizeof is_ac, &size)) && is_ac)
++    {
++      BYTE info[sizeof (TOKEN_APPCONTAINER_INFORMATION) + SECURITY_MAX_SID_SIZE];
++      if (NT_SUCCESS (NtQueryInformationToken (tok, TokenAppContainerSid, info,
++					       sizeof info, &size)))
++	{
++	  PSID sid = ((PTOKEN_APPCONTAINER_INFORMATION) info)->TokenAppContainer;
++	  WCHAR sidstr[256];
++	  UNICODE_STRING usid;
++
++	  RtlInitEmptyUnicodeString (&usid, sidstr, sizeof sidstr);
++	  if (sid && NT_SUCCESS (RtlConvertSidToUnicodeString (&usid, sid,
++							      FALSE)))
++	    {
++	      __small_swprintf (buf,
++				L"\\Sessions\\%u\\AppContainerNamedObjects\\%S",
++				session_id, &usid);
++	      ret = true;
++	    }
++	}
++    }
++  NtClose (tok);
++  return ret;
++}
++
++/* True when this process runs in an AppContainer.  Its access checks also
++   need the AppContainer side of a DACL granted, see sec_acl. */
++bool
++in_appcontainer ()
++{
++  static NO_COPY int cached = -1;
++
++  if (cached < 0)
++    {
++      HANDLE tok;
++      ULONG is_ac = 0, size;
++
++      cached = 0;
++      if (NT_SUCCESS (NtOpenProcessToken (NtCurrentProcess (), TOKEN_QUERY,
++					  &tok)))
++	{
++	  if (NT_SUCCESS (NtQueryInformationToken (tok, TokenIsAppContainer,
++						   &is_ac, sizeof is_ac,
++						   &size)))
++	    cached = is_ac ? 1 : 0;
++	  NtClose (tok);
++	}
++    }
++  return cached == 1;
++}
++
++static ULONG
++current_session_id ()
++{
++  PROCESS_SESSION_INFORMATION psi;
++
++  if (!NT_SUCCESS (NtQueryInformationProcess (NtCurrentProcess (),
++					      ProcessSessionInformation,
++					      &psi, sizeof psi, NULL)))
++    return 0;
++  return psi.SessionId;
++}
++
++/* Named pipes follow the same rule: an AppContainer may only create them
++   below its own prefix of the named pipe file system, which Win32 spells
++   \\.\pipe\LOCAL\.  Returns that prefix relative to \Device\NamedPipe\,
++   with a trailing backslash, or an empty string outside an AppContainer. */
++PCWSTR
++appcontainer_pipe_prefix ()
++{
++  static NO_COPY WCHAR prefix[MAX_PATH];
++  static NO_COPY bool done;
++
++  if (!done)
++    {
++      WCHAR acdir[MAX_PATH];
++      /* acdir is \Sessions\N\AppContainerNamedObjects\SID; drop the
++	 leading backslash to make it relative to the NPFS root. */
++      if (appcontainer_object_dir (acdir, current_session_id ()))
++	__small_swprintf (prefix, L"%W\\", acdir + 1);
++      else
++	prefix[0] = L'\0';
++      done = true;
++    }
++  return prefix;
++}
++
++#ifndef PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY
++#define PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY 0x00020007
++#endif
++#define MITIGATION_BOTTOM_UP_ASLR_ALWAYS_OFF	(0x00000002ULL << 16)
++#define MITIGATION_HIGH_ENTROPY_ASLR_ALWAYS_OFF	(0x00000002ULL << 20)
++
++/* An AppContainer process runs with bottom-up and high-entropy ASLR forced
++   on, and so do the children it creates.  A randomized allocation made by
++   the loader can then land in the child's fixed cygheap range and the fork
++   or exec fails with "cygheap read copy failed".  Ask for those two
++   policies off in the child; fall back to a plain CreateProcessW if the
++   system refuses the attribute. */
++BOOL
++create_process_fixed_layout (LPCWSTR app, LPWSTR cmd,
++			     LPSECURITY_ATTRIBUTES psa,
++			     LPSECURITY_ATTRIBUTES tsa, BOOL inherit,
++			     DWORD flags, LPVOID env, LPCWSTR cwd,
++			     LPSTARTUPINFOW si, LPPROCESS_INFORMATION pi)
++{
++  if (in_appcontainer ())
++    {
++      SIZE_T size = 0;
++      InitializeProcThreadAttributeList (NULL, 1, 0, &size);
++      PPROC_THREAD_ATTRIBUTE_LIST attr
++	= (PPROC_THREAD_ATTRIBUTE_LIST) alloca (size);
++      DWORD64 policy = MITIGATION_BOTTOM_UP_ASLR_ALWAYS_OFF
++		       | MITIGATION_HIGH_ENTROPY_ASLR_ALWAYS_OFF;
++      if (InitializeProcThreadAttributeList (attr, 1, 0, &size))
++	{
++	  BOOL ret = FALSE;
++	  if (UpdateProcThreadAttribute (attr, 0,
++					 PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
++					 &policy, sizeof policy, NULL, NULL))
++	    {
++	      STARTUPINFOEXW six;
++	      memset (&six, 0, sizeof six);
++	      six.StartupInfo = *si;
++	      six.StartupInfo.cb = sizeof six;
++	      six.lpAttributeList = attr;
++	      ret = CreateProcessW (app, cmd, psa, tsa, inherit,
++				    flags | EXTENDED_STARTUPINFO_PRESENT,
++				    env, cwd, &six.StartupInfo, pi);
++	      if (!ret)
++		debug_printf ("CreateProcessW with ASLR attribute, %E");
++	    }
++	  DeleteProcThreadAttributeList (attr);
++	  if (ret)
++	    return ret;
++	}
++    }
++  return CreateProcessW (app, cmd, psa, tsa, inherit, flags, env, cwd, si,
++			 pi);
++}
++
++/* The root process of a tree is created by whoever launched it, so inside
++   an AppContainer it keeps high-entropy ASLR and its fixed cygheap range
++   can already be taken.  Run the same command again as a child created by
++   create_process_fixed_layout, pass the standard handles through, and exit
++   with its status.  Returns only if that is not possible. */
++void
++relaunch_with_fixed_layout ()
++{
++  typedef BOOL (WINAPI *gpmp_t) (HANDLE, int, PVOID, SIZE_T);
++  gpmp_t gpmp = (gpmp_t) (void *)
++    GetProcAddress (GetModuleHandleW (L"kernel32.dll"),
++		    "GetProcessMitigationPolicy");
++  DWORD aslr = 0;
++  /* ProcessASLRPolicy is 1; bit 2 is EnableHighEntropy.  Without it the
++     relaunched child would hit the same collision, so do not loop. */
++  if (!in_appcontainer () || !gpmp
++      || !gpmp (GetCurrentProcess (), 1, &aslr, sizeof aslr)
++      || !(aslr & 4))
++    return;
++
++  PCWSTR cl = GetCommandLineW ();
++  SIZE_T len = (wcslen (cl) + 1) * sizeof (WCHAR);
++  PWCHAR cmd = (PWCHAR) HeapAlloc (GetProcessHeap (), 0, len);
++  PWCHAR app = (PWCHAR) HeapAlloc (GetProcessHeap (), 0,
++				   NT_MAX_PATH * sizeof (WCHAR));
++  if (!cmd || !app || !GetModuleFileNameW (NULL, app, NT_MAX_PATH))
++    return;
++  memcpy (cmd, cl, len);
++
++  STARTUPINFOW si;
++  memset (&si, 0, sizeof si);
++  si.cb = sizeof si;
++  si.dwFlags = STARTF_USESTDHANDLES;
++  si.hStdInput = GetStdHandle (STD_INPUT_HANDLE);
++  si.hStdOutput = GetStdHandle (STD_OUTPUT_HANDLE);
++  si.hStdError = GetStdHandle (STD_ERROR_HANDLE);
++  PROCESS_INFORMATION pi;
++  if (!create_process_fixed_layout (app, cmd, NULL, NULL, TRUE,
++				    CREATE_UNICODE_ENVIRONMENT, NULL, NULL,
++				    &si, &pi))
++    return;
++  CloseHandle (pi.hThread);
++  WaitForSingleObject (pi.hProcess, INFINITE);
++  DWORD code = 1;
++  GetExitCodeProcess (pi.hProcess, &code);
++  ExitProcess (code);
++}
++
+ /* This function returns a handle to the top-level directory in the global
+    NT namespace used to implement global objects including shared memory. */
+ 
+@@ -44,10 +249,17 @@ get_shared_parent_dir ()
+   if (!shared_parent_dir)
+     {
+       WCHAR bnoname[MAX_PATH];
+-      __small_swprintf (bnoname, L"\\BaseNamedObjects\\%s%s-%S",
+-			cygwin_version.shared_id,
+-			_cygwin_testing ? cygwin_version.dll_build_date : "",
+-			&cygheap->installation_key);
++      WCHAR acdir[MAX_PATH];
++      if (appcontainer_object_dir (acdir, current_session_id ()))
++	__small_swprintf (bnoname, L"%W\\%s%s-%S", acdir,
++			  cygwin_version.shared_id,
++			  _cygwin_testing ? cygwin_version.dll_build_date : "",
++			  &cygheap->installation_key);
++      else
++	__small_swprintf (bnoname, L"\\BaseNamedObjects\\%s%s-%S",
++			  cygwin_version.shared_id,
++			  _cygwin_testing ? cygwin_version.dll_build_date : "",
++			  &cygheap->installation_key);
+       RtlInitUnicodeString (&uname, bnoname);
+       InitializeObjectAttributes (&attr, &uname, OBJ_OPENIF, NULL,
+ 				  everyone_sd (CYG_SHARED_DIR_ACCESS));
+@@ -79,11 +291,18 @@ get_session_parent_dir ()
+       else
+ 	{
+ 	  WCHAR bnoname[MAX_PATH];
+-	  __small_swprintf (bnoname,
+-			    L"\\Sessions\\BNOLINKS\\%d\\%s%s-%S",
+-			    psi.SessionId, cygwin_version.shared_id,
+-			    _cygwin_testing ? cygwin_version.dll_build_date : "",
+-			    &cygheap->installation_key);
++	  WCHAR acdir[MAX_PATH];
++	  if (appcontainer_object_dir (acdir, psi.SessionId))
++	    __small_swprintf (bnoname, L"%W\\%s%s-%S.session", acdir,
++			      cygwin_version.shared_id,
++			      _cygwin_testing ? cygwin_version.dll_build_date : "",
++			      &cygheap->installation_key);
++	  else
++	    __small_swprintf (bnoname,
++			      L"\\Sessions\\BNOLINKS\\%d\\%s%s-%S",
++			      psi.SessionId, cygwin_version.shared_id,
++			      _cygwin_testing ? cygwin_version.dll_build_date : "",
++			      &cygheap->installation_key);
+ 	  RtlInitUnicodeString (&uname, bnoname);
+ 	  InitializeObjectAttributes (&attr, &uname, OBJ_OPENIF, NULL,
+ 				      everyone_sd(CYG_SHARED_DIR_ACCESS));
+@@ -282,7 +501,7 @@ shared_info::create ()
+ 					       cygwin_shared_h,
+ 					       sizeof (*cygwin_shared),
+ 					       SH_CYGWIN_SHARED,
+-					       &sec_all_nih);
++					       sec_all_ac (false));
+   cygwin_shared->initialize ();
+   cygheap->shared_regions.cygwin_shared_addr = cygwin_shared;
+ }
+diff --git a/winsup/cygwin/sec/helper.cc b/winsup/cygwin/sec/helper.cc
+index 89090fc..6a70161 100644
+--- a/winsup/cygwin/sec/helper.cc
++++ b/winsup/cygwin/sec/helper.cc
+@@ -64,6 +64,14 @@ MKSID (well_known_authenticated_users_sid, "S-1-5-11",
+        SECURITY_NT_AUTHORITY, 1, SECURITY_AUTHENTICATED_USER_RID);
+ MKSID (well_known_this_org_sid, "S-1-5-15",
+        SECURITY_NT_AUTHORITY, 1, 15);
++#ifndef SECURITY_APP_PACKAGE_AUTHORITY
++#define SECURITY_APP_PACKAGE_AUTHORITY {0,0,0,0,0,15}
++#define SECURITY_APP_PACKAGE_BASE_RID 2
++#define SECURITY_BUILTIN_PACKAGE_ANY_PACKAGE 1
++#endif
++MKSID (well_known_all_app_packages_sid, "S-1-15-2-1",
++       SECURITY_APP_PACKAGE_AUTHORITY, 2, SECURITY_APP_PACKAGE_BASE_RID,
++       SECURITY_BUILTIN_PACKAGE_ANY_PACKAGE);
+ MKSID (well_known_system_sid, "S-1-5-18",
+        SECURITY_NT_AUTHORITY, 1, SECURITY_LOCAL_SYSTEM_RID);
+ MKSID (well_known_local_service_sid, "S-1-5-19",
+@@ -547,7 +555,7 @@ bool
+ sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD access2)
+ {
+   NTSTATUS status;
+-  size_t acl_len = MAX_DACL_LEN (5);
++  size_t acl_len = MAX_DACL_LEN (6);
+   LPVOID pAce;
+   cygpsid psid;
+ 
+@@ -591,6 +599,15 @@ sec_acl (PACL acl, bool original, bool admins, PSID sid1, PSID sid2, DWORD acces
+ 				   well_known_system_sid);
+   if (!NT_SUCCESS (status))
+     debug_printf ("RtlAddAccessAllowedAce(system) %y", status);
++  /* An AppContainer is only granted what the DACL also grants to an
++     AppContainer SID, so its own objects need that side too. */
++  if (in_appcontainer ())
++    {
++      status = RtlAddAccessAllowedAce (acl, ACL_REVISION, GENERIC_ALL,
++				       well_known_all_app_packages_sid);
++      if (!NT_SUCCESS (status))
++	debug_printf ("RtlAddAccessAllowedAce(app packages) %y", status);
++    }
+   status = RtlFirstFreeAce (acl, &pAce);
+   if (NT_SUCCESS (status) && pAce)
+     acl->AclSize = (char *) pAce - (char *) acl;
+@@ -693,7 +710,7 @@ _everyone_sd (void *buf, ACCESS_MASK access)
+     {
+       RtlCreateSecurityDescriptor (psd, SECURITY_DESCRIPTOR_REVISION);
+       PACL dacl = (PACL) (psd + 1);
+-      RtlCreateAcl (dacl, MAX_DACL_LEN (1), ACL_REVISION);
++      RtlCreateAcl (dacl, MAX_DACL_LEN (2), ACL_REVISION);
+       status = RtlAddAccessAllowedAce (dacl, ACL_REVISION, access,
+ 				       well_known_world_sid);
+       if (!NT_SUCCESS (status))
+@@ -701,6 +718,16 @@ _everyone_sd (void *buf, ACCESS_MASK access)
+ 	  debug_printf ("RtlAddAccessAllowedAce: %y", status);
+ 	  return NULL;
+ 	}
++      if (in_appcontainer ())
++	{
++	  status = RtlAddAccessAllowedAce (dacl, ACL_REVISION, access,
++					   well_known_all_app_packages_sid);
++	  if (!NT_SUCCESS (status))
++	    {
++	      debug_printf ("RtlAddAccessAllowedAce: %y", status);
++	      return NULL;
++	    }
++	}
+       LPVOID ace;
+       status = RtlFirstFreeAce (dacl, &ace);
+       if (!NT_SUCCESS (status))
+@@ -714,6 +741,70 @@ _everyone_sd (void *buf, ACCESS_MASK access)
+   return psd;
+ }
+ 
++/* Inside an AppContainer a NULL DACL does not let another process of the
++   same container open the object, so named objects shared between Cygwin
++   processes get an explicit DACL granting Everyone, ALL APPLICATION
++   PACKAGES and the container's own SID full access.  Outside an
++   AppContainer this is the NULL DACL of sec_all/sec_all_nih. */
++PSECURITY_ATTRIBUTES
++sec_all_ac (bool inherit)
++{
++  static NO_COPY bool done;
++  static NO_COPY bool ok;
++  static NO_COPY SECURITY_ATTRIBUTES sa[2];
++  static NO_COPY char sd_buf[sizeof (SECURITY_DESCRIPTOR) + MAX_DACL_LEN (3)];
++
++  if (!in_appcontainer ())
++    return inherit ? &sec_all : &sec_all_nih;
++  if (!done)
++    {
++      PISECURITY_DESCRIPTOR psd = (PISECURITY_DESCRIPTOR) sd_buf;
++      PACL dacl = (PACL) (psd + 1);
++      BYTE info[sizeof (TOKEN_APPCONTAINER_INFORMATION)
++		+ SECURITY_MAX_SID_SIZE];
++      ULONG size;
++      HANDLE tok;
++
++      RtlCreateSecurityDescriptor (psd, SECURITY_DESCRIPTOR_REVISION);
++      RtlCreateAcl (dacl, MAX_DACL_LEN (3), ACL_REVISION);
++      ok = NT_SUCCESS (RtlAddAccessAllowedAce (dacl, ACL_REVISION,
++					       GENERIC_ALL,
++					       well_known_world_sid))
++	   && NT_SUCCESS (RtlAddAccessAllowedAce (dacl, ACL_REVISION,
++						  GENERIC_ALL,
++					well_known_all_app_packages_sid));
++      if (ok && NT_SUCCESS (NtOpenProcessToken (NtCurrentProcess (),
++						TOKEN_QUERY, &tok)))
++	{
++	  if (NT_SUCCESS (NtQueryInformationToken (tok, TokenAppContainerSid,
++						   info, sizeof info, &size))
++	      && ((PTOKEN_APPCONTAINER_INFORMATION) info)->TokenAppContainer)
++	    ok = NT_SUCCESS (RtlAddAccessAllowedAce (dacl, ACL_REVISION,
++			  GENERIC_ALL,
++			  ((PTOKEN_APPCONTAINER_INFORMATION) info)->TokenAppContainer));
++	  NtClose (tok);
++	}
++      LPVOID ace;
++      if (ok && NT_SUCCESS (RtlFirstFreeAce (dacl, &ace)) && ace)
++	{
++	  dacl->AclSize = (char *) ace - (char *) dacl;
++	  RtlSetDaclSecurityDescriptor (psd, TRUE, dacl, FALSE);
++	}
++      else
++	ok = false;
++      for (int i = 0; i < 2; i++)
++	{
++	  sa[i].nLength = sizeof (SECURITY_ATTRIBUTES);
++	  sa[i].lpSecurityDescriptor = psd;
++	  sa[i].bInheritHandle = i;
++	}
++      done = true;
++    }
++  if (!ok)
++    return inherit ? &sec_all : &sec_all_nih;
++  return &sa[inherit ? 1 : 0];
++}
++
+ static NO_COPY SRWLOCK authz_lock = SRWLOCK_INIT;
+ #define AUTHZ_LOCK()    (AcquireSRWLockExclusive (&authz_lock))
+ #define AUTHZ_UNLOCK()  (ReleaseSRWLockExclusive (&authz_lock))
+diff --git a/winsup/cygwin/spawn.cc b/winsup/cygwin/spawn.cc
+index 7fcc33f..c31face 100644
+--- a/winsup/cygwin/spawn.cc
++++ b/winsup/cygwin/spawn.cc
+@@ -653,7 +653,7 @@ child_info_spawn::worker (const char *prog_arg, const char *const *argv,
+ 	      && !::cygheap->user.groups.issetgroups ()
+ 	      && !::cygheap->user.setuid_to_restricted))
+ 	{
+-	  rc = CreateProcessW (runpath,		/* image name w/ full path */
++	  rc = create_process_fixed_layout (runpath,	/* image name w/ full path */
+ 			       cmd.wcs (wcmd),	/* what was passed to exec */
+ 			       sa,		/* process security attrs */
+ 			       sa,		/* thread security attrs */
+diff --git a/winsup/cygwin/syscalls.cc b/winsup/cygwin/syscalls.cc
+index f04b7d3..292552e 100644
+--- a/winsup/cygwin/syscalls.cc
++++ b/winsup/cygwin/syscalls.cc
+@@ -3655,7 +3655,7 @@ seteuid (uid_t uid)
+ 	debug_printf ("NtSetInformationToken (user.token, TokenPrimaryGroup),"
+ 		      "%y", status);
+       /* Try setting default DACL */
+-      PACL dacl_buf = (PACL) alloca (MAX_DACL_LEN (5));
++      PACL dacl_buf = (PACL) alloca (MAX_DACL_LEN (6));
+       if (sec_acl (dacl_buf, true, true, usersid))
+ 	{
+ 	  TOKEN_DEFAULT_DACL tdacl = { dacl_buf };
+diff --git a/winsup/cygwin/thread.cc b/winsup/cygwin/thread.cc
+index d410b95..4c7b2c2 100644
+--- a/winsup/cygwin/thread.cc
++++ b/winsup/cygwin/thread.cc
+@@ -2545,7 +2545,7 @@ semaphore::semaphore (unsigned long long shash, LUID sluid, int sfd,
+ 
+   __small_sprintf (name, "semaphore/%016X%08x%08x",
+ 		   hash, luid.HighPart, luid.LowPart);
+-  this->win32_obj_id = ::CreateSemaphore (&sec_all, value, INT32_MAX, name);
++  this->win32_obj_id = ::CreateSemaphore (sec_all_ac (true), value, INT32_MAX, name);
+   if (!this->win32_obj_id)
+     magic = 0;
+   if (GetLastError () == ERROR_ALREADY_EXISTS && (oflag & O_EXCL))
+diff --git a/winsup/cygwin/tty.cc b/winsup/cygwin/tty.cc
+index c8730e8..96483e1 100644
+--- a/winsup/cygwin/tty.cc
++++ b/winsup/cygwin/tty.cc
+@@ -70,7 +70,7 @@ tty_list::init_session ()
+   char *name = shared_name (mutex_name, "tty_list::mutex", 0);
+ 
+   /* tty_list::mutex is used while searching for a tty slot */
+-  if (!(mutex = CreateMutex (&sec_all_nih, FALSE, name)))
++  if (!(mutex = CreateMutex (sec_all_ac (false), FALSE, name)))
+     api_fatal ("can't create tty_list::mutex '%s', %E", name);
+   ProtectHandle (mutex);
+ }
+@@ -265,7 +265,7 @@ tty::get_event (const char *fmt, PSECURITY_ATTRIBUTES sa, BOOL manual_reset)
+ 
+   shared_name (buf, fmt, get_minor ());
+   if (!sa)
+-    sa = &sec_all;
++    sa = sec_all_ac (true);
+   if (!(hev = CreateEvent (sa, manual_reset, FALSE, buf)))
+     {
+       termios_printf ("couldn't create %s", buf);

@@ -1,0 +1,54 @@
+name: "Windows Terminal in Auto: base vs head"
+on:
+  push:
+    branches: [t3c-*]
+  workflow_dispatch:
+jobs:
+  msys_patch:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    env:
+      PYTHONPATH: studio/backend
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - shell: pwsh
+        run: '"UNSLOTH_STUDIO_HOME=$env:RUNNER_TEMP\studio" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8'
+      - run: python -m pip install -q -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart aiofiles sqlalchemy cryptography psutil pyyaml jinja2 requests "numpy<3"
+      - name: Install MXC and prepare the host
+        shell: pwsh
+        run: |
+          $dir = "$env:UNSLOTH_STUDIO_HOME\mxc-runtime\windows-x86_64"
+          python studio/install_mxc_prebuilt.py --install-dir $dir | Out-Null; "install exit=$LASTEXITCODE"
+          python studio/install_mxc_prebuilt.py --prepare-host --install-dir $dir | Out-Null; "prepare-host exit=$LASTEXITCODE"
+      - name: One-time read grant on the Python prefix and sandbox_site
+        shell: pwsh
+        run: |
+          $py = python -c "import sys; print(sys.prefix)"
+          $site = (Resolve-Path "studio\backend\core\inference\sandbox_site").Path
+          foreach ($r in @($py, $site)) { icacls $r /grant "*S-1-15-2-1:(OI)(CI)(RX)" /Q | Out-Null; "grant $r exit=$LASTEXITCODE" }
+          git --version; (Get-Command git).Source
+      - name: Terminal through tools._bash_exec, DACL opt-in on
+        shell: pwsh
+        run: |
+          $env:UNSLOTH_MXC_ALLOW_DACL_FALLBACK = "1"
+          python -u term_ab.py on 2>&1 | Select-String -NotMatch '"level": "info"|\[info'
+          exit 0
+      - name: Terminal through tools._bash_exec, DACL opt-in off
+        shell: pwsh
+        run: |
+          python -u term_ab.py off 2>&1 | Select-String -NotMatch '"level": "info"|\[info'
+          exit 0
+      - name: MXC suites, non-native and native, opt-in on
+        shell: pwsh
+        run: |
+          $env:UNSLOTH_MXC_ALLOW_DACL_FALLBACK = "1"
+          $env:UNSLOTH_MXC_NATIVE_PACKAGE = "$env:UNSLOTH_STUDIO_HOME\mxc-runtime\windows-x86_64"
+          $tests = @("test_mxc_windows_backend.py", "test_mxc_dacl_fallback.py", "test_mxc_policy_identity.py", "test_mxc_runtime_integrity.py", "test_mxc_git_bash_namespace.py", "test_mxc_native_windows.py", "test_mxc_read_grants.py", "test_mxc_drive_alias.py", "test_mxc_cmd_command_line.py", "test_windows_cmd_terminal_profile.py", "test_windows_bash_shell.py") | ForEach-Object { "studio/backend/tests/$_" } | Where-Object { Test-Path $_ }
+          python -m pytest @tests -m "not gpu and not slow and not server" -q -rs -p no:cacheprovider --junitxml "$env:RUNNER_TEMP\junit.xml" 2>&1 | Select-Object -Last 25
+          "pytest exit=$LASTEXITCODE"
+          python junit_summary.py junit.xml
+          exit 0

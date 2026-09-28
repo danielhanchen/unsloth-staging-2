@@ -1,0 +1,227 @@
+diff --git a/winsup/cygwin/dcrt0.cc b/winsup/cygwin/dcrt0.cc
+index 33cad1e..8a63536 100644
+--- a/winsup/cygwin/dcrt0.cc
++++ b/winsup/cygwin/dcrt0.cc
+@@ -581,12 +581,18 @@ get_cygwin_startup_info ()
+ #define dll_bss_start &__bss_start__
+ #define dll_bss_end &__bss_end__
+ 
++extern "C" void msys_diag_note (const char *);
++extern "C" void msys_diag_start ();
+ void
+ child_info_fork::handle_fork ()
+ {
++  msys_diag_note ("fork child: handle_fork start");
+   cygheap_fixup_in_child (false);
++  msys_diag_note ("fork child: cygheap fixed");
+   memory_init ();
++  msys_diag_note ("fork child: memory_init done");
+   myself.thisproc (NULL);
++  msys_diag_note ("fork child: thisproc done");
+   myself->uid = cygheap->user.real_uid;
+   myself->gid = cygheap->user.real_gid;
+ 
+@@ -619,6 +625,7 @@ child_info_fork::handle_fork ()
+ 	      "bss", user_data->bss_start, user_data->bss_end,
+ 	      NULL);
+ 
++  msys_diag_note ("fork child: data copied");
+   if (fixup_mmaps_after_fork (parent))
+     api_fatal ("recreate_mmaps_after_fork_failed");
+ 
+@@ -726,16 +733,21 @@ void
+ dll_crt0_0 ()
+ {
+   wincap.init ();
++  msys_diag_start ();
++  msys_diag_note ("dll_crt0_0 start");
+   GetModuleFileNameW (NULL, global_progname, NT_MAX_PATH);
+   child_proc_info = get_cygwin_startup_info ();
++  msys_diag_note (child_proc_info ? "startup info: child" : "startup info: none");
+   init_windows_system_directory ();
+   initial_env ();
++  msys_diag_note ("initial_env done");
+ 
+   SetErrorMode (SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+ 
+   lock_process::init ();
+   user_data->impure_ptr = _impure_ptr;
+   user_data->impure_ptr_ptr = &_impure_ptr;
++  msys_diag_note ("lock_process/user_data done");
+ 
+   DuplicateHandle (GetCurrentProcess (), GetCurrentThread (),
+ 		   GetCurrentProcess (), &hMainThread,
+@@ -743,10 +755,14 @@ dll_crt0_0 ()
+ 
+   NtOpenProcessToken (NtCurrentProcess (), MAXIMUM_ALLOWED, &hProcToken);
+   set_cygwin_privileges (hProcToken);
++  msys_diag_note ("token/privileges done");
+ 
+   device::init ();
++  msys_diag_note ("device::init done");
+   do_global_ctors (&__CTOR_LIST__, 1);
++  msys_diag_note ("global ctors done");
+   cygthread::init ();
++  msys_diag_note ("cygthread::init done");
+ 
+   if (!child_proc_info)
+     {
+@@ -760,6 +776,7 @@ dll_crt0_0 ()
+ 	{
+ 	case _CH_FORK:
+ 	  fork_info->handle_fork ();
++	  msys_diag_note ("fork child: handle_fork returned");
+ 	  break;
+ 	case _CH_SPAWN:
+ 	case _CH_EXEC:
+diff --git a/winsup/cygwin/fork.cc b/winsup/cygwin/fork.cc
+index 25b9c32..f922526 100644
+--- a/winsup/cygwin/fork.cc
++++ b/winsup/cygwin/fork.cc
+@@ -7,6 +7,7 @@ Cygwin license.  Please consult the file "CYGWIN_LICENSE" for
+ details. */
+ 
+ #include "winsup.h"
++extern "C" void msys_diag_note (const char *);
+ #include <stdio.h>
+ #include <unistd.h>
+ #include <stdlib.h>
+@@ -340,7 +341,7 @@ frok::parent (volatile char * volatile stack_here)
+ 
+   *with_forkables = dlls.setup_forkables (*with_forkables);
+ 
+-  ch.silentfail (!*with_forkables); /* fail silently without forkables */
++  ch.silentfail (false); /* DIAGNOSTIC: always report */
+ 
+   PSECURITY_ATTRIBUTES sa = (PSECURITY_ATTRIBUTES) alloca (1024);
+   if (!sec_user_nih (sa, cygheap->user.saved_sid (),
+@@ -360,6 +361,7 @@ frok::parent (volatile char * volatile stack_here)
+       syscall_printf ("CreateProcessW (%W, %W, 0, 0, 1, %y, 0, 0, %p, %p)",
+ 		      forking_progname, myself->progname, c_flags, &si, &pi);
+ 
++      msys_diag_note ("fork parent: CreateProcessW");
+       hchild = NULL;
+       /* cygwin1.dll may reuse the forking_progname buffer, even
+ 	 in case of failure: don't reuse forking_progname later */
+diff --git a/winsup/cygwin/mm/cygheap.cc b/winsup/cygwin/mm/cygheap.cc
+index 4ffefa1..f00bc5f 100644
+--- a/winsup/cygwin/mm/cygheap.cc
++++ b/winsup/cygwin/mm/cygheap.cc
+@@ -290,6 +290,20 @@ cygheap_init ()
+ {
+   if (cygheap == &cygheap_dummy)
+     {
++      /* DIAGNOSTIC: force the collision in a root process that still has
++	 high-entropy ASLR, to exercise relaunch_with_fixed_layout. */
++      if (GetEnvironmentVariableW (L"MSYS_DIAG_OCCUPY", NULL, 0))
++	{
++	  typedef BOOL (WINAPI *gpmp_t) (HANDLE, int, PVOID, SIZE_T);
++	  gpmp_t gpmp = (gpmp_t) (void *)
++	    GetProcAddress (GetModuleHandleW (L"kernel32.dll"),
++			    "GetProcessMitigationPolicy");
++	  DWORD aslr = 0;
++	  if (gpmp && gpmp (GetCurrentProcess (), 1, &aslr, sizeof aslr)
++	      && (aslr & 4))
++	    VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW, 65536, MEM_RESERVE,
++			  PAGE_NOACCESS);
++	}
+       cygheap = (init_cygheap *) VirtualAlloc ((LPVOID) CYGHEAP_STORAGE_LOW,
+ 					       CYGHEAP_STORAGE_HIGH
+ 					       - CYGHEAP_STORAGE_LOW,
+diff --git a/winsup/cygwin/strace.cc b/winsup/cygwin/strace.cc
+index 0010a17..819e390 100644
+--- a/winsup/cygwin/strace.cc
++++ b/winsup/cygwin/strace.cc
+@@ -20,6 +20,84 @@ details. */
+ #include "child_info.h"
+ #include "sync.h"
+ 
++/* DIAGNOSTIC ONLY: append to %MSYS_DIAG_LOG% so messages from processes
++   without a usable stderr (forked children) are not lost. */
++extern "C" void
++msys_diag_write (const char *buf, int len)
++{
++  WCHAR path[MAX_PATH];
++  DWORD n = GetEnvironmentVariableW (L"MSYS_DIAG_LOG", path, MAX_PATH);
++  if (!n || n >= MAX_PATH)
++    return;
++  HANDLE h = CreateFileW (path, FILE_APPEND_DATA, FILE_SHARE_READ
++			  | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, 0, NULL);
++  if (h == INVALID_HANDLE_VALUE)
++    return;
++  char pre[64];
++  DWORD done;
++  int m = __small_sprintf (pre, "[winpid %u] ", GetCurrentProcessId ());
++  WriteFile (h, pre, m, &done, NULL);
++  WriteFile (h, buf, len, &done, NULL);
++  WriteFile (h, "\n", 1, &done, NULL);
++  CloseHandle (h);
++}
++
++extern "C" void
++msys_diag_note (const char *what)
++{
++  char b[256];
++  int n = __small_sprintf (b, "note %s err=%u base=%p", what, GetLastError (),
++			   GetModuleHandleW (L"msys-2.0.dll"));
++  msys_diag_write (b, n);
++}
++
++static LONG CALLBACK
++msys_diag_veh (PEXCEPTION_POINTERS ep)
++{
++  static LONG seen;
++  if (InterlockedIncrement (&seen) > 40)
++    return EXCEPTION_CONTINUE_SEARCH;
++  char b[256];
++  PEXCEPTION_RECORD er = ep->ExceptionRecord;
++  int n = __small_sprintf (b, "exception %y at %p base=%p info0=%p info1=%p",
++			   er->ExceptionCode, er->ExceptionAddress,
++			   GetModuleHandleW (L"msys-2.0.dll"),
++			   (void *) (er->NumberParameters > 0 ? er->ExceptionInformation[0] : 0),
++			   (void *) (er->NumberParameters > 1 ? er->ExceptionInformation[1] : 0));
++  msys_diag_write (b, n);
++  return EXCEPTION_CONTINUE_SEARCH;
++}
++
++extern "C" void
++msys_diag_start ()
++{
++  if (!GetEnvironmentVariableW (L"MSYS_DIAG_LOG", NULL, 0))
++    return;
++  AddVectoredExceptionHandler (1, msys_diag_veh);
++  /* Raw DWORD policies: 1 ASLR, 2 dynamic code, 3 strict handle check,
++     4 system call disable, 10 image load. */
++  typedef BOOL (WINAPI *gpmp_t) (HANDLE, int, PVOID, SIZE_T);
++  gpmp_t gpmp = (gpmp_t) (void *) GetProcAddress (GetModuleHandleW (L"kernel32.dll"),
++					 "GetProcessMitigationPolicy");
++  DWORD aslr = 0, dyn = 0, sh = 0, sc = 0, il = 0;
++  if (gpmp)
++    {
++      gpmp (GetCurrentProcess (), 1, &aslr, sizeof aslr);
++      gpmp (GetCurrentProcess (), 2, &dyn, sizeof dyn);
++      gpmp (GetCurrentProcess (), 3, &sh, sizeof sh);
++      gpmp (GetCurrentProcess (), 4, &sc, sizeof sc);
++      gpmp (GetCurrentProcess (), 10, &il, sizeof il);
++    }
++  STARTUPINFOW si;
++  GetStartupInfoW (&si);
++  char b[256];
++  int n = __small_sprintf (b, "policies aslr=%y dyncode=%y stricthandle=%y "
++			   "syscalldisable=%y imageload=%y cbReserved2=%u flags=%y",
++			   aslr, dyn, sh, sc, il,
++			   si.cbReserved2, si.dwFlags);
++  msys_diag_write (b, n);
++}
++
+ #define PROTECT(x) {x[NT_MAX_PATH - 1] = '\0';}
+ #define CHECK(x) if (x[NT_MAX_PATH - 1] != '\0') \
+ 		   { small_printf ("array bound exceeded %d\n", __LINE__); \
+@@ -264,6 +342,7 @@ strace::vprntf (unsigned category, const char *func, const char *fmt, va_list ap
+   if (category & _STRACE_SYSTEM)
+     {
+       DWORD done;
++      msys_diag_write (buf, len);
+       WriteFile (GetStdHandle (STD_ERROR_HANDLE), buf, len, &done, 0);
+       FlushFileBuffers (GetStdHandle (STD_ERROR_HANDLE));
+       /* Make sure that the message shows up on the screen, too, since this is
