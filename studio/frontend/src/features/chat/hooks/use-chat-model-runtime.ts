@@ -126,6 +126,7 @@ import {
   unpinnedDefaultRequest,
   unpinnedLoadContext,
   resolveLoadMaxSeqLength,
+  resolveLoadMaxSeqLengthDetailed,
   resolveExplicitCtxPin,
   loadRequestContextPin,
   replayMaxTokensCap,
@@ -2420,7 +2421,7 @@ export function useChatModelRuntime() {
             ) {
               loadCustomContextLength = loadContextLength;
             }
-            const effectiveMaxSeqLength = resolveLoadMaxSeqLength({
+            const resolvedMaxSeqLength = resolveLoadMaxSeqLengthDetailed({
               modelId,
               ggufVariant,
               isGguf,
@@ -2437,6 +2438,7 @@ export function useChatModelRuntime() {
                 ),
               presetSource: loadActivePresetSource,
             });
+            const effectiveMaxSeqLength = resolvedMaxSeqLength.value;
             const loadMaxSeqLength = resolveFitMaxSeqLength(
               isGguf,
               loadGpuMemoryMode,
@@ -2461,6 +2463,12 @@ export function useChatModelRuntime() {
               nativePathLease: loadNativePathLease,
               hf_token: hfToken,
               max_seq_length: loadMaxSeqLength,
+              // Lets the backend re-fit its own replayed context for a forced drafter (#9550).
+              // biome-ignore lint/style/useNamingConvention: API schema
+              max_seq_length_auto_derived:
+                resolvedMaxSeqLength.source === "resident-reload" &&
+                loadMaxSeqLength === resolvedMaxSeqLength.value &&
+                loadMaxSeqLength > 0,
               load_in_4bit: true,
               is_lora: isLora,
               gguf_variant: ggufVariant ?? null,

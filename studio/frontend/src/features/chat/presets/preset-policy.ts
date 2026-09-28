@@ -333,19 +333,7 @@ export function mergeBackendRecommendedInference({
   };
 }
 
-export function resolveLoadMaxSeqLength({
-  modelId,
-  ggufVariant,
-  isGguf,
-  customContextLength,
-  loadedContextLength,
-  currentCheckpoint,
-  activeGgufVariant,
-  isMlx,
-  pinnedMaxSeqLength,
-  defaultMaxSeqLength,
-  presetSource,
-}: {
+type LoadMaxSeqLengthArgs = {
   modelId: string;
   ggufVariant?: string | null;
   isGguf?: boolean | null;
@@ -357,7 +345,31 @@ export function resolveLoadMaxSeqLength({
   pinnedMaxSeqLength: number | null;
   defaultMaxSeqLength: number;
   presetSource: ChatPresetSource;
-}): number {
+};
+
+/** Where the load context came from. Only `resident-reload` (our own fitter's answer,
+ *  replayed on a same-model reload) may be re-fit by the backend (#9550). */
+export type LoadMaxSeqLengthSource =
+  | "user-pinned"
+  | "builtin-default"
+  | "resident-reload"
+  | "gguf-auto"
+  | "pinned"
+  | "unpinned";
+
+export function resolveLoadMaxSeqLengthDetailed({
+  modelId,
+  ggufVariant,
+  isGguf,
+  customContextLength,
+  loadedContextLength,
+  currentCheckpoint,
+  activeGgufVariant,
+  isMlx,
+  pinnedMaxSeqLength,
+  defaultMaxSeqLength,
+  presetSource,
+}: LoadMaxSeqLengthArgs): { value: number; source: LoadMaxSeqLengthSource } {
   const isDirectGgufFile = modelId.toLowerCase().endsWith(".gguf");
   const isGgufLoad = isGguf === true || ggufVariant != null || isDirectGgufFile;
   const isReloadingCurrentGguf =
@@ -366,21 +378,28 @@ export function resolveLoadMaxSeqLength({
     (ggufVariant ?? null) === (activeGgufVariant ?? null);
 
   if (customContextLength != null) {
-    return customContextLength;
+    return { value: customContextLength, source: "user-pinned" };
   }
   if (isGgufLoad && presetSource === "builtin-default") {
-    return 0;
+    return { value: 0, source: "builtin-default" };
   }
   if (isReloadingCurrentGguf) {
-    return loadedContextLength ?? 0;
+    return { value: loadedContextLength ?? 0, source: "resident-reload" };
   }
   if (isGgufLoad) {
-    return 0;
+    return { value: 0, source: "gguf-auto" };
   }
   if (pinnedMaxSeqLength != null) {
-    return pinnedMaxSeqLength;
+    return { value: pinnedMaxSeqLength, source: "pinned" };
   }
-  return unpinnedLoadContext(isGgufLoad, isMlx, defaultMaxSeqLength);
+  return {
+    value: unpinnedLoadContext(isGgufLoad, isMlx, defaultMaxSeqLength),
+    source: "unpinned",
+  };
+}
+
+export function resolveLoadMaxSeqLength(args: LoadMaxSeqLengthArgs): number {
+  return resolveLoadMaxSeqLengthDetailed(args).value;
 }
 
 /** The user's own context pin behind a load request, or null where the request is not one.

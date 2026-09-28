@@ -57,6 +57,8 @@ export interface LoadModelRequest {
   nativePathLease?: string | null;
   hf_token: string | null;
   max_seq_length: number;
+  /** max_seq_length is the backend's own fitted context replayed, not a user pin (#9550). */
+  max_seq_length_auto_derived?: boolean;
   load_in_4bit: boolean;
   is_lora: boolean;
   gguf_variant?: string | null;

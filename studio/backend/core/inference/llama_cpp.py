@@ -574,6 +574,8 @@ class GgufLoadIntent:
     # for the session.
     disable_vision: bool = False
     n_ctx: int = 4096
+    # n_ctx is our fitter's earlier answer replayed by the client, not a user pin (#9550).
+    n_ctx_auto_derived: bool = False
     chat_template_override: Optional[str] = None
     cache_type_kv: Optional[str] = None
     speculative_type: Optional[str] = None
@@ -22916,6 +22918,7 @@ class LlamaCppBackend:
         is_vision = intent.is_vision
         disable_vision = intent.disable_vision
         n_ctx = intent.n_ctx
+        n_ctx_auto_derived = intent.n_ctx_auto_derived
         chat_template_override = intent.chat_template_override
         cache_type_kv = intent.cache_type_kv
         speculative_type = intent.speculative_type
@@ -25625,6 +25628,71 @@ class LlamaCppBackend:
                                 max_available_ctx = min(_AUTO_OFFLOAD_CTX, native_ctx_for_cap)
 
                         if explicit_ctx:
+                            # A replayed context of ours was fit while Auto had dropped the
+                            # drafter; a forced drafter re-arms the reserve, so re-fit on the
+                            # cards it was fit for rather than pulling in another GPU (#9550).
+                            # "Forced" = anything that bypasses the Auto drop probe above.
+                            if (
+                                n_ctx_auto_derived
+                                and _mtp_reserves_gpu
+                                and (
+                                    (_canonicalize_spec_mode(speculative_type) or "auto") != "auto"
+                                    or _user_mtp_via_extras
+                                    or _user_draft_via_extras
+                                    or _extra_args_set_spec_type(extra_args)
+                                    or _extra_args_mtp_draft_path(extra_args, env = _spec_env)
+                                )
+                            ):
+                                # Unreserved fraction: the flat MTP reserve would inflate the base placement.
+                                _base_indices, _base_fit = self._select_gpus_split_aware(
+                                    model_size_fit
+                                    + _kv_bytes(effective_ctx)
+                                    + _cc_bytes(effective_ctx),
+                                    gpus,
+                                    usable_fraction = _vram_frac,
+                                    total_by_idx = total_by_idx,
+                                    per_device_overhead_bytes = _pipeline_overhead_bytes
+                                    + _cc_bytes(effective_ctx),
+                                    min_gpus = _layer_min_gpus,
+                                    split_extra_bytes = _cc_split_extra(effective_ctx),
+                                )
+                                _base_gpus = (
+                                    [g for g in gpus if g[0] in set(_base_indices)]
+                                    if _base_indices and not _base_fit
+                                    else []
+                                )
+                                _refit = (
+                                    self._fit_context_to_vram(
+                                        effective_ctx,
+                                        _pool_budget_mib(_base_gpus, _pin_fraction),
+                                        _subset_model_size(len(_base_gpus)),
+                                        cache_type_kv,
+                                        swa_full = swa_full,
+                                        n_parallel = n_parallel,
+                                        kv_unified = planned_kv_unified,
+                                        n_ubatch = _effective_ubatch,
+                                        flash_attn = planned_flash_attn,
+                                        mtp_engaged = _mtp_reserves_gpu,
+                                        mtp_overhead_fn = mtp_overhead_fn,
+                                        compute_ctx_bytes_fn = lambda c, n = len(_base_gpus): _cc_bytes(
+                                            c, n
+                                        ),
+                                        budget_frac = 1.0,
+                                        pooled = True,
+                                        total_mib = None,
+                                        ctx_checkpoints = _fit_ctx_checkpoints,
+                                    )
+                                    if _base_gpus
+                                    else 0
+                                )
+                                # Only downwards: the fitter echoes the request when weights alone are over budget.
+                                if 0 < _refit < effective_ctx:
+                                    logger.info(
+                                        "Context re-fit for the forced drafter: "
+                                        f"{effective_ctx} -> {_refit} "
+                                        f"(reserve {_mtp_bytes(_refit) / 1024**3:.2f} GB)"
+                                    )
+                                    effective_ctx = _refit
                             # Honor the requested context verbatim. If it fits,
                             # pin GPUs and skip --fit; else ship -c <ctx> --fit
                             # on and let llama-server flex -ngl (CPU offload).
