@@ -94,6 +94,7 @@ import {
   type SearchImageEntry,
   type SearchImagesToolResult,
 } from "../search-images/search-images";
+import { mlxSpeculativeLoadFields } from "@/lib/speculative-modes";
 import { parseParamCountB } from "@/lib/model-size";
 import { createLoadingToastIcon, toast } from "@/lib/toast";
 import { notifyPromptQueueRunFailed } from "../utils/prompt-queue-boundary";
@@ -2406,6 +2407,13 @@ const VISIBLE_MODEL_RUNTIME_KEYS = [
   // Or a background autoload leaves its width and verdict on the restored model.
   // The rest of the group mlxRuntimeStateFrom writes.
   "mlxKvBits",
+  "mlxSpeculativeMode",
+  "mlxDraftModel",
+  "mlxDraftBlockSize",
+  "loadedMlxSpeculativeMode",
+  "loadedMlxDraftModel",
+  "loadedMlxDraftBlockSize",
+  "mlxSpeculativeReason",
   "loadedMlxKvBitsRequested",
   "mlxKvQuantReason",
   "mlxKvQuantNote",
@@ -3384,6 +3392,15 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
     const effectiveChatTemplateOverride = config.chatTemplateOverride?.trim()
       ? config.chatTemplateOverride
       : null;
+    const autoLoadPlatform = usePlatformStore.getState();
+    const mlxSpeculativeFields = mlxSpeculativeLoadFields(
+      config,
+      isServedByMlx(
+        candidate.kind === "gguf",
+        autoLoadPlatform.deviceType,
+        autoLoadPlatform.chatOnlyReason,
+      ),
+    );
     if (
       !(await canAutoLoadRecordingFailures(failureLabel, {
         model_path: modelPath,
@@ -3396,6 +3413,7 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
         n_parallel: config.nParallel ?? null,
         speculative_type: effectiveSpeculativeType,
         spec_draft_n_max: effectiveSpecDraftNMax,
+        ...mlxSpeculativeFields,
         ...(candidate.kind === "gguf"
           ? {
               gpu_ids: effectiveGpuIds ?? undefined,
@@ -3452,6 +3470,7 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
       chat_template_override: effectiveChatTemplateOverride,
       cache_type_kv: config.kvCacheDtype,
       mlx_kv_bits: config.mlxKvBits ?? null,
+      ...mlxSpeculativeFields,
       speculative_type: effectiveSpeculativeType,
       spec_draft_n_max: effectiveSpecDraftNMax,
       reasoning_budget:
