@@ -693,6 +693,7 @@ VLLM_SUPPORTED_VLM = [
     # Qwen3.5 ships as Qwen3_5ForConditionalGeneration with a vision_config, so it
     # reaches this gate even for the text-only checkpoints.
     "qwen3_5",
+    "idefics3",
 ]
 VLLM_NON_LORA_VLM = [
     "mllama",
@@ -2023,7 +2024,7 @@ class FastBaseModel:
         if is_vlm_config and fast_inference:
             if not any(arch in VLLM_SUPPORTED_VLM for arch in model_types):
                 raise RuntimeError(
-                    f"Unsloth: Fast inference is only supported for Language models and Qwen2.5-VL, Qwen3-VL, Gemma3, Mistral3 among vision models. "
+                    f"Unsloth: Fast inference is only supported for Language models and these vision model types: {', '.join(VLLM_SUPPORTED_VLM)}. "
                     f"Found architectures: {', '.join(model_types)}!"
                 )
 
