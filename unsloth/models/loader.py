@@ -33,6 +33,13 @@ from transformers import AutoConfig
 from transformers import __version__ as transformers_version
 from peft import PeftConfig, PeftModel
 from .grouped_linear_lora import register_grouped_linear_lora_for_adapter
+from .mistral_format import (
+    MistralFormatRedirect,
+    is_mistral_format_view,
+    mistral_format_conversions_active,
+    mistral_format_redirect,
+    prepare_mistral_format_checkpoint,
+)
 from .loader_utils import (
     DEFAULT_DEVICE_MAP,
     OFFLOAD_EMBEDDING_AUTO,
@@ -698,6 +705,7 @@ def _fix_rope_inv_freq(model):
 class FastLanguageModel(FastLlamaModel):
     @staticmethod
     @_offline_aware_load
+    @mistral_format_redirect
     def from_pretrained(
         model_name = "unsloth/Llama-3.2-1B-Instruct",
         max_seq_length = 2048,
@@ -1048,6 +1056,12 @@ class FastLanguageModel(FastLlamaModel):
                     f"to obtain the latest transformers build, then restart this session."
                 )
             if _is_mistral_format_checkpoint(model_name, token, base_revision, local_files_only):
+                # Known architectures load via a translated view; others keep the error.
+                _view = prepare_mistral_format_checkpoint(
+                    model_name, token, base_revision, local_files_only
+                )
+                if _view is not None:
+                    raise MistralFormatRedirect(_view, model_name)
                 raise RuntimeError(_mistral_format_error(model_name)) from autoconfig_exc
             combined_error = (
                 "Unsloth: Failed to load model. Both AutoConfig and PeftConfig loading failed.\n\n"
@@ -1139,6 +1153,9 @@ class FastLanguageModel(FastLlamaModel):
 
         if not was_disabled:
             enable_progress_bars()
+        # A view, or an adapter trained on one, still names Mistral's tensors.
+        if is_mistral_format_view(model_name) and not mistral_format_conversions_active():
+            raise MistralFormatRedirect(None, model_name)
 
         if check_precision_flags and _precision_flags_conflict(
             load_in_4bit, load_in_8bit, load_in_16bit, load_in_fp8
@@ -1501,6 +1518,7 @@ class FastModel(FastBaseModel):
 
     @staticmethod
     @_offline_aware_load
+    @mistral_format_redirect
     def from_pretrained(
         model_name = "unsloth/Llama-3.2-11B-Vision-Instruct-bnb-4bit",
         max_seq_length = 2048,
@@ -1865,6 +1883,12 @@ class FastModel(FastBaseModel):
                     f"to obtain the latest transformers build, then restart this session."
                 )
             if _is_mistral_format_checkpoint(model_name, token, base_revision, local_files_only):
+                # Known architectures load via a translated view; others keep the error.
+                _view = prepare_mistral_format_checkpoint(
+                    model_name, token, base_revision, local_files_only
+                )
+                if _view is not None:
+                    raise MistralFormatRedirect(_view, model_name)
                 raise RuntimeError(_mistral_format_error(model_name)) from autoconfig_exc
             combined_error = (
                 "Unsloth: Failed to load model. Both AutoConfig and PeftConfig loading failed.\n\n"
@@ -2095,6 +2119,9 @@ class FastModel(FastBaseModel):
 
         if not was_disabled:
             enable_progress_bars()
+        # A view, or an adapter trained on one, still names Mistral's tensors.
+        if is_mistral_format_view(model_name) and not mistral_format_conversions_active():
+            raise MistralFormatRedirect(None, model_name)
 
         do_logging = os.environ.get("UNSLOTH_ENABLE_LOGGING", "0") == "1"
         if do_logging:
