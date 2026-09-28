@@ -1580,6 +1580,7 @@ _AMPLIFY = "x=" + "A" * 20 + "; y=" + "$x" * 20 + "; z=" + "$y" * 20 + "; "
         ('UNSLOTH_STUDIO_HOME=$UNSLOTH_STUDIO_HOME; cat "$UNSLOTH_STUDIO_HOME/auth/auth.db"', True),
         (_AMPLIFY + 'r=../..; q=$r; s=$q; cd "$s"; cat auth/auth.db', True),
         ("export PATH=$PATH:/usr/local/bin; echo ok", False),
+        ("x=" + "A" * 500 + "; y=" + "$x" * 100 + "; z=" + "$y" * 100 + "; echo ok", True),
     ),
     ids = (
         "self-reference",
@@ -1592,6 +1593,7 @@ _AMPLIFY = "x=" + "A" * 20 + "; y=" + "$x" * 20 + "; z=" + "$y" * 20 + "; "
         "inherited",
         "amplified",
         "path",
+        "fan-out",
     ),
 )
 def test_assignment_expansion_settles(studio_home, monkeypatch, command, refused):
@@ -1600,7 +1602,9 @@ def test_assignment_expansion_settles(studio_home, monkeypatch, command, refused
     def counted(text, *args, **kwargs):
         calls.append(text)
         assert len(calls) < 100 and len(text) < 200_000, "the expansion does not settle"
-        return expand(text, *args, **kwargs)
+        expanded = expand(text, *args, **kwargs)
+        assert len(expanded) < 200_000, "the expansion was built past the size cap"
+        return expanded
 
     monkeypatch.setattr(tools, "_expand_shell_assignments", counted)
     workdir = str(studio_home / "sandbox" / _SESSION)

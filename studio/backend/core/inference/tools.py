@@ -5272,13 +5272,37 @@ def _shell_assignments(command: str, inherited: bool = True) -> "dict[str, str]"
     return env
 
 
-def _expand_shell_assignments(command: str, inherited: bool = True) -> str:
+class _ExpansionTooLarge(Exception):
+    pass
+
+
+def _expand_shell_assignments(
+    command: str,
+    inherited: bool = True,
+    budget: "int | None" = None,
+) -> str:
     """Best-effort substitution of `NAME=value ... $NAME`, so a sensitive path split across an
     assignment and an argument (p=/etc; cat $p/passwd) is still visible to the scan. Also applies
-    pattern replacement. Fail-open: only adds detections."""
+    pattern replacement. Fail-open: only adds detections. Growing the text by more than *budget*
+    raises `_ExpansionTooLarge` mid-substitution: `y=$x$x...; z=$y$y...` built ~1 GB otherwise."""
     env = _shell_assignments(command, inherited)
     if not env:
         return command
+    grown = 0
+
+    def bounded(repl):
+        if budget is None:
+            return repl
+
+        def counted(m):
+            nonlocal grown
+            out = repl(m)
+            grown += len(out) - len(m.group(0))
+            if grown > budget:
+                raise _ExpansionTooLarge
+            return out
+
+        return counted
 
     def repl_pattern(m):
         var, is_global, pat, rep = m.group(1), m.group(2), m.group(3), m.group(4)
@@ -5304,25 +5328,30 @@ def _expand_shell_assignments(command: str, inherited: bool = True) -> str:
         pointed = env.get(m.group(1))
         return env.get(pointed, m.group(0)) if pointed is not None else m.group(0)
 
-    command = _SHELL_PARAM_INDIRECT_RE.sub(repl_indirect, command)
-    command = _SHELL_PARAM_REPL_RE.sub(repl_pattern, command)
-    command = _SHELL_PARAM_CASE_RE.sub(repl_case, command)
-    return _SHELL_VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), command)
+    command = _SHELL_PARAM_INDIRECT_RE.sub(bounded(repl_indirect), command)
+    command = _SHELL_PARAM_REPL_RE.sub(bounded(repl_pattern), command)
+    command = _SHELL_PARAM_CASE_RE.sub(bounded(repl_case), command)
+    return _SHELL_VAR_RE.sub(
+        bounded(lambda m: env.get(m.group(1) or m.group(2), m.group(0))), command
+    )
 
 
 def _shell_assignment_passes(command: str):
     """`_expand_shell_assignments` passes while each changes the text. A chain of n names settles
     within n.bit_length() passes; cycles (`a=$b b=$c c=$a`) and copies (`b=$a$a`) never settle,
-    hence the pass cap. A later pass past the size cap yields None: the pass it cut off can resolve
-    the path, so the caller refuses rather than scanning it."""
+    hence the pass cap. A later pass outgrowing the size cap stops mid-substitution and yields None:
+    the pass it cut off can resolve the path, so the caller refuses rather than scanning it."""
     passes = len({name for name, _ in _SHELL_ASSIGN_RE.findall(command)}).bit_length() + 1
     limit = 4 * len(command) + _MAX_TERMINAL_SCAN_CHARS
     for index in range(passes):
-        expanded = _expand_shell_assignments(command, inherited = not index)
-        if expanded == command:
-            return
-        if index and len(expanded) > limit:
+        try:
+            expanded = _expand_shell_assignments(
+                command, inherited = not index, budget = limit - len(command) if index else None
+            )
+        except _ExpansionTooLarge:
             yield None
+            return
+        if expanded == command:
             return
         yield expanded
         command = expanded
