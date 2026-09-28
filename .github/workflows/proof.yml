@@ -1,8 +1,8 @@
-name: PR 12167 / 12169 Windows proof
+name: Windows proof
 on:
   push:
     branches: [proof-12167-12169]
-    paths: ['.github/workflows/proof.yml']
+    paths: ['.github/workflows/proof.yml', 'exp/mxc_proof.py']
 permissions:
   contents: read
 jobs:
@@ -15,81 +15,39 @@ jobs:
       matrix:
         os: [windows-latest, windows-11-arm]
         arm: [base, head]
-        pr: ['12178']
+        pr: ['12182']
         include:
-          - {arm: base, sha: be9e6afd9269f3b1b63fa7c657ba710fd911482a}
-          - {pr: '12178', arm: head, sha: 2cd84e6f96eae1defc01463a23dc15dbbdde7dc2}
+          - {arm: base, sha: e417798d3fece7432280e2ecba02c3cf1c3f264a}
+          - {pr: '12182', arm: head, sha: b0f433b18d78db6c839dae869acaff82aa16c83f}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: unslothai/unsloth
           ref: ${{ matrix.sha }}
           persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: proofkit
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: '3.12'
-      - run: python -m pip install -U pip pytest typer pyyaml pydantic click rich tomli httpx
+      - run: python -m pip install -U pip pytest
+      - name: real Windows PowerShell 5.1 run
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          python proofkit/exp/mxc_proof.py 2>&1 | Tee-Object proof.log
+          $code = $LASTEXITCODE
+          Write-Host "PROOF_EXIT=$code"
+          exit $code
       - name: pytest
         if: ${{ !cancelled() }}
         shell: pwsh
-        env:
-          PR: ${{ matrix.pr }}
         run: |
-          if ($env:PR -eq '12178') {
-            $files = @('tests/python/test_windows_installer_concurrency_guard.py')
-            if (Test-Path 'tests/security/test_lint_av_shapes.py') { $files += 'tests/security/test_lint_av_shapes.py' }
-            python -m pytest -rA -s -p no:cacheprovider @files 2>&1 | Tee-Object pytest.log
-            $code = $LASTEXITCODE
-            Write-Host "PROOF_PYTEST_EXIT=$code"
-            Select-String -Path pytest.log -Pattern '^(PASSED|FAILED|SKIPPED|ERROR) ' | ForEach-Object { "ID " + $_.Line }
-            pwsh -NoProfile -File tests/studio/test_path_resolver_degrades.ps1
-            if ($LASTEXITCODE -ne 0) { $code = 1 }
-            exit $code
-          } elseif ($env:PR -eq '12166') {
-            if (-not (Test-Path 'unsloth_cli/tests/test_ssl_keylog.py')) { 'NO_TEST_ON_THIS_ARM'; exit 0 }
-            $files = @('unsloth_cli/tests/test_ssl_keylog.py')
-          } elseif ($env:PR -eq '12167') {
-            $files = @('tests/python/test_windows_setup_output_encoding.py','tests/python/test_windows_studio_update_launcher.py','tests/studio/install/test_keep_install_backcompat_9979.py','tests/security/test_release_desktop_signing_simulation.py')
-          } else {
-            $files = @('tests/security/test_scan_packages.py')
-          }
-          python -m pytest -rA -s -p no:cacheprovider @files 2>&1 | Tee-Object pytest.log
+          python -m pytest -rA -p no:cacheprovider studio/backend/tests/test_install_mxc_prebuilt.py 2>&1 | Tee-Object pytest.log
           $code = $LASTEXITCODE
+          Select-String -Path pytest.log -Pattern '^(PASSED|FAILED|SKIPPED|ERROR) ' | ForEach-Object { "ID " + $_.Line }
           Write-Host "PROOF_PYTEST_EXIT=$code"
-          Select-String -Path pytest.log -Pattern 'console_attached|^(PASSED|FAILED|SKIPPED|ERROR) ' | ForEach-Object { "ID " + $_.Line }
           exit $code
-      - name: dev-machine gate (GITHUB_ACTIONS unset)
-        if: ${{ !cancelled() && matrix.pr == '12167' }}
-        shell: pwsh
-        run: |
-          Remove-Item Env:GITHUB_ACTIONS -ErrorAction SilentlyContinue
-          python -m pytest -rs -p no:cacheprovider tests/python/test_windows_setup_output_encoding.py -k "console_less or redirected_stream" 2>&1 | Tee-Object gate.log
-          $probes = Get-ChildItem $env:TEMP -Recurse -Filter '*_console_less_probe.ps1' -ErrorAction SilentlyContinue
-          "PROBE_FILES_LEFT=$(@($probes).Count)"
-          "GATE_SKIPS=$(@(Select-String -Path gate.log -Pattern 'FreeConsole probe trips').Count)"
-      - name: rollback lifecycle (pwsh)
-        if: ${{ !cancelled() && matrix.pr == '12167' }}
-        run: pwsh -NoProfile -File tests/studio/test_install_rollback_lifecycle.ps1
-      - name: Pester FindInstalledUv
-        if: ${{ !cancelled() && matrix.pr == '12167' }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (-not (Get-Module -ListAvailable Pester | Where-Object Version -ge ([version]'5.5.0'))) {
-            Install-Module Pester -MinimumVersion 5.5.0 -Force -SkipPublisherCheck -Scope CurrentUser
-          }
-          Import-Module Pester -MinimumVersion 5.5.0 -Force
-          $cfg = New-PesterConfiguration
-          $cfg.Run.Path = 'tests/studio_setup_ps1/Studio.Setup.FindInstalledUv.Tests.ps1'
-          $cfg.Run.Exit = $true
-          $cfg.Run.Throw = $true
-          $cfg.Output.Verbosity = 'Detailed'
-          Invoke-Pester -Configuration $cfg
-      - name: no renamed system binaries left behind
-        if: ${{ !cancelled() }}
-        shell: pwsh
-        run: |
-          $hits = Get-ChildItem $env:RUNNER_TEMP, $env:TEMP -Recurse -File -Include *.exe -ErrorAction SilentlyContinue |
-            Where-Object { $_.VersionInfo.CompanyName -like 'Microsoft*' -and $_.VersionInfo.OriginalFilename -and ($_.Name -ne $_.VersionInfo.OriginalFilename.Replace('.MUI','')) }
-          $hits | ForEach-Object { "RENAMED_SYSTEM_BINARY $($_.FullName) <- $($_.VersionInfo.OriginalFilename)" }
-          "RENAMED_COUNT=$(@($hits).Count)"
