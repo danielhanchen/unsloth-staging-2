@@ -4018,7 +4018,9 @@ def _references_studio_credential_here(
         # directory every later relative path opens from, and handing the unexpanded text to the cwd
         # walk read `$d` as a directory name and never moved.
         for expanded in _shell_assignment_passes(text):
-            if _references_studio_credential_here(expanded, workdir, _expanded = True):
+            if expanded is None or _references_studio_credential_here(
+                expanded, workdir, _expanded = True
+            ):
                 return True
     # A `cd` earlier in the command moves where every later relative path opens from.
     if workdir and ("cd" in text.lower() or "pushd" in text.lower()):
@@ -5252,13 +5254,14 @@ def _posix_join(parts) -> str:
     return out
 
 
-def _shell_assignments(command: str) -> "dict[str, str]":
-    """`NAME=value` bindings, last wins; a self-reference takes the prior binding (`p=..; p=$p/auth`
-    -> `../auth`), as the shell does. Substituting it into itself doubled `PATH=$PATH:/x` forever."""
+def _shell_assignments(command: str, self_refs: str = "keep") -> "dict[str, str]":
+    """`NAME=value` bindings, last wins. `p=$p/x` under *self_refs*: "keep" as written; "prior" the
+    earlier binding, else `$p`; "drop" the earlier binding, else nothing (a repeated pass can't grow).
+    Only the additive credential passes resolve them: a subshell's `(p=/tmp)` is no prior binding."""
     env: "dict[str, str]" = {}
     for name, value in _SHELL_ASSIGN_RE.findall(command):
         own = re.compile(rf"\$(?:{name}\b|\{{!?{name}\b[^{{}}]*\}})")
-        if own.search(value):
+        if self_refs != "keep" and (name in env or self_refs == "drop") and own.search(value):
             value = own.sub(lambda _m: env.get(name, ""), value)
             # Repeated `a=$a$a` doubles; past any real path length the earlier binding stands.
             if len(value) > _MAX_PATH_SCAN_CHARS:
@@ -5267,13 +5270,36 @@ def _shell_assignments(command: str) -> "dict[str, str]":
     return env
 
 
-def _expand_shell_assignments(command: str) -> str:
-    """Best-effort substitution of `NAME=value ... $NAME`, so a sensitive path split across an
-    assignment and an argument (p=/etc; cat $p/passwd) is still visible to the scan. Also applies
-    pattern replacement. Fail-open: only adds detections."""
-    env = _shell_assignments(command)
+class _ExpansionTooLarge(Exception):
+    pass
+
+
+def _expand_shell_assignments(
+    command: str,
+    self_refs: str = "keep",
+    budget: "int | None" = None,
+) -> str:
+    """Best-effort substitution of `NAME=value ... $NAME` (p=/etc; cat $p/passwd) and pattern
+    replacement. Fail-open: only adds detections. Past *budget* growth raises `_ExpansionTooLarge`
+    mid-substitution (`y=$x$x...; z=$y$y...` built ~1 GB)."""
+    env = _shell_assignments(command, self_refs)
     if not env:
         return command
+    grown = 0
+
+    def bounded(repl):
+        if budget is None:
+            return repl
+
+        def counted(m):
+            nonlocal grown
+            out = repl(m)
+            grown += len(out) - len(m.group(0))
+            if grown > budget:
+                raise _ExpansionTooLarge
+            return out
+
+        return counted
 
     def repl_pattern(m):
         var, is_global, pat, rep = m.group(1), m.group(2), m.group(3), m.group(4)
@@ -5299,21 +5325,30 @@ def _expand_shell_assignments(command: str) -> str:
         pointed = env.get(m.group(1))
         return env.get(pointed, m.group(0)) if pointed is not None else m.group(0)
 
-    command = _SHELL_PARAM_INDIRECT_RE.sub(repl_indirect, command)
-    command = _SHELL_PARAM_REPL_RE.sub(repl_pattern, command)
-    command = _SHELL_PARAM_CASE_RE.sub(repl_case, command)
-    return _SHELL_VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), command)
+    command = _SHELL_PARAM_INDIRECT_RE.sub(bounded(repl_indirect), command)
+    command = _SHELL_PARAM_REPL_RE.sub(bounded(repl_pattern), command)
+    command = _SHELL_PARAM_CASE_RE.sub(bounded(repl_case), command)
+    return _SHELL_VAR_RE.sub(
+        bounded(lambda m: env.get(m.group(1) or m.group(2), m.group(0))), command
+    )
 
 
 def _shell_assignment_passes(command: str):
-    """`_expand_shell_assignments` passes while each changes the text. A chain of n names settles
-    within n.bit_length() passes; cycles (`a=$b b=$c c=$a`) and copies (`b=$a$a`) never settle,
-    hence the pass cap and the size cap."""
+    """Expansion passes while each changes the text; n chained names settle in n.bit_length() passes,
+    cycles never do. A later pass past the size cap yields None: the caller refuses."""
     passes = len({name for name, _ in _SHELL_ASSIGN_RE.findall(command)}).bit_length() + 1
     limit = 4 * len(command) + _MAX_TERMINAL_SCAN_CHARS
     for index in range(passes):
-        expanded = _expand_shell_assignments(command)
-        if expanded == command or (index and len(expanded) > limit):
+        try:
+            expanded = _expand_shell_assignments(
+                command,
+                self_refs = "drop" if index else "prior",
+                budget = limit - len(command) if index else None,
+            )
+        except _ExpansionTooLarge:
+            yield None
+            return
+        if expanded == command:
             return
         yield expanded
         command = expanded
