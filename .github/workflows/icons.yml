@@ -1,0 +1,57 @@
+name: WSL shortcut icon proof
+on:
+  push:
+    branches: [proof-12167-12169]
+    paths: ['icons/**', '.github/workflows/icons.yml']
+permissions:
+  contents: read
+jobs:
+  icons:
+    name: ${{ matrix.variant }} ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+        variant: [base, head, none]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.12'
+      - name: install, stale, reinstall
+        shell: powershell
+        env:
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          New-Item -ItemType Directory -Force -Path C:\proof | Out-Null
+          Copy-Item icons\unsloth.ico C:\proof\unsloth.ico
+          $script = "icons\wsl_shortcut_$env:VARIANT.ps1"
+          $lnk = Join-Path ([Environment]::GetFolderPath('Desktop')) 'Unsloth Studio (WSL - Ubuntu).lnk'
+          & icons\shot.ps1 0_clean
+          & powershell -NoProfile -ExecutionPolicy RemoteSigned -File $script
+          "INSTALL1_EXIT=$LASTEXITCODE"
+          Start-Sleep -Seconds 5
+          & icons\shot.ps1 1_installed
+          $ws = New-Object -ComObject WScript.Shell
+          $s = $ws.CreateShortcut($lnk)
+          "ICON_AFTER_INSTALL=$($s.IconLocation)"
+          $s.IconLocation = "$env:SystemRoot\System32\shell32.dll,3"
+          $s.Save()
+          Start-Sleep -Seconds 5
+          & icons\shot.ps1 2_other_icon_written
+          & powershell -NoProfile -ExecutionPolicy RemoteSigned -File $script
+          "INSTALL2_EXIT=$LASTEXITCODE"
+          Start-Sleep -Seconds 5
+          & icons\shot.ps1 3_reinstalled
+          "ICON_AFTER_REINSTALL=$($ws.CreateShortcut($lnk).IconLocation)"
+          Get-Process explorer -ErrorAction SilentlyContinue | ForEach-Object { "EXPLORER pid=$($_.Id) session=$($_.SessionId)" }
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: ${{ always() }}
+        with:
+          name: shots-${{ matrix.variant }}-${{ matrix.os }}
+          path: shots/
