@@ -39,3 +39,17 @@ export function formatMcpToolName(
   if (sep <= 0) return null;
   return `${mcpServer || rest.slice(0, sep)} · ${mcpTool || rest.slice(sep + 2)}`;
 }
+
+export function mcpServerIdFromToolName(toolName: string): string | null {
+  if (!toolName.startsWith(MCP_TOOL_PREFIX)) return null;
+  const rest = toolName.slice(MCP_TOOL_PREFIX.length);
+  const sep = rest.indexOf("__");
+  return sep > 0 ? rest.slice(0, sep) : null;
+}
+
+export function mcpBareToolName(toolName: string): string | null {
+  if (!toolName.startsWith(MCP_TOOL_PREFIX)) return null;
+  const rest = toolName.slice(MCP_TOOL_PREFIX.length);
+  const sep = rest.indexOf("__");
+  return sep > 0 ? rest.slice(sep + 2) : null;
+}

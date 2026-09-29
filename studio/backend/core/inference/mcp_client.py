@@ -1537,8 +1537,123 @@ def invalidate_tool_cache(server_id: Optional[str] = None) -> None:
         _probe_cooloff_until.pop(_account_key(server_id), None)
 
 
+UI_RESOURCE_SCHEME = "ui://"
+MAX_UI_RESOURCE_CHARS = 5_000_000
+
+
+def _meta_values(tool: Any, key: str) -> list:
+    out = []
+    if not isinstance(tool, dict):
+        return out
+    for spelling in ("meta", "_meta"):
+        meta = tool.get(spelling)
+        if isinstance(meta, dict) and key in meta:
+            out.append(meta[key])
+    return out
+
+
+def _ui_meta_field(tool: Any, field: str):
+    for ui in _meta_values(tool, "ui"):
+        if isinstance(ui, dict) and ui.get(field) is not None:
+            return ui[field]
+    for value in _meta_values(tool, f"ui/{field}"):
+        if value is not None:
+            return value
+    return None
+
+
+def tool_ui_resource_uri(tool: Any) -> Optional[str]:
+    """Only ui:// is honoured: the host fetches this URI."""
+    uri = _ui_meta_field(tool, "resourceUri")
+    if not isinstance(uri, str):
+        return None
+    uri = uri.strip()
+    return (
+        uri if uri.startswith(UI_RESOURCE_SCHEME) and len(uri) > len(UI_RESOURCE_SCHEME) else None
+    )
+
+
+def _tool_visibility(tool: Any) -> Optional[tuple]:
+    visibility = _ui_meta_field(tool, "visibility")
+    return tuple(visibility) if isinstance(visibility, (list, tuple)) else None
+
+
+def tool_model_visible(tool: Any) -> bool:
+    visibility = _tool_visibility(tool)
+    return True if visibility is None else "model" in visibility
+
+
+def tool_app_callable(tool: Any) -> bool:
+    visibility = _tool_visibility(tool)
+    return True if visibility is None else "app" in visibility
+
+
+def ui_resource_uris_for_tools(tools: list) -> dict:
+    out = {}
+    for tool in tools or []:
+        name = tool.get("name") if isinstance(tool, dict) else None
+        uri = tool_ui_resource_uri(tool)
+        if name and uri:
+            out[str(name)] = uri
+    return out
+
+
 MCP_IMAGES_SENTINEL = mcp_images.SENTINEL
 MAX_IMAGE_PAYLOAD_CHARS = 12_000_000
+
+# Emitted BEFORE the image envelope, whose parse reads to end of string.
+MCP_UI_SENTINEL = "__MCP_UI__:"
+MAX_UI_STRUCTURED_CHARS = 1_000_000
+
+
+def _ui_envelope(result: Any, ui_resource_uri: str, seed_content: list) -> str:
+    payload: dict = {"resourceUri": ui_resource_uri}
+    structured = getattr(result, "structured_content", None)
+    meta = getattr(result, "meta", None)
+    if isinstance(meta, dict) and meta:
+        payload["_meta"] = meta
+    if structured is not None:
+        payload["structuredContent"] = structured
+    if seed_content:
+        payload["content"] = seed_content
+    try:
+        line = json.dumps(payload)
+    except (TypeError, ValueError):
+        line = None
+    if line is None or len(line) > MAX_UI_STRUCTURED_CHARS:
+        # Shed structuredContent first; dropping the blocks too would leave the view nothing.
+        reduced = {"resourceUri": ui_resource_uri, "structuredContentOmitted": True}
+        for key in ("content", "_meta"):
+            value = payload.get(key)
+            if value is None:
+                continue
+            candidate = dict(reduced)
+            candidate[key] = value
+            try:
+                probe = json.dumps(candidate)
+            except (TypeError, ValueError):
+                continue
+            if len(probe) <= MAX_UI_STRUCTURED_CHARS:
+                reduced = candidate
+        line = json.dumps(reduced)
+    return "\n" + MCP_UI_SENTINEL + line
+
+
+def _is_ui_envelope_line(line: str) -> bool:
+    if not line.startswith(MCP_UI_SENTINEL):
+        return False
+    try:
+        payload = json.loads(line[len(MCP_UI_SENTINEL) :])
+    except (ValueError, RecursionError):
+        return False
+    return isinstance(payload, dict) and isinstance(payload.get("resourceUri"), str)
+
+
+def _drop_forged_ui_sentinels(body: str) -> str:
+    """Readers take the last marker, so a tool-written one could summon a widget with forged seed text."""
+    if MCP_UI_SENTINEL not in body:
+        return body
+    return "\n".join(line for line in body.split("\n") if not _is_ui_envelope_line(line))
 
 
 def _block_text(block: Any) -> Optional[str]:
@@ -1713,9 +1828,21 @@ def _strip_payloads(value: Any, payloads: set[str]) -> Any:
     return _MIRRORED if value and not kept else kept
 
 
-def _flatten_result(result: Any) -> str:
+# The frontend refills bytes positionally into image blocks that have no `data`.
+def _seeded_image_block(block: Any, mime: str) -> dict:
+    out = {k: v for k, v in _content_block_json(block).items() if k != "data"}
+    resource = out.get("resource")
+    if isinstance(resource, dict) and "blob" in resource:
+        out["resource"] = {k: v for k, v in resource.items() if k != "blob"}
+    out["type"] = "image"
+    out["mimeType"] = mime
+    return out
+
+
+def _flatten_result(result: Any, ui_resource_uri: Optional[str] = None) -> str:
     parts = []
     images = []
+    seed = []
     unshown = []
     payloads = set()
     omitted = 0
@@ -1726,10 +1853,12 @@ def _flatten_result(result: Any) -> str:
         if text:
             parts.append(text)
             has_text = True
+            seed.append(_content_block_json(block))
             continue
         link = _block_link(block)
         if link:
             parts.append(link)
+            seed.append(_content_block_json(block))
             continue
         image = _block_image(block)
         if image is not None:
@@ -1740,7 +1869,10 @@ def _flatten_result(result: Any) -> str:
                 continue
             budget -= len(data)
             images.append({"data": data, "mimeType": mime})
+            # Bytes omitted: they ride the image envelope and the frontend refills them.
+            seed.append(_seeded_image_block(block, mime))
             continue
+        seed.append(_content_block_json(block))
         attachment = _block_attachment(block)
         if attachment is not None:
             note, data = attachment
@@ -1768,6 +1900,9 @@ def _flatten_result(result: Any) -> str:
     if getattr(result, "is_error", False):
         # "Error: " prefix triggers tool_call_parser's TOOL_ERROR_PREFIXES nudge.
         body = f"Error: {body}" if body else "Error: tool returned no content"
+    body = _drop_forged_ui_sentinels(body)
+    if ui_resource_uri and not getattr(result, "is_error", False):
+        body += _ui_envelope(result, ui_resource_uri, seed)
     if images:
         body += "\n" + MCP_IMAGES_SENTINEL + json.dumps(images)
     return body
@@ -1838,7 +1973,9 @@ def _call_session_tool(
     scope: Optional[str],
     config_check,
     use_oauth: bool = False,
+    dispatch = None,
 ) -> Any:
+    """Run ``dispatch`` (default: the tool call) on a stdio server's persistent session."""
     if cancel_event is not None and cancel_event.is_set():
         raise _MCPCancelled
     # One deadline covers the key-lock wait, connect, call-lock wait, and the call itself, matching the one-shot path
@@ -1933,7 +2070,9 @@ def _call_session_tool(
                 rem = _remaining()
                 # raise_on_error=False for the same reason as the one-shot path.
                 coro = _race_tool_call(
-                    session.client.call_tool(name, args, raise_on_error = False),
+                    dispatch(session.client)
+                    if dispatch is not None
+                    else session.client.call_tool(name, args, raise_on_error = False),
                     rem,
                     cancel_event,
                     # Only a cached session is worth waiting on.
@@ -2001,6 +2140,7 @@ def call_tool_sync(
     cancel_event = None,
     scope: Optional[str] = None,
     config_check = None,
+    ui_resource_uri: Optional[str] = None,
 ) -> str:
     """Call one MCP tool and return its flattened text/image result. Never raises: every failure comes
     back as an "Error: ..." string for the model.
@@ -2015,7 +2155,8 @@ def call_tool_sync(
 
     ``timeout`` is one budget covering connect and call together. ``cancel_event`` aborts an
     in-flight call. ``config_check`` re-reads the server row so a call that raced an edit or delete
-    cannot dispatch on the stale configuration.
+    cannot dispatch on the stale configuration. ``ui_resource_uri`` appends the frontend-only
+    __MCP_UI__ envelope.
     """
 
     async def _one_shot() -> Any:
@@ -2046,7 +2187,145 @@ def call_tool_sync(
         logger.exception("MCP call_tool failed for %s: %s", name, exc)
         return f"Error: MCP tool '{name}' failed: {exc}"
 
-    return _flatten_result(result)
+    return _flatten_result(result, ui_resource_uri)
+
+
+# Bounded: this crosses to a browser.
+MAX_UI_TOOL_RESULT_CHARS = 4_000_000
+
+
+def _content_block_json(block: Any) -> dict:
+    dump = getattr(block, "model_dump", None)
+    if callable(dump):
+        try:
+            # by_alias, or the SDK's `meta` reaches the widget instead of `_meta`.
+            return dump(mode = "json", exclude_none = True, by_alias = True)
+        except Exception:  # noqa: BLE001
+            pass
+    out = {"type": getattr(block, "type", "text")}
+    for field in ("text", "data", "mimeType", "uri", "name"):
+        value = getattr(block, field, None)
+        if value is not None:
+            out[field] = value if isinstance(value, (str, int, float, bool)) else str(value)
+    return out
+
+
+def _structured_result(result: Any) -> dict:
+    out: dict = {
+        "content": [_content_block_json(b) for b in getattr(result, "content", None) or []],
+        "isError": bool(getattr(result, "is_error", False)),
+    }
+    structured = getattr(result, "structured_content", None)
+    if structured is not None:
+        out["structuredContent"] = structured
+    meta = getattr(result, "meta", None)
+    if isinstance(meta, dict) and meta:
+        out["_meta"] = meta
+    try:
+        size = len(json.dumps(out))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"tool result is not JSON-serialisable: {exc}") from exc
+    if size > MAX_UI_TOOL_RESULT_CHARS:
+        raise ValueError(f"tool result is {size} chars, over the {MAX_UI_TOOL_RESULT_CHARS} limit")
+    return out
+
+
+def call_tool_structured_sync(
+    url: str,
+    headers: Optional[dict],
+    name: str,
+    args: dict,
+    timeout: Optional[float] = 120.0,
+    use_oauth: bool = False,
+    cancel_event = None,
+    scope: Optional[str] = None,
+    config_check = None,
+) -> dict:
+    async def _one_shot() -> Any:
+        async with _client(url, headers, use_oauth) as client:
+            return await client.call_tool(name, args, raise_on_error = False)
+
+    try:
+        if is_stdio(url) or (scope and not use_oauth):
+            result = _call_session_tool(
+                url, headers, name, args, timeout, cancel_event, scope, config_check, use_oauth
+            )
+        else:
+            result = asyncio.run(_race_tool_call(_one_shot(), timeout, cancel_event))
+    except _MCPCancelled as exc:
+        raise TimeoutError(f"MCP tool '{name}' was cancelled") from exc
+    return _structured_result(result)
+
+
+def _resource_contents(blocks: Any, uri: str) -> dict:
+    """Of several contents the one matching the requested uri wins, else the first."""
+    import base64
+
+    items = list(blocks or [])
+    if not items:
+        raise ValueError("resource is empty")
+    chosen = next((b for b in items if str(getattr(b, "uri", "")) == uri), items[0])
+    mime = getattr(chosen, "mimeType", None) or ""
+    text = getattr(chosen, "text", None)
+    if text is None:
+        blob = getattr(chosen, "blob", None)
+        if blob is None:
+            raise ValueError("resource carries neither text nor blob content")
+        try:
+            text = base64.b64decode(str(blob)).decode("utf-8")
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"resource blob is not UTF-8 HTML: {exc}") from exc
+    text = str(text)
+    if len(text) > MAX_UI_RESOURCE_CHARS:
+        raise ValueError(f"resource is {len(text)} chars, over the {MAX_UI_RESOURCE_CHARS} limit")
+    # _meta.ui on the contents, not the tool: the template's CSP declaration.
+    ui = None
+    for spelling in ("meta", "_meta"):
+        meta = getattr(chosen, spelling, None)
+        if isinstance(meta, dict) and isinstance(meta.get("ui"), dict):
+            ui = meta["ui"]
+            break
+    return {
+        "uri": uri,
+        "mimeType": str(mime),
+        "text": text,
+        "ui": ui if isinstance(ui, dict) else {},
+    }
+
+
+def read_resource_sync(
+    url: str,
+    headers: Optional[dict],
+    uri: str,
+    timeout: Optional[float] = 60.0,
+    use_oauth: bool = False,
+    cancel_event = None,
+    scope: Optional[str] = None,
+    config_check = None,
+) -> dict:
+    async def _one_shot() -> Any:
+        async with _client(url, headers, use_oauth) as client:
+            return await client.read_resource(uri)
+
+    try:
+        if is_stdio(url) or (scope and not use_oauth):
+            blocks = _call_session_tool(
+                url,
+                headers,
+                uri,
+                {},
+                timeout,
+                cancel_event,
+                scope,
+                config_check,
+                use_oauth,
+                dispatch = lambda client: client.read_resource(uri),
+            )
+        else:
+            blocks = asyncio.run(_race_tool_call(_one_shot(), timeout, cancel_event))
+    except _MCPCancelled as exc:
+        raise TimeoutError(f"reading MCP resource '{uri}' was cancelled") from exc
+    return _resource_contents(blocks, uri)
 
 
 class _MCPCancelled(Exception):

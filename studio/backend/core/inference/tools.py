@@ -73,6 +73,8 @@ from core.inference.mcp_client import (
     probe_timeout,
     record_probe_failure,
     stdio_mcp_enabled,
+    tool_model_visible,
+    tool_ui_resource_uri,
 )
 from storage import mcp_servers_db
 from utils.account_context import account_thread, current_account_id, is_owner_context
@@ -13209,21 +13211,7 @@ _MCP_ALIAS_SUFFIX_LEN = _MCP_ALIAS_DIGEST_LEN + 1
 
 
 def _mcp_tool_model_visible(tool: dict) -> bool:
-    """False for MCP Apps tools marked app-only (_meta.ui.visibility without "model"): those exist
-    for a server-rendered widget to call, not the LLM."""
-    # model_dump() gives "meta", the wire "_meta"; unrelated keys in one must not mask the other.
-    for key in ("meta", "_meta"):
-        meta = tool.get(key)
-        if not isinstance(meta, dict):
-            continue
-        ui = meta.get("ui")
-        visibility = ui.get("visibility") if isinstance(ui, dict) else None
-        if visibility is None:
-            # Tolerated, not spec: only flat "ui/resourceUri" is deprecated.
-            visibility = meta.get("ui/visibility")
-        if isinstance(visibility, (list, tuple)):
-            return "model" in visibility
-    return True
+    return tool_model_visible(tool)
 
 
 def _mcp_tool_names(server: dict, mcp_tools: list[dict]) -> dict[str, str]:
@@ -13413,6 +13401,19 @@ async def get_enabled_mcp_tools() -> list[dict]:
             continue
         specs.extend(_mcp_specs_for_server(server, payload))
     return specs
+
+
+def mcp_tool_definition(server_id: str, tool_name: str) -> "dict | None":
+    """Cache only: callers must not spawn a stdio subprocess or block on a probe."""
+    for tool in get_cached_tools(server_id) or []:
+        if isinstance(tool, dict) and tool.get("name") == tool_name:
+            return tool
+    return None
+
+
+def mcp_tool_ui_resource(server_id: str, tool_name: str) -> "str | None":
+    tool = mcp_tool_definition(server_id, tool_name)
+    return tool_ui_resource_uri(tool) if tool is not None else None
 
 
 _TIMEOUT_UNSET = object()
@@ -13653,6 +13654,7 @@ def execute_tool(
                 cancel_event = cancel_event,
                 scope = mcp_scope,
                 config_check = _config_current,
+                ui_resource_uri = mcp_tool_ui_resource(server_id, tool_name),
             ),
             name,
         )

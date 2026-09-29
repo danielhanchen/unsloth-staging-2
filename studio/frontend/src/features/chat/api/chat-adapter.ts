@@ -1038,6 +1038,76 @@ export interface McpImageToolResult {
   images: { data: string; mimeType: string }[];
 }
 
+export interface McpUiEnvelope {
+  resourceUri: string;
+  /** Image blocks carry no `data`: it rides the image sentinel. */
+  content?: { type?: string; data?: string; [key: string]: unknown }[];
+  structuredContent?: unknown;
+  _meta?: Record<string, unknown>;
+  /** Seed data was too large to persist; the widget must fetch it itself. */
+  structuredContentOmitted?: boolean;
+}
+
+export interface McpUiToolResult {
+  text: string;
+  ui: McpUiEnvelope;
+  images?: { data: string; mimeType: string }[];
+}
+
+const MCP_UI_MARKER = "\n__MCP_UI__:";
+const MCP_UI_TOOL_PREFIX = "mcp__";
+
+/** A trailing __MCP_UI__ line on an MCP result; one JSON line, so the image envelope may follow. */
+export function extractMcpUiEnvelope(
+  raw: string,
+  toolName: string,
+): {
+  text: string;
+  ui: McpUiEnvelope | null;
+} {
+  if (!toolName.startsWith(MCP_UI_TOOL_PREFIX)) return { text: raw, ui: null };
+  const start = raw.lastIndexOf(MCP_UI_MARKER);
+  if (start === -1) return { text: raw, ui: null };
+  const payloadStart = start + MCP_UI_MARKER.length;
+  const lineEnd = raw.indexOf("\n", payloadStart);
+  const end = lineEnd === -1 ? raw.length : lineEnd;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw.slice(payloadStart, end));
+  } catch {
+    return { text: raw, ui: null };
+  }
+  if (
+    typeof parsed !== "object" ||
+    parsed === null ||
+    typeof (parsed as { resourceUri?: unknown }).resourceUri !== "string"
+  ) {
+    return { text: raw, ui: null };
+  }
+  return {
+    text: raw.slice(0, start) + raw.slice(end),
+    ui: parsed as McpUiEnvelope,
+  };
+}
+
+export function isMcpUiToolResult(
+  val: unknown,
+  toolName?: string,
+): val is McpUiToolResult {
+  // Shape alone is not proof: an imported conversation carries arbitrary objects.
+  if (toolName !== undefined && !toolName.startsWith(MCP_UI_TOOL_PREFIX)) {
+    return false;
+  }
+  if (typeof val !== "object" || val === null) return false;
+  const v = val as { text?: unknown; ui?: unknown };
+  return (
+    typeof v.text === "string" &&
+    typeof v.ui === "object" &&
+    v.ui !== null &&
+    typeof (v.ui as { resourceUri?: unknown }).resourceUri === "string"
+  );
+}
+
 /** The text the model actually saw, for a result that may be wrapped. Exports feed fine-tuning
  *  datasets, so a serialized wrapper would train on the card's metadata. */
 export function toolResultModelText(
@@ -1045,6 +1115,7 @@ export function toolResultModelText(
   toolName?: string,
 ): unknown {
   if (
+    isMcpUiToolResult(result, toolName) ||
     isMcpImageToolResult(result) ||
     isSearchImagesToolResult(result) ||
     isSandboxWrapper(result, toolName)
@@ -1075,10 +1146,16 @@ export function isMcpImageToolResult(val: unknown): val is McpImageToolResult {
   if (typeof val !== "object" || val === null) {
     return false;
   }
-  const v = val as { text?: unknown; images?: unknown; sessionId?: unknown };
+  const v = val as {
+    text?: unknown;
+    images?: unknown;
+    sessionId?: unknown;
+    ui?: unknown;
+  };
   return (
     typeof v.text === "string" &&
     v.sessionId === undefined &&
+    v.ui === undefined &&
     Array.isArray(v.images) &&
     v.images.length > 0 &&
     v.images.every(
@@ -1108,6 +1185,7 @@ function serializeToolResultPart(
     // Backend ChatMessage rejects role="tool" with empty content; a sentinel JSON round-trips it.
     content = result.length > 0 ? result : JSON.stringify({ result: "" });
   } else if (
+    isMcpUiToolResult(result, tc.toolName ?? "") ||
     // The wrapper the live parser builds -- {text, images} and nothing else -- from an
     // MCP result, or from any tool whose raw output ends in a valid envelope. Those
     // are unwrapped by shape, since JSON.stringify below would replay the whole base64
@@ -7126,10 +7204,16 @@ export function createOpenAIStreamAdapter(
                     const rawEvent = (toolEvent.result as string) ?? "";
                     // Pulled out first, ahead of __IMAGES__, so the image slice below is unchanged. Only from the
                     // tools that emit it: elsewhere that line is content.
-                    const { text: rawResult, files: createdFiles } =
+                    const { text: withUi, files: createdFiles } =
                       SANDBOX_FILE_TOOLS.has(toolCallParts[idx].toolName ?? "")
                         ? extractCreatedFiles(rawEvent)
                         : { text: rawEvent, files: [] as SandboxFile[] };
+                    // Ahead of the image slice, which parses to end of string.
+                    const { text: rawResult, ui: mcpUi } =
+                      extractMcpUiEnvelope(
+                        withUi,
+                        toolCallParts[idx].toolName ?? "",
+                      );
                     // Same rule: only from the tool that emits it.
                     const { text: searchText, images: webImages } =
                       toolCallParts[idx].toolName === SEARCH_IMAGE_TOOL
@@ -7153,6 +7237,7 @@ export function createOpenAIStreamAdapter(
                           files?: SandboxFile[];
                         }
                       | McpImageToolResult
+                      | McpUiToolResult
                       | SearchImagesToolResult
                       | {
                           image_b64: string;
@@ -7221,6 +7306,19 @@ export function createOpenAIStreamAdapter(
                       parsedResult = { text: searchText, webImages };
                     } else {
                       parsedResult = rawResult;
+                    }
+                    if (mcpUi) {
+                      parsedResult = {
+                        text: isMcpImageToolResult(parsedResult)
+                          ? parsedResult.text
+                          : typeof parsedResult === "string"
+                            ? parsedResult
+                            : rawResult,
+                        ui: mcpUi,
+                        ...(isMcpImageToolResult(parsedResult)
+                          ? { images: parsedResult.images }
+                          : {}),
+                      };
                     }
                     const nextArgs =
                       toolEvent.arguments &&

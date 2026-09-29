@@ -54,9 +54,22 @@ const ROW_RELEASE_DELAY_MS = 300;
 // Keys whose values are base64 image/audio payloads, not searchable text.
 const BINARY_KEY = /b64|base64|^(images?|audio|video)$/i;
 
+// MCP Apps result: index only `text` (what was shown), not the up-to-1MB `ui` seed; name-gated like the adapter.
+function mcpWidgetText(value: object, toolName: string | undefined): string | null {
+  if (!toolName?.startsWith("mcp__")) return null;
+  const v = value as { text?: unknown; ui?: unknown };
+  const ui = v.ui as { resourceUri?: unknown } | undefined;
+  const isWidget =
+    typeof v.text === "string" &&
+    typeof ui === "object" &&
+    ui !== null &&
+    typeof ui.resourceUri === "string";
+  return isWidget ? (v.text as string) : null;
+}
+
 // Readable text from tool args/results, dropping base64 image/audio blobs so they never
 // bloat the index.
-function searchableText(value: unknown, depth = 0): string {
+function searchableText(value: unknown, depth = 0, toolName?: string): string {
   if (typeof value === "string") {
     let text = splitMcpImages(value).text;
     const cut = text.indexOf("\n__IMAGES__:");
@@ -70,6 +83,10 @@ function searchableText(value: unknown, depth = 0): string {
     return value.map((v) => searchableText(v, depth + 1)).join(" ");
   }
   if (typeof value === "object") {
+    if (depth === 0) {
+      const widgetText = mcpWidgetText(value, toolName);
+      if (widgetText !== null) return searchableText(widgetText, depth + 1);
+    }
     const out: string[] = [];
     for (const [k, v] of Object.entries(value)) {
       if (!BINARY_KEY.test(k)) out.push(searchableText(v, depth + 1));
@@ -118,7 +135,11 @@ function extractText(message: MessageRecord): string {
         typeof p.argsText === "string" ? p.argsText : p.args,
       );
       if (args) parts.push(args);
-      const result = searchableText(p.result);
+      const result = searchableText(
+        p.result,
+        0,
+        typeof p.toolName === "string" ? p.toolName : undefined,
+      );
       if (result) parts.push(result);
     } else if (p.type === "source") {
       for (const v of [p.title, p.url])

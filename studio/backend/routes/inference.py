@@ -3978,6 +3978,86 @@ async def artifact_preview_frame(allow_network: bool = False):
     )
 
 
+# A bare "*" is refused: such a template gets the default-deny.
+_MCP_APP_DOMAIN_RE = _re.compile(
+    r"^(?:(?:https?|wss?)://)?"  # optional scheme
+    r"(?:\*\.)?"  # optional leading wildcard label
+    r"(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*"
+    r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    r"(?::[0-9]{1,5})?$"
+)
+_MCP_APP_MAX_DOMAINS = 24
+# Documents/workers from these schemes inherit this policy and origin; bare "https:" would equal "*".
+_MCP_APP_LOCAL_SCHEMES = frozenset({"blob:", "data:"})
+
+
+def _mcp_app_domains(raw: Optional[str], local_schemes: bool = True) -> list:
+    """Non-host entries are dropped: these come from the browser and go into a response header."""
+    if not raw:
+        return []
+    out = []
+    for part in raw.split(","):
+        candidate = part.strip()
+        if not candidate or len(out) >= _MCP_APP_MAX_DOMAINS:
+            continue
+        if local_schemes and candidate.lower() in _MCP_APP_LOCAL_SCHEMES:
+            out.append(candidate.lower())
+        elif _MCP_APP_DOMAIN_RE.match(candidate):
+            out.append(candidate)
+    return out
+
+
+def _mcp_app_csp(connect: list, resource: list, frame: list, base_uri: list) -> str:
+    resource_src = " ".join(resource)
+    # Plain locals: nested same-quote f-strings need Python 3.12; this file targets 3.11.
+    connect_src = " ".join(connect) if connect else "'none'"
+    frame_src = " ".join(frame) if frame else "'none'"
+    base_uri_src = " ".join(base_uri) if base_uri else "'none'"
+    worker_src = "blob:" if "blob:" in resource else "'none'"
+    return (
+        "default-src 'none'; "
+        f"script-src 'unsafe-inline'{' ' + resource_src if resource_src else ''}; "
+        f"style-src 'unsafe-inline'{' ' + resource_src if resource_src else ''}; "
+        f"img-src data: blob:{' ' + resource_src if resource_src else ''}; "
+        f"font-src data:{' ' + resource_src if resource_src else ''}; "
+        f"media-src data: blob:{' ' + resource_src if resource_src else ''}; "
+        f"connect-src {connect_src}; "
+        f"frame-src {frame_src}; "
+        f"worker-src {worker_src}; "
+        "object-src 'none'; "
+        f"base-uri {base_uri_src}; "
+        "form-action 'none'; "
+        f"frame-ancestors {_ARTIFACT_PREVIEW_FRAME_ANCESTORS}; "
+        "sandbox allow-scripts"
+    )
+
+
+@studio_router.get("/mcp-app-frame", include_in_schema = False)
+async def mcp_app_frame(
+    connect: Optional[str] = None,
+    resource: Optional[str] = None,
+    frame: Optional[str] = None,
+    base_uri: Optional[str] = None,
+):
+    """Unauthenticated like the canvas shell: no server resource here; calls use the authenticated /ui-tool-call."""
+    csp = _mcp_app_csp(
+        _mcp_app_domains(connect),
+        _mcp_app_domains(resource),
+        _mcp_app_domains(frame),
+        _mcp_app_domains(base_uri, local_schemes = False),
+    )
+    return Response(
+        content = _ARTIFACT_PREVIEW_FRAME_HTML,
+        media_type = "text/html; charset=utf-8",
+        headers = {
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": csp,
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
 # Whitespace/escape-tolerant bare-JSON tool-template detector (matches pretty-printed and
 # JSON-escaped ``{"name":`` plus the ``"function"`` alias), mirroring the parser's tolerance.
 _BARE_JSON_NAME_MARKER_RE = _re.compile(r'\{\s*\\?"(?:name|function)\\?"\s*:')
