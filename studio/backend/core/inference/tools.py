@@ -2088,7 +2088,7 @@ def _find_blocked_commands(command: str, posix: "bool | None" = None) -> set[str
 # child's PYTHONPATH in _build_safe_env.
 _SANDBOX_SITE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sandbox_site")
 
-# "Approve for me" (permission_mode="auto") safety detection. Auto mode pauses only calls classified here as
+# "Auto-approve" (permission_mode="auto") safety detection. Auto mode pauses only calls classified here as
 # potentially unsafe. The sandbox and hard blocks still apply at run time; this gate only decides prompting, and fails
 # closed: anything not provably read-only asks.
 
@@ -7114,7 +7114,7 @@ def _web_search_fetches_url(name: str, arguments: dict) -> bool:
 def is_potentially_unsafe_tool_call(name: str, arguments: dict) -> bool:
     """Whether a tool call must still pause for approval in auto mode.
 
-    Used by permission_mode="auto" ("Approve for me"): read-only calls
+    Used by permission_mode="auto" ("Auto-approve"): read-only calls
     auto-run, anything that can mutate state, execute arbitrary code, or is
     simply unrecognized asks first. Unknown tools fail closed.
     """
@@ -7162,7 +7162,7 @@ def is_potentially_unsafe_tool_call(name: str, arguments: dict) -> bool:
 
 
 # Terminal commands that are high risk regardless of their arguments, so auto
-# ("Approve for me") pauses them while ordinary dev commands (pip install, mkdir,
+# ("Auto-approve") pauses them while ordinary dev commands (pip install, mkdir,
 # cp, make, git, ...) run. The hard-block command set, rlimits, secret-env
 # stripping and the per-session scratch workdir stay on beneath this prompt.
 _HIGH_RISK_COMMANDS = frozenset(
@@ -9234,7 +9234,7 @@ def _python_is_high_risk(code: str) -> bool:
 
 
 def is_high_risk_tool_call(name: str, arguments: dict) -> bool:
-    """Whether a tool call is sensitive enough to pause for approval in auto (Approve for me) mode.
+    """Whether a tool call is sensitive enough to pause for approval in auto (Auto-approve) mode.
 
     Unlike is_potentially_unsafe_tool_call (which prompts on anything not read-only), this prompts
     only on genuinely sensitive actions - credential access, privilege escalation,
@@ -9860,7 +9860,7 @@ def _requested_execution_mode(tool_execution_mode: str, disable_sandbox: bool) -
         raise os_sandbox.SandboxUnavailableError(
             "TOOL_EXECUTION_MODE_INVALID: full access is not requestable through "
             "tool_execution_mode",
-            remediation = "Full access is granted with disable_sandbox (Bypass Permissions).",
+            remediation = "Bypass permissions (disable_sandbox) turns the sandbox off.",
         )
     return tool_execution_mode
 
@@ -10165,10 +10165,11 @@ def _windows_system_cmd() -> str:
 def _terminal_profile(disable_sandbox: bool = False) -> str:
     """Which shell the Terminal runs: "bash", "cmd_isolated" or "cmd_fallback".
 
-    Git Bash cannot start inside MXC (microsoft/mxc#1061), so when the MXC probe names exactly that
-    failure and cmd.exe qualifies instead, Auto runs the Terminal isolated on cmd rather than
-    unsandboxed on bash. Only the MSYS verdict triggers the cmd probe, so hosts without a working MXC
-    pay nothing extra. Full access and UNSLOTH_MXC_TERMINAL_CMD=0 keep the host shell.
+    Git Bash cannot start inside MXC (microsoft/mxc#1061), so when bash fails the MXC probe and
+    cmd.exe qualifies instead, Auto runs the Terminal isolated on cmd rather than unsandboxed on bash.
+    Any bash failure counts, not only the MSYS verdict: on a freshly prepared host bash fails without
+    that signature while cmd passes. Only the DACL tier probes at all, and only a failed bash probes
+    cmd. Full access and UNSLOTH_MXC_TERMINAL_CMD=0 keep the host shell.
     """
     if sys.platform != "win32":
         return "bash"
@@ -10177,7 +10178,7 @@ def _terminal_profile(disable_sandbox: bool = False) -> str:
     if disable_sandbox or os.environ.get("UNSLOTH_MXC_TERMINAL_CMD") == "0":
         return host_default
     try:
-        from . import mxc_policy, mxc_probe
+        from . import mxc_policy
 
         if bash:
             # Measured only on MXC's DACL tier; BaseContainer hosts keep bash until it is.
@@ -10186,7 +10187,7 @@ def _terminal_profile(disable_sandbox: bool = False) -> str:
             verdict = os_sandbox.capability_snapshot(
                 execution_kind = "terminal", selected_executable = bash
             )
-            if verdict.available or verdict.reason != mxc_probe.MSYS_NAMESPACE_REASON:
+            if verdict.available:
                 return "bash"
         cmd = os_sandbox.capability_snapshot(
             execution_kind = "terminal", selected_executable = _windows_system_cmd()
@@ -10201,12 +10202,25 @@ def _terminal_profile(disable_sandbox: bool = False) -> str:
 _request_profile: list = [None, 0.0]
 _request_profile_lock = threading.Lock()
 _REQUEST_PROFILE_REFRESH_SECONDS = 240.0
+# Bumped by every reset: a refresh that started earlier must not publish the profile it computed.
+_request_profile_generation = 0
+
+
+def reset_terminal_profile_cache() -> None:
+    """Forget the advertised Terminal profile, so the next request re-checks it (isolation settings changed)."""
+    global _request_profile_generation
+    with _request_profile_lock:
+        _request_profile[:] = [None, 0.0]
+        _request_profile_generation += 1
 
 
 def _refresh_request_profile() -> str:
+    with _request_profile_lock:
+        generation = _request_profile_generation
     profile = _terminal_profile(False)
     with _request_profile_lock:
-        _request_profile[:] = [profile, time.monotonic()]
+        if generation == _request_profile_generation:
+            _request_profile[:] = [profile, time.monotonic()]
     return profile
 
 

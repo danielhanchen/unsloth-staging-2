@@ -23,6 +23,8 @@ export const SETTINGS_SEARCH_INDEX: Record<SettingsTab, TranslationKey[]> = {
     "settings.general.huggingFaceToken",
     "settings.appearance.language.title",
     "settings.appearance.language.label",
+    "settings.general.permissions.sectionTitle",
+    "settings.general.permissions.bypassLabel",
     "settings.general.notifications.sectionTitle",
     "settings.general.notifications.showLlamaUpdates",
     "settings.general.notifications.showWhisperUpdates",
@@ -277,6 +279,12 @@ export const SETTINGS_SEARCH_INDEX: Record<SettingsTab, TranslationKey[]> = {
     "settings.keyboardShortcuts.actions.renameChat.label",
     "settings.keyboardShortcuts.actions.openKeyboardShortcuts.label",
   ],
+  // The Windows rows render only on Windows, so only the rows every platform shows are indexed.
+  sandbox: [
+    "settings.sandbox.toolsSection",
+    "settings.sandbox.python",
+    "settings.sandbox.terminal",
+  ],
   debugging: [
     "settings.debugging.logSection",
     "settings.debugging.source",
@@ -353,6 +361,10 @@ export const SETTINGS_SEARCH_KEYWORDS: Partial<
 > = {
   "settings.resources.storage.modelsFolder":
     "settings.resources.storage.modelsFolderKeywords",
+  // Mode names live in the dropdown, not the row label.
+  "settings.general.permissions.bypassLabel":
+    "settings.general.permissions.modeKeywords",
+  "settings.sandbox.toolsSection": "settings.sandbox.setupKeywords",
   // "purge", "prune" and the tool names are in none of the labels, so the row
   // the feature is named after was unreachable by search.
   "settings.resources.storage.caches.label":
