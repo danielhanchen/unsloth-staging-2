@@ -22,6 +22,7 @@ import {
   clearNewChatDraft,
   hydrateModelDisclaimerPreference,
   openFolderAsProject,
+  startLlamaCppAutoReload,
   StopRunningChatsDialog,
   useOpeningFolder,
   useChatRuntimeStore,
@@ -251,6 +252,10 @@ function CredentialBootstrapGate({
       window.removeEventListener(AUTH_SESSION_STORED_EVENT, reconcile);
     };
   }, [active]);
+  useEffect(() => {
+    if (active && ready) return startLlamaCppAutoReload();
+  }, [active, ready]);
+
   return (
     <>
       <SettingsDialogMount active={active && ready} />

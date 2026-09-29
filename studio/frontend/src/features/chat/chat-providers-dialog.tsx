@@ -80,7 +80,10 @@ import {
   supportsRemoteModelCatalog,
   toExternalBackendProviderType,
 } from "./external-providers";
-import { useExternalProvidersStore } from "./stores/external-providers-store";
+import {
+  providerSavesInFlight,
+  useExternalProvidersStore,
+} from "./stores/external-providers-store";
 import {
   mergeLearnedModelCapabilities,
   pruneProviderModelIds,
@@ -279,6 +282,9 @@ export function ChatProvidersSettings({
     CUSTOM_PROVIDER_DISPLAY_NAME,
   );
   const [isReasoningModel, setIsReasoningModel] = useState(false);
+  const [autoReloadModels, setAutoReloadModels] = useState(false);
+  // Model fields as the edit form opened them.
+  const modelFieldsAtOpenRef = useRef<string | null>(null);
   const reduceMotion = useReducedMotion();
   const connectionsEnabled = useExternalProvidersStore(
     (s) => s.connectionsEnabled,
@@ -528,6 +534,8 @@ export function ChatProvidersSettings({
     setModelSearchQuery("");
     setCustomProviderName(customProviderDisplayName(providerType));
     setIsReasoningModel(false);
+    setAutoReloadModels(false);
+    modelFieldsAtOpenRef.current = null;
   }
 
   function openAddProvider() {
@@ -900,6 +908,8 @@ export function ChatProvidersSettings({
 
         authKind: created.auth_kind,
         authStatus: created.auth_status,
+        autoReloadModels:
+          uiProviderType === "llama_cpp" ? autoReloadModels : undefined,
         isReasoningModel: supportsProviderReasoningToggle(uiProviderType)
           ? isReasoningModel
           : undefined,
@@ -907,7 +917,7 @@ export function ChatProvidersSettings({
         updatedAt,
       };
       onProvidersChange([
-        ...providers.filter((p) => p.id !== created.id),
+        ...useExternalProvidersStore.getState().providers.filter((p) => p.id !== created.id),
         provider,
       ]);
       void refreshProviderModelCatalogs([provider]);
@@ -998,7 +1008,16 @@ export function ChatProvidersSettings({
         return;
       }
     }
+    // Untouched model fields are left out of the save, so an auto reload landing before or during it stands.
+    const keepSavedModels =
+      existing.providerType === "llama_cpp" &&
+      modelFieldsAtOpenRef.current ===
+        JSON.stringify([selectedModelIds, manualIds, availableModels]);
+    const availableModelsToSave = manualOnly
+      ? []
+      : pruneProviderModelIds(existing.providerType, availableModels);
     setMutatingProvider(true);
+    providerSavesInFlight.add(editingProviderId);
     try {
       const baseUrl = parseBaseUrlForProvider(
         baseUrlDraft,
@@ -1015,10 +1034,8 @@ export function ChatProvidersSettings({
           : existing.name,
         baseUrl,
         apiType: providerType === LEGACY_CUSTOM_PROVIDER_TYPE ? apiType : undefined,
-        models: modelsToSave,
-        availableModels: manualOnly
-          ? []
-          : pruneProviderModelIds(existing.providerType, availableModels),
+        models: keepSavedModels ? undefined : modelsToSave,
+        availableModels: keepSavedModels ? undefined : availableModelsToSave,
         maxOutputTokens,
         ...(credentialEdit.action === "replace"
           ? { apiKey: credentialEdit.apiKey }
@@ -1042,13 +1059,15 @@ export function ChatProvidersSettings({
         name: updated.display_name,
         baseUrl: updated.base_url ?? "",
         apiType: updated.api_type ?? "chat_completions",
-        models: modelsToSave,
-        availableModels: manualOnly
-          ? []
-          : pruneProviderModelIds(existing.providerType, availableModels),
+        models: keepSavedModels ? (updated.models ?? existing.models) : modelsToSave,
+        availableModels: keepSavedModels
+          ? (updated.available_models ?? existing.availableModels)
+          : availableModelsToSave,
         maxOutputTokens: updated.max_output_tokens ?? undefined,
 
         hasApiKey: updated.has_api_key,
+        autoReloadModels:
+          existing.providerType === "llama_cpp" ? autoReloadModels : undefined,
         isReasoningModel: supportsProviderReasoningToggle(
           existing.providerType,
         )
@@ -1056,8 +1075,9 @@ export function ChatProvidersSettings({
           : undefined,
         updatedAt,
       };
+      // Live store, not the render snapshot: auto reload may have written during the await.
       onProvidersChange(
-        providers.map((provider) =>
+        useExternalProvidersStore.getState().providers.map((provider) =>
           provider.id === editingProviderId ? editedProvider : provider,
         ),
       );
@@ -1070,6 +1090,7 @@ export function ChatProvidersSettings({
       const message = error instanceof Error ? error.message : "Unknown error";
       toast.error(`Failed to update connection: ${message}`);
     } finally {
+      providerSavesInFlight.delete(editingProviderId);
       setMutatingProvider(false);
     }
   }
@@ -1151,6 +1172,8 @@ export function ChatProvidersSettings({
     setClearApiKeyRequested(false);
     setShowApiKey(false);
     setBaseUrlDraft(provider.baseUrl);
+    setAutoReloadModels(provider.autoReloadModels === true);
+    modelFieldsAtOpenRef.current = null;
     setApiType(provider.apiType ?? "chat_completions");
     // Seeded at the floor: parseMaxOutputTokens throws below it, so a row stored under one would
     // fail every unrelated edit. The resolver already reads it as the floor.
@@ -1189,12 +1212,11 @@ export function ChatProvidersSettings({
       ]);
       setAvailableModels(catalogModels);
       const catalogSet = new Set(catalogModels);
-      setSelectedModelIds(
-        provider.models.filter((model) => catalogSet.has(model)),
-      );
-      setManualModelIds(
-        provider.models.filter((model) => !catalogSet.has(model)).join("\n"),
-      );
+      const selected = provider.models.filter((model) => catalogSet.has(model));
+      const manual = provider.models.filter((model) => !catalogSet.has(model));
+      setSelectedModelIds(selected);
+      setManualModelIds(manual.join("\n"));
+      modelFieldsAtOpenRef.current = JSON.stringify([selected, manual, catalogModels]);
       return;
     }
     if (provider.authKind === "chatgpt_oauth") {
@@ -1262,7 +1284,9 @@ export function ChatProvidersSettings({
       await deleteProviderConfig(providerId);
       removeExternalProviderApiKey(providerId);
       onProvidersChange(
-        providers.filter((provider) => provider.id !== providerId),
+        useExternalProvidersStore.getState().providers.filter(
+          (provider) => provider.id !== providerId,
+        ),
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unknown error";
@@ -1652,6 +1676,31 @@ export function ChatProvidersSettings({
                 </div>
               ) : null}
 
+              {providerType === "llama_cpp" ? (
+                <div className="flex items-center justify-between gap-4 px-4 py-3">
+                  <div className="space-y-1">
+                    <Label
+                      htmlFor="provider-auto-reload-models"
+                      className="text-sm font-medium"
+                    >
+                      Reload models automatically on connect
+                    </Label>
+                    <p
+                      id="provider-auto-reload-models-help"
+                      className="text-xs text-muted-foreground"
+                    >
+                      Refresh once on connect and after a disconnect while Studio is open.
+                      New model IDs are enabled automatically. Saved in this browser.
+                    </p>
+                  </div>
+                  <Switch
+                    id="provider-auto-reload-models"
+                    checked={autoReloadModels}
+                    onCheckedChange={setAutoReloadModels}
+                    aria-describedby="provider-auto-reload-models-help"
+                  />
+                </div>
+              ) : null}
               {showReasoningToggle ? (
                 <div className="grid grid-cols-[minmax(140px,0.8fr)_minmax(0,1.2fr)] items-center gap-4 px-4 py-3 @max-[520px]:grid-cols-1">
                   <Label
