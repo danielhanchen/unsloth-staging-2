@@ -163,6 +163,7 @@ def test_no_nameable_arch_is_left_without_kernels():
         for arch in nameable
         if arch not in stack_mod._GENERIC_ROCM_WHEEL_GFX
         and not stack_mod._generic_rocm_wheel_lacks_kernels(arch)
+        and arch not in stack_mod._WINDOWS_MULTIARCH_GFX
     }
     assert stranded == set(), stranded
 
