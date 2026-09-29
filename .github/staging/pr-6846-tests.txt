@@ -1,0 +1,2 @@
+studio/backend/tests/test_llama_compat_routes.py
+studio/backend/tests/test_sandbox_files_and_storage_roots.py
