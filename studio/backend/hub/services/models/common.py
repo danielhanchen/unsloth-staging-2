@@ -13,6 +13,7 @@ from typing import List, Literal, Optional
 from urllib.parse import quote
 
 from hub.schemas.inventory import (
+    LocalArtifactKind,
     LocalModelCapabilities,
     LocalModelInfo,
     ModelFormat,
@@ -101,7 +102,27 @@ def _is_model_directory(d: Path) -> bool:
         return False
 
 
+def _diffusers_pipeline_artifact_kind(path: Optional[Path]) -> Optional[LocalArtifactKind]:
+    """Return the root-manifest contract for a complete Diffusers pipeline directory."""
+    if path is None:
+        return None
+    from core.inference.diffusion_families import local_pipeline_components_are_complete
+
+    return _PIPELINE_ARTIFACT_KINDS.get(
+        tuple(local_pipeline_components_are_complete(path, name) for name in _PIPELINE_MANIFESTS)
+    )
+
+
+_PIPELINE_MANIFESTS = ("model_index.json", "modular_model_index.json")
+_PIPELINE_ARTIFACT_KINDS = {
+    (True, True): "diffusers_dual_pipeline",
+    (True, False): "diffusers_pipeline",
+    (False, True): "diffusers_modular_pipeline",
+}
+
+
 def _is_diffusers_pipeline_dir(path: Path) -> bool:
+    # An interrupted copy is still one pipeline; completeness gates only artifact_kind.
     try:
         return (path / "model_index.json").is_file() or (
             path / "modular_model_index.json"
@@ -793,6 +814,7 @@ def _local_model_info(
     load_path: Path,
     source: LocalModelSource,
     model_format: ModelFormat,
+    artifact_kind: Optional[LocalArtifactKind] = None,
     display_name: Optional[str] = None,
     model_id: Optional[str] = None,
     updated_at: Optional[float] = None,
@@ -813,6 +835,10 @@ def _local_model_info(
         else str(load_path)
     )
     semantic_id = model_id or str(load_path)
+    if artifact_kind is None and model_format in {"safetensors", "checkpoint"}:
+        artifact_kind = "single_file_checkpoint" if scan_path.is_file() else "transformers_model"
+    elif artifact_kind is None:
+        artifact_kind = model_format if model_format in {"gguf", "adapter"} else "unknown"
     return LocalModelInfo(
         id = load_id,
         inventory_id = _local_inventory_id(
@@ -835,6 +861,7 @@ def _local_model_info(
         updated_at = updated_at,
         partial = partial,
         model_format = model_format,
+        artifact_kind = artifact_kind,
         runtime = _runtime_for_format(model_format),
         format_variant = format_variant,
         capabilities = _capabilities_for_format(
@@ -976,6 +1003,9 @@ def _classify_local_path(
                 load_path = load_path,
                 source = source,
                 model_format = fallback_format,
+                artifact_kind = (
+                    _diffusers_pipeline_artifact_kind(scan_path) if scan_path.is_dir() else None
+                ),
                 display_name = display_name,
                 model_id = model_id,
                 updated_at = updated_at,

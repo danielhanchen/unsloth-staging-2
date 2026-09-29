@@ -2257,7 +2257,7 @@ def test_cached_models_scan_emits_curated_and_custom_whisper_as_stt(monkeypatch,
         lambda repo_path, _snapshot = None: {"_hidden_stt": "custom-whisper" in str(repo_path)},
     )
 
-    rows = cache_inventory._scan_cached_models()
+    rows = cache_inventory._scan_cached_models(active_hub_cache = curated_path.parent)
 
     rows_by_repo = {row["repo_id"]: row for row in rows}
     assert set(rows_by_repo) == {"unsloth/whisper-tiny", "Org/custom-whisper"}
@@ -2329,7 +2329,7 @@ def _diffusion_scan(
         return task
 
     monkeypatch.setattr(cache_inventory, "_cached_row_task", row_task)
-    rows = cache_inventory._scan_cached_models()
+    rows = cache_inventory._scan_cached_models(active_hub_cache = tmp_path / "hub")
     assert len(rows) == 1
     assert selected_snapshots == ([snapshot] if expect_task_classification else [])
     return rows[0]
@@ -2378,6 +2378,7 @@ def test_cached_models_scan_keeps_a_complete_pipeline_loadable(monkeypatch, tmp_
     assert row["partial"] is False
     assert row["companion_prefetch"] is False
     assert row["single_file"] is False
+    assert row["load_id"] == "Org/Pipeline-Complete"
 
 
 def test_cached_models_scan_exposes_minimax_music3_modular_pipeline(monkeypatch, tmp_path):
@@ -2393,6 +2394,14 @@ def test_cached_models_scan_exposes_minimax_music3_modular_pipeline(monkeypatch,
         modular_manifest = {
             "_class_name": "MiniMaxMusic3ModularPipeline",
             "_blocks_class_name": "MiniMaxMusic3Blocks",
+            "transformer": [
+                "diffusers",
+                "MiniMaxMusic3Transformer1DModel",
+                {
+                    "pretrained_model_name_or_path": "MiniMaxAI/MiniMax-Music3",
+                    "subfolder": "transformer",
+                },
+            ],
         },
         expect_task_classification = False,
     )
@@ -2400,6 +2409,10 @@ def test_cached_models_scan_exposes_minimax_music3_modular_pipeline(monkeypatch,
     assert row["task"] == "text-to-speech"
     assert row["audio_type"] == "minimax_music3"
     assert row["capabilities"]["can_chat"] is False
+    assert row["artifact_kind"] == "diffusers_modular_pipeline"
+    assert row["load_id"] == str(
+        tmp_path / "hub/models--MiniMaxAI--MiniMax-Music3/snapshots" / _SNAPSHOT_SHA
+    )
     assert row["partial"] is False
     assert row["single_file"] is False
 
@@ -6915,7 +6928,13 @@ def _write_pipeline(root: Path, *, components = ("transformer", "vae", "text_enc
     (MiniMax-H3, HunyuanVideo, Qwen-Image, HiDream) has exactly this shape."""
     root.mkdir(parents = True, exist_ok = True)
     (root / "model_index.json").write_text(
-        json.dumps({"_class_name": "MiniMaxH3Pipeline", "_diffusers_version": "0.39.0"}),
+        json.dumps(
+            {
+                "_class_name": "MiniMaxH3Pipeline",
+                "_diffusers_version": "0.39.0",
+                "transformer": ["diffusers", "MiniMaxH3Transformer3DModel"],
+            }
+        ),
         encoding = "utf-8",
     )
     for name in components:
@@ -6957,6 +6976,17 @@ def test_the_lmstudio_walk_does_not_descend_into_a_pipeline(tmp_path):
 
     assert names == {"MiniMax-H3-local"}
     assert not names & {"vae", "transformer", "text_encoder"}
+
+
+def test_the_walk_does_not_descend_into_an_interrupted_pipeline_copy(tmp_path):
+    root = tmp_path / "scan"
+    pipeline = _write_pipeline(root / "MiniMax-H3-local")
+    (pipeline / "transformer" / "diffusion_pytorch_model.safetensors").unlink()
+
+    names = {Path(row.path).name for row in local_inventory._scan_lmstudio_dir(root)}
+
+    assert names == {"MiniMax-H3-local"}
+    assert model_common._diffusers_pipeline_artifact_kind(pipeline) is None
 
 
 def test_a_scan_folder_pointed_straight_at_a_pipeline_is_not_walked_as_a_publisher(tmp_path):

@@ -44,6 +44,47 @@ def _touch(path: Path) -> Path:
     return path
 
 
+_TRANSFORMER = {"transformer": ["diffusers", "Transformer2DModel"]}
+
+
+def _write(path: Path, text: str = "{}") -> None:
+    path.parent.mkdir(parents = True, exist_ok = True)
+    path.write_text(text)
+
+
+def _index(
+    root: Path,
+    name: str = "model_index.json",
+    **payload,
+) -> Path:
+    payload.setdefault("_class_name", "DiffusionPipeline")
+    _write(root / name, json.dumps(payload))
+    return root / name
+
+
+def _pipeline_manifest(
+    root: Path,
+    name: str = "model_index.json",
+    **payload,
+) -> Path:
+    """A complete one-component pipeline; modular manifests also get a blocks class."""
+    if name.startswith("modular_"):
+        payload.setdefault("_blocks_class_name", "TestPipelineBlocks")
+    path = _index(root, name, **{**_TRANSFORMER, **payload})
+    _write(root / "transformer" / "config.json")
+    _touch(root / "transformer" / "diffusion_pytorch_model.safetensors")
+    return path
+
+
+def _complete(
+    root: Path,
+    name: str = "model_index.json",
+    **kwargs,
+) -> bool:
+    from core.inference.diffusion_families import local_pipeline_components_are_complete
+    return local_pipeline_components_are_complete(root, name, **kwargs)
+
+
 def _empty_compat_sources(tmp_path: Path):
     empty = tmp_path / "empty"
     return models_route._CompatLocalInventorySources(
@@ -505,9 +546,7 @@ def test_scan_models_dir_surfaces_diffusers_pipeline_folder(tmp_path):
     # must surface it or it never reaches the On Device picker. Not a GGUF, so model_format stays None.
     root = tmp_path / "models"
     pipe = root / "my-pipeline"
-    _touch(pipe / "model_index.json")
-    _touch(pipe / "transformer" / "config.json")
-    _touch(pipe / "transformer" / "diffusion_pytorch_model.safetensors")
+    _pipeline_manifest(pipe)
     _touch(pipe / "vae" / "diffusion_pytorch_model.safetensors")
 
     rows = {Path(m.path).name: m for m in models_route._scan_models_dir(root)}
@@ -519,15 +558,251 @@ def test_scan_models_dir_surfaces_diffusers_pipeline_folder(tmp_path):
 def test_scan_models_dir_surfaces_root_diffusers_pipeline(tmp_path):
     # A scan folder can point DIRECTLY at a diffusers pipeline, which _is_model_directory rejects; without admitting it the scan surfaces component subdirs and hides the pipeline.
     root = tmp_path / "my-local-pipeline"
-    _touch(root / "model_index.json")
-    _touch(root / "transformer" / "config.json")
-    _touch(root / "transformer" / "diffusion_pytorch_model.safetensors")
+    _pipeline_manifest(root)
     _touch(root / "vae" / "diffusion_pytorch_model.safetensors")
 
     rows = models_route._scan_models_dir(root)
 
     assert [r.path for r in rows] == [str(root)]
     assert rows[0].model_format is None
+
+
+def _bom(pipeline):
+    manifest = pipeline / "model_index.json"
+    manifest.write_bytes(b"\xef\xbb\xbf" + manifest.read_bytes())
+
+
+@pytest.mark.parametrize(
+    "manifests, mutate, expected",
+    [
+        (("model_index.json",), None, "diffusers_pipeline"),
+        (("model_index.json",), _bom, "diffusers_pipeline"),
+        (("modular_model_index.json",), None, "diffusers_modular_pipeline"),
+        (("model_index.json", "modular_model_index.json"), None, "diffusers_dual_pipeline"),
+        (
+            ("model_index.json",),
+            lambda p: (p / "transformer" / "diffusion_pytorch_model.safetensors").unlink(),
+            "unknown",
+        ),
+    ]
+    + [
+        (("model_index.json",), lambda p, t = text: (p / "model_index.json").write_text(t), "unknown")
+        for text in [
+            "",
+            "{",
+            "[]",
+            "{}",
+            '{"_class_name":" "}',
+            '{"_class_name":"DiffusionPipeline"}',
+        ]
+    ],
+)
+def test_hub_inventory_types_pipeline_roots_structurally(tmp_path, manifests, mutate, expected):
+    from hub.services.models.common import _classify_local_path
+
+    pipeline = tmp_path / "opaque-model"
+    for name in manifests:
+        _pipeline_manifest(pipeline, name)
+    if mutate:
+        mutate(pipeline)
+
+    [row] = _classify_local_path(pipeline, "custom")
+
+    assert row.model_format == "unknown"
+    assert row.artifact_kind == expected
+
+
+def test_hub_inventory_does_not_confuse_transformers_or_adapter_with_pipeline(tmp_path):
+    from hub.services.models.common import _classify_local_path, _diffusers_pipeline_artifact_kind
+
+    transformer = tmp_path / "transformer"
+    _pipeline_manifest(transformer)
+    _touch(transformer / "model.safetensors")
+    (transformer / "config.json").write_text('{"architectures":["Qwen3ForCausalLM"]}')
+    adapter = tmp_path / "adapter"
+    _pipeline_manifest(adapter)
+    _touch(adapter / "adapter_model.safetensors")
+    (adapter / "adapter_config.json").write_text("{}")
+
+    assert _classify_local_path(transformer, "custom")[0].artifact_kind == "transformers_model"
+    assert _classify_local_path(adapter, "custom")[0].artifact_kind == "adapter"
+    assert _diffusers_pipeline_artifact_kind(None) is None
+
+
+def test_hub_inventory_never_discovers_loose_encoder_or_dtype_shard(tmp_path):
+    from hub.services.models.local_inventory import _scan_models_dir as scan_hub_models_dir
+
+    _touch(tmp_path / "qwen_3_4b.safetensors")
+    _touch(tmp_path / "diffusion_pytorch_model-00001-of-00002.bf16.safetensors")
+
+    assert scan_hub_models_dir(tmp_path) == []
+
+
+def test_local_pipeline_completeness_checks_configs_and_every_indexed_shard(tmp_path):
+    _pipeline_manifest(tmp_path)
+    component = tmp_path / "transformer"
+    (component / "diffusion_pytorch_model.safetensors").unlink()
+    (component / "config.json").write_text("{")
+    index = component / "diffusion_pytorch_model.safetensors.index.json"
+    index.write_text(json.dumps({"weight_map": {"layer": "weights-00001-of-00001.safetensors"}}))
+    assert _complete(tmp_path) is False
+
+    (component / "config.json").write_text("{}")
+    assert _complete(tmp_path) is False
+
+    _touch(component / "weights-00001-of-00001.safetensors")
+    assert _complete(tmp_path) is True
+
+    index.write_text(json.dumps({"weight_map": {"layer": "..\\outside.safetensors"}}))
+    assert _complete(tmp_path) is False
+
+
+def test_local_pipeline_completeness_rejects_variant_only_weights(tmp_path):
+    # The pipeline loads at variant=None, where diffusers / transformers raise on fp16-only folders.
+    _pipeline_manifest(tmp_path)
+    component = tmp_path / "transformer"
+    (component / "diffusion_pytorch_model.safetensors").unlink()
+    _touch(component / "diffusion_pytorch_model.fp16-00001-of-00001.safetensors")
+    (component / "diffusion_pytorch_model.safetensors.index.fp16.json").write_text(
+        json.dumps(
+            {"weight_map": {"layer": "diffusion_pytorch_model.fp16-00001-of-00001.safetensors"}}
+        )
+    )
+    assert _complete(tmp_path) is False
+
+    _touch(component / "diffusion_pytorch_model.safetensors")
+    assert _complete(tmp_path) is True
+
+
+def test_local_pipeline_completeness_ignores_an_unused_bin_index(tmp_path):
+    _pipeline_manifest(tmp_path)
+    component = tmp_path / "transformer"
+    (component / "diffusion_pytorch_model.bin.index.json").write_text(
+        json.dumps({"weight_map": {"layer": "diffusion_pytorch_model-00001-of-00001.bin"}})
+    )
+    assert _complete(tmp_path) is True
+
+    (component / "diffusion_pytorch_model.safetensors").unlink()
+    assert _complete(tmp_path) is False
+
+
+def test_local_pipeline_completeness_ignores_list_valued_pipeline_config(tmp_path):
+    _pipeline_manifest(tmp_path, text_encoder_select_layers = [2, 5, 8, 11])
+    assert _complete(tmp_path) is True
+
+
+def test_local_pipeline_completeness_allows_hidream_caller_supplied_encoder(tmp_path):
+    encoders = {
+        "text_encoder_4": ["transformers", "LlamaForCausalLM"],
+        "tokenizer_4": ["transformers", "PreTrainedTokenizerFast"],
+    }
+    _pipeline_manifest(tmp_path, _class_name = "HiDreamImagePipeline", **encoders)
+    assert _complete(tmp_path) is True
+    (tmp_path / "text_encoder_4").mkdir()
+    assert _complete(tmp_path) is False
+    (tmp_path / "text_encoder_4").rmdir()
+    _pipeline_manifest(tmp_path, **encoders)
+    assert _complete(tmp_path) is False
+
+
+def test_local_pipeline_completeness_can_exclude_an_injected_denoiser(tmp_path):
+    _index(tmp_path, scheduler = ["diffusers", "FlowMatchEulerDiscreteScheduler"], **_TRANSFORMER)
+    _write(tmp_path / "scheduler" / "scheduler_config.json")
+    assert _complete(tmp_path) is False
+    assert _complete(tmp_path, excluded_components = ("transformer",)) is True
+
+    _index(tmp_path, **_TRANSFORMER)
+    assert _complete(tmp_path, excluded_components = ("transformer",)) is False
+
+
+def test_local_pipeline_completeness_validates_metadata_component_contracts(tmp_path):
+    def check(name, library, class_name, *files):
+        _index(tmp_path, **{name: [library, class_name]})
+        (tmp_path / name).mkdir(exist_ok = True)
+        for file in files:
+            _write(tmp_path / name / file)
+        return _complete(tmp_path)
+
+    assert check("scheduler", "diffusers", "FlowMatchEulerDiscreteScheduler", "README.md") is False
+    assert check(
+        "scheduler", "diffusers", "FlowMatchEulerDiscreteScheduler", "scheduler_config.json"
+    )
+    assert check("tokenizer", "transformers", "Qwen2Tokenizer", "tokenizer_config.json") is False
+    assert check("tokenizer", "transformers", "Qwen2Tokenizer", "tokenizer.json")
+    assert check("tokenizer_2", "transformers", "ByT5Tokenizer", "tokenizer_config.json")
+    assert check("guider", "diffusers", "ClassifierFreeGuidance", "guider_config.json")
+    assert (
+        check("processor", "transformers", "Qwen3VLProcessor", "preprocessor_config.json") is False
+    )
+    assert check("processor", "transformers", "Qwen3VLProcessor", "tokenizer.json")
+
+
+def test_local_pipeline_completeness_can_validate_model_configuration_without_weights(tmp_path):
+    _index(tmp_path, unet = ["diffusers", "UNet2DConditionModel"])
+    _write(tmp_path / "unet" / "config.json")
+    assert _complete(tmp_path) is False
+    assert _complete(tmp_path, config_only_model_components = True) is True
+
+
+@pytest.mark.parametrize("filename", ["model_index.json", "modular_model_index.json"])
+@pytest.mark.parametrize(
+    "class_name, asset",
+    [("CustomModel", "custom_weights.safetensors"), ("CustomScheduler", "custom_schedule.json")],
+)
+def test_local_pipeline_preserves_custom_component_contracts(tmp_path, filename, class_name, asset):
+    from hub.services.models.common import _diffusers_pipeline_artifact_kind
+
+    _index(
+        tmp_path,
+        filename,
+        component = ["local_extensions", class_name],
+        optional_component = [None, None],
+    )
+    component = tmp_path / "component"
+    assert not _complete(tmp_path, filename)
+    component.mkdir()
+    assert not _complete(tmp_path, filename)
+    (component / asset).write_bytes(b"")
+    assert not _complete(tmp_path, filename)
+    (component / asset).write_text("{}")
+    assert _complete(tmp_path, filename)
+    assert _diffusers_pipeline_artifact_kind(tmp_path) == (
+        "diffusers_pipeline" if filename == "model_index.json" else "diffusers_modular_pipeline"
+    )
+
+
+def test_local_pipeline_completeness_honors_modular_external_component_sources(tmp_path):
+    pipeline = tmp_path / "external-modular"
+    modular = "modular_model_index.json"
+
+    def manifest(
+        source,
+        subfolder = "tokenizer",
+        library = "transformers",
+        class_name = "Qwen2Tokenizer",
+    ):
+        spec = {"pretrained_model_name_or_path": source, "subfolder": subfolder}
+        _index(pipeline, modular, tokenizer = [library, class_name, spec])
+        return _complete(pipeline, modular)
+
+    assert manifest("Org/components") is True
+    assert manifest("./missing") is False
+
+    source = tmp_path / "component-source"
+    _write(source / "tokenizer" / "tokenizer_config.json")
+    _write(source / "tokenizer" / "tokenizer.json")
+    assert manifest(str(source)) is True
+    assert manifest(str(source), "../outside") is False
+
+    (source / "custom_weights.safetensors").write_bytes(b"weights")
+    assert manifest(str(source), None, "local_extensions", "CustomModel") is True
+
+
+@pytest.mark.parametrize("optional_spec", [None, [None, None], ["transformers", "CLIPTextModel"]])
+def test_local_pipeline_optional_component_presence(tmp_path, optional_spec):
+    extra = {} if optional_spec is None else {"text_encoder": optional_spec}
+    _pipeline_manifest(tmp_path, **extra)
+    assert _complete(tmp_path) is (optional_spec is None or optional_spec == [None, None])
 
 
 def test_scan_models_dir_surfaces_root_single_file_checkpoint(tmp_path):
@@ -777,7 +1052,7 @@ def test_an_ancestor_directory_does_not_name_an_unhydrated_gguf(tmp_path, monkey
 def test_local_task_tags_family_named_pipeline_dir(tmp_path):
     # A local diffusers pipeline whose id resolves to a supported image family loads fine, so tag it and the Images picker keeps it.
     d = tmp_path / "flux-pipeline"
-    _touch(d / "model_index.json")
+    _pipeline_manifest(d)
     _touch(d / "unet" / "diffusion_pytorch_model.safetensors")
     assert (
         models_route._local_model_task(_local(d, model_id = "black-forest-labs/FLUX.1-dev"))
@@ -788,7 +1063,7 @@ def test_local_task_tags_family_named_pipeline_dir(tmp_path):
 def test_local_task_none_for_familyless_pipeline_dir(tmp_path):
     # A generically named on-device pipeline (model_index.json, no family token) is UNLOADABLE: the Images load resolves no family and 400s after eviction, so it stays untagged.
     d = tmp_path / "my-local-pipeline"
-    _touch(d / "model_index.json")
+    _pipeline_manifest(d)
     _touch(d / "unet" / "diffusion_pytorch_model.safetensors")
     assert models_route._local_is_diffusers(_local(d)) is True
     assert models_route._local_model_task(_local(d)) is None
@@ -815,14 +1090,11 @@ def test_local_task_none_for_plain_llm(tmp_path):
 def test_local_task_tags_minimax_music3_modular_pipeline(tmp_path):
     d = tmp_path / "music3"
     d.mkdir()
-    (d / "modular_model_index.json").write_text(
-        json.dumps(
-            {
-                "_class_name": "MiniMaxMusic3ModularPipeline",
-                "_blocks_class_name": "MiniMaxMusic3Blocks",
-            }
-        ),
-        encoding = "utf-8",
+    _pipeline_manifest(
+        d,
+        "modular_model_index.json",
+        _class_name = "MiniMaxMusic3ModularPipeline",
+        _blocks_class_name = "MiniMaxMusic3Blocks",
     )
 
     assert models_route._local_model_task(_local(d, model_format = "safetensors")) == (
@@ -834,14 +1106,11 @@ def test_compat_local_inventory_preserves_minimax_music3_audio_type(monkeypatch,
     models_dir = tmp_path / "models"
     d = models_dir / "music3"
     d.mkdir(parents = True)
-    (d / "modular_model_index.json").write_text(
-        json.dumps(
-            {
-                "_class_name": "MiniMaxMusic3ModularPipeline",
-                "_blocks_class_name": "MiniMaxMusic3Blocks",
-            }
-        ),
-        encoding = "utf-8",
+    _pipeline_manifest(
+        d,
+        "modular_model_index.json",
+        _class_name = "MiniMaxMusic3ModularPipeline",
+        _blocks_class_name = "MiniMaxMusic3Blocks",
     )
     sources = models_route._CompatLocalInventorySources(
         hf_cache_dir = models_dir,
@@ -929,7 +1198,7 @@ def test_a_modular_pipeline_root_counts_as_a_pipeline_index(tmp_path):
 
     modular = tmp_path / "modular"
     (modular / "transformer").mkdir(parents = True)
-    (modular / "modular_model_index.json").write_text("{}")
+    _pipeline_manifest(modular, "modular_model_index.json")
     assert _local_pipeline_index(modular) is True
     assert (
         models_route._local_is_diffusers(_local(modular, display_name = "opaque", id = str(modular)))
@@ -938,7 +1207,7 @@ def test_a_modular_pipeline_root_counts_as_a_pipeline_index(tmp_path):
 
     conventional = tmp_path / "conventional"
     conventional.mkdir()
-    (conventional / "model_index.json").write_text("{}")
+    _pipeline_manifest(conventional)
     assert _local_pipeline_index(conventional) is True
 
     neither = tmp_path / "neither"
