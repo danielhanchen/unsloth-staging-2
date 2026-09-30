@@ -57,6 +57,13 @@ ALL_BYTES = sum(size for _name, size in Z_IMAGE_FILES)
 
 
 @pytest.fixture(autouse = True)
+def _unmeasured_torchao(monkeypatch):
+    """Pin "no measured torchao" so the installed release does not decide the offload tiers."""
+    from core.inference import diffusion_memory
+    monkeypatch.setattr(diffusion_memory, "_installed_torchao_version", lambda: None)
+
+
+@pytest.fixture(autouse = True)
 def _safetensors_readable_regardless_of_the_installed_torchao(monkeypatch):
     """Pin the torchao floor so planning tests ignore the installed release."""
     import core.inference.prequant_safetensors as prequant_safetensors
@@ -1027,6 +1034,50 @@ def test_an_artifact_plan_that_streams_the_transformer_still_declines(monkeypatc
         lambda *_a, **_k: types.SimpleNamespace(offload_policy = "group", stream_transformer = True),
     )
     assert _settle(backend) == PIPELINE_SEED_DECLINED
+
+
+@pytest.mark.parametrize("policy", ["group", "streaming"])
+def test_an_artifact_plan_that_streams_the_transformer_seeds_on_a_measured_torchao(
+    monkeypatch, policy
+):
+    from core.inference import diffusion_memory
+
+    monkeypatch.setattr(diffusion_memory, "_installed_torchao_version", lambda: (0, 18))
+    monkeypatch.setattr(diffusion_memory, "_torchao_stream_pinnable", lambda plan: True)
+    backend = _settle_backend(monkeypatch)
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_plan_memory",
+        lambda *_a, **_k: types.SimpleNamespace(offload_policy = policy, stream_transformer = True),
+    )
+    assert _settle(backend) == "fp8"
+
+
+def test_a_resident_rung_still_beats_a_streamed_one(monkeypatch):
+    from core.inference import diffusion_memory
+
+    monkeypatch.setattr(diffusion_memory, "_installed_torchao_version", lambda: (0, 18))
+    monkeypatch.setattr(diffusion_memory, "_torchao_stream_pinnable", lambda plan: True)
+    backend = _settle_backend_walking(
+        monkeypatch, artifacts = ("int8", "fp8"), candidates = ("int8", "fp8")
+    )
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_plan_memory",
+        lambda *_a, **k: types.SimpleNamespace(
+            offload_policy = "group" if k["transformer_resident_override_mib"] >= 31_000 else "none",
+            stream_transformer = True,
+        ),
+    )
+    assert _settle(backend) == "fp8"
+    # no resident rung: the first streamed one is seeded
+    backend = _settle_backend_walking(monkeypatch, artifacts = ("int8",), candidates = ("int8", "fp8"))
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_plan_memory",
+        lambda *_a, **_k: types.SimpleNamespace(offload_policy = "group", stream_transformer = True),
+    )
+    assert _settle(backend) == "int8"
 
 
 def test_a_seed_whose_load_plan_streams_only_the_encoders_is_kept(fake_runtime, monkeypatch):
