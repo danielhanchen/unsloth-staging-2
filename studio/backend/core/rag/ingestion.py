@@ -487,6 +487,7 @@ def start_ingestion(
     linked_relative_path: str | None = None,
     background: bool = True,
     content_hash: str | None = None,
+    reuse_identical: bool = False,
 ) -> tuple[str, str]:
     """Create the document + job rows and spawn the worker, returning
     ``(document_id, job_id)``. A duplicate content hash in this scope returns the
@@ -497,7 +498,10 @@ def start_ingestion(
     reconciliation hashes it to detect content-identical renames) pass that digest
     through instead of paying for a second full read of the file. Must be the lowercase
     hex sha256 of ``stored_path``; a mismatched value would misfile the document under
-    the wrong hash, so it is trusted as given and never reverified here."""
+    the wrong hash, so it is trusted as given and never reverified here.
+
+    ``reuse_identical`` (dedupe=False only) copies a completed same-hash document's index
+    onto a new row instead of re-embedding, keeping per-path ownership for linked folders."""
     account_path(stored_path)
     if account_is_retired():
         raise RuntimeError("Account is retired")
@@ -573,6 +577,53 @@ def start_ingestion(
             for failed in store.failed_documents_by_hash(conn, scope, sha):
                 store.delete_document(conn, failed["id"], commit = False)
                 _remove_upload(failed.get("stored_path"), keep_path = stored_path)
+
+        if reuse_identical and not dedupe:
+            donor = store.reusable_document_by_hash(conn, scope, sha, ext, effective_identity)
+            if donor is not None:
+                conn.execute("SAVEPOINT reuse_identical")
+                reused_id = store.create_document(
+                    conn,
+                    scope = scope,
+                    filename = filename,
+                    sha256 = sha,
+                    kb_id = kb_id,
+                    thread_id = thread_id,
+                    project_id = project_id,
+                    status = "completed",
+                    stored_path = stored_path,
+                    embedding_model = donor["embedding_model"],
+                    linked_folder_id = linked_folder_id,
+                    linked_relative_path = linked_relative_path,
+                    commit = False,
+                )
+                donor_chunks = donor["num_chunks"] or 0
+                copied = store.copy_document_index(conn, donor, reused_id, scope)
+                if rag_db.vec_table_exists(conn) and copied != donor_chunks:
+                    # Donor lost vectors: ingest normally rather than copy a dense-search-invisible doc.
+                    conn.execute("ROLLBACK TO reuse_identical")
+                    conn.execute("RELEASE reuse_identical")
+                    logger.info(
+                        "linked-folder reuse donor %s in scope %s is missing vectors; "
+                        "falling back to a normal ingest",
+                        donor["id"],
+                        scope,
+                    )
+                else:
+                    conn.execute("RELEASE reuse_identical")
+                    conn.execute(
+                        "UPDATE documents SET num_chunks=? WHERE id=?",
+                        (donor_chunks, reused_id),
+                    )
+                    job_id = _new_job(conn, reused_id, scope, status = "completed", progress = 1.0)
+                    with _jobs_lock:
+                        _jobs[account_key(job_id)] = queue.Queue()
+                    _emit(
+                        job_id,
+                        {"type": "complete", "num_chunks": donor_chunks, "reused": True},
+                    )
+                    _emit(job_id, None)
+                    return reused_id, job_id
 
         document_id = store.create_document(
             conn,
