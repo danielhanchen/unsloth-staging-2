@@ -45,6 +45,7 @@ def _run_batch(backend, questions):
     return [(texts.get(h), stats[h]) for h in range(len(questions))]
 
 
+@pytest.mark.allow_network
 @pytest.mark.parametrize("kv_quant", ["4", "tq-4"])
 def test_kv_quantized_text_load_batches_and_reuses_snapshots(kv_quant):
     from core.inference.mlx_inference import MLXInferenceBackend
