@@ -1,0 +1,715 @@
+name: "staging-12328 studio-regress"
+on:
+  push:
+    branches: ["pr-12328-regress-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  before-fast-ubuntu-latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      SR_HOME: ${{ github.workspace }}/sr-home
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/sr-home
+      # The installer's uv-managed interpreter (the venv's base python) must be cached with the
+      # install: under ~/.local/share/uv a restored venv points at a python the new runner lacks.
+      UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/sr-uv-python
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      STUDIO_REGRESS_UPSTREAM_SUITES: 'playwright_chat_ui.py,playwright_extra_ui.py'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: 4700dbc86f0e9f0d433e8075d32aac4096cbffb2
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Studio install cache (4700dbc86)
+        id: sr-install
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # --local installs editable from src/: the built frontend lives in the checkout, not the home
+          path: |
+            sr-home
+            sr-uv-python
+            src/studio/frontend/dist
+          key: sr-studio-v3-ubuntu-latest-4700dbc86f0e9f0d433e8075d32aac4096cbffb2
+      - name: Tiny model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # engine.SUITE_HF_HOME: run.py prefetches into <workspace>/temp/studio_regress/hf_home
+          # (WORKSPACE unset here, so the checkout root), never ~/.cache/huggingface
+          path: temp/studio_regress/hf_home
+          key: sr-hf-v2-ubuntu-latest-e2a093344a8a
+      - name: Install Studio at before (4700dbc86)
+        if: steps.sr-install.outputs.cache-hit != 'true'
+        working-directory: src
+        shell: bash
+        run: |
+          ./install.sh --local --no-torch
+      - name: Playwright
+        shell: bash
+        run: |
+          pip install 'playwright<2' httpx pillow numpy
+          python -m playwright install --with-deps chromium || python -m playwright install chromium
+      - name: Journeys (fast, before)
+        shell: bash
+        env:
+          PYTHONPATH: harness/.github/scripts
+          # Windows: UTF-8 file and pipe I/O for the harness and the Studio it launches (cp1252 otherwise)
+          PYTHONUTF8: '1'
+        run: |
+          set +e
+          python harness/.github/scripts/studio_regress/run.py --pr 12328 --repo src --side before \
+            --home-before "$SR_HOME" --tier fast --only auth,settings,crawl --root out --json > out-before-fast.json
+          echo "rc=$?" | tee out-before-fast.rc
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: studio-regress-ubuntu-latest-before-fast
+          path: |
+            out/
+            out-before-fast.*
+            sr-home/logs/
+          if-no-files-found: warn
+  after-fast-ubuntu-latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      SR_HOME: ${{ github.workspace }}/sr-home
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/sr-home
+      # The installer's uv-managed interpreter (the venv's base python) must be cached with the
+      # install: under ~/.local/share/uv a restored venv points at a python the new runner lacks.
+      UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/sr-uv-python
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      STUDIO_REGRESS_UPSTREAM_SUITES: 'playwright_chat_ui.py,playwright_extra_ui.py'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: 8f93eadfdbe65e35faebdf702dd41918a109b9ed
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Studio install cache (8f93eadfd)
+        id: sr-install
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # --local installs editable from src/: the built frontend lives in the checkout, not the home
+          path: |
+            sr-home
+            sr-uv-python
+            src/studio/frontend/dist
+          key: sr-studio-v3-ubuntu-latest-8f93eadfdbe65e35faebdf702dd41918a109b9ed
+      - name: Tiny model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # engine.SUITE_HF_HOME: run.py prefetches into <workspace>/temp/studio_regress/hf_home
+          # (WORKSPACE unset here, so the checkout root), never ~/.cache/huggingface
+          path: temp/studio_regress/hf_home
+          key: sr-hf-v2-ubuntu-latest-e2a093344a8a
+      - name: Install Studio at after (8f93eadfd)
+        if: steps.sr-install.outputs.cache-hit != 'true'
+        working-directory: src
+        shell: bash
+        run: |
+          ./install.sh --local --no-torch
+      - name: Playwright
+        shell: bash
+        run: |
+          pip install 'playwright<2' httpx pillow numpy
+          python -m playwright install --with-deps chromium || python -m playwright install chromium
+      - name: Journeys (fast, after)
+        shell: bash
+        env:
+          PYTHONPATH: harness/.github/scripts
+          # Windows: UTF-8 file and pipe I/O for the harness and the Studio it launches (cp1252 otherwise)
+          PYTHONUTF8: '1'
+        run: |
+          set +e
+          python harness/.github/scripts/studio_regress/run.py --pr 12328 --repo src --side after \
+            --home-after "$SR_HOME" --tier fast --only auth,settings,crawl --root out --json > out-after-fast.json
+          echo "rc=$?" | tee out-after-fast.rc
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: studio-regress-ubuntu-latest-after-fast
+          path: |
+            out/
+            out-after-fast.*
+            sr-home/logs/
+          if-no-files-found: warn
+  before-model-ubuntu-latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      SR_HOME: ${{ github.workspace }}/sr-home
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/sr-home
+      # The installer's uv-managed interpreter (the venv's base python) must be cached with the
+      # install: under ~/.local/share/uv a restored venv points at a python the new runner lacks.
+      UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/sr-uv-python
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      STUDIO_REGRESS_UPSTREAM_SUITES: 'playwright_chat_ui.py,playwright_extra_ui.py'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: 4700dbc86f0e9f0d433e8075d32aac4096cbffb2
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Studio install cache (4700dbc86)
+        id: sr-install
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # --local installs editable from src/: the built frontend lives in the checkout, not the home
+          path: |
+            sr-home
+            sr-uv-python
+            src/studio/frontend/dist
+          key: sr-studio-v3-ubuntu-latest-4700dbc86f0e9f0d433e8075d32aac4096cbffb2
+      - name: Tiny model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # engine.SUITE_HF_HOME: run.py prefetches into <workspace>/temp/studio_regress/hf_home
+          # (WORKSPACE unset here, so the checkout root), never ~/.cache/huggingface
+          path: temp/studio_regress/hf_home
+          key: sr-hf-v2-ubuntu-latest-e2a093344a8a
+      - name: Install Studio at before (4700dbc86)
+        if: steps.sr-install.outputs.cache-hit != 'true'
+        working-directory: src
+        shell: bash
+        run: |
+          ./install.sh --local --no-torch
+      - name: Allow unprivileged user namespaces (bwrap isolation journey)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Playwright
+        shell: bash
+        run: |
+          pip install 'playwright<2' httpx pillow numpy
+          python -m playwright install --with-deps chromium || python -m playwright install chromium
+      - name: Journeys (model, before)
+        shell: bash
+        env:
+          PYTHONPATH: harness/.github/scripts
+          # Windows: UTF-8 file and pipe I/O for the harness and the Studio it launches (cp1252 otherwise)
+          PYTHONUTF8: '1'
+        run: |
+          set +e
+          python harness/.github/scripts/studio_regress/run.py --pr 12328 --repo src --side before \
+            --home-before "$SR_HOME" --tier model --only upstream_ci,inference_settings,full_access_isolated --root out --json > out-before-model.json
+          echo "rc=$?" | tee out-before-model.rc
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: studio-regress-ubuntu-latest-before-model
+          path: |
+            out/
+            out-before-model.*
+            sr-home/logs/
+          if-no-files-found: warn
+  after-model-ubuntu-latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      SR_HOME: ${{ github.workspace }}/sr-home
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/sr-home
+      # The installer's uv-managed interpreter (the venv's base python) must be cached with the
+      # install: under ~/.local/share/uv a restored venv points at a python the new runner lacks.
+      UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/sr-uv-python
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      STUDIO_REGRESS_UPSTREAM_SUITES: 'playwright_chat_ui.py,playwright_extra_ui.py'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: 8f93eadfdbe65e35faebdf702dd41918a109b9ed
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Studio install cache (8f93eadfd)
+        id: sr-install
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # --local installs editable from src/: the built frontend lives in the checkout, not the home
+          path: |
+            sr-home
+            sr-uv-python
+            src/studio/frontend/dist
+          key: sr-studio-v3-ubuntu-latest-8f93eadfdbe65e35faebdf702dd41918a109b9ed
+      - name: Tiny model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # engine.SUITE_HF_HOME: run.py prefetches into <workspace>/temp/studio_regress/hf_home
+          # (WORKSPACE unset here, so the checkout root), never ~/.cache/huggingface
+          path: temp/studio_regress/hf_home
+          key: sr-hf-v2-ubuntu-latest-e2a093344a8a
+      - name: Install Studio at after (8f93eadfd)
+        if: steps.sr-install.outputs.cache-hit != 'true'
+        working-directory: src
+        shell: bash
+        run: |
+          ./install.sh --local --no-torch
+      - name: Allow unprivileged user namespaces (bwrap isolation journey)
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+      - name: Playwright
+        shell: bash
+        run: |
+          pip install 'playwright<2' httpx pillow numpy
+          python -m playwright install --with-deps chromium || python -m playwright install chromium
+      - name: Journeys (model, after)
+        shell: bash
+        env:
+          PYTHONPATH: harness/.github/scripts
+          # Windows: UTF-8 file and pipe I/O for the harness and the Studio it launches (cp1252 otherwise)
+          PYTHONUTF8: '1'
+        run: |
+          set +e
+          python harness/.github/scripts/studio_regress/run.py --pr 12328 --repo src --side after \
+            --home-after "$SR_HOME" --tier model --only upstream_ci,inference_settings,full_access_isolated --root out --json > out-after-model.json
+          echo "rc=$?" | tee out-after-model.rc
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: studio-regress-ubuntu-latest-after-model
+          path: |
+            out/
+            out-after-model.*
+            sr-home/logs/
+          if-no-files-found: warn
+  before-fast-macos-15:
+    runs-on: macos-15
+    timeout-minutes: 75
+    env:
+      SR_HOME: ${{ github.workspace }}/sr-home
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/sr-home
+      # The installer's uv-managed interpreter (the venv's base python) must be cached with the
+      # install: under ~/.local/share/uv a restored venv points at a python the new runner lacks.
+      UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/sr-uv-python
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      STUDIO_REGRESS_UPSTREAM_SUITES: 'playwright_chat_ui.py,playwright_extra_ui.py'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: 4700dbc86f0e9f0d433e8075d32aac4096cbffb2
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Studio install cache (4700dbc86)
+        id: sr-install
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # --local installs editable from src/: the built frontend lives in the checkout, not the home
+          path: |
+            sr-home
+            sr-uv-python
+            src/studio/frontend/dist
+          key: sr-studio-v3-macos-15-4700dbc86f0e9f0d433e8075d32aac4096cbffb2
+      - name: Tiny model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # engine.SUITE_HF_HOME: run.py prefetches into <workspace>/temp/studio_regress/hf_home
+          # (WORKSPACE unset here, so the checkout root), never ~/.cache/huggingface
+          path: temp/studio_regress/hf_home
+          key: sr-hf-v2-macos-15-e2a093344a8a
+      - name: Install Studio at before (4700dbc86)
+        if: steps.sr-install.outputs.cache-hit != 'true'
+        working-directory: src
+        shell: bash
+        run: |
+          ./install.sh --local --no-torch
+      - name: Playwright
+        shell: bash
+        run: |
+          pip install 'playwright<2' httpx pillow numpy
+          python -m playwright install --with-deps chromium || python -m playwright install chromium
+      - name: Journeys (fast, before)
+        shell: bash
+        env:
+          PYTHONPATH: harness/.github/scripts
+          # Windows: UTF-8 file and pipe I/O for the harness and the Studio it launches (cp1252 otherwise)
+          PYTHONUTF8: '1'
+        run: |
+          set +e
+          python harness/.github/scripts/studio_regress/run.py --pr 12328 --repo src --side before \
+            --home-before "$SR_HOME" --tier fast --only auth,settings,crawl --root out --json > out-before-fast.json
+          echo "rc=$?" | tee out-before-fast.rc
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: studio-regress-macos-15-before-fast
+          path: |
+            out/
+            out-before-fast.*
+            sr-home/logs/
+          if-no-files-found: warn
+  after-fast-macos-15:
+    runs-on: macos-15
+    timeout-minutes: 75
+    env:
+      SR_HOME: ${{ github.workspace }}/sr-home
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/sr-home
+      # The installer's uv-managed interpreter (the venv's base python) must be cached with the
+      # install: under ~/.local/share/uv a restored venv points at a python the new runner lacks.
+      UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/sr-uv-python
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      STUDIO_REGRESS_UPSTREAM_SUITES: 'playwright_chat_ui.py,playwright_extra_ui.py'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: 8f93eadfdbe65e35faebdf702dd41918a109b9ed
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Studio install cache (8f93eadfd)
+        id: sr-install
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # --local installs editable from src/: the built frontend lives in the checkout, not the home
+          path: |
+            sr-home
+            sr-uv-python
+            src/studio/frontend/dist
+          key: sr-studio-v3-macos-15-8f93eadfdbe65e35faebdf702dd41918a109b9ed
+      - name: Tiny model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # engine.SUITE_HF_HOME: run.py prefetches into <workspace>/temp/studio_regress/hf_home
+          # (WORKSPACE unset here, so the checkout root), never ~/.cache/huggingface
+          path: temp/studio_regress/hf_home
+          key: sr-hf-v2-macos-15-e2a093344a8a
+      - name: Install Studio at after (8f93eadfd)
+        if: steps.sr-install.outputs.cache-hit != 'true'
+        working-directory: src
+        shell: bash
+        run: |
+          ./install.sh --local --no-torch
+      - name: Playwright
+        shell: bash
+        run: |
+          pip install 'playwright<2' httpx pillow numpy
+          python -m playwright install --with-deps chromium || python -m playwright install chromium
+      - name: Journeys (fast, after)
+        shell: bash
+        env:
+          PYTHONPATH: harness/.github/scripts
+          # Windows: UTF-8 file and pipe I/O for the harness and the Studio it launches (cp1252 otherwise)
+          PYTHONUTF8: '1'
+        run: |
+          set +e
+          python harness/.github/scripts/studio_regress/run.py --pr 12328 --repo src --side after \
+            --home-after "$SR_HOME" --tier fast --only auth,settings,crawl --root out --json > out-after-fast.json
+          echo "rc=$?" | tee out-after-fast.rc
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: studio-regress-macos-15-after-fast
+          path: |
+            out/
+            out-after-fast.*
+            sr-home/logs/
+          if-no-files-found: warn
+  before-fast-windows-latest:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    env:
+      SR_HOME: ${{ github.workspace }}/sr-home
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/sr-home
+      # The installer's uv-managed interpreter (the venv's base python) must be cached with the
+      # install: under ~/.local/share/uv a restored venv points at a python the new runner lacks.
+      UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/sr-uv-python
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      STUDIO_REGRESS_UPSTREAM_SUITES: 'playwright_chat_ui.py,playwright_extra_ui.py'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: 4700dbc86f0e9f0d433e8075d32aac4096cbffb2
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Studio install cache (4700dbc86)
+        id: sr-install
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # --local installs editable from src/: the built frontend lives in the checkout, not the home
+          path: |
+            sr-home
+            sr-uv-python
+            src/studio/frontend/dist
+          key: sr-studio-v3-windows-latest-4700dbc86f0e9f0d433e8075d32aac4096cbffb2
+      - name: Tiny model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # engine.SUITE_HF_HOME: run.py prefetches into <workspace>/temp/studio_regress/hf_home
+          # (WORKSPACE unset here, so the checkout root), never ~/.cache/huggingface
+          path: temp/studio_regress/hf_home
+          key: sr-hf-v2-windows-latest-e2a093344a8a
+      - name: Install Studio at before (4700dbc86)
+        if: steps.sr-install.outputs.cache-hit != 'true'
+        working-directory: src
+        shell: pwsh
+        run: |
+          & ./install.ps1 --local --no-torch; exit $LASTEXITCODE
+      - name: Playwright
+        shell: bash
+        run: |
+          pip install 'playwright<2' httpx pillow numpy
+          python -m playwright install --with-deps chromium || python -m playwright install chromium
+      - name: Journeys (fast, before)
+        shell: bash
+        env:
+          PYTHONPATH: harness/.github/scripts
+          # Windows: UTF-8 file and pipe I/O for the harness and the Studio it launches (cp1252 otherwise)
+          PYTHONUTF8: '1'
+        run: |
+          set +e
+          python harness/.github/scripts/studio_regress/run.py --pr 12328 --repo src --side before \
+            --home-before "$SR_HOME" --tier fast --only auth,settings,crawl --root out --json > out-before-fast.json
+          echo "rc=$?" | tee out-before-fast.rc
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: studio-regress-windows-latest-before-fast
+          path: |
+            out/
+            out-before-fast.*
+            sr-home/logs/
+          if-no-files-found: warn
+  after-fast-windows-latest:
+    runs-on: windows-latest
+    timeout-minutes: 75
+    env:
+      SR_HOME: ${{ github.workspace }}/sr-home
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/sr-home
+      # The installer's uv-managed interpreter (the venv's base python) must be cached with the
+      # install: under ~/.local/share/uv a restored venv points at a python the new runner lacks.
+      UV_PYTHON_INSTALL_DIR: ${{ github.workspace }}/sr-uv-python
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
+      HF_HUB_DISABLE_TELEMETRY: '1'
+      STUDIO_REGRESS_UPSTREAM_SUITES: 'playwright_chat_ui.py,playwright_extra_ui.py'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          ref: 8f93eadfdbe65e35faebdf702dd41918a109b9ed
+          path: src
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Studio install cache (8f93eadfd)
+        id: sr-install
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # --local installs editable from src/: the built frontend lives in the checkout, not the home
+          path: |
+            sr-home
+            sr-uv-python
+            src/studio/frontend/dist
+          key: sr-studio-v3-windows-latest-8f93eadfdbe65e35faebdf702dd41918a109b9ed
+      - name: Tiny model cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          # engine.SUITE_HF_HOME: run.py prefetches into <workspace>/temp/studio_regress/hf_home
+          # (WORKSPACE unset here, so the checkout root), never ~/.cache/huggingface
+          path: temp/studio_regress/hf_home
+          key: sr-hf-v2-windows-latest-e2a093344a8a
+      - name: Install Studio at after (8f93eadfd)
+        if: steps.sr-install.outputs.cache-hit != 'true'
+        working-directory: src
+        shell: pwsh
+        run: |
+          & ./install.ps1 --local --no-torch; exit $LASTEXITCODE
+      - name: Playwright
+        shell: bash
+        run: |
+          pip install 'playwright<2' httpx pillow numpy
+          python -m playwright install --with-deps chromium || python -m playwright install chromium
+      - name: Journeys (fast, after)
+        shell: bash
+        env:
+          PYTHONPATH: harness/.github/scripts
+          # Windows: UTF-8 file and pipe I/O for the harness and the Studio it launches (cp1252 otherwise)
+          PYTHONUTF8: '1'
+        run: |
+          set +e
+          python harness/.github/scripts/studio_regress/run.py --pr 12328 --repo src --side after \
+            --home-after "$SR_HOME" --tier fast --only auth,settings,crawl --root out --json > out-after-fast.json
+          echo "rc=$?" | tee out-after-fast.rc
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: studio-regress-windows-latest-after-fast
+          path: |
+            out/
+            out-after-fast.*
+            sr-home/logs/
+          if-no-files-found: warn
+  diff-ubuntu-latest:
+    needs: [before-fast-ubuntu-latest, after-fast-ubuntu-latest, before-model-ubuntu-latest, after-model-ubuntu-latest]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: studio-regress-ubuntu-latest-*
+          path: art
+          merge-multiple: true
+      - name: Pair and diff (ubuntu-latest)
+        env:
+          PYTHONPATH: harness/.github/scripts
+        run: |
+          pip install pillow numpy
+          python harness/.github/scripts/studio_regress/diff.py --root art/out --json --report \
+            --pr 12328 --base-sha 4700dbc86f0e9f0d433e8075d32aac4096cbffb2 --head-sha 8f93eadfdbe65e35faebdf702dd41918a109b9ed --side-rc art/out-*.rc \
+            > diff-ubuntu-latest.json || true
+          cp art/out/report.json report.json 2>/dev/null || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: studio-regress-report-ubuntu-latest
+          path: |
+            report.json
+            diff-ubuntu-latest.json
+            art/out/**/*.png
+            art/out/**/*.json
+  diff-macos-15:
+    needs: [before-fast-macos-15, after-fast-macos-15]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: studio-regress-macos-15-*
+          path: art
+          merge-multiple: true
+      - name: Pair and diff (macos-15)
+        env:
+          PYTHONPATH: harness/.github/scripts
+        run: |
+          pip install pillow numpy
+          python harness/.github/scripts/studio_regress/diff.py --root art/out --json --report \
+            --pr 12328 --base-sha 4700dbc86f0e9f0d433e8075d32aac4096cbffb2 --head-sha 8f93eadfdbe65e35faebdf702dd41918a109b9ed --side-rc art/out-*.rc \
+            > diff-macos-15.json || true
+          cp art/out/report.json report.json 2>/dev/null || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: studio-regress-report-macos-15
+          path: |
+            report.json
+            diff-macos-15.json
+            art/out/**/*.png
+            art/out/**/*.json
+  diff-windows-latest:
+    needs: [before-fast-windows-latest, after-fast-windows-latest]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          path: harness
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          pattern: studio-regress-windows-latest-*
+          path: art
+          merge-multiple: true
+      - name: Pair and diff (windows-latest)
+        env:
+          PYTHONPATH: harness/.github/scripts
+        run: |
+          pip install pillow numpy
+          python harness/.github/scripts/studio_regress/diff.py --root art/out --json --report \
+            --pr 12328 --base-sha 4700dbc86f0e9f0d433e8075d32aac4096cbffb2 --head-sha 8f93eadfdbe65e35faebdf702dd41918a109b9ed --side-rc art/out-*.rc \
+            > diff-windows-latest.json || true
+          cp art/out/report.json report.json 2>/dev/null || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: studio-regress-report-windows-latest
+          path: |
+            report.json
+            diff-windows-latest.json
+            art/out/**/*.png
+            art/out/**/*.json
