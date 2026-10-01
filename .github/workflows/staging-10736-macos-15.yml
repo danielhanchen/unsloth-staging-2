@@ -1,0 +1,33 @@
+name: "staging-10736 macos-15"
+on:
+  push:
+    branches: ["pr-10736-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: python -m pip install git+https://github.com/unslothai/unsloth-zoo mlx mlx-lm mlx-vlm gguf
+      - run: python -c "import importlib.util as u, mlx.core as mx, mlx_lm; assert u.find_spec('unsloth_zoo'), 'unsloth_zoo missing'; print('mlx', mx.__version__, mx.default_device())"
+      - run: echo 'test_select - no test in studio/backend/tests reaches this change (TARGETED - 7 test files reach the change (0 in scope)), nothing to run'
