@@ -200,6 +200,7 @@ class AttentionContext:
     # PrefixGrouper: non-None routes Q/K/V through the FlexAttention shared-prefix kernel; None leaves
     # every existing construction and behavior unchanged.
     prefix_seg_info: Optional[Any] = None
+    is_causal: bool = True
 
 
 def select_attention_backend(use_varlen: bool = False) -> str:
@@ -359,6 +360,12 @@ def run_attention(
     flash_varlen_kwargs = config.flash_varlen_kwargs or {}
     sdpa_kwargs = config.sdpa_kwargs or {}
     xformers_kwargs = config.xformers_kwargs or {}
+    # Mask builders only see is_causal when False, so causal callers and their patches are unchanged.
+    direction = {}
+    if not context.is_causal:
+        flash_dense_kwargs = {**flash_dense_kwargs, "causal": False}
+        flash_varlen_kwargs = {**flash_varlen_kwargs, "causal": False}
+        direction = {"is_causal": False}
 
     bsz = context.bsz
     n_heads = context.n_heads
@@ -423,6 +430,7 @@ def run_attention(
         # Only CausalLM_fast_forward supplies the mask; a direct decoder call (Liger, TRL's get_decoder paths) would attend bidirectionally.
         if (
             base_mask is None
+            and context.is_causal
             and xformers is not None
             and context.seq_info is None
             and q_len == kv_seq_len
@@ -432,6 +440,7 @@ def run_attention(
             context.seq_info,
             sliding_window = sliding_window,
             base_mask = base_mask,
+            **direction,
         )
         attn_bias = move_xformers_attention_bias(attn_bias, Q.device)
 
@@ -496,6 +505,7 @@ def run_attention(
                 dtype = Q.dtype,
                 device = Q.device,
                 sliding_window = sliding_window,
+                **direction,
             )
         else:
             q_len_local = Q.shape[-2]
@@ -516,7 +526,13 @@ def run_attention(
                     q_pos = torch.arange(past_len, past_len + q_len_local, device = Q.device)
                     k_pos = torch.arange(k_len_local, device = Q.device)
 
-                    causal_keep = k_pos[None, :] <= q_pos[:, None]  # True = allowed (SDPA)
+                    causal_keep = (
+                        k_pos[None, :] <= q_pos[:, None]
+                        if context.is_causal
+                        else torch.ones(
+                            (q_len_local, k_len_local), dtype = torch.bool, device = Q.device
+                        )
+                    )  # True = allowed (SDPA)
                     if sliding_window is not None:
                         causal_keep &= k_pos[None, :] >= (q_pos[:, None] - (sliding_window - 1))
 
@@ -546,7 +562,9 @@ def run_attention(
                     q_len_local, k_len_local, sliding_window, Q.device
                 )
 
-            is_causal_local = local_mask is None and q_len_local == k_len_local
+            is_causal_local = (
+                context.is_causal and local_mask is None and q_len_local == k_len_local
+            )
 
         kwargs = dict(sdpa_kwargs)
         kwargs.setdefault("attn_mask", local_mask)
