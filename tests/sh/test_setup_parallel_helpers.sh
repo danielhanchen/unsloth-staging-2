@@ -1,0 +1,218 @@
+#!/bin/bash
+# Unit tests for parallel setup helpers from studio/setup.sh (issue #8818).
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SETUP_SH="$SCRIPT_DIR/../../studio/setup.sh"
+PASS=0
+FAIL=0
+
+_FUNC_FILE=$(mktemp)
+sed -n '/^_setup_parallel_reset()/,/^}/p' "$SETUP_SH" > "$_FUNC_FILE"
+sed -n '/^_setup_parallel_run()/,/^}/p' "$SETUP_SH" >> "$_FUNC_FILE"
+sed -n '/^_setup_parallel_wait()/,/^}/p' "$SETUP_SH" >> "$_FUNC_FILE"
+sed -n '/^_setup_frontend_reap_if_exited()/,/^}/p' "$SETUP_SH" >> "$_FUNC_FILE"
+
+if [ ! -s "$_FUNC_FILE" ]; then
+    echo "FAIL: could not extract parallel helpers from $SETUP_SH"
+    exit 1
+fi
+
+# shellcheck disable=SC1090
+. "$_FUNC_FILE"
+
+step() { :; }
+substep() { :; }
+
+_setup_bg_fail() {
+    return 1
+}
+
+assert_parallel_ok() {
+    local label="$1"
+    _setup_parallel_reset
+    _setup_parallel_run "$label" true
+    if _setup_parallel_wait; then
+        echo "  PASS: $label"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: $label"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+assert_parallel_fail() {
+    local label="$1"
+    _setup_parallel_reset
+    _setup_parallel_run "$label" false
+    if _setup_parallel_wait; then
+        echo "  FAIL: $label (expected failure)"
+        FAIL=$((FAIL + 1))
+    else
+        echo "  PASS: $label (failed as expected)"
+        PASS=$((PASS + 1))
+    fi
+}
+
+echo "setup parallel helpers"
+assert_parallel_ok "single successful job"
+assert_parallel_fail "single failing job"
+
+_setup_parallel_reset
+_setup_parallel_run "job-a" true
+_setup_parallel_run "job-b" true
+if _setup_parallel_wait; then
+    echo "  PASS: two successful jobs"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: two successful jobs"
+    FAIL=$((FAIL + 1))
+fi
+
+rm -f "$_FUNC_FILE"
+
+# ── under set -e a failed job still joins the rest and reports its label ──
+_SETE_FILE=$(mktemp)
+for _fn in _setup_parallel_reset _setup_parallel_run _setup_bg_fail _setup_parallel_wait; do
+    sed -n "/^$_fn()/,/^}/p" "$SETUP_SH" >> "$_SETE_FILE"
+done
+_SETE_OUT=$(
+    bash -c '
+        set -euo pipefail
+        C_ERR=; step() { echo "STEP $*"; }
+        _setup_frontend_reap_if_exited() { :; }; _setup_abort_frontend_job() { echo ABORTED; }
+        . "$1"
+        _setup_parallel_reset
+        _setup_parallel_run "T5 a" bash -c "exit 5"
+        _setup_parallel_run "T5 b" bash -c "sleep 0.3; echo B_DONE"
+        _setup_parallel_wait
+    ' _ "$_SETE_FILE" 2>&1
+) && _sete_rc=0 || _sete_rc=$?
+if [ "$_sete_rc" -ne 0 ] && printf '%s\n' "$_SETE_OUT" | grep -q 'T5 a failed' \
+    && printf '%s\n' "$_SETE_OUT" | grep -q B_DONE && printf '%s\n' "$_SETE_OUT" | grep -q ABORTED; then
+    echo "  PASS: set -e parent joins every job and aborts the frontend"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: set -e parallel wait (rc=$_sete_rc): $_SETE_OUT"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$_SETE_FILE"
+
+# ── gitignore hide/restore scoped to npm run build ──
+_GI_FILE=$(mktemp)
+sed -n '/^_setup_hide_star_gitignores_from()/,/^}/p' "$SETUP_SH" > "$_GI_FILE"
+sed -n '/^_setup_restore_star_gitignores()/,/^}/p' "$SETUP_SH" >> "$_GI_FILE"
+sed -n '/^_setup_restore_twbuild_gitignores_from()/,/^}/p' "$SETUP_SH" >> "$_GI_FILE"
+# shellcheck disable=SC1090
+. "$_GI_FILE"
+_HIDDEN_GITIGNORES=()
+
+_GI_ROOT=$(mktemp -d)
+mkdir -p "$_GI_ROOT/frontend"
+printf '*\n' > "$_GI_ROOT/.gitignore"
+_setup_hide_star_gitignores_from "$_GI_ROOT/frontend"
+if [ -f "$_GI_ROOT/.gitignore._twbuild" ] && [ ! -f "$_GI_ROOT/.gitignore" ]; then
+    echo "  PASS: hide star gitignore during build window"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: hide star gitignore during build window"
+    FAIL=$((FAIL + 1))
+fi
+_setup_restore_star_gitignores
+if [ -f "$_GI_ROOT/.gitignore" ] && [ ! -f "$_GI_ROOT/.gitignore._twbuild" ]; then
+    echo "  PASS: restore star gitignore after build"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: restore star gitignore after build"
+    FAIL=$((FAIL + 1))
+fi
+
+printf '*\n' > "$_GI_ROOT/.gitignore"
+mv "$_GI_ROOT/.gitignore" "$_GI_ROOT/.gitignore._twbuild"
+_setup_restore_twbuild_gitignores_from "$_GI_ROOT/frontend"
+if [ -f "$_GI_ROOT/.gitignore" ] && [ ! -f "$_GI_ROOT/.gitignore._twbuild" ]; then
+    echo "  PASS: abort path restores leftover ._twbuild gitignore"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: abort path restores leftover ._twbuild gitignore"
+    FAIL=$((FAIL + 1))
+fi
+rm -rf "$_GI_ROOT"
+rm -f "$_GI_FILE"
+
+# ── abort kills the background frontend job ──
+_ABORT_FILE=$(mktemp)
+sed -n '/^_setup_restore_twbuild_gitignores_from()/,/^}/p' "$SETUP_SH" > "$_ABORT_FILE"
+sed -n '/^_setup_abort_frontend_job()/,/^}/p' "$SETUP_SH" >> "$_ABORT_FILE"
+# shellcheck disable=SC1090
+. "$_ABORT_FILE"
+sleep 30 &
+_SETUP_FRONTEND_BG_PID=$!
+_sleep_pid=$_SETUP_FRONTEND_BG_PID
+_setup_abort_frontend_job
+if kill -0 "$_sleep_pid" 2>/dev/null; then
+    echo "  FAIL: abort should kill the frontend job"
+    FAIL=$((FAIL + 1))
+    kill -KILL "$_sleep_pid" 2>/dev/null || true
+    wait "$_sleep_pid" 2>/dev/null || true
+else
+    echo "  PASS: abort kills the frontend job"
+    PASS=$((PASS + 1))
+fi
+rm -f "$_ABORT_FILE"
+
+# ── frontend reap fails fast in parent when bg job already exited ──
+_REAP_FILE=$(mktemp)
+sed -n '/^_setup_frontend_reap_if_exited()/,/^}/p' "$SETUP_SH" >> "$_REAP_FILE"
+# shellcheck disable=SC1090
+. "$_REAP_FILE"
+_SETUP_FAIL_CALLED=0
+_setup_bg_fail() {
+    _SETUP_FAIL_CALLED=1
+    return 1
+}
+false &
+_SETUP_FRONTEND_BG_PID=$!
+wait "$_SETUP_FRONTEND_BG_PID" 2>/dev/null || true
+if _setup_frontend_reap_if_exited; then
+    echo "  FAIL: reap should propagate frontend failure"
+    FAIL=$((FAIL + 1))
+else
+    if [ "$_SETUP_FAIL_CALLED" -eq 1 ]; then
+        echo "  PASS: reap fails when frontend job failed"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: reap did not fail"
+        FAIL=$((FAIL + 1))
+    fi
+fi
+rm -f "$_REAP_FILE"
+
+# ── a background failure reaches Desktop as one specific [TAURI:ERROR] ──
+_MARK_FILE=$(mktemp)
+for _fn in setup_fail _setup_bg_fail _setup_abort_frontend_job _setup_frontend_reap_if_exited; do
+    sed -n "/^$_fn()/,/^}/p" "$SETUP_SH" >> "$_MARK_FILE"
+done
+_MARK_OUT=$(
+    UNSLOTH_TAURI_UPDATE=1 bash -c '
+        C_ERR=; step() { :; }; _setup_restore_twbuild_gitignores_from() { :; }
+        . "$1"
+        ( setup_fail 7 "OXC validator dependency installation failed" ) &
+        _SETUP_FRONTEND_BG_PID=$!
+        while kill -0 "$_SETUP_FRONTEND_BG_PID" 2>/dev/null; do sleep 0.05; done
+        _setup_frontend_reap_if_exited
+    ' _ "$_MARK_FILE" 2>/dev/null
+) && _mark_rc=0 || _mark_rc=$?
+if [ "$_mark_rc" -eq 7 ] && [ "$(printf '%s\n' "$_MARK_OUT" | grep -c '^\[TAURI:ERROR\]')" -eq 1 ] \
+    && printf '%s\n' "$_MARK_OUT" | grep -q '^\[TAURI:ERROR\] OXC validator'; then
+    echo "  PASS: one specific TAURI error marker, exit code kept"
+    PASS=$((PASS + 1))
+else
+    echo "  FAIL: TAURI markers (rc=$_mark_rc): $_MARK_OUT"
+    FAIL=$((FAIL + 1))
+fi
+rm -f "$_MARK_FILE"
+
+echo ""
+echo "Passed: $PASS  Failed: $FAIL"
+[ "$FAIL" -eq 0 ] || exit 1
