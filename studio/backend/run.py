@@ -536,6 +536,15 @@ def _network_share_host_for_bind(host: str) -> str:
     return host
 
 
+def _is_wsl_nat() -> bool:
+    from lan_access import _wsl_networking_mode
+    from utils.paths.file_manager import _in_container
+
+    # "unknown" = WSL too old for wslinfo, which is NAT; "none" has no network at all. A container on
+    # Docker Desktop's WSL2 kernel also reads "unknown", but its host port is whatever -p published.
+    return _wsl_networking_mode() in ("nat", "unknown") and not _in_container()
+
+
 def _loopback_bind_host_for(host: str) -> str:
     return wildcard_loopback_host(host) or "127.0.0.1"
 
@@ -624,6 +633,7 @@ def _emit_startup_output(
         network_host = _network_share_host_for_bind(host),
         include_stop_hint = False,
         lan_addresses = lan_addresses,
+        wsl_windows_browser_hint = wildcard_bind and _is_wsl_nat(),
     )
     if localhost_mismatch_url:
         _print_localhost_ipv6_mismatch_warning(localhost_mismatch_url, port)
