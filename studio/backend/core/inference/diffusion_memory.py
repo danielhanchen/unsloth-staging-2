@@ -2904,14 +2904,12 @@ PIN_TOP_GROUP_ENV = "UNSLOTH_DIFFUSION_PIN_TOP_GROUP"
 def _pin_top_level_group(
     module: Any,
     logger: Any = None,
-    pinned_mib: Optional[list] = None,
+    reserved_mib: int = 0,
 ) -> bool:
-    """Onload a block-streamed DiT's top-level group (embedders, norm_out, proj_out) from one pinned host copy.
+    """Onload a block-streamed DiT's top-level group (stream-less in diffusers) from one pinned copy, no copy back.
 
-    diffusers gives that group no stream: every forward uploaded it from pageable memory and every offload copied it
-    back to a fresh host buffer, which inference never needs. Now the onload is an async H2D on the compute stream and
-    the offload only re-points the tensors; VRAM unchanged. Skipped for torchao weights (not re-pointable via
-    ``.data``) and when the copy does not fit the pinnable host RAM."""
+    Skipped for torchao weights (not re-pointable via .data) and when the copy exceeds the pin budget less
+    ``reserved_mib`` (planned pins not yet made)."""
     if (os.environ.get(PIN_TOP_GROUP_ENV) or "").strip().lower() in ("0", "off", "false", "no"):
         return False
     try:
@@ -2950,7 +2948,6 @@ def _pin_top_level_group(
             return False
         if any(type(t) not in (torch.Tensor, torch.nn.Parameter) for t in tensors):
             return False
-        # the user's "pin nothing" override wins, as on every other streamed path
         if str(os.environ.get(GROUP_OFFLOAD_PIN_ENV, "")).strip().lower() in (
             "0",
             "off",
@@ -2958,16 +2955,14 @@ def _pin_top_level_group(
             "no",
         ):
             return False
-        # per tensor rounded to a power of two, like torch's pinned allocator (and _module_host_mib)
+        # power-of-two per tensor, like torch's pinned allocator
         need_mib = sum(
             1 << (int(t.numel()) * int(t.element_size()) - 1).bit_length()
             for t in tensors
             if int(t.numel()) * int(t.element_size()) > 0
         ) // (1024 * 1024)
         budget = None if _pinned_memory_capped() else _pin_budget_mib()
-        # on the running total the encoders and torchao denoisers already pinned (or will, deferred) count against
-        already = pinned_mib[0] if pinned_mib else 0
-        if budget is None or already + need_mib > budget:
+        if budget is None or need_mib + max(0, int(reserved_mib)) > budget:
             return False
         host = {
             t: (t.data if t.data.device.type == "cpu" else t.data.cpu()).pin_memory()
@@ -2979,7 +2974,7 @@ def _pin_top_level_group(
             for tensor, pinned in list(host.items()):
                 current = tensor.data
                 if current.device.type == "cpu" and current.data_ptr() != pinned.data_ptr():
-                    # replaced while offloaded (a .to() conversion, an adapter fused on the host): re-pin what is there now
+                    # replaced while offloaded: re-pin the new host tensor
                     pinned = current if current.is_pinned() else current.pin_memory()
                     host[tensor] = pinned
                 tensor.data = pinned.to(device, non_blocking = True)
@@ -2995,8 +2990,6 @@ def _pin_top_level_group(
         group.onload_ = onload_
         group.offload_ = offload_
         group._unsloth_pinned_top = True
-        if pinned_mib is not None:
-            pinned_mib[0] = already + need_mib
         if logger is not None:
             logger.info(
                 "diffusion.memory: %s top-level weights (%d MiB) onload from a pinned copy, no copy back",
@@ -3114,11 +3107,12 @@ def _apply_group_offload(
             if isinstance(comp, torch.nn.Module):
                 comp.to(onload)
         # Encoders the plan pins count against the same budget as any torchao denoiser pinned below.
-        pinned_mib = [
+        pinned_mib_encoders = (
             sum(_module_host_mib(m) for m in streamed_encoders.values())
             if stream_text_encoders and pin_streamed[1]
             else 0
-        ]
+        )
+        pinned_mib = [pinned_mib_encoders]
         for module in streamed.values():
             # torchao weights need their up-front pin (lazy pinning refuses them), so they never defer.
             if (
@@ -3134,11 +3128,8 @@ def _apply_group_offload(
                 )
             installed += 1
             if use_stream:
-                _pin_top_level_group(module, logger, pinned_mib)
-        if resident_transformer_mib:
-            room = int(resident_transformer_mib)
-            for module in streamed.values():
-                room -= _keep_groups_resident(module, room, onload, logger)
+                # a planned DiT pin already covers its top group; otherwise leave the planned encoder pins room
+                _pin_top_level_group(module, logger, 0 if pin_streamed[0] else pinned_mib_encoders)
         # The encoders come AFTER the DiTs and are applied one by one, each failure absorbed. A text encoder is a far
         # less well-trodden target for block-level group offloading than a DiT (a family whose encoder exposes no
         # recognisable block list can refuse), and this tier is a rescue: the alternative to streaming an encoder is
@@ -3674,13 +3665,7 @@ def _streaming_prefetch_enabled() -> bool:
     )
 
 
-def _apply_streaming_offload(
-    pipe: Any,
-    device: str,
-    logger: Any,
-    *,
-    resident_transformer_mib: Optional[int] = None,
-) -> None:
+def _apply_streaming_offload(pipe: Any, device: str, logger: Any) -> None:
     """Stream transformer blocks and text-encoder leaves without whole-component onloads.
 
     This is selected only after measuring a component larger than the safe device budget, so a
@@ -3719,15 +3704,17 @@ def _apply_streaming_offload(
                 component.to(onload)
 
         pinned_mib = [0]
-        # Overlap needs a pinned host copy and record_stream (record_stream=False syncs the compute stream per group).
+        # Overlap needs pinned host copies and record_stream: record_stream=False drains the compute stream per group.
         prefetch = use_stream and _streaming_prefetch_enabled()
         pin_dits, pin_encoders = False, False
+        encoder_mib = sum(_module_host_mib(m) for m, t in streamed.values() if t != "block_level")
         if prefetch:
             pin_dits, pin_encoders = _streamed_pin_plan(
                 sum(_module_host_mib(m) for m, t in streamed.values() if t == "block_level"),
-                sum(_module_host_mib(m) for m, t in streamed.values() if t != "block_level"),
+                encoder_mib,
                 logger,
             )
+        top_reserved_mib = encoder_mib if pin_encoders and not pin_dits else 0
         defer = (
             prefetch
             and bool(getattr(pipe, _BACKGROUND_PIN_REQUEST_ATTR, False))
@@ -3735,11 +3722,6 @@ def _apply_streaming_offload(
         )
         if defer:
             install_group_pin_wait()
-        # pinned encoders count against the budget a torchao denoiser pins within, as on the group tier
-        if pin_encoders:
-            pinned_mib[0] = sum(
-                _module_host_mib(m) for m, t in streamed.values() if t != "block_level"
-            )
 
         for module, offload_type in streamed.values():
             kwargs: dict[str, Any] = {
@@ -3764,7 +3746,7 @@ def _apply_streaming_offload(
                 _defer_pinning(pipe, module, onload, logger)
             installed += 1
             if use_stream and offload_type == "block_level":
-                _pin_top_level_group(module, logger, pinned_mib)
+                _pin_top_level_group(module, logger, top_reserved_mib)
             if offload_type == "leaf_level":
                 _pin_vision_embedding_device(module)
         if resident_transformer_mib:

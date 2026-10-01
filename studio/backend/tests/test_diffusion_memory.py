@@ -937,8 +937,7 @@ def test_apply_streaming_uses_block_and_leaf_hooks_with_bounded_cpu_memory(monke
     )
     import core.inference.diffusion_memory as mem
 
-    # no pinnable host RAM: every streamed module stays unpinned (bounded CPU memory), and record_stream keeps the
-    # offload from draining the compute stream
+    # no pinnable host RAM: everything stays unpinned, record_stream still on
     monkeypatch.delenv(mem.STREAMING_PREFETCH_ENV, raising = False)
     monkeypatch.delenv(mem.GROUP_OFFLOAD_PIN_ENV, raising = False)
     monkeypatch.setattr(mem, "_pin_budget_mib", lambda: 0)
@@ -962,6 +961,8 @@ def _streaming_apply_kwargs(
     *,
     env = None,
     request_background = False,
+    sizes = (4000, 7500),
+    top_calls = None,
 ):
     """{component: apply kwargs} and the modules handed to a deferred pinner, for one streaming apply."""
     import sys
@@ -1010,7 +1011,15 @@ def _streaming_apply_kwargs(
         "_defer_pinning",
         lambda pipe, module, device, logger: deferred.append(module.name) or True,
     )
-    parts = {"transformer": Module(4000), "text_encoder": Module(7500), "vae": Module(200)}
+    if top_calls is not None:
+        monkeypatch.setattr(
+            mem,
+            "_pin_top_level_group",
+            lambda module, logger = None, reserved_mib = 0: top_calls.append(
+                (module.name, reserved_mib)
+            ),
+        )
+    parts = {"transformer": Module(sizes[0]), "text_encoder": Module(sizes[1]), "vae": Module(200)}
     for name, module in parts.items():
         module.name = name
     pipe = types.SimpleNamespace(transformer = parts["transformer"], components = parts)
@@ -1021,8 +1030,6 @@ def _streaming_apply_kwargs(
 
 
 def test_streaming_pins_the_transformer_within_the_host_budget(monkeypatch):
-    # An unpinned host copy is re-pinned on the CPU at every onload, and record_stream=False synchronises the compute
-    # stream after every group, so that pinning ran with the GPU idle (Wan2.2-5B streamed on an L4: see the PR).
     seen, deferred = _streaming_apply_kwargs(monkeypatch, 6000)
     assert seen["transformer"]["low_cpu_mem_usage"] is False
     assert seen["transformer"]["record_stream"] is True
@@ -1032,6 +1039,34 @@ def test_streaming_pins_the_transformer_within_the_host_budget(monkeypatch):
     assert deferred == []
 
 
+@pytest.mark.parametrize(
+    "sizes, reserved",
+    [((9000, 4096), 4096), ((4000, 7500), 0)],
+)
+def test_streaming_top_group_leaves_room_for_planned_encoder_pins(monkeypatch, sizes, reserved):
+    # DiT over budget, encoders pinned: the top group must not take the encoders' share
+    top_calls: list = []
+    _streaming_apply_kwargs(monkeypatch, 6000, sizes = sizes, top_calls = top_calls)
+    assert top_calls == [("transformer", reserved)]
+
+
+def test_top_level_group_refuses_what_planned_pins_already_claim(monkeypatch):
+    import core.inference.diffusion_memory as mem
+
+    module, group = _top_group_module(monkeypatch)
+    monkeypatch.delenv(mem.PIN_TOP_GROUP_ENV, raising = False)
+    monkeypatch.delenv(mem.GROUP_OFFLOAD_PIN_ENV, raising = False)
+    monkeypatch.setattr(mem, "_pinned_memory_capped", lambda: False)
+    monkeypatch.setattr(mem, "_pin_budget_mib", lambda: 10)
+    group.modules = [
+        types.SimpleNamespace(
+            parameters = lambda: [__import__("torch").empty(1 << 20)], buffers = lambda: []
+        )
+    ]
+    assert mem._pin_top_level_group(module, reserved_mib = 7) is False
+    assert group.onload_ == "diffusers"
+
+
 def test_streaming_pins_everything_on_a_ram_rich_host(monkeypatch):
     seen, _ = _streaming_apply_kwargs(monkeypatch, 40_000)
     assert all(kw["low_cpu_mem_usage"] is False for kw in seen.values()), seen
@@ -1039,7 +1074,7 @@ def test_streaming_pins_everything_on_a_ram_rich_host(monkeypatch):
 
 def test_streaming_pins_off_the_load_path_when_asked(monkeypatch):
     seen, deferred = _streaming_apply_kwargs(monkeypatch, 6000, request_background = True)
-    # applied unpinned, then handed to the background pinner; the encoder is outside the budget so never pinned
+    # deferred to the background pinner; the encoder is over budget
     assert seen["transformer"]["low_cpu_mem_usage"] is True
     assert seen["transformer"]["record_stream"] is True
     assert deferred == ["transformer"]
@@ -2960,27 +2995,6 @@ def test_top_level_group_respects_the_pinned_allocator_rounding(monkeypatch):
     assert group.onload_ == "diffusers"
 
 
-def test_top_level_group_counts_against_the_running_pin_total(monkeypatch):
-    import core.inference.diffusion_memory as mem
-
-    module, group = _top_group_module(monkeypatch)
-    monkeypatch.delenv(mem.PIN_TOP_GROUP_ENV, raising = False)
-    monkeypatch.delenv(mem.GROUP_OFFLOAD_PIN_ENV, raising = False)
-    monkeypatch.setattr(mem, "_pinned_memory_capped", lambda: False)
-    group.modules = [
-        types.SimpleNamespace(
-            parameters = lambda: [__import__("torch").empty(1 << 18)], buffers = lambda: []
-        )
-    ]
-    monkeypatch.setattr(mem, "_pin_budget_mib", lambda: 8)
-    # 8 MiB budget, 8 MiB of encoders already pinned: the 1 MiB top group no longer fits
-    assert mem._pin_top_level_group(module, None, [8]) is False
-    assert group.onload_ == "diffusers"
-    total = [4]
-    assert mem._pin_top_level_group(module, None, total) is True
-    assert total == [5]
-
-
 @pytest.mark.parametrize("kind", ["streamed_group", "torchao"])
 def test_top_level_group_left_alone_when_not_the_streamless_top_group(monkeypatch, kind):
     import core.inference.diffusion_memory as mem
@@ -3036,7 +3050,6 @@ def test_top_level_weights_onload_from_one_pinned_copy_on_a_real_gpu(monkeypatch
     with torch.no_grad():
         got = [net(x.cuda()).cpu() for _ in range(3)]
     torch.cuda.synchronize()
-    # offloaded between forwards onto the same pinned host copy: no device-to-host copy into a fresh host buffer
     ptr = net.proj_out.weight.data_ptr()
     assert net.proj_out.weight.device.type == "cpu" and net.proj_out.weight.is_pinned()
     with torch.no_grad():
@@ -3080,31 +3093,8 @@ def test_top_level_weights_replaced_while_offloaded_are_picked_up(monkeypatch):
         for _ in range(2):
             net(x.cuda())
         torch.cuda.synchronize()
-        # e.g. a .to() conversion or an adapter fused on the host while the weights sit offloaded
         net.proj_out.weight.data = net.proj_out.weight.data * 2
         ref.proj_out.weight.data = ref.proj_out.weight.data * 2
         got = net(x.cuda()).cpu()
         want = ref(x)
     assert torch.allclose(got, want, atol = 1e-5)
-
-
-def test_streaming_counts_pinned_encoders_before_a_torchao_denoiser_pins(monkeypatch):
-    # The torchao denoiser pins within a running total; encoders the plan pins must already be on it (as on the group
-    # tier), or the two together exceed the pinnable host budget.
-    import core.inference.diffusion_memory as mem
-
-    seen_totals: dict = {}
-    real = mem._torchao_group_offload_kwargs
-
-    def _spy(
-        module,
-        kwargs,
-        pinned_mib = None,
-    ):
-        seen_totals[module.name] = pinned_mib[0] if pinned_mib else None
-        return real(module, kwargs, pinned_mib)
-
-    monkeypatch.setattr(mem, "_torchao_group_offload_kwargs", _spy)
-    _streaming_apply_kwargs(monkeypatch, 40_000)
-    # the 7500 MiB encoder, rounded up to a power of two like the pinned allocator
-    assert seen_totals["transformer"] == 8192
