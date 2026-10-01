@@ -3,6 +3,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
+import { additionalAssetDownloads } from "./required-assets";
+
 import { toast } from "@/lib/toast";
 
 import { DOWNLOAD_KIND } from "./constants";
@@ -37,12 +39,17 @@ export function useStagedDownload({
   scopeId,
   onReady,
   onCancelled,
+  confirmAssets = true,
 }: {
   scopeId: string;
+  confirmAssets?: boolean;
   onReady: () => void;
   /** Clears the consumer's pending auto-load when the plan ends without every entry on disk: leaving it behind lets a later completion load a model nobody asked for. */
   onCancelled?: () => void;
 }) {
+  const confirmAssetsRef = useRef(confirmAssets);
+  confirmAssetsRef.current = confirmAssets;
+  const [pendingAssets, setPendingAssets] = useState<StagedDownloadEntry[] | null>(null);
   const [queue, setQueue] = useState<StagedDownloadEntry[] | null>(null);
   // Keep the original total as completed entries leave the queue.
   const [staged, setStaged] = useState({ bytes: 0, plan: 0 });
@@ -149,7 +156,13 @@ export function useStagedDownload({
   const stage = useCallback((entries: StagedDownloadEntry[]): number => {
     generation.current += 1;
     inFlight.current = null;
-    setQueue(entries.length > 0 ? entries : null);
+    if (confirmAssetsRef.current && additionalAssetDownloads(entries).length > 0) {
+      setQueue(null);
+      setPendingAssets(entries);
+    } else {
+      setPendingAssets(null);
+      setQueue(entries.length > 0 ? entries : null);
+    }
     setStaged({
       bytes: entries.reduce((sum, entry) => sum + Math.max(0, entry.bytes), 0),
       plan: generation.current,
@@ -169,5 +182,17 @@ export function useStagedDownload({
     [downloadedBytes, totalBytes, plan],
   );
 
-  return { stage, staging: queue !== null, progress };
+  const assetDownloadPrompt = {
+    entries: pendingAssets,
+    onConfirm: () => {
+      setPendingAssets(null);
+      setQueue(pendingAssets);
+    },
+    onCancel: () => {
+      if (!pendingAssets) return;
+      setPendingAssets(null);
+      onCancelledRef.current?.();
+    },
+  };
+  return { stage, remaining: queue, staging: queue !== null || pendingAssets !== null, progress, assetDownloadPrompt };
 }
