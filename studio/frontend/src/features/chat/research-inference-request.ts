@@ -18,6 +18,7 @@ export interface ResearchInferenceRequest {
   externalModel?: string;
   temperature?: number;
   topP?: number;
+  samplingFieldsExplicit?: string[];
   maxTokens?: number;
   maxOutputTokens?: number;
   maxOutputTokensFromSavedCap?: boolean;
@@ -46,6 +47,7 @@ export function buildResearchInferenceRequest(input: {
   };
   temperature: number;
   topP: number;
+  samplingFieldsExplicit?: readonly string[];
   maxTokens: number;
   reasoningRequested: boolean;
   reasoningStyle: string;
@@ -59,6 +61,9 @@ export function buildResearchInferenceRequest(input: {
   const model = input.external?.modelId ?? input.checkpoint;
   const request: ResearchInferenceRequest = {
     model,
+    ...(!input.external && input.samplingFieldsExplicit !== undefined
+      ? { samplingFieldsExplicit: [...input.samplingFieldsExplicit] }
+      : {}),
     ...(input.external
       ? {
           providerId: input.external.providerId,

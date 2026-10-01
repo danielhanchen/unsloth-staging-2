@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { CustomLlamaConfigEditor } from "./custom-llama-config-editor";
+import {
+  MANAGED_LLAMA_CPP_CONFIG,
+  normalizeLlamaCppConfig,
+} from "../model-config/llama-cpp-config";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import { InfoHint } from "@/components/ui/info-hint";
@@ -338,6 +343,7 @@ function withoutUnsupportedDiffusionSettings(
     config.nBatch == null &&
     config.nUbatch == null &&
     (config.llamaExtraArgs == null || config.llamaExtraArgs.length === 0) &&
+    config.llamaCppConfig?.mode !== "custom" &&
     !hasUnsupportedGpuPick
   ) {
     return config;
@@ -358,6 +364,11 @@ function withoutUnsupportedDiffusionSettings(
     // them as though it had, so a box filled before classification flipped would leave the
     // model running without what it says.
     llamaExtraArgs: null,
+    // Explicit managed, not omitted: the diffusion runner has no llama-server, and an omitted
+    // field inherits the stored custom config.
+    ...(config.llamaCppConfig?.mode === "custom"
+      ? { llamaCppConfig: MANAGED_LLAMA_CPP_CONFIG }
+      : {}),
     ...(hasUnsupportedGpuPick
       ? {
           selectedGpuIds: undefined,
@@ -1310,9 +1321,58 @@ function LoadModeRow({
   );
 }
 
+/** Locked while a custom INI owns llama.cpp tuning. */
+function ManagedFieldset({
+  locked,
+  label,
+  children,
+}: {
+  locked: boolean;
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <fieldset
+      disabled={locked}
+      inert={locked ? true : undefined}
+      className={`min-w-0 space-y-5 ${locked ? "opacity-50" : ""}`}
+      aria-label={label}
+    >
+      {children}
+    </fieldset>
+  );
+}
+
+function VisionRow({
+  config,
+  update,
+}: {
+  config: PerModelConfig;
+  update: (patch: Partial<PerModelConfig>) => void;
+}) {
+  return (
+    <div className={ROW_CLASS}>
+      <div className="flex min-w-0 items-center gap-1.5">
+        <span className={LABEL_CLASS}>Vision</span>
+        <InfoHint>
+          Loads the vision projector so the model can read images. Turning it
+          off frees that VRAM for more layers on the GPU. Text generation is
+          unaffected either way.
+        </InfoHint>
+      </div>
+      <Switch
+        className="panel-switch shrink-0"
+        checked={!config.disableVision}
+        onCheckedChange={(checked) => update({ disableVision: !checked })}
+      />
+    </div>
+  );
+}
+
 function GgufAdvancedSettings({
   config,
   update,
+  hideVision = false,
   showDraftTokens,
   showSpecDraftCacheDtype,
   speculativeFallback,
@@ -1328,6 +1388,8 @@ function GgufAdvancedSettings({
 }: {
   config: PerModelConfig;
   update: (patch: Partial<PerModelConfig>) => void;
+  /** Rendered by the caller instead, outside a locked managed fieldset. */
+  hideVision?: boolean;
   showDraftTokens: boolean;
   showSpecDraftCacheDtype: boolean;
   speculativeFallback: string;
@@ -1631,22 +1693,8 @@ function GgufAdvancedSettings({
 
       {/* withoutUnsupportedDiffusionSettings forces disableVision back to false on a diffusion model
           and the runner never reads it, so the switch would flip back under the pointer. */}
-      {!isDiffusion && (
-        <div className={ROW_CLASS}>
-          <div className="flex min-w-0 items-center gap-1.5">
-            <span className={LABEL_CLASS}>Vision</span>
-            <InfoHint>
-              Loads the vision projector so the model can read images. Turning
-              it off frees that VRAM for more layers on the GPU. Text generation
-              is unaffected either way.
-            </InfoHint>
-          </div>
-          <Switch
-            className="panel-switch shrink-0"
-            checked={!config.disableVision}
-            onCheckedChange={(checked) => update({ disableVision: !checked })}
-          />
-        </div>
+      {!isDiffusion && !hideVision && (
+        <VisionRow config={config} update={update} />
       )}
 
       {!isDiffusion && (
@@ -2160,6 +2208,8 @@ export function ModelConfigPage({
   // refuse. Held by the panel rather than the row, since the row unmounts whenever Advanced
   // settings collapse while its tokens stay in the config.
   const [extraArgsLoadable, setExtraArgsLoadable] = useState(true);
+  const [customConfigLoadable, setCustomConfigLoadable] = useState(true);
+  const effectiveCustomSummary = useChatRuntimeStore((s) => s.llamaCppConfigSummary);
   // True until the server-row read below settles: a load started before it lands sends none of the
   // row's settings, and with Remember unchecked it forgets the row it never read.
   const [extraArgsHydrating, setExtraArgsHydrating] = useState(
@@ -2219,7 +2269,8 @@ export function ModelConfigPage({
   // and a width that starts applying then has to surface.
   const autoOpenForMlxKvQuant = servedByMlx && initialMlxKvQuant != null;
   const showAdvanced =
-    advancedPreference ?? (autoOpenAdvanced || autoOpenForMlxKvQuant);
+    configState.llamaCppConfig?.mode === "custom" ||
+    (advancedPreference ?? (autoOpenAdvanced || autoOpenForMlxKvQuant));
   const toggleAdvanced = saveAdvancedSettingsOpen;
   const contextInputRef = useRef<NumericValueInputHandle>(null);
   const maxSeqLengthInputRef = useRef<NumericValueInputHandle>(null);
@@ -2863,6 +2914,7 @@ export function ModelConfigPage({
           nCpuMoe: runtimeConfig.nCpuMoe ?? null,
           selectedGpuIds: runtimeConfig.selectedGpuIds ?? null,
           llamaExtraArgs: runtimeConfig.llamaExtraArgs ?? null,
+          llamaCppConfig: runtimeConfig.llamaCppConfig,
         }
       : null;
   const memoryEstimate = useMemoryEstimate(memoryEstimateRequest);
@@ -3144,6 +3196,14 @@ export function ModelConfigPage({
   };
 
   const persistConfig = (next: PerModelConfig) => {
+    // Normalizing drops a blank or oversized custom config, saving managed over a good one.
+    if (
+      remember &&
+      next.llamaCppConfig !== undefined &&
+      normalizeLlamaCppConfig(next.llamaCppConfig) === undefined
+    ) {
+      return { saved: false, defaultConfig: false };
+    }
     // Judge what storage keeps: savePerModelConfig normalizes first, so the raw object over-reports.
     const normalized = normalizePerModelConfig(next);
     const evicted: { modelId: string; ggufVariant: string | null }[] = [];
@@ -3293,6 +3353,9 @@ export function ModelConfigPage({
     setVramBudgetLocked(false);
     onRun(effectiveLoadConfig, classifiedIsDiffusion);
   };
+  // Diffusion hides the editor and loads managed, so its custom config must not lock the page.
+  const customActive =
+    config.llamaCppConfig?.mode === "custom" && !resolvedIsDiffusion;
 
   return (
     <div
@@ -3339,8 +3402,9 @@ export function ModelConfigPage({
         remember={remember}
         hasSavedSettings={savedRemember}
       />
-      <div className="space-y-5">
-        {memoryEstimateRequest != null && (
+      {/* Outside the managed fieldset: custom mode is sent too, so the row reports it unsizable instead of a managed figure. */}
+      {memoryEstimateRequest != null && (
+        <div className="mb-5">
           <MemoryEstimateRow
             estimate={memoryEstimate.estimate}
             loading={memoryEstimate.loading}
@@ -3361,7 +3425,9 @@ export function ModelConfigPage({
             expanded={memoryBreakdownOpen}
             onExpandedChange={setMemoryBreakdownOpen}
           />
-        )}
+        </div>
+      )}
+      <ManagedFieldset locked={customActive} label="Studio engine settings">
         {target.isGguf && (
           <>
             <div className="space-y-2">
@@ -3446,30 +3512,6 @@ export function ModelConfigPage({
               </div>
             </div>
 
-            {/* Above the block it reveals, so expanding never moves the switch. */}
-            <AdvancedSettingsToggle
-              checked={showAdvanced}
-              onCheckedChange={toggleAdvanced}
-            />
-
-            {showAdvanced && (
-              <GgufAdvancedSettings
-                config={config}
-                update={update}
-                showDraftTokens={showDraftTokens}
-                showSpecDraftCacheDtype={showSpecDraftCacheDtype}
-                speculativeFallback={speculativeFallback}
-                onEditTemplate={() => setTemplateOpen(true)}
-                layerCount={stagedDims?.layerCount ?? null}
-                moeLayerCount={stagedDims?.moeLayerCount ?? null}
-                isDiffusion={resolvedIsDiffusion}
-                gpuDevices={gpuDevices}
-                gpuLayersInputRef={gpuLayersInputRef}
-                moeLayersInputRef={moeLayersInputRef}
-                draftKey={draftKey}
-                onExtraArgsLoadableChange={setExtraArgsLoadable}
-              />
-            )}
           </>
         )}
         {!target.isGguf && (
@@ -3505,7 +3547,64 @@ export function ModelConfigPage({
             )}
           </>
         )}
-      </div>
+      </ManagedFieldset>
+
+      {target.isGguf && (
+        <div className="mt-5 space-y-5">
+          <AdvancedSettingsToggle
+            checked={showAdvanced}
+            onCheckedChange={toggleAdvanced}
+          />
+          {showAdvanced && (
+            <>
+              <ManagedFieldset
+                locked={customActive}
+                label="Managed llama.cpp settings"
+              >
+                <GgufAdvancedSettings
+                  hideVision={customActive}
+                  config={config}
+                  update={update}
+                  showDraftTokens={showDraftTokens}
+                  showSpecDraftCacheDtype={showSpecDraftCacheDtype}
+                  speculativeFallback={speculativeFallback}
+                  onEditTemplate={() => setTemplateOpen(true)}
+                  layerCount={stagedDims?.layerCount ?? null}
+                  moeLayerCount={stagedDims?.moeLayerCount ?? null}
+                  isDiffusion={resolvedIsDiffusion}
+                  gpuDevices={gpuDevices}
+                  gpuLayersInputRef={gpuLayersInputRef}
+                  moeLayersInputRef={moeLayersInputRef}
+                  draftKey={draftKey}
+                  onExtraArgsLoadableChange={setExtraArgsLoadable}
+                />
+              </ManagedFieldset>
+              {/* The projector still reaches a custom load, so it stays editable. */}
+              {customActive && (
+                <div>
+                  <VisionRow config={config} update={update} />
+                </div>
+              )}
+              {!resolvedIsDiffusion && (
+                <div>
+                  <CustomLlamaConfigEditor
+                    value={config.llamaCppConfig}
+                    onChange={(llamaCppConfig) => update({ llamaCppConfig })}
+                    modelPath={target.id}
+                    ggufVariant={target.ggufVariant}
+                    hfToken={hfToken || null}
+                    nativePathToken={nativePathToken}
+                    onLoadableChange={setCustomConfigLoadable}
+                    effectiveSummary={
+                      isActiveModel && atBaseline ? effectiveCustomSummary : null
+                    }
+                  />
+                </div>
+              )}
+            </>
+          )}
+        </div>
+      )}
 
       {/* Stacked in both variants: a row that wraps on demand reflows when the same click that
           commits a draft mounts Save settings, moving Load out from under the cursor. */}
@@ -3538,8 +3637,10 @@ export function ModelConfigPage({
               sharedVariantUnresolved ||
               stagedMetadataPending ||
               budgetSettling ||
-              (!extraArgsLoadable && !sharedExtraArgsCleared) ||
-              sharedExtraArgsRefused ||
+              (customActive && !customConfigLoadable) ||
+              (!customActive &&
+                ((!extraArgsLoadable && !sharedExtraArgsCleared) ||
+                  sharedExtraArgsRefused)) ||
               extraArgsHydrating ||
               (isActiveModel &&
                 atBaseline &&
@@ -3565,7 +3666,10 @@ export function ModelConfigPage({
                 stagedMetadataPending ||
                 budgetSettling ||
                 (remember &&
-                  ((!extraArgsLoadable && !sharedExtraArgsCleared) ||
+                  ((customActive &&
+                    normalizeLlamaCppConfig(config.llamaCppConfig) ===
+                      undefined) ||
+                    (!extraArgsLoadable && !sharedExtraArgsCleared) ||
                     sharedExtraArgsRefused ||
                     extraArgsHydrating))
               }
@@ -3592,6 +3696,7 @@ export function ModelConfigPage({
                 // running process's arguments, so a reload after Reset kept the flags the box says are gone.
                 ...DEFAULT_PER_MODEL_CONFIG,
                 llamaExtraArgs: null,
+                llamaCppConfig: MANAGED_LLAMA_CPP_CONFIG,
               });
             }}
           >

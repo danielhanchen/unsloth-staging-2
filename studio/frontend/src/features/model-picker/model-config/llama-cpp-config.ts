@@ -1,0 +1,167 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+// Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+
+export type LlamaCppConfig =
+  | { version: 1; mode: "managed" }
+  | { version: 1; mode: "custom"; ini: string; section: string | null };
+
+export interface LlamaCppConfigSummary {
+  mode: "custom";
+  section: string | null;
+  digest: string;
+  tuning: Record<string, unknown>;
+  request_defaults: Record<string, unknown>;
+  diagnostics: string[];
+}
+
+export const MANAGED_LLAMA_CPP_CONFIG: LlamaCppConfig = {
+  version: 1,
+  mode: "managed",
+};
+
+export const MAX_LLAMA_CPP_CONFIG_BYTES = 65_536;
+
+/** Shape validation only. The selected server is authoritative for INI semantics. */
+export function normalizeLlamaCppConfig(
+  value: unknown,
+): LlamaCppConfig | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const source = value as Record<string, unknown>;
+  if (source.version !== 1) return undefined;
+  if (source.mode === "managed") return { version: 1, mode: "managed" };
+  if (
+    source.mode !== "custom" ||
+    typeof source.ini !== "string" ||
+    source.ini.trim().length === 0 ||
+    (source.section !== null && typeof source.section !== "string") ||
+    new TextEncoder().encode(source.ini).length > MAX_LLAMA_CPP_CONFIG_BYTES
+  )
+    return undefined;
+  return {
+    version: 1,
+    mode: "custom",
+    ini: source.ini,
+    section: source.section,
+  };
+}
+
+/** The mode switch: coming back to custom restores the last source instead of a blank one. */
+export function toggledLlamaCppConfig(
+  value: LlamaCppConfig | undefined,
+  lastCustom: { ini: string; section: string | null } | null,
+): LlamaCppConfig {
+  if (value?.mode === "custom") return { version: 1, mode: "managed" };
+  return {
+    version: 1,
+    mode: "custom",
+    ini: lastCustom?.ini ?? "[*]\n",
+    section: lastCustom?.section ?? null,
+  };
+}
+
+/** Suggestions for the selector, never a parser or a validation verdict. */
+export function customConfigSections(ini: string): string[] {
+  return [
+    ...new Set(
+      [...ini.matchAll(/^\[[ \t]*([^\]\r\n]+)\][ \t]*(?:[#;].*)?$/gm)]
+        .map((match) => match[1])
+        .filter((name) => name !== "*"),
+    ),
+  ];
+}
+
+export function llamaCppConfigPayload(
+  config: LlamaCppConfig | undefined,
+  options: { isDiffusion?: boolean } = {},
+) {
+  if (config === undefined) return {};
+  // The diffusion runner has no llama-server; explicit managed keeps the backend from inheriting custom.
+  return {
+    llama_cpp_config:
+      options.isDiffusion && config.mode === "custom"
+        ? MANAGED_LLAMA_CPP_CONFIG
+        : config,
+  };
+}
+
+export const SAMPLING_WIRE_FIELDS = {
+  temperature: "temperature",
+  topP: "top_p",
+  topK: "top_k",
+  minP: "min_p",
+  repetitionPenalty: "repetition_penalty",
+  presencePenalty: "presence_penalty",
+  frequencyPenalty: "frequency_penalty",
+  reasoningEnabled: "enable_thinking",
+  reasoningEffort: "reasoning_effort",
+  preserveThinking: "preserve_thinking",
+} as const;
+
+/** The sampling a chat preset owns (getPresetOwnedParams); reasoning stays outside presets. */
+export const PRESET_SAMPLING_WIRES: readonly string[] = [
+  SAMPLING_WIRE_FIELDS.temperature,
+  SAMPLING_WIRE_FIELDS.topP,
+  SAMPLING_WIRE_FIELDS.topK,
+  SAMPLING_WIRE_FIELDS.minP,
+  SAMPLING_WIRE_FIELDS.repetitionPenalty,
+  SAMPLING_WIRE_FIELDS.presencePenalty,
+];
+
+export function explicitSamplingFields(
+  snapshot: Record<string, unknown>,
+): string[] {
+  if (Array.isArray(snapshot.samplingFieldsExplicit)) {
+    return snapshot.samplingFieldsExplicit.filter(
+      (field): field is string =>
+        typeof field === "string" &&
+        (Object.values(SAMPLING_WIRE_FIELDS) as string[]).includes(field),
+    );
+  }
+  // Presence in an old saved snapshot is user intent, regardless of its numeric value.
+  return Object.entries(SAMPLING_WIRE_FIELDS)
+    .filter(([key]) => snapshot[key] !== undefined)
+    .map(([, wire]) => wire);
+}
+
+export function inheritedSamplingFields(
+  snapshot: Record<string, unknown>,
+  fallback: Record<string, unknown>,
+): string[] {
+  const own = new Set(explicitSamplingFields(snapshot));
+  const inherited = new Set(explicitSamplingFields(fallback));
+  return Object.entries(SAMPLING_WIRE_FIELDS)
+    .filter(([key, wire]) =>
+      (snapshot[key] !== undefined ? own : inherited).has(wire),
+    )
+    .map(([, wire]) => wire);
+}
+
+export function markSamplingFields<
+  T extends { samplingFieldsExplicit?: string[] },
+>(params: T, ...fields: string[]): T {
+  return {
+    ...params,
+    samplingFieldsExplicit: [
+      ...new Set([
+        ...(params.samplingFieldsExplicit ??
+          Object.values(SAMPLING_WIRE_FIELDS)),
+        ...fields,
+      ]),
+    ],
+  };
+}
+
+/** Unset provenance is a legacy user snapshot; an empty list is an automatic seed. */
+export function customSamplingPayload(
+  config: LlamaCppConfig | null | undefined,
+  explicit: readonly string[] | undefined,
+) {
+  return config?.mode === "custom"
+    ? {
+        sampling_fields_explicit:
+          explicit === undefined
+            ? Object.values(SAMPLING_WIRE_FIELDS)
+            : [...explicit],
+      }
+    : {};
+}
