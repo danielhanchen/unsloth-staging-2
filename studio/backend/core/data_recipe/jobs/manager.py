@@ -359,7 +359,15 @@ class JobManager:
             base_dataset_path = Path(artifact_path)
             parquet_dir = base_dataset_path / "parquet-files"
             if not parquet_dir.exists():
-                return {"error": f"dataset path missing: {parquet_dir}"}
+                if job_status in {"completed", "error", "cancelled"}:
+                    return {"error": f"dataset path missing: {parquet_dir}"}
+                return None
+            if job_status not in {"completed", "error", "cancelled"}:
+                # DuckDB opens with FILE_SHARE_DELETE; the pyarrow fallback would block the
+                # worker's merge rmtree on Windows.
+                return self._load_dataset_page_with_duckdb(
+                    parquet_dir = parquet_dir, limit = limit, offset = offset
+                )
 
             return self._load_dataset_page(parquet_dir = parquet_dir, limit = limit, offset = offset)
         except Exception as exc:
@@ -587,6 +595,8 @@ class JobManager:
                 return
             if et == EVENT_JOB_STARTED:
                 self._job.status = "active"
+                self._job.artifact_path = event.get("artifact_path") or self._job.artifact_path
+                self._job.execution_type = event.get("execution_type") or self._job.execution_type
             if et == EVENT_JOB_COMPLETED:
                 self._job.status = "completed"
                 self._job.finished_at = time.time()
