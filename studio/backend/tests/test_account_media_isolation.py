@@ -63,6 +63,20 @@ def _save(kind):
     if kind == "audio":
         meta.update(audio_type = "snac", sample_rate = 24000, created_at = "2026-08-06T00:00:00Z")
         return audio_gallery.save(b"RIFF\x24\x00\x00\x00WAVEfmt ", meta)
+    if kind == "audio-separate":
+        meta.update(
+            audio_type = "audiocpp_sep",
+            workflow = "separate",
+            sample_rate = 44100,
+            created_at = "2026-08-06T00:00:00Z",
+            role = "vocals",
+            group_id = "c" * 32,
+        )
+        staging = audio_gallery.gallery_dir() / ".separate-test"
+        staging.mkdir(parents = True, exist_ok = True)
+        src = staging / "vocals.wav"
+        src.write_bytes(b"RIFF\x24\x00\x00\x00WAVEfmt ")
+        return audio_gallery.save_file(src, meta)
     meta["created_at"] = "2026-08-06T00:00:00Z"
     return video_gallery.save(b"\x00\x00\x00\x18ftypmp42", meta)
 
@@ -85,11 +99,11 @@ def _client(account):
     return TestClient(app)
 
 
-@pytest.mark.parametrize("kind", ["images", "audio", "video"])
+@pytest.mark.parametrize("kind", ["images", "audio", "audio-separate", "video"])
 @pytest.mark.parametrize("account,other", [(ALICE, BOB), (BOB, ALICE)])
 def test_gallery_object_routes_do_not_resolve_another_accounts_ids(kind, account, other):
     record = run_as(account, _save, kind)
-    root = f"/api/inference/{kind}/gallery"
+    root = f"/api/inference/{kind.split('-')[0]}/gallery"
     with _client(other) as client:
         assert client.get(f"{root}/{record['id']}/file").status_code == 404
         assert client.patch(f"{root}/{record['id']}", json = {"starred": True}).status_code == 404
@@ -239,3 +253,112 @@ def test_a_failed_replacement_load_leaves_residency_with_the_resident_model(monk
     assert unloaded == []
     with _client(ALICE) as client:
         assert client.get("/api/inference/video/status").json()["repo_id"] == "alice/private-video"
+
+
+def _save_input(account):
+    import asyncio
+
+    from core.inference import audio_inputs
+
+    async def chunks():
+        import io
+        import wave
+
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\x01\x00" * 16000)
+        yield buf.getvalue()
+
+    return run_as(account, lambda: asyncio.run(audio_inputs.save_stream(chunks(), "me.wav"))[0])
+
+
+def _save_voice(account):
+    from core.inference import audio_inputs, audio_voices
+    record = _save_input(account)
+    return run_as(
+        account,
+        lambda: audio_voices.create(audio_inputs.input_path(record["id"]), {"name": "private"}),
+    )
+
+
+@pytest.mark.parametrize("account,other", [(ALICE, BOB), (BOB, ALICE)])
+def test_audio_inputs_do_not_resolve_another_accounts_ids(account, other, monkeypatch):
+    async def fake_transcribe(*_args, **_kwargs):
+        return {"text": "private words", "language": None}
+
+    monkeypatch.setattr(inference, "_transcribe_audio_result", fake_transcribe)
+    record = _save_input(account)
+    root = "/api/inference/audio/inputs"
+    with _client(other) as client:
+        assert client.get(f"{root}/{record['id']}/file").status_code == 404
+        assert (
+            client.post(f"{root}/{record['id']}/transcribe", json = {"model": "m"}).status_code == 404
+        )
+        assert client.delete(f"{root}/{record['id']}").status_code == 404
+    with _client(account) as client:
+        assert client.get(f"{root}/{record['id']}/file").status_code == 200
+        assert (
+            client.post(f"{root}/{record['id']}/transcribe", json = {"model": "m"}).json()["text"]
+            == "private words"
+        )
+        assert client.delete(f"{root}/{record['id']}").json() == {"removed": True}
+
+
+@pytest.mark.parametrize("account,other", [(ALICE, BOB), (BOB, ALICE)])
+def test_saved_voices_do_not_resolve_another_accounts_ids(account, other, monkeypatch):
+    async def fake_transcribe(*_args, **_kwargs):
+        return {"text": "private words", "language": None}
+
+    monkeypatch.setattr(inference, "_transcribe_audio_result", fake_transcribe)
+    voice = _save_voice(account)
+    clip = run_as(account, _save, "audio")
+    root = "/api/inference/audio/voices"
+    with _client(other) as client:
+        assert voice["id"] not in client.get(root).text
+        assert client.get(f"{root}/{voice['id']}/file").status_code == 404
+        assert client.patch(f"{root}/{voice['id']}", json = {"name": "mine"}).status_code == 404
+        assert client.delete(f"{root}/{voice['id']}").status_code == 404
+        transcribe = "/api/inference/audio/inputs/source/transcribe"
+        assert (
+            client.post(
+                transcribe, params = {"voice_id": voice["id"]}, json = {"model": "m"}
+            ).status_code
+            == 404
+        )
+        assert (
+            client.post(transcribe, params = {"clip_id": clip["id"]}, json = {"model": "m"}).status_code
+            == 404
+        )
+        # A voice cannot be saved from another account's clip either.
+        assert (
+            client.post(
+                root, json = {"source": {"clip_id": clip["id"]}, "name": "stolen"}
+            ).status_code
+            == 404
+        )
+    with _client(account) as client:
+        assert [v["id"] for v in client.get(root).json()["voices"]] == [voice["id"]]
+        assert client.get(f"{root}/{voice['id']}/file").status_code == 200
+
+
+def test_inputs_and_voices_live_in_the_accounts_audio_folder(tmp_path):
+    from core.inference import audio_inputs, audio_voices
+
+    assert run_as(BOB, audio_inputs.inputs_dir) == (
+        tmp_path / "accounts" / BOB.account_id / "audio" / "inputs"
+    )
+    assert run_as(BOB, audio_voices.voices_dir) == (
+        tmp_path / "accounts" / BOB.account_id / "audio" / "voices"
+    )
+    assert run_as(OWNER, audio_inputs.inputs_dir) == tmp_path / "audio" / "inputs"
+
+
+def test_a_separate_scoped_clear_is_account_scoped():
+    a = run_as(ALICE, _save, "audio-separate")
+    b = run_as(BOB, _save, "audio-separate")
+    assert run_as(ALICE, audio_gallery.clear, workflow = "separate") == 1
+    assert run_as(ALICE, audio_gallery.owned_audio_path, a["id"]) is None
+    assert run_as(BOB, audio_gallery.owned_audio_path, b["id"]).is_file()
