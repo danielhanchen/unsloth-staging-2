@@ -109,3 +109,60 @@ def test_whisper_classification_survives_the_mlx_post_load_mirror(monkeypatch):
 
     assert info["audio_type"] == "whisper"
     assert info["has_audio_input"] is True
+
+
+def test_audio_cpp_workflow_fields_cross_the_worker_and_the_parent(monkeypatch):
+    """A clone-only audio.cpp load reports its workflows, transcript rule and required inputs.
+    Dropped at either hop, status would fall back to "speak" from audio_type and offer Speak
+    for a model that cannot speak without a reference."""
+    from core.inference.orchestrator import _mirrored_model_entry
+
+    mc = _mc("audiocpp_tts", is_audio = True, has_audio_input = False)
+    fields = {
+        "audio_family": "qwen3_tts",
+        "audio_options": [],
+        "gguf_variant": "Q8_0",
+        "audio_workflows": ["clone"],
+        "audio_reference_text": "required",
+        "audio_required_inputs": ["instruct"],
+        "audio_clone": {
+            "reference_text": "required",
+            "reference_text_waived": [],
+            "emotion_audio": False,
+        },
+        "audio_options_by_workflow": {"convert": [{"name": "length_adjust", "type": "float"}]},
+        "audio_workflow_tasks": {"clone": "clon", "convert": "vc", "convert:singing": "svc"},
+        "audio_server_task": "clon",
+        "audio_convert": {"modes": ["speech"], "target": "audio", "source_max_seconds": 300},
+        "audio_convert_route": "v2_vc",
+        "audio_convert_rules": {"source_rate": 16000, "target_rate": 24000},
+    }
+    backend = SimpleNamespace(
+        device = "cuda",
+        active_model_name = mc.identifier,
+        models = {
+            mc.identifier: {
+                "is_audio": True,
+                "audio_type": "audiocpp_tts",
+                "has_audio_input": False,
+                **fields,
+            }
+        },
+        load_model = lambda **kw: True,
+    )
+    monkeypatch.setattr(worker, "_build_model_config", lambda cfg: mc)
+    monkeypatch.setattr(worker, "_run_security_gates", lambda *a, **k: True)
+    monkeypatch.setattr(worker, "_resolve_lora_4bit", lambda mc_, v: False)
+    monkeypatch.setattr(worker, "_needs_nemotron_trust", lambda *a, **k: False)
+    fake_xet = type(sys)("utils.hf_xet_fallback")
+    fake_xet.start_watchdog = lambda **k: SimpleNamespace(set = lambda: None)
+    monkeypatch.setitem(sys.modules, "utils.hf_xet_fallback", fake_xet)
+    q = _Q()
+    worker._handle_load(backend, {"model_name": mc.identifier}, q)
+    (loaded,) = [m for m in q.sent if m.get("type") == "loaded"]
+    info = loaded["model_info"]
+    for key, value in fields.items():
+        assert info[key] == value, key
+    entry = _mirrored_model_entry(info, mc.identifier)
+    for key, value in fields.items():
+        assert entry[key] == value, key

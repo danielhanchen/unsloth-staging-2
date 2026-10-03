@@ -15,10 +15,15 @@ export const AUDIO_CPP_AUDIO_TYPES: ReadonlySet<string> = new Set([
 
 export type AudioCppTask = "tts" | "music" | "asr";
 
+/** The Audio pages a model lists on. Mirrors AudioWorkflowId; spelled out so this file stays import-free. */
+export type AudioCppWorkflow = "speak" | "clone" | "convert" | "music" | "transcribe";
+
 export interface AudioCppModel {
   /** Hub repo id, or `${AUDIO_CPP_REPO}/<folder>` for a package in the shared repo. */
   id: string;
   task: AudioCppTask;
+  /** The pages it lists on, when they differ from its task's (clone-only speech models). */
+  workflows?: readonly AudioCppWorkflow[];
   /** ASR only: the primary language codes the model transcribes. Absent = multilingual. */
   languages?: readonly string[];
   /** Phonemizes with eSpeak-ng, which upstream runtime bundles lack (backend needs_espeak). */
@@ -47,9 +52,17 @@ export const AUDIO_CPP_MODELS: readonly AudioCppModel[] = [
   { id: folder("MOSS-TTS-Nano-100M-GGUF"), task: "tts" },
   { id: folder("Supertonic-3-GGUF"), task: "tts" },
   { id: folder("Chatterbox-Turbo-GGUF"), task: "tts" },
-  { id: folder("VoxCPM2-GGUF"), task: "tts" },
+  { id: folder("VoxCPM2-GGUF"), task: "tts", workflows: ["speak", "clone"] },
+  { id: folder("Qwen3-TTS-12Hz-0.6B-Base-GGUF"), task: "tts", workflows: ["clone"] },
+  { id: folder("Chatterbox-GGUF"), task: "tts", workflows: ["clone", "convert"] },
+  { id: folder("IndexTTS2-GGUF"), task: "tts", workflows: ["clone"] },
+  { id: folder("CosyVoice3-GGUF"), task: "tts", workflows: ["clone"] },
   { id: folder("Qwen3-TTS-12Hz-1.7B-CustomVoice-GGUF"), task: "tts" },
   { id: folder("Qwen3-TTS-12Hz-1.7B-VoiceDesign-GGUF"), task: "tts" },
+  { id: folder("Vevo2-GGUF"), task: "tts", workflows: ["clone", "convert"] },
+  { id: folder("SeedVC-MLX-GGUF"), task: "tts", workflows: ["convert"] },
+  { id: folder("RVC-GGUF"), task: "tts", workflows: ["convert"] },
+  { id: folder("MeanVC2-GGUF"), task: "tts", workflows: ["convert"] },
   { id: "audio-cpp/MiniMax-Music3-GGUF", task: "music" },
   { id: "audio-cpp/Yue2-3B-GGUF", task: "music" },
   { id: folder("ACE-Step1.5-GGUF"), task: "music" },
@@ -151,6 +164,24 @@ export function isAudioRuntimeGguf(
     audioCppModelFor(id) !== null ||
     isAudioCppFolderId(id)
   );
+}
+
+/** The pages a catalog model lists on: its own list, else the one its task implies. */
+export function audioCppWorkflowsFor(
+  model: AudioCppModel,
+): readonly AudioCppWorkflow[] {
+  if (model.workflows) return model.workflows;
+  return model.task === "music"
+    ? ["music"]
+    : model.task === "asr"
+      ? ["transcribe"]
+      : ["speak"];
+}
+
+/** Whether a model speaks without a reference clip. Anything outside the catalog is assumed to. */
+export function audioCppModelSpeaks(id: string | null | undefined): boolean {
+  const model = audioCppModelFor(id);
+  return !model || audioCppWorkflowsFor(model).includes("speak");
 }
 
 export function audioCppModelsForTask(task: AudioCppTask): AudioCppModel[] {

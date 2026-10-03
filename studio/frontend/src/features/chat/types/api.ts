@@ -254,6 +254,8 @@ export interface LoadModelResponse {
   diffusion_requested_ngl?: number | null;
   is_audio?: boolean;
   audio_type?: string | null;
+  /** Audio page workflows the loaded model can run, as in the status response. */
+  audio_workflows?: string[] | null;
   has_audio_input?: boolean;
   has_video_input?: boolean;
   inference?: {
@@ -378,6 +380,19 @@ export interface InferenceStatusResponse {
   /** The loaded GGUF audio model's generation options, as its spec declares them. Unknown-shaped
    *  on purpose: the Audio page validates it with parseAudioOptions. */
   audio_options?: unknown;
+  /** Audio page workflows the loaded model can run ("speak", "clone", "music", "transcribe"); empty when it is not an audio model. */
+  audio_workflows?: string[] | null;
+  /** Clone: whether the model needs the reference clip's transcript ("required"), can use it
+   *  ("optional") or ignores it ("unused"); null when the model does not clone. */
+  audio_reference_text?: "required" | "optional" | "unused" | null;
+  audio_options_by_workflow?: Record<string, unknown> | null;
+  /** e.g. {"clone": "clon", "convert": "vc", "convert:singing": "svc"}; a task other than audio_server_task reloads. */
+  audio_workflow_tasks?: Record<string, string> | null;
+  audio_server_task?: string | null;
+  audio_convert_route?: string | null;
+  audio_convert?: AudioConvertCaps | null;
+  /** Request inputs the loaded model's spec marks required (Maya1: "instruct", its voice description). */
+  audio_required_inputs?: string[] | null;
   has_audio_input?: boolean;
   has_video_input?: boolean;
   loading: string[];
@@ -814,4 +829,14 @@ export interface OpenAIChatChunk {
     // must fit inside. Not re-derived here: the formula lives in the fit.
     prompt_target?: number;
   };
+}
+
+export interface AudioConvertCaps {
+  modes: ("speech" | "singing")[];
+  target: "audio" | "builtin";
+  builtin_voices: { id: string; label: string }[];
+  pitch: Partial<Record<"speech" | "singing", { auto: boolean }>>;
+  style: boolean;
+  route_reloads: boolean;
+  source_max_seconds: number;
 }
