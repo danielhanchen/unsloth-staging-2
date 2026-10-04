@@ -1030,8 +1030,7 @@ def test_write_codex_subagent_bridge_keeps_parent_credentials_out(tmp_path, monk
         "codex_home": str(tmp_path / "child"),
         "bypass_permissions": False,
     }
-    if os.name != "nt":
-        assert path.stat().st_mode & 0o077 == 0
+    assert path.stat().st_mode & 0o077 == 0
     profile = _parse_toml((tmp_path / "child" / "unsloth_api.config.toml").read_text())
     assert profile["model"] == local["id"]
     assert profile["model_provider"] == start._CODEX_PROFILE
@@ -1060,8 +1059,7 @@ def test_write_codex_parent_overlay_preserves_user_state_and_instructions(tmp_pa
     assert instructions.startswith("Keep my existing instructions.\n")
     assert start._CODEX_SUBAGENT_ROUTING_INSTRUCTIONS in instructions
     assert not (overlay / "AGENTS.md").exists()
-    if os.name != "nt":
-        assert (overlay / "AGENTS.override.md").stat().st_mode & 0o077 == 0
+    assert (overlay / "AGENTS.override.md").stat().st_mode & 0o077 == 0
     assert (source / "AGENTS.override.md").read_text() == "Keep my existing instructions.\n"
 
 
@@ -2758,12 +2756,6 @@ def test_no_launch_last_line_is_self_contained(fake_studio, tmp_path):
     result = CliRunner().invoke(start.start_app, ["codex", "--no-launch"])
     assert result.exit_code == 0, result.output
     last = [ln for ln in result.output.splitlines() if ln.strip()][-1]
-    if os.name == "nt":
-        # PowerShell has no VAR=value prefix form; env lives in the $env: block.
-        _assert_env_set(result.output, "CODEX_HOME", str(tmp_path / "agents" / "codex"))
-        assert '$env:UNSLOTH_STUDIO_AUTH_TOKEN = "sk-unsloth-' in result.output
-        assert last.split()[0] == "codex"
-        return
     parts = shlex.split(last)
     assignments = {}
     command = []
@@ -2783,11 +2775,6 @@ def test_no_launch_claude_last_line_blanks_conflicting_auth(fake_studio):
     # user's own ANTHROPIC_API_KEY to the Unsloth base.
     result = CliRunner().invoke(start.start_app, ["claude", "--no-launch"])
     assert result.exit_code == 0, result.output
-    if os.name == "nt":
-        _assert_env_unset(result.output, "ANTHROPIC_API_KEY")
-        _assert_env_unset(result.output, "CLAUDE_CODE_OAUTH_TOKEN")
-        assert '$env:ANTHROPIC_AUTH_TOKEN = "' in result.output
-        return
     last = [ln for ln in result.output.splitlines() if ln.strip()][-1]
     for name in start._CLAUDE_ENV_UNSET:
         assert f"{name}= " in last
@@ -4418,12 +4405,7 @@ def test_start_studio_server_builds_command_and_waits(monkeypatch, capsys):
         ),
     )
     cmd = captured["command"]
-    if sys.platform == "win32":
-        # #8490: Windows re-execs via sys.executable, not the `unsloth` launcher.
-        assert cmd[:3] == [sys.executable, "-X", "utf8"]
-        assert cmd[cmd.index("-c") + 2] == "run"
-    else:
-        assert cmd[1] == "run"
+    assert cmd[1] == "run"
     assert "--disable-tools" in cmd and "--no-cloudflare" in cmd
     assert "--reasoning" not in cmd
     assert captured["kwargs"]["env"]["LLAMA_ARG_REASONING"] == "auto"
@@ -4438,10 +4420,7 @@ def test_start_studio_server_builds_command_and_waits(monkeypatch, capsys):
     assert cmd[cmd.index("-p") + 1] == "8888"
     assert returned_base == "http://127.0.0.1:8888"
     assert start.LoadOptions().load_in_4bit is True and "--no-load-in-4bit" not in cmd
-    if os.name == "nt":
-        assert captured["kwargs"].get("creationflags") == start.subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-        assert captured["kwargs"].get("start_new_session") is True
+    assert captured["kwargs"].get("start_new_session") is True  # own process group
     assert server.pid == 4321
     output = capsys.readouterr().out
     assert "Starting Unsloth server\n" in output
@@ -6756,7 +6735,7 @@ def test_connect_pi_as_subagent_preserves_cloud_parent(fake_studio, tmp_path, yo
     assert result.exit_code == 0, result.output
     command = _launch_command(result.output)
     assert command[:2] == ["pi", "--extension"]
-    assert Path(command[2]).as_posix().endswith("unsloth_cli/pi_subagent.ts")
+    assert command[2].endswith("unsloth_cli/pi_subagent.ts")
     assert ("--approve" in command) is yolo
     assert "--provider" not in command
     assert "--model" not in command
@@ -8016,7 +7995,6 @@ def test_non_codex_agents_keep_the_studio_private_root(monkeypatch, tmp_path):
     assert start._ephemeral_session_prefix("claude", None) == "unsloth-claude-"
 
 
-@pytest.mark.skipif(os.name == "nt", reason = "unwritability is staged via POSIX dir modes")
 def test_session_config_falls_back_when_existing_temp_root_is_unwritable(monkeypatch, tmp_path):
     # mkdir(exist_ok = True) succeeds on an existing unwritable root, so the lock fails first.
     agents = tmp_path / "agents"
@@ -8087,7 +8065,6 @@ def test_probe_env_carries_install_dirs_and_restores_path(monkeypatch, tmp_path)
     assert os.environ.get("PATH") == before
 
 
-@pytest.mark.skipif(os.name == "nt", reason = "unwritability is staged via POSIX dir modes")
 def test_session_config_falls_back_when_studio_auth_root_is_unwritable(monkeypatch, tmp_path):
     # Attaching to a remote Unsloth needs no local auth tree, so a read-only one must not stop it.
     readonly = tmp_path / "readonly"
