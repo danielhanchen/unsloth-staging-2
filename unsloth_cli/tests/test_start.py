@@ -1302,7 +1302,7 @@ def test_subagent_model_id_warns_when_status_unavailable(monkeypatch, capsys):
     assert "could not verify the loaded GGUF variant" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("agent", ["openclaw", "hermes", "dsh"])
+@pytest.mark.parametrize("agent", ["openclaw", "hermes", "dsh", "vibe"])
 @pytest.mark.parametrize("flag", ["--as-subagent", "--as-subagent=true", "--as-subagent=false"])
 def test_unsupported_agents_reject_as_subagent(agent, flag):
     result = CliRunner().invoke(start.start_app, [agent, flag])
@@ -1311,7 +1311,7 @@ def test_unsupported_agents_reject_as_subagent(agent, flag):
 
 
 @pytest.mark.parametrize(
-    "agent", ["claude", "codex", "openclaw", "opencode", "hermes", "pi", "dsh"]
+    "agent", ["claude", "codex", "openclaw", "opencode", "hermes", "pi", "dsh", "vibe"]
 )
 def test_launch_preflights_agent_before_connect(agent, monkeypatch):
     events = []
@@ -1410,7 +1410,7 @@ def test_declined_opencode_subagent_install_stops_before_connect(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "agent", ["claude", "codex", "openclaw", "opencode", "hermes", "pi", "dsh"]
+    "agent", ["claude", "codex", "openclaw", "opencode", "hermes", "pi", "dsh", "vibe"]
 )
 def test_noninteractive_missing_agent_stops_before_connect(agent, monkeypatch):
     monkeypatch.setattr(start, "_which_with_install_dirs", lambda _: None)
@@ -1431,7 +1431,7 @@ def test_noninteractive_missing_agent_stops_before_connect(agent, monkeypatch):
     assert f"`{agent}` not found on PATH" in result.output
 
 
-@pytest.mark.parametrize("agent", ["claude", "codex", "openclaw", "hermes", "pi", "dsh"])
+@pytest.mark.parametrize("agent", ["claude", "codex", "openclaw", "hermes", "pi", "dsh", "vibe"])
 def test_no_launch_skips_agent_resolution(agent, monkeypatch):
     monkeypatch.setattr(
         start,
@@ -3902,7 +3902,7 @@ def test_connect_load_knobs_reach_server_even_when_id_loaded(fake_studio):
 
 
 @pytest.mark.parametrize(
-    "command_name", ["claude", "codex", "openclaw", "opencode", "hermes", "pi", "dsh"]
+    "command_name", ["claude", "codex", "openclaw", "opencode", "hermes", "pi", "dsh", "vibe"]
 )
 def test_start_agents_expose_gpu_memory_mode_option(command_name):
     import inspect
@@ -6962,6 +6962,159 @@ def test_connect_dsh_no_launch(fake_studio, tmp_path):
     assert not (home / "settings.yaml").exists()
 
 
+# ── Vibe (Mistral, OpenAI-compatible /v1, key via env, ~/.vibe relocated via VIBE_HOME) ──
+
+
+def _vibe_settings(env: dict) -> tuple:
+    return json.loads(env["VIBE_PROVIDERS"]), json.loads(env["VIBE_MODELS"])
+
+
+def test_vibe_env(tmp_path):
+    env = start._vibe_env(BASE, MODEL)
+    providers, models = _vibe_settings(env)
+    assert providers == [
+        {
+            "name": start._VIBE_PROVIDER,
+            "api_base": f"{BASE}/v1",
+            "api_key_env_var": start._VIBE_ENV_KEY,
+            "api_style": "openai",
+            "backend": "generic",
+        }
+    ]
+    assert models == [
+        {
+            "name": MODEL["id"],
+            "provider": start._VIBE_PROVIDER,
+            "alias": start._VIBE_MODEL_ALIAS,
+            "auto_compact_threshold": int(MODEL["context_length"] * 0.9),
+        }
+    ]
+    assert env["VIBE_ACTIVE_MODEL"] == start._VIBE_MODEL_ALIAS
+    assert env["VIBE_ENABLE_TELEMETRY"] == "false"
+
+
+def test_vibe_env_carries_temperature_and_odd_model_ids():
+    model = {"id": 'C:\\models\\q"\U0001f600.gguf', "max_context_length": 32768}
+    _, models = _vibe_settings(start._vibe_env(BASE, model, {"temperature": 0.7}))
+    assert models[0]["name"] == model["id"]
+    assert models[0]["temperature"] == 0.7
+    assert models[0]["auto_compact_threshold"] == int(32768 * 0.9)
+    _, models = _vibe_settings(start._vibe_env(BASE, {"id": "m"}))
+    assert set(models[0]) == {"name", "provider", "alias"}
+
+
+def test_connect_vibe_no_launch_keeps_user_config(fake_studio, tmp_path):
+    home = tmp_path / "agents" / "vibe"
+    home.mkdir(parents = True)
+    # Vibe persists /config edits here; a stable --no-launch home must keep them.
+    user_config = 'vim_keybindings = true\ndefault_agent = "plan"\n'
+    (home / "config.toml").write_text(user_config)
+    result = CliRunner().invoke(start.start_app, ["vibe", "--no-launch", "--yolo"])
+    assert result.exit_code == 0, result.output
+    _assert_env_set(result.output, "UNSLOTH_API_KEY", "sk-unsloth-feedfacefeedface")
+    _assert_env_set(result.output, "VIBE_HOME", str(home))
+    _assert_env_set(result.output, "VIBE_ACTIVE_MODEL", start._VIBE_MODEL_ALIAS)
+    assert _launch_command(result.output) == ["vibe", "--auto-approve"]
+    assert (home / "config.toml").read_text() == user_config
+    assert sorted(p.name for p in home.iterdir()) == ["config.toml"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason = "symlink privilege")
+def test_vibe_session_sees_user_agents_and_cleanup_keeps_them(fake_studio, tmp_path, monkeypatch):
+    user_home = tmp_path / "user"
+    agents = user_home / ".vibe" / "agents"
+    agents.mkdir(parents = True)
+    (agents / "mine.toml").write_text('display_name = "mine"\n')
+    monkeypatch.setattr(start.Path, "home", lambda: user_home)
+    monkeypatch.delenv("VIBE_HOME", raising = False)
+    monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/vibe")
+    monkeypatch.setattr(start, "_managed_node_tools", lambda: None)
+    seen = {}
+
+    def run(
+        command,
+        env = None,
+        **kwargs,
+    ):
+        seen["profile"] = (Path(env["VIBE_HOME"]) / "agents" / "mine.toml").read_text()
+        return SimpleNamespace(returncode = 0)
+
+    monkeypatch.setattr(start.subprocess, "run", run)
+    result = CliRunner().invoke(start.start_app, ["vibe", "--agent", "mine"])
+    assert result.exit_code == 0, result.output
+    assert seen["profile"] == 'display_name = "mine"\n'
+    # The ephemeral session is removed; the user's profile is not.
+    assert (agents / "mine.toml").exists()
+
+
+def test_write_vibe_user_resources_honours_user_vibe_home(tmp_path, monkeypatch):
+    custom = tmp_path / "custom"
+    (custom / "skills").mkdir(parents = True)
+    monkeypatch.setenv("VIBE_HOME", str(custom))
+    session = tmp_path / "session"
+    session.mkdir()
+    start.write_vibe_user_resources(session)
+    assert (session / "skills").resolve() == (custom / "skills").resolve()
+    assert not (session / "agents").exists()
+    start.write_vibe_user_resources(custom)
+    assert not (custom / "skills").is_symlink()
+
+
+def test_vibe_launch_keeps_user_home(fake_studio, monkeypatch):
+    monkeypatch.setattr(start.shutil, "which", lambda _: "/usr/local/bin/vibe")
+    captured = _capture_launch(monkeypatch, ["vibe", "--temperature", "0.6", "-p", "hi"])
+    assert captured["command"][-3:] == ["/usr/local/bin/vibe", "-p", "hi"]
+    # Vibe's tools run git/ssh/gh, which need the user's real HOME.
+    assert captured["env"].get("HOME") == os.environ.get("HOME")
+    assert _vibe_settings(captured["env"])[1][0]["temperature"] == 0.6
+
+
+@pytest.mark.skipif(shutil.which("vibe") is None, reason = "needs the mistral-vibe CLI")
+def test_vibe_real_cli_reaches_unsloth(monkeypatch, tmp_path):
+    requests = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append((self.headers.get("Authorization"), body))
+            chunk = {
+                "choices": [{"index": 0, "delta": {"content": "pong"}, "finish_reason": "stop"}]
+            }
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n".encode())
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target = server.serve_forever, daemon = True).start()
+    base = f"http://127.0.0.1:{server.server_address[1]}"
+    monkeypatch.setattr(start, "_connect", lambda *args, **kwargs: (base, "sk-unsloth-e2e", MODEL))
+    monkeypatch.chdir(tmp_path)
+    try:
+        result = CliRunner().invoke(
+            start.start_app,
+            ["vibe", "--yolo", "--temperature", "0.5", "--disabled-tools", "*", "-p", "Reply pong"],
+        )
+    finally:
+        server.shutdown()
+    assert result.exit_code == 0, result.output
+    assert requests, "vibe never called the Unsloth /v1 endpoint"
+    auth, body = requests[0]
+    assert auth == "Bearer sk-unsloth-e2e"
+    assert body["model"] == MODEL["id"]
+    assert body["temperature"] == 0.5
+
+
+def test_vibe_install_hint_per_os(monkeypatch):
+    monkeypatch.setattr(start.os, "name", "nt")
+    assert start._vibe_install_hint() == start._VIBE_WINDOWS_INSTALL_HINT
+    monkeypatch.setattr(start.os, "name", "posix")
+    assert start._vibe_install_hint() == start._VIBE_POSIX_INSTALL_HINT
+
+
 @pytest.mark.skipif(os.name == "nt", reason = "WSL scenario")
 def test_dsh_under_wsl_gets_the_windows_patch_path(fake_studio, monkeypatch):
     # WSLENV translates DSH_HOME for a Windows dsh, but a path on the command line reaches
@@ -8127,6 +8280,7 @@ _RESUME_ENV_VAR = {
     "hermes": "HERMES_HOME",
     "pi": "HOME",
     "dsh": "DSH_HOME",
+    "vibe": "VIBE_HOME",
 }
 
 
