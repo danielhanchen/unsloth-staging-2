@@ -7061,10 +7061,17 @@ exit 0
     }
     $DetectedPython = Remove-SkippedPython (Find-CompatiblePython)
 
+    # No usable interpreter: uv provides one once it is installed below, instead of a
+    # system-wide winget / python.org install (#7802). Windows on ARM keeps the system
+    # install, whose x64-vs-ARM64 choice the steps below depend on.
+    $PythonFromUv = (-not $DetectedPython) -and ((Get-HostMachineArch) -ne "arm64")
     if ($DetectedPython) {
         step "python" "Python $($DetectedPython.Version) already installed"
+    } elseif ($PythonFromUv) {
+        step "python" "no Python 3.11-3.13 found; uv will provide Python $PythonVersion"
     }
-    if (-not $DetectedPython) {
+    # Dot-sourced so $DetectedPython lands in this scope; also the fallback when uv cannot.
+    $InstallSystemPython = {
         substep "installing Python ${PythonVersion}..."
         $pythonPackageId = "Python.Python.$PythonVersion"
         $wingetExit = $null
@@ -7128,8 +7135,11 @@ exit 0
             Write-StudioLine "        Please install Python $PythonVersion manually from https://www.python.org/downloads/" -ForegroundColor Yellow
             Write-StudioLine "        Make sure to check 'Add Python to PATH' during installation." -ForegroundColor Yellow
             Write-StudioLine "        Then re-run this installer." -ForegroundColor Yellow
-            return (Exit-InstallFailure "Python installation failed")
         }
+    }
+    if (-not $DetectedPython -and -not $PythonFromUv) {
+        . $InstallSystemPython
+        if (-not $DetectedPython) { return (Exit-InstallFailure "Python installation failed") }
     }
     # Re-probe for the interpreter actually selected: every native decision is keyed to a cp3XX tag.
     $WoaProbedMinor = $PythonVersion
@@ -7596,6 +7606,47 @@ exit 0
     }
     if (-not $env:UV_HTTP_TIMEOUT) {
         $env:UV_HTTP_TIMEOUT = "180"
+    }
+
+    # --no-bin / --no-registry: only uv's own Python store changes, nothing on PATH or in
+    # the py launcher. --system: `find` otherwise answers with an active venv's python.
+    # $null sends the caller to the system install.
+    function Resolve-UvManagedPython {
+        $requests = @($PythonVersion)
+        if ($PythonFallbackFullVersion -like "$PythonVersion.*") { $requests += $PythonFallbackFullVersion }
+        foreach ($request in $requests) {
+            $installExit = Invoke-InstallCommand -NoMirror -Label "install uv-managed Python $request" {
+                & $script:UvExe python install --no-bin --no-registry $request
+            }
+            if ($installExit -ne 0) { return $null }
+            $exe = ""
+            try {
+                $exe = (& $script:UvExe python find --system --managed-python $request 2>$null | Select-Object -First 1)
+            } catch {}
+            $exe = "$exe".Trim()
+            if (-not $exe -or -not (Test-Path -LiteralPath $exe -PathType Leaf)) { return $null }
+            $minor = ""
+            try {
+                $minor = (& $exe -S -c "import sys; print('{}.{}'.format(*sys.version_info[:2]))" 2>$null | Select-Object -First 1)
+            } catch {}
+            $minor = "$minor".Trim()
+            if ($minor -notmatch '^3\.1[1-3]$') { return $null }
+            # A store already holding a skipped patch answers the minor with it: ask for the pinned patch.
+            $candidate = Remove-SkippedPython @{ Version = $minor; Path = $exe; Arch = "" }
+            if ($candidate) { return $candidate }
+        }
+        return $null
+    }
+
+    if ($PythonFromUv) {
+        $DetectedPython = Resolve-UvManagedPython
+        if ($DetectedPython) {
+            step "python" "using uv-managed Python $($DetectedPython.Version)"
+        } else {
+            substep "uv could not provide Python $PythonVersion -- installing it system-wide instead." "Yellow"
+            . $InstallSystemPython
+            if (-not $DetectedPython) { return (Exit-InstallFailure "Python installation failed") }
+        }
     }
 
     # ── Create the venv; hand uv the resolved exe path so it does not re-resolve back to conda. ──
