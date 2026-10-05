@@ -1468,11 +1468,24 @@ export class IncrementalMarkdownCache {
     // definition, so with no `]:` left in the tail the whole-reply lex can only say `blocks`.
     if (
       FOOTNOTE_REFERENCE_RE.test(repaired) ||
-      FOOTNOTE_DEFINITION_RE.test(repaired) ||
-      (hasLinkDefinition(this.tail) &&
-        markdownRenderScope(markdown) === "document")
+      FOOTNOTE_DEFINITION_RE.test(repaired)
     ) {
       return this.renderFullDocument(markdown);
+    }
+    // Scoped on what is rendered: remend closes a mid-stream `[docs][ref` early, always in the tail.
+    // Sticky only once the source itself pairs, since the stream can still abandon that reference.
+    if (hasLinkDefinition(this.tail)) {
+      const repairedDocument =
+        repaired !== this.tail && hasLinkReference(repaired)
+          ? markdown.slice(0, this.committedLength) + repaired
+          : markdown;
+      if (markdownRenderScope(repairedDocument) === "document") {
+        const render = this.renderFullDocument(markdown);
+        this.fullDocumentMode =
+          repairedDocument === markdown ||
+          markdownRenderScope(markdown) === "document";
+        return render;
+      }
     }
 
     const blocks = parseMarkdownIntoBlocks(repaired);

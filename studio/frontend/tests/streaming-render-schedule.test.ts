@@ -1036,3 +1036,33 @@ test("a live reference pair inside a list or quote still holds as one document",
     assert.equal(isFullDocumentMode(cache), true, definition);
   }
 });
+
+const streamEachCharacter = (source: string) => {
+  const cache = new IncrementalMarkdownCache();
+  for (let length = 0; length <= source.length; length += 1) {
+    const input = source.slice(0, length);
+    const render = cache.update(input);
+    assert.deepEqual(
+      render.parseMarkdownIntoBlocks(render.markdown),
+      parseMarkdownIntoRenderableBlocks(remend(input)),
+      `block mismatch at prefix ${length}`,
+    );
+  }
+  return cache;
+};
+
+test("a mid-stream reference is scoped from the repaired document", () => {
+  const cache = streamEachCharacter(
+    `${paragraphs(20, "lead")}[ref]: /docs\n\n${paragraphs(5, "mid")}See [docs][ref] for more.`,
+  );
+  assert.equal(isFullDocumentMode(cache), true);
+});
+
+test("a reference the stream abandons does not stick to the full-document path", () => {
+  for (const reference of ["See [docs][ref\n\n", "See [docs][ref oops\n\n"]) {
+    const source = `${paragraphs(20, "lead")}[ref]: /docs\n\n${paragraphs(5, "mid")}${reference}${paragraphs(10, "tail")}`;
+    const cache = streamEachCharacter(source);
+    assert.equal(markdownRenderScope(source), "blocks", reference);
+    assert.equal(isFullDocumentMode(cache), false, reference);
+  }
+});
