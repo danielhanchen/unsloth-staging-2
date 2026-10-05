@@ -573,13 +573,34 @@ _npm_mirror_retry() {
     _NPM_REGISTRY_ARGS=(--registry "$UNSLOTH_NPM_REGISTRY")
 }
 
+# Local errno is matched on npm's code line only (cleanup warnings carry EPERM after
+# network failures too) and before the network check, since FetchError names
+# registry.npmjs.org even on a local error (#8725). Keep in sync with setup.ps1.
+_NPM_LOCAL_FAILURE_RE='npm (error|ERR!) code (EACCES|EPERM|EBUSY|ENOSPC|ENFILE|EMFILE)|operation was rejected by your operating system'
+
+_suggest_npm_local_failure() {
+    printf '\n' >&2
+    step "frontend" "npm hit a local file error (permission, lock or disk), not a network block" "$C_WARN" >&2
+    substep "Usual causes: antivirus or a file watcher locking a file in the npm cache," >&2
+    substep "an unwritable npm cache, a read-only install directory, or a full disk." >&2
+    substep "Things that usually clear it:" >&2
+    substep "  npm cache clean --force" >&2
+    substep "  Or point npm at a writable cache: NPM_CONFIG_CACHE=\"\$HOME/.npm-cache\"" >&2
+    return 0
+}
+
 # Print actionable guidance when a frontend/OXC npm/bun install fails and the registry
 # lock is the likely cause (corporate firewall/proxy). No-op once the user has opted in
 # via UNSLOTH_NPM_REGISTRY. This only guides; the mirror fallback does any switching.
 # $1 = path to a captured install log (may be empty/missing).
 _suggest_npm_registry() {
-    [ -n "${UNSLOTH_NPM_REGISTRY:-}" ] && return 0
     local _log="${1:-}"
+    # Before the UNSLOTH_NPM_REGISTRY opt-out: a mirror does not unlock a cache.
+    if [ -n "$_log" ] && [ -s "$_log" ] && grep -Eq "$_NPM_LOCAL_FAILURE_RE" "$_log"; then
+        _suggest_npm_local_failure
+        return 0
+    fi
+    [ -n "${UNSLOTH_NPM_REGISTRY:-}" ] && return 0
     # If we captured output and it does NOT look like a registry/network problem, stay
     # quiet -- the raw error already shown is more useful than a misleading hint.
     if [ -n "$_log" ] && [ -s "$_log" ] \
