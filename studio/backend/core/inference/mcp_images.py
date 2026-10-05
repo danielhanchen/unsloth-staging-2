@@ -48,8 +48,31 @@ def is_image_tool(name: str) -> bool:
     return name == "view_image" or name.startswith(MCP_TOOL_PREFIX)
 
 
+# The tool loop's own notes, which results saved before #11367 carry after the array (#11358).
+_LOOP_NOTE = re.compile(
+    r"\[(?:No room in the window for this result, so "
+    r"|[^\n\]]+ returned exactly this \d+ times; it will not change)[^\n]*\]"
+)
+
+
 def split_images(result: str) -> tuple[str, list[dict]]:
     """Validated, so tool text that merely mentions the marker is not truncated."""
+    text, images = _split_images(result)
+    notes = ""
+    body = result
+    # At most the starved note and then the repeat note.
+    for _ in range(2):
+        if images or not body.endswith("]"):
+            break
+        cut = body.rfind("\n\n[", max(0, len(body) - 512))
+        if cut == -1 or not _LOOP_NOTE.fullmatch(body, cut + 2):
+            break
+        body, notes = body[:cut], body[cut:] + notes
+        text, images = _split_images(body)
+    return (text + notes, images) if images else (result, [])
+
+
+def _split_images(result: str) -> tuple[str, list[dict]]:
     head, sep, payload = result.rpartition("\n" + SENTINEL)
     if not sep:
         return result, []
