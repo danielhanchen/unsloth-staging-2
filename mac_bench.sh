@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # macOS A/B for unslothai#152 (mapping span) and the macOS readahead carry, on b11368.
 #   A = b11368 stock, B = A + #152, C = B + macOS readahead
-set -u
+set -u -o pipefail
 ROOT=$PWD
 OUT=$ROOT/out; mkdir -p "$OUT"
 M=$ROOT/model/gemma-4-E2B-it-Q4_K_M.gguf
@@ -35,7 +35,8 @@ done
 
 # 3. timing: cold (sudo purge before each run), ABC / CBA alternating, plus A with lazy off
 run() {  # arm lazy mode round
-  local a=$1 lz=$2 mode=$3 r=$4 log=$OUT/t_${mode}_${a}_${lz}_r$4.log
+  local a=$1 lz=$2 mode=$3 r=$4
+  local log=$OUT/t_${mode}_${a}_${lz}_r${r}.log
   [ "$mode" = cold ] && sudo purge
   /usr/bin/time -l ./src_$a/build/bin/llama-batched-bench -m "$M" -ngl 99 -npp $NP -ntg $NT -npl 1 -lzm $lz > "$log" 2>&1
   python3 - "$log" "$a" "$lz" "$mode" "$r" <<'EOF'

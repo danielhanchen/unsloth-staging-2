@@ -31,7 +31,7 @@ jobs:
           curl -sSL -o model/gemma-4-E2B-it-Q4_K_M.gguf https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf
           ls -l model
       - name: Bench
-        run: bash mac_bench.sh 2>&1 | tee bench.txt
+        run: set -o pipefail; bash mac_bench.sh 2>&1 | tee bench.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
