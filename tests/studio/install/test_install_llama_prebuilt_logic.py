@@ -43,6 +43,7 @@ activate_install_tree = INSTALL_LLAMA_PREBUILT.activate_install_tree
 activate_staged_dir = INSTALL_LLAMA_PREBUILT.activate_staged_dir
 create_install_staging_dir = INSTALL_LLAMA_PREBUILT.create_install_staging_dir
 replace_with_busy_retry = INSTALL_LLAMA_PREBUILT.replace_with_busy_retry
+blocked_replace_hint = INSTALL_LLAMA_PREBUILT.blocked_replace_hint
 remove_tree_logged = INSTALL_LLAMA_PREBUILT.remove_tree_logged
 prune_stale_install_side_paths = INSTALL_LLAMA_PREBUILT.prune_stale_install_side_paths
 sha256_file = INSTALL_LLAMA_PREBUILT.sha256_file
@@ -1116,6 +1117,63 @@ def test_replace_with_busy_retry_waits_out_a_transient_windows_lock(
 
     assert attempts["count"] == 3
     assert (destination / "payload.txt").read_text() == "payload\n"
+
+
+def test_blocked_replace_hint_names_the_cause_per_winerror():
+    assert "scanner" in blocked_replace_hint(32)
+    denied = blocked_replace_hint(5)
+    assert "access is denied" in denied and "ACL" in denied
+    not_empty = blocked_replace_hint(145)
+    assert "not empty" in not_empty and "scanner" not in not_empty
+
+
+def _run_denied_replace(tmp_path, monkeypatch, failures):
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "payload.txt").write_text("payload\n")
+    destination = tmp_path / "dst"
+    original_replace = INSTALL_LLAMA_PREBUILT.os.replace
+    attempts = {"count": 0}
+
+    def access_denied(src, dst):
+        attempts["count"] += 1
+        if attempts["count"] <= failures:
+            exc = OSError(errno.EACCES, "Access is denied")
+            exc.winerror = 5
+            raise exc
+        return original_replace(src, dst)
+
+    logged: list[str] = []
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT.os, "name", "nt")
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT.os, "replace", access_denied)
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(INSTALL_LLAMA_PREBUILT, "log", logged.append)
+    return source, destination, logged
+
+
+def test_replace_with_busy_retry_prints_acl_repair_once_when_denial_persists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, destination, logged = _run_denied_replace(tmp_path, monkeypatch, failures = 99)
+    with pytest.raises(OSError):
+        replace_with_busy_retry(source, destination, attempts = 3)
+    retry_lines = [line for line in logged if "blocked (5)" in line]
+    assert len(retry_lines) == 2 and "scanner" not in retry_lines[0].split("--")[0]
+    assert all("takeown" not in line for line in retry_lines)
+    # One command per line so each can be pasted; src is the tree, dst does not exist yet.
+    assert logged.count(f'takeown /F "{source}" /R /D Y') == 1
+    assert logged.count(f'icacls "{source}" /reset /T') == 1
+    assert not any(str(destination) in line for line in logged if "takeown" in line)
+
+
+def test_replace_with_busy_retry_skips_acl_repair_when_denial_clears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source, destination, logged = _run_denied_replace(tmp_path, monkeypatch, failures = 1)
+    replace_with_busy_retry(source, destination)
+    assert (destination / "payload.txt").read_text() == "payload\n"
+    assert any("blocked (5)" in line for line in logged)
+    assert not any("takeown" in line for line in logged)
 
 
 def test_replace_with_busy_retry_does_not_retry_a_posix_permission_error(

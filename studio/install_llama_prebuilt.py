@@ -4798,6 +4798,27 @@ def unique_install_side_path(install_dir: Path, label: str) -> Path:
     return candidate
 
 
+def blocked_replace_hint(winerror: object) -> str:
+    # 5 is also what a scanner holding a handle returns (is_busy_lock_error: busy).
+    if winerror == 5:
+        return (
+            "access is denied -- a scanner or running process may still hold a handle, "
+            "or the ACLs are broken"
+        )
+    if winerror == 145:
+        return "the directory is not empty yet -- an earlier copy is still being removed"
+    return "a scanner is likely still holding the install open"
+
+
+def log_acl_repair(path: Path) -> None:
+    # Printed, never run: repairing permissions is the user's call (#9928).
+    log(
+        "rename still denied after retrying; if the permissions on this tree are broken, run in an elevated PowerShell:"
+    )
+    log(f'takeown /F "{path}" /R /D Y')
+    log(f'icacls "{path}" /reset /T')
+
+
 def replace_with_busy_retry(
     src: Path,
     dst: Path,
@@ -4806,7 +4827,7 @@ def replace_with_busy_retry(
 ) -> None:
     """``os.replace``, retried against transient Windows sharing violations.
 
-    WinError 5/32/145 means a scanner still holds a handle inside the tree,
+    WinError 5/32/145 usually means a scanner holds a handle inside the tree,
     which clears in a second or two; without a backoff that turns an update
     into a failure, and on the aside-move of the *existing* install that is the
     failure this installer most needs to avoid. Mirrors the Node installer's
@@ -4822,12 +4843,16 @@ def replace_with_busy_retry(
             os.replace(src, dst)
             return
         except OSError as exc:
-            transient = os.name == "nt" and getattr(exc, "winerror", None) in (5, 32, 145)
+            winerror = getattr(exc, "winerror", None)
+            transient = os.name == "nt" and winerror in (5, 32, 145)
             if not transient or attempt == attempts - 1:
+                if transient and winerror == 5:
+                    # src, not dst: the aside-move's dst does not exist yet.
+                    log_acl_repair(src)
                 raise
             log(
-                f"rename {src.name} -> {dst.name} blocked ({exc.winerror}), retrying in "
-                f"{delay:.2f}s -- a scanner is likely still holding the install open"
+                f"rename {src.name} -> {dst.name} blocked ({winerror}), retrying in "
+                f"{delay:.2f}s -- {blocked_replace_hint(winerror)}"
             )
             time.sleep(delay)
             delay = min(delay * 2, 4.0)
