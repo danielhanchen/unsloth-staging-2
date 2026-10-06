@@ -792,6 +792,17 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         ) WITHOUT ROWID
         """
     )
+    # Import ledger: without it a re-import cannot tell a turn deleted in Studio from a newly appended one.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS external_import_sessions (
+            source TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            turns_imported INTEGER NOT NULL,
+            PRIMARY KEY (source, session_id)
+        ) WITHOUT ROWID
+        """
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS prompt_entries (
@@ -2550,6 +2561,16 @@ def _reparent_surviving_forks(conn: sqlite3.Connection, deleted_ids: set[str]) -
             "UPDATE chat_threads SET forked_from_thread_id = ? WHERE id = ?",
             (source_id, row["id"]),
         )
+
+
+def lift_all_chat_thread_tombstones() -> None:
+    """Forget every deleted thread id, so an import into an emptied Studio can recreate them."""
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM chat_thread_tombstones")
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def _tombstone_chat_threads(conn: sqlite3.Connection, thread_ids: Iterable[str]) -> None:
@@ -5409,5 +5430,35 @@ def upsert_chat_legacy_imports(legacy_thread_ids: list[str]) -> tuple[int, int]:
                 inserted += 1
         conn.commit()
         return len(ids), inserted
+    finally:
+        conn.close()
+
+
+def get_external_import_mark(source: str, session_id: str) -> Optional[int]:
+    """How many turns of an imported session were brought over, or None if it never was."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT turns_imported FROM external_import_sessions WHERE source = ? AND session_id = ?",
+            (source, session_id),
+        ).fetchone()
+        return None if row is None else row["turns_imported"]
+    finally:
+        conn.close()
+
+
+def record_external_import_mark(source: str, session_id: str, turns: int) -> None:
+    conn = get_connection()
+    try:
+        conn.execute(
+            """
+            INSERT INTO external_import_sessions (source, session_id, turns_imported)
+            VALUES (?, ?, ?)
+            ON CONFLICT(source, session_id) DO UPDATE SET
+                turns_imported = MAX(excluded.turns_imported, external_import_sessions.turns_imported)
+            """,
+            (source, session_id, int(turns)),
+        )
+        conn.commit()
     finally:
         conn.close()
