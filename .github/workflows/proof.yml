@@ -2,52 +2,87 @@ name: Windows proof
 on:
   push:
     branches: [proof-12167-12169]
-    paths: ['.github/workflows/proof.yml', 'exp/mxc_proof.py']
+    paths: ['.github/workflows/proof.yml']
 permissions:
   contents: read
 jobs:
-  proof:
-    name: ${{ matrix.pr }} ${{ matrix.arm }} ${{ matrix.os }}
+  ps1:
+    name: 12849 ${{ matrix.arm }} ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         os: [windows-latest, windows-11-arm]
         arm: [base, head]
-        pr: ['12182']
         include:
-          - {arm: base, sha: e417798d3fece7432280e2ecba02c3cf1c3f264a}
-          - {pr: '12182', arm: head, sha: b0f433b18d78db6c839dae869acaff82aa16c83f}
+          - {arm: base, sha: 192fe85e88b7b7792063593f5dae67ba533d44b6}
+          - {arm: head, sha: 180e33f0c61b160e248afc814dcc49eb69306191}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           repository: unslothai/unsloth
           ref: ${{ matrix.sha }}
           persist-credentials: false
+      - name: head test against this arm's install.ps1 (pwsh 7)
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          git fetch -q --depth 1 origin 180e33f0c61b160e248afc814dcc49eb69306191
+          git show 180e33f0c61b160e248afc814dcc49eb69306191:tests/studio/test_unsloth_torch_override.ps1 | Set-Content -Encoding utf8 head_test.ps1
+          Copy-Item head_test.ps1 tests/studio/test_unsloth_torch_override.ps1 -Force
+          $PSVersionTable.PSVersion.ToString()
+          pwsh -NoProfile -File tests/studio/test_unsloth_torch_override.ps1 2>&1 | Tee-Object pwsh7.log
+          $code = $LASTEXITCODE
+          Select-String -Path pwsh7.log -Pattern 'FAIL|All checks|FAILED' | ForEach-Object { "R7 " + $_.Line }
+          Write-Host "PWSH7_EXIT=$code"
+          exit $code
+      - name: same under Windows PowerShell 5.1
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tests/studio/test_unsloth_torch_override.ps1 2>&1 | Tee-Object ps51.log
+          $code = $LASTEXITCODE
+          Select-String -Path ps51.log -Pattern 'FAIL|All checks|FAILED' | ForEach-Object { "R51 " + $_.Line }
+          Write-Host "PS51_EXIT=$code"
+          exit $code
+  pytest:
+    name: 12850 ${{ matrix.arm }} ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        arm: [base, head]
+        include:
+          - {arm: base, sha: 192fe85e88b7b7792063593f5dae67ba533d44b6}
+          - {arm: head, sha: b6adeae7475033730a339811630542f63eeb674e}
+    steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          path: proofkit
+          repository: unslothai/unsloth
+          ref: ${{ matrix.sha }}
           persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
-          python-version: '3.12'
-      - run: python -m pip install -U pip pytest huggingface_hub structlog
-      - name: real Windows PowerShell 5.1 run
+          python-version: '3.13'
+      - run: python -m pip install -U pip pytest "torch<2.11" --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+      - name: three tests, CUDA_VISIBLE_DEVICES unset / empty / -1, plus whole file
         if: ${{ !cancelled() }}
-        shell: pwsh
+        shell: bash
+        env:
+          PYTHONPATH: studio
+          UNSLOTH_COMPILE_DISABLE: '1'
         run: |
-          $PSVersionTable.PSVersion.ToString()
-          python proofkit/exp/mxc_proof.py 2>&1 | Tee-Object proof.log
-          $code = $LASTEXITCODE
-          Write-Host "PROOF_EXIT=$code"
-          exit $code
-      - name: pytest
-        if: ${{ !cancelled() }}
-        shell: pwsh
-        run: |
-          python -m pytest -rA -p no:cacheprovider studio/backend/tests/test_install_mxc_prebuilt.py 2>&1 | Tee-Object pytest.log
-          $code = $LASTEXITCODE
-          Select-String -Path pytest.log -Pattern '^(PASSED|FAILED|SKIPPED|ERROR) ' | ForEach-Object { "ID " + $_.Line }
-          Write-Host "PROOF_PYTEST_EXIT=$code"
-          exit $code
+          F=tests/python/test_torchcodec_torch_compat.py
+          T="$F::test_a_mismatched_accelerator_build_is_named_when_the_codec_cannot_load $F::test_the_provenance_hint_reads_a_codec_it_cannot_import $F::test_query_authenticated_mirror_repairs_decline_instead_of_falling_back"
+          rc=0
+          r(){ echo "RES $1: $(eval "$2" 2>&1 | grep -aE '^FAILED|[0-9]+ (passed|failed)' | sed 's/ - .*//' | tr '\n' ' ')"; }
+          r "unset" "env -u CUDA_VISIBLE_DEVICES python -m pytest -q -p no:cacheprovider $T"
+          r "empty" "CUDA_VISIBLE_DEVICES= python -m pytest -q -p no:cacheprovider $T"
+          r "minus1" "CUDA_VISIBLE_DEVICES=-1 python -m pytest -q -p no:cacheprovider $T"
+          r "whole-file" "python -m pytest -q -p no:cacheprovider $F"
+          pip install -q torchcodec 2>&1 | tail -1 || true
+          python -c "import importlib.metadata as m; print('TORCHCODEC', m.version('torchcodec'))" || true
+          r "torchcodec-installed" "python -m pytest -q -p no:cacheprovider $T"
