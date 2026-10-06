@@ -321,6 +321,7 @@ from models.models import (
     ExportSizeResponse,
     GgufVariantDetail,
     GgufVariantsResponse,
+    LocalModelSource,
     ModelType,
     ScanFolderInfo,
     AddScanFolderRequest,
@@ -645,9 +646,10 @@ def _dir_model_format(path: Path, recursive: bool = False) -> Optional[str]:
         return None
 
 
-def _scan_lmstudio_dir(lm_dir: Path) -> List[LocalModelInfo]:
-    """Scan an LM Studio models directory: ``publisher/model-name`` folders of GGUF files, or
-    standalone GGUFs at the top level."""
+def _scan_lmstudio_dir(
+    lm_dir: Path, *, source: LocalModelSource = "lmstudio"
+) -> List[LocalModelInfo]:
+    """Scan a host-app model root; ``source`` names which app it belongs to."""
     if not lm_dir.exists() or not lm_dir.is_dir():
         return []
 
@@ -662,7 +664,7 @@ def _scan_lmstudio_dir(lm_dir: Path) -> List[LocalModelInfo]:
                 id = str(lm_dir),
                 display_name = lm_dir.name,
                 path = str(lm_dir),
-                source = "lmstudio",
+                source = source,
                 model_format = _dir_model_format(lm_dir),
                 updated_at = updated_at,
             ),
@@ -686,7 +688,7 @@ def _scan_lmstudio_dir(lm_dir: Path) -> List[LocalModelInfo]:
                             id = str(child),
                             display_name = child.stem,
                             path = str(child),
-                            source = "lmstudio",
+                            source = source,
                             model_format = "gguf",
                             updated_at = updated_at,
                         ),
@@ -704,7 +706,7 @@ def _scan_lmstudio_dir(lm_dir: Path) -> List[LocalModelInfo]:
                         id = str(child),
                         display_name = child.name,
                         path = str(child),
-                        source = "lmstudio",
+                        source = source,
                         model_format = _dir_model_format(child),
                         updated_at = updated_at,
                     ),
@@ -735,7 +737,7 @@ def _scan_lmstudio_dir(lm_dir: Path) -> List[LocalModelInfo]:
                                 model_id = model_id,
                                 display_name = model_dir.name,
                                 path = str(model_dir),
-                                source = "lmstudio",
+                                source = source,
                                 model_format = _dir_model_format(model_dir),
                                 updated_at = updated_at,
                             ),
@@ -755,7 +757,7 @@ def _scan_lmstudio_dir(lm_dir: Path) -> List[LocalModelInfo]:
                                 model_id = f"{child.name}/{model_dir.stem}",
                                 display_name = model_dir.stem,
                                 path = str(model_dir),
-                                source = "lmstudio",
+                                source = source,
                                 model_format = "gguf",
                                 updated_at = updated_at,
                             ),
@@ -804,6 +806,7 @@ class _CompatLocalInventorySources(NamedTuple):
     known_hf_caches: tuple[Path, ...]
     hermes_dirs: tuple[Path, ...] = ()
     ollama_dirs: tuple[Path, ...] = ()
+    omlx_dirs: tuple[Path, ...] = ()
 
 
 def _compat_local_inventory_sources() -> _CompatLocalInventorySources:
@@ -813,6 +816,7 @@ def _compat_local_inventory_sources() -> _CompatLocalInventorySources:
         hf_default_cache_dir,
         legacy_hf_cache_dir,
         lmstudio_model_dirs,
+        omlx_model_dirs,
     )
     from utils.hf_cache_settings import known_hf_hub_caches
     return _CompatLocalInventorySources(
@@ -823,6 +827,7 @@ def _compat_local_inventory_sources() -> _CompatLocalInventorySources:
         tuple(known_hf_hub_caches()),
         tuple(hermes_model_dirs()),
         tuple(ollama_model_dirs()),
+        tuple(omlx_model_dirs()),
     )
 
 
@@ -956,6 +961,12 @@ def collect_local_models(
             local_models += _scan_ollama_dir(ollama_dir, materialize_links = materialize_ollama_links)
         except Exception as e:
             logger.warning("Error scanning Ollama directory %s: %s", ollama_dir, e)
+
+    for omlx_dir in sources.omlx_dirs:
+        try:
+            local_models += _scan_lmstudio_dir(omlx_dir, source = "omlx")
+        except Exception as e:
+            logger.warning("Error scanning oMLX directory %s: %s", omlx_dir, e)
 
     # Scan user-added custom folders (per-folder cap).
     _MAX_MODELS_PER_FOLDER = 200
