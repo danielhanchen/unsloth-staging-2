@@ -387,6 +387,7 @@ export function AudioPage({
     loadMore,
     selectClip,
     handleDeleteClip,
+    handleDeleteGroup,
     handleArchiveClip,
     handleTogglePin,
     historyReorder,
@@ -2010,6 +2011,7 @@ export function AudioPage({
                     onPickModel={pickRecommendedModel}
                     separate={separate}
                     onSendStem={handleSendStem}
+                    handleDeleteGroup={handleDeleteGroup}
                   />
                 ) : ttsWorkflow === "clone" ? (
                   <CloneOutput
