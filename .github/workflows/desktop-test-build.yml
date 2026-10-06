@@ -1,0 +1,249 @@
+# Temporary, staging only: a signed Windows Desktop build of this branch for hand
+# testing on real machines. Never merged. The Windows leg of release-desktop.yml,
+# minus the release, updater manifest and PyPI stamp steps, with a low app
+# version so the official release stays an upgrade over it.
+name: desktop-test-build
+
+on:
+  push:
+    branches: [desktop-test-r11]
+  workflow_dispatch:
+    inputs:
+      app_version:
+        description: 'App version baked into the build (keep it below the official release)'
+        default: '0.0.1'
+        required: true
+      backend_version:
+        description: 'UNSLOTH_DESKTOP_BACKEND_VERSION (the official release uses its latest.json pypi_version)'
+        default: '2026.9.14'
+        required: true
+      official_tag:
+        description: 'Official release the install-over / restore check uses'
+        default: 'v0.1.902-beta'
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-test-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - args: ''
+            label: Windows (x64)
+            artifact: windows-x64
+            target: ''
+          - args: '--target aarch64-pc-windows-msvc'
+            label: Windows (ARM64)
+            artifact: windows-arm64
+            target: aarch64-pc-windows-msvc
+    name: Build ${{ matrix.label }}
+    runs-on: windows-latest
+    environment: release-signing
+    timeout-minutes: 75
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      APP_VERSION: ${{ inputs.app_version || '0.0.1' }}
+      UNSLOTH_DESKTOP_BACKEND_VERSION: ${{ inputs.backend_version || '2026.9.14' }}
+    steps:
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Lockfile supply-chain audit (pre-install scan)
+        shell: bash
+        run: python3 scripts/lockfile_supply_chain_audit.py
+
+      - name: Install pinned Tauri CLI
+        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+
+      - name: Verify pinned Tauri CLI
+        shell: bash
+        run: |
+          out="$(npx --prefix studio tauri --version)"
+          echo "$out"
+          [ "$out" = "tauri-cli 2.10.1" ] || { echo "Expected tauri-cli 2.10.1, got $out" >&2; exit 1; }
+
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm install --no-fund --no-audit
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8  # stable @ 2026-03-27
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Patch desktop app version
+        shell: bash
+        working-directory: studio/src-tauri
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, pathlib, re, sys
+          v = os.environ['APP_VERSION']
+          toml = pathlib.Path('Cargo.toml')
+          lines = toml.read_text().splitlines(keepends=True)
+          in_pkg = False
+          for i, line in enumerate(lines):
+              s = line.strip()
+              if s == '[package]':
+                  in_pkg = True
+                  continue
+              if s.startswith('[') and s.endswith(']'):
+                  in_pkg = False
+              if in_pkg and re.fullmatch(r'version\s*=\s*"[^"]+"\s*', s):
+                  lines[i] = f'version = "{v}"\n'
+                  break
+          else:
+              sys.exit('Could not patch [package] version in Cargo.toml')
+          toml.write_text(''.join(lines))
+          lock = pathlib.Path('Cargo.lock')
+          text, n = re.subn(r'(?m)(^\[\[package\]\]\nname = "unsloth-studio"\nversion = ")[^"]+(")',
+                            lambda m: f'{m.group(1)}{v}{m.group(2)}', lock.read_text())
+          if n != 1:
+              sys.exit(f'Could not patch unsloth-studio in Cargo.lock (matches={n})')
+          lock.write_text(text)
+          PY
+          cargo metadata --locked --no-deps --format-version 1 | python3 -c "import json,os,sys; v=[p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='unsloth-studio']; sys.exit(0 if v==[os.environ['APP_VERSION']] else f'version mismatch {v}')"
+          git diff --stat -- Cargo.toml Cargo.lock
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        with:
+          workspaces: 'studio/src-tauri -> target'
+          save-if: false
+
+      - name: Install trusted-signing-cli
+        shell: pwsh
+        env:
+          TRUSTED_SIGNING_CLI_URL: "https://github.com/Levminer/artifact-signing-cli/releases/download/0.10.0/trusted-signing-cli.exe"
+          TRUSTED_SIGNING_CLI_SHA256: "8c9d750ca582891a7433925dcf302d5d3761fbed757b46c4bf5b417562dccb0e"
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dir = Join-Path $env:RUNNER_TEMP "trusted-signing-cli"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $dest = Join-Path $dir "trusted-signing-cli.exe"
+          Invoke-WebRequest -Uri $env:TRUSTED_SIGNING_CLI_URL -OutFile $dest -MaximumRetryCount 3 -RetryIntervalSec 5
+          $actual = (Get-FileHash -Path $dest -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $env:TRUSTED_SIGNING_CLI_SHA256.ToLower()) { Remove-Item -Force $dest; Write-Output "::error::trusted-signing-cli digest mismatch ($actual)"; exit 1 }
+          $dir | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $dest --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Sign the bundled install script
+        shell: pwsh
+        env:
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          AZURE_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+        run: |
+          git show HEAD:install.ps1 > "$env:RUNNER_TEMP\install.unsigned.ps1"
+          $script = (Resolve-Path 'install.ps1').Path
+          studio/src-tauri/windows/sign-with-trusted-signing.ps1 -Path $script
+          if ($LASTEXITCODE -ne 0) { Write-Host "::error::could not sign install.ps1 (exit $LASTEXITCODE)"; exit 1 }
+          $sig = Get-AuthenticodeSignature $script
+          Write-Host "install.ps1 -> $($sig.Status) $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { Write-Host "::error::install.ps1 is $($sig.Status) after signing"; exit 1 }
+
+      - name: Prefetch Tauri Windows bundler tools
+        shell: pwsh
+        run: .github/scripts/prefetch-tauri-windows-tools.ps1
+
+      - name: Build Windows installer
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_TRUSTED_SIGNING_ACCOUNT_NAME: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          AZURE_CERTIFICATE_PROFILE_NAME: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+        run: |
+          set -euo pipefail
+          npx --prefix studio tauri build -v --bundles nsis ${{ matrix.args }} \
+            --config '{"bundle":{"createUpdaterArtifacts":false,"windows":{"allowDowngrades":true}}}'
+          root=studio/src-tauri/target
+          [ -n "${{ matrix.target }}" ] && root="$root/${{ matrix.target }}"
+          mapfile -t exes < <(find "$root/release/bundle/nsis" -maxdepth 1 -name '*-setup.exe')
+          [ ${#exes[@]} -eq 1 ] || { echo "::error::expected one installer, got ${#exes[@]}"; exit 1; }
+          echo "INSTALLER=${exes[0]}" >> "$GITHUB_ENV"
+
+      - name: Verify every executable in the installer is signed
+        shell: pwsh
+        run: .github/scripts/assert-bundle-signed.ps1 -Path $env:INSTALLER
+
+      - name: Install over the official release, check, then restore it
+        if: matrix.artifact == 'windows-x64'
+        shell: pwsh
+        env:
+          OFFICIAL_TAG: ${{ inputs.official_tag || 'v0.1.902-beta' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Unsloth Studio (Desktop)'
+          function Installed { (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).DisplayVersion }
+          function Run-Installer($exe) {
+            $p = Start-Process -FilePath $exe -ArgumentList '/S' -Wait -PassThru
+            Write-Host "$([IO.Path]::GetFileName($exe)) /S -> exit $($p.ExitCode), installed $(Installed)"
+          }
+          $official = Join-Path $env:RUNNER_TEMP 'official.exe'
+          Invoke-WebRequest "https://github.com/unslothai/unsloth/releases/download/$env:OFFICIAL_TAG/Unsloth-Desktop-Windows.exe" -OutFile $official -MaximumRetryCount 3 -RetryIntervalSec 5
+          $want = $env:OFFICIAL_TAG.TrimStart('v')
+          Run-Installer $official
+          if ((Installed) -ne $want) { Write-Host "::error::official install reports $(Installed)"; exit 1 }
+          Run-Installer $env:INSTALLER
+          if ((Installed) -ne $env:APP_VERSION) { Write-Host "::error::test build over official reports $(Installed), want $env:APP_VERSION"; exit 1 }
+          $dir = (Get-ItemProperty -Path $key).InstallLocation
+          if (-not $dir) { $dir = Join-Path $env:LOCALAPPDATA 'Unsloth Studio (Desktop)' }
+          $bundled = Get-ChildItem -LiteralPath $dir.Trim('"') -Recurse -Filter install.ps1 | Select-Object -First 1
+          if (-not $bundled) { Write-Host "::error::no bundled install.ps1 under $dir"; exit 1 }
+          $sig = Get-AuthenticodeSignature $bundled.FullName
+          Write-Host "bundled $($bundled.FullName): $($sig.Status) $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') { Write-Host "::error::bundled install.ps1 is $($sig.Status)"; exit 1 }
+          $text = [IO.File]::ReadAllText($bundled.FullName)
+          $cut = $text.IndexOf("`r`n# SIG # Begin signature block")
+          if ($cut -lt 0) { $cut = $text.IndexOf("# SIG # Begin signature block") }
+          $body = $text.Substring(0, $cut).Replace("`r`n", "`n").TrimEnd()
+          $src = [IO.File]::ReadAllText("$env:RUNNER_TEMP\install.unsigned.ps1").Replace("`r`n", "`n").TrimEnd()
+          if ($body -ne $src) { Write-Host "::error::bundled install.ps1 differs from $(git rev-parse HEAD):install.ps1"; exit 1 }
+          Write-Host "bundled install.ps1 matches $(git rev-parse --short HEAD) and is signed"
+          Run-Installer $official
+          if ((Installed) -ne $want) { Write-Host "::error::restore reports $(Installed), want $want"; exit 1 }
+          Write-Host "install over ${want}, then restore to ${want}: OK"
+
+      - name: Stage and upload
+        shell: pwsh
+        env:
+          NAME: ${{ matrix.artifact == 'windows-arm64' && 'Unsloth-Desktop-Windows-ARM64.exe' || 'Unsloth-Desktop-Windows.exe' }}
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'stage'
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+          Copy-Item $env:INSTALLER (Join-Path $out $env:NAME)
+          $h = (Get-FileHash (Join-Path $out $env:NAME) -Algorithm SHA256).Hash
+          "$h  $env:NAME" | Out-File -Encoding ascii (Join-Path $out "$env:NAME.sha256")
+          Get-ChildItem $out | Format-Table Name, Length
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: desktop-test-${{ matrix.artifact }}
+          path: ${{ runner.temp }}/stage/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
