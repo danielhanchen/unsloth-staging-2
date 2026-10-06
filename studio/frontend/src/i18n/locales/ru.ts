@@ -2733,6 +2733,8 @@ export const ru = {
         modelMultilingual: "Многоязычная",
         modelEnglish: "Английская",
         modelTypedDecisions: "Типизированные решения",
+        modelClefFlash: "Clef-flash",
+        modelClef: "Clef",
         recommended: "Рекомендуется",
         device: "Запускать на",
         deviceDescription: "GPU отвечает быстрее, но держит память зарезервированной до перезапуска.",
@@ -2742,11 +2744,13 @@ export const ru = {
         notDownloaded: "Не скачана · {size}",
         downloading: "Скачивание…",
         downloaded: "Скачана · загрузится при первом запросе",
+        ready: "Готова · загрузится при первом запросе",
         installing: "Установка…",
         loading: "Загрузка…",
         loadedOn: "Загружена на {device}",
         download: "Скачать",
         downloadConfirmTitle: "Скачать Laya {model}?",
+        downloadConfirmTitleModel: "Скачать {model}?",
         downloadConfirmBody:
           "API решений нужна эта модель, чтобы отвечать на запросы. Около {size}, загружается один раз в кэш Hugging Face.",
         unload: "Выгрузить",
@@ -2878,6 +2882,9 @@ export const ru = {
       datasetLabel: "Датасет",
       modelTooltip: "Базовая модель, которую вы хотите дообучить.",
       methodTooltip: "Как обучается модель. LoRA и QLoRA обновляют небольшие адаптеры вместо всех весов.",
+      checkpointLabel: "Чекпоинт",
+      checkpointTooltip:
+        "Чекпоинт Laya для дообучения. Многоязычная подходит для большинства наборов данных.",
       datasetTooltip: "Обучающие данные для дообучения модели.",
       hfTokenDescription:
         "Необходим для моделей и наборов данных с ограниченным или закрытым доступом.",
@@ -3366,6 +3373,10 @@ export const ru = {
         learningRatePositive: "Введите скорость обучения больше нуля.",
         embeddingLearningRateRange:
           "Введите скорость обучения эмбеддингов больше 0 и меньше 1.",
+        decisionColumnsMissing:
+          "Моделям решений нужны столбцы state, questions и gold (или answers). Не хватает: {columns}.",
+        decisionOwnerOnly:
+          "Дообучать модели решений может только владелец Studio.",
         hfDatasetRequired: "Сначала выберите датасет Hugging Face.",
         hfDatasetSplitRequired:
           "Сначала выберите или введите обучающую выборку.",
@@ -3501,6 +3512,9 @@ export const ru = {
       title: "Прогресс обучения",
       liveMetrics: "Метрики обучения в реальном времени",
       exportGguf: "Экспортировать в GGUF",
+      useInDecisionApi: "Использовать в API решений",
+      decisionApiEnabled: "API решений теперь использует {name}.",
+      decisionApiFailed: "Не удалось переключить API решений на эту модель.",
       openConfig: "Открыть конфигурацию обучения",
       configLabel: "Конфигурация обучения",
       hyperparams: "Гиперпараметры",
