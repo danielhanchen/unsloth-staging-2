@@ -2393,6 +2393,16 @@ export const ar = {
       importingChats: "جارٍ استيراد المحادثات: {count} حتى الآن ({percent}%)...",
       importedChatCountPartial: "تم استيراد {count} محادثة إلى الأخيرة؛ تعذّر حفظ {failed} منها.",
       importFailed: "فشل الاستيراد.",
+      importFromSource: "الاستيراد من {source}",
+      importFromSourceDescription:
+        "انسخ محادثاتك في {source} إلى Studio، مجمّعة حسب المشروع.",
+      importingAction: "جارٍ الاستيراد...",
+      importSourceNoChats: "لم يُعثر على محادثات {source}.",
+      importedSourceOneChat: "تم استيراد محادثة واحدة من {source}.",
+      importedSourceChatCount:
+        "تم استيراد المحادثات من {source}. العدد: {count}.",
+      sourceUpToDate: "محادثات {source} محدَّثة بالفعل.",
+      importedSourcePartial: "تعذّر استيراد بعض محادثات {source}.",
       clearHistory: "مسح سجل المحادثات",
       clearHistoryDescription: "حذف سجل المحادثات من هذا الجهاز.",
       clearAction: "مسح",
