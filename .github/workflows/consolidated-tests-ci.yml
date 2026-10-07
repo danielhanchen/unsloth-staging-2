@@ -777,6 +777,7 @@ jobs:
         # reads the floor from pyproject, so raising requires-python relaxes it
         # rather than making it lie.
         run: |
+          exit 1  # staging: injected failure
           python -m pytest -v --tb=short tests/test_python39_compatibility.py
 
       - name: unsloth Bucket-A — CPU tests not in Repo tests (CPU)
