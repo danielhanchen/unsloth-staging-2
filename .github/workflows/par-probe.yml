@@ -1,66 +1,68 @@
-name: par-probe
+name: par-probe-2
 on:
   push:
     branches: [ci-par-probe]
 jobs:
-  happy:
+  fg-fails-wait-not-cancelled:
     runs-on: ubuntu-24.04
     steps:
-      - name: t0
-        run: date +%s > /tmp/t0
-      - parallel:
-          - name: lane-a
-            id: lane_a
-            run: sleep 20; echo "val=a" >> "$GITHUB_OUTPUT"; echo "LANE_A=1" >> "$GITHUB_ENV"
-          - name: lane-b
-            id: lane_b
-            run: sleep 20; echo "val=b" >> "$GITHUB_OUTPUT"
-          - name: lane-c
-            id: lane_c
-            run: sleep 20
-      - name: elapsed + outputs
-        run: |
-          echo "elapsed=$(( $(date +%s) - $(cat /tmp/t0) ))"
-          echo "a=${{ steps.lane_a.outputs.val }} b=${{ steps.lane_b.outputs.val }} env=$LANE_A"
-          echo "outcomes ${{ steps.lane_a.outcome }} ${{ steps.lane_b.outcome }} ${{ steps.lane_c.outcome }}"
+      - name: Harden runner (audit)
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1  # v2.21.1
+        with:
+          egress-policy: audit
       - name: bg
         id: bg
         background: true
-        run: sleep 10; echo "v=bg" >> "$GITHUB_OUTPUT"
-      - name: fg while bg
+        run: sleep 20; echo "BG-DONE"
+      - name: fg-fails
+        if: ${{ !cancelled() }}
+        run: sleep 2; exit 1
+      - name: fg-after (if !cancelled, should RUN)
+        if: ${{ !cancelled() }}
+        run: echo "FG-AFTER-RAN"
+      - name: fg-default (should be skipped)
+        run: echo SHOULD-NOT-RUN
+      - name: advisory
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: exit 5
+      - wait: bg
+        if: ${{ !cancelled() }}
+      - name: summary
+        if: always()
+        run: echo "bg=${{ steps.bg.outcome }}"
+  fg-fails-no-wait-guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: bg
+        id: bg
+        background: true
+        run: sleep 20; echo "BG-DONE"
+      - name: fg-fails
+        run: sleep 2; exit 1
+      - wait: bg
+      - name: summary
+        if: always()
+        run: echo "bg=${{ steps.bg.outcome }}"
+  bg-continue-on-error:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: bg
+        id: bg
+        background: true
+        continue-on-error: true
+        run: sleep 5; exit 4
+      - name: fg
         run: echo fg
       - wait: bg
-      - name: after wait
-        run: echo "bg=${{ steps.bg.outputs.v }} outcome=${{ steps.bg.outcome }}"
-  fail-in-parallel:
+      - name: after (should RUN)
+        run: echo "AFTER-RAN outcome=${{ steps.bg.outcome }} conclusion=${{ steps.bg.conclusion }}"
+  never-waited:
     runs-on: ubuntu-24.04
     steps:
-      - parallel:
-          - name: fails-fast
-            id: f
-            run: sleep 2; exit 1
-          - name: slow-sibling
-            id: s
-            run: sleep 25; echo "sibling finished"
-      - name: next (should be skipped)
-        id: n
-        run: echo SHOULD-NOT-RUN
-      - name: summary
-        if: always()
-        run: echo "f=${{ steps.f.outcome }} s=${{ steps.s.outcome }} n=${{ steps.n.outcome }}"
-  fail-in-background:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: bg-fail
-        id: bf
+      - name: bg
+        id: bg
         background: true
-        run: sleep 2; exit 3
-      - name: fg-continues
-        id: fg
-        run: sleep 10; echo "fg ran"
-      - wait-all:
-      - name: next (should be skipped)
-        run: echo SHOULD-NOT-RUN
-      - name: summary
-        if: always()
-        run: echo "bf=${{ steps.bf.outcome }} fg=${{ steps.fg.outcome }}"
+        run: sleep 15; echo "BG-DONE"; exit 6
+      - name: fg
+        run: echo fg-green
