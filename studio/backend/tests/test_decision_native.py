@@ -475,6 +475,25 @@ def test_gpu_flags_offload_to_the_freest_device(home, stub, tmp_path):
     assert second._key != api_key
 
 
+@pytest.mark.parametrize("mask, expected", [("1,0", "CUDA0"), ("0,1", "CUDA1"), ("5", "CUDA1")])
+def test_freest_gpu_follows_the_visibility_order(stub, monkeypatch, mask, expected):
+    # Physical GPU 1 is the freest; llama.cpp numbers devices in CUDA_VISIBLE_DEVICES order.
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES = mask)
+    assert native_worker._pick_device("llama-server", env) == expected
+    # Vulkan ordinals ignore the CUDA mask.
+    monkeypatch.setattr(
+        LlamaCppBackend, "_enumerated_gpu_devices", staticmethod(lambda *_: ["Vulkan0", "Vulkan1"])
+    )
+    assert native_worker._pick_device("llama-server", env) == "Vulkan1"
+    # ROCm follows HIP_VISIBLE_DEVICES.
+    monkeypatch.setattr(
+        LlamaCppBackend, "_enumerated_gpu_devices", staticmethod(lambda *_: ["ROCm0", "ROCm1"])
+    )
+    hip = dict(os.environ, HIP_VISIBLE_DEVICES = mask)
+    hip.pop("ROCR_VISIBLE_DEVICES", None)
+    assert native_worker._pick_device("llama-server", hip) == expected.replace("CUDA", "ROCm")
+
+
 @pytest.mark.parametrize("mode", ["nodecisions", "wrongalias"])
 def test_a_server_without_a_decisions_output_is_not_capable(home, stub, tmp_path, mode):
     model = tmp_path / "m.gguf"
@@ -1277,3 +1296,20 @@ def test_an_image_that_decodes_to_too_many_pixels_is_refused(home, client, stub)
     refused = _post(client, images = [_image_url("png", big.getvalue())])
     assert refused.status_code == 422 and "4096 x 4096" in refused.text
     assert stub.records("start") == []
+
+
+def test_a_laya_model_never_reports_an_earlier_clefs_fallback_reason(monkeypatch):
+    from core.systemone import laya_runtime
+
+    monkeypatch.setattr(laya_runtime, "_fallback_reason", "The GGUF is not downloaded.")
+    clef = SimpleNamespace(name = "clef-flash", backend = "pytorch", layout = "clef")
+    laya = SimpleNamespace(name = "laya-multilingual", backend = "pytorch", layout = "laya")
+    monkeypatch.setattr(laya_runtime, "_loaded", clef)
+    assert laya_runtime.status()["fallback_reason"] == "The GGUF is not downloaded."
+    monkeypatch.setattr(laya_runtime, "_loaded", laya)
+    assert laya_runtime.status()["fallback_reason"] is None
+    # A Laya request leaves the reason alone, so a concurrent Clef load keeps its own.
+    monkeypatch.setattr(laya_runtime, "select", lambda checkpoint, *a, **k: (checkpoint, None))
+    monkeypatch.setattr(laya_runtime, "_decide", lambda *_: {"ok": True})
+    assert laya_runtime._route(laya, "s", {}, None) == {"ok": True}
+    assert laya_runtime._fallback_reason == "The GGUF is not downloaded."
