@@ -1,0 +1,3 @@
+studio/backend/tests/test_install_mxc_prebuilt.py
+studio/backend/tests/test_rag_source_files_indexing.py
+studio/backend/tests/test_setup_llama_cpp_backend.py
