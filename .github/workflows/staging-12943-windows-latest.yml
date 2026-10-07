@@ -1,0 +1,37 @@
+name: "staging-12943 windows-latest"
+on:
+  push:
+    branches: ["pr-12943-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+      - name: Node tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test tests/browser-native-view-snapshot.test.ts tests/browser-settings.test.ts
