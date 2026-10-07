@@ -33,7 +33,7 @@ from unsloth.utils import (
     enable_padding_free_metadata,
     enable_sample_packing,
 )
-from unsloth.utils.packing import patch_hybrid_linear_attention_varlen
+from unsloth.utils.packing import _stateful_mixer_kind, patch_hybrid_linear_attention_varlen
 from unsloth_zoo.training_utils import (
     unsloth_train as _unsloth_train,
 )
@@ -532,27 +532,28 @@ def _is_hybrid_linear_attention_model(model) -> bool:
         if any(hasattr(config, marker) for marker in _HYBRID_CONFIG_MARKERS):
             return True
 
-    # Module-level: a mixer carrying a recurrent gated-delta op plus a conv1d.
-    named_modules = getattr(model, "named_modules", None)
-    if named_modules is None:
+    # Module-level: any recurrent / causal-conv mixer, whether or not the varlen shim can serve it.
+    modules = getattr(model, "modules", None)
+    if modules is None:
+        return _config_has_stateful_mixer(getattr(model, "config", None))
+    return any(_stateful_mixer_kind(module) is not None for module in modules())
+
+
+def _config_has_stateful_mixer(config) -> bool:
+    # A string model= only has its config here: build it on the meta device and classify its modules.
+    if config is None or not hasattr(config, "model_type"):
         return False
-    seen = set()
-    for _, module in named_modules():
-        if id(module) in seen:
-            continue
-        seen.add(id(module))
-        cls = type(module).__name__
-        if not (
-            cls.endswith("GatedDeltaNet") or "LinearAttention" in cls or cls.endswith("Mamba2Mixer")
-        ):
-            continue
-        has_recurrent = any(
-            hasattr(module, attr)
-            for attr in ("chunk_gated_delta_rule", "recurrent_gated_delta_rule", "A_log")
-        )
-        if has_recurrent and hasattr(module, "conv1d"):
-            return True
-    return False
+    try:
+        import torch
+        from transformers import AutoModel, AutoModelForCausalLM
+        with torch.device("meta"):
+            try:
+                model = AutoModelForCausalLM.from_config(config)
+            except Exception:
+                model = AutoModel.from_config(config)
+    except Exception:
+        return False
+    return any(_stateful_mixer_kind(module) is not None for module in model.modules())
 
 
 def _resolve_string_model_config(model_name, config_arg):
@@ -1366,8 +1367,8 @@ def _patch_sft_trainer_auto_packing(trl_module):
                 else model
             )
             is_hybrid = _is_hybrid_linear_attention_model(hybrid_target)
-            # Hybrid models corrupt packed batches unless the gated-delta conv and scan reset at sequence
-            # boundaries, so enable the experimental varlen shim (flag plus kernels) or keep them blocked.
+            # Hybrid models corrupt packed batches unless the gated-delta / Mamba2 conv and scan reset at
+            # sequence boundaries, so enable the experimental varlen shim (flag plus kernels) or keep them blocked.
             if (
                 is_hybrid
                 and not isinstance(model, str)
