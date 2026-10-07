@@ -1,16 +1,19 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { getLocale, translate } from "@/i18n";
 import { isTauri } from "@/lib/api-base";
 import { DownloadCancelledError, downloadFile, isDownloadCancelled } from "@/lib/native-files";
 import { toast } from "@/lib/toast";
-import { fileNameFromUrl, withBaseUrl } from "./address";
+import { fileNameFromUrl, isWebUrl, withBaseUrl } from "./address";
 import { type BrowserPage, fetchBrowserPage } from "./api";
+import { approveDownload } from "./download-approval-queue";
 import { useBrowserHistoryStore } from "./history-store";
 import { saveNativeDownload } from "./native-downloads";
 import { useBrowserPrefsStore } from "./prefs-store";
 
-export type BrowserDownload = { blob: Blob; name: string; contentType: string; url: string | null };
+/** `site`: the page a download is asked about for, when not the file's own address. */
+export type BrowserDownload = { blob: Blob; name: string; contentType: string; url: string | null; site?: string };
 
 type SaveHandle = {
   name: string;
@@ -23,11 +26,12 @@ function saveFilePicker(): SaveFilePicker | null {
   return typeof picker === "function" ? picker : null;
 }
 
-/** The desktop app always asks; the web build needs the browser's save dialog (Chromium). */
+/** The desktop app has its own dialog; the web build needs the browser's (Chromium). */
 export function canAskWhereToSave(): boolean {
-  return !isTauri && saveFilePicker() !== null;
+  return isTauri || saveFilePicker() !== null;
 }
 
+/** The web build's save dialog is on in Settings. */
 function asksWhereToSave(): boolean {
   return !isTauri && saveFilePicker() !== null && useBrowserPrefsStore.getState().askWhereToSave;
 }
@@ -51,18 +55,45 @@ async function pickSaveTarget(name: string): Promise<SaveHandle | null> {
   }
 }
 
-/** Save a file from the panel and add it to the download history. `target` is a save location
- *  already picked, or null for none; left out, the dialog opens here when Settings asks. */
-export async function saveBrowserDownload(
+/** Whether a file from `url` may be saved; files from websites wait for the user's approval,
+ *  remembered for `site` (the file's own address unless given). */
+function approved(url: string | null, name: string, site?: string): Promise<boolean> {
+  return url && isWebUrl(url) ? approveDownload(url, name, site ?? url) : Promise.resolve(true);
+}
+
+/** Save a file from the panel and add it to the download history. A file from a website
+ *  waits for approval first. `target` is a save location already picked (approval included),
+ *  or null for none; left out, the dialog opens here when Settings asks. */
+export async function saveBrowserDownload(download: BrowserDownload, target?: SaveHandle | null): Promise<void> {
+  if (target === undefined) {
+    if (!(await approved(download.url, download.name, download.site))) return;
+    // The save dialog opens only right after a click, and one that finished later (a slow file,
+    // or one nobody was asked about) would save without it: wait for a click on Save instead.
+    if (saveNeedsClick()) {
+      const locale = getLocale();
+      toast(translate("browser.downloadPrompt.ready", { name: download.name }, locale), {
+        action: {
+          label: translate("browser.downloadPrompt.save", {}, locale),
+          onClick: () => void writeDownload(download, undefined),
+        },
+      });
+      return;
+    }
+  }
+  await writeDownload(download, target);
+}
+
+/** Write an approved download where Settings says, and add it to the download history. */
+async function writeDownload(
   { blob, name, contentType, url }: BrowserDownload,
-  target?: SaveHandle | null,
+  target: SaveHandle | null | undefined,
 ): Promise<void> {
   let saved: { id: string; name: string } | null = null;
   let picked: SaveHandle | null = null;
   try {
     if (isTauri) {
       // The app keeps the path so Download history can reveal it.
-      saved = await saveNativeDownload(blob, name);
+      saved = await saveNativeDownload(blob, name, useBrowserPrefsStore.getState().askWhereToSave, url);
       if (!saved) return;
     } else {
       picked = target === undefined ? await pickSaveTarget(name) : target;
@@ -121,8 +152,11 @@ export async function saveLinkAs(url: string): Promise<void> {
     ]);
     // A link that already failed has nothing to save: report it without asking for a name.
     if (quick && "error" in quick) throw quick.error;
+    const name = quick?.download.name ?? fileNameFromUrl(url);
     try {
-      target = await pickSaveTarget(quick?.download.name ?? fileNameFromUrl(url));
+      // Approved before the dialog, which creates the file. Answering is a fresh click for it.
+      if (!(await approved(url, name))) throw new DownloadCancelledError();
+      target = await pickSaveTarget(name);
     } catch (error) {
       // No save after all: stop the fetch, which the backend drops on disconnect.
       controller.abort();

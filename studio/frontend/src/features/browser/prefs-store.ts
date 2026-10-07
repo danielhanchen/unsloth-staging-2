@@ -36,8 +36,10 @@ interface BrowserPrefsState {
   /** Days visits are kept (HISTORY_RETENTION_DAYS); 0 for until cleared. */
   historyRetentionDays: number;
   saveDownloadHistory: boolean;
-  /** Web build: a save dialog for each download, where the browser offers one. */
+  /** A save dialog for each download (in the web build, where the browser offers one). */
   askWhereToSave: boolean;
+  /** Confirm downloads from websites before they're saved. */
+  askBeforeDownloading: boolean;
   annotationScreenshots: AnnotationScreenshots;
   setOpenLinksInBrowser: (value: boolean) => void;
   setOpenFilesInBrowser: (value: boolean) => void;
@@ -55,6 +57,7 @@ interface BrowserPrefsState {
   setHistoryRetentionDays: (value: number) => void;
   setSaveDownloadHistory: (value: boolean) => void;
   setAskWhereToSave: (value: boolean) => void;
+  setAskBeforeDownloading: (value: boolean) => void;
   setAnnotationScreenshots: (value: AnnotationScreenshots) => void;
 }
 
@@ -76,6 +79,7 @@ export const useBrowserPrefsStore = create<BrowserPrefsState>()(
       historyRetentionDays: 0,
       saveDownloadHistory: true,
       askWhereToSave: false,
+      askBeforeDownloading: true,
       annotationScreenshots: "never",
       setOpenLinksInBrowser: (openLinksInBrowser) => set({ openLinksInBrowser }),
       setOpenFilesInBrowser: (openFilesInBrowser) => set({ openFilesInBrowser }),
@@ -98,6 +102,7 @@ export const useBrowserPrefsStore = create<BrowserPrefsState>()(
       setHistoryRetentionDays: (historyRetentionDays) => set({ historyRetentionDays }),
       setSaveDownloadHistory: (saveDownloadHistory) => set({ saveDownloadHistory }),
       setAskWhereToSave: (askWhereToSave) => set({ askWhereToSave }),
+      setAskBeforeDownloading: (askBeforeDownloading) => set({ askBeforeDownloading }),
       setAnnotationScreenshots: (annotationScreenshots) => set({ annotationScreenshots }),
     }),
     {
