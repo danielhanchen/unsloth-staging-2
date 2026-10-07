@@ -1,0 +1,19 @@
+name: p2-fg-fails-no-wait-guard
+on:
+  push:
+    branches:
+    - ci-par-probe
+jobs:
+  fg-fails-no-wait-guard:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: bg
+      id: bg
+      background: true
+      run: sleep 20; echo "BG-DONE"
+    - name: fg-fails
+      run: sleep 2; exit 1
+    - wait: bg
+    - name: summary
+      if: always()
+      run: echo "bg=${{ steps.bg.outcome }}"

@@ -1,0 +1,20 @@
+name: p2-bg-continue-on-error
+on:
+  push:
+    branches:
+    - ci-par-probe
+jobs:
+  bg-continue-on-error:
+    runs-on: ubuntu-24.04
+    steps:
+    - name: bg
+      id: bg
+      background: true
+      continue-on-error: true
+      run: sleep 5; exit 4
+    - name: fg
+      run: echo fg
+    - wait: bg
+    - name: after (should RUN)
+      run: echo "AFTER-RAN outcome=${{ steps.bg.outcome }} conclusion=${{ steps.bg.conclusion
+        }}"
