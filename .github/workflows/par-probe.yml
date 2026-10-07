@@ -1,0 +1,66 @@
+name: par-probe
+on:
+  push:
+    branches: [ci-par-probe]
+jobs:
+  happy:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: t0
+        run: date +%s > /tmp/t0
+      - parallel:
+          - name: lane-a
+            id: lane_a
+            run: sleep 20; echo "val=a" >> "$GITHUB_OUTPUT"; echo "LANE_A=1" >> "$GITHUB_ENV"
+          - name: lane-b
+            id: lane_b
+            run: sleep 20; echo "val=b" >> "$GITHUB_OUTPUT"
+          - name: lane-c
+            id: lane_c
+            run: sleep 20
+      - name: elapsed + outputs
+        run: |
+          echo "elapsed=$(( $(date +%s) - $(cat /tmp/t0) ))"
+          echo "a=${{ steps.lane_a.outputs.val }} b=${{ steps.lane_b.outputs.val }} env=$LANE_A"
+          echo "outcomes ${{ steps.lane_a.outcome }} ${{ steps.lane_b.outcome }} ${{ steps.lane_c.outcome }}"
+      - name: bg
+        id: bg
+        background: true
+        run: sleep 10; echo "v=bg" >> "$GITHUB_OUTPUT"
+      - name: fg while bg
+        run: echo fg
+      - wait: bg
+      - name: after wait
+        run: echo "bg=${{ steps.bg.outputs.v }} outcome=${{ steps.bg.outcome }}"
+  fail-in-parallel:
+    runs-on: ubuntu-24.04
+    steps:
+      - parallel:
+          - name: fails-fast
+            id: f
+            run: sleep 2; exit 1
+          - name: slow-sibling
+            id: s
+            run: sleep 25; echo "sibling finished"
+      - name: next (should be skipped)
+        id: n
+        run: echo SHOULD-NOT-RUN
+      - name: summary
+        if: always()
+        run: echo "f=${{ steps.f.outcome }} s=${{ steps.s.outcome }} n=${{ steps.n.outcome }}"
+  fail-in-background:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: bg-fail
+        id: bf
+        background: true
+        run: sleep 2; exit 3
+      - name: fg-continues
+        id: fg
+        run: sleep 10; echo "fg ran"
+      - wait-all:
+      - name: next (should be skipped)
+        run: echo SHOULD-NOT-RUN
+      - name: summary
+        if: always()
+        run: echo "bf=${{ steps.bf.outcome }} fg=${{ steps.fg.outcome }}"
