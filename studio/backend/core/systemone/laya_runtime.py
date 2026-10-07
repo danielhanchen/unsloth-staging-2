@@ -1738,7 +1738,11 @@ def _route(checkpoint: Checkpoint, state, questions, images) -> dict[str, Any]:
     if checkpoint.layout != "laya":
         _fallback_reason = reason
     try:
-        return _decide(target, state, questions, images)
+        result = _decide(target, state, questions, images)
+        if checkpoint.layout == "laya":
+            # Only once Laya serves: a failed load leaves the previous Clef resident with its reason.
+            _fallback_reason = None
+        return result
     except NativeContextOverflow as exc:
         # Auto answers on PyTorch only what its longer window can hold; at equal windows it would refuse too.
         from .catalog import clef_unsupported_reason
