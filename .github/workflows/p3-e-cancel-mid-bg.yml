@@ -1,0 +1,17 @@
+name: p3-e-cancel-mid-bg
+on:
+  push:
+    branches: [ci-par-probe]
+jobs:
+  j:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: bg
+        id: bg
+        background: true
+        run: for i in $(seq 1 300); do echo "tick $i"; sleep 1; done
+      - name: fg
+        run: sleep 280
+      - wait: bg
+      - name: after
+        run: echo SHOULD-NOT-RUN

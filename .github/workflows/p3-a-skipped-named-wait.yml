@@ -1,0 +1,23 @@
+name: p3-a-skipped-named-wait
+on:
+  push:
+    branches: [ci-par-probe]
+jobs:
+  j:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: deps
+        id: deps
+        run: exit 1
+      - name: bg
+        id: bg
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        background: true
+        run: echo BG-RAN
+      - name: gate
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: echo GATE-RAN
+      - wait: bg
+      - name: summary
+        if: always()
+        run: echo "bg=${{ steps.bg.outcome }}"

@@ -1,0 +1,20 @@
+name: p3-b-skipped-wait-all
+on:
+  push:
+    branches: [ci-par-probe]
+jobs:
+  j:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: deps
+        id: deps
+        run: exit 1
+      - name: bg
+        id: bg
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        background: true
+        run: echo BG-RAN
+      - wait-all:
+      - name: summary
+        if: always()
+        run: echo "bg=${{ steps.bg.outcome }}"

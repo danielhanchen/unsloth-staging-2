@@ -1,0 +1,20 @@
+name: p3-f-security-shape
+on:
+  push:
+    branches: [ci-par-probe]
+jobs:
+  j:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install pytest + PyYAML
+        run: echo ok
+      - name: Run workflow-trigger lint
+        id: trigger-lint
+        background: true
+        timeout-minutes: 5
+        run: sleep 3; echo LINT-FAIL; exit 1
+      - name: Install heavy
+        run: sleep 10; echo HEAVY
+      - name: Run security regression tests
+        run: echo REGRESSIONS-RAN
+      - wait: trigger-lint

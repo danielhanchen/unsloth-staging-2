@@ -1,0 +1,21 @@
+name: p3-c-bg-timeout
+on:
+  push:
+    branches: [ci-par-probe]
+jobs:
+  j:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: t0
+        run: date +%s > /tmp/t0
+      - name: bg
+        id: bg
+        background: true
+        timeout-minutes: 1
+        run: sleep 150; echo SHOULD-NOT-PRINT
+      - name: fg
+        run: echo fg
+      - wait: bg
+      - name: summary
+        if: always()
+        run: echo "bg=${{ steps.bg.outcome }} elapsed=$(( $(date +%s) - $(cat /tmp/t0) ))"

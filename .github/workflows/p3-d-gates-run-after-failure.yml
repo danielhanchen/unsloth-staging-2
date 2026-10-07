@@ -1,0 +1,30 @@
+name: p3-d-gates-run-after-failure
+on:
+  push:
+    branches: [ci-par-probe]
+jobs:
+  j:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: deps
+        id: deps
+        run: echo ok
+      - name: bg
+        id: bg
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        background: true
+        run: sleep 15; echo BG-DONE
+      - name: gate1-fails
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: exit 1
+      - name: gate2
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        run: echo GATE2-RAN
+      - name: advisory
+        if: ${{ !cancelled() && steps.deps.outcome == 'success' }}
+        continue-on-error: true
+        run: exit 7
+      - wait: bg
+      - name: summary
+        if: always()
+        run: echo "bg=${{ steps.bg.outcome }}"
