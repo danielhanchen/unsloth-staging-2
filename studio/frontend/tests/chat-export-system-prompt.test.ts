@@ -21,6 +21,7 @@ import {
 } from "../src/features/chat/utils/conversation-markdown.ts";
 import {
   buildNamedConversationsMarkdown,
+  conversationExportBasename,
   createConversationMarkdownBuilder,
   createConversationMarkdownExporter,
 } from "../src/features/chat/utils/conversation-markdown-export.ts";
@@ -169,6 +170,7 @@ function loadExporters(
     renderConversationBlocks,
     buildConversationMarkdown,
     buildNamedConversationsMarkdown,
+    conversationExportBasename,
     createConversationMarkdownBuilder,
     createConversationMarkdownExporter,
     CONVERSATION_MARKDOWN_MIME_TYPE,

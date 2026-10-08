@@ -129,6 +129,7 @@ function loadExporters(
     csvDocument,
     CSV_MIME,
     exportTs: () => "ts",
+    conversationBasename: async () => "conversation",
     downloadBlob: async (body: string) => {
       downloads.push(body);
     },
