@@ -2707,6 +2707,55 @@ def _split_parallel_tool_calls(messages: list) -> list:
     return out
 
 
+def _repair_orphan_tool_results(messages: list) -> list:
+    """Give each replayed tool result with no assistant call before it a placeholder call, since
+    strict templates (gpt-oss) refuse an orphan result. Render fallback only: the placeholder is
+    text the model reads, so it is built only after the plain render failed. A preceding assistant
+    text turn takes the calls rather than a second assistant turn, which alternation checks refuse.
+    A repaired list repairs to itself."""
+    mutated = False
+    out: list = []
+    # Whether the previous message is an assistant call or a result answering one.
+    linked = False
+    # Index in out of the assistant turn this repair gave calls to, while its results run.
+    repaired_at = None
+
+    for message in messages:
+        role = message.get("role") if isinstance(message, dict) else None
+        if role != "tool":
+            linked = role == "assistant" and bool(message.get("tool_calls"))
+            repaired_at = None
+            out.append(message)
+            continue
+        if linked and repaired_at is None:
+            out.append(message)
+            continue
+
+        call_id = message.get("tool_call_id") or f"replayed_tool_{len(out)}"
+        call = {
+            "id": call_id,
+            "type": "function",
+            "function": {"name": message.get("name") or "tool", "arguments": {}},
+        }
+        if repaired_at is not None:
+            calls = out[repaired_at]["tool_calls"]
+            if all(c.get("id") != call_id for c in calls):
+                out[repaired_at] = {**out[repaired_at], "tool_calls": [*calls, call]}
+        elif out and isinstance(out[-1], dict) and out[-1].get("role") == "assistant":
+            out[-1] = {**out[-1], "tool_calls": [call]}
+            repaired_at = len(out) - 1
+        else:
+            out.append({"role": "assistant", "content": "", "tool_calls": [call]})
+            repaired_at = len(out) - 1
+        if not message.get("tool_call_id"):
+            message = {**message, "tool_call_id": call_id}
+        out.append(message)
+        linked = True
+        mutated = True
+
+    return out if mutated else messages
+
+
 _MARKUP_BY_TOKENIZER: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
 
 
@@ -3370,6 +3419,9 @@ def apply_chat_template_for_generation(
         split = _split_parallel_tool_calls(normalized)
         if split is not normalized:
             candidates.append(split)
+        repaired = _repair_orphan_tool_results(split)
+        if repaired is not split:
+            candidates.append(repaired)
         for candidate in candidates:
             try:
                 return _render_with_fallback(candidate)
