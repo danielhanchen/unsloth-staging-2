@@ -8808,6 +8808,53 @@ def _as_ollama_manifest_request(request):
     return request.model_copy(update = {"model_path": ref})
 
 
+def _as_local_scan_folder_request(request):
+    """*request* with a repo id whose GGUF copy sits outside the active hub cache (e.g. a scan folder) rewritten to it."""
+    from core.inference.local_model_resolver import _is_abs_path_id, resolve_local_gguf
+    from core.inference.model_ids import hf_cache_repo_id
+
+    identifier = (request.model_path or "").strip()
+    # Bare names mean unsloth/<name> remotely; a same-stemmed local file must not win them.
+    if (
+        not identifier
+        or "/" not in identifier
+        or is_ollama_manifest_ref(identifier)
+        or _is_abs_path_id(identifier)
+    ):
+        return request
+    # Same boundary as _as_ollama_manifest_request: grants and leases name the exact id.
+    if account_access.managed_account() or getattr(request, "native_path_lease", None):
+        return request
+    wanted = f"{identifier}:{request.gguf_variant}" if request.gguf_variant else identifier
+    try:
+        resolved = resolve_local_gguf(wanted)
+    except Exception:
+        return request
+    if resolved is None:
+        return request
+    load_path, variant = str(resolved[0]), resolved[1]
+    # GGUF snapshots of this very repo only: their path maps back to the repo id for status,
+    # unload and consent, which an LM Studio dir or a non-GGUF checkpoint would not.
+    if not variant or (hf_cache_repo_id(load_path) or "").lower() != identifier.lower():
+        return request
+    # A repo directly in the active hub cache already loads by repo id without downloading.
+    try:
+        from hub.utils.hf_cache_state import same_existing_path
+        from routes.models import _resolve_hf_cache_dir
+
+        repo_dir = next(p for p in Path(load_path).parents if p.name.startswith("models--"))
+        if same_existing_path(repo_dir.parent, Path(_resolve_hf_cache_dir())):
+            return request
+    except Exception:
+        return request
+    logger.info(
+        "Resolved repo id '%s' to local path %s instead of downloading",
+        identifier,
+        load_path,
+    )
+    return request.model_copy(update = {"model_path": load_path, "gguf_variant": variant})
+
+
 async def _lease_ollama_model_ref(
     request: LoadRequest | ValidateModelRequest, *, operation: str, stack: ExitStack
 ) -> Optional[str]:
@@ -18049,6 +18096,7 @@ async def _load_model_impl(
     if account_access.managed_account() and not native_access_deferred:
         await asyncio.to_thread(account_access.require_model_access, request.model_path)
     request = await asyncio.to_thread(_as_ollama_manifest_request, request)
+    request = await asyncio.to_thread(_as_local_scan_folder_request, request)
     if account_access.managed_account():
         request = request.model_copy(
             update = {"hf_token": account_access.account_hf_token(request.hf_token)}
@@ -19566,6 +19614,8 @@ async def validate_model(
     if account_access.managed_account() and not native_access_deferred:
         await asyncio.to_thread(account_access.require_model_access, request.model_path)
     request = await asyncio.to_thread(_as_ollama_manifest_request, request)
+    # The chat flow validates before /load; offline the remote probe would refuse the id.
+    request = await asyncio.to_thread(_as_local_scan_folder_request, request)
     from core.inference.llama_cpp import (
         LlamaServerNotFoundError,
         _hf_offline_if_unreachable_for,
