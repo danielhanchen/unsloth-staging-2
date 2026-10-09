@@ -6,7 +6,7 @@ name: desktop-test-build
 
 on:
   push:
-    branches: [desktop-test-r11]
+    branches: [desktop-test-r13]
   workflow_dispatch:
     inputs:
       app_version:
