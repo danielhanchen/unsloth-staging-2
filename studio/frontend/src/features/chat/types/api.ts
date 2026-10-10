@@ -116,6 +116,8 @@ export interface LoadModelRequest {
   /** Load a vision-capable GGUF without its mmproj, freeing the VRAM the projector would occupy.
    *  Image input is unavailable for the session; text generation is unaffected. */
   disable_vision?: boolean | null;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  use_model_ini?: boolean;
   /** GPU memory strategy for GGUF models. "auto" (default): Unsloth selects GPUs and caps context to
    *  fit VRAM. "manual": you own the offload, with gpu_layers -1 handing sizing to llama.cpp's
    *  --fit and >= 0 pinning layers/n_cpu_moe. */
@@ -301,6 +303,13 @@ export interface LoadModelResponse {
    *  round-trips the Advanced Settings switch even on a GGUF that never had a projector, unlike
    *  vision_disabled_by_user below. */
   disable_vision?: boolean;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  model_ini_applied?: boolean;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  model_ini_sampling?: boolean;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  model_ini_sampling_keys?: string[];
+  model_ini_cache_type?: boolean;
   /** Image input is off because the user asked, not because the mmproj is missing. */
   vision_disabled_by_user?: boolean;
   gpu_memory_mode?: "auto" | "manual";
@@ -446,6 +455,13 @@ export interface InferenceStatusResponse {
   /** The load ran with the vision projector deliberately left unloaded. Echoes the request, so it
    *  round-trips the Advanced Settings switch even on a GGUF that never had a projector. */
   disable_vision?: boolean;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  model_ini_applied?: boolean;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  model_ini_sampling?: boolean;
+  // biome-ignore lint/style/useNamingConvention: API schema
+  model_ini_sampling_keys?: string[];
+  model_ini_cache_type?: boolean;
   /** Image input is off because the user asked, not because the mmproj is missing. */
   vision_disabled_by_user?: boolean;
   gpu_memory_mode?: "auto" | "manual";
@@ -848,4 +864,17 @@ export interface AudioConvertCaps {
   style: boolean;
   route_reloads: boolean;
   source_max_seconds: number;
+}
+
+export interface ModelIniResponse {
+  found: boolean;
+  filename: string;
+  location: string | null;
+  sections: string[];
+  // biome-ignore lint/style/useNamingConvention: API schema
+  applied_sections: string[];
+  args: string[];
+  // biome-ignore lint/style/useNamingConvention: API schema
+  n_parallel: number | null;
+  ignored: { key: string; section: string; reason: string }[];
 }

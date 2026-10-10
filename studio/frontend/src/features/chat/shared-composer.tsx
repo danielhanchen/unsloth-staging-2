@@ -155,6 +155,7 @@ import {
   type PerModelConfig,
   loadedContextFields,
 } from "@/features/model-picker";
+import { structuredKvCacheDtypeAfterLoad } from "@/features/model-picker/model-config/model-ini";
 import { loadManagedLlamaFlags } from "@/features/model-picker/api/llama-flags";
 import { fetchLoadExtraArgs } from "@/features/model-picker/api/model-overrides";
 import { sanitizeStoredExtraArgs } from "@/features/model-picker/model-config/llama-extra-args";
@@ -1745,6 +1746,10 @@ export function SharedComposer({
                 gpu_layers: effectiveGpuLayers,
                 // Slots scale the KV estimate; keep validate sized like the load.
                 n_parallel: ownConfig.nParallel ?? null,
+                ...(ownConfig.useModelIni && !resolvedIsDiffusion
+                  ? // biome-ignore lint/style/useNamingConvention: API schema
+                    { use_model_ini: true }
+                  : {}),
                 reasoning_budget: resolvedIsDiffusion
                   ? -1
                   : ownConfig.reasoningBudget,
@@ -1859,6 +1864,10 @@ export function SharedComposer({
                   ? // biome-ignore lint/style/useNamingConvention: API schema
                     { llama_extra_args: ownConfig.llamaExtraArgs ?? [] }
                   : {}),
+                ...(ownConfig.useModelIni && !resolvedIsDiffusion
+                  ? // biome-ignore lint/style/useNamingConvention: API schema
+                    { use_model_ini: true }
+                  : {}),
                 ...(ownConfig.nBatch != null
                   ? { n_batch: ownConfig.nBatch }
                   : {}),
@@ -1951,8 +1960,16 @@ export function SharedComposer({
           supportsPreserveThinking: resp.supports_preserve_thinking ?? false,
           preserveThinking: resolvePreserveThinkingOnLoad(resp),
           supportsTools: resp.supports_tools ?? false,
-          kvCacheDtype: resp.cache_type_kv ?? null,
-          loadedKvCacheDtype: resp.cache_type_kv ?? null,
+          kvCacheDtype: structuredKvCacheDtypeAfterLoad(
+            resp.cache_type_kv,
+            ownConfig.kvCacheDtype,
+            resp.model_ini_cache_type,
+          ),
+          loadedKvCacheDtype: structuredKvCacheDtypeAfterLoad(
+            resp.cache_type_kv,
+            ownConfig.kvCacheDtype,
+            resp.model_ini_cache_type,
+          ),
           ...mlxRuntimeStateFrom(resp),
           // Click-time value, not the resolved echo (see the single-model load).
           nParallel: committedSlots,
@@ -2003,6 +2020,8 @@ export function SharedComposer({
           // Adopted from the echo like the knob above: this pane loaded its own model, so the editable
           // value must follow it or Advanced Settings shows the other pane's Vision state.
           disableVision: resp.disable_vision ?? false,
+          useModelIni: resp.model_ini_applied === true,
+          loadedModelIni: resp.model_ini_applied === true,
           defaultChatTemplate: resp.chat_template ?? null,
           chatTemplateOverride: effectiveChatTemplateOverride,
           loadedChatTemplateOverride: effectiveChatTemplateOverride,
