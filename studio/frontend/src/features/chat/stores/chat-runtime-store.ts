@@ -2517,6 +2517,12 @@ type ChatRuntimeStore = {
   loadedDisableVision: boolean | null;
   /** Load a vision GGUF without its mmproj, freeing the projector's VRAM. */
   disableVision: boolean;
+  /** Launch with the unsloth.ini beside the GGUF; `loadedModelIni` = the running server's model_ini_applied echo. */
+  useModelIni: boolean;
+  loadedModelIni: boolean | null;
+  /** The sampling keys the last merged load or status took from an unsloth.ini, so a value the file stops
+   *  supplying is reset instead of kept as if the user had set it. Survives unload, like the sliders. */
+  modelIniSamplingKeys: string[];
   /** Backend-reported: image input is off by request, not by absence of a projector. Null until first hydrated. */
   loadedVisionDisabledByUser: boolean | null;
   /** GPU memory strategy for GGUF loads. "auto" fits GPUs and context for you; "manual" owns
@@ -4286,6 +4292,9 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   loadedTensorParallel: null,
   loadedDisableVision: null,
   disableVision: false,
+  useModelIni: false,
+  loadedModelIni: null,
+  modelIniSamplingKeys: [],
   loadedVisionDisabledByUser: null,
   gpuMemoryMode: readPersistedGpuMemoryMode(),
   loadedGpuMemoryMode: null,
@@ -5237,6 +5246,8 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       loadedTensorParallel: null,
   loadedDisableVision: null,
       disableVision: false,
+      useModelIni: false,
+      loadedModelIni: null,
       loadedVisionDisabledByUser: null,
       // Standing preference: survives unload, unlike the per-model knobs above.
       gpuMemoryMode: readPersistedGpuMemoryMode(),

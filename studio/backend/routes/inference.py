@@ -8384,6 +8384,214 @@ def _unsloth_serving_fields(model_info: dict) -> dict:
     }
 
 
+def _model_ini_record_for(request, source) -> Optional[tuple]:
+    """``(prefix, source, sets_sampling)`` for a load that applied its unsloth.ini, else None.
+    Kept even with no tokens: an INI holding only ``np`` still shaped the load."""
+    if not getattr(request, "_model_ini_applied", False):
+        return None
+    return (
+        tuple(_model_ini_tokens(request)),
+        source,
+        bool(getattr(request, "_model_ini_sampling", False)),
+    )
+
+
+def _resident_model_ini_record(llama_backend) -> Optional[tuple]:
+    """The resident load's INI record, while the stored extras are still that load's."""
+    record = getattr(llama_backend, "_studio_model_ini_record", None)
+    if not record or record[1] != getattr(llama_backend, "extra_args_source", None):
+        return None
+    return record
+
+
+def _model_ini_resident(llama_backend) -> bool:
+    return bool(not llama_backend.is_diffusion and _resident_model_ini_record(llama_backend))
+
+
+def _model_ini_prefix(llama_backend) -> tuple[str, ...]:
+    """The unsloth.ini tokens the resident load put ahead of its extras."""
+    record = _resident_model_ini_record(llama_backend)
+    return record[0] if record else ()
+
+
+def _without_model_ini(llama_backend, args: Optional[list[str]]) -> Optional[list[str]]:
+    """``args`` (a stored extras list) minus the resident unsloth.ini prefix: the INI is
+    re-read per load, so it must never be inherited as if the user had typed it."""
+    prefix = _model_ini_prefix(llama_backend)
+    if not prefix or args is None:
+        return args
+    # Placement can drop INI flags from the stored list (device, split-mode, tensor-split strips),
+    # so match the prefix one flag group at a time and skip groups that are gone.
+    groups: list[tuple[str, ...]] = []
+    for token in prefix:
+        if token.startswith("--") or not groups:
+            groups.append((token,))
+        else:
+            groups[-1] = (*groups[-1], token)
+    args = list(args)
+    i = 0
+    for group in groups:
+        if tuple(args[i : i + len(group)]) == group:
+            i += len(group)
+    return args[i:]
+
+
+def _model_ini_tokens(request) -> list[str]:
+    """The request's unsloth.ini tokens. Manual GPU memory owns the offload flags, the same
+    rule typed and inherited extras follow."""
+    args = list(getattr(request, "_model_ini_args", ()) or ())
+    if args and getattr(request, "gpu_memory_mode", None) == "manual":
+        args = strip_shadowing_flags(
+            args,
+            strip_context = False,
+            strip_cache = False,
+            strip_spec = False,
+            strip_template = False,
+            strip_split_mode = False,
+            strip_tensor_split = _should_strip_tensor_split(request),
+            strip_offload = True,
+        )
+    return args
+
+
+def _with_model_ini(request, extras: Optional[list[str]]) -> Optional[list[str]]:
+    """INI tokens first, then the caller's extras, so a typed flag still wins (last wins)."""
+    ini = _model_ini_tokens(request)
+    if not ini:
+        return extras
+    return [*ini, *(extras or [])]
+
+
+def _apply_model_ini_to_request(request, model_identifier: str, label: str):
+    """Resolve and compile the unsloth.ini a ``use_model_ini`` request asked for. Returns the
+    request with ``_model_ini_args`` set and ``np`` moved into ``n_parallel``; unchanged for a
+    non-GGUF model. Blocking (file listing, download): call off-loop."""
+    from core.inference.llama_model_ini import (
+        MODEL_INI_FILENAME,
+        NotGgufModel,
+        locate_model_ini,
+        parse_model_ini,
+    )
+
+    if not getattr(request, "use_model_ini", False):
+        return request
+    try:
+        # Same reachability guard config resolution uses: a cached repo resolves from disk offline.
+        with _hf_offline_if_unreachable_for(model_identifier) as forced_offline:
+            located = locate_model_ini(
+                model_identifier,
+                request.gguf_variant,
+                hf_token = request.hf_token,
+                offline = bool(forced_offline),
+            )
+    except NotGgufModel:
+        return request
+    except ValueError as exc:
+        raise HTTPException(status_code = 400, detail = redact_native_paths(str(exc))) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code = 503,
+            detail = f"Could not read {MODEL_INI_FILENAME}: {redact_native_paths(str(exc))}",
+        ) from exc
+    if located is None:
+        raise HTTPException(
+            status_code = 400,
+            detail = (
+                f"{label} has no {MODEL_INI_FILENAME} beside the selected GGUF. "
+                "Turn off 'Use .ini file' in Advanced settings, or add the file."
+            ),
+        )
+    compiled = parse_model_ini(
+        located.text, quant = located.quant, gguf_filename = located.gguf_filename
+    )
+    try:
+        args = validate_extra_args(compiled.args)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code = 400,
+            detail = f"{MODEL_INI_FILENAME}: {redact_native_paths(str(exc))}",
+        ) from exc
+    if compiled.ignored:
+        logger.info(
+            "%s: ignored %s",
+            MODEL_INI_FILENAME,
+            ", ".join(f"[{i['section']}] {i['key']} ({i['reason']})" for i in compiled.ignored),
+        )
+    if compiled.n_parallel is not None:
+        request = request.model_copy(update = {"n_parallel": compiled.n_parallel})
+    request._model_ini_args = tuple(args)
+    request._model_ini_applied = True
+    request._model_ini_sampling = any(token in _MODEL_INI_SAMPLING for token in args)
+    return request
+
+
+_MODEL_INI_SAMPLING = {
+    "--temp": "temperature",
+    "--temperature": "temperature",
+    "--top-p": "top_p",
+    "--top-k": "top_k",
+    "--min-p": "min_p",
+    "--repeat-penalty": "repetition_penalty",
+    "--presence-penalty": "presence_penalty",
+}
+# ChatCompletionRequest's bounds: a promoted value outside them would 422 every chat request.
+_MODEL_INI_SAMPLING_BOUNDS = {
+    "temperature": (0.0, 2.0),
+    "top_p": (0.0, 1.0),
+    "top_k": (-1, 100),
+    "min_p": (0.0, 1.0),
+    "repetition_penalty": (1.0, 2.0),
+    "presence_penalty": (0.0, 2.0),
+}
+
+
+def _model_ini_sampling_values(llama_backend) -> dict:
+    """The samplers the resident unsloth.ini supplied, keyed like ``inference``. Values come
+    from the whole launched list, last wins as in llama.cpp, so a typed --temp after the INI's
+    is the one reported."""
+    record = _resident_model_ini_record(llama_backend)
+    if not record or not record[2]:
+        return {}
+    supplied = {_MODEL_INI_SAMPLING[t] for t in record[0] if t in _MODEL_INI_SAMPLING}
+    tokens = [str(t) for t in getattr(llama_backend, "extra_args", None) or record[0]]
+    values: dict = {}
+    from core.inference.llama_server_args import _flag_name
+
+    for i, token in enumerate(tokens):
+        _, eq, inline = token.partition("=")
+        key = _MODEL_INI_SAMPLING.get(_flag_name(token) or "")
+        if key not in supplied:
+            continue
+        value = inline if eq else (tokens[i + 1] if i + 1 < len(tokens) else None)
+        try:
+            values[key] = int(value) if key == "top_k" else float(value)
+        except (TypeError, ValueError):
+            continue
+    # A typed override past the chat bounds launches as typed but is not pushed into the sliders.
+    return {
+        key: value
+        for key, value in values.items()
+        if _MODEL_INI_SAMPLING_BOUNDS[key][0] <= value <= _MODEL_INI_SAMPLING_BOUNDS[key][1]
+    }
+
+
+def _model_ini_sampling_keys(llama_backend) -> list[str]:
+    if not _model_ini_resident(llama_backend):
+        return []
+    return sorted(_model_ini_sampling_values(llama_backend))
+
+
+def _with_model_ini_sampling(inference: Optional[dict], llama_backend) -> Optional[dict]:
+    """``inference`` with the resident unsloth.ini's sampling values on top: the chat sends its
+    sliders on every request, so a server default alone would never reach the user."""
+    values = _model_ini_sampling_values(llama_backend)
+    if not inference or not values:
+        return inference
+    return {**inference, **values}
+
+
 def _llama_runtime_fields(llama_backend: LlamaCppBackend) -> dict:
     """Runtime state shared by load, dedupe, and status; duplicates echo active settings."""
     fields = {
@@ -8453,8 +8661,15 @@ def _llama_runtime_fields(llama_backend: LlamaCppBackend) -> dict:
             else (
                 None
                 if getattr(llama_backend, "requested_extra_args", None) is None
-                else list(llama_backend.requested_extra_args)
+                else _without_model_ini(llama_backend, list(llama_backend.requested_extra_args))
             )
+        ),
+        model_ini_applied = _model_ini_resident(llama_backend),
+        model_ini_sampling_keys = _model_ini_sampling_keys(llama_backend),
+        model_ini_sampling = bool(_model_ini_sampling_keys(llama_backend)),
+        model_ini_cache_type = any(
+            flag in ("--cache-type-k", "--cache-type-v")
+            for flag in _model_ini_prefix(llama_backend)
         ),
     )
     unresolved = (
@@ -8508,8 +8723,9 @@ def _gguf_load_response(
         is_lora = False,
         is_gguf = True,
         is_local_model = is_local_model,
-        inference = load_inference_config(
-            inference_identifier or llama_backend.model_identifier or model
+        inference = _with_model_ini_sampling(
+            load_inference_config(inference_identifier or llama_backend.model_identifier or model),
+            llama_backend,
         ),
         # Advisory, and None on nearly every load. Recorded by load_model when the
         # weights outgrow fast memory, so the client can say why generation is slow.
@@ -8705,7 +8921,7 @@ def _active_gguf_intent(
     n_parallel: int,
     native_grant_backed: bool,
 ) -> GgufLoadIntent:
-    backend_extra = list(llama_backend.extra_args or ())
+    backend_extra = list(_without_model_ini(llama_backend, llama_backend.extra_args) or ())
     request_fields_set = getattr(request, "model_fields_set", set())
     inherits_extras = request.llama_extra_args is None
     if inherits_extras:
@@ -8739,6 +8955,7 @@ def _active_gguf_intent(
     else:
         effective_extra = request.llama_extra_args
         batch_overrides_inherit = False
+    effective_extra = _with_model_ini(request, effective_extra)
     source = llama_backend.last_load_intent or GgufLoadIntent(
         model_identifier = model_identifier,
         gguf_path = None if llama_backend.hf_repo else llama_backend.gguf_path,
@@ -16671,9 +16888,12 @@ def _resolve_inherited_extra_args(
     if not getattr(config, "is_gguf", False):
         return extra_llama_args
     llama_backend = get_llama_cpp_backend()
-    stored_args = getattr(llama_backend, "extra_args", None)
+    raw_stored = getattr(llama_backend, "extra_args", None)
+    stored_args = _without_model_ini(llama_backend, raw_stored)
     if not stored_args:
-        return extra_llama_args
+        # Only INI tokens were stored: an explicit [] makes the backend drop them, where None
+        # would keep them as this load's extras for the next load to inherit.
+        return [] if raw_stored and extra_llama_args is None else extra_llama_args
     # Inherit the previous load's extras (the chat-settings Apply path doesn't
     # round-trip them; an explicit [] still clears). Gated on (model_identifier,
     # hf_variant) to refuse cross-model pickup, and shadowing flags are
@@ -18452,6 +18672,11 @@ async def _load_model_impl(
         if native_access_deferred:
             await asyncio.to_thread(account_access.require_model_access, model_identifier)
 
+        # Before the slot count below, which np in the INI feeds.
+        request = await asyncio.to_thread(
+            _apply_model_ini_to_request, request, model_identifier, model_log_label
+        )
+
         # Keep the inventory ref public while loading the materialized artifact.
         public_model_identifier = _public_model_identifier(request.model_path, model_identifier)
         # Only when unset: auto-switch and the idle stash own their own scope. Walks
@@ -18718,6 +18943,8 @@ async def _load_model_impl(
             extra_llama_args,
             effective_chat_template_override,
         )
+        if config.is_gguf:
+            extra_llama_args = _with_model_ini(request, extra_llama_args)
 
         # Invalid GPU IDs must fail before the training coexistence guard.
         placement = await _prepare_load_placement(config, request, extra_llama_args)
@@ -19234,6 +19461,9 @@ async def _load_model_impl(
 
             llama_backend._openai_gguf_companion_roots = tuple(request._gguf_companion_roots)
             llama_backend._openai_gguf_companion_state = gguf_companion_state
+            llama_backend._studio_model_ini_record = _model_ini_record_for(
+                request, llama_backend.extra_args_source
+            )
             if replacing:
                 await asyncio.to_thread(note_model_loaded, llama_backend)
             # None elsewhere: only an Ollama load has an identifier no client should be handed.
@@ -19870,6 +20100,9 @@ async def validate_model(
         )
         if native_access_deferred:
             await asyncio.to_thread(account_access.require_model_access, model_identifier)
+        request = await asyncio.to_thread(
+            _apply_model_ini_to_request, request, model_identifier, model_log_label
+        )
 
         # Same roots /load will use, or a sibling-revision projector reads as text-only here
         # and the load then serves vision.
@@ -19919,6 +20152,8 @@ async def validate_model(
             _public_model_identifier(request.model_path, model_identifier),
             getattr(request, "llama_extra_args", None),
         )
+        if config.is_gguf:
+            effective_extra_args = _with_model_ini(request, effective_extra_args)
 
         # The caller's list is judged BEFORE anything rewrites it, exactly as /load
         # judges the explicit list it was sent. Translating first let a list /load
@@ -22201,7 +22436,9 @@ async def _slot_status(current_subject: str):
             _native_grant_backed = getattr(llama_backend, "_native_grant_backed", False)
             # Shared with /chat/count_tokens, so a client can tell whose tokenizer counted.
             _display_model_id, _reported_model_identifier = _llama_status_model_ids(llama_backend)
-            _inference_cfg = load_inference_config(_model_id) if _model_id else None
+            _inference_cfg = _with_model_ini_sampling(
+                load_inference_config(_model_id) if _model_id else None, llama_backend
+            )
             # Don't surface Unsloth's auto-applied bundled family template (e.g. the
             # gemma-4 override) as a user-authored override: the frontend adopts
             # status.chat_template_override as editable state and would otherwise

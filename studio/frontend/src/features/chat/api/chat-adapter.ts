@@ -43,6 +43,7 @@ import {
   loadedContextFields,
   resolveInitialConfig,
 } from "@/features/model-picker";
+import { structuredKvCacheDtypeAfterLoad } from "@/features/model-picker/model-config/model-ini";
 import { isMlxId } from "@/features/model-picker/components/model-selector/recommended-fit";
 import { loadManagedLlamaFlags } from "@/features/model-picker/api/llama-flags";
 import { fetchLoadExtraArgs } from "@/features/model-picker/api/model-overrides";
@@ -3780,6 +3781,7 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
             ...(resolvedExtraArgs !== undefined
               ? { llama_extra_args: resolvedExtraArgs ?? [] }
               : {}),
+            ...(config.useModelIni && !isDiffusion ? { use_model_ini: true } : {}),
           }
         : {}),
     }).catch((error: unknown) => {
@@ -3872,8 +3874,16 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
           preserveThinking: resolvePreserveThinkingOnLoad(loadResp),
           supportsTools: loadResp.supports_tools ?? false,
           ...resolveToolsEnabledOnLoad(loadResp.supports_tools ?? false),
-          kvCacheDtype: loadResp.cache_type_kv ?? null,
-          loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
+          kvCacheDtype: structuredKvCacheDtypeAfterLoad(
+            loadResp.cache_type_kv,
+            config.kvCacheDtype,
+            loadResp.model_ini_cache_type,
+          ),
+          loadedKvCacheDtype: structuredKvCacheDtypeAfterLoad(
+            loadResp.cache_type_kv,
+            config.kvCacheDtype,
+            loadResp.model_ini_cache_type,
+          ),
           ...mlxRuntimeStateFrom(loadResp),
           // Click-time value, not the resolved backend echo (see performLoad).
           nParallel: committedSlots,
@@ -3919,6 +3929,8 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
           // Repaired from the echo alongside tensorParallel: a stale true would show Vision off over a
           // loaded projector, and the next Apply would send it.
           disableVision: loadResp.disable_vision ?? false,
+          useModelIni: loadResp.model_ini_applied === true,
+          loadedModelIni: loadResp.model_ini_applied === true,
           loadedVisionDisabledByUser: loadResp.vision_disabled_by_user ?? false,
           ...loadedGpuMemoryFields(loadResp),
           loadedCustomContextLength: keepCustomCtx,
@@ -3944,8 +3956,16 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
           preserveThinking: resolvePreserveThinkingOnLoad(loadResp),
           supportsTools: loadResp.supports_tools ?? false,
           ...resolveToolsEnabledOnLoad(loadResp.supports_tools ?? false),
-          kvCacheDtype: loadResp.cache_type_kv ?? null,
-          loadedKvCacheDtype: loadResp.cache_type_kv ?? null,
+          kvCacheDtype: structuredKvCacheDtypeAfterLoad(
+            loadResp.cache_type_kv,
+            config.kvCacheDtype,
+            loadResp.model_ini_cache_type,
+          ),
+          loadedKvCacheDtype: structuredKvCacheDtypeAfterLoad(
+            loadResp.cache_type_kv,
+            config.kvCacheDtype,
+            loadResp.model_ini_cache_type,
+          ),
           ...mlxRuntimeStateFrom(loadResp),
           nParallel: committedSlots,
           loadedNParallel: committedSlots,

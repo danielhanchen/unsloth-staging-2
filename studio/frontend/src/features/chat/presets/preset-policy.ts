@@ -274,6 +274,7 @@ interface BackendInferenceDefaults {
   top_k?: number;
   min_p?: number;
   presence_penalty?: number;
+  repetition_penalty?: number;
   trust_remote_code?: boolean;
 }
 
@@ -283,17 +284,64 @@ export interface BackendInferenceEnvelope {
   inference?: BackendInferenceDefaults | null;
 }
 
+// `inference` keys an unsloth.ini can set, and the slider each one drives.
+const MODEL_INI_SAMPLING_PARAMS = {
+  temperature: "temperature",
+  top_p: "topP",
+  top_k: "topK",
+  min_p: "minP",
+  repetition_penalty: "repetitionPenalty",
+  presence_penalty: "presencePenalty",
+} as const satisfies Record<string, keyof InferenceParams>;
+
+/** The Qwen3 thinking table with each sampling key the model's unsloth.ini set taken from `inference`
+ *  instead: the file outranks the table, but only for what it names. */
+export function qwenThinkingParamsWithModelIni<T extends Partial<InferenceParams>>(
+  qwenParams: T,
+  response: {
+    inference?: BackendInferenceDefaults | null;
+    model_ini_sampling_keys?: readonly string[] | null;
+  },
+): T {
+  const merged: Partial<InferenceParams> = { ...qwenParams };
+  for (const key of response.model_ini_sampling_keys ?? []) {
+    const param = MODEL_INI_SAMPLING_PARAMS[key as keyof typeof MODEL_INI_SAMPLING_PARAMS];
+    const value = toFiniteNumber(
+      response.inference?.[key as keyof BackendInferenceDefaults],
+    );
+    if (param && value !== undefined) {
+      merged[param] = value;
+    }
+  }
+  return merged as T;
+}
+
+/** The INI-owned sampling keys to remember after a merge. Only a Default-preset merge adopts the file's
+ *  values, so only it changes which keys the file owns. */
+export function modelIniSamplingKeysAfterMerge(
+  presetSource: ChatPresetSource,
+  previous: readonly string[],
+  response: { model_ini_sampling_keys?: readonly string[] | null },
+): string[] {
+  return presetSource === "builtin-default"
+    ? [...(response.model_ini_sampling_keys ?? [])]
+    : [...previous];
+}
+
 export function mergeBackendRecommendedInference({
   current,
   response,
   modelId,
   presetSource,
   loadedContextLength,
+  previousModelIniSamplingKeys,
 }: {
   current: InferenceParams;
   response: BackendInferenceEnvelope;
   modelId: string;
   presetSource: ChatPresetSource;
+  /** The INI-owned keys of the previous merge: a penalty the file set and no longer does goes back to default. */
+  previousModelIniSamplingKeys?: readonly string[] | null;
   /** The window the response reports, as the context constructor reads it -- not the raw
    *  field, where a backend that sizes nothing echoes the length it was asked for. */
   loadedContextLength: number | null;
@@ -330,6 +378,12 @@ export function mergeBackendRecommendedInference({
     presencePenalty:
       toFiniteNumber(inference?.presence_penalty) ??
       defaultInferenceParams.presencePenalty,
+    // Only an unsloth.ini reports it; absent, the slider keeps its value unless the file had set it.
+    repetitionPenalty:
+      toFiniteNumber(inference?.repetition_penalty) ??
+      (previousModelIniSamplingKeys?.includes("repetition_penalty")
+        ? defaultInferenceParams.repetitionPenalty
+        : next.repetitionPenalty),
   };
 }
 

@@ -41,6 +41,7 @@ import type {
   ListModelsResponse,
   LoadModelRequest,
   LoadModelResponse,
+  ModelIniResponse,
   OpenAIChatChunk,
   OpenAIChatCompletionsRequest,
   UnloadModelRequest,
@@ -419,6 +420,11 @@ export async function validateModel(
       ...(payload.llama_extra_args !== undefined
         ? // biome-ignore lint/style/useNamingConvention: API schema
           { llama_extra_args: payload.llama_extra_args }
+        : {}),
+      // The INI can set -c and cache types, so the preflight must size the same command.
+      ...(payload.use_model_ini
+        ? // biome-ignore lint/style/useNamingConvention: API schema
+          { use_model_ini: true }
         : {}),
       // batch sizes scale the same estimate; omitted when blank so they never read as set
       ...(payload.n_batch != null ? { n_batch: payload.n_batch } : {}),
@@ -1491,6 +1497,30 @@ export async function listGgufVariants(
     });
     return parseJsonOrThrow<GgufVariantsResponse>(response);
   });
+}
+
+/** The unsloth.ini beside a GGUF variant. Absent is `found: false`, not an error. */
+export async function fetchModelIni(
+  repoId: string,
+  ggufVariant: string | null | undefined,
+  options?: { hfToken?: string; signal?: AbortSignal; nativePathToken?: string | null },
+): Promise<ModelIniResponse> {
+  const params = new URLSearchParams({ repo_id: repoId });
+  if (ggufVariant) params.set("gguf_variant", ggufVariant);
+  if (isHuggingFaceOffline()) params.set("offline", "true");
+  // A file-picked GGUF is known to the backend only through a lease; its id is just a label.
+  if (options?.nativePathToken) {
+    const { nativePathLease } = await consumeNativePathToken(
+      options.nativePathToken,
+      "validate-model",
+    );
+    params.set("native_path_lease", nativePathLease);
+  }
+  const response = await authFetch(`/api/models/model-ini?${params}`, {
+    headers: hubTokenHeader(options?.hfToken),
+    signal: options?.signal,
+  });
+  return parseJsonOrThrow<ModelIniResponse>(response);
 }
 
 export interface KvCacheEstimate {

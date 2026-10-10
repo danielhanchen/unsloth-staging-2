@@ -73,6 +73,11 @@ SPEECH_GGUF_ARCHS = _gguf_archs.SPEECH_GGUF_ARCHS
 is_speech_gguf_architecture = _gguf_archs.is_speech_gguf_architecture
 from utils.account_context import account_thread
 from utils.utils import canonical_model_repo_id, log_and_http_error
+from utils.native_path_leases import (
+    NativePathLeaseError,
+    redact_native_paths,
+    verify_native_path_lease,
+)
 
 import re as _re
 
@@ -326,6 +331,7 @@ from models.models import (
     GgufVariantDetail,
     GgufVariantsResponse,
     LocalModelSource,
+    ModelIniResponse,
     ModelType,
     ScanFolderInfo,
     AddScanFolderRequest,
@@ -4840,6 +4846,77 @@ async def get_gguf_variants(
             status_code = 500,
             detail = "Failed to list GGUF variants",
         )
+
+
+@router.get("/model-ini", response_model = ModelIniResponse)
+async def get_model_ini(
+    repo_id: str = Query(..., description = "HF repo ID or local model path"),
+    gguf_variant: Optional[str] = Query(None, description = "Quant the INI sections are matched to"),
+    local_path: Optional[str] = None,
+    hf_token: Optional[str] = Query(None, description = "HuggingFace token for private repos"),
+    offline: bool = False,
+    native_path_lease: Optional[str] = Query(
+        None, description = "Grant for a GGUF picked in the native file dialog"
+    ),
+    hf_token_header: HfTokenArg = Depends(get_request_hf_token),
+    current_subject: str = Depends(get_current_subject),
+    via_api_key: bool = Depends(authenticated_via_api_key),
+):
+    """The unsloth.ini beside a GGUF variant (its folder, then the model root), compiled to the
+    allowlisted llama-server settings ``use_model_ini`` would apply. ``found`` false when absent."""
+    from core.inference.llama_model_ini import (
+        NotGgufModel,
+        describe,
+        locate_model_ini,
+        parse_model_ini,
+    )
+
+    repo_id = resolve_host_path_reference(repo_id) or repo_id
+    local_path = resolve_host_path_reference(local_path) or local_path
+    if native_path_lease:
+        # A native pick sends only its label; the grant names the file, as /validate reads it.
+        try:
+            grant = verify_native_path_lease(
+                native_path_lease,
+                operation = "validate-model",
+                expected_kind = "model",
+                expected_path_type = "file",
+                allowed_suffixes = (".gguf",),
+            )
+        except NativePathLeaseError as exc:
+            raise HTTPException(status_code = 400, detail = redact_native_paths(str(exc))) from exc
+        repo_id, local_path = str(grant.canonical_path), None
+    if account_access.managed_account():
+        await asyncio.to_thread(
+            account_access.require_model_access, repo_id, **({"offline": True} if offline else {})
+        )
+        # The listing authorizes its own local copies; this route reads only what the grant names.
+        local_path = None
+    hf_token = _resolve_hub_token(hf_token_header, hf_token)
+
+    def _read():
+        try:
+            located = locate_model_ini(
+                local_path or repo_id, gguf_variant, hf_token = hf_token, offline = offline
+            )
+        except NotGgufModel:
+            return describe(None, None)
+        if located is None:
+            return describe(None, None)
+        compiled = parse_model_ini(
+            located.text, quant = located.quant, gguf_filename = located.gguf_filename
+        )
+        return describe(located, compiled)
+
+    try:
+        body = await asyncio.to_thread(_read)
+    except ValueError as e:
+        raise HTTPException(status_code = 400, detail = str(e))
+    except Exception as e:
+        # Unreachable Hub, gated repo: the toggle just stays hidden; a load reports the error.
+        logger.warning(f"Could not read unsloth.ini for '{repo_id}': {e}")
+        body = describe(None, None)
+    return redact_host_paths(ModelIniResponse(**body), via_api_key = via_api_key)
 
 
 @router.get("/gguf-download-progress")

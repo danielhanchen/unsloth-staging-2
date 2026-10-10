@@ -141,6 +141,8 @@ import { residentModelMatchesPick } from "../lib/resident-model-match";
 import {
   loadedContextForParams,
   mergeBackendRecommendedInference,
+  modelIniSamplingKeysAfterMerge,
+  qwenThinkingParamsWithModelIni,
   resolveFitMaxSeqLength,
   isReplayedLoadContext,
   unpinnedDefaultRequest,
@@ -177,6 +179,7 @@ import {
   type PerModelConfig,
   loadedContextFields,
 } from "@/features/model-picker";
+import { structuredKvCacheDtypeAfterLoad } from "@/features/model-picker/model-config/model-ini";
 import {
   invalidateLlamaFlagCatalog,
   loadManagedLlamaFlags,
@@ -2199,6 +2202,13 @@ export function useChatModelRuntime() {
               (loadSwitchesModelOrVariant
                 ? DEFAULT_PER_MODEL_CONFIG.disableVision
                 : stateBeforeUnload.disableVision));
+          // Per-model like Vision: a switch to another model or quant never carries the file over.
+          const loadUseModelIni =
+            isGguf &&
+            !targetIsDiffusion &&
+            (pendingLoadConfig
+              ? pendingLoadConfig.useModelIni === true
+              : !loadSwitchesModelOrVariant && stateBeforeUnload.useModelIni);
           const loadActivePresetSource = stateBeforeUnload.activePresetSource;
           const loadActiveGgufVariant = stateBeforeUnload.activeGgufVariant;
           const loadGpuMemoryMode =
@@ -2377,6 +2387,7 @@ export function useChatModelRuntime() {
                     // when it fits.
                     gpu_layers: validateGpuLayers,
                     n_parallel: validateNParallel,
+                    ...(loadUseModelIni ? { use_model_ini: true } : {}),
                     reasoning_budget: targetIsDiffusion
                       ? -1
                       : validateReasoningBudget,
@@ -2760,6 +2771,8 @@ export function useChatModelRuntime() {
               ...(isGguf && !targetIsDiffusion && loadLlamaExtraArgs !== undefined
                 ? { llama_extra_args: loadLlamaExtraArgs ?? [] }
                 : {}),
+              // Only when on, so a load without the file sends the same payload as before.
+              ...(loadUseModelIni ? { use_model_ini: true } : {}),
               // omitted when blank: a null counts as set and strips inherited -b / -ub
               ...(isGguf && loadNBatch != null ? { n_batch: loadNBatch } : {}),
               ...(isGguf && loadNUbatch != null
@@ -2825,6 +2838,8 @@ export function useChatModelRuntime() {
                   modelId,
                   presetSource: useChatRuntimeStore.getState().activePresetSource,
                   loadedContextLength: loadedFields.loadedContextLength,
+                  previousModelIniSamplingKeys:
+                    useChatRuntimeStore.getState().modelIniSamplingKeys,
                 }),
                 // The served window, as background and compare loads already record,
                 // or the active model reports a context it is not running at.
@@ -2845,6 +2860,13 @@ export function useChatModelRuntime() {
                 maxTokensCap: loadedContextCap,
               },
             );
+            useChatRuntimeStore.setState((state) => ({
+              modelIniSamplingKeys: modelIniSamplingKeysAfterMerge(
+                state.activePresetSource,
+                state.modelIniSamplingKeys,
+                loadResponse,
+              ),
+            }));
             // Qwen3.5/3.6 small models (0.8B, 2B, 4B, 9B) disable thinking by default. Anchored regex:
             // first "Xb" / "X.Xb" after start-of-string or [-_/.] so the version literal in "qwen3.5" /
             // "qwen3.6" does not match first, and "Qwen3.5-35B-A3B" yields 35 (total), not 3 (MoE active).
@@ -2869,7 +2891,11 @@ export function useChatModelRuntime() {
                 }
               }
             }
-            const loadedKv = loadResponse.cache_type_kv ?? null;
+            const loadedKv = structuredKvCacheDtypeAfterLoad(
+              loadResponse.cache_type_kv,
+              loadKvCacheDtype,
+              loadResponse.model_ini_cache_type,
+            );
             const loadedTp = loadResponse.tensor_parallel ?? false;
             const loadedSpec = normalizeSpeculativeType(
               loadResponse.speculative_type,
@@ -2969,6 +2995,8 @@ export function useChatModelRuntime() {
               // diffusion target without writing the store, so a Vision-off GGUF followed by a diffusion
               // load would leave the switch off over a load that never sent it.
               disableVision: loadResponse.disable_vision ?? false,
+              useModelIni: loadResponse.model_ini_applied ?? loadUseModelIni,
+              loadedModelIni: loadResponse.model_ini_applied ?? loadUseModelIni,
               // Set alongside loadedIsMultimodal so the composer can say WHY images are unavailable.
               loadedVisionDisabledByUser:
                 loadResponse.vision_disabled_by_user ?? false,
@@ -3050,11 +3078,13 @@ export function useChatModelRuntime() {
             noteLoadedModelReasoningMode(modelId, nextReasoningEnabled, true);
             // Unlock attach menus for capabilities the catalog entry lacked.
             syncModelCapabilities(modelId, loadResponse);
-            // Qwen3-family: apply thinking-mode-specific params after load.
-            const p = resolveQwenThinkingParams(
+            // Qwen3-family: apply thinking-mode-specific params after load, the unsloth.ini's keys over them.
+            const qwenTable = resolveQwenThinkingParams(
               modelId,
               nextReasoningEnabled,
             );
+            const p =
+              qwenTable && qwenThinkingParamsWithModelIni(qwenTable, loadResponse);
             if (
               p !== null &&
               (loadResponse.supports_reasoning ?? false)
@@ -3179,6 +3209,7 @@ export function useChatModelRuntime() {
                   // applyPerModelConfigToRuntime has already overwritten with the TARGET's setting, and not
                   // loadedVisionDisabledByUser, which is narrowed to models that can do images.
                   disable_vision: rollbackState.loadedDisableVision ?? false,
+                  ...(rollbackState.loadedModelIni ? { use_model_ini: true } : {}),
                   // Restore the previous model's GPU Memory placement, not backend defaults.
                   gpu_memory_mode: rollbackState.loadedGpuMemoryMode ?? "auto",
                   gpu_layers: rollbackState.loadedGpuLayers ?? GPU_LAYERS_AUTO,
@@ -3264,6 +3295,8 @@ export function useChatModelRuntime() {
                   // The rolled-back model's own loaded value, matching the request above field for field. Not
                   // stateBeforeUnload.disableVision, which holds the TARGET's value by now, and not the echo either.
                   disableVision: rollbackState.loadedDisableVision ?? false,
+                  useModelIni: rollbackState.loadedModelIni === true,
+                  loadedModelIni: rollbackState.loadedModelIni === true,
                   loadedVisionDisabledByUser:
                     rollbackResponse.vision_disabled_by_user ?? false,
                   customContextLength:

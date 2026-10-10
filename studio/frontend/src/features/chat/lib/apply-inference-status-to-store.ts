@@ -16,6 +16,8 @@ import { getInferenceStatus } from "../api/chat-api";
 import { isSpeechOnlyStatus } from "./speech-only-status";
 import {
   mergeBackendRecommendedInference,
+  modelIniSamplingKeysAfterMerge,
+  qwenThinkingParamsWithModelIni,
   replayMaxTokensCap,
 } from "../presets/preset-policy";
 import { clampReasoningEffortToLevels } from "../provider-capabilities";
@@ -182,6 +184,7 @@ export function applyActiveModelStatusToStore(
         modelId: checkpointId,
         presetSource: store.activePresetSource,
         loadedContextLength: loadedContextFields(status).loadedContextLength,
+        previousModelIniSamplingKeys: store.modelIniSamplingKeys,
       }),
       // The model's remembered settings outrank the recommendation, or every poll would undo them,
       // but not past the context it loaded with. context_length is reported for safetensors too,
@@ -193,6 +196,13 @@ export function applyActiveModelStatusToStore(
           options.adoptingExistingServerModel === true,
       },
     );
+    useChatRuntimeStore.setState((state) => ({
+      modelIniSamplingKeys: modelIniSamplingKeysAfterMerge(
+        state.activePresetSource,
+        state.modelIniSamplingKeys,
+        status,
+      ),
+    }));
   }
 
   const previousGgufVariant =
@@ -504,8 +514,10 @@ export function applyActiveModelStatusToStore(
           specDraftModel: status.spec_draft_model ?? null,
         }),
       }),
+    // A cache type the unsloth.ini set is what the server echoes, not a structured setting to adopt.
     ...(seedLoadParams &&
-      status.cache_type_kv !== undefined && {
+      status.cache_type_kv !== undefined &&
+      status.model_ini_cache_type !== true && {
         loadedKvCacheDtype: status.cache_type_kv,
         ...((prevState.loadedKvCacheDtype === null ||
           hydratingExistingModel ||
@@ -520,6 +532,17 @@ export function applyActiveModelStatusToStore(
           hydratingExistingModel ||
           prevState.tensorParallel === prevState.loadedTensorParallel) && {
           tensorParallel: status.tensor_parallel,
+        }),
+      }),
+    // Seeded like tensorParallel: a tab that never performed the load must not show the .ini
+    // switch off over a server launched with it, or its next Reload drops the file.
+    ...(seedLoadParams &&
+      status.model_ini_applied !== undefined && {
+        loadedModelIni: status.model_ini_applied,
+        ...((prevState.loadedModelIni === null ||
+          hydratingExistingModel ||
+          prevState.useModelIni === prevState.loadedModelIni) && {
+          useModelIni: status.model_ini_applied,
         }),
       }),
     // A load knob like tensorParallel above. Without a reseed a tab that never performed the
@@ -767,7 +790,7 @@ export function applyActiveModelStatusToStore(
     );
     if (qwenParams !== null && current.activePresetSource === "builtin-default") {
       current.setParams(
-        { ...current.params, ...qwenParams },
+        { ...current.params, ...qwenThinkingParamsWithModelIni(qwenParams, status) },
         {
           fromModelDefaults: true,
           maxTokensCap: replayMaxTokensCap(status.context_length),
