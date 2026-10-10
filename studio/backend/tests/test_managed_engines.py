@@ -298,7 +298,10 @@ def test_glibc_floor_matches_the_lock_platform(engine, monkeypatch):
     reason = install.support_reason(engine, wait = False)
     assert reason is None or "glibc" not in reason
     monkeypatch.setattr(install.platform, "libc_ver", lambda: ("glibc", "2.33"))
-    assert install.support_reason(engine, wait = False) == f"{engine} requires glibc 2.34 or newer."
+    assert (
+        install.support_reason(engine, wait = False)
+        == f"{install.ENGINE_NAMES[engine]} requires glibc 2.34 or newer."
+    )
 
 
 def fake_dist(site, name, version, *requires):
@@ -1182,11 +1185,15 @@ def test_memory_reserve_grows_with_the_card(monkeypatch):
 
 def test_engine_start_reserves_a_share_of_the_card():
     import inspect
+    import re
     from core.inference import managed_engine
 
     # The local and the WSL launch both keep the share free.
     source = inspect.getsource(managed_engine)
-    assert source.count("memory_reserve_mib(self.engine, options), RESERVE_SHARE") == 2
+    assert (
+        len(re.findall(r"memory_reserve_mib\(self\.engine, options\),\s*RESERVE_SHARE", source))
+        == 2
+    )
 
 
 @_LOCAL_ENGINE_HOST
