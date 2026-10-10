@@ -274,6 +274,7 @@ interface BackendInferenceDefaults {
   top_k?: number;
   min_p?: number;
   presence_penalty?: number;
+  repetition_penalty?: number;
   trust_remote_code?: boolean;
 }
 
@@ -283,17 +284,73 @@ export interface BackendInferenceEnvelope {
   inference?: BackendInferenceDefaults | null;
 }
 
+const MODEL_INI_SAMPLING_PARAMS = {
+  temperature: "temperature",
+  top_p: "topP",
+  top_k: "topK",
+  min_p: "minP",
+  repetition_penalty: "repetitionPenalty",
+  presence_penalty: "presencePenalty",
+} as const satisfies Record<string, keyof InferenceParams>;
+
+/** ``params`` without the sliders the applied unsloth.ini owns, so the Think toggle keeps them. */
+export function withoutModelIniOwnedParams<T extends Partial<InferenceParams>>(
+  params: T,
+  ownedKeys: readonly string[],
+): T {
+  const kept: Partial<InferenceParams> = { ...params };
+  for (const key of ownedKeys) {
+    const param = MODEL_INI_SAMPLING_PARAMS[key as keyof typeof MODEL_INI_SAMPLING_PARAMS];
+    if (param) delete kept[param];
+  }
+  return kept as T;
+}
+
+/** The unsloth.ini outranks the Qwen3 thinking table, but only for the keys it sets. */
+export function qwenThinkingParamsWithModelIni<T extends Partial<InferenceParams>>(
+  qwenParams: T,
+  response: {
+    inference?: BackendInferenceDefaults | null;
+    model_ini_sampling_keys?: readonly string[] | null;
+  },
+): T {
+  const merged: Partial<InferenceParams> = { ...qwenParams };
+  for (const key of response.model_ini_sampling_keys ?? []) {
+    const param = MODEL_INI_SAMPLING_PARAMS[key as keyof typeof MODEL_INI_SAMPLING_PARAMS];
+    const value = toFiniteNumber(
+      response.inference?.[key as keyof BackendInferenceDefaults],
+    );
+    if (param && value !== undefined) {
+      merged[param] = value;
+    }
+  }
+  return merged as T;
+}
+
+export function modelIniSamplingKeysAfterMerge(
+  presetSource: ChatPresetSource,
+  previous: readonly string[],
+  response: { model_ini_sampling_keys?: readonly string[] | null },
+): string[] {
+  return presetSource === "builtin-default"
+    ? [...(response.model_ini_sampling_keys ?? [])]
+    : [...previous];
+}
+
 export function mergeBackendRecommendedInference({
   current,
   response,
   modelId,
   presetSource,
   loadedContextLength,
+  previousModelIniSamplingKeys,
 }: {
   current: InferenceParams;
   response: BackendInferenceEnvelope;
   modelId: string;
   presetSource: ChatPresetSource;
+  /** A penalty the file set and no longer does goes back to default. */
+  previousModelIniSamplingKeys?: readonly string[] | null;
   /** The window the response reports, as the context constructor reads it -- not the raw
    *  field, where a backend that sizes nothing echoes the length it was asked for. */
   loadedContextLength: number | null;
@@ -330,6 +387,11 @@ export function mergeBackendRecommendedInference({
     presencePenalty:
       toFiniteNumber(inference?.presence_penalty) ??
       defaultInferenceParams.presencePenalty,
+    repetitionPenalty:
+      toFiniteNumber(inference?.repetition_penalty) ??
+      (previousModelIniSamplingKeys?.includes("repetition_penalty")
+        ? defaultInferenceParams.repetitionPenalty
+        : next.repetitionPenalty),
   };
 }
 

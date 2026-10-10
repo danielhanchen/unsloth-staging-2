@@ -45,6 +45,8 @@ type ResidentRuntime = Pick<
   | "requested_cache_ram"
   | "tensor_parallel"
   | "disable_vision"
+  | "model_ini_applied"
+  | "model_ini_cache_type"
   | "chat_template_override"
   | "requested_llama_extra_args"
   | "gpu_memory_mode"
@@ -273,7 +275,10 @@ const SETTING_CHECKS: SettingCheck[] = [
   },
   {
     pinned: () => true,
-    agrees: (c, s) => (c.kvCacheDtype ?? null) === (s.cache_type_kv ?? null),
+    // An INI-set cache type echoes the file's value, which no structured value matches.
+    agrees: (c, s) =>
+      (c.kvCacheDtype ?? null) === (s.cache_type_kv ?? null) ||
+      (c.useModelIni === true && s.model_ini_cache_type === true),
   },
   {
     mlxComparable: true,
@@ -410,6 +415,11 @@ const SETTING_CHECKS: SettingCheck[] = [
     chatOnly: true,
     pinned: () => true,
     agrees: (c, s) => c.disableVision === (s.disable_vision ?? false),
+  },
+  {
+    chatOnly: true,
+    pinned: () => true,
+    agrees: (c, s) => (c.useModelIni === true) === (s.model_ini_applied === true),
   },
   {
     // Blank-trimmed on both ends: the applier and the load both send "" as null.
