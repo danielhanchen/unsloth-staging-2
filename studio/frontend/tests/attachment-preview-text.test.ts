@@ -37,6 +37,7 @@ const {
   repackDocxPreviewArchive,
   truncateAttachmentPreviewText,
   writeDocxBreaksAndCheckboxes,
+  writeDocxListNumbers,
   writeDocxTableRows,
 } = await import("../src/features/chat/attachment-content.ts");
 const { definePDFJSModule } = await import("unpdf");
@@ -1678,6 +1679,228 @@ test("an html rowspan keeps its full standards-defined range", async () => {
   );
 
   assert.equal(extracted, ["Group\trow 0", ...labels.map((label) => `\t${label}`)].join("\n\n"));
+});
+
+test("a Word numbered list keeps its numbers", async () => {
+  const w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+  const lvl = (ilvl: number, format: string, text: string) =>
+    `<w:lvl w:ilvl="${ilvl}"><w:start w:val="1"/><w:numFmt w:val="${format}"/><w:lvlText w:val="${text}"/></w:lvl>`;
+  const p = (text: string, pPr = "") => `<w:p>${pPr && `<w:pPr>${pPr}</w:pPr>`}<w:r><w:t>${text}</w:t></w:r></w:p>`;
+  const numPr = (numId: number, ilvl = 0) => `<w:numPr><w:ilvl w:val="${ilvl}"/><w:numId w:val="${numId}"/></w:numPr>`;
+  const bytes = zipSync({
+    "[Content_Types].xml": strToU8("<Types/>"),
+    "_rels/.rels": relationships([["officeDocument", "word/document.xml"]]),
+    "word/_rels/document.xml.rels": relationships([["numbering", "numbering.xml"], ["styles", "styles.xml"]]),
+    "word/document.xml": strToU8(
+      `<w:document ${w}><w:body>` +
+        p("Terms") +
+        p("Payment is due within 30 days.", numPr(2)) +
+        p("By bank transfer", numPr(2, 1)) +
+        p("Late payments incur a 2% fee.", numPr(2)) +
+        p("Termination", '<w:pStyle w:val="ListNumber"/>') +
+        p("Restarted", numPr(3)) +
+        p("Bullet", numPr(4)) +
+        "</w:body></w:document>",
+    ),
+    "word/numbering.xml": strToU8(
+      `<w:numbering ${w}>` +
+        `<w:abstractNum w:abstractNumId="1">${lvl(0, "decimal", "%1.")}${lvl(1, "lowerLetter", "(%2)")}</w:abstractNum>` +
+        `<w:abstractNum w:abstractNumId="2">${lvl(0, "bullet", "\u2022")}</w:abstractNum>` +
+        '<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>' +
+        '<w:num w:numId="2"><w:abstractNumId w:val="1"/></w:num>' +
+        '<w:num w:numId="3"><w:abstractNumId w:val="1"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride></w:num>' +
+        '<w:num w:numId="4"><w:abstractNumId w:val="2"/></w:num>' +
+        "</w:numbering>",
+    ),
+    "word/styles.xml": strToU8(
+      `<w:styles ${w}><w:style w:type="paragraph" w:styleId="ListNumber"><w:pPr><w:numPr><w:numId w:val="1"/></w:numPr></w:pPr></w:style></w:styles>`,
+    ),
+  });
+  const globals = globalThis as { DOMParser?: unknown; XMLSerializer?: unknown };
+  const original = { DOMParser: globals.DOMParser, XMLSerializer: globals.XMLSerializer };
+  globals.DOMParser = XmlDomParser;
+  globals.XMLSerializer = XmlSerializer;
+  try {
+    const { default: mammoth } = await import("mammoth");
+    const { value } = await mammoth.extractRawText({
+      buffer: Buffer.from(writeDocxTableRows(writeDocxBreaksAndCheckboxes(writeDocxListNumbers(bytes)))),
+    });
+    assert.equal(
+      value,
+      "Terms\n\n1. Payment is due within 30 days.\n\n(a) By bank transfer\n\n2. Late payments incur a 2% fee.\n\n" +
+        "3. Termination\n\n1. Restarted\n\nBullet\n\n",
+    );
+  } finally {
+    Object.assign(globals, original);
+  }
+});
+
+test("a Word legal list reads every level as a decimal and skips unnumbered levels", async () => {
+  const w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+  const p = (text: string, ilvl: number) =>
+    `<w:p><w:pPr><w:numPr><w:ilvl w:val="${ilvl}"/><w:numId w:val="1"/></w:numPr></w:pPr><w:r><w:t>${text}</w:t></w:r></w:p>`;
+  const bytes = zipSync({
+    "[Content_Types].xml": strToU8("<Types/>"),
+    "_rels/.rels": relationships([["officeDocument", "word/document.xml"]]),
+    "word/_rels/document.xml.rels": relationships([["numbering", "numbering.xml"]]),
+    "word/document.xml": strToU8(`<w:document ${w}><w:body>${p("Term", 0)}${p("Renewal", 1)}${p("Notice", 2)}</w:body></w:document>`),
+    "word/numbering.xml": strToU8(
+      `<w:numbering ${w}><w:abstractNum w:abstractNumId="1">` +
+        '<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="upperRoman"/><w:lvlText w:val="Article %1"/></w:lvl>' +
+        '<w:lvl w:ilvl="1"><w:start w:val="1"/><w:numFmt w:val="decimalZero"/><w:isLgl/><w:lvlText w:val="Section %1.%2"/></w:lvl>' +
+        '<w:lvl w:ilvl="2"><w:start w:val="1"/><w:numFmt w:val="none"/><w:lvlText w:val="%3"/></w:lvl>' +
+        '</w:abstractNum><w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num></w:numbering>',
+    ),
+  });
+  const globals = globalThis as { DOMParser?: unknown; XMLSerializer?: unknown };
+  const original = { DOMParser: globals.DOMParser, XMLSerializer: globals.XMLSerializer };
+  globals.DOMParser = XmlDomParser;
+  globals.XMLSerializer = XmlSerializer;
+  try {
+    const { default: mammoth } = await import("mammoth");
+    const { value } = await mammoth.extractRawText({ buffer: Buffer.from(writeDocxListNumbers(bytes)) });
+    assert.equal(value, "Article I Term\n\nSection 1.01 Renewal\n\nNotice\n\n");
+  } finally {
+    Object.assign(globals, original);
+  }
+});
+
+async function docxListText(levels: string, nums: string, paragraphs: [string, number, number][]): Promise<string> {
+  const w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+  const body = paragraphs
+    .map(([text, numId, ilvl]) =>
+      `<w:p><w:pPr><w:numPr><w:ilvl w:val="${ilvl}"/><w:numId w:val="${numId}"/></w:numPr></w:pPr><w:r><w:t>${text}</w:t></w:r></w:p>`,
+    )
+    .join("");
+  const bytes = zipSync({
+    "[Content_Types].xml": strToU8("<Types/>"),
+    "_rels/.rels": relationships([["officeDocument", "word/document.xml"]]),
+    "word/_rels/document.xml.rels": relationships([["numbering", "numbering.xml"]]),
+    "word/document.xml": strToU8(`<w:document ${w}><w:body>${body}</w:body></w:document>`),
+    "word/numbering.xml": strToU8(`<w:numbering ${w}><w:abstractNum w:abstractNumId="1">${levels}</w:abstractNum>${nums}</w:numbering>`),
+  });
+  const globals = globalThis as { DOMParser?: unknown; XMLSerializer?: unknown };
+  const original = { DOMParser: globals.DOMParser, XMLSerializer: globals.XMLSerializer };
+  globals.DOMParser = XmlDomParser;
+  globals.XMLSerializer = XmlSerializer;
+  try {
+    const { default: mammoth } = await import("mammoth");
+    return (await mammoth.extractRawText({ buffer: Buffer.from(writeDocxListNumbers(bytes)) })).value.trim().split(/\n+/).join(" | ");
+  } finally {
+    Object.assign(globals, original);
+  }
+}
+
+const wordLevel = (ilvl: number, format: string, text: string, extra = "") =>
+  `<w:lvl w:ilvl="${ilvl}"><w:start w:val="1"/><w:numFmt w:val="${format}"/>${extra}<w:lvlText w:val="${text}"/></w:lvl>`;
+
+test("Word list counters follow Word's sharing, restart and bullet rules", async () => {
+  const levels = wordLevel(0, "decimal", "%1.") + wordLevel(1, "decimal", "%1.%2");
+  const nums =
+    '<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>' +
+    '<w:num w:numId="2"><w:abstractNumId w:val="1"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride></w:num>';
+  // A restart applies once; the original instance then continues from the restarted count.
+  assert.equal(
+    await docxListText(levels, nums, [["a", 1, 0], ["b", 1, 0], ["c", 2, 0], ["d", 1, 0]]),
+    "1. a | 2. b | 1. c | 2. d",
+  );
+  // A bullet parent still restarts its numbered children.
+  const mixed = wordLevel(0, "bullet", "\u2022") + wordLevel(1, "decimal", "%2)");
+  assert.equal(
+    await docxListText(mixed, '<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>', [["x", 1, 0], ["x1", 1, 1], ["x2", 1, 1], ["y", 1, 0], ["y1", 1, 1]]),
+    "x | 1) x1 | 2) x2 | y | 1) y1",
+  );
+  // A tracked-deleted item neither prints nor counts.
+  const w = 'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"';
+  const redline = await (async () => {
+    const globals = globalThis as { DOMParser?: unknown; XMLSerializer?: unknown };
+    const original = { DOMParser: globals.DOMParser, XMLSerializer: globals.XMLSerializer };
+    globals.DOMParser = XmlDomParser;
+    globals.XMLSerializer = XmlSerializer;
+    const item = (text: string, rPr = "") =>
+      `<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr>${rPr}</w:pPr><w:r><w:t>${text}</w:t></w:r></w:p>`;
+    try {
+      const bytes = zipSync({
+        "[Content_Types].xml": strToU8("<Types/>"),
+        "_rels/.rels": relationships([["officeDocument", "word/document.xml"]]),
+        "word/_rels/document.xml.rels": relationships([["numbering", "numbering.xml"]]),
+        "word/document.xml": strToU8(
+          `<w:document ${w}><w:body>${item("a")}` +
+            `<w:p><w:pPr><w:numPr><w:ilvl w:val="0"/><w:numId w:val="1"/></w:numPr><w:rPr><w:del w:id="1" w:author="x"/></w:rPr></w:pPr><w:del w:id="2" w:author="x"><w:r><w:delText>gone</w:delText></w:r></w:del></w:p>` +
+            `${item("b")}</w:body></w:document>`,
+        ),
+        "word/numbering.xml": strToU8(
+          `<w:numbering ${w}><w:abstractNum w:abstractNumId="1">${levels}</w:abstractNum>` +
+            '<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>' +
+            '<w:num w:numId="2"><w:abstractNumId w:val="1"/><w:lvlOverride w:ilvl="0.5"><w:startOverride w:val="1"/></w:lvlOverride></w:num></w:numbering>',
+        ),
+      });
+      const { default: mammoth } = await import("mammoth");
+      return (await mammoth.extractRawText({ buffer: Buffer.from(writeDocxListNumbers(bytes)) })).value.trim().split(/\n+/).join(" | ");
+    } finally {
+      Object.assign(globals, original);
+    }
+  })();
+  assert.equal(redline, "1. a | 2. b");
+  // A fractional override level is ignored rather than aborting the extraction.
+  assert.equal(
+    await docxListText(levels, '<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num><w:num w:numId="2"><w:abstractNumId w:val="1"/><w:lvlOverride w:ilvl="0.5"><w:startOverride w:val="1"/></w:lvlOverride></w:num>', [["a", 1, 0], ["b", 2, 0]]),
+    "1. a | 2. b",
+  );
+  // lvlRestart 0 keeps a level counting across its parents.
+  const running = wordLevel(0, "decimal", "%1.") + wordLevel(1, "decimal", "(%2)", '<w:lvlRestart w:val="0"/>');
+  assert.equal(
+    await docxListText(running, '<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>', [["a", 1, 0], ["a1", 1, 1], ["b", 1, 0], ["b1", 1, 1]]),
+    "1. a | (1) a1 | 2. b | (2) b1",
+  );
+});
+
+test("list counters past the alphabet or out of range stay bounded", async () => {
+  const letters = wordLevel(0, "lowerLetter", "%1)");
+  const many = Array.from({ length: 28 }, (_, i): [string, number, number] => [`i${i + 1}`, 1, 0]);
+  const word = await docxListText(letters, '<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>', many);
+  assert.ok(word.endsWith("z) i26 | aa) i27 | bb) i28"), word);
+  const huge = '<w:lvl w:ilvl="999999999"><w:start w:val="1"/><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>';
+  assert.equal(await docxListText(huge, '<w:num w:numId="1"><w:abstractNumId w:val="1"/></w:num>', [["deep", 1, 999999999]]), "deep");
+
+  const withAttributes = (node: StubNode, attributes: Record<string, string> = {}) =>
+    Object.assign(node, { getAttribute: (name: string) => attributes[name] ?? null });
+  const item = (text: string) => withAttributes(element("li", textNode(text)));
+  const extracted = await withStubDom(
+    () =>
+      element(
+        "body",
+        withAttributes(element("ol", item("p"), item("q")), { start: "27", type: "a" }),
+        withAttributes(element("ol", item("r")), { start: "9".repeat(400), type: "i" }),
+        withAttributes(element("ol", item("s")), { start: "4000", type: "I" }),
+      ),
+    () => extractHtmlAttachmentText("<html/>"),
+  );
+  assert.equal(extracted, "aa. p\n\nab. q\n\nInfinity. r\n\n4000. s");
+});
+
+test("an html ordered list keeps its numbers", async () => {
+  const withAttributes = (node: StubNode, attributes: Record<string, string> = {}) =>
+    Object.assign(node, { getAttribute: (name: string) => attributes[name] ?? null });
+  const item = (text: string, attributes?: Record<string, string>) =>
+    withAttributes(element("li", textNode(text)), attributes);
+  const extracted = await withStubDom(
+    () =>
+      element(
+        "body",
+        element("p", textNode("Steps:")),
+        withAttributes(element("ol", textNode("\n  "), item("Build the image"), textNode("\n  "), item("Push the image"))),
+        withAttributes(element("ol", item("five"), item("nine", { value: "9" }), item("ten")), { start: "5" }),
+        withAttributes(element("ol", item("third"), item("second"), item("first")), { reversed: "", type: "I" }),
+        element("ul", element("li", textNode("bullet"))),
+      ),
+    () => extractHtmlAttachmentText("<html/>"),
+  );
+
+  assert.equal(
+    extracted,
+    "Steps:\n\n1. Build the image\n\n2. Push the image\n\n5. five\n\n9. nine\n\n10. ten\n\nIII. third\n\nII. second\n\nI. first\n\nbullet",
+  );
 });
 
 test("attachmentTextLanguage maps source files and leaves prose alone", () => {
