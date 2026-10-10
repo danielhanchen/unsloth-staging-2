@@ -381,25 +381,6 @@ jobs:
         run: |
           python -m pytest -v --tb=short tests/test_import_fixes_drift.py
 
-      - name: triton-absent import guard (HARD GATE)
-        # PyPI ships no Windows `triton` wheel, so the unconditional module-level import
-        # in _gpu_init.py killed `import unsloth` on a CPU-only Windows install. Named
-        # here because nothing else in the repo collects this file, so a deleted guard
-        # would leave CI green.
-        run: |
-          python -m pytest -v --tb=short tests/test_triton_optional_import.py
-
-      - name: public-api surface drift detectors (9 tests, HARD GATE)
-        # Companion to test_import_fixes_drift.py: that file catches
-        # third-party drift; this one catches drift in unsloth's OWN
-        # public surface (FastLanguageModel / FastVisionModel /
-        # FastModel + their classmethods + is_bf16_supported). A
-        # rename here would silently break the unslothai/notebooks tree
-        # one PR cycle later -- this gate catches it BEFORE the
-        # breakage reaches users.
-        run: |
-          python -m pytest -v --tb=short tests/test_public_api_surface.py
-
       - name: callback signature drift detector (HARD GATE)
         # Catches the MLX-style bug from PR #5498: a producer in
         # unsloth_zoo (or unsloth) grows a callback arg, but a consumer
@@ -416,577 +397,16 @@ jobs:
         run: |
           python -m pytest -v --tb=short tests/test_callback_signature_drift.py
 
-      - name: python floor compatibility (HARD GATE)
-        # pyproject declares requires-python >=3.9 but every job here pins 3.12,
-        # so nothing ran the floor: registry.py grew a dataclass field annotated
-        # `list[QuantType] | dict[...]`, which evaluates at class creation and is
-        # a TypeError below 3.10. Static AST check, no torch and no network. It
-        # reads the floor from pyproject, so raising requires-python relaxes it
-        # rather than making it lie.
-        run: |
-          python -m pytest -v --tb=short tests/test_python39_compatibility.py
-
-      - name: generation correctness guards (HARD GATE)
-        # Deterministic CPU guards, each validated to fail on its pre-fix code:
-        # leftpad = batched left-padded generation (#1066/#3699, fixed by
-        # #2216 + #4100; staging proof: unsloth-staging-2 PRs 170/172);
-        # rope_scaling_drift = config.rope_scaling dropped by replaced rotary
-        # classes (#2405). AST checks run first so import breakage cannot mask them.
-        run: |
-          python -m pytest -v --tb=short \
-            tests/utils/test_prepare_inputs_leftpad.py \
-            tests/utils/test_rope_scaling_drift.py
-
-      - name: dataset_num_proc worker bounds (HARD GATE)
-        # Guards for #2693: Dataset.map() dying with "One of the subprocesses
-        # has abruptly died", which is the OOM killer reaping tokenizer workers
-        # that nothing bounded. These assert the policy that replaced the
-        # unbounded cpu_count + 4 -> 64 heuristic -- the memory clamp, the
-        # 1 -> None normalisation (datasets >= 4.1 builds a Pool(1)), the
-        # non-fork and macOS vetoes, and the UNSLOTH_DATASET_NUM_PROC hatch.
-        #
-        # Their own step rather than Bucket-A: they need no accelerator and no
-        # model, they import the module standalone by path (so they cannot be
-        # masked by unrelated import breakage), and their assertions are pinned
-        # against simulated CPU counts and memory so the result is identical on
-        # a 4-vCPU runner and a 192-core box.
-        #
-        # The drift guard is named explicitly (these jobs collect paths, not
-        # trees): it is the only leg with a transformers past the `>=4.51,<5.5`
-        # pin, and the wording it exists to survive landed in 5.10.
-        #
-        # The Unsloth file runs here rather than in studio-backend-ci, which
-        # installs studio.txt and so has no unsloth_zoo at all. Note the policy
-        # module is not on unsloth_zoo main either until the companion PR lands,
-        # and this job clones UNSLOTH_ZOO_REF (main by default) -- so those cases
-        # reach the policy through _shared_policy, which falls back to this
-        # repo's own copy. Skipping instead would leave the 14 cases that matter
-        # green while the wiring they guard was inert.
-        run: |
-          python -m pytest -v --tb=short \
-            tests/utils/test_dataset_num_proc.py \
-            tests/utils/test_train_on_responses_only_num_proc.py
-          PYTHONPATH=studio/backend python -m pytest -v --tb=short \
-            studio/backend/tests/test_dataset_map_num_proc.py \
-            studio/backend/tests/test_compressed_tensors_signature_drift.py
-
-      - name: unsloth Bucket-A — CPU tests not in Repo tests (CPU)
-        # CPU tests across 6 files under tests/saving/, tests/utils/, tests/python/
-        # that Repo tests (CPU) --ignores. AST/protobuf/regex plus tiny CPU model
-        # loads; run cleanly here (transformers/torch installed).
-        run: |
-          python -m pytest -q --tb=short \
-            tests/saving/test_save_shell_injection.py \
-            tests/saving/test_patch_saving_none_tokenizer.py \
-            tests/saving/test_fix_sentencepiece_gguf_robustness.py \
-            tests/saving/test_fix_sentencepiece_tokenizer_guard.py \
-            tests/saving/test_compressed_export_schemes.py \
-            tests/saving/test_export_api_surface.py \
-            tests/saving/test_openvino_export.py \
-            tests/saving/test_export_dispatch.py \
-            tests/saving/test_imatrix_export.py \
-            tests/saving/test_gguf_single_pass_export.py \
-            tests/saving/test_offline_gguf_vlm_tokenizer_7481.py \
-            tests/saving/test_is_vlm_detection.py \
-            tests/saving/test_save_method_lora_routing.py \
-            tests/utils/test_attention_masks.py \
-            tests/utils/test_packing.py \
-            tests/utils/test_trunc_normal_patch.py \
-            tests/utils/test_q_galore.py \
-            tests/python/test_fast_language_model_text_only.py \
-            tests/test_bad_mappings_redirect.py \
-            tests/test_ollama_eos_token_order.py \
-            tests/test_prefetch_snapshot_scope.py \
-            tests/test_gemma_2b_mapper_key.py \
-            tests/test_raw_text_json_loading.py \
-            tests/test_map_eos_token.py \
-            tests/test_apertus_instruct_mapping.py \
-            tests/test_push_to_ollama_modelfile_args.py
-          # test_run_attention_flash_varlen_receives_window_and_softcap was deselected
-          # until attention_dispatch.py predefined flash_attn_varlen_func as None; it
-          # monkeypatches that name, so it no longer needs flash_attn on this runner.
-
-      - name: Static checks — unsloth/trainer.py + unsloth/models/rl.py against latest pip TRL
-        # AST-only sanity: confirm both files parse and that every TRL symbol
-        # they reference still exists in the installed `trl`. Catches API
-        # drift (renamed / removed TRL classes) without running training.
-        # Pre-fetches latest pip transformers in case TRL pinned an older one.
-        run: |
-          set -euxo pipefail
-          # Use the matrix-resolved transformers + trl versions already
-          # installed by the runtime-deps step (don't upgrade here; that
-          # would defeat the matrix's purpose of testing against the
-          # specific (transformers, trl) combination the cell selected).
-          python <<'PY'
-          import ast, importlib, pathlib, sys
-          paths = [pathlib.Path("unsloth/trainer.py"),
-                   pathlib.Path("unsloth/models/rl.py")]
-          for p in paths:
-              src = p.read_text()
-              tree = ast.parse(src, filename=str(p))
-              # Collect every `from trl... import X` and `from trl... import (X, Y)`
-              missing = []
-              for node in ast.walk(tree):
-                  if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("trl"):
-                      mod = importlib.import_module(node.module)
-                      for alias in node.names:
-                          if alias.name == "*":
-                              continue
-                          if not hasattr(mod, alias.name):
-                              missing.append(f"{node.module}.{alias.name}")
-              print(f"{p}: TRL symbols referenced and resolved -> {'OK' if not missing else 'MISSING ' + ', '.join(missing)}")
-              if missing:
-                  sys.exit(1)
-          PY
-
-      - name: Static checks — unsloth_zoo/tiled_mlp.py against latest pip transformers
-        # AST parse + transformers symbol-resolution. The user flagged tiled
-        # MLP patching as the path that breaks first when transformers ships
-        # an MLP class rename; this step is the canary against whatever
-        # transformers version the matrix cell selected.
-        working-directory: ${{ runner.temp }}/unsloth-zoo
-        run: |
-          set -euxo pipefail
-          python <<'PY'
-          import ast, importlib, pathlib, sys
-          p = pathlib.Path("unsloth_zoo/tiled_mlp.py")
-          src = p.read_text()
-          tree = ast.parse(src, filename=str(p))
-          missing = []
-          for node in ast.walk(tree):
-              if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("transformers"):
-                  try:
-                      mod = importlib.import_module(node.module)
-                  except Exception as e:
-                      missing.append(f"{node.module} (import failed: {type(e).__name__})")
-                      continue
-                  for alias in node.names:
-                      if alias.name == "*":
-                          continue
-                      if not hasattr(mod, alias.name):
-                          missing.append(f"{node.module}.{alias.name}")
-          print(f"{p}: transformers symbols referenced -> {'OK' if not missing else 'MISSING ' + ', '.join(missing)}")
-          if missing:
-              sys.exit(1)
-          PY
-
-      - name: Static checks — unsloth_zoo/hf_utils.py syntax + import-graph
-        working-directory: ${{ runner.temp }}/unsloth-zoo
-        run: |
-          set -euxo pipefail
-          python <<'PY'
-          import ast, pathlib
-          p = pathlib.Path("unsloth_zoo/hf_utils.py")
-          tree = ast.parse(p.read_text(), filename=str(p))
-          # Surface every public function + class so the PR check log shows
-          # what's covered, not just OK/FAIL.
-          public = []
-          for node in tree.body:
-              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not node.name.startswith("_"):
-                  public.append(f"{type(node).__name__.replace('Def','').lower()}:{node.name}")
-          print(f"hf_utils.py public surface ({len(public)}): " + ", ".join(public))
-          PY
-
-      - name: Runtime checks — invoke every zero-arg patch_* across both repos (via pytest shim)
-        # Routed through pytest so tests/conftest.py's GPU-spoof harness
-        # applies before any unsloth_zoo.temporary_patches.* import.
-        # Locally validated 50/51 zero-arg patches succeed; the lone failure
-        # surfaces a real bug (unsloth.models._utils.patch_fast_lora raises
-        # NameError: name 'fast_lora_forward' is not defined). The shim
-        # reports the full ledger but only fails when one of the two
-        # `required` helpers is absent.
-        run: |
-          set -euxo pipefail
-          cat > tests/_runtime_patch_check_shim.py <<'PY'
-          # Auto-generated by .github/workflows/consolidated-tests-ci.yml.
-          # Wraps the runtime patch_* validation into a pytest test so the
-          # tests/conftest.py GPU-spoof harness applies. continue-on-error
-          # at the workflow level catches per-patch failures; this shim only
-          # asserts that the two `required` helpers are reachable.
-          import sys, pathlib
-          sys.path.insert(0, str(pathlib.Path(__file__).parent))
-          import _zoo_aggressive_cuda_spoof as _spoof
-          _spoof.apply()
-          import importlib, inspect
-
-          MODULES = [
-              "unsloth.models._utils", "unsloth.models.rl", "unsloth.import_fixes",
-              "unsloth.kernels.cross_entropy_loss", "unsloth.kernels.rms_layernorm",
-              "unsloth.tokenizer_utils", "unsloth.save",
-              "unsloth_zoo.patching_utils", "unsloth_zoo.gradient_checkpointing",
-              "unsloth_zoo.loss_utils", "unsloth_zoo.tokenizer_utils",
-              "unsloth_zoo.tiled_mlp", "unsloth_zoo.dataset_utils",
-              "unsloth_zoo.patch_torch_functions",
-              "unsloth_zoo.temporary_patches.gemma",
-              "unsloth_zoo.temporary_patches.ministral",
-              "unsloth_zoo.temporary_patches.pixtral",
-              "unsloth_zoo.temporary_patches.deepseek_v3_moe",
-              "unsloth_zoo.temporary_patches.qwen3_5_moe",
-              "unsloth_zoo.temporary_patches.mxfp4",
-              "unsloth_zoo.temporary_patches.bitsandbytes",
-              "unsloth_zoo.temporary_patches.flex_attention_bwd",
-          ]
-          REQUIRED = {
-              "patch_unsloth_smart_gradient_checkpointing",
-              "patch_gradient_accumulation_fix",
-          }
-          # Patches whose signature looks zero-arg (`()` or all-defaulted)
-          # but which actually require either runtime args or real CUDA.
-          # Calling these in isolation is meaningless, so skip the
-          # invocation. Symbol presence (REQUIRED above) is still verified.
-          #   patch_linear_scaling / patch_llama_rope_scaling: defaults are
-          #     None placeholders; the bodies start with
-          #     `assert <param> is not None`.
-          #   patch_unsloth_smart_gradient_checkpointing: legitimately
-          #     allocates CUDA tensors via aten::empty.memory_format inside
-          #     initialize_unsloth_gradient_checkpointing(); the
-          #     torch.cuda.* spoof can't intercept that at the dispatcher
-          #     level.
-          NEEDS_PRECONDITION = {
-              "patch_linear_scaling",
-              "patch_llama_rope_scaling",
-              "patch_unsloth_smart_gradient_checkpointing",
-          }
-
-          def test_zero_arg_patch_invocations():
-              ok, fail, args, skipped, miss_imports = 0, [], [], [], {}
-              seen_required = set()
-              for mod_name in MODULES:
-                  try:
-                      mod = importlib.import_module(mod_name)
-                  except Exception as e:
-                      miss_imports[mod_name] = f"{type(e).__name__}: {e}"
-                      continue
-                  for name in sorted(dir(mod)):
-                      if not name.startswith("patch_"): continue
-                      fn = getattr(mod, name, None)
-                      if not callable(fn): continue
-                      if name in REQUIRED: seen_required.add(name)
-                      try:
-                          sig = inspect.signature(fn)
-                          need = [p.name for p in sig.parameters.values()
-                                  if p.default is inspect.Parameter.empty
-                                  and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                                                 inspect.Parameter.POSITIONAL_ONLY)]
-                      except (TypeError, ValueError):
-                          need = []
-                      if need:
-                          args.append((mod_name, name, need)); continue
-                      if name in NEEDS_PRECONDITION:
-                          skipped.append(f"{mod_name}.{name}")
-                          print(f"  SKIP {mod_name}.{name} (needs precondition / CUDA)")
-                          continue
-                      try:
-                          fn()
-                          ok += 1
-                          print(f"  OK   {mod_name}.{name}")
-                      except Exception as e:
-                          fail.append((mod_name, name, type(e).__name__, str(e)[:200]))
-                          print(f"  FAIL {mod_name}.{name} -> {type(e).__name__}: {str(e)[:200]}")
-              print(f"\nzero-arg patch_*: ok={ok} fail={len(fail)} skipped={len(skipped)}")
-              print(f"arg-required patch_* (skipped, listed for review): {len(args)}")
-              for m, n, r in args:
-                  print(f"    needs={r}: {m}.{n}")
-              if skipped:
-                  print(f"explicitly skipped (needs precondition / CUDA): {skipped}")
-              if miss_imports:
-                  print("\nmodules failed to import (skipped):")
-                  for k, v in miss_imports.items():
-                      print(f"    {k}: {v}")
-              print(f"required patch_* helpers seen: {sorted(seen_required)}")
-              missing = REQUIRED - seen_required
-              assert not missing, f"required patch_* helpers MISSING: {sorted(missing)}"
-              # Strict: any zero-arg patch that raises is a real
-              # regression now that #5319 has landed (the three previously
-              # known-broken patches are fixed; legitimate
-              # CPU-precondition skips are recorded in NEEDS_PRECONDITION
-              # above, not in `fail`). Print all failures and re-raise
-              # them as one assertion message.
-              if fail:
-                  raise AssertionError(
-                      f"zero-arg patch_* invocation failures (ok={ok}, "
-                      f"fail={len(fail)}, skipped={len(skipped)}):\n  "
-                      + "\n  ".join(
-                          f"{m}.{n} -> {ec}: {msg}" for m, n, ec, msg in fail
-                      )
-                  )
-          PY
-          python -m pytest -q --tb=short tests/_runtime_patch_check_shim.py -s
-          rm -f tests/_runtime_patch_check_shim.py
-
-      - name: Runtime checks — patch_tiled_mlp on a synthetic MLP module (via pytest shim)
-        # Same shim pattern: pytest picks up tests/conftest.py before importing
-        # unsloth_zoo.tiled_mlp, so the GPU-spoof harness covers
-        # unsloth_zoo.temporary_patches.gpt_oss's mem_get_info call.
-        run: |
-          set -euxo pipefail
-          cat > tests/_tiled_mlp_check_shim.py <<'PY'
-          # Auto-generated by .github/workflows/consolidated-tests-ci.yml.
-          import sys, pathlib
-          sys.path.insert(0, str(pathlib.Path(__file__).parent))
-          import _zoo_aggressive_cuda_spoof as _spoof
-          _spoof.apply()
-          import torch
-          import torch.nn as nn
-          from unsloth_zoo.tiled_mlp import patch_tiled_mlp, patch_mlp
-
-          class _MLP(nn.Module):
-              def __init__(self, hidden=64, intermediate=128):
-                  super().__init__()
-                  self.gate_proj = nn.Linear(hidden, intermediate, bias=False)
-                  self.up_proj   = nn.Linear(hidden, intermediate, bias=False)
-                  self.down_proj = nn.Linear(intermediate, hidden, bias=False)
-                  self.act_fn = nn.SiLU()
-              def forward(self, x):
-                  return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-
-          class _FakeModel(nn.Module):
-              def __init__(self):
-                  super().__init__()
-                  self.layers = nn.ModuleList([nn.ModuleDict({"mlp": _MLP()}) for _ in range(2)])
-              def forward(self, x):
-                  for layer in self.layers:
-                      x = x + layer["mlp"](x)
-                  return x
-
-          def test_patch_tiled_mlp_numerical_equivalence():
-              # `patch_mlp(target_arctic=True)` sets `chunk_size = max(1, H)`
-              # and shards the SEQUENCE dim with `n_shards = max(1, S //
-              # chunk_size)`. Pick S > H so the tiled path actually runs
-              # multi-shard (n_shards = 192 // 64 = 3, plus a remainder
-              # shard) rather than degenerating to n_shards = 1 which is
-              # bit-exact and only confirms patching installed something.
-              # If the tiled implementation is correct, multi-shard output
-              # must still match the un-tiled reference within FP32 noise.
-              torch.manual_seed(0)
-              m = _FakeModel().eval()
-              hidden = 64
-              # 192 = 3 * hidden, so divmod(192, 64) = (3, 0) -> 3 shards,
-              # no remainder; gives a clean multi-shard verification.
-              x = torch.randn(2, 192, hidden)
-              with torch.no_grad():
-                  y_before = m(x).clone()
-              patch_mlp(m.layers[0]["mlp"])
-              patch_tiled_mlp(m)
-              # Sanity-check we are actually exercising the multi-shard
-              # path: poke chunk_size by re-deriving it the same way
-              # `tiled_forward_arctic_size` does.
-              S = x.shape[1]
-              chunk = max(1, hidden)
-              n_shards_expected = max(1, S // chunk)
-              assert n_shards_expected > 1, (
-                  "tiled MLP shim is not exercising multi-shard: "
-                  f"S={S}, chunk={chunk}, n_shards={n_shards_expected}"
-              )
-              with torch.no_grad():
-                  y_after = m(x).clone()
-              err = (y_before - y_after).abs().max().item()
-              print(
-                  f"patch_tiled_mlp multi-shard (n_shards={n_shards_expected}) "
-                  f"output diff = {err:.3e}"
-              )
-              assert err < 1e-3, f"tiled MLP output drifted: {err}"
-          PY
-          python -m pytest -q --tb=short tests/_tiled_mlp_check_shim.py -s
-          rm -f tests/_tiled_mlp_check_shim.py
-
-      - name: Compiler cache hygiene + source-rewriter invariants (synthetic inputs)
-        # Lightweight pipeline coverage for unsloth_zoo.compiler. Pure regex
-        # / tokenize / ast paths driven by tiny synthetic source strings:
-        #   - higher_precision_softmax (basic + idempotent)
-        #   - fix_rotary_embedding_dtype (no-op + active under
-        #     UNSLOTH_FORCE_CUSTOM_DTYPE)
-        #   - fix_attention_dtype_consistency (insert + idempotent)
-        #   - convert_attention_masks_to_bool (rewrite + no-op)
-        #   - create_new_function happy-path (versioning block, license
-        #     header, AST parse, importlib re-import)
-        #   - create_new_function **kwargs collision (exercises
-        #     _rewrite_kwargs_param + _insert_kwargs_alias)
-        #   - UNSLOTH_COMPILE_OVERWRITE=0 forced-recompile on transformers
-        #     version mismatch (compiler.py:947-963)
-        #   - matching short-circuit when versions are equal
-        # No real transformers modeling module is loaded; complements the
-        # heavier real-class round-trip step below. Wall-time ~10-25s.
-        run: |
-          set -euxo pipefail
-          cat > tests/_compiler_cache_invariants_shim.py <<'PY'
-          # Auto-generated by .github/workflows/consolidated-tests-ci.yml.
-          # Cache-hygiene + source-rewriter invariants for unsloth_zoo.compiler.
-          import sys, pathlib, os, ast, importlib, importlib.util, time
-          sys.path.insert(0, str(pathlib.Path(__file__).parent))
-          import _zoo_aggressive_cuda_spoof as _spoof
-          _spoof.apply()
-          import pytest
-          import torch  # noqa: F401  (compiler.py imports torch at module load)
-
-
-          def _isolate_cache(tmp_path, monkeypatch):
-              """Point UNSLOTH_COMPILE_LOCATION at tmp_path and reset module
-              globals. The compiler.py global is captured at module load
-              (line 75/179), so we delete + reimport per test."""
-              monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(tmp_path))
-              if "unsloth_zoo.compiler" in sys.modules:
-                  del sys.modules["unsloth_zoo.compiler"]
-              import unsloth_zoo.compiler as compiler
-              compiler.UNSLOTH_COMPILE_LOCATION = str(tmp_path)
-              compiler.UNSLOTH_COMPILE_USE_TEMP = False
-              return compiler
-
-
-          def test_higher_precision_softmax_basic_and_idempotent(tmp_path, monkeypatch):
-              c = _isolate_cache(tmp_path, monkeypatch)
-              src = (
-                  "y = nn.functional.softmax(x, dim=-1)\n"
-                  "z = F.softmax(a, dim=1, dtype=torch.bfloat16)\n"
-              )
-              out = c.higher_precision_softmax(src)
-              assert "dtype = torch.float32).to(x.dtype)" in out
-              assert "dtype = torch.float32).to(a.dtype)" in out
-              # Idempotency landed in unslothai/unsloth-zoo#631
-              # (negative-lookahead on `.to(<var>.dtype)` so a second
-              # pass does not append another cast).
-              assert c.higher_precision_softmax(out) == out
-
-
-          def test_fix_rotary_dtype_no_op_without_env(tmp_path, monkeypatch):
-              c = _isolate_cache(tmp_path, monkeypatch)
-              monkeypatch.delenv("UNSLOTH_FORCE_CUSTOM_DTYPE", raising=False)
-              src = "out = cos.to(dtype=x.dtype) + sin.to(dtype=x.dtype)\n"
-              assert c.fix_rotary_embedding_dtype(src) == src
-
-
-          def test_fix_rotary_dtype_active(tmp_path, monkeypatch):
-              c = _isolate_cache(tmp_path, monkeypatch)
-              monkeypatch.setenv(
-                  "UNSLOTH_FORCE_CUSTOM_DTYPE",
-                  "float16;torch.float32;torch.bfloat16;torch.float16;pass",
-              )
-              monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
-              src = "out = cos.to(dtype=x.dtype) + sin.to(dtype=x.dtype)\n"
-              out = c.fix_rotary_embedding_dtype(src)
-              # Active form rewrites cos.to / sin.to. Either the conditional
-              # form or the cast form is acceptable -- different transformers
-              # versions surface slightly different outputs from the rewriter.
-              assert "cos.to(dtype=x.dtype)" not in out
-              assert "sin.to(dtype=x.dtype)" not in out
-
-
-          def test_fix_attention_dtype_consistency_insert_then_idempotent(tmp_path, monkeypatch):
-              c = _isolate_cache(tmp_path, monkeypatch)
-              src = (
-                  "    query_states, key_states = apply_rotary_pos_emb("
-                  "query_states, key_states, cos, sin)\n"
-                  "    attn = q @ k.T\n"
-              )
-              out = c.fix_attention_dtype_consistency(src)
-              assert out.count("value_states = value_states.to(query_states.dtype)") == 1
-              assert c.fix_attention_dtype_consistency(out) == out
-
-
-          def test_convert_attention_masks_to_bool_rewrites(tmp_path, monkeypatch):
-              c = _isolate_cache(tmp_path, monkeypatch)
-              src = (
-                  "def make_mask(x):\n"
-                  "    out = torch.finfo(x.dtype).min * x\n"
-                  "    return out\n"
-              )
-              out = c.convert_attention_masks_to_bool("make_mask", src)
-              # Loose match: rewriter inserts a `!=torch.finfo(...).min` check
-              # somewhere on the return path. Tightening to an exact
-              # last-line match is brittle across transformers versions.
-              assert "!=torch.finfo" in out
-
-
-          def test_convert_attention_masks_to_bool_no_op(tmp_path, monkeypatch):
-              c = _isolate_cache(tmp_path, monkeypatch)
-              src = "def make_mask(x):\n    return x\n"
-              assert c.convert_attention_masks_to_bool("make_mask", src) == src
-
-
-          def _versioning_lines(file_text):
-              """Extract the four version strings from the versioning block."""
-              assert file_text.startswith('"""\n'), "missing opening triple-quote"
-              head = file_text.split("__UNSLOTH_VERSIONING__", 1)[0]
-              lines = [ln for ln in head.splitlines() if ln and ln != '"""']
-              return lines
-
-
-          def test_create_new_function_happy_path(tmp_path, monkeypatch):
-              c = _isolate_cache(tmp_path, monkeypatch)
-              src = "def f(x):\n    return nn.functional.softmax(x, dim=-1)\n"
-              c.create_new_function(
-                  name="f_happy", new_source=src, model_location="builtins",
-                  functions=[], overwrite=True,
-              )
-              cached = tmp_path / "f_happy.py"
-              assert cached.exists()
-              text = cached.read_text(encoding="utf-8")
-              versions = _versioning_lines(text)
-              assert len(versions) == 4, versions
-              assert text.count(c._full_license_header) == 1
-              ast.parse(text)
-              spec = importlib.util.spec_from_file_location("f_happy_reimport", cached)
-              m2 = importlib.util.module_from_spec(spec)
-              spec.loader.exec_module(m2)
-              assert callable(m2.f)
-              import inspect as _inspect
-              # higher_precision_softmax should have promoted to float32.
-              assert "dtype = torch.float32" in _inspect.getsource(m2.f)
-
-
-          def test_create_new_function_overwrite_zero_recompiles_on_version_mismatch(
-              tmp_path, monkeypatch,
-          ):
-              c = _isolate_cache(tmp_path, monkeypatch)
-              name = "vmismatch"
-              cached = tmp_path / f"{name}.py"
-              stub = (
-                  '"""\n0.0.0\n0.0.0\n0.0.0-stub\n0.0.0\n__UNSLOTH_VERSIONING__\n"""\n'
-                  + c._full_license_header
-                  + "def vmismatch(x):\n    return x\n"
-              )
-              cached.write_text(stub, encoding="utf-8")
-              monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
-              src = "def vmismatch(x):\n    return x + 1\n"
-              c.create_new_function(
-                  name=name, new_source=src, model_location="builtins",
-                  functions=[], overwrite=False,
-              )
-              text = cached.read_text(encoding="utf-8")
-              assert "0.0.0-stub" not in text, (
-                  "OVERWRITE=0 + transformers-version-mismatch did NOT recompile"
-              )
-              versions = _versioning_lines(text)
-              import importlib.metadata as _md
-              assert versions[2] == _md.version("transformers")
-
-
-          def test_create_new_function_overwrite_zero_short_circuits_when_versions_match(
-              tmp_path, monkeypatch,
-          ):
-              c = _isolate_cache(tmp_path, monkeypatch)
-              name = "vmatch"
-              src = "def vmatch(x):\n    return x\n"
-              c.create_new_function(
-                  name=name, new_source=src, model_location="builtins",
-                  functions=[], overwrite=True,
-              )
-              cached = tmp_path / f"{name}.py"
-              mtime_before = cached.stat().st_mtime_ns
-              time.sleep(0.05)
-              monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
-              c.create_new_function(
-                  name=name, new_source=src, model_location="builtins",
-                  functions=[], overwrite=False,
-              )
-              assert cached.stat().st_mtime_ns == mtime_before, (
-                  "OVERWRITE=0 + matching versions should NOT rewrite the file"
-              )
-          PY
-          python -m pytest -q --tb=short tests/_compiler_cache_invariants_shim.py
-          rm -f tests/_compiler_cache_invariants_shim.py
-
+      # From here the job runs on native background steps, each still its own process.
+      # The full-model sweep (the long pole) starts first and is joined right before
+      # Summary; the remaining checks run beside it in waves of at most five, balanced
+      # on measured step times, so at most six run at once on the 4-vCPU runner. Each
+      # wave is joined by `wait` before the next starts, so a failure still skips the
+      # later waves (its siblings in the same wave finish first). GitHub rejects `if:`
+      # on a wait step, and a wait always runs.
       - name: Compiler full-model-sweep (every transformers.models.*) + SFT trainer round-trip
+        id: model-sweep
+        background: true
         # Calls `unsloth_compile_transformers(model_type=...)` against EVERY
         # `transformers.models.<x>` package the matrix's transformers ships
         # (pkgutil.iter_modules walk -- 383 packages on 4.57.6, similar on
@@ -1347,7 +767,109 @@ jobs:
           python -m pytest -q --tb=short tests/_zoo_compiler_cache_shim.py
           rm -f tests/_zoo_compiler_cache_shim.py
 
+      - name: python floor compatibility (HARD GATE)
+        id: python-floor
+        background: true
+        # pyproject declares requires-python >=3.9 but every job here pins 3.12,
+        # so nothing ran the floor: registry.py grew a dataclass field annotated
+        # `list[QuantType] | dict[...]`, which evaluates at class creation and is
+        # a TypeError below 3.10. Static AST check, no torch and no network. It
+        # reads the floor from pyproject, so raising requires-python relaxes it
+        # rather than making it lie.
+        run: |
+          exit 1  # staging: injected failure
+          python -m pytest -v --tb=short tests/test_python39_compatibility.py
+
+      - name: unsloth Bucket-A — CPU tests not in Repo tests (CPU)
+        id: bucket-a
+        background: true
+        # CPU tests across 6 files under tests/saving/, tests/utils/, tests/python/
+        # that Repo tests (CPU) --ignores. AST/protobuf/regex plus tiny CPU model
+        # loads; run cleanly here (transformers/torch installed).
+        run: |
+          python -m pytest -q --tb=short \
+            tests/saving/test_save_shell_injection.py \
+            tests/saving/test_patch_saving_none_tokenizer.py \
+            tests/saving/test_fix_sentencepiece_gguf_robustness.py \
+            tests/saving/test_fix_sentencepiece_tokenizer_guard.py \
+            tests/saving/test_compressed_export_schemes.py \
+            tests/saving/test_export_api_surface.py \
+            tests/saving/test_openvino_export.py \
+            tests/saving/test_export_dispatch.py \
+            tests/saving/test_imatrix_export.py \
+            tests/saving/test_gguf_single_pass_export.py \
+            tests/saving/test_offline_gguf_vlm_tokenizer_7481.py \
+            tests/saving/test_is_vlm_detection.py \
+            tests/saving/test_save_method_lora_routing.py \
+            tests/utils/test_attention_masks.py \
+            tests/utils/test_packing.py \
+            tests/utils/test_trunc_normal_patch.py \
+            tests/utils/test_q_galore.py \
+            tests/python/test_fast_language_model_text_only.py \
+            tests/test_bad_mappings_redirect.py \
+            tests/test_ollama_eos_token_order.py \
+            tests/test_prefetch_snapshot_scope.py \
+            tests/test_gemma_2b_mapper_key.py \
+            tests/test_raw_text_json_loading.py \
+            tests/test_map_eos_token.py \
+            tests/test_apertus_instruct_mapping.py \
+            tests/test_push_to_ollama_modelfile_args.py
+          # test_run_attention_flash_varlen_receives_window_and_softcap was deselected
+          # until attention_dispatch.py predefined flash_attn_varlen_func as None; it
+          # monkeypatches that name, so it no longer needs flash_attn on this runner.
+
+      - name: dataset_num_proc worker bounds (HARD GATE)
+        id: num-proc-bounds
+        background: true
+        # Guards for #2693: Dataset.map() dying with "One of the subprocesses
+        # has abruptly died", which is the OOM killer reaping tokenizer workers
+        # that nothing bounded. These assert the policy that replaced the
+        # unbounded cpu_count + 4 -> 64 heuristic -- the memory clamp, the
+        # 1 -> None normalisation (datasets >= 4.1 builds a Pool(1)), the
+        # non-fork and macOS vetoes, and the UNSLOTH_DATASET_NUM_PROC hatch.
+        #
+        # Their own step rather than Bucket-A: they need no accelerator and no
+        # model, they import the module standalone by path (so they cannot be
+        # masked by unrelated import breakage), and their assertions are pinned
+        # against simulated CPU counts and memory so the result is identical on
+        # a 4-vCPU runner and a 192-core box.
+        #
+        # The drift guard is named explicitly (these jobs collect paths, not
+        # trees): it is the only leg with a transformers past the `>=4.51,<5.5`
+        # pin, and the wording it exists to survive landed in 5.10.
+        #
+        # The Unsloth file runs here rather than in studio-backend-ci, which
+        # installs studio.txt and so has no unsloth_zoo at all. Note the policy
+        # module is not on unsloth_zoo main either until the companion PR lands,
+        # and this job clones UNSLOTH_ZOO_REF (main by default) -- so those cases
+        # reach the policy through _shared_policy, which falls back to this
+        # repo's own copy. Skipping instead would leave the 14 cases that matter
+        # green while the wiring they guard was inert.
+        run: |
+          python -m pytest -v --tb=short \
+            tests/utils/test_dataset_num_proc.py \
+            tests/utils/test_train_on_responses_only_num_proc.py
+          PYTHONPATH=studio/backend python -m pytest -v --tb=short \
+            studio/backend/tests/test_dataset_map_num_proc.py \
+            studio/backend/tests/test_compressed_tensors_signature_drift.py
+
+      - wait: python-floor
+      - wait: bucket-a
+      - wait: num-proc-bounds
+
+      - name: triton-absent import guard (HARD GATE)
+        id: triton-absent
+        background: true
+        # PyPI ships no Windows `triton` wheel, so the unconditional module-level import
+        # in _gpu_init.py killed `import unsloth` on a CPU-only Windows install. Named
+        # here because nothing else in the repo collects this file, so a deleted guard
+        # would leave CI green.
+        run: |
+          python -m pytest -v --tb=short tests/test_triton_optional_import.py
+
       - name: TRL trainer + Config auto-discovery + dynamic patch coverage
+        id: trl-discovery
+        background: true
         # Mirror unsloth/models/rl.py:patch_trl_rl_trainers AND verify the
         # dynamic per-version patch surface:
         #   1. AST-parse every *_trainer / *_config submodule.
@@ -1841,7 +1363,448 @@ jobs:
           python -m pytest -q --tb=short -s tests/_trl_trainer_discovery_shim.py
           rm -f tests/_trl_trainer_discovery_shim.py
 
+      - name: public-api surface drift detectors (9 tests, HARD GATE)
+        id: public-api
+        background: true
+        # Companion to test_import_fixes_drift.py: that file catches
+        # third-party drift; this one catches drift in unsloth's OWN
+        # public surface (FastLanguageModel / FastVisionModel /
+        # FastModel + their classmethods + is_bf16_supported). A
+        # rename here would silently break the unslothai/notebooks tree
+        # one PR cycle later -- this gate catches it BEFORE the
+        # breakage reaches users.
+        run: |
+          python -m pytest -v --tb=short tests/test_public_api_surface.py
+
+      - wait: triton-absent
+      - wait: trl-discovery
+      - wait: public-api
+
+      - name: generation correctness guards (HARD GATE)
+        id: generation-guards
+        background: true
+        # Deterministic CPU guards, each validated to fail on its pre-fix code:
+        # leftpad = batched left-padded generation (#1066/#3699, fixed by
+        # #2216 + #4100; staging proof: unsloth-staging-2 PRs 170/172);
+        # rope_scaling_drift = config.rope_scaling dropped by replaced rotary
+        # classes (#2405). AST checks run first so import breakage cannot mask them.
+        run: |
+          python -m pytest -v --tb=short \
+            tests/utils/test_prepare_inputs_leftpad.py \
+            tests/utils/test_rope_scaling_drift.py
+
+      - name: Runtime checks — invoke every zero-arg patch_* across both repos (via pytest shim)
+        id: patch-invoke
+        background: true
+        # Routed through pytest so tests/conftest.py's GPU-spoof harness
+        # applies before any unsloth_zoo.temporary_patches.* import.
+        # Locally validated 50/51 zero-arg patches succeed; the lone failure
+        # surfaces a real bug (unsloth.models._utils.patch_fast_lora raises
+        # NameError: name 'fast_lora_forward' is not defined). The shim
+        # reports the full ledger but only fails when one of the two
+        # `required` helpers is absent.
+        run: |
+          set -euxo pipefail
+          cat > tests/_runtime_patch_check_shim.py <<'PY'
+          # Auto-generated by .github/workflows/consolidated-tests-ci.yml.
+          # Wraps the runtime patch_* validation into a pytest test so the
+          # tests/conftest.py GPU-spoof harness applies. continue-on-error
+          # at the workflow level catches per-patch failures; this shim only
+          # asserts that the two `required` helpers are reachable.
+          import sys, pathlib
+          sys.path.insert(0, str(pathlib.Path(__file__).parent))
+          import _zoo_aggressive_cuda_spoof as _spoof
+          _spoof.apply()
+          import importlib, inspect
+
+          MODULES = [
+              "unsloth.models._utils", "unsloth.models.rl", "unsloth.import_fixes",
+              "unsloth.kernels.cross_entropy_loss", "unsloth.kernels.rms_layernorm",
+              "unsloth.tokenizer_utils", "unsloth.save",
+              "unsloth_zoo.patching_utils", "unsloth_zoo.gradient_checkpointing",
+              "unsloth_zoo.loss_utils", "unsloth_zoo.tokenizer_utils",
+              "unsloth_zoo.tiled_mlp", "unsloth_zoo.dataset_utils",
+              "unsloth_zoo.patch_torch_functions",
+              "unsloth_zoo.temporary_patches.gemma",
+              "unsloth_zoo.temporary_patches.ministral",
+              "unsloth_zoo.temporary_patches.pixtral",
+              "unsloth_zoo.temporary_patches.deepseek_v3_moe",
+              "unsloth_zoo.temporary_patches.qwen3_5_moe",
+              "unsloth_zoo.temporary_patches.mxfp4",
+              "unsloth_zoo.temporary_patches.bitsandbytes",
+              "unsloth_zoo.temporary_patches.flex_attention_bwd",
+          ]
+          REQUIRED = {
+              "patch_unsloth_smart_gradient_checkpointing",
+              "patch_gradient_accumulation_fix",
+          }
+          # Patches whose signature looks zero-arg (`()` or all-defaulted)
+          # but which actually require either runtime args or real CUDA.
+          # Calling these in isolation is meaningless, so skip the
+          # invocation. Symbol presence (REQUIRED above) is still verified.
+          #   patch_linear_scaling / patch_llama_rope_scaling: defaults are
+          #     None placeholders; the bodies start with
+          #     `assert <param> is not None`.
+          #   patch_unsloth_smart_gradient_checkpointing: legitimately
+          #     allocates CUDA tensors via aten::empty.memory_format inside
+          #     initialize_unsloth_gradient_checkpointing(); the
+          #     torch.cuda.* spoof can't intercept that at the dispatcher
+          #     level.
+          NEEDS_PRECONDITION = {
+              "patch_linear_scaling",
+              "patch_llama_rope_scaling",
+              "patch_unsloth_smart_gradient_checkpointing",
+          }
+
+          def test_zero_arg_patch_invocations():
+              ok, fail, args, skipped, miss_imports = 0, [], [], [], {}
+              seen_required = set()
+              for mod_name in MODULES:
+                  try:
+                      mod = importlib.import_module(mod_name)
+                  except Exception as e:
+                      miss_imports[mod_name] = f"{type(e).__name__}: {e}"
+                      continue
+                  for name in sorted(dir(mod)):
+                      if not name.startswith("patch_"): continue
+                      fn = getattr(mod, name, None)
+                      if not callable(fn): continue
+                      if name in REQUIRED: seen_required.add(name)
+                      try:
+                          sig = inspect.signature(fn)
+                          need = [p.name for p in sig.parameters.values()
+                                  if p.default is inspect.Parameter.empty
+                                  and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                                                 inspect.Parameter.POSITIONAL_ONLY)]
+                      except (TypeError, ValueError):
+                          need = []
+                      if need:
+                          args.append((mod_name, name, need)); continue
+                      if name in NEEDS_PRECONDITION:
+                          skipped.append(f"{mod_name}.{name}")
+                          print(f"  SKIP {mod_name}.{name} (needs precondition / CUDA)")
+                          continue
+                      try:
+                          fn()
+                          ok += 1
+                          print(f"  OK   {mod_name}.{name}")
+                      except Exception as e:
+                          fail.append((mod_name, name, type(e).__name__, str(e)[:200]))
+                          print(f"  FAIL {mod_name}.{name} -> {type(e).__name__}: {str(e)[:200]}")
+              print(f"\nzero-arg patch_*: ok={ok} fail={len(fail)} skipped={len(skipped)}")
+              print(f"arg-required patch_* (skipped, listed for review): {len(args)}")
+              for m, n, r in args:
+                  print(f"    needs={r}: {m}.{n}")
+              if skipped:
+                  print(f"explicitly skipped (needs precondition / CUDA): {skipped}")
+              if miss_imports:
+                  print("\nmodules failed to import (skipped):")
+                  for k, v in miss_imports.items():
+                      print(f"    {k}: {v}")
+              print(f"required patch_* helpers seen: {sorted(seen_required)}")
+              missing = REQUIRED - seen_required
+              assert not missing, f"required patch_* helpers MISSING: {sorted(missing)}"
+              # Strict: any zero-arg patch that raises is a real
+              # regression now that #5319 has landed (the three previously
+              # known-broken patches are fixed; legitimate
+              # CPU-precondition skips are recorded in NEEDS_PRECONDITION
+              # above, not in `fail`). Print all failures and re-raise
+              # them as one assertion message.
+              if fail:
+                  raise AssertionError(
+                      f"zero-arg patch_* invocation failures (ok={ok}, "
+                      f"fail={len(fail)}, skipped={len(skipped)}):\n  "
+                      + "\n  ".join(
+                          f"{m}.{n} -> {ec}: {msg}" for m, n, ec, msg in fail
+                      )
+                  )
+          PY
+          python -m pytest -q --tb=short tests/_runtime_patch_check_shim.py -s
+          rm -f tests/_runtime_patch_check_shim.py
+
+      - name: Runtime checks — patch_tiled_mlp on a synthetic MLP module (via pytest shim)
+        id: patch-tiled-mlp
+        background: true
+        # Same shim pattern: pytest picks up tests/conftest.py before importing
+        # unsloth_zoo.tiled_mlp, so the GPU-spoof harness covers
+        # unsloth_zoo.temporary_patches.gpt_oss's mem_get_info call.
+        run: |
+          set -euxo pipefail
+          cat > tests/_tiled_mlp_check_shim.py <<'PY'
+          # Auto-generated by .github/workflows/consolidated-tests-ci.yml.
+          import sys, pathlib
+          sys.path.insert(0, str(pathlib.Path(__file__).parent))
+          import _zoo_aggressive_cuda_spoof as _spoof
+          _spoof.apply()
+          import torch
+          import torch.nn as nn
+          from unsloth_zoo.tiled_mlp import patch_tiled_mlp, patch_mlp
+
+          class _MLP(nn.Module):
+              def __init__(self, hidden=64, intermediate=128):
+                  super().__init__()
+                  self.gate_proj = nn.Linear(hidden, intermediate, bias=False)
+                  self.up_proj   = nn.Linear(hidden, intermediate, bias=False)
+                  self.down_proj = nn.Linear(intermediate, hidden, bias=False)
+                  self.act_fn = nn.SiLU()
+              def forward(self, x):
+                  return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+
+          class _FakeModel(nn.Module):
+              def __init__(self):
+                  super().__init__()
+                  self.layers = nn.ModuleList([nn.ModuleDict({"mlp": _MLP()}) for _ in range(2)])
+              def forward(self, x):
+                  for layer in self.layers:
+                      x = x + layer["mlp"](x)
+                  return x
+
+          def test_patch_tiled_mlp_numerical_equivalence():
+              # `patch_mlp(target_arctic=True)` sets `chunk_size = max(1, H)`
+              # and shards the SEQUENCE dim with `n_shards = max(1, S //
+              # chunk_size)`. Pick S > H so the tiled path actually runs
+              # multi-shard (n_shards = 192 // 64 = 3, plus a remainder
+              # shard) rather than degenerating to n_shards = 1 which is
+              # bit-exact and only confirms patching installed something.
+              # If the tiled implementation is correct, multi-shard output
+              # must still match the un-tiled reference within FP32 noise.
+              torch.manual_seed(0)
+              m = _FakeModel().eval()
+              hidden = 64
+              # 192 = 3 * hidden, so divmod(192, 64) = (3, 0) -> 3 shards,
+              # no remainder; gives a clean multi-shard verification.
+              x = torch.randn(2, 192, hidden)
+              with torch.no_grad():
+                  y_before = m(x).clone()
+              patch_mlp(m.layers[0]["mlp"])
+              patch_tiled_mlp(m)
+              # Sanity-check we are actually exercising the multi-shard
+              # path: poke chunk_size by re-deriving it the same way
+              # `tiled_forward_arctic_size` does.
+              S = x.shape[1]
+              chunk = max(1, hidden)
+              n_shards_expected = max(1, S // chunk)
+              assert n_shards_expected > 1, (
+                  "tiled MLP shim is not exercising multi-shard: "
+                  f"S={S}, chunk={chunk}, n_shards={n_shards_expected}"
+              )
+              with torch.no_grad():
+                  y_after = m(x).clone()
+              err = (y_before - y_after).abs().max().item()
+              print(
+                  f"patch_tiled_mlp multi-shard (n_shards={n_shards_expected}) "
+                  f"output diff = {err:.3e}"
+              )
+              assert err < 1e-3, f"tiled MLP output drifted: {err}"
+          PY
+          python -m pytest -q --tb=short tests/_tiled_mlp_check_shim.py -s
+          rm -f tests/_tiled_mlp_check_shim.py
+
+      - wait: generation-guards
+      - wait: patch-invoke
+      - wait: patch-tiled-mlp
+
+      - name: Compiler cache hygiene + source-rewriter invariants (synthetic inputs)
+        id: compiler-hygiene
+        background: true
+        # Lightweight pipeline coverage for unsloth_zoo.compiler. Pure regex
+        # / tokenize / ast paths driven by tiny synthetic source strings:
+        #   - higher_precision_softmax (basic + idempotent)
+        #   - fix_rotary_embedding_dtype (no-op + active under
+        #     UNSLOTH_FORCE_CUSTOM_DTYPE)
+        #   - fix_attention_dtype_consistency (insert + idempotent)
+        #   - convert_attention_masks_to_bool (rewrite + no-op)
+        #   - create_new_function happy-path (versioning block, license
+        #     header, AST parse, importlib re-import)
+        #   - create_new_function **kwargs collision (exercises
+        #     _rewrite_kwargs_param + _insert_kwargs_alias)
+        #   - UNSLOTH_COMPILE_OVERWRITE=0 forced-recompile on transformers
+        #     version mismatch (compiler.py:947-963)
+        #   - matching short-circuit when versions are equal
+        # No real transformers modeling module is loaded; complements the
+        # heavier real-class round-trip step below. Wall-time ~10-25s.
+        run: |
+          set -euxo pipefail
+          cat > tests/_compiler_cache_invariants_shim.py <<'PY'
+          # Auto-generated by .github/workflows/consolidated-tests-ci.yml.
+          # Cache-hygiene + source-rewriter invariants for unsloth_zoo.compiler.
+          import sys, pathlib, os, ast, importlib, importlib.util, time
+          sys.path.insert(0, str(pathlib.Path(__file__).parent))
+          import _zoo_aggressive_cuda_spoof as _spoof
+          _spoof.apply()
+          import pytest
+          import torch  # noqa: F401  (compiler.py imports torch at module load)
+
+
+          def _isolate_cache(tmp_path, monkeypatch):
+              """Point UNSLOTH_COMPILE_LOCATION at tmp_path and reset module
+              globals. The compiler.py global is captured at module load
+              (line 75/179), so we delete + reimport per test."""
+              monkeypatch.setenv("UNSLOTH_COMPILE_LOCATION", str(tmp_path))
+              if "unsloth_zoo.compiler" in sys.modules:
+                  del sys.modules["unsloth_zoo.compiler"]
+              import unsloth_zoo.compiler as compiler
+              compiler.UNSLOTH_COMPILE_LOCATION = str(tmp_path)
+              compiler.UNSLOTH_COMPILE_USE_TEMP = False
+              return compiler
+
+
+          def test_higher_precision_softmax_basic_and_idempotent(tmp_path, monkeypatch):
+              c = _isolate_cache(tmp_path, monkeypatch)
+              src = (
+                  "y = nn.functional.softmax(x, dim=-1)\n"
+                  "z = F.softmax(a, dim=1, dtype=torch.bfloat16)\n"
+              )
+              out = c.higher_precision_softmax(src)
+              assert "dtype = torch.float32).to(x.dtype)" in out
+              assert "dtype = torch.float32).to(a.dtype)" in out
+              # Idempotency landed in unslothai/unsloth-zoo#631
+              # (negative-lookahead on `.to(<var>.dtype)` so a second
+              # pass does not append another cast).
+              assert c.higher_precision_softmax(out) == out
+
+
+          def test_fix_rotary_dtype_no_op_without_env(tmp_path, monkeypatch):
+              c = _isolate_cache(tmp_path, monkeypatch)
+              monkeypatch.delenv("UNSLOTH_FORCE_CUSTOM_DTYPE", raising=False)
+              src = "out = cos.to(dtype=x.dtype) + sin.to(dtype=x.dtype)\n"
+              assert c.fix_rotary_embedding_dtype(src) == src
+
+
+          def test_fix_rotary_dtype_active(tmp_path, monkeypatch):
+              c = _isolate_cache(tmp_path, monkeypatch)
+              monkeypatch.setenv(
+                  "UNSLOTH_FORCE_CUSTOM_DTYPE",
+                  "float16;torch.float32;torch.bfloat16;torch.float16;pass",
+              )
+              monkeypatch.setenv("UNSLOTH_FORCE_FLOAT32", "1")
+              src = "out = cos.to(dtype=x.dtype) + sin.to(dtype=x.dtype)\n"
+              out = c.fix_rotary_embedding_dtype(src)
+              # Active form rewrites cos.to / sin.to. Either the conditional
+              # form or the cast form is acceptable -- different transformers
+              # versions surface slightly different outputs from the rewriter.
+              assert "cos.to(dtype=x.dtype)" not in out
+              assert "sin.to(dtype=x.dtype)" not in out
+
+
+          def test_fix_attention_dtype_consistency_insert_then_idempotent(tmp_path, monkeypatch):
+              c = _isolate_cache(tmp_path, monkeypatch)
+              src = (
+                  "    query_states, key_states = apply_rotary_pos_emb("
+                  "query_states, key_states, cos, sin)\n"
+                  "    attn = q @ k.T\n"
+              )
+              out = c.fix_attention_dtype_consistency(src)
+              assert out.count("value_states = value_states.to(query_states.dtype)") == 1
+              assert c.fix_attention_dtype_consistency(out) == out
+
+
+          def test_convert_attention_masks_to_bool_rewrites(tmp_path, monkeypatch):
+              c = _isolate_cache(tmp_path, monkeypatch)
+              src = (
+                  "def make_mask(x):\n"
+                  "    out = torch.finfo(x.dtype).min * x\n"
+                  "    return out\n"
+              )
+              out = c.convert_attention_masks_to_bool("make_mask", src)
+              # Loose match: rewriter inserts a `!=torch.finfo(...).min` check
+              # somewhere on the return path. Tightening to an exact
+              # last-line match is brittle across transformers versions.
+              assert "!=torch.finfo" in out
+
+
+          def test_convert_attention_masks_to_bool_no_op(tmp_path, monkeypatch):
+              c = _isolate_cache(tmp_path, monkeypatch)
+              src = "def make_mask(x):\n    return x\n"
+              assert c.convert_attention_masks_to_bool("make_mask", src) == src
+
+
+          def _versioning_lines(file_text):
+              """Extract the four version strings from the versioning block."""
+              assert file_text.startswith('"""\n'), "missing opening triple-quote"
+              head = file_text.split("__UNSLOTH_VERSIONING__", 1)[0]
+              lines = [ln for ln in head.splitlines() if ln and ln != '"""']
+              return lines
+
+
+          def test_create_new_function_happy_path(tmp_path, monkeypatch):
+              c = _isolate_cache(tmp_path, monkeypatch)
+              src = "def f(x):\n    return nn.functional.softmax(x, dim=-1)\n"
+              c.create_new_function(
+                  name="f_happy", new_source=src, model_location="builtins",
+                  functions=[], overwrite=True,
+              )
+              cached = tmp_path / "f_happy.py"
+              assert cached.exists()
+              text = cached.read_text(encoding="utf-8")
+              versions = _versioning_lines(text)
+              assert len(versions) == 4, versions
+              assert text.count(c._full_license_header) == 1
+              ast.parse(text)
+              spec = importlib.util.spec_from_file_location("f_happy_reimport", cached)
+              m2 = importlib.util.module_from_spec(spec)
+              spec.loader.exec_module(m2)
+              assert callable(m2.f)
+              import inspect as _inspect
+              # higher_precision_softmax should have promoted to float32.
+              assert "dtype = torch.float32" in _inspect.getsource(m2.f)
+
+
+          def test_create_new_function_overwrite_zero_recompiles_on_version_mismatch(
+              tmp_path, monkeypatch,
+          ):
+              c = _isolate_cache(tmp_path, monkeypatch)
+              name = "vmismatch"
+              cached = tmp_path / f"{name}.py"
+              stub = (
+                  '"""\n0.0.0\n0.0.0\n0.0.0-stub\n0.0.0\n__UNSLOTH_VERSIONING__\n"""\n'
+                  + c._full_license_header
+                  + "def vmismatch(x):\n    return x\n"
+              )
+              cached.write_text(stub, encoding="utf-8")
+              monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+              src = "def vmismatch(x):\n    return x + 1\n"
+              c.create_new_function(
+                  name=name, new_source=src, model_location="builtins",
+                  functions=[], overwrite=False,
+              )
+              text = cached.read_text(encoding="utf-8")
+              assert "0.0.0-stub" not in text, (
+                  "OVERWRITE=0 + transformers-version-mismatch did NOT recompile"
+              )
+              versions = _versioning_lines(text)
+              import importlib.metadata as _md
+              assert versions[2] == _md.version("transformers")
+
+
+          def test_create_new_function_overwrite_zero_short_circuits_when_versions_match(
+              tmp_path, monkeypatch,
+          ):
+              c = _isolate_cache(tmp_path, monkeypatch)
+              name = "vmatch"
+              src = "def vmatch(x):\n    return x\n"
+              c.create_new_function(
+                  name=name, new_source=src, model_location="builtins",
+                  functions=[], overwrite=True,
+              )
+              cached = tmp_path / f"{name}.py"
+              mtime_before = cached.stat().st_mtime_ns
+              time.sleep(0.05)
+              monkeypatch.setenv("UNSLOTH_COMPILE_OVERWRITE", "0")
+              c.create_new_function(
+                  name=name, new_source=src, model_location="builtins",
+                  functions=[], overwrite=False,
+              )
+              assert cached.stat().st_mtime_ns == mtime_before, (
+                  "OVERWRITE=0 + matching versions should NOT rewrite the file"
+              )
+          PY
+          python -m pytest -q --tb=short tests/_compiler_cache_invariants_shim.py
+          rm -f tests/_compiler_cache_invariants_shim.py
+
       - name: MoE per-family coverage + GRPO patches + grouped_gemm AST
+        id: moe-coverage
+        background: true
         # Catches the recurring class of bugs that PR #624 (gemma4 missing
         # extractor), PR #612 (gemma4 GRPO patch silently dropped), PR #607
         # (gate_up LoRA dropped from grad graph), PR #601 (qwen MoE shape
@@ -2260,6 +2223,101 @@ jobs:
           python -m pytest -q --tb=short -s tests/_moe_coverage_shim.py
           rm -f tests/_moe_coverage_shim.py
 
+      - name: Static checks — unsloth/trainer.py + unsloth/models/rl.py against latest pip TRL
+        id: static-trl
+        background: true
+        # AST-only sanity: confirm both files parse and that every TRL symbol
+        # they reference still exists in the installed `trl`. Catches API
+        # drift (renamed / removed TRL classes) without running training.
+        # Pre-fetches latest pip transformers in case TRL pinned an older one.
+        run: |
+          set -euxo pipefail
+          # Use the matrix-resolved transformers + trl versions already
+          # installed by the runtime-deps step (don't upgrade here; that
+          # would defeat the matrix's purpose of testing against the
+          # specific (transformers, trl) combination the cell selected).
+          python <<'PY'
+          import ast, importlib, pathlib, sys
+          paths = [pathlib.Path("unsloth/trainer.py"),
+                   pathlib.Path("unsloth/models/rl.py")]
+          for p in paths:
+              src = p.read_text()
+              tree = ast.parse(src, filename=str(p))
+              # Collect every `from trl... import X` and `from trl... import (X, Y)`
+              missing = []
+              for node in ast.walk(tree):
+                  if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("trl"):
+                      mod = importlib.import_module(node.module)
+                      for alias in node.names:
+                          if alias.name == "*":
+                              continue
+                          if not hasattr(mod, alias.name):
+                              missing.append(f"{node.module}.{alias.name}")
+              print(f"{p}: TRL symbols referenced and resolved -> {'OK' if not missing else 'MISSING ' + ', '.join(missing)}")
+              if missing:
+                  sys.exit(1)
+          PY
+
+      - name: Static checks — unsloth_zoo/tiled_mlp.py against latest pip transformers
+        id: static-tiled-mlp
+        background: true
+        # AST parse + transformers symbol-resolution. The user flagged tiled
+        # MLP patching as the path that breaks first when transformers ships
+        # an MLP class rename; this step is the canary against whatever
+        # transformers version the matrix cell selected.
+        working-directory: ${{ runner.temp }}/unsloth-zoo
+        run: |
+          set -euxo pipefail
+          python <<'PY'
+          import ast, importlib, pathlib, sys
+          p = pathlib.Path("unsloth_zoo/tiled_mlp.py")
+          src = p.read_text()
+          tree = ast.parse(src, filename=str(p))
+          missing = []
+          for node in ast.walk(tree):
+              if isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("transformers"):
+                  try:
+                      mod = importlib.import_module(node.module)
+                  except Exception as e:
+                      missing.append(f"{node.module} (import failed: {type(e).__name__})")
+                      continue
+                  for alias in node.names:
+                      if alias.name == "*":
+                          continue
+                      if not hasattr(mod, alias.name):
+                          missing.append(f"{node.module}.{alias.name}")
+          print(f"{p}: transformers symbols referenced -> {'OK' if not missing else 'MISSING ' + ', '.join(missing)}")
+          if missing:
+              sys.exit(1)
+          PY
+
+      - name: Static checks — unsloth_zoo/hf_utils.py syntax + import-graph
+        id: static-hf-utils
+        background: true
+        working-directory: ${{ runner.temp }}/unsloth-zoo
+        run: |
+          set -euxo pipefail
+          python <<'PY'
+          import ast, pathlib
+          p = pathlib.Path("unsloth_zoo/hf_utils.py")
+          tree = ast.parse(p.read_text(), filename=str(p))
+          # Surface every public function + class so the PR check log shows
+          # what's covered, not just OK/FAIL.
+          public = []
+          for node in tree.body:
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not node.name.startswith("_"):
+                  public.append(f"{type(node).__name__.replace('Def','').lower()}:{node.name}")
+          print(f"hf_utils.py public surface ({len(public)}): " + ", ".join(public))
+          PY
+
+      - wait: compiler-hygiene
+      - wait: moe-coverage
+      - wait: static-trl
+      - wait: static-tiled-mlp
+      - wait: static-hf-utils
+
+      - wait: model-sweep
+
       - name: Summary
         if: always()
         run: |
@@ -2285,6 +2343,7 @@ jobs:
           dir: ${{ steps.pip-cache.outputs.dir }}
           key: ${{ steps.pip-cache.outputs.key }}
           cache-hit: ${{ steps.pip-cache.outputs.cache-hit }}
+
 
   # The unsloth_zoo suite, lifted out of the `consolidated` cell above.
   #

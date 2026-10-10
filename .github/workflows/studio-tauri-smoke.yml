@@ -100,6 +100,13 @@ jobs:
         # against a mirror that was degraded rather than dead, and every attempt
         # then hit the same wall -- three kills and no result. The bound exists to
         # stop an infinite hang, not to race a slow mirror.
+        #
+        # In the background: nothing before `cargo test` links against these
+        # packages. The toolchain, the caches, the lockfile audit, both `npm ci`s and
+        # the vite build run beside the apt transaction instead of behind it, and the
+        # `wait` before the Rust unit tests is where a failed install fails the job.
+        id: linux-native-deps
+        background: true
         timeout-minutes: 15
         env:
           RETRY_ATTEMPTS: '2'
@@ -157,6 +164,9 @@ jobs:
           npm ci --no-fund --no-audit
           npm run build
           test -f dist/index.html
+
+      # The WebKit2GTK dev packages have to be on disk before cargo links anything.
+      - wait: linux-native-deps
 
       # The crate carries ~100 unit tests (native_file_dialogs, preflight,
       # install, desktop_auth, ...) that nothing ran until now: this workflow

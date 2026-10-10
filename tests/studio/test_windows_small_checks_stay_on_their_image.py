@@ -94,10 +94,14 @@ def test_no_phase_is_stranded_and_no_cell_is_idle():
 
 
 def test_every_step_is_gated_so_a_cell_runs_only_its_own_phases():
+    # `wait` / `wait-all` / `cancel` only join background steps, which carry their own
+    # gate; on their own they do no work on any image.
     ungated = [
         s.get("name") or s.get("uses")
         for s in _job()["steps"]
-        if "matrix.phases" not in str(s.get("if", "")) and "checkout" not in str(s.get("uses", ""))
+        if "matrix.phases" not in str(s.get("if", ""))
+        and "checkout" not in str(s.get("uses", ""))
+        and not {"wait", "wait-all", "cancel"} & set(s)
     ]
     assert not ungated, f"these steps carry no phase gate and would run on every image: {ungated}"
 

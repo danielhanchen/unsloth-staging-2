@@ -75,7 +75,15 @@ jobs:
         # asserting against. xdist and vermin stay unpinned: neither is under test.
         run: pip install pyyaml==6.0.2 pytest==9.0.3 pytest-xdist vermin
 
+      # The two lints run as background steps beside the guard suites below rather than
+      # ahead of them: all three only read the checkout, and the lints were ~60s of a
+      # ~6 minute job spent before the suites started. Each keeps its own step, log and
+      # exit code, and `wait-all` at the end of the job fails it exactly as before if
+      # either lint does. The one difference is that a failing lint no longer skips the
+      # suites, so a run reports both verdicts instead of the first.
       - name: Lint workflow triggers + cache keys
+        id: lint-triggers
+        background: true
         run: python3 scripts/lint_workflow_triggers.py
 
       # What the dropped interpreter legs used to catch, as far as a static check can.
@@ -87,6 +95,8 @@ jobs:
       # added after the floor fails here in seconds rather than on main in 23 minutes.
       # No paths filter on this workflow, so it sees every pull request.
       - name: Backend still runs on the oldest interpreter the matrix claims
+        id: lint-python-floor
+        background: true
         run: python3 scripts/lint_backend_python_floor.py
 
       # ONE pytest invocation, not one per file.
@@ -136,6 +146,7 @@ jobs:
             tests/studio/test_cache_budget_discipline.py \
             tests/studio/test_cached_paths_hold_no_credentials.py \
             tests/studio/test_actions_are_pinned_to_commits.py \
+            tests/studio/test_parallel_steps_stay_flat.py \
             tests/studio/test_local_actions_are_in_path_filters.py \
             tests/studio/test_chat_ui_shards_cover_everything.py \
             tests/studio/test_ui_shard_engines.py \
@@ -189,6 +200,9 @@ jobs:
             --ignore=tests/security/test_custom_dtype_wire_format.py \
             --ignore=tests/security/test_mapper_probe_no_exec.py \
             --ignore=tests/security/test_inherited_custom_dtype_is_neutralized.py
+
+      # Collects the two background lints above; a failure in either fails the job here.
+      - wait-all:
 
 
   # The four security suites the job above has to --ignore. That job installs four
