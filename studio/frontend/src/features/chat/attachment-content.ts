@@ -1054,6 +1054,199 @@ export function writeDocxTableRows(archive: Uint8Array): Uint8Array {
   return zipSync({ ...unzipSync(archive), ...rewritten }, { level: 0 });
 }
 
+function listNumber(n: number, format: string | undefined): string {
+  if (format === "none") return "";
+  const lower = format?.startsWith("lower");
+  // Out-of-range counters read as decimals, like CSS (roman stops at 3999); this also bounds the loops below.
+  if (n < 1 || n > (format?.endsWith("Roman") ? 3999 : 26 * 256) || !Number.isInteger(n) || !(lower || format?.startsWith("upper"))) {
+    return format === "decimalZero" && n >= 0 && n < 10 ? `0${n}` : String(n);
+  }
+  let text = "";
+  if (format!.endsWith("Roman")) text = romanNumeral(n);
+  // CSS lower-alpha is bijective (z, aa, ab); Word's lowerLetter repeats the letter (z, aa, bb).
+  else if (format!.endsWith("Alpha")) for (let k = n; k > 0; k = Math.floor((k - 1) / 26)) text = String.fromCharCode(97 + ((k - 1) % 26)) + text;
+  else text = String.fromCharCode(97 + ((n - 1) % 26)).repeat(Math.ceil(n / 26));
+  return lower ? text : text.toUpperCase();
+}
+
+function wordValue(node: Element | undefined, name: string): string | undefined {
+  const ns = node?.namespaceURI ?? "";
+  return (node && childElements(node, ns, name)[0]?.getAttributeNS(ns, "val")) || undefined;
+}
+
+// Labels are an extra: a numbering part this cannot read leaves the text as Mammoth reads it.
+export function writeDocxListNumbers(archive: Uint8Array): Uint8Array {
+  try {
+    return injectDocxListNumbers(archive);
+  } catch {
+    return archive;
+  }
+}
+
+function injectDocxListNumbers(archive: Uint8Array): Uint8Array {
+  const parts = unzipSync(archive, { filter: (entry) => /\.(?:xml|rels)$/.test(entry.name) });
+  const resolve = (targets: string[] | undefined, fallback: string) =>
+    targets?.find((path) => Object.hasOwn(parts, path)) ?? fallback;
+  const main = resolve(readDocxXmlTargets(parts[DOCX_PACKAGE_RELATIONSHIPS], "").get(DOCX_MAIN_DOCUMENT_TYPE), DOCX_MAIN_DOCUMENT_FALLBACK);
+  const targets = readDocxXmlTargets(parts[docxRelationshipsPath(main)], main.slice(0, Math.max(0, main.lastIndexOf("/"))));
+  const parse = (path: string) => {
+    const bytes = Object.hasOwn(parts, path) ? parts[path] : undefined;
+    if (!bytes) return null;
+    const doc = new DOMParser().parseFromString(strFromU8(bytes), "application/xml");
+    const root = doc.documentElement;
+    if (!WORDPROCESSINGML_NAMESPACES.has(root?.namespaceURI ?? "") || doc.getElementsByTagName("parsererror").length) return null;
+    return { doc, root, w: root.namespaceURI ?? "" };
+  };
+  const related = (name: string) => parse(resolve(targets.get(`${DOCX_RELATIONSHIP_NAMESPACE}${name}`), `word/${name}.xml`));
+  const numbering = related("numbering");
+  const body = numbering && parse(main);
+  if (!numbering || !body) return archive;
+
+  const byId = (parent: Element, ns: string, name: string, id: string) =>
+    new Map(childElements(parent, ns, name).map((node) => [node.getAttributeNS(ns, id) ?? "", node]));
+  const n = numbering.w;
+  const abstracts = byId(numbering.root, n, "abstractNum", "abstractNumId");
+  const nums = byId(numbering.root, n, "num", "numId");
+  const styles = related("styles");
+  const styleById = styles ? byId(styles.root, styles.w, "style", "styleId") : new Map<string, Element>();
+  const styleNumbering = new Map<string, Element | undefined>();
+  const styleNumPr = (id: string | undefined, depth = 0): Element | undefined => {
+    if (id === undefined) return undefined;
+    if (styleNumbering.has(id)) return styleNumbering.get(id);
+    const style = styleById.get(id);
+    if (!style || depth > 20) return undefined;
+    const pPr = childElements(style, style.namespaceURI ?? "", "pPr")[0];
+    const numPr = (pPr && childElements(pPr, style.namespaceURI ?? "", "numPr")[0]) ?? styleNumPr(wordValue(style, "basedOn"), depth + 1);
+    styleNumbering.set(id, numPr);
+    return numPr;
+  };
+
+  type Level = { lvl?: Element; start: number; format?: string; restart?: string; legal: boolean; text: string };
+  const firstByLevel = (nodes: Element[]) => {
+    const byLevel = new Map<string, Element>();
+    for (const node of nodes) {
+      const at = node.getAttributeNS(n, "ilvl") ?? "";
+      if (!byLevel.has(at)) byLevel.set(at, node);
+    }
+    return byLevel;
+  };
+  const definedLevels = new Map<string, Map<string, Element>>();
+  // Each instance's nine levels are resolved once, not per paragraph.
+  type Instance = { abstractId: string; levels: Level[]; restarts: number[] };
+  const instances = new Map<string, Instance | undefined>();
+  const instance = (numId: string): Instance | undefined => {
+    if (instances.has(numId)) return instances.get(numId);
+    const num = nums.get(numId);
+    const abstractId = wordValue(num, "abstractNumId") ?? "";
+    const abstract = abstracts.get(abstractId);
+    let resolved: Instance | undefined;
+    if (num && abstract) {
+      const overrides = firstByLevel(childElements(num, n, "lvlOverride"));
+      const defined = definedLevels.get(abstractId) ?? firstByLevel(childElements(abstract, n, "lvl"));
+      definedLevels.set(abstractId, defined);
+      const levels = Array.from({ length: 9 }, (_, index): Level => {
+        const override = overrides.get(String(index));
+        const lvl = (override && childElements(override, n, "lvl")[0]) ?? defined.get(String(index));
+        return {
+          lvl,
+          start: Number(wordValue(override, "startOverride") ?? wordValue(lvl, "start") ?? 0) || 0,
+          format: wordValue(lvl, "numFmt"),
+          restart: wordValue(lvl, "lvlRestart"),
+          // isLgl (legal numbering) shows every level's number in Arabic digits: "Section 1.01" under "Article I".
+          legal: !!lvl && childElements(lvl, n, "isLgl").some((node) => !/^(?:0|false|off)$/.test(node.getAttributeNS(n, "val") ?? "")),
+          text: wordValue(lvl, "lvlText") ?? "",
+        };
+      });
+      const restarts = Array.from(overrides.entries())
+        .filter(([at, node]) => /^[0-8]$/.test(at) && childElements(node, n, "startOverride").length)
+        .map(([at]) => Number(at));
+      resolved = { abstractId, levels, restarts };
+    }
+    instances.set(numId, resolved);
+    return resolved;
+  };
+  const W15 = "http://schemas.microsoft.com/office/word/2012/wordml";
+  const restartsAfterBreak = new Set(
+    Array.from(abstracts.entries())
+      .filter(([, node]) => /^(?:1|true|on)$/.test(node.getAttributeNS(W15, "restartNumberingAfterBreak") ?? ""))
+      .map(([id]) => id),
+  );
+
+  const counters = new Map<string, (number | undefined)[]>();
+  const started = new Set<string>();
+  const { doc, w } = body;
+  const tag = (local: string) => (body.root.prefix ? `${body.root.prefix}:${local}` : local);
+  let found = false;
+  const label = (p: Element, pPr: Element | undefined) => {
+    // A tracked-deleted paragraph mark removes the item; Mammoth folds its text into the next paragraph.
+    const mark = pPr && childElements(pPr, w, "rPr")[0];
+    if (mark && (childElements(mark, w, "del").length || childElements(mark, w, "moveFrom").length)) return;
+    const direct = pPr && childElements(pPr, w, "numPr")[0];
+    const styled = styleNumPr(wordValue(pPr, "pStyle"));
+    const numId = wordValue(direct, "numId") ?? wordValue(styled, "numId");
+    const list = numId === undefined ? undefined : instance(numId);
+    if (!list) return;
+    const { abstractId, levels, restarts } = list;
+    const ilvl = Math.min(8, Math.max(0, Math.trunc(Number(wordValue(direct, "ilvl") ?? wordValue(styled, "ilvl") ?? 0) || 0)));
+    const { lvl, format, legal, text } = levels[ilvl];
+    if (!lvl) return;
+    // Instances of one abstract definition share its counters, as in Word; a start override
+    // restarts them once, when its instance is first used.
+    const counts = counters.get(abstractId) ?? [];
+    counters.set(abstractId, counts);
+    if (!started.has(numId!)) {
+      started.add(numId!);
+      for (const at of restarts) if (at < counts.length) counts.length = at;
+    }
+    for (let i = 0; i < ilvl; i++) counts[i] ??= levels[i].start;
+    const current = counts[ilvl];
+    counts[ilvl] = current === undefined ? levels[ilvl].start : current + 1;
+    // A deeper level restarts after any shallower one unless lvlRestart (1-based, 0 = never) says otherwise.
+    for (let i = ilvl + 1; i < counts.length; i++) {
+      const restart = levels[i].restart;
+      if (restart === undefined || ilvl < Number(restart)) counts[i] = undefined;
+    }
+    // Word caps a number format far below this; a longer one is not a label.
+    if (format === "bullet" || text.length > 256) return;
+    let value = "";
+    for (const [index, piece] of text.split(/%([1-9])/).entries()) {
+      if (index % 2 === 0) value += piece;
+      else {
+        const { start, format } = levels[Number(piece) - 1];
+        value += listNumber(counts[Number(piece) - 1] ?? start, legal && format !== "none" && !format?.startsWith("decimal") ? "decimal" : format);
+      }
+      if (value.length > 256) return;
+    }
+    if (!value.trim()) return;
+    const run = doc.createElementNS(w, tag("r"));
+    const t = doc.createElementNS(w, tag("t"));
+    t.setAttributeNS("http://www.w3.org/XML/1998/namespace", "xml:space", "preserve");
+    t.appendChild(doc.createTextNode(`${value} `));
+    run.appendChild(t);
+    p.insertBefore(run, pPr ? pPr.nextSibling : p.firstChild);
+    found = true;
+  };
+  // Mammoth reads only mc:Fallback, so paragraphs under mc:Choice must not count twice.
+  const MC = "http://schemas.openxmlformats.org/markup-compatibility/2006";
+  const paragraphs: Element[] = [];
+  const stack: Element[] = [doc.documentElement];
+  while (stack.length) {
+    const node = stack.pop()!;
+    if (node.localName === "Choice" && node.namespaceURI === MC) continue;
+    if (node.localName === "p" && node.namespaceURI === w) paragraphs.push(node);
+    const kids = Array.from(node.childNodes).filter((child): child is Element => child.nodeType === ELEMENT_NODE);
+    for (let i = kids.length - 1; i >= 0; i--) stack.push(kids[i]);
+  }
+  for (const p of paragraphs) {
+    const pPr = childElements(p, w, "pPr")[0];
+    label(p, pPr);
+    // A section break restarts the lists that opt in (Word's "restart numbering after break").
+    if (pPr && childElements(pPr, w, "sectPr").length) for (const id of restartsAfterBreak) counters.delete(id);
+  }
+  if (!found) return archive;
+  return zipSync({ ...unzipSync(archive), [main]: strToU8(new XMLSerializer().serializeToString(doc)) }, { level: 0 });
+}
+
 const DOCX_NOTE_REFERENCE_RE =
   /<(?:([\w.-]+):)?(footnote|endnote)Reference\b([^>]*?)(\/?)>(\s*<\/(?:[\w.-]+:)?\2Reference\s*>)?/g;
 const DOCX_NOTE_ID_RE = /(?:^|\s)(?:[\w.-]+:)?id\s*=\s*["']([^"']*)["']/;
@@ -1581,7 +1774,7 @@ export async function extractDocxAttachmentText(file: File): Promise<string> {
   );
   const marked = markDocxNotes(linearizeDocxMath(repacked));
   const { value } = await mammoth.extractRawText({
-    arrayBuffer: toArrayBuffer(writeDocxTableRows(writeDocxBreaksAndCheckboxes(marked.archive))),
+    arrayBuffer: toArrayBuffer(writeDocxTableRows(writeDocxBreaksAndCheckboxes(writeDocxListNumbers(marked.archive)))),
   });
   return marked.label(value);
 }
@@ -1781,13 +1974,34 @@ function collectHtmlBlockText(
   }
 
   const groupSpans = HTML_ROW_GROUP_TAGS.has(tag) ? [] : rowSpans;
+  const isItem = (child: Node) =>
+    tag === "ol" && child.nodeType === ELEMENT_NODE && (child as Element).tagName.toLowerCase() === "li";
+  const reversed = tag === "ol" && element.getAttribute("reversed") !== null;
+  const start = tag === "ol" ? Number.parseInt(element.getAttribute("start") ?? "", 10) : Number.NaN;
+  let number = Number.isNaN(start) ? (reversed ? Array.from(element.childNodes).filter(isItem).length : 1) : start;
+  const format = tag === "ol" ? lookUp(HTML_LIST_FORMATS, element.getAttribute("type") ?? "") : undefined;
   const text = Array.from(element.childNodes)
-    .map((child) => collectHtmlBlockText(child, preformatted, groupSpans))
+    .map((child) => {
+      const inner = collectHtmlBlockText(child, preformatted, groupSpans);
+      if (!isItem(child)) return inner;
+      const value = Number.parseInt((child as Element).getAttribute("value") ?? "", 10);
+      if (!Number.isNaN(value)) number = value;
+      const label = listNumber(number, lookUp(HTML_LIST_FORMATS, (child as Element).getAttribute("type") ?? "") ?? format);
+      number += reversed ? -1 : 1;
+      return `\n${label}. ${inner.trimStart()}`;
+    })
     .join("");
   return HTML_BLOCK_TAGS.has(tag) ? `\n${text}\n` : text;
 }
 
 const HTML_ROW_GROUP_TAGS = new Set(["table", "thead", "tbody", "tfoot"]);
+const HTML_LIST_FORMATS: Record<string, string> = {
+  "1": "decimal",
+  a: "lowerAlpha",
+  A: "upperAlpha",
+  i: "lowerRoman",
+  I: "upperRoman",
+};
 
 function containsPre(node: Node): boolean {
   return Array.from(node.childNodes).some(
