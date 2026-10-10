@@ -71,7 +71,7 @@ concurrency:
   # Per repository, not per ref. Two runs would fight over the same release tag and the same
   # self-hosted GPU runner, and a wheel build is too expensive to cancel a running one for a
   # newer dispatch, so they queue instead.
-  group: prebuilt-cuda-wheels-${{ github.repository }}
+  group: prebuilt-cuda-wheels-${{ github.repository }}-${{ github.run_id }}
   cancel-in-progress: false
 
 jobs:
