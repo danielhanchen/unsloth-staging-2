@@ -386,7 +386,8 @@ if "fp32" in outs:
 if "bf16" in outs and "bf16_int8wo" in outs:
     log("int8wo_vs_bf16", {"out": metrics(outs["bf16_int8wo"], outs["bf16"]), "hidden": metrics(hidden["bf16_int8wo"], hidden["bf16"])})
 log("mps_fallback_warnings", sorted(set(fallbacks))[:20])
-del SD
+if os.environ.get("ZI_KEEP_SD") != "1":
+    del SD
 gc.collect()
 
 # ---------- VAE decode ----------
