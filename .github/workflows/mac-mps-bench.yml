@@ -6,6 +6,13 @@ jobs:
   bench:
     runs-on: macos-15
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {leg: t_latest_512, torch: "torch", env: "ZI_SIDE=512"}
+          - {leg: t_latest_1024, torch: "torch", env: "ZI_SIDE=1024 ZI_VAE=0 ZI_GEMM=0 ZI_ARMS=bf16,bf16_int8wo,fp32"}
+          - {leg: t26_512, torch: "torch==2.6.0", env: "ZI_SIDE=512 ZI_VAE=0 ZI_ARMS=bf16,bf16_int8wo,fp32"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -14,19 +21,19 @@ jobs:
       - name: install
         run: |
           python -m pip install -q --upgrade pip
-          python -m pip install -q torch torchao mlx numpy safetensors huggingface_hub
+          python -m pip install -q '${{ matrix.torch }}' numpy safetensors huggingface_hub
           if [ -f bench/requirements.txt ]; then python -m pip install -q -r bench/requirements.txt; fi
           python -m pip list 2>/dev/null | grep -i -E "torch|mlx|diffusers|transformers|numpy"
       - name: run
         env:
           PYTHONUNBUFFERED: "1"
           HF_HUB_DISABLE_PROGRESS_BARS: "1"
-        run: bash bench/run.sh
+        run: env LEG=${{ matrix.leg }} ZI_LAYERS=1 ZI_REFINERS=1 ${{ matrix.env }} bash bench/run.sh
       - name: results
         if: always()
         run: for f in out/*.json; do echo "=== $f"; cat "$f"; done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: out
+          name: out-${{ matrix.leg }}
           path: out/
