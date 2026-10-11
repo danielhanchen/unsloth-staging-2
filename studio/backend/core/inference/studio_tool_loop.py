@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import threading
 
 from dataclasses import dataclass, field
@@ -1370,6 +1371,60 @@ def _advance_tool_stream(generator: Any, outcome: dict[str, Any]) -> Any:
         return _STEP_DONE
 
 
+_PARALLEL_TOOL_CALLS_ENV = "UNSLOTH_PARALLEL_TOOL_CALLS"
+
+# The most calls one round overlaps, each a worker with a pump task on top. Same figure as the GGUF
+# loop's `_MAX_PARALLEL_TOOL_CALLS_PER_ROUND`, kept here because the two loops must not import.
+_MAX_PARALLEL_TOOL_CALLS_PER_ROUND = 8
+
+
+def parallel_tool_calls_enabled() -> bool:
+    """Whether one turn's tool calls may run at the same time. On unless switched off: independent
+    is the model's claim, and two calls that write the same file interleave differently."""
+    raw = os.environ.get(_PARALLEL_TOOL_CALLS_ENV)
+    if raw is None:
+        return True
+    return raw.strip().lower() not in ("0", "false", "no", "off")
+
+
+def round_call_key(name: Any, arguments: Any) -> tuple:
+    """A conservative identity for one call, computed before the controller heals it: llama.cpp can
+    leak the raw `<tool_call>` markup AND emit the parsed call, so both are re-serialised sorted."""
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except Exception:
+            return (name, "raw:" + arguments)
+    try:
+        return (name, json.dumps(arguments, sort_keys = True, default = str))
+    except Exception:
+        return (name, repr(arguments))
+
+
+async def _pump_tool_stream(
+    tool_stream: Any,
+    outcome: dict[str, Any],
+    queue: "asyncio.Queue[Any]",
+    cancel_event: threading.Event,
+) -> None:
+    """Drive one tool's event stream to completion, buffering what it emits: the tool only advances
+    while somebody calls ``next()``. Events are queued, the SSE stream staying in the model's order."""
+    try:
+        while True:
+            if cancel_event.is_set():
+                break
+            event = await asyncio.to_thread(_advance_tool_stream, tool_stream, outcome)
+            if event is _STEP_DONE:
+                break
+            await queue.put(event)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - handed back to the model as the result
+        outcome["error"] = exc
+    finally:
+        await queue.put(_STEP_DONE)
+
+
 async def _drain_step_task(task: Any, cancel_event: threading.Event) -> None:
     """Join a pending ``next(gen)`` worker before its generator is closed. Cancelling the awaiting
     task does not stop the worker thread, and calling close() while next() is still running
@@ -1404,8 +1459,12 @@ async def stream_with_studio_tools(
     run: ToolLoopRun,
     policy: ToolLoopPolicy,
     cancel_event: threading.Event,
+    preempt_signal = None,
     mcp_image = None,
 ) -> AsyncIterator[str]:
+    """Stream a provider, execute requested Unsloth tools, continue to a final answer.
+    ``preempt_signal`` lets a KV-pressure pause interrupt the provider stream; tool execution is
+    not interruptible, so the signal is held off there and honoured at the next round's stream."""
     conversation = [dict(message) for message in run.messages]
     if mcp_image is not None:
         targets = await asyncio.to_thread(mcp_image_targets, sorted(_tool_names(policy.tools)))
@@ -1525,7 +1584,26 @@ async def stream_with_studio_tools(
     # ends a run that executes nothing, so a lower bound here only cuts a productive run short with no final answer.
     max_provider_turns = max(1, remaining) + 2 * MAX_ACT_REPROMPTS + 4
 
+    # Opened when a round's calls materialise, closed at the top of the next round. A superset
+    # of the strictly unsafe stretch, which is the safe direction to err.
+    _unsafe_window = None
+
+    def _close_unsafe_window() -> None:
+        nonlocal _unsafe_window
+        if _unsafe_window is not None:
+            _unsafe_window.__exit__(None, None, None)
+            _unsafe_window = None
+
+    def _open_unsafe_window() -> None:
+        nonlocal _unsafe_window
+        if preempt_signal is not None and _unsafe_window is None:
+            _unsafe_window = preempt_signal.unsafe_window()
+            _unsafe_window.__enter__()
+
     while not cancel_event.is_set():
+        # Any window the previous round opened ends here, at the top of a round, which is
+        # exactly where a pause is safe to land.
+        _close_unsafe_window()
         if provider_turns >= max_provider_turns:
             # Reached only by a model that keeps asking for tools it cannot run (all disabled, or the budget is gone).
             # Executions are already capped; this caps the asking, so the conversation cannot grow without bound when
@@ -1793,6 +1871,10 @@ async def stream_with_studio_tools(
         # the scraped web text in its prompts cannot reach python or terminal, so a naive or compromised endpoint
         # echoing a call back must not be able to execute it here.
         calls = [] if unrun_reason is not None else turn.calls(used_call_ids, painted_card_ids)
+        if calls:
+            # From here until the next round's stream, results are being produced and appended.
+            # A pause there would discard the work of tools that ran, or re-run them on resume.
+            _open_unsafe_window()
         if not calls:
             # The badge clears between iterations, and this turn is over too. Without it a turn whose only call was
             # refused never reaches the empty status below, so the client keeps the card it drew for that call open
@@ -1851,22 +1933,143 @@ async def stream_with_studio_tools(
         turn_mcp_images: list[list[dict[str, Any]]] = []
         turn_executed_real_tool = False
 
+        # Whether this round's calls may overlap. Decided BEFORE any is prepared: it has to hold for
+        # the whole round, or a modal lands in front of work already in flight.
+        _approval_gate = confirm_tool_calls and not bypass_permissions and permission_mode != "off"
+        if _approval_gate and permission_mode == "auto":
+            _approval_gate = any(
+                is_high_risk_tool_call(
+                    (item.get("function") or {}).get("name", ""), item.get("arguments")
+                )
+                for item in calls
+            )
+        # And only when the calls cannot depend on each other's RESULTS. `prepare_call` has
+        # exactly two such dependencies, both written by `record_result`. Keyed as the ledger
+        # keys them, healed, so two spellings of one call run once.
+        _one_shot = frozenset(getattr(controller, "_one_shot_tools", ()) or ())
+        _round_keys = []
+        for item in calls:
+            try:
+                _round_keys.append(controller.call_key(item))
+            except Exception:
+                _round_keys.append(
+                    round_call_key(
+                        (item.get("function") or {}).get("name", ""),
+                        (item.get("function") or {}).get("arguments"),
+                    )
+                )
+        _round_one_shot = [
+            (item.get("function") or {}).get("name", "")
+            for item in calls
+            if (item.get("function") or {}).get("name", "") in _one_shot
+        ]
+        parallel_round = (
+            parallel_tool_calls_enabled()
+            and len(calls) > 1
+            # Bounded: overlap is a thread and a task per call, and this round's length is the
+            # model's choice, not the user's.
+            and len(calls) <= _MAX_PARALLEL_TOOL_CALLS_PER_ROUND
+            and not _approval_gate
+            and mcp_image is None
+            and len(set(_round_keys)) == len(_round_keys)
+            and len(set(_round_one_shot)) == len(_round_one_shot)
+        )
+        # (decision, name, call_id, card_id, tool_stream, outcome, queue, pump)
+        pending_calls: list[tuple] = []
+
+        async def _settle_call(entry: tuple) -> AsyncIterator[str]:
+            """Yield one call's events in order, then record its result. Everything after the
+            tool returns stays sequential; only the WAITING was ever worth overlapping."""
+            nonlocal remaining, turn_executed_real_tool, executed_any, last_reprompt_text
+            if entry[0] == "lines":
+                # A call that produced its whole answer without running a tool. Written straight
+                # out from the preparing pass these landed AHEAD of every call still running.
+                _, lines, tool_message = entry
+                for line in lines:
+                    yield line
+                if tool_message is not None:
+                    tool_messages.append(tool_message)
+                return
+            _, decision, name, call_id, card_id, tool_stream, outcome, queue, pump = entry
+            # The pump queues _STEP_DONE from its own `finally` and then returns, so the
+            # consumer can see the sentinel a tick before `pump.done()` is true.
+            drained = False
+            try:
+                while True:
+                    event = await queue.get()
+                    if event is _STEP_DONE:
+                        drained = True
+                        break
+                    if isinstance(event, dict) and event.get("type") == "heartbeat":
+                        yield _SSE_KEEPALIVE
+                    else:
+                        yield _sse(event)
+                if outcome.get("error") is not None:
+                    result = f"Error: tool raised an exception: {outcome['error']}"
+                elif "result" in outcome:
+                    result = outcome["result"]
+                elif cancel_event.is_set():
+                    # Stopped before the tool returned. "" would paint a normal tool_end, claiming
+                    # nothing was produced when its side effects may already have happened.
+                    result = _TOOL_CANCELLED
+                else:
+                    result = ""
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - reported back to the model
+                result = f"Error: tool raised an exception: {exc}"
+            finally:
+                if not drained and not pump.done():
+                    # The worker thread cannot be cancelled, so tell the tool to stop and join
+                    # it: close() during next() raises "generator already executing".
+                    cancel_event.set()
+                try:
+                    await asyncio.shield(pump)
+                except (asyncio.CancelledError, Exception):
+                    pass
+                tool_stream.close()
+
+            completion = controller.record_result(decision, result)
+            # Counted whether or not the tool succeeded, a failing call having already done its
+            # side effects. Per call, so parallel calls each spend one.
+            if not unlimited:
+                remaining -= 1
+            turn_executed_real_tool = True
+            executed_any = True
+            last_reprompt_text = ""
+            yield _sse(completion.tool_end_event())
+            tool_messages.append(completion.tool_message())
+            # Only for a target that reads them, and off the loop: the envelope is
+            # a 12 MB json-load, and a text-only run discards the result anyway.
+            _completion_images = (
+                await asyncio.to_thread(completion.mcp_images) if run.supports_vision else []
+            )
+            if _completion_images:
+                turn_mcp_images.append(_completion_images)
+
         for call in calls:
             if cancel_event.is_set():
                 break
             # Before the gate: an exhausted call is replayed too, and only the decision's replay is guaranteed to parse.
             decision = controller.prepare_call(call)
             signed_provider_call = _signed_provider_call_for_replay(call)
-            if not unlimited and remaining <= 0:
+            # The LAUNCHED entries each spend one when they settle. Counting the whole list also
+            # counted duplicates, denials and budget refusals, none of which decrement `remaining`.
+            _launched = sum(1 for _entry in pending_calls if _entry[0] != "lines")
+            if not unlimited and remaining - _launched <= 0:
                 # Budget spent.
-                for card_line in _unrun_call_card(
-                    tool_name = call["function"]["name"],
-                    tool_call_id = call.get("card_id") or call.get("stream_id") or call["id"],
-                    arguments = decision.tool_start_payload()["arguments"],
-                    result = _TOOL_BUDGET_EXHAUSTED,
-                    provenance = _unrun_provenance(call["function"]["name"], round_id),
-                ):
-                    yield card_line
+                _exhausted_lines = list(
+                    _unrun_call_card(
+                        tool_name = call["function"]["name"],
+                        tool_call_id = call.get("card_id") or call.get("stream_id") or call["id"],
+                        arguments = decision.tool_start_payload()["arguments"],
+                        result = _TOOL_BUDGET_EXHAUSTED,
+                        provenance = _unrun_provenance(call["function"]["name"], round_id),
+                    )
+                )
+                if not parallel_round:
+                    for card_line in _exhausted_lines:
+                        yield card_line
                 # The result below has to be replayed with its call: only the call that spent the last slot reaches
                 # assistant_tool_calls further down, so this one would arrive as an orphan role="tool" message and
                 # OpenAI, Anthropic and Gemini all reject that history instead of answering.
@@ -1879,14 +2082,17 @@ async def stream_with_studio_tools(
                 ):
                     exhausted_call["extra_content"] = exhausted_extra
                 assistant_tool_calls.append(exhausted_call)
-                tool_messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call["id"],
-                        "name": call["function"]["name"],
-                        "content": _TOOL_BUDGET_EXHAUSTED,
-                    }
-                )
+                _exhausted_message = {
+                    "role": "tool",
+                    "tool_call_id": call["id"],
+                    "name": call["function"]["name"],
+                    "content": _TOOL_BUDGET_EXHAUSTED,
+                }
+                if parallel_round:
+                    # In its own place, behind the calls above it that are still running.
+                    pending_calls.append(("lines", _exhausted_lines, _exhausted_message))
+                else:
+                    tool_messages.append(_exhausted_message)
                 continue
             # The frontend groups a round's reasoning by this id (codexLocalToolRoundId), so every tool card the loop
             # emits has to carry it, including the budget-exhausted card above.
@@ -1922,16 +2128,22 @@ async def stream_with_studio_tools(
                 # user switched off. That one is answered in the conversation only.
                 if decision.action == "disabled":
                     continue
-                for card_line in _unrun_call_card(
-                    tool_name = decision.tool_name,
-                    tool_call_id = (
-                        call.get("card_id") or call.get("stream_id") or decision.tool_call_id
-                    ),
-                    arguments = decision.arguments,
-                    result = _TOOL_SKIPPED.get(decision.action, "Unsloth did not run this call."),
-                    provenance = decision.provenance,
-                ):
-                    yield card_line
+                _noop_lines = list(
+                    _unrun_call_card(
+                        tool_name = decision.tool_name,
+                        tool_call_id = (
+                            call.get("card_id") or call.get("stream_id") or decision.tool_call_id
+                        ),
+                        arguments = decision.arguments,
+                        result = _TOOL_SKIPPED.get(decision.action, "Unsloth did not run this call."),
+                        provenance = decision.provenance,
+                    )
+                )
+                if parallel_round:
+                    pending_calls.append(("lines", _noop_lines, None))
+                else:
+                    for card_line in _noop_lines:
+                        yield card_line
                 continue
             assistant_call = signed_provider_call or decision.as_assistant_tool_call()
             call_extra = call.get("extra_content")
@@ -2029,7 +2241,7 @@ async def stream_with_studio_tools(
                     if denied_reason == DECISION_EXPIRED
                     else TOOL_REJECTED_MESSAGE
                 )
-                yield _sse(
+                _denied_line = _sse(
                     {
                         "type": "tool_end",
                         "tool_name": name,
@@ -2045,6 +2257,13 @@ async def stream_with_studio_tools(
                 }
                 if call_id:
                     denied_message["tool_call_id"] = call_id
+                # A denial cannot occur in an overlapped round today, a round needing approval
+                # being kept sequential. Deferred anyway: it is one term away from reachable.
+                if parallel_round:
+                    pending_calls.append(("lines", [_denied_line], denied_message))
+                    reprompts = max_reprompts
+                    continue
+                yield _denied_line
                 tool_messages.append(denied_message)
                 # A denial is an answer, not a stall: never nudge after one.
                 reprompts = max_reprompts
@@ -2058,6 +2277,7 @@ async def stream_with_studio_tools(
                 call = decision,
                 approved = host_access_approved,
                 strict = strict_isolation,
+                share = image_share,
             ) -> str:
                 kwargs: dict[str, Any] = {
                     "cancel_event": cancel_event,
@@ -2099,8 +2319,8 @@ async def stream_with_studio_tools(
                 if accepts_output_callback(execute_tool):
                     kwargs["output_callback"] = output_callback
                 kwargs.update(search_images_kwargs(execute_tool, call.tool_name))
-                if image_share is not None:
-                    kwargs["mcp_image"] = image_share["image"]
+                if share is not None:
+                    kwargs["mcp_image"] = share["image"]
                 return execute_tool(call.tool_name, call.arguments, **kwargs)
 
             # The same wrapper the local loops run tools through: live stdout for the card, and a heartbeat so a long
@@ -2112,63 +2332,25 @@ async def stream_with_studio_tools(
                 cancel_event = cancel_event,
             )
             outcome: dict[str, Any] = {}
-            step_task: Any = None
-            try:
-                while True:
-                    if cancel_event.is_set():
-                        # A tool that does not watch the cancel event would keep producing heartbeats and hold the
-                        # answer open forever. Stop asking for them and let the drain below join the worker under its
-                        # own bounded timeout.
-                        break
-                    step_task = asyncio.create_task(
-                        asyncio.to_thread(_advance_tool_stream, tool_stream, outcome)
-                    )
-                    # wait, not await: cancelling this coroutine must leave the worker pending so the drain below can
-                    # still join it.
-                    await asyncio.wait({step_task})
-                    event = step_task.result()
-                    step_task = None
-                    if event is _STEP_DONE:
-                        break
-                    if isinstance(event, dict) and event.get("type") == "heartbeat":
-                        yield _SSE_KEEPALIVE
-                    else:
-                        yield _sse(event)
-                if "result" in outcome:
-                    result = outcome["result"]
-                elif cancel_event.is_set():
-                    # Stopped before the tool returned. Defaulting to "" here would record a successful empty result
-                    # and paint a normal tool_end, so the transcript would claim a tool ran and produced nothing, when
-                    # in truth it was abandoned partway and its side effects may already have happened.
-                    result = _TOOL_CANCELLED
-                else:
-                    result = ""
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 - reported back to the model
-                result = f"Error: tool raised an exception: {exc}"
-            finally:
-                await _drain_step_task(step_task, cancel_event)
-                tool_stream.close()
-
-            completion = controller.record_result(decision, result)
-            # Counted whether or not the tool succeeded: a failing call has already done its work (and possibly its
-            # side effects), so letting it run for free would put the budget past max_calls. Counted per call rather
-            # than per turn, so parallel calls each spend one.
-            if not unlimited:
-                remaining -= 1
-            turn_executed_real_tool = True
-            executed_any = True
-            last_reprompt_text = ""
-            yield _sse(completion.tool_end_event())
-            tool_messages.append(completion.tool_message())
-            # Only for a target that reads them, and off the loop: the envelope is
-            # a 12 MB json-load, and a text-only run discards the result anyway.
-            _completion_images = (
-                await asyncio.to_thread(completion.mcp_images) if run.supports_vision else []
+            # Unbounded on purpose: the pump must never block on a consumer that has not
+            # reached this call yet, or two overlapping tools deadlock.
+            events: "asyncio.Queue[Any]" = asyncio.Queue()
+            pump = asyncio.create_task(
+                _pump_tool_stream(tool_stream, outcome, events, cancel_event)
             )
-            if _completion_images:
-                turn_mcp_images.append(_completion_images)
+            entry = ("call", decision, name, call_id, card_id, tool_stream, outcome, events, pump)
+            if parallel_round:
+                # Started, not awaited: the next call's tool is launched while this one works.
+                pending_calls.append(entry)
+                continue
+            async for line in _settle_call(entry):
+                yield line
+
+        # Whatever was left running. Empty in a sequential round.
+        for entry in pending_calls:
+            async for line in _settle_call(entry):
+                yield line
+        pending_calls = []
 
         yield _status_sse("")
 
@@ -2245,6 +2427,7 @@ async def stream_with_studio_tools(
             if not getattr(transport, "tool_result_only_continuation", False):
                 _append_user_turn(conversation, _BUDGET_EXHAUSTED_NUDGE)
 
+    _close_unsafe_window()
     usage_line = _usage_chunk_line(model_name, usage_totals, last_timings)
     if usage_line is not None:
         yield usage_line

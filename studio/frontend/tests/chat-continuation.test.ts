@@ -55,6 +55,10 @@ const { createImageGateRunOwner, isImageGateRunOnly } = await import(
   "../src/features/chat/utils/image-input-support.ts"
 );
 
+const { mergeContextTruncation } = await import(
+  "../src/features/chat/utils/context-truncation.ts"
+);
+
 const { issuedRunFrom } = await import(
   "../src/features/chat/utils/auto-continue-issued-run.ts"
 );
@@ -785,6 +789,32 @@ test("a partial that already fills the budget is not resumed", () => {
       promptTarget: 3648,
     }),
     true,
+  );
+});
+
+test("a decline-time refusal arriving after the answer still blocks resuming", () => {
+  resetAutoContinue();
+  // The backend declines its own continuation with a `context_truncated` chunk sent AFTER the
+  // content. Merged onto the preflight's event, which reported a prompt that fitted, that has
+  // to be what the turn is judged on: the client resumed a turn the backend had just refused.
+  const merged = mergeContextTruncation(
+    { dropped_messages: 2, fits: true, context_length: 8192, boundary_messages: 4 },
+    { dropped_messages: 0, fits: false, context_length: 8192, prompt_target: 6144 },
+  );
+  assert.equal(merged.fits, false);
+  // The decline evicted nothing, so the compaction the earlier fit performed is still the
+  // only one counted.
+  assert.equal(merged.dropped_messages, 2);
+  assert.equal(merged.boundary_messages, 4);
+  assert.equal(
+    shouldAutoContinue("length", "parent-1", {
+      fits: merged.fits,
+      // Under the budget on the client's own character estimate, which is the case that used
+      // to slip through: a code-heavy answer counts far short of what it renders to.
+      partialTokens: 1800,
+      promptTarget: merged.prompt_target,
+    }),
+    false,
   );
 });
 

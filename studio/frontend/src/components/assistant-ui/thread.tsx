@@ -196,6 +196,7 @@ import {
   readContinuationSource,
   readIncompleteInfo,
   readTextThoughtSignature,
+  resumesWithoutText,
   claimAutoContinue,
   forgetAutoContinue,
   recordAutoContinue,
@@ -7550,6 +7551,17 @@ function useContinuation() {
       }),
     [messageContent, thoughtResumable, geminiReplayTurns],
   );
+  // The same question with the "there must be text" half dropped, for a turn the backend
+  // gave up on before its first token. Selected unconditionally: a hook cannot be conditional.
+  const continuableIfEmpty = useMemo(
+    () =>
+      isContinuableContent(messageContent, {
+        thought: thoughtResumable,
+        replay: geminiReplayTurns.length > 0,
+        allowEmpty: true,
+      }),
+    [messageContent, thoughtResumable, geminiReplayTurns],
+  );
   // Audio input re-listens to the recording and answers afresh rather than resuming,
   // so continuing there would append a second answer.
   const fromAudioInput = useAuiState(({ thread }) =>
@@ -7566,10 +7578,15 @@ function useContinuation() {
   const stamped = readIncompleteInfo(metadata);
   const cancelled =
     status?.type === "incomplete" && status?.reason === "cancelled";
+  // `paused` has no assistant-ui status of its own, so `restoredAssistantStatus` maps it to
+  // `cancelled` and a reload would relabel a backend pause as "Response stopped".
   const reason =
     cancelled && !isProviderReportedReason(stamped?.reason)
       ? ("cancelled" as const)
       : stamped?.reason;
+  // A turn the backend gave up on can be empty: the chat was evicted while still prefilling, and
+  // both content gates below are written for a turn that has text.
+  const noTextIsExpected = resumesWithoutText(reason);
   const carriedReasoning = thoughtResumable ? reasoning : "";
 
   const canResume =
@@ -7577,16 +7594,17 @@ function useContinuation() {
     !isRunning &&
     !researchRunId &&
     !researchActive &&
-    continuable &&
+    (noTextIsExpected ? continuableIfEmpty : continuable) &&
     modeAllowsContinuation({
       fromAudioInput,
       audioOutputModel,
     }) &&
-    Boolean(
-      partial.trim() ||
-        carriedReasoning.trim() ||
-        geminiReplayTurns.length > 0,
-    );
+    (noTextIsExpected ||
+      Boolean(
+        partial.trim() ||
+          carriedReasoning.trim() ||
+          geminiReplayTurns.length > 0,
+      ));
 
   const reasoningDuration = readThoughtDuration(metadata);
   // Hands the started run back, untyped: the only handle identified with THIS run.
