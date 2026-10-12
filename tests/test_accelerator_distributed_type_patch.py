@@ -13,11 +13,7 @@
 #
 # You should have received a copy of the GNU Affero General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
-"""`_utils.py` must patch `Accelerator.distributed_type` with a property, not a bare
-function: a function binds as a method and inverts accelerate's `!= NO` device_map
-guards on a single device (#10016). `import unsloth` needs CUDA or XPU, so these run
-the statement from source in a fresh interpreter, which also catches a revert.
-"""
+"""Accelerator.distributed_type must be a property: a bare function inverts accelerate's != NO guards."""
 
 import ast
 import pathlib

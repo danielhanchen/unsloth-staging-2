@@ -1,12 +1,4 @@
-"""End-to-end GPU guard for batched left-padded generation (issues #1066, #3699).
-
-Greedy generation in a left-padded batch must match solo batch-size-1
-generation for the first PREFIX_TOKENS tokens (the bug makes padded rows
-diverge into garbage immediately; a full-length match would be flaky due to
-benign batch-numerics tie-flips deep in the sequence) and must not be
-gibberish. Skipped without a GPU. Run: `python -m pytest
-tests/utils/test_batched_leftpad_generation_gpu.py -v`.
-"""
+"""Greedy left-padded batch output must match solo for the first PREFIX_TOKENS; full length is flaky."""
 
 import pytest
 import torch
@@ -15,8 +7,7 @@ cuda_available = torch.cuda.is_available()
 xpu_available = hasattr(torch, "xpu") and torch.xpu.is_available()
 device = "cuda" if cuda_available else "xpu" if xpu_available else "cpu"
 
-# Non-strict rather than CUDA-only: keeps the XPU divergence visible, and goes
-# green by itself once XPU generation is fixed.
+# Non-strict: keeps the XPU divergence visible and passes once XPU is fixed.
 pytestmark = [
     pytest.mark.skipif(not (cuda_available or xpu_available), reason = "requires a CUDA or XPU GPU"),
     pytest.mark.xfail(

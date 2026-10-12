@@ -78,7 +78,6 @@ def layernorm_backward(
     LONG_INDEXING: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
-    # Approximately follows karpathy/llm.c doc/layernorm/layernorm.md
     row_idx = tl.program_id(0)
     if LONG_INDEXING:
         row_idx = row_idx.to(tl.int64)
@@ -90,7 +89,6 @@ def layernorm_backward(
     r += row_idx
     mu += row_idx
 
-    # Per torchtune's Fp32LayerNorm, all modules are in float32.
     dY_row = tl.load(dY + col_offsets, mask = mask, other = 0).to(tl.float32)
     X_row = tl.load(X + col_offsets, mask = mask, other = 0).to(tl.float32)
     W_row = tl.load(W + col_offsets, mask = mask, other = 0).to(tl.float32)

@@ -1,14 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
 
-"""Windows on ARM: install.ps1 must not settle for a native ARM64 interpreter.
-
-pyarrow (via datasets) and hf-transfer publish no win_arm64 wheels, so an ARM64
-Python source-builds both and dies minutes into the run. The resolver prefers an
-x64 build of the requested minor and bootstraps one otherwise; the case pinned
-here is the recovery path, where nothing can be downloaded but an x64 build of a
-lower-priority supported minor is already installed.
-"""
+"""On Windows on ARM, prefer x64 Python, as pyarrow and hf-transfer publish no win_arm64 wheels."""
 
 from __future__ import annotations
 
@@ -33,25 +26,12 @@ def _extract(pattern: str, source: str) -> str:
 
 
 def _resolver_script(installed: list[tuple[str, str]], can_download: bool) -> str:
-    """Both production functions verbatim, over a fake set of interpreters.
-
-    Extracted rather than reimplemented so the test cannot drift away from the
-    text install.ps1 actually runs. `installed` is (minor, arch) in py-launcher
-    order, so the first entry for a minor is what a bare `py -3.13` resolves to.
-    The fake interpreters are named `*.exe` and invoked through the call operator,
-    which resolves a string to a function, so no real binary is needed.
-    """
+    """Extracts the real install.ps1 functions verbatim so the test cannot drift from what runs."""
     source = INSTALL_PS1.read_text(encoding = "utf-8")
     finder = _extract(r"    function Find-CompatiblePython \{.*?\n    \}\n", source)
     installer = _extract(r"    function Install-X64Python \{.*?\n    \}\n", source)
-    # The selection consults the ARM64 opt-out, so the real reader comes with it rather than
-    # a stub: a stub is a second copy of the thing under test, and without it the extracted
-    # function calls a command this scope does not have and the whole run aborts.
+    # Use the real opt-out reader, not a stub, or the extracted function calls a missing command.
     opt_out = _extract(r"    function Test-Arm64PythonOptOut \{.*?\n    \}\n", source)
-    # `Install-X64Python` asks this before anything else, and without it the extracted
-    # function aborts on an unknown command -- which is a pwsh error, not a resolver answer,
-    # so every case that reaches the x64 bootstrap failed for a reason that had nothing to
-    # do with what it was testing. Extracted too, for the same reason as the rest.
     conda_active = _extract(r"    function Test-ActiveCondaEnvironment \{.*?\n    \}\n", source)
 
     names = [f"Py{minor.replace('.', '')}{arch}.exe" for minor, arch in installed]
@@ -128,11 +108,7 @@ if ($found) {{ Write-Output "$($found.Version)|$($found.Arch)" }} else {{ Write-
 
 
 def _opt_out_script(installed: list[tuple[str, str]], can_download: bool) -> str:
-    """The same fakes, but ending in the REAL swap resolver rather than a condensed one.
-
-    UNSLOTH_ALLOW_ARM64_PYTHON is read in two places -- the selection and the swap after it
-    -- and the cases below are about both, so the swap cannot be a paraphrase here.
-    """
+    """Uses the real swap resolver: `UNSLOTH_ALLOW_ARM64_PYTHON` is read by selection and by the swap."""
     source = INSTALL_PS1.read_text(encoding = "utf-8")
     resolver = _extract(r"    function Resolve-WindowsOnArmX64Python \{.*?\n    \}\n", source)
     base = _resolver_script(installed, can_download)
@@ -149,22 +125,12 @@ def _opt_out_script(installed: list[tuple[str, str]], can_download: bool) -> str
 @pytest.mark.parametrize(
     ("installed", "can_download", "expected"),
     [
-        # The opt-out asks for a NATIVE interpreter. With x64 3.13 and ARM64 3.12 installed
-        # the per-minor loop answered the version preference first, returned the x64 3.13 and
-        # stopped -- and the swap never runs on an x64 selection, so the variable produced an
-        # x64 environment after all, which is the opposite of what it asks for.
+        # The opt-out wants a native interpreter, even over the preferred minor's x64 build.
         ([("3.13", "x86_64"), ("3.12", "arm64")], True, "3.12|arm64"),
-        # The requested minor's own ARM64 build still wins over a lower one.
         ([("3.13", "arm64"), ("3.12", "arm64")], True, "3.13|arm64"),
-        # No ARM64 anywhere: the opt-out cannot invent one, so the x64 build is used.
         ([("3.13", "x86_64")], False, "3.13|x86_64"),
-        # A 32-bit interpreter is NOT an ARM64 one. Its platform tag is neither win-amd64 nor
-        # win-arm64, so it reaches the swap as "not x64", and returning it under this
-        # variable would label it native ARM64 and install a stack it cannot hold. The x64
-        # bootstrap runs instead.
+        # A 32-bit interpreter is not ARM64; returning it here would label it native ARM64.
         ([("3.13", "win32")], True, "3.13|x86_64"),
-        # And with nothing to download, that same interpreter fails closed rather than being
-        # accepted as native.
         ([("3.13", "win32")], False, "none"),
     ],
 )
@@ -188,25 +154,16 @@ def test_the_arm64_opt_out_selects_a_native_interpreter(installed, can_download,
 
 
 def _environment_without_the_arm64_opt_out() -> dict:
-    """These cases are the DEFAULT ARM64 host, which is the one that must prefer x64.
-
-    UNSLOTH_ALLOW_ARM64_PYTHON now reaches the selection rather than only the swap after it,
-    so a developer who happens to have it exported would flip every expectation below and
-    read as a regression in the resolver.
-    """
+    """Strips UNSLOTH_ALLOW_ARM64_PYTHON and CONDA_PREFIX so an exported value cannot flip expectations."""
     environment = os.environ.copy()
     environment.pop("UNSLOTH_ALLOW_ARM64_PYTHON", None)
-    # And these cases are not inside a conda environment either: `Install-X64Python` takes a
-    # different branch there, and a developer running the suite from one would read as a
-    # resolver regression.
+    # Install-X64Python takes a different branch inside a conda env.
     environment.pop("CONDA_PREFIX", None)
     environment.pop("CONDA_DEFAULT_ENV", None)
     return environment
 
 
 def _pwsh(script: str) -> str:
-    # Every ARM64 case below is decided by the one "version|arch" line this run prints, and check = True means a pwsh
-    # that aborts at startup would surface as the resolver block itself throwing.
     result = run_pwsh(
         ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
         check = True,
@@ -221,14 +178,10 @@ def _pwsh(script: str) -> str:
 @pytest.mark.parametrize(
     ("installed", "can_download", "expected"),
     [
-        # An x64 build of the requested minor wins outright, downloads irrelevant.
         ([("3.13", "arm64"), ("3.13", "x86_64")], False, "3.13|x86_64"),
-        # Requested minor is ARM64-only: bootstrap x64 rather than take the native one.
         ([("3.13", "arm64")], True, "3.13|x86_64"),
-        # Offline, but an x64 build of a lower-priority minor is here. Use it: the native
-        # 3.13 cannot resolve pyarrow or hf-transfer, and this one can.
+        # Native 3.13 ARM64 cannot resolve pyarrow or hf-transfer, so the lower x64 minor wins.
         ([("3.13", "arm64"), ("3.11", "x86_64")], False, "3.11|x86_64"),
-        # ARM64 everywhere: still returned, and the caller warns.
         ([("3.13", "arm64"), ("3.11", "arm64")], False, "3.13|arm64"),
     ],
 )
@@ -279,17 +232,10 @@ if ($found) {{ Write-Output "$($found.Version)|$($found.Arch)" }} else {{ Write-
 @pytest.mark.parametrize(
     ("cfg", "arch", "present", "expected"),
     [
-        # base-executable names it exactly, which is what a modern venv records.
         ("home = /py312\nbase-executable = BasePython.exe\n", "arm64", True, "3.12|arm64"),
-        # An older venv records only home; the interpreter beside it is the same answer.
         ("home = /py312\n", "arm64", True, "3.12|arm64"),
-        # The interpreter that built it is gone: nothing to honour the opt-out with, and
-        # inventing one would be worse than the x64 selection this replaces.
         ("base-executable = BasePython.exe\n", "arm64", False, "none"),
-        # An x64 base is not what the opt-out asks for, so it is not preferred over the
-        # selection the ordinary rules already made.
         ("base-executable = BasePython.exe\n", "x86_64", True, "none"),
-        # A cfg with neither key answers nothing rather than guessing a path.
         ("include-system-site-packages = false\n", "arm64", True, "none"),
     ],
 )

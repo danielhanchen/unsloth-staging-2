@@ -1,15 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""Every action-bar control the thread browser harnesses ask for is still rendered there.
-
-#12735 took Delete off the assistant action bar and made it the last item of the More menu.
-playwright_heavy_thread.py kept asking for a "Delete message" button, so its delete action could
-not run, and probe_dismiss_guard.py kept attacking that button, so every one of its cases would
-have errored. Both sit behind earlier steps of the same CI job, which hid the breakage until those
-steps went green. This reads the labels the harnesses ask for and requires each to be rendered by
-the assistant action bar in thread.tsx, so the next move of a control fails here, with its name.
-"""
+"""Every control the thread browser harnesses ask for must still render in the assistant action bar."""
 
 from __future__ import annotations
 
@@ -35,11 +27,7 @@ def _component_body(tsx: str, name: str) -> str | None:
 
 
 def _assistant_bar_source(tsx: str) -> str:
-    """AssistantActionBar and every thread.tsx component it renders, transitively.
-
-    The harnesses act on the last ASSISTANT message, so a control only counts if the assistant
-    bar renders it: a whole-file search would still find a label in the user message's bar.
-    """
+    """Only the assistant bar's own render tree, since a whole-file search would match the user bar."""
     seen: dict[str, str] = {}
     queue = ["AssistantActionBar"]
     while queue:

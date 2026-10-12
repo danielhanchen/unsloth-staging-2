@@ -1,19 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
-"""`delete_message` reaches Delete where the app puts it: the last item of the reply's More menu.
-
-#12735 took Delete off the assistant action bar and made it the More menu's last item. The scene
-still looked for a "Delete message" button on the bar, waited out `ACTION_BAR_WAIT_MS` for it, and
-reported `delete_message: NOT RUN -- no Delete button`, which fails the real-path session's
-liveness gate on every pull request.
-
-Two checks. The first runs the shipped `DELETE_JS` and `dom.js` in node against a shim of the
-handful of DOM calls they make, so the menu walk is exercised rather than re-implemented. The
-second reads thread.tsx and requires every control name the scene asks for to still be rendered
-there, so the next move of a control fails here, with its name, instead of as a NOT RUN in a
-browser job.
-"""
+"""Delete lives in the reply's More menu, so the scene reaches it there and not on the action bar."""
 
 from __future__ import annotations
 
@@ -175,8 +163,6 @@ def test_delete_opens_the_more_menu_and_selects_its_delete_item():
     assert out["ran"] is True, out
     assert out["ms"] is not None, "the reply never left the document after Delete was selected"
     assert (out["before"], out["after"]) == (2, 1), out
-    # The menu mounts three paints late. The document-wide lookup for it runs on the first look
-    # and when body's children change, not once per paint while waiting.
     assert out["menuLookups"] <= 2, out
 
 
@@ -206,12 +192,7 @@ def _component_body(tsx: str, name: str) -> str | None:
 
 
 def _assistant_bar_source(tsx: str) -> str:
-    """AssistantActionBar and every thread.tsx component it renders, transitively.
-
-    The scene acts on the last ASSISTANT message, so a control only counts if the assistant bar
-    renders it: `More` and `Delete` also exist in the user message's menu and as reusable
-    components, and a whole-file search would still find them after the assistant bar dropped them.
-    """
+    """Collects only what AssistantActionBar renders; a whole-file search would find the user's More too."""
     seen: dict[str, str] = {}
     queue = ["AssistantActionBar"]
     while queue:
@@ -236,8 +217,7 @@ def test_every_control_the_scene_asks_for_is_still_rendered():
         {"More", "Copy"} <= buttons and "Delete" in items
     ), "parsed fewer control names than the scene uses; this check would pass on nothing"
     tooltips = set(re.findall(r"tooltip=\"([^\"]+)\"", tsx))
-    # An item's label is its last line of text before the closing tag. Its attributes can hold
-    # arrow functions, so the opening tag cannot be skipped with a `[^>]*` match.
+    # Attributes can hold arrow functions, so the opening tag cannot be skipped with [^>]*.
     rendered_items = set()
     for body in re.findall(
         r"<ActionBarMorePrimitive\.Item\b([\s\S]*?)</ActionBarMorePrimitive\.Item>", tsx
