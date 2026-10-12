@@ -50,9 +50,11 @@ def snap_scale_up(scale: Any, dtype: Any) -> Any:
     a fixed gain error (up to 2**-9 in bf16) on every output row. Rounding up never clips a code."""
     import torch
 
-    cast = scale.to(dtype)
+    # On CPU: per-row scales are tiny, and nextafter is not implemented on every backend.
+    host = scale.detach().to("cpu", torch.float32)
+    cast = host.to(dtype)
     up = torch.nextafter(cast, torch.full_like(cast, float("inf")))
-    return torch.where(cast.float() < scale, up, cast).float()
+    return torch.where(cast.float() < host, up, cast).float().to(scale.device)
 
 
 def int8_rotation_group() -> int:
@@ -276,10 +278,10 @@ def native_linear_class():
 
         def _int8pack_ok(self, x: Any) -> bool:
             return (
-                self.scheme == NATIVE_INT8
+                x.device.type == "mps"
+                and self.scheme == NATIVE_INT8
                 and not self.act_int8
                 and not self.rot_group
-                and x.device.type == "mps"
                 and x.dtype in (torch.bfloat16, torch.float16, torch.float32)
                 and self.in_features % _INT8PACK_ALIGN == 0
                 and self.out_features % _INT8PACK_ALIGN == 0
@@ -416,6 +418,16 @@ def native_quant_reason(module: Any, scheme: str) -> str:
             f"W8A8: {scheme} weights and activations through torch._int_mm"
             + (f" with a g{rot} ConvRot rotation" if rot else "")
             + " (torchao-free; plain buffers, so the offload hooks can move it)"
+        )
+    if (
+        layer is not None
+        and getattr(layer, "scheme", None) == NATIVE_INT8
+        and getattr(getattr(layer, "weight_q", None), "device", None) is not None
+        and layer.weight_q.device.type == "mps"
+    ):
+        return (
+            f"weight-only: {scheme} weights through the Apple Silicon int8 kernel "
+            "(torchao-free; half the weight memory)"
         )
     return (
         f"weight-only: {scheme} weights, bf16 compute "

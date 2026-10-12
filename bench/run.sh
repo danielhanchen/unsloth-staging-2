@@ -4,7 +4,7 @@ python -c "import torch, diffusers; print(torch.__version__, diffusers.__version
 python bench/studio_int8_ab.py fetch 2>&1 | tail -3
 (cd bench/head_backend && python -m pytest -q -p no:cacheprovider -rs tests/test_diffusion_native_quant_mps.py -k "not image_gate" 2>&1 | tail -15) | tee out/pytest_${LEG}.txt
 for side in $SIDES; do
-  for round in 1 2 3; do
+  for round in ${ROUNDS:-1 2 3}; do
     case $round in 1) arms="dense base_native head_native";; 2) arms="head_native dense base_native";; 3) arms="base_native head_native dense";; esac
     for a in $arms; do python bench/studio_int8_ab.py run $a $side out/ab_${LEG}_${side}_${a}_r${round}.json 2>&1 | tail -1; done
   done

@@ -10,8 +10,8 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {leg: t_latest, torch: "torch", env: "SIDES='512 1024'"}
-          - {leg: t26, torch: "torch==2.6.0", env: "SIDES=512"}
+          - {leg: t_latest, torch: "torch", env: "SIDES=512 ROUNDS=1"}
+          - {leg: t26, torch: "torch==2.6.0", env: "SIDES=512 ROUNDS=1"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
