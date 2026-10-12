@@ -53,11 +53,12 @@ pub(crate) fn new_id(prefix: &str) -> String {
     format!("{}-{}-{}", sanitize_component(prefix), now_ms(), n)
 }
 
+/// A chosen root only once it exists: creating it here would stop install.ps1 claiming it.
 pub fn studio_dir() -> PathBuf {
-    dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".unsloth")
-        .join("studio")
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    crate::studio_home::chosen_root_for_home(&home)
+        .filter(|root| root.is_dir())
+        .unwrap_or_else(|| crate::studio_home::default_root_for_home(&home))
 }
 
 pub fn logs_dir() -> PathBuf {

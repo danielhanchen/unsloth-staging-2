@@ -16,7 +16,7 @@ import { useDocumentFlag } from "@/lib/document-flag";
 import type { CopySupportDiagnosticsResult } from "@/lib/tauri-diagnostics";
 
 import { AnimatePresence, motion } from "motion/react";
-import { type ReactNode, useEffect, useState } from "react";
+import { lazy, type ReactNode, Suspense, useEffect, useState } from "react";
 
 interface StartupScreenProps {
   status: BackendStatus;
@@ -78,7 +78,11 @@ function CheckingContent() {
   );
 }
 
+// Lazy: only the Windows first-run screen needs it (startup bundle budget).
+const InstallLocation = lazy(() => import("@/components/tauri/install-location"));
+
 function NotInstalledContent({ onInstall }: { onInstall: () => void }) {
+  const [starting, setStarting] = useState(false);
   return (
     <div className="flex h-full flex-col items-center">
       <div className="flex flex-1 flex-col items-center justify-center">
@@ -91,9 +95,18 @@ function NotInstalledContent({ onInstall }: { onInstall: () => void }) {
         >
           To install Unsloth, click Get Started.
         </p>
-        <Button size="hero" onClick={onInstall}>
+        <Button
+          size="hero"
+          onClick={() => {
+            setStarting(true);
+            onInstall();
+          }}
+        >
           Get Started
         </Button>
+        <Suspense fallback={null}>
+          <InstallLocation disabled={starting} />
+        </Suspense>
       </div>
     </div>
   );
