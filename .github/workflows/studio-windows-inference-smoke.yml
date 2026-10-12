@@ -162,7 +162,16 @@ jobs:
 
       # Fast GPU-free gate: parse install.ps1 + setup.ps1 and run the PowerShell
       # unit tests (CUDA-toolkit + torch-flavor helpers) before the heavy GGUF smoke.
+      #
+      # Both unit-test steps run in the background, beside the toolchain setup and the
+      # install, instead of ahead of them: ~1 minute of a Windows job's critical path.
+      # They only parse the checkout and work in their own GUID-named directories under
+      # %TEMP%, so nothing they touch is anything the install reads or writes. The
+      # `wait-all` after the install collects them; a failure there fails the job as
+      # before, it just no longer skips the install and the phases.
       - name: PowerShell installer unit tests
+        id: ps-unit-tests
+        background: true
         shell: pwsh
         run: |
           foreach ($f in @('install.ps1', 'studio/setup.ps1')) {
@@ -195,6 +204,8 @@ jobs:
       # uninstall.ps1: native uninstall must keep the shared unsloth.ico while a
       # WSL shortcut still references it (dual install), else that shortcut blanks.
       - name: uninstall.ps1 unit test (dual-install icon preserve)
+        id: uninstall-unit-test
+        background: true
         shell: pwsh
         run: |
           $errs = $null
@@ -314,6 +325,9 @@ jobs:
         with:
           cache-hit: ${{ steps.uv-cache.outputs.cache-hit }}
           key: ${{ steps.uv-cache.outputs.key }}
+
+      # Collects the two background unit-test steps at the top of the job.
+      - wait-all:
 
       - name: Assert install.ps1 used the Windows llama.cpp prebuilt
         id: assert-prebuilt
