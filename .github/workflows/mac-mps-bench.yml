@@ -4,14 +4,13 @@ on:
     branches: ["mac-mps-*"]
 jobs:
   bench:
-    runs-on: macos-15
-    timeout-minutes: 90
+    runs-on: macos-15-xlarge
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          - {leg: t_latest, torch: "torch", env: "SIDES=512 ROUNDS=1"}
-          - {leg: t26, torch: "torch==2.6.0", env: "SIDES=512 ROUNDS=1"}
+          - {leg: xl_latest, torch: "torch", env: "SIDES='512 1024' ROUNDS='1 2 3'"}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +19,7 @@ jobs:
       - name: install
         run: |
           python -m pip install -q --upgrade pip
-          python -m pip install -q '${{ matrix.torch }}' numpy safetensors huggingface_hub pytest
+          python -m pip install -q '${{ matrix.torch }}' torchao mlx numpy safetensors huggingface_hub pytest
           if [ -f bench/requirements.txt ]; then python -m pip install -q -r bench/requirements.txt; fi
           python -m pip list 2>/dev/null | grep -i -E "torch|mlx|diffusers|transformers|numpy"
       - name: run

@@ -1,5 +1,7 @@
 set -x
 mkdir -p out
+sysctl -n hw.model machdep.cpu.brand_string hw.memsize; system_profiler SPDisplaysDataType | head -20
+python bench/probe.py out/probe_${LEG}.json 2>&1 | grep -E "cpu|mps_avail|recommended|gemm_mps|weight_int8pack|sdpa_512"
 python -c "import torch, diffusers; print(torch.__version__, diffusers.__version__, torch.backends.mps.is_available())"
 python bench/studio_int8_ab.py fetch 2>&1 | tail -3
 (cd bench/head_backend && python -m pytest -q -p no:cacheprovider -rs tests/test_diffusion_native_quant_mps.py -k "not image_gate" 2>&1 | tail -15) | tee out/pytest_${LEG}.txt
