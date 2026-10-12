@@ -108,6 +108,7 @@ __all__ = [
     "planned_prefetch_depth",
     "trim_config_for_block_swap",
     "attach_offload_layers",
+    "mark_auto_offload_for_ddp",
     "skip_swapped_checkpoint_keys",
     "get_moe_target_parameters",
     "get_moe_target_modules",
@@ -5265,6 +5266,7 @@ def patch_gradient_accumulation_fix(Trainer):
                 from .llama import _decline_fused_lora_for_fsdp
                 _decline_fused_lora_for_fsdp(getattr(self, "model", None))
             _replan_auto_offload_safely(self)
+            _block_swap_for_trainer_backend(self)
 
         _unsloth_trainer_init.__wrapped__ = _original_trainer_init
         Trainer.__init__ = _unsloth_trainer_init
@@ -7868,6 +7870,104 @@ def _replan_auto_offload_safely(trainer):
                 "keeping the current plan."
             )
         return None
+
+
+def mark_auto_offload_for_ddp(model, ddp_auto):
+    """Record that from_pretrained(offload_layers = "auto") planned this rank's card for DDP, on every
+    rank, also ranks whose plan swapped nothing, so each builds the same DDP ignore list and a late
+    FSDP / DeepSpeed Trainer refuses on every rank. Not set when the launch already showed a sharded
+    backend: "auto" then declined and loaded every layer, as before."""
+    if ddp_auto and model is not None:
+        model._unsloth_offload_layers_auto_ddp = True
+    return model
+
+
+def _ignore_block_swap_params_for_ddp(model):
+    """offload_layers = "auto" plans each rank on its own free memory, so under DDP ranks can swap
+    different layers, and a swapped weight is a 0-element tensor between uses. DDP broadcasts every
+    parameter it does not ignore from rank 0 when it wraps the model, which needs equal shapes on
+    every rank: keep the frozen decoder weights out of it (they load identically on every rank and
+    DDP never syncs frozen weights afterwards). The list must be the same on every rank, so it
+    follows the request and the architecture, never this rank's plan. Names are relative to the
+    model the Trainer wraps (the PeftModel). Returns the names added."""
+    from .loader_utils import is_distributed
+
+    if model is None or find_decoder_layers is None or not is_distributed():
+        return []
+    if not getattr(model, "_unsloth_offload_layers_auto_ddp", False) and (
+        getattr(model, "_unsloth_offload_layers_auto", None) is None
+    ):
+        return []
+    # Only once PEFT froze the base: before that only the swapped layers are frozen, so the list
+    # would differ between ranks.
+    if getattr(model, "peft_config", None) is None:
+        return []
+    try:
+        layer_params = {id(p) for p in find_decoder_layers(model).parameters()}
+    except Exception:
+        return []
+    # A decoder weight PEFT made trainable after the swap captured it (bias = "all" / "lora_only",
+    # modules_to_save inside a layer) can be a placeholder on one rank and full on another, and DDP
+    # must sync its gradient. Decided from the PEFT config alone, so every rank refuses alike.
+    trainable = [
+        name
+        for name, p in model.named_parameters()
+        if id(p) in layer_params and p.requires_grad and "lora_" not in name
+    ]
+    if trainable:
+        raise ValueError(
+            "Unsloth: offload_layers = 'auto' under DDP keeps the frozen decoder weights out of DDP, "
+            f"but {len(trainable)} decoder weights are trainable (e.g. {trainable[0]}). Use "
+            "bias = 'none' and no modules_to_save inside the decoder layers, or offload_layers = 0."
+        )
+    names = [
+        name
+        for name, p in model.named_parameters()
+        if id(p) in layer_params and not p.requires_grad
+    ]
+    ignored = list(getattr(model, "_ddp_params_and_buffers_to_ignore", None) or [])
+    seen = set(ignored)
+    added = [name for name in names if name not in seen]
+    if not added:
+        return []
+    from torch.nn.parallel import DistributedDataParallel
+
+    DistributedDataParallel._set_params_and_buffers_to_ignore_for_model(model, ignored + added)
+    return added
+
+
+def _block_swap_for_trainer_backend(trainer):
+    """DDP: keep the swapped weights out of its init-time broadcast. FSDP / DeepSpeed: refuse an
+    offload_layers = "auto" swap. TrainingArguments(fsdp = ...) / (deepspeed = ...) under torchrun
+    leaves no trace at from_pretrained, so "auto" planned for DDP, and a sharding backend would
+    flatten or partition the 0-element placeholders."""
+    model = getattr(trainer, "model", None)
+    backend = (
+        "FSDP"
+        if getattr(trainer, "is_fsdp_enabled", False)
+        else "DeepSpeed"
+        if getattr(trainer, "is_deepspeed_enabled", False)
+        else None
+    )
+    if backend is None:
+        return _ignore_block_swap_params_for_ddp(model)
+    swapper = getattr(model, "_unsloth_block_swap", None) if model is not None else None
+    swapped = len(getattr(swapper, "indices", None) or ())
+    # "auto" planned per rank (from_pretrained or get_peft_model): every rank refuses, also one whose
+    # own plan swapped nothing, since a peer may have swapped and a one-sided refusal would hang the
+    # others. A launch that already showed FSDP / DeepSpeed never planned, so it never gets here.
+    auto = model is not None and (
+        getattr(model, "_unsloth_offload_layers_auto_ddp", False)
+        or getattr(model, "_unsloth_offload_layers_auto", None) is not None
+    )
+    if auto:
+        raise ValueError(
+            f"Unsloth: offload_layers = 'auto' (this rank swapped {swapped} decoder layers to host "
+            f"RAM) cannot be combined with {backend}, which shards the weights itself and cannot wrap "
+            "swapped layers. Load with offload_layers = 0 (and get_peft_model(offload_layers = 0)), "
+            f"or launch without {backend}."
+        )
+    return []
 
 
 def _trainer_offload_replan_skip(trainer):

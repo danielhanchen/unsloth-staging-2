@@ -131,6 +131,7 @@ from ._utils import (
     _is_seq2seq_lm_config,
 )
 from ._utils import *
+from ._utils import _ignore_block_swap_params_for_ddp
 from ._uma_safetensors import is_integrated_unified_memory_gpu
 from ._utils import estimate_training_reserve_bytes as _zoo_reserve_estimate
 from ._remote_code_buffers import restore_remote_code_non_persistent_buffers
@@ -160,6 +161,8 @@ from .loader_utils import (
     raise_if_bnb_cpu_spill,
     requested_device_map,
     resolve_auto_block_swap,
+    ddp_auto_block_swap_launch,
+    auto_offload_for_launch,
     resolve_unsloth_device_map,
     sync_load_when_quantizing,
     warn_if_bitsandbytes_quantized_nothing,
@@ -3475,7 +3478,9 @@ class FastBaseModel:
                 "needs every layer on one GPU; pass offload_layers to get_peft_model instead.",
             )
         _embedding_needed = None
+        _ddp_auto_swap = False
         if _offload_layers == "auto":
+            _ddp_auto_swap = ddp_auto_block_swap_launch(requested_device_map(device_map))
             _offload_layers, device_map, _embedding_needed = resolve_auto_block_swap(
                 requested_device_map(device_map),
                 model_name,
@@ -3512,6 +3517,11 @@ class FastBaseModel:
                     extra_skip_modules = _architecture_skip_modules(model_types) or None,
                 ),
             )
+            # Marked only when the resolver planned: a veto (None) loads every layer, as before.
+            _ddp_auto_swap = _ddp_auto_swap and _embedding_needed is not None
+            if _ddp_auto_swap:
+                # DDP refuses a module with a CPU parameter: the embedding stays on this rank's card.
+                offload_embedding = False
         _block_swap_device = block_swap_load_device(device_map)
         if (_offload_layers or _embedding_needed) and _block_swap_device is not None:
             # A placement strategy would spill the host-bound weights to the CPU, which 4-bit loads refuse.
@@ -4337,6 +4347,7 @@ class FastBaseModel:
         finish_block_swap_load(
             model, _block_swap_state, planned_prefetch_depth(device_map_planner_kwargs)
         )
+        mark_auto_offload_for_ddp(model, _ddp_auto_swap)
 
         # LAST, like the llama loader: patch_model_and_tokenizer below REPLACES the embedding and lm_head with fresh modules carrying the weights but not the _hf_hook, so a model split across cards would still meet the original cross-device index_select. Idempotent.
         # Embeddings offloaded later sit on the host on purpose: a dispatch hook would pull them back.
@@ -4803,7 +4814,7 @@ class FastBaseModel:
         offload_embedding_if_tight(model)
         install_block_swap(
             model,
-            offload_layers,
+            auto_offload_for_launch(offload_layers),
             prefetch_depth = prefetch_depth,
             use_gradient_checkpointing = use_gradient_checkpointing,
         )
@@ -4824,6 +4835,9 @@ class FastBaseModel:
         # Detect a stray pre-train forward so train() can drop the torch.compile graph cache it would otherwise poison (see prepare_for_training_mode).
         _unsloth_install_pretrain_detector(model)
         model = _exclude_rope_inv_freq_from_ddp(model)
+        # Here, not at load: only after get_peft_model is the frozen set the same on every rank, and a
+        # custom loop may hand the model to DistributedDataParallel without a Trainer.
+        _ignore_block_swap_params_for_ddp(model)
         return model
 
     @staticmethod
