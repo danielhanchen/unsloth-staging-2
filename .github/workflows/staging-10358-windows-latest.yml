@@ -1,0 +1,42 @@
+name: "staging-10358 windows-latest"
+on:
+  push:
+    branches: ["pr-10358-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; ran=0; rm -f pytest_out.txt; r=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_a_cancelled_round_drains_every_call.py studio/backend/tests/test_a_diffusion_runner_never_asks_for_an_exact_reload.py studio/backend/tests/test_a_failed_props_read_keeps_the_park_notices.py studio/backend/tests/test_a_holder_that_parks_during_the_erases_keeps_its_charge.py studio/backend/tests/test_a_load_in_flight_counts_for_the_exact_reload.py studio/backend/tests/test_a_parallel_round_charges_its_arguments_once.py studio/backend/tests/test_a_parallel_round_dedupes_healed_calls_and_freezes_its_branch.py studio/backend/tests/test_a_park_keepalive_cannot_outlive_the_cap.py studio/backend/tests/test_a_pause_keeps_the_thought_and_a_stop_ends_the_wait.py studio/backend/tests/test_a_raw_park_reaches_the_client_and_exact_needs_the_server_to_park.py studio/backend/tests/test_a_refused_yield_and_a_padded_name_keep_their_accounting.py studio/backend/tests/test_account_installation_mutations.py studio/backend/tests/test_account_shared_load_settings.py studio/backend/tests/test_admission_switches_are_honoured_everywhere.py studio/backend/tests/test_an_auto_load_with_an_unsized_pool_does_not_keep_an_oversized_parking_budget.py studio/backend/tests/test_an_exact_retry_bounds_its_parking_like_a_plain_launch.py studio/backend/tests/test_anthropic_messages.py studio/backend/tests/test_auto_exact_falls_back_before_launch_when_its_weights_take_the_room.py studio/backend/tests/test_auto_exact_on_an_unreadable_host_and_a_save_during_resolution.py studio/backend/tests/test_chat_generation_lease_compat.py studio/backend/tests/test_checkpoint_compaction.py studio/backend/tests/test_exact_concurrency_switch.py studio/backend/tests/test_external_tool_edge_cases.py studio/backend/tests/test_length_truncated_reasoning_continuation.py studio/backend/tests/test_llama_admission_enforced_max_tokens.py studio/backend/tests/test_llama_admission_enforced_paths.py studio/backend/tests/test_llama_admission_kv_budget.py studio/backend/tests/test_llama_admission_unstated_max_tokens.py studio/backend/tests/test_llama_cpp_tool_loop.py studio/backend/tests/test_llama_plain_chat_preempt_resume.py studio/backend/tests/test_llama_preemption.py studio/backend/tests/test_llama_preemption_is_armed_on_chat_surfaces.py studio/backend/tests/test_llama_route_timeouts.py studio/backend/tests/test_llama_tool_loop_preempt_resume.py studio/backend/tests/test_only_output_counts_and_a_spent_cap_is_not_reopened.py studio/backend/tests/test_parallel_round_divides_room_among_launched_calls.py studio/backend/tests/test_preempt_resumes_end_on_stalls_not_counts.py studio/backend/tests/test_preemption_on_by_default.py studio/backend/tests/test_raw_nonstream_waits_out_a_server_park.py studio/backend/tests/test_research_internal_call_tool_gate.py studio/backend/tests/test_server_mode_token_path_reads_no_slots.py studio/backend/tests/test_server_park_notices_are_indexed.py studio/backend/tests/test_server_side_preemption_handoff.py studio/backend/tests/test_single_user_latency_levers.py studio/backend/tests/test_studio_tool_loop.py studio/backend/tests/test_studio_tool_loop_preemption.py studio/backend/tests/test_the_optimism_matches_what_can_be_reclaimed.py studio/backend/tests/test_tool_calls_within_one_turn_overlap.py studio/backend/tests/test_underscore_spellings_are_read_as_llama_cpp_reads_them.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' >> pytest_out.txt 2>&1 || r=$?; if [ "$r" != "5" ]; then ran=1; if [ "$r" -gt "$rc" ]; then rc=$r; fi; fi; r=0; PYTHONPATH=studio/backend python -m pytest tests/studio/test_passthrough_prefill_keepalive.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' >> pytest_out.txt 2>&1 || r=$?; if [ "$r" != "5" ]; then ran=1; if [ "$r" -gt "$rc" ]; then rc=$r; fi; fi; if [ "$ran" = "0" ]; then rc=5; fi; cat pytest_out.txt; tot=$(grep -cE "^(FAILED|ERROR) " pytest_out.txt) || tot=0; dep=$(grep -cE "^(FAILED|ERROR) .* ((ModuleNotFoundError|ImportError). No module named .(torch|unsloth_zoo|transformers).|ImportError. Unsloth. (torch|unsloth_zoo|transformers) not found. Please install .*)$" pytest_out.txt) || dep=0; bare=$(awk '/^_+ ERROR collecting [^ ]+ _+$/ {cur=$4; next} /^(=|_)+ / {cur=""} cur != "" && /((ModuleNotFoundError|ImportError). No module named .(torch|unsloth_zoo|transformers).|ImportError. Unsloth. (torch|unsloth_zoo|transformers) not found)/ {ok[cur]=1} /^ERROR [^ ]+$/ && ($2 in ok) {n++} END {print n+0}' pytest_out.txt) || bare=0; dep=$((dep + bare)); if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers).|Unsloth. (torch|unsloth_zoo|transformers) not found" pytest_out.txt && { [ "$tot" = "0" ] || [ "$tot" = "$dep" ]; }; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; exit "$rc"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+      - name: Node tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test tests/admission-sse-stream.test.ts tests/admission-status.test.ts tests/chat-continuation-keeps-the-recompute.test.ts tests/chat-continuation.test.ts tests/chat-runtime-reload-status.test.ts tests/chat-save-conflict-detail.test.ts tests/continuation-paused-reason.test.ts tests/durable-follower-renders-the-pause.test.ts tests/exact-concurrency-indicator.test.ts tests/preempt-gave-up-then-answered.test.ts tests/preempt-gave-up-turn.test.ts
