@@ -83,8 +83,15 @@ export const BUDGET = {
   // The KV cache, GPU memory limit and seed engine options (#13596) add 5.7 KB raw / 1.4 KB transfer
   // (6,573.5 -> 6,579.2 KB raw, 1,976.9 -> 1,978.3 KB transfer against abfe3142c, one machine and
   // build), inline in the eager chat and settings chunks like the other engine options; raised by that.
-  transferBytes: 2_026_500,
-  rawBytes: 6_743_000,
+  // The paused and queued chat states (admission status, the paused continuation reason) add 2.3 KB
+  // raw / 1.0 KB transfer to the eager chat chunk (6,570.6 -> 6,572.9 KB raw, 1,975.5 -> 1,976.5 KB
+  // transfer against b8d76e169, one machine and build). They render on the first chat screen, so
+  // raised by that.
+  // The exact concurrency setting, its chat chip and their strings in every eager locale add 4.5 KB
+  // raw / 1.2 KB transfer to the eager settings and chat chunks (6,572.9 -> 6,577.4 KB raw,
+  // 1,976.5 -> 1,977.7 KB transfer against bfab55021, one machine and build), raised by that.
+  transferBytes: 2_028_900,
+  rawBytes: 6_750_100,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
