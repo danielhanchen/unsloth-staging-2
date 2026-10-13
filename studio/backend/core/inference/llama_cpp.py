@@ -682,6 +682,9 @@ class GgufLoadIntent:
     gpu_ids_are_vulkan_ordinals: Optional[bool] = None
     n_threads: Optional[int] = None
     n_parallel: int = 1
+    # The caller left the slot count at the server default, so Auto speculation may
+    # lower it to keep a drafter that does not fit (#8872). A chosen count is kept.
+    n_parallel_from_default: bool = False
     # none follows the llama.cpp defaults (2048 / 512)
     n_batch: Optional[int] = None
     n_ubatch: Optional[int] = None
@@ -4532,6 +4535,9 @@ def _auto_mode_drops_mtp(
 _MLA_MTP_FAST_ARCHS = frozenset({"glm5next", "glm5-next"})
 # Smallest context Auto shrinks to so a fast MLA head still launches.
 _FAST_MTP_MIN_CTX = 65536
+# Share of the target-only Auto context a drafter may take once slots are down to one.
+# Qwen3.6-27B on a 46 GB card needs 7% at one slot (18% at four).
+_MTP_SLOT_CTX_TRIM = 0.10
 
 
 def _arch_has_fast_mla_mtp(architecture: Optional[str]) -> bool:
@@ -6777,6 +6783,23 @@ def _emitted_n_batch(n_batch: Optional[int], n_parallel: int) -> Optional[int]:
     return max(int(n_batch), max(2, int(n_parallel or 1)))
 
 
+def _with_parallel_slots(
+    cmd: Sequence[str], slots: int, *, n_batch: Optional[int], supports_kv_unified: bool
+) -> list[str]:
+    """``cmd`` relaunched at ``slots``: Unsloth's own --parallel, its batch floor, and the
+    --kv-unified a multi-slot launch adds. Each is emitted before the extras, so the
+    first occurrence is the one to rewrite and a hand-typed flag still last-wins."""
+    out = [str(a) for a in cmd]
+    at = out.index("--parallel")
+    out[at + 1] = str(slots)
+    if n_batch is not None and "--batch-size" in out:
+        b = out.index("--batch-size")
+        out[b + 1] = str(_emitted_n_batch(n_batch, slots))
+    if slots > 1 and supports_kv_unified and "--kv-unified" not in out and "-kvu" not in out:
+        out[at + 2 : at + 2] = ["--kv-unified"]
+    return out
+
+
 def _extra_args_split_mode(
     extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
 ) -> Optional[str]:
@@ -8211,6 +8234,8 @@ class LlamaCppBackend:
         self._effective_parallel_slots: int = 1
         # --parallel the last load asked for, before any fit-time reduction.
         self._requested_n_parallel: int = 1
+        # Auto lowered that default count to keep the drafter (#8872).
+        self._slots_cut_for_drafter: bool = False
         # Budget the running child was sized against; None before any load, so the
         # settings route reports a stale budget instead of nagging on every save.
         self._vram_fraction_launched: Optional[float] = None
@@ -8798,6 +8823,7 @@ class LlamaCppBackend:
         self._effective_parallel_slots = 1
         # Cleared with the effective count so a stale value can't skew the dedupe.
         self._requested_n_parallel = 1
+        self._slots_cut_for_drafter = False
         self._requested_n_batch = None
         self._requested_n_ubatch = None
         self._requested_load_mode = None
@@ -9236,6 +9262,9 @@ class LlamaCppBackend:
         if self._requested_n_ctx != int(intent.n_ctx):
             return False
         if not self._is_diffusion and self._requested_n_parallel != max(1, int(intent.n_parallel)):
+            return False
+        # The same count chosen rather than defaulted is one Auto may not cut.
+        if self._slots_cut_for_drafter and not intent.n_parallel_from_default:
             return False
         if not self._is_diffusion and (
             self._requested_n_batch != intent.n_batch or self._requested_n_ubatch != intent.n_ubatch
@@ -25943,6 +25972,8 @@ class LlamaCppBackend:
                 # Auto dropped the drafter because only the target fit. Bound before the
                 # try: the launch below reads it either way.
                 _spec_dropped_no_vram = False
+                # The slot count Auto gave up to keep the drafter, for the drafterless retry.
+                _mtp_slots_asked: Optional[int] = None
                 # The projector runs on the CPU and so allocates no VRAM:
                 # --no-mmproj-offload clears mmproj_use_gpu and clip.cpp gates its whole
                 # GPU backend on that, leaving no partial offload. Only the paravirtual
@@ -26584,6 +26615,17 @@ class LlamaCppBackend:
                             - _cc_bytes(ctx, 1, slots, cache_type),
                         )
 
+                    # The lump below at a candidate slot count and its micro-batch.
+                    def _layer_compute_buffer(slots: int) -> int:
+                        cb = self._estimate_compute_buffer_bytes(
+                            n_ubatch = _ubatch_for_slots(slots),
+                            n_parallel = slots,
+                            per_device_tensor = False,
+                        )
+                        return (
+                            cb if cb > 0 else self._TENSOR_PARALLEL_BUFFER_RESERVE_MIB * 1024 * 1024
+                        )
+
                     # Layer-split compute buffer (one lump; tensor mode reserves it
                     # per device in _plan_tensor_parallel). Context-independent, so
                     # fold it into the model footprint for the branches below. Falls
@@ -27014,7 +27056,11 @@ class LlamaCppBackend:
                                 else 0.0
                             )
 
-                        def _probe_base(drafter: bool, n: int) -> int:
+                        def _probe_base(
+                            drafter: bool,
+                            n: int,
+                            slots: int = 0,
+                        ) -> int:
                             # model_size_fit's terms, before it is built below.
                             _soft = self._CUDA_CONTEXT_RESERVE_BYTES
                             if effective_is_vision and mmproj_size > 0:
@@ -27023,7 +27069,11 @@ class LlamaCppBackend:
                                 _soft += self._MTP_DRAFT_COMPUTE_BYTES
                             return (
                                 model_size
-                                + _compute_buffer_pipeline
+                                + (
+                                    _layer_compute_buffer(slots)
+                                    if slots
+                                    else _compute_buffer_pipeline
+                                )
                                 + _soft
                                 + max(0, n - 1) * _pipeline_overhead_bytes
                             )
@@ -27073,6 +27123,11 @@ class LlamaCppBackend:
                         _both_fit_somewhere = False
                         _probe_ctx = 0
                         _probe_need = _probe_have = 0.0
+                        # (GPU count, target-only context, budget with the drafter) for
+                        # every subset of the drafter's ranking the walk priced the target
+                        # on: the order the final placement sorts by once the drafter stays.
+                        _target_placements: list[tuple[int, int, float]] = []
+                        _drafter_order = _probe_orders[-1]
                         for _probe_ranked in _probe_orders:
                             if _both_fit_somewhere:
                                 break
@@ -27156,6 +27211,8 @@ class LlamaCppBackend:
                                         _foot_w,
                                         _budget_w,
                                     )
+                                if _probe_ranked is _drafter_order:
+                                    _target_placements.append((_n, _ctx_wo, _budget_w))
                                 if _foot_w <= _budget_w:
                                     _both_fit_somewhere = True
                                     break
@@ -27215,6 +27272,108 @@ class LlamaCppBackend:
                                             _budget_w / 1024,
                                         )
                                     break
+                        # Fewer serving slots before no drafter: the KV, the compute buffer
+                        # and the drafter's per-slot rollback state all shrink with the slot
+                        # count. Each count is priced the way the Auto walk will place it:
+                        # the first subset that holds the drafter at any context is the one
+                        # it takes, so that context must keep the subset's target-only one,
+                        # less at most _MTP_SLOT_CTX_TRIM at one slot (the draft KV grows
+                        # with the context the target alone already filled). A count set in
+                        # the extras or the environment wins at launch, so it is kept.
+                        if (
+                            _target_fits_somewhere
+                            and not _both_fit_somewhere
+                            and n_parallel > 1
+                            and intent.n_parallel_from_default
+                            and _extra_args_n_parallel(extra_args) is None
+                        ):
+
+                            def _mtp_foot_mib(n: int, ctx: int, s: int) -> float:
+                                ub = _ubatch_for_slots(s)
+                                return (
+                                    _probe_base(True, n, s)
+                                    + self._estimate_kv_cache_bytes(
+                                        ctx,
+                                        cache_type_kv,
+                                        n_parallel = s,
+                                        swa_full = swa_full,
+                                        kv_unified = planned_kv_unified,
+                                        n_ubatch = ub,
+                                        flash_attn = planned_flash_attn,
+                                    )
+                                    + _cc_bytes(ctx, n, s)
+                                    + _mtp_bytes(ctx, s, ub)
+                                ) / (1024 * 1024)
+
+                            def _ctx_with_drafter(n: int, ctx: int, budget: float, s: int) -> int:
+                                if explicit_ctx:
+                                    return ctx if _mtp_foot_mib(n, ctx, s) <= budget else 0
+                                ub = _ubatch_for_slots(s)
+                                fitted = self._fit_context_to_vram(
+                                    ctx,
+                                    budget,
+                                    _probe_base(True, n, s),
+                                    cache_type_kv,
+                                    swa_full = swa_full,
+                                    n_parallel = s,
+                                    kv_unified = planned_kv_unified,
+                                    n_ubatch = ub,
+                                    flash_attn = planned_flash_attn,
+                                    mtp_engaged = True,
+                                    mtp_overhead_fn = (
+                                        functools.partial(mtp_overhead_fn, _np = s, _n_ubatch = ub)
+                                        if mtp_overhead_fn is not None
+                                        else None
+                                    ),
+                                    compute_ctx_bytes_fn = lambda c: _cc_bytes(c, n, s),
+                                    budget_frac = 1.0,
+                                    pooled = True,
+                                    total_mib = None,
+                                    ctx_checkpoints = _placement_ctx_checkpoints,
+                                )
+                                return (
+                                    fitted
+                                    if fitted > 0 and _mtp_foot_mib(n, fitted, s) <= budget
+                                    else 0
+                                )
+
+                            _mtp_slots = _mtp_slots_ctx = 0
+                            for _s in range(n_parallel - 1, 0, -1):
+                                _keep = 1 - (
+                                    _MTP_SLOT_CTX_TRIM if _s == 1 and not explicit_ctx else 0
+                                )
+                                for _n, _ctx_c, _budget_c in _target_placements:
+                                    _c = _ctx_with_drafter(_n, _ctx_c, _budget_c, _s)
+                                    if _c <= 0:
+                                        continue
+                                    if _c >= _ctx_c * _keep:
+                                        _mtp_slots, _mtp_slots_ctx = _s, _c
+                                    break
+                                if _mtp_slots:
+                                    break
+                            if _mtp_slots:
+                                logger.info(
+                                    "Auto: serving slots reduced %d -> %d so the drafter fits "
+                                    "in VRAM at context %d (target alone: %d). Set Parallel "
+                                    "Slots to keep %d without the drafter.",
+                                    n_parallel,
+                                    _mtp_slots,
+                                    _mtp_slots_ctx,
+                                    _probe_ctx,
+                                    n_parallel,
+                                )
+                                _mtp_slots_asked = n_parallel
+                                n_parallel = _mtp_slots  # allow-slot-clamp: the drafter fits in VRAM only at fewer slots
+                                _effective_ubatch = _ubatch_for_slots(n_parallel)
+                                _compute_buffer_pipeline = _layer_compute_buffer(n_parallel)
+                                if mtp_overhead_fn is not None:
+                                    # Its defaults were bound at the requested count.
+                                    mtp_overhead_fn = functools.partial(
+                                        mtp_overhead_fn,
+                                        _np = n_parallel,
+                                        _n_ubatch = _effective_ubatch,
+                                    )
+                                _both_fit_somewhere = True
                         if _target_fits_somewhere and not _both_fit_somewhere:
                             _spec_dropped_no_vram = True
                             _mtp_will_engage = False
@@ -32989,12 +33148,50 @@ class LlamaCppBackend:
                             strip_split_mode = False,
                         )
                     fallback_cmd = cmd[:_spec_at] + ["--spec-default"] + _fb_tail
+                    # Those slots bought a drafter this retry no longer runs, and the
+                    # target alone fit them at a context at least this large. If they
+                    # are what fails (a model refusing unified KV), retry as launched.
+                    _fb_cut = (
+                        (fallback_cmd, n_parallel, _auto_ctx_checkpoints, _auto_ckpt_emitted)
+                        if _mtp_slots_asked is not None
+                        else None
+                    )
+                    if _fb_cut is not None:
+                        n_parallel = _mtp_slots_asked
+                        fallback_cmd = _with_parallel_slots(
+                            fallback_cmd,
+                            n_parallel,
+                            n_batch = n_batch,
+                            supports_kv_unified = bool(server_caps.get("supports_kv_unified")),
+                        )
+                        # The checkpoint cap is per slot; same re-decide as the single-seq rung.
+                        if _auto_ckpt_emitted:
+                            fallback_cmd = self._without_flag_pairs(
+                                fallback_cmd, _auto_ckpt_emitted
+                            )
+                        _auto_ctx_checkpoints = _decide_auto_ctx_checkpoints()
+                        _auto_ckpt_emitted = _emit_auto_ctx_checkpoints(fallback_cmd)
+                        kv_cache_unified = _kv_unified_from_args(fallback_cmd)
                     _unified_withdraw_if_unneeded(
                         fallback_cmd,
                         mtp_engages = False,
                         why = "The retry without speculative decoding",
                     )
                     healthy = _spawn_and_wait(fallback_cmd, label = "-retry")
+                    if not healthy and _fb_cut is not None and not _load_cancelled():
+                        logger.warning(
+                            "The retry without speculative decoding failed at %d slots; "
+                            "retrying at the %d the drafter launch ran.",
+                            n_parallel,
+                            _fb_cut[1],
+                        )
+                        self._kill_process()
+                        fallback_cmd, _fb_slots, _auto_ctx_checkpoints, _auto_ckpt_emitted = _fb_cut
+                        n_parallel = (
+                            _fb_slots  # allow-slot-clamp: the restored count failed to start
+                        )
+                        kv_cache_unified = _kv_unified_from_args(fallback_cmd)
+                        healthy = _spawn_and_wait(fallback_cmd, label = "-retry-cut")
                     if healthy:
                         self._speculative_type = "default"
                         _mtp_active_for_launched_server = False
@@ -33399,6 +33596,9 @@ class LlamaCppBackend:
                 self._requested_n_ctx = int(effective_ctx if _replayed_ctx_refit else n_ctx)
                 # Local n_parallel may have been reduced above; the snapshot has the ask.
                 self._requested_n_parallel = max(1, int(intent.n_parallel))
+                self._slots_cut_for_drafter = (
+                    _mtp_slots_asked is not None and n_parallel < _mtp_slots_asked
+                )
                 # Commit with the rest of the known-good state: only a launch that got
                 # this far replaced the runtime, so a rejected preflight leaves the old
                 # marker intact, and the diffusion runner returns well before it without
