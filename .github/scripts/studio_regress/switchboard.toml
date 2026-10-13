@@ -1,0 +1,683 @@
+# studio_regress switchboard: ONE registry deciding what runs for a PR.
+#
+# [[target]] fields
+#   name          journey module name (journeys/<name>.py) or jobs script ("jobs/<file>.py ARGS")
+#   kind          "journey" (Studio, before/after screenshots)
+#                 | "external" (absolute pass / fail suite elsewhere in scripts/, external.py)
+#                 | "job" (Core: jobs/ab.py base-vs-head, jobs/compare.py verdict; core.py)
+#                 | "regression" (Core: tiny-model suite regression/run.py base-vs-head; core.py)
+#                 job / regression need no Studio install: they run in the Core interpreter
+#                 (run --core-python; default $STUDIO_REGRESS_CORE_PYTHON, else temp/venv_core,
+#                 else the active venv: it needs torch + unsloth deps and a working bitsandbytes)
+#   repos         PR repos the target applies to; default journey / external -> unslothai/unsloth,
+#                 job / regression -> unslothai/unsloth and unslothai/unsloth-zoo
+#   args          job: extra argv for the job script (after any args in the name)
+#                 regression: extra argv for `regression/run.py run`
+#   regression_tier  regression: smoke | standard | full (regression/registry.py TIERS)
+#   gpus          regression: distinct GPUs leased (2: base and head side by side)
+#   compare_args  job: extra jobs/compare.py flags, e.g. "--perf-gate"
+#   timeout_s     wall-clock cap per target (default max(1800 or 5400, 6 * est_s))
+#   cmd           external only: argv list run from scripts/ with {install} {side} {out} {gpu};
+#                 head first, exit 0 = SAME; on failure base runs: base ok -> FAIL_HEAD,
+#                 base fails -> FAIL_BOTH. {out}/results.json is linked in report.json
+#   tier          fast (CPU, no model) | model (CPU GGUF ok) | gpu
+#   perf_sensitive  true -> exclusive GPU lease (timings compared); false -> packed with others
+#   gpu_mem_gb    peak + 20% (refreshed from reports into temp/studio_regress/mem_cache.json)
+#   est_s         warm seconds per side
+#   triggers      glob patterns over changed paths; "label:<name>"; "always"
+#   deps          targets that must run first on the same side (shared state)
+#   models        fixture keys from [models]
+#   owner         fork / module that implements it ("pending" = not yet implemented)
+#
+# Selection (selection.py): a target is picked when any trigger matches. Changed paths that no
+# trigger matches are listed as UNMATCHED and add the `fast` smoke set (conservative).
+
+[models]
+gguf_270m = { repo = "unsloth/gemma-3-270m-it-GGUF", variant = "UD-Q4_K_XL" }
+gguf_qwen35_08b_mtp = { repo = "unsloth/Qwen3.5-0.8B-MTP-GGUF", variant = "UD-Q4_K_XL" }
+gguf_qwen35_2b_mtp = { repo = "unsloth/Qwen3.5-2B-MTP-GGUF", variant = "UD-Q4_K_XL" }
+train_270m = { repo = "unsloth/gemma-3-270m-it" }
+# Keys named after Journey.needs (fork B's models.toml): run.py hands ctx.models[key] to the journey.
+gguf_small = { repo = "unsloth/gemma-3-270m-it-GGUF", variant = "UD-Q4_K_XL" }
+gguf_compaction = { repo = "unsloth/Qwen3.5-0.8B-MTP-GGUF", variant = "UD-Q4_K_XL" }
+gguf_tools = { repo = "unsloth/Qwen3.5-0.8B-MTP-GGUF", variant = "UD-Q4_K_XL" }   # needs a tool-capable template
+train_small = { repo = "unsloth/gemma-3-270m-it" }
+# local_snapshot: Studio loads non-GGUF, non-unsloth/* pipelines only from a path, so run.py and
+# prefetch materialise these under $WORKSPACE/hf_tiny/<name> (journeys/_diffusion.ensure_tiny),
+# the same directory diffusion_bench/fetch_tiny.py fills for the external targets below.
+tiny_sdxl = { repo = "hf-internal-testing/tiny-stable-diffusion-xl-pipe", local_snapshot = true }
+tiny_wan = { repo = "hf-internal-testing/tiny-wan-pipe", local_snapshot = true }
+# External diffusion_bench targets: prefetch runs `fetch_tiny.py --set <set>` (14 pipes, ~340 MB,
+# plus the rope-128 tiny Wan derivative the HTTP video checks need).
+diffusion_bench_tiny = { fetch_script = "diffusion_bench/fetch_tiny.py", args = ["--set", "all"] }
+tiny_gpt_oss = { repo = "trl-internal-testing/tiny-GptOssForCausalLM" }
+tiny_qwen3_moe = { repo = "trl-internal-testing/tiny-Qwen3MoeForCausalLM" }
+tiny_gemma4 = { repo = "trl-internal-testing/tiny-Gemma4ForConditionalGeneration" }
+tiny_qwen35 = { repo = "trl-internal-testing/tiny-Qwen3_5ForConditionalGeneration-NoThink" }
+gemma4_e2b = { repo = "unsloth/gemma-4-E2B-it" }
+qwen35_08b = { repo = "unsloth/Qwen3.5-0.8B" }
+
+# ---------------------------------------------------------------- Studio journeys (fork A)
+[[target]]
+name = "auth"
+kind = "journey"
+tier = "fast"
+perf_sensitive = false
+gpu_mem_gb = 0
+est_s = 40
+triggers = ["always", "studio/frontend/src/features/auth/**", "studio/backend/auth/**",
+            "studio/backend/routes/auth.py", "studio/frontend/src/app/**"]
+owner = "a"
+
+[[target]]
+name = "settings"
+kind = "journey"
+tier = "fast"
+perf_sensitive = false
+gpu_mem_gb = 0
+est_s = 60
+triggers = ["always", "studio/frontend/src/features/settings/**", "studio/backend/routes/settings.py",
+            "studio/backend/utils/*settings*.py", "studio/frontend/src/components/**"]
+owner = "a"
+
+[[target]]
+name = "model_picker"
+kind = "journey"
+tier = "fast"
+perf_sensitive = false
+gpu_mem_gb = 0
+est_s = 40
+# Canned quant listing + canned device (journeys/model_picker.py): the frontend's ordering, fit
+# verdicts and recommended star, offline and host-independent (unsloth#11606).
+triggers = ["studio/frontend/src/features/model-picker/**", "studio/frontend/src/hooks/use-gpu-info.ts",
+            "studio/frontend/src/hooks/use-system.ts", "studio/backend/routes/models.py",
+            "studio/backend/hub/services/models/gguf_variants*.py", "label:affects UI#"]
+owner = "val"
+
+[[target]]
+name = "crawl"
+kind = "journey"
+tier = "fast"
+perf_sensitive = false
+gpu_mem_gb = 0
+est_s = 180
+triggers = ["always", "label:affects UI#", "studio/frontend/**", "studio/backend/routes/**"]
+owner = "a"
+
+[[target]]
+name = "upstream_ci"
+kind = "journey"
+tier = "model"
+perf_sensitive = false
+gpu_mem_gb = 2
+est_s = 300
+triggers = ["label:affects UI#", "studio/frontend/src/features/chat/**", "studio/backend/routes/inference.py",
+            "studio/backend/core/inference/**", "tests/studio/playwright_chat_ui.py",
+            "tests/studio/playwright_extra_ui.py", "studio/frontend/src/features/settings/**"]
+models = ["gguf_270m"]
+owner = "a"
+
+[[target]]
+name = "cli"
+kind = "journey"
+tier = "model"
+perf_sensitive = false
+gpu_mem_gb = 2
+est_s = 90
+triggers = ["unsloth_cli/**", "studio/backend/run.py", "install.sh", "studio/setup.sh"]
+models = ["gguf_270m"]
+owner = "a"
+
+# ---------------------------------------------------------------- Studio journeys (fork B)
+[[target]]
+name = "inference_settings"
+kind = "journey"
+tier = "model"
+perf_sensitive = false
+gpu_mem_gb = 2           # fork B measured ~1.5 GB, 28.5 s warm
+est_s = 45
+triggers = ["studio/frontend/src/features/chat/**", "studio/frontend/src/features/model-picker/**",
+            "studio/backend/routes/inference.py", "studio/backend/core/inference/llama_cpp*.py",
+            "studio/backend/core/inference/**", "studio/backend/routes/chat_history.py",
+            "studio/backend/models/inference.py"]
+models = ["gguf_small"]
+owner = "b"
+
+[[target]]
+name = "parallel"
+kind = "journey"
+tier = "gpu"
+perf_sensitive = false
+gpu_mem_gb = 6           # fork B measured ~5 GB (chat + tiny training), 98.6 s
+est_s = 120
+triggers = ["studio/backend/routes/chat_generation_runs.py", "studio/backend/core/inference/gpu_arbiter.py",
+            "studio/backend/routes/training_vram.py", "studio/frontend/src/features/chat/compare/**",
+            "studio/backend/routes/training.py", "studio/backend/routes/inference.py",
+            "studio/backend/core/training/**"]
+models = ["gguf_small", "train_small"]   # starts its own tiny training run; no dependency
+owner = "b"
+
+[[target]]
+name = "compaction"
+kind = "journey"
+tier = "gpu"
+perf_sensitive = false
+gpu_mem_gb = 3           # fork B measured ~2.5 GB, 113 s
+est_s = 130
+triggers = ["studio/backend/core/inference/checkpoint.py", "studio/backend/core/inference/context_window.py",
+            "studio/backend/core/rag/**", "studio/frontend/src/features/chat/utils/**",
+            "studio/frontend/src/components/assistant-ui/**"]
+models = ["gguf_compaction"]
+owner = "b"
+
+[[target]]
+name = "full_access_isolated"
+kind = "journey"
+tier = "model"
+perf_sensitive = false
+gpu_mem_gb = 2           # fork B measured 32-45 s inside docker --network none
+est_s = 90               # + the isolation wrapper start (run.py runs it nested, per side)
+triggers = ["studio/backend/core/inference/tools.py", "studio/backend/core/inference/tool_confinement.py",
+            "studio/backend/auth/**", "studio/frontend/src/features/chat/permission-mode-select.tsx",
+            "studio/frontend/src/features/chat/bypass-permissions-menu-item.tsx"]
+models = ["gguf_tools"]  # Qwen3.5-0.8B: gemma-3-270m has no tool-call template
+owner = "b"
+
+[[target]]
+name = "train_responses_only"
+kind = "journey"
+tier = "gpu"
+perf_sensitive = false
+gpu_mem_gb = 6           # fork B measured ~5 GB, 140-230 s
+est_s = 230
+triggers = ["studio/backend/core/training/**", "studio/backend/routes/training.py", "studio/backend/models/training.py",
+            "studio/backend/utils/datasets/**", "studio/frontend/src/features/studio/**",
+            "unsloth/chat_templates.py", "unsloth/trainer.py"]
+models = ["train_small"]
+owner = "b"
+
+[[target]]
+name = "export_reload"
+kind = "journey"
+tier = "gpu"
+perf_sensitive = false
+gpu_mem_gb = 6           # fork B measured ~5 GB, 75 s after training
+est_s = 90
+triggers = ["studio/backend/routes/export.py", "studio/backend/core/export/**", "studio/frontend/src/features/export/**",
+            "unsloth/save.py", "unsloth_zoo/llama_cpp.py", "unsloth_zoo/saving_utils.py"]
+deps = ["train_responses_only"]   # reads the adapter it trains (<home>/studio_regress_last_adapter.json)
+models = ["train_small"]
+owner = "b"
+
+[[target]]
+name = "diffusion_gen"
+kind = "journey"
+tier = "gpu"
+perf_sensitive = false
+gpu_mem_gb = 3           # fork C measured 0.6-1.9 GB (Studio tree), 43 s cold / 13 s warm
+est_s = 45
+triggers = ["studio/backend/core/inference/diffusion*", "studio/backend/routes/inference.py",
+            "studio/backend/routes/images.py", "studio/frontend/src/features/images/**",
+            "studio/frontend/src/features/image*/**"]
+models = ["tiny_sdxl"]
+owner = "c"
+
+[[target]]
+name = "diffusion_train"
+kind = "journey"
+tier = "gpu"
+perf_sensitive = false
+gpu_mem_gb = 3           # fork C measured 1.7-1.9 GB (train, deploy, generate with LoRA)
+est_s = 130              # 77-130 s: trainer run + waiting for its process to exit
+triggers = ["studio/backend/core/training/diffusion*/**", "studio/backend/core/training/diffusion*",
+            "studio/backend/routes/training.py", "studio/backend/core/inference/diffusion_lora*",
+            "studio/frontend/src/features/images/**"]
+models = ["tiny_sdxl"]
+owner = "c"
+
+[[target]]
+name = "diffusion_video"
+kind = "journey"
+tier = "gpu"
+perf_sensitive = false
+gpu_mem_gb = 10          # 8.5 GB when memory_mode fast stays resident, 1.5-3.1 GB when it offloads
+est_s = 75               # 30-71 s: load, /video, 9-frame clip over HTTP, plays, UI cancel, unload
+triggers = ["studio/backend/core/inference/video*", "studio/backend/routes/video.py",
+            "studio/backend/core/inference/diffusion*", "studio/frontend/src/features/video/**"]
+models = ["tiny_wan"]
+owner = "c"
+
+[[target]]
+name = "desktop"
+kind = "journey"
+tier = "fast"
+perf_sensitive = false
+gpu_mem_gb = 0
+est_s = 900
+staging_only = true      # WebDriver on the staging runner, not Playwright
+triggers = ["studio/src-tauri/**", "studio/frontend/src/**/tauri*", "studio/frontend/src/lib/tauri*"]
+owner = "c"
+
+[[target]]
+name = "desktop_update"
+kind = "journey"
+tier = "fast"
+perf_sensitive = false
+gpu_mem_gb = 0
+est_s = 1200
+staging_only = true      # nightly N-1 -> latest updater
+triggers = [".github/workflows/release-desktop.yml", "studio/src-tauri/src/desktop_updater.rs",
+            "studio/src-tauri/src/debian_update.rs", "studio/src-tauri/tauri.conf.json"]
+owner = "c"
+
+# ---------------------------------------------------------------- diffusion_bench (unslothai/scripts #330)
+# Absolute pass / fail suites run on the side's Studio install and source tree. Head first; the
+# base runs only on a head failure (external.py). known_failures = "results_json": the suite's
+# KNOWN_STUDIO_FAILS (host RAM kept after unload, VRAM held after unloading mid-render, host RAM
+# after a video->image switch) do not count, so only NEW failures force the base run.
+# Pins: diffusers-*.txt (diffusers) and overrides.txt (torch) select the tiny suites too.
+# The driver is the side's Studio python (it has av for the HTTP video decode); prefetch runs
+# fetch_tiny.py so every tiny pipe and the rope-128 Wan copy exist under $WORKSPACE/hf_tiny.
+[[target]]
+name = "diffusion_bench_tiny_http"
+kind = "external"
+tier = "gpu"
+perf_sensitive = false
+gpu_mem_gb = 8
+est_s = 300
+known_failures = "results_json"
+cmd = ["{install}/unsloth_studio/bin/python", "diffusion_bench/edge/run_edge.py", "--tier", "tiny",
+       "--surface", "http", "--studio-src", "{src}", "--python", "{install}/unsloth_studio/bin/python",
+       "--gpu", "{gpu}", "--out", "{out}"]
+triggers = ["studio/backend/core/inference/diffusion*.py", "studio/backend/core/inference/video*.py",
+            "studio/backend/core/inference/video_families*.py", "studio/backend/core/inference/gpu_arbiter*.py",
+            "studio/backend/core/inference/media_auto_switch*.py", "studio/backend/routes/images.py",
+            "studio/backend/routes/video.py", "studio/backend/models/inference.py", "studio/backend/main.py",
+            "studio/backend/requirements/diffusers-*.txt", "studio/backend/requirements/overrides.txt"]
+models = ["diffusion_bench_tiny"]
+owner = "330"
+
+[[target]]
+name = "diffusion_bench_tiny_inproc"
+kind = "external"
+tier = "gpu"
+perf_sensitive = false
+gpu_mem_gb = 8
+est_s = 290
+known_failures = "results_json"
+cmd = ["{install}/unsloth_studio/bin/python", "diffusion_bench/edge/run_edge.py", "--tier", "tiny",
+       "--surface", "inproc", "--studio-src", "{src}", "--python", "{install}/unsloth_studio/bin/python",
+       "--gpu", "{gpu}", "--out", "{out}"]
+triggers = ["studio/backend/core/inference/diffusion*.py", "studio/backend/core/inference/video*.py",
+            "studio/backend/core/inference/video_families*.py", "studio/backend/core/inference/gpu_arbiter*.py",
+            "studio/backend/core/inference/media_auto_switch*.py", "studio/backend/models/inference.py",
+            "studio/backend/requirements/diffusers-*.txt", "studio/backend/requirements/overrides.txt"]
+models = ["diffusion_bench_tiny"]
+owner = "330"
+
+[[target]]
+name = "diffusion_bench_matrix_tiny"
+kind = "external"
+tier = "gpu"
+perf_sensitive = true    # records timings: exclusive GPU lease
+gpu_mem_gb = 6
+est_s = 600
+# Every cell runs on the side's install and source tree, not an envs.py-built venv.
+cmd = ["{install}/unsloth_studio/bin/python", "diffusion_bench/matrix.py", "diffusion_bench/specs/tiny_plumbing.json",
+       "--out", "{out}", "--gpus", "{gpu}", "--set", "venv={install}/unsloth_studio/bin/python",
+       "--set", "options.studio_src={src}"]
+triggers = ["studio/backend/core/inference/diffusion*.py", "studio/backend/core/inference/video*.py",
+            "studio/backend/core/inference/gpu_arbiter*.py",
+            "studio/backend/requirements/diffusers-*.txt", "studio/backend/requirements/overrides.txt"]
+models = ["diffusion_bench_tiny"]
+owner = "330"
+
+[[target]]
+name = "diffusion_bench_fast"
+kind = "external"
+tier = "gpu"
+perf_sensitive = false
+gpu_mem_gb = 40          # SDXL-Turbo, Z-Image-Turbo, Wan2.2-TI2V-5B (real weights, fetched by the suite)
+est_s = 660          # measured 657 s (head side, B200, 2026-09-25)
+known_failures = "results_json"
+cmd = ["{install}/unsloth_studio/bin/python", "diffusion_bench/edge/run_edge.py", "--tier", "fast",
+       "--surface", "both", "--studio-src", "{src}", "--python", "{install}/unsloth_studio/bin/python",
+       "--gpu", "{gpu}", "--out", "{out}"]
+# Label-only: real SDXL-Turbo / Z-Image-Turbo / Wan2.2-5B weights, ~11 min and ~40 GB per side.
+# The three tiny targets above cover the same diffusion code paths in 6 to 8 min each (all SAME
+# on #11604); run this one on request (label, or --only diffusion_bench_fast).
+triggers = ["label:affects diffusion"]
+owner = "330"
+
+# CPU-only diffusion coverage that needs no model: both run with the side's Studio python and source tree.
+# diffusion_imports: every image / video family's diffusers classes import under the installed pins (a pin bump
+# or a family registry edit that names a class this diffusers lacks). Head first, base only on failure.
+[[target]]
+name = "diffusion_imports"
+kind = "external"
+tier = "fast"
+perf_sensitive = false
+gpu_mem_gb = 0
+est_s = 300          # one child importing every class; 40 s idle, ~600 s on a loaded host
+known_failures = "results_json"
+cmd = ["{install}/unsloth_studio/bin/python", "studio_regress/diffusion_imports.py", "--src", "{src}",
+       "--out", "{out}", "--python", "{install}/unsloth_studio/bin/python"]
+triggers = ["studio/backend/core/inference/**", "studio/backend/requirements/**"]
+owner = "switchboard"
+
+# planner_matrix: the image, video and MiniMax-H3 planners over 8..96 GiB x discrete / unified x auto / int8 /
+# fp8 / bf16, on BOTH sides (compare = "planner_matrix"); every moved cell is tabled, admitted -> refused and
+# strictly slower placements flagged. PLAN_DIFF is for a reader, never a regression (planner_matrix.py).
+[[target]]
+name = "planner_matrix"
+kind = "external"
+tier = "fast"
+perf_sensitive = false
+gpu_mem_gb = 0
+est_s = 120
+compare = "planner_matrix"
+cmd = ["{install}/unsloth_studio/bin/python", "studio_regress/planner_matrix.py", "--src", "{src}",
+       "--out", "{out}", "--python", "{install}/unsloth_studio/bin/python"]
+triggers = ["studio/backend/core/inference/diffusion_memory.py", "studio/backend/core/inference/diffusion.py",
+            "studio/backend/core/inference/video.py", "studio/backend/core/inference/diffusion_families.py",
+            "studio/backend/core/inference/video_families.py", "studio/backend/core/inference/video_minimax_h3*.py",
+            "studio/backend/core/inference/diffusion_auto_policy.py",
+            "studio/backend/core/inference/diffusion_transformer_quant.py",
+            "studio/frontend/src/features/model-picker/components/model-selector/model-catalog.ts"]
+owner = "switchboard"
+
+# ---------------------------------------------------------------- regression suite (unslothai/scripts #332)
+# Tiny-model checks for Unsloth / unsloth-zoo (load, training parity vs a plain HF reference, MoE,
+# losses, generate, save / merge, quant formats, remote code, tokenizer). One regression/run.py
+# call runs base and head side by side on two leased GPUs (companion repo pinned to one SHA) and
+# diffs them: pass -> fail and metric moves beyond tolerance are regressions; registry `known`
+# entries keep failures that already exist on main from counting. Needs `regression/run.py
+# prefetch --tier smoke` once (models into $WORKSPACE/temp/regression/hub).
+[[target]]
+name = "regression_smoke"
+kind = "regression"
+tier = "gpu"
+perf_sensitive = false
+regression_tier = "smoke"
+gpus = 2
+gpu_mem_gb = 12
+est_s = 1300
+triggers = ["unsloth/models/**", "unsloth/kernels/**", "unsloth/save.py", "unsloth/trainer.py",
+            "unsloth/tokenizer_utils.py", "unsloth/import_fixes.py", "unsloth/__init__.py", "unsloth/utils/**", "unsloth/dataprep/**", "unsloth/registry/**",
+            "unsloth_zoo/**", "pyproject.toml"]
+
+[[target]]
+name = "regression_standard"
+kind = "regression"
+tier = "gpu"
+perf_sensitive = false
+regression_tier = "standard"
+gpus = 2
+gpu_mem_gb = 16
+est_s = 2000
+timeout_s = 7200
+triggers = ["label:regression standard"]
+
+# ---------------------------------------------------------------- Core jobs (jobs/*.py)
+[[target]]
+name = "jobs/sft.py"
+dtypes = ["fp16", "bf16"]   # passed on a Kaggle T4 (fp16, 2026-10-07): Kaggle / Colab T4 may take it
+kind = "job"
+tier = "gpu"
+perf_sensitive = true
+gpu_mem_gb = 8
+est_s = 120
+triggers = ["unsloth/models/**", "unsloth/kernels/**", "unsloth/trainer.py", "unsloth/tokenizer_utils.py",
+            "unsloth_zoo/**", "pyproject.toml"]
+
+[[target]]
+name = "jobs/grpo.py"
+kind = "job"
+tier = "gpu"
+perf_sensitive = true
+gpu_mem_gb = 30
+est_s = 400
+triggers = ["unsloth/models/rl*.py", "unsloth_zoo/rl_*.py", "unsloth_zoo/vllm_*.py"]
+
+[[target]]
+name = "jobs/grpo.py --preset gpt_oss_tiny"
+dtypes = ["fp16", "bf16"]   # passed on a Kaggle T4 (fp16, 2026-10-07): Kaggle / Colab T4 may take it
+kind = "job"
+tier = "gpu"
+perf_sensitive = true
+gpu_mem_gb = 4
+est_s = 240
+triggers = ["unsloth/models/gpt_oss*.py", "unsloth/models/rl*.py", "unsloth_zoo/rl_*.py",
+            "unsloth/kernels/moe/**", "unsloth_zoo/temporary_patches/gpt_oss*.py"]
+models = ["tiny_gpt_oss"]
+
+[[target]]
+name = "jobs/moe_sft.py"
+dtypes = ["fp16", "bf16"]   # passed on a Kaggle T4 (fp16, 2026-10-07): Kaggle / Colab T4 may take it
+kind = "job"
+tier = "gpu"
+perf_sensitive = true
+gpu_mem_gb = 4
+est_s = 60
+triggers = ["unsloth/kernels/moe/**", "unsloth/models/qwen3_moe*.py", "unsloth_zoo/temporary_patches/moe*.py",
+            "unsloth_zoo/**/grouped_mm*"]
+models = ["tiny_qwen3_moe"]
+
+[[target]]
+name = "jobs/dpo.py"
+dtypes = ["fp16", "bf16"]   # passed on a Kaggle T4 (fp16, 2026-10-07): Kaggle / Colab T4 may take it
+kind = "job"
+tier = "gpu"
+perf_sensitive = true
+gpu_mem_gb = 8
+est_s = 120
+triggers = ["unsloth/models/rl*.py", "unsloth_zoo/rl_replacements.py"]
+
+[[target]]
+name = "jobs/vision_sft.py"
+kind = "job"
+tier = "gpu"
+perf_sensitive = true
+gpu_mem_gb = 12
+est_s = 180
+triggers = ["unsloth/models/vision.py", "unsloth/trainer.py", "unsloth_zoo/vision_utils.py"]
+
+[[target]]
+name = "jobs/vision_sft.py --preset gemma4"
+kind = "job"
+tier = "gpu"
+perf_sensitive = true
+gpu_mem_gb = 16
+est_s = 240
+triggers = ["unsloth/models/gemma4*.py", "unsloth/models/vision.py", "unsloth_zoo/vision_utils.py",
+            "unsloth_zoo/temporary_patches/gemma4*.py"]
+models = ["gemma4_e2b"]
+
+[[target]]
+name = "jobs/vision_sft.py --preset qwen3_5"
+kind = "job"
+tier = "gpu"
+perf_sensitive = true
+gpu_mem_gb = 8
+est_s = 600
+triggers = ["unsloth/models/qwen3_5*.py", "unsloth/kernels/fla/**", "unsloth_zoo/fla/**",
+            "unsloth_zoo/temporary_patches/qwen3_5*.py"]
+models = ["qwen35_08b"]
+
+[[target]]
+name = "jobs/audio_sft.py"
+kind = "job"
+tier = "gpu"
+perf_sensitive = true
+gpu_mem_gb = 16
+est_s = 300
+triggers = ["unsloth/models/gemma4*.py", "unsloth_zoo/vision_utils.py", "unsloth/trainer.py"]
+models = ["gemma4_e2b"]
+
+[[target]]
+name = "jobs/vision_grpo.py"
+kind = "job"
+tier = "gpu"
+perf_sensitive = true
+gpu_mem_gb = 30
+est_s = 480
+triggers = ["unsloth/models/rl*.py", "unsloth/models/vision.py", "unsloth_zoo/rl_*.py"]
+models = ["gemma4_e2b"]
+
+[[target]]
+name = "jobs/inference_smoke.py"
+dtypes = ["fp16", "bf16"]   # passed on a Kaggle T4 (fp16, 2026-10-07): Kaggle / Colab T4 may take it
+kind = "job"
+tier = "gpu"
+perf_sensitive = true
+gpu_mem_gb = 6
+est_s = 60
+triggers = ["unsloth/models/**", "unsloth/kernels/**", "unsloth_zoo/**"]
+
+[[target]]
+name = "jobs/mlx_sft.py"
+kind = "job"
+tier = "fast"
+perf_sensitive = false
+gpu_mem_gb = 0
+est_s = 300
+# Apple Silicon only: ab.py on this Linux host exits 3 (NOT_RUN), so `run` skips it and `select`
+# prints the staging macOS command, which also runs the PR's tests with the MLX stack installed.
+staging_only = true
+staging = "python pr_review/staging_ci.py cross-platform {pr} --repo {repo} --oses macos-15 --job mlx_sft"
+triggers = ["unsloth/mlx/**", "unsloth_zoo/mlx*/**", "unsloth_zoo/mlx*.py", "unsloth_zoo/**/*mlx*.py",
+            "studio/backend/**/mlx*", "studio/backend/**/*_mlx*", "studio/frontend/src/**/*mlx*",
+            ".github/workflows/mlx-ci.yml", "scripts/install_*_mlx.sh"]
+
+# ---------------------------------------------------------------- playbook workflows
+# [[workflow]]: path triggers that route a PR to claude/workflows/<name>.md (what to try and why);
+# `select` reports them as WORKFLOW lines and pr_extra_workflows.py inlines them into the session.
+# One entry per (name, repo) so each glob only fires for its own repo; repos may be ones no
+# target covers (unslothai/llama.cpp).
+
+[[workflow]]
+name = "training_perf_workflow"
+why = "compiler / kernels / quantized-weight / MoE / GC / device-map / model patch paths"
+repos = ["unslothai/unsloth"]
+triggers = [
+    "unsloth/kernels/**",
+    "unsloth/_compressed_quantize.py",
+    "unsloth/models/_utils.py",
+    "unsloth/models/loader.py",
+    "unsloth/models/loader_utils.py",
+    "unsloth/models/vision.py",
+    "unsloth/models/llama*.py",
+    "unsloth/models/gemma*.py",
+    "unsloth/models/qwen*.py",
+    "unsloth/models/mistral.py",
+    "unsloth/models/cohere.py",
+    "unsloth/models/granite.py",
+    "unsloth/models/falcon_h1.py",
+    "unsloth/models/glm4_moe.py",
+    "unsloth/models/longcat_lsa.py",
+    "unsloth/models/grouped_linear_lora.py",
+    "unsloth/models/modelopt_fp8.py",
+    "unsloth/models/_custom_dtype.py",
+    "unsloth/models/_attn_mask_compat.py",
+    "unsloth/models/_remote_code_buffers.py",
+    "unsloth/models/remote_code_shims.py",
+]
+
+[[workflow]]
+name = "training_perf_workflow"
+why = "compiler / kernels / quantized-weight / MoE / GC / device-map / model patch paths"
+repos = ["unslothai/unsloth-zoo"]
+triggers = [
+    "unsloth_zoo/compiler.py",
+    "unsloth_zoo/compiler_replacements.py",
+    "unsloth_zoo/compile_cache.py",
+    "unsloth_zoo/temporary_patches/**",
+    "unsloth_zoo/gradient_checkpointing.py",
+    "unsloth_zoo/fused_losses/**",
+    "unsloth_zoo/loss_utils.py",
+    "unsloth_zoo/patching_utils.py",
+    "unsloth_zoo/patch_torch_functions.py",
+    "unsloth_zoo/peft_utils.py",
+    "unsloth_zoo/tiled_mlp.py",
+    "unsloth_zoo/device_map_planner.py",
+    "unsloth_zoo/empty_model.py",
+    "unsloth_zoo/flex_attention/**",
+    "unsloth_zoo/gated_delta_vjp.py",
+    "unsloth_zoo/fp16_emulation.py",
+    "unsloth_zoo/_vendored/**",
+]
+
+[[workflow]]
+name = "diffusion_perf_workflow"
+why = "Studio diffusion + video inference / training paths"
+repos = ["unslothai/unsloth"]
+triggers = [
+    "studio/backend/core/inference/diffusion*.py",
+    "studio/backend/core/inference/video_*.py",
+    "studio/backend/core/inference/sd_cpp_*.py",
+    "studio/backend/core/training/diffusion_*.py",
+]
+
+[[workflow]]
+name = "kernel_verify_workflow"
+why = "hand-written / fused kernel"
+repos = ["unslothai/unsloth"]
+triggers = [
+    "unsloth/kernels/**",
+    "unsloth/**/*triton*.py",
+    "studio/backend/**/*_fused.py",
+    "studio/backend/**/*triton*.py",
+    "**/*.cu",
+]
+
+[[workflow]]
+name = "kernel_verify_workflow"
+why = "hand-written / fused kernel"
+repos = ["unslothai/unsloth-zoo"]
+triggers = [
+    "unsloth_zoo/**/*triton*.py",
+    "unsloth_zoo/**/*fused*.py",
+    "unsloth_zoo/**/kernels/**",
+    "**/*.cu",
+]
+
+[[workflow]]
+name = "gguf_quant_workflow"
+why = "GGUF export, llama.cpp quantize / imatrix / quant kernels"
+repos = ["unslothai/llama.cpp"]
+triggers = [
+    "tools/quantize/**",
+    "tools/imatrix/**",
+    "tools/perplexity/**",
+    "src/llama-quant.cpp",
+    "ggml/src/ggml-quants.c",
+    "ggml/src/ggml-common.h",
+    "ggml/src/ggml-cpu/quants.c",
+    "ggml/src/ggml-cuda/quantize.cu",
+    "ggml/src/ggml-cuda/convert.cu",
+    "ggml/src/ggml-cuda/mmq.cu*",
+    "ggml/src/ggml-cuda/mmvq.cu*",
+    "ggml/src/ggml-cuda/vecdotq.cuh",
+    "ggml/src/ggml-cuda/template-instances/mmq-*",
+    "gguf-py/gguf/quants.py",
+    "gguf-py/gguf/constants.py",
+    "convert_hf_to_gguf.py",
+]
+
+[[workflow]]
+name = "gguf_quant_workflow"
+why = "GGUF export, llama.cpp quantize / imatrix / quant kernels"
+repos = ["unslothai/unsloth"]
+triggers = [
+    "unsloth/save.py",
+    "studio/backend/core/export/**",
+]
+
+[[workflow]]
+name = "gguf_quant_workflow"
+why = "GGUF export, llama.cpp quantize / imatrix / quant kernels"
+repos = ["unslothai/unsloth-zoo"]
+triggers = [
+    "unsloth_zoo/llama_cpp.py",
+    "unsloth_zoo/saving_utils.py",
+]
