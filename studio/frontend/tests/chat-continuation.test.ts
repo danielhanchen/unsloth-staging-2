@@ -55,6 +55,10 @@ const { createImageGateRunOwner, isImageGateRunOnly } = await import(
   "../src/features/chat/utils/image-input-support.ts"
 );
 
+const { mergeContextTruncation } = await import(
+  "../src/features/chat/utils/context-truncation.ts"
+);
+
 const { issuedRunFrom } = await import(
   "../src/features/chat/utils/auto-continue-issued-run.ts"
 );
@@ -443,7 +447,7 @@ test("the bar offers the way out in place of a Continue that cannot help", () =>
   );
   assert.match(
     thread,
-    /const remedy = reason \? incompleteRemedy\(reason\) : null/,
+    /const remedy = reason \? incompleteRemedyFor\(reason, canResume\) : null/,
     "the bar no longer asks whether resuming can help",
   );
   assert.match(
@@ -785,6 +789,28 @@ test("a partial that already fills the budget is not resumed", () => {
       promptTarget: 3648,
     }),
     true,
+  );
+});
+
+test("a decline-time refusal arriving after the answer still blocks resuming", () => {
+  resetAutoContinue();
+  // The backend's own decline arrives AFTER the content and must decide the turn.
+  const merged = mergeContextTruncation(
+    { dropped_messages: 2, fits: true, context_length: 8192, boundary_messages: 4 },
+    { dropped_messages: 0, fits: false, context_length: 8192, prompt_target: 6144 },
+  );
+  assert.equal(merged.fits, false);
+  assert.equal(merged.dropped_messages, 2);
+  assert.equal(merged.boundary_messages, 4);
+  assert.equal(
+    shouldAutoContinue("length", "parent-1", {
+      fits: merged.fits,
+      // Under budget on the client estimate: a code-heavy answer counts far short of what it
+      // renders to.
+      partialTokens: 1800,
+      promptTarget: merged.prompt_target,
+    }),
+    false,
   );
 });
 
