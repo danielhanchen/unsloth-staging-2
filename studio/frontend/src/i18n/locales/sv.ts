@@ -3313,6 +3313,7 @@ export const sv = {
       desktopAppVersion: "Skrivbordsappens version",
       desktopAppVersionUnavailable: "Inte tillgänglig",
       llamaCppVersion: "llama.cpp-version",
+      audioCppVersion: "audio.cpp-version",
       hardware: "Maskinvara",
       gpu: "GPU",
       cuda: "CUDA",

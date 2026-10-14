@@ -3091,6 +3091,7 @@ export const ar = {
       desktopAppVersion: "إصدار تطبيق سطح المكتب",
       desktopAppVersionUnavailable: "غير متاح",
       llamaCppVersion: "إصدار llama.cpp",
+      audioCppVersion: "إصدار audio.cpp",
       hardware: "الأجهزة",
       gpu: "GPU",
       cuda: "CUDA",

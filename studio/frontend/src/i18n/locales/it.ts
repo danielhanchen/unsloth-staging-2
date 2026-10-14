@@ -3041,6 +3041,7 @@ export const it = {
       desktopAppVersionUnavailable: "Non disponibile",
       packageVersion: "Versione del pacchetto",
       llamaCppVersion: "Versione di llama.cpp",
+      audioCppVersion: "Versione di audio.cpp",
       hardware: "Hardware",
       gpu: "GPU",
       cuda: "CUDA",
