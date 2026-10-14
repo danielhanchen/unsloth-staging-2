@@ -14,11 +14,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {name: fresh-906-125, first: '', tag: v0.1.906-beta, scale: 125}
-          - {name: fresh-906-150, first: '', tag: v0.1.906-beta, scale: 150}
-          - {name: fresh-905-150, first: '', tag: v0.1.905-beta, scale: 150}
-          - {name: upgrade-905to906-100, first: v0.1.905-beta, tag: v0.1.906-beta, scale: 100}
-          - {name: upgrade-905to906-150, first: v0.1.905-beta, tag: v0.1.906-beta, scale: 150}
+          - {name: long-905-100, first: '', tag: v0.1.905-beta, scale: 100}
+          - {name: long-906-100, first: '', tag: v0.1.906-beta, scale: 100}
+          - {name: long-905-125, first: '', tag: v0.1.905-beta, scale: 125}
+          - {name: long-906-125, first: '', tag: v0.1.906-beta, scale: 125}
+          - {name: long-906-150, first: '', tag: v0.1.906-beta, scale: 150}
     name: ${{ matrix.name }}
     runs-on: windows-latest
     timeout-minutes: 150
@@ -62,7 +62,7 @@ jobs:
         run: ./ci/install_release.ps1 -Tag '${{ matrix.tag }}'
       - name: Drive ${{ matrix.tag }}
         shell: pwsh
-        run: python -u ci/i13604_win.py --app "$env:APP_EXE" --out out --label "${{ matrix.name }}"
+        run: python -u ci/i13604_win.py --app "$env:APP_EXE" --out out --label "${{ matrix.name }}" --prompt "Count from 1 to 120, one number per line, then say Hello."
       - name: Collect app logs
         if: always()
         shell: pwsh

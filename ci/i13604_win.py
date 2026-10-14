@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--app", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--label", required=True)
+    ap.add_argument("--prompt", default="Reply Hello")
     ap.add_argument("--seed-only", action="store_true", help="chat once, maximize, quit (the pre-update session)")
     a = ap.parse_args()
     out = Path(a.out)
@@ -78,7 +79,7 @@ def main():
         return 2
     log("desktop token ok")
     print(http("POST", "/api/inference/load", {"model_path": "unsloth/Qwen3-0.6B-GGUF", "gguf_variant": "Q4_K_M",
-                                               "max_seq_length": 4096}, token, timeout=900))
+                                               "max_seq_length": 8192}, token, timeout=900))
     for _ in range(200):
         if http("GET", "/api/inference/status", token=token).get("loaded"):
             break
@@ -157,7 +158,7 @@ def main():
         log("::error::no composer edit found")
         return 2
     c.click_input()
-    send_keys("Reply{SPACE}Hello{ENTER}")
+    send_keys(a.prompt.replace(" ", "{SPACE}") + "{ENTER}", with_spaces=False)
     time.sleep(3)
     snap("02_streaming")
     end = time.time() + 600
