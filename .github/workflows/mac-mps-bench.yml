@@ -96,6 +96,8 @@ jobs:
           python -u bench/mps_normal_load.py "$PWD/base" out/normal_base
           python -u bench/mps_normal_load.py "$PWD/head" out/normal_head
       - name: sd.cpp mmap A/B
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           export UNSLOTH_STUDIO_HOME="$PWD/sdhome/studio"
@@ -115,5 +117,6 @@ jobs:
             out/**/*.json
             out/**/*.log
             out/**/*.png
+            out/**/*.npy
             pytest_*.txt
             failed_*.txt
