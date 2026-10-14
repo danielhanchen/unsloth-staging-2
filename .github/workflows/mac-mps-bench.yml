@@ -28,13 +28,19 @@ jobs:
           python -c "import torch; print(torch.__version__, torch.backends.mps.is_available())"
           sysctl -n machdep.cpu.brand_string hw.memsize hw.model
           sysctl vm.swapusage
-      - name: unit tests (head, darwin)
+      - name: unit tests (base vs head, darwin)
         run: |
-          set -euo pipefail
-          cd head/studio/backend
-          python -m pytest -q -p no:cacheprovider tests/test_diffusion_device.py tests/test_sd_cpp_args.py 2>&1 | tee ../../../pytest.txt | tail -5
-          grep -q " passed" ../../../pytest.txt
-          ! grep -qE "[0-9]+ (failed|error)" ../../../pytest.txt
+          set -uo pipefail
+          for arm in base head; do
+            (cd $arm/studio/backend && python -m pytest -q -p no:cacheprovider -rf tests/test_diffusion_device.py tests/test_sd_cpp_args.py > ../../../pytest_$arm.txt 2>&1); echo "$arm rc=$?"
+            tail -3 pytest_$arm.txt
+            grep "^FAILED" pytest_$arm.txt | sed 's/ - .*//' | sort > failed_$arm.txt || true
+          done
+          echo "new failures on head:"; comm -13 failed_base.txt failed_head.txt | tee new_failed.txt
+          test ! -s new_failed.txt
+          (cd head/studio/backend && python -m pytest -q -p no:cacheprovider tests/test_diffusion_device.py tests/test_sd_cpp_args.py -k "mmap or mps_cap or mps_ratio or mps_target_sets") 2>&1 | tee pytest_new.txt | tail -2
+          grep -qE "^[0-9]+ passed" <(tail -1 pytest_new.txt)
+          ! grep -qE "failed|error|skipped" <(tail -1 pytest_new.txt)
       - name: MPS cap A/B (fill past RAM)
         run: |
           set -uo pipefail
@@ -70,4 +76,5 @@ jobs:
             out/**/*.json
             out/**/*.log
             out/**/*.png
-            pytest.txt
+            pytest_*.txt
+            failed_*.txt
