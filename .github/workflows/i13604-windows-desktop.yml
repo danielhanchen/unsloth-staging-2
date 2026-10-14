@@ -14,11 +14,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {name: long-905-100, first: '', tag: v0.1.905-beta, scale: 100}
-          - {name: long-906-100, first: '', tag: v0.1.906-beta, scale: 100}
-          - {name: long-905-125, first: '', tag: v0.1.905-beta, scale: 125}
-          - {name: long-906-125, first: '', tag: v0.1.906-beta, scale: 125}
-          - {name: long-906-150, first: '', tag: v0.1.906-beta, scale: 150}
+          - {name: mtp-905-100, first: '', tag: v0.1.905-beta, scale: 100}
+          - {name: mtp-906-100, first: '', tag: v0.1.906-beta, scale: 100}
+          - {name: mtp-906-125, first: '', tag: v0.1.906-beta, scale: 125}
     name: ${{ matrix.name }}
     runs-on: windows-latest
     timeout-minutes: 150
@@ -62,7 +60,7 @@ jobs:
         run: ./ci/install_release.ps1 -Tag '${{ matrix.tag }}'
       - name: Drive ${{ matrix.tag }}
         shell: pwsh
-        run: python -u ci/i13604_win.py --app "$env:APP_EXE" --out out --label "${{ matrix.name }}" --prompt "Count from 1 to 120, one number per line, then say Hello."
+        run: python -u ci/i13604_win.py --app "$env:APP_EXE" --out out --label "${{ matrix.name }}" --model unsloth/Qwen3.5-2B-MTP-GGUF --variant IQ4_XS
       - name: Collect app logs
         if: always()
         shell: pwsh

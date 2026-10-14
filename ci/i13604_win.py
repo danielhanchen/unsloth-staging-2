@@ -47,6 +47,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--label", required=True)
     ap.add_argument("--prompt", default="Reply Hello")
+    ap.add_argument("--model", default="unsloth/Qwen3-0.6B-GGUF")
+    ap.add_argument("--variant", default="Q4_K_M")
     ap.add_argument("--seed-only", action="store_true", help="chat once, maximize, quit (the pre-update session)")
     a = ap.parse_args()
     out = Path(a.out)
@@ -78,7 +80,7 @@ def main():
         grab(out / f"{a.label}_notoken.png")
         return 2
     log("desktop token ok")
-    print(http("POST", "/api/inference/load", {"model_path": "unsloth/Qwen3-0.6B-GGUF", "gguf_variant": "Q4_K_M",
+    print(http("POST", "/api/inference/load", {"model_path": a.model, "gguf_variant": a.variant,
                                                "max_seq_length": 8192}, token, timeout=900))
     for _ in range(200):
         if http("GET", "/api/inference/status", token=token).get("loaded"):
