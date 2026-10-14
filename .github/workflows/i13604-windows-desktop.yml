@@ -1,0 +1,85 @@
+name: "issue-13604 windows desktop composer"
+on:
+  push:
+    branches: ["issue-13604-win-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        tag: [v0.1.905-beta, v0.1.906-beta]
+    runs-on: windows-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Driver deps
+        shell: pwsh
+        run: python -m pip install "playwright<2" pillow
+      - name: Screen resolution
+        shell: pwsh
+        run: |
+          try { Set-DisplayResolution -Width 1920 -Height 1080 -Force -ErrorAction Stop; Write-Host "set 1920x1080" }
+          catch { Write-Host "Set-DisplayResolution unavailable: $($_.Exception.Message)" }
+          Get-CimInstance Win32_VideoController | Select-Object Name, CurrentHorizontalResolution, CurrentVerticalResolution | Format-List
+          Add-Type -AssemblyName System.Windows.Forms
+          [System.Windows.Forms.Screen]::AllScreens | Format-List
+      - name: Download the shipped Desktop installer (${{ matrix.tag }})
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dl out
+          gh release download "${{ matrix.tag }}" --repo unslothai/unsloth --pattern 'Unsloth-Desktop-Windows.exe' --dir dl
+          ls -la dl
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath (Resolve-Path dl/Unsloth-Desktop-Windows.exe) -ArgumentList '/S' -Wait -PassThru
+          Write-Host "installer exit: $($p.ExitCode)"
+          if ($p.ExitCode -ne 0) { exit 1 }
+          $found = Get-ChildItem -Path "$env:LOCALAPPDATA","$env:ProgramFiles" -Recurse -Filter '*Unsloth*.exe' -ErrorAction SilentlyContinue |
+                   Where-Object { $_.Name -notmatch '(?i)uninstall' } | Select-Object -First 1
+          if (-not $found) { Write-Host '::error::no installed executable found'; exit 1 }
+          Write-Host "installed: $($found.FullName)"
+          "APP_EXE=$($found.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Bundled installer, as first launch runs it
+        shell: pwsh
+        run: |
+          $root = Split-Path -Parent $env:APP_EXE
+          $ps1 = Get-ChildItem -Path $root -Recurse -Filter 'install.ps1' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $ps1) { Write-Host '::error::no bundled install.ps1'; exit 1 }
+          Remove-Item Env:UNSLOTH_STUDIO_HOME -ErrorAction SilentlyContinue
+          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $ps1.FullName --tauri *>&1 |
+            Tee-Object -FilePath out/bundled-install.log | Select-Object -Last 40
+          Write-Host "bundled installer exit: $LASTEXITCODE"
+          exit $LASTEXITCODE
+      - name: Drive the app (WebView2 over CDP)
+        shell: pwsh
+        env:
+          PYTHONUTF8: '1'
+        run: |
+          python -u ci/i13604_win.py --app "$env:APP_EXE" --out out --label "${{ matrix.tag }}"
+      - name: Collect app logs
+        if: always()
+        shell: pwsh
+        run: |
+          Copy-Item "$env:USERPROFILE\.unsloth\studio\tauri.log" out/ -ErrorAction SilentlyContinue
+          Get-ChildItem "$env:USERPROFILE\.unsloth\studio\logs" -Recurse -Filter *.log -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime | Select-Object -Last 2 | Copy-Item -Destination out/ -ErrorAction SilentlyContinue
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: i13604-${{ matrix.tag }}
+          path: out/
