@@ -1,0 +1,73 @@
+name: mac-mps-bench
+on:
+  push:
+    branches: ["mac-mps-*"]
+jobs:
+  ab:
+    runs-on: macos-15
+    timeout-minutes: 75
+    env:
+      BASE_SHA: 9f606d6fa1
+      HEAD_BRANCH: opt2-mac-head
+      HF_HUB_DISABLE_PROGRESS_BARS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth base
+          git -C base checkout -q "$BASE_SHA"
+          git clone -q --depth 1 -b "$HEAD_BRANCH" https://github.com/danielhanchen/unsloth-staging-2 head
+          git -C base log -1 --format='base %H'; git -C head log -1 --format='head %H'
+          python -m pip install -q --upgrade pip
+          python -m pip install -q torch numpy pytest pillow diffusers transformers accelerate huggingface_hub psutil
+          python -m pip install -q -r head/studio/backend/requirements/studio.txt pytest-asyncio pytest-timeout python-multipart
+          python -c "import torch; print(torch.__version__, torch.backends.mps.is_available())"
+          sysctl -n machdep.cpu.brand_string hw.memsize hw.model
+          sysctl vm.swapusage
+      - name: unit tests (head, darwin)
+        run: |
+          set -euo pipefail
+          cd head/studio/backend
+          python -m pytest -q -p no:cacheprovider tests/test_diffusion_device.py tests/test_sd_cpp_args.py 2>&1 | tee ../../../pytest.txt | tail -5
+          grep -q " passed" ../../../pytest.txt
+          ! grep -qE "[0-9]+ (failed|error)" ../../../pytest.txt
+      - name: MPS cap A/B (fill past RAM)
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          python -c "import torch,sys; sys.exit(0 if torch.backends.mps.is_available() else 1)"
+          python -u bench/mps_cap_probe.py "$PWD/base" out/cap_base.json 1.0 2>&1 | tail -40; echo "base rc=${PIPESTATUS[0]}"
+          sysctl vm.swapusage
+          python -u bench/mps_cap_probe.py "$PWD/head" out/cap_head.json 1.0 2>&1 | tail -40; echo "head rc=${PIPESTATUS[0]}"
+          test -f out/cap_head.json
+          test -f out/cap_base.json || echo '{"error":"process died","reached_limit":false,"allocated_gib":-1,"post_matmul_finite":false,"swap_before_mib":null,"swap_after_fill_mib":null}' > out/cap_base.json
+      - name: MPS normal load A/B (sd-turbo)
+        run: |
+          set -euo pipefail
+          python -u bench/mps_normal_load.py "$PWD/base" out/normal_base
+          python -u bench/mps_normal_load.py "$PWD/head" out/normal_head
+      - name: sd.cpp mmap A/B
+        run: |
+          set -euo pipefail
+          export UNSLOTH_STUDIO_HOME="$PWD/sdhome/studio"
+          python head/studio/install_sd_cpp_prebuilt.py --install-dir "$PWD/sdhome/stable-diffusion.cpp"
+          cat sdhome/stable-diffusion.cpp/.unsloth-sd-cpp-install.json; echo
+          SD=$(find "$PWD/sdhome/stable-diffusion.cpp" -name sd-cli -type f | head -1); echo "sd-cli: $SD"
+          GGUF=$(python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('Green-Sky/SD-Turbo-GGUF','sd_turbo-f16-q8_0.gguf', local_dir='models'))")
+          ls -la "$GGUF"
+          python -u bench/sdcpp_mmap.py "$SD" "$GGUF" "$PWD/base" "$PWD/head" out/sdcpp
+      - name: gate
+        run: python bench/gate.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-mps-opt2
+          path: |
+            out/**/*.json
+            out/**/*.log
+            out/**/*.png
+            pytest.txt
