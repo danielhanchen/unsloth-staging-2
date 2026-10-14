@@ -3,7 +3,46 @@ on:
   push:
     branches: ["mac-mps-*"]
 jobs:
+  int8block:
+    if: github.ref_name == 'mac-mps-opt2-int8'
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: |
+          set -euo pipefail
+          git clone -q --depth 1 -b studio-mps-int8pack https://github.com/unslothai/unsloth pr
+          git clone -q --depth 1 -b opt2-mac-int8-head https://github.com/danielhanchen/unsloth-staging-2 head
+          git -C pr log -1 --format='pr %H'; git -C head log -1 --format='head %H'
+          python -m pip install -q --upgrade pip
+          python -m pip install -q torch numpy pytest
+          python -m pip install -q -r head/studio/backend/requirements/studio.txt pytest-asyncio pytest-timeout python-multipart
+          sysctl -n machdep.cpu.brand_string hw.memsize
+      - name: unit tests (head, MPS)
+        run: |
+          set -euo pipefail
+          cd head/studio/backend
+          python -m pytest -q -p no:cacheprovider -rs tests/test_diffusion_native_quant_mps.py -k "not image_gate and not video_gate" 2>&1 | tee ../../../pytest_int8.txt | tail -6
+          ! grep -qE "[0-9]+ (failed|error)" ../../../pytest_int8.txt
+          ! grep -q "needs an MPS device" ../../../pytest_int8.txt
+      - name: whole-block probe
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python -u bench/int8_block_probe.py "$PWD/pr" "$PWD/head" out/int8_block.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-int8-block
+          path: |
+            out/int8_block.json
+            pytest_int8.txt
   ab:
+    if: github.ref_name != 'mac-mps-opt2-int8'
     runs-on: macos-15
     timeout-minutes: 75
     env:
