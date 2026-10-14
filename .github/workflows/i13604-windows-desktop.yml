@@ -13,10 +13,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tag: [v0.1.905-beta, v0.1.906-beta]
-        res: ['1920x1080', '1366x768']
+        include:
+          - {name: fresh-906-125, first: '', tag: v0.1.906-beta, scale: 125}
+          - {name: fresh-906-150, first: '', tag: v0.1.906-beta, scale: 150}
+          - {name: fresh-905-150, first: '', tag: v0.1.905-beta, scale: 150}
+          - {name: upgrade-905to906-100, first: v0.1.905-beta, tag: v0.1.906-beta, scale: 100}
+          - {name: upgrade-905to906-150, first: v0.1.905-beta, tag: v0.1.906-beta, scale: 150}
+    name: ${{ matrix.name }}
     runs-on: windows-latest
-    timeout-minutes: 120
+    timeout-minutes: 150
+    env:
+      PYTHONUTF8: '1'
     steps:
       - uses: actions/checkout@v4
         with:
@@ -27,62 +34,46 @@ jobs:
       - name: Driver deps
         shell: pwsh
         run: python -m pip install pywinauto pillow
-      - name: Screen resolution
+      - name: Screen 1920x1080 at ${{ matrix.scale }}%
         shell: pwsh
         run: |
-          $wh = '${{ matrix.res }}'.Split('x')
-          try { Set-DisplayResolution -Width ([int]$wh[0]) -Height ([int]$wh[1]) -Force -ErrorAction Stop; Write-Host "set ${{ matrix.res }}" }
-          catch { Write-Host "Set-DisplayResolution unavailable: $($_.Exception.Message)" }
-          Get-CimInstance Win32_VideoController | Select-Object Name, CurrentHorizontalResolution, CurrentVerticalResolution | Format-List
-          Add-Type -AssemblyName System.Windows.Forms
-          [System.Windows.Forms.Screen]::AllScreens | Format-List
+          try { Set-DisplayResolution -Width 1920 -Height 1080 -Force -ErrorAction Stop } catch { Write-Host "Set-DisplayResolution: $($_.Exception.Message)" }
+          python ci/set_scale.py ${{ matrix.scale }}
           Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue | Select-Object pv | Format-List
-      - name: Download the shipped Desktop installer (${{ matrix.tag }})
+      - name: Download installers
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          mkdir -p dl out
-          gh release download "${{ matrix.tag }}" --repo unslothai/unsloth --pattern 'Unsloth-Desktop-Windows.exe' --dir dl
-          ls -la dl
-      - name: Silent install
+          mkdir -p out
+          for t in ${{ matrix.first }} ${{ matrix.tag }}; do
+            mkdir -p "dl/$t"
+            gh release download "$t" --repo unslothai/unsloth --pattern 'Unsloth-Desktop-Windows.exe' --dir "dl/$t"
+          done
+          find dl -type f
+      - name: Install + first session on ${{ matrix.first }}
+        if: matrix.first != ''
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath (Resolve-Path dl/Unsloth-Desktop-Windows.exe) -ArgumentList '/S' -Wait -PassThru
-          Write-Host "installer exit: $($p.ExitCode)"
-          if ($p.ExitCode -ne 0) { exit 1 }
-          $found = Get-ChildItem -Path "$env:LOCALAPPDATA","$env:ProgramFiles" -Recurse -Filter '*Unsloth*.exe' -ErrorAction SilentlyContinue |
-                   Where-Object { $_.Name -notmatch '(?i)uninstall' } | Select-Object -First 1
-          if (-not $found) { Write-Host '::error::no installed executable found'; exit 1 }
-          Write-Host "installed: $($found.FullName)"
-          "APP_EXE=$($found.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-      - name: Bundled installer, as first launch runs it
+          ./ci/install_release.ps1 -Tag '${{ matrix.first }}'
+          python -u ci/i13604_win.py --app "$env:APP_EXE" --out out --label "${{ matrix.name }}-seed-${{ matrix.first }}" --seed-only
+      - name: Install ${{ matrix.tag }} (over the old one when upgrading)
         shell: pwsh
-        run: |
-          $root = Split-Path -Parent $env:APP_EXE
-          $ps1 = Get-ChildItem -Path $root -Recurse -Filter 'install.ps1' -ErrorAction SilentlyContinue | Select-Object -First 1
-          if (-not $ps1) { Write-Host '::error::no bundled install.ps1'; exit 1 }
-          Remove-Item Env:UNSLOTH_STUDIO_HOME -ErrorAction SilentlyContinue
-          & powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $ps1.FullName --tauri *>&1 |
-            Tee-Object -FilePath out/bundled-install.log | Select-Object -Last 40
-          Write-Host "bundled installer exit: $LASTEXITCODE"
-          exit $LASTEXITCODE
-      - name: Drive the app (WebView2 over CDP)
+        run: ./ci/install_release.ps1 -Tag '${{ matrix.tag }}'
+      - name: Drive ${{ matrix.tag }}
         shell: pwsh
-        env:
-          PYTHONUTF8: '1'
-        run: |
-          python -u ci/i13604_win.py --app "$env:APP_EXE" --out out --label "${{ matrix.tag }}-${{ matrix.res }}"
+        run: python -u ci/i13604_win.py --app "$env:APP_EXE" --out out --label "${{ matrix.name }}"
       - name: Collect app logs
         if: always()
         shell: pwsh
         run: |
           Copy-Item "$env:USERPROFILE\.unsloth\studio\tauri.log" out/ -ErrorAction SilentlyContinue
-          Get-ChildItem "$env:USERPROFILE\.unsloth\studio\logs" -Recurse -Filter *.log -ErrorAction SilentlyContinue |
-            Sort-Object LastWriteTime | Select-Object -Last 2 | Copy-Item -Destination out/ -ErrorAction SilentlyContinue
+          Get-ChildItem "$env:APPDATA","$env:LOCALAPPDATA" -Directory -Filter '*unsloth*' -ErrorAction SilentlyContinue | ForEach-Object {
+            Get-ChildItem $_.FullName -Recurse -Include *.json,*.dat -ErrorAction SilentlyContinue | Where-Object { $_.Length -lt 200kb } |
+              Select-Object FullName, Length | Format-Table -AutoSize | Out-String -Width 300 | Write-Host }
           exit 0
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: i13604-${{ matrix.tag }}-${{ matrix.res }}
+          name: i13604-${{ matrix.name }}
           path: out/

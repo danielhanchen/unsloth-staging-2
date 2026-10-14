@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--app", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--label", required=True)
+    ap.add_argument("--seed-only", action="store_true", help="chat once, maximize, quit (the pre-update session)")
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -53,7 +54,7 @@ def main():
 
     import ctypes
     from ctypes import wintypes
-    ctypes.windll.user32.SetProcessDPIAware()
+    ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
     work = wintypes.RECT()
     ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(work), 0)  # SPI_GETWORKAREA
     res["work_area"] = {"left": work.left, "top": work.top, "right": work.right, "bottom": work.bottom}
@@ -171,6 +172,12 @@ def main():
     win.maximize()
     time.sleep(5)
     snap("04_maximized")
+    if a.seed_only:
+        (out / f"{a.label}_results.json").write_text(json.dumps(res, indent=1))
+        subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"], check=False)
+        time.sleep(10)
+        log(f"SEEDED {a.label}")
+        return 0
 
     win.restore()
     time.sleep(5)
