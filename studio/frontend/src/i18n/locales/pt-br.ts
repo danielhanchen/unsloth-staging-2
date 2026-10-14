@@ -3125,6 +3125,7 @@ export const ptBR = {
       desktopAppVersion: "Versão do aplicativo de desktop",
       desktopAppVersionUnavailable: "Indisponível",
       llamaCppVersion: "Versão do llama.cpp",
+      audioCppVersion: "Versão do audio.cpp",
       hardware: "Hardware",
       gpu: "GPU",
       cuda: "CUDA",
