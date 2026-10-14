@@ -3,6 +3,39 @@ on:
   push:
     branches: ["mac-mps-*"]
 jobs:
+  sdcppaa:
+    if: github.ref_name == 'mac-mps-opt2-aa'
+    runs-on: macos-15
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none https://github.com/unslothai/unsloth base
+          git -C base checkout -q 9f606d6fa1
+          git clone -q --depth 1 -b opt2-mac-head https://github.com/danielhanchen/unsloth-staging-2 head
+          python -m pip install -q --upgrade pip
+          python -m pip install -q numpy pillow huggingface_hub psutil
+          python -m pip install -q -r head/studio/backend/requirements/studio.txt
+      - name: sd.cpp mmap A/A + A/B x3
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export UNSLOTH_STUDIO_HOME="$PWD/sdhome/studio"
+          python head/studio/install_sd_cpp_prebuilt.py --install-dir "$PWD/sdhome/stable-diffusion.cpp"
+          SD=$(find "$PWD/sdhome/stable-diffusion.cpp" -name sd-cli -type f | head -1)
+          GGUF=$(python -c "from huggingface_hub import hf_hub_download; print(hf_hub_download('Green-Sky/SD-Turbo-GGUF','sd_turbo-f16-q8_0.gguf', local_dir='models'))")
+          python -u bench/sdcpp_aa.py "$SD" "$GGUF" "$PWD/base" "$PWD/head" out/aa 3
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mac-sdcpp-aa
+          path: out/aa/*.json
   int8block:
     if: github.ref_name == 'mac-mps-opt2-int8'
     runs-on: macos-15
@@ -42,7 +75,7 @@ jobs:
             out/int8_block.json
             pytest_int8.txt
   ab:
-    if: github.ref_name != 'mac-mps-opt2-int8'
+    if: github.ref_name == 'mac-mps-opt2'
     runs-on: macos-15
     timeout-minutes: 75
     env:
