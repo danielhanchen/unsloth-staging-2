@@ -145,6 +145,10 @@ def main():
         except Exception:  # noqa: BLE001
             pass
     time.sleep(2)
+    for _ in range(30):
+        if composer() is not None:
+            break
+        time.sleep(2)
     snap("01_new_chat")
 
     c = composer()
@@ -189,6 +193,33 @@ def main():
     win.maximize()
     time.sleep(5)
     snap("07_reopened_maximized")
+
+    # Interface zoom (Ctrl+=, native WebView2 zoom), as a user on a high-DPI or zoomed setup has.
+    win.restore()
+    time.sleep(3)
+    for step in range(3):
+        win.set_focus()
+        send_keys("^=")
+        time.sleep(3)
+    snap("08_zoomed_restored")
+    win.maximize()
+    time.sleep(5)
+    snap("09_zoomed_maximized")
+    c = composer()
+    if c is not None:
+        c.click_input()
+        send_keys("Reply{SPACE}Hello{SPACE}again{ENTER}")
+        time.sleep(3)
+        end = time.time() + 600
+        while time.time() < end:
+            if not [b for b in win.descendants(control_type="Button") if "Stop generating" in (b.window_text() or "")]:
+                break
+            time.sleep(3)
+        time.sleep(6)
+        snap("10_zoomed_maximized_after_reply")
+    win.restore()
+    time.sleep(5)
+    snap("11_zoomed_restored_after_reply")
 
     (out / f"{a.label}_results.json").write_text(json.dumps(res, indent=1))
     bad = [k for k, v in res.items() if isinstance(v, dict) and "composer_visible" in v and not v["composer_visible"]]

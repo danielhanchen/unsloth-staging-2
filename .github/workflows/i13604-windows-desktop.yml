@@ -14,6 +14,7 @@ jobs:
       fail-fast: false
       matrix:
         tag: [v0.1.905-beta, v0.1.906-beta]
+        res: ['1920x1080', '1366x768']
     runs-on: windows-latest
     timeout-minutes: 120
     steps:
@@ -29,11 +30,13 @@ jobs:
       - name: Screen resolution
         shell: pwsh
         run: |
-          try { Set-DisplayResolution -Width 1920 -Height 1080 -Force -ErrorAction Stop; Write-Host "set 1920x1080" }
+          $wh = '${{ matrix.res }}'.Split('x')
+          try { Set-DisplayResolution -Width ([int]$wh[0]) -Height ([int]$wh[1]) -Force -ErrorAction Stop; Write-Host "set ${{ matrix.res }}" }
           catch { Write-Host "Set-DisplayResolution unavailable: $($_.Exception.Message)" }
           Get-CimInstance Win32_VideoController | Select-Object Name, CurrentHorizontalResolution, CurrentVerticalResolution | Format-List
           Add-Type -AssemblyName System.Windows.Forms
           [System.Windows.Forms.Screen]::AllScreens | Format-List
+          Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue | Select-Object pv | Format-List
       - name: Download the shipped Desktop installer (${{ matrix.tag }})
         shell: bash
         env:
@@ -69,7 +72,7 @@ jobs:
         env:
           PYTHONUTF8: '1'
         run: |
-          python -u ci/i13604_win.py --app "$env:APP_EXE" --out out --label "${{ matrix.tag }}"
+          python -u ci/i13604_win.py --app "$env:APP_EXE" --out out --label "${{ matrix.tag }}-${{ matrix.res }}"
       - name: Collect app logs
         if: always()
         shell: pwsh
@@ -81,5 +84,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: i13604-${{ matrix.tag }}
+          name: i13604-${{ matrix.tag }}-${{ matrix.res }}
           path: out/
