@@ -103,9 +103,64 @@ def _bench_int8pack_vs_dense(layer: Any, dtype: Any, device: Any) -> tuple:
     return k_s[1], d_s[1]
 
 
+def _representative_block(module: Any, eligible: list) -> list:
+    """The eligible layers of one repeated block: the first entry of the ``ModuleList`` (of 2+ entries) whose first
+    entry holds the most eligible layers, so the probe times a whole block's GEMM mix (attention projections, MLP up
+    and down, modulation) rather than its single largest layer. A model without repeated blocks probes every
+    eligible layer."""
+    import torch
+
+    ids = {id(m) for m in eligible}
+    best_n, best = 0, None
+    for sub in module.modules():
+        if isinstance(sub, torch.nn.ModuleList) and len(sub) >= 2:
+            layers = [m for m in sub[0].modules() if id(m) in ids]
+            if len(layers) > best_n:
+                best_n, best = len(layers), layers
+    return best if best else list(eligible)
+
+
+def _bench_block_int8pack(layers: list, dtype: Any, device: Any) -> tuple:
+    """(kernel s, fallback s) per pass over ``layers``, each called through its own forward with the kernel on and
+    then off, arms interleaved over 3 rounds. The fallback arm is the path forwards take when the kernel is declined
+    (dequantise + GEMM today), so the verdict compares the two choices this probe actually makes."""
+    import torch
+
+    inputs: dict = {}
+    for layer in layers:
+        if layer.in_features not in inputs:
+            inputs[layer.in_features] = torch.randn(
+                _INT8PACK_PROBE_ROWS, layer.in_features, dtype = dtype, device = device
+            )
+    sync = torch.mps.synchronize if device.type == "mps" else (lambda: None)
+
+    def run_with(kernel_on: bool) -> Callable[[], None]:
+        def run() -> None:
+            _INT8PACK_PROBED[dtype] = kernel_on
+            with torch.no_grad():
+                for layer in layers:
+                    layer(inputs[layer.in_features])
+
+        return run
+
+    kernel, fallback = run_with(True), run_with(False)
+    try:
+        kernel()
+        fallback()
+        k_s, f_s = [], []
+        for _ in range(3):
+            k_s.append(_median_call_s(kernel, sync))
+            f_s.append(_median_call_s(fallback, sync))
+    finally:
+        _INT8PACK_PROBED.pop(dtype, None)
+    k_s.sort()
+    f_s.sort()
+    return k_s[1], f_s[1]
+
+
 def probe_mps_int8pack(module: Any, dtype: Any, *, device: Any = "mps", logger: Any = None) -> bool:
-    """Time the Metal kernel against a dense ``dtype`` GEMM on ``module``'s largest kernel-eligible layer, once per
-    process and dtype, and record whether forwards take it. The env override skips the probe."""
+    """Time one whole block's layers through the Metal kernel against the same layers on the fallback path, once per
+    process and dtype, and record whether forwards take the kernel. The env override skips the probe."""
     import torch
 
     if mps_int8pack_disabled() or mps_int8pack_forced():
@@ -113,32 +168,32 @@ def probe_mps_int8pack(module: Any, dtype: Any, *, device: Any = "mps", logger: 
     if dtype in _INT8PACK_PROBED:
         return _INT8PACK_PROBED[dtype]
     cls = native_linear_class()
-    layers = [
+    eligible = [
         m for m in module.modules()
         if isinstance(m, cls) and m._int8pack_layer_ok(dtype, probe = True)
     ]
-    if not layers:
+    if not eligible:
         return False
-    layer = max(layers, key = lambda m: m.in_features * m.out_features)
+    layers = _representative_block(module, eligible)
     try:
-        kernel_s, dense_s = _bench_int8pack_vs_dense(layer, dtype, torch.device(device))
+        kernel_s, fallback_s = _bench_block_int8pack(layers, dtype, torch.device(device))
     except Exception as exc:  # noqa: BLE001 -- a failed probe keeps the dequantise path
         if logger is not None:
             logger.info("diffusion.native_quant: int8pack probe failed, dequantising: %s", exc)
         _INT8PACK_PROBED[dtype] = False
         return False
-    speedup = dense_s / max(kernel_s, 1e-9)
+    speedup = fallback_s / max(kernel_s, 1e-9)
     verdict = speedup >= _INT8PACK_MIN_SPEEDUP
     _INT8PACK_PROBED[dtype] = verdict
     if logger is not None:
         logger.info(
-            "diffusion.native_quant: int8pack probe %dx%dx%d: kernel %.3f ms, dense %s %.3f ms (%.2fx) -> %s",
+            "diffusion.native_quant: int8pack probe, %d layers x %d rows: kernel %.3f ms, fallback %s %.3f ms "
+            "(%.2fx) -> %s",
+            len(layers),
             _INT8PACK_PROBE_ROWS,
-            layer.in_features,
-            layer.out_features,
             kernel_s * 1e3,
             str(dtype).replace("torch.", ""),
-            dense_s * 1e3,
+            fallback_s * 1e3,
             speedup,
             "Metal int8 kernel" if verdict else "dequantise",
         )

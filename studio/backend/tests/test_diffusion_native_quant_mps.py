@@ -297,37 +297,67 @@ def test_unprobed_auto_mode_keeps_dequantise(_no_probe_state):
 
 @pytest.mark.skipif(not _HAS_OP, reason = "torch has no _weight_int8pack_mm")
 @pytest.mark.parametrize(
-    "kernel_s, dense_s, expect",
+    "kernel_s, fallback_s, expect",
     [
         (0.6, 0.8, True),  # M1-like: bf16 GEMM has no fast path
-        (1.02, 1.0, False),  # M3-like: parity
+        (1.02, 1.0, False),  # parity
         (4.1, 1.0, False),  # M5-like: 16-bit GEMM on the matrix units
         (0.95, 1.0, False),  # under the margin: not worth a nondeterministic kernel
     ],
 )
-def test_probe_takes_the_kernel_only_when_it_beats_bf16(
-    _no_probe_state, monkeypatch, kernel_s, dense_s, expect
+def test_probe_takes_the_kernel_only_when_it_beats_the_fallback(
+    _no_probe_state, monkeypatch, kernel_s, fallback_s, expect
 ):
     seen = []
 
-    def bench(layer, dtype, device):
-        seen.append((layer.in_features, layer.out_features))
-        return kernel_s, dense_s
+    def bench(layers, dtype, device):
+        seen.append(sorted((l.in_features, l.out_features) for l in layers))
+        return kernel_s, fallback_s
 
-    monkeypatch.setattr(nq, "_bench_int8pack_vs_dense", bench)
+    monkeypatch.setattr(nq, "_bench_block_int8pack", bench)
     toy = _toy_native()
     assert nq.probe_mps_int8pack(toy, torch.bfloat16, device = "cpu") is expect
-    assert seen == [(128, 256)]  # the largest eligible layer, probed once
+    assert seen == [[(128, 128), (128, 256), (256, 128)]]  # no repeated blocks: every eligible layer, once
     assert nq.mps_int8pack_selected(torch.bfloat16) is expect
     assert nq.probe_mps_int8pack(toy, torch.bfloat16, device = "cpu") is expect
     assert len(seen) == 1
+
+
+class _Stack(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = torch.nn.Linear(64, 128)
+        self.blocks = torch.nn.ModuleList([_Toy(), _Toy()])
+        self.refiner = torch.nn.ModuleList([torch.nn.Linear(128, 128), torch.nn.Linear(128, 128)])
+        self.proj_out = torch.nn.Linear(128, 1024)  # the largest layer, outside every block
+
+
+@pytest.mark.skipif(not _HAS_OP, reason = "torch has no _weight_int8pack_mm")
+def test_probe_times_one_whole_block_not_the_largest_layer(_no_probe_state, monkeypatch):
+    stack = _Stack().to(torch.bfloat16)
+    nq.apply_native_weight_quant(
+        stack, "int8", filter_fn = lambda m, n: isinstance(m, torch.nn.Linear), act_int8 = False, scale_dtype = torch.bfloat16
+    )
+    seen = []
+    monkeypatch.setattr(nq, "_bench_block_int8pack", lambda layers, *a: seen.append(layers) or (1.0, 1.0))
+    nq.probe_mps_int8pack(stack, torch.bfloat16, device = "cpu")
+    assert seen and [id(l) for l in seen[0]] == [id(stack.blocks[0].to_q), id(stack.blocks[0].ff), id(stack.blocks[0].out)]
+
+
+@pytest.mark.skipif(not _HAS_OP, reason = "torch has no _weight_int8pack_mm")
+def test_block_bench_runs_both_arms_and_restores_the_verdict_state(_no_probe_state):
+    toy = _toy_native()
+    layers = [toy.to_q, toy.ff, toy.out]
+    kernel_s, fallback_s = nq._bench_block_int8pack(layers, torch.bfloat16, torch.device("cpu"))
+    assert kernel_s > 0 and fallback_s > 0
+    assert torch.bfloat16 not in nq._INT8PACK_PROBED
 
 
 @pytest.mark.parametrize("env, expect", [("0", False), ("1", True)])
 def test_env_override_skips_the_probe(_no_probe_state, monkeypatch, env, expect):
     monkeypatch.setenv(nq.NATIVE_MPS_INT8PACK_ENV, env)
     monkeypatch.setattr(
-        nq, "_bench_int8pack_vs_dense", lambda *a: pytest.fail("probed despite the override")
+        nq, "_bench_block_int8pack", lambda *a: pytest.fail("probed despite the override")
     )
     assert nq.probe_mps_int8pack(_toy_native(), torch.bfloat16, device = "cpu") is expect
 
@@ -337,7 +367,7 @@ def test_failed_probe_keeps_dequantise(_no_probe_state, monkeypatch):
     def boom(*a):
         raise RuntimeError("no Metal device")
 
-    monkeypatch.setattr(nq, "_bench_int8pack_vs_dense", boom)
+    monkeypatch.setattr(nq, "_bench_block_int8pack", boom)
     assert nq.probe_mps_int8pack(_toy_native(), torch.bfloat16, device = "cpu") is False
     assert not nq.mps_int8pack_selected(torch.bfloat16)
 
