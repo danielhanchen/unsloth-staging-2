@@ -1,75 +1,44 @@
 """Issue 13604 on a real Windows Unsloth Desktop (WebView2): is the chat composer on screen after
 the first reply, when the chat is reopened, and with the window maximized?
 
-The installed app is launched with WebView2 remote debugging on, and Playwright attaches over CDP.
-Writes probe JSON + webview and full-screen screenshots to --out.
+Release builds keep WebView2 DevTools off, so there is no CDP. The app is driven like a user:
+native keyboard / mouse through Windows UI Automation (WebView2 exposes its accessibility tree
+there, with screen coordinates), the model is loaded over the backend API with the desktop
+secret the app itself uses, and every state gets a full-screen grab.
 """
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 import time
 import urllib.request
 from pathlib import Path
 
-PROBE_JS = r"""
-() => {
-  const pick = () => {
-    const all = [...document.querySelectorAll('.aui-thread-composer-dock textarea, form textarea')];
-    return all.find(t => t.offsetParent !== null) || all[0] || null;
-  };
-  const ta = pick();
-  const r = (el) => { if (!el) return null; const b = el.getBoundingClientRect();
-    return {top: Math.round(b.top), bottom: Math.round(b.bottom), height: Math.round(b.height), left: Math.round(b.left), width: Math.round(b.width)}; };
-  let hit = null;
-  if (ta) { const b = ta.getBoundingClientRect(); const x = b.left + b.width / 2, y = b.top + b.height / 2;
-    const el = (y >= 0 && y < innerHeight) ? document.elementFromPoint(x, y) : null;
-    hit = el ? (el === ta || ta.contains(el) ? 'textarea' : (String(el.className || el.tagName)).slice(0, 120)) : 'offscreen'; }
-  const q = (s) => r(document.querySelector(s));
-  const chain = [];
-  for (let el = document.querySelector('.aui-thread-root'); el; el = el.parentElement) {
-    const b = el.getBoundingClientRect(); const cs = getComputedStyle(el);
-    chain.push({tag: el.tagName, cls: String(el.className || '').slice(0, 90), h: Math.round(b.height), top: Math.round(b.top), bottom: Math.round(b.bottom), display: cs.display, overflow: cs.overflow});
-  }
-  return {
-    innerWidth, innerHeight, outerWidth, outerHeight, dpr: devicePixelRatio,
-    screen: {w: screen.width, h: screen.height, availW: screen.availWidth, availH: screen.availHeight},
-    visualViewport: window.visualViewport ? {w: visualViewport.width, h: visualViewport.height, scale: visualViewport.scale} : null,
-    htmlClass: document.documentElement.className,
-    htmlAttrs: [...document.documentElement.attributes].map(a => a.name).filter(n => n.startsWith('data-')),
-    docScrollHeight: document.documentElement.scrollHeight, bodyScrollHeight: document.body.scrollHeight,
-    textarea: r(ta), dock: q('.aui-thread-composer-dock'), root: q('.aui-thread-root'), viewport: q('.aui-thread-viewport'),
-    hitAtTextarea: hit, path: location.pathname + location.search, chain,
-    messages: document.querySelectorAll('[data-message-id]').length,
-    text: (document.querySelector('.aui-thread-viewport') || document.body).innerText.slice(-300),
-  };
-}
-"""
+API = "http://127.0.0.1:8888"
 
 
 def log(*a):
     print(*a, flush=True)
 
 
-def grab_screen(path):
-    try:
-        from PIL import ImageGrab
-        ImageGrab.grab(all_screens=True).save(path)
-    except Exception as e:  # noqa: BLE001
-        log("screen grab failed:", e)
+def http(method, path, body=None, token=None, timeout=60):
+    req = urllib.request.Request(API + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Content-Type": "application/json"})
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read() or b"{}")
 
 
-def wait_cdp(port, timeout):
-    end = time.time() + timeout
-    while time.time() < end:
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/version", timeout=3) as r:
-                return json.load(r)
-        except Exception:  # noqa: BLE001
-            time.sleep(2)
-    return None
+def grab(path):
+    from PIL import ImageGrab
+    ImageGrab.grab(all_screens=True).save(path)
+
+
+def rect(r):
+    return {"left": r.left, "top": r.top, "right": r.right, "bottom": r.bottom}
 
 
 def main():
@@ -77,143 +46,154 @@ def main():
     ap.add_argument("--app", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--label", required=True)
-    ap.add_argument("--cdp", type=int, default=9222)
     a = ap.parse_args()
     out = Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    results = {"label": a.label}
+    res = {"label": a.label}
 
-    env = dict(os.environ)
-    env["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = f"--remote-debugging-port={a.cdp}"
-    app_log = open(out / "app-stdout.log", "wb")
-    proc = subprocess.Popen([a.app], env=env, stdout=app_log, stderr=subprocess.STDOUT)
-    log("app pid", proc.pid)
-    ver = wait_cdp(a.cdp, 180)
-    if not ver:
-        log("::error::WebView2 CDP endpoint never opened")
-        grab_screen(out / f"{a.label}_nocdp.png")
-        return 2
-    results["webview2"] = ver.get("Browser")
-    log("webview2", ver.get("Browser"))
+    import ctypes
+    from ctypes import wintypes
+    ctypes.windll.user32.SetProcessDPIAware()
+    work = wintypes.RECT()
+    ctypes.windll.user32.SystemParametersInfoW(0x30, 0, ctypes.byref(work), 0)  # SPI_GETWORKAREA
+    res["work_area"] = {"left": work.left, "top": work.top, "right": work.right, "bottom": work.bottom}
+    res["screen"] = [ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)]
+    log("work area", res["work_area"], "screen", res["screen"])
 
-    from playwright.sync_api import sync_playwright
-    with sync_playwright() as p:
-        browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{a.cdp}")
-        ctx = browser.contexts[0]
-        end = time.time() + 120
-        page = None
-        while time.time() < end and page is None:
-            page = next((pg for pg in ctx.pages if not pg.url.startswith("devtools")), None)
-            if page is None:
-                time.sleep(1)
-        consoles = []
-        page.on("console", lambda m: consoles.append(f"{m.type}: {m.text}"[:300]))
-        page.on("pageerror", lambda e: consoles.append(f"pageerror: {e}"[:400]))
-
-        def snap(name):
-            r = page.evaluate(PROBE_JS)
-            results[name] = r
-            log(name, json.dumps({k: r.get(k) for k in ("innerHeight", "outerHeight", "screen", "dpr", "textarea", "dock", "root", "hitAtTextarea", "path")}))
-            try:
-                page.screenshot(path=str(out / f"{a.label}_{name}.png"))
-            except Exception as e:  # noqa: BLE001
-                log("page shot failed", e)
-            grab_screen(out / f"{a.label}_{name}_screen.png")
-
-        # Startup: preflight, managed server, desktop auth, then the chat route.
-        end = time.time() + 900
-        while time.time() < end:
-            try:
-                path = page.evaluate("location.pathname")
-                ready = page.evaluate("!!document.querySelector('form textarea') && !!localStorage.getItem('unsloth_auth_token')")
-            except Exception:  # noqa: BLE001
-                path, ready = "?", False
-            if ready:
-                break
-            time.sleep(3)
-        log("ready at", page.url)
-        grab_screen(out / f"{a.label}_00_ready_screen.png")
-        page.screenshot(path=str(out / f"{a.label}_00_ready.png"))
-
-        port = page.evaluate("""async () => {
-          for (let p = 8888; p <= 8908; p++) {
-            try { const r = await fetch(`http://127.0.0.1:${p}/api/health`); if (r.ok) return p; } catch (e) {}
-          }
-          return null; }""")
-        results["api_port"] = port
-        log("api port", port)
-        load = page.evaluate("""async (port) => {
-          const tok = localStorage.getItem('unsloth_auth_token');
-          const h = {'Content-Type': 'application/json', Authorization: 'Bearer ' + tok};
-          const r = await fetch(`http://127.0.0.1:${port}/api/inference/load`, {method: 'POST', headers: h,
-            body: JSON.stringify({model_path: 'unsloth/Qwen3-0.6B-GGUF', gguf_variant: 'Q4_K_M', max_seq_length: 4096})});
-          return r.status + ' ' + (await r.text()).slice(0, 300); }""", port)
-        log("load:", load)
-        for _ in range(200):
-            st = page.evaluate("""async (port) => {
-              const tok = localStorage.getItem('unsloth_auth_token');
-              const r = await fetch(`http://127.0.0.1:${port}/api/inference/status`, {headers: {Authorization: 'Bearer ' + tok}});
-              return (await r.json()).loaded; }""", port)
-            if st:
-                break
-            time.sleep(3)
-        log("model loaded:", st)
-        page.evaluate("localStorage.setItem('unsloth_chat_reasoning_enabled', 'false')")
-        page.reload()
-        page.wait_for_selector("form textarea", timeout=120_000)
-        time.sleep(3)
-        snap("01_new_chat")
-
-        box = page.locator("form textarea").first
-        box.click()
-        box.fill("Reply Hello")
-        box.press("Enter")
-        time.sleep(2)
-        snap("02_streaming")
+    proc = subprocess.Popen([a.app], stdout=open(out / "app-stdout.log", "wb"), stderr=subprocess.STDOUT)
+    secret_file = Path.home() / ".unsloth" / "studio" / "auth" / ".desktop_secret"
+    end = time.time() + 600
+    token = None
+    while time.time() < end and token is None:
         try:
-            page.wait_for_function(
-                "() => ![...document.querySelectorAll('button[aria-label=\"Stop generating\"]')].some(b => b.offsetParent !== null)",
-                timeout=600_000, polling=1000)
-        except Exception as e:  # noqa: BLE001
-            log("stop wait:", e)
-        time.sleep(5)
-        snap("03_after_reply")
+            if secret_file.exists():
+                token = http("POST", "/api/auth/desktop-login", {"secret": secret_file.read_text().strip()})["access_token"]
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(3)
+    if not token:
+        log("::error::no desktop token")
+        grab(out / f"{a.label}_notoken.png")
+        return 2
+    log("desktop token ok")
+    print(http("POST", "/api/inference/load", {"model_path": "unsloth/Qwen3-0.6B-GGUF", "gguf_variant": "Q4_K_M",
+                                               "max_seq_length": 4096}, token, timeout=900))
+    for _ in range(200):
+        if http("GET", "/api/inference/status", token=token).get("loaded"):
+            break
+        time.sleep(3)
+    log("model loaded")
+    time.sleep(15)
 
-        page.evaluate("window.__TAURI__.window.getCurrentWindow().maximize()")
-        time.sleep(4)
-        snap("04_maximized")
+    from pywinauto import Desktop
+    from pywinauto.keyboard import send_keys
+    win = None
+    for _ in range(60):
+        wins = [w for w in Desktop(backend="uia").windows() if w.process_id() == proc.pid
+                or "Unsloth" in (w.window_text() or "")]
+        wins = [w for w in wins if w.class_name() != "ConsoleWindowClass"]
+        if wins:
+            win = wins[0]
+            break
+        time.sleep(2)
+    if win is None:
+        log("::error::app window not found")
+        grab(out / f"{a.label}_nowindow.png")
+        return 2
+    log("window", win.window_text(), win.class_name(), rect(win.rectangle()))
+    win.set_focus()
+    # The app reloads its chat once the model is resident; let it settle.
+    time.sleep(5)
 
-        url = page.url
-        page.reload()
-        time.sleep(10)
-        snap("05_reloaded_maximized")
-        if "thread=" not in url:
+    def edits():
+        found = []
+        for e in win.descendants(control_type="Edit"):
             try:
-                page.locator('[data-sidebar="menu-button"]').filter(has_text="Hello").first.click(timeout=5000)
-            except Exception:  # noqa: BLE001
-                try:
-                    page.locator('[data-sidebar="menu-button"]').filter(has_text="New Chat").first.click(timeout=5000)
-                except Exception as e:  # noqa: BLE001
-                    log("reopen click:", e)
-            time.sleep(5)
-            snap("06_reopened_maximized")
+                found.append({"name": e.window_text()[:60], "rect": rect(e.rectangle()),
+                              "offscreen": bool(e.element_info.element.CurrentIsOffscreen)})
+            except Exception as ex:  # noqa: BLE001
+                found.append({"error": str(ex)[:100]})
+        return found
 
-        page.evaluate("window.__TAURI__.window.getCurrentWindow().unmaximize()")
-        time.sleep(4)
-        snap("07_unmaximized")
-        results["console"] = consoles[-60:]
-    (out / f"{a.label}_results.json").write_text(json.dumps(results, indent=1))
+    def composer():
+        cands = []
+        for e in win.descendants(control_type="Edit"):
+            try:
+                r = e.rectangle()
+            except Exception:  # noqa: BLE001
+                continue
+            if r.width() > 300:
+                cands.append((r.bottom, e))
+        return max(cands, key=lambda c: c[0])[1] if cands else None
+
+    def snap(name):
+        wr = win.rectangle()
+        state = {"window": rect(wr), "maximized": win.is_maximized(), "edits": edits()}
+        c = composer()
+        state["composer"] = rect(c.rectangle()) if c else None
+        bottom_limit = min(wr.bottom, work.bottom)
+        state["composer_visible"] = bool(c) and c.rectangle().bottom <= bottom_limit and c.rectangle().top >= wr.top
+        res[name] = state
+        log(name, json.dumps({k: state[k] for k in ("window", "maximized", "composer", "composer_visible")}))
+        grab(out / f"{a.label}_{name}.png")
+
+    for label in ("Remind me later", "Later", "Dismiss"):
+        try:
+            win.child_window(title=label, control_type="Button").click_input()
+            log("dismissed banner via", label)
+            break
+        except Exception:  # noqa: BLE001
+            pass
+    time.sleep(2)
+    snap("01_new_chat")
+
+    c = composer()
+    if c is None:
+        log("::error::no composer edit found")
+        return 2
+    c.click_input()
+    send_keys("Reply{SPACE}Hello{ENTER}")
+    time.sleep(3)
+    snap("02_streaming")
+    end = time.time() + 600
+    while time.time() < end:
+        stops = [b for b in win.descendants(control_type="Button") if "Stop generating" in (b.window_text() or "")]
+        if not stops:
+            break
+        time.sleep(3)
+    time.sleep(6)
+    snap("03_after_reply")
+
+    win.maximize()
+    time.sleep(5)
+    snap("04_maximized")
+
+    win.restore()
+    time.sleep(5)
+    snap("05_restored")
+
+    # Reopen: a new chat, then back to the first chat in Recents.
+    send_keys("^+o")
+    time.sleep(3)
+    try:
+        items = [i for i in win.descendants() if (i.window_text() or "").strip() in ("New Chat", "Hello", "Reply Hello")]
+        log("recents candidates", [(i.window_text(), i.element_info.control_type) for i in items][:10])
+        for i in items:
+            if i.rectangle().left < 300:
+                i.click_input()
+                break
+    except Exception as e:  # noqa: BLE001
+        log("reopen:", e)
+    time.sleep(5)
+    snap("06_reopened")
+    win.maximize()
+    time.sleep(5)
+    snap("07_reopened_maximized")
+
+    (out / f"{a.label}_results.json").write_text(json.dumps(res, indent=1))
+    bad = [k for k, v in res.items() if isinstance(v, dict) and "composer_visible" in v and not v["composer_visible"]]
+    log(f"VERDICT {a.label}: composer off-screen in {bad}" if bad else f"VERDICT {a.label}: composer visible in every state")
     proc.terminate()
-    # Verdict line for the log: composer bottom inside the visible webview after the reply.
-    bad = []
-    for k in ("03_after_reply", "04_maximized", "05_reloaded_maximized", "06_reopened_maximized", "07_unmaximized"):
-        r = results.get(k)
-        if not r:
-            continue
-        ta = r.get("textarea") or {}
-        if not ta or ta.get("bottom", 1e9) > r["innerHeight"] or r.get("hitAtTextarea") != "textarea":
-            bad.append(k)
-    log(f"VERDICT {a.label}: composer off-screen or covered in {bad}" if bad else f"VERDICT {a.label}: composer visible in every state")
     return 0
 
 

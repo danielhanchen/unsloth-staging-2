@@ -25,7 +25,7 @@ jobs:
           python-version: '3.12'
       - name: Driver deps
         shell: pwsh
-        run: python -m pip install "playwright<2" pillow
+        run: python -m pip install pywinauto pillow
       - name: Screen resolution
         shell: pwsh
         run: |
