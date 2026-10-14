@@ -46,9 +46,9 @@ jobs:
           set -uo pipefail
           mkdir -p out
           python -c "import torch,sys; sys.exit(0 if torch.backends.mps.is_available() else 1)"
-          python -u bench/mps_cap_probe.py "$PWD/base" out/cap_base.json 1.0 2>&1 | tail -40; echo "base rc=${PIPESTATUS[0]}"
+          python -u bench/mps_cap_probe.py "$PWD/base" out/cap_base.json 1.0 > out/cap_base.log 2>&1 && brc=0 || brc=$?; tail -40 out/cap_base.log; echo "base rc=$brc"
           sysctl vm.swapusage
-          python -u bench/mps_cap_probe.py "$PWD/head" out/cap_head.json 1.0 2>&1 | tail -40; echo "head rc=${PIPESTATUS[0]}"
+          python -u bench/mps_cap_probe.py "$PWD/head" out/cap_head.json 1.0 > out/cap_head.log 2>&1 && hrc=0 || hrc=$?; tail -40 out/cap_head.log; echo "head rc=$hrc"; test "$hrc" -eq 0
           test -f out/cap_head.json
           test -f out/cap_base.json || echo '{"error":"process died","reached_limit":false,"allocated_gib":-1,"post_matmul_finite":false,"swap_before_mib":null,"swap_after_fill_mib":null}' > out/cap_base.json
       - name: MPS normal load A/B (sd-turbo)
