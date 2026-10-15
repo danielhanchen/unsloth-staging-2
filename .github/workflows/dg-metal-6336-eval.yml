@@ -1,0 +1,42 @@
+name: dg-metal-6336-eval
+on:
+  push:
+    branches: [dg-metal-6336-eval]
+  workflow_dispatch:
+
+jobs:
+  eval:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 330
+    env:
+      DG_SHA: 6a7388aac74ab896d9d4f0fb187ddac4847c02f0
+      MODEL_URL: https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF/resolve/main/diffusiongemma-26B-A4B-it-Q4_K_M.gguf
+    steps:
+      - uses: actions/checkout@v4
+      - name: build (Metal, PR head + EXPS_CPU eval knob)
+        run: |
+          python3 -m venv venv && . venv/bin/activate && pip install -q numpy
+          mkdir -p src && cd src
+          git init -q && git remote add origin https://github.com/danielhanchen/llama.cpp
+          git fetch -q --depth 1 origin "$DG_SHA" && git checkout -q FETCH_HEAD && git log --oneline -1
+          python3 ../scripts/dg_metal/patch_eval.py examples/diffusion-gemma-eval/diffusion-gemma-eval.cpp
+          cmake -B build -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=OFF -DCMAKE_BUILD_TYPE=Release > /dev/null
+          cmake --build build -j 4 --target llama-diffusion-gemma-eval llama-tokenize 2>&1 | tail -2
+      - name: model
+        run: |
+          curl -fL --http1.1 --retry 8 --retry-all-errors --retry-delay 10 -C - -sS -o model.gguf "$MODEL_URL"; ls -la model.gguf
+      - name: eval
+        run: |
+          . venv/bin/activate
+          bash scripts/dg_metal/run_full_eval.sh src/build/bin model.gguf out/eval 2>&1 | tee eval.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dg-eval-${{ matrix.os }}
+          path: |
+            *.log
+            out/

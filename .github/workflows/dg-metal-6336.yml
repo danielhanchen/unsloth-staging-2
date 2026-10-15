@@ -39,7 +39,7 @@ jobs:
           echo "BIN=$PWD/llama-$t" >> "$GITHUB_ENV"
       - name: model
         run: |
-          curl -fL --retry 5 --retry-delay 10 -sS -o model.gguf "$MODEL_URL"; ls -la model.gguf
+          curl -fL --http1.1 --retry 8 --retry-all-errors --retry-delay 10 -C - -sS -o model.gguf "$MODEL_URL"; ls -la model.gguf
       - name: CPU (-ngl 0)
         run: bash scripts/dg_metal/run_full.sh "$BIN" model.gguf out cpu:-ngl,0 2>&1 | tee -a full.log
       - name: Metal, experts on CPU (-ngl 99 --n-cpu-moe 30)
