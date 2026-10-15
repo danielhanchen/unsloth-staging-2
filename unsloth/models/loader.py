@@ -105,6 +105,9 @@ SUPPORTS_GEMMA4 = transformers_version >= Version("5.5.0")
 VLLM_UNSUPPORTED_MODEL_TYPES = ("gpt_oss",)
 # model_type -> unsloth_zoo.empty_model symbol that rebuilds it from vLLM; an older zoo falls back.
 _VLLM_NEEDS_ZOO_SYMBOL = {"nemotron_h": "extract_nemotron_h_mixer"}
+# vLLM 0.31 has no attention backend for these below sm80: TRITON_ATTN needs 96 KB shared memory
+# for Gemma 4's 512-wide global heads (T4 has 64 KB), FlexAttention rejects its KV sharing.
+VLLM_NEEDS_SM80_MODEL_TYPES = ("gemma4", "gemma4_text", "gemma4_unified", "gemma4_unified_text")
 
 
 def _vllm_unsupported_model_types(model_types):
@@ -115,6 +118,23 @@ def _vllm_unsupported_model_types(model_types):
             if not hasattr(zoo_empty_model, symbol):
                 unsupported.append(model_type)
     return unsupported
+
+
+def _vllm_needs_newer_gpu(model_types):
+    """First model type vLLM cannot run on this CUDA GPU (compute capability < 8), else None."""
+    if DEVICE_TYPE != "cuda":
+        return None
+    model_type = next((t for t in model_types if t in VLLM_NEEDS_SM80_MODEL_TYPES), None)
+    if model_type is None:
+        return None
+    import torch
+
+    try:
+        if torch.cuda.get_device_capability()[0] >= 8:
+            return None
+    except Exception:
+        return None
+    return model_type
 
 
 # Transformers v5 meta-device loading corrupts non-persistent buffers (inv_freq); see _fix_rope_inv_freq() below.
@@ -1004,6 +1024,7 @@ _VLLM_ENGINE_KWARGS = (
     "conservativeness",
     "max_logprobs",
     "max_num_seqs",
+    "max_num_batched_tokens",
     "return_args",
     "training",
 )
@@ -2209,6 +2230,8 @@ class FastModel(FastBaseModel):
         )
         # The PeftConfig probe reads the adapter repo, which peft loads in-process, so it keeps the ref even when vLLM takes the base model's away just after.
         adapter_revision = base_revision
+        # Restored if fast_inference is switched off below.
+        _revision_before_vllm = base_revision
         # vLLM fetches the default branch, so the pin is dead for the weights. Drop it here, not at dispatch: model_types, auto_model and the text-only decision all come off the config probed below, so a ref the weights are not at dispatches the wrong model.
         if base_revision is not None and fast_inference and is_vLLM_available():
             logger.warning_once(
@@ -2384,6 +2407,15 @@ class FastModel(FastBaseModel):
             )
             fast_inference = False
             _drop_vllm_engine_kwargs(kwargs)
+        _vllm_old_gpu = _vllm_needs_newer_gpu(model_types) if fast_inference else None
+        if _vllm_old_gpu is not None:
+            print(
+                f"Unsloth: fast_inference (vLLM) cannot run {_vllm_old_gpu} on GPUs older than compute capability 8.0 "
+                "(such as T4) - will switch to Unsloth inference!"
+            )
+            fast_inference = False
+            _drop_vllm_engine_kwargs(kwargs)
+            base_revision = _revision_before_vllm
 
         # Text-diffusion models (DiffusionGemma) take a transformers-only slow path: a custom block-diffusion generate over a novel backbone, so Unsloth's autoregressive kernel/compile patching is skipped and the unmodified HF model is loaded, keeping 4bit/8bit and PEFT LoRA.
         # Remote-code checkpoints can report their backbone's type (Nemotron-Labs-Diffusion says "nemotron"), so also match the raw config.
