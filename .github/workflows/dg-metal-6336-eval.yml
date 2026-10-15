@@ -25,18 +25,21 @@ jobs:
           git fetch -q --depth 1 origin "$DG_SHA" && git checkout -q FETCH_HEAD && git log --oneline -1
           python3 ../scripts/dg_metal/patch_eval.py examples/diffusion-gemma-eval/diffusion-gemma-eval.cpp
           cmake -B build -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=OFF -DCMAKE_BUILD_TYPE=Release > /dev/null
-          cmake --build build -j 4 --target llama-diffusion-gemma-eval llama-tokenize 2>&1 | tail -2
+          cmake --build build -j 4 --target llama-diffusion-gemma-eval llama-tokenize llama-diffusion-cli 2>&1 | tail -2
       - name: model
         run: |
           curl -fL --http1.1 --retry 8 --retry-all-errors --retry-delay 10 -C - -sS -o model.gguf "$MODEL_URL"; ls -la model.gguf
-      - name: eval
+      - name: eval, routed experts of layers 0-3 on Metal
         run: |
           . venv/bin/activate
-          bash scripts/dg_metal/run_full_eval.sh src/build/bin model.gguf out/eval 2>&1 | tee eval.log
+          bash scripts/dg_metal/run_moe_eval.sh src/build/bin model.gguf out/moe_eval 'blk\.([4-9]|[1-9][0-9])\.ffn_(up|down|gate|gate_up)_exps' 2>&1 | tee moe_eval.log
+      - name: CLI, routed experts of layers 0-1 on Metal
+        run: |
+          ARM_TIMEOUT=14000 bash scripts/dg_metal/run_full.sh src/build/bin model.gguf out/cli 'metal_moe01:-ngl,99,-ot,blk\.([2-9]|[1-9][0-9])\.ffn_(up|down|gate|gate_up)_exps=CPU,-v' 2>&1 | tee cli.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: dg-eval-${{ matrix.os }}
+          name: dg-moe-eval-${{ matrix.os }}
           path: |
             *.log
             out/

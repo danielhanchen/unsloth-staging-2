@@ -5,13 +5,14 @@ p = sys.argv[1]
 s = open(p).read()
 anchor = '    mparams.n_gpu_layers = atoi(getenv("NGL") ? getenv("NGL") : "0");\n'
 assert anchor in s, "anchor missing"
-add = '''    const llama_model_tensor_buft_override exps_cpu[] = {
-        { "\\\\.ffn_(up|down|gate|gate_up)_exps", ggml_backend_cpu_buffer_type() },
+add = '''    const char * exps_pat = getenv("EXPS_CPU_PATTERN") ? getenv("EXPS_CPU_PATTERN") : "\\\\.ffn_(up|down|gate|gate_up)_exps";
+    const llama_model_tensor_buft_override exps_cpu[] = {
+        { exps_pat, ggml_backend_cpu_buffer_type() },
         { nullptr, nullptr },
     };
     if (getenv("EXPS_CPU") && atoi(getenv("EXPS_CPU"))) {
         mparams.tensor_buft_overrides = exps_cpu;
-        fprintf(stderr, "routed experts on CPU\\n");
+        fprintf(stderr, "routed experts on CPU: %s\\n", exps_pat);
     }
 '''
 if "EXPS_CPU" not in s:
