@@ -56,6 +56,7 @@ EOF
   rm -f "$E"/*.bin
 fi
 
+[ -n "${SKIP_CLI:-}" ] && exit 0
 C=$OUT/cli_$LABEL; mkdir -p "$C"
 PROMPT='What is 2+2? Answer in one short sentence.'
 for ngl in 0 99; do for fa in auto off; do for gs in on off; do for kv in on off; do

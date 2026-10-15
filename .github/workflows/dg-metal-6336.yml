@@ -5,70 +5,54 @@ on:
   workflow_dispatch:
 
 jobs:
-  probe:
+  full:
     strategy:
       fail-fast: false
       matrix:
         os: [macos-15, macos-26]
+        bin: [src, b9632-mix-2d6bd50, b11541-mix-2500203]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 240
+    timeout-minutes: 330
     env:
       DG_SHA: 6a7388aac74ab896d9d4f0fb187ddac4847c02f0
       MODEL_URL: https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF/resolve/main/diffusiongemma-26B-A4B-it-Q4_K_M.gguf
-      KEEP: ${{ vars.DG_KEEP || '0,5' }}
     steps:
       - uses: actions/checkout@v4
       - name: host
         run: |
-          sysctl -n machdep.cpu.brand_string hw.memsize; sw_vers; df -h . | tail -1
-          system_profiler SPDisplaysDataType | head -20
-      - name: source
+          sysctl -n machdep.cpu.brand_string hw.memsize; sw_vers | grep ProductVersion; df -h . | tail -1
+      - name: build (Metal, PR head)
+        if: matrix.bin == 'src'
         run: |
           mkdir -p src && cd src
           git init -q && git remote add origin https://github.com/danielhanchen/llama.cpp
           git fetch -q --depth 1 origin "$DG_SHA" && git checkout -q FETCH_HEAD && git log --oneline -1
-      - name: python
-        run: |
-          python3 -m venv venv && . venv/bin/activate
-          pip install -q numpy tqdm pyyaml requests && pip install -q --no-deps ./src/gguf-py
-      - name: build (Metal)
-        run: |
-          cd src
           cmake -B build -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DLLAMA_CURL=OFF -DLLAMA_BUILD_SERVER=OFF -DCMAKE_BUILD_TYPE=Release > /dev/null
-          cmake --build build -j 4 --target llama-diffusion-cli llama-diffusion-gemma-eval llama-tokenize test-llama-archs 2>&1 | tail -3
-      - name: prebuilt bundles
+          cmake --build build -j 4 --target llama-diffusion-cli 2>&1 | tail -2
+          echo "BIN=$PWD/build/bin" >> "$GITHUB_ENV"
+      - name: prebuilt bundle
+        if: matrix.bin != 'src'
         run: |
-          mkdir -p rel && cd rel
-          for t in b9632-mix-2d6bd50 b11541-mix-2500203; do
-            curl -fsSL -o "$t.tgz" "https://github.com/unslothai/llama.cpp/releases/download/$t/llama-$t-bin-macos-arm64.tar.gz" && tar xzf "$t.tgz" && rm "$t.tgz"
-          done
-          ls
-      - name: truncated model
+          t=${{ matrix.bin }}
+          curl -fsSL -o b.tgz "https://github.com/unslothai/llama.cpp/releases/download/$t/llama-$t-bin-macos-arm64.tar.gz"
+          tar xzf b.tgz && rm b.tgz
+          echo "BIN=$PWD/llama-$t" >> "$GITHUB_ENV"
+      - name: model
         run: |
-          . venv/bin/activate
-          mkdir -p model
-          python -u scripts/dg_trunc.py "$MODEL_URL" model/dg.gguf --keep "$KEEP"
-      - name: test-llama-archs (Metal vs CPU, random weights)
-        run: |
-          ./src/build/bin/test-llama-archs -a 'diffusion-gemma' 2>&1 | tail -40 | tee archs.log
-      - name: probes (source build)
-        run: |
-          . venv/bin/activate
-          bash scripts/dg_metal/run_probes.sh src/build/bin model/dg.gguf out src 2>&1 | tee probes_src.log
-      - name: probes (prebuilt b9632, reporter's build)
-        run: |
-          . venv/bin/activate
-          B=rel/llama-b9632-mix-2d6bd50; [ -d "$B" ] || B=$(ls -d rel/*b9632* | head -1)
-          bash scripts/dg_metal/run_probes.sh "$B" model/dg.gguf out b9632 2>&1 | tee probes_b9632.log
-      - name: probes (prebuilt b11541, latest)
-        run: |
-          . venv/bin/activate
-          B=rel/llama-b11541-mix-2500203; [ -d "$B" ] || B=$(ls -d rel/*b11541* | head -1)
-          bash scripts/dg_metal/run_probes.sh "$B" model/dg.gguf out b11541 2>&1 | tee probes_b11541.log
+          curl -fL --retry 5 --retry-delay 10 -sS -o model.gguf "$MODEL_URL"; ls -la model.gguf
+      - name: CPU (-ngl 0)
+        run: bash scripts/dg_metal/run_full.sh "$BIN" model.gguf out cpu:-ngl,0 2>&1 | tee -a full.log
+      - name: Metal, experts on CPU (-ngl 99 --n-cpu-moe 30)
+        run: bash scripts/dg_metal/run_full.sh "$BIN" model.gguf out metal_moecpu:-ngl,99,--n-cpu-moe,30,-v 2>&1 | tee -a full.log
+      - name: Metal, experts on CPU, FA off
+        run: bash scripts/dg_metal/run_full.sh "$BIN" model.gguf out metal_moecpu_faoff:-ngl,99,--n-cpu-moe,30,-fa,off 2>&1 | tee -a full.log
+      - name: Metal, experts on CPU, host self-conditioning
+        if: matrix.bin == 'src'
+        run: bash scripts/dg_metal/run_full.sh "$BIN" model.gguf out metal_moecpu_gsoff:-ngl,99,--n-cpu-moe,30,--diffusion-gpu-sampling,off 2>&1 | tee -a full.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: dg-metal-${{ matrix.os }}
+          name: dg-full-${{ matrix.os }}-${{ matrix.bin }}
           path: |
             *.log
             out/
