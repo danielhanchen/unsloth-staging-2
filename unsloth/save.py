@@ -3390,6 +3390,11 @@ def _gguf_reuses_loaded_checkpoint(model, state_dict = None):
         return False
     if state_dict is not None or getattr(model, "_unsloth_full_finetuning", False):
         return False
+    # REAP pruned in memory: the loaded folder still holds every expert.
+    if getattr(model, "_unsloth_reap_report", None) and not getattr(
+        model, "_unsloth_reap_saved", None
+    ):
+        return False
     # A ModelScope load keeps its snapshot here, since `_name_or_path` holds the repo id (#3726).
     name_or_path = getattr(model, "_unsloth_modelscope_snapshot", None) or getattr(
         getattr(model, "config", None), "_name_or_path", None
@@ -5798,6 +5803,18 @@ def unsloth_generic_save(
         )
     else:
         raise_if_merging_mistral_format_view(model, save_method)
+        # Inline, builtins only: the merge rebuilds the base from disk, which still has every expert
+        # after an in-memory REAP prune (get_peft_model refuses this too; raw PEFT does not).
+        if getattr(model, "_unsloth_reap_report", None) and not getattr(
+            model, "_unsloth_reap_saved", None
+        ):
+            raise RuntimeError(
+                "Unsloth: this model was REAP pruned in memory only, but a merged save rebuilds the "
+                f"base weights from `{model.config._name_or_path}`, which still has every expert. "
+                'Nothing was written. Call `reap_prune(..., save_directory = "pruned_model")` (or '
+                "save the pruned model and load it again) before `get_peft_model`."
+            )
+        _prewarm_base_model_hub_cache(model, save_method = save_method, token = token)
         from unsloth_zoo.saving_utils import merge_and_overwrite_lora
 
         # An older unsloth_zoo accepts `output_dtype` but still writes the base dtype.
