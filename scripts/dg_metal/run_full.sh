@@ -11,7 +11,7 @@ for spec in "$@"; do
   name=${spec%%:*}; args=${spec#*:}; args=${args//,/ }
   start=$(date +%s)
   printf 'What is 2+2? Answer in one short sentence.\n' | \
-    tmo 3600 "$BIN/llama-diffusion-cli" -m "$MODEL" -cnv -n 256 -s 42 $args > "$OUT/$name.out" 2> "$OUT/$name.err"
+    tmo "${ARM_TIMEOUT:-3600}" "$BIN/llama-diffusion-cli" -m "$MODEL" -cnv -n 256 -s 42 $args > "$OUT/$name.out" 2> "$OUT/$name.err"
   rc=$?
   steps=$(grep -h -o '[0-9]* steps over [0-9]* blocks' "$OUT/$name.out" | head -1)
   fa=$(grep -h -o 'flash_attn *= *[a-z]*' "$OUT/$name.err" | head -1 | tr -d ' ')

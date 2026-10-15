@@ -9,12 +9,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-15, macos-26]
-        bin: [src, b9632-mix-2d6bd50, b11541-mix-2500203]
+        os: [macos-15]
+        bin: [src, b11541-mix-2500203]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 330
+    timeout-minutes: 360
     env:
       DG_SHA: 6a7388aac74ab896d9d4f0fb187ddac4847c02f0
+      ARM_TIMEOUT: '17000'
       MODEL_URL: https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF/resolve/main/diffusiongemma-26B-A4B-it-Q4_K_M.gguf
     steps:
       - uses: actions/checkout@v4
@@ -40,19 +41,12 @@ jobs:
       - name: model
         run: |
           curl -fL --http1.1 --retry 8 --retry-all-errors --retry-delay 10 -C - -sS -o model.gguf "$MODEL_URL"; ls -la model.gguf
-      - name: CPU (-ngl 0)
-        run: bash scripts/dg_metal/run_full.sh "$BIN" model.gguf out cpu:-ngl,0 2>&1 | tee -a full.log
-      - name: Metal, experts on CPU (-ngl 99 --n-cpu-moe 30)
+      - name: Metal, experts on CPU (-ngl 99 --n-cpu-moe 30), no step cap
         run: bash scripts/dg_metal/run_full.sh "$BIN" model.gguf out metal_moecpu:-ngl,99,--n-cpu-moe,30,-v 2>&1 | tee -a full.log
-      - name: Metal, experts on CPU, FA off
-        run: bash scripts/dg_metal/run_full.sh "$BIN" model.gguf out metal_moecpu_faoff:-ngl,99,--n-cpu-moe,30,-fa,off 2>&1 | tee -a full.log
-      - name: Metal, experts on CPU, host self-conditioning
-        if: matrix.bin == 'src'
-        run: bash scripts/dg_metal/run_full.sh "$BIN" model.gguf out metal_moecpu_gsoff:-ngl,99,--n-cpu-moe,30,--diffusion-gpu-sampling,off 2>&1 | tee -a full.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: dg-full-${{ matrix.os }}-${{ matrix.bin }}
+          name: dg-full2-${{ matrix.os }}-${{ matrix.bin }}
           path: |
             *.log
             out/
