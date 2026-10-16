@@ -2263,11 +2263,36 @@ def grpo_trainer__move_model_to_vllm(function_name, function):
     if function_name != "_move_model_to_vllm":
         return function
 
-    def _move_model_to_vllm(self, *args, **kwargs):
-        return None
+    # Only fast_inference shares weights with vLLM. TRL's own vLLM (colocate or server, e.g. full
+    # finetuning, which fast_inference refuses) must still receive the trainer weights every step.
+    match = re.search(
+        r"^[ \t]*def _move_model_to_vllm\(.*?\).*?:[ \t]*\n",
+        function,
+        re.MULTILINE | re.DOTALL,
+    )
+    body_indent = (
+        re.search(r"^([ \t]+)\S", function[match.end() :], re.MULTILINE) if match else None
+    )
+    if match is None or body_indent is None:
 
-    function = inspect.getsource(_move_model_to_vllm)
-    return function
+        def _move_model_to_vllm(self, *args, **kwargs):
+            return None
+
+        return inspect.getsource(_move_model_to_vllm)
+    indent = body_indent.group(1)
+    # PEFT merge_adapter requantizes bitsandbytes base weights from the fp32 LoRA delta, so the
+    # next fast_lora backward fails on a float32 quant_state: keep those runs on the old no-op.
+    guard = (
+        f"{indent}if getattr(getattr(self, 'llm', None), 'shared_weights', False):\n"
+        f"{indent}    return None\n"
+        f"{indent}if getattr(self, '_unsloth_bnb_vllm_sync_skip', None) is None:\n"
+        f"{indent}    self._unsloth_bnb_vllm_sync_skip = any(type(_p).__name__ in ('Params4bit', 'Int8Params') for _p in self.model.parameters())\n"
+        f"{indent}    if self._unsloth_bnb_vllm_sync_skip:\n"
+        f"{indent}        print('Unsloth: vLLM weight sync is skipped for a bitsandbytes 4-bit / 8-bit model without fast_inference, so rollouts use the initial weights. Load with fast_inference = True to sample from the trained model.')\n"
+        f"{indent}if self._unsloth_bnb_vllm_sync_skip:\n"
+        f"{indent}    return None\n"
+    )
+    return function[: match.end()] + guard + function[match.end() :]
 
 
 RL_FUNCTIONS["grpo_trainer"].append(grpo_trainer__move_model_to_vllm)
