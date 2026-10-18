@@ -210,8 +210,31 @@ export const BUDGET = {
   // by that growth.
   // The audio.cpp v0.9.2 picker rows (#14073) add 253 B raw / 59 B transfer to the eager audio catalog
   // table (one machine and build, chunk count unchanged at 95). Raised by that.
-  transferBytes: 2_047_608,
-  rawBytes: 6_806_087,
+  // The paused and queued chat states (admission status, the paused continuation reason) add 2.3 KB
+  // raw / 1.0 KB transfer to the eager chat chunk (6,570.6 -> 6,572.9 KB raw, 1,975.5 -> 1,976.5 KB
+  // transfer against b8d76e169, one machine and build). They render on the first chat screen, so
+  // raised by that.
+  // The exact concurrency setting, its chat chip and their strings in every eager locale add 4.5 KB
+  // raw / 1.2 KB transfer to the eager settings and chat chunks (6,572.9 -> 6,577.4 KB raw,
+  // 1,976.5 -> 1,977.7 KB transfer against bfab55021, one machine and build), raised by that.
+  // Together they measure 7,058 B raw / 2,903 B transfer against c77695db2 (6,743,283 -> 6,750,341 B
+  // raw, 2,026,381 -> 2,029,284 B transfer, one machine and build).
+  // Re-measured on main at 5e927b0fa: +7,064 B raw / +2,314 B transfer (6,764,333 -> 6,771,397 B raw,
+  // 2,033,495 -> 2,035,809 B transfer, one machine and build).
+  // Re-measured on main at a2003f1a0: +7,225 B raw / +2,416 B transfer (6,790,366 -> 6,797,591 B raw,
+  // 2,042,026 -> 2,044,442 B transfer, one machine and build). On main's limits plus that growth, with
+  // 0.9 KB raw / 0.4 KB transfer above it for the CI runner, which measured this branch 0.6 KB raw higher.
+  // Re-measured on main at cb7a04736: +7,303 B raw / +2,367 B transfer (6,800,624 -> 6,807,927 B raw,
+  // 2,045,484 -> 2,047,851 B transfer, one machine and build). Set to main's limits plus that growth, with
+  // 0.9 KB raw / 0.4 KB transfer above it for the CI runner.
+  // Re-measured on main at f172c8d7c: +7,290 B raw / +2,204 B transfer (6,804,401 -> 6,811,691 B raw,
+  // 2,047,544 -> 2,049,748 B transfer, one machine and build). Set to main's limits plus that growth, with
+  // 0.9 KB raw / 0.4 KB transfer above it for the CI runner.
+  // Re-measured on main at 475a02ac1: +7,290 B raw / +2,197 B transfer (6,805,192 -> 6,812,482 B raw,
+  // 2,047,700 -> 2,049,897 B transfer, one machine and build). Set to main's limits plus that growth, with
+  // 0.9 KB raw / 0.4 KB transfer above it for the CI runner.
+  transferBytes: 2_050_205,
+  rawBytes: 6_814_277,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
