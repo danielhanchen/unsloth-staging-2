@@ -3613,6 +3613,11 @@ def _gguf_reuses_loaded_checkpoint(model, state_dict = None):
         return False
     if state_dict is not None or getattr(model, "_unsloth_full_finetuning", False):
         return False
+    # REAP pruned in memory: the loaded folder still holds every expert.
+    if getattr(model, "_unsloth_reap_report", None) and not getattr(
+        model, "_unsloth_reap_saved", None
+    ):
+        return False
     # The loaded folder holds the stock MTP head; a trained one needs a fresh checkpoint.
     if _attached_mtp_head(model) is not None:
         return False
@@ -5922,6 +5927,23 @@ def unsloth_generic_save(
     # Rebound rather than kept in a new local, because the `locals()` below is forwarded as
     # this function's own keywords.
     safe_serialization = _normalize_safe_serialization(safe_serialization)
+
+    # Inline, builtins only (no new locals: they are forwarded below), and before the Hub revision
+    # route, which creates the repo / branch first. After an in-memory REAP prune the base
+    # checkpoint on disk still has every expert, and both a merge (which rebuilds from it) and an
+    # adapter save (which records it as the base) would use it. get_peft_model refuses this too;
+    # raw PEFT does not.
+    if (
+        isinstance(model, PeftModel)
+        and getattr(model, "_unsloth_reap_report", None)
+        and not getattr(model, "_unsloth_reap_saved", None)
+    ):
+        raise RuntimeError(
+            "Unsloth: this model was REAP pruned in memory only, but this save would use the base "
+            f"checkpoint `{model.config._name_or_path}`, which still has every expert. Nothing was "
+            'written. Call `reap_prune(..., save_directory = "pruned_model")` (or save the pruned '
+            "model and load it again) before `get_peft_model`."
+        )
 
     # A trained MTP head can only be stitched into a local copy, which this route makes first.
     if push_to_hub and (
