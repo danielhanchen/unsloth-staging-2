@@ -262,7 +262,6 @@ class Fast_Layernorm(torch.autograd.Function):
                 ),
                 device,
                 num_warps = num_warps,
-                enable_fp_fusion = True,
             )
         ctx.eps = eps
         ctx.BLOCK_SIZE = BLOCK_SIZE
@@ -301,7 +300,6 @@ class Fast_Layernorm(torch.autograd.Function):
                     ),
                     device,
                     num_warps = ctx.num_warps,
-                    enable_fp_fusion = True,
                 )
             return dX.view(*shape), None, None, None
 
@@ -331,7 +329,6 @@ class Fast_Layernorm(torch.autograd.Function):
                     ),
                     device,
                     num_warps = ctx.num_warps,
-                    enable_fp_fusion = True,
                 )
             _launch(
                 _layernorm_sum_partials,
@@ -340,7 +337,6 @@ class Fast_Layernorm(torch.autograd.Function):
                 3,
                 dict(BLOCK_ROWS = 64, BLOCK_COLS = 64),
                 device,
-                enable_fp_fusion = True,
             )
         return dX.view(*shape), dW, dB, None
 

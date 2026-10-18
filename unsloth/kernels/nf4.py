@@ -262,8 +262,11 @@ def _launch(
         LUT_MODE = lut_mode,
     )
     grid = (-(-n_blocks // rows),)
-    # Explicit both ways: Triton 3.9 defaults enable_fp_fusion to False.
-    options = {"num_warps": num_warps, "enable_fp_fusion": bool(fp_fusion)}
+    options = (
+        {"num_warps": num_warps}
+        if fp_fusion
+        else {"num_warps": num_warps, "enable_fp_fusion": False}
+    )
     if kernel is _nf4_dequant_kernel:
         entry = launch(kernel, grid, args, 7, constexprs, W.device.index, **options)
         if plan:

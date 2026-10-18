@@ -635,7 +635,6 @@ def _rms_forward(
                 ),
                 device,
                 num_warps = num_warps,
-                enable_fp_fusion = True,
             )
             return Y, r
         except Exception as error:
@@ -661,7 +660,6 @@ def _rms_forward(
         ),
         device,
         num_warps = num_warps,
-        enable_fp_fusion = True,
     )
     return Y, r
 
@@ -757,7 +755,6 @@ def _rms_backward(
                 ),
                 device,
                 num_warps = num_warps,
-                enable_fp_fusion = True,
             )
         except Exception as error:
             if _multirow_must_raise(error, wrap):
@@ -795,7 +792,6 @@ def _rms_backward(
         device,
         num_warps = num_warps,
         **options,
-        enable_fp_fusion = True,
     )
     return _rms_sum_partials(partials, W, wrap)
 
@@ -813,7 +809,6 @@ def _rms_sum_partials(partials, W, wrap):
         2,
         dict(BLOCK_ROWS = 64, BLOCK_COLS = 64),
         partials.device,
-        enable_fp_fusion = True,
     )
     return dW
 
