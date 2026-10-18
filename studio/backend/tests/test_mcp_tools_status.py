@@ -121,14 +121,21 @@ def test_every_slot_is_reported(monkeypatch):
             },
         ],
         "loading": ["unsloth/gemma-3-1b-it"],
+        "multi_model_mode": None,
     }
     assert status["image"] == {
         "loaded": True,
         "model": "black-forest-labs/FLUX.1-schnell",
         "family": "flux",
         "generating": False,
+        "placement": None,
     }
-    assert status["video"] == {"loaded": True, "model": "Lightricks/LTX-Video", "generating": False}
+    assert status["video"] == {
+        "loaded": True,
+        "model": "Lightricks/LTX-Video",
+        "generating": False,
+        "placement": None,
+    }
     assert status["stt"] == {
         "engine": "gguf",
         "model": "whisper-large-v3-turbo-q5",
@@ -185,6 +192,13 @@ def test_every_slot_is_reported(monkeypatch):
     assert called == set(PAYLOADS)
 
 
+def test_chat_reports_the_keep_multiple_models_loaded_mode(monkeypatch):
+    for mode in ("off", "fit", "always"):
+        overrides = {("GET", "/api/inference/status"): {**CHAT, "multi_model_mode": mode}}
+        result, _studio = _status(monkeypatch, overrides)
+        assert result["structuredContent"]["chat"]["multi_model_mode"] == mode
+
+
 def test_failing_and_owner_only_slots_do_not_fail_the_tool(monkeypatch):
     broken = JSONResponse({"detail": "Video backend crashed at /srv/hf/ltx"}, status_code = 500)
     owner_only = JSONResponse(
@@ -203,7 +217,12 @@ def test_failing_and_owner_only_slots_do_not_fail_the_tool(monkeypatch):
     assert set(status["unavailable"]) == {"video"}
     assert "Video backend crashed" in status["unavailable"]["video"]
     assert "/srv/hf" not in status["unavailable"]["video"]
-    assert status["video"] == {"loaded": False, "model": None, "generating": False}
+    assert status["video"] == {
+        "loaded": False,
+        "model": None,
+        "generating": False,
+        "placement": None,
+    }
     assert status["embedder"] == {"available": False, "loaded": False, "model": None}
     assert status["image"]["generating"] is True
     assert status["chat"]["loaded"]
@@ -256,5 +275,6 @@ def test_unloaded_slots_name_no_model(monkeypatch):
         ("GET", "/api/inference/video/status"): {"loaded": False},
     }
     status = _status(monkeypatch, overrides)[0]["structuredContent"]
-    assert status["image"] == {"loaded": False, "model": None, "family": None, "generating": False}
-    assert status["video"] == {"loaded": False, "model": None, "generating": False}
+    unplaced = {"generating": False, "placement": None}
+    assert status["image"] == {"loaded": False, "model": None, "family": None, **unplaced}
+    assert status["video"] == {"loaded": False, "model": None, **unplaced}
