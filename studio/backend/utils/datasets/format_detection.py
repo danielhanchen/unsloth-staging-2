@@ -248,7 +248,6 @@ def detect_custom_format_heuristic(dataset):
         "task",
     ]
 
-    # Only pair today: "text" inside "context".
     role_words = assistant_words + user_words + system_words
 
     metadata_exact_match = {
@@ -363,7 +362,6 @@ def detect_custom_format_heuristic(dataset):
         score = 0
         score += 10
 
-        # Penalize ambiguous "task" so other user columns win.
         if role_type == "user":
             col_lower = col_name.lower()
             if "task" in col_lower and not any(kw in col_lower for kw in user_words_high_priority):
@@ -470,9 +468,7 @@ def detect_custom_format_heuristic(dataset):
             user_candidates.append((col, score))
 
     if not user_candidates and not any(col != assistant_col for col in user_potential):
-        # has_keyword drops "context" from user_potential because "text" only matches
-        # inside it. When nothing else can hold the user turn, that column is a better
-        # user turn than an assistant-worded leftover.
+        # "text" only matches inside "context", so it is still the best user column if nothing else fits.
         shadowed_potential = [
             col
             for col in content_columns
@@ -604,7 +600,6 @@ def detect_multimodal_dataset(dataset):
     audio_columns = []
     modality_types = set()
 
-    # Image detection pass 1: column-name heuristic (word-boundary match).
     for col_name in column_names:
         for keyword in image_keywords:
             if _keyword_in_column(keyword, col_name):
@@ -612,7 +607,6 @@ def detect_multimodal_dataset(dataset):
                 modality_types.add(keyword)
                 break
 
-    # Pass 2: inspect actual values.
     already_detected = set(multimodal_columns)
     for col_name in column_names:
         if col_name in already_detected:
@@ -622,7 +616,6 @@ def detect_multimodal_dataset(dataset):
             multimodal_columns.append(col_name)
             modality_types.add("image")
 
-    # Audio detection pass 1: column-name heuristic (word-boundary match).
     for col_name in column_names:
         for keyword in audio_keywords:
             if _keyword_in_column(keyword, col_name):
@@ -630,7 +623,6 @@ def detect_multimodal_dataset(dataset):
                 modality_types.add("audio")
                 break
 
-    # Pass 2: inspect actual values, catching non-obvious column names.
     already_audio = set(audio_columns)
     for col_name in column_names:
         if col_name in already_audio:
@@ -640,7 +632,7 @@ def detect_multimodal_dataset(dataset):
             audio_columns.append(col_name)
             modality_types.add("audio")
 
-    # Drop audio columns from the image list: a {"bytes","path"} audio column can match _is_image_value.
+    # An undecoded audio {bytes, path} dict can also match _is_image_value.
     if audio_columns:
         audio_set = set(audio_columns)
         multimodal_columns = [c for c in multimodal_columns if c not in audio_set]
@@ -655,7 +647,6 @@ def detect_multimodal_dataset(dataset):
 
     is_audio = len(audio_columns) > 0
 
-    # speaker_id column for TTS datasets (CSM, Orpheus, Spark)
     detected_speaker_col = None
     if audio_columns:
         speaker_keywords = ["source", "speaker", "speaker_id"]
@@ -693,12 +684,11 @@ def _is_image_value(value) -> bool:
     if _is_decoded_image_value(value):
         return True
 
-    # HF Image feature: decoded as PIL, or {"bytes", "path"} when undecoded. Exclude audio dicts, whose decoded form has "array" + "sampling_rate".
+    # Undecoded HF Image is {bytes, path}; decoded audio dicts carry array + sampling_rate.
     if isinstance(value, dict):
         if "array" in value and "sampling_rate" in value:
             return False
         if "bytes" in value and "path" in value:
-            # Use path extension to exclude audio files.
             path = value.get("path") or ""
             if isinstance(path, str) and any(
                 path.lower().endswith(ext) for ext in _AUDIO_EXTENSIONS
@@ -765,7 +755,6 @@ def _is_audio_value(value) -> bool:
     if value is None:
         return False
 
-    # HF Audio feature: decoded -> {"array", "sampling_rate"}; undecoded -> {"bytes", "path"}.
     if isinstance(value, dict):
         if "array" in value and "sampling_rate" in value:
             return True
@@ -855,7 +844,6 @@ def detect_vlm_dataset_structure(dataset):
                         "text_column": None,
                     }
 
-    # ShareGPT/ChatML conversations with an <image> placeholder plus a companion image column, e.g. Lin-Chen/ShareGPT4V and LLaVA-style datasets.
     for chat_col in ("conversations", "messages"):
         if chat_col not in column_names:
             continue
@@ -865,7 +853,6 @@ def detect_vlm_dataset_structure(dataset):
         first_msg = chat_data[0]
         if not isinstance(first_msg, dict):
             continue
-        # ShareGPT (from/value) or ChatML (role/content).
         msg_text = first_msg.get("value") or first_msg.get("content")
         if not isinstance(msg_text, str):
             continue
@@ -996,7 +983,6 @@ def detect_vlm_dataset_structure(dataset):
                 if score > 0:
                     candidates.append((col, score))
 
-        # Pass 2: value-based fallback for image URLs/paths even when the name does not match keywords.
         already = {c[0] for c in candidates}
         for col in column_names:
             if col in already:
@@ -1004,7 +990,6 @@ def detect_vlm_dataset_structure(dataset):
             sample_value = sample[col]
             if _is_image_value(sample_value):
                 score = _score_image_candidate(col, sample_value)
-                # Penalise non-keyword columns so keyword matches win on ties.
                 candidates.append((col, max(score - 5, 1)))
 
         if not candidates:
@@ -1020,7 +1005,6 @@ def detect_vlm_dataset_structure(dataset):
             if _probe_image_candidate(col, sample_value):
                 return col
 
-        # None probed OK: return the highest-scored, since conversion may still resolve it.
         return candidates[0][0]
 
     def find_text_column():
@@ -1039,7 +1023,6 @@ def detect_vlm_dataset_structure(dataset):
                     and len(sample_value) > 0
                     and is_text(col, sample_value)
                 ):
-                    # Longer text = higher priority (content, not a label).
                     priority = min(len(sample_value), 1000)
                     candidates.append((col, priority))
                 elif (
@@ -1047,7 +1030,6 @@ def detect_vlm_dataset_structure(dataset):
                     and len(sample_value) > 0
                     and isinstance(sample_value[0], str)
                 ):
-                    # List of strings, e.g. captions, ranks below a plain str.
                     priority = min(len(sample_value[0]), 1000) // 2
                     candidates.append((col, priority))
 

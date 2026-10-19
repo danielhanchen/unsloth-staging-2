@@ -41,7 +41,6 @@ _KEPT_UNDER_ALWAYS = frozenset({CHAT, DIFFUSION, VIDEO})
 _lock = threading.Lock()
 _owner: Optional[str] = None
 _owner_epoch = 0
-# Account whose load put the current owner on the GPU, so routes can refuse to evict it.
 _owner_account: Optional[str] = None
 _prior_account: Optional[str] = None
 # Every resident and the physical GPU ids it uses (None = unknown, treat as every GPU).
@@ -136,9 +135,7 @@ def _evict_chat() -> None:
 
     unload_extra_models(strict = True)
     llama = get_llama_cpp_backend()
-    # is_active (process exists), not is_loaded (exists AND healthy): a chat model still starting up holds VRAM but is
-    # not healthy. chat_load_active too, since an HF load has no process until its GGUF downloaded. unload_model sets
-    # the cancel event the download loop polls, so it aborts.
+    # is_active, not is_loaded: a model still starting holds VRAM. chat_load_active covers HF GGUF downloads.
     if llama.is_active or chat_load_active():
         # unload_model clears the identity, so read it first for the pre-swap KV save.
         unloaded = _chat_identity(llama)
@@ -147,9 +144,7 @@ def _evict_chat() -> None:
     orchestrator = get_inference_backend()
     if orchestrator.active_model_name:
         orchestrator.unload_model(orchestrator.active_model_name)
-    # An in-flight safetensors load has no active_model_name yet (published only on success), so the unload above misses
-    # it and it would finish onto the GPU we just granted away. cancel_load discards the loading marker BEFORE tearing
-    # the worker down, and runs off the lifecycle gate.
+    # An in-flight safetensors load has no active_model_name yet, so the unload above misses it.
     for pending in list(getattr(orchestrator, "loading_models", ()) or ()):
         orchestrator.cancel_load(pending)
     # Kill the subprocess too: its base CUDA context holds VRAM diffusion needs.
@@ -159,8 +154,7 @@ def _evict_chat() -> None:
         raise RuntimeError(
             "The inference engine did not stop; GPU ownership cannot be transferred."
         )
-    # The driver reclaims the killed VRAM asynchronously, so wait for it to settle before diffusion allocates, else a
-    # warm handoff can transiently OOM.
+    # The driver reclaims killed VRAM asynchronously; wait or a warm handoff can transiently OOM.
     llama._wait_for_vram_settle(since_kill = time.monotonic())
     from hub.services.models.account_access import clear_resident
 
@@ -185,7 +179,6 @@ def _commit_swap_kv(unloaded) -> None:
 
 
 def _evict_diffusion() -> None:
-    # Unload whichever engine the router has active (diffusers or native sd.cpp).
     from core.inference.diffusion_engine_router import get_active_diffusion_engine
 
     # A launching upsampler warm start holds the engine's generation slot the unload waits on.
