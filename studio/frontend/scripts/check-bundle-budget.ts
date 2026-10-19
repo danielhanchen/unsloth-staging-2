@@ -281,8 +281,20 @@ export const BUDGET = {
   // Naming a chat export after its model, title and day (#12586) adds 615 B raw / 65 B transfer (6,842,183 ->
   // 6,842,798 B raw, 2,060,321 -> 2,060,386 B transfer against 46e4f50bea, one machine and build, Node 24,
   // 96 chunks): the name builder sits beside the chat exporters in the eager chat chunk. Raised by that growth.
-  transferBytes: 2_060_794,
-  rawBytes: 6_843_649,
+  // The paused and queued chat states (admission status, the paused continuation reason) add 2.3 KB
+  // raw / 1.0 KB transfer to the eager chat chunk (6,570.6 -> 6,572.9 KB raw, 1,975.5 -> 1,976.5 KB
+  // transfer against b8d76e169, one machine and build). They render on the first chat screen, so
+  // raised by that.
+  // The exact concurrency setting, its chat chip and their strings in every eager locale add 4.5 KB
+  // raw / 1.2 KB transfer to the eager settings and chat chunks (6,572.9 -> 6,577.4 KB raw,
+  // 1,976.5 -> 1,977.7 KB transfer against bfab55021, one machine and build), raised by that.
+  // Together they measure 7,058 B raw / 2,903 B transfer against c77695db2 (6,743,283 -> 6,750,341 B
+  // raw, 2,026,381 -> 2,029,284 B transfer, one machine and build).
+  // Re-measured on main at 0a96b9de3: +7,253 B raw / +2,471 B transfer (6,843,566 -> 6,850,819 B raw,
+  // 2,060,656 -> 2,063,127 B transfer, one machine and build). Set to main's limits plus that growth, with
+  // 0.9 KB raw / 0.4 KB transfer above it for the CI runner.
+  transferBytes: 2_063_665,
+  rawBytes: 6_851_802,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
