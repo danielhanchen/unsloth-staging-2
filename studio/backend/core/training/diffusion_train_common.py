@@ -2095,7 +2095,44 @@ def _assert_trusted_base_model(base_model: str, *, allow_modular: bool = False) 
         )
     # An existing LOCAL base is loaded as a full pipeline, which needs an index; reject a non-pipeline local dir
     # before /diffusion/start frees the GPU models.
-    _assert_local_base_is_pipeline(base_model, allow_modular = allow_modular)
+    try:
+        _assert_local_base_is_pipeline(base_model, allow_modular = allow_modular)
+    except ValueError as e:
+        single = _local_single_file_checkpoint(base_model)
+        if single is None:
+            raise
+        raise ValueError(
+            f"'{single}' is a single-file checkpoint, which cannot be a training base yet: training "
+            f"loads the base as a diffusers pipeline folder (one subfolder per component). Pick a "
+            f"base from the list instead."
+        ) from e
+
+
+_SINGLE_FILE_SUFFIXES = (".safetensors", ".ckpt", ".gguf")
+_NOT_A_CHECKPOINT_FOLDER = (
+    "model_index.json",
+    "modular_model_index.json",
+    "config.json",
+    "adapter_config.json",
+)
+
+
+def _local_single_file_checkpoint(base_model: str) -> Optional[str]:
+    """The checkpoint a local base names or holds (an A1111 / ComfyUI models folder). Wording only, never a verdict."""
+    try:
+        path = Path(str(base_model or "").strip()).expanduser()
+        if path.is_file():
+            return str(path) if path.name.lower().endswith(_SINGLE_FILE_SUFFIXES) else None
+        if not path.is_dir() or any((path / m).exists() for m in _NOT_A_CHECKPOINT_FOLDER):
+            return None
+        names = [
+            entry.name
+            for entry in os.scandir(path)
+            if entry.name.lower().endswith(_SINGLE_FILE_SUFFIXES) and entry.is_file()
+        ]
+    except OSError:
+        return None
+    return str(path / min(names)) if names else None
 
 
 # One writer and one reader for BOTH trainers, so an SDXL and a DiT run resume from the same bundle shape.
