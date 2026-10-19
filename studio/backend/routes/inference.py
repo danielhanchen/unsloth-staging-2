@@ -18260,7 +18260,16 @@ async def get_active_generations(
         )
         if slot is not None:
             only, llama = set(slot.generations), slot.llama
-        elif await asyncio.to_thread(model_slots.in_slot, None, lambda: _loaded_satisfies(model)):
+        elif await asyncio.to_thread(
+            model_slots.in_slot,
+            None,
+            # A cached standard-backend model counts as primary: /unload of it stops primary chats.
+            lambda: _loaded_satisfies(model)
+            or (
+                (standard := _peek_inference_backend()) is not None
+                and _unload_evicts_standard_backend(standard, model)
+            ),
+        ):
             exclude |= model_slots.all_generations()
         else:
             only = set()  # an absent model cannot interrupt any generation
@@ -22659,9 +22668,27 @@ async def _unload_model_impl(request: UnloadRequest, current_subject: str):
         if (
             request.cancel_load_request_id is None
             and account_access.managed_account()
-            and account_access.release_shared_resident("chat")
+            and account_access.shares_resident_with_others("chat")
         ):
-            return UnloadResponse(status = "unloaded", model = request.model_path)
+            # Leaving a share stops only this account's chats on it; the others keep theirs.
+            # A stale name leaves the share as before but stops nothing.
+            scope = account_access.account_scope()
+            elsewhere = model_slots.all_generations()
+            running = (
+                active_generations.count(scope, elsewhere, include_external = False)
+                if await asyncio.to_thread(_loaded_satisfies, request.model_path)
+                else 0
+            )
+            if running and not request.force_cancel_active:
+                raise _active_generations_conflict(
+                    "Unloading the model",
+                    running,
+                    active_generations.active_thread_ids(scope, elsewhere, include_external = False),
+                )
+            if account_access.release_shared_resident("chat"):
+                if running:
+                    active_generations.cancel_all(scope, elsewhere, include_external = False)
+                return UnloadResponse(status = "unloaded", model = request.model_path)
         account_access.require_resident_control(
             "chat", _loaded_slot_ident() if account_access.managed_account() else None
         )
