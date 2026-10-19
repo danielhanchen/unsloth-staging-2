@@ -169,6 +169,10 @@ except Exception:
     _gdn_chunk = None
 
 
+def _keep_saved(tensor):
+    return tensor
+
+
 def _self_check(q, k, v, g, beta):
     """Opaque op vs fla's own autograd.Function: outputs, fake metas and grads bit-equal."""
     if _gdn_chunk is None or not q.is_cuda:
@@ -178,12 +182,17 @@ def _self_check(q, k, v, g, beta):
     # Private generator: the default one feeds LoRA dropout, which checkpoint recompute replays.
     gen = torch.Generator(device = v.device).manual_seed(0)
     do = torch.randn(v.shape, dtype = v.dtype, device = v.device, generator = gen)
-    ins = [t.contiguous().requires_grad_() for t in (q, k, v, g, beta)]
-    ref, _ = chunk_gated_delta_rule(*ins, use_qk_l2norm_in_kernel = True)
-    ref_g = torch.autograd.grad(ref, ins, do)
-    ins2 = [t.detach().clone().requires_grad_() for t in ins]
-    out = _gdn_chunk(*ins2, q.shape[-1] ** -0.5)
-    got_g = torch.autograd.grad(out[0], ins2, do)
+    # The check runs inside the layer's first forward. Under a distributed launch that forward is a
+    # non-reentrant checkpoint (plus offload hooks): its saved-tensor hooks would pack the check's own
+    # tensors, and its grad would recompute the layer that is still running (_StopRecomputationError,
+    # the check fails, fla stays a graph break in every block). Identity hooks keep the check local.
+    with torch.autograd.graph.saved_tensors_hooks(_keep_saved, _keep_saved):
+        ins = [t.contiguous().requires_grad_() for t in (q, k, v, g, beta)]
+        ref, _ = chunk_gated_delta_rule(*ins, use_qk_l2norm_in_kernel = True)
+        ref_g = torch.autograd.grad(ref, ins, do)
+        ins2 = [t.detach().clone().requires_grad_() for t in ins]
+        out = _gdn_chunk(*ins2, q.shape[-1] ** -0.5)
+        got_g = torch.autograd.grad(out[0], ins2, do)
     metas = [(o.shape, o.dtype) for o in out[1:]]
     want = [(torch.Size(s), d) for s, d in _chunk_meta(q, k, v, g)]
     return (
