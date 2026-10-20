@@ -1,0 +1,33 @@
+name: repro-14300
+on:
+  push:
+    branches: [repro-14300]
+jobs:
+  repro:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      UNSLOTH_IS_PRESENT: "1"
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: arms
+        run: |
+          git clone -q https://github.com/unslothai/unsloth src
+          git -C src fetch -q origin pull/14300/head:pr
+          git -C src worktree add -q "$PWD/base" 56d6f7563a34c66f15feede73dd8c5f0695aadcd
+          git -C src worktree add -q "$PWD/head" pr
+          git -C head log -1 --format='head %H'; git -C base log -1 --format='base %H'
+          cp head/unsloth_cli/tests/test_claude_subagent_mcp.py head/unsloth_cli/tests/test_codex_subagent_mcp.py base/unsloth_cli/tests/
+      - name: install
+        run: python -m pip install -q -r head/studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - name: base vs head
+        run: |
+          for arm in base head; do
+            echo "=== ARM $arm"
+            (cd $arm && PYTHONPATH="$PWD:$PWD/studio/backend" python -m pytest unsloth_cli/tests/test_claude_subagent_mcp.py unsloth_cli/tests/test_codex_subagent_mcp.py -q -rA -p no:cacheprovider 2>&1 | grep -E "^(PASSED|FAILED|SKIPPED|ERROR)|passed|failed|INJECTED" | head -80) || true
+          done
