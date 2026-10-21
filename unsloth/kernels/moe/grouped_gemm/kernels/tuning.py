@@ -31,20 +31,21 @@ class DeviceProperties:
     WARP_SIZE: int
 
 
-# Per device: config pruning runs on the launching card, which differs on a mixed host.
-_DEVICE_PROPERTIES: dict = {}
+_DEVICE_PROPERTIES: Optional[DeviceProperties] = None
 
 
 def get_device_properties():
-    device = torch.cuda.current_device()
-    if device not in _DEVICE_PROPERTIES:
-        properties = triton.runtime.driver.active.utils.get_device_properties(device)
+    global _DEVICE_PROPERTIES
+    if _DEVICE_PROPERTIES is None:
+        properties = triton.runtime.driver.active.utils.get_device_properties(
+            torch.cuda.current_device()
+        )
         NUM_SM = properties["multiprocessor_count"]
         NUM_REGS = properties["max_num_regs"]
         SIZE_SMEM = properties["max_shared_mem"]
         WARP_SIZE = properties["warpSize"]
-        _DEVICE_PROPERTIES[device] = DeviceProperties(NUM_SM, NUM_REGS, SIZE_SMEM, WARP_SIZE)
-    return _DEVICE_PROPERTIES[device]
+        _DEVICE_PROPERTIES = DeviceProperties(NUM_SM, NUM_REGS, SIZE_SMEM, WARP_SIZE)
+    return _DEVICE_PROPERTIES
 
 
 @dataclass

@@ -264,7 +264,6 @@ def _run_moe_autotuning(
 
     # Autotune via the interface function with autotune=True (lets triton tune)
     from .grouped_gemm.interface import (
-        _autotuner_for,
         grouped_gemm_forward,
         grouped_gemm_dX,
         grouped_gemm_dW,
@@ -291,9 +290,7 @@ def _run_moe_autotuning(
         permute_y = False,
         autotune = True,
     )
-    triton_config_fwd = _autotuner_for(
-        _autotuned_grouped_gemm_forward_kernel, hidden_states.device
-    ).best_config
+    triton_config_fwd = _autotuned_grouped_gemm_forward_kernel.best_config
 
     config_fwd = KernelConfigForward(
         BLOCK_SIZE_M = triton_config_fwd.kwargs["BLOCK_SIZE_M"],
@@ -318,9 +315,7 @@ def _run_moe_autotuning(
         permute_y = False,
         autotune = True,
     )
-    triton_config_bwd_dx = _autotuner_for(
-        _autotuned_grouped_gemm_dX_kernel, dummy_grad.device
-    ).best_config
+    triton_config_bwd_dx = _autotuned_grouped_gemm_dX_kernel.best_config
 
     # Safe Backward Configs: 64x64x256
     config_bwd_dx = KernelConfigBackward_dX(
@@ -345,9 +340,7 @@ def _run_moe_autotuning(
         permute_y = False,
         autotune = True,
     )
-    triton_config_bwd_dw = _autotuner_for(
-        _autotuned_grouped_gemm_dW_kernel, hidden_states.device
-    ).best_config
+    triton_config_bwd_dw = _autotuned_grouped_gemm_dW_kernel.best_config
 
     config_bwd_dw = KernelConfigBackward_dW(
         BLOCK_SIZE_M = triton_config_bwd_dw.kwargs["BLOCK_SIZE_M"],
@@ -398,7 +391,7 @@ _HEURISTIC_SMEM_STEP_DOWN = {
 
 
 def _device_smem_per_block() -> Optional[int]:
-    # Read per current device: the launching card on a mixed host.
+    # Per current device: tuning.get_device_properties() caches the first device's limit process-wide.
     try:
         index = torch.cuda.current_device()
     except Exception:
