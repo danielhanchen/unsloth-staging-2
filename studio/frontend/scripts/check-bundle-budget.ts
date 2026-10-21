@@ -348,8 +348,14 @@ export const BUDGET = {
   // REAP on the Export page (#14130) passes its options through the eager export runtime store (the card is
   // in the lazy export page): +371 B raw / +119 B transfer (6,878,631 -> 6,879,002 B raw, 2,071,507 ->
   // 2,071,626 B transfer against 4df9ce74f, one machine and build, Node 24, 97 chunks). Raised by that.
-  transferBytes: 2_071_693,
-  rawBytes: 6_879_150,
+  // DPO, ORPO and GRPO in Studio (#12601) add 27,796 B raw / 8,585 B transfer (6,842,532 -> 6,870,328 B raw,
+  // 2,060,384 -> 2,068,969 B transfer against 2c7c841f69 and 3ecf7f8ff, one machine and build, 96 chunks): the
+  // objective, column-role and reward strings join the eager English catalog, the RL settings and role mapping sit
+  // in the eager training store, and its icons in the shared icon chunk. Raised by that growth on top of main's
+  // budget, which keeps main's margin (re-added on top of main at acc10af9d). The GRPO prompt preview reading
+  // each row's own system message adds 405 B raw / 154 B transfer (6,906,755 -> 6,907,160 B raw at 528a73372).
+  transferBytes: 2_080_432,
+  rawBytes: 6_907_351,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
