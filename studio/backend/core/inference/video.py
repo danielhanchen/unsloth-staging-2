@@ -63,6 +63,8 @@ from .diffusion_flow_shift import apply_comfy_flow_shift
 from .diffusion_comfy_quant import (
     comfy_fp8_backend,
     comfy_int8_backend,
+    fp8_storage_wanted,
+    pipe_fp8_stored_layers,
     comfy_resident_mib,
     load_comfy_quant_transformer,
     refuse_comfy_quant,
@@ -484,15 +486,26 @@ def _video_comfy_backends(
 ) -> dict[str, Optional[str]]:
     """``load_comfy_quant_transformer`` backends for a ComfyUI-quantized video DiT: the ones Studio's own int8 / fp8
     quant would run on this card and plan (int8: torchao resident, the torchao-free twin under offload; fp8: torchao
-    resident only). ``keep=False`` (the user asked for the bf16 DiT) dequantizes everything."""
+    resident only); under offload, fp8 layers neither runtime takes stay stored as fp8, widened per layer
+    (``fp8_storage_wanted``).
+    ``keep=False`` (the user asked for the bf16 DiT) dequantizes everything."""
     if not keep:
-        return {"int8_backend": None, "fp8_backend": None}
+        return {"int8_backend": None, "fp8_backend": None, "fp8_storage": False}
     offload = not _video_comfy_resident(plan, bf16_plan)
     name = getattr(fam, "name", None)
     return {
         "int8_backend": comfy_int8_backend(target, name, base, offload = offload),
         "fp8_backend": comfy_fp8_backend(target, name, base, offload = offload),
+        "fp8_storage": _video_fp8_storage(fam, target, offload),
     }
+
+
+def _video_fp8_storage(fam: Any, target: Any, offload: bool) -> bool:
+    """``fp8_storage_wanted`` for a video DiT: stored as fp8 when the plan offloads it (or the env forces it). H3's
+    loader keeps its torchao-or-dequantize rule (its pin / stream / residency path is built on torchao weights)."""
+    return getattr(fam, "name", None) != "minimax-h3" and fp8_storage_wanted(
+        target, offload = offload
+    )
 
 
 def _video_comfy_resident_mib(
@@ -510,7 +523,7 @@ def _video_comfy_resident_mib(
     int8 runtime runs here, fp8 layers as fp8 when the resident fp8 path does, the rest at bf16 (a dequantized fp8
     file is twice its size on disk). ``offload`` prices what an offloaded load keeps instead."""
     name = getattr(fam, "name", None)
-    keep_int8 = keep_fp8 = False
+    keep_int8 = keep_fp8 = fp8_stored = False
     exclude: tuple = ()
     filters: dict = {}
     if keep:
@@ -530,11 +543,13 @@ def _video_comfy_resident_mib(
         # Only a resident runtime keeps codes in a resident plan; an offloaded plan is re-priced.
         keep_int8 = bool(comfy_int8_backend(target, name, base, offload = offload))
         keep_fp8 = comfy_fp8_backend(target, name, base, offload = offload) is not None
+        fp8_stored = _video_fp8_storage(fam, target, offload)
     return comfy_resident_mib(
         str(path),
         scan,
         keep_int8 = keep_int8,
         keep_fp8 = keep_fp8,
+        fp8_stored = fp8_stored,
         keep_key = keep_key,
         exclude_tokens = exclude,
         key_map = _video_comfy_key_map(fam),
@@ -3021,9 +3036,13 @@ def _video_seed_stays_resident(
 
 
 def _render_under_no_grad(state: Any) -> bool:
-    """Render under no_grad: torchao weight subclasses fail an offload hook's in-place swap under inference_mode."""
+    """Render under no_grad: torchao weight subclasses fail an offload hook's in-place swap under inference_mode.
+    Stored fp8 layers (plain buffers) under offload too: moved under inference_mode they become inference tensors
+    the offload hook cannot version, so every offload would copy them back to fresh host memory."""
     if not getattr(state, "transformer_quant", None):
-        return False
+        return getattr(state, "offload_policy", OFFLOAD_NONE) != OFFLOAD_NONE and bool(
+            pipe_fp8_stored_layers(getattr(state, "pipe", None))
+        )
     if getattr(state, "denoiser_streamed", False):
         return True
     family = getattr(state, "family", None)

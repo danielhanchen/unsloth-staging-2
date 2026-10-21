@@ -36,6 +36,12 @@ QUANT_METADATA_KEY = "_quantization_metadata"
 LEGACY_SCALED_FP8_KEY = "scaled_fp8"
 COMFY_INT8_ENV = "UNSLOTH_DIFFUSION_COMFY_INT8"
 COMFY_FP8_ENV = "UNSLOTH_DIFFUSION_COMFY_FP8"
+# fp8 layers no fp8 GEMM takes can stay stored as fp8 (+ scale) and widen per layer in the forward, as ComfyUI's
+# manual_cast does. Unset: only where the widened load would offload the denoiser or run short of host RAM (the per-layer
+# widen costs eager steps); ``1``: every such load; ``0``: never (widen at load, twice the host RAM and VRAM).
+FP8_STORAGE_ENV = "UNSLOTH_DIFFUSION_FP8_STORAGE"
+# Host RAM left free after a widened single-file load before fp8 storage is preferred.
+FP8_STORAGE_HOST_RESERVE_MIB = 4096
 # Header metadata our own converter writes (base model, scheme); ComfyUI ignores it.
 CONVERSION_RECORD_KEY = "unsloth_comfy_conversion"
 
@@ -269,12 +275,30 @@ _DTYPE_BYTES = {
 }
 
 
+def fp8_stored_by_header(
+    fmt: str,
+    shape: Any,
+    name: str = "",
+    keep_fp32: Any = (),
+) -> bool:
+    """The header-side rule for which fp8 layers fp8 storage keeps as codes, shared by the host RAM estimate
+    (``load_comfy_quant_transformer``) and the planner's size (``comfy_resident_mib(fp8_stored=True)``): a 2-D
+    float8 weight outside the fp32-kept modules. The loader's own test (an ``nn.Linear`` after conversion) can only
+    widen more, and that widen is still charged live."""
+    return (
+        fmt in FP8_FORMATS
+        and len(shape or ()) == 2
+        and not any(m in str(name).split(".") for m in (keep_fp32 or ()))
+    )
+
+
 def comfy_resident_mib(
     path: Optional[str],
     scan: Optional[ComfyQuantScan] = None,
     *,
     keep_int8: bool,
     keep_fp8: bool,
+    fp8_stored: bool = False,
     keep_nvfp4: bool = False,
     keep_mxfp8: bool = False,
     compute_bytes: int = 2,
@@ -335,6 +359,7 @@ def comfy_resident_mib(
             and _fits(shape, 0)
         ) or (
             (layer.format == FP8_E4M3 and keep_fp8 and _fits(shape, fp8_divisible))
+            or (fp8_stored and fp8_stored_by_header(layer.format, shape))
             or (
                 {NVFP4: keep_nvfp4, MXFP8: keep_mxfp8}.get(layer.format, False)
                 # input smoothing has no runtime Linear: the loader dequantizes such a layer
@@ -829,7 +854,8 @@ def comfy_fp8_backend(
     quant runs natively (ROCm, the stubbed torchao), None (dequantize to bf16) where neither runs: an
     older GPU, CPU, MPS, or an offloaded plan on the torchao path (the model offload hooks cannot move a
     ``Float8Tensor``: "Attempted to set the storage of a tensor on device cuda:0 to a storage on ... cpu").
-    ``UNSLOTH_DIFFUSION_COMFY_FP8=0`` always dequantizes."""
+    ``UNSLOTH_DIFFUSION_COMFY_FP8=0`` never takes an fp8 GEMM; the layers are then stored as fp8 and widened per
+    layer (``comfy_fp8_storage``) unless ``UNSLOTH_DIFFUSION_FP8_STORAGE=0`` too."""
     if (os.environ.get(COMFY_FP8_ENV) or "").strip().lower() in ("0", "off", "false", "no"):
         return None
     try:
@@ -853,6 +879,72 @@ def comfy_fp8_backend(
     except Exception:  # noqa: BLE001 -- an unanswerable probe takes the exact dense path
         pass
     return None
+
+
+# Set on a transformer whose fp8 Linears were stored as fp8 (``comfy_fp8_storage``): how many.
+FP8_STORED_ATTR = "_unsloth_fp8_stored"
+
+
+def fp8_stored_layers(model: Any) -> int:
+    """How many Linears of ``model`` a loader kept stored as fp8 and widens per forward (they cannot carry a LoRA)."""
+    try:
+        return int(getattr(model, FP8_STORED_ATTR, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def pipe_fp8_stored_layers(pipe: Any) -> int:
+    """``fp8_stored_layers`` summed over a pipeline's denoisers (``transformer``, ``transformer_2``)."""
+    return sum(
+        fp8_stored_layers(getattr(pipe, attr, None)) for attr in ("transformer", "transformer_2")
+    )
+
+
+def fp8_storage_disabled() -> bool:
+    return (os.environ.get(FP8_STORAGE_ENV) or "").strip().lower() in ("0", "off", "false", "no")
+
+
+def fp8_storage_forced() -> bool:
+    return (os.environ.get(FP8_STORAGE_ENV) or "").strip().lower() in ("1", "on", "true", "yes")
+
+
+def fp8_storage_wanted(
+    target: Any = None,
+    *,
+    lora: bool = False,
+    offload: bool = False,
+    widened_mib: Optional[int] = None,
+    host_available_mib: Optional[int] = None,
+) -> bool:
+    """The default rule: store fp8 (``comfy_fp8_storage``) where widening at load would offload the denoiser
+    (``offload``: the plan priced at the widened size does not keep it resident) or leave under
+    ``FP8_STORAGE_HOST_RESERVE_MIB`` of host RAM (``widened_mib`` vs ``host_available_mib``). Elsewhere the widened
+    weight stays the default: same output, and eager steps skip the per-layer widen (measured +45% s/step eager on
+    Krea 2 / B200, parity compiled). ``UNSLOTH_DIFFUSION_FP8_STORAGE=1`` stores on every load that can."""
+    if not comfy_fp8_storage(target, lora = lora):
+        return False
+    if fp8_storage_forced() or offload:
+        return True
+    if widened_mib is None or host_available_mib is None:
+        return False
+    return int(widened_mib) + FP8_STORAGE_HOST_RESERVE_MIB > int(host_available_mib)
+
+
+def comfy_fp8_storage(target: Any = None, *, lora: bool = False) -> bool:
+    """Whether fp8 layers no fp8 GEMM runtime takes keep their fp8 codes and scale, widened per layer inside the
+    forward (``NativeWeightOnlyLinear``, scheme fp8) instead of dequantized at load. The forward rebuilds exactly the
+    weight the load-time dequant would have held, so outputs are unchanged; only the stored bytes halve. Off with
+    ``UNSLOTH_DIFFUSION_FP8_STORAGE=0``, for a LoRA (adapters need dense Linears), on MPS (no float8) and on a torch
+    without float8 dtypes. Torch imported lazily."""
+    if lora or fp8_storage_disabled():
+        return False
+    if str(getattr(target, "device", "") or "").split(":")[0] == "mps":
+        return False
+    try:
+        import torch
+        return hasattr(torch, "float8_e4m3fn") and hasattr(torch, "float8_e5m2")
+    except Exception:  # noqa: BLE001 -- no torch: nothing to store
+        return False
 
 
 def comfy_conversion_record(path: Optional[str]) -> dict:
@@ -979,6 +1071,7 @@ def load_comfy_quant_transformer(
     key_map: Any = None,
     prepare_model: Any = None,
     keep_dtype: Any = None,
+    fp8_storage: Optional[bool] = None,
 ) -> Any:
     """Build ``transformer_cls`` from the ComfyUI-quantized ``path``.
 
@@ -991,7 +1084,9 @@ def load_comfy_quant_transformer(
     as per-row ``Float8Tensor`` weights or native fp8 twins; with an ``nvfp4_backend`` / ``mxfp8_backend``
     (``diffusion_comfy_block.comfy_block_backend``) the nvfp4 / mxfp8 layers the matching Studio filter selects
     keep their codes on Studio's FlashInfer NVFP4 Linear / the ``torch._scaled_mm`` MXFP8 Linear. Everything
-    else is dequantized to the compute dtype. ``finalize`` applies the small-M padding here (the single-file path); the hosted
+    else is dequantized to the compute dtype, except fp8 Linears under ``fp8_storage`` (None: only when
+    ``UNSLOTH_DIFFUSION_FP8_STORAGE=1``; callers with a plan pass ``fp8_storage_wanted``), which keep their codes and scale and widen per layer in the forward (the same
+    weight, half the bytes). ``finalize`` applies the small-M padding here (the single-file path); the hosted
     prequant loader passes False and pads after placement, as for its own checkpoints.
 
     ``keep_key(key)`` limits the read to the DiT's keys of a file that bundles other components;
@@ -1037,6 +1132,9 @@ def load_comfy_quant_transformer(
         # Studio's fp8 runtime asserts bf16 weights; an fp16 / fp32 pipeline dequantizes them instead.
         fp8_backend = None
         mxfp8_backend = None
+    if fp8_storage is None:
+        # no plan to judge by: only the explicit opt-in (callers with a plan pass fp8_storage_wanted)
+        fp8_storage = fp8_storage_forced() and comfy_fp8_storage(target)
     if keep_key is None:
         state = load_file(str(path))
     else:
@@ -1086,15 +1184,41 @@ def load_comfy_quant_transformer(
     # Mirrors the source loop below: a layer is kept as codes only with a runtime for its format (fp16_keep
     # merely defers the dtype choice; the layer is still expanded) and, for a block format, no key map.
     # nvfp4 headers describe packed uint8 (K / 2 columns); the dense weight is N x K.
+    # fp8 storage keeps its layers as the memory-mapped codes (0 here); their fp32 row scales are added below.
+    header_shapes = {}
+    if fp8_storage:
+        try:
+            _hdr, _ = _read_header(str(path))
+            header_shapes = {
+                k: (v or {}).get("shape") for k, v in _hdr.items() if k != "__metadata__"
+            }
+        except Exception:  # noqa: BLE001 -- the estimate then prices them widened (conservative)
+            header_shapes = {}
+
+    def _stored(layer: Any) -> bool:
+        shape = header_shapes.get(layer.name + ".weight")
+        return (
+            bool(fp8_storage)
+            and shape is not None
+            and fp8_stored_by_header(
+                layer.format, shape, layer.name, keep_fp32 if fp16_keep else ()
+            )
+        )
+
     _widened = {
         layer.name + ".weight": (
             (2 if layer.format == NVFP4 else 1)
-            if not backends.get(layer.format)
+            if not (backends.get(layer.format) or _stored(layer))
             or (layer.format in BLOCK_SIZES and key_map is not None)
             else 0
         )
         for layer in scan.layers.values()
     }
+    _stored_scale_bytes = sum(
+        4 * int(header_shapes[layer.name + ".weight"][0])
+        for layer in scan.layers.values()
+        if _stored(layer) and not backends.get(layer.format)
+    )
     # The header estimate refuses early; the budget it activates is charged by every allocating helper
     # below, so a layer the estimate cannot see (runtime filters, nibble swaps) still cannot OOM the host.
     budget = HostRamBudget(
@@ -1108,6 +1232,7 @@ def load_comfy_quant_transformer(
             dequantized = _widened.get,
             keep_key = keep_key,
         )
+        + _stored_scale_bytes
     )
     budget.activate()
     sources: list = []  # (layer, codes, scale, block extras or None) kept for a runtime
@@ -1133,9 +1258,9 @@ def load_comfy_quant_transformer(
         elif layer.format in FP8_FORMATS and codes.dtype == torch.uint8:
             codes = codes.view(getattr(torch, layer.format))
         # A key-mapped (original-layout) family moves rows whole, which the tiled block scales do not survive.
-        if (backends.get(layer.format) or fp16_keep) and not (
-            extra is not None and key_map is not None
-        ):
+        if (
+            backends.get(layer.format) or fp16_keep or (fp8_storage and layer.format in FP8_FORMATS)
+        ) and not (extra is not None and key_map is not None):
             sources.append((layer, codes, scale, extra))
             state[layer.name + ".weight"] = None  # placeholder, tagged below
         elif extra is not None:
@@ -1278,6 +1403,7 @@ def load_comfy_quant_transformer(
     modules = dict(model.named_modules())
     rotations: dict = {}
     native: dict = {}
+    stored: dict = {}  # fqn -> (codes, scale): fp8 Linears no fp8 GEMM takes, widened per layer in the forward
     block_native: dict = {}  # fqn -> (fmt, codes, scale, tensor_scale, input_scale, bias)
     built = {TQ_INT8: 0, TQ_FP8: 0, TQ_NVFP4: 0, TQ_MXFP8: 0}
     for name, value in list(converted.items()):
@@ -1331,6 +1457,20 @@ def load_comfy_quant_transformer(
                 weight = _int8_tensor(name, codes, scale, dtype)
             else:
                 weight = _fp8_tensor(name, codes, scale, dtype, fast_accum)
+        if (
+            weight is None
+            and fp8_storage
+            and fmt in FP8_FORMATS
+            and not group
+            and isinstance(module, torch.nn.Linear)
+            and name.endswith(".weight")
+            and _dtype_for(name) == dtype
+            and not any(m in fqn.split(".") for m in keep_fp32)
+        ):
+            # the forward's widen is ``_dequant`` for this layer: (codes fp32 * row scale fp32).to(compute dtype)
+            stored[fqn] = (codes, scale.reshape(-1, 1).expand(codes.shape[0], 1))
+            del converted[name]
+            continue
         if weight is None:
             converted[name] = _dequant(codes, scale, group, _dtype_for(name))
             dequantized += 1
@@ -1360,6 +1500,16 @@ def load_comfy_quant_transformer(
                 codes = codes,
                 scale = scale,
             )
+            setattr(parent, leaf, layer)
+            converted[fqn + ".weight_q"] = layer.weight_q
+            converted[fqn + ".weight_scale"] = layer.weight_scale
+        for fqn, (codes, scale) in stored.items():
+            parent_name, _, leaf = fqn.rpartition(".")
+            parent = model.get_submodule(parent_name) if parent_name else model
+            charge_host_ram(
+                4 * int(codes.shape[0])
+            )  # the fp32 row scale; the codes stay as read (a view)
+            layer = cls(getattr(parent, leaf).to(dtype), TQ_FP8, codes = codes, scale = scale)
             setattr(parent, leaf, layer)
             converted[fqn + ".weight_q"] = layer.weight_q
             converted[fqn + ".weight_scale"] = layer.weight_scale
@@ -1462,7 +1612,8 @@ def load_comfy_quant_transformer(
         logger.info(
             "diffusion.comfy_quant: %s loaded from a ComfyUI checkpoint (%s): %d int8 layers kept as "
             "int8 (%s, %d ConvRot), %d fp8 layers kept as fp8 (%s), %d nvfp4 layers kept as nvfp4 (%s), "
-            "%d mxfp8 layers kept as mxfp8 (%s), %d layers dequantized to %s",
+            "%d mxfp8 layers kept as mxfp8 (%s), %d fp8 layers stored as fp8 and widened per layer to %s, "
+            "%d layers dequantized to %s",
             transformer_cls.__name__,
             ", ".join(f"{k} x{v}" for k, v in sorted(scan.counts().items())),
             built[TQ_INT8],
@@ -1474,6 +1625,8 @@ def load_comfy_quant_transformer(
             f"{nvfp4_backend} runtime" if built[TQ_NVFP4] else "no nvfp4 runtime",
             built[TQ_MXFP8],
             f"{mxfp8_backend} runtime" if built[TQ_MXFP8] else "no mxfp8 runtime",
+            len(stored),
+            str(dtype).replace("torch.", ""),
             dequantized,
             str(dtype).replace("torch.", ""),
         )
@@ -1486,6 +1639,9 @@ def load_comfy_quant_transformer(
             "fp8": built[TQ_FP8],
             "dequantized": dequantized,
         }
+        if stored:
+            info["fp8_stored"] = len(stored)
+            setattr(model, FP8_STORED_ATTR, len(stored))
         for fmt, backend in ((NVFP4, nvfp4_backend), (MXFP8, mxfp8_backend)):
             if scan.counts().get(fmt):
                 info[f"{fmt}_backend"] = backend if built[schemes[fmt]] else None
