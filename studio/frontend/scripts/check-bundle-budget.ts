@@ -369,8 +369,10 @@ export const BUDGET = {
   // 6,729.6 KB raw / 2,027.3 KB transfer (Node 24, 98 chunks). Raised to that plus about 200 B.
   // Passive Settings update check: +24 B raw / +43 B transfer against e24fa71e1b
   // (6,891,238 -> 6,891,262 raw, 2,076,088 -> 2,076,131 transfer, Node 26). Raised by that.
-  transferBytes: 2_076_193,
-  rawBytes: 6_891_324,
+  // Settings API / Remote / LAN strings (#14596) merged with main at c2f75c486c: 6,891,550 B raw / 2,076,208 B
+  // transfer (Node 26, 98 chunks). Raised to that plus about 200 B.
+  transferBytes: 2_076_400,
+  rawBytes: 6_891_750,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the

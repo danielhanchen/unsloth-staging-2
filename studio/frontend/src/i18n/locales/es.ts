@@ -3154,6 +3154,7 @@ export const es = {
       relativeNever: "nunca",
       relativeJustNow: "justo ahora",
       expired: "caducado",
+      expiredStatus: "Caducado",
       today: "hoy",
       created: "Creado {value}",
       used: "Usado {value}",

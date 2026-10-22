@@ -3234,6 +3234,7 @@ export const he = {
       relativeNever: "אף פעם",
       relativeJustNow: "זה עתה",
       expired: "פג תוקף",
+      expiredStatus: "פג תוקף",
       today: "היום",
       created: "נוצר {value}",
       used: "שימוש אחרון {value}",

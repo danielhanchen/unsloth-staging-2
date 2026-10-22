@@ -97,6 +97,12 @@ def test_anthropic_lists_past_the_default_page(mock_http):
     assert "limit" not in mock_http[-1].url.params
 
 
+def test_gemini_lists_past_the_default_page(mock_http):
+    base = "https://generativelanguage.googleapis.com/v1beta"
+    _run(ExternalProviderClient("gemini", base, "AIza").list_models())
+    assert mock_http[-1].url.params["pageSize"] == "1000"
+
+
 @pytest.mark.parametrize(
     "status,expected",
     [

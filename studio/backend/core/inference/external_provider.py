@@ -7673,8 +7673,10 @@ class ExternalProviderClient:
     async def _models_payload(self, timeout: Any) -> tuple[Any, list[dict[str, Any]]]:
         response = await _client().get(
             f"{self.base_url}/models",
-            # Anthropic pages 20 models by default; 1000 is its documented maximum.
-            params = {"limit": 1000} if self.provider_type == "anthropic" else None,
+            # Anthropic pages 20 models and native Gemini 50 by default; both cap a page at 1000.
+            params = {"anthropic": {"limit": 1000}, "gemini": {"pageSize": 1000}}.get(
+                self.provider_type
+            ),
             headers = self._auth_headers(),
             timeout = timeout,
         )
