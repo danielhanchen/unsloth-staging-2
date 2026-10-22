@@ -40,6 +40,7 @@ import { normalizeEscapedInlineMath } from "@/lib/escaped-inline-math";
 import { preprocessLaTeX } from "@/lib/latex";
 import { withDataImageSupport } from "@/lib/markdown-data-images";
 import { downloadFile, isDownloadCancelled, urlToBlob } from "@/lib/native-files";
+import { backendPathUrl, desktopSignedMediaPath } from "@/lib/api-base";
 import { openLink } from "@/lib/open-link";
 import { safeMarkdownUrl } from "@/lib/safe-markdown-url";
 import { Tick02Icon } from "@/lib/tick-icon";
@@ -235,10 +236,10 @@ const MarkdownImage = memo(function MarkdownImage(props: ComponentProps<"img">) 
   const activeThreadId = useChatRuntimeStore((state) => state.activeThreadId);
   const projectId = useChatProjectScope();
   const file = src
-    ? markdownSandboxImageSrc(src, {
+    ? (markdownSandboxImageSrc(src, {
         threadId: remoteId ?? activeThreadId ?? undefined,
         projectId,
-      })
+      }) ?? desktopSignedMediaPath(src))
     : null;
   const sandbox = useSandboxImage(file);
   const [failedSrc, setFailedSrc] = useState<string | null>(null);
@@ -369,13 +370,14 @@ function MarkdownLink({ href, children, ...props }: ComponentProps<"a">) {
       </SandboxFileLink>
     );
   }
+  const target = href ? backendPathUrl(href) : href;
   const link = (
     <a
-      href={href}
+      href={target}
       rel="noopener noreferrer"
       className={LINK_CLASS}
       onClick={(e) => {
-        if (href && openLink(href)) {
+        if (target && openLink(target)) {
           e.preventDefault();
         }
       }}
@@ -384,7 +386,7 @@ function MarkdownLink({ href, children, ...props }: ComponentProps<"a">) {
       {children}
     </a>
   );
-  return href ? <WebLinkContextMenu href={href}>{link}</WebLinkContextMenu> : link;
+  return target ? <WebLinkContextMenu href={target}>{link}</WebLinkContextMenu> : link;
 }
 
 function SandboxFileLink({
