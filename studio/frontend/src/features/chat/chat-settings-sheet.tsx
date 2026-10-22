@@ -536,6 +536,42 @@ export function ChatSettingsPanel({
     );
   }, [open, isCompact, settingsWidth, settingsScale, uiSpaceScale]);
   const currentCheckpoint = params.checkpoint;
+  const setRememberedParamsForModel = useChatRuntimeStore(
+    (s) => s.setRememberedParamsForModel,
+  );
+  // Without this a chat's sampling stays that chat's: new chats start from the model's memory.
+  const saveSamplingForCurrentModel = async () => {
+    const modelId = currentCheckpoint;
+    const current = params;
+    try {
+      const { saveSamplingForModel } = await import(
+        "./lib/save-sampling-for-model"
+      );
+      await saveSamplingForModel(modelId, current);
+      const sampling = {
+        temperature: current.temperature,
+        topP: current.topP,
+        topK: current.topK,
+        minP: current.minP,
+        minPMode: current.minPMode,
+        repetitionPenalty: current.repetitionPenalty,
+        presencePenalty: current.presencePenalty,
+      };
+      // Writing the memory also sets the live sliders: skip it if one moved during the save.
+      const live = useChatRuntimeStore.getState().params;
+      if (
+        live.checkpoint === modelId &&
+        Object.entries(sampling).every(
+          ([key, value]) => live[key as keyof typeof sampling] === value,
+        )
+      ) {
+        setRememberedParamsForModel(modelId, sampling);
+      }
+      toast.success("Sampling saved for this model.");
+    } catch (error: unknown) {
+      toast.error(error instanceof Error ? error.message : String(error));
+    }
+  };
   const activeModelIsLocal = useChatRuntimeStore(
     (s) => s.activeModelIsLocal,
   );
@@ -1736,6 +1772,22 @@ export function ChatSettingsPanel({
             <RetrievalSettingsSection />
           </CollapsibleSection>
             )}
+
+            {!isExternalModel && currentCheckpoint ? (
+          <div className="border-t border-[rgb(0_0_0_/_calc(0.13*var(--contrast-edge-gain,1)))] py-5 dark:border-[rgb(255_255_255_/_calc(0.09*var(--contrast-edge-gain,1)))]">
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="w-full"
+              onClick={() => {
+                saveSamplingForCurrentModel().catch(() => undefined);
+              }}
+            >
+              Save for this model
+            </Button>
+          </div>
+            ) : null}
       </div>
       </div>
       </div>
