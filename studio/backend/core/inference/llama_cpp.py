@@ -2285,6 +2285,7 @@ def _archive_and_recall(
     recall_budget_tokens: int = 0,
     count_tokens: Optional[Callable[[list[dict]], int]] = None,
     branch_messages: Optional[list[dict]] = None,
+    cancel_check: Optional[Callable[[], bool]] = None,
 ) -> dict:
     """Keep the turns this fit evicted, then pull the relevant ones back.
 
@@ -2314,14 +2315,18 @@ def _archive_and_recall(
         # recall slots on text already in the prompt.
         archived = (
             conversation_archive.archive_turns(
-                thread_id, gone, live = conversation, branch = branch_messages or conversation
+                thread_id,
+                gone,
+                live = conversation,
+                branch = branch_messages or conversation,
+                cancel_check = cancel_check,
             )
             if gone
             else 0
         )
         counts = {"archived_messages": archived}
 
-        if recall_done:
+        if recall_done or (cancel_check is not None and cancel_check()):
             result["counts"] = counts
             return result
         if not force_recall:
@@ -39868,6 +39873,7 @@ class LlamaCppBackend:
                             chat_template_kwargs = _reasoning_kw,
                             continue_final_message = continue_final_message,
                         ),
+                        cancel_check = lambda: bool(cancel_event and cancel_event.is_set()),
                     )
                     openai_messages = _recalled["conversation"]
                     truncation = {**truncation, **_recalled["counts"]}
@@ -40942,6 +40948,7 @@ class LlamaCppBackend:
                                 strict = True,
                                 chat_template_kwargs = _reasoning_kw,
                             ),
+                            cancel_check = lambda: bool(cancel_event and cancel_event.is_set()),
                         )
                         conversation = _recalled["conversation"]
                         truncation = {**truncation, **_recalled["counts"]}
@@ -41103,6 +41110,7 @@ class LlamaCppBackend:
                                 style = "inline",
                                 recall_done = True,
                                 branch_messages = _extend_live_branch(conversation),
+                                cancel_check = lambda: bool(cancel_event and cancel_event.is_set()),
                             )["counts"]
                         )
                     payload["messages"] = neutralize_control_markup_in_messages(
@@ -43792,6 +43800,7 @@ class LlamaCppBackend:
                             strict = True,
                             chat_template_kwargs = _reasoning_kw,
                         ),
+                        cancel_check = lambda: bool(cancel_event and cancel_event.is_set()),
                     )
                     conversation = _recalled["conversation"]
                     truncation = {**truncation, **_recalled["counts"]}
@@ -43936,6 +43945,7 @@ class LlamaCppBackend:
                             style = "inline",
                             recall_done = True,
                             branch_messages = _extend_live_branch(conversation),
+                            cancel_check = lambda: bool(cancel_event and cancel_event.is_set()),
                         )["counts"]
                     )
                 # Recorded rather than only forwarded, for the same reason as the

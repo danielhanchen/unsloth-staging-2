@@ -1464,6 +1464,179 @@ def test_a_first_compaction_embeds_its_turns_in_one_pass(conn, monkeypatch):
     assert calls[0] >= 12
 
 
+def test_archive_embed_honors_cancel_between_batches(conn, monkeypatch):
+    """Chat Stop must interrupt the pre-inference SentenceTransformer.encode (#14519)."""
+    from core.rag import embeddings
+
+    thread_id = "cancel-embed-thread"
+    _save_thread(thread_id, _turn("hello", "hi"), append = True)
+    monkeypatch.setattr(conversation_archive, "_ARCHIVE_EMBED_BATCH", 2)
+    monkeypatch.setattr(conversation_archive, "_ARCHIVE_EMBED_MAX_CHUNKS_DEFAULT", 10_000)
+
+    calls = []
+    real = embeddings.encode_with_identity
+
+    def counted(texts, **kwargs):
+        calls.append(len(texts))
+        return real(texts, **kwargs)
+
+    monkeypatch.setattr(embeddings, "encode_with_identity", counted)
+
+    evicted = []
+    for index in range(8):
+        evicted.append({"role": "user", "content": f"cancel question {index} unique {index}"})
+        evicted.append({"role": "assistant", "content": f"cancel answer {index} unique {index}"})
+
+    def cancel_check():
+        return bool(calls)
+
+    written = conversation_archive.archive_turns(thread_id, evicted, cancel_check = cancel_check)
+    assert 0 < written < 8
+    assert len(calls) == 1
+    assert conversation_archive.archive_turns(thread_id, evicted) == 8 - written
+
+
+def test_archive_embed_caps_chunks_per_call(conn, monkeypatch):
+    """A huge first compaction must not monopolise the generation path (#14519)."""
+    from core.rag import embeddings
+
+    thread_id = "cap-embed-thread"
+    _save_thread(thread_id, _turn("hello", "hi"), append = True)
+    monkeypatch.setenv("RAG_ARCHIVE_EMBED_MAX_CHUNKS", "4")
+    monkeypatch.setattr(conversation_archive, "_ARCHIVE_EMBED_BATCH", 64)
+
+    calls = []
+    real = embeddings.encode_with_identity
+
+    def counted(texts, **kwargs):
+        calls.append(len(texts))
+        return real(texts, **kwargs)
+
+    monkeypatch.setattr(embeddings, "encode_with_identity", counted)
+
+    evicted = []
+    for index in range(10):
+        evicted.append({"role": "user", "content": f"cap question {index} unique token {index}"})
+        evicted.append({"role": "assistant", "content": f"cap answer {index} unique token {index}"})
+
+    first = conversation_archive.archive_turns(thread_id, evicted)
+    assert 0 < first < 10
+    assert calls and calls[0] <= 4
+    total = first
+    for _ in range(10):
+        written = conversation_archive.archive_turns(thread_id, evicted)
+        if not written:
+            break
+        total += written
+    assert total == 10
+    assert all(n <= 4 for n in calls)
+    assert conversation_archive.archive_turns(thread_id, evicted) == 0
+
+
+def test_a_stop_before_chunking_skips_the_embedder_entirely(conn, monkeypatch):
+    """Stop already set: no tokenizer load, no chunking, no encode (#14519)."""
+    from core.rag import embeddings
+
+    thread_id = "stop-early-thread"
+    _save_thread(thread_id, _turn("hello", "hi"), append = True)
+    touched = []
+    monkeypatch.setattr(embeddings, "token_counter", lambda *_a, **_k: touched.append("count"))
+    monkeypatch.setattr(
+        conversation_archive, "chunk_pages", lambda *_a, **_k: touched.append("chunk")
+    )
+    evicted = _turn("early question", "early answer")
+
+    assert conversation_archive.archive_turns(thread_id, evicted, cancel_check = lambda: True) == 0
+    assert touched == []
+
+
+def test_chunking_stops_once_the_cap_is_reached(conn, monkeypatch):
+    """A long backlog must not be tokenized in full when only the cap's worth is embedded."""
+    thread_id = "cap-chunk-thread"
+    _save_thread(thread_id, _turn("hello", "hi"), append = True)
+    monkeypatch.setenv("RAG_ARCHIVE_EMBED_MAX_CHUNKS", "3")
+    real = conversation_archive.chunk_pages
+    chunked = []
+
+    def counted(*args, **kwargs):
+        chunked.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(conversation_archive, "chunk_pages", counted)
+    evicted = []
+    for index in range(20):
+        evicted += _turn(f"chunk question {index} unique {index}", f"chunk answer {index}")
+
+    assert conversation_archive.archive_turns(thread_id, evicted) == 3
+    assert len(chunked) == 3
+
+
+def test_archive_embed_restarts_in_the_new_space_after_a_backend_swap(conn, monkeypatch):
+    """Batches before an ST -> llama-server swap must not be written under the old identity."""
+    from core.rag import embeddings
+
+    thread_id = "swap-embed-thread"
+    _save_thread(thread_id, _turn("hello", "hi"), append = True)
+    monkeypatch.setattr(conversation_archive, "_ARCHIVE_EMBED_BATCH", 2)
+    monkeypatch.setattr(conversation_archive, "_ARCHIVE_EMBED_MAX_CHUNKS_DEFAULT", 10_000)
+
+    real = embeddings.encode_with_identity
+    calls = []
+
+    def swapping(texts, **kwargs):
+        calls.append(len(texts))
+        vectors, _identity = real(texts, **kwargs)
+        return vectors, "sentence-transformers:old" if len(calls) <= 2 else "llama-server:new"
+
+    monkeypatch.setattr(embeddings, "encode_with_identity", swapping)
+
+    evicted = []
+    for index in range(8):
+        evicted.append({"role": "user", "content": f"swap question {index} unique {index}"})
+        evicted.append({"role": "assistant", "content": f"swap answer {index} unique {index}"})
+
+    assert conversation_archive.archive_turns(thread_id, evicted) == 8
+    scope = store.conversation_archive_scope(thread_id)
+    labels = {
+        row[0]
+        for row in conn.execute("SELECT embedding_model FROM documents WHERE scope = ?", (scope,))
+    }
+    assert labels == {"llama-server:new"}
+
+
+def test_archive_embed_failure_keeps_completed_batches(conn, monkeypatch):
+    """A batch failing late in a long pass must not discard the batches before it (#14519)."""
+    from core.rag import embeddings
+
+    thread_id = "fail-embed-thread"
+    _save_thread(thread_id, _turn("hello", "hi"), append = True)
+    monkeypatch.setattr(conversation_archive, "_ARCHIVE_EMBED_BATCH", 2)
+    monkeypatch.setattr(conversation_archive, "_ARCHIVE_EMBED_MAX_CHUNKS_DEFAULT", 10_000)
+
+    real = embeddings.encode_with_identity
+    calls = []
+
+    def flaky(texts, **kwargs):
+        calls.append(len(texts))
+        if len(calls) == 3:
+            raise TimeoutError("embedder timed out")
+        return real(texts, **kwargs)
+
+    monkeypatch.setattr(embeddings, "encode_with_identity", flaky)
+
+    evicted = []
+    for index in range(8):
+        evicted.append({"role": "user", "content": f"fail question {index} unique {index}"})
+        evicted.append({"role": "assistant", "content": f"fail answer {index} unique {index}"})
+
+    written = conversation_archive.archive_turns(thread_id, evicted)
+    assert 0 < written < 8
+    assert conversation_archive.degraded()
+    calls.clear()
+    assert conversation_archive.archive_turns(thread_id, evicted) == 8 - written
+    assert sum(calls) <= 8 - written
+
+
 VARIABLE = "ZQXVARA123"
 
 
