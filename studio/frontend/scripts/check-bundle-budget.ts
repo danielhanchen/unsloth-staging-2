@@ -387,8 +387,21 @@ export const BUDGET = {
   // at c5a9fe021: 6,912,687 B raw / 2,082,221 B transfer (Node 24, 97 chunks). Raised to that plus about 200 B.
   // The MLX PLE and expert offload controls (#14326): +7,406 B raw / +2,073 B transfer, plus about 500 B raw
   // (a CI build measured about 100 B over a local one). Raised by that.
-  transferBytes: 2_084_696,
-  rawBytes: 6_920_821,
+  // The Settings > MCP tab and per-tool toggles add 1,966 B raw / 738 B transfer (measured against d9aded3801, one
+  // machine and build, Node 24, 96 -> 97 chunks): the tab panel is lazy, so the growth is its strings in the eager
+  // English catalog plus the TABS, search and palette entries. The 97th chunk is api-provider-logo, split out of the
+  // eager providers-api chunk, not new code. Raised by that.
+  // Merged with main at 725455e1a the build measures 6,922,232 B raw / 2,085,011 B transfer (Node 24, 98 chunks).
+  // Raised to that plus 500 B raw / 200 B transfer (CI builds measure about 100 B over local ones).
+  // The chat's Unsloth Studio tools preset and the "Not in chat" note add 233 B raw / 15 B transfer (measured
+  // against the MCP tab build, one machine and build, Node 24, 97 chunks), in the eager chat chunk and English
+  // catalog. Raised by that.
+  // Opening backend media links against the backend on Desktop adds 82 B raw (6,861,779 -> 6,861,861 B raw,
+  // 2,066,292 -> 2,066,268 B transfer, one machine and build, Node 22, 97 chunks). Raised by that.
+  // Merged with the MCP tab branch at b27d49b31 the build measures 6,922,638 B raw / 2,085,153 B transfer (Node 24,
+  // 98 chunks). Raised to that plus 500 B raw / 200 B transfer.
+  transferBytes: 2_085_353,
+  rawBytes: 6_923_138,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
