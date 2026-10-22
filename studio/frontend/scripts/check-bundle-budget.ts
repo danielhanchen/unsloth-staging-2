@@ -383,8 +383,10 @@ export const BUDGET = {
   // transfer (Node 26, 98 chunks). Raised to that plus about 200 B.
   // Apple unified-memory fit hint (#14598) merged with main at a29487c52: 6,909,320 B raw / 2,081,284 B
   // transfer (Node 26, 98 chunks). Raised to that plus about 200 B.
-  transferBytes: 2_081_484,
-  rawBytes: 6_909_520,
+  // The MLX PLE and expert offload controls (#14326): +7,406 B raw / +2,073 B transfer, plus about 500 B raw
+  // (a CI build measured about 100 B over a local one). Raised by that.
+  transferBytes: 2_083_759,
+  rawBytes: 6_917_454,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
