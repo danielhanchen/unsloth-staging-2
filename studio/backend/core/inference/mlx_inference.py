@@ -4978,13 +4978,12 @@ class MLXInferenceBackend:
                     reason,
                 )
                 model = tokenizer_or_processor = _eligibility = None
-        if model is None:
-            import gc
-
-            # Outside the except: its traceback keeps the failed load's weights alive.
-            gc.collect()
-            _drain_generation_streams(mx)
-            mx.clear_cache()
+        # unsloth-zoo builds an image checkpoint mlx-vlm lacks through mlx-lm, whose image
+        # inputs this backend does not read yet: serve it as the text model it loaded as.
+        served_as_text = use_vlm and getattr(model, "_is_vlm_model", None) is False
+        if served_as_text:
+            is_vision = False
+        if model is None or served_as_text:
             if speculates:
                 speculates = False
                 spec_reason = (
@@ -4995,6 +4994,13 @@ class MLXInferenceBackend:
             elif self._turboquant:
                 self._turboquant_refusal = MLX_TURBOQUANT_TEXT_LOAD
             use_vlm = False
+        if model is None:
+            import gc
+
+            # Outside the except: its traceback keeps the failed load's weights alive.
+            gc.collect()
+            _drain_generation_streams(mx)
+            mx.clear_cache()
             load_kwargs["text_only"] = True
             model, tokenizer_or_processor = FastMLXModel.from_pretrained(
                 load_source,
@@ -5019,11 +5025,15 @@ class MLXInferenceBackend:
             self._processor = None
             self._is_vlm = False
 
+        _config_audio_type = getattr(config, "audio_type", None)
+        if served_as_text and _config_audio_type == "audio_vlm":
+            # Omni audio input rides mlx-vlm's processor, which a text load does not have.
+            _config_audio_type = None
         _audio_type = _classify_mlx_audio_type(
             model,
             self._processor,
             is_vision,
-            config_audio_type = getattr(config, "audio_type", None),
+            config_audio_type = _config_audio_type,
         )
         _served_ctx, _native_ctx, _max_ctx = self._resolve_context_lengths(
             self._model, max_seq_length
