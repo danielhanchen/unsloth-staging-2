@@ -412,8 +412,10 @@ export const BUDGET = {
   // Skill ZIP import/export (#14181) adds 2,721 B raw / 758 B transfer to the eager Skills dialog
   // and locale strings (6,929,934 -> 6,932,655 B raw, 2,087,782 -> 2,088,540 B transfer against
   // fb104d2b57, one machine and build, Node 22.23.2, unchanged at 99 chunks). Raised by that growth.
-  transferBytes: 2_088_648,
-  rawBytes: 6_932_971,
+  // Scheduled tasks (#13871) add 14,794 B raw / 4,463 B transfer (results poll, unseen dots, strings;
+  // page and dialog lazy) against main 245c2b1c7, one machine and build. Raised by that growth.
+  transferBytes: 2_093_111,
+  rawBytes: 6_947_765,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
