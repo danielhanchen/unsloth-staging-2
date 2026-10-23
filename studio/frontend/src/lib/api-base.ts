@@ -64,4 +64,14 @@ export function isStudioUrl(url: string): boolean {
   }
 }
 
+// Media tools link to the backend origin-relative; Desktop's webview origin is not the backend's.
+export function backendPathUrl(url: string): string {
+  return /^\/(v1|api)\//.test(url) ? apiUrl(url) : url
+}
+
+// Signed backend media (the token is the credential): Desktop's img-src blocks the loopback backend, so fetch it.
+export function desktopSignedMediaPath(url: string): string | null {
+  return apiBase && /^\/(?:api|v1)\/[^?#]+\/file-signed\?token=[^&#]+$/.test(url) ? url : null
+}
+
 export { isTauri }
