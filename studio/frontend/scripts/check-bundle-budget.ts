@@ -409,8 +409,32 @@ export const BUDGET = {
   // The waiting-for-approval mark, Desktop attention request and tool_approved handling (#14877): measured
   // 6,929,942 B raw / 2,087,788 B transfer merged with main at b3004af53 (Node 24, 99 chunks). Set to
   // that plus about 300 B raw / 100 B transfer, as for #14568.
-  transferBytes: 2_087_890,
-  rawBytes: 6_930_250,
+  // The paused and queued chat states (admission status, the paused continuation reason) add 2.3 KB
+  // raw / 1.0 KB transfer to the eager chat chunk (6,570.6 -> 6,572.9 KB raw, 1,975.5 -> 1,976.5 KB
+  // transfer against b8d76e169, one machine and build). They render on the first chat screen, so
+  // raised by that.
+  // The exact concurrency setting, its chat chip and their strings in every eager locale add 4.5 KB
+  // raw / 1.2 KB transfer to the eager settings and chat chunks (6,572.9 -> 6,577.4 KB raw,
+  // 1,976.5 -> 1,977.7 KB transfer against bfab55021, one machine and build), raised by that.
+  // Together they measure 7,058 B raw / 2,903 B transfer against c77695db2 (6,743,283 -> 6,750,341 B
+  // raw, 2,026,381 -> 2,029,284 B transfer, one machine and build).
+  // Re-measured merged with main at 3ba06aa596: +7,310 B raw / +2,259 B transfer (6,886,472 -> 6,893,782 B raw,
+  // 2,075,354 -> 2,077,613 B transfer, one machine and build, Node 24, 98 chunks). Set to main's limits plus that
+  // growth, keeping main's 528 B raw / 196 B transfer above the measured build.
+  // Merged with main at c0c0759bb9, which adds the passive Settings update check (+24 B raw / +43 B transfer):
+  // raised by that.
+  // Merged with main at f76dd22958, whose limits rose by +1,892 B raw / +702 B transfer since c0c0759bb9: raised by that.
+  // Merged with main at 3569dfa8a5, whose limits rose by +16,304 B raw / +4,589 B transfer since f76dd22958: raised by that.
+  // Merged with main at 9880bc0af9, whose limits rose by +11,301 B raw / +3,212 B transfer since 3569dfa8a5: raised by that.
+  // Merged with main at aab980fe77. CI on the previous head measured 6,765.1 KB raw / 2,037.8 KB transfer (over by 3.5 KB / 0.3 KB:
+  // the summed limits under-counted). This merge measured 6,766.0 KB raw / 2,038.1 KB transfer (Node 24, 97 chunks): set to that plus about 200 B.
+  // Merged with main at 96ccc9a256: measured 6,767.9 KB raw / 2,038.8 KB transfer (Node 24, 98 chunks), set to that plus about 200 B.
+  // Merged with main at 14e0178e00: measured 6,770.5 KB raw / 2,039.7 KB transfer (Node 24, 98 chunks), set to that plus
+  // about 300 B raw / 100 B transfer (CI measures about 100 B over a local build).
+  // Merged with main at fb104d2b57: measured 6,774.6 KB raw / 2,041.2 KB transfer (Node 24, 99 chunks), set to that plus
+  // about 300 B raw / 100 B transfer (CI measures about 100 B over a local build).
+  transferBytes: 2_090_340,
+  rawBytes: 6_937_540,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
