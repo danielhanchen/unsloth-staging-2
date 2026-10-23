@@ -409,8 +409,9 @@ export const BUDGET = {
   // The waiting-for-approval mark, Desktop attention request and tool_approved handling (#14877): measured
   // 6,929,942 B raw / 2,087,788 B transfer merged with main at b3004af53 (Node 24, 99 chunks). Set to
   // that plus about 300 B raw / 100 B transfer, as for #14568.
-  transferBytes: 2_087_890,
-  rawBytes: 6_930_250,
+  // Scheduled tasks (#13871): +17,533 B raw / +5,578 B transfer vs main at d95472002 (page and dialog lazy).
+  transferBytes: 2_093_468,
+  rawBytes: 6_947_783,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
