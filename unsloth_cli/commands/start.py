@@ -87,6 +87,10 @@ _DSH_SAFE_PERMISSION_MODE = "workspace-write"
 _DSH_YOLO_PERMISSION_MODE = "danger-full-access"
 # dsh's pi-ai provider sends max_tokens = contextWindow - its prompt estimate - 4,096 (pi-ai CONTEXT_SAFETY_TOKENS), floored at 1, and dsh's own instructions and tools are about 6,500 tokens: at 8,192 every reply is cut after one token (#14315).
 _DSH_MIN_CONTEXT = 16384
+# First request of a stock install (system prompt + tool schemas) before any user text, measured on Claude Code 2.1 and OpenCode 1.19 / 2.1. MCP servers and project instructions add to it.
+_CLAUDE_PROMPT_TOKENS = 16_000
+_OPENCODE_PROMPT_TOKENS = 7_500
+_OPENCODE_V2_PROMPT_TOKENS = 5_500
 _PI_PROVIDER = "unsloth"
 _SUBAGENT_NAME = "unsloth"
 _SUBAGENT_DESCRIPTION = (
@@ -205,6 +209,10 @@ _OPENCODE_PROVIDER = "unsloth-studio"
 # OpenCode sends min(limit.output, this) as max_tokens unless the env var below raises it.
 _OPENCODE_OUTPUT_TOKEN_MAX = 32_000
 _CLAUDE_COMPACT_OUTPUT_RESERVE = 20_000
+# Claude Code 2.1.307-2.1.309 compact one token past window - min(max output, 20k) - 3k, in the TUI and -p alike.
+_CLAUDE_COMPACT_BUFFER = 3_000
+# claude 2.1 ignores a smaller CLAUDE_CODE_AUTO_COMPACT_WINDOW and warns about it on every launch.
+_CLAUDE_MIN_AUTO_COMPACT_WINDOW = 100_000
 _OPENCODE_OUTPUT_TOKEN_MAX_ENV = "OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"
 _VIBE_PROVIDER = "unsloth-studio"
 _VIBE_MODEL_ALIAS = "unsloth"
@@ -3259,9 +3267,12 @@ def _claude_local_env(
     if window:
         # claude assumes 200k for a model id it does not recognize, and clamps AUTO_COMPACT_WINDOW to [100k, that]. MAX_CONTEXT_TOKENS sets the window itself.
         env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(int(window))
-        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(int(window))
+        # Blank, not omitted, below the floor so an inherited value cannot apply; MAX_CONTEXT_TOKENS still bounds compaction there.
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = (
+            str(int(window)) if int(window) >= _CLAUDE_MIN_AUTO_COMPACT_WINDOW else ""
+        )
         env["CLAUDE_AUTOCOMPACT_PCT_OVERRIDE"] = "90"
-        # claude reserves min(max output, 20k) + 13k before compacting, so its 32k default output leaves a 32k window nothing; above 20k the cap gains no room.
+        # claude reserves min(max output, 20k) + 3k before compacting, so its 32k default output would take 20k of a 32k window; above 20k the cap gains no room.
         output = opencode_output_limit(int(window))
         if output < _CLAUDE_COMPACT_OUTPUT_RESERVE:
             env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(output)
@@ -5361,6 +5372,80 @@ def opencode_compaction_reserved(window: int, output: int) -> int:
     return max(1, min(output, max(window // 10, 8192)))
 
 
+def _agent_compacts_at(
+    agent: str,
+    window: int,
+    max_tokens: Optional[int] = None,
+) -> int:
+    if agent == "claude":
+        output = min(opencode_output_limit(window), _CLAUDE_COMPACT_OUTPUT_RESERVE)
+        return min(window * 9 // 10, window - output - _CLAUDE_COMPACT_BUFFER)
+    return window - opencode_compaction_reserved(window, opencode_output_limit(window, max_tokens))
+
+
+def _check_agent_context(
+    agent: str,
+    name: str,
+    entry: dict,
+    prompt_tokens: int,
+    max_tokens: Optional[int] = None,
+    loaded: bool = True,
+    refuse: bool = True,
+    model: Optional[str] = None,
+    gguf_variant: Optional[str] = None,
+) -> None:
+    window = entry.get("context_length") or entry.get("max_context_length")
+    if not window:
+        return
+    window = int(window)
+    roomy = 2 * prompt_tokens
+    compacts_at = _agent_compacts_at(agent, window, max_tokens)
+    # Before the load only refuse; the window Studio actually fits is checked again after it.
+    if compacts_at >= roomy or (not loaded and (compacts_at >= prompt_tokens or not refuse)):
+        return
+    suggested = next(
+        (
+            size
+            for size in (1 << bits for bits in range(14, 21))
+            if _agent_compacts_at(agent, size, max_tokens) >= roomy
+        ),
+        1 << 20,
+    )
+    native = int(entry.get("native_context_length") or 0)
+    if native:
+        suggested = min(suggested, native)
+    if native and (
+        native <= window or _agent_compacts_at(agent, native, max_tokens) < prompt_tokens
+    ):
+        hint = f"Its full context is {native:,} tokens, so pick a model with a longer one."
+    else:
+        quote = _powershell_quote if os.name == "nt" else shlex.quote
+        target = f" --model {quote(model)}" if model else ""
+        if gguf_variant:
+            target += f" --gguf-variant {quote(gguf_variant)}"
+        hint = (
+            f"Run unsloth start {agent}{target} --max-seq-length {suggested} "
+            "(a smaller quant if that does not fit in memory)."
+        )
+    state = "is loaded" if loaded else "would load"
+    if compacts_at < prompt_tokens:
+        message = (
+            f"{entry['id']} {state} with {window:,} tokens of context, too few for {name}: "
+            f"its own instructions and tools take about {prompt_tokens:,}, so it would compact "
+            f"on every message. {hint}"
+        )
+        if refuse:
+            _fail(message)
+        typer.echo(f"Warning: {message}", err = True)
+        return
+    typer.echo(
+        f"Warning: {entry['id']} {state} with {window:,} tokens of context, and {name}'s "
+        f"instructions and tools take about {prompt_tokens:,} of it (more with MCP servers), "
+        f"so it will compact often. {hint}",
+        err = True,
+    )
+
+
 def _opencode_output_env(model: dict, max_tokens: Optional[int]) -> dict:
     """Lift OpenCode's output ceiling when --max-tokens exceeds it; re-emit an inherited one so a --no-launch recipe keeps it."""
     window = model.get("context_length") or model.get("max_context_length")
@@ -6977,6 +7062,20 @@ def claude(
     )
     # Before the install prompt: _install_agent runs a remote installer, and this can refuse outright, so asking first fetches a tool the run cannot use.
     _preflight_agent_gguf(_CLAUDE_GGUF_AGENT, model, serve = serve, launch = launch)
+    # Only a bare interactive launch is refused: its prompt is the stock one and the TUI would hide a warning. Forwarded args (-p, --tools, a --no-launch recipe a driver extends) can shrink the prompt, so they only warn.
+    refuse_small_context = launch and not ctx.args
+    if max_seq_length > 0 and not as_subagent:
+        # Before the load, which would evict the resident model only for this to refuse.
+        _check_agent_context(
+            "claude",
+            "Claude Code",
+            {"id": model or "The loaded model", "context_length": max_seq_length},
+            _CLAUDE_PROMPT_TOKENS,
+            loaded = False,
+            model = model,
+            gguf_variant = gguf_variant,
+            refuse = refuse_small_context,
+        )
     _require_agent_for_launch("claude", install_hint, launch)
     server_options = ServerOptions(
         enable_tools = enable_tools,
@@ -7008,6 +7107,16 @@ def claude(
     try:
         if not entry.get("connection"):
             _require_gguf_for_agent(_CLAUDE_GGUF_AGENT, base, key, entry["id"])
+        if not as_subagent:
+            _check_agent_context(
+                "claude",
+                "Claude Code",
+                entry,
+                _CLAUDE_PROMPT_TOKENS,
+                refuse = refuse_small_context,
+                model = model,
+                gguf_variant = gguf_variant,
+            )
     except BaseException:
         _shutdown_auto_served()
         raise
@@ -7373,6 +7482,20 @@ def opencode(
     _check_app_flags(app, ctx.args, as_subagent)
     command_name, opencode_v2 = _opencode_command()
     install_hint = _npm_install_hint("@opencode/cli" if opencode_v2 else "opencode-ai")
+    opencode_prompt_tokens = _OPENCODE_V2_PROMPT_TOKENS if opencode_v2 else _OPENCODE_PROMPT_TOKENS
+    refuse_small_context = launch and not ctx.args
+    if max_seq_length > 0 and not as_subagent and not app:
+        _check_agent_context(
+            "opencode",
+            "OpenCode",
+            {"id": model or "The loaded model", "context_length": max_seq_length},
+            opencode_prompt_tokens,
+            max_tokens,
+            loaded = False,
+            model = model,
+            gguf_variant = gguf_variant,
+            refuse = refuse_small_context,
+        )
     _require_agent_for_launch(command_name, install_hint, launch and not app)
     server_options = ServerOptions(
         enable_tools = enable_tools,
@@ -7406,6 +7529,21 @@ def opencode(
     if app:
         target = _opencode_app_target(max_tokens, server_options.request_body())
         return _add_app_provider(target, base, api_key, entry)
+    if not as_subagent:
+        try:
+            _check_agent_context(
+                "opencode",
+                "OpenCode",
+                entry,
+                opencode_prompt_tokens,
+                max_tokens,
+                refuse = refuse_small_context,
+                model = model,
+                gguf_variant = gguf_variant,
+            )
+        except BaseException:
+            _shutdown_auto_served()
+            raise
     if opencode_v2:
         typer.echo(
             f"OpenCode V2 provider policies must allow '{_OPENCODE_PROVIDER}'.",
