@@ -51538,6 +51538,7 @@ async def diffusion_download_plan(
                 gpu_ordinal = gpu_ordinal,
                 gguf_filename = request.gguf_filename,
                 engine = request.engine,
+                with_loras = bool(request.loras),
             )
             if fam is not None
             else None
@@ -51863,6 +51864,7 @@ async def load_diffusion_model_gated(
                     gpu_ordinal = gpu_ordinal,
                     gguf_filename = request.gguf_filename,
                     engine = request.engine,
+                    with_loras = bool(request.loras),
                 )
                 if fam is not None
                 else None
@@ -52007,6 +52009,7 @@ async def load_diffusion_model_gated(
                 gguf_filename = request.gguf_filename,
                 # The load's own engine pick (auto when absent); refused there rather than swapped.
                 engine = request.engine,
+                with_loras = bool(request.loras),
             ),
         )
         # predict_engine is selection's read-only twin: it never installs, so a host whose sd-cli
