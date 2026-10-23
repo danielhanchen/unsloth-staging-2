@@ -102,9 +102,13 @@ class _FakePrefetcher(sh._EncoderPrefetcher):
             ):
                 raise RuntimeError("copy failed")
             self.copies.append((group.name, threading.current_thread() is threading.main_thread()))
-        with self.cond:
-            self.peak_inflight = max(self.peak_inflight, self.inflight + group.nbytes)
+        if threading.current_thread() is not threading.main_thread():
+            with self.cond:
+                self.peak_inflight = max(self.peak_inflight, self.inflight + group.nbytes)
         return [group.name], None, group.nbytes
+
+    def _group_bytes(self, group):
+        return group.nbytes
 
     def _attach(self, group, moved, done):
         self.attached.append(moved[0])
@@ -154,8 +158,61 @@ def test_prefetch_stays_within_the_byte_budget():
     assert pf.peak_inflight <= pf.budget + sh._PREFETCH_MIN_BYTES // 4
 
 
+def test_prefetch_with_no_budgeted_room_starts_no_worker(monkeypatch):
+    """#14816 r9: a zero budget copies every group synchronously instead of one group ahead."""
+    monkeypatch.setattr(sh, "_prefetch_budget_bytes", lambda device: 0)
+    groups = [_FakeGroup(f"g{i}", 10) for i in range(6)]
+    pf = _FakePrefetcher(groups)
+    _forward(pf, groups)
+    pf.copies.clear()
+    pf.begin()
+    try:
+        assert pf.worker is None
+        for g in groups:
+            pf.onload(g)
+    finally:
+        pf.end()
+    assert pf.stats["prefetched"] == 0 and pf.stats["sync"] == 12
+    assert all(main for _n, main in pf.copies) and pf.inflight == 0 and not pf.ready
+    assert pf.order == [id(g) for g in groups]
+
+
 def test_prefetch_one_oversized_group_still_progresses():
     groups = [_FakeGroup("big", sh._PREFETCH_MAX_BYTES * 4), _FakeGroup("small", 1)]
+    pf = _FakePrefetcher(groups)
+    _forward(pf, groups)
+    _forward(pf, groups)
+    assert pf.stats["prefetched"] == 2
+
+
+def test_lowered_budget_copies_a_group_over_the_window_synchronously(monkeypatch):
+    """Codex #14816 r10: under a lowered Budget a whole next group larger than the window would eat the reserve."""
+    monkeypatch.setattr(sh, "_prefetch_budget_bytes", lambda device: 256 * sh._MIB)
+    monkeypatch.setattr(sh, "_prefetch_budget_lowered", lambda device: True, raising = False)
+    big = 1536 * sh._MIB
+    groups = [
+        _FakeGroup("a", big),
+        _FakeGroup("s0", 100 * sh._MIB),
+        _FakeGroup("b", big),
+        _FakeGroup("s1", 100 * sh._MIB),
+        _FakeGroup("s2", 100 * sh._MIB),
+    ]
+    pf = _FakePrefetcher(groups)
+    _forward(pf, groups)
+    pf.copies.clear()
+    _forward(pf, groups)
+    on_worker = [n for n, main in pf.copies if not main]
+    assert "a" not in on_worker and "b" not in on_worker
+    assert sorted(on_worker) == ["s0", "s1", "s2"]
+    assert pf.peak_inflight <= 256 * sh._MIB
+    assert pf.attached[-5:] == [g.name for g in groups]
+    assert pf.stats["prefetched"] == 3 and not pf.skipped and pf.inflight == 0
+
+
+def test_default_budget_still_prefetches_an_oversized_group(monkeypatch):
+    monkeypatch.setattr(sh, "_prefetch_budget_bytes", lambda device: 256 * sh._MIB)
+    monkeypatch.setattr(sh, "_prefetch_budget_lowered", lambda device: False, raising = False)
+    groups = [_FakeGroup("a", 1536 * sh._MIB), _FakeGroup("s0", 1)]
     pf = _FakePrefetcher(groups)
     _forward(pf, groups)
     _forward(pf, groups)
