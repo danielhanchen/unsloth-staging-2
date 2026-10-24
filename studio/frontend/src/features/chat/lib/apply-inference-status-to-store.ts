@@ -14,6 +14,7 @@ import { loadedPlacementFrom } from "./partial-offload";
 import { normalizeMlxKvQuant } from "@/features/model-picker/model-config/per-model-config";
 import { modelDisplayName } from "@/features/hub/lib/model-identity";
 import { getInferenceStatus } from "../api/chat-api";
+import { normalizeExactConcurrency } from "./exact-concurrency";
 import { isSpeechOnlyStatus } from "./speech-only-status";
 import {
   mergeBackendRecommendedInference,
@@ -500,6 +501,8 @@ export function applyActiveModelStatusToStore(
     defaultChatTemplate: nextDefaultChatTemplate,
     loadedIsMultimodal: isMultimodalResponse(status),
     loadedIsDiffusion: status.is_diffusion ?? false,
+    loadedExactConcurrency: normalizeExactConcurrency(status.exact_concurrency),
+    loadedRequestedExactConcurrency: status.requested_exact_concurrency ?? null,
     activeModelIsLocal: status.is_local_model ?? false,
     specFallbackReason: status.spec_fallback_reason ?? null,
     mmprojFallbackReason: status.mmproj_fallback_reason ?? null,

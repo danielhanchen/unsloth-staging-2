@@ -119,6 +119,10 @@ import {
 } from "../search-images/search-images";
 import { parseParamCountB } from "@/lib/model-size";
 import { createLoadingToastIcon, toast } from "@/lib/toast";
+import {
+  type AdmissionStatus,
+  admissionStatusLabel,
+} from "../utils/admission-status";
 import { notifyPromptQueueRunFailed } from "../utils/prompt-queue-boundary";
 import {
   providerCompactionConnectionKey,
@@ -378,6 +382,7 @@ import { resolveLoadMaxSeqLength } from "../presets/preset-policy";
 import type { CachedGgufRepo, CachedModelRepo } from "./chat-api";
 import {
   budgetImpliesTruncation,
+  completedAfterGivingUp,
   CONTINUE_INSTRUCTION,
   continuationSeed,
   createContinuationMerger,
@@ -385,13 +390,16 @@ import {
   incompleteLabel,
   incompleteReasonAfterError,
   type IncompleteReason,
+  isPreemptGaveUp,
   isRestart,
   noteRunStartedThisSession,
   readIncompleteInfo,
   resolveIncompleteReason,
   readContinuationRequest,
+  resumesEarlierTurn,
   rejectsAssistantPrefill,
   resumesExactly,
+  withRecomputedModel,
 } from "../utils/continuation";
 import {
   claimLiveGenerationRun,
@@ -629,6 +637,10 @@ type ThreadAutosaveHandle = {
 };
 
 const pendingFirstThreadSaves = new Map<string, Promise<void>>();
+
+function recomputedOnField(recomputed: boolean, modelIds: string[]): string[] | undefined {
+  return recomputed && modelIds.length > 0 ? modelIds : undefined;
+}
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -5034,6 +5046,7 @@ export function createOpenAIStreamAdapter(
       };
       const deepResearchHandoff = newDeepResearchHandoff();
       const continuation = readContinuationRequest(runConfig);
+      const resumesTurn = continuation !== null || resumesEarlierTurn(runConfig);
       let deepResearchArmed =
         runtime.deepResearchEnabled &&
         !options.pairId &&
@@ -5619,7 +5632,7 @@ export function createOpenAIStreamAdapter(
       // the uncontinuable audio path.
       const audioBase64 = findLatestUserAudioBase64(
         survivingMessages,
-        !queuedRunSettings && !continuation,
+        !queuedRunSettings && !resumesTurn,
       );
       const videoBase64 = findLatestUserVideoBase64(survivingMessages);
 
@@ -5776,7 +5789,7 @@ export function createOpenAIStreamAdapter(
         // A tool-only image needs the live stream to ask before it is sent.
         mcpImage ||
           findLatestUserImageBase64(currentTurnMessages) ||
-          findLatestUserAudioBase64(currentTurnMessages, !queuedRunSettings && !continuation) ||
+          findLatestUserAudioBase64(currentTurnMessages, !queuedRunSettings && !resumesTurn) ||
           findLatestUserVideoBase64(currentTurnMessages),
       );
       const generationCandidate = isDurableRunCandidate({
@@ -6011,6 +6024,12 @@ export function createOpenAIStreamAdapter(
       };
       let codexRoundToolCallIds: string[] = [];
       let contextTruncation: OpenAIChatChunk["context_truncated"];
+      // Persisted with the message so the chip's note survives a reload; seeded from the continued
+      // answer.
+      let sawPreemptRecompute = continuation?.preemptRecomputed === true;
+      let preemptRecomputedOn: string[] =
+        continuation?.preemptRecomputedModelIds ??
+        (sawPreemptRecompute ? withRecomputedModel([], params.checkpoint) : []);
       let compactionMarkers: CompactionMarker[] | undefined;
       let providerCompaction: ProviderCompactionContentPart | undefined =
         continuationCompaction ?? undefined;
@@ -6043,6 +6062,8 @@ export function createOpenAIStreamAdapter(
         openaiCodexReasoning: codexReasoningLedger,
         openaiResponsesReasoning: openAIResponsesReasoningLedger,
         contextTruncation,
+        preemptRecomputed: sawPreemptRecompute || undefined,
+        preemptRecomputedModelIds: recomputedOnField(sawPreemptRecompute, preemptRecomputedOn),
         compactionMarkers,
         providerCompaction,
         providerCompactionAfterToolCalls,
@@ -6069,6 +6090,8 @@ export function createOpenAIStreamAdapter(
       });
       // Why this turn stopped early. Drives the Continue affordance.
       let incompleteReason: IncompleteReason | null = null;
+      // Latched: the notice arrives before the terminal chunk, whose `length` would otherwise win.
+      let preemptGaveUp = false;
       // MLX reports finish_reason "stop" even at the cap, so an exhausted budget is its only truncation signal.
       let requestedMaxTokens: number | undefined;
       // Served window: null if unknown, Infinity if only the output cap can bind.
@@ -7126,7 +7149,7 @@ export function createOpenAIStreamAdapter(
             image_base64: findLatestUserImageBase64(currentTurnMessages),
             audio_base64: findLatestUserAudioBase64(
               currentTurnMessages,
-              !queuedRunSettings && !continuation,
+              !queuedRunSettings && !resumesTurn,
             ),
             extra_audio_base64:
               findLatestUserExtraAudioBase64(currentTurnMessages),
@@ -7401,6 +7424,31 @@ export function createOpenAIStreamAdapter(
                 responseModelId = chunkModel;
               }
 
+              // Queued or paused: neither yields tokens, so without a status line both look wedged.
+              const admissionStatus = (
+                chunk as unknown as { _admissionStatus?: AdmissionStatus }
+              )._admissionStatus;
+              if (admissionStatus !== undefined) {
+                if (admissionStatus === "recomputed") {
+                  sawPreemptRecompute = true;
+                  preemptRecomputedOn = withRecomputedModel(preemptRecomputedOn, params.checkpoint);
+                  yield {
+                    content: liveAssistantContent(),
+                    metadata: {
+                      timing: buildTiming(streamStartTime, totalChunks, firstTokenTime),
+                      custom: liveCustom(),
+                    },
+                  };
+                  continue;
+                }
+                runtime.setToolStatus(
+                  liveThreadKey(serverCancel),
+                  admissionStatusLabel(admissionStatus),
+                  serverCancel,
+                );
+                continue;
+              }
+
               const toolStatusText = (
                 chunk as unknown as { _toolStatus?: string }
               )._toolStatus;
@@ -7428,6 +7476,9 @@ export function createOpenAIStreamAdapter(
                   contextTruncation,
                   chunk.context_truncated,
                 );
+                if (isPreemptGaveUp(chunk.context_truncated)) {
+                  preemptGaveUp = true;
+                }
                 compactionMarkers = appendCompactionMarker(
                   compactionMarkers,
                   chunk.context_truncated,
@@ -8108,6 +8159,9 @@ export function createOpenAIStreamAdapter(
                 incompleteReason = "length";
               } else if (chunk.choices?.[0]?.finish_reason) {
                 incompleteReason = null;
+                if (completedAfterGivingUp(chunk.choices[0].finish_reason)) {
+                  preemptGaveUp = false;
+                }
               }
               const chunkFinishReason = chunk.choices?.[0]?.finish_reason;
               if (typeof chunkFinishReason === "string" && chunkFinishReason) {
@@ -8138,6 +8192,9 @@ export function createOpenAIStreamAdapter(
                 structuredReasoningContinues,
                 hasStructuredReasoning,
               } = extractDeltaText(rawDelta);
+              if (preemptGaveUp && delta) {
+                preemptGaveUp = false;
+              }
               const deltaExtraContent = (
                 chunk.choices?.[0]?.delta as
                   | { extra_content?: unknown }
@@ -8945,6 +9002,10 @@ export function createOpenAIStreamAdapter(
           );
         }
 
+        if (preemptGaveUp) {
+          incompleteReason = "paused";
+        }
+
         // Before the lookup below: its network time is not generation time.
         const finishedAt = Date.now();
 
@@ -9086,6 +9147,8 @@ export function createOpenAIStreamAdapter(
               openaiCodexReasoning: codexReasoningLedger,
               openaiResponsesReasoning: openAIResponsesReasoningLedger,
               contextTruncation,
+              preemptRecomputed: sawPreemptRecompute || undefined,
+              preemptRecomputedModelIds: recomputedOnField(sawPreemptRecompute, preemptRecomputedOn),
               compactionMarkers,
               providerCompaction,
               providerCompactionAfterToolCalls,
@@ -9276,6 +9339,8 @@ export function createOpenAIStreamAdapter(
               custom: {
                 ...reasoningDurationTracker.metadata(),
                 contextTruncation,
+                preemptRecomputed: sawPreemptRecompute || undefined,
+                preemptRecomputedModelIds: recomputedOnField(sawPreemptRecompute, preemptRecomputedOn),
                 compactionMarkers,
                 providerCompaction,
                 providerCompactionAfterToolCalls,
