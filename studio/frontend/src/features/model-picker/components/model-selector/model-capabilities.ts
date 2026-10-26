@@ -50,6 +50,13 @@ const VIDEO_GEN_TAGS = new Set([
   "image-text-to-video",
 ]);
 
+export function isDiffusionTask(task: string | null | undefined): boolean {
+  return (
+    task === "image-diffusion-unsupported" ||
+    (task != null && (IMAGE_GEN_TAGS.has(task) || VIDEO_GEN_TAGS.has(task)))
+  );
+}
+
 // Repo-name fallbacks, bounded so we never read a token out of a longer word.
 const SEP = "(?:^|[-_/. ])";
 const END = "(?=$|[-_/. ])";
