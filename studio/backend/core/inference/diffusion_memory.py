@@ -6192,8 +6192,32 @@ def _pin_budget_mib() -> Optional[int]:
     available = _available_system_memory_mib()
     if total is None or available is None:
         return None
+    available = int(available) + _pin_mapped_cache_credit_mib(int(available))
     reserve = max(_PIN_RESERVE_MIN_MIB, int(int(total) * _PIN_RESERVE_FRACTION))
-    return max(0, int(available) - reserve)
+    return max(0, available - reserve)
+
+
+# 0 restores the stricter cgroup reading that counts mapped file pages on the active list as used.
+PIN_CREDIT_MAPPED_ENV = "UNSLOTH_DIFFUSION_PIN_CREDIT_MAPPED"
+
+
+def _pin_mapped_cache_credit_mib(available_mib: int) -> int:
+    """Clean mapped page cache a capped cgroup reclaims for a pin (pins replace the checkpoint's mmap views), bounded by
+    host MemAvailable, which already counts it on an uncapped host."""
+    if str(os.environ.get(PIN_CREDIT_MAPPED_ENV, "")).strip().lower() in ("0", "off", "false", "no"):
+        return 0
+    try:
+        from utils import host_memory
+
+        credit = host_memory.mapped_cache_credit_mib()
+        if credit <= 0:
+            return 0
+        host = host_memory.system_available_mib()
+        if host is not None:
+            credit = min(credit, max(0, int(host) - available_mib))
+        return credit
+    except Exception:  # noqa: BLE001 - the uncredited reading still stands
+        return 0
 
 
 def _remove_group_offload_hooks(module: Any) -> None:
