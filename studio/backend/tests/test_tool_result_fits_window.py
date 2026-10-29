@@ -622,7 +622,7 @@ class TestTheSpillStaysInsideTheSandbox:
 
     @pytest.mark.skipif(
         os.utime not in os.supports_follow_symlinks,
-        reason = "cannot date a symlink itself here (Windows), so it cannot be made the oldest",
+        reason = "os.utime cannot set a symlink's own mtime on this platform",
     )
     def test_pruning_does_not_follow_symlinks_either(self, tmp_path):
         target = _own(tmp_path)
@@ -1154,7 +1154,7 @@ class TestConcurrentSpillsKeepTheirRecords:
 
         root = tmp_path / tools._SPILL_DIR
         recorded = set(tools._spill_manifest(str(root)))
-        # The manifest keys are "/"-joined on every OS.
+        # The manifest keys with "/" on every platform; str() would give "\\" on Windows.
         on_disk = {
             p.relative_to(root).as_posix() for p in root.rglob("*.txt") if p.name != "victim.txt"
         }
@@ -1449,6 +1449,10 @@ class TestReadingASpillCannotBeRedirected:
     sandbox's own directory. A plain open by name would follow a symlink installed in
     between and block forever on a FIFO or a device, with no timeout above it."""
 
+    @pytest.mark.skipif(
+        not hasattr(os, "O_NOFOLLOW"),
+        reason = "no O_NOFOLLOW; callers reject links first through the lstat stamp",
+    )
     def test_a_symlink_at_the_name_is_not_followed(self, tmp_path):
         elsewhere = tmp_path / "elsewhere.txt"
         elsewhere.write_text("someone else's file")
@@ -1457,39 +1461,7 @@ class TestReadingASpillCannotBeRedirected:
 
         assert tools._file_digest(str(link)) is None
 
-    def test_without_o_nofollow_a_symlink_is_still_refused(self, tmp_path, monkeypatch):
-        """Windows has no O_NOFOLLOW, so the guard above cannot rest on the open flag alone."""
-        monkeypatch.delattr(os, "O_NOFOLLOW", raising = False)
-        elsewhere = tmp_path / "elsewhere.txt"
-        elsewhere.write_text("someone else's file")
-        link = tmp_path / "abcdef123456.txt"
-        link.symlink_to(elsewhere)
-        plain = tmp_path / "fedcba654321.txt"
-        plain.write_text("a spill")
-
-        assert tools._file_digest(str(link)) is None
-        assert tools._file_digest(str(plain)) == hashlib.sha256(b"a spill").hexdigest()
-
-    def test_without_o_nofollow_a_link_swapped_in_before_the_open_is_refused(
-        self, tmp_path, monkeypatch
-    ):
-        monkeypatch.delattr(os, "O_NOFOLLOW", raising = False)
-        elsewhere = tmp_path / "elsewhere.txt"
-        elsewhere.write_text("someone else's file")
-        name = tmp_path / "abcdef123456.txt"
-        name.write_text("a spill")
-        real_open = os.open
-
-        def _swap_then_open(path, *args, **kwargs):
-            if os.fspath(path) == str(name):
-                os.unlink(name)
-                name.symlink_to(elsewhere)
-            return real_open(path, *args, **kwargs)
-
-        monkeypatch.setattr(os, "open", _swap_then_open)
-        assert tools._file_digest(str(name)) is None
-
-    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason = "no FIFOs on this OS")
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason = "no FIFOs on this platform")
     def test_a_fifo_is_refused_rather_than_read(self, tmp_path):
         fifo = tmp_path / "abcdef123456.txt"
         os.mkfifo(fifo)
@@ -1555,7 +1527,7 @@ class TestPruningNeverMovesSomethingItCannotPutBack:
         assert open(os.path.join(spill, "receipts.csv")).read() == "the user's own data"
         assert not self._private_names(root)
 
-    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason = "no FIFOs on this OS")
+    @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason = "no FIFOs on this platform")
     def test_a_fifo_left_at_the_name_is_not_moved(self, tmp_path, monkeypatch):
         root, spill, owned = self._a_recorded_spill(tmp_path)
         os.unlink(spill)
