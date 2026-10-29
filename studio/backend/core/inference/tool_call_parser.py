@@ -2458,6 +2458,16 @@ def _parse_function_xml(
         # Strict mode: a dangling parameter means the call was cut off; a closed zero-parameter call stays valid.
         if not allow_incomplete and param_unclosed:
             continue
+        if allow_incomplete and not param_starts and body.lstrip().startswith("{"):
+            # No <parameter> blocks but a JSON object body: models mix the Hermes and XML forms, and
+            # reading it as zero arguments ran the tool with {} (web_search: "No query provided").
+            # A heal, so only with Auto-Heal on; strict mode keeps the well-formed reading.
+            try:
+                _json_body = json.loads(body.strip())
+            except (json.JSONDecodeError, ValueError, RecursionError):
+                _json_body = None
+            if isinstance(_json_body, dict):
+                args = _json_body
 
         out.append(
             {
