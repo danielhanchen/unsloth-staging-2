@@ -20,19 +20,35 @@ import {
 } from "./components/assistant-ui/reasoning-row-containment";
 import { fetchDeviceType } from "./config/env";
 import { refreshSession } from "./features/auth/api";
+import { getPostAuthRoute, hasAuthToken } from "./features/auth/session";
+import { loadChatPage, prefetchChatPage } from "./features/chat/load-chat-page";
 import {
   applyInterfaceScaleBeforeFirstPaint,
   useInterfaceScaleStore,
 } from "./features/settings/stores/interface-scale-store";
 import { initializeLocale } from "./i18n";
 import { isTauri } from "./lib/api-base";
+import { markAppSessionStart } from "./lib/app-session-start";
 import { setHubSessionRefresh } from "./lib/hf-endpoint";
 import { watchInputModality } from "./lib/input-modality";
 import { watchMacStrayKeyText } from "./lib/mac-stray-key-text";
 import { watchOverlayScrollbarGutter } from "./lib/overlay-scrollbar";
 import { watchSpellCheck } from "./lib/spellcheck";
 
+markAppSessionStart();
 setHubSessionRefresh(refreshSession);
+
+// Chat is where a signed-in session lands ("/" redirects there), so its page is fetched alongside the
+// startup bundle and the first render waits for it, as it did when the page was part of that bundle.
+const startPath = window.location.pathname;
+const chatPageAtStart =
+  startPath === "/chat" ||
+  (startPath === "/" && hasAuthToken() && getPostAuthRoute() === "/chat")
+    ? loadChatPage().then(
+        () => undefined,
+        () => undefined,
+      )
+    : null;
 
 const rootElement = document.getElementById("root");
 if (!rootElement) {
@@ -76,22 +92,43 @@ if (isTauri && /Mac/.test(navigator.platform)) {
   watchMacStrayKeyText(window);
 }
 
+const APP_SHELL_READY_EVENT = "unsloth:app-shell-ready";
+const CHAT_PREFETCH_FALLBACK_MS = 3000;
+
 function renderApp(): void {
   root.render(
     <StrictMode>
       <App />
     </StrictMode>,
   );
+  // Any other first screen: fetch Chat as soon as that screen is up, so opening it later does not
+  // wait. Fetching it during the first frame would slow that screen down. Screens that send no
+  // ready signal get it after CHAT_PREFETCH_FALLBACK_MS; hovering or focusing a Chat entry in the
+  // sidebar starts it sooner.
+  if (!chatPageAtStart) {
+    const prefetchOnce = () => {
+      window.removeEventListener(APP_SHELL_READY_EVENT, afterReady);
+      window.clearTimeout(fallback);
+      prefetchChatPage();
+    };
+    const afterReady = () => {
+      window.setTimeout(prefetchOnce, 0);
+    };
+    window.addEventListener(APP_SHELL_READY_EVENT, afterReady, { once: true });
+    const fallback = window.setTimeout(prefetchOnce, CHAT_PREFETCH_FALLBACK_MS);
+  }
 }
 
 const localeInitialization = initializeLocale();
 const interfaceScaleInitialization = applyInterfaceScaleBeforeFirstPaint(
   useInterfaceScaleStore.getState().scale,
 );
-if (typeof localeInitialization !== "string" || isTauri) {
-  Promise.all([localeInitialization, interfaceScaleInitialization]).then(
-    renderApp,
-  );
+if (typeof localeInitialization !== "string" || isTauri || chatPageAtStart) {
+  Promise.all([
+    localeInitialization,
+    interfaceScaleInitialization,
+    chatPageAtStart,
+  ]).then(renderApp);
 } else {
   renderApp();
 }

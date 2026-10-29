@@ -3,6 +3,10 @@
 
 import { ImageViewer } from "@/components/image-viewer";
 import { useAppShellReadySignal } from "@/components/app-readiness";
+import {
+  LazyImportBoundary,
+  LazyImportFailure,
+} from "@/components/lazy-import-boundary";
 import { AppSidebar } from "@/components/app-sidebar";
 import { CommandPalette } from "@/components/command-palette";
 import { SpookyDecorations } from "@/features/halloween/spooky-decorations";
@@ -21,9 +25,10 @@ import {
   useIsAccountOwner,
 } from "@/features/auth";
 import {
-  ChatPage,
   type ChatSearch,
   hydrateModelDisclaimerPreference,
+  loadChatPage,
+  loadedChatPage,
   openFolderAsProject,
   startLlamaCppAutoReload,
   StopRunningChatsDialog,
@@ -80,6 +85,7 @@ import {
 
   type ReactNode,
   Suspense,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -159,6 +165,64 @@ function RouteBoundary({
       {readyWhenCommitted && <ReloadSnapshotReady />}
       {children}
     </Suspense>
+  );
+}
+
+// Loaded on first use so other screens start without it. Startup on Chat and the prefetch after the
+// first render load it before it mounts, so it renders straight away; only a mount that beats them
+// suspends. A new lazy() per attempt, since lazy() keeps a rejection for good.
+function lazyChatPage() {
+  return lazy(() => loadChatPage().then((m) => ({ default: m.ChatPage })));
+}
+
+function ChatPageLoadFailure({
+  active,
+  onRetry,
+}: {
+  active: boolean;
+  onRetry: () => void;
+}) {
+  const t = useT();
+  const wasActive = useRef(active);
+  // Coming back to Chat after leaving it tries the import again.
+  useEffect(() => {
+    if (active && !wasActive.current) {
+      onRetry();
+    }
+    wasActive.current = active;
+  }, [active, onRetry]);
+  return (
+    <LazyImportFailure
+      message={t("settings.dialog.panelFailed")}
+      reloadLabel={t("settings.dialog.panelReload")}
+      testId="chat-page-load-failure"
+      className="flex h-full min-h-0 flex-1 flex-col items-center justify-center p-6 text-center text-muted-foreground"
+    />
+  );
+}
+
+function ChatPage(props: { search: ChatSearch; active: boolean }) {
+  // Kept until an attempt fails: switching component type would remount the page and drop its state.
+  const [page, setPage] = useState(() => ({
+    attempt: 0,
+    Page: loadedChatPage() ?? lazyChatPage(),
+  }));
+  const retry = useCallback(() => {
+    setPage((current) => ({
+      attempt: current.attempt + 1,
+      Page: loadedChatPage() ?? lazyChatPage(),
+    }));
+  }, []);
+  const { Page } = page;
+  return (
+    <LazyImportBoundary
+      key={page.attempt}
+      fallback={<ChatPageLoadFailure active={props.active} onRetry={retry} />}
+    >
+      <Suspense fallback={<RouteFallback />}>
+        <Page {...props} />
+      </Suspense>
+    </LazyImportBoundary>
   );
 }
 
