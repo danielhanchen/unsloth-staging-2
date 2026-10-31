@@ -24,6 +24,8 @@ def check_page(browser, session, action, followed):
         f"localStorage.setItem('unsloth_auth_token', {json.dumps(session['access_token'])});"
         f"localStorage.setItem('unsloth_refresh_token', {json.dumps(session['refresh_token'])});"
     )
+    context.add_init_script("window.__ubm=[];window.addEventListener('message',e=>{const d=e.data;"
+        "if(d&&d.source==='unsloth-browser')window.__ubm.push([Math.round(performance.now()),d.type,d.url||'']);},true);")
     page = context.new_page()
     label = f"{action}-{'followed' if followed else 'typed'}"
     try:
@@ -73,7 +75,18 @@ def check_page(browser, session, action, followed):
         content = panel.frame_locator('iframe[src*="/api/browser/frame"]').frame_locator("iframe")
         expect(content.get_by_role("link", name = "Follow link")).to_be_visible()
         if followed:
+            _n0 = page.evaluate("window.__ubm.length")
+            _t1 = page.evaluate("performance.now()")
             content.get_by_role("link", name = "Follow link").click()
+            _seen = []
+            for _ in range(32):
+                _v = panel.get_by_role("textbox", name = "Search or enter a URL").input_value()
+                _seen.append(_v.rsplit("/", 1)[-1])
+                if _v == SECOND:
+                    break
+                page.wait_for_timeout(250)
+            _msgs = page.evaluate(f"window.__ubm.slice({_n0})")
+            print(f"FOLLOWPROBE {os.environ.get('STUDIO_PLAYWRIGHT_BROWSER')} {label} t_click={_t1:.0f} addr={_seen[-3:]} n={len(_seen)} msgs={_msgs}", flush = True)
         current = SECOND if followed else FIRST
         title = "Followed page" if followed else "Typed page"
         expect(address).to_have_value(current)
@@ -184,7 +197,7 @@ def main():
         browser = getattr(playwright, engine).launch(**options)
         failures = []
         try:
-            for action in ("Save", "Enter") * 6:
+            for action in ("Save", "Enter") * 10:
                 for followed in (False, True):
                     try:
                         check_page(browser, session, action, followed)
