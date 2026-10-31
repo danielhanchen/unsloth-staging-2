@@ -49,7 +49,22 @@ def check_page(browser, session, action, followed):
 
         page.route("**/api/browser/fetch", fetched_page)
         page.goto(f"{BASE}/chat", wait_until = "domcontentloaded")
-        page.get_by_role("button", name = "New tab", exact = True).click()
+        import time as _t
+        _btn = page.get_by_role("button", name = "New tab", exact = True)
+        _t0 = _t.monotonic()
+        _btn.click()
+        _clicked = _t.monotonic() - _t0
+        _samples = []
+        for _ in range(20):
+            _samples.append((
+                page.get_by_role("region", name = "Browser", exact = True).count(),
+                page.locator('[role="menu"]').count(),
+                _btn.get_attribute("aria-expanded") if _btn.count() else "gone",
+            ))
+            if _samples[-1][0]:
+                break
+            page.wait_for_timeout(250)
+        print(f"PROBE {os.environ.get('STUDIO_PLAYWRIGHT_BROWSER')} {label} click_s={_clicked:.2f} samples={_samples}", flush = True)
         panel = page.get_by_role("region", name = "Browser", exact = True)
         address = panel.get_by_role("textbox", name = "Search or enter a URL")
         address.fill(FIRST)
@@ -169,7 +184,7 @@ def main():
         browser = getattr(playwright, engine).launch(**options)
         failures = []
         try:
-            for action in ("Save", "Enter"):
+            for action in ("Save", "Enter") * 6:
                 for followed in (False, True):
                     try:
                         check_page(browser, session, action, followed)
