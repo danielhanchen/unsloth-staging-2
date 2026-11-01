@@ -1,0 +1,23 @@
+name: metal-nvfp4-check
+on:
+  push:
+jobs:
+  metal:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: "Build ggml, test-backend-ops and ggml-metal-lib (xcrun metal compiles every kernel)"
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=OFF \
+            -DLLAMA_BUILD_TESTS=ON -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_CURL=OFF
+          cmake --build build -j 4 --target ggml test-backend-ops ggml-metal-lib
+          find build -name "*.metallib" -exec ls -la {} \;
+          test -n "$(find build -name 'default.metallib')"
+      - name: NVFP4 ops on Metal
+        run: |
+          cd build/bin
+          ./test-backend-ops -l 2>&1 | head -20 || true
+          for op in MUL_MAT MUL_MAT_ID GET_ROWS; do
+            echo "== $op"; ./test-backend-ops test -b MTL0 -o $op -p nvfp4 2>&1 | tail -6
+          done
+          echo "== support"; ./test-backend-ops support -b MTL0 -o MUL_MAT -p nvfp4 2>&1 | grep -cE "\byes\b" || true
