@@ -11,6 +11,7 @@ import json
 import logging
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -28,6 +29,16 @@ MAX_FRAME_RATE = 4
 MIN_SAMPLED_SECONDS = 1.0
 _PROBE_TIMEOUT_S = 30
 _SHRINK_TIMEOUT_S = 300
+
+
+def video_tools(ffmpeg_dir: Optional[str] = None) -> Optional[tuple[str, str]]:
+    """Resolve the native FFmpeg pair on llama-server's search path."""
+    names = ("ffmpeg.exe", "ffprobe.exe") if sys.platform == "win32" else ("ffmpeg", "ffprobe")
+    if ffmpeg_dir:
+        found = [shutil.which(name, path = ffmpeg_dir) for name in names]
+    else:
+        found = [shutil.which(name) for name in names]
+    return (found[0], found[1]) if found[0] and found[1] else None
 
 
 def _run(argv: list[str], timeout: float) -> subprocess.CompletedProcess:
@@ -186,6 +197,7 @@ def shrink_video_for_llama(
     max_bytes: int,
     max_pixels: int = MAX_FRAME_PIXELS,
     sampled_fps: Optional[float] = None,
+    ffmpeg_dir: Optional[str] = None,
 ) -> str:
     """Make a clip cheap and safe for llama-server to sample, as bare base64.
 
@@ -200,10 +212,10 @@ def shrink_video_for_llama(
         return video_b64
     # Before the tool check: without ffmpeg the clip still reaches llama-server's own FFmpeg.
     refuse_playlist(raw)
-    ffmpeg = shutil.which("ffmpeg")
-    ffprobe = shutil.which("ffprobe")
-    if not ffmpeg or not ffprobe:
+    tools = video_tools(ffmpeg_dir)
+    if tools is None:
         return video_b64
+    ffmpeg, ffprobe = tools
     try:
         with tempfile.TemporaryDirectory(prefix = "unsloth-video-") as tmp:
             source = Path(tmp) / "clip"
