@@ -38,9 +38,14 @@ import { useExportRuntimeLifecycle } from "@/features/export";
 import { FIND_SCOPE_ATTRIBUTE, FindInPage } from "@/features/find-in-page";
 import { HfTokenWarningDialog } from "@/features/hf-auth";
 import { InterfaceZoom, zoomInterfaceFromMenu } from "@/features/interface-zoom";
-import { bootstrapPersistedCredentials } from "@/features/credentials/bootstrap";
-import { ManagedEngineOfferDialog } from "@/features/model-picker/components/managed-engine-offer-dialog";
-import { SharedRunConfigLinkHandler } from "@/features/model-picker/sharing/link-handler";
+import {
+  bootstrapPersistedCredentials,
+  takeStartupCredentialBootstrap,
+} from "@/features/credentials/bootstrap";
+import {
+  ManagedEngineOfferDialog,
+  SharedRunConfigLinkHandler,
+} from "@/features/model-picker";
 import { backfillModelOverrides } from "@/features/model-picker/api/migrate-model-overrides";
 import { hydratePins } from "@/lib/pins-mirror";
 import { usePersonalizationSync } from "@/features/profile";
@@ -315,7 +320,9 @@ function CredentialBootstrapGate({
         return;
       }
       setReady(false);
-      void bootstrapPersistedCredentials().finally(() => {
+      void (
+        takeStartupCredentialBootstrap() ?? bootstrapPersistedCredentials()
+      ).finally(() => {
         if (
           mounted &&
           revision === runRevision.current &&
