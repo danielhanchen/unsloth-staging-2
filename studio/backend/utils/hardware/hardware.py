@@ -2606,6 +2606,17 @@ def _smi_visible_utilization(parent_visible_spec: Dict[str, Any]) -> Optional[Di
     """SMI visible-GPU utilization keyed by the parent's ids. amd-smi filters by its own gpu ids, not HIP's, so translate when the mapping is readable."""
     ids = parent_visible_spec["numeric_ids"]
     smi_ids = _amd_smi_ids_for_hip_ids(ids) if IS_ROCM and ids else None
+    if IS_ROCM and ids and smi_ids is None and not _rocm_visibility_mask_active():
+        from . import amd
+
+        runtime_count = _torch_get_physical_gpu_count()
+        physical_count = amd.get_physical_gpu_count()
+        if (
+            runtime_count is not None
+            and physical_count is not None
+            and runtime_count != physical_count
+        ):
+            return None
     result = _smi_query(
         "get_visible_gpu_utilization",
         ids if smi_ids is None else smi_ids,
@@ -5179,6 +5190,45 @@ _ROCM_DISCRETE_ONLY_ARCHES = frozenset(
 )
 
 
+_KFD_TOPOLOGY_NODES = "/sys/class/kfd/kfd/topology/nodes"
+_DRI_DIR = "/dev/dri"
+
+
+def _rocm_kfd_render_nodes_openable() -> bool:
+    """True when every AMD GPU KFD node's DRM render node opens. libhsakmt drops a node whose render device it
+    cannot open and renumbers the rest, so a container given only some render nodes sees fewer GPUs than KFD sysfs
+    lists, and KFD order is no longer HIP order. Opening a render node creates no GPU context."""
+    try:
+        entries = sorted((int(e), e) for e in os.listdir(_KFD_TOPOLOGY_NODES) if e.isdigit())
+    except OSError:
+        return False
+    for _node, entry in entries:
+        try:
+            with open(
+                os.path.join(_KFD_TOPOLOGY_NODES, entry, "properties"), encoding = "utf-8"
+            ) as fh:
+                props = fh.read()
+        except (OSError, UnicodeDecodeError):
+            return False
+        simd = re.search(r"\bsimd_count\s+(\d+)\b", props)
+        if simd is None or int(simd.group(1)) <= 0:
+            continue
+        if not re.search(r"\bvendor_id\s+%d\b" % _AMD_PCI_VENDOR_ID, props):
+            continue
+        minor = re.search(r"\bdrm_render_minor\s+(\d+)\b", props)
+        if minor is None or int(minor.group(1)) <= 0:
+            return False
+        try:
+            fd = os.open(
+                os.path.join(_DRI_DIR, f"renderD{int(minor.group(1))}"),
+                os.O_RDWR | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError:
+            return False
+        os.close(fd)
+    return True
+
+
 def _rocm_context_free_visible_devices() -> list[Dict[str, Any]]:
     """Linux ROCm per-device VRAM from KFD topology + DRM sysfs, joined by PCI address, with no torch call. Empty under
     any visibility mask, a KFD reader disagreement, a shared PCI address or a KFD address with no amdgpu device (a
@@ -5199,6 +5249,9 @@ def _rocm_context_free_visible_devices() -> list[Dict[str, Any]]:
         logger.debug("KFD gfx target read failed: %s", e)
         return []
     if targets is None or len(targets) != len(pci_ids):
+        return []
+    # A runtime-filtered node (render device not passed into the container) shifts every later HIP ordinal.
+    if not _rocm_kfd_render_nodes_openable():
         return []
     vram_by_pci = _rocm_linux_sysfs_vram_by_pci_gb()
     devices = []
