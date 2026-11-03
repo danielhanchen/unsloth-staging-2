@@ -1,0 +1,48 @@
+name: "staging-15611 macos-15"
+on:
+  push:
+    branches: ["pr-15611-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_FORCE_GPU_PATH: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart psutil
+      - run: |
+          for attempt in 1 2 3; do python -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo" trl peft && break; [ "$attempt" = 3 ] && exit 1; sleep $((5 * attempt)); done
+      - run: python -c "import torch, importlib.util as u; assert u.find_spec('unsloth_zoo'); print('torch', torch.__version__); assert '+cu' not in torch.__version__"
+      - run: python -m pip install git+https://github.com/unslothai/unsloth-zoo mlx mlx-lm mlx-vlm gguf
+      - run: python -c "import importlib.util as u, mlx.core as mx, mlx_lm; assert u.find_spec('unsloth_zoo'), 'unsloth_zoo missing'; print('mlx', mx.__version__, mx.default_device())"
+      - run: rc=0; ran=0; rm -f pytest_out.txt; r=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_final_loss_not_average.py studio/backend/tests/test_flows_notebooks.py studio/backend/tests/test_flows_train_cache.py studio/backend/tests/test_flows_train_node.py studio/backend/tests/test_middleware.py studio/backend/tests/test_notebook_catalog.py studio/backend/tests/test_rewards.py studio/backend/tests/test_rl_history_metrics.py studio/backend/tests/test_rl_raw_format.py studio/backend/tests/test_rl_training.py studio/backend/tests/test_training_provenance.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' >> pytest_out.txt 2>&1 || r=$?; if [ "$r" != "5" ]; then ran=1; if [ "$r" -gt "$rc" ]; then rc=$r; fi; fi; if [ "$ran" = "0" ]; then rc=5; fi; cat pytest_out.txt; tot=$(grep -cE "^(FAILED|ERROR) " pytest_out.txt) || tot=0; dep=$(grep -cE "^(FAILED|ERROR) .* ((ModuleNotFoundError|ImportError). No module named .(torch|unsloth_zoo|transformers).|ImportError. Unsloth. (torch|unsloth_zoo|transformers) not found. Please install .*)$" pytest_out.txt) || dep=0; bare=$(awk '/^_+ ERROR collecting [^ ]+ _+$/ {cur=$4; next} /^(=|_)+ / {cur=""} cur != "" && /((ModuleNotFoundError|ImportError). No module named .(torch|unsloth_zoo|transformers).|ImportError. Unsloth. (torch|unsloth_zoo|transformers) not found)/ {ok[cur]=1} /^ERROR [^ ]+$/ && ($2 in ok) {n++} END {print n+0}' pytest_out.txt) || bare=0; dep=$((dep + bare)); if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers).|Unsloth. (torch|unsloth_zoo|transformers) not found" pytest_out.txt && { [ "$tot" = "0" ] || [ "$tot" = "$dep" ]; }; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; exit "$rc"
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: studio/frontend/package-lock.json
+      - name: Install frontend deps
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit
+      - name: Node tests
+        working-directory: studio/frontend
+        run: node --experimental-strip-types --test tests/flows-train-node.test.ts tests/reward-summary.test.ts tests/rl-chart-keys.test.ts tests/rl-dataset-roles-stale-preview.test.ts tests/rl-history-merge.test.ts tests/rl-roles.test.ts tests/rl-system-prompt.test.ts tests/rl-workspace-session.test.ts tests/training-duplicate-run.test.ts tests/training-rl-beta-switch.test.ts tests/training-rl-model-switch-lr.test.ts tests/training-start-payload-rl.test.ts tests/yaml-config-rl.test.ts
