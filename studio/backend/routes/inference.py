@@ -3644,6 +3644,18 @@ def _request_used_api_key(request: Any) -> bool:
         return False
 
 
+async def _enforce_token_limit(request: Any, *, external: bool) -> None:
+    state = getattr(request, "state", None)
+    if state is not None and getattr(state, "token_limit_admitted", False):
+        return
+    from core.inference import token_limit
+
+    api = external or _request_used_api_key(request)
+    await asyncio.to_thread(token_limit.enforce, api = api)
+    if state is not None:
+        state.token_limit_admitted = True
+
+
 from state.tool_approvals import (
     resolve_tool_decision,
     tool_decision_grants_host_access,
@@ -3651,7 +3663,7 @@ from state.tool_approvals import (
 )
 
 from core.inference.model_ids import display_model_name, model_id_matches, public_model_id
-from core.inference.api_monitor import api_monitor
+from core.inference.api_monitor import api_monitor, TemporaryUsage, temporary_usage_scope
 from core.inference.image_orientation import exif_upright
 from core.inference.mcp_images import (
     MAX_MODEL_IMAGES as _MCP_MAX_MODEL_IMAGES,
@@ -7078,6 +7090,7 @@ def _monitor_usage(
             completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens"),
             total_tokens = usage.get("total_tokens"),
             context_length = context_length,
+            context_tokens = usage.get("context_tokens"),
         )
     tok_per_sec = prompt_tok_per_sec = prompt_ms = decode_ms = None
     if isinstance(timings, dict):
@@ -30681,12 +30694,41 @@ async def openai_chat_completions(
             status_code = 403,
             detail = "External providers can only be used from the Unsloth UI or with an API key.",
         )
-    response = await produce_openai_chat_completions(
-        payload,
-        request,
-        current_subject,
-        cancel_on_disconnect = True,
-    )
+    await _enforce_token_limit(request, external = bool(payload.provider_id or payload.provider_type))
+    temporary = None
+    internal = _request_is_internal_workflow(request)
+    if (payload.temporary_chat or internal) and not _request_used_api_key(request):
+        thread = (
+            uuid.uuid4().hex
+            if internal
+            else payload.thread_id or payload.cancel_id or uuid.uuid4().hex
+        )
+        temporary = TemporaryUsage(
+            _hashlib.sha256(thread.encode("utf-8")).hexdigest(),
+            "external" if payload.provider_id or payload.provider_type else "local",
+            _hashlib.sha256(f"{thread}\0{payload.temporary_message_id}".encode()).hexdigest()
+            if not internal and payload.temporary_message_id
+            else None,
+            _hashlib.sha256(f"{thread}\0{payload.temporary_parent_id}".encode()).hexdigest()
+            if not internal and payload.temporary_parent_id
+            else (None if internal else payload.temporary_parent_id),
+        )
+    with temporary_usage_scope(temporary):
+        response = await produce_openai_chat_completions(
+            payload,
+            request,
+            current_subject,
+            cancel_on_disconnect = True,
+        )
+    if temporary and isinstance(response, StreamingResponse):
+        iterator = response.body_iterator
+
+        async def tracked():
+            with temporary_usage_scope(temporary):
+                async for chunk in iterator:
+                    yield chunk
+
+        response.body_iterator = tracked()
     if connection is None or not isinstance(response, StreamingResponse):
         return response
     response.body_iterator = _relay_split_thinking(
@@ -37531,6 +37573,7 @@ async def openai_completions(request: Request, current_subject: str = Depends(ge
     """
     from utils.hardware import DeviceType, get_device
 
+    await _enforce_token_limit(request, external = False)
     try:
         _pre = await request.json()
     except (json.JSONDecodeError, ValueError):
@@ -38323,6 +38366,7 @@ def _embeddings_input_present(body: dict) -> bool:
 async def openai_embeddings(request: Request, current_subject: str = Depends(get_current_subject)):
     """OpenAI-compatible embeddings: the resident embedding GGUF when one is loaded,
     else Unsloth's configured embedding model."""
+    await _enforce_token_limit(request, external = False)
     if model_slots.slots:
         try:
             await _route_to_extra_slot(_raw_body_model(await request.json()))
@@ -40885,6 +40929,7 @@ async def openai_responses(
     """
     _admit_tool_access(payload)
     connection = _connection_model_ref(payload.model)
+    await _enforce_token_limit(request, external = connection is not None)
     for history_param in ("previous_response_id", "conversation"):
         if getattr(payload, history_param, None) is not None:
             raise HTTPException(
@@ -43522,6 +43567,7 @@ async def anthropic_messages(
     """
     _admit_tool_access(payload)
     connection = _connection_model_ref(payload.model)
+    await _enforce_token_limit(request, external = connection is not None)
     if connection is not None:
         return await _anthropic_messages_via_connection(
             payload, request, current_subject, *connection

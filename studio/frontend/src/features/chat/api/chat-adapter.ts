@@ -5555,10 +5555,19 @@ export function createOpenAIStreamAdapter(
         .find((message) => message.role === "user");
       // Names the turn whose file changes /rewind can undo; a continuation reuses its turn's prompt.
       // A temporary chat keeps no file history.
+      const temporaryChat = Boolean(
+        resolvedThreadId && isThreadIncognito(resolvedThreadId),
+      );
+      const temporaryUsageFields = temporaryChat
+        ? {
+            temporary_chat: true,
+            temporary_message_id: unstable_assistantMessageId,
+            temporary_parent_id: continuation?.sourceMessageId ??
+              [...rawMessages].reverse().find((message) => message.role === "assistant")?.id ?? "",
+          }
+        : {};
       const userMessageIdField = userMessageIdRequestField(
-        resolvedThreadId && isThreadIncognito(resolvedThreadId)
-          ? undefined
-          : generationUserMessage?.id,
+        temporaryChat ? undefined : generationUserMessage?.id,
       );
 
       // The durability gate keys on THIS turn's attachments only, so an old screenshot does not keep
@@ -5829,6 +5838,7 @@ export function createOpenAIStreamAdapter(
       let quoteCut = false;
       // Provisional reason per yield since aborts skip terminal yields; a reported window outranks it.
       const liveCustom = () => ({
+        tokenUsageParentId: continuation?.sourceMessageId,
         ...reasoningDurationTracker.metadata(),
         resumeTiming: passSoFar ? addPass(priorTiming, passSoFar()) : priorTiming,
         openaiCodexReasoning: codexReasoningLedger,
@@ -6659,6 +6669,7 @@ export function createOpenAIStreamAdapter(
             return {
               model: externalSelection.modelId,
               messages: outboundMessages,
+              ...temporaryUsageFields,
               ...(providerSupportsPreserveThinking(externalProvider?.providerType)
                 ? { preserve_thinking: runtime.preserveThinking }
                 : {}),
@@ -6914,6 +6925,7 @@ export function createOpenAIStreamAdapter(
               : {}),
             ...(resolvedThreadId ? { thread_id: resolvedThreadId } : {}),
             ...userMessageIdField,
+            ...temporaryUsageFields,
             ...(useAdapter === undefined ? {} : { use_adapter: useAdapter }),
             ...localReasoningFields,
             ...(supportsPreserveThinking
@@ -8824,8 +8836,7 @@ export function createOpenAIStreamAdapter(
             timing: finalTiming,
             custom: {
               ...reasoningDurationTracker.metadata(),
-              // Persisted so Continue survives a reload; cleared on a normal end.
-
+              tokenUsageParentId: continuation?.sourceMessageId,
               openaiCodexReasoning: codexReasoningLedger,
               openaiResponsesReasoning: openAIResponsesReasoningLedger,
               contextTruncation,
@@ -8840,7 +8851,6 @@ export function createOpenAIStreamAdapter(
               incomplete: finalIncompleteReason
                 ? { reason: finalIncompleteReason }
                 : undefined,
-              // Persisted refusal flag driving the two-pass prune.
               anthropicRefusal: anthropicRefusalSeen || undefined,
               serverTimings: finalServerTimings ?? undefined,
               stopReason: lastFinishReason ?? undefined,
@@ -9010,6 +9020,7 @@ export function createOpenAIStreamAdapter(
               timing: partialTiming,
               custom: {
                 ...reasoningDurationTracker.metadata(),
+                tokenUsageParentId: continuation?.sourceMessageId,
                 contextTruncation,
                 compactionMarkers,
                 providerCompaction,
@@ -9019,8 +9030,6 @@ export function createOpenAIStreamAdapter(
                 providerCompactionConnectionKey:
                   providerCompactionOriginConnectionKey,
                 geminiContinuationReplay: geminiContinuationReplay(true),
-                // Unfinished too, so it also offers Continue -- unless the provider already
-                // said why the model stopped.
                 incomplete: {
                   reason: resolveIncompleteReason(
                     incompleteReasonAfterError(
