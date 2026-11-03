@@ -19,6 +19,7 @@ import torch
 from ..device_type import DEVICE_COUNT, DEVICE_TYPE_TORCH
 from typing import Tuple
 from .utils import long_indexing, next_power_of_2, torch_gpu_device, torch_device_stream
+from .triton_launch import jit_any_alignment
 from .rms_layernorm import (
     _BF16_TRACEABLE,
     _TRACEABLE,
@@ -46,12 +47,12 @@ def _rope_heads_tile(
     n_heads,
     cos1,
     sin1,
-    half_head_dim: tl.constexpr,
-    HEADS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    CAST_TO_SIN: tl.constexpr,
-    LONG_INDEXING: tl.constexpr,
-    BACKWARD_PASS: tl.constexpr,
+    half_head_dim: tl.constexpr,  # head_dim // 2
+    HEADS: tl.constexpr,  # heads in this tile (HEADS_Q or HEADS_K)
+    BLOCK_SIZE: tl.constexpr,  # next pow2 of half_head_dim
+    CAST_TO_SIN: tl.constexpr,  # upcast x to sin's dtype (float32 RoPE for Gemma)
+    LONG_INDEXING: tl.constexpr,  # int64 offsets when numel can pass 2**31
+    BACKWARD_PASS: tl.constexpr,  # rotate by -sin (backward)
 ):
     # Rotates HEADS heads of one (batch, seq) row from X into OUT (OUT may be X: each element is
     # read before it is written by the same program).
@@ -123,15 +124,15 @@ def _rope_embedding_QK(
     n_heads_Q: tl.constexpr,  # 32
     n_heads_K: tl.constexpr,  # 8 (0 without K)
     n_groups_Q: tl.constexpr,  # 1
-    half_head_dim: tl.constexpr,
-    BACKWARD_PASS: tl.constexpr,
-    HAS_ROPE_INDICES: tl.constexpr,
-    LONG_INDEXING: tl.constexpr,
-    CAST_TO_SIN: tl.constexpr,
-    HEADS_Q: tl.constexpr,
-    HEADS_K: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    EVICT_INDICES: tl.constexpr,
+    half_head_dim: tl.constexpr,  # head_dim // 2
+    BACKWARD_PASS: tl.constexpr,  # rotate by -sin (backward)
+    HAS_ROPE_INDICES: tl.constexpr,  # position ids tensor given, else seq index
+    LONG_INDEXING: tl.constexpr,  # int64 offsets when numel can pass 2**31
+    CAST_TO_SIN: tl.constexpr,  # upcast x to sin's dtype (float32 RoPE for Gemma)
+    HEADS_Q: tl.constexpr,  # query heads per program, pow2 capped by tile size
+    HEADS_K: tl.constexpr,  # key heads per program, pow2 capped by tile size
+    BLOCK_SIZE: tl.constexpr,  # next pow2 of half_head_dim
+    EVICT_INDICES: tl.constexpr,  # eviction hints on the position ids loads
 ):
     """
     RoPE is Q * cos + rotate_half(Q) * sin; the backward is the same with -sin.
@@ -224,7 +225,8 @@ def _rope_embedding_QK(
 
 # No triton.heuristics wrapper: the launcher passes real bools, and the wrapper's per-call cost
 # showed up at small (decode / short-sequence) shapes.
-_rope_embedding_QK = triton.jit(_rope_embedding_QK)
+# seqlen is 1 in decode and the prompt length in prefill: no % 16 binary for multiple-of-16 prompts.
+_rope_embedding_QK = jit_any_alignment("seqlen")(_rope_embedding_QK)
 
 # Elements of one half-head tile a program rotates: several heads per program instead of one
 # program per (row, head) with half its lanes masked off.
