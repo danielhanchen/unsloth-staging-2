@@ -9,7 +9,7 @@ import {
 import type { TrainingViewData } from "@/features/training";
 import { cn } from "@/lib/utils";
 import type { ReactElement } from "react";
-import { useEffect, useState } from "react";
+import { Suspense, lazy, useEffect, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { ChartsSection } from "./sections/charts-section";
 import { OffloadPanel } from "./sections/offload-panel";
@@ -20,7 +20,14 @@ import {
 } from "./sections/run-config-override";
 import { TrainingStartOverlay } from "./training-start-overlay";
 
-/** A lookup issued as the run starts can briefly miss the row. */
+const RlChartsGrid = lazy(() =>
+  import("./sections/charts/rl-charts").then((module) => ({
+    default: module.RlChartsGrid,
+  })),
+);
+
+/** Retry budget for the run-config lookup. The row is inserted at start_training(), but a
+* lookup issued in the same instant can still miss it; a few short retries cover that. */
 const RUN_CONFIG_FETCH_RETRIES = 5;
 const RUN_CONFIG_FETCH_RETRY_MS = 1000;
 
@@ -63,6 +70,7 @@ export function LiveTrainingView(): ReactElement {
       lrHistory: state.lrHistory,
       gradNormHistory: state.gradNormHistory,
       evalLossHistory: state.evalLossHistory,
+      rlMetricHistory: state.rlMetricHistory,
       firstStepReceived: state.firstStepReceived,
       isStarting: state.isStarting,
     })),
@@ -199,6 +207,11 @@ export function LiveTrainingView(): ReactElement {
           gradNormHistory={viewData.gradNormHistory}
           evalLossHistory={viewData.evalLossHistory}
         />
+        {runtime.rlMetricHistory.length > 0 ? (
+          <Suspense fallback={null}>
+            <RlChartsGrid history={runtime.rlMetricHistory} />
+          </Suspense>
+        ) : null}
       </div>
       {showOverlay ? (
         <TrainingStartOverlay

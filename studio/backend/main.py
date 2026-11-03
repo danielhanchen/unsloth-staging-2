@@ -399,7 +399,9 @@ from routes import (
     mcp_servers_router,
     openai_fine_tuning_router,
     skills_router,
+    rewards_router,
     models_router,
+    notebooks_router,
     providers_router,
     openai_codex_auth_router,
     rag_router,
@@ -435,6 +437,8 @@ from routes.sandbox_capability import router as sandbox_capability_router
 from routes.systemone import MCP_PATH as DECISIONS_MCP_PATH, RequireStudioAuth
 from routes.systemone import router as systemone_router
 from routes.prompts import router as prompts_router
+from routes.flows import hooks_router as flows_hooks_router
+from routes.flows import router as flows_router
 from routes.scheduled_tasks import router as scheduled_tasks_router
 from routes.library import router as library_router
 from routes.profile_stats import router as profile_stats_router
@@ -904,6 +908,16 @@ async def lifespan(app: FastAPI):
         except Exception as exc:
             _lifespan_log.warning("chat generation orphan reconciliation failed: %s", exc)
 
+        try:
+            from storage.flows_db import reconcile_orphaned_runs as reconcile_flow_runs
+            interrupted_flows = _run_as(_account, reconcile_flow_runs)
+            if interrupted_flows:
+                _lifespan_log.warning(
+                    "Marked %s flow run(s) interrupted after restart.", interrupted_flows
+                )
+        except Exception as exc:
+            _lifespan_log.warning("flow run reconciliation failed: %s", exc)
+
         # Each account has its own rag.db, so its stuck ingestion jobs are only visible from inside it.
         try:
             from storage.rag_db import reconcile_orphaned_ingestion_jobs
@@ -980,6 +994,10 @@ async def lifespan(app: FastAPI):
 
     sweep_slot_save_dir()
     app.state.idle_unload_task = asyncio.create_task(idle_unload_loop())
+
+    from core.flows.triggers import SCHEDULER as _flow_trigger_scheduler
+
+    _flow_trigger_scheduler.start(app)
 
     # Initialize RSA key pair for API key encryption (external providers).
     _install_key_pair()
@@ -1070,6 +1088,14 @@ async def lifespan(app: FastAPI):
         stop_auto_sync()
     except Exception as exc:
         _lifespan_log.warning("linked-folder auto-sync failed at shutdown: %s", exc)
+
+    from core.flows.triggers import SCHEDULER as _flow_trigger_scheduler
+
+    await _flow_trigger_scheduler.stop()
+
+    from core.flows.engine import get_engine as _flow_engine
+
+    await _flow_engine().release_spare_keys()
 
     _idle_task = getattr(app.state, "idle_unload_task", None)
     if _idle_task is not None:
@@ -1516,6 +1542,7 @@ _BODY_PROTECTED_PREFIXES = (
     "/api/export",
     "/api/library",
     "/api/browser",
+    "/api/rewards",
     # Unauthenticated (login, refresh): every route takes a few hundred bytes of JSON.
     "/api/auth",
     "/mcp",
@@ -1613,6 +1640,10 @@ def _get_upload_passthrough_request_max_bytes(path: str) -> int:
 
 
 def _get_request_body_max_bytes(path: str) -> int:
+    # Flow webhooks take unauthenticated calls: cap what is buffered before the secret is even checked.
+    if path.startswith("/api/flows/hooks/"):
+        from routes.flows import WEBHOOK_MAX_BYTES
+        return WEBHOOK_MAX_BYTES
     if path.startswith("/api/inference/audio/transcribe/raw"):
         return STT_AUDIO_RAW_MAX_BYTES
     if path.startswith("/api/inference/audio/transcribe"):
@@ -1941,17 +1972,22 @@ app.include_router(settings_router, prefix = "/api/settings", tags = ["settings"
 app.include_router(sandbox_capability_router, prefix = "/api/sandbox", tags = ["sandbox"])
 app.include_router(mcp_servers_router, prefix = "/api/mcp/servers", tags = ["mcp"])
 app.include_router(skills_router, prefix = "/api/skills", tags = ["skills"])
+app.include_router(rewards_router, prefix = "/api/rewards", tags = ["rewards"])
 app.include_router(prompts_router, prefix = "/api/prompts", tags = ["prompts"])
 app.include_router(scheduled_tasks_router, prefix = "/api/scheduled-tasks", tags = ["scheduled-tasks"])
 app.include_router(library_router, prefix = "/api/library", tags = ["library"])
 app.include_router(profile_stats_router, prefix = "/api/profile", tags = ["profile"])
 app.include_router(datasets_router, prefix = "/api/datasets", tags = ["datasets"])
 app.include_router(data_recipe_router, prefix = "/api/data-recipe", tags = ["data-recipe"])
+# Before the flows router: webhook triggers authenticate by their secret, not a Studio session.
+app.include_router(flows_hooks_router, prefix = "/api/flows/hooks", tags = ["flows"])
+app.include_router(flows_router, prefix = "/api/flows", tags = ["flows"])
 app.include_router(llama_router, prefix = "/api/llama", tags = ["llama"])
 app.include_router(engines_router, prefix = "/api/engines", tags = ["engines"])
 app.include_router(whisper_router, prefix = "/api/whisper", tags = ["whisper"])
 app.include_router(npu_router, prefix = "/api/npu", tags = ["npu"])
 app.include_router(export_router, prefix = "/api/export", tags = ["export"])
+app.include_router(notebooks_router, prefix = "/api/notebooks", tags = ["notebooks"])
 app.include_router(external_import_router, prefix = "/api/import", tags = ["import"])
 app.include_router(rag_router, prefix = "/api/rag", tags = ["rag"])
 app.include_router(training_history_router, prefix = "/api/train", tags = ["training-history"])

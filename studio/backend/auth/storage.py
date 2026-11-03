@@ -1910,6 +1910,19 @@ def revoke_internal_api_key(key_id: int) -> bool:
         conn.close()
 
 
+def internal_api_key_active(key_id: int) -> bool:
+    """Whether an internal key minted ahead is still usable: an account credential reset deletes its keys."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM api_keys WHERE id = ? AND is_internal = 1 AND is_active = 1",
+            (key_id,),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
 def is_internal_api_key(raw_key: str) -> bool:
     """Memoized: it runs on the event loop per API-key request, and a key's origin never changes."""
     if not raw_key.startswith(API_KEY_PREFIX):

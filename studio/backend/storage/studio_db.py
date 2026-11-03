@@ -11,6 +11,7 @@ import base64
 import binascii
 import hashlib
 import json
+import math
 import logging
 import os
 import platform
@@ -328,6 +329,120 @@ def _replace_inventory_update_trigger(conn: sqlite3.Connection) -> None:
         raise
 
 
+def _ensure_flows_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flows (
+            id TEXT NOT NULL PRIMARY KEY,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            doc_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flow_tombstones (
+            id TEXT NOT NULL PRIMARY KEY,
+            deleted_at INTEGER NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flow_runs (
+            id TEXT NOT NULL PRIMARY KEY,
+            flow_id TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN
+                ('queued', 'running', 'cancelling', 'cancelled', 'completed', 'failed', 'interrupted')),
+            cancel_requested INTEGER NOT NULL DEFAULT 0,
+            options_json TEXT NOT NULL DEFAULT '{}',
+            outputs_json TEXT,
+            error TEXT,
+            last_event_seq INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            finished_at INTEGER
+        )
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_runs_flow ON flow_runs(flow_id, created_at)")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flow_run_events (
+            run_id TEXT NOT NULL REFERENCES flow_runs(id) ON DELETE CASCADE,
+            seq INTEGER NOT NULL,
+            event_json TEXT NOT NULL,
+            PRIMARY KEY (run_id, seq)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flow_node_results (
+            run_id TEXT NOT NULL REFERENCES flow_runs(id) ON DELETE CASCADE,
+            node_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            outputs_json TEXT,
+            error TEXT,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (run_id, node_id)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flow_cache (
+            key TEXT NOT NULL PRIMARY KEY,
+            node_type TEXT NOT NULL,
+            outputs_json TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            last_used_at INTEGER NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flow_sessions (
+            flow_id TEXT NOT NULL,
+            slot TEXT NOT NULL,
+            label TEXT,
+            state_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL,
+            PRIMARY KEY (flow_id, slot)
+        ) WITHOUT ROWID
+        """
+    )
+    # What the owner approved a flow to do; kept out of the document, which any editor or import can write.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flow_capabilities (
+            flow_id TEXT PRIMARY KEY,
+            approved_json TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        ) WITHOUT ROWID
+        """
+    )
+    # Schedule and webhook triggers of saved flows; the webhook secret lives here, never in the exportable document.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flow_triggers (
+            flow_id TEXT NOT NULL,
+            node_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            config_json TEXT NOT NULL,
+            token TEXT,
+            token_hash TEXT,
+            last_fired_at INTEGER,
+            PRIMARY KEY (flow_id, node_id)
+        ) WITHOUT ROWID
+        """
+    )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_flow_triggers_token ON flow_triggers(token_hash)")
+
+
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute(
@@ -380,6 +495,10 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    # DPO/ORPO/GRPO metrics for the History charts, one JSON object per step; NULL for SFT.
+    metric_cols = {row[1] for row in conn.execute("PRAGMA table_info(training_metrics)").fetchall()}
+    if "rl_json" not in metric_cols:
+        conn.execute("ALTER TABLE training_metrics ADD COLUMN rl_json TEXT")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_metrics_run_id ON training_metrics(run_id)")
     # Partial on the resumed_later subquery's exact status list so no other query (or its tie order) changes plan.
     conn.execute(
@@ -838,6 +957,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_data_recipe_executions_recipe"
         " ON data_recipe_executions(recipe_id, created_at)"
     )
+    _ensure_flows_schema(conn)
     # next_run_at NULL = nothing left to run; notify = all|failures|none; named=0 = title follows the instructions.
     conn.execute(
         """
@@ -1688,28 +1808,37 @@ def insert_metrics_batch(run_id: str, metrics: list[dict]) -> None:
         return
     conn = get_connection()
     try:
-        _insert_metrics_rows(conn, run_id, metrics)
-        conn.commit()
-    finally:
-        conn.close()
-
-
-def insert_metrics_with_progress(
-    run_id: str,
-    metrics: list[dict],
-    *,
-    step: int,
-    loss: Optional[float],
-    duration_seconds: Optional[float],
-) -> None:
-    """insert_metrics_batch + update_run_progress in one commit: a failure writes neither."""
-    conn = get_connection()
-    try:
-        if metrics:
-            _insert_metrics_rows(conn, run_id, metrics)
-        conn.execute(
-            "UPDATE training_runs SET final_step = ?, final_loss = ?, duration_seconds = ? WHERE id = ?",
-            (step, loss, duration_seconds, run_id),
+        conn.executemany(
+            """
+            INSERT INTO training_metrics
+                (run_id, step, loss, learning_rate, grad_norm, eval_loss, epoch, num_tokens, elapsed_seconds,
+                 rl_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id, step) DO UPDATE SET
+                loss = COALESCE(excluded.loss, loss),
+                learning_rate = COALESCE(excluded.learning_rate, learning_rate),
+                grad_norm = COALESCE(excluded.grad_norm, grad_norm),
+                eval_loss = COALESCE(excluded.eval_loss, eval_loss),
+                epoch = COALESCE(excluded.epoch, epoch),
+                num_tokens = COALESCE(excluded.num_tokens, num_tokens),
+                elapsed_seconds = COALESCE(excluded.elapsed_seconds, elapsed_seconds),
+                rl_json = COALESCE(excluded.rl_json, rl_json)
+            """,
+            [
+                (
+                    run_id,
+                    m.get("step"),
+                    m.get("loss"),
+                    m.get("learning_rate"),
+                    m.get("grad_norm"),
+                    m.get("eval_loss"),
+                    m.get("epoch"),
+                    m.get("num_tokens"),
+                    m.get("elapsed_seconds"),
+                    json.dumps(m["rl"]) if m.get("rl") else None,
+                )
+                for m in metrics
+            ],
         )
         conn.commit()
     finally:
@@ -1902,7 +2031,7 @@ def get_run_metrics(id: str) -> dict:
         rows = conn.execute(
             """
             SELECT step, loss, learning_rate, grad_norm, eval_loss, epoch,
-                   num_tokens, elapsed_seconds
+                   num_tokens, elapsed_seconds, rl_json
             FROM training_metrics
             WHERE run_id = ?
             ORDER BY step
@@ -1921,6 +2050,7 @@ def get_run_metrics(id: str) -> dict:
         eval_step_history: list[int] = []
         final_epoch: float | None = None
         final_num_tokens: int | None = None
+        rl_history: list[dict] = []
 
         for row in rows:
             step = row["step"]
@@ -1941,6 +2071,19 @@ def get_run_metrics(id: str) -> dict:
                 final_epoch = row["epoch"]
             if row["num_tokens"] is not None:
                 final_num_tokens = row["num_tokens"]
+            if step > 0 and row["rl_json"]:
+                try:
+                    values = json.loads(row["rl_json"])
+                except (json.JSONDecodeError, TypeError):
+                    values = None
+                if isinstance(values, dict):
+                    # Starlette won't render NaN/inf, which a diverging run can log.
+                    clean = {
+                        k: float(v)
+                        for k, v in values.items()
+                        if isinstance(v, (int, float)) and math.isfinite(v)
+                    }
+                    rl_history.append({"step": step, **clean})
 
         return {
             "step_history": step_history,
@@ -1954,6 +2097,7 @@ def get_run_metrics(id: str) -> dict:
             "eval_step_history": eval_step_history,
             "final_epoch": final_epoch,
             "final_num_tokens": final_num_tokens,
+            "rl_history": rl_history,
         }
     finally:
         conn.close()
