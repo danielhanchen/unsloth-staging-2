@@ -15,6 +15,8 @@ import threading
 import time
 import uuid
 from collections import deque
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -30,6 +32,18 @@ from storage.api_usage_db import (
 
 logger = logging.getLogger(__name__)
 TerminalCallback = Callable[[ApiUsageReceipt], None]
+_temporary_usage: ContextVar[Optional[tuple[str, str]]] = ContextVar(
+    "temporary_usage", default = None
+)
+
+
+@contextmanager
+def temporary_usage_scope(value: Optional[tuple[str, str]]):
+    token = _temporary_usage.set(value)
+    try:
+        yield
+    finally:
+        _temporary_usage.reset(token)
 
 
 _MAX_ENTRIES = 50
@@ -187,6 +201,7 @@ class ApiMonitorEntry:
     account_id: str = field(default_factory = current_account_id)
     # True for sk-unsloth callers only: the panel auto-opens on these, not Unsloth's chat.
     via_api_key: bool = False
+    temporary_usage: Optional[tuple[str, str]] = None
     # Monotonic anchors so duration math survives wall-clock steps (NTP).
     started_monotonic: float = 0.0
     finished_monotonic: Optional[float] = None
@@ -195,6 +210,7 @@ class ApiMonitorEntry:
     context_length: Optional[int] = None
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
+    context_tokens: Optional[int] = None
     total_tokens: Optional[int] = None
     total_tokens_authoritative: bool = False
     error: Optional[str] = None
@@ -409,6 +425,7 @@ class ApiMonitor:
             via_api_key = via_api_key,
             started_monotonic = time.monotonic(),
             context_length = context_length,
+            temporary_usage = _temporary_usage.get(),
         )
         with self._lock:
             self._entries.appendleft(entry)
@@ -817,6 +834,7 @@ class ApiMonitor:
         completion_tokens: Optional[int] = None,
         total_tokens: Optional[int] = None,
         context_length: Optional[int] = None,
+        context_tokens: Optional[int] = None,
     ) -> None:
         if not entry_id:
             return
@@ -825,6 +843,8 @@ class ApiMonitor:
         completion_tokens = _token_count_or_none(completion_tokens)
         total_tokens = _token_count_or_none(total_tokens)
         context_length = _token_count_or_none(context_length)
+        if context_tokens is not None:
+            context_tokens = _token_count_or_none(context_tokens)
         with self._lock:
             entry = self._find_locked(entry_id)
             if entry is None or entry.finished_at is not None:
@@ -843,6 +863,8 @@ class ApiMonitor:
                 entry.total_tokens = (entry.prompt_tokens or 0) + (entry.completion_tokens or 0)
             if context_length is not None:
                 entry.context_length = context_length
+            if context_tokens is not None:
+                entry.context_tokens = context_tokens
             _advance_updated_at(entry)
 
     def finish(
@@ -932,7 +954,7 @@ class ApiMonitor:
         if (
             callback is None
             or entry.kind != "request"
-            or entry.via_api_key is not True
+            or (entry.via_api_key is not True and entry.temporary_usage is None)
             or not subject
             or entry.finished_at is None
         ):
@@ -955,6 +977,9 @@ class ApiMonitor:
                 created_at = int(entry.finished_at * 1000),
                 kind = entry.kind,
                 via_api_key = entry.via_api_key,
+                temporary_thread = entry.temporary_usage[0] if entry.temporary_usage else None,
+                temporary_source = entry.temporary_usage[1] if entry.temporary_usage else "local",
+                context_tokens = entry.context_tokens,
             ),
         )
 
