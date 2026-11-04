@@ -179,7 +179,7 @@ test("stopping records the intent before the shutdown it can outlive", async () 
 
   // Reaping can block ~15s, so the marker must be written before it; order is load bearing.
   const mark = body.indexOf("markServerStopIntent();\n    try {");
-  const invoke = body.indexOf('await invoke("stop_server")');
+  const invoke = body.indexOf('await invoke("stop_server"');
   assert.ok(
     mark > 0 && invoke > mark,
     "the marker is written after the stop it must survive",
@@ -190,11 +190,29 @@ test("stopping records the intent before the shutdown it can outlive", async () 
     /catch \(e\) \{\s*clearServerStopIntent\(\);\s*throw e;\s*\}/,
     "a failed stop keeps a marker it did not earn",
   );
+});
 
-  const external = body.slice(0, body.indexOf("const { invoke }"));
+test("an attached server is stopped, not only detached", async () => {
+  const hook = USE_TAURI_BACKEND;
+  const body = hook.slice(
+    hook.indexOf("async function runStopServer()"),
+    hook.indexOf("async function startInstall("),
+  );
+
+  assert.doesNotMatch(
+    body,
+    /isExternalServer\)/,
+    "the stop branches on render state the tray handler never sees",
+  );
+  const invoke = body.indexOf('await invoke("stop_server"');
+  const detach = body.indexOf("setIsExternalServer(false);");
+  assert.ok(
+    invoke > 0 && detach > invoke,
+    "the app lets go of an attached server without stopping it",
+  );
   assert.match(
-    external,
-    /stopExternalServerPoll\(\);\s*markServerStopIntent\(\);/,
+    body.slice(detach),
+    /stopExternalServerPoll\(\);\s*setBackendStatus\("stopped"\);/,
   );
 });
 
@@ -203,8 +221,8 @@ test("a second stop cannot run while the first is in flight", async () => {
 
   const tray = hook.slice(hook.indexOf('register<void>("tray-toggle-server"'));
   assert.match(
-    tray.slice(0, tray.indexOf("});")),
-    /statusRef\.current === "running"\)\s*\{\s*stopServer\(\);/,
+    tray.slice(0, tray.indexOf("retry();")),
+    /statusRef\.current === "running"\)\s*\{\s*stopServer\(\)/,
   );
 
   const guard = hook.slice(
@@ -244,4 +262,14 @@ test("every deliberate start drops the marker", async () => {
   );
   assert.match(retry, /clearServerStopIntent\(\);/);
   assert.match(retry, /checkInstallAndStart\(\);/);
+});
+
+test("a tray stop that fails tells the user why", () => {
+  const hook = USE_TAURI_BACKEND;
+  const tray = hook.slice(hook.indexOf('register<void>("tray-toggle-server"'));
+  assert.match(
+    tray.slice(0, tray.indexOf("retry();")),
+    /stopServer\(\)\.catch\(\(e\) => \{\s*toast\.error\([^)]*String\(e\)/,
+    "the tray drops the reason a stop failed",
+  );
 });

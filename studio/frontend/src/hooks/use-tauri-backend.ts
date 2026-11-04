@@ -9,6 +9,7 @@ import {
   useSyncExternalStore,
 } from "react";
 import { isTauri, setApiBase } from "@/lib/api-base";
+import { toast } from "@/lib/toast";
 import { invalidateHardwareInfo } from "@/hooks/use-hardware-info";
 import {
   MANAGED_ENVIRONMENT_BUSY,
@@ -146,7 +147,7 @@ export function useTauriBackend() {
   );
   // Dedupe step names (Strict Mode, event replay).
   const seenStepsRef = useRef(new Set<string>());
-  // Attached to a server we did not spawn, so we cannot stop it.
+  // Attached to a server we did not spawn.
   const [isExternalServer, setIsExternalServer] = useState(false);
   const externalPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const externalPollAbortedRef = useRef(false);
@@ -503,24 +504,18 @@ export function useTauriBackend() {
   }
 
   async function runStopServer() {
-    if (isExternalServer) {
-      startingRef.current = false;
-      setIsExternalServer(false);
-      stopExternalServerPoll();
-      markServerStopIntent();
-      setBackendStatus("stopped");
-      return;
-    }
     const { invoke } = await import("@tauri-apps/api/core");
     // Record intent before the await (reaping can block ~15s); roll back if the stop fails.
     markServerStopIntent();
     try {
-      await invoke("stop_server");
+      await invoke("stop_server", { port: portRef.current });
     } catch (e) {
       clearServerStopIntent();
       throw e;
     }
     startingRef.current = false;
+    setIsExternalServer(false);
+    stopExternalServerPoll();
     setBackendStatus("stopped");
   }
 
@@ -783,7 +778,9 @@ export function useTauriBackend() {
 
       register<void>("tray-toggle-server", () => {
         if (statusRef.current === "running") {
-          stopServer();
+          stopServer().catch((e) => {
+            toast.error("Could not stop the server", { description: String(e) });
+          });
         } else if (
           statusRef.current === "stopped" ||
           statusRef.current === "error"
