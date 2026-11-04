@@ -147,9 +147,8 @@ export function useTauriBackend() {
   );
   // Dedupe step names (Strict Mode, event replay).
   const seenStepsRef = useRef(new Set<string>());
-  // Port of the attached server we did not spawn.
-  const [externalServerPort, setExternalServerPort] = useState<number | null>(null);
-  const isExternalServer = externalServerPort !== null;
+  // Attached to a server we did not spawn.
+  const [isExternalServer, setIsExternalServer] = useState(false);
   const externalPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const externalPollAbortedRef = useRef(false);
   const environmentWaitRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -515,7 +514,7 @@ export function useTauriBackend() {
       throw e;
     }
     startingRef.current = false;
-    setExternalServerPort(null);
+    setIsExternalServer(false);
     stopExternalServerPoll();
     setBackendStatus("stopped");
   }
