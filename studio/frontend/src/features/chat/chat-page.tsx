@@ -173,6 +173,7 @@ import {
   ResearchActivitySheet,
 } from "./components/research-activity-panel";
 import { ChatModelNotice } from "./components/chat-model-notice";
+import { TokenLimitNotice } from "./components/token-limit-notice";
 import {
   chatModelSwitchMeta,
   type ChatModelSwitchTarget,
@@ -4681,6 +4682,7 @@ export function ChatPage({
                 onAutoSwitch={handleAutoSwitchToChatModel}
               />
             )}
+            <TokenLimitNotice active={active} />
             {view.mode !== "compare" && currentProjectId && (
               <nav
                 aria-label="Project location"
