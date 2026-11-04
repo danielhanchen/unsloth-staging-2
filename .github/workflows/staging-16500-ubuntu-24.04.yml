@@ -1,0 +1,123 @@
+name: PR16500 feature-free MLX shim control
+'on':
+  pull_request:
+    branches:
+    - upstream-main
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  mlx-baseline:
+    strategy:
+      fail-fast: false
+      matrix:
+        combo:
+        - id: baseline-latest
+          label: HF5.22.1 TRL1.17.1
+          transformers_spec: transformers==5.22.1
+          trl_spec: trl==1.17.1
+    name: MLX shim control without token allowance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 50
+    env:
+      UNSLOTH_ZOO_REF: acb328e084e2cc597596c62ac228633067443b46
+      MATRIX_COMBO_ID: ${{ matrix.combo.id }}
+      PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION: python
+      PYTHONPATH: ${{ github.workspace }}/studio
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      with:
+        persist-credentials: false
+        repository: unslothai/unsloth
+        ref: d792213488b56c4add1a179c1dc7dc5f4aadb9ed
+    - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+      with:
+        python-version: '3.12'
+    - name: Restore the pip cache
+      id: pip-cache
+      uses: ./.github/actions/pip-cache-restore
+      with:
+        name: consolidated
+        key-files: 'pyproject.toml
+
+          studio/backend/requirements/*.txt
+
+          '
+    - name: Core CPU setup
+      uses: ./.github/actions/core-cpu-setup
+      with:
+        transformers-spec: ${{ matrix.combo.transformers_spec }}
+        trl-spec: ${{ matrix.combo.trl_spec }}
+        unsloth-zoo-ref: ${{ env.UNSLOTH_ZOO_REF }}
+    - name: Same isolated MLX group on base and head, one host
+      env:
+        PYTEST_TIMEOUT: 300
+      working-directory: ${{ runner.temp }}/unsloth-zoo
+      run: "set -euo pipefail\npython - <<'PY'\n# SPDX-License-Identifier: AGPL-3.0-only\n\
+        import importlib.metadata\nimport json\nimport os\nimport subprocess\nimport\
+        \ sys\nimport xml.etree.ElementTree as ET\nfrom pathlib import Path\n\nBASE\
+        \ = \"d792213488b56c4add1a179c1dc7dc5f4aadb9ed\"\nHEAD = \"90f54baa87f9e09e2a924cff3bee92092d080188\"\
+        \nZOO = \"acb328e084e2cc597596c62ac228633067443b46\"\nrepo = Path(os.environ[\"\
+        GITHUB_WORKSPACE\"])\nzoo = Path.cwd()\nscratch = Path(os.environ[\"RUNNER_TEMP\"\
+        ])\nexpected = {\"transformers\": \"5.22.1\", \"trl\": \"1.17.1\", \"peft\"\
+        : \"0.19.1\", \"torch\": \"2.10.0+cpu\"}\nactual = {key: importlib.metadata.version(key)\
+        \ for key in expected}\nassert actual == expected, (actual, expected)\nassert\
+        \ subprocess.check_output([\"git\", \"rev-parse\", \"HEAD\"], text=True).strip()\
+        \ == ZOO\nsubprocess.run([\"git\", \"-C\", str(repo), \"fetch\", \"--depth=1\"\
+        , \"origin\", HEAD], check=True)\nexclude = {\"test_mlx_generate.py\", \"\
+        test_mlx_neftune_quant_map.py\", \"test_mlx_gated_delta_vjp.py\"}\ntargets\
+        \ = [str(p.relative_to(zoo)) for p in sorted((zoo / \"tests\").glob(\"test_mlx_*.py\"\
+        ))\n           if p.name not in exclude]\nassert targets\nobserved = {\"zoo\"\
+        : ZOO, \"versions\": actual, \"targets\": targets, \"arms\": {}}\nfor arm,\
+        \ sha in ((\"base\", BASE), (\"head\", HEAD)):\n    subprocess.run([\"git\"\
+        , \"-C\", str(repo), \"checkout\", \"--detach\", sha], check=True)\n    assert\
+        \ subprocess.check_output([\"git\", \"-C\", str(repo), \"rev-parse\", \"HEAD\"\
+        ], text=True).strip() == sha\n    report = scratch / f\"mlx-{arm}.xml\"\n\
+        \    print(\"MLX_CONTROL_ARM\", arm, sha, flush=True)\n    result = subprocess.run([sys.executable,\
+        \ \"-m\", \"pytest\", \"-q\", \"-rs\", \"--tb=short\",\n                 \
+        \            f\"--junitxml={report}\", *targets])\n    assert report.is_file(),\
+        \ (arm, result.returncode)\n    cases = list(ET.parse(report).getroot().iter(\"\
+        testcase\"))\n    failures = sorted(f\"{t.get('classname')}::{t.get('name')}\"\
+        \ for t in cases\n                      if t.find(\"failure\") is not None\
+        \ or t.find(\"error\") is not None)\n    observed[\"arms\"][arm] = {\"sha\"\
+        : sha, \"rc\": result.returncode, \"cases\": len(cases),\n               \
+        \              \"failures\": failures,\n                             \"skipped\"\
+        : sum(t.find(\"skipped\") is not None for t in cases)}\n    (repo / \"mlx_control_result.json\"\
+        ).write_text(json.dumps(observed, indent=2) + \"\\n\", encoding=\"utf-8\"\
+        )\n    print(\"MLX_CONTROL_OBSERVED\", arm, json.dumps(observed[\"arms\"][arm]),\
+        \ flush=True)\nbase, head = observed[\"arms\"][\"base\"], observed[\"arms\"\
+        ][\"head\"]\nassert base[\"rc\"] in (1, 2) and head[\"rc\"] in (1, 2)\nassert\
+        \ base[\"failures\"] and base[\"failures\"] == head[\"failures\"], observed\n\
+        assert base[\"cases\"] == head[\"cases\"] and base[\"skipped\"] == head[\"\
+        skipped\"]\nobserved[\"verdict\"] = \"PRE_EXISTING: same MLX shim failures\
+        \ on the feature-free base and head\"\n(repo / \"mlx_control_result.json\"\
+        ).write_text(json.dumps(observed, indent=2) + \"\\n\", encoding=\"utf-8\"\
+        )\nprint(\"MLX_CONTROL_VERDICT\", json.dumps(observed), flush=True)\n\nPY\n"
+    - name: Summary
+      if: always()
+      run: 'echo "::group::Versions"
+
+        python -c "import sys, platform; print(sys.version); print(platform.platform())"
+
+        python -c "import torch; print(''torch'', torch.__version__, ''cuda?'', torch.cuda.is_available())"
+
+        python -c "import transformers; print(''transformers'', transformers.__version__)"
+
+        # pip show: importing unsloth_zoo raises without an accelerator outside pytest.
+
+        pip show unsloth_zoo
+
+        echo "::endgroup::"
+
+        echo "Core zoo job done. Coverage:"
+
+        echo "  - unsloth_zoo @ ${UNSLOTH_ZOO_REF} pytest tests/ (GPU-only cases deselected)"
+
+        echo "  - unsloth_zoo.compiler.test_apply_fused_lm_head"
+
+        '
