@@ -292,6 +292,7 @@ from ._custom_dtype import cast_mixed_linear_inputs, resolve_dtype, trusted_cust
 from ._mamba_lora import patch_mamba_fused_lora
 from .remote_code_shims import apply_remote_code_shims
 from .grouped_linear_lora import register_grouped_linear_lora
+from . import _generic_decode_graphs
 from .loader_utils import (
     _bnb_bits_requested,
     vlm_gradient_checkpointing_reentrant,
@@ -1504,6 +1505,9 @@ def _eager_decodes(model):
     return _is_decode_compile_model(model) and "forward" not in model.__dict__
 
 
+_NO_FORWARD = object()
+
+
 class _EagerDecodeSteps:
     """One generate() call. Each eager decode step (one new token per row) runs inside zoo's
     `unsloth_eager_decode()`, so compiled regions call their eager originals; prefill and
@@ -1531,12 +1535,58 @@ class _EagerDecodeSteps:
         def forward(*args, **kwargs):
             return step(*args, **kwargs)
 
+        # An instance forward (accelerate's mixed-precision wrapper, GRPO's hidden-states wrapper) is put back on exit.
+        self._previous = self.model.__dict__.get("forward", _NO_FORWARD)
         self.model.forward = forward
         return self
 
     def __exit__(self, *exc):
-        del self.model.forward
+        if self._previous is _NO_FORWARD:
+            del self.model.forward
+        else:
+            self.model.forward = self._previous
         return False
+
+
+class _GraphDecodeSteps(_EagerDecodeSteps):
+    """One generate() call over a static cache with decode CUDA graphs on: each one-token decode
+    step replays a captured graph of the step the eager path runs (_generic_decode_graphs), else
+    runs as before (inside `unsloth_eager_decode()` for the models that compile their decode)."""
+
+    def __init__(self, model):
+        super().__init__(model)
+        self.eager_decodes = _eager_decodes(model)
+        # Diagnostic: =1 graphs the eager originals of compiled regions (not what eager decode runs).
+        self.eager_regions = self.eager_decodes or (
+            os.environ.get("UNSLOTH_DECODE_GENERIC_GRAPHS_EAGER_REGIONS", "0") == "1"
+        )
+
+    def _forward(self, *args, **kwargs):
+        if not args and not torch.compiler.is_compiling():
+            # The graph records exactly the step the eager path runs: compiled regions stay
+            # compiled unless this model's eager decode leaves them (a different kernel mix
+            # rounds differently, and greedy tokens drift after a few dozen steps).
+            out = _generic_decode_graphs.decode_step(
+                self.model,
+                self.forward,
+                kwargs,
+                unsloth_eager_decode if self.eager_regions else None,
+            )
+            if out is not None:
+                return out
+        if self.eager_decodes:
+            return super()._forward(*args, **kwargs)
+        return self.forward(*args, **kwargs)
+
+    def __enter__(self):
+        _generic_decode_graphs.begin(self.model)
+        return super().__enter__()
+
+    def __exit__(self, *exc):
+        try:
+            return super().__exit__(*exc)
+        finally:
+            _generic_decode_graphs.end(self.model)
 
 
 # One-token decode is slower on flex than SDPA, but prefill must stay on flex (its block mask skips tiles a
@@ -2388,7 +2438,17 @@ def unsloth_base_fast_generate(self, *args, **kwargs):
             kwargs["compile_config"] = compile_config
 
     decode_scope = _CompileDecodeOnRepeat(self) if compile_decode else contextlib.nullcontext()
-    eager_scope = _EagerDecodeSteps(self) if _eager_decodes(self) else contextlib.nullcontext()
+    if (
+        cache_implementation == "static"
+        and not force_dynamic_cache
+        and not compile_decode
+        and _generic_decode_graphs.wanted(self)
+    ):
+        eager_scope = _GraphDecodeSteps(self)
+    elif _eager_decodes(self):
+        eager_scope = _EagerDecodeSteps(self)
+    else:
+        eager_scope = contextlib.nullcontext()
     try:
         with (
             _NonFlexGenerate(self),

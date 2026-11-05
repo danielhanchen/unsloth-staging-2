@@ -694,6 +694,10 @@ def invalidate(model):
     global BUFFER_EPOCH
     for state in _states(model):
         state.clear()
+    for module in model.modules():
+        generic = module.__dict__.get("_unsloth_generic_decode_graphs")
+        if generic is not None:
+            generic.invalidate()
     BUFFER_EPOCH += 1
 
 
@@ -709,6 +713,10 @@ def release(model):
             found = True
             state.clear()
             state.statics.clear()
+        generic = d.get("_unsloth_generic_decode_graphs")
+        if generic is not None:
+            # FastModel generate's graphs (_generic_decode_graphs).
+            generic.invalidate()
         if "_unsloth_graph_buffers" in d:
             found = True
             del d["_unsloth_graph_buffers"]
@@ -787,6 +795,17 @@ def _fingerprint(model, layers, rope_len):
             items.append((cos.data_ptr(), sin.data_ptr(), cos.shape[0]))
     # Every adapter-aware module outside the projections too (embeddings, lm_head, modules_to_save):
     # their enabled / active / merged state picks the branch a captured step baked in.
+    adapters = _adapter_state(model)
+    if adapters is None:
+        return None
+    items.extend(adapters)
+    items.append(K._OPTIMIZER_STEPS)
+    return tuple(items)
+
+
+def _adapter_state(model):
+    """(module, disabled, active adapters, merged) of every adapter-aware module; None if unreadable."""
+    items = []
     for module in model.modules():
         if hasattr(module, "disable_adapters") or hasattr(module, "active_adapter"):
             try:
@@ -805,8 +824,7 @@ def _fingerprint(model, layers, rope_len):
                 )
             except Exception:
                 return None
-    items.append(K._OPTIMIZER_STEPS)
-    return tuple(items)
+    return items
 
 
 def _eligible(model, layers):
