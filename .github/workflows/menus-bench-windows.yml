@@ -9,13 +9,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - arm: main
-            ref: bench/main
-          - arm: p16854
-            ref: bench/16854
+        arm: [pre16902, at16902, main-now]
     runs-on: windows-latest
-    timeout-minutes: 240
+    timeout-minutes: 300
     defaults:
       run:
         shell: bash
@@ -26,7 +22,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: danielhanchen/unsloth-staging-2
-          ref: ${{ matrix.ref }}
+          ref: bench/${{ matrix.arm }}
           path: src
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -50,18 +46,29 @@ jobs:
           nohup unsloth studio -H 127.0.0.1 -p 12611 > studio.log 2>&1 &
           for i in $(seq 1 90); do curl -sf http://127.0.0.1:12611/api/health && break; sleep 5; done
           curl -sf http://127.0.0.1:12611/api/health || { tail -60 studio.log; exit 1; }
+      - name: Record which build is served
+        run: |
+          mkdir -p out
+          {
+            echo "arm=${{ matrix.arm }} src_head=$(git -C src rev-parse HEAD)"
+            echo "served:"; curl -sf http://127.0.0.1:12611/ | grep -oE '/assets/[A-Za-z0-9_.-]+\.(js|css)' | sort -u
+            for f in src/studio/frontend/dist/index.html; do
+              [ -f "$f" ] && { echo "built ($f):"; grep -oE '/assets/[A-Za-z0-9_.-]+\.(js|css)' "$f" | sort -u; }
+            done
+          } | tee out/build_manifest.txt
       - name: Seed short and long threads, run the menu bench (Edge = WebView2 engine, Chromium)
         run: |
           python -m pip install -q 'playwright<2' httpx pillow huggingface_hub
           python -m playwright install chromium
-          mkdir -p work out && tar -xzf benchsrc/bench/pack_menus.tgz -C work
+          mkdir -p work && tar -xzf benchsrc/bench/pack_menus.tgz -C work
           export PACK="$PWD/work/pack" WORKSPACE="$PWD/work/pack"
           HOME_W=$(cygpath -w ~/.unsloth/studio)
           python -u work/pack/menu_bench.py seed --base-url http://127.0.0.1:12611 --home "$HOME_W" --turns 1 150 --out out/threads.json
           python -u work/pack/menu_bench.py run --base-url http://127.0.0.1:12611 --home "$HOME_W" --threads out/threads.json \
-            --arm ${{ matrix.arm }} --engines msedge,chromium --shots out/shots --out out/menus_${{ matrix.arm }}_win.json 2>&1 | tee out/menus.log | grep -E "^MENU"
+            --arm ${{ matrix.arm }} --engines msedge,chromium --shots out/shots --out out/menus_${{ matrix.arm }}_win.json 2>&1 | tee out/menus.log | grep -E "^MENU" || true
           python -u work/pack/menu_bench.py run --base-url http://127.0.0.1:12611 --home "$HOME_W" --threads out/threads.json \
-            --arm ${{ matrix.arm }}_glass --material glass --engines msedge,chromium --out out/menus_${{ matrix.arm }}_glass_win.json 2>&1 | tee out/menus_glass.log | grep -E "^MENU"
+            --arm ${{ matrix.arm }}_glass --material glass --engines msedge,chromium --out out/menus_${{ matrix.arm }}_glass_win.json 2>&1 | tee out/menus_glass.log | grep -E "^MENU" || true
+          test -s out/menus_${{ matrix.arm }}_win.json && test -s out/menus_${{ matrix.arm }}_glass_win.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
