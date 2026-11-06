@@ -60,6 +60,8 @@ jobs:
           python -u work/pack/menu_bench.py seed --base-url http://127.0.0.1:12611 --home "$HOME_W" --turns 1 150 --out out/threads.json
           python -u work/pack/menu_bench.py run --base-url http://127.0.0.1:12611 --home "$HOME_W" --threads out/threads.json \
             --arm ${{ matrix.arm }} --engines msedge,chromium --shots out/shots --out out/menus_${{ matrix.arm }}_win.json 2>&1 | tee out/menus.log | grep -E "^MENU"
+          python -u work/pack/menu_bench.py run --base-url http://127.0.0.1:12611 --home "$HOME_W" --threads out/threads.json \
+            --arm ${{ matrix.arm }}_glass --material glass --engines msedge,chromium --out out/menus_${{ matrix.arm }}_glass_win.json 2>&1 | tee out/menus_glass.log | grep -E "^MENU"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
