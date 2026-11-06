@@ -7106,3 +7106,24 @@ html[data-glass] :is([data-wallpaper-workspace], [data-chat-content-root]):has(>
 :is([data-wallpaper-workspace], [data-chat-content-root]):has(> .chat-wallpaper[data-ready][data-outline="false"]) .glass-lens::after {
   display: none;
 }
+
+/* MessagePrimitive's slack helper clears inline flex-shrink on viewport updates.
+   Keep measured placeholders and reconnected display:contents bodies at natural height. */
+.aui-thread-viewport [data-message-windowed] {
+	flex-shrink: 0;
+	/* duration-150 on user rows otherwise transitions the placeholder's height
+	   from its empty padding box, moving the reader as every batch is parked. */
+	transition-property: none;
+}
+
+/* Keep WebKitGTK thumb jumps synchronized with paints of newly mounted bodies.
+   Fixed backgrounds synchronize overflow scrolling with main-thread paints. */
+.aui-thread-viewport[data-windowed-messages]::before {
+	content: "";
+	position: absolute;
+	width: 1px;
+	height: 1px;
+	pointer-events: none;
+	background-image: linear-gradient(transparent, transparent);
+	background-attachment: fixed;
+}

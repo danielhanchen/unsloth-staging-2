@@ -16,6 +16,46 @@ export const INITIAL_MESSAGES = 16;
 /** Messages added per widening frame; trades build-in height against length, not total work. */
 export const CHUNK_MESSAGES = 32;
 
+/** Leave native scrolling and its momentum alone before changing the scroll range. */
+export function watchProgressiveScroll(
+  viewport: EventTarget,
+  now: () => number = () => performance.now(),
+) {
+  // Let the initial tail paint before starting background work.
+  let resumeAt = now() + 300;
+  const pause = () => { resumeAt = now() + 300; };
+  const onScroll = () => { if (now() < resumeAt) pause(); };
+  const onKey = (event: Event) => {
+    const key = event as KeyboardEvent;
+    if (key.defaultPrevented || !["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(key.key)) return;
+    const target = key.target as HTMLElement | null;
+    if (target?.isContentEditable || target?.closest?.("input, textarea, select")) return;
+    pause();
+  };
+  const listeners = { wheel: pause, touchmove: pause, keydown: onKey, scroll: onScroll };
+  const inputTarget = (viewport as HTMLElement).ownerDocument ?? viewport;
+  inputTarget.addEventListener("pointerdown", pause, { capture: true, passive: true });
+  inputTarget.addEventListener("beforeinput", pause, { capture: true, passive: true });
+  inputTarget.addEventListener("compositionupdate", pause, { capture: true, passive: true });
+  for (const [type, listener] of Object.entries(listeners)) {
+    viewport.addEventListener(type, listener, { capture: true, passive: true });
+  }
+  return {
+    blocked(pointerHeld: boolean): boolean {
+      if (pointerHeld) pause();
+      return now() < resumeAt;
+    },
+    dispose() {
+      inputTarget.removeEventListener("pointerdown", pause, { capture: true });
+      inputTarget.removeEventListener("beforeinput", pause, { capture: true });
+      inputTarget.removeEventListener("compositionupdate", pause, { capture: true });
+      for (const [type, listener] of Object.entries(listeners)) {
+        viewport.removeEventListener(type, listener, { capture: true });
+      }
+    },
+  };
+}
+
 /** Caps the tail walk so a tail of non-rendering messages cannot mount the whole thread. */
 export const MAX_INITIAL_SPAN = INITIAL_MESSAGES * 4;
 
@@ -45,11 +85,11 @@ export function isCovered(current: MountWindow): boolean {
 }
 
 /** Returns null once it would cover the thread, so the restriction drops in the same commit. */
-export function widen(current: MountWindow, count: number): MountWindow {
+export function widen(current: MountWindow, count: number, chunk = CHUNK_MESSAGES): MountWindow {
   if (current == null) return null;
   // A start past the end withholds nothing; clamping then subtracting would unmount rows.
   if (current.start >= count) return null;
-  const start = Math.max(0, current.start - CHUNK_MESSAGES);
+  const start = Math.max(0, current.start - chunk);
   if (start <= 0) return null;
   return { start };
 }
