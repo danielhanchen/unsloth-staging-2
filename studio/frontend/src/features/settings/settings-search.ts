@@ -147,6 +147,8 @@ export const SETTINGS_SEARCH_INDEX: Record<SettingsTab, TranslationKey[]> = {
     "settings.chat.pastedTextThreshold",
     "settings.chat.turnNavigation",
     "settings.chat.groups.conversations.title",
+    "settings.chat.groups.replies.title",
+    "settings.chat.groups.thinkingTools.title",
     "settings.chat.library.label",
     "settings.chat.groups.display.title",
     "settings.chat.modelSelection.title",
@@ -171,6 +173,7 @@ export const SETTINGS_SEARCH_INDEX: Record<SettingsTab, TranslationKey[]> = {
     "settings.chat.inlineEditResponse",
     "settings.chat.showReplyTimes",
     "settings.chat.showGenerationDetails",
+    "settings.chat.generationStatsUpdates",
     "settings.chat.groups.menu.title",
   ],
   browser: [
@@ -510,6 +513,7 @@ export const SETTINGS_SEARCH_KEYWORDS: Partial<
   "settings.chat.showLinkPreviews": "settings.chat.showLinkPreviewsDescription",
   "settings.chat.showReplyTimes": "settings.chat.showReplyTimesKeywords",
   "settings.chat.showGenerationDetails": "settings.chat.showGenerationDetailsKeywords",
+  "settings.chat.generationStatsUpdates": "settings.chat.generationStatsUpdatesKeywords",
   // match protocol and agent names omitted from the title.
   "settings.apiKeys.mcp.title": "settings.apiKeys.mcp.keywords",
   // the intro names only some agents; every listed one has to find this page.
