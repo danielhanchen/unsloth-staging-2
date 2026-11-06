@@ -34,6 +34,7 @@ import {
 import { initializeLocale } from "./i18n";
 import { isTauri } from "./lib/api-base";
 import { markAppSessionStart } from "./lib/app-session-start";
+import { watchClosingDialogFocus } from "./lib/closing-dialog-focus";
 import { setHubSessionRefresh } from "./lib/hf-endpoint";
 import { watchInputModality } from "./lib/input-modality";
 import { watchMacStrayKeyText } from "./lib/mac-stray-key-text";
@@ -83,6 +84,7 @@ watchReasoningRowContainmentOverride();
 
 watchOverlayScrollbarGutter(window);
 watchInputModality(window);
+watchClosingDialogFocus(document);
 
 watchSpellCheck(window);
 watchTimeFormat(window);
