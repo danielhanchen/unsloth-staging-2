@@ -508,11 +508,11 @@ def glass_image() -> Path:
     return img
 
 
-def build_patched(name: str, patch: Path) -> Path | None:
+def build_patched(name: str, patch: Path, ref: str = "origin/main") -> Path | None:
     dist = W / f"dist_{name}"
     if (dist / "index.html").exists():
         return dist
-    wt = worktree("origin/main", name)
+    wt = worktree(ref, name)
     fe = wt / "studio" / "frontend"
     try:
         sh(f"git apply {patch}", f"apply_{name}", cwd=wt)
@@ -531,14 +531,20 @@ def stage_glassdiag() -> None:
     """Glass attribution: arms = (build, material, override CSS) from PACK/glassdiag/arms.json."""
     img = glass_image()
     spec = json.loads((PACK / "glassdiag" / "arms.json").read_text())
-    dists = {"main": build_app("origin/main", "gd_main")}
+    base = os.environ.get("GLASSDIAG_BASE", "origin/main")  # optional pin; default unchanged
+    dists = {"main": build_app(base, "gd_main")}
     patch = PACK / "glassdiag" / "fix.patch"
     if patch.exists() and any(a["build"] == "fix" for a in spec["arms"]):
-        dists["fix"] = build_patched("gd_fix", patch)
+        dists["fix"] = build_patched("gd_fix", patch, base)
+    builds = ["main", "fix"]
+    for b in dict.fromkeys(a["build"] for a in spec["arms"]):  # optional extra builds: PACK/glassdiag/<build>.patch
+        if b not in builds and (PACK / "glassdiag" / f"{b}.patch").exists():
+            dists[b] = build_patched(f"gd_{b}", PACK / "glassdiag" / f"{b}.patch", base)
+            builds.append(b)
     shots = OUT / "shots"
     for rep in range(int(spec.get("reps", 2))):
         arms = spec["arms"][rep % len(spec["arms"]):] + spec["arms"][: rep % len(spec["arms"])]
-        for build in ("main", "fix"):
+        for build in builds:
             mine = [a for a in arms if a["build"] == build]
             if not mine or dists.get(build) is None:
                 continue
@@ -551,7 +557,7 @@ def stage_glassdiag() -> None:
                     try:
                         sh(f"{sys.executable} -u {PACK}/glass_bench.py --base-url {url} --home {HOME} "
                            f"--arm {a['label']} --rep {rep} --image {img} --material {a.get('material', 'glass')} "
-                           f"{css} {shot} --out {out}", f"gd_{a['label']}_{rep}", timeout=1500, echo="GLASS")
+                           f"{css} {shot} {a.get('args', '')} --out {out}", f"gd_{a['label']}_{rep}", timeout=1500, echo="GLASS")
                         r = json.loads(out.read_text())
                         for eng, d in r["engines"].items():
                             result("glassdiag", {"arm": a["label"], "rep": rep, "engine": eng, **d.get("summary", {}),
@@ -659,6 +665,75 @@ def stage_catalog() -> None:
         result("catalog", {"error": str(exc)[:400]})
     finally:
         stop()
+
+
+
+def build_variant(ref: str, name: str, patch: Path | None) -> Path | None:
+    """build_app with an optional harness-side ablation patch (never pushed anywhere)."""
+    if patch is None:
+        return build_app(ref, name)
+    dist = W / f"dist_{name}"
+    if (dist / "index.html").exists():
+        return dist
+    wt = worktree(ref, name)
+    fe = wt / "studio" / "frontend"
+    try:
+        sh(f"git apply {patch}", f"apply_{name}", cwd=wt)
+        node_modules(fe)
+        sh(f"npx vite build --outDir {dist} --emptyOutDir", f"build_{name}", cwd=fe, timeout=1800)
+    except Exception as exc:  # noqa: BLE001
+        log(f"build {name} failed: {exc}"[:600])
+        return None
+    finally:
+        (fe / "node_modules").unlink(missing_ok=True)
+        git("worktree", "remove", "--force", str(wt), check=False)
+    return dist
+
+
+def stage_load() -> None:
+    """Long-thread load time, arms interleaved per round: LOAD_ARMS=label=ref[+patchfile],..."""
+    bench = Path(__file__).resolve().parent
+    arms = []
+    for spec in os.environ["LOAD_ARMS"].split(","):
+        label, rest = spec.split("=", 1)
+        ref, _, patch = rest.partition("+")
+        arms.append((label, ref, bench / "patches" / patch if patch else None))
+    refs = sorted({r for _, r, _ in arms})
+    sh("git fetch -q https://github.com/danielhanchen/unsloth-staging-2 "
+       + " ".join(f"{r}:{r}" for r in refs) + " --force", "fetch_load", cwd=REPO)
+    dists = {}
+    for label, ref, patch in arms:
+        d = build_variant(ref, "l_" + label, patch)
+        if d is None:
+            result("load", {"arm": label, "error": "build failed"})
+            continue
+        dists[label] = (d, ref)
+    if not dists:
+        return
+    threads = W / "threads_load.json"
+    url = launch(next(iter(dists.values()))[0], W / "hf_empty")
+    try:
+        if not threads.exists():
+            sh(f"{sys.executable} -u {PACK}/menu_bench.py seed --base-url {url} --home {HOME} "
+               f"--turns {os.environ.get('LOAD_TURNS', '1 150')} --out {threads}", "seed_load", timeout=3600)
+    finally:
+        stop()
+    turns = os.environ.get("LOAD_TURNS", "1 150").split()[-1]
+    for rnd in range(int(os.environ.get("LOAD_ROUNDS", "3"))):
+        for label, (dist, ref) in dists.items():
+            try:
+                url = launch(dist, W / "hf_empty")
+                if rnd == 0:
+                    record_build(label, ref, dist, url)
+                for mat in os.environ.get("LOAD_MATERIALS", "solid,glass").split(","):
+                    out = OUT / f"load_{label}_{mat}_{rnd}.json"
+                    sh(f"{sys.executable} -u {bench}/load_bench.py --base-url {url} --home {HOME} --threads {threads} "
+                       f"--turns {turns} --arm {label} --engine {os.environ.get('LOAD_ENGINE', 'webkit')} "
+                       f"--material {mat} --reps 1 --out {out}", f"load_{label}_{mat}_{rnd}", timeout=900, echo="LOAD")
+            except Exception as exc:  # noqa: BLE001
+                result("load", {"arm": label, "round": rnd, "error": str(exc)[:300]})
+            finally:
+                stop()
 
 
 def main() -> int:
