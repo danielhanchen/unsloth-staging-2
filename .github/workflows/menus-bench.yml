@@ -1,0 +1,38 @@
+name: menus-bench
+on:
+  push:
+    branches: ["bench/menus-ci"]
+permissions:
+  contents: read
+jobs:
+  menus:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+        arm: [main, p16854]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Menu bench (short 1-turn vs long 150-turn thread)
+        env:
+          BENCH_WORK: ${{ runner.temp }}/lagbench
+          MENU_ARMS: ${{ matrix.arm }}
+          MENU_ENGINES: ${{ matrix.os == 'macos-15' && 'webkit,chromium' || 'chromium,webkit,webkit_mac' }}
+        run: |
+          mkdir -p job
+          cp bench/pack_menus.tgz job/
+          cd job
+          python -u ../bench/run_all.py menus
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: menus-${{ matrix.os }}-${{ matrix.arm }}
+          path: job/out
