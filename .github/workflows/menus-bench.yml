@@ -10,9 +10,9 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15]
-        arm: [main, p16854]
+        arm: [pre16902, at16902, main-now]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 240
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -21,13 +21,18 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Menu bench (short 1-turn vs long 150-turn thread)
+      - name: Record arm ref
+        run: |
+          mkdir -p job/out
+          git ls-remote https://github.com/danielhanchen/unsloth-staging-2 "refs/heads/bench/${{ matrix.arm }}" | tee job/out/arm_ref.txt
+      - name: Menu bench (short 1-turn vs long 150-turn thread, Glass off and on)
         env:
           BENCH_WORK: ${{ runner.temp }}/lagbench
-          MENU_ARMS: ${{ matrix.arm }}
-          MENU_ENGINES: ${{ matrix.os == 'macos-15' && 'webkit,chromium' || 'chromium,webkit,webkit_mac' }}
+          MENU_ARM_REFS: ${{ matrix.arm }}=bench/${{ matrix.arm }}
+          MENU_GLASS: "1"
+          MENU_TURNS: "1 150"
+          MENU_ENGINES: webkit,chromium
         run: |
-          mkdir -p job
           cp bench/pack_menus.tgz job/
           cd job
           python -u ../bench/run_all.py menus

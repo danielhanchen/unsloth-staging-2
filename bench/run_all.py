@@ -70,7 +70,7 @@ def sh(cmd: str, name: str, cwd=None, env=None, check=True, timeout=None, echo: 
                 fh.write(line)
                 fh.flush()
                 if line.startswith(echo):
-                    print(line.rstrip()[:600], flush=True)
+                    print(line.rstrip()[:4000], flush=True)
             proc.wait()
             killer.cancel()
             p = proc
@@ -104,7 +104,14 @@ def setup() -> None:
         os.environ["PATH"] = f"{W}/node/bin:" + os.environ["PATH"]
     log("node " + subprocess.run(["node", "-v"], capture_output=True, text=True).stdout.strip())
     sh(f"{sys.executable} -m pip install -q playwright httpx pillow huggingface_hub", "pip")
-    sh(f"{sys.executable} -m playwright install --with-deps chromium webkit", "pw_install", timeout=1800)
+    for attempt in range(3):  # apt mirrors on hosted runners occasionally hang; retry instead of failing
+        try:
+            sh(f"{sys.executable} -m playwright install --with-deps chromium webkit", "pw_install", timeout=900)
+            break
+        except Exception as exc:  # noqa: BLE001
+            log(f"playwright install attempt {attempt} failed: {str(exc)[:200]}")
+            if attempt == 2:
+                raise
     if not REPO.exists():
         sh(f"git clone -q --filter=blob:none https://github.com/unslothai/unsloth {REPO}", "clone")
     sh("git fetch -q origin pull/16852/head:pr16852 pull/16831/head:pr16831 "
@@ -315,9 +322,29 @@ def stage_scroll() -> None:
                 stop()
 
 
+def _assets(html: str) -> list[str]:
+    import re
+    return sorted(set(re.findall(r"/assets/[A-Za-z0-9_.-]+\.(?:js|css)", html)))
+
+
+def record_build(label: str, ref: str, dist: Path, url: str) -> None:
+    """Prove the arm served its own build: ref SHA, dist assets, assets the running server returned."""
+    built = _assets((dist / "index.html").read_text())
+    try:
+        served = _assets(urllib.request.urlopen(url + "/", timeout=10).read().decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        served = [f"error: {exc}"]
+    result("menus_build", {"arm": label, "ref": ref, "sha": git("rev-parse", ref, check=False),
+                           "built_assets": built, "served_assets": served, "match": built == served})
+
+
 def stage_menus() -> None:
-    want = os.environ.get("MENU_ARMS", "main,p16854").split(",")
-    arms = [(lbl, ref) for lbl, ref in SCROLL_ARMS if lbl in want]
+    spec = os.environ.get("MENU_ARM_REFS")
+    if spec:  # label=ref,label=ref (refs on danielhanchen/unsloth-staging-2)
+        arms = [tuple(x.split("=", 1)) for x in spec.split(",")]
+    else:
+        want = os.environ.get("MENU_ARMS", "main,p16854").split(",")
+        arms = [(lbl, ref) for lbl, ref in SCROLL_ARMS if lbl in want]
     sh("git fetch -q https://github.com/danielhanchen/unsloth-staging-2 "
        + " ".join(f"{r}:{r}" for _, r in arms) + " --force", "fetch_bench", cwd=REPO)
     dists = {}
@@ -342,6 +369,8 @@ def stage_menus() -> None:
         for arm in dists:
             try:
                 url = launch(dists[arm], W / "hf_empty")
+                if rep == 0:
+                    record_build(arm, dict(arms)[arm], dists[arm], url)
                 out = OUT / f"menus_{arm}_{rep}.json"
                 shots = f"--shots {OUT / 'shots'}" if rep == 0 else ""
                 sh(f"{sys.executable} -u {PACK}/menu_bench.py run --base-url {url} --home {HOME} "
@@ -462,6 +491,116 @@ def stage_glass() -> None:
                 result("glass", {"arm": arm, "rep": rep, "error": str(exc)[:300]})
             finally:
                 stop()
+
+
+def glass_image() -> Path:
+    from PIL import Image
+    import random
+    img = W / "bg.png"
+    if not img.exists():
+        random.seed(16852)
+        im = Image.new("RGB", (1920, 1080))
+        px = im.load()
+        for y in range(1080):
+            for x in range(0, 1920):
+                px[x, y] = ((x * 255) // 1920, (y * 255) // 1080, (x * y + random.randint(0, 60)) % 256)
+        im.save(img)
+    return img
+
+
+def build_patched(name: str, patch: Path) -> Path | None:
+    dist = W / f"dist_{name}"
+    if (dist / "index.html").exists():
+        return dist
+    wt = worktree("origin/main", name)
+    fe = wt / "studio" / "frontend"
+    try:
+        sh(f"git apply {patch}", f"apply_{name}", cwd=wt)
+        node_modules(fe)
+        sh(f"npx vite build --outDir {dist} --emptyOutDir", f"build_{name}", cwd=fe, timeout=1800)
+    except Exception as exc:  # noqa: BLE001
+        log(f"build {name} failed: {exc}"[:600])
+        return None
+    finally:
+        (fe / "node_modules").unlink(missing_ok=True)
+        git("worktree", "remove", "--force", str(wt), check=False)
+    return dist
+
+
+def stage_glassdiag() -> None:
+    """Glass attribution: arms = (build, material, override CSS) from PACK/glassdiag/arms.json."""
+    img = glass_image()
+    spec = json.loads((PACK / "glassdiag" / "arms.json").read_text())
+    dists = {"main": build_app("origin/main", "gd_main")}
+    patch = PACK / "glassdiag" / "fix.patch"
+    if patch.exists() and any(a["build"] == "fix" for a in spec["arms"]):
+        dists["fix"] = build_patched("gd_fix", patch)
+    shots = OUT / "shots"
+    for rep in range(int(spec.get("reps", 2))):
+        arms = spec["arms"][rep % len(spec["arms"]):] + spec["arms"][: rep % len(spec["arms"])]
+        for build in ("main", "fix"):
+            mine = [a for a in arms if a["build"] == build]
+            if not mine or dists.get(build) is None:
+                continue
+            try:
+                url = launch(dists[build], W / "hf_empty")
+                for a in mine:
+                    out = OUT / f"gd_{a['label']}_{rep}.json"
+                    css = f"--css-file {PACK / 'glassdiag' / a['css']}" if a.get("css") else ""
+                    shot = f"--shots {shots}" if rep == 0 else ""
+                    try:
+                        sh(f"{sys.executable} -u {PACK}/glass_bench.py --base-url {url} --home {HOME} "
+                           f"--arm {a['label']} --rep {rep} --image {img} --material {a.get('material', 'glass')} "
+                           f"{css} {shot} --out {out}", f"gd_{a['label']}_{rep}", timeout=1500, echo="GLASS")
+                        r = json.loads(out.read_text())
+                        for eng, d in r["engines"].items():
+                            result("glassdiag", {"arm": a["label"], "rep": rep, "engine": eng, **d.get("summary", {}),
+                                                 "state": d.get("state"), "err": d.get("error")})
+                    except Exception as exc:  # noqa: BLE001
+                        result("glassdiag", {"arm": a["label"], "rep": rep, "error": str(exc)[:300]})
+            finally:
+                stop()
+    shrink_shots(shots)
+
+
+def shrink_shots(shots: Path) -> None:
+    """Pixel-diff paired arms on the full PNGs, then keep JPEGs so the artifact fits the 5 MB cap."""
+    if not shots.is_dir():
+        return
+    try:
+        from PIL import Image, ImageChops
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pillow"], check=False)
+        from PIL import Image, ImageChops
+    pngs = {p.name: p for p in shots.glob("*.png")}
+    try:  # optional extra pairs: an arm with "diff_ref" is diffed against that arm
+        extra = tuple((x["diff_ref"], x["label"]) for x in json.loads((PACK / "glassdiag" / "arms.json").read_text())["arms"]
+                      if x.get("diff_ref"))
+    except Exception:  # noqa: BLE001
+        extra = ()
+    for a, b in (("glass", "fix"), ("solid", "fix_solid")) + extra:
+        for name, p in sorted(pngs.items()):
+            if not name.startswith(f"{a}_r0_"):
+                continue
+            q = pngs.get(name.replace(f"{a}_r0_", f"{b}_r0_", 1))
+            if q is None:
+                continue
+            x, y = Image.open(p).convert("RGB"), Image.open(q).convert("RGB")
+            if x.size != y.size:
+                result("glassshot", {"pair": f"{a}/{b}", "shot": name, "error": f"size {x.size} vs {y.size}"})
+                continue
+            d = ImageChops.difference(x, y).convert("L")
+            hist = d.histogram()
+            total = x.size[0] * x.size[1]
+            result("glassshot", {"pair": f"{a}/{b}", "shot": name[len(a) + 4:],
+                                 "px_changed": total - hist[0], "px_over8": sum(hist[9:]),
+                                 "px_over32": sum(hist[33:]), "max": max(i for i, c in enumerate(hist) if c) if total - hist[0] else 0,
+                                 "total": total})
+    for p in pngs.values():
+        im = Image.open(p).convert("RGB")
+        im.thumbnail((1400, 1400))
+        im.save(p.with_suffix(".jpg"), quality=80)
+        p.unlink()
 
 
 def seed_catalog(hf: Path) -> dict:
