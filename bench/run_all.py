@@ -348,6 +348,13 @@ def stage_menus() -> None:
                    f"--threads {threads} --arm {arm} --engines {os.environ.get('MENU_ENGINES', 'chromium,webkit,webkit_mac')} "
                    f"{shots} --out {out}", f"menus_{arm}_{rep}", timeout=2700, echo="MENU")
                 result("menus", {"arm": arm, "rep": rep, "file": out.name})
+                if os.environ.get("MENU_GLASS", "1") == "1":
+                    out = OUT / f"menus_{arm}_glass_{rep}.json"
+                    sh(f"{sys.executable} -u {PACK}/menu_bench.py run --base-url {url} --home {HOME} "
+                       f"--threads {threads} --arm {arm}_glass --material glass "
+                       f"--engines {os.environ.get('MENU_ENGINES', 'chromium,webkit,webkit_mac')} "
+                       f"--out {out}", f"menus_{arm}_glass_{rep}", timeout=2700, echo="MENU")
+                    result("menus", {"arm": f"{arm}_glass", "rep": rep, "file": out.name})
             except Exception as exc:  # noqa: BLE001
                 result("menus", {"arm": arm, "rep": rep, "error": str(exc)[:300]})
             finally:
