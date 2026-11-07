@@ -14,11 +14,11 @@ jobs:
         rep: [1, 2, 3]
         include:
           - rep: 1
-            arms: "main=bench/r7-main,pr17005=bench/r7-pr17005,pr17006=bench/r7-pr17006"
+            arms: "main=bench/r7-main,pr17006=bench/r7-pr17006"
           - rep: 2
-            arms: "pr17005=bench/r7-pr17005,pr17006=bench/r7-pr17006,main=bench/r7-main"
+            arms: "pr17006=bench/r7-pr17006,main=bench/r7-main"
           - rep: 3
-            arms: "pr17006=bench/r7-pr17006,main=bench/r7-main,pr17005=bench/r7-pr17005"
+            arms: "main=bench/r7-main,pr17006=bench/r7-pr17006"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 300
     steps:
@@ -32,14 +32,16 @@ jobs:
       - name: Record arm refs
         run: |
           mkdir -p job/out
-          git ls-remote https://github.com/danielhanchen/unsloth-staging-2 "refs/heads/bench/r7-main" "refs/heads/bench/r7-pr17005" "refs/heads/bench/r7-pr17006" | tee job/out/arm_ref.txt
-      - name: Menu bench round 7 (short vs long, solid, main vs #17005 vs #17006, same runner, rotated order)
+          git ls-remote https://github.com/danielhanchen/unsloth-staging-2 "refs/heads/bench/r7-main" "refs/heads/bench/r7-pr17006" | tee job/out/arm_ref.txt
+      - name: Menu bench round 8 (rename close re-check, frame-start window, main vs #17006, rotated order)
         env:
           BENCH_WORK: ${{ runner.temp }}/lagbench
           MENU_ARM_REFS: ${{ matrix.arms }}
           MENU_GLASS: "0"
           MENU_TURNS: "1 150"
           MENU_ENGINES: webkit,chromium
+          MENU_SURFACES: rename_chat,tools_menu,command_palette,chat_options,composer_menu
+          MENU_SKIP_TS: "1"
         run: |
           cp bench/pack_menus.tgz job/
           cd job
@@ -47,5 +49,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: r7-${{ matrix.os }}-r${{ matrix.rep }}
+          name: r8-${{ matrix.os }}-r${{ matrix.rep }}
           path: job/out
