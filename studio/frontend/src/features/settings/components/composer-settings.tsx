@@ -134,6 +134,46 @@ export function ComposerSettings({ embedded = false }: { embedded?: boolean }) {
               ))}
             </div>
           </SettingsRow>
+          <SettingsRow
+            label={t("composerSettings.shareDraft")}
+            description={t("composerSettings.shareDraftDescription")}
+          >
+            <Switch
+              aria-label={t("composerSettings.shareDraft")}
+              checked={prefs.shareComposerDraft}
+              onCheckedChange={prefs.setShareComposerDraft}
+            />
+          </SettingsRow>
+          <SettingsRow
+            label={t("composerSettings.plainText")}
+            description={t("composerSettings.plainTextDescription")}
+          >
+            <Switch
+              aria-label={t("composerSettings.plainText")}
+              checked={prefs.plainTextComposer}
+              onCheckedChange={prefs.setPlainTextComposer}
+            />
+          </SettingsRow>
+          <SettingsRow
+            label={t("composerSettings.richPaste")}
+            badge={<Badge variant="secondary" className="h-4 px-1.5 text-ui-10 text-muted-foreground">{t("shell.beta")}</Badge>}
+            description={t("composerSettings.richPasteDescription", {
+              shortcut: isMacPlatform() ? "\u21e7\u2318V" : "Ctrl+Shift+V",
+            })}
+          >
+            <Switch
+              aria-label={t("composerSettings.richPaste")}
+              checked={prefs.richTextPaste}
+              onCheckedChange={prefs.setRichTextPaste}
+            />
+          </SettingsRow>
+          <SettingsRow label={t("composerSettings.showContext")}>
+            <Switch
+              aria-label={t("composerSettings.showContext")}
+              checked={prefs.showContextWindowUsage}
+              onCheckedChange={prefs.setShowContextWindowUsage}
+            />
+          </SettingsRow>
         </div>
       </SettingsSection>
     </div>
