@@ -14,13 +14,13 @@ jobs:
         rep: [1, 2, 3, 4]
         include:
           - rep: 1
-            arms: "main=bench/r9-main,pr17006=bench/r9-pr17006,main2=bench/r9-main2"
+            arms: "main=bench/r10-main,pr17035=bench/r10-pr17035,main2=bench/r10-main2"
           - rep: 2
-            arms: "main2=bench/r9-main2,pr17006=bench/r9-pr17006,main=bench/r9-main"
+            arms: "main2=bench/r10-main2,pr17035=bench/r10-pr17035,main=bench/r10-main"
           - rep: 3
-            arms: "main=bench/r9-main,main2=bench/r9-main2,pr17006=bench/r9-pr17006"
+            arms: "main=bench/r10-main,main2=bench/r10-main2,pr17035=bench/r10-pr17035"
           - rep: 4
-            arms: "pr17006=bench/r9-pr17006,main2=bench/r9-main2,main=bench/r9-main"
+            arms: "pr17035=bench/r10-pr17035,main2=bench/r10-main2,main=bench/r10-main"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 300
     steps:
@@ -34,15 +34,15 @@ jobs:
       - name: Record arm refs
         run: |
           mkdir -p job/out
-          git ls-remote https://github.com/danielhanchen/unsloth-staging-2 "refs/heads/bench/r9-main" "refs/heads/bench/r9-main2" "refs/heads/bench/r9-pr17006" | tee job/out/arm_ref.txt
-      - name: Menu bench round 9 (balanced main vs #17006 with an A/A main copy, WebKit, 150 turns)
+          git ls-remote https://github.com/danielhanchen/unsloth-staging-2 "refs/heads/bench/r10-main" "refs/heads/bench/r10-main2" "refs/heads/bench/r10-pr17035" | tee job/out/arm_ref.txt
+      - name: Menu bench round 10 (balanced main vs #17035 with an A/A main copy, WebKit + Chromium, 1 vs 150 turns)
         env:
           BENCH_WORK: ${{ runner.temp }}/lagbench
           MENU_ARM_REFS: ${{ matrix.arms }}
           MENU_GLASS: "0"
-          MENU_TURNS: "150"
-          MENU_ENGINES: webkit
-          MENU_SURFACES: tools_menu,command_palette,chat_options,composer_menu,rename_chat,sidebar_toggle
+          MENU_TURNS: "1 150"
+          MENU_ENGINES: webkit,chromium
+          MENU_SURFACES: run_settings,sidebar_toggle,browser_pane,tools_menu
           MENU_SKIP_TS: "1"
         run: |
           cp bench/pack_menus.tgz job/
@@ -51,5 +51,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: r9-${{ matrix.os }}-r${{ matrix.rep }}
+          name: r10-${{ matrix.os }}-r${{ matrix.rep }}
           path: job/out
