@@ -90,6 +90,8 @@ export interface SystemInfoResponse {
     available_gb: number;
     percent_used: number;
     process_used_mb: number;
+    /** The server plus its child processes (llama-server, workers). */
+    process_tree_used_mb?: number;
   };
   disk: {
     total_gb: number;
@@ -115,6 +117,8 @@ export interface SystemInfoResponse {
 
 let cachedSystem: SystemInfoResponse | null = null;
 let systemFetchPromise: Promise<SystemInfoResponse | null> | null = null;
+/** The in-flight fetch's GPU freshness bound; undefined is the server's 10 s cache. */
+let systemFetchGpuMaxAgeMs: number | undefined;
 let systemFetchProbesMedia = false;
 const systemSubscribers = new Set<(data: SystemInfoResponse) => void>();
 let vulkanRetrySubscribers = 0;
@@ -208,33 +212,58 @@ function scheduleVulkanRetry(): void {
   );
 }
 
+export function systemUrl(
+  refreshMemory: boolean,
+  gpuMaxAgeMs?: number,
+  probeMedia = false,
+): string {
+  const params = new URLSearchParams();
+  if (refreshMemory) params.set("refresh_memory", "true");
+  if (probeMedia) params.set("probe_media", "true");
+  if (gpuMaxAgeMs !== undefined && Number.isFinite(gpuMaxAgeMs) && gpuMaxAgeMs > 0) {
+    params.set("gpu_max_age", String(gpuMaxAgeMs / 1000));
+  }
+  const query = params.toString();
+  return query ? `/api/system?${query}` : "/api/system";
+}
+
 export async function fetchSystemInfo({
   force = false,
   refreshMemory = false,
+  gpuMaxAgeMs,
   probeMedia = false,
-}: { force?: boolean; refreshMemory?: boolean; probeMedia?: boolean } = {}): Promise<SystemInfoResponse | null> {
+}: {
+  force?: boolean;
+  refreshMemory?: boolean;
+  /** GPU readings no older than this (the backend clamps to 1-10 s; default is its 10 s cache). */
+  gpuMaxAgeMs?: number;
+  probeMedia?: boolean;
+} = {}): Promise<SystemInfoResponse | null> {
   if (systemFetchPromise) {
-    if (!refreshMemory && (!probeMedia || systemFetchProbesMedia)) return systemFetchPromise;
-    // A resident-memory refresh or media probe needs more than an ordinary snapshot.
+    // A pending fetch with a looser GPU bound would hand a fast poll the 10 s cache.
+    const looser =
+      gpuMaxAgeMs !== undefined &&
+      (systemFetchGpuMaxAgeMs === undefined || systemFetchGpuMaxAgeMs > gpuMaxAgeMs);
+    if (!refreshMemory && !looser && (!probeMedia || systemFetchProbesMedia)) {
+      return systemFetchPromise;
+    }
+    // A resident-memory refresh, fresher GPU read or media probe needs more than an ordinary snapshot.
     await systemFetchPromise;
-    return fetchSystemInfo({ force, refreshMemory, probeMedia });
+    return fetchSystemInfo({ force, refreshMemory, gpuMaxAgeMs, probeMedia });
   }
   if (!force && !refreshMemory && !probeMedia && cachedSystem) {
     refreshDeviceTypeAfterSystemInfo({ detectHardware: true });
     return cachedSystem;
   }
 
+  systemFetchGpuMaxAgeMs = gpuMaxAgeMs;
   systemFetchProbesMedia = probeMedia;
   systemFetchPromise = (async () => {
     const timeout = disposableTimeoutSignal(SYSTEM_FETCH_TIMEOUT_MS);
     try {
-      const query = new URLSearchParams();
-      if (refreshMemory) query.set("refresh_memory", "true");
-      if (probeMedia) query.set("probe_media", "true");
-      const res = await authFetch(
-        query.size ? "/api/system?" + query.toString() : "/api/system",
-        { signal: timeout.signal },
-      );
+      const res = await authFetch(systemUrl(refreshMemory, gpuMaxAgeMs, probeMedia), {
+        signal: timeout.signal,
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data = await res.json();
 
@@ -258,11 +287,14 @@ export async function fetchSystemInfo({
 interface UseSystemInfoOptions {
   pollMs?: number;
   enabled?: boolean;
+  /** Ask for GPU readings as fresh as the poll; otherwise VRAM moves only every 10 s. */
+  gpuFollowsPoll?: boolean;
 }
 
 export function useSystemInfo({
   pollMs,
   enabled = true,
+  gpuFollowsPoll = false,
 }: UseSystemInfoOptions = {}): SystemInfoResponse {
   const [systemInfo, setSystemInfo] = useState<SystemInfoResponse>(cachedSystem ?? DEFAULT_SYSTEM);
   const [failedPolls, setFailedPolls] = useState(0);
@@ -282,7 +314,7 @@ export function useSystemInfo({
 
     const update = (force: boolean) => {
       inFlight = true;
-      void fetchSystemInfo({ force })
+      void fetchSystemInfo({ force, gpuMaxAgeMs: gpuFollowsPoll ? pollMs : undefined })
         .then((info) => {
           if (cancelled) return;
           setFailedPolls((previous) => nextFailedPolls(previous, info !== null));
@@ -322,7 +354,7 @@ export function useSystemInfo({
       if (timeoutId !== null) window.clearTimeout(timeoutId);
       document.removeEventListener("visibilitychange", onVisibilityChange);
     };
-  }, [enabled, pollMs]);
+  }, [enabled, pollMs, gpuFollowsPoll]);
 
   const stale = enabled && isReadingStale(systemInfo.status, failedPolls, Boolean(pollMs));
   return useMemo(
