@@ -1,0 +1,17 @@
+studio/backend/tests/multi_account/test_media_unload_handoff.py
+studio/backend/tests/test_diffusion_backend.py
+studio/backend/tests/test_diffusion_hosted_vae_pipeline.py
+studio/backend/tests/test_diffusion_ideogram4_te_prequant.py
+studio/backend/tests/test_diffusion_inpaint_mask.py
+studio/backend/tests/test_diffusion_layer_split_lifecycle.py
+studio/backend/tests/test_diffusion_load_settle_reuse.py
+studio/backend/tests/test_diffusion_multigpu_wiring.py
+studio/backend/tests/test_diffusion_prompt_cache.py
+studio/backend/tests/test_diffusion_prompt_hint.py
+studio/backend/tests/test_diffusion_qwen_edit_multi_image.py
+studio/backend/tests/test_diffusion_qwen_layered.py
+studio/backend/tests/test_diffusion_static_skip.py
+studio/backend/tests/test_diffusion_step_skip_defaults.py
+studio/backend/tests/test_diffusion_unified_edit.py
+studio/backend/tests/test_image_fetch_ids_unsloth.py
+studio/backend/tests/test_image_hub_metadata_unsloth.py
