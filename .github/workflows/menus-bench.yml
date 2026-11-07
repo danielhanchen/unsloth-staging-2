@@ -2,6 +2,7 @@ name: menus-bench
 on:
   push:
     branches: ["bench/menus-ci"]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
