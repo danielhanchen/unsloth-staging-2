@@ -14,11 +14,11 @@ jobs:
         rep: [1, 2, 3]
         include:
           - rep: 1
-            arms: "main-now2=bench/main-now2,main-now3=bench/main-now3"
+            arms: "now3-on=bench/main-now3,now3-off=bench/main-now3b"
           - rep: 2
-            arms: "main-now3=bench/main-now3,main-now2=bench/main-now2"
+            arms: "now3-off=bench/main-now3b,now3-on=bench/main-now3"
           - rep: 3
-            arms: "main-now2=bench/main-now2,main-now3=bench/main-now3"
+            arms: "now3-on=bench/main-now3,now3-off=bench/main-now3b"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 300
     steps:
@@ -32,15 +32,16 @@ jobs:
       - name: Record arm ref
         run: |
           mkdir -p job/out
-          git ls-remote https://github.com/danielhanchen/unsloth-staging-2 "refs/heads/bench/main-now2" "refs/heads/bench/main-now3" | tee job/out/arm_ref.txt
-      - name: Menu bench (150-turn thread, solid + liquid-3d, main-now2 vs main-now3)
+          git ls-remote https://github.com/danielhanchen/unsloth-staging-2 "refs/heads/bench/main-now3" "refs/heads/bench/main-now3b" | tee job/out/arm_ref.txt
+      - name: Menu bench (150-turn thread, solid + liquid-3d, main-now3 row containment on vs off)
         env:
           BENCH_WORK: ${{ runner.temp }}/lagbench
           # both arms on the same runner, order alternates per rep
           MENU_ARM_REFS: ${{ matrix.arms }}
           MENU_GLASS: "1"
           MENU_TURNS: "150"
-          MENU_ENGINES: webkit,chromium
+          MENU_ENGINES: webkit
+          MENU_INIT_JS_MAP: '{"now3-off": "window.__UNSLOTH_MESSAGE_ROW_CONTAINMENT__ = false;"}'
         run: |
           cp bench/pack_menus.tgz job/
           cd job
@@ -48,5 +49,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: r4-${{ matrix.os }}-r${{ matrix.rep }}
+          name: r5-${{ matrix.os }}-r${{ matrix.rep }}
           path: job/out
