@@ -306,6 +306,8 @@ const REFRESH_LOCK_WAIT_MS = 8000;
 const REFRESH_RETRY_DEFAULT_MS = 1000;
 const REFRESH_RETRY_MIN_MS = 250;
 const REFRESH_RETRY_MAX_MS = 5000;
+const REFRESH_PEER_WAIT_MS = 3000;
+const REFRESH_PEER_POLL_MS = 100;
 
 function refreshRetryDelay(response: Response): number {
   const header = response.headers.get("Retry-After")?.trim();
@@ -319,7 +321,36 @@ function refreshRetryDelay(response: Response): number {
   );
 }
 
-async function runRefresh(refreshToken: string, preserveSessionMark = false): Promise<RefreshOutcome> {
+/** The winner's 200 committed before this 401 was sent, so its pair lands here within moments. */
+async function peerRotated(
+  refreshToken: string,
+  startGeneration: number,
+  sessionMark: string | null,
+): Promise<boolean> {
+  const deadline = Date.now() + REFRESH_PEER_WAIT_MS;
+  let mark = sessionMark;
+  for (;;) {
+    const currentMark = getAuthSessionMark();
+    mark ??= currentMark;
+    if (
+      startGeneration !== logoutGeneration ||
+      accountTransitionPending() ||
+      currentMark !== mark
+    )
+      return false;
+    const current = getRefreshToken();
+    if (current !== refreshToken) return current !== null;
+    if (Date.now() >= deadline) return false;
+    await wait(REFRESH_PEER_POLL_MS);
+  }
+}
+
+async function runRefresh(
+  refreshToken: string,
+  preserveSessionMark = false,
+  // No Web Locks: a peer tab may spend this token first. null: mark read at the 401.
+  peerSessionMark?: string | null,
+): Promise<RefreshOutcome> {
   const startGeneration = logoutGeneration;
   const startedAt = Date.now();
   const superseded = (): RefreshOutcome | null => {
@@ -340,6 +371,11 @@ async function runRefresh(refreshToken: string, preserveSessionMark = false): Pr
     }
     // Only a 401 rejects the token; a 5xx, 429 or proxy error says nothing about the session.
     if (response.status === 401) {
+      if (
+        peerSessionMark !== undefined &&
+        (await peerRotated(refreshToken, startGeneration, peerSessionMark))
+      )
+        return "ok";
       clearAuthTokensIfCurrent(refreshToken);
       return "rejected";
     }
@@ -381,7 +417,8 @@ export async function refreshSessionOutcome(): Promise<RefreshOutcome> {
 
   const generation = logoutGeneration;
   const locks = typeof window !== "undefined" ? window.navigator?.locks : undefined;
-  const sessionMark = locks ? ensureAuthSessionMark() : null;
+  const priorMark = getAuthSessionMark();
+  const sessionMark = ensureAuthSessionMark();
   if (getRefreshToken() !== refreshToken) return "unavailable";
   const promise = locks
     ? (async (): Promise<RefreshOutcome> => {
@@ -409,7 +446,8 @@ export async function refreshSessionOutcome(): Promise<RefreshOutcome> {
           clearTimeout(timer);
         }
       })()
-    : runRefresh(refreshToken);
+    : // A mark minted here may lose a peer's write, so it is not proof of a switch.
+      runRefresh(refreshToken, false, priorMark === null ? null : sessionMark);
   refreshInflight = promise;
   refreshInflightToken = refreshToken;
   try {
