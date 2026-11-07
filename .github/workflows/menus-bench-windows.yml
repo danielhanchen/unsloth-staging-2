@@ -10,8 +10,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arm: [main-now2]
         rep: [1, 2]
+        include:
+          - rep: 1
+            order: "main-pr16986base pr16986"
+          - rep: 2
+            order: "pr16986 main-pr16986base"
     runs-on: windows-latest
     timeout-minutes: 300
     defaults:
@@ -24,8 +28,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: danielhanchen/unsloth-staging-2
-          ref: bench/${{ matrix.arm }}
-          path: src
+          ref: bench/main-pr16986base
+          path: src_main-pr16986base
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: danielhanchen/unsloth-staging-2
+          ref: bench/pr16986
+          path: src_pr16986
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -33,49 +43,51 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Install Studio from this build (install.ps1 --local --no-torch)
+      - name: Install Studio from the base checkout (install.ps1 --local --no-torch); the PR is frontend-only
         shell: pwsh
-        working-directory: src
+        working-directory: src_main-pr16986base
         run: |
           $child = '$ErrorActionPreference = ''Stop''; $ProgressPreference = ''SilentlyContinue''; & ./install.ps1 --local --no-torch; exit $LASTEXITCODE'
           pwsh -NoProfile -ExecutionPolicy Bypass -Command $child 2>&1 | Tee-Object -FilePath ../install.log | Select-Object -Last 40
           if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited with code $LASTEXITCODE" }
-      - name: Launch Studio
+      - name: Build both frontends the same way (vite build in each checkout)
         run: |
-          SHIM_DIR=~/.unsloth/studio/bin
-          ls "$SHIM_DIR/unsloth.exe"
-          export PATH="$SHIM_DIR:$PATH"
-          nohup unsloth studio -H 127.0.0.1 -p 12611 > studio.log 2>&1 &
-          for i in $(seq 1 90); do curl -sf http://127.0.0.1:12611/api/health && break; sleep 5; done
-          curl -sf http://127.0.0.1:12611/api/health || { tail -60 studio.log; exit 1; }
-      - name: Record which build is served
-        run: |
-          mkdir -p out
-          {
-            echo "arm=${{ matrix.arm }} src_head=$(git -C src rev-parse HEAD)"
-            echo "served:"; curl -sf http://127.0.0.1:12611/ | grep -oE '/assets/[A-Za-z0-9_.-]+\.(js|css)' | sort -u
-            for f in src/studio/frontend/dist/index.html; do
-              [ -f "$f" ] && { echo "built ($f):"; grep -oE '/assets/[A-Za-z0-9_.-]+\.(js|css)' "$f" | sort -u; }
-            done
-          } | tee out/build_manifest.txt
-      - name: Seed short and long threads, run the menu bench (Edge = WebView2 engine, Chromium)
+          for arm in main-pr16986base pr16986; do
+            ( cd src_$arm/studio/frontend && { [ -d node_modules ] || npm ci --no-audit --no-fund; } && npx vite build > ../../../build_$arm.log 2>&1 ) || { tail -40 build_$arm.log; exit 1; }
+            echo "$arm $(git -C src_$arm rev-parse HEAD) $(grep -oE '/assets/index-[A-Za-z0-9_-]+\.js' src_$arm/studio/frontend/dist/index.html)"
+          done
+      - name: A/B in alternating order on this runner (Edge = WebView2 engine), 150 turns, solid
         run: |
           python -m pip install -q 'playwright<2' httpx pillow huggingface_hub
-          python -m playwright install chromium
-          mkdir -p work && tar -xzf benchsrc/bench/pack_menus.tgz -C work
+          mkdir -p work out && tar -xzf benchsrc/bench/pack_menus.tgz -C work
           export PACK="$PWD/work/pack" WORKSPACE="$PWD/work/pack"
+          export PATH=~/.unsloth/studio/bin:"$PATH"
           HOME_W=$(cygpath -w ~/.unsloth/studio)
-          python -u work/pack/menu_bench.py seed --base-url http://127.0.0.1:12611 --home "$HOME_W" --turns 1 150 --out out/threads.json
-          python -u work/pack/menu_bench.py run --base-url http://127.0.0.1:12611 --home "$HOME_W" --threads out/threads.json \
-            --arm ${{ matrix.arm }} --engines msedge,chromium --shots out/shots --out out/menus_${{ matrix.arm }}_win.json 2>&1 | tee out/menus.log | grep -E "^MENU" || true
-          python -u work/pack/menu_bench.py run --base-url http://127.0.0.1:12611 --home "$HOME_W" --threads out/threads.json \
-            --arm ${{ matrix.arm }}_glass --material glass --engines msedge,chromium --out out/menus_${{ matrix.arm }}_glass_win.json 2>&1 | tee out/menus_glass.log | grep -E "^MENU" || true
-          test -s out/menus_${{ matrix.arm }}_win.json && test -s out/menus_${{ matrix.arm }}_glass_win.json
+          for arm in ${{ matrix.order }}; do
+            DIST_W=$(cygpath -w "$PWD/src_$arm/studio/frontend/dist")
+            nohup unsloth studio -H 127.0.0.1 -p 12611 -f "$DIST_W" > studio_$arm.log 2>&1 &
+            for i in $(seq 1 90); do curl -sf http://127.0.0.1:12611/api/health >/dev/null && break; sleep 5; done
+            curl -sf http://127.0.0.1:12611/api/health >/dev/null || { tail -60 studio_$arm.log; exit 1; }
+            {
+              echo "arm=$arm src_head=$(git -C src_$arm rev-parse HEAD)"
+              echo "served:"; curl -sf http://127.0.0.1:12611/ | grep -oE '/assets/[A-Za-z0-9_.-]+\.(js|css)' | sort -u
+              echo "built:"; grep -oE '/assets/[A-Za-z0-9_.-]+\.(js|css)' src_$arm/studio/frontend/dist/index.html | sort -u
+            } > out/build_manifest_$arm.txt
+            [ -f out/threads.json ] || python -u work/pack/menu_bench.py seed --base-url http://127.0.0.1:12611 --home "$HOME_W" --turns 150 --out out/threads.json
+            python -u work/pack/menu_bench.py run --base-url http://127.0.0.1:12611 --home "$HOME_W" --threads out/threads.json \
+              --arm $arm --engines msedge --shots out/shots --out out/menus_${arm}_win.json 2>&1 | tee out/menus_$arm.log | grep -E "^MENU" || true
+            unsloth studio stop || true
+            for i in $(seq 1 30); do curl -sf http://127.0.0.1:12611/api/health >/dev/null || break; sleep 2; done
+            curl -sf http://127.0.0.1:12611/api/health >/dev/null && { echo "studio did not stop"; exit 1; }
+            sleep 3
+          done
+          for arm in ${{ matrix.order }}; do test -s out/menus_${arm}_win.json; done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: menus-windows-${{ matrix.arm }}-r${{ matrix.rep }}
+          name: r3-windows-r${{ matrix.rep }}
           path: |
             out
-            studio.log
+            studio_*.log
+            build_*.log
             install.log
