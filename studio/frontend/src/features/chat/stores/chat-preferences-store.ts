@@ -26,6 +26,8 @@ import {
 } from "../lib/live-generation-stats.ts";
 
 export interface ChatPreferencesState {
+  shareComposerDraft: boolean;
+  setShareComposerDraft: (value: boolean) => void;
   plainTextComposer: boolean;
   setPlainTextComposer: (value: boolean) => void;
   showContextWindowUsage: boolean;
@@ -95,6 +97,8 @@ export const useChatPreferencesStore = create<ChatPreferencesState>()(
   persist(
     (set) => ({
       ...normalizeComposerPreferences(null),
+      shareComposerDraft: false,
+      setShareComposerDraft: (shareComposerDraft) => set({ shareComposerDraft }),
       setPlainTextComposer: (plainTextComposer) => set({ plainTextComposer }),
       setShowContextWindowUsage: (showContextWindowUsage) =>
         set({ showContextWindowUsage }),
@@ -169,6 +173,7 @@ export const useChatPreferencesStore = create<ChatPreferencesState>()(
         return {
           ...current,
           ...normalizeComposerPreferences(saved),
+          shareComposerDraft: saved?.shareComposerDraft === true,
           confirmDeleteChats: saved?.confirmDeleteChats ?? true,
           alwaysDeleteChatFiles: saved?.alwaysDeleteChatFiles ?? false,
           showResponseModel: saved?.showResponseModel ?? false,
