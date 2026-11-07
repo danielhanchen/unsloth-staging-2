@@ -10,7 +10,8 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-15]
-        arm: [pre16902, at16902, main-now]
+        arm: [main-now2]
+        rep: [1, 2]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 300
     steps:
@@ -24,11 +25,12 @@ jobs:
       - name: Record arm ref
         run: |
           mkdir -p job/out
-          git ls-remote https://github.com/danielhanchen/unsloth-staging-2 "refs/heads/bench/${{ matrix.arm }}" | tee job/out/arm_ref.txt
+          git ls-remote https://github.com/danielhanchen/unsloth-staging-2 "refs/heads/bench/${{ matrix.arm }}" "refs/heads/bench/main-now" | tee job/out/arm_ref.txt
       - name: Menu bench (short 1-turn vs long 150-turn thread, Glass off and on)
         env:
           BENCH_WORK: ${{ runner.temp }}/lagbench
-          MENU_ARM_REFS: ${{ matrix.arm }}=bench/${{ matrix.arm }}
+          # rep 1 also runs the old main-now on the same runner as a paired baseline
+          MENU_ARM_REFS: ${{ matrix.rep == 1 && format('{0}=bench/{0},main-now=bench/main-now', matrix.arm) || format('{0}=bench/{0}', matrix.arm) }}
           MENU_GLASS: "1"
           MENU_TURNS: "1 150"
           MENU_ENGINES: webkit,chromium
@@ -39,5 +41,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: menus-${{ matrix.os }}-${{ matrix.arm }}
+          name: menus-${{ matrix.os }}-${{ matrix.arm }}-r${{ matrix.rep }}
           path: job/out
