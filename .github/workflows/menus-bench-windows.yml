@@ -11,13 +11,6 @@ jobs:
       fail-fast: false
       matrix:
         rep: [1, 2, 3]
-        include:
-          - rep: 1
-            order: "now3-on now3-off"
-          - rep: 2
-            order: "now3-off now3-on"
-          - rep: 3
-            order: "now3-on now3-off"
     runs-on: windows-latest
     timeout-minutes: 300
     defaults:
@@ -30,7 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: danielhanchen/unsloth-staging-2
-          ref: bench/main-now3
+          ref: bench/main-now4
           path: src
           persist-credentials: false
       - uses: actions/setup-python@v5
@@ -39,16 +32,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Install Studio from main-now3 (install.ps1 --local --no-torch)
+      - name: Install Studio from main-now4 (origin/main) (install.ps1 --local --no-torch)
         shell: pwsh
         working-directory: src
         run: |
           $child = '$ErrorActionPreference = ''Stop''; $ProgressPreference = ''SilentlyContinue''; & ./install.ps1 --local --no-torch; exit $LASTEXITCODE'
           pwsh -NoProfile -ExecutionPolicy Bypass -Command $child 2>&1 | Tee-Object -FilePath ../install.log | Select-Object -Last 40
           if ($LASTEXITCODE -ne 0) { throw "install.ps1 exited with code $LASTEXITCODE" }
-      - name: Containment on vs off (runtime switch via init script), same build, alternating order, Edge, solid + glass
-        env:
-          MENU_INIT_JS_MAP: '{"now3-off": "window.__UNSLOTH_MESSAGE_ROW_CONTAINMENT__ = false;"}'
+      - name: Short (1 turn) vs long (150 turns), Edge, solid + glass
         run: |
           python -m pip install -q 'playwright<2' httpx pillow huggingface_hub
           mkdir -p work out && tar -xzf benchsrc/bench/pack_menus.tgz -C work
@@ -59,18 +50,18 @@ jobs:
           for i in $(seq 1 90); do curl -sf http://127.0.0.1:12611/api/health >/dev/null && break; sleep 5; done
           curl -sf http://127.0.0.1:12611/api/health >/dev/null || { tail -60 studio.log; exit 1; }
           { echo "src_head=$(git -C src rev-parse HEAD)"; echo "served:"; curl -sf http://127.0.0.1:12611/ | grep -oE '/assets/index-[A-Za-z0-9_.-]+\.(js|css)' | sort -u; } | tee out/build_manifest.txt
-          python -u work/pack/menu_bench.py seed --base-url http://127.0.0.1:12611 --home "$HOME_W" --turns 150 --out out/threads.json
-          for arm in ${{ matrix.order }}; do
+          python -u work/pack/menu_bench.py seed --base-url http://127.0.0.1:12611 --home "$HOME_W" --turns 1 150 --out out/threads.json
+          for arm in main-now4; do
             python -u work/pack/menu_bench.py run --base-url http://127.0.0.1:12611 --home "$HOME_W" --threads out/threads.json \
               --arm $arm --engines msedge --out out/menus_${arm}_win.json 2>&1 | tee out/menus_$arm.log | grep -E "^MENU" || true
             python -u work/pack/menu_bench.py run --base-url http://127.0.0.1:12611 --home "$HOME_W" --threads out/threads.json \
               --arm ${arm}_glass --material glass --engines msedge --out out/menus_${arm}_glass_win.json 2>&1 | tee out/menus_${arm}_glass.log | grep -E "^MENU" || true
           done
-          for arm in ${{ matrix.order }}; do test -s out/menus_${arm}_win.json && test -s out/menus_${arm}_glass_win.json; done
+          for arm in main-now4; do test -s out/menus_${arm}_win.json && test -s out/menus_${arm}_glass_win.json; done
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: r5-windows-r${{ matrix.rep }}
+          name: r6-windows-r${{ matrix.rep }}
           path: |
             out
             studio.log
