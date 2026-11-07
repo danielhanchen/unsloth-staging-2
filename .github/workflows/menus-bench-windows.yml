@@ -2,6 +2,7 @@ name: menus-bench-windows
 on:
   push:
     branches: ["bench/menus-win"]
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
