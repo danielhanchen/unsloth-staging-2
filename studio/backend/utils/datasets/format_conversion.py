@@ -843,6 +843,198 @@ def convert_to_vlm_format(
     return converted_list
 
 
+class _HubClips:
+    """Repo-relative clip names of a Hub dataset, resolved by download the way bare image filenames are."""
+
+    def __init__(
+        self,
+        dataset_name,
+        revision = None,
+    ):
+        # The revision load_dataset read, so a pinned run trains on that revision's clips.
+        self.repo, self.revision, self.files = dataset_name, revision, None
+        # A repo id only: "local" and local folders have nothing to list.
+        if (
+            not isinstance(dataset_name, str)
+            or dataset_name.count("/") != 1
+            or os.path.exists(dataset_name)
+        ):
+            self.repo = None
+
+    def resolve(self, path):
+        if self.repo is None or os.path.exists(path) or "://" in path or os.path.isabs(path):
+            return None
+        if self.files is None:
+            from huggingface_hub import HfApi
+
+            from .format_detection import _VIDEO_EXTENSIONS
+
+            self.files, ambiguous = {}, {}
+            try:
+                repo_files = HfApi().list_repo_files(
+                    self.repo, repo_type = "dataset", revision = self.revision
+                )
+            except Exception as e:  # noqa: BLE001 -- not a Hub repo or offline: paths stay local
+                logger.info(f"Could not list {self.repo} to resolve video filenames: {e}")
+                repo_files = []
+            for f in repo_files:
+                if f.lower().endswith(_VIDEO_EXTENSIONS + (".webm",)):
+                    ambiguous.setdefault(os.path.basename(f), []).append(f)
+            for f in repo_files:
+                if f.lower().endswith(_VIDEO_EXTENSIONS + (".webm",)):
+                    name = os.path.basename(f)
+                    # A name in several folders resolves to its list, refused below: one copy is a guess.
+                    self.files.setdefault(name, f if len(ambiguous[name]) == 1 else ambiguous[name])
+                    # A full repo path is exact, so a root-level clip.mp4 is its own path, not a guess.
+                    self.files[f] = f
+        if path not in self.files:
+            return None
+        if isinstance(self.files[path], list):
+            raise ValueError(
+                f"Video '{path}' matches several files in {self.repo} ({', '.join(self.files[path])}); "
+                "use the repo-relative path."
+            )
+        from huggingface_hub import hf_hub_download
+
+        from utils.hf_cache_settings import active_hf_hub_cache
+
+        return hf_hub_download(
+            self.repo,
+            self.files[path],
+            repo_type = "dataset",
+            revision = self.revision,
+            cache_dir = active_hf_hub_cache(),
+        )
+
+
+def _own_video_part(
+    video,
+    account,
+    hub = None,
+):
+    from .format_detection import encoded_video
+
+    video = encoded_video(video)
+    if isinstance(video, dict):
+        if not video.get("path") and video.get("bytes"):
+            raise ValueError(
+                "A video is stored as embedded bytes with no file path; training reads clips from "
+                "files, so save the clips to files and point the column at their paths."
+            )
+        video = video.get("path")
+    if not isinstance(video, str) or not video.strip():
+        raise ValueError("Row has no video")
+    if video.strip().lower().startswith(("http://", "https://")):
+        # The collator would fetch it unguarded; the image fetchers' 64 MB cap does not fit clips.
+        raise ValueError(
+            f"Remote video URLs are not fetched for training: {video}. "
+            "Download the clips and point the column at local files or a Hub dataset."
+        )
+    resolved = hub.resolve(video) if hub is not None else None
+    if resolved is not None:
+        return resolved
+    return _own_image_path(video, account)
+
+
+def own_message_videos(
+    rows,
+    dataset_name = None,
+    dataset_revision = None,
+):
+    """Check every video path in VLM messages rows the way image paths are checked; returns the rows as a list."""
+    from utils.account_context import current_account
+    from .format_detection import video_parts
+
+    account = current_account()
+    hub = _HubClips(dataset_name, dataset_revision)
+    rows = [row for row in rows]
+    for row in rows:
+        if not video_parts(row.get("messages")):
+            continue
+        for message in row["messages"]:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            # Arrow fills absent keys with None, and the collator reads any "image" key as an image.
+            content[:] = [
+                {k: v for k, v in part.items() if v is not None} if isinstance(part, dict) else part
+                for part in content
+            ]
+        for part in video_parts(row["messages"]):
+            part["video"] = _own_video_part(part["video"], account, hub)
+    return rows
+
+
+def convert_video_to_vlm_format(
+    dataset,
+    video_column,
+    text_column,
+    question_column = None,
+    instruction = None,
+    video_columns = None,
+    dataset_name = None,
+    dataset_revision = None,
+):
+    """Flat video + text rows to VLM messages, one video part per clip column; the collator decodes the clip, so the path stays a path."""
+    from utils.account_context import current_account
+
+    from .format_detection import _holds_images, _is_image_value
+
+    account = current_account()
+    hub = _HubClips(dataset_name, dataset_revision)
+    answer_feature = (getattr(dataset, "features", None) or {}).get(text_column)
+    # A ClassLabel column stores ids; train on the class name.
+    as_label = getattr(answer_feature, "int2str", None)
+    default_instruction = instruction or "Describe this video."
+    converted = []
+    for row in dataset:
+        answer = row.get(text_column)
+        clip_columns = video_columns or [video_column]
+        # Detection probes a few rows; an image further down would otherwise be dropped silently.
+        images = [
+            c
+            for c, v in row.items()
+            if c not in clip_columns and (_is_image_value(v) or _holds_images(v))
+        ]
+        if images:
+            raise ValueError(
+                f"Rows mix video with image columns {images}; video conversion would drop the images, "
+                "so remove those columns or split the dataset."
+            )
+        clips = [row[c] for c in clip_columns if row.get(c) is not None]
+        if not clips or answer is None or not str(answer).strip():
+            continue
+        answer = as_label(answer) if as_label and isinstance(answer, int) else str(answer)
+        question = row.get(question_column) if question_column else None
+        if not isinstance(question, str) or not question.strip():
+            question = default_instruction
+        converted.append(
+            {
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            *(
+                                {"type": "video", "video": _own_video_part(clip, account, hub)}
+                                for clip in clips
+                            ),
+                            {"type": "text", "text": question},
+                        ],
+                    },
+                    {"role": "assistant", "content": [{"type": "text", "text": answer}]},
+                ]
+            }
+        )
+    if not converted:
+        raise ValueError(
+            f"No rows have both a video in '{video_column}' and text in '{text_column}'"
+        )
+    skipped = len(dataset) - len(converted) if hasattr(dataset, "__len__") else 0
+    if skipped:
+        logger.info(f"Skipping {skipped} rows without a video or text")
+    return converted
+
+
 def convert_sharegpt_with_images_to_vlm_format(
     dataset,
     image_column = "image",

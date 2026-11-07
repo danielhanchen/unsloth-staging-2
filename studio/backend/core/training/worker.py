@@ -2629,6 +2629,11 @@ def _adapt_for_mlx_vlm(
             if isinstance(content, list):
                 new_content = []
                 for part in content:
+                    if isinstance(part, dict) and part.get("type") == "video":
+                        raise ValueError(
+                            "Training on video is not supported on Apple Silicon (MLX) yet. "
+                            "Train this dataset on an NVIDIA or AMD GPU, or drop the video column."
+                        )
                     if isinstance(part, dict) and part.get("type") == "image":
                         img = part.get("image")
                         if img is not None:
@@ -3574,6 +3579,7 @@ def _run_mlx_training(event_queue, stop_queue, config):
                 tokenizer = tokenizer,
                 is_vlm = True,
                 dataset_name = hf_dataset or "local",
+                dataset_revision = config.get("dataset_revision"),
                 custom_format_mapping = custom_format_mapping,
                 progress_callback = _fmt_progress,
             )
@@ -3598,6 +3604,7 @@ def _run_mlx_training(event_queue, stop_queue, config):
                     tokenizer = tokenizer,
                     is_vlm = True,
                     dataset_name = hf_dataset or "local",
+                    dataset_revision = config.get("dataset_revision"),
                     custom_format_mapping = custom_format_mapping,
                 )
                 if ev_info.get("success"):
