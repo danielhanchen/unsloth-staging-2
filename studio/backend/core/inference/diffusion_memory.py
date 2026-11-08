@@ -3448,6 +3448,13 @@ _MEASURED_STREAMED_IMAGE_PEAK_MIB: dict[str, int] = {
     "qwen-image": 2560,
 }
 MEASURED_ACTIVATION_STREAMED_ENV = "UNSLOTH_DIFFUSION_MEASURED_ACTIVATION_STREAMED"
+# Streamed placement sized from the denoise seed, resident blocks lent to the VAE decode (whose 2_437 MiB FLUX.3 seed
+# never runs beside the stream); "0" restores the whole-render seed.
+STREAMED_DECODE_LEND_ENV = "UNSLOTH_DIFFUSION_STREAMED_DECODE_LEND"
+# Measured on L4 (int8 / fp8, 6 GiB) only.
+_STREAMED_DECODE_LEND_FAMILIES = frozenset({"flux.3-klein", "flux.3-klein-base"})
+_PHASE_DENOISE_COLUMN = 1
+_PHASE_DECODE_COLUMN = 2
 # "0": Qwen-Image t2i streams with the borrowed Edit figure again.
 QWEN_IMAGE_STREAMED_SEED_ENV = "UNSLOTH_DIFFUSION_QWEN_IMAGE_STREAMED_SEED"
 _QWEN_IMAGE_BORROWED_STREAMED_MIB = 3824
@@ -3586,9 +3593,11 @@ def measured_image_runtime_mib(
     dense_bf16: bool = False,
     small_host_int8: bool = False,
     streamed: bool = False,
+    seed_phase: Optional[int] = None,
 ) -> Optional[int]:
     """Measured runtime headroom for ``family`` at this size, or None (unmeasured: use the flat estimate).
     ``streamed``: use ``_MEASURED_STREAMED_IMAGE_PEAK_MIB`` (window excluded) where present.
+    ``seed_phase``: the ``_MEASURED_IMAGE_ACTIVATION_MIB`` column to seed from instead of the worst of the first three.
     ``phase`` (``diffusion_measured_peaks.PHASES``) reads that phase's learned peak instead of the whole render's.
     ``dense_transformer_mib`` selects the dense eager table; ``compute_bytes`` scales it (fp32 Qwen-Image: 8480 vs 4248).
 
@@ -3635,8 +3644,9 @@ def measured_image_runtime_mib(
         if seed is None and phase_seeds:
             phases = _MEASURED_IMAGE_ACTIVATION_MIB.get(str(family or "").lower())
             if phases is not None:
-                # worst of encoder / denoise / untiled decode at 1024x1024 for this tier
-                seed = max(phases[1 if speed_mode == "max" else 0][:3])
+                row = phases[1 if speed_mode == "max" else 0]
+                # worst of encoder / denoise / untiled decode at 1024x1024 for this tier, unless one is asked for
+                seed = row[seed_phase] if seed_phase is not None else max(row[:3])
     w = max(64, int(width or DEFAULT_IMAGE_WIDTH))
     h = max(64, int(height or DEFAULT_IMAGE_HEIGHT))
     batch = max(1, int(batch_size or 1))
@@ -4091,9 +4101,17 @@ def _stream_window_mib(pipe: Any) -> int:
                 continue
             if not isinstance(module, torch.nn.Module):
                 continue
+            stacks = []
             for child in module.children():
-                if not isinstance(child, (torch.nn.ModuleList, torch.nn.Sequential)):
-                    continue
+                if isinstance(child, (torch.nn.ModuleList, torch.nn.Sequential)):
+                    stacks.append(child)
+                elif isinstance(child, torch.nn.ModuleDict) and _dict_block_modules(module):
+                    stacks.extend(
+                        v
+                        for v in child.values()
+                        if isinstance(v, (torch.nn.ModuleList, torch.nn.Sequential))
+                    )
+            for child in stacks:
                 for block in child:
                     seen: set[int] = set()
                     nbytes = 0
@@ -4107,6 +4125,27 @@ def _stream_window_mib(pipe: Any) -> int:
         return -(-largest * (prefetch_depth() + 1) // (1024 * 1024))
     except Exception:  # noqa: BLE001
         return -1
+
+
+def _streamed_decode_lend_seed(
+    pipe: Any, family: Optional[str], speed_mode: Optional[str]
+) -> Optional[int]:
+    """Untiled decode seed (MiB) when ``family``'s streamed placement may lend its resident blocks to the decode."""
+    name = str(family or "").lower()
+    if (
+        _env_off(STREAMED_DECODE_LEND_ENV)
+        or name not in _STREAMED_DECODE_LEND_FAMILIES
+        or not bool(getattr(pipe, "_unsloth_phase_seeds", False))
+        or str(speed_mode or "") not in _MEASURED_PEAK_SPEED_MODES
+    ):
+        return None
+    phases = _MEASURED_IMAGE_ACTIVATION_MIB.get(name)
+    if phases is None:
+        return None
+    row = phases[1 if speed_mode == "max" else 0]
+    if row[_PHASE_DENOISE_COLUMN] >= row[_PHASE_DECODE_COLUMN]:
+        return None
+    return int(row[_PHASE_DECODE_COLUMN])
 
 
 def _streamed_dit_room_mib(memory: Any, headroom_mib: int, other_mib: int, window_mib: int) -> int:
@@ -4772,6 +4811,7 @@ def _refine_plan_from_loaded_weights(
                 # partial: the encode keeps the flat room (install_encode_release)
                 window = _stream_window_mib(pipe)
                 streamed_headroom = headroom
+                lend_decode = None
                 if static_seed and not small_host_int8:
                     streamed_headroom = min(
                         headroom,
@@ -4786,6 +4826,24 @@ def _refine_plan_from_loaded_weights(
                         )
                         or headroom,
                     )
+                    lend_decode = _streamed_decode_lend_seed(pipe, family, speed_mode)
+                    if lend_decode is not None:
+                        from .diffusion_measured_peaks import PHASE_PRE_DECODE
+                        denoise_headroom = measured_image_runtime_mib(
+                            family,
+                            speed_mode,
+                            compute_bytes = compute_bytes or 2,
+                            quant = read_quant,
+                            phase_seeds = True,
+                            static_seed = static_seed,
+                            streamed = True,
+                            seed_phase = _PHASE_DENOISE_COLUMN,
+                            phase = PHASE_PRE_DECODE,
+                        )
+                        if denoise_headroom is not None and denoise_headroom < streamed_headroom:
+                            streamed_headroom = denoise_headroom
+                        else:
+                            lend_decode = None
                 streamed_room = min(
                     _streamed_dit_room_mib(memory, streamed_headroom, other, window), dit
                 )
@@ -4797,6 +4855,34 @@ def _refine_plan_from_loaded_weights(
                         estimates["measured_streamed_headroom_mib"] = streamed_headroom
                         # seed covers denoise only; flat encode room on top overran at 16 GiB
                         encode_room = 0
+                    if lend_decode is not None:
+                        from .diffusion_measured_peaks import PHASE_DECODE_UNPADDED
+
+                        decode = (
+                            int(lend_decode),
+                            DEFAULT_IMAGE_WIDTH * DEFAULT_IMAGE_HEIGHT,
+                            False,
+                        )
+                        # a larger learned decode peak (with its own bucket) wins over the seed
+                        learned_decode = lookup_bucket(
+                            family = family,
+                            quant = read_quant,
+                            speed_mode = speed_mode,
+                            phase = PHASE_DECODE_UNPADDED,
+                        )
+                        if learned_decode is not None and int(learned_decode[0]) > decode[0]:
+                            decode = (
+                                int(learned_decode[0]),
+                                int(learned_decode[1]),
+                                bool(learned_decode[2]),
+                            )
+                        estimates.update(
+                            measured_streamed_seed_phase = _PHASE_DENOISE_COLUMN,
+                            decode_lend_transformer_mib = int(streamed_room),
+                            measured_decode_peak_mib = decode[0],
+                            measured_decode_peak_pixels = decode[1],
+                            measured_decode_peak_quadratic = decode[2],
+                        )
         te_room = (
             min(max(0, room - dit_room), encoders) if stream_te and policy == OFFLOAD_GROUP else 0
         )
@@ -5252,7 +5338,9 @@ def decode_lend_from_plan(plan: Any) -> Optional[tuple[int, int, int, bool]]:
     estimates = getattr(plan, "estimates", None) or {}
     lend = estimates.get("decode_lend_text_encoder_mib")
     if not lend or not getattr(plan, "resident_text_encoder_mib", None):
-        return None
+        lend = estimates.get("decode_lend_transformer_mib")
+        if not lend or not getattr(plan, "resident_transformer_mib", None):
+            return None
     return (
         int(lend),
         int(estimates.get("measured_decode_peak_mib") or 0),
@@ -5855,8 +5943,19 @@ def measured_request_extra_mib(
     sized["dense_bf16"] = bool(len(reserve) > 10 and reserve[10])
     sized["small_host_int8"] = bool(len(reserve) > 11 and reserve[11])
     sized["streamed"] = bool(len(reserve) > 12 and reserve[12])
+    seed_phase = reserve[13] if len(reserve) > 13 else None
+    if seed_phase is not None:
+        from .diffusion_measured_peaks import PHASE_PRE_DECODE
+
+        # the decode is priced by release_for_decode
+        sized.update(seed_phase = int(seed_phase), phase = PHASE_PRE_DECODE)
     need = measured_image_runtime_mib(family, speed_mode, **sized)
-    learned = reserve[5] if len(reserve) > 5 else None
+    if seed_phase is not None and isinstance(identity, tuple) and len(identity) == 3:
+        # the learned pre-decode peak the placement read, scaled to this request by the store
+        stored = measured_image_runtime_mib(family, speed_mode, quant = identity[1], **sized)
+        if stored is not None:
+            need = stored if need is None else max(need, stored)
+    learned = reserve[5] if len(reserve) > 5 and seed_phase is None else None
     # placed from a peak recorded without CFG: a request that runs it doubles the denoiser batch no measurement covers
     cfg_unmeasured = bool(len(reserve) > 9 and reserve[9]) and cfg is not False
     # tier and phase seeds were measured on text-to-image: an unsized reference is not covered
@@ -6466,6 +6565,52 @@ def _module_pin_mib(module: Any) -> int:
         return _module_host_mib(module)
 
 
+# Block-level offload groups only direct ModuleList children, so FLUX.3's ModuleDict of block stacks (mode_blocks)
+# stayed in the always-onloaded top-level group; block_modules splits it per block. "0" restores that.
+GROUP_OFFLOAD_DICT_BLOCKS_ENV = "UNSLOTH_DIFFUSION_GROUP_OFFLOAD_DICT_BLOCKS"
+_DICT_BLOCK_CLASSES = frozenset({"Flux3Transformer2DModel"})
+
+
+def _dict_block_modules(module: Any) -> list[str]:
+    """Direct children of ``module`` that are ModuleDicts of block stacks."""
+    if _env_off(GROUP_OFFLOAD_DICT_BLOCKS_ENV) or type(module).__name__ not in _DICT_BLOCK_CLASSES:
+        return []
+    try:
+        import torch
+
+        names = []
+        for name, child in module.named_children():
+            if (
+                isinstance(child, torch.nn.ModuleDict)
+                and len(child) > 0
+                and all(
+                    isinstance(v, (torch.nn.ModuleList, torch.nn.Sequential))
+                    for v in child.values()
+                )
+            ):
+                names.append(name)
+        return names
+    except Exception:  # noqa: BLE001 - unreadable: the stock grouping
+        return []
+
+
+def _with_dict_block_modules(
+    apply: Callable[..., Any], module: Any, kwargs: dict[str, Any]
+) -> dict[str, Any]:
+    if kwargs.get("offload_type", "block_level") != "block_level" or "block_modules" in kwargs:
+        return kwargs
+    names = _dict_block_modules(module)
+    if not names:
+        return kwargs
+    try:
+        import inspect
+        if "block_modules" not in inspect.signature(apply).parameters:
+            return kwargs
+    except (TypeError, ValueError):
+        return kwargs
+    return {**kwargs, "block_modules": names}
+
+
 def _apply_group_offloading_packed(
     apply: Callable[..., Any],
     module: Any,
@@ -6479,6 +6624,7 @@ def _apply_group_offloading_packed(
     pages, so overlap is unchanged. Lazy (``low_cpu_mem_usage``) and unstreamed applies run as before."""
     from .diffusion_pinned_arena import packable_bytes, pinned_arena_for_group_offload
 
+    kwargs = _with_dict_block_modules(apply, module, kwargs)
     pack = (
         bool(kwargs.get("use_stream"))
         and not kwargs.get("low_cpu_mem_usage", False)
