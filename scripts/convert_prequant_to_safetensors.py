@@ -275,14 +275,13 @@ def convert(
         pass
     source["converter_torch"] = torch.__version__
 
-    # Read as Studio does (allowlisted weights_only); on torchao >= 0.18 v1 int8 loads as Int8Tensor.
+    # The only .pt reader left (allowlisted weights_only); on torchao >= 0.18 v1 int8 loads as Int8Tensor.
     facts: list = []
     restore = _record_v1_facts(facts)
     try:
         if str(src).lower().endswith(".safetensors"):
             ckpt = dp._load_prequant_checkpoint(src, map_location = "cpu", mmap = True)
         else:
-            # Bypasses Studio's nvfp4 pickle refusal: the only way a local nvfp4 .pt becomes .safetensors.
             ckpt = dp._torch_load_prequant(src, map_location = "cpu", mmap = True)
     finally:
         restore()
