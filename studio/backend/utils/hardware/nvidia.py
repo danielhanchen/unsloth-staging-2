@@ -764,6 +764,115 @@ def get_cuda_ordinal_smi_rows() -> Optional[list[int]]:
     return rows or None
 
 
+# Same driver-API child as _CUDA_BUS_ID_SCRIPT, plus the total memory and name. Exit 2: no NVIDIA driver;
+# no output after cuInit's CUDA_ERROR_NO_DEVICE (100): no device. Both are definite answers.
+_CUDA_DEVICE_INFO_SCRIPT = r"""
+import ctypes, sys
+try:
+    lib = ctypes.WinDLL("nvcuda.dll") if sys.platform == "win32" else ctypes.CDLL("libcuda.so.1")
+except OSError:
+    sys.exit(2)
+rc = lib.cuInit(0)
+if rc == 100:  # CUDA_ERROR_NO_DEVICE
+    sys.exit(0)
+if rc != 0:
+    sys.exit(3)
+count = ctypes.c_int(0)
+if lib.cuDeviceGetCount(ctypes.byref(count)) != 0:
+    sys.exit(4)
+total_mem = lib.cuDeviceTotalMem_v2
+total_mem.argtypes = [ctypes.POINTER(ctypes.c_size_t), ctypes.c_int]
+for ordinal in range(count.value):
+    dev = ctypes.c_int(0)
+    bus = ctypes.create_string_buffer(64)
+    name = ctypes.create_string_buffer(256)
+    integrated = ctypes.c_int(0)
+    total = ctypes.c_size_t(0)
+    if (
+        lib.cuDeviceGet(ctypes.byref(dev), ordinal) != 0
+        or lib.cuDeviceGetAttribute(ctypes.byref(integrated), 18, dev) != 0  # CU_DEVICE_ATTRIBUTE_INTEGRATED
+        or total_mem(ctypes.byref(total), dev) != 0
+        or lib.cuDeviceGetName(name, 256, dev) != 0
+    ):
+        print("ERR")  # this ordinal did not answer; the others still count
+        continue
+    # The bus id is informational: a driver that cannot report it (some virtualised ones) still answers.
+    bus_id = bus.value.decode() if lib.cuDeviceGetPCIBusId(bus, 64, dev) == 0 and bus.value else "-"
+    print(bus_id, integrated.value, total.value, name.value.decode(errors = "replace"))
+"""
+
+
+# An unknown or partial answer, per (mask, device order), reused for this long: callers retry those on
+# every lookup, and a host whose cuInit is slow or failing must not start a child each time.
+_CUDA_DEVICE_INFO_RETRY_S = 60.0
+_CUDA_DEVICE_INFO_RECENT: dict[tuple, tuple[float, Any]] = {}
+
+
+def get_cuda_device_info() -> Optional[list[Optional[tuple[str, bool, int, str]]]]:
+    """(PCI bus id, integrated, total bytes, name) per CUDA ordinal of this process's environment, None for
+    an ordinal that did not answer; the bus id is "" when the driver cannot report it.
+
+    The CUDA driver API in a short child: it enumerates devices under the inherited CUDA_VISIBLE_DEVICES /
+    CUDA_DEVICE_ORDER and reads their attributes without creating a context, and the Studio process never
+    initialises CUDA. torch.cuda.get_device_properties instead initialises CUDA in the calling process,
+    after which torch's device calls open a context (hundreds of MiB) on each card they touch. [] when
+    there is no NVIDIA driver or no device; None when the answer is unknown (the child failed or timed
+    out), so a caller does not cache it. Unknown and partial answers are reused for
+    _CUDA_DEVICE_INFO_RETRY_S before the driver is asked again.
+    """
+    key = (os.environ.get("CUDA_VISIBLE_DEVICES"), os.environ.get("CUDA_DEVICE_ORDER"))
+    recent = _CUDA_DEVICE_INFO_RECENT.get(key)
+    if recent is not None and time.monotonic() - recent[0] < _CUDA_DEVICE_INFO_RETRY_S:
+        return None if recent[1] is None else list(recent[1])
+    info = _query_cuda_device_info()
+    if info is None or any(device is None for device in info):
+        _CUDA_DEVICE_INFO_RECENT[key] = (time.monotonic(), info)
+    else:
+        _CUDA_DEVICE_INFO_RECENT.pop(key, None)
+    return info
+
+
+def _query_cuda_device_info() -> Optional[list[Optional[tuple[str, bool, int, str]]]]:
+    import sys
+
+    from utils.child_stdio import utf8_child_env
+
+    try:
+        child = subprocess.run(
+            [sys.executable, "-c", _CUDA_DEVICE_INFO_SCRIPT],
+            capture_output = True,
+            text = True,
+            encoding = "utf-8",
+            errors = "replace",
+            timeout = 15,
+            env = utf8_child_env(child_env_without_native_path_secret()),
+            **_windows_hidden_subprocess_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if child.returncode == 2:
+        return []
+    if child.returncode != 0:
+        return None
+    devices: list[Optional[tuple[str, bool, int, str]]] = []
+    for line in child.stdout.strip().splitlines():
+        if line.strip() == "ERR":
+            devices.append(None)
+            continue
+        parts = line.strip().split(" ", 3)
+        if len(parts) < 3 or parts[1] not in ("0", "1") or not parts[2].isdigit():
+            return None
+        devices.append(
+            (
+                "" if parts[0] == "-" else parts[0],
+                parts[1] == "1",
+                int(parts[2]),
+                parts[3] if len(parts) > 3 else "",
+            )
+        )
+    return devices
+
+
 def get_pci_bus_ids() -> dict[int, tuple[int, str]]:
     """nvidia-smi row index -> normalized PCI bus id; {} when nvidia-smi does not answer."""
     try:
