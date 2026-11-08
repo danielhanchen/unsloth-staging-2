@@ -57,17 +57,10 @@ def upload_destination(
     """The repo-root filename this build should publish under.
 
     The loader asks for the family's declared ``prequant_filenames`` name first and the derived
-    ``<Model>-<SCHEME>.pt`` second, so a ROTATED artifact published under the legacy
-    ``transformer_<scheme>.pt`` is either never resolved at all, or resolved as the fallback by a
-    build too old to honour the rotation, which then refuses the v2 tag and drops to the dense
-    download. A rotated build therefore goes to the declared name or nowhere. Plain builds keep
-    the legacy name they have always used.
-
-    A SAFETENSORS build is in the same position for a different reason: both derived names end in
-    ``.pt``, so no build ever asks the Hub for a safetensors artifact unless the family names it.
-    Uploading one under a derived name produces a file that is reachable by nothing and a repo that
-    looks like it has a checkpoint when it does not, so it is refused here rather than discovered
-    as a silent dense fallback later.
+    ``<Model>-<SCHEME>.safetensors`` second, so a ROTATED artifact goes to the declared name or
+    nowhere (under the derived name a build too old to honour the rotation would pick it up). A
+    plain build takes the declared name unless that names the rotated artifact, else the derived
+    name of ``upload_repo``.
 
     An ``override`` skips the family table, because naming the artifact by hand is the escape hatch
     for a repo the table does not describe yet. It does NOT skip the container check: every loader
@@ -75,20 +68,21 @@ def upload_destination(
     pickle and a pickle published as ``.safetensors`` is read from a header it does not have. Either
     way the upload succeeds and the artifact is unopenable, after the hours the quantization took.
 
-    nvfp4 publishes safetensors only: Studio never resolves or opens an nvfp4 pickle.
+    Every scheme publishes safetensors only: Studio never resolves or opens a pre-quant pickle. A ``.pt`` build
+    is still written for local conversion (scripts/convert_prequant_to_safetensors.py), never published.
     """
-    if (scheme or "").strip().lower() == "nvfp4" and not safetensors:
+    if not safetensors:
         raise ValueError(
-            "nvfp4 checkpoints are published as .safetensors only (Studio never reads an nvfp4 "
-            "pickle); write --out as a .safetensors file"
+            "pre-quantized checkpoints are published as .safetensors only (Studio never reads a "
+            ".pt pickle); write --out as a .safetensors file, or convert the .pt with "
+            "scripts/convert_prequant_to_safetensors.py before uploading"
         )
+    wanted = ".safetensors"
     if override:
-        wanted = ".safetensors" if safetensors else ".pt"
         if not override.lower().endswith(wanted):
-            container = "safetensors" if safetensors else "torch.save"
             raise ValueError(
                 f"--upload-filename {override!r} does not end in {wanted!r}, but --out writes the "
-                f"{container} container. The loader dispatches on the extension alone, so this "
+                "safetensors container. The loader dispatches on the extension alone, so this "
                 "would publish an artifact nothing can open. Rename the upload, or change --out."
             )
         return override
@@ -103,7 +97,6 @@ def upload_destination(
                 f"({scheme!r}, {component!r}), so the loader would never ask for this component. "
                 "Add the entry to the family table, or pass --upload-filename."
             )
-        wanted = ".safetensors" if safetensors else ".pt"
         if not specific.lower().endswith(wanted):
             raise ValueError(
                 f"family {getattr(fam, 'name', fam)!r} declares {specific!r} for "
@@ -111,10 +104,6 @@ def upload_destination(
                 "Rename --out, or pass --upload-filename."
             )
         return specific
-    from core.inference.diffusion_prequant import prequant_filename
-
-    if not rotated and not safetensors:
-        return prequant_filename(scheme)
     from core.inference.diffusion_families import family_prequant_filename
     from core.inference.diffusion_transformer_quant import (
         convrot_prequant_filename,
@@ -131,10 +120,11 @@ def upload_destination(
                 f"the runtime path; a group {convrot_group} build needs --upload-filename."
             )
     preferred = rotated_name or family_prequant_filename(fam, scheme)
+    if not rotated and preferred and "-convrot" in preferred.lower():
+        preferred = None
     why = "a rotated checkpoint" if rotated else "a safetensors checkpoint"
     if not preferred:
-        # Plain safetensors builds have a derived name; rotated builds still need a declared one.
-        if safetensors and not rotated and upload_repo:
+        if not rotated and upload_repo:
             from core.inference.diffusion_prequant import prequant_repo_filename
             return prequant_repo_filename(upload_repo, scheme, ".safetensors")
         raise ValueError(
@@ -142,16 +132,12 @@ def upload_destination(
             f"{scheme!r}, so {why} has no name the loader would ask for. Add the "
             "entry to the family table, or pass --upload-filename."
         )
-    # Check both directions: the declared name's extension must match the container.
-    wanted = ".safetensors" if safetensors else ".pt"
     if not preferred.lower().endswith(wanted):
-        reads_as = "a pickle" if safetensors else "safetensors"
-        writes = "safetensors" if safetensors else "torch.save"
         raise ValueError(
             f"family {getattr(fam, 'name', fam)!r} declares {preferred!r} for {scheme!r}, which "
-            f"does not end in {wanted!r}, but --out writes the {writes} container. The loader "
-            f"dispatches on the extension alone, so this would be published under a name it reads "
-            f"as {reads_as}. Point the prequant_filenames entry at the matching artifact, or pass "
+            f"does not end in {wanted!r}, but --out writes the safetensors container. The loader "
+            "dispatches on the extension alone, so this would be published under a name it reads "
+            "as a pickle. Point the prequant_filenames entry at the matching artifact, or pass "
             "--upload-filename."
         )
     return preferred
@@ -193,8 +179,9 @@ def main(argv = None) -> int:
     p.add_argument(
         "--out",
         required = True,
-        help = "output path; a .safetensors extension writes the safetensors container, anything "
-        "else writes the torch.save one",
+        help = "output path; a .safetensors extension writes the safetensors container Studio loads, "
+        "anything else writes a torch.save one Studio never reads (convert it with "
+        "scripts/convert_prequant_to_safetensors.py)",
     )
     p.add_argument("--min-features", type = int, default = 512)
     p.add_argument("--dtype", default = "bfloat16", choices = ["bfloat16"])
@@ -219,19 +206,30 @@ def main(argv = None) -> int:
         "--upload-filename",
         default = None,
         help = "repo-root filename to publish under; defaults to the family's declared "
-        "prequant_filenames entry for a rotated build and the legacy transformer_<scheme>.pt "
-        "otherwise",
+        "prequant_filenames entry, else the derived <Model>-<SCHEME>.safetensors name",
     )
     args = p.parse_args(argv)
-    if (args.scheme or "").strip().lower() == "nvfp4" and not str(args.out).lower().endswith(
-        ".safetensors"
-    ):
+    if not str(args.out).lower().endswith(".safetensors"):
+        if (args.scheme or "").strip().lower() == "nvfp4":
+            print(
+                "error: --scheme nvfp4 writes .safetensors only (Studio never reads an NVFP4 pickle); "
+                "give --out a .safetensors path",
+                flush = True,
+            )
+            return 2
+        if args.upload_repo:
+            print(
+                "error: Studio loads pre-quantized checkpoints from .safetensors only, so a .pt build "
+                "is never uploaded; give --out a .safetensors path, or convert the .pt with "
+                "scripts/convert_prequant_to_safetensors.py",
+                flush = True,
+            )
+            return 2
         print(
-            "error: --scheme nvfp4 writes .safetensors only (Studio never reads an NVFP4 pickle); "
-            "give --out a .safetensors path",
+            "note: Studio loads pre-quantized checkpoints from .safetensors only; convert this .pt "
+            "with scripts/convert_prequant_to_safetensors.py before using it",
             flush = True,
         )
-        return 2
 
     sys.path.insert(0, str(BACKEND))
     import torch

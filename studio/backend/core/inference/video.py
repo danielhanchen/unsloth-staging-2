@@ -73,7 +73,8 @@ from .diffusion_comfy_quant import (
     load_comfy_quant_transformer,
     refuse_comfy_quant,
 )
-from .diffusion_single_file_trust import assert_safetensors_file, single_file_load_allowed
+from .diffusion_single_file_trust import assert_pickle_free_single_file, single_file_load_allowed
+from .diffusers_safetensors import component_safetensors_kwargs, pipeline_safetensors_kwargs
 from .diffusion_prequant import scoped_local_files_only
 from .video_moe_pair import moe_expert_of, moe_partner_filename, moe_pick_pairs
 from .diffusion_cache import (
@@ -7520,8 +7521,7 @@ class VideoBackend:
             if getattr(source, "kind", None) != "repo":
                 continue
             names = list(dict.fromkeys(candidate_filenames_of(source)))
-            # the resolver's filter: readable names, unless that leaves none
-            names = [n for n in names if restricted_prequant_load_supported(scheme, n)] or names
+            names = [n for n in names if restricted_prequant_load_supported(scheme, n)]
             names = prefer_cached_pickle_twins(
                 source.location,
                 names,
@@ -7685,10 +7685,7 @@ class VideoBackend:
         files: list[tuple[str, int]] = []
         for src in sources:
             names = list(candidate_filenames_of(src))
-            # the resolver's filter: readable names, unless that leaves none
-            names = [
-                n for n in names if restricted_prequant_load_supported(transformer_quant, n)
-            ] or names
+            names = [n for n in names if restricted_prequant_load_supported(transformer_quant, n)]
             wanted = prefer_cached_pickle_twins(
                 src.location,
                 names,
@@ -8484,7 +8481,6 @@ class VideoBackend:
             # Local path overrides are validated at injection; they never justify skipping the dense download.
             if getattr(source, "kind", None) != "repo" or not getattr(source, "filename", None):
                 continue
-            # Try every candidate: the preferred safetensors name is absent from most repos.
             from .diffusion_te_prequant import te_candidate_filenames, te_candidate_is_readable
 
             from .diffusion_prequant import prefer_cached_pickle_twins
@@ -9085,8 +9081,9 @@ class VideoBackend:
                         fetch = _checkpoint_fetch,
                     )
                 )
-                if not _is_trusted_video_repo(repo_id):
-                    assert_safetensors_file(comfy_checkpoint)
+                assert_pickle_free_single_file(
+                    comfy_checkpoint, check_header = not _is_trusted_video_repo(repo_id)
+                )
             return self._load_h3_modular_pipeline(
                 diffusers = diffusers,
                 torch = torch,
@@ -9172,9 +9169,11 @@ class VideoBackend:
                 fetch = _checkpoint_fetch,
             )
             # Admitted per file from an untrusted repo: prove each file is a safetensors container before any probe.
-            untrusted_single_file = kind == "single_file" and not _is_trusted_video_repo(repo_id)
-            if untrusted_single_file:
-                assert_safetensors_file(checkpoint_path)
+            # diffusers torch.loads any single file not named exactly *.safetensors, trusted repo or not.
+            checked_single_file = kind == "single_file"
+            untrusted_single_file = checked_single_file and not _is_trusted_video_repo(repo_id)
+            if checked_single_file:
+                assert_pickle_free_single_file(checkpoint_path, check_header = untrusted_single_file)
             if fam.name == "ltx-2":
                 from .video_ltx2 import ltx23_variant_identifier
                 variant_id = ltx23_variant_identifier(checkpoint_path)
@@ -9194,8 +9193,8 @@ class VideoBackend:
                 """Resident MiB of one checkpoint file's DiT and its ComfyUI quant scan (None: a plain file)."""
                 scan = None
                 mib: Optional[int] = None
-                if untrusted_single_file:
-                    assert_safetensors_file(path)
+                if checked_single_file:
+                    assert_pickle_free_single_file(path, check_header = untrusted_single_file)
                 size_mib = file_size_mib(str(path))
                 if kind == "single_file":
                     scan = refuse_comfy_quant(str(path))
@@ -9592,6 +9591,15 @@ class VideoBackend:
                 else {}
             )
 
+        def _safetensors_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
+            """use_safetensors=True when the base folder ships safetensors for every component this load reads."""
+            return pipeline_safetensors_kwargs(
+                _base_local_dir or fetch_base,
+                passed = kwargs,
+                cache_dir = kwargs.get("cache_dir"),
+                pipeline_cls = pipeline_cls,
+            )
+
         pipe_kwargs: dict[str, Any] = {
             "torch_dtype": dtype,
             "cache_dir": hub_cache_dir(),
@@ -9793,6 +9801,7 @@ class VideoBackend:
                         _base_local_dir or fetch_base,
                         **_pinned_base_kwargs(),
                         **pipe_kwargs,
+                        **_safetensors_kwargs(pipe_kwargs),
                     )
             except Exception as exc:
                 refusal = (
@@ -10020,6 +10029,7 @@ class VideoBackend:
                         _base_local_dir or fetch_base,
                         **_pinned_base_kwargs(),
                         **{**pipe_kwargs, "transformer": ltx25_transformer},
+                        **_safetensors_kwargs({**pipe_kwargs, "transformer": ltx25_transformer}),
                     )
             else:
 
@@ -10065,6 +10075,7 @@ class VideoBackend:
                     _base_local_dir or fetch_base,
                     **_pinned_base_kwargs(),
                     **{**pipe_kwargs, **experts},
+                    **_safetensors_kwargs({**pipe_kwargs, **experts}),
                 )
 
         # Dtype dict already loads the Wan VAE in float32; this backstops any path bypassing it (e.g. vae=).
@@ -10185,6 +10196,12 @@ class VideoBackend:
                             local_files_only = local_files_only,
                             **({"token": hf_token} if hf_token else {}),
                             **_pinned_base_kwargs(),
+                            **component_safetensors_kwargs(
+                                _base_local_dir or fetch_base,
+                                component,
+                                cache_dir = hub_cache_dir(),
+                                model_cls = dense_cls,
+                            ),
                         )
                     }
                 )
