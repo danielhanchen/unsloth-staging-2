@@ -1052,8 +1052,9 @@ def stored_denoiser_precision(local_dir: Optional[str]) -> Optional[str]:
     return None
 
 
-def _module_quantised_marker(module: Any) -> Optional[str]:
-    """Explain why ``module`` is not a dense bf16 source, or return None."""
+def _module_quantised_marker(module: Any, *, allow_float16: bool = False) -> Optional[str]:
+    """Explain why ``module`` is not a dense bf16 source, or return None. ``allow_float16``: an fp16 pipeline on an
+    fp16-only card (``fp16_card_int8_host``), whose dense weights were cast to float16 on load."""
     if getattr(module, "_unsloth_runtime_quant", None):
         return "it is already quantised by this loader"
     source = getattr(module, SOURCE_PRECISION_ATTR, None)
@@ -1071,14 +1072,14 @@ def _module_quantised_marker(module: Any) -> Optional[str]:
     try:
         for param in module.parameters(recurse = True):
             name = str(getattr(param, "dtype", "")).rsplit(".", 1)[-1]
-            if name not in _DENSE_PARAM_DTYPE_NAMES:
+            if name not in _DENSE_PARAM_DTYPE_NAMES and not (allow_float16 and name == "float16"):
                 return f"its weights are stored as {name}, not dense bfloat16"
     except Exception:  # noqa: BLE001 -- an unwalkable module is not evidence of anything
         return None
     return None
 
 
-def dense_quant_blocker(pipe: Any) -> Optional[str]:
+def dense_quant_blocker(pipe: Any, *, allow_float16: bool = False) -> Optional[str]:
     """Explain why a pipeline cannot be quantised in place, or return None."""
     denoisers = denoiser_modules(pipe)
     if not denoisers:
@@ -1087,7 +1088,7 @@ def dense_quant_blocker(pipe: Any) -> Optional[str]:
             "dense torchao schemes do not cover)"
         )
     for attr, module in denoisers:
-        marker = _module_quantised_marker(module)
+        marker = _module_quantised_marker(module, allow_float16 = allow_float16)
         if marker is not None:
             where = "its transformer" if attr == "transformer" else f"its {attr}"
             return f"{where} is not a dense bf16 source: {marker}"
@@ -1216,42 +1217,42 @@ def native_quant_scheme(
     return scheme
 
 
-# Checkpoint int8 codes on a GPU with no Studio int8 runtime (pre-Ampere fp16, XPU) stay int8, widened per layer.
-# Unset: offloaded plans only (resident, the expanded DiT is faster); 1: resident too; 0: always expand.
-INT8_STORAGE_ENV = "UNSLOTH_DIFFUSION_INT8_STORAGE"
+FP16_CARD_INT8_ENV = "UNSLOTH_DIFFUSION_FP16_CARD_INT8"
+# sm70 has no int8 tensor cores; Ampere+ runs bf16 through torchao.
+_FP16_CARD_INT8_CAPS = ((7, 5), (8, 0))
 
 
-def _int8_storage_setting() -> str:
-    return (_os.environ.get(INT8_STORAGE_ENV) or "").strip().lower()
+def fp16_card_int8_enabled() -> bool:
+    raw = (_os.environ.get(FP16_CARD_INT8_ENV) or "").strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
-def int8_storage_host(target: Any) -> bool:
-    """Whether ``target`` keeps checkpoint int8 codes as weight-only storage (no int8 GEMM)."""
-    if _int8_storage_setting() in ("0", "off", "false", "no"):
+def fp16_card_int8_host(target: Any) -> bool:
+    """A Turing NVIDIA card running the pipeline in fp16 or fp32 (no bf16): torchao refuses it, but the torchao-free
+    int8 linear runs there (``torch._int_mm`` is cuBLASLt int8 with no capability gate). False on every bf16 GPU."""
+    if getattr(target, "device", None) != "cuda" or not fp16_card_int8_enabled():
         return False
-    device = getattr(target, "device", None)
+    if torch_is_rocm() or is_stubbed("torchao"):
+        return False
     try:
         import torch
-
-        dtype = getattr(target, "dtype", None)
-        if device == "xpu":
-            return dtype in (torch.bfloat16, torch.float16)
-        if device != "cuda" or torch_is_rocm() or is_stubbed("torchao"):
+        if getattr(target, "dtype", None) not in (torch.float16, torch.float32):
             return False
-        return dtype is torch.float16
     except Exception:
         return False
+    cap = _capability(getattr(target, "ordinal", None))
+    return cap is not None and _FP16_CARD_INT8_CAPS[0] <= cap < _FP16_CARD_INT8_CAPS[1]
 
 
-def int8_storage_scheme(
+def fp16_card_int8_scheme(
     target: Any,
+    requested: Optional[str],
     family: Optional[str] = None,
-    *,
-    offload: bool = False,
 ) -> Optional[str]:
-    if not (offload or _int8_storage_setting() in ("1", "on", "true", "yes")):
+    """``int8`` for an explicit int8 request on an ``fp16_card_int8_host``, else None (AUTO is unchanged)."""
+    if normalize_transformer_quant(requested) != TQ_INT8 or not fp16_card_int8_host(target):
         return None
-    if not int8_storage_host(target) or _family_denied(family, TQ_INT8):
+    if _family_denied(family, TQ_INT8):
         return None
     return TQ_INT8
 
@@ -2038,8 +2039,10 @@ def make_filter_fn(
     *,
     require_bf16: bool = False,
     require_divisible: int = 0,
+    require_dtype: Any = None,
 ):
-    """A non-bf16 Linear aborts the whole quantise pass; an unaligned one crashes the first matmul later."""
+    """A non-bf16 Linear aborts the whole quantise pass; an unaligned one crashes the first matmul later.
+    ``require_dtype``: keep only Linears of that dtype (the fp16-card int8 path's compute dtype)."""
 
     def filter_fn(module: Any, fqn: str = "") -> bool:
         try:
@@ -2067,6 +2070,10 @@ def make_filter_fn(
             weight = getattr(module, "weight", None)
             if weight is None or weight.dtype != torch.bfloat16:
                 return False
+        if require_dtype is not None:
+            weight = getattr(module, "weight", None)
+            if weight is None or weight.dtype != require_dtype:
+                return False
         return True
 
     return filter_fn
@@ -2087,6 +2094,9 @@ def quantize_transformer(
 ) -> Optional[str]:
     """Quantise ``pipe.transformer`` in place, returning the scheme or None (GGUF); ``base_repo`` picks the NVFP4 policy."""
     native = native_quant_scheme(target, mode, family = family, offload = offload)
+    fp16_card = native is None and fp16_card_int8_scheme(target, mode, family) is not None
+    if fp16_card:
+        native = TQ_INT8
     if native is not None:
         mps = _mps_bf16(target)
         if act_int8 is None or mps:
@@ -2099,6 +2109,7 @@ def quantize_transformer(
             act_int8 = bool(act_int8) and native == TQ_INT8,
             logger = logger,
             scale_dtype = getattr(target, "dtype", None) if mps else None,
+            compute_dtype = getattr(target, "dtype", None) if fp16_card else None,
         )
     scheme = select_transformer_quant_scheme(target, mode, family = family, base_repo = base_repo)
     if scheme is None:
@@ -2192,7 +2203,9 @@ def _quantize_native(
     act_int8: bool,
     logger: Any,
     scale_dtype: Any = None,
+    compute_dtype: Any = None,
 ) -> Optional[str]:
+    """``compute_dtype``: the pipeline dtype on an fp16-only card (fp16 / fp32); None keeps the bf16 filter."""
     transformer = getattr(pipe, "transformer", None)
     if transformer is None:
         return None
@@ -2203,7 +2216,8 @@ def _quantize_native(
         filter_fn = make_filter_fn(
             min_features,
             exclude_name_tokens = exclude_tokens_for_scheme(scheme, family, baked = True) + ("lora_",),
-            require_bf16 = True,
+            require_bf16 = compute_dtype is None,
+            require_dtype = compute_dtype,
         )
         if not apply_native_weight_quant(
             transformer,
