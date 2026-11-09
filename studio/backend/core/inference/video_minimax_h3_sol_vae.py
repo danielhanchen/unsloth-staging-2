@@ -274,12 +274,9 @@ def _build_module_classes():
             )
             return out[0].transpose(0, 1).reshape(S, D)
 
-        def _window_attn(
-            self, q: Any, k: Any, v: Any, kgw: Any, vgw: Any, gvalid: Any, k0: int, s: int
-        ) -> Any:
+        def _window_attn(self, q: Any, k: Any, v: Any, kgw: Any, vgw: Any, k0: int, s: int) -> Any:
             """Attention over every spatial window of one temporal window. q/k/v (n, H, W, D) start ``k0`` latents into
-            the padded window; kgw / vgw (G, D) are the global tokens of the blocks it overlaps, gvalid (G,) bool or
-            None when all are valid."""
+            the padded window; kgw / vgw (G, D) are the global tokens of the blocks it overlaps (all attended)."""
             n, H, W, D = q.shape
             ws, tb, hd, dh = self.window, self.block, self.heads, self.dh
             Hp = -(-(H + s) // ws) * ws
@@ -299,20 +296,15 @@ def _build_module_classes():
             keys = torch.cat([part(k), kg], 2)
             vals = torch.cat([part(v), vg], 2)
             mask = None
-            # every padded slot holds a token iff the window starts at 0, is full, unshifted and unpadded
-            lean = gvalid is None and _lean_windows()
-            full = k0 == 0 and n == tb and s == 0 and Hp == H and Wp == W
-            if not (lean and full):
+            # Geometry decides padding: no device read (host sync / graph break) per window.
+            if not (k0 == 0 and n == tb and s == 0 and Hp == H and Wp == W):
                 valid = torch.zeros(tb, Hp, Wp, dtype = torch.bool, device = q.device)
                 valid[k0 : k0 + n, s : s + H, s : s + W] = True
                 valid = valid.view(tb, nh, ws, nw, ws).permute(1, 3, 0, 2, 4).reshape(nW, L)
-                if gvalid is None:
-                    gvalid = torch.ones(G, dtype = torch.bool, device = q.device)
-                kmask = torch.cat([valid, gvalid[None].expand(nW, G)], 1)
-                if lean or not bool(kmask.all()):
-                    mask = torch.zeros(kmask.shape, dtype = q.dtype, device = q.device)
-                    mask.masked_fill_(~kmask, float("-inf"))
-                    mask = mask[:, None, None, :]
+                kmask = torch.cat([valid, valid.new_ones(nW, G)], 1)
+                mask = torch.zeros(kmask.shape, dtype = q.dtype, device = q.device)
+                mask.masked_fill_(~kmask, float("-inf"))
+                mask = mask[:, None, None, :]
             out = torch.nn.functional.scaled_dot_product_attention(
                 part(q), keys, vals, attn_mask = mask
             )
@@ -350,12 +342,12 @@ def _build_module_classes():
                 lo = max(0, j * tb - st)
                 hi = min(T - 1, (j + 1) * tb - st - 1)
                 b0, b1 = lo // tb, hi // tb
+                for b in [b for b in slots if b < b0]:
+                    del slots[b]  # freed before the next slot: at most two live
                 for b in range(b0, b1 + 1):
                     if b not in slots:
                         slots[b] = self._slot(blk, x, b, s, st)
                         og[b] = self._global_attn(qg[b], kg[b], vg[b], slots[b][1], slots[b][2])
-                for b in [b for b in slots if b < b0]:
-                    del slots[b]  # the ring: at most the two blocks a window can overlap stay live
                 parts = []
                 for b in range(b0, b1 + 1):
                     a0, a1 = max(lo, b * tb) - b * tb, min(hi + 1, (b + 1) * tb) - b * tb
@@ -369,7 +361,7 @@ def _build_module_classes():
                 else:
                     # the reference pads the second block slot and masks it; leaving it out is the same softmax
                     kgw, vgw = kg[b0], vg[b0]
-                o = self._window_attn(q, k, v, kgw, vgw, None, lo - (j * tb - st), s)
+                o = self._window_attn(q, k, v, kgw, vgw, lo - (j * tb - st), s)
                 del q, k, v, parts
                 xw = x[lo : hi + 1].view(-1, D)
                 normed = fused._add_rmsnorm(
