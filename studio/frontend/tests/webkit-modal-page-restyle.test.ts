@@ -55,6 +55,16 @@ test("the lock's body styles are static, with what react-remove-scroll-bar injec
   }
 });
 
+test("on screen <body> already has the lock's overflow and position, so a lock toggle is a no-op", () => {
+  const css = readSrc("index.css");
+  assert.match(
+    css,
+    /@media screen \{\s*body \{\s*overflow: hidden;\s*position: relative;\s*\}\s*\}/,
+  );
+  const lock = rule(css, "body[data-scroll-locked]");
+  assert.ok(lock.includes("overflow: hidden !important;") && lock.includes("position: relative !important;"));
+});
+
 test("document pointer listeners are pinned once per type, before the app mounts", () => {
   const added: [string, unknown][] = [];
   const target = {
