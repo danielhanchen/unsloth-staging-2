@@ -1,0 +1,3 @@
+studio/backend/tests/test_kernel_install.py
+studio/backend/tests/test_logging_middleware.py
+studio/backend/tests/test_pdf_ocr_regressions.py
