@@ -411,6 +411,12 @@ def main() -> int:
         default = int(os.environ.get("LONG_THREAD_AB_TALL", "1")),
         help = "repeat each seeded reply's answer block this many times (taller, heavier rows)",
     )
+    ap.add_argument(
+        "--stream-ms",
+        type = int,
+        default = int(os.environ.get("LONG_THREAD_AB_STREAM_MS", "0")),
+        help = "gap between streamed chunks in ms (0: the area matrix's own)",
+    )
     ap.add_argument("--json", type = Path)
     args = ap.parse_args()
 
@@ -443,10 +449,13 @@ def main() -> int:
 
     if "stream_scroll" in wanted and len(wanted) > 1:
         ap.error("stream_scroll runs alone: --areas stream_scroll")
+    if args.stream_ms:
+        areas.STREAM_MS = args.stream_ms
     if args.tall > 1:
         tall_turns(args.tall)
     if "stream_scroll" in wanted and not args.stream_chars:
-        args.stream_chars = 20000  # the stream must outlast the wheel
+        # The stream must outlast the wheel and the reading after it: about 8 s of 60-char chunks.
+        args.stream_chars = max(20000, 8000 // areas.STREAM_MS * 60)
     if args.stream_chars:
         lengthen_stream(args.stream_chars)
     started = time.time()
@@ -502,6 +511,7 @@ def main() -> int:
                     "reps": args.reps,
                     "stream_chars": args.stream_chars,
                     "tall": args.tall,
+                    "stream_ms": args.stream_ms or areas.STREAM_MS,
                     "rows": rows,
                     "errors": got["errors"],
                     "readings": got["readings"],
