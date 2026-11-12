@@ -224,7 +224,7 @@ jobs:
         continue-on-error: true
         run: |
           python -m tests.studio.studiobench --tier standard --rungs 100K --reps 4 --engine chromium \
-            --attach "http://127.0.0.1:${PORT_A}" --branch "${{ steps.refs.outputs.merge_base }}" \
+            --attach "http://127.0.0.1:${PORT_A}" --password "$PASSWORD_a" --branch "${{ steps.refs.outputs.merge_base }}" \
             --ab "${{ steps.refs.outputs.side_b }}" --attach-b "http://127.0.0.1:${PORT_B}" --password-b "$PASSWORD_b" \
             --windowed-arm base,treatment --out outputs/ab 2>&1 | tail -c 400000 > logs/ab.log
 
