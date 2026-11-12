@@ -42,9 +42,12 @@ jobs:
           python3 -m playwright install --with-deps chromium
       - name: A/B base vs ${{ matrix.label }}, the gate's reply
         run: python3 -u tests/studio/long_thread_ab.py --base-ref "$BASE" --head-ref "${{ matrix.head }}" --reps 5 --json "out/short_${{ matrix.label }}.json"
-      - name: A/B base vs ${{ matrix.label }}, a 20 kchar reply, then the reader scrolls away mid-stream
+      - name: A/B base vs ${{ matrix.label }}, a 20 kchar reply
         if: always()
-        run: python3 -u tests/studio/long_thread_ab.py --base-ref "$BASE" --head-ref "${{ matrix.head }}" --reps 5 --areas stream,stream_scroll --gated stream,stream_scroll --json "out/long_${{ matrix.label }}.json"
+        run: python3 -u tests/studio/long_thread_ab.py --base-ref "$BASE" --head-ref "${{ matrix.head }}" --reps 5 --areas stream --gated stream --stream-chars 20000 --json "out/long_${{ matrix.label }}.json"
+      - name: A/B base vs ${{ matrix.label }}, the reader scrolls away mid-stream
+        if: always()
+        run: python3 -u tests/studio/long_thread_ab.py --base-ref "$BASE" --head-ref "${{ matrix.head }}" --reps 5 --areas stream_scroll --gated stream_scroll --json "out/scroll_${{ matrix.label }}.json"
       - if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:

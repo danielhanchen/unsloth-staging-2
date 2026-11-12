@@ -170,6 +170,8 @@ STREAM_DONE = (
 COVERAGE_MIN = 0.5
 WHEEL_STEPS, WHEEL_PX, WHEEL_GAP_MS = 40, -600, 60
 
+# Measured on a page of its own (--areas stream_scroll): after the stream area, the composer and
+# the tail are in that area's end state, not a reader's.
 areas.AREAS["stream_scroll"] = {
     "setup": ("compose", areas.STREAM_PROMPT),
     "open": ("stream_scroll", None),
@@ -187,8 +189,16 @@ class ABPage(areas.Page):
         if action is None or action[0] != "stream_scroll":
             return super().act(action)
         page = self.page
+        before = page.evaluate("() => window.__gateStreams || 0")
         page.keyboard.press("Enter")
-        page.wait_for_function("() => (window.__gateStreams || 0) > 0", timeout = 10_000)
+        try:
+            # This area's own stream: an earlier area's finished stream must not satisfy the wait.
+            page.wait_for_function(
+                "(n) => (window.__gateStreams || 0) > n", arg = before, timeout = 10_000
+            )
+        except Exception:  # noqa: BLE001 - no stream started, the area is NOT_RUN
+            self.last_error = "Enter did not start a stream"
+            return False
         page.wait_for_timeout(500)
         box = page.locator(".aui-thread-viewport").bounding_box()
         page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
@@ -311,7 +321,9 @@ def judge(
             row["metrics"][m] = info
         cov = row["metrics"].get("coverage_min")
         # Blank viewport while scrolling: head leaves spacers unfilled where base showed rows.
-        if cov and cov["head_median"] < COVERAGE_MIN <= cov["base_median"]:
+        # One blank moment is a reader-visible failure, so any head reading counts; base must have
+        # stayed filled in every reading for it to be the change's.
+        if cov and min(cov["head"]) < COVERAGE_MIN <= min(cov["base"]):
             slower.append("coverage_min")
         verdict = f"SLOWER ({', '.join(slower)})" if slower else "ok"
         if slower and a in gated:
@@ -374,6 +386,8 @@ def main() -> int:
             print(f"VOID: no app build at {d / 'index.html'} ({side})", flush = True)
             return 2
 
+    if "stream_scroll" in wanted and len(wanted) > 1:
+        ap.error("stream_scroll runs alone: --areas stream_scroll")
     if "stream_scroll" in wanted and not args.stream_chars:
         args.stream_chars = 20000  # the stream must outlast the wheel
     if args.stream_chars:
