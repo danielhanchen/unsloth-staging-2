@@ -2492,17 +2492,14 @@ test("Escape closes the bar from the walk buttons, not just the field", async ()
 test("only threads this search can read are forced to finish mounting", async () => {
   assert.match(
     USE_FIND_IN_PAGE,
-    /completeProgressiveMounts\(\s*\(viewport\) =>\s*\n?\s*indexReaches\(scope, viewport\),\s*fill\.signal,/,
+    /completeProgressiveMounts\(\(viewport\) =>\s*\n?\s*indexReaches\(scope, viewport\)/,
   );
-  // Closing Find lets go of the full mount it asked for, so the window slides again at once.
-  assert.match(USE_FIND_IN_PAGE, /live = false;\s*fill\.abort\(\);/);
   const progressive = await readSrcAsync(
     "components/assistant-ui/progressive-messages.tsx",
   );
-  // Re-read on every pass and filtered, so a thread this search cannot read never holds it open.
   assert.match(
     progressive,
-    /!wanted\(\)\.some\(\(entry\) => entry\.withholding\(\)\) &&\s*\(observed \|\| Date\.now\(\) >= deadline\)/,
+    /if \(wanted\(\)\.length === 0 && \(observed \|\| Date\.now\(\) >= deadline\)\)/,
   );
 });
 

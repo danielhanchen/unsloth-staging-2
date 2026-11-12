@@ -28,8 +28,6 @@ import { createPortal } from "react-dom";
 import {
   completeProgressiveMounts,
   hasPendingProgressiveMounts,
-  revealProgressiveRow,
-  subscribeMountedRows,
 } from "@/components/assistant-ui/progressive-messages";
 import {
   threadTurns,
@@ -343,10 +341,6 @@ const TurnRail: FC<{ viewportRef: RefObject<HTMLElement | null> }> = ({
       }
       const selector = `[data-message-id="${CSS.escape(messageId)}"]`;
       let target = viewport.querySelector<HTMLElement>(selector);
-      // The thread mounts only the rows near the reader; ask for this one rather than for all.
-      if (!target && revealProgressiveRow(viewport, messageId)) {
-        target = viewport.querySelector<HTMLElement>(selector);
-      }
       if (!target) {
         await completeProgressiveMounts((candidate) => candidate === viewport);
         target = viewport.querySelector<HTMLElement>(selector);
@@ -552,30 +546,18 @@ const TurnRail: FC<{ viewportRef: RefObject<HTMLElement | null> }> = ({
       },
       { root: viewport },
     );
-    // Rows mount and unmount as the reader moves, so the watched set follows them.
-    const watch = () => {
-      observer.disconnect();
-      markerFor.clear();
-      const messages = new Map<string, Element>();
-      for (const message of viewport.querySelectorAll("[data-message-id]")) {
-        messages.set(message.getAttribute("data-message-id") ?? "", message);
+    const messages = new Map<string, Element>();
+    for (const message of viewport.querySelectorAll("[data-message-id]")) {
+      messages.set(message.getAttribute("data-message-id") ?? "", message);
+    }
+    for (const marker of rail.querySelectorAll<HTMLElement>("button[data-turn-id]")) {
+      const message = messages.get(marker.dataset.turnId ?? "");
+      if (message) {
+        markerFor.set(message, marker);
+        observer.observe(message);
       }
-      for (const marker of rail.querySelectorAll<HTMLElement>("button[data-turn-id]")) {
-        const message = messages.get(marker.dataset.turnId ?? "");
-        if (message) {
-          markerFor.set(message, marker);
-          observer.observe(message);
-        } else {
-          marker.removeAttribute("data-in-view");
-        }
-      }
-    };
-    watch();
-    const unsubscribe = subscribeMountedRows(watch);
-    return () => {
-      unsubscribe();
-      observer.disconnect();
-    };
+    }
+    return () => observer.disconnect();
   }, [viewportRef, signature, turnCount]);
   const hidePreview = useCallback(() => {
     cancelHide();

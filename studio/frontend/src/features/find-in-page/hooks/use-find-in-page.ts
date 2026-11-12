@@ -224,10 +224,8 @@ export function useFindInPage(
 
     // The thread mounts its tail first, so complete progressive mounts for this scope only.
     let live = true;
-    const fill = new AbortController();
-    void completeProgressiveMounts(
-      (viewport) => indexReaches(scope, viewport),
-      fill.signal,
+    void completeProgressiveMounts((viewport) =>
+      indexReaches(scope, viewport),
     ).then(() => {
       if (!live) return;
       // Only re-anchor if completion actually renumbered, so a mid-run Enter is kept.
@@ -316,7 +314,6 @@ export function useFindInPage(
 
     return () => {
       live = false;
-      fill.abort();
       cancelRevealPasses();
       window.removeEventListener("resize", invalidate);
       window.removeEventListener("wheel", noteScroll, { capture: true });
