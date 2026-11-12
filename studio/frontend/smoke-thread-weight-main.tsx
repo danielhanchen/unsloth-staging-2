@@ -4,6 +4,10 @@
 // Harness for tests/studio/playwright_thread_weight.py: the real Thread and real markdown bodies,
 // seeded via thread.import on a local runtime (only it backs export/import used by delete).
 
+import {
+  hasPendingProgressiveMounts,
+  holdProgressiveMounts,
+} from "@/components/assistant-ui/progressive-messages";
 import { Thread } from "@/components/assistant-ui/thread";
 import { SidebarInset, SidebarProvider } from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -102,6 +106,8 @@ type SeedOptions = {
    * `sources` adds six URL source parts after every web_search call.
    */
   agent?: { rounds: number; compactionEvery?: number; sources?: boolean; rich?: boolean };
+  /** Each default reply also carries a numbered equation, which KaTeX counts page-wide. */
+  numbered?: boolean;
 };
 
 const AGENT_TOOLS = ["web_search", "terminal", "python"] as const;
@@ -200,7 +206,10 @@ function buildMessages(
           type: "text" as const,
           text: isPlain((index - 1) / 2, options)
             ? plainAssistantMarkdown(index)
-            : assistantMarkdown(index),
+            : assistantMarkdown(index) +
+              (options?.numbered
+                ? `\n\n$$\n\\begin{equation}E_{${index}} = mc^2\\end{equation}\n$$`
+                : ""),
         },
       ],
     };
@@ -290,6 +299,24 @@ function ThreadWeightApi({
       messageCount(): number {
         return document.querySelectorAll("[data-role]").length;
       },
+      /** Opens the last user prompt's editor; returns its message id. */
+      editLastPrompt(): string | null {
+        const messages = aui.thread().getState().messages;
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+          if (messages[index].role !== "user") continue;
+          aui.thread().message({ index }).composer().beginEdit();
+          return messages[index].id;
+        }
+        return null;
+      },
+      /** The conversation's length, where messageCount() is how much of it is mounted. */
+      threadLength(): number {
+        return aui.thread().getState().messages.length;
+      },
+      /** What the turn rail waits on before it renders: a full mount still under way. */
+      pendingMounts(): boolean {
+        return hasPendingProgressiveMounts();
+      },
       counts(): {
         messages: number;
         assistantMessages: number;
@@ -375,6 +402,13 @@ function ThreadWeightApi({
   }, [aui, setThreadMounted]);
 
   return null;
+}
+
+// The checks on this page measure what a whole thread costs in the DOM (the state an open find bar
+// or a print puts the app in), so every row stays mounted. `?window=1` leaves the thread as the
+// app opens it: only the rows near the reader are mounted.
+if (new URLSearchParams(window.location.search).get("window") !== "1") {
+  holdProgressiveMounts();
 }
 
 // `?shell=1`: the ancestors the app puts around the thread (root layout + chat page), so CSS
