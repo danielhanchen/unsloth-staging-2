@@ -1,0 +1,70 @@
+name: long-thread A/B bisect 17504
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ab:
+    name: ab ${{ matrix.label }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {label: aa, head: 31d7eb47ea446f8dd40c060e7d76db1a660adfd5}
+          - {label: c01, head: fb71eb876bd96e73addd3ca6ac217710d61a7ad9}
+          - {label: c02, head: 3d9c95c4ab2375d43fd8a01e7fdce37825b3f44a}
+          - {label: c03, head: 4a02c521bd622e9bd361b739c5387f4b00535091}
+          - {label: c05, head: d44ad4a9dd5c9778f3ba6e9d743d1ce5bff80367}
+          - {label: c06, head: 2d804f15a933239703407dd6af1e8864911b0160}
+          - {label: c08, head: 935866a968b2f511e7918ec3f469477199d768d0}
+          - {label: c09, head: ce5b49a5e138566c4aa595f164f92b42fc9b2c8c}
+          - {label: c10, head: ad87c329c8840b67340465db207daa21ede86bf0}
+          - {label: c11, head: 3857fe0beebbc23e02c3616ad5b69e36f0ac9c23}
+          - {label: c12, head: c15d35e16eff3e68a7697f33d16fdd5e0311332e}
+          - {label: c13, head: f3d4996ae132c12a89ac61a8c85bec87b76c2d35}
+          - {label: c14, head: 62cf0cb16d18850f93fd6470d577e22063984a5d}
+          - {label: c15, head: b5f4acb086fec11b3485e17dcd44dc87d6b8db13}
+          - {label: c16, head: 5892d02531446487ab666a9fa87c59d5d34ca52d}
+          - {label: c17, head: a2bb5e1574863400ec29fe3bdec50cd1f05a4540}
+          - {label: c18, head: 35930a924acf434141972a3cfa00755c7a0f5844}
+          - {label: c19, head: 886ab8dc7a6ff38d3ea0cb77d9ac2dcac2d47f19}
+          - {label: c20, head: 5ef7cdb6424e3b2ef06b11e74ef74c096bd91d48}
+          - {label: c21, head: 405ccad9a21b7c875bcd6cf038215868cf369290}
+          - {label: c22, head: d1e7d3d893c5f25d1193d8faa6d9a24681783c1a}
+          - {label: c23, head: e44f16d4e4a4ab2c255ad7ef60a87b0d7011bf93}
+          - {label: c24, head: 7ceb3064664d2b3248649623c0390e9b621731ad}
+    env:
+      BASE: 31d7eb47ea446f8dd40c060e7d76db1a660adfd5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Fetch the PR commits
+        run: git fetch --no-tags https://github.com/unslothai/unsloth refs/pull/17504/head
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+      - name: npm ci
+        working-directory: studio/frontend
+        run: |
+          npm install -g npm@^11 --no-fund --no-audit
+          npm ci --strict-allow-scripts --no-fund --no-audit
+      - name: Chromium
+        run: |
+          python3 -m pip install 'playwright>=1.45,<2'
+          python3 -m playwright install --with-deps chromium
+      - name: A/B base vs ${{ matrix.label }}, the gate's reply
+        run: python3 -u tests/studio/long_thread_ab.py --base-ref "$BASE" --head-ref "${{ matrix.head }}" --reps 5 --json "out/short_${{ matrix.label }}.json"
+      - name: A/B base vs ${{ matrix.label }}, a 20 kchar reply
+        if: always()
+        run: python3 -u tests/studio/long_thread_ab.py --base-ref "$BASE" --head-ref "${{ matrix.head }}" --reps 5 --areas stream --gated stream --stream-chars 20000 --json "out/long_${{ matrix.label }}.json"
+      - if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: ab-${{ matrix.label }}
+          path: out/
+          if-no-files-found: ignore
