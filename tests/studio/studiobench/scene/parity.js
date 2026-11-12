@@ -266,6 +266,27 @@
     index: null,
   };
 
+  // DIAG (probe only): per-event trace of what the viewport held during the action.
+  const TR = [];
+  const tr = (o) => { if (TR.length < 3000) TR.push(o); };
+  const ordsIn = (node) => {
+    const out = [];
+    if (!node || node.nodeType !== 1) return out;
+    if (node.hasAttribute("aria-posinset")) out.push(Number(node.getAttribute("aria-posinset")));
+    if (node.querySelectorAll) {
+      for (const inner of node.querySelectorAll("[aria-posinset]")) {
+        out.push(Number(inner.getAttribute("aria-posinset")));
+        if (out.length > 80) break;
+      }
+    }
+    return out;
+  };
+  const spacers = (vp) => {
+    const t = vp.querySelector('[data-thread-spacer="top"]');
+    const b = vp.querySelector('[data-thread-spacer="bottom"]');
+    return [t ? t.style.height : null, b ? b.style.height : null];
+  };
+
   const ordinalOf = (el, position) => {
     // Position in the thread, not the mounted list; aria-posinset is the windowed arm's own claim.
     const owner = el.closest ? el.closest("[aria-posinset]") : null;
@@ -361,6 +382,15 @@
         VIS.index = null;
         VIS.obs = new IntersectionObserver((entries) => {
           for (const entry of entries) {
+            const rb = entry.rootBounds;
+            tr({
+              k: "io", t: Math.round(entry.time), ord: entry.target.__sbOrdinal,
+              x: entry.isIntersecting, role: entry.target.getAttribute("data-role"),
+              top: rb ? Math.round(entry.boundingClientRect.top - rb.top) : null,
+              bot: rb ? Math.round(entry.boundingClientRect.bottom - rb.top) : null,
+              rh: rb ? Math.round(rb.height) : null,
+              conn: entry.target.isConnected,
+            });
             if (!entry.isIntersecting) continue;
             const ord = entry.target.__sbOrdinal;
             if (typeof ord === "number") VIS.ever.add(ord);
@@ -369,7 +399,30 @@
         observeAll();
         // No characterData: streamed text must not reach this callback. aria-posinset is watched
         // because a virtualizer renumbers rows in place without a childList mutation.
-        VIS.mut = new MutationObserver(observeAdded);
+        TR.length = 0;
+        const running = () => Boolean(D().isRunning && D().isRunning());
+        tr({ k: "watch", t: Math.round(performance.now()), top: Math.round(vp.scrollTop), h: vp.scrollHeight, ch: vp.clientHeight, run: running(), sp: spacers(vp), rows: ordsIn(vp) });
+        VIS.onScroll = () => tr({ k: "scroll", t: Math.round(performance.now()), top: Math.round(vp.scrollTop), h: vp.scrollHeight, run: running(), sp: spacers(vp) });
+        vp.addEventListener("scroll", VIS.onScroll, { passive: true });
+        VIS.vp = vp;
+        let last = "";
+        const frame = () => {
+          if (!VIS.watching) return;
+          const now = { top: Math.round(vp.scrollTop), h: vp.scrollHeight, run: running(), sp: spacers(vp) };
+          const key = JSON.stringify(now);
+          if (key !== last) { last = key; tr({ k: "frame", t: Math.round(performance.now()), ...now }); }
+          requestAnimationFrame(frame);
+        };
+        VIS.mut = new MutationObserver((records) => {
+          const add = [], del = [];
+          for (const rec of records) {
+            if (rec.type !== "childList") continue;
+            for (const n of rec.addedNodes) add.push(...ordsIn(n));
+            for (const n of rec.removedNodes) del.push(...ordsIn(n));
+          }
+          if (add.length || del.length) tr({ k: "mut", t: Math.round(performance.now()), add, del, top: Math.round(vp.scrollTop), sp: spacers(vp) });
+          observeAdded(records);
+        });
         VIS.mut.observe(vp, {
           childList: true,
           subtree: true,
@@ -377,6 +430,7 @@
           attributeFilter: ["aria-posinset"],
         });
         VIS.watching = true;
+        requestAnimationFrame(frame);
         return { visible_attempted: true, already: false };
       } catch (e) {
         return { visible_attempted: false, reason: String(e) };
@@ -445,6 +499,11 @@
           status_hook_present: anyPublishes,
           // A windowed arm can unmount the streaming message, so live.size can be 0 with intact hooks.
           in_flight_unplaced: Boolean(generating && live.size === 0 && probeBlind),
+          trace_json: (() => {
+            const vp = VIS.vp;
+            if (vp) tr({ k: "capture", t: Math.round(performance.now()), top: Math.round(vp.scrollTop), h: vp.scrollHeight, sp: spacers(vp), rows: ordsIn(vp) });
+            return JSON.stringify(TR);
+          })(),
           ever_visible: ever,
           ever_visible_count: ever.length,
           mounted_ever_visible,
@@ -463,6 +522,7 @@
       try {
         if (VIS.obs) VIS.obs.disconnect();
         if (VIS.mut) VIS.mut.disconnect();
+        if (VIS.vp && VIS.onScroll) VIS.vp.removeEventListener("scroll", VIS.onScroll);
       } catch (e) { /* nothing to do */ }
       VIS.obs = null;
       VIS.mut = null;
