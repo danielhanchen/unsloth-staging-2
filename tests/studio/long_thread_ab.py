@@ -14,7 +14,8 @@ over MAX_RATIO times base's and every head reading is above every base reading.
   python tests/studio/long_thread_ab.py --base DIST_A --head DIST_B      # prebuilt dists
   python tests/studio/long_thread_ab.py --base-ref X --head-ref X        # A/A noise
 
-Exit 0 no regression, 1 regression, 2 void (a build or a page that did not run).
+Exit 0 no regression, 1 regression, 2 void (a page or area that did not run), 3 not comparable (a
+build failed, e.g. the base needs other node_modules).
 """
 
 from __future__ import annotations
@@ -164,11 +165,27 @@ COVERAGE = """() => {
   for (const [t, b] of spans) { const s = Math.max(t, end); if (b > s) { covered += b - s; end = b; } }
   return covered / Math.max(1, f.height);
 }"""
+AFTER_WHEEL = (
+    """async ([frames, samples, gap]) => {
+  const cover = """
+    + COVERAGE
+    + """;
+  const out = [];
+  for (let i = 0; i < frames; i++) await new Promise((r) => requestAnimationFrame(r));
+  for (let i = 0; i < samples; i++) {
+    const c = cover();
+    if (c !== null) out.push(c);
+    await new Promise((r) => setTimeout(r, gap));
+  }
+  return out;
+}"""
+)
+AFTER_FRAMES, AFTER_SAMPLES, AFTER_GAP_MS = 20, 15, 100
 STREAM_DONE = (
     """() => !!window.__gateStreamDone && !document.querySelector('.aui-composer-cancel')"""
 )
 COVERAGE_MIN = 0.5
-WHEEL_STEPS, WHEEL_PX, WHEEL_GAP_MS = 40, -600, 60
+WHEEL_STEPS, WHEEL_PX, WHEEL_GAP_MS = 12, -600, 60
 
 # Measured on a page of its own (--areas stream_scroll): after the stream area, the composer and
 # the tail are in that area's end state, not a reader's.
@@ -209,6 +226,10 @@ class ABPage(areas.Page):
             c = page.evaluate(COVERAGE)
             if c is not None:
                 self.coverage.append(c)
+        # Then the reader stops and reads while the reply is still being written: the rows under
+        # them must land within frames, not when the reply ends.
+        self.coverage += page.evaluate(AFTER_WHEEL, [AFTER_FRAMES, AFTER_SAMPLES, AFTER_GAP_MS])
+        self.still_streaming = page.evaluate("() => !window.__gateStreamDone")
         self.hovered = True
         return True
 
@@ -220,6 +241,25 @@ class ABPage(areas.Page):
             return True
         except Exception:  # noqa: BLE001 - a stream that never ends is NOT_RUN
             return False
+
+
+def tall_turns(repeat: int) -> None:
+    """Replies `repeat` times the gate's answer block (prose, code, table, math): rows a couple of
+    viewports tall, each slower to render than the gap between two streamed chunks, as long agent
+    replies are. A window commit that a chunk restarts then never lands while the reply streams."""
+    short = areas.turn
+
+    def turn(tid: str, t: int, parent):
+        pair = short(tid, t, parent)
+        parts = pair[1]["content"]
+        answer = next(p for p in parts if p["type"] == "text")
+        answer["text"] = "\n\n".join(
+            [answer["text"]]
+            + [answer["text"].replace(f"Answer {t}.", f"Part {k}.") for k in range(1, repeat)]
+        )
+        return pair
+
+    areas.turn = turn
 
 
 def open_page(browser, base: str, turns: int, mode: dict):
@@ -265,7 +305,14 @@ def measure(dists: dict[str, Path], turns: int, reps: int, wanted: list[str]) ->
                             if a == "stream_scroll":
                                 cov = getattr(page, "coverage", None) or [0.0]
                                 got["coverage_min"] = round(min(cov), 3)
-                                got["coverage_blank_samples"] = sum(c < 0.5 for c in cov)
+                                got["coverage_blank_samples"] = sum(c < COVERAGE_MIN for c in cov)
+                                if not getattr(page, "still_streaming", False):
+                                    # The reply ended before the reader stopped: nothing was
+                                    # measured under a stream.
+                                    errors.append(
+                                        f"{side} rep {k} {a}: the reply ended before the check"
+                                    )
+                                    continue
                             readings[side][a].append(got)
                         line = "  ".join(
                             f"{a} {cells.get(a, {}).get('main_ms', float('nan')):.0f}"
@@ -358,6 +405,12 @@ def main() -> int:
         default = int(os.environ.get("LONG_THREAD_AB_STREAM_CHARS", "0")),
         help = "lengthen the streamed reply by about this many characters (0: the gate's own reply)",
     )
+    ap.add_argument(
+        "--tall",
+        type = int,
+        default = int(os.environ.get("LONG_THREAD_AB_TALL", "1")),
+        help = "repeat each seeded reply's answer block this many times (taller, heavier rows)",
+    )
     ap.add_argument("--json", type = Path)
     args = ap.parse_args()
 
@@ -379,8 +432,10 @@ def main() -> int:
             else:
                 ap.error(f"give --{side} or --{side}-ref")
     except subprocess.CalledProcessError as exc:
-        print(f"VOID: build failed: {exc}", flush = True)
-        return 2
+        # Usually the base predates this checkout's node_modules (a dependency change): the two
+        # builds cannot be compared, which is not a measurement that failed.
+        print(f"NOT_COMPARABLE: build failed: {exc}", flush = True)
+        return 3
     for side, d in dists.items():
         if not (d / "index.html").exists():
             print(f"VOID: no app build at {d / 'index.html'} ({side})", flush = True)
@@ -388,6 +443,8 @@ def main() -> int:
 
     if "stream_scroll" in wanted and len(wanted) > 1:
         ap.error("stream_scroll runs alone: --areas stream_scroll")
+    if args.tall > 1:
+        tall_turns(args.tall)
     if "stream_scroll" in wanted and not args.stream_chars:
         args.stream_chars = 20000  # the stream must outlast the wheel
     if args.stream_chars:
@@ -444,6 +501,7 @@ def main() -> int:
                     "turns": args.turns,
                     "reps": args.reps,
                     "stream_chars": args.stream_chars,
+                    "tall": args.tall,
                     "rows": rows,
                     "errors": got["errors"],
                     "readings": got["readings"],
