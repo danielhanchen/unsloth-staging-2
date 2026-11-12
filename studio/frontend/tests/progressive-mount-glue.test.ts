@@ -637,20 +637,31 @@ test("a copy from a field leaves the window alone", () => {
 });
 
 test("a commit that can wait does not start while a reply streams", () => {
-  // React restarts a transition render on every chunk: one issued mid-stream lands after the reply.
+  // Every chunk is a synchronous store update and React restarts a transition render on each:
+  // a slide issued as one rendered for the whole reply, landed after it, and held every step
+  // back meanwhile, so a reader who scrolled away looked at a spacer until the reply ended.
   const step = section(GLUE, "const step = useCallback(", "stepRef.current = step;");
   assert.match(
     step,
     /if \(streaming && !\(WEBKIT_GTK \|\| trimOnly \|\| exposed\)\) \{[\s\S]*?settleTimerRef\.current = window\.setTimeout\(schedule, STREAM_QUIET_MS\);\s*return;\s*\}\s*commit\(next, WEBKIT_GTK \|\| trimOnly \|\| exposed\);/,
     "what is not urgent waits for the reply to pause, and is looked at again",
   );
+  // A reader waiting on a full mount is not made to wait for the reply: a small pass, at once.
   assert.match(step, /if \(streaming\) next = planFill\(current, total, 1, heightOf\);/);
-  assert.match(step, /if \(modeRef\.current === "fill"\) \{\s*commit\(next, true\);\s*return;/);
+  // With nothing mounted ahead, a spacer a screen away is filled before a scroll shows it, a row
+  // a frame: the eight rows of a whole step were one 100-230 ms frame under the reader's wheel.
+  assert.match(
+    step,
+    /if \(modeRef\.current !== "fill"\) \{\s*next = holdTailTurn\(\s*planSlide\(\{[\s\S]*?maxStep: 1,\s*reach: Math\.min\(viewport\.clientHeight, WINDOW_REACH_PX\),\s*trim,\s*\}\),/,
+  );
+  assert.match(step, /if \(!sameWindow\(next, current\)\) \{\s*commit\(next, true\);\s*return;\s*\}\s*settle\(viewport, current, lookup\);/);
+  // Streaming is a chunk seen lately in a running thread, counted off the store, not per render.
   assert.match(
     GLUE,
     /pulseRef\.current\?\.streaming\(performance\.now\(\)\) === true &&\s*aui\.thread\(\)\.getState\(\)\.isRunning === true/,
   );
   assert.match(GLUE, /return aui\.subscribe\(\(\) => pulse\.note\(tailContent\(\), performance\.now\(\)\)\);/);
+  // A transition a stream starts under is finished in a frame instead of starving.
   assert.match(
     step,
     /if \(viewport && pendingRef\.current && inFlight\) \{[\s\S]*?if \(streamingNow\(\) && \(pulseRef\.current\?\.changes \?\? 0\) - inFlight\.changes >= 2\) \{\s*commit\(inFlight\.next, true\);\s*return;/,

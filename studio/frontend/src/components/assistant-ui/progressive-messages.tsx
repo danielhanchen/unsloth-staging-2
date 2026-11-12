@@ -73,6 +73,7 @@ const ANCHOR_PRECISION = 1 / 64;
 const FILL_RELEASE_MS = 3000;
 const SETTLE_RETRY_MS = 350;
 const HOLD_RECHECK_MS = 1000;
+/** How often a transition in flight is looked at, in case a stream started under it. */
 const TRANSITION_WATCH_MS = 250;
 const FIND_FLAG = "data-find-bar-open";
 // Not `[data-role]`: a prompt being edited renders as an EditComposer, which has no role.
@@ -325,8 +326,8 @@ function rowIndex(child: Element, lookup: Metas): number | undefined {
   return lookup.index.get(child.getAttribute("data-message-id") ?? "");
 }
 
-/** Height = top to the top of what follows, so the margins between rows are counted. The
- *  `writing` row is skipped: each chunk would move the estimate every spacer is sized from. */
+/** Height = top to the top of what follows, so the margins between rows are counted. `writing`
+ *  is a reply mid-stream: each chunk would move the estimate every spacer is sized from. */
 function measureRows(
   viewport: HTMLElement,
   lookup: Metas,
@@ -524,8 +525,10 @@ function useThreadWindow(
   const settleTimerRef = useRef(0);
   const ordinalsRef = useRef(false);
   const pulseRef = useRef<TailPulse | null>(null);
+  /** The transition commit in flight, and the chunks seen when it was issued. */
   const transitionRef = useRef<{ next: RowWindow | null; changes: number } | null>(null);
 
+  /** A reply is being written into the tail right now. */
   const streamingNow = useCallback(
     () =>
       pulseRef.current?.streaming(performance.now()) === true &&
@@ -636,7 +639,8 @@ function useThreadWindow(
     const viewport = viewportRef.current;
     const inFlight = transitionRef.current;
     if (viewport && pendingRef.current && inFlight) {
-      // Every streamed chunk restarts a transition render, so it would never land: finish it now.
+      // A stream caught up with a transition: every chunk restarts its render, so it would not
+      // land before the reply ends, and no step runs until it does. Finish it in this frame.
       if (streamingNow() && (pulseRef.current?.changes ?? 0) - inFlight.changes >= 2) {
         commit(inFlight.next, true);
         return;
@@ -724,6 +728,7 @@ function useThreadWindow(
             chunkRef.current, frontier, FILL_CHUNK, WINDOW_REACH_PX))
         : FILL_CHUNK;
       next = planFill(current, total, chunk, heightOf);
+      // A reader is waiting and no transition lands while a reply streams: a row each way, now.
       if (streaming) next = planFill(current, total, 1, heightOf);
     } else {
       chunkRef.current = 0;
@@ -766,17 +771,40 @@ function useThreadWindow(
       (current.start > 0 && first.top > 0) ||
       (current.end < total && last.bottom < viewport.clientHeight);
     if (streaming && !(WEBKIT_GTK || trimOnly || exposed)) {
-      if (modeRef.current === "fill") {
+      // No transition lands while a reply streams, so a spacer within a screen of the viewport
+      // is filled before a scroll can show it: a row a frame, a whole step is a long frame.
+      if (modeRef.current !== "fill") {
+        next = holdTailTurn(
+          planSlide({
+            win: current,
+            count: total,
+            rows: inWindow,
+            viewHeight: viewport.clientHeight,
+            threadTop: measured.threadTop,
+            slack: slackRef.current,
+            heightOf,
+            maxStep: 1,
+            reach: Math.min(viewport.clientHeight, WINDOW_REACH_PX),
+            trim,
+          }),
+          total,
+          lookup.tailTurn,
+        );
+        if (next != null) next = keepPinned(viewport, lookup, next, tail);
+      }
+      if (!sameWindow(next, current)) {
         commit(next, true);
         return;
       }
-      // No transition while streaming: every chunk would restart it. Wait for a pause.
+      // The rest can wait for the reply to pause: a transition now would be restarted by every
+      // chunk.
       settle(viewport, current, lookup);
       window.clearTimeout(settleTimerRef.current);
       settleTimerRef.current = window.setTimeout(schedule, STREAM_QUIET_MS);
       return;
     }
     commit(next, WEBKIT_GTK || trimOnly || exposed);
+    // Watched while it is in flight: a stream that starts under it would starve it.
     if (pendingRef.current) {
       window.clearTimeout(settleTimerRef.current);
       settleTimerRef.current = window.setTimeout(schedule, TRANSITION_WATCH_MS);
@@ -1080,6 +1108,7 @@ function useThreadWindow(
     };
   }, [viewportRef, topRef, bottomRef, schedule, commit, complete, readMetas]);
 
+  // One comparison per store write: the tail's content is replaced by every streamed chunk.
   useEffect(() => {
     const tailContent = () => {
       const messages = aui.thread().getState().messages;
