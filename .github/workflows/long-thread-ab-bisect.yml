@@ -1,4 +1,4 @@
-name: long-thread A/B 17504 fixes
+name: long-thread A/B 17504 fix on main
 on:
   pull_request:
   workflow_dispatch:
@@ -13,14 +13,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {label: aa, head: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e}
-          - {label: pr, head: 60855079b1d6bdec3ea98d8c6cc76b786edfbea6}
-          - {label: fix1, head: f51e79d5ec3927e08d25df3b2c52666eba5c355f}
-          - {label: fix2, head: d35cfd27f7825903047b0ba7e5918052dd532b87}
-          - {label: fix3, head: 1dabae44d0158e2166355df237525524df36bf4e}
-          - {label: fix4, head: e0b0a36d4582318c40f64036987e94eec6dd4c22}
+          - {label: aa_main, base: e91e7be4d0880b557ba436572c9b742353168013, head: e91e7be4d0880b557ba436572c9b742353168013}
+          - {label: main_vs_fix, base: e91e7be4d0880b557ba436572c9b742353168013, head: 61704fd058b7a359d1d21951c95ccd7c12980351}
+          - {label: pre_vs_main, base: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e, head: e91e7be4d0880b557ba436572c9b742353168013}
+          - {label: pre_vs_fix, base: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e, head: 61704fd058b7a359d1d21951c95ccd7c12980351}
     env:
-      BASE: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e
+      BASE: ${{ matrix.base }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
