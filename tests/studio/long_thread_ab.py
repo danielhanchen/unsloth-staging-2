@@ -145,12 +145,79 @@ def lengthen_stream(chars: int) -> None:
     )
 
 
+# The reader wheels up through the thread while a reply streams, so a windowed thread has to move
+# its window under a stream (#17504's cost: a low-priority window commit that every streamed chunk
+# restarts). Coverage samples how much of the viewport real rows fill while scrolling: a spacer left
+# blank where rows should be reads below 1.
+COVERAGE = """() => {
+  const v = document.querySelector('.aui-thread-viewport');
+  if (!v) return null;
+  const f = v.getBoundingClientRect();
+  const spans = [];
+  for (const r of v.querySelectorAll('[data-message-id]')) {
+    const b = r.getBoundingClientRect();
+    const top = Math.max(b.top, f.top), bottom = Math.min(b.bottom, f.bottom);
+    if (bottom > top) spans.push([top, bottom]);
+  }
+  spans.sort((x, y) => x[0] - y[0]);
+  let covered = 0, end = f.top;
+  for (const [t, b] of spans) { const s = Math.max(t, end); if (b > s) { covered += b - s; end = b; } }
+  return covered / Math.max(1, f.height);
+}"""
+STREAM_DONE = (
+    """() => !!window.__gateStreamDone && !document.querySelector('.aui-composer-cancel')"""
+)
+COVERAGE_MIN = 0.5
+WHEEL_STEPS, WHEEL_PX, WHEEL_GAP_MS = 40, -600, 60
+
+areas.AREAS["stream_scroll"] = {
+    "setup": ("compose", areas.STREAM_PROMPT),
+    "open": ("stream_scroll", None),
+    "ready": ("stream_done",),
+    "close": None,
+    "gone": ("settle",),
+    "covers": [],
+}
+
+
+class ABPage(areas.Page):
+    coverage: list[float]
+
+    def act(self, action) -> bool:
+        if action is None or action[0] != "stream_scroll":
+            return super().act(action)
+        page = self.page
+        page.keyboard.press("Enter")
+        page.wait_for_function("() => (window.__gateStreams || 0) > 0", timeout = 10_000)
+        page.wait_for_timeout(500)
+        box = page.locator(".aui-thread-viewport").bounding_box()
+        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+        self.coverage = []
+        for _ in range(WHEEL_STEPS):
+            page.mouse.wheel(0, WHEEL_PX)
+            page.wait_for_timeout(WHEEL_GAP_MS)
+            c = page.evaluate(COVERAGE)
+            if c is not None:
+                self.coverage.append(c)
+        self.hovered = True
+        return True
+
+    def wait(self, pred, base_overlays: int) -> bool:
+        if pred[0] != "stream_done":
+            return super().wait(pred, base_overlays)
+        try:
+            self.page.wait_for_function(STREAM_DONE, timeout = areas.STREAM_TIMEOUT_MS, polling = 50)
+            return True
+        except Exception:  # noqa: BLE001 - a stream that never ends is NOT_RUN
+            return False
+
+
 def open_page(browser, base: str, turns: int, mode: dict):
     """One retry: the first page in a fresh browser on a loaded runner can miss the load timeout."""
     try:
-        return areas.Page(browser, base, turns, mode, [])
+        return ABPage(browser, base, turns, mode, [])
     except Exception:  # noqa: BLE001 - the second failure is the one reported
-        return areas.Page(browser, base, turns, mode, [])
+        return ABPage(browser, base, turns, mode, [])
 
 
 def measure(dists: dict[str, Path], turns: int, reps: int, wanted: list[str]) -> dict:
@@ -184,7 +251,12 @@ def measure(dists: dict[str, Path], turns: int, reps: int, wanted: list[str]) ->
                             if cell.get("status") != "OK":
                                 errors.append(f"{side} rep {k} {a}: {cell.get('status')}")
                                 continue
-                            readings[side][a].append({m: cell.get(m, 0.0) for m in METRICS})
+                            got = {m: cell.get(m, 0.0) for m in METRICS}
+                            if a == "stream_scroll":
+                                cov = getattr(page, "coverage", None) or [0.0]
+                                got["coverage_min"] = round(min(cov), 3)
+                                got["coverage_blank_samples"] = sum(c < 0.5 for c in cov)
+                            readings[side][a].append(got)
                         line = "  ".join(
                             f"{a} {cells.get(a, {}).get('main_ms', float('nan')):.0f}"
                             f" (blocked {cells.get(a, {}).get('blocked_ms', float('nan')):.0f}"
@@ -200,6 +272,10 @@ def measure(dists: dict[str, Path], turns: int, reps: int, wanted: list[str]) ->
     return {"readings": readings, "errors": errors}
 
 
+def fmt(x: float) -> str:
+    return f"{x:.2f}" if abs(x) < 10 and x != int(x) else f"{x:.0f}"
+
+
 def judge(
     readings: dict, wanted: list[str], max_ratio: float, gated: list[str]
 ) -> tuple[list[dict], bool]:
@@ -213,7 +289,10 @@ def judge(
             continue
         row = {"area": a, "metrics": {}}
         slower = []
-        for m in METRICS:
+        extra = [
+            k for k in ("coverage_min", "coverage_blank_samples") if k in readings["head"][a][0]
+        ]
+        for m in (*METRICS, *extra):
             b = [r[m] for r in readings["base"][a]]
             h = [r[m] for r in readings["head"][a]]
             mb, mh = statistics.median(b), statistics.median(h)
@@ -230,6 +309,10 @@ def judge(
                 if info["ratio"] > max_ratio and info["separated"]:
                     slower.append(m)
             row["metrics"][m] = info
+        cov = row["metrics"].get("coverage_min")
+        # Blank viewport while scrolling: head leaves spacers unfilled where base showed rows.
+        if cov and cov["head_median"] < COVERAGE_MIN <= cov["base_median"]:
+            slower.append("coverage_min")
         verdict = f"SLOWER ({', '.join(slower)})" if slower else "ok"
         if slower and a in gated:
             regressed = True
@@ -251,7 +334,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--gated",
-        default = os.environ.get("LONG_THREAD_AB_GATED", "stream,type"),
+        default = os.environ.get("LONG_THREAD_AB_GATED", "stream,type,stream_scroll"),
         help = "areas whose SLOWER verdict fails the run; the rest are reported",
     )
     ap.add_argument(
@@ -291,6 +374,8 @@ def main() -> int:
             print(f"VOID: no app build at {d / 'index.html'} ({side})", flush = True)
             return 2
 
+    if "stream_scroll" in wanted and not args.stream_chars:
+        args.stream_chars = 20000  # the stream must outlast the wheel
     if args.stream_chars:
         lengthen_stream(args.stream_chars)
     started = time.time()
@@ -311,11 +396,17 @@ def main() -> int:
             )
             continue
         for m, i in r["metrics"].items():
-            if m not in GATES and m not in ("long_tasks", "longest_task_ms", "elements"):
+            if m not in GATES and m not in (
+                "long_tasks",
+                "longest_task_ms",
+                "elements",
+                "coverage_min",
+                "coverage_blank_samples",
+            ):
                 continue
             print(
-                f"| {r['area']} | {m} | {i['base_median']:.0f} {[round(x) for x in i['base']]} | "
-                f"{i['head_median']:.0f} {[round(x) for x in i['head']]} | {i.get('ratio', '')} | {i.get('separated', '')} |"
+                f"| {r['area']} | {m} | {fmt(i['base_median'])} {[fmt(x) for x in i['base']]} | "
+                f"{fmt(i['head_median'])} {[fmt(x) for x in i['head']]} | {i.get('ratio', '')} | {i.get('separated', '')} |"
             )
         print(f"| {r['area']} | verdict | | | | {r['verdict']} |")
     for e in got["errors"]:
