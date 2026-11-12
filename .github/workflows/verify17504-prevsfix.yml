@@ -1,0 +1,251 @@
+name: verify 17504 prefix vs fix
+on:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  perf:
+    name: studiobench standard 100K, null then A/B, one runner
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    env:
+      UNSLOTH_DISABLE_UPDATE_CHECK: '1'
+      PORT_A: '18904'
+      PORT_B: '18905'
+      PORT_C: '18906'
+      HOME_A: ${{ github.workspace }}/.parity/home_a
+      HOME_B: ${{ github.workspace }}/.parity/home_b
+      HOME_C: ${{ github.workspace }}/.parity/home_c
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
+        with:
+          node-version: '22'
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0  # v7.1.0
+        with:
+          python-version: '3.12'
+
+      # The merge base, not the base tip, so other merged changes are not credited to this PR.
+      - name: Resolve the merge base and the head
+        id: refs
+        run: |
+          set -euo pipefail
+          BASE_TIP='${{ github.event.pull_request.base.sha }}'
+          HEAD_SHA='${{ github.event.pull_request.head.sha }}'
+          # Fetch by sha: a fork head is not on origin under any branch name.
+          git fetch --no-tags origin "+${BASE_TIP}:refs/parity/base-tip" \
+                                     "+${HEAD_SHA}:refs/parity/head" 2> /dev/null \
+            || echo "::notice::fetch by sha declined; relying on the checkout's own objects"
+          # Side A is main WITH #17504 (the commit under the fix), so the pair isolates the fix.
+          MERGE_BASE="$(git rev-parse "${HEAD_SHA}~2")"
+          SIDE_B="$HEAD_SHA"
+          echo "merge_base=$MERGE_BASE" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA"        >> "$GITHUB_OUTPUT"
+          echo "side_b=$SIDE_B"        >> "$GITHUB_OUTPUT"
+          echo "side A (base)      = $MERGE_BASE"
+          echo "side B (treatment) = $SIDE_B"
+          if [ "$MERGE_BASE" = "$SIDE_B" ]; then
+            echo "this arm is the NULL CONTROL: both sides are the same commit"
+          fi
+
+      - name: Check the two sides out as separate trees
+        run: |
+          set -euo pipefail
+          # Separate trees: install.sh --local is an editable install of the tree it runs from.
+          git worktree add --detach "$RUNNER_TEMP/side_a" "${{ steps.refs.outputs.merge_base }}"
+          git worktree add --detach "$RUNNER_TEMP/side_b" "${{ steps.refs.outputs.side_b }}"
+          git worktree add --detach "$RUNNER_TEMP/side_c" "${{ steps.refs.outputs.merge_base }}"
+
+      # Through the action that owns the key (tests/studio/test_uv_cache_discipline.py).
+      - name: Restore the uv download cache
+        id: uv-cache
+        uses: ./.github/actions/uv-cache-restore
+
+      # No frontend-dist cache: its key hashes the root checkout, not either side's tree.
+      - name: Install the base side
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Withheld on PR: this step runs checked-out PR code; studiobench needs no model.
+          HF_TOKEN: ${{ github.event_name != 'pull_request' && secrets.HF_TOKEN || '' }}
+        run: bash .github/scripts/parity-install-side.sh "$RUNNER_TEMP/side_a" "$HOME_A" logs/install_a.log
+
+      - name: Install the treatment side
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HF_TOKEN: ${{ github.event_name != 'pull_request' && secrets.HF_TOKEN || '' }}
+        run: bash .github/scripts/parity-install-side.sh "$RUNNER_TEMP/side_b" "$HOME_B" logs/install_b.log
+
+      - name: Install the base side again, its own home (null control)
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/parity-install-side.sh "$RUNNER_TEMP/side_c" "$HOME_C" logs/install_c.log
+
+      - name: Declare this job a uv cache consumer, not a producer
+        uses: ./.github/actions/uv-cache-save
+        with:
+          cache-hit: ${{ steps.uv-cache.outputs.cache-hit }}
+          key: ${{ steps.uv-cache.outputs.key }}
+          save: 'false'
+
+      - name: Pin the Playwright version so the browser cache has a key
+        id: pw
+        run: |
+          pip install 'playwright>=1.45,<2' psutil
+          echo "version=$(python -c 'import playwright; from importlib.metadata import version; print(version("playwright"))')" >> "$GITHUB_OUTPUT"
+          # Browser builds differ per OS release; one restored onto another release exits at launch.
+          echo "os=$(. /etc/os-release && echo "${ID}-${VERSION_ID}")" >> "$GITHUB_OUTPUT"
+
+      # Same key as studiobench-ci.yml.
+      - name: Restore the Playwright browser cache
+        id: pw-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        continue-on-error: true
+        with:
+          path: ~/.cache/ms-playwright
+          key: ms-playwright-${{ runner.os }}-${{ steps.pw.outputs.os }}-${{ steps.pw.outputs.version }}-c-v2
+
+      # Chromium only, without --with-deps; 2 x 300s + 125s lock wait fits 12 minutes.
+      - name: Install the Chromium engine
+        id: pw-install
+        timeout-minutes: 12
+        env:
+          RETRY_ATTEMPTS: '2'
+          RETRY_ATTEMPT_TIMEOUT: '300'
+          APT_ACQUIRE_RETRIES: '0'
+        run: |
+          if [ "${{ steps.pw-cache.outputs.cache-hit }}" != "true" ]; then
+            bash .github/scripts/retry-with-apt-lock.sh \
+              python -m playwright install chromium
+          fi
+
+          probe() {
+            python - <<'PY'
+          import sys
+          from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              try:
+                  browser = p.chromium.launch()
+                  browser.close()
+              except Exception as exc:
+                  print(f"chromium will not start: {type(exc).__name__}: {exc}")
+                  sys.exit(1)
+          print("chromium launches; system libraries are present")
+          PY
+          }
+
+          if probe; then
+            echo "::notice::skipped playwright install-deps; the runner image already has the libraries"
+          else
+            echo "system libraries are missing, installing them"
+            bash .github/scripts/retry-with-apt-lock.sh \
+              python -m playwright install-deps chromium
+            probe
+          fi
+
+      # Two instances, homes and ports; each boot puts its side's venv first on PATH.
+      - name: Boot both Unsloth instances
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          boot() {
+            local home="$1" port="$2" label="$3"
+            local bin
+            bin="$(bash .github/scripts/parity-find-unsloth.sh "$home")"
+            UNSLOTH_STUDIO_HOME="$home" PATH="$(dirname "$bin"):$PATH" \
+              bash .github/scripts/boot-studio-api-only.sh \
+                --port "$port" --log "logs/studio_${label}.log" --pid-var "STUDIO_${label}_PID"
+            bash .github/scripts/wait-for-health.sh --port "$port" --log "logs/studio_${label}.log"
+            # Read the bootstrap password once here: it is deleted after first use.
+            local pw
+            pw="$(cat "$home/auth/.bootstrap_password")"
+            echo "::add-mask::$pw"
+            echo "PASSWORD_${label}=$pw" >> "$GITHUB_ENV"
+          }
+          boot "$HOME_A" "$PORT_A" a
+          boot "$HOME_B" "$PORT_B" b
+          boot "$HOME_C" "$PORT_C" c
+
+      # Both arms must start empty; read sqlite since authenticated routes 403 until the password changes.
+      - name: Both arms start from an empty thread list
+        timeout-minutes: 2
+        run: |
+          set -euo pipefail
+          python - "$HOME_A" "$HOME_B" "$HOME_C" <<'PY'
+          import pathlib
+          import sqlite3
+          import sys
+
+          bad = False
+          for home in sys.argv[1:]:
+              db = pathlib.Path(home) / "studio.db"
+              if not db.exists():
+                  print(f"  {home}: no studio.db yet, so no thread can be in it")
+                  continue
+              # Read-only, and immutable so a live writer cannot block the read.
+              con = sqlite3.connect(f"file:{db}?mode=ro", uri = True)
+              try:
+                  n = con.execute("SELECT count(*) FROM chat_threads").fetchone()[0]
+              except sqlite3.Error as exc:
+                  # A schema this does not recognise is NOT MEASURED, and saying so beats
+                  # passing quietly on a check that has silently stopped checking.
+                  print(f"::error::{home}: could not count chat_threads ({exc})")
+                  bad = True
+                  continue
+              finally:
+                  con.close()
+              print(f"  {home}: {n} existing thread(s)")
+              if n:
+                  bad = True
+          if bad:
+              print("::error::an arm is not starting clean. Anything it renders is partly some")
+              print("other run, so the pair below would be a real screenshot of the wrong state.")
+              sys.exit(1)
+          PY
+
+      - name: Null control, base vs base
+        if: ${{ false }}
+        timeout-minutes: 140
+        continue-on-error: true
+        run: |
+          python -m tests.studio.studiobench --tier standard --rungs 100K --reps 4 --engine chromium \
+            --attach "http://127.0.0.1:${PORT_A}" --password "$PASSWORD_a" --branch "${{ steps.refs.outputs.merge_base }}" \
+            --ab "${{ steps.refs.outputs.merge_base }}" --attach-b "http://127.0.0.1:${PORT_C}" --password-b "$PASSWORD_c" \
+            --windowed-arm base,treatment --out outputs/null 2>&1 | tail -c 400000 > logs/null.log
+
+      - name: A/B, base vs head
+        timeout-minutes: 140
+        continue-on-error: true
+        run: |
+          python -m tests.studio.studiobench --tier standard --rungs 100K --reps 4 --engine chromium \
+            --attach "http://127.0.0.1:${PORT_A}" --password "$PASSWORD_a" --branch "${{ steps.refs.outputs.merge_base }}" \
+            --ab "${{ steps.refs.outputs.side_b }}" --attach-b "http://127.0.0.1:${PORT_B}" --password-b "$PASSWORD_b" \
+            --windowed-arm base,treatment --out outputs/ab 2>&1 | tail -c 400000 > logs/ab.log
+
+      - name: Reports
+        if: always()
+        run: |
+          for r in null ab; do
+            python -m tests.studio.studiobench --report outputs/$r/payload.jsonl --tier standard > logs/report_$r.txt 2>&1 || true
+            python -m tests.studio.studiobench --assert-liveness outputs/$r/payload.jsonl > logs/liveness_$r.txt 2>&1 || true
+          done
+          python -m tests.studio.studiobench.sweep.floor_table outputs/ab > logs/floor_table.txt 2>&1 || true
+          python -m tests.studio.studiobench.sweep.ui_parity --mode visible outputs/ab > logs/ui_parity_visible.txt 2>&1 || true
+          python -m tests.studio.studiobench.sweep.ui_parity --mode behaviour outputs/ab > logs/ui_parity_behaviour.txt 2>&1 || true
+          tail -60 logs/floor_table.txt
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        if: always()
+        with:
+          name: verify17504-perf
+          path: |
+            logs/
+            outputs/null/payload.jsonl
+            outputs/ab/payload.jsonl
