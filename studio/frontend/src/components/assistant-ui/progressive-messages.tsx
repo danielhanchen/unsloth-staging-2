@@ -808,6 +808,19 @@ function useThreadWindow(
     spacer("bottom")?.style.setProperty("height", `${spacers.bottom}px`);
   }, [atFirstRow, spacers, viewportRef]);
 
+  // The rows this commit inserted get their role and ordinals here, before anything has read
+  // their style: written in the layout effect below, after the anchor reads, the role restyled
+  // every row a second time (the stylesheet has selectors on [role]), and scrolling mounts rows
+  // on almost every step.
+  useInsertionEffect(() => {
+    const viewport = viewportRef.current;
+    if (!viewport) return;
+    const windowed = win != null;
+    if (!windowed && !ordinalsRef.current) return;
+    publishOrdinals(viewport, readMetas(), windowed);
+    ordinalsRef.current = windowed;
+  }, [win, count, readMetas, viewportRef]);
+
   useLayoutEffect(() => {
     winRef.current = win;
     const captured = anchorRef.current;

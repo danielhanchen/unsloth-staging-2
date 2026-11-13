@@ -666,3 +666,17 @@ test("a commit that can wait does not start while a reply streams", () => {
     /pendingRef\.current = false;\s*transitionRef\.current = null;/,
   );
 });
+
+test("rows get their role and ordinals before anything reads their style", () => {
+  // Written in the commit's layout effect, after the anchor reads had computed the new rows'
+  // style, the role restyled every row a second time as the window mounted it: style
+  // recalculation while scrolling rose from 1.7 s to 2.5 s over the window gate's sweep.
+  const early = section(GLUE, "useInsertionEffect(() => {\n    const viewport = viewportRef.current;\n    if (!viewport) return;\n    const windowed", "}, [win, count, readMetas, viewportRef]);");
+  assert.match(early, /publishOrdinals\(viewport, readMetas\(\), windowed\);/);
+  assert.match(early, /ordinalsRef\.current = windowed;/);
+  assert.ok(
+    GLUE.indexOf("publishOrdinals(viewport, readMetas(), windowed);") <
+      GLUE.indexOf("useLayoutEffect(() => {\n    winRef.current = win;"),
+    "the ordinals go on before the layout effect's anchor reads",
+  );
+});
