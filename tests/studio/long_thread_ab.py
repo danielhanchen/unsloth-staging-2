@@ -3,12 +3,12 @@
 
 """Base vs head: does a change make a long chat cost more than its base build does?
 
-playwright_long_thread_gate.py compares a build with itself (40 vs 200 turns, one appearance vs
-another), so a cost every message pays alike in both lengths passes it (#17504: a streamed reply
-cost 3x its base in main-thread time, every within-build ratio stayed green). This runs areas of the
-area matrix (_area_matrix.py) on two production builds of vite.long-thread.config.ts, interleaved
-ABBA on fresh pages in one browser, and fails when head's median main-thread time for an area is
-over MAX_RATIO times base's and every head reading is above every base reading.
+playwright_long_thread_gate.py compares a build with itself (40 vs 200 turns), so a cost both
+lengths pay alike passes it: #17504 left the viewport blank while a reply streamed under a reader
+who had scrolled away, and every within-build ratio stayed green. This runs areas of the area
+matrix (_area_matrix.py) on production builds of both refs, ABBA on fresh pages in one browser. An
+area fails when head's median main-thread or long-task time is over --max-ratio times base's with no
+overlap, or (stream_scroll) when any head reading leaves the viewport blank and no base one does.
 
   python tests/studio/long_thread_ab.py --base-ref origin/main --head-ref HEAD
   python tests/studio/long_thread_ab.py --base DIST_A --head DIST_B      # prebuilt dists
@@ -46,17 +46,13 @@ METRICS = (
     "elements",
     "longest_task_ms",
 )
-# Gated on the renderer main thread: raster / compositor threads run on every frame under software
-# compositing and swing with the runner, not the build.
-# Metric -> floor (ms) under which differences are noise. blocked_ms is the Long Tasks share (what
-# studiobench's stream cost sums): total main-thread time can fall while a change bunches it.
+# Renderer main thread only (raster/compositor swing with the runner); floors in ms.
 GATES = {"main_ms": 50.0, "blocked_ms": 100.0}
 
 
 def _split_with_blocking(events: list) -> dict[str, dict]:
-    """The area matrix's counters plus main-thread blocking: the part of each renderer main-thread
-    task over 50 ms (the Long Tasks definition, what studiobench's stream cost sums) and their count.
-    Total time can fall while a change bunches it into fewer, longer tasks the reader feels."""
+    """The area matrix's counters plus the part of each main-thread task over 50 ms (Long Tasks):
+    total time can fall while a change bunches it into tasks the reader feels."""
     out = _split_trace(events)
     names, windows = {}, {}
     for e in events:
@@ -112,20 +108,31 @@ def build_ref(ref: str) -> tuple[Path, str]:
     if not modules.exists():
         modules.symlink_to(FRONTEND / "node_modules", target_is_directory = True)
     t = time.time()
-    subprocess.run(
-        ["npx", "vite", "build", "--config", "vite.long-thread.config.ts", "--outDir", str(out)],
-        cwd = wt / "studio" / "frontend",
-        check = True,
-        shell = os.name == "nt",
-        stdout = subprocess.DEVNULL,
-    )
+    try:
+        subprocess.run(
+            [
+                "npx",
+                "vite",
+                "build",
+                "--config",
+                "vite.long-thread.config.ts",
+                "--outDir",
+                str(out),
+            ],
+            cwd = wt / "studio" / "frontend",
+            check = True,
+            shell = os.name == "nt",
+            stdout = subprocess.DEVNULL,
+        )
+    finally:
+        modules.unlink(missing_ok = True)
+        sh(["git", "worktree", "remove", "--force", str(wt)], REPO)
     print(f"built {ref} ({sha[:12]}) in {time.time() - t:.0f} s -> {out}", flush = True)
     return out, sha
 
 
 def lengthen_stream(chars: int) -> None:
-    """Stream about `chars` characters of prose before the reply's end, so a cost paid per streamed
-    chunk (not per message) shows: the gate's own reply is a few hundred characters."""
+    """Stream about `chars` more characters: the gate's own reply is a few hundred."""
     short = areas.stream_frames
 
     def frames() -> list[dict]:
@@ -140,16 +147,11 @@ def lengthen_stream(chars: int) -> None:
         return out[:end] + extra + out[end:]
 
     areas.stream_frames = frames
-    # At STREAM_MS a frame, plus the page's own time on a slow runner.
     areas.STREAM_TIMEOUT_MS = max(
         areas.STREAM_TIMEOUT_MS, 30_000 + 4 * areas.STREAM_MS * len(frames())
     )
 
 
-# The reader wheels up through the thread while a reply streams, so a windowed thread has to move
-# its window under a stream (#17504's cost: a low-priority window commit that every streamed chunk
-# restarts). Coverage samples how much of the viewport real rows fill while scrolling: a spacer left
-# blank where rows should be reads below 1.
 COVERAGE = """() => {
   const v = document.querySelector('.aui-thread-viewport');
   if (!v) return null;
@@ -187,8 +189,7 @@ STREAM_DONE = (
 COVERAGE_MIN = 0.5
 WHEEL_STEPS, WHEEL_PX, WHEEL_GAP_MS = 12, -600, 60
 
-# Measured on a page of its own (--areas stream_scroll): after the stream area, the composer and
-# the tail are in that area's end state, not a reader's.
+# #17504: every chunk restarted the window's transition commit. Runs on a page no stream has used.
 areas.AREAS["stream_scroll"] = {
     "setup": ("compose", areas.STREAM_PROMPT),
     "open": ("stream_scroll", None),
@@ -209,7 +210,6 @@ class ABPage(areas.Page):
         before = page.evaluate("() => window.__gateStreams || 0")
         page.keyboard.press("Enter")
         try:
-            # This area's own stream: an earlier area's finished stream must not satisfy the wait.
             page.wait_for_function(
                 "(n) => (window.__gateStreams || 0) > n", arg = before, timeout = 10_000
             )
@@ -226,8 +226,6 @@ class ABPage(areas.Page):
             c = page.evaluate(COVERAGE)
             if c is not None:
                 self.coverage.append(c)
-        # Then the reader stops and reads while the reply is still being written: the rows under
-        # them must land within frames, not when the reply ends.
         self.coverage += page.evaluate(AFTER_WHEEL, [AFTER_FRAMES, AFTER_SAMPLES, AFTER_GAP_MS])
         self.still_streaming = page.evaluate("() => !window.__gateStreamDone")
         self.hovered = True
@@ -244,9 +242,8 @@ class ABPage(areas.Page):
 
 
 def tall_turns(repeat: int) -> None:
-    """Replies `repeat` times the gate's answer block (prose, code, table, math): rows a couple of
-    viewports tall, each slower to render than the gap between two streamed chunks, as long agent
-    replies are. A window commit that a chunk restarts then never lands while the reply streams."""
+    """Each reply's answer block (prose, code, table, math) `repeat` times: rows slower to render
+    than the gap between two streamed chunks, as long agent replies are."""
     short = areas.turn
 
     def turn(tid: str, t: int, parent):
@@ -263,7 +260,7 @@ def tall_turns(repeat: int) -> None:
 
 
 def open_page(browser, base: str, turns: int, mode: dict):
-    """One retry: the first page in a fresh browser on a loaded runner can miss the load timeout."""
+    """One retry: a fresh browser's first page can miss the load timeout on a loaded runner."""
     try:
         return ABPage(browser, base, turns, mode, [])
     except Exception:  # noqa: BLE001 - the second failure is the one reported
@@ -278,7 +275,6 @@ def measure(dists: dict[str, Path], turns: int, reps: int, wanted: list[str]) ->
     servers = {side: areas.serve_app(d) for side, d in dists.items()}
     readings: dict[str, dict[str, list[dict]]] = {s: {a: [] for a in wanted} for s in dists}
     errors: list[str] = []
-    # ABBA: a drift in runner speed over the run lands on both sides alike.
     order = [("base", "head") if k % 2 == 0 else ("head", "base") for k in range(reps)]
     try:
         with sync_playwright() as pw:
@@ -307,8 +303,6 @@ def measure(dists: dict[str, Path], turns: int, reps: int, wanted: list[str]) ->
                                 got["coverage_min"] = round(min(cov), 3)
                                 got["coverage_blank_samples"] = sum(c < COVERAGE_MIN for c in cov)
                                 if not getattr(page, "still_streaming", False):
-                                    # The reply ended before the reader stopped: nothing was
-                                    # measured under a stream.
                                     errors.append(
                                         f"{side} rep {k} {a}: the reply ended before the check"
                                     )
@@ -367,9 +361,7 @@ def judge(
                     slower.append(m)
             row["metrics"][m] = info
         cov = row["metrics"].get("coverage_min")
-        # Blank viewport while scrolling: head leaves spacers unfilled where base showed rows.
-        # One blank moment is a reader-visible failure, so any head reading counts; base must have
-        # stayed filled in every reading for it to be the change's.
+        # One blank moment is visible, so any head reading counts; a base that blanks too is not the change's.
         if cov and min(cov["head"]) < COVERAGE_MIN <= min(cov["base"]):
             slower.append("coverage_min")
         verdict = f"SLOWER ({', '.join(slower)})" if slower else "ok"
@@ -438,8 +430,7 @@ def main() -> int:
             else:
                 ap.error(f"give --{side} or --{side}-ref")
     except subprocess.CalledProcessError as exc:
-        # Usually the base predates this checkout's node_modules (a dependency change): the two
-        # builds cannot be compared, which is not a measurement that failed.
+        # Usually a dependency change: the base cannot build with this node_modules.
         print(f"NOT_COMPARABLE: build failed: {exc}", flush = True)
         return 3
     for side, d in dists.items():
@@ -454,7 +445,6 @@ def main() -> int:
     if args.tall > 1:
         tall_turns(args.tall)
     if "stream_scroll" in wanted and not args.stream_chars:
-        # The stream must outlast the wheel and the reading after it: about 8 s of 60-char chunks.
         args.stream_chars = max(20000, 8000 // areas.STREAM_MS * 60)
     if args.stream_chars:
         lengthen_stream(args.stream_chars)

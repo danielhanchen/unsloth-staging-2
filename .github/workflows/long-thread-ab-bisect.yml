@@ -1,4 +1,4 @@
-name: long-thread A/B 17504 scroll reliability
+name: long-thread A/B 17597 with 17588
 on:
   pull_request:
   workflow_dispatch:
@@ -13,17 +13,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {label: aa1, base: e91e7be4d0880b557ba436572c9b742353168013, head: e91e7be4d0880b557ba436572c9b742353168013}
-          - {label: aa2, base: e91e7be4d0880b557ba436572c9b742353168013, head: e91e7be4d0880b557ba436572c9b742353168013}
-          - {label: aa3, base: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e, head: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e}
-          - {label: pre_main1, base: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e, head: e91e7be4d0880b557ba436572c9b742353168013}
-          - {label: pre_main2, base: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e, head: e91e7be4d0880b557ba436572c9b742353168013}
-          - {label: pre_main3, base: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e, head: e91e7be4d0880b557ba436572c9b742353168013}
-          - {label: pre_pr, base: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e, head: 60855079b1d6bdec3ea98d8c6cc76b786edfbea6}
-          - {label: main_fix1, base: e91e7be4d0880b557ba436572c9b742353168013, head: 61704fd058b7a359d1d21951c95ccd7c12980351}
-          - {label: main_fix2, base: e91e7be4d0880b557ba436572c9b742353168013, head: 61704fd058b7a359d1d21951c95ccd7c12980351}
-          - {label: pre_fix, base: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e, head: 61704fd058b7a359d1d21951c95ccd7c12980351}
-          - {label: pre_fixnolook, base: 4589af4fa24eb15bcde71e018d4ee0bec735dd1e, head: f51e79d5ec3927e08d25df3b2c52666eba5c355f}
+          - {label: aa, base: b2784e3e6db19b3d2df3a26f5d166589943ca75c, head: b2784e3e6db19b3d2df3a26f5d166589943ca75c}
+          - {label: main_17597, base: b2784e3e6db19b3d2df3a26f5d166589943ca75c, head: 61afe2599a19ad12d56b2820737db5daca8c1417}
+          - {label: base_17588, base: e91e7be4d0880b557ba436572c9b742353168013, head: fb4a3fdd674f7666f1e9756656516cd2a90f1d34}
+          - {label: main_combo, base: b2784e3e6db19b3d2df3a26f5d166589943ca75c, head: 80ad66a45213a882c9bd98fa461acf3280881bde}
+          - {label: p17597_combo, base: 61afe2599a19ad12d56b2820737db5daca8c1417, head: 80ad66a45213a882c9bd98fa461acf3280881bde}
     env:
       BASE: ${{ matrix.base }}
     steps:
@@ -32,7 +26,9 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
       - name: Fetch the fix branches
-        run: git fetch --no-tags origin 'refs/heads/verify-17504-*:refs/remotes/origin/verify-17504-*'
+        run: |
+          git fetch --no-tags origin 'refs/heads/verify-17597-*:refs/remotes/origin/verify-17597-*'
+          git fetch --no-tags https://github.com/unslothai/unsloth refs/pull/17588/head refs/pull/17597/head
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v7.1.0
         with:
           node-version: '22'
@@ -45,6 +41,8 @@ jobs:
         run: |
           python3 -m pip install 'playwright>=1.45,<2'
           python3 -m playwright install --with-deps chromium
+      - name: A/B base vs ${{ matrix.label }}, the gate's reply
+        run: python3 -u tests/studio/long_thread_ab.py --base-ref "$BASE" --head-ref "${{ matrix.head }}" --reps 5 --json "out/short_${{ matrix.label }}.json"
       - name: A/B base vs ${{ matrix.label }}, the reader scrolls away mid-stream
         if: always()
         run: python3 -u tests/studio/long_thread_ab.py --base-ref "$BASE" --head-ref "${{ matrix.head }}" --reps 5 --areas stream_scroll --gated stream_scroll --tall 6 --stream-ms 10 --json "out/scroll_${{ matrix.label }}.json"
