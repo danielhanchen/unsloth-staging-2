@@ -25477,7 +25477,10 @@ async def openai_audio_translations(
 
     sidecar_model = None if model in (None, "", "whisper-1") else model
     # mtmd / audio.cpp engines and turbo checkpoints would just transcribe.
-    if _stt_engine_for_model(sidecar_model) is not None or not can_translate(sidecar_model):
+    # can_translate may read a config from a custom folder on a slow mount.
+    if _stt_engine_for_model(sidecar_model) is not None or not await asyncio.to_thread(
+        can_translate, sidecar_model
+    ):
         raise HTTPException(
             status_code = 400,
             detail = openai_error_body(
@@ -25928,11 +25931,29 @@ async def stt_status(
     audio_cpp_runtime = await asyncio.to_thread(_audio_cpp_runtime_status)
     # The first probe imports torch, Transformers and PyAV (seconds); keep it off the event loop.
     transformers_available = await asyncio.to_thread(is_available)
-    transformers_downloaded = [
-        model_id for model_id in STT_MODELS if stt_sidecar.is_model_downloaded(model_id)
-    ]
-    if model and model not in STT_MODELS and stt_sidecar.is_model_downloaded(model):
-        transformers_downloaded.append(model)
+
+    def downloaded_ids() -> tuple[list[str], list[str], list[str]]:
+        transformers = [
+            model_id for model_id in STT_MODELS if stt_sidecar.is_model_downloaded(model_id)
+        ]
+        if model and model not in STT_MODELS and stt_sidecar.is_model_downloaded(model):
+            transformers.append(model)
+        mtmd_ids = [
+            model_id
+            for model_id in stt_mtmd_sidecar.MTMD_STT_MODELS
+            if stt_mtmd_sidecar.is_model_downloaded(model_id)
+        ]
+        gguf_ids = [
+            model_id
+            for model_id in stt_ggml_sidecar.GGML_STT_MODELS
+            if stt_ggml_sidecar._cached_model_path(model_id) is not None
+        ]
+        return transformers, mtmd_ids, gguf_ids
+
+    # The lookups may read custom folders on a slow mount.
+    transformers_downloaded, mtmd_downloaded, gguf_downloaded = await asyncio.to_thread(
+        downloaded_ids
+    )
     response = JSONResponse(
         content = {
             "available": transformers_available,
@@ -25963,11 +25984,7 @@ async def stt_status(
                 "keep_alive_seconds": mtmd.keep_alive_seconds,
                 "default_model": None,
                 "models": list(stt_mtmd_sidecar.MTMD_STT_MODELS),
-                "downloaded_models": [
-                    model_id
-                    for model_id in stt_mtmd_sidecar.MTMD_STT_MODELS
-                    if stt_mtmd_sidecar.is_model_downloaded(model_id)
-                ],
+                "downloaded_models": mtmd_downloaded,
                 "download": stt_mtmd_sidecar.download_status(),
             },
             # whisper.cpp (GGUF) engine.
@@ -25979,11 +25996,7 @@ async def stt_status(
                 "keep_alive_seconds": ggml.keep_alive_seconds,
                 "default_model": stt_ggml_sidecar.DEFAULT_GGML_STT_MODEL,
                 "models": list(stt_ggml_sidecar.GGML_STT_MODELS.keys()),
-                "downloaded_models": [
-                    model_id
-                    for model_id in stt_ggml_sidecar.GGML_STT_MODELS
-                    if stt_ggml_sidecar._cached_model_path(model_id) is not None
-                ],
+                "downloaded_models": gguf_downloaded,
                 "download": stt_ggml_sidecar.download_status(),
             },
             # models: recommended list plus downloads; downloaded_models: found by GGUF header in the HF cache.
@@ -52001,7 +52014,7 @@ async def prompt_upsampler_download(
     from core.inference.stt_sidecar import SttDownloadCacheError, SttModelIdError
 
     account_access.require_installation_owner()
-    if flux3_prompt_upsampler.status().get("override"):
+    if flux3_prompt_upsampler._overridden():
         raise HTTPException(
             status_code = 409,
             detail = "The prompt upsampler files come from UNSLOTH_FLUX3_UPSAMPLER_GGUF / _MMPROJ; set both instead.",
@@ -52234,7 +52247,8 @@ async def mask_segmenter_download(
 
     account_access.require_installation_owner()
     if not diffusion_segment.transformers_supports_sam3():
-        raise HTTPException(status_code = 501, detail = diffusion_segment.status()["reason"])
+        status = await asyncio.to_thread(diffusion_segment.status)
+        raise HTTPException(status_code = 501, detail = status["reason"])
     variant = await asyncio.to_thread(diffusion_segment.active_variant)
     if (os.environ.get(diffusion_segment.ENV_PATH_OVERRIDE) or "").strip():
         raise HTTPException(
@@ -52252,7 +52266,7 @@ async def mask_segmenter_download(
         download_id = await asyncio.to_thread(diffusion_segment.start_download, token, variant.id)
     except (SttModelIdError, SttDownloadCacheError) as exc:
         raise HTTPException(status_code = 409, detail = str(exc))
-    plan = diffusion_segment.download_plan(variant)
+    plan = await asyncio.to_thread(diffusion_segment.download_plan, variant)
     return JSONResponse(
         content = {
             **diffusion_segment.download_status(),
