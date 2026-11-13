@@ -32,6 +32,7 @@ export {
 export { useHubInfiniteScroll } from "./hooks/use-hub-infinite-scroll";
 export type { CapabilityKey } from "./lib/model-capabilities";
 export {
+  detectBaseModel,
   HUB_CAPABILITY_FILTERS,
   type HubCapabilityFilter,
 } from "./lib/model-capabilities";

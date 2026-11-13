@@ -5,7 +5,13 @@ export { ModelSelector } from "./components/model-selector";
 export { FolderBrowser } from "./components/model-selector/folder-browser";
 export { invalidateLlamaFlagCatalog } from "./api/llama-flags";
 export { ModelRowMenu } from "./components/model-selector/model-row-menu";
-export { formatFootprintBytes } from "./components/model-selector/pickers";
+export { ModelLoadSettingsAction } from "./components/model-selector/model-load-settings-action";
+export { PillTabs } from "./components/model-selector/pill-tabs";
+export {
+  formatFootprintBytes,
+  ListLabel,
+  ModelRow,
+} from "./components/model-selector/pickers";
 export {
   makePinRank,
   pinKey,
