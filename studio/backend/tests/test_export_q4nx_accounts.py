@@ -19,6 +19,12 @@ ALICE = AccountContext("alice-q4nx-account", "alice")
 BOB = AccountContext("bob-q4nx-account", "bob")
 
 
+@pytest.fixture(autouse = True)
+def q4nx_opted_in(monkeypatch):
+    from utils import q4nx_export_settings
+    monkeypatch.setattr(q4nx_export_settings, "q4nx_export_allowed", lambda: True)
+
+
 def _convert(
     account,
     gguf_path = None,
@@ -116,3 +122,40 @@ def test_managed_account_and_owner_reach_the_converter_for_allowed_paths(convert
             _convert(account, path)
         assert exc.value.status_code == 400 and "stop before converting" in exc.value.detail
     assert len(converted) == 2
+
+
+def test_no_npu_and_no_opt_in_refuses_before_anything(monkeypatch, authorized):
+    from utils import q4nx_export_settings
+
+    monkeypatch.setattr(q4nx_export_settings, "q4nx_export_allowed", lambda: False)
+    with pytest.raises(HTTPException) as exc:
+        _convert(ALICE, repo_id = "org/private-GGUF", filename = "m.Q4_1.gguf")
+    assert exc.value.status_code == 403
+    assert authorized == []
+
+
+def test_q4nx_export_is_allowed_by_an_npu_or_the_setting(monkeypatch):
+    from utils import q4nx_export_settings as s
+    monkeypatch.undo()  # drop the autouse opt-in
+    for npu, setting, allowed in [(False, False, False), (True, False, True), (False, True, True)]:
+        monkeypatch.setattr(s, "npu_supported", lambda: npu)
+        monkeypatch.setattr(s, "get_q4nx_export_setting", lambda: setting)
+        assert s.q4nx_export_allowed() is allowed
+
+
+def test_q4nx_export_settings_hide_the_npu_from_a_managed_account(monkeypatch):
+    from routes import settings as settings_routes
+    from utils import q4nx_export_settings as s
+    from utils.account_context import run_as
+
+    monkeypatch.setattr(s, "npu_supported", lambda: True)
+    monkeypatch.setattr(s, "get_q4nx_export_setting", lambda: False)
+    # _shared_policy_read rebinds a managed caller to OWNER, which would undo the redaction.
+    [route] = [
+        r
+        for r in settings_routes._account_settings_router.routes
+        if r.path == "/q4nx-export" and "GET" in r.methods
+    ]
+    assert route.endpoint is settings_routes.get_q4nx_export
+    assert run_as(OWNER, settings_routes.get_q4nx_export, "s").npu_supported is True
+    assert run_as(ALICE, settings_routes.get_q4nx_export, "s").npu_supported is False
