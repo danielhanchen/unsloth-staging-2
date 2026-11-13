@@ -200,7 +200,6 @@ areas.AREAS["stream_scroll"] = {
 }
 
 
-# A reader wheeling up through the thread and back: the window mounts rows on almost every step.
 areas.AREAS["wheel_sweep"] = {
     "open": ("wheel_sweep", None),
     "ready": ("settle",),
@@ -405,7 +404,7 @@ def main() -> int:
     )
     ap.add_argument(
         "--gated",
-        default = os.environ.get("LONG_THREAD_AB_GATED", "stream,type,stream_scroll"),
+        default = os.environ.get("LONG_THREAD_AB_GATED", "stream,type,stream_scroll,wheel_sweep"),
         help = "areas whose SLOWER verdict fails the run; the rest are reported",
     )
     ap.add_argument(
