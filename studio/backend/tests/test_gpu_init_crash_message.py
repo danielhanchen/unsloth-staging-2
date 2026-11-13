@@ -106,6 +106,8 @@ def _run_cpu_fallback_load(
     stall_launches = (),
     stall_kind = "no_progress",
     gpu_memory = None,
+    n_ctx = 4096,
+    health_predicate = None,
 ):
     """``stall_launches``: 0-based launch indexes whose child stays alive while the
     health wait reports a startup stall (a hung driver rather than a crash), ended
@@ -169,7 +171,7 @@ def _run_cpu_fallback_load(
     health_timeouts = []
 
     class _Process:
-        pid = 123
+        pid = None
         stdout = ()
 
         def __init__(self, returncode):
@@ -205,6 +207,8 @@ def _run_cpu_fallback_load(
             backend._health_wait_stalled = True
             backend._health_wait_stall_kind = stall_kind
             return False
+        if health_predicate is not None:
+            return health_predicate(launches[-1][0])
         return returncodes[len(launches) - 1] is None
 
     cleanups = []
@@ -243,6 +247,7 @@ def _run_cpu_fallback_load(
             gguf_path = str(gguf),
             mmproj_path = str(mmproj) if mmproj_from_argv else None,
             model_identifier = "owner/model",
+            n_ctx = n_ctx,
             is_vision = mmproj_from_argv,
             extra_args = list(extra_args) if extra_args else None,
             cpu_fallback = cpu_fallback,
@@ -1248,7 +1253,7 @@ def test_terminal_signal_with_explicit_child_placement_does_not_replay(
     launches = []
 
     class _SignalProcess:
-        pid = 123
+        pid = None
         returncode = -11
         stdout = ()
 
@@ -1530,7 +1535,14 @@ def _fit_mode(cmd):
     return None
 
 
-def _run_full_offload_spawns(monkeypatch, tmp_path, *, outputs, returncodes):
+def _run_full_offload_spawns(
+    monkeypatch,
+    tmp_path,
+    *,
+    outputs = (),
+    returncodes = (),
+    outcome = None,
+):
     """Runs load_model with --fit off; use_system_rocm=False skips /opt/rocm/lib, as the retry does."""
 
     def _gguf_string(value: str) -> bytes:
@@ -1581,7 +1593,7 @@ def _run_full_offload_spawns(monkeypatch, tmp_path, *, outputs, returncodes):
     launches = []
 
     class _Process:
-        pid = 123
+        pid = None
         stdout = ()
 
         def __init__(self, returncode):
@@ -1607,11 +1619,17 @@ def _run_full_offload_spawns(monkeypatch, tmp_path, *, outputs, returncodes):
             return _real_popen(cmd, **kwargs)
         idx = len(launches)
         launches.append((list(cmd), dict(kwargs["env"])))
+        if outcome is not None:
+            return _Process(outcome(list(cmd))[0])
         code = returncodes[idx] if idx < len(returncodes) else 1
         return _Process(code)
 
     def _wait_for_health(timeout = 600.0, **_kw):
         idx = len(launches) - 1
+        if outcome is not None:
+            code, output = outcome(launches[-1][0])
+            backend._stdout_lines = [output]
+            return code is None
         if 0 <= idx < len(outputs):
             backend._stdout_lines = [outputs[idx]]
         code = returncodes[idx] if 0 <= idx < len(returncodes) else 1
@@ -1696,3 +1714,198 @@ class TestHipRocrRetryKeepsFitBudget:
         assert _fit_mode(launches[1][0]) == "off"
         assert "HIP/ROCR" in str(error)
         assert not LlamaCppBackend._prefers_bundle_only_rocm("/fake/llama-server")
+
+
+# The tail of the RX 5700 XT log in #16395: the child dies in the fit step's device-memory query.
+_FIT_STEP_CRASH_OUTPUT = "\n".join(
+    (
+        "0.00.085.772 I srv    load_model: local path 'models/LFM3-1.7B-Q6_K.gguf'",
+        "0.00.085.785 I cmn  common_fit_a: fitting params to device memory ...",
+        "0.00.085.824 I common_params_fit_impl: getting device memory data for initial parameters:",
+    )
+)
+_WINDOWS_ACCESS_VIOLATION = 0xC0000005
+
+
+def _last_fit_mode(cmd):
+    modes = [cmd[i + 1] for i, tok in enumerate(cmd[:-1]) if tok == "--fit"]
+    return modes[-1] if modes else None
+
+
+class TestFitStepCrashRetry:
+    def test_failed_fit_off_retry_keeps_flash_attention_recovery(self, monkeypatch, tmp_path):
+        _backend, loaded, launches, fallback_sources = _run_cpu_fallback_load(
+            monkeypatch,
+            tmp_path,
+            returncodes = [_WINDOWS_ACCESS_VIOLATION, _WINDOWS_ACCESS_VIOLATION, None],
+            first_output = _FIT_STEP_CRASH_OUTPUT,
+            platform = "win32",
+            cpu_fallback_available = False,
+            health_predicate = lambda cmd: (
+                _last_fit_mode(cmd) == "on" and cmd[cmd.index("--flash-attn") + 1] == "off"
+            ),
+        )
+        assert loaded is True
+        assert fallback_sources == []
+        assert len(launches) == 3
+        assert [_last_fit_mode(cmd) for cmd, _env in launches] == ["on", "off", "on"]
+
+    def test_a_crash_inside_the_fit_step_retries_on_the_gpu_with_fit_off(
+        self, monkeypatch, tmp_path
+    ):
+        _backend, loaded, launches, fallback_sources = _run_cpu_fallback_load(
+            monkeypatch,
+            tmp_path,
+            returncodes = [_WINDOWS_ACCESS_VIOLATION, None],
+            first_output = _FIT_STEP_CRASH_OUTPUT,
+            platform = "win32",
+            n_ctx = 0,
+        )
+
+        assert loaded is True
+        assert fallback_sources == []
+        assert len(launches) == 2
+        assert _last_fit_mode(launches[0][0]) == "on"
+        assert _last_fit_mode(launches[1][0]) == "off"
+        assert launches[0][0][launches[0][0].index("-c") + 1] == "0"
+        assert launches[1][0][launches[1][0].index("-c") + 1] == "8192"
+        assert "--device" not in launches[1][0]
+        assert launches[1][0][launches[1][0].index("--flash-attn") + 1] == "on"
+
+    def test_a_crash_after_the_fit_step_keeps_the_old_recovery(self, monkeypatch, tmp_path):
+        _backend, loaded, launches, fallback_sources = _run_cpu_fallback_load(
+            monkeypatch,
+            tmp_path,
+            returncodes = [_WINDOWS_ACCESS_VIOLATION, None],
+            first_output = _FIT_STEP_CRASH_OUTPUT + "\nload_tensors: offloaded 17/17 layers to GPU",
+            platform = "win32",
+        )
+
+        assert loaded is True
+        assert len(launches) == 2
+        assert all(_last_fit_mode(cmd) == "on" for cmd, _env in launches)
+
+    def test_a_fit_off_retry_that_also_crashes_still_reaches_the_cpu_replay(
+        self, monkeypatch, tmp_path
+    ):
+        crash = _WINDOWS_ACCESS_VIOLATION
+        _backend, loaded, launches, fallback_sources = _run_cpu_fallback_load(
+            monkeypatch,
+            tmp_path,
+            returncodes = [crash, crash, crash, None],
+            first_output = _FIT_STEP_CRASH_OUTPUT,
+            platform = "win32",
+        )
+
+        assert loaded is True
+        assert _last_fit_mode(launches[1][0]) == "off"
+        assert len(fallback_sources) == 1
+        assert "--device" in launches[-1][0]
+
+    @pytest.mark.parametrize("extras", (["--fit", "on"], ["-fit", "on"]))
+    def test_a_user_chosen_fit_is_not_overridden(self, monkeypatch, tmp_path, extras):
+        _backend, _loaded, launches, _fallback_sources = _run_cpu_fallback_load(
+            monkeypatch,
+            tmp_path,
+            returncodes = [_WINDOWS_ACCESS_VIOLATION, None],
+            first_output = _FIT_STEP_CRASH_OUTPUT,
+            platform = "win32",
+            extra_args = extras,
+        )
+
+        assert all(_last_fit_mode(cmd) == "on" for cmd, _env in launches)
+
+
+class TestFitStepCrashHelpers:
+    @pytest.mark.parametrize(
+        "args, env, expected",
+        (
+            (["--parallel", "8", "--no-kv-unified"], {}, "65536"),
+            (["--parallel", "8", "--kv-unified"], {}, "8192"),
+            ([], {"LLAMA_ARG_N_PARALLEL": "4", "LLAMA_ARG_KV_UNIFIED": "off"}, "32768"),
+        ),
+    )
+    def test_retry_ctx_preserves_per_slot_floor(self, args, env, expected):
+        cmd = ["llama-server", "--fit-ctx", "8192", *args]
+        assert LlamaCppBackend._fit_step_retry_ctx(cmd, env)[-1] == expected
+
+    @pytest.mark.parametrize(
+        "lines, expected",
+        (
+            (_FIT_STEP_CRASH_OUTPUT.splitlines(), True),
+            ([*_FIT_STEP_CRASH_OUTPUT.splitlines(), "", "[studio] attempt end exit_code=1"], True),
+            (["llama_params_fit: failed to fit params to free device memory"], True),
+            ([*_FIT_STEP_CRASH_OUTPUT.splitlines(), "load_tensors: loading model tensors"], False),
+            (["main: model loaded"], False),
+            ([], False),
+        ),
+    )
+    def test_is_fit_step_crash(self, lines, expected):
+        assert LlamaCppBackend._is_fit_step_crash(lines) is expected
+
+    def test_retry_ctx_pins_the_fit_floor_when_no_context_is_named(self):
+        cmd = ["llama-server", "--fit", "on", "--fit-ctx", "16384", "--fit", "off"]
+        assert LlamaCppBackend._fit_step_retry_ctx(cmd, {})[-2:] == ["-c", "16384"]
+        assert LlamaCppBackend._fit_step_retry_ctx(["llama-server"], {})[-2:] == ["-c", "8192"]
+
+    @pytest.mark.parametrize(
+        "cmd, env, extras",
+        (
+            (["llama-server", "-c", "4096", "--fit", "off"], {}, None),
+            (
+                ["llama-server", "--ctx-size", "0", "--fit", "off"],
+                {},
+                ["--ctx-size", "0"],
+            ),
+            (["llama-server", "--fit", "off"], {"LLAMA_ARG_CTX_SIZE": "2048"}, None),
+            (["llama-server", "-c", "0", "--fit", "off"], {"LLAMA_ARG_CTX_SIZE": "0"}, None),
+        ),
+    )
+    def test_retry_ctx_keeps_a_named_context(self, cmd, env, extras):
+        assert LlamaCppBackend._fit_step_retry_ctx(cmd, env, extras) == cmd
+
+    @pytest.mark.parametrize(
+        "cmd, extras, env, expected",
+        (
+            (["--fit", "on"], None, {}, True),
+            (["-c", "4096"], None, {}, True),
+            (["--fit", "on"], ["--fit", "on"], {}, False),
+            (["--fit", "on"], None, {"LLAMA_ARG_FIT": "on"}, False),
+            (["--fit", "off"], None, {}, False),
+        ),
+    )
+    def test_retry_eligibility(self, cmd, extras, env, expected):
+        assert LlamaCppBackend._fit_step_retry_eligible(cmd, extras, env) is expected
+
+
+class TestForcedFitOffFitStepCrash:
+    """#16395 as logged: --fit off crashes, every --fit on child dies in the fit step, and
+    only --flash-attn off with --fit off is left untried."""
+
+    @staticmethod
+    def _outcome(cmd):
+        fa_off = cmd[cmd.index("--flash-attn") + 1] == "off" if "--flash-attn" in cmd else False
+        if _last_fit_mode(cmd) == "on":
+            return _WINDOWS_ACCESS_VIOLATION, _FIT_STEP_CRASH_OUTPUT
+        if fa_off:
+            return None, ""
+        return _WINDOWS_ACCESS_VIOLATION, "load_tensors: offloaded 17/17 layers to GPU"
+
+    def test_flash_attn_off_retry_tries_fit_off_without_repeating_launches(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(llama_cpp.sys, "platform", "win32")
+        launches, loaded, error = _run_full_offload_spawns(
+            monkeypatch, tmp_path, outcome = self._outcome
+        )
+        cmds = [cmd for cmd, _env in launches]
+        modes = [
+            (
+                _last_fit_mode(cmd),
+                cmd[cmd.index("--flash-attn") + 1] if "--flash-attn" in cmd else None,
+            )
+            for cmd in cmds
+        ]
+        assert error is None, modes
+        assert loaded, modes
+        assert modes == [("off", "on"), ("on", "on"), ("on", "off"), ("off", "off")]

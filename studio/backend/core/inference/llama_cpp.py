@@ -144,6 +144,7 @@ from core.inference.llama_server_args import (
     load_mode_left_auto,
     memory_env_selects_load_mode,
     memory_state_satisfies_settings,
+    fit_ctx_in,
     fit_is_effectively_on,
     fit_target_margin_in,
     MANAGED_DIO_FLAGS,
@@ -31460,13 +31461,7 @@ class LlamaCppBackend:
                     }
 
                 def _spawn_and_wait(run_cmd, *, label = ""):
-                    """Start llama-server with run_cmd and wait for health.
-
-                    Up to four launches: the first, one ROCm env correction, one
-                    retry without the MoE expert cache, and one --fit recovery.
-                    Separate flags, so a library mix does not spend the fit slot
-                    and a VRAM crash after the correction can still fit-retry.
-                    """
+                    """Start llama-server; each recovery has a separate once-only guard."""
                     # _mem_host_resident too: the --fit on retry re-arms the
                     # page-lock and writes it back, which without this makes the
                     # read below an UnboundLocalError instead.
@@ -31485,8 +31480,10 @@ class LlamaCppBackend:
                         )
                     _fit_retry_allowed = self._fit_off_retry_eligible(run_cmd, use_fit)
                     _did_fit_retry = False
+                    _did_fit_step_retry = False
+                    _fit_off_crashed = False
                     _did_moe_cache_retry = False
-                    for _spawn_attempt in (0, 1, 2, 3):
+                    for _spawn_attempt in (0, 1, 2, 3, 4):
                         if _spawn_attempt:
                             run_cmd = self._drop_managed_lazy_mode(run_cmd, "startup")
                         # Defensive kill: drop an orphan Popen a concurrent load may
@@ -31877,6 +31874,10 @@ class LlamaCppBackend:
                             and _crashed_proc.poll() is not None
                             and _crashed_proc.returncode != 0
                         )
+                        # A fit-on child dying in the fit step: a fit-on relaunch repeats it unless it drops a split.
+                        _in_fit_step = fit_is_effectively_on(
+                            run_cmd, env
+                        ) and self._is_fit_step_crash(self._stdout_lines[-50:])
                         # Split-axis aborts and old builds refusing tensor-mode quantized KV are not
                         # fit problems.
                         _startup_output = "\n".join(self._stdout_lines[-50:])
@@ -31980,10 +31981,13 @@ class LlamaCppBackend:
                             not _did_fit_retry
                             and fully_gpu_offloaded
                             and _startup_crashed
+                            and not (_in_fit_step and not self._mixed_split_flags)
                             and not _capability_crash
                             and not _hip_rocr_mismatch
                         ):
                             # Our VRAM math was optimistic: fall back to --fit on and let llama.cpp offload; DSpark takes this path too (fit only skips its sidecar reserve).
+                            # A failed --fit off launch: the fit-step rung must not replay it.
+                            _fit_off_crashed = not fit_is_effectively_on(run_cmd, env)
                             logger.warning(
                                 "llama-server crashed during startup (exit code %s) "
                                 "with forced --fit off; the fit estimate was optimistic, "
@@ -32048,22 +32052,47 @@ class LlamaCppBackend:
                             # The fit that vouched for the ceiling is what just failed.
                             self._vram_fit_context_length = None
                             continue
-                        if (
+                        _fit_step_crashed = (
+                            not _did_fit_step_retry
+                            and not _fit_off_crashed
+                            and _startup_crashed
+                            and _in_fit_step
+                            and not _capability_crash
+                            and not _hip_rocr_mismatch
+                            and self._fit_step_retry_eligible(run_cmd, extra_args, env)
+                        )
+                        if _fit_step_crashed or (
                             not _did_fit_retry
                             and _fit_retry_allowed
                             and _startup_crashed
                             and not _capability_crash
                             and not _hip_rocr_mismatch
                         ):
-                            logger.warning(
-                                "llama-server crashed during startup (exit code %s) "
-                                "with the default memory-fit step enabled; Unsloth "
-                                "already verified the model fits, retrying once "
-                                "with --fit off. Crash log: %s",
-                                _crashed_proc.returncode,
-                                self._llama_log_path,
-                            )
-                            run_cmd = [*run_cmd, "--fit", "off"]
+                            if _fit_step_crashed:
+                                logger.warning(
+                                    "llama-server crashed during startup (exit code %s) "
+                                    "inside llama.cpp's memory-fit step, before any "
+                                    "weights loaded; retrying once with --fit off. "
+                                    "Crash log: %s",
+                                    _crashed_proc.returncode,
+                                    self._llama_log_path,
+                                )
+                            else:
+                                logger.warning(
+                                    "llama-server crashed during startup (exit code %s) "
+                                    "with the default memory-fit step enabled; Unsloth "
+                                    "already verified the model fits, retrying once "
+                                    "with --fit off. Crash log: %s",
+                                    _crashed_proc.returncode,
+                                    self._llama_log_path,
+                                )
+                            run_cmd = [
+                                *(self._without_flags(run_cmd, {"-fit", "--fit"}) or run_cmd),
+                                "--fit",
+                                "off",
+                            ]
+                            if _fit_step_crashed:
+                                run_cmd = self._fit_step_retry_ctx(run_cmd, env, extra_args)
                             # The mirror of the --fit on retry above. Turning the
                             # fitter off leaves -ngl at its default, which llama.cpp
                             # resolves to every layer, so the fitted attempt's
@@ -32117,7 +32146,10 @@ class LlamaCppBackend:
                                         " ".join(_retry_dio),
                                     )
                                 self._record_memory_state(run_cmd, env)
-                            _did_fit_retry = True
+                            if _fit_step_crashed:
+                                _did_fit_step_retry = True
+                            else:
+                                _did_fit_retry = True
                             continue
                         return False
 
@@ -36042,6 +36074,55 @@ class LlamaCppBackend:
             if a in ("-fit", "--fit") or a.startswith(("-fit=", "--fit=")):
                 return False
         return True
+
+    _FIT_STEP_LOG_RE = re.compile(r"\b(?:common_(?:params_)?fit|llama_params_fit)")
+
+    @classmethod
+    def _is_fit_step_crash(cls, lines: "Iterable[str]") -> bool:
+        # Studio appends an attempt-end marker after the child's last line.
+        for line in reversed("\n".join(entry or "" for entry in lines or ()).splitlines()):
+            text = line.strip()
+            if not text or text.startswith("[studio]"):
+                continue
+            return cls._FIT_STEP_LOG_RE.search(text) is not None
+        return False
+
+    @staticmethod
+    def _fit_step_retry_eligible(
+        cmd: "list[str]", extra_args: "Optional[Iterable[str]]", env: "Optional[Mapping[str, str]]"
+    ) -> bool:
+        if _extra_args_set_any_flag(extra_args, {"-fit", "--fit"}):
+            return False
+        if env and env.get("LLAMA_ARG_FIT") is not None:
+            return False
+        return fit_is_effectively_on(cmd, env)
+
+    @staticmethod
+    def _fit_step_retry_ctx(
+        cmd: "list[str]",
+        env: "Optional[Mapping[str, str]]",
+        extra_args: "Optional[Iterable[str]]" = None,
+    ) -> "list[str]":
+        # Studio emits -c 0 for Auto too; extras/env distinguish an explicit native context.
+        context_flags = {"-c", "--ctx-size"}
+        if _extra_args_set_any_flag(extra_args, context_flags):
+            return cmd
+        if _last_flag_value(cmd, context_flags) not in (None, "0"):
+            return cmd
+        if env and env.get("LLAMA_ARG_CTX_SIZE") is not None:
+            return cmd
+        floor = fit_ctx_in(cmd, env)
+        floor = floor if floor is not None and floor > 0 else 8192
+        streams = (
+            1
+            if _kv_unified_from_args(cmd, env = env or {})
+            else max(1, _extra_args_n_parallel(cmd, env or {}) or 1)
+        )
+        return [
+            *(strip_context_only(cmd) or []),
+            "-c",
+            str(floor * streams),
+        ]
 
     def _probe_mtp_decode(self, timeout: float = 60.0) -> bool:
         """/health can pass while MTP crashes on first decode, so probe a real completion; False on
