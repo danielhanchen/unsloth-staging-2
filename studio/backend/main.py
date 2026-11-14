@@ -466,6 +466,7 @@ import routes.browser as _browser_routes
 from routes.llama import router as llama_router
 from routes.engines import router as engines_router
 from routes.llama_compat import is_engine_probe_path, router as llama_compat_router
+from routes.spark_serving import router as spark_serving_router
 from routes.whisper import router as whisper_router
 from routes.video_restyle import router as video_restyle_router
 from routes.npu import router as npu_router
@@ -1217,6 +1218,11 @@ async def lifespan(app: FastAPI):
 
     await _close_llama_http()
 
+    try:
+        from core.inference.spark_serving import shutdown as _spark_serving_shutdown
+        await _spark_serving_shutdown()
+    except Exception as exc:
+        _lifespan_log.warning("two-Spark serving teardown failed at shutdown: %s", exc)
     from core.systemone.laya_runtime import shutdown as shutdown_decisions
 
     await asyncio.to_thread(shutdown_decisions)
@@ -2159,6 +2165,11 @@ app.include_router(
     prefix = "/api/accounts",
     tags = ["accounts"],
 )
+app.include_router(
+    __import__("routes.cluster", fromlist = ["router"]).router,
+    prefix = "/api/cluster",
+    tags = ["cluster"],
+)
 app.include_router(training_router, prefix = "/api/train", tags = ["training"])
 app.include_router(models_router, prefix = "/api/models", tags = ["models"])
 app.include_router(chat_history_router, prefix = "/api/chat", tags = ["chat"])
@@ -2200,6 +2211,7 @@ app.include_router(profile_stats_router, prefix = "/api/profile", tags = ["profi
 app.include_router(datasets_router, prefix = "/api/datasets", tags = ["datasets"])
 app.include_router(data_recipe_router, prefix = "/api/data-recipe", tags = ["data-recipe"])
 app.include_router(llama_router, prefix = "/api/llama", tags = ["llama"])
+app.include_router(spark_serving_router, prefix = "/api/inference/spark", tags = ["inference"])
 app.include_router(engines_router, prefix = "/api/engines", tags = ["engines"])
 app.include_router(whisper_router, prefix = "/api/whisper", tags = ["whisper"])
 app.include_router(npu_router, prefix = "/api/npu", tags = ["npu"])

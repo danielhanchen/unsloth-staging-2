@@ -347,6 +347,28 @@ _LOST_CONNECTION_MSG = (
 )
 
 
+def _cluster_ux(name: str, *args: Any, **kwargs: Any) -> Any:
+    """``core.inference.cluster_ux.<name>(...)``: cluster wording for the user, or None if it fails."""
+    try:
+        from core.inference import cluster_ux
+        return getattr(cluster_ux, name)(*args, **kwargs)
+    except Exception:
+        return None
+
+
+def _lost_connection_msg() -> str:
+    """The lost-connection error, naming the paired workers when the model was split across them."""
+    return _cluster_ux("lost_connection_message") or _LOST_CONNECTION_MSG
+
+
+def _cluster_lost_connection_detail(exc: BaseException) -> Optional[str]:
+    """The streaming path's lost-connection text naming the workers, for a non-streaming failure of a split model."""
+    lost = (
+        isinstance(exc, httpx.RequestError) and not isinstance(exc, httpx.TimeoutException)
+    ) or "Lost connection to llama-server" in str(exc)
+    return _cluster_ux("lost_connection_message") if lost else None
+
+
 _OVERSIZE_TOKENS_RE = _re.compile(
     r"request \((\d+) tokens?\) exceeds the available context size \((\d+) tokens?\)"
 )
@@ -376,14 +398,14 @@ def _friendly_error(exc: Exception) -> str:
         return "Timed out communicating with the model server. Try again shortly."
     # Any httpx RequestError means llama-server is unreachable: crashed or still starting.
     if isinstance(exc, httpx.RequestError):
-        return _LOST_CONNECTION_MSG
+        return _lost_connection_msg()
     msg = str(exc)
     m = _OVERSIZE_TOKENS_RE.search(msg)
     if m:
         # llama-server only knows the prompt total; let the fit's diagnosis pick the wording.
         return context_refusal.describe_oversize(int(m.group(1)), int(m.group(2)))
     if "Lost connection to llama-server" in msg:
-        return _LOST_CONNECTION_MSG
+        return _lost_connection_msg()
     template_msg = _template_raise_message(msg, _loaded_chat_template())
     if template_msg:
         return f"An internal error occurred: {template_msg}"
@@ -1874,11 +1896,24 @@ _LIVE_DECODE_FRAME_INTERVAL_S = 0.25
 _APPROVAL_CACHE_RECLAIM_POLL_S = 0.25
 
 
+def _spark_replica_count(llama_backend) -> int:
+    """Healthy replicas behind a paired-Spark router, else 1: each runs the primary's slots and KV pool."""
+    try:
+        from core.inference import spark_serving
+
+        if spark_serving.route_base_url(llama_backend) is None:
+            return 1
+        router = spark_serving.state().router
+        return max(1, len(router.healthy_backends())) if router is not None else 1
+    except Exception:
+        return 1
+
+
 def _openai_llama_admission_capacity(request: Optional[Request], llama_backend = None) -> int:
     """Slots from the loaded backend, which may lower --parallel at load; app state is only a fallback."""
     slots = _positive_int_or_none(getattr(llama_backend, "effective_parallel_slots", None))
     if slots is not None:
-        return slots
+        return slots * _spark_replica_count(llama_backend)
     try:
         slots = getattr(request.app.state, "llama_parallel_slots", None)
     except Exception:
@@ -1889,7 +1924,8 @@ def _openai_llama_admission_capacity(request: Optional[Request], llama_backend =
 def _openai_llama_admission_budget(llama_backend) -> Optional[int]:
     """Prefer aggregate KV total (context_length is per-slot after read-back, undercounts N-fold); else context_length; None means slot-only admission."""
     total = _positive_int_or_none(getattr(llama_backend, "_kv_cache_context_total", None))
-    return total or _positive_int_or_none(getattr(llama_backend, "context_length", None))
+    total = total or _positive_int_or_none(getattr(llama_backend, "context_length", None))
+    return total * _spark_replica_count(llama_backend) if total is not None else None
 
 
 def _openai_llama_admission_can_yield(llama_backend) -> bool:
@@ -5608,6 +5644,9 @@ async def _monitored_llama_call(llama_backend, path: str, *, request, monitor_id
         raise
     except Exception as exc:
         api_monitor.fail(monitor_id, _friendly_error(exc))
+        _lost = _cluster_lost_connection_detail(exc)
+        if _lost:
+            raise HTTPException(status_code = 502, detail = _lost) from exc
         raise
     finally:
         # Nested so a close-time failure still unregisters; a phantom entry 409s swaps.
@@ -16256,6 +16295,15 @@ def _wait_for_native_audio_gpu_free_gb(
         time.sleep(min(interval, remaining))
 
 
+def _spark_topology() -> Optional[str]:
+    """The two-Spark serving topology for the status poll; None off a paired Spark."""
+    try:
+        from core.inference.spark_serving import current_topology
+        return current_topology()
+    except Exception:
+        return None
+
+
 async def _unload_llama_before_standard_load(llama_backend) -> None:
     """Tear down llama-server and wait for asynchronous driver VRAM reclaim.
 
@@ -16756,6 +16804,8 @@ def _resolve_gguf_load_intent(
     if config.gguf_hf_repo:
         source = GgufLoadIntent(
             model_identifier = public_model_identifier,
+            requested_identifier = request.model_path,
+            requested_variant = request.gguf_variant,
             hf_repo = config.gguf_hf_repo,
             hf_variant = config.gguf_variant,
             hf_token = request.hf_token,
@@ -16787,6 +16837,8 @@ def _resolve_gguf_load_intent(
                 )
         source = GgufLoadIntent(
             model_identifier = public_model_identifier,
+            requested_identifier = request.model_path,
+            requested_variant = request.gguf_variant,
             gguf_path = config.gguf_file,
             mmproj_path = config.gguf_mmproj_file,
             mtp_draft_path = config.gguf_mtp_file,
@@ -17070,6 +17122,47 @@ def _guard_chat_load_against_training(
     raise HTTPException(status_code = 409, detail = detail)
 
 
+def _shadow_stripped_inherited(
+    request,
+    stored_args: list[str],
+    effective_chat_template_override: Optional[str] = None,
+) -> list[str]:
+    """``stored_args`` without the split block and without every flag a field the request set
+    now emits itself (last-wins would otherwise keep the stale value)."""
+    from core.inference.llama_server_args import matches_explicit_ctx_override
+    from core.inference.spark_serving import strip_layer_split_extra_args
+
+    fields_set = getattr(request, "model_fields_set", set())
+    return strip_shadowing_flags(
+        # Our Spark split block: a reload re-plans it rather than relaunching against the old rpc-server.
+        strip_layer_split_extra_args(stored_args),
+        strip_context = "max_seq_length" in fields_set
+        and not matches_explicit_ctx_override(
+            stored_args, getattr(request, "max_seq_length", None)
+        ),
+        strip_cache = "cache_type_kv" in fields_set,
+        strip_spec = ("speculative_type" in fields_set or "spec_draft_n_max" in fields_set),
+        strip_template = (
+            "chat_template_override" in fields_set or effective_chat_template_override is not None
+        ),
+        strip_split_mode = _should_strip_split_mode(request, stored_args),
+        # Drop an inherited --tensor-split but keep the user's --split-mode choice.
+        strip_tensor_split = _should_strip_tensor_split(request),
+        # auto keeps an inherited -ngl; getattr: a validate request has no offload fields.
+        strip_offload = getattr(request, "gpu_memory_mode", "auto") == "manual",
+        strip_reasoning_budget = "reasoning_budget" in fields_set,
+        strip_reasoning_budget_message = "reasoning_budget_message" in fields_set,
+        strip_batch = "n_batch" in fields_set,
+        strip_ubatch = "n_ubatch" in fields_set,
+        # A trailing deprecated load-mode alias resets the whole mode, so aliases go too.
+        strip_ctx_checkpoints = "ctx_checkpoints" in fields_set,
+        strip_cache_ram = "cache_ram" in fields_set,
+        strip_spec_draft_cache = "spec_draft_cache_type" in fields_set,
+        strip_load_mode = "load_mode" in fields_set,
+        strip_load_mode_aliases = "load_mode" in fields_set,
+    )
+
+
 def _resolve_inherited_extra_args(
     request,
     config: ModelConfig,
@@ -17113,39 +17206,18 @@ def _resolve_inherited_extra_args(
         # Clear explicitly so the backend doesn't inherit via 'no opinion'.
         extra_llama_args = []
     else:
-        # Strip only groups whose field was set; a bundled family template also strips --chat-template-file, else the stale arg shadows the bundled template.
-        fields_set = getattr(request, "model_fields_set", set())
-        # A matching inherited -c is the user's opt-in to exceed the fit estimate; keep it.
-        from core.inference.llama_server_args import matches_explicit_ctx_override
-
-        stripped = strip_shadowing_flags(
-            stored_args,
-            strip_context = "max_seq_length" in fields_set
-            and not matches_explicit_ctx_override(
-                stored_args, getattr(request, "max_seq_length", None)
-            ),
-            strip_cache = "cache_type_kv" in fields_set,
-            strip_spec = ("speculative_type" in fields_set or "spec_draft_n_max" in fields_set),
-            strip_template = (
-                "chat_template_override" in fields_set
-                or effective_chat_template_override is not None
-            ),
-            strip_split_mode = _should_strip_split_mode(request, stored_args),
-            # Manual per-GPU ratio emits its own --tensor-split; drop the inherited one (appended last wins), but keep the user's --split-mode choice.
-            strip_tensor_split = _should_strip_tensor_split(request),
-            # Manual emits its own --fit/--gpu-layers, so an inherited offload flag must not win last; auto keeps the user's -ngl. getattr: validate lacks fields.
-            strip_offload = getattr(request, "gpu_memory_mode", "auto") == "manual",
-            strip_reasoning_budget = "reasoning_budget" in fields_set,
-            strip_reasoning_budget_message = "reasoning_budget_message" in fields_set,
-            # a set field emits its own flag; an inherited -b / -ub would last-wins-override it
-            strip_batch = "n_batch" in fields_set,
-            strip_ubatch = "n_ubatch" in fields_set,
-            # The load mode also strips its deprecated aliases: a trailing one resets the mode.
-            strip_ctx_checkpoints = "ctx_checkpoints" in fields_set,
-            strip_cache_ram = "cache_ram" in fields_set,
-            strip_spec_draft_cache = "spec_draft_cache_type" in fields_set,
-            strip_load_mode = "load_mode" in fields_set,
-            strip_load_mode_aliases = "load_mode" in fields_set,
+        # Strip only the groups whose first-class field was set by the caller, so
+        # an inherited --chat-template-file survives an Apply that omits
+        # chat_template_override. A bundled family template (e.g. gemma-4) counts as
+        # a first-class template even when the request omits chat_template_override,
+        # so strip the inherited --chat-template-file then too -- else the stale arg
+        # (appended last) shadows the bundled template while Unsloth reports its caps.
+        # A MATCHING inherited -c/--ctx-size is the user's opt-in to exceed the
+        # VRAM-fit estimate, so it survives here as it does on auto-switch.
+        # Stripping it relaunched an Apply at the fit estimate, silently collapsing
+        # the confirmed context while the stored override still said otherwise.
+        stripped = _shadow_stripped_inherited(
+            request, stored_args, effective_chat_template_override
         )
         # Drop only denylisted flags, not the whole inherited list.
         extra_llama_args, _dropped = drop_managed_flags(stripped)
@@ -17912,6 +17984,34 @@ def _cancel_scoped_load_attempt(
         return attempt, is_running
 
 
+def _spark_inherited_extra_args(request: LoadRequest) -> Optional[list[str]]:
+    """The previous same-model load's pass-through extras, inherited when a request omits the field."""
+    if getattr(request, "llama_extra_args", None) is not None:
+        return None
+    try:
+        llama_backend = get_llama_cpp_backend()
+        stored = getattr(llama_backend, "extra_args", None)
+        source = getattr(llama_backend, "extra_args_requested_source", None)
+    except Exception:
+        return None
+    if not stored:
+        return None
+    if not source or not source[0]:
+        return None
+    requested = str(getattr(request, "model_path", "") or "").strip().lower()
+    stored_id = str(source[0] or "").strip().lower()
+    if not requested or requested != stored_id:
+        return None
+    # The variant is part of the identity: two quants are different files with different sidecars.
+    if (
+        str(getattr(request, "gguf_variant", "") or "").strip().lower()
+        != str(source[1] or "").strip().lower()
+    ):
+        return None
+    # Our own split block, shadow-stripped as the route would, so it is never read as a caller --rpc.
+    return drop_managed_flags(_shadow_stripped_inherited(request, stored))[0]
+
+
 def _hub_access_warnings(token_rejections) -> list[str]:
     """What this request's Hub reads tell the user: a refused token, a refused repo's copy."""
     warnings = [HUB_TOKEN_REJECTED_WARNING] if token_rejections.recovered else []
@@ -17932,6 +18032,49 @@ def _with_token_rejected_warning(response, token_rejections):
     return response.model_copy(update = {"memory_warning": warning})
 
 
+def _cluster_refusal_detail(exc: BaseException) -> str:
+    """A cluster planner refusal in words a user can act on; other refusals keep their text."""
+    return _cluster_ux("does_not_fit_detail", exc) or str(exc)
+
+
+def _cluster_dropped_notice() -> Optional[str]:
+    """Right after planning: the paired workers this load leaves out, or None."""
+    return _cluster_ux("dropped_worker_notice")
+
+
+def _with_load_warning(response, warning: Optional[str]):
+    """Append a notice to a LoadResponse's warning, the field the client shows after a load."""
+    if not warning or not isinstance(response, LoadResponse):
+        return response
+    existing = response.memory_warning
+    if existing and warning in existing:
+        return response
+    return response.model_copy(
+        update = {"memory_warning": " ".join(([existing] if existing else []) + [warning])}
+    )
+
+
+def _with_cluster_summary(response):
+    """Name the machines a split load landed on, for the loaded toast."""
+    if not isinstance(response, LoadResponse):
+        return response
+    summary = _cluster_ux("split_summary")
+    return response.model_copy(update = {"cluster_summary": summary}) if summary else response
+
+
+def _with_cluster_notice_detail(exc: HTTPException, notice: Optional[str]) -> HTTPException:
+    """A failed load that left out an unreachable worker says so: it may be why the load failed."""
+    if (
+        not notice
+        or exc.status_code in (401, 403, 404, 409)  # refused or cancelled, not a failed load
+        or not isinstance(exc.detail, str)
+        or notice in exc.detail
+    ):
+        return exc
+    exc.detail = f"{exc.detail.rstrip()} {notice}" if exc.detail.strip() else notice
+    return exc
+
+
 def _remember_hub_access_warning(response, token_rejections) -> None:
     """Keep a GGUF load's Hub notice for /status, whose warning the client re-shows after a load."""
     if isinstance(response, LoadResponse) and response.is_gguf:
@@ -17941,7 +18084,11 @@ def _remember_hub_access_warning(response, token_rejections) -> None:
 
 def _status_load_warning(llama_backend) -> Optional[str]:
     """The running GGUF's load warning as its load response carried it."""
-    notices = (llama_backend.last_load_warning, getattr(llama_backend, "hub_access_warning", None))
+    notices = (
+        llama_backend.last_load_warning,
+        getattr(llama_backend, "hub_access_warning", None),
+        getattr(llama_backend, "cluster_notice", None),
+    )
     return " ".join(notice for notice in notices if notice) or None
 
 
@@ -17999,6 +18146,48 @@ async def _run_tracked_load_model_impl(
             follow = asyncio.create_task(_follow_request_cancel())
         if attempt.cancel_event.is_set():
             raise HTTPException(status_code = 409, detail = "Model load cancelled")
+        from core.inference import spark_serving
+
+        _spark_slots = _resolve_parallel_slots(request, fastapi_request)
+        if (
+            spark_serving.enabled()
+            and request.engine == "auto"
+            and account_access.managed_account()
+            and not _defers_access_to_native_grant(request)
+        ):
+            # before_load can tear down the current model's split, so refuse first.
+            await asyncio.to_thread(account_access.require_model_access, request.model_path)
+        force_cancel = bool(getattr(request, "force_cancel_active", False))
+
+        async def _confirm_split_teardown() -> None:
+            account_access.require_idle_other_accounts()
+            on_reload_confirmed(cancel = False)
+            if not force_cancel:
+                return
+            # Tearing the split down kills the served model's remote layers: stop and drain its
+            # chats first, or they fail as upstream errors before _load_model_impl's own cancel.
+            if attempt.cancel_event.is_set():
+                raise HTTPException(status_code = 409, detail = "Model load cancelled")
+            on_reload_confirmed(cancel = True)
+            await _wait_for_model_switch_idle(
+                current_request_counted = current_request_counted,
+                timeout_s = _POST_CANCEL_DRAIN_TIMEOUT_S,
+            )
+
+        try:
+            request = await spark_serving.before_load(
+                request,
+                _spark_slots,
+                inherited_extra_args = _spark_inherited_extra_args(request),
+                cancel_event = attempt.cancel_event,
+                confirm_teardown = None if on_reload_confirmed is None else _confirm_split_teardown,
+            )
+        except spark_serving.SparkLoadDoesNotFit as exc:
+            logger.warning("inference.spark_load_does_not_fit: %s", exc)
+            raise HTTPException(
+                status_code = 400, detail = redact_native_paths(_cluster_refusal_detail(exc))
+            )
+        cluster_notice = _cluster_dropped_notice()
         warnings_token = _load_warnings_reach_user.set(not background)
         try:
             with collecting_hub_token_rejections() as token_rejections:
@@ -18009,10 +18198,32 @@ async def _run_tracked_load_model_impl(
                     current_request_counted = current_request_counted,
                     on_reload_confirmed = on_reload_confirmed,
                     load_cancel_event = attempt.cancel_event,
+                    spark_planned = True,
                     **impl_kwargs,
                 )
+        except HTTPException as exc:
+            await spark_serving.load_failed()
+            raise _with_cluster_notice_detail(exc, cluster_notice)
+        except BaseException:
+            await spark_serving.load_failed()
+            raise
         finally:
             _load_warnings_reach_user.reset(warnings_token)
+        response = _with_load_warning(response, cluster_notice)
+        if isinstance(response, LoadResponse) and response.is_gguf:
+            # /status re-shows the load warning after a load; without this it clears the notice.
+            get_llama_cpp_backend().cluster_notice = cluster_notice
+        if await spark_serving.after_load(
+            get_llama_cpp_backend(), _spark_slots, cancel_event = attempt.cancel_event
+        ):
+            # Cancelled after the replica was healthy: the unload route left it for this load to undo.
+            from core.inference.llama_keepwarm import note_model_unloaded
+
+            await asyncio.to_thread(get_llama_cpp_backend().unload_model)
+            note_model_unloaded()
+            raise HTTPException(status_code = 409, detail = "Model load cancelled")
+        # After after_load: it drops a split the launched server does not carry.
+        response = _with_cluster_summary(response)
         response = _with_token_rejected_warning(response, token_rejections)
         _remember_hub_access_warning(response, token_rejections)
         return response
@@ -19087,6 +19298,7 @@ async def _load_model_impl(
     on_reload_confirmed = None,
     allow_gpu_owner_eviction: bool = True,
     load_cancel_event: Optional[threading.Event] = None,
+    spark_planned: bool = False,
     cache_environment: Optional[dict[str, str]] = None,
     anonymous_hf_access: bool = False,
     speech_codec_path: Optional[str] = None,
@@ -19173,8 +19385,14 @@ async def _load_model_impl(
         extra_llama_args: Optional[list[str]] = (
             None if request.llama_extra_args is None else extra_llama_args
         )
+        if spark_planned and extra_llama_args:
+            # The split block spark_serving appended (its --rpc) is ours, not the caller's path.
+            from core.inference.spark_serving import strip_layer_split_extra_args
+            _caller_args = strip_layer_split_extra_args(extra_llama_args)
+        else:
+            _caller_args = extra_llama_args
         _refuse_managed_custom_projector(
-            extra_llama_args, request.model_path, request._override_alias_id, request.gguf_variant
+            _caller_args, request.model_path, request._override_alias_id, request.gguf_variant
         )
 
         _reasoning_updates = {}
@@ -19657,6 +19875,10 @@ async def _load_model_impl(
         cancel_pending = (
             serving and on_reload_confirmed is not None and bool(request.force_cancel_active)
         )
+        if not spark_planned:
+            # Paired Spark only, after resolution and gates, so a refused load keeps its remote layers.
+            from core.inference import spark_serving
+            await spark_serving.reconcile_internal_load()
 
         if not config.is_gguf and _mlx_distributed_launch_detected():
             raise HTTPException(
@@ -22912,6 +23134,7 @@ async def _slot_status(current_subject: str):
                 llama_cpp_prebuilt_stale = _stale,
                 llama_cpp_installed_tag = _installed_tag,
                 llama_cpp_latest_tag = _latest_tag,
+                spark_topology = _spark_topology(),
             )
 
         # Peek rather than build: the chat UI polls this from first paint.
@@ -23086,6 +23309,13 @@ def _reset_load_progress_step():
         _last_load_progress_step = -1
 
 
+def _cluster_load_message(progress: Optional[dict]) -> Optional[str]:
+    """What a load across paired workers is doing, for the stretches the byte count cannot show."""
+    if progress is not None and progress.get("phase") == "ready":
+        return None
+    return _cluster_ux("load_progress_message", llama_started = progress is not None)
+
+
 @router.get("/load-progress", response_model = LoadProgressResponse)
 async def get_load_progress(current_subject: str = Depends(get_current_subject)):
     """
@@ -23109,9 +23339,10 @@ async def get_load_progress(current_subject: str = Depends(get_current_subject))
             return LoadProgressResponse(phase = managed.phase)
         llama_backend = loading[0].llama if loading else get_llama_cpp_backend()
         progress = llama_backend.load_progress()
+        message = _cluster_load_message(progress)
         if progress is None:
-            return LoadProgressResponse()
-        resp = LoadProgressResponse(**progress)
+            return LoadProgressResponse(message = message)
+        resp = LoadProgressResponse(**progress, message = message)
         _log_load_progress_step(resp.fraction, resp.phase)
         return resp
     except Exception as e:
@@ -34460,7 +34691,10 @@ async def produce_openai_chat_completions(
                             param = "messages",
                         ),
                     )
-                raise HTTPException(status_code = 500, detail = safe_error_detail(e))
+                raise HTTPException(
+                    status_code = 500,
+                    detail = _cluster_lost_connection_detail(e) or safe_error_detail(e),
+                )
             finally:
                 if admission_lease is not None:
                     admission_lease.release()
@@ -35124,7 +35358,10 @@ async def produce_openai_chat_completions(
                             param = "messages",
                         ),
                     )
-                raise HTTPException(status_code = 500, detail = safe_error_detail(e))
+                raise HTTPException(
+                    status_code = 500,
+                    detail = _cluster_lost_connection_detail(e) or safe_error_detail(e),
+                )
             finally:
                 if admission_lease is not None:
                     admission_lease.release()
@@ -45549,6 +45786,9 @@ async def anthropic_messages(
             raise
         except Exception as exc:
             api_monitor.fail(monitor_id, _friendly_error(exc))
+            _lost = _cluster_lost_connection_detail(exc)
+            if _lost:
+                raise HTTPException(status_code = 502, detail = _lost) from exc
             raise
         return _monitor_anthropic_response(
             response,

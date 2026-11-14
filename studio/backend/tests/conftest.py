@@ -65,6 +65,7 @@ os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 # Avoid real pip installs for attention backends; setdefault so an override wins.
 os.environ.setdefault("UNSLOTH_DIFFUSION_ATTENTION_INSTALL", "0")
 os.environ.setdefault("UNSLOTH_STUDIO_DISABLE_DEVICE_PROBE", "1")
+os.environ.setdefault("UNSLOTH_SPARK_SERVING", "0")
 # Tests that hide nvidia-smi must not find real GPUs via NVML.
 os.environ.setdefault("UNSLOTH_NVIDIA_LIBRARY_PROBE", "0")
 # A fake CPU host must not take the Vulkan route through this machine's real GPUs.
@@ -387,6 +388,13 @@ def _no_background_sandbox_probes(monkeypatch):
     _forget()
     yield
     _forget()
+
+
+@pytest.fixture(autouse = True)
+def _no_inherited_cluster_state(monkeypatch):
+    # An exported UNSLOTH_CLUSTER_STATE_DIR outranks the per-test studio home: a developer's paired
+    # master would switch cluster serving on in every test.
+    monkeypatch.delenv("UNSLOTH_CLUSTER_STATE_DIR", raising = False)
 
 
 @pytest.fixture(autouse = True)
