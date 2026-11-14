@@ -869,6 +869,123 @@ def _speech_stop_streamer(cancel_event):
     return _StopOnCancel()
 
 
+def _speech_event_streamers(events, cancel_event, stopped):
+    """LFM3 streamers queueing ("text", id) / ("frame", codes); the text streamer's first put is the prompt."""
+    from transformers.generation.streamers import BaseStreamer
+
+    def check():
+        if stopped.is_set() or (cancel_event is not None and cancel_event.is_set()):
+            raise _SpeechStopped
+
+    class _Text(BaseStreamer):
+        prompt_seen = False
+
+        def put(self, value):
+            check()
+            if not self.prompt_seen:
+                self.prompt_seen = True
+                return
+            for token in value.reshape(-1).tolist():
+                events.put(("text", int(token)))
+
+        def end(self):
+            pass
+
+    class _Audio(BaseStreamer):
+        def put(self, value):
+            check()
+            events.put(("frame", value.detach().reshape(-1).clone()))
+
+        def end(self):
+            pass
+
+    return _Text(), _Audio()
+
+
+# LiquidCodec frames are 80 ms: a short first chunk starts playback early.
+_SPEECH_FIRST_CHUNK_FRAMES = 4
+_SPEECH_CHUNK_FRAMES = 12
+
+
+class _SpeechChunker:
+    """Chunked decode through LiquidCodecStreamingCache: the chunks join into the whole decode."""
+
+    def __init__(self, codec, model):
+        self.codec, self.model = codec, model
+        self.pending: list = []
+        self.streamed = False
+        self.cache = None
+        self._placed = False
+        cache_cls = getattr(
+            sys.modules.get(type(codec).__module__), "LiquidCodecStreamingCache", None
+        )
+        try:
+            takes_cache = "streaming_cache" in inspect.signature(codec.decode).parameters
+        except (TypeError, ValueError):
+            takes_cache = False
+        if cache_cls is not None and takes_cache:
+            self.cache = cache_cls(codec.config)
+
+    def _place(self):
+        if self._placed:
+            return
+        self._placed = True
+        device = next(self.model.parameters()).device
+        if next(self.codec.parameters()).device != device:
+            self.codec.to(device = device)
+
+    def _decode(self, codes, **kwargs):
+        self._place()
+        device = next(self.codec.parameters()).device
+        with torch.inference_mode():
+            out = self.codec.decode(codes.to(device), **kwargs)
+        return out.audio_values[0].float().cpu().numpy()
+
+    def add(self, frame):
+        if self.cache is None:
+            return None
+        self.pending.append(frame)
+        need = _SPEECH_CHUNK_FRAMES if self.streamed else _SPEECH_FIRST_CHUNK_FRAMES
+        if len(self.pending) < need:
+            return None
+        return self._flush(finalize = False)
+
+    def _flush(self, finalize):
+        codes = (
+            torch.stack(self.pending, dim = -1)[None]
+            if self.pending
+            else torch.zeros((1, self.codec.config.n_q, 0), dtype = torch.long)
+        )
+        self.pending = []
+        self.streamed = True
+        samples = self._decode(codes, streaming_cache = self.cache, finalize = finalize)
+        return samples if samples.size else None
+
+    def finish(self):
+        return self._flush(finalize = True)
+
+    def whole(self, codes):
+        return self._decode(codes)
+
+
+def _speech_item(samples, sample_rate) -> dict:
+    """Clipped, not peak-normalised, so chunks of one reply keep the same loudness."""
+    import base64
+    import io
+    import wave
+
+    import numpy as np
+
+    pcm = (np.clip(samples.reshape(-1), -1.0, 1.0) * 32767).astype(np.int16)
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.tobytes())
+    return {"speech": base64.b64encode(buf.getvalue()).decode("ascii"), "sample_rate": sample_rate}
+
+
 def _processor_takes_text_first(processor) -> bool:
     """LFM3-Omni's processor is (text, audio, ..., images); the usual VLM order is (images, text)."""
     # unsloth_zoo wraps __call__ as (*args, **kwargs); read the first class that names its arguments.
@@ -2866,8 +2983,6 @@ class InferenceBackend:
     def _speak_audio_reply(
         self, messages, system_prompt, audio_array, max_new_tokens, use_adapter, cancel_event
     ):
-        import base64
-
         system = "\n\n".join(p for p in (_SPEECH_REPLY_SYSTEM_PROMPT, system_prompt) if p)
         conversation = messages_with_attached_image(
             alternating_turns(messages),
@@ -2876,16 +2991,146 @@ class InferenceBackend:
             image = 0,
             audio = audio_array,
         )
-        result = self._generate_speech(
+        yield from self._stream_speech(
             conversation, "<|mixed_start|>", max_new_tokens, use_adapter, cancel_event
         )
-        if result is None:
+
+    def _stream_speech(self, conversation, prefill, max_new_tokens, use_adapter, cancel_event):
+        """Yields text deltas and ``{"speech", "sample_rate"}`` WAV chunks as frames arrive."""
+        import base64
+        import queue
+
+        model_info = self.models[self.active_model_name]
+        model = model_info["model"]
+        processor = model_info.get("processor") or model_info.get("tokenizer")
+        codec = _speech_codec(model, processor)
+        if codec is None:
+            raise RuntimeError("The loaded model cannot answer in speech.")
+        inputs, prompt_len, max_new_tokens = self._speech_inputs(
+            model, processor, conversation, prefill, max_new_tokens
+        )
+        sample_rate = int(getattr(codec.config, "sampling_rate", None) or 24000)
+        raw_tokenizer = getattr(processor, "tokenizer", processor)
+        events: "queue.Queue" = queue.Queue()
+        done = object()
+        stopped = threading.Event()
+        text_stream, audio_stream = _speech_event_streamers(events, cancel_event, stopped)
+        kwargs = dict(
+            **inputs,
+            max_new_tokens = max_new_tokens,
+            do_sample = False,
+            return_dict_in_generate = True,
+            streamer = text_stream,
+            audio_streamer = audio_stream,
+        )
+        result: dict = {}
+        timer = GenerationTimer()
+
+        def run():
+            try:
+                # Grad mode is per thread: this one starts with it on.
+                with torch.no_grad():
+                    result["out"] = model.generate(**kwargs)
+            except _SpeechStopped:
+                pass
+            except BaseException as exc:  # noqa: BLE001 -- re-raised in the consumer
+                result["error"] = exc
+            finally:
+                timer.finish()
+                events.put(done)
+
+        def cancelled():
+            return stopped.is_set() or (cancel_event is not None and cancel_event.is_set())
+
+        with self._generation_lock, self._adapter_scope(use_adapter):
+            if cancel_event is not None and cancel_event.is_set():
+                return
+            decoder = _SpeechChunker(codec, model)
+            timer.start()
+            worker = threading.Thread(target = run, name = "lfm3-spoken-reply", daemon = True)
+            worker.start()
+            text_ids: list = []
+            said = ""
+            finished = False
+            try:
+                while True:
+                    item = events.get()
+                    if item is done:
+                        finished = True
+                        break
+                    if cancelled():
+                        continue
+                    kind, value = item
+                    if kind == "text":
+                        text_ids.append(value)
+                        full = raw_tokenizer.decode(text_ids, skip_special_tokens = True).lstrip()
+                        # A trailing U+FFFD is a character split over byte tokens (an emoji): wait for the rest.
+                        if (
+                            not full.endswith("\ufffd")
+                            and full.startswith(said)
+                            and len(full) > len(said)
+                        ):
+                            yield full[len(said) :]
+                            said = full
+                    else:
+                        wav = decoder.add(value)
+                        if wav is not None:
+                            yield _speech_item(wav, sample_rate)
+            finally:
+                # The worker can still be alive just after queueing `done`; only an early exit stops it.
+                if not finished:
+                    stopped.set()
+                worker.join()
+            if "error" in result:
+                raise result["error"]
+            if cancelled() or "out" not in result:
+                return
+            out = result["out"]
+            if decoder.streamed:
+                wav = decoder.finish()
+            else:
+                # No frame reached the streamer: decode what generate returned, as before.
+                lengths = getattr(out, "audio_lengths", None)
+                frames = int(lengths[0]) if lengths is not None else 0
+                wav = decoder.whole(out.audio_codes[:1, :, :frames]) if frames > 0 else None
+        if cancel_event is not None and cancel_event.is_set():
             return
-        text, wav, sample_rate = result
-        if text:
+        text = raw_tokenizer.decode(out.sequences[0, prompt_len:], skip_special_tokens = True).strip()
+        if not said and text:
             yield text
-        if wav:
-            yield {"speech": base64.b64encode(wav).decode("ascii"), "sample_rate": sample_rate}
+        elif said and text.startswith(said) and len(text) > len(said):
+            yield text[len(said) :]
+        if wav is not None:
+            yield _speech_item(wav, sample_rate)
+        self._record_generation_stats(
+            prompt_tokens = prompt_len,
+            completion_tokens = int(out.sequences.shape[1]) - prompt_len,
+            max_new_tokens = max_new_tokens,
+            timer = timer,
+        )
+
+    def _speech_inputs(self, model, processor, conversation, prefill, max_new_tokens):
+        from core.inference.chat_template_helpers import neutralize_for_render
+
+        # Neutralize before the prefill, which is itself control markup (#7066).
+        conversation, _, _ = neutralize_for_render(processor, conversation, None)
+        conversation = [*conversation, {"role": "assistant", "content": prefill}]
+        inputs = processor.apply_chat_template(
+            conversation,
+            continue_final_message = True,
+            tokenize = True,
+            return_dict = True,
+            return_tensors = "pt",
+            truncation = False,
+        ).to(model.device)
+        prompt_len = int(inputs["input_ids"].shape[1])
+        budget = generation_budget_within_context(model, prompt_len, max_new_tokens)
+        # Unset: the free window, capped as the MLX path caps it.
+        return (
+            inputs,
+            prompt_len,
+            budget if max_new_tokens else min(budget, UNSET_GENERATION_BUDGET),
+        )
 
     def _speak_text(self, text, max_new_tokens, use_adapter, cancel_event, language, audio_options):
         """The loaded LFM3 model reads ``text`` aloud in its TTS mode: ``(wav_bytes, sample_rate)``."""
@@ -2909,7 +3154,6 @@ class InferenceBackend:
         """Render ``conversation`` with the assistant turn opened by ``prefill`` and generate.
         Returns ``(text, wav_bytes or None, sample_rate)``, or None once stopped."""
         from core.inference.audio_codecs import _numpy_to_wav_bytes
-        from core.inference.chat_template_helpers import neutralize_for_render
 
         model_info = self.models[self.active_model_name]
         model = model_info["model"]
@@ -2917,21 +3161,9 @@ class InferenceBackend:
         codec = _speech_codec(model, processor)
         if codec is None:
             raise RuntimeError("The loaded model cannot answer in speech.")
-        # Neutralize before the prefill, which is itself control markup (#7066).
-        conversation, _, _ = neutralize_for_render(processor, conversation, None)
-        conversation = [*conversation, {"role": "assistant", "content": prefill}]
-        inputs = processor.apply_chat_template(
-            conversation,
-            continue_final_message = True,
-            tokenize = True,
-            return_dict = True,
-            return_tensors = "pt",
-            truncation = False,
-        ).to(model.device)
-        prompt_len = int(inputs["input_ids"].shape[1])
-        budget = generation_budget_within_context(model, prompt_len, max_new_tokens)
-        # Unset: the free window, capped as the MLX path caps it.
-        max_new_tokens = budget if max_new_tokens else min(budget, UNSET_GENERATION_BUDGET)
+        inputs, prompt_len, max_new_tokens = self._speech_inputs(
+            model, processor, conversation, prefill, max_new_tokens
+        )
         kwargs = dict(
             **inputs,
             max_new_tokens = max_new_tokens,

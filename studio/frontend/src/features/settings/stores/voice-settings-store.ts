@@ -20,6 +20,12 @@ import {
 } from "./stt-model-catalog";
 import { syncSttDevicePreference } from "../api/stt-device";
 
+import {
+  DEFAULT_VOICE_ORB_OVERLAY_PREFS,
+  readVoiceOrbOverlayPrefs,
+  type VoiceOrbOverlayPrefs,
+} from "./voice-orb-overlay-prefs";
+
 export * from "./stt-model-catalog";
 export * from "./stt-context";
 
@@ -38,6 +44,9 @@ const QUOTA_TRIM_KEEP = 200;
 const MAX_RECENT_DICTATION_LENGTH = 2000;
 const MAX_DICTIONARY_ENTRIES = 100;
 const MAX_DICTIONARY_ENTRY_LENGTH = 120;
+// Raw-string key the chat header's mic picker wrote (chat-runtime-store), read
+// once by merge() below so an existing pin survives that picker's removal.
+const LEGACY_LOOP_MIC_KEY = "unsloth_chat_mic_device_id";
 
 const HF_REPO_ID =
   /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}\/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
@@ -101,7 +110,10 @@ export function isCuratedSttModel(model: SttModel): boolean {
   return (STT_MODELS as readonly string[]).includes(model.trim());
 }
 
-export interface VoiceSettingsState {
+export interface VoiceSettingsState extends VoiceOrbOverlayPrefs {
+  setShowVoiceArcs: (value: boolean) => void;
+  setShowVoiceCaption: (value: boolean) => void;
+
   /** input device; "default" selects the system microphone. */
   micDeviceId: string;
   setMicDeviceId: (value: string) => void;
@@ -184,6 +196,16 @@ export interface VoiceSettingsState {
   setTtsPitch: (value: number) => void;
   ttsVolume: number;
   setTtsVolume: (value: number) => void;
+
+  /** Log every voice-model verdict (with the transcript it judged) to the backend's decision log. Off by default. */
+  voiceLogEnabled: boolean;
+  setVoiceLogEnabled: (value: boolean) => void;
+  /** Chats that asked not to be logged; their calls send log:false whatever the toggle says. */
+  voiceLogOptOutThreadIds: string[];
+  setVoiceLogOptOut: (threadId: string, optOut: boolean) => void;
+  /** When the decision log was last exported from settings, for "Since last export". */
+  voiceLogExportedAt: number | null;
+  setVoiceLogExportedAt: (value: number | null) => void;
 }
 
 /** On quota errors drop the oldest dictations instead of losing the whole save. */
@@ -378,6 +400,21 @@ export const useVoiceSettingsStore = create<VoiceSettingsState>()(
       setTtsPitch: (ttsPitch) => set({ ttsPitch }),
       ttsVolume: 1,
       setTtsVolume: (ttsVolume) => set({ ttsVolume }),
+
+      ...DEFAULT_VOICE_ORB_OVERLAY_PREFS,
+      setShowVoiceArcs: (showVoiceArcs) => set({ showVoiceArcs }),
+      setShowVoiceCaption: (showVoiceCaption) => set({ showVoiceCaption }),
+
+      voiceLogEnabled: false,
+      setVoiceLogEnabled: (voiceLogEnabled) => set({ voiceLogEnabled }),
+      voiceLogOptOutThreadIds: [],
+      setVoiceLogOptOut: (threadId, optOut) =>
+        set((state) => {
+          const rest = state.voiceLogOptOutThreadIds.filter((id) => id !== threadId);
+          return { voiceLogOptOutThreadIds: optOut ? [...rest, threadId] : rest };
+        }),
+      voiceLogExportedAt: null,
+      setVoiceLogExportedAt: (voiceLogExportedAt) => set({ voiceLogExportedAt }),
     }),
     {
       name: "unsloth_voice_settings",
@@ -402,9 +439,35 @@ export const useVoiceSettingsStore = create<VoiceSettingsState>()(
         )
           ? savedSttModel
           : DEFAULT_STT_MODEL;
+        // The voice loop briefly kept its own mic pin under this key, in a picker
+        // inside the chat header. That picker is gone and the loop reads this
+        // store now, so a pin made there must carry over or the loop silently
+        // drops to the OS default input -- on a box with a webcam mic that is a
+        // different microphone. Adopted only when nothing was ever set here.
+        // The carry-over happens once: the old key is dropped after this load, so a later
+        // explicit "default" pick here is not overridden by it on every reload.
+        let micDeviceId = asString(saved?.micDeviceId, "default");
+        try {
+          const legacyMic = localStorage.getItem(LEGACY_LOOP_MIC_KEY);
+          if (legacyMic !== null) {
+            if (micDeviceId === "default" && legacyMic) micDeviceId = legacyMic;
+            const carried = micDeviceId;
+            // After create() returns: save the carried pin here first, then drop the old key.
+            queueMicrotask(() => {
+              useVoiceSettingsStore.setState({ micDeviceId: carried });
+              try {
+                localStorage.removeItem(LEGACY_LOOP_MIC_KEY);
+              } catch {
+                // storage unavailable: nothing to drop
+              }
+            });
+          }
+        } catch {
+          // storage unavailable: keep the default
+        }
         return {
           ...current,
-          micDeviceId: asString(saved?.micDeviceId, "default"),
+          micDeviceId,
           dictationEngine,
           micTarget: saved?.micTarget === "model" ? "model" : "asr",
           sttModel,
@@ -439,6 +502,13 @@ export const useVoiceSettingsStore = create<VoiceSettingsState>()(
           ttsRate: clampNumber(saved?.ttsRate, 0.5, 2, 1),
           ttsPitch: clampNumber(saved?.ttsPitch, 0, 2, 1),
           ttsVolume: clampNumber(saved?.ttsVolume, 0, 1, 1),
+          ...readVoiceOrbOverlayPrefs(saved),
+          voiceLogEnabled: saved?.voiceLogEnabled === true,
+          voiceLogOptOutThreadIds: Array.isArray(saved?.voiceLogOptOutThreadIds)
+            ? saved.voiceLogOptOutThreadIds.filter((v): v is string => typeof v === "string" && !!v)
+            : [],
+          voiceLogExportedAt:
+            typeof saved?.voiceLogExportedAt === "number" ? saved.voiceLogExportedAt : null,
         };
       },
     },

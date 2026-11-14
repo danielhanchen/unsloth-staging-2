@@ -33,6 +33,7 @@ import {
   type StudioDictationSession,
   StudioWebSpeechDictationAdapter,
 } from "./studio-web-speech-dictation-adapter";
+import { getVoiceMode, startVoiceListen } from "../voice/voice-loop-bridge";
 
 // one live session lets Escape cancel because assistant-ui only exposes stop, which transcribes.
 let activeSession: StudioDictationSession | null = null;
@@ -125,6 +126,12 @@ export class StudioDictationAdapter implements DictationAdapter {
   }
 
   private createSession(): StudioDictationSession {
+    // First, whatever the mic target or dictation engine: the loop owns its turns and attaches their speech.
+    // chatId null is an unlinked composer (browser annotations, Compare): it keeps plain dictation.
+    if (this.chatId !== null && getVoiceMode() === "active") {
+      const session = startVoiceListen();
+      if (session) return session;
+    }
     const clipTarget = audioClipTarget;
     if (clipTarget && micRecordsForModel(this.chatId)) {
       if (!PcmRecorder.isSupported()) {
