@@ -30,6 +30,7 @@ class ExtraSlot:
     last_used: float = 0.0
     generations: set = field(default_factory = set)
     refs: int = 0
+    voice: bool = False
 
 
 slots: list[ExtraSlot] = []
@@ -295,7 +296,11 @@ def unload_extra_models(
 def unload_idle() -> int:
     """Drop every kept model no request is using or loading."""
     filling = loading[0] if loading else None
-    idle = [s for s in list(slots) if s is not filling and not s.generations and not s.refs]
+    idle = [
+        s
+        for s in list(slots)
+        if s is not filling and not s.generations and not s.refs and not s.voice
+    ]
     return len(evict_these(idle))
 
 
