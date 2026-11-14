@@ -1,0 +1,7 @@
+studio/backend/tests/test_diffusion_int8_cutlass.py
+studio/backend/tests/test_kernel_install.py
+studio/backend/tests/test_log_bounds.py
+studio/backend/tests/test_logging_middleware.py
+studio/backend/tests/test_orphaned_children.py
+studio/backend/tests/test_pdf_ocr_regressions.py
+studio/backend/tests/test_tool_error_nudge_replay.py
