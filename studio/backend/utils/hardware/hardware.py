@@ -5,6 +5,7 @@
 
 import ast
 import copy
+import functools
 import gc
 import glob
 import importlib.util
@@ -3752,45 +3753,212 @@ def _rocm_windows_counter_stdout_uncached(ps: str) -> Optional[str]:
     return r.stdout
 
 
+def _rocm_windows_engine_counter_ps(instances: str) -> str:
+    return (
+        f"$s=(Get-Counter '\\GPU Engine({instances})\\Utilization Percentage'"
+        " -ErrorAction SilentlyContinue).CounterSamples;"
+        "if($s){$s|ForEach-Object{'{0}|{1}' -f $_.InstanceName,"
+        f"{_ROCM_WIN_INVARIANT_COOKED}}}}}else{{'__NONE__'}}"
+    )
+
+
+_PDH_FMT_DOUBLE_NOCAP100 = 0x00000200 | 0x00008000
+_PDH_MORE_DATA = 0x800007D2
+# A rate over a few milliseconds is noise; inside this the last collect answers.
+_ROCM_WIN_PDH_MIN_INTERVAL_S = 1.0
+_rocm_win_pdh_lock = threading.Lock()
+# luid -> [query, counter, collected_at, samples]
+_rocm_win_pdh_queries: dict[int, list] = {}
+
+
+@functools.lru_cache(maxsize = 1)
+def _rocm_windows_pdh():
+    import ctypes
+    from ctypes import wintypes
+
+    pdh = ctypes.WinDLL("pdh")
+    handle_out = ctypes.POINTER(wintypes.HANDLE)
+    pdh.PdhOpenQueryW.argtypes = [wintypes.LPCWSTR, ctypes.c_size_t, handle_out]
+    pdh.PdhAddEnglishCounterW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.LPCWSTR,
+        ctypes.c_size_t,
+        handle_out,
+    ]
+    pdh.PdhCollectQueryData.argtypes = [wintypes.HANDLE]
+    pdh.PdhCloseQuery.argtypes = [wintypes.HANDLE]
+    pdh.PdhGetFormattedCounterArrayW.argtypes = [
+        wintypes.HANDLE,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.c_void_p,
+    ]
+    for name in (
+        "PdhOpenQueryW",
+        "PdhAddEnglishCounterW",
+        "PdhCollectQueryData",
+        "PdhCloseQuery",
+        "PdhGetFormattedCounterArrayW",
+    ):
+        getattr(pdh, name).restype = wintypes.DWORD
+    return pdh
+
+
+def _rocm_windows_pdh_samples(pdh, counter) -> list[tuple[str, float]]:
+    import ctypes
+    from ctypes import wintypes
+
+    class _Value(ctypes.Structure):
+        _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
+
+    class _Item(ctypes.Structure):
+        _fields_ = [("szName", wintypes.LPWSTR), ("FmtValue", _Value)]
+
+    size, count = wintypes.DWORD(0), wintypes.DWORD(0)
+    status = pdh.PdhGetFormattedCounterArrayW(
+        counter, _PDH_FMT_DOUBLE_NOCAP100, ctypes.byref(size), ctypes.byref(count), None
+    )
+    if status != _PDH_MORE_DATA:
+        return []
+    buf = ctypes.create_string_buffer(size.value)
+    if pdh.PdhGetFormattedCounterArrayW(
+        counter, _PDH_FMT_DOUBLE_NOCAP100, ctypes.byref(size), ctypes.byref(count), buf
+    ):
+        raise OSError("PdhGetFormattedCounterArrayW failed")
+    items = ctypes.cast(buf, ctypes.POINTER(_Item))
+    # CStatus 0 / 1: valid / new data; anything else is no reading for that instance.
+    return [
+        (items[i].szName, items[i].FmtValue.doubleValue)
+        for i in range(count.value)
+        if items[i].FmtValue.CStatus in (0, 1) and items[i].szName
+    ]
+
+
+def _rocm_windows_adapter_engine_samples(luid: int) -> Optional[list[tuple[str, float]]]:
+    """This adapter's GPU Engine utilization from an in-process PDH query (#18005): a standard user's Get-Counter overran the 5 s timeout (5.5 s measured), and nothing is spawned, so nothing can elevate. One query per LUID; each collect is the average since the previous one."""
+    from ctypes import byref, wintypes
+    with _rocm_win_pdh_lock:
+        entry = _rocm_win_pdh_queries.get(luid)
+        try:
+            pdh = _rocm_windows_pdh()
+            if entry is None:
+                query, counter = wintypes.HANDLE(), wintypes.HANDLE()
+                if pdh.PdhOpenQueryW(None, 0, byref(query)):
+                    return None
+                path = f"\\GPU Engine(*luid_0x{luid >> 32:08x}_0x{luid & 0xFFFFFFFF:08x}*)\\Utilization Percentage"
+                if pdh.PdhAddEnglishCounterW(
+                    query, path, 0, byref(counter)
+                ) or pdh.PdhCollectQueryData(query):
+                    pdh.PdhCloseQuery(query)
+                    return None
+                # A rate needs two collects: the first poll pays this once.
+                time.sleep(0.25)
+                entry = [query, counter, 0.0, None]
+                _rocm_win_pdh_queries[luid] = entry
+            now = time.monotonic()
+            if entry[3] is not None and now - entry[2] < _ROCM_WIN_PDH_MIN_INTERVAL_S:
+                return entry[3]
+            if pdh.PdhCollectQueryData(entry[0]):
+                raise OSError("PdhCollectQueryData failed")
+            entry[2], entry[3] = now, _rocm_windows_pdh_samples(pdh, entry[1])
+            return entry[3]
+        except Exception:
+            # Windows reassigns LUIDs on a driver restart: the next poll opens a fresh query.
+            if entry is not None:
+                _rocm_win_pdh_queries.pop(luid, None)
+                try:
+                    _rocm_windows_pdh().PdhCloseQuery(entry[0])
+                except Exception:
+                    pass
+            return None
+
+
 def _rocm_windows_perf_counter_gpu_util_pct(luid: Optional[int] = None) -> Optional[float]:
-    """AMD GPU compute utilization via Windows Performance Counters (3D engine nodes). ``luid`` narrows the sum to one adapter's engines, matched here rather than in the counter path so tests can reach it."""
+    """AMD GPU utilization via Windows Performance Counters. With ``luid``: that adapter's busiest engine of any type, since HIP runs on Compute while 3D idles (#18005); PDH narrows the query, the LUID match here decides. Without: the host's 3D engines."""
     if platform.system() != "Windows":
         return None
     try:
-        ps = (
-            "$s=(Get-Counter '\\GPU Engine(*engtype_3D*)\\Utilization Percentage'"
-            " -ErrorAction SilentlyContinue).CounterSamples;"
-            "if($s){$s|ForEach-Object{'{0}|{1}' -f $_.InstanceName,"
-            f"{_ROCM_WIN_INVARIANT_COOKED}}}}}else{{'__NONE__'}}"
-        )
-        stdout = _rocm_windows_counter_stdout(("util", "3D"), ps)
-        if stdout is None:
-            return None
-        total = 0.0
-        matched = False
-        for line in stdout.splitlines():
-            line = line.strip()
-            if not line or line == "__NONE__" or "|" not in line:
-                continue
-            instance, _, raw = line.rpartition("|")
-            instance = instance.strip()
+        if luid is None:
+            stdout = _rocm_windows_counter_stdout(
+                ("util", "3D"), _rocm_windows_engine_counter_ps("*engtype_3D*")
+            )
+            if stdout is None:
+                return None
+            samples = [
+                line.strip().rpartition("|")[::2]
+                for line in stdout.splitlines()
+                if "|" in line and line.strip() != "__NONE__"
+            ]
+        else:
+            samples = _rocm_windows_adapter_engine_samples(luid)
+            if samples is None:
+                return None
+        by_engine: dict[str, float] = {}
+        for instance, raw in samples:
             # Hosts spell it engtype_3D and engtype_3d both.
-            if "engtype_3d" not in instance.lower():
+            name = instance.strip().lower()
+            _, sep, engine_type = name.rpartition("engtype_")
+            if not sep or (luid is None and engine_type != "3d"):
                 continue
-            if luid is not None and _engine_instance_luid(instance) != luid:
+            if luid is not None and _engine_instance_luid(instance.strip()) != luid:
                 continue
             try:
-                value = float(raw.strip())
+                value = float(raw.strip() if isinstance(raw, str) else raw)
             except (ValueError, TypeError):
                 continue
             # 0.0 is an idle engine, so a reading; NaN / inf / negative is not.
             if value != value or value in (float("inf"), float("-inf")) or value < 0:
                 continue
-            total += value
-            matched = True
-        if not matched:
+            # Processes on one engine add up; the adapter is as busy as its busiest engine (Task Manager).
+            engine = re.search(r"_phys_\d+_eng_\d+_", name) if luid is not None else None
+            key = engine.group(0) if engine else engine_type
+            by_engine[key] = by_engine.get(key, 0.0) + value
+        if not by_engine:
             return None
-        return round(min(total, 100.0), 1)
+        return round(min(max(by_engine.values()), 100.0), 1)
+    except Exception:
+        return None
+
+
+def _rocm_windows_d3dkmt_temperature_c(luid: Optional[int]) -> Optional[float]:
+    """Adapter temperature via D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERPERFDATA = 62): D3DKMT_ADAPTER_PERFDATA.Temperature, ULONG deci-Celsius at offset 56 of 64. No vendor library, no admin. Its Power is a percentage (AMD reports 0), so watts stay unknown."""
+    if platform.system() != "Windows" or luid is None:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _Luid(ctypes.Structure):
+            _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+        class _OpenAdapterFromLuid(ctypes.Structure):
+            _fields_ = [("AdapterLuid", _Luid), ("hAdapter", wintypes.UINT)]
+
+        class _QueryAdapterInfo(ctypes.Structure):
+            _fields_ = [
+                ("hAdapter", wintypes.UINT),
+                ("Type", ctypes.c_int),
+                ("pPrivateDriverData", ctypes.c_void_p),
+                ("PrivateDriverDataSize", wintypes.UINT),
+            ]
+
+        gdi = ctypes.WinDLL("gdi32")
+        opened = _OpenAdapterFromLuid()
+        opened.AdapterLuid.LowPart = luid & 0xFFFFFFFF
+        opened.AdapterLuid.HighPart = ctypes.c_int32(luid >> 32).value
+        if gdi.D3DKMTOpenAdapterFromLuid(ctypes.byref(opened)) != 0:
+            return None
+        perf = ctypes.create_string_buffer(64)
+        try:
+            query = _QueryAdapterInfo(opened.hAdapter, 62, ctypes.cast(perf, ctypes.c_void_p), 64)
+            if gdi.D3DKMTQueryAdapterInfo(ctypes.byref(query)) != 0:
+                return None
+        finally:
+            gdi.D3DKMTCloseAdapter(ctypes.byref(wintypes.UINT(opened.hAdapter)))
+        raw = int.from_bytes(perf.raw[56:60], "little")
+        # 0 = the driver has no sensor; above 150 C is not a reading.
+        return round(raw / 10.0, 1) if 0 < raw <= 1500 else None
     except Exception:
         return None
 
@@ -4773,6 +4941,14 @@ def _rocm_windows_per_device_vram(
     else:
         # Counter unavailable: show every GPU with a correct total, used unknown.
         assigned = [None] * len(dev_meta)
+        # A standard user's Get-Counter overruns its timeout (#18005), but HIP still names each plain adapter,
+        # which the in-process engine and temperature reads need. A linked node (mask set) stays unknown.
+        identities = _rocm_windows_hip_adapter_ids(
+            [int(meta["visible_ordinal"]) for meta in dev_meta],
+            [str(meta["name"]) for meta in dev_meta],
+        )
+        if identities is not None and len({luid for luid, _ in identities}) == len(identities):
+            whole_adapter = [None if node_mask else luid for luid, node_mask in identities]
 
     # A pool-scoped total needs a numerator spanning the same ground, and Dedicated Usage saturates at the carve-out, so pairing them reports a loaded card as mostly free (#9362 measured the plateau at ~30.5 GiB on a gfx1151). _rocm_windows_unified_used_bytes sums Dedicated and Shared for exactly this, and a decline must null the reading rather than leave the carve-out figure under a pool-sized total. Pool-scoped covers both routes -- a total this call widened, and a confirmed APU whose props.total_memory already spanned the pool -- while being a UMA part is not enough by itself, since an APU whose driver probe failed still carries a carve-out-sized total Dedicated Usage is right for.
     pool_scoped = [
@@ -4798,7 +4974,13 @@ def _rocm_windows_per_device_vram(
             # Beside another GPU only HIP's LUID says which counters are the iGPU's (#8942).
             for position, luid in enumerate(whole_adapter):
                 meta = dev_meta[position]
-                if pool_scoped[position] and meta["positively_unified"] and luid is not None:
+                # HIP alone can name the LUID (#18005); without a Dedicated snapshot there is nothing to sum.
+                if (
+                    pool_scoped[position]
+                    and meta["positively_unified"]
+                    and luid is not None
+                    and adapters
+                ):
                     assigned[position] = _rocm_windows_unified_used_bytes_for_luid(
                         luid, adapters, float(meta["total_bytes"])
                     )
@@ -4843,7 +5025,7 @@ def _rocm_windows_device_payload_entry(
         "visible_ordinal": dev["visible_ordinal"],
         "name": dev.get("name", "Unknown"),
         "gpu_utilization_pct": gpu_util_pct,
-        "temperature_c": None,
+        "temperature_c": _rocm_windows_d3dkmt_temperature_c(dev.get("luid")),
         "vram_used_gb": used_gb,
         "vram_total_gb": total_gb,
         "vram_utilization_pct": round((used_gb / total_gb) * 100, 1)
