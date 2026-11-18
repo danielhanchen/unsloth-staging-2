@@ -105,6 +105,8 @@ export interface PickerRow {
   loaded?: boolean;
   onDevice?: boolean;
   groups?: string[];
+  /** The maker by the repo's own owner (or an Unsloth re-upload's known family), never a base model. */
+  org?: string;
   section?: ListSection;
   sizeBytes?: number;
   /** Curated position (the Hub's NPU order); breaks date ties before the name does. */
@@ -275,6 +277,32 @@ export function filterRows<T extends PickerRow>(
       norm(row.providerName).includes(q)
     );
   });
+}
+
+// Official Hub orgs whose name isn't the provider's id; the rest match their id (`google`, `Qwen`, ...).
+const ORG_ALIASES: Record<string, string> = {
+  coherelabs: "cohere",
+  cohereforai: "cohere",
+  huggingfacetb: "huggingface",
+  "ibm-granite": "ibm",
+  minimaxai: "minimax",
+};
+
+export function ownerOrgId(owner: string): string {
+  const key = owner.trim().toLowerCase();
+  return ORG_ALIASES[key] ?? key;
+}
+
+export function orgFilterApplies(tab: string): boolean {
+  return tab === RECOMMENDED_TAB || tab === DEVICE_TAB;
+}
+
+/** Only rows attributed to `org` itself; a row with no org never passes a filter. */
+export function filterByOrg<T extends PickerRow>(
+  rows: T[],
+  org: string | null,
+): T[] {
+  return org ? rows.filter((row) => row.org === org) : rows;
 }
 
 export function dedupeRows<T extends PickerRow>(rows: readonly T[]): T[] {

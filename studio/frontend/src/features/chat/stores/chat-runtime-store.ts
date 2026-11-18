@@ -190,6 +190,7 @@ export const CHAT_EXPAND_QUANTIZATIONS_KEY =
 export const CHAT_SHOW_ALL_QUANTIZATIONS_KEY =
   "unsloth_chat_show_all_quantizations";
 export const CHAT_SHOW_MEMORY_BAR_KEY = "unsloth_chat_show_memory_bar";
+export const CHAT_PICKER_ORGS_KEY = "unsloth_chat_picker_orgs";
 export const MODELS_FIT_ON_DEVICE_ONLY_KEY =
   "unsloth_models_fit_on_device_only";
 export const CHAT_BYPASS_PERMISSIONS_KEY = "unsloth_chat_bypass_permissions";
@@ -2182,6 +2183,19 @@ function chatFullAccessPermissionPatch(
 }
 
 
+function loadPickerOrgs(): string[] | null {
+  const raw = readStorageValue(CHAT_PICKER_ORGS_KEY);
+  if (raw === null) return null;
+  try {
+    const list: unknown = JSON.parse(raw);
+    return Array.isArray(list)
+      ? list.filter((id): id is string => typeof id === "string")
+      : null;
+  } catch {
+    return null;
+  }
+}
+
 function loadString(key: string, fallback: string): string {
   return readStorageValue(key) ?? fallback;
 }
@@ -2753,6 +2767,8 @@ type ChatRuntimeStore = {
   showAllQuantizations: boolean;
   showMemoryBar: boolean;
   fitOnDeviceOnly: boolean;
+  /** The composer picker's org filters, or null for its own suggestions. */
+  pickerOrgs: string[] | null;
   loadedIsMultimodal: boolean;
   loadedIsDiffusion: boolean;
   activeDiffusionCanvasByThreadId: Record<string, DiffusionCanvasFrame>;
@@ -2953,6 +2969,7 @@ type ChatRuntimeStore = {
   setShowAllQuantizations: (value: boolean) => void;
   setShowMemoryBar: (value: boolean) => void;
   setFitOnDeviceOnly: (value: boolean) => void;
+  setPickerOrgs: (value: string[] | null) => void;
   setPendingAudio: (base64: string, name: string) => void;
   clearPendingAudio: () => void;
   setPendingImageEditReference: (
@@ -4633,6 +4650,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   showAllQuantizations: loadBool(CHAT_SHOW_ALL_QUANTIZATIONS_KEY, false),
   showMemoryBar: loadBool(CHAT_SHOW_MEMORY_BAR_KEY, false),
   fitOnDeviceOnly: loadBool(MODELS_FIT_ON_DEVICE_ONLY_KEY, false),
+  pickerOrgs: loadPickerOrgs(),
   loadedIsMultimodal: false,
   loadedIsDiffusion: false,
   customContextLength: null,
@@ -6481,6 +6499,10 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   setShowMemoryBar: (showMemoryBar) => {
     saveBool(CHAT_SHOW_MEMORY_BAR_KEY, showMemoryBar);
     set({ showMemoryBar });
+  },
+  setPickerOrgs: (pickerOrgs) => {
+    saveString(CHAT_PICKER_ORGS_KEY, JSON.stringify(pickerOrgs));
+    set({ pickerOrgs });
   },
   setFitOnDeviceOnly: (fitOnDeviceOnly) => {
     saveBool(MODELS_FIT_ON_DEVICE_ONLY_KEY, fitOnDeviceOnly);
