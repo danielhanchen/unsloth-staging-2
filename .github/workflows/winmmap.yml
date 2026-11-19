@@ -32,7 +32,7 @@ jobs:
             git -C "src_$arm" checkout -q FETCH_HEAD
             cmake -S "src_$arm" -B "build_$arm" -DGGML_RPC=ON -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF
             if ($LASTEXITCODE -ne 0) { exit 1 }
-            cmake --build "build_$arm" --config Release -j 4 --target llama-server rpc-server
+            cmake --build "build_$arm" --config Release -j 4 --target llama-server ggml-rpc-server
             if ($LASTEXITCODE -ne 0) { exit 1 }
           }
       - name: Fetch model

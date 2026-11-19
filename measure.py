@@ -52,7 +52,7 @@ def wait_health(port, proc, timeout = 600):
 
 def one(arm, bindir, model, mode, logs, i):
     rpc_log = open(logs / f"{i}_{arm}_{mode}_rpc.log", "wb")
-    rpc = subprocess.Popen([str(bindir / "rpc-server.exe"), "-H", "127.0.0.1", "-p", "50052"],
+    rpc = subprocess.Popen([str(bindir / "ggml-rpc-server.exe"), "-H", "127.0.0.1", "-p", "50052"],
                            stdout = rpc_log, stderr = subprocess.STDOUT)
     time.sleep(3)
     log = logs / f"{i}_{arm}_{mode}_server.log"
