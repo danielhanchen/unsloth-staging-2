@@ -25,11 +25,7 @@ jobs:
             New-Item -ItemType Directory -Force "s_$arm" | Out-Null
             tar -xzf src.tgz -C "s_$arm"
             $src = (Get-ChildItem "s_$arm" -Directory)[0].FullName
-            if ($arm -eq "head") {
-              git -C $src init -q
-              git -C $src apply --verbose -C1 "$env:GITHUB_WORKSPACE\winmmap.patch"
-              if ($LASTEXITCODE -ne 0) { exit 1 }
-            }
+            Copy-Item "$env:GITHUB_WORKSPACE\llama-mmap.$arm.cpp" "$src\src\llama-mmap.cpp" -Force
             Select-String -Path "$src\src\llama-mmap.cpp" -Pattern "ERROR_NOT_LOCKED" | ForEach-Object { "$arm : $($_.Line)" }
             cmake -S $src -B "b_$arm" -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
             if ($LASTEXITCODE -ne 0) { exit 1 }
