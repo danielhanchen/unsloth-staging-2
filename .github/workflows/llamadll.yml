@@ -1,0 +1,45 @@
+name: "llama.dll for b12347-mix-241a0f3 (base vs win-mmap patch)"
+
+on:
+  push:
+    branches: [llama-win-mmap-dll]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Build llama.dll twice
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/unslothai/llama.cpp/releases/download/b12347-mix-241a0f3/llama.cpp-source-b12347-mix-241a0f3.tar.gz" -OutFile src.tgz
+          New-Item -ItemType Directory -Force out | Out-Null
+          foreach ($arm in @("base", "head")) {
+            New-Item -ItemType Directory -Force "s_$arm" | Out-Null
+            tar -xzf src.tgz -C "s_$arm"
+            $src = (Get-ChildItem "s_$arm" -Directory)[0].FullName
+            if ($arm -eq "head") {
+              git -C $src init -q
+              git -C $src apply --verbose -C1 "$env:GITHUB_WORKSPACE\winmmap.patch"
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+            }
+            Select-String -Path "$src\src\llama-mmap.cpp" -Pattern "ERROR_NOT_LOCKED" | ForEach-Object { "$arm : $($_.Line)" }
+            cmake -S $src -B "b_$arm" -G "Visual Studio 17 2022" -A x64 -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_TOOLS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_CURL=OFF
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            cmake --build "b_$arm" --config Release -j 4 --target llama
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            New-Item -ItemType Directory -Force "out\$arm" | Out-Null
+            Copy-Item "b_$arm\bin\Release\llama.dll" "out\$arm\llama.dll"
+          }
+          Get-FileHash out\*\llama.dll | Format-List
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-dll
+          path: out
