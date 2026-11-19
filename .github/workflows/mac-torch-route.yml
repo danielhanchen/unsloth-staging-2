@@ -1,0 +1,109 @@
+# Staging-only workflow (never upstream). Drop into .github/workflows/ on the staging branch that
+# staging_ci.py made for the PR. BASE_SHA = the PR's merge base with main.
+name: mac-torch-route
+on:
+  pull_request:
+  workflow_dispatch:
+env:
+  BASE_SHA: 8ef13a7a83b37c85e3999a97fd678ff1e3e03a1a
+jobs:
+  install:
+    # Proves the installer route: base installs torch 2.11, head installs 2.13, on a fresh home.
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [base, head]
+        python: ['3.10', '3.13']
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: base arm uses the merge-base installer
+        if: matrix.arm == 'base'
+        run: git checkout "$BASE_SHA" -- install.sh && git diff --stat HEAD -- install.sh
+      - name: install (full torch, fresh home)
+        env:
+          UNSLOTH_STUDIO_HOME: ${{ runner.temp }}/studio_home
+        run: ./install.sh --local --python ${{ matrix.python }} 2>&1 | tee install.log
+      - name: trio, codec, MPS
+        env:
+          UNSLOTH_STUDIO_HOME: ${{ runner.temp }}/studio_home
+        run: |
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          "$PY" -I - "${{ matrix.arm }}" <<'PY'
+          import sys, platform
+          from importlib.metadata import version
+          import torch, torchvision, torchaudio
+          arm = sys.argv[1]
+          v = {p: version(p) for p in ("torch", "torchvision", "torchaudio")}
+          try:
+              v["torchcodec"] = version("torchcodec")
+          except Exception:
+              v["torchcodec"] = None
+          try:
+              v["mflux"] = version("mflux")
+          except Exception:
+              v["mflux"] = None
+          print("MAC-TORCH", arm, platform.mac_ver()[0], sys.version.split()[0], v,
+                "mps", torch.backends.mps.is_available())
+          minor = int(v["torch"].split(".")[1])
+          want = 13 if arm == "head" else 11
+          assert minor == want, (arm, v)
+          assert int(v["torchvision"].split(".")[1]) == minor + 15, v
+          assert v["torchaudio"].startswith("2.11."), v
+          assert torch.backends.mps.is_available()
+          x = torch.randn(4, 8, 64, 64, device="mps", dtype=torch.bfloat16)
+          torch.nn.functional.scaled_dot_product_attention(x, x, x).sum().item()
+          if v["torchcodec"]:
+              import torchcodec  # noqa: F401  imports against this torch's ABI
+          PY
+          "$PY" -m pip check || true   # informational: mflux declares torch>=2.13 (base arm lists it)
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: install-log-${{ matrix.arm }}-${{ matrix.python }}
+          path: install.log
+
+  mps-attention:
+    # Correctness on the virtual M1 GPU: every family's attention shape vs a CPU fp64 reference,
+    # plus the #13188 Qwen-Image-2.1 large render, on the old and the new torch.
+    strategy:
+      fail-fast: false
+      matrix:
+        torch: ['2.11.0', '2.13.0']
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: deps
+        run: |
+          T=${{ matrix.torch }}; M=${T#2.}; M=${M%%.*}
+          python -m pip install "torch==$T" "torchvision==0.$((M + 15)).*" \
+            --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+          python -m pip install -r studio/backend/requirements/diffusers-pin.txt \
+            transformers accelerate huggingface_hub safetensors pytest pytest-timeout psutil
+          python -c "import torch; print('torch', torch.__version__, 'mps', torch.backends.mps.is_available())"
+      - name: MPS attention across families + #13188 regression
+        working-directory: studio/backend
+        env:
+          GITHUB_ACTIONS: 'true'
+          PYTHONPATH: .
+        run: |
+          python -m pytest -o addopts= -q -rA -W always::UserWarning \
+            tests/test_mps_attention_families.py \
+            tests/test_diffusion_qwenimage21_large_render.py \
+            tests/test_diffusion_qwenimage21_math.py 2>&1 | tee ../../mps_attn_${{ matrix.torch }}.txt
+          test "${PIPESTATUS[0]}" = 0
+      - name: records
+        if: always()
+        run: grep -h "MPS-ATTN\|denoise peak\|FLASH-only" mps_attn_*.txt | sort -u || true
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: mps-attn-${{ matrix.torch }}
+          path: mps_attn_*.txt
