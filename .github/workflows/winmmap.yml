@@ -1,0 +1,50 @@
+name: "llama.cpp Windows mmap working set (base vs head)"
+
+on:
+  push:
+    branches: [llama-win-mmap-check]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  BASE_SHA: e4b620af19f02960dea7a3a81de7c5805aa3a333
+  HEAD_SHA: f12ce09a08c9aea37588245a5124645e1fe79bda
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+      - name: Build base and head (CPU + RPC)
+        run: |
+          foreach ($arm in @("base", "head")) {
+            $sha = if ($arm -eq "base") { $env:BASE_SHA } else { $env:HEAD_SHA }
+            git init -q "src_$arm"
+            git -C "src_$arm" fetch -q --depth 1 https://github.com/unslothai/llama.cpp.git $sha
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            git -C "src_$arm" checkout -q FETCH_HEAD
+            cmake -S "src_$arm" -B "build_$arm" -DGGML_RPC=ON -DGGML_NATIVE=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_CURL=OFF
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+            cmake --build "build_$arm" --config Release -j 4 --target llama-server rpc-server
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+      - name: Fetch model
+        run: |
+          Invoke-WebRequest -Uri "https://huggingface.co/unsloth/Qwen3-1.7B-GGUF/resolve/main/Qwen3-1.7B-Q8_0.gguf" -OutFile model.gguf
+      - name: Measure
+        run: |
+          New-Item -ItemType Directory -Force out | Out-Null
+          python measure.py build_base\bin\Release build_head\bin\Release model.gguf out\results.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: winmmap-results
+          path: out
