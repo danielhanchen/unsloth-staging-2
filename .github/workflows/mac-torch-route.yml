@@ -85,6 +85,7 @@ jobs:
           T=${{ matrix.torch }}; M=${T#2.}; M=${M%%.*}
           python -m pip install "torch==$T" "torchvision==0.$((M + 15)).*" \
             --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
+          python -m pip install -r studio/backend/requirements/studio.txt
           python -m pip install -r studio/backend/requirements/diffusers-pin.txt \
             transformers accelerate huggingface_hub safetensors pytest pytest-timeout psutil
           python -c "import torch; print('torch', torch.__version__, 'mps', torch.backends.mps.is_available())"
