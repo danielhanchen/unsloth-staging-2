@@ -32,8 +32,9 @@ jobs:
       - name: plugins and backend import
         run: |
           PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          cd studio/backend  # the plugins import the backend's utils package, as the running Studio does
           "$PY" -c "import sys; assert sys.version_info[:2]==(3,10), sys.version; from importlib.metadata import entry_points, version; print('PY310', '${{ matrix.arm }}', version('data-designer-unstructured-seed'), version('data-designer-github-repo-seed')); [e.load() for e in entry_points(group='data_designer.plugins')]"
-          cd studio/backend && "$PY" -c "import main; print('BACKEND-IMPORT ok')"
+          "$PY" -c "import main; print('BACKEND-IMPORT ok')"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         if: always()
         with:
