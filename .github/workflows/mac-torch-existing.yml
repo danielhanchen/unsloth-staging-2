@@ -14,14 +14,13 @@ jobs:
         python: ['3.10', '3.13']
     runs-on: macos-15
     timeout-minutes: 120
-    env:
-      UNSLOTH_STUDIO_HOME: ${{ runner.temp }}/studio_home
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           fetch-depth: 0
       - name: check script
         run: |
+          echo "UNSLOTH_STUDIO_HOME=$RUNNER_TEMP/studio_home" >> "$GITHUB_ENV"
           cat > "$RUNNER_TEMP/trio.sh" <<'SH'
           #!/bin/bash
           # $1 = label, $2 = expected torch minor
