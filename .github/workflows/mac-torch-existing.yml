@@ -1,0 +1,68 @@
+# Staging-only workflow (never upstream): what happens to an EXISTING Mac install when this PR's
+# installer runs over it. BASE_SHA = the PR's merge base with main.
+name: mac-torch-existing
+on:
+  push:
+    branches: ['mac-torch-existing-*']
+env:
+  BASE_SHA: 8ef13a7a83b37c85e3999a97fd678ff1e3e03a1a
+jobs:
+  existing-home:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.13']
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      UNSLOTH_STUDIO_HOME: ${{ runner.temp }}/studio_home
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: check script
+        run: |
+          cat > "$RUNNER_TEMP/trio.sh" <<'SH'
+          #!/bin/bash
+          # $1 = label, $2 = expected torch minor
+          PY="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/python"
+          "$PY" -I - "$1" "$2" <<'PY'
+          import sys
+          from importlib.metadata import version
+          label, want = sys.argv[1], int(sys.argv[2])
+          v = {p: version(p) for p in ("torch", "torchvision", "torchaudio")}
+          import torch
+          print("MAC-EXISTING", label, v, "mps", torch.backends.mps.is_available())
+          assert int(v["torch"].split(".")[1]) == want, (label, v)
+          assert int(v["torchvision"].split(".")[1]) == want + 15, (label, v)
+          x = torch.randn(2, 4, 32, 32, device="mps", dtype=torch.bfloat16)
+          torch.nn.functional.scaled_dot_product_attention(x, x, x).sum().item()
+          PY
+          SH
+          chmod +x "$RUNNER_TEMP/trio.sh"
+      - name: 1. install with main's installer (the install users have today)
+        run: |
+          git show "$BASE_SHA:install.sh" > "$RUNNER_TEMP/install_main.sh"; chmod +x "$RUNNER_TEMP/install_main.sh"
+          cp "$RUNNER_TEMP/install_main.sh" ./install_main.sh
+          ./install_main.sh --local --python ${{ matrix.python }} 2>&1 | tee s1.log
+          "$RUNNER_TEMP/trio.sh" "1-main-fresh" 11
+      - name: 2. this PR's installer over the existing install, no flag (update / rerun)
+        run: |
+          ./install.sh --local --python ${{ matrix.python }} 2>&1 | tee s2.log
+          grep -n "keeping it" s2.log || true
+          "$RUNNER_TEMP/trio.sh" "2-pr-rerun-existing" 11
+      - name: 3. this PR's installer with UNSLOTH_TORCH_UPGRADE=1 (what Settings > Repair installation sets)
+        env:
+          UNSLOTH_TORCH_UPGRADE: '1'
+        run: |
+          ./install.sh --local --python ${{ matrix.python }} 2>&1 | tee s3.log
+          "$RUNNER_TEMP/trio.sh" "3-pr-repair-upgrade" 13
+      - name: 4. rerun without the flag after the upgrade (stays on 2.13)
+        run: |
+          ./install.sh --local --python ${{ matrix.python }} 2>&1 | tee s4.log
+          "$RUNNER_TEMP/trio.sh" "4-pr-rerun-after-upgrade" 13
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        if: always()
+        with:
+          name: existing-${{ matrix.python }}
+          path: s*.log
