@@ -5,7 +5,7 @@ on:
   push:
     branches: ['mac-torch-existing-*']
 env:
-  BASE_SHA: 8ef13a7a83b37c85e3999a97fd678ff1e3e03a1a
+  BASE_SHA: 3a70d12e1a9fa80e841c23c8275db4cdfe766b68
 jobs:
   existing-home:
     strategy:
