@@ -1,0 +1,262 @@
+{
+ "name": "campaign_vae_compile",
+ "description": "VAE decode compile (diffusion_speed.py, UNSLOTH_DIFFUSION_COMPILE_VAE=auto|0|1; auto allows AutoencoderKL and denies QwenImage / Wan / MiniMaxH3) at speed_mode default. What moves is the decode, so read new_s and cold_s (compile tax) rather than s/step, which cancels the VAE by construction. Each cell gets its own TORCHINDUCTOR_CACHE_DIR / TRITON_CACHE_DIR: fresh on the FIRST run only, so delete $WORKSPACE/temp/diffusion_bench/inductor/<tag> (or --set a new env path) before re-measuring cold. Wan cells force the denied path (vae1) to re-check the deny decision. Needs a Studio tree that has COMPILE_VAE (feature worktrees such as wt_refresh_speed; not in unsloth main at 168961def, 2026-09-23, where the env var is ignored and vae0 / vae1 / auto are the same cell).",
+ "models": {
+  "flux_schnell": {
+   "repo": "black-forest-labs/FLUX.1-schnell",
+   "local": "$WORKSPACE/hf_local_bases/black-forest-labs/FLUX.1-schnell"
+  },
+  "sdxl_turbo": {
+   "repo": "stabilityai/sdxl-turbo",
+   "local": "$WORKSPACE/sdxl_turbo_base"
+  },
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "local": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+  },
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "local": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo"
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "venv": {
+   "profile": "studio"
+  },
+  "kind": "image",
+  "width": 1024,
+  "height": 1024,
+  "prompts": "image_24",
+  "n": 6,
+  "warmup": 1,
+  "short_n": 3,
+  "options": {
+   "model_kind": "pipeline",
+   "transformer_quant": "none",
+   "speed_mode": "default",
+   "memory_mode": "fast",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 10,
+  "min_free_mib": 90000,
+  "timeout_s": 1800
+ },
+ "baseline": {
+  "source": "diffusion_bench_knowledge.md 1.7 (VAE compile), 1.6 (H3 VAE)",
+  "wan_vae_compiled_p50_s": [
+   35.76,
+   37.41
+  ],
+  "wan_vae_compile_cold_s": 193,
+  "wan_grid": "not recorded in the knowledge doc; TODO(verify)",
+  "h3_vae_640x384x121_s": {
+   "eager": 0.871,
+   "compiled": 0.422,
+   "cold_s": 1427,
+   "960x544": "RecursionError -> _VAE_COMPILE_DENY"
+  },
+  "autoencoderkl_models": "no recorded numbers: the first run of this spec is the baseline"
+ },
+ "cells": [
+  {
+   "tag": "sdxlt_vae0",
+   "model": "@sdxl_turbo",
+   "ref": "sdxlt_vae0",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "sdxl"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_COMPILE_VAE": "0",
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/sdxlt_vae0",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/sdxlt_vae0"
+   }
+  },
+  {
+   "tag": "sdxlt_vae1",
+   "model": "@sdxl_turbo",
+   "ref": "sdxlt_vae0",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "sdxl"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_COMPILE_VAE": "1",
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/sdxlt_vae1",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/sdxlt_vae1"
+   }
+  },
+  {
+   "tag": "sdxlt_vaeauto",
+   "model": "@sdxl_turbo",
+   "ref": "sdxlt_vae0",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "sdxl"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_COMPILE_VAE": "auto",
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/sdxlt_vaeauto",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/sdxlt_vaeauto"
+   }
+  },
+  {
+   "tag": "flux_vae0",
+   "model": "@flux_schnell",
+   "ref": "flux_vae0",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_COMPILE_VAE": "0",
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/flux_vae0",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/flux_vae0"
+   }
+  },
+  {
+   "tag": "flux_vae1",
+   "model": "@flux_schnell",
+   "ref": "flux_vae0",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_COMPILE_VAE": "1",
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/flux_vae1",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/flux_vae1"
+   }
+  },
+  {
+   "tag": "flux_vaeauto",
+   "model": "@flux_schnell",
+   "ref": "flux_vae0",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_COMPILE_VAE": "auto",
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/flux_vaeauto",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/flux_vaeauto"
+   }
+  },
+  {
+   "tag": "zimg_vae0",
+   "model": "@zimage_turbo",
+   "ref": "zimg_vae0",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_COMPILE_VAE": "0",
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/zimg_vae0",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/zimg_vae0"
+   }
+  },
+  {
+   "tag": "zimg_vae1",
+   "model": "@zimage_turbo",
+   "ref": "zimg_vae0",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_COMPILE_VAE": "1",
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/zimg_vae1",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/zimg_vae1"
+   }
+  },
+  {
+   "tag": "zimg_vaeauto",
+   "model": "@zimage_turbo",
+   "ref": "zimg_vae0",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_COMPILE_VAE": "auto",
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/zimg_vaeauto",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/zimg_vaeauto"
+   }
+  },
+  {
+   "tag": "wan_vae0",
+   "model": "@wan22_5b",
+   "ref": "wan_vae0",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "guidance": null,
+   "steps": 20,
+   "short_steps": 5,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_cache": "off"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_COMPILE_VAE": "0",
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/wan_vae0",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/wan_vae0"
+   }
+  },
+  {
+   "tag": "wan_vae1",
+   "model": "@wan22_5b",
+   "ref": "wan_vae0",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "guidance": null,
+   "steps": 20,
+   "short_steps": 5,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_cache": "off"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_COMPILE_VAE": "1",
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/wan_vae1",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/wan_vae1"
+   }
+  }
+ ]
+}

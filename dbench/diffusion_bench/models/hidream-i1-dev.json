@@ -1,0 +1,278 @@
+{
+ "family": "hidream-i1-dev",
+ "kind": "image",
+ "aliases": [],
+ "bline": {
+  "graph": "hidream-i1",
+  "template": "hidream_i1_dev.json",
+  "template_sha": "7e18752e65a6dfaeafa7a88fc76ffce3449da765",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "hidream_i1_dev_fp8.safetensors",
+   "te": [
+    "clip_l_hidream.safetensors",
+    "clip_g_hidream.safetensors",
+    "t5xxl_fp8_e4m3fn_scaled.safetensors",
+    "llama_3.1_8b_instruct_fp8_scaled.safetensors"
+   ],
+   "vae": "ae.safetensors"
+  },
+  "shift_in_graph": true
+ },
+ "defaults": {
+  "steps": 28,
+  "cfg": 1.0,
+  "sampler": "lcm",
+  "scheduler": "normal",
+  "shift": 6.0,
+  "width": 1024,
+  "height": 1024,
+  "frames": null,
+  "fps": null,
+  "negative": "bad ugly jpeg artifacts",
+  "enhancer": false
+ },
+ "expected_passes": "steps * (2 if cfg > 1 else 1)",
+ "formats": {
+  "fp8": {
+   "studio": {
+    "model_path": "HiDream-ai/HiDream-I1-Dev",
+    "transformer_quant": "fp8",
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "format fp8: transformer_quant='fp8'"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df hidream-i1: no te_quant_auto (dense TEs)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "HiDream-ai/HiDream-I1-Dev": {
+      "repo": "HiDream-ai/HiDream-I1-Dev",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "hidream_i1_dev_fp8.safetensors",
+     "te": [
+      "clip_l_hidream.safetensors",
+      "clip_g_hidream.safetensors",
+      "t5xxl_fp8_e4m3fn_scaled.safetensors",
+      "llama_3.1_8b_instruct_fp8_scaled.safetensors"
+     ],
+     "vae": "ae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "bf16",
+      "evidence": "header: {'F8_E4M3': 1615} (name token confirmed by the header); unet_manual_cast over ['bf16']"
+     },
+     "text_encoder": {
+      "weights": "fp16+fp16+fp8_scaled+fp8_scaled",
+      "compute": null,
+      "evidence": "clip_l_hidream.safetensors: header: {'F16': 197}; clip_g_hidream.safetensors: header: {'F16': 517}; t5xxl_fp8_e4m3fn_scaled.safetensors: header: {'F32': 168, 'F16': 52, 'F8_E4M3': 169} (name token confirmed by the header); llama_3.1_8b_instruct_fp8_scaled.safetensors: header: {'F32': 224, 'BF16': 67, 'F8_E4M3': 225} (name token confirmed by the header); compute of non-quantized TEs not traced (CLIP dtype logic is per model)"
+     },
+     "vae": {
+      "weights": "fp32",
+      "compute": "bf16",
+      "evidence": "header: {'F32': 244}; compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "hidream_i1_dev_fp8.safetensors": {
+      "source": null,
+      "reason": "never built from the official repo (HiDream-I1 was never timed against the baseline UI); only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "clip_l_hidream.safetensors": {
+      "source": null,
+      "reason": "never built from the official repo (HiDream-I1 was never timed against the baseline UI); only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "clip_g_hidream.safetensors": {
+      "source": null,
+      "reason": "never built from the official repo (HiDream-I1 was never timed against the baseline UI); only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "t5xxl_fp8_e4m3fn_scaled.safetensors": {
+      "source": null,
+      "reason": "never built from the official repo (HiDream-I1 was never timed against the baseline UI); only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "llama_3.1_8b_instruct_fp8_scaled.safetensors": {
+      "source": null,
+      "reason": "never built from the official repo (HiDream-I1 was never timed against the baseline UI); only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "ae.safetensors": {
+      "repo": "black-forest-labs/FLUX.1-schnell",
+      "file": "ae.safetensors",
+      "build": null,
+      "fetch_repo": "unsloth/FLUX.1-schnell",
+      "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38"
+     }
+    }
+   },
+   "source": "template files (fp8 DiT and TEs)",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "bf16": {
+   "studio": {
+    "model_path": "HiDream-ai/HiDream-I1-Dev",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format bf16: transformer_quant='none'"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df hidream-i1: no te_quant_auto (dense TEs)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "HiDream-ai/HiDream-I1-Dev": {
+      "repo": "HiDream-ai/HiDream-I1-Dev",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": null,
+   "source": "official repo; Studio keeps dense weights",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "HiDream-ai/HiDream-I1-Dev"
+  },
+  "gen": {
+   "steps": 28,
+   "guidance": 0.0,
+   "negative_prompt": "bad ugly jpeg artifacts"
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "scheduler",
+   "check": null,
+   "note": "Dev / Fast: template lcm / normal with shift 6 / 3; Studio uses the shipped scheduler with no shift override; Full: UniPC bh2 vs bh1 (others.md HiDream row, bline_defaults_audit.md LIST)."
+  },
+  {
+   "id": "guidance_meaning",
+   "check": "guidance_semantics",
+   "note": "Studio guidance 0 = no CFG = template cfg 1 for Dev / Fast."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "text_encoder"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "template TEs are fp16 CLIP-L/G + fp8_scaled T5 / Llama; Studio keeps dense bf16 TEs (no te_quant_auto)"
+  },
+  {
+   "id": "accepted_precision_1",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "vae"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "ae fp32 file computed bf16; Studio bf16"
+  },
+  {
+   "id": "accepted_precision_2",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "transformer"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "the template's plain fp8 DiT file (no per-layer quant config) is cast to the model dtype per layer by unet_manual_cast (no fp8 matmul unless weight_dtype fp8_e4m3fn_fast); Studio's fp8 route runs fp8 matmul on sm89+"
+  }
+ ],
+ "sources": [
+  "outputs/bline_defaults_audit.md#hidream-i1",
+  "outputs/settings_audit_nov10/others.md#HiDream",
+  "temp/settings_audit/workflow_templates/templates/hidream_i1_dev.json"
+ ]
+}

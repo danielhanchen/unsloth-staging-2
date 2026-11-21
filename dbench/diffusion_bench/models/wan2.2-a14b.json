@@ -1,0 +1,366 @@
+{
+ "family": "wan2.2-a14b",
+ "kind": "video",
+ "aliases": [
+  "wan22-a14b",
+  "wan2.2-t2v-a14b"
+ ],
+ "bline": {
+  "graph": "wan2.2-a14b",
+  "template": "video_wan2_2_14B_t2v.json",
+  "template_sha": "ed634941de12f418401a22ec2ab4f20c8f3df686",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors",
+   "dit2": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
+   "te": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+   "vae": "wan_2.1_vae.safetensors"
+  },
+  "shift_in_graph": true
+ },
+ "defaults": {
+  "steps": 20,
+  "cfg": 3.5,
+  "sampler": "euler",
+  "scheduler": "simple",
+  "shift": 5.0,
+  "width": 640,
+  "height": 640,
+  "frames": 81,
+  "fps": 16,
+  "negative": "\u8272\u8c03\u8273\u4e3d\uff0c\u8fc7\u66dd\uff0c\u9759\u6001\uff0c\u7ec6\u8282\u6a21\u7cca\u4e0d\u6e05\uff0c\u5b57\u5e55\uff0c\u98ce\u683c\uff0c\u4f5c\u54c1\uff0c\u753b\u4f5c\uff0c\u753b\u9762\uff0c\u9759\u6b62\uff0c\u6574\u4f53\u53d1\u7070\uff0c\u6700\u5dee\u8d28\u91cf\uff0c\u4f4e\u8d28\u91cf\uff0cJPEG\u538b\u7f29\u6b8b\u7559\uff0c\u4e11\u964b\u7684\uff0c\u6b8b\u7f3a\u7684\uff0c\u591a\u4f59\u7684\u624b\u6307\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u624b\u90e8\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u8138\u90e8\uff0c\u7578\u5f62\u7684\uff0c\u6bc1\u5bb9\u7684\uff0c\u5f62\u6001\u7578\u5f62\u7684\u80a2\u4f53\uff0c\u624b\u6307\u878d\u5408\uff0c\u9759\u6b62\u4e0d\u52a8\u7684\u753b\u9762\uff0c\u6742\u4e71\u7684\u80cc\u666f\uff0c\u4e09\u6761\u817f\uff0c\u80cc\u666f\u4eba\u5f88\u591a\uff0c\u5012\u7740\u8d70",
+  "enhancer": false
+ },
+ "expected_passes": "steps * (2 if cfg > 1 else 1)",
+ "formats": {
+  "fp8": {
+   "studio": {
+    "model_path": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    "transformer_quant": "fp8",
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "format fp8: transformer_quant='fp8'"
+     },
+     "text_encoder": {
+      "weights": "fp8",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df wan2.2-*: te_quant_auto fp8 (layerwise)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "fp32",
+      "evidence": "Studio origin/main beb98536df wan2.2-*: vae_force_fp32"
+     }
+    },
+    "sources": {
+     "Wan-AI/Wan2.2-T2V-A14B-Diffusers": {
+      "repo": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "Wan2.2-TI2V-5B-text_encoder-FP8.safetensors": {
+      "repo": "unsloth/Wan2.2-TI2V-5B-FP8",
+      "file": "Wan2.2-TI2V-5B-text_encoder-FP8.safetensors",
+      "build": null,
+      "sha256": "5da032a8c7caaccd5e0e927c683e13934f2992233175fa6ff7d8f9be9c418d80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors",
+     "dit2": "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors",
+     "te": "umt5_xxl_fp8_e4m3fn_scaled.safetensors",
+     "vae": "wan_2.1_vae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp8_scaled",
+      "compute": "fp16",
+      "evidence": "header: {'F32': 812, 'F16': 689, 'F8_E4M3': 407} (name token confirmed by the header); unet_manual_cast over ['fp16', 'bf16']"
+     },
+     "text_encoder": {
+      "weights": "fp8_scaled",
+      "compute": null,
+      "evidence": "umt5_xxl_fp8_e4m3fn_scaled.safetensors: header: {'F32': 168, 'F16': 74, 'F8_E4M3': 169, 'U8': 1} (name token confirmed by the header); compute of non-quantized TEs not traced (CLIP dtype logic is per model)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'BF16': 194}; compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "wan2.2_t2v_high_noise_14B_fp8_scaled.safetensors": {
+      "repo": "Wan-AI/Wan2.2-T2V-A14B",
+      "file": "high_noise_model/",
+      "build": "scripts/vidcmp_nov5/convert_bline.py --group wan22_a14b (scaled fp8 expert)"
+     },
+     "wan2.2_t2v_low_noise_14B_fp8_scaled.safetensors": {
+      "repo": "Wan-AI/Wan2.2-T2V-A14B",
+      "file": "low_noise_model/",
+      "build": "scripts/vidcmp_nov5/convert_bline.py --group wan22_a14b (scaled fp8 expert)"
+     },
+     "umt5_xxl_fp8_e4m3fn_scaled.safetensors": {
+      "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+      "file": "text_encoder/",
+      "build": "scripts/vidcmp_nov5/convert_bline.py --group wan22_5b --te fp8 (legacy scaled fp8)"
+     },
+     "wan_2.1_vae.safetensors": {
+      "repo": "Wan-AI/Wan2.2-T2V-A14B",
+      "file": "Wan2.1_VAE.pth",
+      "build": "scripts/vidcmp_nov5/convert_bline.py --group wan22_a14b (vae)"
+     }
+    }
+   },
+   "source": "template fp8_scaled experts",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "fp16": {
+   "studio": {
+    "model_path": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format fp16: transformer_quant='none'"
+     },
+     "text_encoder": {
+      "weights": "fp8",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df wan2.2-*: te_quant_auto fp8 (layerwise)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "fp32",
+      "evidence": "Studio origin/main beb98536df wan2.2-*: vae_force_fp32"
+     }
+    },
+    "sources": {
+     "Wan-AI/Wan2.2-T2V-A14B-Diffusers": {
+      "repo": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "Wan2.2-TI2V-5B-text_encoder-FP8.safetensors": {
+      "repo": "unsloth/Wan2.2-TI2V-5B-FP8",
+      "file": "Wan2.2-TI2V-5B-text_encoder-FP8.safetensors",
+      "build": null,
+      "sha256": "5da032a8c7caaccd5e0e927c683e13934f2992233175fa6ff7d8f9be9c418d80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "wan2.2_t2v_high_noise_14B_fp16.safetensors",
+     "dit2": "wan2.2_t2v_low_noise_14B_fp16.safetensors",
+     "te": "umt5_xxl_fp16.safetensors",
+     "vae": "wan_2.1_vae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "header: {'F16': 1095} (name token confirmed by the header); unet_manual_cast over ['fp16', 'bf16']"
+     },
+     "text_encoder": {
+      "weights": "fp16",
+      "compute": null,
+      "evidence": "umt5_xxl_fp16.safetensors: header: {'F16': 242, 'U8': 1} (name token confirmed by the header); compute of non-quantized TEs not traced (CLIP dtype logic is per model)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'BF16': 194}; compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "wan2.2_t2v_high_noise_14B_fp16.safetensors": {
+      "repo": "Wan-AI/Wan2.2-T2V-A14B",
+      "file": "high_noise_model/",
+      "build": "scripts/vidcmp_nov5/convert_bline.py --group wan22_a14b (fp16 expert)"
+     },
+     "wan2.2_t2v_low_noise_14B_fp16.safetensors": {
+      "repo": "Wan-AI/Wan2.2-T2V-A14B",
+      "file": "low_noise_model/",
+      "build": "scripts/vidcmp_nov5/convert_bline.py --group wan22_a14b (fp16 expert)"
+     },
+     "umt5_xxl_fp16.safetensors": {
+      "source": null,
+      "reason": "scripts/vidcmp_nov5/convert_bline.py --te bf16 builds a bf16 UMT5, not the template's fp16 file"
+     },
+     "wan_2.1_vae.safetensors": {
+      "repo": "Wan-AI/Wan2.2-T2V-A14B",
+      "file": "Wan2.1_VAE.pth",
+      "build": "scripts/vidcmp_nov5/convert_bline.py --group wan22_a14b (vae)"
+     }
+    }
+   },
+   "source": "Bline-Org/Wan_2.2_BlineUI_Repackaged fp16 experts",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+  },
+  "gen": {
+   "steps": 20,
+   "guidance": 3.5,
+   "width": 640,
+   "height": 640,
+   "num_frames": 81,
+   "fps": 16,
+   "negative_prompt": "\u8272\u8c03\u8273\u4e3d\uff0c\u8fc7\u66dd\uff0c\u9759\u6001\uff0c\u7ec6\u8282\u6a21\u7cca\u4e0d\u6e05\uff0c\u5b57\u5e55\uff0c\u98ce\u683c\uff0c\u4f5c\u54c1\uff0c\u753b\u4f5c\uff0c\u753b\u9762\uff0c\u9759\u6b62\uff0c\u6574\u4f53\u53d1\u7070\uff0c\u6700\u5dee\u8d28\u91cf\uff0c\u4f4e\u8d28\u91cf\uff0cJPEG\u538b\u7f29\u6b8b\u7559\uff0c\u4e11\u964b\u7684\uff0c\u6b8b\u7f3a\u7684\uff0c\u591a\u4f59\u7684\u624b\u6307\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u624b\u90e8\uff0c\u753b\u5f97\u4e0d\u597d\u7684\u8138\u90e8\uff0c\u7578\u5f62\u7684\uff0c\u6bc1\u5bb9\u7684\uff0c\u5f62\u6001\u7578\u5f62\u7684\u80a2\u4f53\uff0c\u624b\u6307\u878d\u5408\uff0c\u9759\u6b62\u4e0d\u52a8\u7684\u753b\u9762\uff0c\u6742\u4e71\u7684\u80cc\u666f\uff0c\u4e09\u6761\u817f\uff0c\u80cc\u666f\u4eba\u5f88\u591a\uff0c\u5012\u7740\u8d70"
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "cfg_batch_rows",
+   "check": "cfg_batch_rows",
+   "note": "CFG > 1: Studio may run cond + uncond as ONE batch-2 forward (diffusion_cfg_batch) where the baseline UI runs two; evaluation counts are per sample row, so a forward-call hook undercounts Studio by 2x (settings_audit_nov10/flux.md, 'Not verified')."
+  },
+  {
+   "id": "t4_fp16",
+   "check": "fp16_only_dtype",
+   "note": "On an fp16-only card (T4, sm75) the stacks resolve different compute dtypes (Studio fp16 or fp32 promote; the baseline UI fp32 for Qwen / Ideogram, fp16 first for Wan / HV1.5); record the resolved dtype per stack (bline_defaults_audit.md 'dtype on fp16-only GPUs')."
+  },
+  {
+   "id": "video_save",
+   "check": null,
+   "note": "Video graphs end in CreateVideo -> SaveVideo (the templates' MP4 export, encode time included). Until the blineui backend passes fps and decodes MP4 (agent B's port), set graph_extra.video_save 'frames' (SaveImage on the same frames). Record which one ran; the MP4 encode is part of what a baseline-UI user waits for."
+  },
+  {
+   "id": "expert_split",
+   "check": "settings_equal",
+   "note": "Template splits experts at a fixed 10/20; Studio's boundary_ratio 0.875 gives 9/11. graph_extra.boundary 0.875 reproduces Studio's split on the baseline UI (others.md Wan2.2 A14B row)."
+  },
+  {
+   "id": "sampler",
+   "check": null,
+   "note": "Template euler vs Studio UniPC: equal evaluations, different images."
+  },
+  {
+   "id": "resolution",
+   "check": "resolution_equal",
+   "note": "Template 640x640 vs Studio 1280x720 default."
+  },
+  {
+   "id": "negative",
+   "check": "settings_equal",
+   "note": "Template Chinese negative; Studio none by default."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "vae"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "Studio forces the Wan VAE to fp32 (vae_force_fp32); the baseline UI computes it bf16"
+  },
+  {
+   "id": "accepted_precision_1",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "transformer"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "the baseline UI computes fp16 weights in fp16 (Wan supports fp16 first); Studio runs bf16 (bline_defaults_audit.md 'Wan, HV1.5 dtype': LIST)"
+  },
+  {
+   "id": "accepted_precision_2",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "text_encoder"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "both store UMT5 fp8; the baseline UI's TE compute is not traced, Studio's is bf16"
+  },
+  {
+   "id": "accepted_precision_3",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "transformer"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "the template's plain fp8 DiT file (no per-layer quant config) is cast to the model dtype per layer by unet_manual_cast (no fp8 matmul unless weight_dtype fp8_e4m3fn_fast); Studio's fp8 route runs fp8 matmul on sm89+"
+  }
+ ],
+ "sources": [
+  "outputs/bline_defaults_audit.md#Wan2.2 T2V-A14B",
+  "outputs/settings_audit_nov10/others.md#Wan2.2 T2V A14B",
+  "temp/settings_audit/workflow_templates/templates/video_wan2_2_14B_t2v.json"
+ ]
+}

@@ -1,0 +1,24 @@
+{
+ "name": "studio_tiny",
+ "description": "Plumbing smoke through Unsloth Studio on the hf-internal-testing random-weight pipelines (downloaded to $WORKSPACE/hf_tiny/<repo name>): every family Studio loads, in process and over HTTP, in seconds per cell. Output is noise by construction, so read these records for load / render success, timing overhead, determinism and memory only, never for quality. Sizes are 256px (Studio's minimum) because the tiny rope tables cannot reach larger latents on some families; tiny-zimage-pipe is left out on purpose (its rope overflows at 256px and the CUDA device assert poisons the process, see edge check tiny.rope_overflow_isolated), and tiny Wan is in-process only here (HTTP accepts only the 1280x704 presets, which the stock tiny rope cannot take; the edge suite covers HTTP video with the tiny-wan-pipe-rope128 variant fetch_tiny.py derives).",
+ "defaults": {
+  "venv": {"profile": "studio"},
+  "prompts": "image_24", "n": 3, "warmup": 1, "short_n": 1,
+  "width": 256, "height": 256, "steps": 4, "short_steps": 2, "guidance": 0.0,
+  "options": {"speed_mode": "off", "memory_mode": "fast"}
+ },
+ "gate": {"max_util": 50, "min_free_mib": 8000, "timeout_s": 300},
+ "cells": [
+  {"tag": "tiny_sdxl", "backend": "studio", "model": "$WORKSPACE/hf_tiny/tiny-stable-diffusion-xl-pipe", "options": {"family_override": "sdxl"}},
+  {"tag": "tiny_sdxl_http", "backend": "studio_http", "model": "$WORKSPACE/hf_tiny/tiny-stable-diffusion-xl-pipe", "options": {"family_override": "sdxl"}},
+  {"tag": "tiny_sdxl_low_vram", "backend": "studio", "model": "$WORKSPACE/hf_tiny/tiny-stable-diffusion-xl-pipe", "options": {"family_override": "sdxl", "memory_mode": "low_vram"}},
+  {"tag": "tiny_flux", "backend": "studio", "model": "$WORKSPACE/hf_tiny/tiny-flux-pipe", "options": {"family_override": "flux.1"}},
+  {"tag": "tiny_flux_http", "backend": "studio_http", "model": "$WORKSPACE/hf_tiny/tiny-flux-pipe", "options": {"family_override": "flux.1"}},
+  {"tag": "tiny_flux_fp8", "backend": "studio", "model": "$WORKSPACE/hf_tiny/tiny-flux-pipe", "options": {"family_override": "flux.1", "transformer_quant": "fp8"}},
+  {"tag": "tiny_qwenimage", "backend": "studio", "model": "$WORKSPACE/hf_tiny/tiny-qwenimage-pipe", "options": {"family_override": "qwen-image"}},
+  {"tag": "tiny_qwenimage21", "backend": "studio", "model": "$WORKSPACE/hf_tiny/tiny-qwenimage21-pipe", "options": {"family_override": "qwen-image-2.1"}},
+  {"tag": "tiny_lumina2", "backend": "studio", "model": "$WORKSPACE/hf_tiny/tiny-lumina2-pipe", "options": {"family_override": "lumina-2"}},
+  {"tag": "tiny_wan_video", "backend": "studio", "kind": "video", "model": "$WORKSPACE/hf_tiny/tiny-wan-pipe",
+   "prompts": "video_3", "n": 2, "frames": 9, "fps": 16, "guidance": 1.0, "options": {"family_override": "wan2.2-ti2v-5b"}}
+ ]
+}

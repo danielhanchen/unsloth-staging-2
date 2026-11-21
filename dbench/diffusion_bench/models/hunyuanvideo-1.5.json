@@ -1,0 +1,324 @@
+{
+ "family": "hunyuanvideo-1.5",
+ "kind": "video",
+ "aliases": [
+  "hv15",
+  "hunyuanvideo15"
+ ],
+ "bline": {
+  "graph": "hunyuanvideo-1.5",
+  "template": "video_hunyuan_video_1.5_720p_t2v.json",
+  "template_sha": "c0b0238f36ae34b8cb2d6baabdbd3fb26decc47f",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "hunyuanvideo1.5_720p_t2v_fp16.safetensors",
+   "te": [
+    "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+    "byt5_small_glyphxl_fp16.safetensors"
+   ],
+   "vae": "hunyuanvideo15_vae_fp16.safetensors"
+  },
+  "shift_in_graph": true
+ },
+ "defaults": {
+  "steps": 20,
+  "cfg": 6.0,
+  "sampler": "euler",
+  "scheduler": "simple",
+  "shift": 7.0,
+  "width": 1280,
+  "height": 720,
+  "frames": 121,
+  "fps": 24,
+  "negative": "",
+  "enhancer": false
+ },
+ "expected_passes": "steps * (2 if cfg > 1 else 1)",
+ "formats": {
+  "fp16": {
+   "studio": {
+    "model_path": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format fp16: transformer_quant='none'"
+     },
+     "text_encoder": {
+      "weights": "fp8+bf16",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df hunyuanvideo-1.5-720p: te_quant_auto fp8 on text_encoder only; byt5 (text_encoder_2) dense"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v": {
+      "repo": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "hunyuanvideo1.5_720p_t2v_fp16.safetensors",
+     "te": [
+      "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "byt5_small_glyphxl_fp16.safetensors"
+     ],
+     "vae": "hunyuanvideo15_vae_fp16.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "header: {'F16': 1361} (name token confirmed by the header); unet_manual_cast over ['fp16', 'bf16']"
+     },
+     "text_encoder": {
+      "weights": "fp8_scaled+fp16",
+      "compute": null,
+      "evidence": "qwen_2.5_vl_7b_fp8_scaled.safetensors: header: {'F32': 716, 'BF16': 371, 'F8_E4M3': 359} (name token confirmed by the header); byt5_small_glyphxl_fp16.safetensors: header: {'F16': 111} (name token confirmed by the header); compute of non-quantized TEs not traced (CLIP dtype logic is per model)"
+     },
+     "vae": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "header: {'F16': 218} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "hunyuanvideo1.5_720p_t2v_fp16.safetensors": {
+      "source": null,
+      "reason": "scripts/vidcmp_nov5/convert_bline_hv15.py converts the 480p t2v DiT only (DIT_FILE transformer/480p_t2v); the 720p file needs that path switched (untested)"
+     },
+     "qwen_2.5_vl_7b_fp8_scaled.safetensors": {
+      "source": null,
+      "reason": "the fp8_scaled Qwen2.5-VL-7B TE has no builder (Qwen-Image 2512 / 2511) or only a 480p-oriented one (scripts/vidcmp_nov5/convert_bline_hv15.py te_fp8, HunyuanVideo-1.5 key map). Substitute used by the rounds: scripts/imgcmp_nov5/build_bline.py --group qe --only te (int8_convrot)"
+     },
+     "byt5_small_glyphxl_fp16.safetensors": {
+      "repo": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
+      "file": "text_encoder_2/model.safetensors",
+      "build": "scripts/vidcmp_nov5/convert_bline_hv15.py (byt5 -> byt5_small_glyphxl_fp16_official)"
+     },
+     "hunyuanvideo15_vae_fp16.safetensors": {
+      "repo": "tencent/HunyuanVideo-1.5",
+      "file": "vae/",
+      "build": "scripts/vidcmp_nov5/convert_bline_hv15.py (vae -> hunyuanvideo15_vae_fp16_official)"
+     }
+    }
+   },
+   "source": "Bline-Org/HunyuanVideo_1.5_repackaged split_files",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "fp8": {
+   "studio": {
+    "model_path": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v",
+    "transformer_quant": "fp8",
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "format fp8: transformer_quant='fp8'"
+     },
+     "text_encoder": {
+      "weights": "fp8+bf16",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df hunyuanvideo-1.5-720p: te_quant_auto fp8 on text_encoder only; byt5 (text_encoder_2) dense"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v": {
+      "repo": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "hunyuanvideo1.5_720p_t2v_fp16.safetensors",
+     "te": [
+      "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "byt5_small_glyphxl_fp16.safetensors"
+     ],
+     "vae": "hunyuanvideo15_vae_fp16.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp8_e4m3fn",
+      "compute": "fp16",
+      "evidence": "header: {'F16': 1361} (name token confirmed by the header); unet_manual_cast over ['fp16', 'bf16']; UNETLoader weight_dtype fp8_e4m3fn casts at load; manual cast to fp16"
+     },
+     "text_encoder": {
+      "weights": "fp8_scaled+fp16",
+      "compute": null,
+      "evidence": "qwen_2.5_vl_7b_fp8_scaled.safetensors: header: {'F32': 716, 'BF16': 371, 'F8_E4M3': 359} (name token confirmed by the header); byt5_small_glyphxl_fp16.safetensors: header: {'F16': 111} (name token confirmed by the header); compute of non-quantized TEs not traced (CLIP dtype logic is per model)"
+     },
+     "vae": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "header: {'F16': 218} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "hunyuanvideo1.5_720p_t2v_fp16.safetensors": {
+      "source": null,
+      "reason": "scripts/vidcmp_nov5/convert_bline_hv15.py converts the 480p t2v DiT only (DIT_FILE transformer/480p_t2v); the 720p file needs that path switched (untested)"
+     },
+     "qwen_2.5_vl_7b_fp8_scaled.safetensors": {
+      "source": null,
+      "reason": "the fp8_scaled Qwen2.5-VL-7B TE has no builder (Qwen-Image 2512 / 2511) or only a 480p-oriented one (scripts/vidcmp_nov5/convert_bline_hv15.py te_fp8, HunyuanVideo-1.5 key map). Substitute used by the rounds: scripts/imgcmp_nov5/build_bline.py --group qe --only te (int8_convrot)"
+     },
+     "byt5_small_glyphxl_fp16.safetensors": {
+      "repo": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-480p_t2v",
+      "file": "text_encoder_2/model.safetensors",
+      "build": "scripts/vidcmp_nov5/convert_bline_hv15.py (byt5 -> byt5_small_glyphxl_fp16_official)"
+     },
+     "hunyuanvideo15_vae_fp16.safetensors": {
+      "repo": "tencent/HunyuanVideo-1.5",
+      "file": "vae/",
+      "build": "scripts/vidcmp_nov5/convert_bline_hv15.py (vae -> hunyuanvideo15_vae_fp16_official)"
+     }
+    }
+   },
+   "source": "fp16 file + weight_dtype fp8_e4m3fn (no fp8 t2v file shipped)",
+   "bline_weight_dtype": "fp8_e4m3fn",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "hunyuanvideo-community/HunyuanVideo-1.5-Diffusers-720p_t2v"
+  },
+  "gen": {
+   "steps": 20,
+   "guidance": 6.0,
+   "width": 1280,
+   "height": 720,
+   "num_frames": 121,
+   "fps": 24
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "cfg_batch_rows",
+   "check": "cfg_batch_rows",
+   "note": "CFG > 1: Studio may run cond + uncond as ONE batch-2 forward (diffusion_cfg_batch) where the baseline UI runs two; evaluation counts are per sample row, so a forward-call hook undercounts Studio by 2x (settings_audit_nov10/flux.md, 'Not verified')."
+  },
+  {
+   "id": "t4_fp16",
+   "check": "fp16_only_dtype",
+   "note": "On an fp16-only card (T4, sm75) the stacks resolve different compute dtypes (Studio fp16 or fp32 promote; the baseline UI fp32 for Qwen / Ideogram, fp16 first for Wan / HV1.5); record the resolved dtype per stack (bline_defaults_audit.md 'dtype on fp16-only GPUs')."
+  },
+  {
+   "id": "video_save",
+   "check": null,
+   "note": "Video graphs end in CreateVideo -> SaveVideo (the templates' MP4 export, encode time included). Until the blineui backend passes fps and decodes MP4 (agent B's port), set graph_extra.video_save 'frames' (SaveImage on the same frames). Record which one ran; the MP4 encode is part of what a baseline-UI user waits for."
+  },
+  {
+   "id": "system_prompt",
+   "check": null,
+   "note": "diffusers' system prompt string differs from the baseline UI's newline-separated text (crop 108); conditioning differs on every prompt (bline_defaults_audit.md HunyuanVideo-1.5 row: LIST)."
+  },
+  {
+   "id": "bypassed_nodes",
+   "check": null,
+   "note": "EasyCache and the 1080p SR stage are mode 4 (bypassed) in the template and do not count."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "transformer",
+    "vae"
+   ],
+   "formats": [
+    "fp16",
+    "fp8"
+   ],
+   "note": "the baseline UI computes the fp16 DiT and VAE in fp16 (HunyuanVideo15 supports fp16 first; VAE working dtype fp16); Studio runs bf16"
+  },
+  {
+   "id": "accepted_precision_1",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "text_encoder"
+   ],
+   "formats": [
+    "fp16",
+    "fp8"
+   ],
+   "note": "byt5 is fp16 in the template and dense bf16 in Studio; Qwen2.5-VL is fp8 on both"
+  }
+ ],
+ "sources": [
+  "outputs/bline_defaults_audit.md#HunyuanVideo-1.5",
+  "outputs/settings_audit_nov10/others.md#HunyuanVideo 1.5 720p",
+  "temp/settings_audit/workflow_templates/templates/video_hunyuan_video_1.5_720p_t2v.json"
+ ]
+}

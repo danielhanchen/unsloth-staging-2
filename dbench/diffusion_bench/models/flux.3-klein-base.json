@@ -1,0 +1,505 @@
+{
+ "family": "flux.3-klein-base",
+ "kind": "image",
+ "aliases": [
+  "flux3-klein-base"
+ ],
+ "bline": {
+  "graph": "flux3-klein",
+  "template": "image_flux3_klein_t2i.json",
+  "template_sha": "f2688847a9907fb61e79a80be66cdeb36dc53dfa",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "flux3-image-klein-base-int8-convrot.safetensors",
+   "te": "qwen3vl_4b_int8_convrot.safetensors",
+   "vae": "flux2-vae.safetensors"
+  },
+  "shift_in_graph": true
+ },
+ "defaults": {
+  "steps": 50,
+  "cfg": 3.5,
+  "sampler": "euler",
+  "scheduler": "simple",
+  "shift": 1.93586,
+  "width": 1024,
+  "height": 1024,
+  "frames": null,
+  "fps": null,
+  "negative": "",
+  "enhancer": false
+ },
+ "expected_passes": "steps * (2 if cfg > 1 else 1)",
+ "formats": {
+  "bf16": {
+   "studio": {
+    "model_path": "black-forest-labs/flux-3-image-klein-base",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format bf16: transformer_quant='none'"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df flux.3-klein*: te_quant_auto int8"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "black-forest-labs/flux-3-image-klein-base": {
+      "repo": "black-forest-labs/flux-3-image-klein-base",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/flux-3-image-klein-base-FP8",
+      "file": "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "14c48e107110bf3a3fa011a3e9a92341829833e9c2f83cfbae34370f684def80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": null,
+   "source": "built from BFL's official weights (scripts/imgcmp_nov5/build_q5.py; image_vs_bline_nov5 Setup)",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "int8": {
+   "studio": {
+    "model_path": "black-forest-labs/flux-3-image-klein-base",
+    "transformer_quant": "int8",
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "format int8: transformer_quant='int8'"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df flux.3-klein*: te_quant_auto int8"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "black-forest-labs/flux-3-image-klein-base": {
+      "repo": "black-forest-labs/flux-3-image-klein-base",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot without the dense transformer weights: the int8 format loads Studio's hosted INT8 transformer below instead (status.resolved.transformer_quant.artifact, pr876_recheck parity_3090 record)",
+      "ignore_patterns": [
+       "transformer/*.safetensors",
+       "transformer/*.bin"
+      ],
+      "dense_on": [
+       "T4"
+      ],
+      "dense_on_note": "on an fp16-only T4 Studio builds INT8 from the dense transformer (diffusion.py load_flux3_pipeline -> Flux3Transformer2DModel.from_pretrained) instead of the hosted INT8 file; the offline trial load failed on the two missing transformer shards (val_nov21 Colab T4 trial, unsloth 8b7cde79eb)"
+     },
+     "flux-3-image-klein-base-INT8.safetensors": {
+      "repo": "unsloth/flux-3-image-klein-base-FP8",
+      "file": "flux-3-image-klein-base-INT8.safetensors",
+      "build": null,
+      "note": "Studio's hosted int8 transformer for this format (status.resolved.transformer_quant.artifact prequant:unsloth/flux-3-image-klein-base-FP8/flux-3-image-klein-base-INT8.safetensors, pr876_recheck parity_3090 record)"
+     },
+     "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/flux-3-image-klein-base-FP8",
+      "file": "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "14c48e107110bf3a3fa011a3e9a92341829833e9c2f83cfbae34370f684def80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "flux3-image-klein-base-int8-convrot.safetensors",
+     "te": "qwen3vl_4b_int8_convrot.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "header: {'F32': 172, 'BF16': 99, 'I8': 172, 'U8': 205}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "qwen3vl_4b_int8_convrot.safetensors: header: {'F32': 253, 'BF16': 460, 'I8': 253, 'U8': 253}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "fp32",
+      "compute": "bf16",
+      "evidence": "header: {'I64': 1, 'F32': 250}; compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "flux3-image-klein-base-int8-convrot.safetensors": {
+      "repo": "black-forest-labs/flux-3-image-klein-bline",
+      "file": "diffusion_models/flux3-image-klein-base-int8-convrot.safetensors",
+      "build": null
+     },
+     "qwen3vl_4b_int8_convrot.safetensors": {
+      "repo": "black-forest-labs/flux-3-image-klein-bline",
+      "file": "text_encoders/qwen3vl_4b_int8_convrot.safetensors",
+      "build": null,
+      "alt_build": "scripts/imgcmp_nov5/build_q5.py --group f3 --roles te_int8"
+     },
+     "flux2-vae.safetensors": {
+      "repo": "black-forest-labs/flux-3-image-klein-bline",
+      "file": "vae/flux2-vae.safetensors",
+      "build": null,
+      "note": "BFL's own BlineUI repo; = BFL ae.safetensors of flux-3-image-klein (same sha256, build_q5.py vae role)"
+     }
+    }
+   },
+   "source": "template file (BFL int8 ConvRot, fused qkv + int8 attention config) or build_q5.py int8_tensorwise",
+   "template_default": true,
+   "min_vram_gib": 12.0,
+   "min_host_ram_gib": 11.4,
+   "est_s_per_render": {
+    "T4": 208.6,
+    "L4": 62.54,
+    "A100-40": null,
+    "G4": 9.65
+   },
+   "planning": {
+    "basis": "slower stack's steady s/render (median over new prompts); VRAM / host = the larger stack's peak at the smallest budget that ran; min_vram_gib = the smallest simulated budget both stacks rendered at (12 GiB, round 5), not a peak",
+    "cite": [
+     "outputs/image_vs_bline_nov5/README.md#Matrix",
+     "outside tester round 5 (2026-11-16, RTX 6000 Ada with a simulated budget: ballast + reported total): both stacks rendered at 12 GiB",
+     "unsloth main 8b7cde79eb: Studio runs INT8 ConvRot on sm75 (#17949 584edfff39 FLUX.3 klein on T4 int8 linears; #18441 8c5ca83271 raced CUTLASS W8A8 GEMM on T4; #18586 31c515f0b0 race cache): the sm75 refusal this card carried is gone"
+    ],
+    "studio_refused": []
+   }
+  },
+  "fp8": {
+   "studio": {
+    "model_path": "black-forest-labs/flux-3-image-klein-base",
+    "transformer_quant": "fp8",
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "format fp8: transformer_quant='fp8'"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df flux.3-klein*: te_quant_auto int8"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "black-forest-labs/flux-3-image-klein-base": {
+      "repo": "black-forest-labs/flux-3-image-klein-base",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/flux-3-image-klein-base-FP8",
+      "file": "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "14c48e107110bf3a3fa011a3e9a92341829833e9c2f83cfbae34370f684def80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": null,
+   "source": "build_q5.py scaled float8_e4m3fn",
+   "template_default": false,
+   "min_vram_gib": 14.8,
+   "min_host_ram_gib": 11.4,
+   "est_s_per_render": {
+    "T4": 1312.4,
+    "L4": 66.55,
+    "A100-40": null,
+    "G4": 10.08
+   },
+   "planning": {
+    "basis": "slower stack's steady s/render (median over new prompts); VRAM / host = the larger stack's peak at the smallest budget that ran",
+    "cite": [
+     "outputs/image_vs_bline_nov5/README.md#Matrix"
+    ],
+    "studio_refused": [
+     "T4"
+    ]
+   }
+  },
+  "nvfp4": {
+   "studio": {
+    "model_path": "black-forest-labs/flux-3-image-klein-base",
+    "transformer_quant": "nvfp4",
+    "precision": {
+     "transformer": {
+      "weights": "nvfp4",
+      "compute": "nvfp4",
+      "evidence": "format nvfp4: transformer_quant='nvfp4'"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df flux.3-klein*: te_quant_auto int8"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "black-forest-labs/flux-3-image-klein-base": {
+      "repo": "black-forest-labs/flux-3-image-klein-base",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/flux-3-image-klein-base-FP8",
+      "file": "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "14c48e107110bf3a3fa011a3e9a92341829833e9c2f83cfbae34370f684def80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": null,
+   "source": "build_q5.py Studio mixed layer map",
+   "template_default": false,
+   "min_vram_gib": 10.2,
+   "min_host_ram_gib": 11.6,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": 8.08
+   },
+   "planning": {
+    "basis": "slower stack's steady s/render (median over new prompts); VRAM / host = the larger stack's peak at the smallest budget that ran",
+    "cite": [
+     "outputs/image_vs_bline_nov5/README.md#Matrix"
+    ],
+    "studio_refused": [
+     "G4 (nvfp4 ruled out for the family)"
+    ]
+   }
+  },
+  "gguf": {
+   "studio": {
+    "model_path": "unsloth/flux-3-image-klein-base-GGUF",
+    "gguf_filename": "flux-3-image-klein-base-Q4_K_M.gguf",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "gguf:Q4_K_M",
+      "compute": "bf16",
+      "evidence": "GGUF kept (transformer_quant none): GGUF weights dequantized per layer"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df flux.3-klein*: te_quant_auto int8"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "flux-3-image-klein-base-Q4_K_M.gguf": {
+      "repo": "unsloth/flux-3-image-klein-base-GGUF",
+      "file": "flux-3-image-klein-base-Q4_K_M.gguf",
+      "build": null,
+      "sha256": "48f0d62520451158f309de2fd38d8540a817d76a8fb104c082ff47397734a8c3"
+     },
+     "black-forest-labs/flux-3-image-klein-base": {
+      "repo": "black-forest-labs/flux-3-image-klein-base",
+      "file": null,
+      "build": null,
+      "note": "text encoder / VAE / configs the GGUF transformer is assembled with",
+      "ignore_patterns": [
+       "transformer/*.safetensors",
+       "transformer/*.bin"
+      ]
+     },
+     "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/flux-3-image-klein-base-FP8",
+      "file": "flux-3-image-klein-base-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "14c48e107110bf3a3fa011a3e9a92341829833e9c2f83cfbae34370f684def80",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "flux-3-image-klein-base-Q4_K_M.gguf",
+     "te": "qwen3vl_4b_int8_convrot.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "gguf:Q4_K_M",
+      "compute": "bf16",
+      "evidence": "GGUF loader node dequantizes per layer, computes in the model dtype"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "qwen3vl_4b_int8_convrot.safetensors: header: {'F32': 253, 'BF16': 460, 'I8': 253, 'U8': 253}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "fp32",
+      "compute": "bf16",
+      "evidence": "header: {'I64': 1, 'F32': 250}; compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "flux-3-image-klein-base-Q4_K_M.gguf": {
+      "repo": "unsloth/flux-3-image-klein-base-GGUF",
+      "file": "flux-3-image-klein-base-Q4_K_M.gguf",
+      "build": null,
+      "sha256": "48f0d62520451158f309de2fd38d8540a817d76a8fb104c082ff47397734a8c3"
+     },
+     "qwen3vl_4b_int8_convrot.safetensors": {
+      "repo": "black-forest-labs/flux-3-image-klein-bline",
+      "file": "text_encoders/qwen3vl_4b_int8_convrot.safetensors",
+      "build": null,
+      "alt_build": "scripts/imgcmp_nov5/build_q5.py --group f3 --roles te_int8"
+     },
+     "flux2-vae.safetensors": {
+      "repo": "black-forest-labs/flux-3-image-klein-bline",
+      "file": "vae/flux2-vae.safetensors",
+      "build": null,
+      "note": "BFL's own BlineUI repo; = BFL ae.safetensors of flux-3-image-klein (same sha256, build_q5.py vae role)"
+     }
+    }
+   },
+   "source": "unsloth GGUF (unsloth/flux-3-image-klein-base-GGUF Q4_K_M) on both stacks: Studio GGUF kept, the baseline through the GGUF loader node (bline_graphs.gguf_loaders); TE / VAE = the int8 format's files",
+   "template_default": false,
+   "min_vram_gib": 12.6,
+   "min_host_ram_gib": 13.7,
+   "est_s_per_render": {
+    "T4": 1262.7,
+    "L4": 136.36,
+    "A100-40": null,
+    "G4": 20.67
+   },
+   "planning": {
+    "basis": "slower stack's steady s/render (median over new prompts); VRAM / host = the larger stack's peak at the smallest budget that ran",
+    "cite": [
+     "outputs/image_vs_bline_nov5/README.md#Matrix"
+    ],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "black-forest-labs/flux-3-image-klein-base"
+  },
+  "gen": {
+   "steps": 50,
+   "guidance": 3.5
+  },
+  "scheduler_map": {
+   "FlowMatchEulerDiscreteScheduler": [
+    "euler",
+    "simple"
+   ]
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "enhancer_off",
+   "check": "enhancer_off",
+   "note": "The template ships a prompt enhancer / upsampler; benchmarks switch it off on the baseline UI arm and send the raw prompt to both stacks."
+  },
+  {
+   "id": "cfg_batch_rows",
+   "check": "cfg_batch_rows",
+   "note": "CFG > 1: Studio may run cond + uncond as ONE batch-2 forward (diffusion_cfg_batch) where the baseline UI runs two; evaluation counts are per sample row, so a forward-call hook undercounts Studio by 2x (settings_audit_nov10/flux.md, 'Not verified')."
+  },
+  {
+   "id": "bf16_vs_int8_default",
+   "check": "precision_equal",
+   "note": "Studio runs FLUX.3 bf16 when it fits; the template file is int8 ConvRot: pin the format (settings_audit_nov10/flux.md (b)2)."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "vae"
+   ],
+   "formats": [
+    "int8"
+   ],
+   "note": "template flux2-vae file is fp32 (computed bf16); Studio bf16"
+  }
+ ],
+ "sources": [
+  "outputs/settings_audit_nov10/flux.md#FLUX-3 klein base",
+  "outputs/bline_r5_nov17/archive/bench.py#WORKLOADS#KB",
+  "outputs/image_vs_bline_nov5/README.md#Setup",
+  "temp/settings_audit/workflow_templates/templates/image_flux3_klein_t2i.json"
+ ]
+}

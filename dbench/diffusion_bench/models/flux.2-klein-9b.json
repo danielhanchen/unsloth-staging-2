@@ -1,0 +1,251 @@
+{
+ "family": "flux.2-klein-9b",
+ "kind": "image",
+ "aliases": [
+  "flux2-klein-9b"
+ ],
+ "bline": {
+  "graph": "flux2-klein",
+  "template": "image_flux2_text_to_image_9b.json",
+  "template_sha": "37876f621ac25f33e9eb8592291ed062eafb9933",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": false,
+  "files": {
+   "dit": "flux-2-klein-9b-fp8.safetensors",
+   "te": "qwen_3_8b_fp8mixed.safetensors",
+   "vae": "full_encoder_small_decoder.safetensors"
+  },
+  "shift_in_graph": true,
+  "reason": "image_flux2_text_to_image_9b ships the 9B BASE subgraph (Flux2Scheduler 20, CFGGuider 5); the 9B distilled card reuses the flux2-klein graph at 4 steps / cfg 1 (the distilled 4B recipe); not rendered on a real baseline UI with 9B files"
+ },
+ "defaults": {
+  "steps": 4,
+  "cfg": 1.0,
+  "sampler": "euler",
+  "scheduler": null,
+  "shift": null,
+  "width": 1024,
+  "height": 1024,
+  "frames": null,
+  "fps": null,
+  "negative": "",
+  "enhancer": false
+ },
+ "expected_passes": "steps * (2 if cfg > 1 else 1)",
+ "formats": {
+  "bf16": {
+   "studio": {
+    "model_path": "black-forest-labs/FLUX.2-klein-9B",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format bf16: transformer_quant='none'"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df flux.2-klein: no te_quant_auto"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "black-forest-labs/FLUX.2-klein-9B": {
+      "repo": "black-forest-labs/FLUX.2-klein-9B",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": null,
+   "source": "no bf16 9B file in the template (fp8 only)",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "fp8": {
+   "studio": {
+    "model_path": "black-forest-labs/FLUX.2-klein-9B",
+    "transformer_quant": "fp8",
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "format fp8: transformer_quant='fp8'"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df flux.2-klein: no te_quant_auto"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "black-forest-labs/FLUX.2-klein-9B": {
+      "repo": "black-forest-labs/FLUX.2-klein-9B",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "flux-2-klein-9b-fp8.safetensors",
+     "te": "qwen_3_8b_fp8mixed.safetensors",
+     "vae": "full_encoder_small_decoder.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "name only (header not readable)"
+     },
+     "text_encoder": {
+      "weights": "fp8mixed",
+      "compute": "mixed(fp8)",
+      "evidence": "qwen_3_8b_fp8mixed.safetensors: header: {'F32': 226, 'BF16': 172, 'F8_E4M3': 226, 'U8': 311}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "fp32",
+      "compute": "bf16",
+      "evidence": "header: {'I64': 1, 'F32': 250}; compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "flux-2-klein-9b-fp8.safetensors": {
+      "repo": "black-forest-labs/FLUX.2-klein-9b-fp8",
+      "file": "flux-2-klein-9b-fp8.safetensors",
+      "build": null,
+      "note": "gated BFL repo: needs a token with access"
+     },
+     "qwen_3_8b_fp8mixed.safetensors": {
+      "source": null,
+      "reason": "Bline-Org's fp8mixed Qwen3-8B recipe is not public; only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet. Substitute: scripts/imgcmp_nov5/prep_files.py --group klein9 te (bf16 merge of BFL's Qwen3-8B shards)"
+     },
+     "full_encoder_small_decoder.safetensors": {
+      "repo": "black-forest-labs/FLUX.2-small-decoder",
+      "file": "full_encoder_small_decoder.safetensors",
+      "build": null
+     }
+    }
+   },
+   "source": "template 9B fp8 files",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "black-forest-labs/FLUX.2-klein-9B"
+  },
+  "gen": {
+   "steps": 4,
+   "guidance": 1.0
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "cfg_batch_rows",
+   "check": "cfg_batch_rows",
+   "note": "CFG > 1: Studio may run cond + uncond as ONE batch-2 forward (diffusion_cfg_batch) where the baseline UI runs two; evaluation counts are per sample row, so a forward-call hook undercounts Studio by 2x (settings_audit_nov10/flux.md, 'Not verified')."
+  },
+  {
+   "id": "small_decoder_vae",
+   "check": "precision_equal",
+   "note": "Several FLUX.2 klein templates (9B, the 4B-base / 9B edits) use full_encoder_small_decoder; Studio uses the full FLUX.2 VAE (decode speed and quality differ; settings_audit_nov10/flux.md (b)3)."
+  },
+  {
+   "id": "te_9b_fp8mixed",
+   "check": "precision_equal",
+   "note": "9B template TE is qwen_3_8b_fp8mixed; Studio runs bf16 (settings_audit_nov10/flux.md (b)4)."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "vae"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "template flux2-vae / small decoder file is fp32 (computed bf16); Studio bf16"
+  },
+  {
+   "id": "accepted_precision_1",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "text_encoder"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "9B template TE is qwen_3_8b fp8mixed; Studio runs bf16"
+  }
+ ],
+ "sources": [
+  "outputs/bline_defaults_audit.md#flux.2-klein",
+  "outputs/settings_audit_nov10/flux.md#FLUX.2 klein",
+  "temp/settings_audit/workflow_templates/templates/image_flux2_text_to_image_9b.json"
+ ]
+}

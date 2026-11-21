@@ -1,0 +1,23 @@
+{
+ "description": "Video prompts used by the Wan2.2-TI2V-5B offload probes (seeds 11+i).",
+ "rows": [
+  {
+   "id": "v0",
+   "prompt": "a monarch butterfly opening and closing its wings on a purple flower",
+   "seed": 11,
+   "split": "eval"
+  },
+  {
+   "id": "v1",
+   "prompt": "a fishing boat returning to harbour through morning fog",
+   "seed": 12,
+   "split": "eval"
+  },
+  {
+   "id": "v2",
+   "prompt": "a child blowing dandelion seeds into the wind, meadow background",
+   "seed": 13,
+   "split": "eval"
+  }
+ ]
+}

@@ -1,0 +1,197 @@
+{
+ "name": "compare_zimage_small",
+ "description": "Z-Image-Turbo 1024px 8 steps, 8 prompts: Studio vs BlineUI vs plain diffusers vs stable-diffusion.cpp GGUF, defaults and each framework's fast path. No-CFG is guidance 0.0 for diffusers-based cells (ZImagePipeline runs CFG pos + g*(pos-neg) whenever g > 0) and cfg 1.0 for BlineUI / sd.cpp. Quality is against each framework's own bf16 default; sd.cpp has no bf16 GGUF here, so its cells are scored against d_bf16 (a cross-framework floor, not a quantisation error). sd_q4ks_blinenoise draws its noise the BlineUI way (--rng cpu, res_multistep / simple) and is scored against c_bf16: with shared noise the cross-framework distance drops (edge probe: LPIPS 0.07-0.23 vs 0.40-0.55 with sd.cpp's default cuda rng), so what remains is closer to the Q4_K_S quantisation error.",
+ "defaults": {
+  "kind": "image",
+  "width": 1024,
+  "height": 1024,
+  "steps": 8,
+  "guidance": 1.0,
+  "prompts": "image_24",
+  "n": 8,
+  "warmup": 1,
+  "short_steps": 4,
+  "short_n": 3
+ },
+ "gate": {
+  "max_util": 10,
+  "min_free_mib": 40000,
+  "timeout_s": 1800
+ },
+ "reference": {
+  "studio": "s_bf16",
+  "blineui": "c_bf16",
+  "diffusers": "d_bf16",
+  "sdcpp": "d_bf16"
+ },
+ "cells": [
+  {
+   "tag": "d_bf16",
+   "backend": "diffusers",
+   "model": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo",
+   "guidance": 0.0,
+   "venv": "bench",
+   "options": {}
+  },
+  {
+   "tag": "s_bf16",
+   "backend": "studio",
+   "model": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo",
+   "guidance": 0.0,
+   "venv": {
+    "profile": "studio"
+   },
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "z-image",
+    "local_files_only": true,
+    "memory_mode": "fast",
+    "speed_mode": "default"
+   }
+  },
+  {
+   "tag": "c_bf16",
+   "backend": "blineui",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "$WORKSPACE/bline_models_agent/split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+     "te": "$WORKSPACE/bline_models_agent/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$WORKSPACE/bline_models_agent/split_files/vae/ae.safetensors"
+    }
+   }
+  },
+  {
+   "tag": "sd_q4ks",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/zimage_ext/jayn7/z_image_turbo-Q4_K_S.gguf",
+     "te": "$WORKSPACE/sdcpp_assets/qwen3_4b_te/Qwen3-4B-Q8_0.gguf",
+     "vae": "$WORKSPACE/sdcpp_assets/flux_vae/ae.safetensors"
+    }
+   }
+  },
+  {
+   "tag": "d_bf16_compile",
+   "backend": "diffusers",
+   "model": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo",
+   "guidance": 0.0,
+   "venv": "bench",
+   "options": {
+    "compile": "regional"
+   }
+  },
+  {
+   "tag": "s_bf16_max",
+   "backend": "studio",
+   "model": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo",
+   "guidance": 0.0,
+   "venv": {
+    "profile": "studio"
+   },
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "z-image",
+    "local_files_only": true,
+    "memory_mode": "fast",
+    "speed_mode": "max"
+   }
+  },
+  {
+   "tag": "c_bf16_fast",
+   "backend": "blineui",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "$WORKSPACE/bline_models_agent/split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+     "te": "$WORKSPACE/bline_models_agent/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$WORKSPACE/bline_models_agent/split_files/vae/ae.safetensors"
+    },
+    "highvram": true,
+    "compile": true,
+    "bline_args": "--fast"
+   }
+  },
+  {
+   "tag": "sd_q4ks_sage",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/zimage_ext/jayn7/z_image_turbo-Q4_K_S.gguf",
+     "te": "$WORKSPACE/sdcpp_assets/qwen3_4b_te/Qwen3-4B-Q8_0.gguf",
+     "vae": "$WORKSPACE/sdcpp_assets/flux_vae/ae.safetensors"
+    },
+    "sage": true
+   }
+  },
+  {
+   "tag": "c_nvfp4",
+   "backend": "blineui",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "$WORKSPACE/bline_models_agent/split_files/diffusion_models/z_image_turbo_nvfp4.safetensors",
+     "te": "$WORKSPACE/bline_models_agent/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$WORKSPACE/bline_models_agent/split_files/vae/ae.safetensors"
+    }
+   }
+  },
+  {
+   "tag": "sd_q3ks",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/zimage_ext/jayn7/z_image_turbo-Q3_K_S.gguf",
+     "te": "$WORKSPACE/sdcpp_assets/qwen3_4b_te/Qwen3-4B-Q8_0.gguf",
+     "vae": "$WORKSPACE/sdcpp_assets/flux_vae/ae.safetensors"
+    }
+   }
+  },
+  {
+   "tag": "sd_q4ks_cli",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/zimage_ext/jayn7/z_image_turbo-Q4_K_S.gguf",
+     "te": "$WORKSPACE/sdcpp_assets/qwen3_4b_te/Qwen3-4B-Q8_0.gguf",
+     "vae": "$WORKSPACE/sdcpp_assets/flux_vae/ae.safetensors"
+    },
+    "mode": "cli"
+   }
+  },
+  {
+   "tag": "sd_q4ks_blinenoise",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/zimage_ext/jayn7/z_image_turbo-Q4_K_S.gguf",
+     "te": "$WORKSPACE/sdcpp_assets/qwen3_4b_te/Qwen3-4B-Q8_0.gguf",
+     "vae": "$WORKSPACE/sdcpp_assets/flux_vae/ae.safetensors"
+    },
+    "rng": "cpu",
+    "sampler": "res_multistep",
+    "scheduler": "simple"
+   },
+   "ref": "c_bf16"
+  }
+ ]
+}

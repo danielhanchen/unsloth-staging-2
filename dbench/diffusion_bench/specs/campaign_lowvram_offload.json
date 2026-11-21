@@ -1,0 +1,378 @@
+{
+ "name": "campaign_lowvram_offload",
+ "description": "Low-VRAM model offload, Sept 24 (PRs 11764 keep-CPU, 11766 pin): stock accelerate model offload copies every weight D2H into fresh pageable memory at ~1 GiB/s on each offload, keep-CPU keeps the host copy and skips that copy, pin page-locks it so H2D runs at ~52 instead of ~6.6 GiB/s. Arms per model: fast (resident, memory_mode fast), stock (memory_mode low_vram, KEEP_CPU=0 PIN=0), keep (KEEP_CPU=1 PIN=0), pin (KEEP_CPU=1 PIN=1). Needs a Studio tree containing both PRs (e.g. --set options.studio_src=pr/11766); on an older tree the env vars are ignored and keep/pin silently equal stock, so check the cell logs for the keep/pin lines (TODO(verify) the exact log text) and status.offload_policy (must be model offload, not group). Peak VRAM must not move between stock/keep/pin; host RAM does (RssAnon falls, RssFile rises with keep). One arm per process is mandatory: ru_maxrss / VmHWM are lifetime peaks. The probe's group_te arms were a monkeypatched planner and are not reproducible through Studio options; they were rejected (1.3-1.6x host RAM). Video cells pass guidance and fps as null so Studio's family defaults apply, as the original probe did (it passed neither).",
+ "models": {
+  "flux_schnell": {
+   "repo": "black-forest-labs/FLUX.1-schnell",
+   "local": "$WORKSPACE/hf_local_bases/black-forest-labs/FLUX.1-schnell"
+  },
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "local": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo"
+  },
+  "qwen_image_21": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
+   "local": "$WORKSPACE/temp/qwen_image_21"
+  },
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "local": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "venv": {
+   "profile": "studio"
+  },
+  "kind": "image",
+  "width": 1024,
+  "height": 1024,
+  "prompts": "image_24",
+  "n": 6,
+  "warmup": 1,
+  "short_n": 2,
+  "options": {
+   "model_kind": "pipeline",
+   "transformer_quant": "none",
+   "speed_mode": "default",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 10,
+  "min_free_mib": 60000,
+  "timeout_s": 1800
+ },
+ "baseline": {
+  "source": "diffusion_bench_knowledge.md 1.5; scripts/lowvram_offload_probe.py and video_offload_keep_probe.py, outputs/{lowvram_probe3..5,offload_keep*,offload_pin2}/<model>/record_<arm>.json, B200",
+  "image_s_per_image_stock_keep_pin": {
+   "flux_schnell_1024_4step": [
+    42.5,
+    9.7,
+    "1.9-2.5"
+   ],
+   "zimage_turbo_1024_8step": [
+    18.5,
+    5.6,
+    "1.7-2.0"
+   ],
+   "qwen_image_21_1024_25step": [
+    27.4,
+    "8.5-9.0",
+    "4.8-5.7"
+   ]
+  },
+  "resident_fast_s_per_image": {
+   "flux_schnell": 0.46
+  },
+  "qwen21_host_ram": {
+   "model_offload_vram_gib": 15.62,
+   "stock_rss_gib": "24.6 -> 26.8",
+   "keep_rss_anon_gib": "24.5 -> 10",
+   "keep_rss_total_gib": "25 -> 40 (file-backed, reclaimable)"
+  },
+  "pin_first_render_s": {
+   "flux_schnell": "58 vs 49 unpinned"
+  },
+  "cause": "accelerate module.to('cpu') D2H into fresh pageable memory ~1 GiB/s (15.8 of 25 s on Z-Image); pageable H2D 6.6 GiB/s vs pinned 52 GiB/s",
+  "video_wan22_5b_832x480x49_20step_low_vram": {
+   "stock_s": "36.9-42.4",
+   "stock_rss_anon_gib": 24.7,
+   "keep_median_s": 25.2,
+   "keep_rss_anon_file_gib": [
+    14.1,
+    29.5
+   ],
+   "keep_pin_median_s": 16.6,
+   "peak_vram_gib": 10.89,
+   "frames_diff": "<= 1/255"
+  },
+  "native_int8_under_offload_pr11712": {
+   "qwen21_1024_20step_balanced_s": [
+    5.5,
+    "bf16 7.6"
+   ],
+   "low_vram_s": [
+    24.3,
+    "bf16 35.6"
+   ],
+   "lpips": "0.004-0.019"
+  }
+ },
+ "reference": {
+  "studio": "flux_stock"
+ },
+ "cells": [
+  {
+   "tag": "flux_fast",
+   "model": "@flux_schnell",
+   "ref": "flux_stock",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "memory_mode": "fast"
+   }
+  },
+  {
+   "tag": "flux_stock",
+   "model": "@flux_schnell",
+   "ref": "flux_stock",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "0",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "0"
+   }
+  },
+  {
+   "tag": "flux_keep",
+   "model": "@flux_schnell",
+   "ref": "flux_stock",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "1",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "0"
+   }
+  },
+  {
+   "tag": "flux_pin",
+   "model": "@flux_schnell",
+   "ref": "flux_stock",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "1",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "1"
+   }
+  },
+  {
+   "tag": "zimg_fast",
+   "model": "@zimage_turbo",
+   "ref": "zimg_stock",
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "memory_mode": "fast"
+   }
+  },
+  {
+   "tag": "zimg_stock",
+   "model": "@zimage_turbo",
+   "ref": "zimg_stock",
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "0",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "0"
+   }
+  },
+  {
+   "tag": "zimg_keep",
+   "model": "@zimage_turbo",
+   "ref": "zimg_stock",
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "1",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "0"
+   }
+  },
+  {
+   "tag": "zimg_pin",
+   "model": "@zimage_turbo",
+   "ref": "zimg_stock",
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "1",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "1"
+   }
+  },
+  {
+   "tag": "q21_fast",
+   "model": "@qwen_image_21",
+   "ref": "q21_stock",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "memory_mode": "fast"
+   }
+  },
+  {
+   "tag": "q21_stock",
+   "model": "@qwen_image_21",
+   "ref": "q21_stock",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "0",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "0"
+   }
+  },
+  {
+   "tag": "q21_keep",
+   "model": "@qwen_image_21",
+   "ref": "q21_stock",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "1",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "0"
+   }
+  },
+  {
+   "tag": "q21_pin",
+   "model": "@qwen_image_21",
+   "ref": "q21_stock",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "1",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "1"
+   }
+  },
+  {
+   "tag": "q21_int8_balanced",
+   "model": "@qwen_image_21",
+   "ref": "q21_stock",
+   "steps": 20,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "memory_mode": "balanced",
+    "transformer_quant": "int8"
+   },
+   "note": "PR 11712 native int8 W8A8 under offload; the baseline ran 20 steps, so its s/image is not the 25-step cells'"
+  },
+  {
+   "tag": "wan_stock",
+   "model": "@wan22_5b",
+   "ref": "wan_stock",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "steps": 20,
+   "short_steps": 5,
+   "guidance": null,
+   "save_frames_every": 6,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "0",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "0"
+   }
+  },
+  {
+   "tag": "wan_keep",
+   "model": "@wan22_5b",
+   "ref": "wan_stock",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "steps": 20,
+   "short_steps": 5,
+   "guidance": null,
+   "save_frames_every": 6,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "1",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "0"
+   }
+  },
+  {
+   "tag": "wan_pin",
+   "model": "@wan22_5b",
+   "ref": "wan_stock",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "steps": 20,
+   "short_steps": 5,
+   "guidance": null,
+   "save_frames_every": 6,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "memory_mode": "low_vram"
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_OFFLOAD_KEEP_CPU": "1",
+    "UNSLOTH_DIFFUSION_OFFLOAD_PIN": "1"
+   }
+  }
+ ]
+}

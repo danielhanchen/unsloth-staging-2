@@ -1,0 +1,383 @@
+{
+ "name": "compare_qwen21_allopt",
+ "description": "Studio vs BlineUI, Qwen-Image-2.1 1024px 25 steps CFG 1, every optimisation on: the cells of temp/q21_allopt_run.sh (qwen21_studio_bench.py + qwen21_bline_legb.py), interleaved Studio / BlineUI in the same order, a GPU gate before each. Pass p1 = 24 prompts (quality + timing), p2 = 8 (timing repeat). Quality is scored against each framework's OWN bf16 T0 cell; the cross-framework bf16 LPIPS is a floor only (different noise). T0 = defaults, T1 = compile + fast kernels (+ sage), T2 = T1 + step cache (Studio fbcache, BlineUI EasyCache 0.2). BlineUI files are Bline-Org/Qwen-Image-2.1's own; Studio loads the diffusers snapshot. To reproduce the original run exactly on its host, reuse its interpreters: DIFFUSION_BENCH_STUDIO_PYTHON=$WORKSPACE/temp/venv_qwen21/bin/python, DIFFUSION_BENCH_BLINE_PYTHON=$WORKSPACE/temp/venv_qwen21/bin/python, DIFFUSION_BENCH_BLINE_DIR=$WORKSPACE/BlineUI_q21.",
+ "defaults": {
+  "kind": "image",
+  "width": 1024,
+  "height": 1024,
+  "steps": 25,
+  "guidance": 1.0,
+  "prompts": "image_24",
+  "n": 24,
+  "warmup": 1,
+  "short_steps": 5,
+  "short_n": 3
+ },
+ "passes": [
+  {
+   "name": "pass1",
+   "n": 24
+  },
+  {
+   "name": "pass2",
+   "n": 8
+  }
+ ],
+ "gate": {
+  "max_util": 10,
+  "min_free_mib": 100000,
+  "timeout_s": 1800
+ },
+ "reference": {
+  "studio": "s_bf16_T0",
+  "blineui": "c_bf16_T0"
+ },
+ "cells": [
+  {
+   "tag": "s_bf16_T0",
+   "backend": "studio",
+   "model": "$WORKSPACE/temp/qwen_image_21",
+   "venv": {
+    "profile": "studio",
+    "studio_src": "$WORKSPACE/wt_q21compile"
+   },
+   "options": {
+    "studio_src": "$WORKSPACE/wt_q21compile",
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "local_files_only": true,
+    "transformer_quant": "none",
+    "text_encoder_quant": "auto",
+    "memory_mode": "fast",
+    "speed_mode": "default",
+    "attention_backend": "auto",
+    "transformer_cache": "off"
+   }
+  },
+  {
+   "tag": "c_bf16_T0",
+   "backend": "blineui",
+   "venv": "bench",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$WORKSPACE/bline_q21/diffusion_models/qwen_image_2.1_bf16.safetensors",
+     "te": "$WORKSPACE/bline_q21/text_encoders/qwen3vl_8b_bf16.safetensors",
+     "vae": "$WORKSPACE/bline_q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "bline": {
+     "commit": "b5cc8830279eae909a59de030af1e50761c36751",
+     "sage": true
+    }
+   }
+  },
+  {
+   "tag": "s_bf16_T1max",
+   "backend": "studio",
+   "model": "$WORKSPACE/temp/qwen_image_21",
+   "venv": {
+    "profile": "studio",
+    "studio_src": "$WORKSPACE/wt_q21compile"
+   },
+   "options": {
+    "studio_src": "$WORKSPACE/wt_q21compile",
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "local_files_only": true,
+    "transformer_quant": "none",
+    "text_encoder_quant": "auto",
+    "memory_mode": "fast",
+    "speed_mode": "max",
+    "attention_backend": "auto",
+    "transformer_cache": "off"
+   }
+  },
+  {
+   "tag": "c_bf16_T1",
+   "backend": "blineui",
+   "venv": "bench",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$WORKSPACE/bline_q21/diffusion_models/qwen_image_2.1_bf16.safetensors",
+     "te": "$WORKSPACE/bline_q21/text_encoders/qwen3vl_8b_bf16.safetensors",
+     "vae": "$WORKSPACE/bline_q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "bline": {
+     "commit": "b5cc8830279eae909a59de030af1e50761c36751",
+     "sage": true
+    },
+    "compile": true,
+    "highvram": true,
+    "bline_args": "--fast --use-sage-attention"
+   }
+  },
+  {
+   "tag": "s_bf16_T1def",
+   "backend": "studio",
+   "model": "$WORKSPACE/temp/qwen_image_21",
+   "venv": {
+    "profile": "studio",
+    "studio_src": "$WORKSPACE/wt_q21compile"
+   },
+   "options": {
+    "studio_src": "$WORKSPACE/wt_q21compile",
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "local_files_only": true,
+    "transformer_quant": "none",
+    "text_encoder_quant": "auto",
+    "memory_mode": "fast",
+    "speed_mode": "default",
+    "attention_backend": "auto",
+    "transformer_cache": "off"
+   }
+  },
+  {
+   "tag": "c_bf16_T1_nosage",
+   "backend": "blineui",
+   "venv": "bench",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$WORKSPACE/bline_q21/diffusion_models/qwen_image_2.1_bf16.safetensors",
+     "te": "$WORKSPACE/bline_q21/text_encoders/qwen3vl_8b_bf16.safetensors",
+     "vae": "$WORKSPACE/bline_q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "bline": {
+     "commit": "b5cc8830279eae909a59de030af1e50761c36751",
+     "sage": true
+    },
+    "compile": true,
+    "highvram": true,
+    "bline_args": "--fast"
+   }
+  },
+  {
+   "tag": "s_bf16_T1_flash4",
+   "backend": "studio",
+   "model": "$WORKSPACE/temp/qwen_image_21",
+   "venv": {
+    "profile": "studio",
+    "studio_src": "$WORKSPACE/wt_q21compile"
+   },
+   "options": {
+    "studio_src": "$WORKSPACE/wt_q21compile",
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "local_files_only": true,
+    "transformer_quant": "none",
+    "text_encoder_quant": "auto",
+    "memory_mode": "fast",
+    "speed_mode": "max",
+    "attention_backend": "flash4",
+    "transformer_cache": "off"
+   }
+  },
+  {
+   "tag": "c_bf16_T2",
+   "backend": "blineui",
+   "venv": "bench",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$WORKSPACE/bline_q21/diffusion_models/qwen_image_2.1_bf16.safetensors",
+     "te": "$WORKSPACE/bline_q21/text_encoders/qwen3vl_8b_bf16.safetensors",
+     "vae": "$WORKSPACE/bline_q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "bline": {
+     "commit": "b5cc8830279eae909a59de030af1e50761c36751",
+     "sage": true
+    },
+    "compile": true,
+    "highvram": true,
+    "bline_args": "--fast --use-sage-attention",
+    "easycache": 0.2
+   }
+  },
+  {
+   "tag": "s_bf16_T1_cudnn",
+   "backend": "studio",
+   "model": "$WORKSPACE/temp/qwen_image_21",
+   "venv": {
+    "profile": "studio",
+    "studio_src": "$WORKSPACE/wt_q21compile"
+   },
+   "options": {
+    "studio_src": "$WORKSPACE/wt_q21compile",
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "local_files_only": true,
+    "transformer_quant": "none",
+    "text_encoder_quant": "auto",
+    "memory_mode": "fast",
+    "speed_mode": "max",
+    "attention_backend": "cudnn",
+    "transformer_cache": "off"
+   }
+  },
+  {
+   "tag": "c_int8_T0",
+   "backend": "blineui",
+   "venv": "bench",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$WORKSPACE/bline_q21/diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
+     "te": "$WORKSPACE/bline_q21/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+     "vae": "$WORKSPACE/bline_q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "bline": {
+     "commit": "b5cc8830279eae909a59de030af1e50761c36751",
+     "sage": true
+    }
+   }
+  },
+  {
+   "tag": "s_bf16_T2",
+   "backend": "studio",
+   "model": "$WORKSPACE/temp/qwen_image_21",
+   "venv": {
+    "profile": "studio",
+    "studio_src": "$WORKSPACE/wt_q21compile"
+   },
+   "options": {
+    "studio_src": "$WORKSPACE/wt_q21compile",
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "local_files_only": true,
+    "transformer_quant": "none",
+    "text_encoder_quant": "auto",
+    "memory_mode": "fast",
+    "speed_mode": "max",
+    "attention_backend": "auto",
+    "transformer_cache": "fbcache"
+   }
+  },
+  {
+   "tag": "c_int8_T1",
+   "backend": "blineui",
+   "venv": "bench",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$WORKSPACE/bline_q21/diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
+     "te": "$WORKSPACE/bline_q21/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+     "vae": "$WORKSPACE/bline_q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "bline": {
+     "commit": "b5cc8830279eae909a59de030af1e50761c36751",
+     "sage": true
+    },
+    "compile": true,
+    "highvram": true,
+    "bline_args": "--fast --use-sage-attention"
+   }
+  },
+  {
+   "tag": "s_int8_T0",
+   "backend": "studio",
+   "model": "$WORKSPACE/temp/qwen_image_21",
+   "venv": {
+    "profile": "studio",
+    "studio_src": "$WORKSPACE/wt_q21compile"
+   },
+   "options": {
+    "studio_src": "$WORKSPACE/wt_q21compile",
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "local_files_only": true,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "auto",
+    "memory_mode": "fast",
+    "speed_mode": "default",
+    "attention_backend": "auto",
+    "transformer_cache": "off"
+   }
+  },
+  {
+   "tag": "c_int8_T2",
+   "backend": "blineui",
+   "venv": "bench",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$WORKSPACE/bline_q21/diffusion_models/qwen_image_2.1_int8_convrot.safetensors",
+     "te": "$WORKSPACE/bline_q21/text_encoders/qwen3vl_8b_int8_convrot.safetensors",
+     "vae": "$WORKSPACE/bline_q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "bline": {
+     "commit": "b5cc8830279eae909a59de030af1e50761c36751",
+     "sage": true
+    },
+    "compile": true,
+    "highvram": true,
+    "bline_args": "--fast --use-sage-attention",
+    "easycache": 0.2
+   }
+  },
+  {
+   "tag": "s_int8_T1max",
+   "backend": "studio",
+   "model": "$WORKSPACE/temp/qwen_image_21",
+   "venv": {
+    "profile": "studio",
+    "studio_src": "$WORKSPACE/wt_q21compile"
+   },
+   "options": {
+    "studio_src": "$WORKSPACE/wt_q21compile",
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "local_files_only": true,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "auto",
+    "memory_mode": "fast",
+    "speed_mode": "max",
+    "attention_backend": "auto",
+    "transformer_cache": "off"
+   }
+  },
+  {
+   "tag": "s_int8_T2",
+   "backend": "studio",
+   "model": "$WORKSPACE/temp/qwen_image_21",
+   "venv": {
+    "profile": "studio",
+    "studio_src": "$WORKSPACE/wt_q21compile"
+   },
+   "options": {
+    "studio_src": "$WORKSPACE/wt_q21compile",
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "local_files_only": true,
+    "transformer_quant": "int8",
+    "text_encoder_quant": "auto",
+    "memory_mode": "fast",
+    "speed_mode": "max",
+    "attention_backend": "auto",
+    "transformer_cache": "fbcache"
+   }
+  },
+  {
+   "tag": "s_bf16_T0_end",
+   "backend": "studio",
+   "model": "$WORKSPACE/temp/qwen_image_21",
+   "venv": {
+    "profile": "studio",
+    "studio_src": "$WORKSPACE/wt_q21compile"
+   },
+   "options": {
+    "studio_src": "$WORKSPACE/wt_q21compile",
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "local_files_only": true,
+    "transformer_quant": "none",
+    "text_encoder_quant": "auto",
+    "memory_mode": "fast",
+    "speed_mode": "default",
+    "attention_backend": "auto",
+    "transformer_cache": "off"
+   }
+  }
+ ]
+}

@@ -1,0 +1,176 @@
+{
+ "name": "sdcpp_gguf_small",
+ "description": "stable-diffusion.cpp (unslothai fork, setup_sdcpp.py source build at the pinned ref; DIFFUSION_BENCH_SDCPP_BIN reuses a binary) on small GGUF quants at 512px: Z-Image-Turbo, Qwen-Image-2.1 and FLUX.1-schnell. Server mode (sd-server, model loaded once) unless the cell says cli. Each cell's \"ref\" names its family's highest-precision cell (Qwen-Image-2.1: the BF16 GGUF; Z-Image: Q4_K_S, the best local quant; FLUX: itself).",
+ "defaults": {
+  "kind": "image",
+  "width": 512,
+  "height": 512,
+  "steps": 8,
+  "guidance": 1.0,
+  "prompts": "image_24",
+  "n": 4,
+  "warmup": 1,
+  "short_steps": 4,
+  "short_n": 2
+ },
+ "gate": {
+  "max_util": 10,
+  "min_free_mib": 30000,
+  "timeout_s": 1800
+ },
+ "reference": {
+  "sdcpp": "sd_zimg_q4ks"
+ },
+ "cells": [
+  {
+   "tag": "sd_zimg_q4ks",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/zimage_ext/jayn7/z_image_turbo-Q4_K_S.gguf",
+     "te": "$WORKSPACE/sdcpp_assets/qwen3_4b_te/Qwen3-4B-Q8_0.gguf",
+     "vae": "$WORKSPACE/sdcpp_assets/flux_vae/ae.safetensors"
+    }
+   },
+   "ref": "sd_zimg_q4ks"
+  },
+  {
+   "tag": "sd_zimg_q3ks",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/zimage_ext/jayn7/z_image_turbo-Q3_K_S.gguf",
+     "te": "$WORKSPACE/sdcpp_assets/qwen3_4b_te/Qwen3-4B-Q8_0.gguf",
+     "vae": "$WORKSPACE/sdcpp_assets/flux_vae/ae.safetensors"
+    }
+   },
+   "ref": "sd_zimg_q4ks"
+  },
+  {
+   "tag": "sd_zimg_q4ks_nofa",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/zimage_ext/jayn7/z_image_turbo-Q4_K_S.gguf",
+     "te": "$WORKSPACE/sdcpp_assets/qwen3_4b_te/Qwen3-4B-Q8_0.gguf",
+     "vae": "$WORKSPACE/sdcpp_assets/flux_vae/ae.safetensors"
+    },
+    "fa": false
+   },
+   "ref": "sd_zimg_q4ks"
+  },
+  {
+   "tag": "sd_zimg_q4ks_cli",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "z-image",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/zimage_ext/jayn7/z_image_turbo-Q4_K_S.gguf",
+     "te": "$WORKSPACE/sdcpp_assets/qwen3_4b_te/Qwen3-4B-Q8_0.gguf",
+     "vae": "$WORKSPACE/sdcpp_assets/flux_vae/ae.safetensors"
+    },
+    "mode": "cli"
+   },
+   "ref": "sd_zimg_q4ks"
+  },
+  {
+   "tag": "sd_q21_bf16",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "steps": 25,
+   "short_steps": 5,
+   "options": {
+    "family": "qwen-image-2.1",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/qwen21_baseline/qwen-image-2.1-BF16.gguf",
+     "te": "$WORKSPACE/q21_sdcpp_models/te_gguf/Qwen3-VL-8B-Instruct-Q4_K_M.gguf",
+     "vae": "$WORKSPACE/q21_sdcpp_models/vae/qwen_image_2.1_vae_bf16.safetensors"
+    }
+   },
+   "ref": "sd_q21_bf16"
+  },
+  {
+   "tag": "sd_q21_q8",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "qwen-image-2.1",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/qwen21_baseline/qwen21-q8_0.gguf",
+     "te": "$WORKSPACE/q21_sdcpp_models/te_gguf/Qwen3-VL-8B-Instruct-Q4_K_M.gguf",
+     "vae": "$WORKSPACE/q21_sdcpp_models/vae/qwen_image_2.1_vae_bf16.safetensors"
+    }
+   },
+   "steps": 25,
+   "short_steps": 5,
+   "ref": "sd_q21_bf16"
+  },
+  {
+   "tag": "sd_q21_q4k",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "qwen-image-2.1",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/qwen21_baseline/qwen21-q4_K.gguf",
+     "te": "$WORKSPACE/q21_sdcpp_models/te_gguf/Qwen3-VL-8B-Instruct-Q4_K_M.gguf",
+     "vae": "$WORKSPACE/q21_sdcpp_models/vae/qwen_image_2.1_vae_bf16.safetensors"
+    }
+   },
+   "steps": 25,
+   "short_steps": 5,
+   "ref": "sd_q21_bf16"
+  },
+  {
+   "tag": "sd_q21_q2k",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "qwen-image-2.1",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/dyn_gguf/qwen21_baseline/qwen21-q2_K.gguf",
+     "te": "$WORKSPACE/q21_sdcpp_models/te_gguf/Qwen3-VL-8B-Instruct-Q4_K_M.gguf",
+     "vae": "$WORKSPACE/q21_sdcpp_models/vae/qwen_image_2.1_vae_bf16.safetensors"
+    }
+   },
+   "steps": 25,
+   "short_steps": 5,
+   "ref": "sd_q21_bf16"
+  },
+  {
+   "tag": "sd_flux_schnell_q4km",
+   "backend": "sdcpp",
+   "venv": "bench",
+   "options": {
+    "family": "flux.1",
+    "expect_device": "CUDA",
+    "files": {
+     "dit": "$WORKSPACE/hf_cg/hub/models--unsloth--FLUX.1-schnell-GGUF/snapshots/65b3e21589c5dc66402b02a079208201ae9fcfc3/flux1-schnell-Q4_K_M.gguf",
+     "te": [
+      "$WORKSPACE/dyn_gguf/flux_te/clip_l.safetensors",
+      "$WORKSPACE/dyn_gguf/flux_te/t5-v1_1-xxl-encoder-Q8_0.gguf"
+     ],
+     "vae": "$WORKSPACE/sdcpp_assets/flux_vae/ae.safetensors"
+    }
+   },
+   "steps": 4,
+   "short_steps": 2,
+   "ref": "sd_flux_schnell_q4km"
+  }
+ ]
+}

@@ -1,0 +1,462 @@
+{
+ "family": "qwen-image-2.1-edit",
+ "kind": "edit",
+ "aliases": [
+  "qwen21-edit"
+ ],
+ "bline": {
+  "graph": "qwen-image-2.1-edit",
+  "template": "image_qwen_image_2_1_image_edit.json",
+  "template_sha": "f6c9b7bc58388acce06f9e6314d5513df3224a47",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "qwen_image_2.1_int8_convrot.safetensors",
+   "te": "qwen3vl_8b_int8_convrot.safetensors",
+   "vae": "qwen_image_2.1_vae_bf16.safetensors"
+  },
+  "shift_in_graph": true,
+  "graph_extra": {
+   "input_images": [
+    "ref.png"
+   ],
+   "resolution": 0,
+   "prefix_cache": "auto"
+  },
+  "alt_graphs": [
+   "o22-qwen-edit (the external tester's resolution-1024 edit graph, 1024^2 latent: Studio's request shape; non-default extra arm)"
+  ]
+ },
+ "defaults": {
+  "steps": 25,
+  "cfg": 1.0,
+  "sampler": "euler",
+  "scheduler": "simple",
+  "shift": null,
+  "width": null,
+  "height": null,
+  "frames": null,
+  "fps": null,
+  "negative": "",
+  "enhancer": false,
+  "output_size": "reference"
+ },
+ "expected_passes": "steps * (2 if cfg > 1 else 1)",
+ "formats": {
+  "bf16": {
+   "studio": {
+    "model_path": "Qwen/Qwen-Image-2.1",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format bf16: transformer_quant='none'"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "text_encoder_quant none"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "Qwen/Qwen-Image-2.1": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "qwen_image_2.1_bf16.safetensors",
+     "te": "qwen3vl_8b_bf16.safetensors",
+     "vae": "qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'BF16': 265} (name token confirmed by the header); unet_manual_cast over ['bf16']"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": null,
+      "evidence": "qwen3vl_8b_bf16.safetensors: header: {'BF16': 750} (name token confirmed by the header); compute of non-quantized TEs not traced (CLIP dtype logic is per model)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'BF16': 238} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "qwen_image_2.1_bf16.safetensors": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "file": "transformer/",
+      "build": "scripts/imgcmp_nov5/build_q5.py --group q21 --roles dit_bf16",
+      "fetch_repo": "unsloth/Qwen-Image-2.1"
+     },
+     "qwen3vl_8b_bf16.safetensors": {
+      "source": null,
+      "reason": "no tested builder for the bf16 TE (build_bline.q21_te's key map without the int8 tool step would produce it; not run)"
+     },
+     "qwen_image_2.1_vae_bf16.safetensors": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "file": "vae/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group q21 --only vae",
+      "fetch_repo": "unsloth/Qwen-Image-2.1"
+     }
+    }
+   },
+   "source": "Bline-Org/Qwen-Image-2.1 (r5 configs q_bf16) or build_q5.py from the official repo",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "int8": {
+   "studio": {
+    "model_path": "Qwen/Qwen-Image-2.1",
+    "transformer_quant": "int8",
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "format int8: transformer_quant='int8'"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df qwen-image-2.1: te_quant_auto int8"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "Qwen/Qwen-Image-2.1": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "Qwen-Image-2.1-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/Qwen-Image-2.1-FP8",
+      "file": "Qwen-Image-2.1-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "0cb5ed0653e2ec8065f25a6cfb2ab6a89b6c8f143a500acea19f0e36214814b7",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "qwen_image_2.1_int8_convrot.safetensors",
+     "te": "qwen3vl_8b_int8_convrot.safetensors",
+     "vae": "qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "header: {'F32': 192, 'BF16': 73, 'I8': 192, 'U8': 192}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "qwen3vl_8b_int8_convrot.safetensors: header: {'F32': 254, 'BF16': 496, 'I8': 254, 'U8': 254}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'BF16': 238} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "qwen_image_2.1_int8_convrot.safetensors": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "file": "transformer/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group q21 --only dit",
+      "fetch_repo": "unsloth/Qwen-Image-2.1",
+      "tool": "Bline-Org/bline-model-tools quant_int8_convrot.py (GitHub)"
+     },
+     "qwen3vl_8b_int8_convrot.safetensors": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "file": "text_encoder/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group q21 --only te",
+      "fetch_repo": "unsloth/Qwen-Image-2.1"
+     },
+     "qwen_image_2.1_vae_bf16.safetensors": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "file": "vae/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group q21 --only vae",
+      "fetch_repo": "unsloth/Qwen-Image-2.1"
+     }
+    }
+   },
+   "source": "template file (Bline-Org int8 ConvRot); Studio auto picks hosted INT8 ConvRot where gated in (sm_100+; tester's Ada resolved it too: settings_audit_nov10/qwen.md A)",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "fp8": {
+   "studio": {
+    "model_path": "Qwen/Qwen-Image-2.1",
+    "transformer_quant": "fp8",
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "format fp8: transformer_quant='fp8'"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df qwen-image-2.1: te_quant_auto int8"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "Qwen/Qwen-Image-2.1": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "Qwen-Image-2.1-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/Qwen-Image-2.1-FP8",
+      "file": "Qwen-Image-2.1-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "0cb5ed0653e2ec8065f25a6cfb2ab6a89b6c8f143a500acea19f0e36214814b7",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "qwen_image_2.1_bf16.safetensors",
+     "te": "qwen3vl_8b_int8_convrot.safetensors",
+     "vae": "qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp8_e4m3fn",
+      "compute": "fp8",
+      "evidence": "header: {'BF16': 265} (name token confirmed by the header); unet_manual_cast over ['bf16']; UNETLoader weight_dtype fp8_e4m3fn_fast casts at load; _fast = fp8 matmul"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "qwen3vl_8b_int8_convrot.safetensors: header: {'F32': 254, 'BF16': 496, 'I8': 254, 'U8': 254}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'BF16': 238} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "qwen_image_2.1_bf16.safetensors": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "file": "transformer/",
+      "build": "scripts/imgcmp_nov5/build_q5.py --group q21 --roles dit_bf16",
+      "fetch_repo": "unsloth/Qwen-Image-2.1"
+     },
+     "qwen3vl_8b_int8_convrot.safetensors": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "file": "text_encoder/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group q21 --only te",
+      "fetch_repo": "unsloth/Qwen-Image-2.1"
+     },
+     "qwen_image_2.1_vae_bf16.safetensors": {
+      "repo": "Qwen/Qwen-Image-2.1",
+      "file": "vae/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group q21 --only vae",
+      "fetch_repo": "unsloth/Qwen-Image-2.1"
+     }
+    }
+   },
+   "source": "bf16 file + weight_dtype fp8_e4m3fn_fast (r5 configs q_fp8fast)",
+   "bline_weight_dtype": "fp8_e4m3fn_fast",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "gguf": {
+   "studio": {
+    "model_path": "unsloth/Qwen-Image-2.1-GGUF",
+    "gguf_filename": "qwen-image-2.1-Q4_K_M.gguf",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "gguf:Q4_K_M",
+      "compute": "bf16",
+      "evidence": "GGUF weights dequantized per layer (Studio GGUF kept / sd.cpp)"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df qwen-image-2.1: te_quant_auto int8"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "qwen-image-2.1-Q4_K_M.gguf": {
+      "repo": "unsloth/Qwen-Image-2.1-GGUF",
+      "file": "qwen-image-2.1-Q4_K_M.gguf",
+      "build": null
+     },
+     "Qwen-Image-2.1-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/Qwen-Image-2.1-FP8",
+      "file": "Qwen-Image-2.1-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "0cb5ed0653e2ec8065f25a6cfb2ab6a89b6c8f143a500acea19f0e36214814b7",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": null,
+   "source": "unsloth GGUF; BlineUI-GGUF needs a general.architecture key added (image_vs_bline_nov5 Setup)",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "Qwen/Qwen-Image-2.1"
+  },
+  "gen": {
+   "steps": 25,
+   "guidance": 1.0,
+   "reference": "<image>",
+   "width": "<reference width, 32-rounded>",
+   "height": "<reference height, 32-rounded>"
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "enhancer_off",
+   "check": "enhancer_off",
+   "note": "The template ships a prompt enhancer / upsampler; benchmarks switch it off on the baseline UI arm and send the raw prompt to both stacks."
+  },
+  {
+   "id": "t4_fp16",
+   "check": "fp16_only_dtype",
+   "note": "On an fp16-only card (T4, sm75) the stacks resolve different compute dtypes (Studio fp16 or fp32 promote; the baseline UI fp32 for Qwen / Ideogram, fp16 first for Wan / HV1.5); record the resolved dtype per stack (bline_defaults_audit.md 'dtype on fp16-only GPUs')."
+  },
+  {
+   "id": "guidance_meaning",
+   "check": "guidance_semantics",
+   "note": "Studio gen.guidance 1.0 = true CFG off (no uncond pass) = the template's cfg 1; Qwen-Image (original / 2512 / edit 2511) runs true CFG 4 on both stacks once a negative (even empty) is encoded (bline_defaults_audit.md qwen rows)."
+  },
+  {
+   "id": "png_compression",
+   "check": "png_compress_equal",
+   "note": "Edit references must be the same PNG bytes on both stacks; Studio saved PNGs at compress level 1, the baseline UI's SaveImage at 4 (a confound in the Nov 9 edit lead: quant_research_nov12/A_history_GOAL_DETAILS_frozen.md:293,318)."
+  },
+  {
+   "id": "new_reference_per_render",
+   "check": "new_reference_per_render",
+   "note": "Use a NEW reference image per timed edit render: a reused one hits Studio's reference-latent cache (same history file, line 318)."
+  },
+  {
+   "id": "edit_size",
+   "check": "resolution_equal",
+   "note": "Template resolution 0: each reference keeps its own size (rounded to 32) and the output latent is the first reference's size (TextEncodeQwenImage21 output 2). Studio by default resizes to ~1 MP (match_source_size): the request must pin the reference's size, or use ~1 MP references so both agree (qwen.md C)."
+  }
+ ],
+ "sources": [
+  "outputs/settings_audit_nov10/qwen.md#C",
+  "outputs/settings_audit_nov10/qwen.md#E",
+  "outputs/bline_r5_nov17/archive/bench.py#WORKLOADS#Q3",
+  "outputs/bline_r5_nov17/archive/bench.py#bline_graph_*#bline_graph_qwen_edit",
+  "temp/settings_audit/workflow_templates/templates/image_qwen_image_2_1_image_edit.json"
+ ]
+}

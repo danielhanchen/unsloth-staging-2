@@ -1,0 +1,186 @@
+{
+ "family": "sdxl",
+ "kind": "image",
+ "aliases": [
+  "sdxl-base"
+ ],
+ "bline": {
+  "graph": "sdxl",
+  "template": "image_sdxl_simple.json",
+  "template_sha": "81a56c815219946840d99c8a67401dba5d9fea37",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "checkpoint": "sd_xl_base_1.0.safetensors"
+  },
+  "shift_in_graph": true
+ },
+ "defaults": {
+  "steps": 25,
+  "cfg": 7.0,
+  "sampler": "dpmpp_2m",
+  "scheduler": "karras",
+  "shift": null,
+  "width": 1024,
+  "height": 1024,
+  "frames": null,
+  "fps": null,
+  "negative": "color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, text, logo, signature\n",
+  "enhancer": false
+ },
+ "expected_passes": "steps * (2 if cfg > 1 else 1)",
+ "formats": {
+  "fp16": {
+   "studio": {
+    "model_path": "stabilityai/stable-diffusion-xl-base-1.0",
+    "precision": {
+     "transformer": {
+      "weights": "fp16",
+      "compute": null,
+      "evidence": "SDXL repo weights fp16; Studio compute dtype not traced"
+     },
+     "text_encoder": {
+      "weights": "fp16",
+      "compute": null,
+      "evidence": "SDXL repo CLIP fp16; Studio compute dtype not traced"
+     },
+     "vae": {
+      "weights": "fp16",
+      "compute": null,
+      "evidence": "SDXL repo VAE fp16; Studio compute dtype not traced"
+     }
+    },
+    "sources": {
+     "stabilityai/stable-diffusion-xl-base-1.0": {
+      "repo": "stabilityai/stable-diffusion-xl-base-1.0",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "checkpoint": "sd_xl_base_1.0.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "header: {'F16': 2515}; unet_manual_cast over ['fp16', 'bf16']"
+     },
+     "vae": {
+      "weights": "fp16",
+      "compute": "bf16",
+      "evidence": "VAE inside the checkpoint (header {'F16': 2515}; LTX quant metadata covers the transformer only; SDXL checkpoints are all F16); bline/sd.py default VAE working_dtypes [bf16, fp32] (LTX: bf16)"
+     },
+     "text_encoder": {
+      "weights": "fp16",
+      "compute": null,
+      "evidence": "CLIP-L/G inside the checkpoint; compute not traced"
+     }
+    },
+    "sources": {
+     "sd_xl_base_1.0.safetensors": {
+      "repo": "stabilityai/stable-diffusion-xl-base-1.0",
+      "file": "sd_xl_base_1.0.safetensors",
+      "build": null,
+      "sha256": "31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b"
+     }
+    }
+   },
+   "source": "the template checkpoint",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "stabilityai/stable-diffusion-xl-base-1.0"
+  },
+  "gen": {
+   "steps": 25,
+   "guidance": 7.0,
+   "sampler": "dpmpp_2m",
+   "schedule_type": "karras"
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "cfg_batch_rows",
+   "check": "cfg_batch_rows",
+   "note": "CFG > 1: Studio may run cond + uncond as ONE batch-2 forward (diffusion_cfg_batch) where the baseline UI runs two; evaluation counts are per sample row, so a forward-call hook undercounts Studio by 2x (settings_audit_nov10/flux.md, 'Not verified')."
+  },
+  {
+   "id": "t4_fp16",
+   "check": "fp16_only_dtype",
+   "note": "On an fp16-only card (T4, sm75) the stacks resolve different compute dtypes (Studio fp16 or fp32 promote; the baseline UI fp32 for Qwen / Ideogram, fp16 first for Wan / HV1.5); record the resolved dtype per stack (bline_defaults_audit.md 'dtype on fp16-only GPUs')."
+  },
+  {
+   "id": "sampler",
+   "check": "settings_equal",
+   "note": "Template dpmpp_2m / karras; Studio is asked for the same pair (studio.gen sampler dpmpp_2m, schedule_type karras: diffusion_sampler.SAMPLERS / _AUTOMATIC_FOR), so the settings check compares like with like (Studio's 'Model default' would run Euler, others.md SDXL row)."
+  },
+  {
+   "id": "negative",
+   "check": "settings_equal",
+   "note": "Template ships a long negative; Studio none by default."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "transformer",
+    "text_encoder",
+    "vae"
+   ],
+   "formats": [
+    "fp16"
+   ],
+   "note": "single fp16 checkpoint on both; Studio compute not traced"
+  }
+ ],
+ "sources": [
+  "outputs/bline_defaults_audit.md#sdxl",
+  "outputs/settings_audit_nov10/others.md#SDXL base",
+  "temp/settings_audit/workflow_templates/templates/image_sdxl_simple.json"
+ ]
+}

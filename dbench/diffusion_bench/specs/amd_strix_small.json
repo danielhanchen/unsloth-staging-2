@@ -1,0 +1,666 @@
+{
+ "name": "amd_strix_small",
+ "description": "Small models on the AMD Strix Halo gfx1151 CI (Radeon 8060S, 64 GiB unified, ROCm 7.13 torch 2.11 from repo.amd.com/rocm/whl/gfx1151). Run by amd/diffusion_probe.py once per state (base / head), in the Studio venv the job installed (Linux) or the venv the probe builds (Windows). Studio never compiles on ROCm (inductor _alloc_from_pool fails for every arm), so speed_mode default is eager there and quant arms are native weight-only (PR 11631, no torchao on Windows). Tiers run in order: tiny_* first (hf-internal-testing random pipelines, 1 to 56 MB downloads, seconds per cell: plumbing only, judged on broken / newly flagged, never on pixels or timing), then the small real models (sdxlt_* zimg_* wan_*), which the probe selects by default; heavy_* cells are opt-in (--only 'heavy_*') because one Qwen-Image-2.1 1024 image costs 180-270 s warm and ~1000 s cold on this APU. Public, ungated weights only: the runner never gets an HF token.",
+ "models": {
+  "sdxl_turbo": {
+   "repo": "stabilityai/sdxl-turbo",
+   "local": "$WORKSPACE/sdxl_turbo_base",
+   "download": {
+    "ignore": [
+     "*.bin",
+     "*.onnx",
+     "*.onnx_data",
+     "*.msgpack",
+     "*.ckpt",
+     "*.fp16.safetensors",
+     "sd_xl_turbo_1.0*.safetensors",
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  },
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "local": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.webp",
+     "assets/*"
+    ]
+   }
+  },
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "local": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.gif",
+     "*.mp4",
+     "assets/*",
+     "examples/*"
+    ]
+   }
+  },
+  "qwen_image_21": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
+   "local": "$WORKSPACE/temp/qwen_image_21",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  },
+  "tiny_flux_pipe": {
+   "repo": "hf-internal-testing/tiny-flux-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-flux-pipe"
+  },
+  "tiny_qwenimage21_pipe": {
+   "repo": "hf-internal-testing/tiny-qwenimage21-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-qwenimage21-pipe"
+  },
+  "tiny_qwenimage_pipe": {
+   "repo": "hf-internal-testing/tiny-qwenimage-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-qwenimage-pipe"
+  },
+  "tiny_stable_diffusion_xl_pipe": {
+   "repo": "hf-internal-testing/tiny-stable-diffusion-xl-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-stable-diffusion-xl-pipe"
+  },
+  "tiny_lumina2_pipe": {
+   "repo": "hf-internal-testing/tiny-lumina2-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-lumina2-pipe"
+  },
+  "tiny_wan_pipe": {
+   "repo": "hf-internal-testing/tiny-wan-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-wan-pipe"
+  },
+  "tiny_zimage_pipe": {
+   "repo": "hf-internal-testing/tiny-zimage-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-zimage-pipe"
+  },
+  "tiny_sd3_pipe": {
+   "repo": "hf-internal-testing/tiny-sd3-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-sd3-pipe"
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "kind": "image",
+  "prompts": "image_24",
+  "n": 3,
+  "warmup": 1,
+  "short_n": 1,
+  "options": {
+   "speed_mode": "default",
+   "memory_mode": "auto",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 15,
+  "min_free_mib": 0,
+  "timeout_s": 600
+ },
+ "baseline": {
+  "source": "diffusion_bench_knowledge.md section 1.8 (Linux run 35811714004, Windows runs of amd-ci-q21-quant-win, PR 11631, PR 11713, PR 11737)",
+  "qwen21_1024_20step_linux": {
+   "bf16_s_per_step": 20.81,
+   "bf16_peak_gib": 38.68,
+   "bf16_repeat_lpips": 0.0,
+   "int8_native_weight_speed_x": 0.94,
+   "int8_native_weight_lpips": 0.101,
+   "fp8_native_weight_speed_x": 0.94,
+   "fp8_native_weight_lpips": 0.147,
+   "gguf_q4_k_m_speed_x": 0.93,
+   "gguf_q4_k_m_lpips": 0.194,
+   "metric": "LPIPS alex vs same-run bf16, 2 prompts"
+  },
+  "qwen21_windows": {
+   "bf16_s_per_step": 25.7,
+   "te_fp8_speed_x": 1.3
+  },
+  "pr11631_studio_int8": {
+   "resident_gib": 6.76,
+   "lpips_linux": 0.092,
+   "lpips_windows": 0.127
+  },
+  "pr11713_fbcache_linux": {
+   "ref_s_per_image_cold_warm": [
+    1021.9,
+    219.5
+   ],
+   "fbcache_s_per_image_cold_warm": [
+    174.3,
+    176.4
+   ],
+   "lpips": "0.005-0.007",
+   "psnr_db": "40-44"
+  },
+  "pr11737_static_linux": {
+   "ref_s_per_image": 270.8,
+   "static_s_per_image": "176.9-190.1",
+   "lpips": "0.006 / 0.019"
+  },
+  "gemm_4096_cubed": {
+   "fp16_tflops": 33.25,
+   "bf16_tflops": 28.19,
+   "int8_int_mm_tops": 29.61,
+   "fp8_scaled_mm": "refused (MI300+ only)"
+  },
+  "cfg_note": "The past Qwen-Image-2.1 AMD arms ran true_cfg 4.0 with negative prompt \" \" (two forwards per step); the heavy_q21_* cells here run CFG 1 like every other harness, so compare their s/step with half the 20.81 figure at most, and treat it as a new baseline.",
+  "notes": "No small-model (SDXL-Turbo / Z-Image / Wan 5B) numbers exist from past AMD runs: the first run of this spec is the baseline. Unified memory is not returned promptly after unload, so one cell per process matters even more here.",
+  "tiny_note": "tiny cells have no baseline by design: every cell ok with no new sanity flag is the pass"
+ },
+ "daily_tags": [
+  "tiny_flux",
+  "tiny_flux_repeat",
+  "tiny_flux_int8",
+  "tiny_flux_fp8",
+  "tiny_q21",
+  "tiny_q21_int8",
+  "tiny_q21_lowvram",
+  "tiny_q21_fbcache",
+  "tiny_qwenimage_cfg",
+  "tiny_sdxl",
+  "tiny_lumina2",
+  "tiny_wan",
+  "tiny_wan_lowvram",
+  "tiny_d_zimage",
+  "tiny_d_sd3",
+  "sdxlt_bf16",
+  "zimg_bf16",
+  "zimg_int8"
+ ],
+ "cells": [
+  {
+   "tag": "tiny_flux",
+   "tier": "tiny",
+   "model": "@tiny_flux_pipe",
+   "ref": "tiny_flux",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_flux_repeat",
+   "tier": "tiny",
+   "model": "@tiny_flux_pipe",
+   "ref": "tiny_flux",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "note": "determinism / noise floor: same cell, new process",
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_flux_int8",
+   "tier": "tiny",
+   "model": "@tiny_flux_pipe",
+   "ref": "tiny_flux",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off",
+    "transformer_quant": "int8"
+   }
+  },
+  {
+   "tag": "tiny_flux_fp8",
+   "tier": "tiny",
+   "model": "@tiny_flux_pipe",
+   "ref": "tiny_flux",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off",
+    "transformer_quant": "fp8"
+   }
+  },
+  {
+   "tag": "tiny_q21",
+   "tier": "tiny",
+   "model": "@tiny_qwenimage21_pipe",
+   "ref": "tiny_q21",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_q21_int8",
+   "tier": "tiny",
+   "model": "@tiny_qwenimage21_pipe",
+   "ref": "tiny_q21",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "off",
+    "transformer_quant": "int8"
+   }
+  },
+  {
+   "tag": "tiny_q21_lowvram",
+   "tier": "tiny",
+   "model": "@tiny_qwenimage21_pipe",
+   "ref": "tiny_q21",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "off",
+    "transformer_quant": "none",
+    "memory_mode": "low_vram"
+   }
+  },
+  {
+   "tag": "tiny_q21_fbcache",
+   "tier": "tiny",
+   "model": "@tiny_qwenimage21_pipe",
+   "ref": "tiny_q21_fbcache",
+   "width": 256,
+   "height": 256,
+   "steps": 12,
+   "short_steps": 4,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "note": "engagement canary: read status.transformer_cache (it did NOT engage on the tiny model with the wt_offload_pin tree)",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "off",
+    "transformer_quant": "none",
+    "transformer_cache": "fbcache"
+   }
+  },
+  {
+   "tag": "tiny_qwenimage_cfg",
+   "tier": "tiny",
+   "model": "@tiny_qwenimage_pipe",
+   "ref": "tiny_qwenimage_cfg",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 4.0,
+   "n": 2,
+   "short_n": 1,
+   "note": "true-CFG path (two forwards per step)",
+   "options": {
+    "family_override": "qwen-image",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_sdxl",
+   "tier": "tiny",
+   "model": "@tiny_stable_diffusion_xl_pipe",
+   "ref": "tiny_sdxl",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "sdxl",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_lumina2",
+   "tier": "tiny",
+   "model": "@tiny_lumina2_pipe",
+   "ref": "tiny_lumina2",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 4.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "lumina-2",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_wan",
+   "tier": "tiny",
+   "model": "@tiny_wan_pipe",
+   "ref": "tiny_wan",
+   "width": 64,
+   "height": 64,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 9,
+   "save_frames_every": 1
+  },
+  {
+   "tag": "tiny_wan_lowvram",
+   "tier": "tiny",
+   "model": "@tiny_wan_pipe",
+   "ref": "tiny_wan",
+   "width": 64,
+   "height": 64,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "speed_mode": "off",
+    "transformer_quant": "none",
+    "memory_mode": "low_vram"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 9,
+   "save_frames_every": 1
+  },
+  {
+   "tag": "tiny_d_zimage",
+   "tier": "tiny",
+   "model": "@tiny_zimage_pipe",
+   "ref": "tiny_d_zimage",
+   "width": 64,
+   "height": 64,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {},
+   "backend": "diffusers",
+   "note": "diffusers backend: Studio refuses images under 256 px and tiny Z-Image's rope (axes_lens 32) overflows at 256 (CUDA device assert)"
+  },
+  {
+   "tag": "tiny_d_sd3",
+   "tier": "tiny",
+   "model": "@tiny_sd3_pipe",
+   "ref": "tiny_d_sd3",
+   "width": 64,
+   "height": 64,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {},
+   "backend": "diffusers",
+   "note": "no Studio family for SD3; diffusers backend keeps a second framework in the plumbing tier"
+  },
+  {
+   "tag": "sdxlt_bf16",
+   "model": "@sdxl_turbo",
+   "ref": "sdxlt_bf16",
+   "width": 512,
+   "height": 512,
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "sdxl",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "zimg_bf16",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16",
+   "width": 512,
+   "height": 512,
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "z-image",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   }
+  },
+  {
+   "tag": "zimg_bf16_repeat",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16",
+   "width": 512,
+   "height": 512,
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "z-image",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none"
+   },
+   "note": "noise floor: the same cell again in a new process; past AMD bf16 repeats were LPIPS 0"
+  },
+  {
+   "tag": "zimg_speed_off",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16",
+   "width": 512,
+   "height": 512,
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "z-image",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "speed_mode": "off"
+   },
+   "note": "no eager patches, no cudnn.benchmark: the bit-identity reference (rule 21)"
+  },
+  {
+   "tag": "zimg_int8",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16",
+   "width": 512,
+   "height": 512,
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "z-image",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "none"
+   }
+  },
+  {
+   "tag": "zimg_fp8",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16",
+   "width": 512,
+   "height": 512,
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "z-image",
+    "transformer_quant": "fp8",
+    "text_encoder_quant": "none"
+   },
+   "note": "gfx1151 has no fp8 _scaled_mm, so this is Studio's weight-only fp8 path; an explicit scheme fails closed rather than falling back"
+  },
+  {
+   "tag": "zimg_int8_te_fp8",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16",
+   "width": 512,
+   "height": 512,
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "z-image",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "fp8"
+   }
+  },
+  {
+   "tag": "wan_bf16",
+   "model": "@wan22_5b",
+   "ref": "wan_bf16",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "width": 480,
+   "height": 320,
+   "frames": 9,
+   "fps": null,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": null,
+   "save_frames_every": 1,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_quant": "none"
+   },
+   "note": "the video gate's SMOKE grid (480x320x9 at 4 steps)"
+  },
+  {
+   "tag": "heavy_q21_bf16",
+   "model": "@qwen_image_21",
+   "ref": "heavy_q21_bf16",
+   "width": 1024,
+   "height": 1024,
+   "steps": 20,
+   "short_steps": 0,
+   "n": 2,
+   "guidance": 1.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "heavy_q21_int8",
+   "model": "@qwen_image_21",
+   "ref": "heavy_q21_bf16",
+   "width": 1024,
+   "height": 1024,
+   "steps": 20,
+   "short_steps": 0,
+   "n": 2,
+   "guidance": 1.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "int8"
+   }
+  },
+  {
+   "tag": "heavy_q21_fbcache",
+   "model": "@qwen_image_21",
+   "ref": "heavy_q21_bf16",
+   "width": 1024,
+   "height": 1024,
+   "steps": 20,
+   "short_steps": 0,
+   "n": 2,
+   "guidance": 1.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "none",
+    "transformer_cache": "fbcache"
+   }
+  },
+  {
+   "tag": "heavy_q21_static",
+   "model": "@qwen_image_21",
+   "ref": "heavy_q21_bf16",
+   "width": 1024,
+   "height": 1024,
+   "steps": 20,
+   "short_steps": 0,
+   "n": 2,
+   "guidance": 1.0,
+   "options": {
+    "model_kind": "pipeline",
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "none",
+    "transformer_cache": "static"
+   }
+  }
+ ]
+}

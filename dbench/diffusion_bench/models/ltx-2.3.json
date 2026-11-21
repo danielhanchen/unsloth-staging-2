@@ -1,0 +1,315 @@
+{
+ "family": "ltx-2.3",
+ "kind": "video",
+ "aliases": [
+  "ltx23"
+ ],
+ "bline": {
+  "graph": "ltx-2.3",
+  "template": "video_ltx2_3_t2v.json",
+  "template_sha": "4786f08094e63093ad7bb7a2836f56d00c00e744",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "checkpoint": "ltx-2.3-22b-dev-fp8.safetensors",
+   "te": "gemma_3_12B_it_fp4_mixed.safetensors",
+   "lora": "ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors"
+  },
+  "shift_in_graph": true,
+  "alt_graphs": [
+   "ltx-2.3-dev (single stage, dev checkpoint, LTXVScheduler + CFG 4: Studio's ltx-2 dev route; non-default extra arm, cell sets steps 40 / cfg 4 / 768x512 / fps 24)"
+  ]
+ },
+ "defaults": {
+  "steps": 8,
+  "cfg": 1.0,
+  "sampler": "euler",
+  "scheduler": null,
+  "shift": null,
+  "width": 1280,
+  "height": 704,
+  "frames": 121,
+  "fps": 25,
+  "negative": "pc game, console game, video game, cartoon, childish, ugly",
+  "enhancer": false,
+  "stage2_sigmas": 3,
+  "lora_strength": 0.5
+ },
+ "expected_passes": "steps + stage2_sigmas",
+ "formats": {
+  "fp8": {
+   "studio": {
+    "model_path": "Lightricks/LTX-2",
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "format fp8: transformer_quant=None"
+     },
+     "text_encoder": {
+      "weights": "fp8",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df ltx-2: te_quant_auto fp8 (layerwise fp8: stored fp8, computed bf16)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "Lightricks/LTX-2": {
+      "repo": "Lightricks/LTX-2",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "checkpoint": "ltx-2.3-22b-dev-fp8.safetensors",
+     "te": "gemma_3_12B_it_fp4_mixed.safetensors",
+     "lora": "ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors",
+     "upscaler": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "header: {'F32': 3282, 'BF16': 4161, 'F8_E4M3': 1496}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "fp4_mixed",
+      "compute": "mixed(fp4/fp8)",
+      "evidence": "gemma_3_12B_it_fp4_mixed.safetensors: header: {'F32': 338, 'BF16': 727, 'F8_E4M3': 336, 'U8': 639}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "VAE inside the checkpoint (header {'F32': 3282, 'BF16': 4161, 'F8_E4M3': 1496}; LTX quant metadata covers the transformer only; SDXL checkpoints are all F16); bline/sd.py default VAE working_dtypes [bf16, fp32] (LTX: bf16)"
+     }
+    },
+    "sources": {
+     "ltx-2.3-22b-dev-fp8.safetensors": {
+      "repo": "Lightricks/LTX-2.3-fp8",
+      "file": "ltx-2.3-22b-dev-fp8.safetensors",
+      "build": null
+     },
+     "gemma_3_12B_it_fp4_mixed.safetensors": {
+      "source": null,
+      "reason": "the fp4_mixed Gemma 3 recipe is not public; only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors": {
+      "source": null,
+      "reason": "the template's rank-111 distilled LoRA is a Bline-Org re-rank; only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet. Official alternative: Lightricks/LTX-2.3 ltx-2.3-22b-distilled-lora-384-1.1.safetensors (rank 384, a different file)"
+     },
+     "ltx-2.3-spatial-upscaler-x2-1.1.safetensors": {
+      "repo": "Lightricks/LTX-2.3",
+      "file": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+      "build": null
+     }
+    }
+   },
+   "source": "template: fp8 dev checkpoint + distilled 1.1 LoRA at 0.5 + fp4_mixed Gemma 3 TE; x2 spatial upscaler ltx-2.3-spatial-upscaler-x2-1.1 placed in BlineUI's latent_upscale_models",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "bf16": {
+   "studio": {
+    "model_path": "Lightricks/LTX-2",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format bf16: transformer_quant='none'"
+     },
+     "text_encoder": {
+      "weights": "fp8",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df ltx-2: te_quant_auto fp8 (layerwise fp8: stored fp8, computed bf16)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "Lightricks/LTX-2": {
+      "repo": "Lightricks/LTX-2",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "checkpoint": "ltx-2.3-22b-dev.safetensors",
+     "te": "gemma_3_12B_it.safetensors",
+     "lora": "ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors",
+     "upscaler": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'F32': 290, 'BF16': 5657}; unet_manual_cast over ['bf16']"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": null,
+      "evidence": "gemma_3_12B_it.safetensors: header: {'BF16': 1065, 'U8': 1}; compute of non-quantized TEs not traced (CLIP dtype logic is per model)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "VAE inside the checkpoint (header {'F32': 290, 'BF16': 5657}; LTX quant metadata covers the transformer only; SDXL checkpoints are all F16); bline/sd.py default VAE working_dtypes [bf16, fp32] (LTX: bf16)"
+     }
+    },
+    "sources": {
+     "ltx-2.3-22b-dev.safetensors": {
+      "repo": "Lightricks/LTX-2.3",
+      "file": "ltx-2.3-22b-dev.safetensors",
+      "build": null
+     },
+     "gemma_3_12B_it.safetensors": {
+      "source": null,
+      "reason": "Bline-Org's single-file split of google/gemma-3-12b-it; no builder from the official (gated) Google repo exists yet"
+     },
+     "ltx_2.3_22b_distilled_1.1_lora_dynamic_fro09_avg_rank_111_bf16.safetensors": {
+      "source": null,
+      "reason": "the template's rank-111 distilled LoRA is a Bline-Org re-rank; only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet. Official alternative: Lightricks/LTX-2.3 ltx-2.3-22b-distilled-lora-384-1.1.safetensors (rank 384, a different file)"
+     },
+     "ltx-2.3-spatial-upscaler-x2-1.1.safetensors": {
+      "repo": "Lightricks/LTX-2.3",
+      "file": "ltx-2.3-spatial-upscaler-x2-1.1.safetensors",
+      "build": null
+     }
+    }
+   },
+   "source": "Lightricks/LTX-2.3 bf16 checkpoint + Bline-Org/ltx-2 split gemma_3_12B_it",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "Lightricks/LTX-2"
+  },
+  "gen": {
+   "steps": 8,
+   "guidance": 1.0,
+   "width": 1280,
+   "height": 704,
+   "num_frames": 121,
+   "fps": 25
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "cfg_batch_rows",
+   "check": "cfg_batch_rows",
+   "note": "CFG > 1: Studio may run cond + uncond as ONE batch-2 forward (diffusion_cfg_batch) where the baseline UI runs two; evaluation counts are per sample row, so a forward-call hook undercounts Studio by 2x (settings_audit_nov10/flux.md, 'Not verified')."
+  },
+  {
+   "id": "t4_fp16",
+   "check": "fp16_only_dtype",
+   "note": "On an fp16-only card (T4, sm75) the stacks resolve different compute dtypes (Studio fp16 or fp32 promote; the baseline UI fp32 for Qwen / Ideogram, fp16 first for Wan / HV1.5); record the resolved dtype per stack (bline_defaults_audit.md 'dtype on fp16-only GPUs')."
+  },
+  {
+   "id": "video_save",
+   "check": null,
+   "note": "Video graphs end in CreateVideo -> SaveVideo (the templates' MP4 export, encode time included). Until the blineui backend passes fps and decodes MP4 (agent B's port), set graph_extra.video_save 'frames' (SaveImage on the same frames). Record which one ran; the MP4 encode is part of what a baseline-UI user waits for."
+  },
+  {
+   "id": "studio_single_stage",
+   "check": "passes_equal",
+   "note": "The template runs 8 half-size + 3 full-size passes (11) with the dev model + distilled LoRA 0.5. Studio's ltx-2 family has no two-stage LTX-2.3 route: its distilled checkpoint runs 8 passes single stage (default 768x512 @ 24), its dev checkpoint 40 steps CFG 4 with STG / modality guidance. Matching Studio to the template needs a two-stage route in Studio; until then an LTX-2.3 pair is VOID on passes (settings_audit_nov10/ltx.md 1b, SUMMARY A.3)."
+  },
+  {
+   "id": "stage2_seed",
+   "check": null,
+   "note": "The template's stage-2 RandomNoise is fixed at 42 (stage 1 takes the seed); graph_extra.stage2_seed overrides it."
+  },
+  {
+   "id": "te_lora_enhancer_only",
+   "check": null,
+   "note": "The abliterated Gemma LoRA in the template feeds only the prompt enhancer (off), not the conditioning; the audit's 'TE + LoRA 1.0' row does not apply with the enhancer off."
+  },
+  {
+   "id": "fps_25",
+   "check": "settings_equal",
+   "note": "Template 5 s @ 25 fps (length 126 -> 121 latent frames, 1280x720 -> 1280x704 output); Studio's ltx-2 family defaults to 24 fps: pin fps 25."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "text_encoder"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "template Gemma 3 TE is fp4_mixed; Studio te_quant_auto fp8 (layerwise)"
+  }
+ ],
+ "sources": [
+  "outputs/settings_audit_nov10/ltx.md#1b",
+  "outputs/settings_audit_nov10/SUMMARY.md#A.3",
+  "outputs/bline_defaults_audit.md#LTX-2.3 distilled",
+  "temp/settings_audit/workflow_templates/templates/video_ltx2_3_t2v.json"
+ ]
+}

@@ -1,0 +1,28 @@
+{
+ "name": "studio_memory_modes",
+ "description": "Speed and footprint of Studio's memory policies on small models, in process: fast (resident) vs balanced vs low_vram (whole-model offload), image and video. Outputs should be bit-identical across modes at speed_mode off; the scorer compares against the fast cell.",
+ "defaults": {
+  "venv": {"profile": "studio"},
+  "prompts": "image_24", "n": 4, "warmup": 1, "short_n": 2,
+  "options": {"speed_mode": "off"}
+ },
+ "gate": {"max_util": 30, "min_free_mib": 40000, "timeout_s": 600},
+ "reference": {"studio": "zimg_fast"},
+ "cells": [
+  {"tag": "zimg_fast", "backend": "studio", "model": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo",
+   "width": 768, "height": 768, "steps": 8, "short_steps": 2, "guidance": 0.0,
+   "options": {"family_override": "z-image", "memory_mode": "fast"}},
+  {"tag": "zimg_balanced", "backend": "studio", "model": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo",
+   "width": 768, "height": 768, "steps": 8, "short_steps": 2, "guidance": 0.0,
+   "options": {"family_override": "z-image", "memory_mode": "balanced"}},
+  {"tag": "zimg_low_vram", "backend": "studio", "model": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo",
+   "width": 768, "height": 768, "steps": 8, "short_steps": 2, "guidance": 0.0,
+   "options": {"family_override": "z-image", "memory_mode": "low_vram"}},
+  {"tag": "wan5b_fast", "backend": "studio", "kind": "video", "model": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "prompts": "video_3", "n": 2, "width": 480, "height": 320, "frames": 17, "fps": 16, "steps": 6, "short_steps": 2,
+   "guidance": 1.0, "short_n": 1, "options": {"family_override": "wan2.2-ti2v-5b", "memory_mode": "fast"}},
+  {"tag": "wan5b_low_vram", "backend": "studio", "kind": "video", "model": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "prompts": "video_3", "n": 2, "width": 480, "height": 320, "frames": 17, "fps": 16, "steps": 6, "short_steps": 2,
+   "guidance": 1.0, "short_n": 1, "options": {"family_override": "wan2.2-ti2v-5b", "memory_mode": "low_vram"}}
+ ]
+}

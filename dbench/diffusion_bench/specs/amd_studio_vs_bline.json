@@ -1,0 +1,2922 @@
+{
+ "name": "amd_studio_vs_bline",
+ "description": "Generate specs/amd_studio_vs_bline.json: Unsloth Studio vs BlineUI on gfx1151, per family, same prompt / seed /\nsteps / size at BlineUI's template operating point (outputs/bline_defaults_audit.md; templates read from\nblineui_workflow_templates_json at the pinned BlineUI commit).\n\nArms per family (tag = <fam>_<arm>):\n  s_def     Studio, its defaults (attention auto -> diffusers native -> torch SDPA; AOTriton on ROCm)\n  s_flash   Studio with attention_backend=\"flash\" (DAO-AILab flash-attention, Triton AMD backend). On main the\n            ROCm gate drops the request (falls back to native); on the patched head it engages.\n  c_def     BlineUI, README ROCm install (download.pytorch.org/whl/rocm7.2 torch), default flags\n  c_rock    BlineUI, AMD gfx1151 torch (repo.amd.com/rocm/whl/gfx1151, the build Studio installs), default flags\n  c_flash   c_rock + --use-flash-attention (same DAO-AILab Triton AMD build) + --enable-dynamic-vram\n  c_kitchen c_rock + --use-ck-attention (Bline Kitchen INT8 attention, quantized) + --enable-dynamic-vram\n\nEvery BlineUI file is public (token=False); each family's Studio repo is public too (FLUX.1-schnell via the\nunsloth mirror, since black-forest-labs/FLUX.1-schnell is gated).\n",
+ "models": {
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.webp",
+     "assets/*"
+    ]
+   }
+  },
+  "bline_zimage": {
+   "repo": "Bline-Org/z_image_turbo",
+   "download": {
+    "allow": [
+     "split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+     "split_files/text_encoders/qwen_3_4b.safetensors",
+     "split_files/vae/ae.safetensors"
+    ]
+   }
+  },
+  "flux2_klein_4b": {
+   "repo": "black-forest-labs/FLUX.2-klein-4B",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  },
+  "bline_klein": {
+   "repo": "Bline-Org/vae-text-encorder-for-flux-klein-4b",
+   "download": {
+    "allow": [
+     "split_files/diffusion_models/flux-2-klein-4b.safetensors",
+     "split_files/text_encoders/qwen_3_4b.safetensors",
+     "split_files/vae/flux2-vae.safetensors"
+    ]
+   }
+  },
+  "sdxl_base": {
+   "repo": "stabilityai/stable-diffusion-xl-base-1.0",
+   "download": {
+    "ignore": [
+     "*.bin",
+     "*.onnx",
+     "*.onnx_data",
+     "*.msgpack",
+     "*.ckpt",
+     "*openvino*",
+     "sd_xl_base_1.0_0.9vae.safetensors",
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  },
+  "flux1_schnell": {
+   "repo": "unsloth/FLUX.1-schnell",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  },
+  "bline_flux_te": {
+   "repo": "blineanonymous/flux_text_encoders",
+   "download": {
+    "allow": [
+     "clip_l.safetensors",
+     "t5xxl_fp16.safetensors"
+    ]
+   }
+  },
+  "qwen_image_21": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg"
+    ]
+   }
+  },
+  "bline_q21": {
+   "repo": "Bline-Org/Qwen-Image-2.1",
+   "download": {
+    "allow": [
+     "diffusion_models/qwen_image_2.1_bf16.safetensors",
+     "text_encoders/qwen3vl_8b_bf16.safetensors",
+     "vae/qwen_image_2.1_vae_bf16.safetensors"
+    ]
+   }
+  },
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "download": {
+    "ignore": [
+     "*.png",
+     "*.jpg",
+     "*.gif",
+     "*.mp4",
+     "assets/*",
+     "examples/*"
+    ]
+   }
+  },
+  "bline_wan": {
+   "repo": "Bline-Org/Wan_2.2_BlineUI_Repackaged",
+   "download": {
+    "allow": [
+     "split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "split_files/text_encoders/umt5_xxl_fp16.safetensors",
+     "split_files/vae/wan2.2_vae.safetensors"
+    ]
+   }
+  },
+  "h3_gguf": {
+   "repo": "unsloth/MiniMax-H3-GGUF",
+   "download": {
+    "allow": [
+     "minimax_h3_fl2va_pruned-Q8_0.gguf",
+     "qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
+     "vae/*"
+    ]
+   }
+  },
+  "bline_h3": {
+   "repo": "Bline-Org/MiniMax-H3",
+   "download": {
+    "allow": [
+     "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+     "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+     "vae/minimax_h3_video_vae_int8_convrot.safetensors",
+     "vae/minimax_h3_audio_vae_fp32.safetensors"
+    ]
+   }
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "kind": "image",
+  "prompts": "image_24",
+  "n": 2,
+  "warmup": 1,
+  "short_n": 1,
+  "options": {
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 15,
+  "min_free_mib": 0,
+  "timeout_s": 600
+ },
+ "cells": [
+  {
+   "tag": "zimg_s_def",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, AuraFlow shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "zimg_s_flash",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, AuraFlow shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "zimg_s_eager",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, AuraFlow shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "eager"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   }
+  },
+  {
+   "tag": "zimg_s_defx",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_defx",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "note": "zimg_s_def with the unified-memory refusal bypassed, so the speed is measurable",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   }
+  },
+  {
+   "tag": "zimg_s_unset",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_off",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, AuraFlow shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   }
+  },
+  {
+   "tag": "zimg_s_off",
+   "backend": "studio",
+   "model": "@zimage_turbo",
+   "ref": "zimg_s_off",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, AuraFlow shift 3",
+   "options": {
+    "family_override": "z-image",
+    "model_kind": "pipeline",
+    "speed_mode": "off"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   }
+  },
+  {
+   "tag": "zimg_c_def",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "zimg_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, AuraFlow shift 3",
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/vae/ae.safetensors"
+    },
+    "cfg": 1.0
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_default/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_zimage"
+  },
+  {
+   "tag": "zimg_c_rock",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "zimg_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, AuraFlow shift 3",
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/vae/ae.safetensors"
+    },
+    "cfg": 1.0
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_zimage"
+  },
+  {
+   "tag": "zimg_c_flash",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "zimg_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, AuraFlow shift 3",
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/vae/ae.safetensors"
+    },
+    "cfg": 1.0,
+    "bline_args": "--use-flash-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "model": "@bline_zimage"
+  },
+  {
+   "tag": "zimg_c_kitchen",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "zimg_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 8,
+   "short_steps": 3,
+   "n": 2,
+   "guidance": 0.0,
+   "note": "image_z_image_turbo: 8 steps, CFG 1, res_multistep / simple, AuraFlow shift 3",
+   "options": {
+    "family": "z-image",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/diffusion_models/z_image_turbo_bf16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_ZIMAGE/split_files/vae/ae.safetensors"
+    },
+    "cfg": 1.0,
+    "bline_args": "--use-ck-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_zimage"
+  },
+  {
+   "tag": "klein_s_def",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "klein_s_flash",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "klein_s_eager",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "speed_mode": "eager"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   }
+  },
+  {
+   "tag": "klein_s_noflag",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1"
+   }
+  },
+  {
+   "tag": "klein_c_def",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family": "flux.2-klein",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_KLEIN/split_files/diffusion_models/flux-2-klein-4b.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_KLEIN/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_KLEIN/split_files/vae/flux2-vae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_default/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_klein"
+  },
+  {
+   "tag": "klein_c_rock",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family": "flux.2-klein",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_KLEIN/split_files/diffusion_models/flux-2-klein-4b.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_KLEIN/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_KLEIN/split_files/vae/flux2-vae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_klein"
+  },
+  {
+   "tag": "klein_c_flash",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family": "flux.2-klein",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_KLEIN/split_files/diffusion_models/flux-2-klein-4b.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_KLEIN/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_KLEIN/split_files/vae/flux2-vae.safetensors"
+    },
+    "bline_args": "--use-flash-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "model": "@bline_klein"
+  },
+  {
+   "tag": "klein_c_kitchen",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family": "flux.2-klein",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_KLEIN/split_files/diffusion_models/flux-2-klein-4b.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_KLEIN/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_KLEIN/split_files/vae/flux2-vae.safetensors"
+    },
+    "bline_args": "--use-ck-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_klein"
+  },
+  {
+   "tag": "sdxl_s_def",
+   "backend": "studio",
+   "model": "@sdxl_base",
+   "ref": "sdxl_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 2,
+   "guidance": 7.0,
+   "negative_prompt": "color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, text, logo, signature\n",
+   "note": "image_sdxl_simple: 25 steps, CFG 7, dpmpp_2m / karras (Studio samples Euler: known LIST item)",
+   "options": {
+    "family_override": "sdxl",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "sdxl_s_flash",
+   "backend": "studio",
+   "model": "@sdxl_base",
+   "ref": "sdxl_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 2,
+   "guidance": 7.0,
+   "negative_prompt": "color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, text, logo, signature\n",
+   "note": "image_sdxl_simple: 25 steps, CFG 7, dpmpp_2m / karras (Studio samples Euler: known LIST item)",
+   "options": {
+    "family_override": "sdxl",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "sdxl_c_def",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "sdxl_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 2,
+   "guidance": 7.0,
+   "negative_prompt": "color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, text, logo, signature\n",
+   "note": "image_sdxl_simple: 25 steps, CFG 7, dpmpp_2m / karras (Studio samples Euler: known LIST item)",
+   "options": {
+    "family": "sdxl",
+    "files": {
+     "checkpoint": "$DBENCH_MODEL_SDXL_BASE/sd_xl_base_1.0.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_default/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@sdxl_base"
+  },
+  {
+   "tag": "sdxl_c_rock",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "sdxl_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 2,
+   "guidance": 7.0,
+   "negative_prompt": "color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, text, logo, signature\n",
+   "note": "image_sdxl_simple: 25 steps, CFG 7, dpmpp_2m / karras (Studio samples Euler: known LIST item)",
+   "options": {
+    "family": "sdxl",
+    "files": {
+     "checkpoint": "$DBENCH_MODEL_SDXL_BASE/sd_xl_base_1.0.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@sdxl_base"
+  },
+  {
+   "tag": "sdxl_c_flash",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "sdxl_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 2,
+   "guidance": 7.0,
+   "negative_prompt": "color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, text, logo, signature\n",
+   "note": "image_sdxl_simple: 25 steps, CFG 7, dpmpp_2m / karras (Studio samples Euler: known LIST item)",
+   "options": {
+    "family": "sdxl",
+    "files": {
+     "checkpoint": "$DBENCH_MODEL_SDXL_BASE/sd_xl_base_1.0.safetensors"
+    },
+    "bline_args": "--use-flash-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "model": "@sdxl_base"
+  },
+  {
+   "tag": "sdxl_c_kitchen",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "sdxl_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 2,
+   "guidance": 7.0,
+   "negative_prompt": "color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, text, logo, signature\n",
+   "note": "image_sdxl_simple: 25 steps, CFG 7, dpmpp_2m / karras (Studio samples Euler: known LIST item)",
+   "options": {
+    "family": "sdxl",
+    "files": {
+     "checkpoint": "$DBENCH_MODEL_SDXL_BASE/sd_xl_base_1.0.safetensors"
+    },
+    "bline_args": "--use-ck-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@sdxl_base"
+  },
+  {
+   "tag": "flux1_s_def",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "flux1_s_flash",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "flux1_s_eager",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline",
+    "speed_mode": "eager"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   }
+  },
+  {
+   "tag": "flux1_c_def",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "flux1_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family": "flux.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_FLUX1_SCHNELL/flux1-schnell.safetensors",
+     "te": [
+      "$DBENCH_MODEL_BLINE_FLUX_TE/clip_l.safetensors",
+      "$DBENCH_MODEL_BLINE_FLUX_TE/t5xxl_fp16.safetensors"
+     ],
+     "vae": "$DBENCH_MODEL_FLUX1_SCHNELL/ae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_default/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_flux_te"
+  },
+  {
+   "tag": "flux1_c_rock",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "flux1_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family": "flux.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_FLUX1_SCHNELL/flux1-schnell.safetensors",
+     "te": [
+      "$DBENCH_MODEL_BLINE_FLUX_TE/clip_l.safetensors",
+      "$DBENCH_MODEL_BLINE_FLUX_TE/t5xxl_fp16.safetensors"
+     ],
+     "vae": "$DBENCH_MODEL_FLUX1_SCHNELL/ae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_flux_te"
+  },
+  {
+   "tag": "flux1_c_flash",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "flux1_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family": "flux.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_FLUX1_SCHNELL/flux1-schnell.safetensors",
+     "te": [
+      "$DBENCH_MODEL_BLINE_FLUX_TE/clip_l.safetensors",
+      "$DBENCH_MODEL_BLINE_FLUX_TE/t5xxl_fp16.safetensors"
+     ],
+     "vae": "$DBENCH_MODEL_FLUX1_SCHNELL/ae.safetensors"
+    },
+    "bline_args": "--use-flash-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "model": "@bline_flux_te"
+  },
+  {
+   "tag": "flux1_c_kitchen",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "flux1_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family": "flux.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_FLUX1_SCHNELL/flux1-schnell.safetensors",
+     "te": [
+      "$DBENCH_MODEL_BLINE_FLUX_TE/clip_l.safetensors",
+      "$DBENCH_MODEL_BLINE_FLUX_TE/t5xxl_fp16.safetensors"
+     ],
+     "vae": "$DBENCH_MODEL_FLUX1_SCHNELL/ae.safetensors"
+    },
+    "bline_args": "--use-ck-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_flux_te"
+  },
+  {
+   "tag": "q21_s_def",
+   "backend": "studio",
+   "model": "@qwen_image_21",
+   "ref": "q21_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "q21_s_flash",
+   "backend": "studio",
+   "model": "@qwen_image_21",
+   "ref": "q21_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "q21_c_def",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "q21_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_Q21/diffusion_models/qwen_image_2.1_bf16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_Q21/text_encoders/qwen3vl_8b_bf16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_Q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_default/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_q21"
+  },
+  {
+   "tag": "q21_c_rock",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "q21_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_Q21/diffusion_models/qwen_image_2.1_bf16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_Q21/text_encoders/qwen3vl_8b_bf16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_Q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_q21"
+  },
+  {
+   "tag": "q21_c_flash",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "q21_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_Q21/diffusion_models/qwen_image_2.1_bf16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_Q21/text_encoders/qwen3vl_8b_bf16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_Q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "bline_args": "--use-flash-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "model": "@bline_q21"
+  },
+  {
+   "tag": "q21_c_kitchen",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "q21_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_Q21/diffusion_models/qwen_image_2.1_bf16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_Q21/text_encoders/qwen3vl_8b_bf16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_Q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    },
+    "bline_args": "--use-ck-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_q21"
+  },
+  {
+   "tag": "wan_s_def",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "short_n": 0
+  },
+  {
+   "tag": "wan_s_flash",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "wan_s_vae",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_vaefp32",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "short_n": 0
+  },
+  {
+   "tag": "wan_s_vaefp32",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_vaefp32",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_VIDEO_VAE_BF16_DECODE": "0"
+   },
+   "short_n": 0
+  },
+  {
+   "tag": "wan_s_notile",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_VAE_TILING": "0"
+   }
+  },
+  {
+   "tag": "wan_s_nocudnn",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_CUDNN_ENABLED": "0"
+   }
+  },
+  {
+   "tag": "wan_s_nocudnn_notile",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_CUDNN_ENABLED": "0",
+    "DBENCH_VAE_TILING": "0"
+   }
+  },
+  {
+   "tag": "wan_c_def",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_WAN/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_WAN/split_files/text_encoders/umt5_xxl_fp16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_WAN/split_files/vae/wan2.2_vae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_default/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_wan"
+  },
+  {
+   "tag": "wan_c_rock",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_WAN/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_WAN/split_files/text_encoders/umt5_xxl_fp16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_WAN/split_files/vae/wan2.2_vae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_wan"
+  },
+  {
+   "tag": "wan_c_flash",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_WAN/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_WAN/split_files/text_encoders/umt5_xxl_fp16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_WAN/split_files/vae/wan2.2_vae.safetensors"
+    },
+    "bline_args": "--use-flash-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "model": "@bline_wan"
+  },
+  {
+   "tag": "wan_c_kitchen",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_WAN/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_WAN/split_files/text_encoders/umt5_xxl_fp16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_WAN/split_files/vae/wan2.2_vae.safetensors"
+    },
+    "bline_args": "--use-ck-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_wan"
+  },
+  {
+   "tag": "h3_s_def",
+   "backend": "studio",
+   "model": "unsloth/MiniMax-H3-GGUF",
+   "ref": "h3_s_def",
+   "width": 832,
+   "height": 480,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 39,
+   "fps": 24,
+   "note": "video_minimax_h3_t2v: 20 steps res_multistep, no CFG; 0.4 MP 39 frames here",
+   "options": {
+    "family_override": "minimax-h3",
+    "model_kind": "gguf",
+    "gguf_filename": "minimax_h3_fl2va_pruned-Q8_0.gguf",
+    "local_files_only": false
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "h3_s_flash",
+   "backend": "studio",
+   "model": "unsloth/MiniMax-H3-GGUF",
+   "ref": "h3_s_def",
+   "width": 832,
+   "height": 480,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 39,
+   "fps": 24,
+   "note": "video_minimax_h3_t2v: 20 steps res_multistep, no CFG; 0.4 MP 39 frames here",
+   "options": {
+    "family_override": "minimax-h3",
+    "model_kind": "gguf",
+    "gguf_filename": "minimax_h3_fl2va_pruned-Q8_0.gguf",
+    "local_files_only": false,
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "h3_s_group",
+   "backend": "studio",
+   "model": "unsloth/MiniMax-H3-GGUF",
+   "ref": "h3_s_group",
+   "width": 832,
+   "height": 480,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 39,
+   "fps": 24,
+   "note": "video_minimax_h3_t2v: 20 steps res_multistep, no CFG; 0.4 MP 39 frames here",
+   "short_n": 0,
+   "short_steps": 0,
+   "options": {
+    "family_override": "minimax-h3",
+    "model_kind": "gguf",
+    "gguf_filename": "minimax_h3_fl2va_pruned-Q8_0.gguf",
+    "local_files_only": false
+   },
+   "env": {
+    "UNSLOTH_H3_APU_RESIDENT": "0"
+   }
+  },
+  {
+   "tag": "h3_s_res",
+   "backend": "studio",
+   "model": "unsloth/MiniMax-H3-GGUF",
+   "ref": "h3_s_group",
+   "width": 832,
+   "height": 480,
+   "steps": 20,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 39,
+   "fps": 24,
+   "note": "video_minimax_h3_t2v: 20 steps res_multistep, no CFG; 0.4 MP 39 frames here",
+   "short_n": 0,
+   "short_steps": 0,
+   "options": {
+    "family_override": "minimax-h3",
+    "model_kind": "gguf",
+    "gguf_filename": "minimax_h3_fl2va_pruned-Q8_0.gguf",
+    "local_files_only": false
+   },
+   "env": {}
+  },
+  {
+   "tag": "h3_c_def",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "h3_c_rock",
+   "width": 832,
+   "height": 480,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 39,
+   "fps": 24,
+   "note": "video_minimax_h3_t2v: 20 steps res_multistep, no CFG; 0.4 MP 39 frames here",
+   "options": {
+    "family": "minimax-h3",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_H3/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_H3/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+     "audio_vae": "$DBENCH_MODEL_BLINE_H3/vae/minimax_h3_audio_vae_fp32.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_default/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_h3"
+  },
+  {
+   "tag": "h3_c_rock",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "h3_c_rock",
+   "width": 832,
+   "height": 480,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 39,
+   "fps": 24,
+   "note": "video_minimax_h3_t2v: 20 steps res_multistep, no CFG; 0.4 MP 39 frames here",
+   "options": {
+    "family": "minimax-h3",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_H3/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_H3/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+     "audio_vae": "$DBENCH_MODEL_BLINE_H3/vae/minimax_h3_audio_vae_fp32.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_h3"
+  },
+  {
+   "tag": "h3_c_flash",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "h3_c_rock",
+   "width": 832,
+   "height": 480,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 39,
+   "fps": 24,
+   "note": "video_minimax_h3_t2v: 20 steps res_multistep, no CFG; 0.4 MP 39 frames here",
+   "options": {
+    "family": "minimax-h3",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_H3/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_H3/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+     "audio_vae": "$DBENCH_MODEL_BLINE_H3/vae/minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "bline_args": "--use-flash-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   },
+   "model": "@bline_h3"
+  },
+  {
+   "tag": "h3_c_kitchen",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "h3_c_rock",
+   "width": 832,
+   "height": 480,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 39,
+   "fps": 24,
+   "note": "video_minimax_h3_t2v: 20 steps res_multistep, no CFG; 0.4 MP 39 frames here",
+   "options": {
+    "family": "minimax-h3",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_H3/diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_H3/text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_H3/vae/minimax_h3_video_vae_int8_convrot.safetensors",
+     "audio_vae": "$DBENCH_MODEL_BLINE_H3/vae/minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "bline_args": "--use-ck-attention --enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_h3"
+  },
+  {
+   "tag": "wan_s_vaeac",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_vae",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_VIDEO_VAE_BF16_DECODE": "autocast"
+   },
+   "short_n": 0
+  },
+  {
+   "tag": "wan_s_vae_2_repeat",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_vae",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "short_n": 0
+  },
+  {
+   "tag": "wan_s_vae_3_repeat",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_vae",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "short_n": 0
+  },
+  {
+   "tag": "wan_s_vae_nocudnn",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_vae",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_CUDNN_ENABLED": "0"
+   },
+   "short_n": 0
+  },
+  {
+   "tag": "wan_s_vae_miopenvae",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_vae",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_ROCM_VAE_MIOPEN": "0"
+   },
+   "short_n": 0
+  },
+  {
+   "tag": "wan_s_vae_notile",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_vae",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_VAE_TILING": "0"
+   },
+   "short_n": 0
+  },
+  {
+   "tag": "wan_s_vae_nocudnn_notile",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_vae",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "DBENCH_CUDNN_ENABLED": "0",
+    "DBENCH_VAE_TILING": "0"
+   },
+   "short_n": 0
+  },
+  {
+   "tag": "wan_c_rock_2_repeat",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_WAN/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_WAN/split_files/text_encoders/umt5_xxl_fp16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_WAN/split_files/vae/wan2.2_vae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_wan",
+   "short_n": 0
+  },
+  {
+   "tag": "wan_c_rock_3_repeat",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_WAN/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_WAN/split_files/text_encoders/umt5_xxl_fp16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_WAN/split_files/vae/wan2.2_vae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_wan",
+   "short_n": 0
+  },
+  {
+   "tag": "wan_c_miopen",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_WAN/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_WAN/split_files/text_encoders/umt5_xxl_fp16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_WAN/split_files/vae/wan2.2_vae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "BLINEUI_ENABLE_MIOPEN": "1"
+   },
+   "model": "@bline_wan",
+   "short_n": 0
+  },
+  {
+   "tag": "wan_c_nockhip",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_WAN/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_WAN/split_files/text_encoders/umt5_xxl_fp16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_WAN/split_files/vae/wan2.2_vae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "BLINE_KITCHEN_DISABLE_HIP": "1"
+   },
+   "model": "@bline_wan",
+   "short_n": 0
+  },
+  {
+   "tag": "wan_c_dyn",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "wan_c_rock",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family": "wan2.2-5b",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_WAN/split_files/diffusion_models/wan2.2_ti2v_5B_fp16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_WAN/split_files/text_encoders/umt5_xxl_fp16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_WAN/split_files/vae/wan2.2_vae.safetensors"
+    },
+    "bline_args": "--enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_wan",
+   "short_n": 0
+  },
+  {
+   "tag": "klein_c_rock_2_repeat",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family": "flux.2-klein",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_KLEIN/split_files/diffusion_models/flux-2-klein-4b.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_KLEIN/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_KLEIN/split_files/vae/flux2-vae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_klein"
+  },
+  {
+   "tag": "klein_c_rock_3_repeat",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family": "flux.2-klein",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_KLEIN/split_files/diffusion_models/flux-2-klein-4b.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_KLEIN/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_KLEIN/split_files/vae/flux2-vae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_klein"
+  },
+  {
+   "tag": "klein_c_nockhip",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family": "flux.2-klein",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_KLEIN/split_files/diffusion_models/flux-2-klein-4b.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_KLEIN/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_KLEIN/split_files/vae/flux2-vae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "BLINE_KITCHEN_DISABLE_HIP": "1"
+   },
+   "model": "@bline_klein"
+  },
+  {
+   "tag": "klein_c_dyn",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "klein_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family": "flux.2-klein",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_KLEIN/split_files/diffusion_models/flux-2-klein-4b.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_KLEIN/split_files/text_encoders/qwen_3_4b.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_KLEIN/split_files/vae/flux2-vae.safetensors"
+    },
+    "bline_args": "--enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_klein"
+  },
+  {
+   "tag": "flux1_c_rock_2_repeat",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "flux1_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family": "flux.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_FLUX1_SCHNELL/flux1-schnell.safetensors",
+     "te": [
+      "$DBENCH_MODEL_BLINE_FLUX_TE/clip_l.safetensors",
+      "$DBENCH_MODEL_BLINE_FLUX_TE/t5xxl_fp16.safetensors"
+     ],
+     "vae": "$DBENCH_MODEL_FLUX1_SCHNELL/ae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_flux_te"
+  },
+  {
+   "tag": "flux1_c_rock_3_repeat",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "flux1_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family": "flux.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_FLUX1_SCHNELL/flux1-schnell.safetensors",
+     "te": [
+      "$DBENCH_MODEL_BLINE_FLUX_TE/clip_l.safetensors",
+      "$DBENCH_MODEL_BLINE_FLUX_TE/t5xxl_fp16.safetensors"
+     ],
+     "vae": "$DBENCH_MODEL_FLUX1_SCHNELL/ae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_flux_te"
+  },
+  {
+   "tag": "flux1_c_nockhip",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "flux1_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family": "flux.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_FLUX1_SCHNELL/flux1-schnell.safetensors",
+     "te": [
+      "$DBENCH_MODEL_BLINE_FLUX_TE/clip_l.safetensors",
+      "$DBENCH_MODEL_BLINE_FLUX_TE/t5xxl_fp16.safetensors"
+     ],
+     "vae": "$DBENCH_MODEL_FLUX1_SCHNELL/ae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "BLINE_KITCHEN_DISABLE_HIP": "1"
+   },
+   "model": "@bline_flux_te"
+  },
+  {
+   "tag": "flux1_c_dyn",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "flux1_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family": "flux.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_FLUX1_SCHNELL/flux1-schnell.safetensors",
+     "te": [
+      "$DBENCH_MODEL_BLINE_FLUX_TE/clip_l.safetensors",
+      "$DBENCH_MODEL_BLINE_FLUX_TE/t5xxl_fp16.safetensors"
+     ],
+     "vae": "$DBENCH_MODEL_FLUX1_SCHNELL/ae.safetensors"
+    },
+    "bline_args": "--enable-dynamic-vram"
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_flux_te"
+  },
+  {
+   "tag": "q21_c_nockhip",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "q21_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family": "qwen-image-2.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_BLINE_Q21/diffusion_models/qwen_image_2.1_bf16.safetensors",
+     "te": "$DBENCH_MODEL_BLINE_Q21/text_encoders/qwen3vl_8b_bf16.safetensors",
+     "vae": "$DBENCH_MODEL_BLINE_Q21/vae/qwen_image_2.1_vae_bf16.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "BLINE_KITCHEN_DISABLE_HIP": "1"
+   },
+   "model": "@bline_q21"
+  },
+  {
+   "tag": "sdxl_c_miopen",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "sdxl_c_rock",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 2,
+   "guidance": 7.0,
+   "negative_prompt": "color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, text, logo, signature\n",
+   "note": "image_sdxl_simple: 25 steps, CFG 7, dpmpp_2m / karras (Studio samples Euler: known LIST item)",
+   "options": {
+    "family": "sdxl",
+    "files": {
+     "checkpoint": "$DBENCH_MODEL_SDXL_BASE/sd_xl_base_1.0.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI",
+    "BLINEUI_ENABLE_MIOPEN": "1"
+   },
+   "model": "@sdxl_base"
+  },
+  {
+   "tag": "klein_s_def_2_repeat",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "klein_s_def_3_repeat",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "klein_s_flash_2_repeat",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_flash",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "klein_s_flash_3_repeat",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_flash",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "klein_s_tunable",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "PYTORCH_TUNABLEOP_ENABLED": "1"
+   }
+  },
+  {
+   "tag": "klein_s_nofused",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_FUSED_ROPE": "0",
+    "UNSLOTH_DIFFUSION_FUSED_ADALN": "0"
+   }
+  },
+  {
+   "tag": "klein_s_ropeonly",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_FUSED_ROPE": "1",
+    "UNSLOTH_DIFFUSION_FUSED_ADALN": "0"
+   }
+  },
+  {
+   "tag": "flux1_s_def_2_repeat",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "flux1_s_def_3_repeat",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "flux1_s_flash_2_repeat",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_flash",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "flux1_s_flash_3_repeat",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_flash",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline",
+    "attention_backend": "flash"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "FLASH_ATTENTION_TRITON_AMD_ENABLE": "TRUE"
+   }
+  },
+  {
+   "tag": "flux1_s_tunable",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "PYTORCH_TUNABLEOP_ENABLED": "1"
+   }
+  },
+  {
+   "tag": "flux1_s_nofused",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_FUSED_ROPE": "0",
+    "UNSLOTH_DIFFUSION_FUSED_ADALN": "0"
+   }
+  },
+  {
+   "tag": "flux1_s_ropeonly",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1",
+    "UNSLOTH_DIFFUSION_FUSED_ROPE": "1",
+    "UNSLOTH_DIFFUSION_FUSED_ADALN": "0"
+   }
+  },
+  {
+   "tag": "sdxl_s_2048",
+   "backend": "studio",
+   "model": "@sdxl_base",
+   "ref": "sdxl_s_2048",
+   "width": 2048,
+   "height": 2048,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 7.0,
+   "negative_prompt": "color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, text, logo, signature\n",
+   "note": "image_sdxl_simple: 25 steps, CFG 7, dpmpp_2m / karras (Studio samples Euler: known LIST item)",
+   "options": {
+    "family_override": "sdxl",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "sdxl_c_rock_2048",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "sdxl_c_rock_2048",
+   "width": 2048,
+   "height": 2048,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 7.0,
+   "negative_prompt": "color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, text, logo, signature\n",
+   "note": "image_sdxl_simple: 25 steps, CFG 7, dpmpp_2m / karras (Studio samples Euler: known LIST item)",
+   "options": {
+    "family": "sdxl",
+    "files": {
+     "checkpoint": "$DBENCH_MODEL_SDXL_BASE/sd_xl_base_1.0.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@sdxl_base"
+  },
+  {
+   "tag": "flux1_s_2048",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_2048",
+   "width": 2048,
+   "height": 2048,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 1,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "flux1_c_rock_2048",
+   "backend": "blineui",
+   "venv": null,
+   "ref": "flux1_c_rock_2048",
+   "width": 2048,
+   "height": 2048,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 1,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family": "flux.1",
+    "files": {
+     "dit": "$DBENCH_MODEL_FLUX1_SCHNELL/flux1-schnell.safetensors",
+     "te": [
+      "$DBENCH_MODEL_BLINE_FLUX_TE/clip_l.safetensors",
+      "$DBENCH_MODEL_BLINE_FLUX_TE/t5xxl_fp16.safetensors"
+     ],
+     "vae": "$DBENCH_MODEL_FLUX1_SCHNELL/ae.safetensors"
+    }
+   },
+   "env": {
+    "DIFFUSION_BENCH_BLINE_PYTHON": "$AMD_CI_WORK/bline_venv_rock/bin/python",
+    "DIFFUSION_BENCH_BLINE_DIR": "$AMD_CI_WORK/BlineUI"
+   },
+   "model": "@bline_flux_te"
+  },
+  {
+   "tag": "klein_s_pt72",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72/bin/python"
+  },
+  {
+   "tag": "flux1_s_pt72",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72/bin/python"
+  },
+  {
+   "tag": "sdxl_s_pt72",
+   "backend": "studio",
+   "model": "@sdxl_base",
+   "ref": "sdxl_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 2,
+   "guidance": 7.0,
+   "negative_prompt": "color, colored, lowres, blurry, out of focus, deformed, bad anatomy, extra limbs, mutated, watermark, text, logo, signature\n",
+   "note": "image_sdxl_simple: 25 steps, CFG 7, dpmpp_2m / karras (Studio samples Euler: known LIST item)",
+   "options": {
+    "family_override": "sdxl",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72/bin/python"
+  },
+  {
+   "tag": "q21_s_pt72",
+   "backend": "studio",
+   "model": "@qwen_image_21",
+   "ref": "q21_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 25,
+   "short_steps": 5,
+   "n": 1,
+   "guidance": 1.0,
+   "note": "image_qwen_image_2_1_t2i: 25 steps, CFG 1, euler / simple",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72/bin/python"
+  },
+  {
+   "tag": "wan_s_pt72",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72/bin/python",
+   "short_n": 0
+  },
+  {
+   "tag": "klein_s_pt72_2_repeat",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_pt72",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72/bin/python"
+  },
+  {
+   "tag": "klein_s_pt72_3_repeat",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_pt72",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72/bin/python"
+  },
+  {
+   "tag": "klein_s_pt72n",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "flux1_s_pt72n",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_def",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python"
+  },
+  {
+   "tag": "wan_s_pt72n",
+   "backend": "studio",
+   "model": "@wan22_5b",
+   "ref": "wan_s_def",
+   "width": 1280,
+   "height": 704,
+   "steps": 20,
+   "short_steps": 4,
+   "n": 1,
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 21,
+   "fps": 24,
+   "guidance": 5.0,
+   "note": "video_wan2_2_5B_ti2v: 1280x704, 20 steps, CFG 5, uni_pc / simple, shift 8 (121 frames in the template; 21 here: a short clip)",
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   },
+   "venv": "$AMD_CI_WORK/studio_pt72n/bin/python",
+   "short_n": 0
+  },
+  {
+   "tag": "klein_s_unset",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_off",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "klein_s_off",
+   "backend": "studio",
+   "model": "@flux2_klein_4b",
+   "ref": "klein_s_off",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "image_flux2_klein_text_to_image (distilled): 4 steps, CFG 1, euler, Flux2Scheduler",
+   "options": {
+    "family_override": "flux.2-klein",
+    "model_kind": "pipeline",
+    "speed_mode": "off"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "flux1_s_unset",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_off",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  },
+  {
+   "tag": "flux1_s_off",
+   "backend": "studio",
+   "model": "@flux1_schnell",
+   "ref": "flux1_s_off",
+   "width": 1024,
+   "height": 1024,
+   "steps": 4,
+   "short_steps": 2,
+   "n": 2,
+   "note": "flux_schnell: 4 steps, CFG 1, euler / simple (template ships an fp8 checkpoint; bf16 split files here so both sides run the same weights)",
+   "options": {
+    "family_override": "flux.1",
+    "model_kind": "pipeline",
+    "speed_mode": "off"
+   },
+   "env": {
+    "DBENCH_ATTN_PROFILE": "1",
+    "TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL": "1"
+   }
+  }
+ ]
+}

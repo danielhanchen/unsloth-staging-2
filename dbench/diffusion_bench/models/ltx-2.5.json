@@ -1,0 +1,364 @@
+{
+ "family": "ltx-2.5",
+ "kind": "video",
+ "aliases": [
+  "ltx25"
+ ],
+ "bline": {
+  "graph": "ltx-2.5",
+  "template": "video_ltx2_5_t2v.json",
+  "template_sha": "3bd79a304a238ca50336db3733752a2815ad4b1e",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "ltx-2.5-22b-distilled-transformer-bline-int8-convrot.safetensors",
+   "te": "gemma4-12b-with-proj-ltx-2.5-bline-int8-convrot.safetensors",
+   "vae": "ltx-2.5-video-vae-bf16.safetensors",
+   "audio_vae": "ltx-2.5-audio-vae-bf16.safetensors"
+  },
+  "shift_in_graph": true
+ },
+ "defaults": {
+  "steps": 8,
+  "cfg": 1.0,
+  "sampler": "euler_ancestral",
+  "scheduler": null,
+  "shift": null,
+  "width": 1280,
+  "height": 704,
+  "frames": 121,
+  "fps": 24,
+  "negative": "pc game, console game, video game, cartoon, childish, ugly",
+  "enhancer": false,
+  "stage2_sigmas": 3
+ },
+ "expected_passes": "steps + stage2_sigmas",
+ "formats": {
+  "int8": {
+   "studio": {
+    "model_path": "Lightricks/LTX-2.5-Diffusers",
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "format int8 (Studio auto = hosted INT8 ConvRot): transformer_quant=None"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "settings_audit_nov10/ltx.md: auto hosted LTX-2.5-text_encoder-INT8-ConvRot"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     },
+     "audio_vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family audio-VAE override)"
+     }
+    },
+    "sources": {
+     "Lightricks/LTX-2.5-Diffusers": {
+      "repo": "Lightricks/LTX-2.5-Diffusers",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "ltx-2.5-22b-distilled-transformer-bline-int8-convrot.safetensors",
+     "te": "gemma4-12b-with-proj-ltx-2.5-bline-int8-convrot.safetensors",
+     "vae": "ltx-2.5-video-vae-bf16.safetensors",
+     "audio_vae": "ltx-2.5-audio-vae-bf16.safetensors",
+     "upscaler": "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "header: {'F32': 1730, 'BF16': 2619, 'I8': 1440, 'U8': 1440}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "gemma4-12b-with-proj-ltx-2.5-bline-int8-convrot.safetensors: header: {'F32': 328, 'BF16': 353, 'I8': 328, 'U8': 333}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'BF16': 396} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     },
+     "audio_vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'BF16': 1329} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "ltx-2.5-22b-distilled-transformer-bline-int8-convrot.safetensors": {
+      "repo": "Lightricks/LTX-2.5",
+      "file": "diffusion_models/ltx-2.5-22b-distilled-transformer-bline-int8-convrot.safetensors",
+      "build": null,
+      "note": "vendor repo, gated (scripts/vidcmp_nov5/ltx25_fetch.py)"
+     },
+     "gemma4-12b-with-proj-ltx-2.5-bline-int8-convrot.safetensors": {
+      "repo": "Lightricks/LTX-2.5",
+      "file": "text_encoders/gemma4-12b-with-proj-ltx-2.5-bline-int8-convrot.safetensors",
+      "build": null,
+      "note": "vendor repo, gated (scripts/vidcmp_nov5/ltx25_fetch.py)"
+     },
+     "ltx-2.5-video-vae-bf16.safetensors": {
+      "repo": "Lightricks/LTX-2.5",
+      "file": "vae/ltx-2.5-video-vae-bf16.safetensors",
+      "build": null,
+      "note": "vendor repo, gated (scripts/vidcmp_nov5/ltx25_fetch.py)"
+     },
+     "ltx-2.5-audio-vae-bf16.safetensors": {
+      "repo": "Lightricks/LTX-2.5",
+      "file": "vae/ltx-2.5-audio-vae-bf16.safetensors",
+      "build": null,
+      "note": "vendor repo, gated (scripts/vidcmp_nov5/ltx25_fetch.py)"
+     },
+     "ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors": {
+      "repo": "Lightricks/LTX-2.5",
+      "file": "latent_upscale_models/ltx-2.5-latent-spatial-upscaler-x2-bf16-1.0.safetensors",
+      "build": null,
+      "note": "vendor repo, gated (scripts/vidcmp_nov5/ltx25_fetch.py)"
+     }
+    }
+   },
+   "source": "Lightricks bline-int8-convrot files (template); Studio auto = its own hosted unsloth/LTX-2.5-FP8 INT8 ConvRot: same scheme, different artefact (ltx.md (b)3)",
+   "template_default": true,
+   "min_vram_gib": 16.0,
+   "min_host_ram_gib": 76.0,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": 291.87,
+    "A100-40": 186.15,
+    "G4": 17.45
+   },
+   "planning": {
+    "basis": "slower stack's s/clip; 16 GiB is the smallest budget that ran, host = its peak (Studio 75.9 GiB)",
+    "cite": [
+     "outputs/video_vs_bline_nov5/README.md#LTX-2.5 (G4 matrix; L4, A100, Kaggle T4)"
+    ],
+    "studio_refused": [
+     "T4 (both stacks BROKEN on a Kaggle T4)"
+    ]
+   },
+   "est_load_s": {
+    "A100-40": {
+     "blineui": 131.7,
+     "studio": 245.9
+    }
+   },
+   "est_load_basis": [
+    "A100-40 blineui: median of load_s + first-render excess over fresh-process timed runs in dbench_nov19, dbench_validation/r4",
+    "A100-40 studio: median of load_s + first-render excess over fresh-process timed runs in dbench_nov19"
+   ]
+  },
+  "fp8": {
+   "studio": {
+    "model_path": "Lightricks/LTX-2.5-Diffusers",
+    "transformer_quant": "fp8",
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "format fp8: transformer_quant='fp8'"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "settings_audit_nov10/ltx.md: auto hosted LTX-2.5-text_encoder-INT8-ConvRot"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     },
+     "audio_vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family audio-VAE override)"
+     }
+    },
+    "sources": {
+     "Lightricks/LTX-2.5-Diffusers": {
+      "repo": "Lightricks/LTX-2.5-Diffusers",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": null,
+   "source": "video_vs_bline_nov5 LTX-2.5 per-format rows",
+   "template_default": false,
+   "min_vram_gib": 65.4,
+   "min_host_ram_gib": 65.7,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": 164.09,
+    "A100-40": null,
+    "G4": 18.12
+   },
+   "planning": {
+    "basis": "slower stack's steady s/render (median over new prompts); VRAM / host = the larger stack's peak at the smallest budget that ran",
+    "cite": [
+     "outputs/video_vs_bline_nov5/README.md#LTX-2.5 (G4 matrix; L4, A100, Kaggle T4)"
+    ],
+    "studio_refused": [
+     "L4 / any offloaded budget (fp8 refused under offload)",
+     "A100-40 (fp8 refused on sm80)"
+    ]
+   }
+  },
+  "gguf": {
+   "studio": {
+    "model_path": "unsloth/LTX-2.5-GGUF",
+    "precision": {
+     "transformer": {
+      "weights": "gguf",
+      "compute": "bf16",
+      "evidence": "GGUF file not fixed by the card; dequantized per layer"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "settings_audit_nov10/ltx.md: auto hosted LTX-2.5-text_encoder-INT8-ConvRot"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     },
+     "audio_vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family audio-VAE override)"
+     }
+    },
+    "sources": {
+     "unsloth/LTX-2.5-GGUF": {
+      "repo": "unsloth/LTX-2.5-GGUF",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": null,
+   "source": "unsloth Q4_K_M / Q8_0 (video_vs_bline_nov5)",
+   "template_default": false,
+   "min_vram_gib": 23.1,
+   "min_host_ram_gib": 41.9,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": 324.24,
+    "A100-40": 187.74,
+    "G4": 24.9
+   },
+   "planning": {
+    "basis": "24 GiB is the smallest budget main ran (16 GiB OOM on main, fixed only on a branch)",
+    "cite": [
+     "outputs/video_vs_bline_nov5/README.md#LTX-2.5 (G4 matrix; L4, A100, Kaggle T4)"
+    ],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "Lightricks/LTX-2.5-Diffusers"
+  },
+  "gen": {
+   "steps": 8,
+   "guidance": 1.0,
+   "width": 1280,
+   "height": 704,
+   "num_frames": 121,
+   "fps": 24
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "cfg_batch_rows",
+   "check": "cfg_batch_rows",
+   "note": "CFG > 1: Studio may run cond + uncond as ONE batch-2 forward (diffusion_cfg_batch) where the baseline UI runs two; evaluation counts are per sample row, so a forward-call hook undercounts Studio by 2x (settings_audit_nov10/flux.md, 'Not verified')."
+  },
+  {
+   "id": "t4_fp16",
+   "check": "fp16_only_dtype",
+   "note": "On an fp16-only card (T4, sm75) the stacks resolve different compute dtypes (Studio fp16 or fp32 promote; the baseline UI fp32 for Qwen / Ideogram, fp16 first for Wan / HV1.5); record the resolved dtype per stack (bline_defaults_audit.md 'dtype on fp16-only GPUs')."
+  },
+  {
+   "id": "video_save",
+   "check": null,
+   "note": "Video graphs end in CreateVideo -> SaveVideo (the templates' MP4 export, encode time included). Until the blineui backend passes fps and decodes MP4 (agent B's port), set graph_extra.video_save 'frames' (SaveImage on the same frames). Record which one ran; the MP4 encode is part of what a baseline-UI user waits for."
+  },
+  {
+   "id": "two_stage",
+   "check": "passes_equal",
+   "note": "8 stage-1 sigmas at half size + 3 stage-2 at full size = 11 evaluations on both stacks; UNSLOTH_LTX25_TWO_STAGE=0 turns Studio's stage 2 off (ltx.md 1)."
+  },
+  {
+   "id": "vae_decoder",
+   "check": "precision_equal",
+   "note": "ltx-2.5-video-vae-bf16 may be the diffusion decoder (loaded if the file has decoder.conv_in_x_t.weight); Studio uses the conv VAE. Unverified (ltx.md 3)."
+  },
+  {
+   "id": "audio_torchaudio",
+   "check": null,
+   "note": "The audio VAE nodes need torchaudio in the baseline UI venv (plan bug 3: setup_blineui strips it)."
+  },
+  {
+   "id": "te_on_cpu",
+   "check": null,
+   "note": "On L4 / A100-40 Studio's Gemma 4 encoder ran on the CPU (163-237 s per new prompt); report TE time separately (video_vs_bline_nov5 LTX-2.5 headline)."
+  },
+  {
+   "id": "stage2_sigma_rounding",
+   "check": "sigma_rounding",
+   "accepted_difference": true,
+   "sigma_tol": 3e-05,
+   "note": "The template's stage-2 ManualSigmas read 0.4219 where Studio's LTX25_STAGE2_SIGMAS (and the model's published distilled list) is 0.421875: 2.5e-5, same grid length and work. Both stacks sample euler_ancestral on the distilled model (Studio's default unless UNSLOTH_LTX25_SAMPLER=euler); an A100 round (2026-11-18) recorded Studio as euler only because the toolkit read the base scheduler class."
+  }
+ ],
+ "sources": [
+  "outputs/settings_audit_nov10/ltx.md#1",
+  "outputs/ltx25_bline_defaults/render/base.json",
+  "outputs/ltx25_bline_defaults/",
+  "outputs/video_vs_bline_nov5/README.md#LTX-2.5",
+  "temp/settings_audit/workflow_templates/templates/video_ltx2_5_t2v.json"
+ ]
+}

@@ -1,0 +1,209 @@
+{
+ "family": "z-image",
+ "kind": "image",
+ "aliases": [
+  "z-image-base"
+ ],
+ "bline": {
+  "graph": "z-image",
+  "template": "image_z_image.json",
+  "template_sha": "3da34f8c659181ba9aba57139200438eca189faf",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "z_image_bf16.safetensors",
+   "te": "qwen_3_4b.safetensors",
+   "vae": "ae.safetensors"
+  },
+  "shift_in_graph": true
+ },
+ "defaults": {
+  "steps": 25,
+  "cfg": 4.0,
+  "sampler": "res_multistep",
+  "scheduler": "simple",
+  "shift": 3.0,
+  "width": 1024,
+  "height": 1024,
+  "frames": null,
+  "fps": null,
+  "negative": "",
+  "enhancer": false
+ },
+ "expected_passes": "steps * (2 if cfg > 1 else 1)",
+ "formats": {
+  "bf16": {
+   "studio": {
+    "model_path": "Tongyi-MAI/Z-Image",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format bf16: transformer_quant='none'"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df z-image: no te_quant_auto (Qwen3-4B bf16)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "Tongyi-MAI/Z-Image": {
+      "repo": "Tongyi-MAI/Z-Image",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "z_image_bf16.safetensors",
+     "te": "qwen_3_4b.safetensors",
+     "vae": "ae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'BF16': 453} (name token confirmed by the header); unet_manual_cast over ['bf16']"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": null,
+      "evidence": "qwen_3_4b.safetensors: header: {'BF16': 398}; compute of non-quantized TEs not traced (CLIP dtype logic is per model)"
+     },
+     "vae": {
+      "weights": "fp32",
+      "compute": "bf16",
+      "evidence": "header: {'F32': 244}; compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "z_image_bf16.safetensors": {
+      "source": null,
+      "reason": "scripts/imgcmp_nov5/prep_files.py only covers Turbo; the same merge on Tongyi-MAI/Z-Image transformer/ is untested"
+     },
+     "qwen_3_4b.safetensors": {
+      "repo": "black-forest-labs/FLUX.2-klein-4B",
+      "file": "text_encoder/",
+      "build": "scripts/imgcmp_nov5/prep_files.py --group klein (te: the two Qwen3-4B shards merged -> qwen3_4b_klein_merged)"
+     },
+     "ae.safetensors": {
+      "repo": "black-forest-labs/FLUX.1-schnell",
+      "file": "ae.safetensors",
+      "build": null,
+      "fetch_repo": "unsloth/FLUX.1-schnell",
+      "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38"
+     }
+    }
+   },
+   "source": "template files",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "Tongyi-MAI/Z-Image"
+  },
+  "gen": {
+   "steps": 25,
+   "guidance": 3.0
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "t4_fp16",
+   "check": "fp16_only_dtype",
+   "note": "On an fp16-only card (T4, sm75) the stacks resolve different compute dtypes (Studio fp16 or fp32 promote; the baseline UI fp32 for Qwen / Ideogram, fp16 first for Wan / HV1.5); record the resolved dtype per stack (bline_defaults_audit.md 'dtype on fp16-only GPUs')."
+  },
+  {
+   "id": "sampler",
+   "check": "sampler_differs",
+   "note": "Template res_multistep (2nd order, 1 eval/step) vs Studio Euler: equal evaluations, different images (others.md (b)3). Accepted for timing pairs only (equal denoiser work); a quality pair stays strict.",
+   "accepted_difference": true,
+   "settings": [
+    "sampler"
+   ],
+   "purposes": [
+    "timing"
+   ]
+  },
+  {
+   "id": "sdcpp_discrete",
+   "check": null,
+   "note": "sd.cpp gets no --scheduler: discrete schedule, last eval at sigma ~0.003, N steps act like N-1 (settings SUMMARY A.2)."
+  },
+  {
+   "id": "cfg_batch_rows",
+   "check": "cfg_batch_rows",
+   "note": "CFG > 1: Studio may run cond + uncond as ONE batch-2 forward (diffusion_cfg_batch) where the baseline UI runs two; evaluation counts are per sample row, so a forward-call hook undercounts Studio by 2x (settings_audit_nov10/flux.md, 'Not verified')."
+  },
+  {
+   "id": "guidance_meaning",
+   "check": "guidance_semantics",
+   "note": "Z-Image base: baseline cfg 4 = Studio guidance 3.0 (g = cfg - 1)."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "vae"
+   ],
+   "formats": [
+    "bf16"
+   ],
+   "note": "template ae file is fp32 (computed bf16); Studio bf16"
+  }
+ ],
+ "sources": [
+  "outputs/bline_defaults_audit.md#z-image base",
+  "outputs/settings_audit_nov10/others.md#Z-Image",
+  "temp/settings_audit/workflow_templates/templates/image_z_image.json"
+ ]
+}

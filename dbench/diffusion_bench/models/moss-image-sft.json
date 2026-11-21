@@ -1,0 +1,409 @@
+{
+ "family": "moss-image-sft",
+ "kind": "image",
+ "aliases": [
+  "moss-image"
+ ],
+ "bline": {
+  "graph": "moss-image",
+  "template": "image_moss_image_t2i.json",
+  "template_sha": "458bc3c646cb70bb329b39703481e4f45c69745a",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "moss_image_sft_int8_convrot.safetensors",
+   "te": "qwen3.5_9b_w4a8_gptq.safetensors",
+   "vae": "flux2-vae_small.safetensors"
+  },
+  "shift_in_graph": false,
+  "graph_extra": {
+   "slg": false
+  }
+ },
+ "defaults": {
+  "steps": 25,
+  "cfg": 2.5,
+  "sampler": "er_sde",
+  "scheduler": "simple",
+  "shift": 5.0,
+  "width": 1024,
+  "height": 1024,
+  "frames": null,
+  "fps": null,
+  "negative": "nsfw, worst quality, bad anatomy, watermark, jpeg artifact",
+  "enhancer": false
+ },
+ "expected_passes": "steps * (2 if cfg > 1 else 1)",
+ "formats": {
+  "int8": {
+   "studio": {
+    "model_path": "OpenMOSS-Team/MOSS-Image-SFT",
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "format int8 (Studio auto = hosted INT8 ConvRot): transformer_quant=None"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df moss-image: te_quant_auto int8"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "OpenMOSS-Team/MOSS-Image-SFT": {
+      "repo": "OpenMOSS-Team/MOSS-Image-SFT",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/MOSS-Image-SFT-FP8",
+      "file": "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "c07b3c0ab59233fb075344f1e3b57cbbe6d4585b96b58f71765bdc410d9de24f",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "moss_image_sft_int8_convrot.safetensors",
+     "te": "qwen3.5_9b_w4a8_gptq.safetensors",
+     "vae": "flux2-vae_small.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "header: {'F32': 169, 'BF16': 210, 'I8': 168, 'U8': 210}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "w4a8_gptq",
+      "compute": "mixed(int4w/int8a)",
+      "evidence": "qwen3.5_9b_w4a8_gptq.safetensors: header: {'F32': 450, 'BF16': 525, 'F8_E4M3': 200, 'I8': 202, 'U8': 202}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "fp32",
+      "compute": "bf16",
+      "evidence": "header: {'I64': 1, 'F32': 250}; compute from bline/sd.py working_dtypes; official file: F32 tensors holding bf16-representable values"
+     }
+    },
+    "sources": {
+     "moss_image_sft_int8_convrot.safetensors": {
+      "source": null,
+      "reason": "only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet (scripts/moss_speed/mk_plan*.py fetched it from Bline-Org/MOSS-Image)"
+     },
+     "qwen3.5_9b_w4a8_gptq.safetensors": {
+      "source": null,
+      "reason": "only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet (scripts/moss_speed/mk_plan*.py fetched it from Bline-Org/MOSS-Image)"
+     },
+     "flux2-vae_small.safetensors": {
+      "repo": "OpenMOSS-Team/MOSS-Image-SFT",
+      "file": "vae/diffusion_pytorch_model.safetensors",
+      "build": null,
+      "sha256": "c3bdf94dc67ec69b30ea9fe1fa8340085679cae64d019f7c7e4a9921f1a7f17a",
+      "note": "the official VAE, fetched as is under the template name: same 251 tensor names, dtypes and shapes as Bline-Org's flux2-vae_small (header-checked 2026-11-19). That mirror is NOT the official file: its decoder + post_quant_conv (140 tensors) are byte-identical, but its encoder, quant_conv and bn running stats are FLUX.2-dev's fp32 originals where the official file stores the same values rounded to bf16 (official == mirror.to(bfloat16) on all 110), and bn.num_batches_tracked is 400000 vs 0. MOSS-Image-Base and -SFT ship the same VAE file (sha256 c3bdf94d)"
+     }
+    }
+   },
+   "source": "template file (int8 ConvRot DiT, per-layer config asks INT8 attention; w4a8 TE)",
+   "template_default": true,
+   "min_vram_gib": 20.6,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": 144.8,
+    "L4": 35.03,
+    "A100-40": 10.58,
+    "G4": 5.64
+   },
+   "planning": {
+    "basis": "slower stack's steady s/render (median over new prompts); VRAM / host = the larger stack's peak at the smallest budget that ran",
+    "cite": [
+     "outputs/moss_speed_vs_bline/REPORT.md#Results per GPU (Studio before = main)"
+    ],
+    "studio_refused": [
+     "T4 (Studio killed while loading)"
+    ]
+   },
+   "est_load_s": {
+    "A100-40": {
+     "blineui": 18.7,
+     "studio": 99.5
+    }
+   },
+   "est_load_basis": [
+    "A100-40 blineui: median of load_s + first-render excess over fresh-process timed runs in dbench_validation/r4",
+    "A100-40 studio: median of load_s + first-render excess over fresh-process timed runs in dbench_validation/r4"
+   ]
+  },
+  "bf16": {
+   "studio": {
+    "model_path": "OpenMOSS-Team/MOSS-Image-SFT",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format bf16: transformer_quant='none'"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df moss-image: te_quant_auto int8"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "OpenMOSS-Team/MOSS-Image-SFT": {
+      "repo": "OpenMOSS-Team/MOSS-Image-SFT",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/MOSS-Image-SFT-FP8",
+      "file": "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "c07b3c0ab59233fb075344f1e3b57cbbe6d4585b96b58f71765bdc410d9de24f",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "moss_image_sft_bf16.safetensors",
+     "te": "qwen3.5_9b_bf16.safetensors",
+     "vae": "flux2-vae_small.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'F32': 1, 'BF16': 378} (name token confirmed by the header); unet_manual_cast over ['bf16']"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": null,
+      "evidence": "qwen3.5_9b_bf16.safetensors: header: {'F32': 48, 'BF16': 727} (name token confirmed by the header); compute of non-quantized TEs not traced (CLIP dtype logic is per model)"
+     },
+     "vae": {
+      "weights": "fp32",
+      "compute": "bf16",
+      "evidence": "header: {'I64': 1, 'F32': 250}; compute from bline/sd.py working_dtypes; official file: F32 tensors holding bf16-representable values"
+     }
+    },
+    "sources": {
+     "moss_image_sft_bf16.safetensors": {
+      "source": null,
+      "reason": "only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet (scripts/moss_speed/mk_plan*.py fetched it from Bline-Org/MOSS-Image)"
+     },
+     "qwen3.5_9b_bf16.safetensors": {
+      "source": null,
+      "reason": "only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet (scripts/moss_speed/mk_plan*.py fetched it from Bline-Org/MOSS-Image)"
+     },
+     "flux2-vae_small.safetensors": {
+      "repo": "OpenMOSS-Team/MOSS-Image-SFT",
+      "file": "vae/diffusion_pytorch_model.safetensors",
+      "build": null,
+      "sha256": "c3bdf94dc67ec69b30ea9fe1fa8340085679cae64d019f7c7e4a9921f1a7f17a",
+      "note": "the official VAE, fetched as is under the template name: same 251 tensor names, dtypes and shapes as Bline-Org's flux2-vae_small (header-checked 2026-11-19). That mirror is NOT the official file: its decoder + post_quant_conv (140 tensors) are byte-identical, but its encoder, quant_conv and bn running stats are FLUX.2-dev's fp32 originals where the official file stores the same values rounded to bf16 (official == mirror.to(bfloat16) on all 110), and bn.num_batches_tracked is 400000 vs 0. MOSS-Image-Base and -SFT ship the same VAE file (sha256 c3bdf94d)"
+     }
+    }
+   },
+   "source": "Bline-Org/MOSS-Image bf16 files",
+   "template_default": false,
+   "min_vram_gib": 29.9,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": 74.59,
+    "A100-40": 19.13,
+    "G4": 11.06
+   },
+   "planning": {
+    "basis": "slower stack's steady s/render (median over new prompts); VRAM / host = the larger stack's peak at the smallest budget that ran",
+    "cite": [
+     "outputs/moss_speed_vs_bline/REPORT.md#Results per GPU (Studio before = main)"
+    ],
+    "studio_refused": []
+   }
+  },
+  "gguf": {
+   "studio": {
+    "model_path": "unsloth/MOSS-Image-SFT-GGUF",
+    "precision": {
+     "transformer": {
+      "weights": "gguf",
+      "compute": "bf16",
+      "evidence": "GGUF file not fixed by the card; dequantized per layer"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df moss-image: te_quant_auto int8"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "unsloth/MOSS-Image-SFT-GGUF": {
+      "repo": "unsloth/MOSS-Image-SFT-GGUF",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     },
+     "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/MOSS-Image-SFT-FP8",
+      "file": "MOSS-Image-SFT-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "c07b3c0ab59233fb075344f1e3b57cbbe6d4585b96b58f71765bdc410d9de24f",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": null,
+   "source": "sd.cpp only in Studio; not measured (moss REPORT 'Could not prove')",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "OpenMOSS-Team/MOSS-Image-SFT"
+  },
+  "gen": {
+   "steps": 25,
+   "guidance": 2.5,
+   "negative_prompt": "nsfw, worst quality, bad anatomy, watermark, jpeg artifact"
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "enhancer_off",
+   "check": "enhancer_off",
+   "note": "The template ships a prompt enhancer / upsampler; benchmarks switch it off on the baseline UI arm and send the raw prompt to both stacks."
+  },
+  {
+   "id": "cfg_batch_rows",
+   "check": "cfg_batch_rows",
+   "note": "CFG > 1: Studio may run cond + uncond as ONE batch-2 forward (diffusion_cfg_batch) where the baseline UI runs two; evaluation counts are per sample row, so a forward-call hook undercounts Studio by 2x (settings_audit_nov10/flux.md, 'Not verified')."
+  },
+  {
+   "id": "t4_fp16",
+   "check": "fp16_only_dtype",
+   "note": "On an fp16-only card (T4, sm75) the stacks resolve different compute dtypes (Studio fp16 or fp32 promote; the baseline UI fp32 for Qwen / Ideogram, fp16 first for Wan / HV1.5); record the resolved dtype per stack (bline_defaults_audit.md 'dtype on fp16-only GPUs')."
+  },
+  {
+   "id": "sampler",
+   "check": "sampler_differs",
+   "note": "Template er_sde / simple vs Studio euler / sgm_uniform: equal DiT calls, images differ by ~0.69 LPIPS across stacks; for cross-stack images run both on euler / sgm_uniform (sigmas match to 1e-7; moss REPORT). Accepted for timing pairs only (equal DiT calls); a quality pair stays strict.",
+   "accepted_difference": true,
+   "settings": [
+    "sampler",
+    "scheduler"
+   ],
+   "purposes": [
+    "timing"
+   ]
+  },
+  {
+   "id": "slg_switch",
+   "check": "settings_equal",
+   "note": "SLG (single layer 22, 0-0.5) is ON for Base and OFF for SFT as the templates ship (graph_extra.slg); Studio's uncond skip follows the same rule."
+  },
+  {
+   "id": "negative",
+   "check": "settings_equal",
+   "note": "Template negative 'nsfw, worst quality, ...'; Studio sends none by default: pass it explicitly."
+  },
+  {
+   "id": "t4_load",
+   "check": null,
+   "note": "Studio cannot load MOSS on a Colab T4 (killed while loading; moss REPORT)."
+  },
+  {
+   "id": "gguf_refused",
+   "check": "gguf_bline_refused",
+   "note": "BlineUI-GGUF @ 6ea2651e has no MOSS-Image architecture (loader.py:12 IMG_ARCH_LIST, tools/convert.py detect_arch): a MOSS GGUF is Studio / sd.cpp only; bline_graphs refuses it."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "text_encoder"
+   ],
+   "formats": [
+    "int8"
+   ],
+   "note": "template TE is qwen3.5_9b w4a8 GPTQ; Studio's is INT8 ConvRot (te_quant_auto int8)"
+  },
+  {
+   "id": "accepted_precision_1",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "vae"
+   ],
+   "formats": [
+    "int8"
+   ],
+   "note": "template VAE file is fp32 flux2-vae_small, computed bf16; Studio runs its VAE bf16"
+  }
+ ],
+ "sources": [
+  "outputs/settings_audit_nov10/others.md#MOSS-Image",
+  "outputs/moss_speed_vs_bline/REPORT.md",
+  "temp/settings_audit/workflow_templates/templates/image_moss_image_t2i.json"
+ ]
+}

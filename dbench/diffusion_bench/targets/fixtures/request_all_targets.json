@@ -1,0 +1,98 @@
+{
+ "name": "sample_all_targets",
+ "revisions": {
+  "unsloth_sha": "0000000000000000000000000000000000000000",
+  "zoo_sha": "1111111111111111111111111111111111111111",
+  "bline_ref": "v0.45.4"
+ },
+ "models": [
+  "qwen-image-2.1",
+  "flux3-klein",
+  {
+   "family": "minimax-h3",
+   "n": 2
+  }
+ ],
+ "arms": [
+  {
+   "stack": "studio",
+   "format": "int8",
+   "tier": "default"
+  },
+  {
+   "stack": "blineui",
+   "format": "int8"
+  },
+  {
+   "stack": "studio",
+   "format": "int8",
+   "budget_gib": 12
+  },
+  {
+   "stack": "blineui",
+   "format": "int8",
+   "budget_gib": 12
+  },
+  {
+   "stack": "sdcpp",
+   "format": "gguf",
+   "families": [
+    "flux3-klein"
+   ]
+  },
+  {
+   "stack": "studio",
+   "format": "gguf",
+   "families": [
+    "flux3-klein"
+   ]
+  },
+  {
+   "stack": "studio",
+   "format": "fp8",
+   "families": [
+    "qwen-image-2.1"
+   ]
+  },
+  {
+   "stack": "blineui",
+   "format": "fp8",
+   "families": [
+    "qwen-image-2.1"
+   ]
+  }
+ ],
+ "targets": [
+  "colab:L4",
+  "colab:T4",
+  "colab:A100-40",
+  {
+   "name": "kaggle:T4x2",
+   "lane_mode": "same_stack"
+  },
+  {
+   "name": "local:B200",
+   "purpose": "quality"
+  },
+  "amd:gfx1151-linux",
+  "amd:gfx1151-windows",
+  {
+   "name": "mac:macos-15",
+   "families": [
+    "flux3-klein"
+   ]
+  },
+  {
+   "name": "cpu",
+   "families": [
+    "flux3-klein"
+   ]
+  },
+  "tester:3090"
+ ],
+ "repeats": 3,
+ "n": 3,
+ "warmup": 1,
+ "account": "michael",
+ "short_n": 0
+}

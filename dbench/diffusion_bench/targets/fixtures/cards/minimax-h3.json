@@ -1,0 +1,60 @@
+{
+ "family": "minimax-h3",
+ "kind": "video",
+ "bline": {
+  "graph": "minimax-h3",
+  "template": "video_minimax_h3",
+  "template_sha": null
+ },
+ "defaults": {
+  "steps": 20,
+  "cfg": 1.0,
+  "sampler": "euler",
+  "scheduler": "simple",
+  "shift": 12.0,
+  "width": 960,
+  "height": 544,
+  "frames": 124,
+  "fps": 24,
+  "negative": "",
+  "enhancer": false
+ },
+ "formats": {
+  "int8": {
+   "studio": {
+    "transformer_quant": "int8"
+   },
+   "bline": {
+    "files": {
+     "dit": {
+      "repo": "Bline-Org/MiniMax-H3",
+      "file": "minimax_h3_int8_convrot.safetensors"
+     }
+    }
+   },
+   "min_vram_gb": 20
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "MiniMaxAI/MiniMax-H3"
+  },
+  "gen": {
+   "fps": 24
+  }
+ },
+ "est": {
+  "render_s_l4": 160,
+  "load_s": 300
+ },
+ "traps": [
+  {
+   "id": "h3_qkv_regroup",
+   "check": null,
+   "note": "fixture"
+  }
+ ],
+ "sources": [
+  "fixture"
+ ]
+}

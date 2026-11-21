@@ -1,0 +1,422 @@
+{
+ "name": "campaign_step_cache",
+ "description": "Step caching: FBCache (PR 11713, CUDA graph kept) vs static step skip (PR 11737 image, 11748 video; transformer_cache=static, schedule from UNSLOTH_STATIC_SKIP_MODE/HEAD/TAIL/EVERY, defaults taylor1 / 0.2 / 0.1 / 2, only at >= 12 steps) on Qwen-Image-2.1 (1024, 25 and 40 steps, CFG 1) and Wan2.2-TI2V-5B (832x480x49, 50 steps, family-default guidance, the video_static_e2e grid), stacked on int8 / fp8. Diffusers never resets FBCache residuals between generations, so a harness that does not reset them overstates FBCache; Studio's backend must (check transformer_cache_stats per render). Assert engagement on every cache cell: status.transformer_cache must name the mode and transformer_cache_stats must show skipped calls (the T2 all-opt Studio cell reported fbcache but it never engaged). zimg_static_below_min is a lever-refusal check (Z-Image-Turbo's 9 steps are under STATIC_MIN_STEPS=12): it should render identically to zimg_off_9 and report static as not applied. Needs a Studio tree with PR 11737 / 11748: unsloth main at 168961def (2026-09-23) has no static mode and refuses the cells (BROKEN: Unsupported transformer_cache 'static'), which is the right outcome there. Studio vs BlineUI with EasyCache lives in specs/compare_qwen21_allopt.json (T2 tier); not duplicated here.",
+ "models": {
+  "qwen_image_21": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
+   "local": "$WORKSPACE/temp/qwen_image_21"
+  },
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "local": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+  },
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "local": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo"
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "venv": {
+   "profile": "studio"
+  },
+  "kind": "image",
+  "width": 1024,
+  "height": 1024,
+  "prompts": "image_24",
+  "n": 8,
+  "warmup": 1,
+  "short_n": 3,
+  "options": {
+   "model_kind": "pipeline",
+   "transformer_quant": "none",
+   "speed_mode": "default",
+   "memory_mode": "fast",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 10,
+  "min_free_mib": 90000,
+  "timeout_s": 1800
+ },
+ "baseline": {
+  "source": "diffusion_bench_knowledge.md 1.4 F and 1.7; outputs/qwen21_fbcache_clean, outputs/qwen21_static_skip, outputs/qwen21_static_quant2, outputs/video_static_skip/*/e2e.json",
+  "q21_25step": {
+   "none_s": 1.69,
+   "fbcache_head_calls_skipped": "82/265",
+   "fbcache_lpips": 0.01,
+   "taylor1_every2": {
+    "s": 1.29,
+    "lpips": 0.008,
+    "skipped": 111
+   },
+   "taylor1_every3": {
+    "s": 1.08,
+    "lpips": 0.023,
+    "skipped": 150
+   },
+   "reuse_every3": {
+    "s": 1.14,
+    "lpips": 0.045
+   },
+   "clean_one_process_ab_s": [
+    1.688,
+    1.138
+   ]
+  },
+  "q21_40step": {
+   "fbcache_skipped_pct": "52-54",
+   "fbcache_lpips_mean_max": [
+    0.089,
+    0.17
+   ],
+   "taylor_every2_lpips": 0.0046,
+   "fbcache_lpips_at_53pct": 0.12
+  },
+  "q21_static_on_quant_s": {
+   "int8": [
+    2.26,
+    1.51
+   ],
+   "fp8": [
+    1.79,
+    1.08
+   ],
+   "lpips_delta": "+0.001-0.002"
+  },
+  "wan_832x480x49_50step_denoise_s": {
+   "bf16": [
+    8.43,
+    6.54
+   ],
+   "fp8": [
+    8.02,
+    6.25
+   ],
+   "nvfp4": [
+    15.31,
+    11.1
+   ],
+   "lpips_delta": "+0.001-0.003",
+   "static_calls_skipped": "34/100 per clip at every=2"
+  },
+  "wan_1280x704x121": {
+   "static_speedup": 1.36,
+   "static_lpips": 0.022,
+   "fbcache_lpips_similar_skip": 0.11,
+   "fbcache_0.12_s": 34.06,
+   "nocache_s": 57.34
+  },
+  "lpips": "alex vs the same framework's uncached render"
+ },
+ "cells": [
+  {
+   "tag": "q21_off",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1"
+   }
+  },
+  {
+   "tag": "q21_fbcache",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_cache": "fbcache"
+   }
+  },
+  {
+   "tag": "q21_static",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_cache": "static"
+   }
+  },
+  {
+   "tag": "q21_static_every3",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_cache": "static"
+   },
+   "env": {
+    "UNSLOTH_STATIC_SKIP_EVERY": "3"
+   }
+  },
+  {
+   "tag": "q21_static_reuse3",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_cache": "static"
+   },
+   "env": {
+    "UNSLOTH_STATIC_SKIP_MODE": "reuse",
+    "UNSLOTH_STATIC_SKIP_EVERY": "3"
+   }
+  },
+  {
+   "tag": "q21_int8_off",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "int8"
+   }
+  },
+  {
+   "tag": "q21_int8_static",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "int8",
+    "transformer_cache": "static"
+   }
+  },
+  {
+   "tag": "q21_fp8_off",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "fp8"
+   }
+  },
+  {
+   "tag": "q21_fp8_static",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "fp8",
+    "transformer_cache": "static"
+   }
+  },
+  {
+   "tag": "q21_off_40",
+   "model": "@qwen_image_21",
+   "ref": "q21_off_40",
+   "steps": 40,
+   "short_steps": 10,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1"
+   }
+  },
+  {
+   "tag": "q21_fbcache_40",
+   "model": "@qwen_image_21",
+   "ref": "q21_off_40",
+   "steps": 40,
+   "short_steps": 10,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_cache": "fbcache"
+   }
+  },
+  {
+   "tag": "q21_static_40",
+   "model": "@qwen_image_21",
+   "ref": "q21_off_40",
+   "steps": 40,
+   "short_steps": 10,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_cache": "static"
+   }
+  },
+  {
+   "tag": "wan_off",
+   "model": "@wan22_5b",
+   "ref": "wan_off",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_cache": "off"
+   }
+  },
+  {
+   "tag": "wan_fbcache",
+   "model": "@wan22_5b",
+   "ref": "wan_off",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_cache": "fbcache"
+   }
+  },
+  {
+   "tag": "wan_static",
+   "model": "@wan22_5b",
+   "ref": "wan_off",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_cache": "static"
+   }
+  },
+  {
+   "tag": "wan_static_every3",
+   "model": "@wan22_5b",
+   "ref": "wan_off",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_cache": "static"
+   },
+   "env": {
+    "UNSLOTH_STATIC_SKIP_EVERY": "3"
+   }
+  },
+  {
+   "tag": "wan_fp8_off",
+   "model": "@wan22_5b",
+   "ref": "wan_off",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_quant": "fp8",
+    "transformer_cache": "off"
+   }
+  },
+  {
+   "tag": "wan_fp8_static",
+   "model": "@wan22_5b",
+   "ref": "wan_off",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_quant": "fp8",
+    "transformer_cache": "static"
+   }
+  },
+  {
+   "tag": "zimg_static_below_min",
+   "model": "@zimage_turbo",
+   "ref": "zimg_off_9",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "transformer_cache": "static"
+   }
+  },
+  {
+   "tag": "zimg_off_9",
+   "model": "@zimage_turbo",
+   "ref": "zimg_off_9",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image"
+   }
+  }
+ ]
+}

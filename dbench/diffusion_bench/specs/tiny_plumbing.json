@@ -1,0 +1,474 @@
+{
+ "name": "tiny_plumbing",
+ "description": "The tiny tier: random-weight pipelines from hf-internal-testing (public, 1 to 56 MB each, local copies under $WORKSPACE/hf_tiny/<name>) through Studio in process, Studio over HTTP and plain diffusers. Every cell takes seconds; run it on EVERY change as plumbing: loads, family routing, quant / offload / cache / compile code paths, video export, the HTTP route. Output is noise: never quote a pixel or a timing from it, and the AMD criteria judge tiny cells on broken / newly flagged only. Sizes are per model: Studio refuses images under 256 px (MIN_OUTPUT_SIDE), tiny Z-Image's rope overflows at 256 so it runs through the diffusers backend at 64, tiny Wan runs at 64x64x9 (video has no 256 floor). Tiny Wan emits blank frames by construction (flagged at every state, so never a regression). Known on the wt_offload_pin tree: FBCache does not engage on tiny Qwen-Image-2.1 (read status.transformer_cache), compile fails on tiny Wan (dynamo fake-tensor SDPA error, so the Wan cells stay at speed off), transformer_cache static is refused on trees without PR 11737. Edit pipelines (tiny-flux-kontext-pipe, tiny-qwenimage-edit-pipe) need an input image and are left to the edge suite; tiny Sana / HunyuanVideo / CogVideoX failed in plain diffusers at 64 px (device assert / size mismatch) and are left out.",
+ "models": {
+  "tiny_flux_pipe": {
+   "repo": "hf-internal-testing/tiny-flux-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-flux-pipe"
+  },
+  "tiny_lumina2_pipe": {
+   "repo": "hf-internal-testing/tiny-lumina2-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-lumina2-pipe"
+  },
+  "tiny_qwenimage21_pipe": {
+   "repo": "hf-internal-testing/tiny-qwenimage21-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-qwenimage21-pipe"
+  },
+  "tiny_qwenimage_pipe": {
+   "repo": "hf-internal-testing/tiny-qwenimage-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-qwenimage-pipe"
+  },
+  "tiny_sd3_pipe": {
+   "repo": "hf-internal-testing/tiny-sd3-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-sd3-pipe"
+  },
+  "tiny_stable_diffusion_xl_pipe": {
+   "repo": "hf-internal-testing/tiny-stable-diffusion-xl-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-stable-diffusion-xl-pipe"
+  },
+  "tiny_wan_pipe": {
+   "repo": "hf-internal-testing/tiny-wan-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-wan-pipe"
+  },
+  "tiny_zimage_pipe": {
+   "repo": "hf-internal-testing/tiny-zimage-pipe",
+   "local": "$WORKSPACE/hf_tiny/tiny-zimage-pipe"
+  },
+  "tiny_flux_pipe_w512": {
+   "derived": "fetch_tiny.py DERIVED (tiny-flux-pipe, DiT rebuilt 512 wide)",
+   "local": "$WORKSPACE/hf_tiny/tiny-flux-pipe-w512"
+  },
+  "tiny_wan_pipe_w512": {
+   "derived": "fetch_tiny.py DERIVED (tiny-wan-pipe, DiT rebuilt 512 wide)",
+   "local": "$WORKSPACE/hf_tiny/tiny-wan-pipe-w512"
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "venv": {
+   "profile": "studio"
+  },
+  "kind": "image",
+  "prompts": "image_24",
+  "warmup": 1,
+  "options": {
+   "model_kind": "pipeline",
+   "memory_mode": "auto",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 100,
+  "min_free_mib": 4000,
+  "timeout_s": 300
+ },
+ "daily_tags": [
+  "tiny_flux",
+  "tiny_flux_repeat",
+  "tiny_flux_int8",
+  "tiny_flux_fp8",
+  "tiny_flux_compiled",
+  "tiny_q21",
+  "tiny_q21_int8",
+  "tiny_q21_lowvram",
+  "tiny_q21_fbcache",
+  "tiny_qwenimage_cfg",
+  "tiny_sdxl",
+  "tiny_lumina2",
+  "tiny_wan",
+  "tiny_wan_lowvram",
+  "tiny_d_zimage",
+  "tiny_d_sd3",
+  "tiny_http_flux"
+ ],
+ "baseline": {
+  "note": "no timing baseline by design; the pass criterion is every cell ok with no new sanity flag"
+ },
+ "cells": [
+  {
+   "tag": "tiny_flux",
+   "tier": "tiny",
+   "model": "@tiny_flux_pipe",
+   "ref": "tiny_flux",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_flux_repeat",
+   "tier": "tiny",
+   "model": "@tiny_flux_pipe",
+   "ref": "tiny_flux",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "note": "determinism / noise floor: same cell, new process",
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_flux_int8",
+   "tier": "tiny",
+   "model": "@tiny_flux_pipe",
+   "ref": "tiny_flux",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off",
+    "transformer_quant": "int8"
+   }
+  },
+  {
+   "tag": "tiny_flux_fp8",
+   "tier": "tiny",
+   "min_compute_cap": "8.9",
+   "model": "@tiny_flux_pipe",
+   "ref": "tiny_flux",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off",
+    "transformer_quant": "fp8"
+   }
+  },
+  {
+   "tag": "tiny_flux_compiled",
+   "tier": "tiny",
+   "model": "@tiny_flux_pipe",
+   "ref": "tiny_flux_compiled",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "default",
+    "transformer_quant": "none"
+   },
+   "note": "compile + CUDA graph path on NVIDIA (status.speed_optims lists compiled, cuda_graph); ROCm never compiles"
+  },
+  {
+   "tag": "tiny_q21",
+   "tier": "tiny",
+   "model": "@tiny_qwenimage21_pipe",
+   "ref": "tiny_q21",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_q21_int8",
+   "tier": "tiny",
+   "model": "@tiny_qwenimage21_pipe",
+   "ref": "tiny_q21",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "off",
+    "transformer_quant": "int8"
+   }
+  },
+  {
+   "tag": "tiny_q21_lowvram",
+   "tier": "tiny",
+   "model": "@tiny_qwenimage21_pipe",
+   "ref": "tiny_q21",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "off",
+    "transformer_quant": "none",
+    "memory_mode": "low_vram"
+   }
+  },
+  {
+   "tag": "tiny_q21_fbcache",
+   "tier": "tiny",
+   "model": "@tiny_qwenimage21_pipe",
+   "ref": "tiny_q21_fbcache",
+   "width": 256,
+   "height": 256,
+   "steps": 12,
+   "short_steps": 4,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "note": "engagement canary: read status.transformer_cache (it did NOT engage on the tiny model with the wt_offload_pin tree)",
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "off",
+    "transformer_quant": "none",
+    "transformer_cache": "fbcache"
+   }
+  },
+  {
+   "tag": "tiny_qwenimage_cfg",
+   "tier": "tiny",
+   "model": "@tiny_qwenimage_pipe",
+   "ref": "tiny_qwenimage_cfg",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 4.0,
+   "n": 2,
+   "short_n": 1,
+   "note": "true-CFG path (two forwards per step)",
+   "options": {
+    "family_override": "qwen-image",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_sdxl",
+   "tier": "tiny",
+   "model": "@tiny_stable_diffusion_xl_pipe",
+   "ref": "tiny_sdxl",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "sdxl",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_lumina2",
+   "tier": "tiny",
+   "model": "@tiny_lumina2_pipe",
+   "ref": "tiny_lumina2",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 4.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "lumina-2",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "tiny_wan",
+   "tier": "tiny",
+   "model": "@tiny_wan_pipe",
+   "ref": "tiny_wan",
+   "width": 64,
+   "height": 64,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 9,
+   "save_frames_every": 1
+  },
+  {
+   "tag": "tiny_wan_lowvram",
+   "tier": "tiny",
+   "model": "@tiny_wan_pipe",
+   "ref": "tiny_wan",
+   "width": 64,
+   "height": 64,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "speed_mode": "off",
+    "transformer_quant": "none",
+    "memory_mode": "low_vram"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 9,
+   "save_frames_every": 1
+  },
+  {
+   "tag": "tiny_flux_int8_group",
+   "tier": "tiny",
+   "model": "@tiny_flux_pipe_w512",
+   "ref": "tiny_flux_int8_group",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off",
+    "transformer_quant": "int8",
+    "memory_mode": "balanced"
+   },
+   "note": "int8 under group offload (memory_mode balanced: block-streamed DiT); the 512-wide DiT: the offload int8 path only takes linears at least 512 wide"
+  },
+  {
+   "tag": "tiny_flux_int8_model",
+   "tier": "tiny",
+   "model": "@tiny_flux_pipe_w512",
+   "ref": "tiny_flux_int8_model",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off",
+    "transformer_quant": "int8",
+    "memory_mode": "low_vram"
+   },
+   "note": "int8 under whole-module offload (memory_mode low_vram); the 512-wide DiT: the offload int8 path only takes linears at least 512 wide"
+  },
+  {
+   "tag": "tiny_wan_int8_lowvram",
+   "tier": "tiny",
+   "model": "@tiny_wan_pipe_w512",
+   "ref": "tiny_wan_int8_lowvram",
+   "width": 64,
+   "height": 64,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "speed_mode": "off",
+    "transformer_quant": "int8",
+    "memory_mode": "low_vram"
+   },
+   "kind": "video",
+   "prompts": "video_3",
+   "frames": 9,
+   "save_frames_every": 1,
+   "note": "video int8 under whole-module offload (the offloaded-quant video path); the 512-wide DiT (see tiny_flux_int8_group)"
+  },
+  {
+   "tag": "tiny_d_zimage",
+   "tier": "tiny",
+   "model": "@tiny_zimage_pipe",
+   "ref": "tiny_d_zimage",
+   "width": 64,
+   "height": 64,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {},
+   "backend": "diffusers",
+   "note": "diffusers backend: Studio refuses images under 256 px and tiny Z-Image's rope (axes_lens 32) overflows at 256 (CUDA device assert)"
+  },
+  {
+   "tag": "tiny_d_sd3",
+   "tier": "tiny",
+   "model": "@tiny_sd3_pipe",
+   "ref": "tiny_d_sd3",
+   "width": 64,
+   "height": 64,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 1.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {},
+   "backend": "diffusers",
+   "note": "no Studio family for SD3; diffusers backend keeps a second framework in the plumbing tier"
+  },
+  {
+   "tag": "tiny_http_flux",
+   "tier": "tiny",
+   "model": "@tiny_flux_pipe",
+   "ref": "tiny_http_flux",
+   "width": 256,
+   "height": 256,
+   "steps": 4,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "n": 2,
+   "short_n": 1,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off",
+    "transformer_quant": "none"
+   },
+   "backend": "studio_http",
+   "note": "the HTTP / Desktop path: needs a Studio venv with the server deps (uvicorn), or DIFFUSION_BENCH_STUDIO_URL"
+  }
+ ]
+}

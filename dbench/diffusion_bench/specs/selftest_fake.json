@@ -1,0 +1,14 @@
+{
+ "name": "selftest_fake",
+ "description": "No model, no GPU: exercises matrix, run_cell, resume, scoring and sanity flags with the fake backend.",
+ "defaults": {"backend": "fake", "width": 256, "height": 256, "steps": 4, "short_steps": 2, "short_n": 2, "n": 4, "warmup": 1},
+ "passes": [{"name": "p1"}, {"name": "p2", "n": 2}],
+ "reference": {"fake": "ref"},
+ "cells": [
+  {"tag": "ref"},
+  {"tag": "same"},
+  {"tag": "noisy", "options": {"noise": 0.05}},
+  {"tag": "video", "kind": "video", "frames": 9, "prompts": "video_3", "n": 2, "short_steps": 0},
+  {"tag": "broken", "options": {"fail_on_load": true}}
+ ]
+}

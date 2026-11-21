@@ -1,0 +1,284 @@
+{
+ "family": "flux.1-schnell",
+ "kind": "image",
+ "aliases": [
+  "flux1-schnell",
+  "flux-schnell"
+ ],
+ "bline": {
+  "graph": "flux.1",
+  "template": "flux_schnell.json",
+  "template_sha": "5db4eb6c6c81ba13604064ebd8348be76f399a77",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "flux1-schnell.safetensors",
+   "te": [
+    "clip_l.safetensors",
+    "t5xxl_fp16.safetensors"
+   ],
+   "vae": "ae.safetensors"
+  },
+  "shift_in_graph": false
+ },
+ "defaults": {
+  "steps": 4,
+  "cfg": 1.0,
+  "sampler": "euler",
+  "scheduler": "simple",
+  "shift": 1.0,
+  "width": 1024,
+  "height": 1024,
+  "frames": null,
+  "fps": null,
+  "negative": "",
+  "enhancer": false
+ },
+ "expected_passes": "steps",
+ "formats": {
+  "bf16": {
+   "studio": {
+    "model_path": "unsloth/FLUX.1-schnell",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format bf16: transformer_quant='none'"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df flux.1: no te_quant_auto (T5 stays bf16)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "unsloth/FLUX.1-schnell": {
+      "repo": "unsloth/FLUX.1-schnell",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "flux1-schnell.safetensors",
+     "te": [
+      "clip_l.safetensors",
+      "t5xxl_fp16.safetensors"
+     ],
+     "vae": "ae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "header: {'BF16': 776}; unet_manual_cast over ['bf16', 'fp16']"
+     },
+     "text_encoder": {
+      "weights": "fp16",
+      "compute": null,
+      "evidence": "clip_l.safetensors: header: {'F16': 196}; t5xxl_fp16.safetensors: header: {'F16': 220} (name token confirmed by the header); compute of non-quantized TEs not traced (CLIP dtype logic is per model)"
+     },
+     "vae": {
+      "weights": "fp32",
+      "compute": "bf16",
+      "evidence": "header: {'F32': 244}; compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "flux1-schnell.safetensors": {
+      "repo": "black-forest-labs/FLUX.1-schnell",
+      "file": "flux1-schnell.safetensors",
+      "build": null,
+      "fetch_repo": "unsloth/FLUX.1-schnell",
+      "sha256": "9403429e0052277ac2a87ad800adece5481eecefd9ed334e1f348723621d2a0a"
+     },
+     "clip_l.safetensors": {
+      "repo": "black-forest-labs/FLUX.1-schnell",
+      "file": "text_encoder/model.safetensors",
+      "build": "scripts/imgcmp_nov5/prep_files.py --group flux (te_clip_l: the HF CLIPTextModel file, loaded as is)",
+      "fetch_repo": "unsloth/FLUX.1-schnell"
+     },
+     "t5xxl_fp16.safetensors": {
+      "repo": "black-forest-labs/FLUX.1-schnell",
+      "file": "text_encoder_2/",
+      "build": "scripts/imgcmp_nov5/prep_files.py --group flux (te_t5: the two shards merged -> t5xxl_flux1schnell_merged; official dtype kept, so it is bf16 where the template file is fp16)",
+      "fetch_repo": "unsloth/FLUX.1-schnell"
+     },
+     "ae.safetensors": {
+      "repo": "black-forest-labs/FLUX.1-schnell",
+      "file": "ae.safetensors",
+      "build": null,
+      "fetch_repo": "unsloth/FLUX.1-schnell",
+      "sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38"
+     }
+    }
+   },
+   "source": "BFL original DiT + blineanonymous/flux_text_encoders (specs/amd_studio_vs_bline.json models)",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "fp8": {
+   "studio": {
+    "model_path": "unsloth/FLUX.1-schnell-FP8",
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "format fp8: transformer_quant=None"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df flux.1: no te_quant_auto (T5 stays bf16)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "unsloth/FLUX.1-schnell-FP8": {
+      "repo": "unsloth/FLUX.1-schnell-FP8",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "checkpoint": "flux1-schnell-fp8.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "bf16",
+      "evidence": "header: {'F32': 246, 'F16': 197, 'F8_E4M3': 995} (name token confirmed by the header); unet_manual_cast over ['bf16', 'fp16']"
+     },
+     "vae": {
+      "weights": "mixed checkpoint",
+      "compute": "bf16",
+      "evidence": "VAE inside the checkpoint (header {'F32': 246, 'F16': 197, 'F8_E4M3': 995}; LTX quant metadata covers the transformer only; SDXL checkpoints are all F16); bline/sd.py default VAE working_dtypes [bf16, fp32] (LTX: bf16)"
+     }
+    },
+    "sources": {
+     "flux1-schnell-fp8.safetensors": {
+      "source": null,
+      "reason": "the template's all-in-one fp8 checkpoint is a Bline-Org repack; only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet. Equivalent arm: flux1-schnell.safetensors with UNETLoader weight_dtype fp8_e4m3fn"
+     }
+    }
+   },
+   "source": "the template's all-in-one Bline-Org/flux1-schnell checkpoint (r5 configs flux_bline_fp8_aio)",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "unsloth/FLUX.1-schnell"
+  },
+  "gen": {
+   "steps": 4,
+   "guidance": 0.0
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "t4_fp16",
+   "check": "fp16_only_dtype",
+   "note": "On an fp16-only card (T4, sm75) the stacks resolve different compute dtypes (Studio fp16 or fp32 promote; the baseline UI fp32 for Qwen / Ideogram, fp16 first for Wan / HV1.5); record the resolved dtype per stack (bline_defaults_audit.md 'dtype on fp16-only GPUs')."
+  },
+  {
+   "id": "t5_length",
+   "check": "settings_equal",
+   "note": "The baseline UI pads T5 to min 256 real tokens, no truncation; Studio buckets <=256 -> 256 (exact) and 257-512 -> 512 (deliberate deviation). Prompts over 256 tokens are not like-for-like (bline_defaults_audit.md FLUX.1 T5 rows)."
+  },
+  {
+   "id": "sdcpp_mu",
+   "check": null,
+   "note": "sd.cpp schnell uses mu ~1.15 where the baseline UI and diffusers use shift 1.0 (settings_audit_nov10/others.md); an sd.cpp arm is not schedule-matched."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "text_encoder",
+    "vae"
+   ],
+   "formats": [
+    "bf16"
+   ],
+   "note": "template CLIP-L / T5 files are fp16 and ae is fp32 (computed bf16); Studio keeps T5 bf16 and the VAE bf16: storage dtype only"
+  },
+  {
+   "id": "guidance_meaning",
+   "check": "guidance_semantics",
+   "note": "Studio guidance 0.0 = no CFG (schnell is guidance-distilled) = the template's cfg 1 with no FluxGuidance node: the parity gate compares this pair through the card (studio.gen.guidance vs defaults.cfg), not as numbers."
+  }
+ ],
+ "sources": [
+  "outputs/bline_defaults_audit.md#flux.1 schnell",
+  "outputs/settings_audit_nov10/others.md#FLUX.1 schnell",
+  "outputs/bline_r5_nov17/archive/configs.json#studio.flux_default",
+  "outputs/bline_r5_nov17/archive/bench.py#WORKLOADS#F1"
+ ]
+}

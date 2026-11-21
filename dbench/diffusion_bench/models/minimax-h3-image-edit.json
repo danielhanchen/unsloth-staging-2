@@ -1,0 +1,219 @@
+{
+ "family": "minimax-h3-image-edit",
+ "kind": "edit",
+ "aliases": [
+  "h3-image-edit"
+ ],
+ "bline": {
+  "graph": "minimax-h3-image-edit",
+  "template": "image_minimax_h3_image_edit.json",
+  "template_sha": "3a756e8db7350e8d289d98e5e27905314637202e",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "minimax_h3_image_pruned_int8_convrot.safetensors",
+   "te": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+   "vae": "minimax_h3_image_vae_fp16.safetensors"
+  },
+  "shift_in_graph": true,
+  "graph_extra": {
+   "input_images": [
+    "ref.png"
+   ],
+   "edit_size": "template"
+  }
+ },
+ "defaults": {
+  "steps": 6,
+  "cfg": 1.0,
+  "sampler": "euler",
+  "scheduler": "simple",
+  "shift": null,
+  "width": 2048,
+  "height": 2048,
+  "frames": null,
+  "fps": null,
+  "negative": "",
+  "enhancer": false
+ },
+ "expected_passes": "steps",
+ "formats": {
+  "int8": {
+   "studio": {
+    "model_path": "MiniMaxAI/MiniMax-H3-Image",
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "format int8 (Studio auto = hosted INT8 ConvRot): transformer_quant=None"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "Studio origin/main beb98536df minimax-h3-image: in-tree loader picks the hosted int8 Qwen3-VL"
+     },
+     "vae": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "h3_bline_audit/h3_image.md #13: probed fp16 decoder"
+     }
+    },
+    "sources": {
+     "MiniMaxAI/MiniMax-H3-Image": {
+      "repo": "MiniMaxAI/MiniMax-H3-Image",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "minimax_h3_image_pruned_int8_convrot.safetensors",
+     "te": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+     "vae": "minimax_h3_image_vae_fp16.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "header: {'F32': 206, 'BF16': 271, 'F16': 51, 'U8': 250, 'I8': 200}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors: header: {'F32': 350, 'BF16': 552, 'I8': 350, 'U8': 350}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "header: {'F16': 416} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "minimax_h3_image_pruned_int8_convrot.safetensors": {
+      "source": null,
+      "reason": "only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet (scripts/h3i_edit2048_bench/fetch.py read Bline-Org/MiniMax-H3-Image); official source MiniMaxAI/MiniMax-H3-Image"
+     },
+     "qwen3vl_32b_minimax_h3_int8_convrot.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/text_encoder/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only te (first 50 layers, int8_convrot)"
+     },
+     "minimax_h3_image_vae_fp16.safetensors": {
+      "source": null,
+      "reason": "only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet (official source MiniMaxAI/MiniMax-H3-Image vae/)"
+     }
+    }
+   },
+   "source": "Bline-Org/MiniMax-H3-Image template files",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "MiniMaxAI/MiniMax-H3-Image"
+  },
+  "gen": {
+   "steps": 6,
+   "guidance": 1.0,
+   "reference": "<image>"
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "enhancer_off",
+   "check": "enhancer_off",
+   "note": "The template ships a prompt enhancer / upsampler; benchmarks switch it off on the baseline UI arm and send the raw prompt to both stacks."
+  },
+  {
+   "id": "h3_qkv_regroup",
+   "check": "h3_qkv_regroup",
+   "note": "Released H3 qkv_proj rows run per head ([q;k;v] of head 0, ...); the baseline UI's Attention splits by thirds. A baseline-UI file built from the release WITHOUT the regroup loads and renders noise (the 'BlineUI H3 decoding noise' mistake). Use Bline-Org's files or build with models.convert.h3_qkv_regroup (from scripts/vidcmp_nov5/build_bline.py h3_dit)."
+  },
+  {
+   "id": "gguf_refused",
+   "check": "gguf_bline_refused",
+   "note": "BlineUI-GGUF has no MiniMax-H3 architecture (loader.py:105 'Unknown model architecture'); bline_graphs refuses an H3 .gguf DiT. H3 GGUF is Studio / sd.cpp only (video_vs_bline_nov5 README:411). BlineUI-GGUF @ 6ea2651e (upstream HEAD) loader.py:12 IMG_ARCH_LIST has no H3 entry and tools/convert.py detect_arch no H3 template, so H3-Image GGUF is refused too (code-read)."
+  },
+  {
+   "id": "sigma_grid",
+   "check": null,
+   "note": "The baseline UI's simple scheduler at 6 steps lands up to 9e-4 off the distilled PDD grid; Studio uses the exact grid (do not copy; h3_image.md #8). sigmas_equal is expected to fail by <1e-3: use a 1e-3 tolerance for this family."
+  },
+  {
+   "id": "fixed_six_steps",
+   "check": null,
+   "note": "Studio diffusers refuses steps != 6 (fused PDD heads); the baseline UI accepts any count (h3_image.md #9)."
+  },
+  {
+   "id": "guidance_meaning",
+   "check": "guidance_semantics",
+   "note": "H3-Image: guidance must be 1.0 in Studio (anything else refused; negative ignored); template cfg 1 with ConditioningZeroOut negative = no uncond pass."
+  },
+  {
+   "id": "png_compression",
+   "check": "png_compress_equal",
+   "note": "Edit references must be the same PNG bytes on both stacks; Studio saved PNGs at compress level 1, the baseline UI's SaveImage at 4 (a confound in the Nov 9 edit lead: quant_research_nov12/A_history_GOAL_DETAILS_frozen.md:293,318)."
+  },
+  {
+   "id": "new_reference_per_render",
+   "check": "new_reference_per_render",
+   "note": "Use a NEW reference image per timed edit render: a reused one hits Studio's reference-latent cache (same history file, line 318)."
+  },
+  {
+   "id": "edit_size",
+   "check": "resolution_equal",
+   "note": "Template: reference -> 4 MP (area) -> multiple of 32, output = that size (GetImageSize). Studio 'source' sizing gives ~1 MP then the 4 MP floor. Studio crops the reference top-left to a multiple of 16 (loses up to 31 px). Pin the size (h3_image.md #2-#4); graph_extra.edit_size 'cell' pins it on the baseline UI."
+  },
+  {
+   "id": "reference_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI samples the reference posterior with a CPU generator seeded 42 and draws reference noise per reference from the sampler seed on the CPU; Studio diffusers uses the request's GPU generator (h3_image.md #5-#7)."
+  }
+ ],
+ "sources": [
+  "outputs/h3_bline_audit/h3_image.md#2-#7",
+  "outputs/quant_research_nov12/A_history_GOAL_DETAILS_frozen.md:293",
+  "temp/settings_audit/workflow_templates/templates/image_minimax_h3_image_edit.json",
+  "scripts/h3i_edit2048_bench/bline_arm.py#graph (rendered Nov 15)"
+ ]
+}

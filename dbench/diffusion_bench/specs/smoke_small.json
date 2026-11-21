@@ -1,0 +1,214 @@
+{
+ "name": "smoke_small",
+ "description": "The everyday tier: small models, few steps, n=3, one short pair, each cell about a minute on an idle B200 (load + one cold compile dominates), image AND video through Studio in process, plus one cell over Studio's HTTP API (the path the UI and Unsloth Desktop take; studio_http launches its own server per cell unless DIFFUSION_BENCH_STUDIO_URL is set). Covers: SDXL UNet path, Z-Image bf16 / int8 / fp8 / low_vram offload (keep + pin as the tree defaults them), FLUX.1-schnell, Qwen-Image-2.1, Wan2.2-TI2V-5B video. Levers that are not on unsloth main yet (static skip, VAE compile, keep / pin env switches) live in the campaign specs, so this tier stays green on main. For plumbing in seconds use tiny_plumbing.json first. Numbers from this tier are for catching breakage and gross regressions against the previous day's run on the SAME GPU, not for publication: use a campaign spec for that. Daily: python diffusion_bench/matrix.py specs/smoke_small.json --out $WORKSPACE/outputs/dbench/smoke_$(date +%Y%m%d) then score.py; the daily_tags list is every cell here.",
+ "models": {
+  "flux_schnell": {
+   "repo": "black-forest-labs/FLUX.1-schnell",
+   "local": "$WORKSPACE/hf_local_bases/black-forest-labs/FLUX.1-schnell"
+  },
+  "qwen_image_21": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
+   "local": "$WORKSPACE/temp/qwen_image_21"
+  },
+  "sdxl_turbo": {
+   "repo": "stabilityai/sdxl-turbo",
+   "local": "$WORKSPACE/sdxl_turbo_base"
+  },
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "local": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+  },
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "local": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo"
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "venv": {
+   "profile": "studio"
+  },
+  "kind": "image",
+  "width": 1024,
+  "height": 1024,
+  "prompts": "image_24",
+  "n": 3,
+  "warmup": 1,
+  "short_n": 1,
+  "options": {
+   "model_kind": "pipeline",
+   "transformer_quant": "none",
+   "speed_mode": "default",
+   "memory_mode": "fast",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 10,
+  "min_free_mib": 60000,
+  "timeout_s": 1800
+ },
+ "daily_tags": [
+  "smoke_sdxlt",
+  "smoke_zimg_bf16",
+  "smoke_zimg_int8",
+  "smoke_zimg_lowvram",
+  "smoke_flux",
+  "smoke_q21",
+  "smoke_zimg_fp8",
+  "smoke_wan",
+  "smoke_http_zimg"
+ ],
+ "baseline": {
+  "note": "no historical numbers at these small shapes; the first green run on a given GPU is the baseline, keep its scores.json"
+ },
+ "cells": [
+  {
+   "tag": "smoke_sdxlt",
+   "model": "@sdxl_turbo",
+   "ref": "smoke_sdxlt",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "n": 3,
+   "short_n": 1,
+   "options": {
+    "family_override": "sdxl"
+   }
+  },
+  {
+   "tag": "smoke_zimg_bf16",
+   "model": "@zimage_turbo",
+   "ref": "smoke_zimg_bf16",
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "n": 3,
+   "short_n": 1,
+   "options": {
+    "family_override": "z-image"
+   }
+  },
+  {
+   "tag": "smoke_zimg_int8",
+   "model": "@zimage_turbo",
+   "ref": "smoke_zimg_bf16",
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "n": 3,
+   "short_n": 1,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "int8"
+   }
+  },
+  {
+   "tag": "smoke_zimg_lowvram",
+   "model": "@zimage_turbo",
+   "ref": "smoke_zimg_bf16",
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "n": 3,
+   "short_n": 1,
+   "options": {
+    "family_override": "z-image",
+    "memory_mode": "low_vram"
+   }
+  },
+  {
+   "tag": "smoke_flux",
+   "model": "@flux_schnell",
+   "ref": "smoke_flux",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "n": 3,
+   "short_n": 1,
+   "options": {
+    "family_override": "flux.1"
+   }
+  },
+  {
+   "tag": "smoke_q21",
+   "model": "@qwen_image_21",
+   "ref": "smoke_q21",
+   "steps": 12,
+   "short_steps": 4,
+   "guidance": 1.0,
+   "width": 512,
+   "height": 512,
+   "n": 3,
+   "short_n": 1,
+   "options": {
+    "family_override": "qwen-image-2.1"
+   }
+  },
+  {
+   "tag": "smoke_zimg_fp8",
+   "model": "@zimage_turbo",
+   "ref": "smoke_zimg_bf16",
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "n": 3,
+   "short_n": 1,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "fp8"
+   }
+  },
+  {
+   "tag": "smoke_wan",
+   "model": "@wan22_5b",
+   "ref": "smoke_wan",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 2,
+   "short_n": 1,
+   "width": 480,
+   "height": 320,
+   "frames": 17,
+   "fps": null,
+   "guidance": null,
+   "steps": 8,
+   "short_steps": 4,
+   "save_frames_every": 1,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_cache": "off"
+   }
+  },
+  {
+   "tag": "smoke_http_zimg",
+   "model": "@zimage_turbo",
+   "ref": "smoke_http_zimg",
+   "steps": 8,
+   "short_steps": 2,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "n": 3,
+   "short_n": 1,
+   "options": {
+    "family_override": "z-image"
+   },
+   "backend": "studio_http"
+  }
+ ]
+}

@@ -1,0 +1,275 @@
+{
+ "name": "mac",
+ "downloads": {
+  "sd_xl_turbo_1.0_fp16.safetensors": {
+   "repo": "stabilityai/sdxl-turbo",
+   "file": "sd_xl_turbo_1.0_fp16.safetensors",
+   "official_repo": "stabilityai/sdxl-turbo"
+  }
+ },
+ "prefetch": {
+  "stabilityai/sdxl-turbo:*": {
+   "repo": "stabilityai/sdxl-turbo",
+   "file": null,
+   "ignore_patterns": [
+    "*.bin",
+    "*.onnx",
+    "*.onnx_data",
+    "*.msgpack",
+    "*.ckpt",
+    "sd_xl_turbo_1.0*.safetensors",
+    "*.png",
+    "*.jpg",
+    "*.pb",
+    "*openvino*",
+    "*.xml"
+   ]
+  }
+ },
+ "comparisons": [
+  {
+   "id": "sdxl-turbo_mac-macos-15",
+   "family": "sdxl-turbo",
+   "target": "mac:macos-15",
+   "budget_gib": null,
+   "purpose": "parity",
+   "arms": [
+    "s_fp16",
+    "c_fp16"
+   ],
+   "runs": {
+    "s_fp16": [
+     "sdxl-turbo_mac-macos-15__s_fp16__k1p0"
+    ],
+    "c_fp16": [
+     "sdxl-turbo_mac-macos-15__c_fp16__k1p1"
+    ]
+   },
+   "order": [
+    "sdxl-turbo_mac-macos-15__s_fp16__k1p0",
+    "sdxl-turbo_mac-macos-15__c_fp16__k1p1"
+   ],
+   "aa_pairs": [],
+   "valid_if": "same vm_id and lane; SM clocks within 3% between the paired runs",
+   "est_min": 16.0,
+   "prefetch": [
+    "stabilityai/sdxl-turbo:*"
+   ],
+   "parity_pairs": [
+    {
+     "format": "fp16",
+     "a": "sdxl-turbo_mac-macos-15__s_fp16__k1p0",
+     "b": "sdxl-turbo_mac-macos-15__c_fp16__k1p1",
+     "quality": false,
+     "waive": []
+    }
+   ],
+   "vm_id": "mac-macos-15-1",
+   "lane": 0
+  }
+ ],
+ "revisions": {
+  "unsloth_sha": "8b7cde79ebf5a901b2fd936bbee214fb8c7562c7",
+  "zoo_sha": "9b3fccb098a01b12b7c3336fcde5b76f43a4cce2",
+  "bline_ref": "v0.46.2",
+  "scripts_sha": "3316ac4927948a58179f84e9dba55421f05254e5"
+ },
+ "vms": [
+  {
+   "vm_id": "mac-macos-15-1",
+   "target": "mac:macos-15",
+   "kind": "mac",
+   "gpu": "MPS",
+   "lanes": 1,
+   "lane_mode": "single",
+   "lane_mode_effective": "single",
+   "purpose": "parity",
+   "account": null,
+   "comparisons": [
+    "sdxl-turbo_mac-macos-15"
+   ],
+   "slots": [
+    [
+     {
+      "tag": "trial__mac-macos-15-1",
+      "lane": 0,
+      "stack": "studio",
+      "timed": false,
+      "comparison": null,
+      "est_min": 4.44,
+      "trial": true
+     }
+    ],
+    [
+     {
+      "tag": "sdxl-turbo_mac-macos-15__s_fp16__k1p0",
+      "lane": 0,
+      "stack": "studio",
+      "timed": false,
+      "family": "sdxl-turbo",
+      "comparison": "sdxl-turbo_mac-macos-15",
+      "est_min": 8.88
+     }
+    ],
+    [
+     {
+      "tag": "sdxl-turbo_mac-macos-15__c_fp16__k1p1",
+      "lane": 0,
+      "stack": "blineui",
+      "timed": false,
+      "family": "sdxl-turbo",
+      "comparison": "sdxl-turbo_mac-macos-15",
+      "est_min": 7.14
+     }
+    ]
+   ],
+   "est_min": 40.5,
+   "est_cu": 0.0
+  }
+ ],
+ "cells": [
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 512,
+   "height": 512,
+   "steps": 1,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "mac:macos-15",
+     "vm_id": "mac-macos-15-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "s_fp16",
+     "comparison": "sdxl-turbo_mac-macos-15",
+     "purpose": "parity",
+     "format": "fp16",
+     "tier": "default"
+    },
+    "parity_probe": true
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   },
+   "model": "stabilityai/sdxl-turbo",
+   "variant": "fp16",
+   "card": "sdxl-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 1,
+   "tag": "sdxl-turbo_mac-macos-15__s_fp16__k1p0",
+   "family": "sdxl-turbo",
+   "est_min": 8.88
+  },
+  {
+   "backend": "blineui",
+   "kind": "image",
+   "width": 512,
+   "height": 512,
+   "steps": 1,
+   "guidance": 1.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 1,
+   "options": {
+    "family": "sdxl-turbo",
+    "files": {
+     "checkpoint": "sd_xl_turbo_1.0_fp16.safetensors"
+    },
+    "sampler": "euler_ancestral",
+    "cache_bust": "sampler",
+    "template": "sdxlturbo_example.json",
+    "target": {
+     "name": "mac:macos-15",
+     "vm_id": "mac-macos-15-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "blineui",
+     "block": 1,
+     "order": "ABBA",
+     "aa_of": null,
+     "label": "c_fp16",
+     "comparison": "sdxl-turbo_mac-macos-15",
+     "purpose": "parity",
+     "format": "fp16",
+     "tier": null
+    },
+    "parity_probe": true
+   },
+   "env": {},
+   "variant": "fp16",
+   "card": "sdxl-turbo",
+   "venv": "bench",
+   "short_n": 1,
+   "tag": "sdxl-turbo_mac-macos-15__c_fp16__k1p1",
+   "family": "sdxl-turbo",
+   "est_min": 7.14
+  },
+  {
+   "backend": "studio",
+   "kind": "image",
+   "width": 512,
+   "height": 512,
+   "steps": 1,
+   "guidance": 0.0,
+   "prompts": "image_24",
+   "n": 1,
+   "warmup": 0,
+   "options": {
+    "generate": {},
+    "speed_mode": "default",
+    "target": {
+     "name": "mac:macos-15",
+     "vm_id": "mac-macos-15-1",
+     "lane": null,
+     "account": null,
+     "simulated_budget_gib": null,
+     "concurrent_with": null
+    },
+    "arm": {
+     "stack": "studio",
+     "block": 0,
+     "order": "trial",
+     "aa_of": null,
+     "label": "s_fp16",
+     "comparison": "sdxl-turbo_mac-macos-15",
+     "purpose": "trial",
+     "format": "fp16",
+     "tier": "default"
+    }
+   },
+   "env": {
+    "UNSLOTH_DIFFUSION_ALLOW_OVERSIZED_LOAD": "1"
+   },
+   "model": "stabilityai/sdxl-turbo",
+   "variant": "fp16",
+   "card": "sdxl-turbo",
+   "venv": {
+    "profile": "studio"
+   },
+   "short_n": 0,
+   "tag": "trial__mac-macos-15-1",
+   "family": "sdxl-turbo",
+   "est_min": 4.44
+  }
+ ]
+}

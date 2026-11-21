@@ -1,0 +1,373 @@
+{
+ "name": "campaign_quant_ladder",
+ "description": "Transformer quant ladder bf16 / int8 / fp8 / nvfp4 for Z-Image-Turbo (1024, 9 steps, CFG 0), FLUX.1-schnell (1024, 4 steps, CFG 0) and Qwen-Image-2.1 (1024, 25 steps, CFG 1), all at speed_mode default (compiled): eager torchao quant is always slower than bf16, so quant arms are only compared compiled (rule 14); the two *_eager Qwen cells exist to show that, not to rank. Every quant cell is scored against its own model's bf16 in the same framework; the *_bf16_repeat cells set the noise floor (compile noise < ~0.012 LPIPS without the canonical deterministic config). An explicit scheme fails CLOSED, so a BROKEN nvfp4 cell off sm_100 is the right answer, not a harness bug; also check status.transformer_quant on every ok cell (a 'dense fp8' run once had tq=None). The TE axis (text_encoder_quant fp8) is the 'why INT8 takes 26 GB' finding: DiT int8 + bf16 TE keeps 16.33 GiB of TE resident. For n=24 like the Qwen-Image-2.1 campaigns: --set n=24.",
+ "models": {
+  "flux_schnell": {
+   "repo": "black-forest-labs/FLUX.1-schnell",
+   "local": "$WORKSPACE/hf_local_bases/black-forest-labs/FLUX.1-schnell"
+  },
+  "qwen_image_21": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
+   "local": "$WORKSPACE/temp/qwen_image_21"
+  },
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "local": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo"
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "venv": {
+   "profile": "studio"
+  },
+  "kind": "image",
+  "width": 1024,
+  "height": 1024,
+  "prompts": "image_24",
+  "n": 8,
+  "warmup": 1,
+  "short_n": 3,
+  "options": {
+   "model_kind": "pipeline",
+   "transformer_quant": "none",
+   "speed_mode": "default",
+   "memory_mode": "fast",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 10,
+  "min_free_mib": 90000,
+  "timeout_s": 1800
+ },
+ "baseline": {
+  "source": "diffusion_bench_knowledge.md 1.1 (June PR 6658 campaign, B200 1024), 1.3, 1.4 A/E/H",
+  "june_warm_s_per_image_b200_1024": {
+   "note": "baseline arm there was GGUF Q4 eager; vs a compiled-bf16 baseline int8 is only 0.9-1.19x (z-image 1.19)",
+   "zimage_turbo": {
+    "gguf_eager": 1.83,
+    "gguf_compile": 0.71,
+    "fp8": 0.51,
+    "int8": 0.51
+   },
+   "flux_schnell": {
+    "gguf_eager": 1.46,
+    "gguf_compile": 0.57,
+    "fp8": 0.44,
+    "int8": 0.41
+   }
+  },
+  "june_accuracy_vs_bf16": {
+   "flux1_lpips_psnr": {
+    "gguf_q4": [
+     0.106,
+     25.9
+    ],
+    "fp8": [
+     0.079,
+     27.3
+    ],
+    "int8": [
+     0.047,
+     32.1
+    ]
+   },
+   "zimage_lpips": {
+    "gguf_q4": 0.166,
+    "fp8": 0.134,
+    "int8": 0.151
+   },
+   "note": "LPIPS network of the June numbers not recorded; FLUX.1 variant (dev vs schnell) ambiguous in the source"
+  },
+  "q21_studio_allopt_1024_25step_T0": {
+   "bf16_steady_s_pass1_pass2": [
+    1.7,
+    1.67
+   ],
+   "int8_steady_s": [
+    1.31,
+    1.34
+   ],
+   "int8_lpips_alex": 0.062,
+   "s_per_step": {
+    "bf16": 0.06,
+    "int8": 0.045
+   },
+   "int8_peak_gib": 27.7,
+   "cold_first_image_s": {
+    "bf16_max": 9.0,
+    "int8_max": 16.2
+   }
+  },
+  "q21_quant_arms_40step_lpips_alex": {
+   "int8_txt_in_excluded_hosted": 0.0642,
+   "int8_modulation_included": 0.0938,
+   "int8_generic": 0.1032,
+   "fp8_txt_in_excluded": 0.1047,
+   "fp8_default": 0.1121,
+   "bf16_other_gpu": 0.0
+  },
+  "q21_te_memory_gib": {
+   "int8_dit_bf16_te_resident": 24.35,
+   "with_te_fp8": 16.77,
+   "render_peak_bf16_te": 30.46,
+   "render_peak_fp8_te": 23.98
+  },
+  "nvfp4_small_dit_prequant_gate_lpips_vgg": {
+   "zimage": 0.301,
+   "flux": 0.31,
+   "qwen": 0.51,
+   "note": "vgg, 7-prompt gate; NOT comparable with the alex numbers this spec produces"
+  },
+  "prequant_load_peak_gib_fp8": {
+   "flux1": [
+    24.6,
+    12.0
+   ],
+   "zimage": [
+    13.0,
+    6.3
+   ],
+   "qwen": [
+    41.7,
+    20.4
+   ]
+  }
+ },
+ "cells": [
+  {
+   "tag": "zimg_bf16",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "zimg_int8",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "int8"
+   }
+  },
+  {
+   "tag": "zimg_fp8",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "fp8"
+   }
+  },
+  {
+   "tag": "zimg_nvfp4",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "nvfp4"
+   }
+  },
+  {
+   "tag": "zimg_bf16_repeat",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "flux_bf16",
+   "model": "@flux_schnell",
+   "ref": "flux_bf16",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "flux_int8",
+   "model": "@flux_schnell",
+   "ref": "flux_bf16",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "int8"
+   }
+  },
+  {
+   "tag": "flux_fp8",
+   "model": "@flux_schnell",
+   "ref": "flux_bf16",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "fp8"
+   }
+  },
+  {
+   "tag": "flux_nvfp4",
+   "model": "@flux_schnell",
+   "ref": "flux_bf16",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "nvfp4"
+   }
+  },
+  {
+   "tag": "flux_bf16_repeat",
+   "model": "@flux_schnell",
+   "ref": "flux_bf16",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "q21_bf16",
+   "model": "@qwen_image_21",
+   "ref": "q21_bf16",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "q21_int8",
+   "model": "@qwen_image_21",
+   "ref": "q21_bf16",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "int8"
+   }
+  },
+  {
+   "tag": "q21_fp8",
+   "model": "@qwen_image_21",
+   "ref": "q21_bf16",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "fp8"
+   }
+  },
+  {
+   "tag": "q21_nvfp4",
+   "model": "@qwen_image_21",
+   "ref": "q21_bf16",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "nvfp4"
+   }
+  },
+  {
+   "tag": "q21_bf16_repeat",
+   "model": "@qwen_image_21",
+   "ref": "q21_bf16",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "q21_int8_te_fp8",
+   "model": "@qwen_image_21",
+   "ref": "q21_bf16",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "fp8"
+   }
+  },
+  {
+   "tag": "q21_bf16_te_fp8",
+   "model": "@qwen_image_21",
+   "ref": "q21_bf16",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "none",
+    "text_encoder_quant": "fp8"
+   }
+  },
+  {
+   "tag": "q21_int8_eager",
+   "model": "@qwen_image_21",
+   "ref": "q21_bf16",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "int8",
+    "speed_mode": "eager"
+   }
+  },
+  {
+   "tag": "q21_bf16_eager",
+   "model": "@qwen_image_21",
+   "ref": "q21_bf16",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "transformer_quant": "none",
+    "speed_mode": "eager"
+   }
+  }
+ ]
+}

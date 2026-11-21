@@ -1,0 +1,78 @@
+{
+ "family": "qwen-image-2.1",
+ "kind": "image",
+ "bline": {
+  "graph": "qwen-image",
+  "template": "image_qwen_image_2_1",
+  "template_sha": null
+ },
+ "defaults": {
+  "steps": 25,
+  "cfg": 1.0,
+  "sampler": "euler",
+  "scheduler": "simple",
+  "shift": null,
+  "width": 1024,
+  "height": 1024,
+  "frames": null,
+  "fps": null,
+  "negative": "",
+  "enhancer": false
+ },
+ "expected_passes": "steps * (2 if cfg > 1 and not cfg_batched else 1)",
+ "formats": {
+  "bf16": {
+   "studio": {
+    "transformer_quant": "none"
+   },
+   "bline": {
+    "files": {
+     "dit": {
+      "repo": "Bline-Org/Qwen-Image-2.1_BlineUI",
+      "file": "split_files/diffusion_models/qwen_image_2.1_bf16.safetensors"
+     }
+    }
+   },
+   "source": "official repo"
+  },
+  "int8": {
+   "studio": {
+    "transformer_quant": "int8"
+   },
+   "bline": {
+    "files": {
+     "dit": {
+      "repo": "Bline-Org/Qwen-Image-2.1_BlineUI",
+      "file": "split_files/diffusion_models/qwen_image_2.1_int8_convrot.safetensors"
+     }
+    }
+   },
+   "source": "official repo"
+  },
+  "fp8": {
+   "studio": {
+    "transformer_quant": "fp8"
+   },
+   "bline": {
+    "files": {
+     "dit": "$CM/qwen_image_2.1_fp8.safetensors"
+    }
+   },
+   "source": "fixture"
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "Qwen/Qwen-Image-2.1"
+  },
+  "gen": {}
+ },
+ "est": {
+  "render_s_l4": 20,
+  "load_s": 150
+ },
+ "traps": [],
+ "sources": [
+  "fixture"
+ ]
+}

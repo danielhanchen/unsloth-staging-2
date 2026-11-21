@@ -1,0 +1,379 @@
+{
+ "name": "campaign_cuda_graphs",
+ "description": "CUDA graph capture on vs off (OFF = UNSLOTH_DISABLE_CUDA_GRAPH=1, what scripts/cg/image_matrix.sh toggled), Sept 8 whole-denoiser capture (static buffers, side stream warm-up, private pool; bitwise identical to eager). Graphs only pay when steps are launch-bound: 512 px and NVFP4 host dispatch; at 1024 px and on video they are ~1.0x and cost reserved VRAM (H3 +8.51 GB), so read peak_alloc / reserved too. The reference of every ON cell is its OFF twin, and the expectation is identical n/n (graphs must not change numerics). Check status.speed_optims / resolved on each ON cell: a cell whose capture silently fell back is not a graph measurement (an engaged graph shows as \"cuda_graph\" in status.speed_optims, observed on the wt_offload_pin tree at speed_mode default). nvfp4 cells need sm_100 + flashinfer (B200); the Qwen cells use Qwen-Image-2512 at its family operating point (20 steps, CFG 4), TODO(verify) which Qwen-Image variant the Sept 8 matrix used.",
+ "models": {
+  "flux_schnell": {
+   "repo": "black-forest-labs/FLUX.1-schnell",
+   "local": "$WORKSPACE/hf_local_bases/black-forest-labs/FLUX.1-schnell"
+  },
+  "qwen_image_2512": {
+   "repo": "Qwen/Qwen-Image-2512",
+   "local": "$WORKSPACE/hf_local_bases/Qwen/Qwen-Image",
+   "note": "$WORKSPACE/hf_local_bases/Qwen/Qwen-Image is a symlink to models/qwen_image_2512_mirror, i.e. Qwen-Image-2512"
+  },
+  "wan22_5b": {
+   "repo": "Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "local": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+  },
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "local": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo"
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "venv": {
+   "profile": "studio"
+  },
+  "kind": "image",
+  "width": 1024,
+  "height": 1024,
+  "prompts": "image_24",
+  "n": 8,
+  "warmup": 1,
+  "short_n": 3,
+  "options": {
+   "model_kind": "pipeline",
+   "transformer_quant": "none",
+   "speed_mode": "default",
+   "memory_mode": "fast",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 10,
+  "min_free_mib": 90000,
+  "timeout_s": 1800
+ },
+ "baseline": {
+  "source": "diffusion_bench_knowledge.md 1.2; scripts/g832/g832_graph.py, scripts/cg/image_matrix.sh -> outputs/cg_*; Jul 6 scripts/bench_cudagraphs.py -> outputs/bench_cg/results.json",
+  "sept8_speedup_graph_vs_eager_512px": {
+   "zimg_fp8": 1.7,
+   "zimg_bf16": 1.26,
+   "zimg_nvfp4": 2.3,
+   "flux": 1.41,
+   "qwen_fp8": 2.53,
+   "qwen_nvfp4": 3.59
+  },
+  "sept8_speedup_1024px": {
+   "range": "1.01-1.07",
+   "qwen_nvfp4": 1.37
+  },
+  "video": {
+   "wan": 0.906,
+   "h3": 1.0018,
+   "h3_reserved_extra_gb": 8.51
+  },
+  "jul6_flux_schnell_1024_4step_s": {
+   "bf16_max": [
+    0.376,
+    0.377
+   ],
+   "bf16_vram_gb": [
+    36,
+    58
+   ],
+   "nvfp4_mslk": [
+    0.506,
+    0.295
+   ],
+   "int8": [
+    0.356,
+    0.36
+   ],
+   "fp8": "fails (MSLK op has no fake impl)"
+  },
+  "warmup_s": {
+   "no_cudagraph": 54.0,
+   "reduce_overhead": 11.2
+  }
+ },
+ "cells": [
+  {
+   "tag": "zimg_bf16_512_cgon",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16_512_cgoff",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "zimg_bf16_512_cgoff",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16_512_cgoff",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "none"
+   },
+   "env": {
+    "UNSLOTH_DISABLE_CUDA_GRAPH": "1"
+   }
+  },
+  {
+   "tag": "zimg_fp8_512_cgon",
+   "model": "@zimage_turbo",
+   "ref": "zimg_fp8_512_cgoff",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "fp8"
+   }
+  },
+  {
+   "tag": "zimg_fp8_512_cgoff",
+   "model": "@zimage_turbo",
+   "ref": "zimg_fp8_512_cgoff",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "fp8"
+   },
+   "env": {
+    "UNSLOTH_DISABLE_CUDA_GRAPH": "1"
+   }
+  },
+  {
+   "tag": "zimg_nvfp4_512_cgon",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nvfp4_512_cgoff",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "nvfp4"
+   }
+  },
+  {
+   "tag": "zimg_nvfp4_512_cgoff",
+   "model": "@zimage_turbo",
+   "ref": "zimg_nvfp4_512_cgoff",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "nvfp4"
+   },
+   "env": {
+    "UNSLOTH_DISABLE_CUDA_GRAPH": "1"
+   }
+  },
+  {
+   "tag": "flux_bf16_512_cgon",
+   "model": "@flux_schnell",
+   "ref": "flux_bf16_512_cgoff",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "flux_bf16_512_cgoff",
+   "model": "@flux_schnell",
+   "ref": "flux_bf16_512_cgoff",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "flux.1",
+    "transformer_quant": "none"
+   },
+   "env": {
+    "UNSLOTH_DISABLE_CUDA_GRAPH": "1"
+   }
+  },
+  {
+   "tag": "qwen_fp8_512_cgon",
+   "model": "@qwen_image_2512",
+   "ref": "qwen_fp8_512_cgoff",
+   "steps": 20,
+   "short_steps": 5,
+   "guidance": 4.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "qwen-image",
+    "transformer_quant": "fp8"
+   }
+  },
+  {
+   "tag": "qwen_fp8_512_cgoff",
+   "model": "@qwen_image_2512",
+   "ref": "qwen_fp8_512_cgoff",
+   "steps": 20,
+   "short_steps": 5,
+   "guidance": 4.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "qwen-image",
+    "transformer_quant": "fp8"
+   },
+   "env": {
+    "UNSLOTH_DISABLE_CUDA_GRAPH": "1"
+   }
+  },
+  {
+   "tag": "qwen_nvfp4_512_cgon",
+   "model": "@qwen_image_2512",
+   "ref": "qwen_nvfp4_512_cgoff",
+   "steps": 20,
+   "short_steps": 5,
+   "guidance": 4.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "qwen-image",
+    "transformer_quant": "nvfp4"
+   }
+  },
+  {
+   "tag": "qwen_nvfp4_512_cgoff",
+   "model": "@qwen_image_2512",
+   "ref": "qwen_nvfp4_512_cgoff",
+   "steps": 20,
+   "short_steps": 5,
+   "guidance": 4.0,
+   "width": 512,
+   "height": 512,
+   "options": {
+    "family_override": "qwen-image",
+    "transformer_quant": "nvfp4"
+   },
+   "env": {
+    "UNSLOTH_DISABLE_CUDA_GRAPH": "1"
+   }
+  },
+  {
+   "tag": "zimg_bf16_1024_cgon",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16_1024_cgoff",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "zimg_bf16_1024_cgoff",
+   "model": "@zimage_turbo",
+   "ref": "zimg_bf16_1024_cgoff",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "transformer_quant": "none"
+   },
+   "env": {
+    "UNSLOTH_DISABLE_CUDA_GRAPH": "1"
+   }
+  },
+  {
+   "tag": "qwen_nvfp4_1024_cgon",
+   "model": "@qwen_image_2512",
+   "ref": "qwen_nvfp4_1024_cgoff",
+   "steps": 20,
+   "short_steps": 5,
+   "guidance": 4.0,
+   "options": {
+    "family_override": "qwen-image",
+    "transformer_quant": "nvfp4"
+   }
+  },
+  {
+   "tag": "qwen_nvfp4_1024_cgoff",
+   "model": "@qwen_image_2512",
+   "ref": "qwen_nvfp4_1024_cgoff",
+   "steps": 20,
+   "short_steps": 5,
+   "guidance": 4.0,
+   "options": {
+    "family_override": "qwen-image",
+    "transformer_quant": "nvfp4"
+   },
+   "env": {
+    "UNSLOTH_DISABLE_CUDA_GRAPH": "1"
+   }
+  },
+  {
+   "tag": "wan_bf16_cgon",
+   "model": "@wan22_5b",
+   "ref": "wan_bf16_cgoff",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_quant": "none"
+   }
+  },
+  {
+   "tag": "wan_bf16_cgoff",
+   "model": "@wan22_5b",
+   "ref": "wan_bf16_cgoff",
+   "kind": "video",
+   "prompts": "video_3",
+   "n": 3,
+   "short_n": 1,
+   "width": 832,
+   "height": 480,
+   "frames": 49,
+   "fps": null,
+   "guidance": null,
+   "steps": 50,
+   "short_steps": 10,
+   "save_frames_every": 4,
+   "options": {
+    "family_override": "wan2.2-ti2v-5b",
+    "transformer_quant": "none"
+   },
+   "env": {
+    "UNSLOTH_DISABLE_CUDA_GRAPH": "1"
+   }
+  }
+ ]
+}

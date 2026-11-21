@@ -1,0 +1,454 @@
+{
+ "family": "krea-2",
+ "kind": "image",
+ "aliases": [
+  "krea2",
+  "krea-2-turbo",
+  "krea2-turbo"
+ ],
+ "bline": {
+  "graph": "krea-2",
+  "template": "image_krea2_turbo_t2i_int8.json",
+  "template_sha": "1b2d59253baec09a782f2514747bf0863e4b3abc",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); byte-identical to 0.11.106 / a8bc07a. The fp8 sibling image_krea2_turbo_t2i.json is blob 64849302ea97cf43b622b9be60cc235c6cc4d9b1",
+  "template_faithful": true,
+  "files": {
+   "dit": "krea2_turbo_int8_convrot.safetensors",
+   "te": "qwen3vl_4b_fp8_scaled.safetensors",
+   "vae": "qwen_image_vae.safetensors"
+  },
+  "shift_in_graph": false,
+  "shift_note": "no ModelSampling node in the template: BlineUI v0.45.6 bline/supported_models.py:2034-2045 Krea2 sampling_settings shift 1.15 on ModelSamplingFlux (model_base.Krea2 ModelType.FLUX) = Studio's fixed Turbo mu 1.15 (diffusion_krea2.py:4-5 is_distilled; Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:2491-2494)",
+  "native_support": "BlineUI v0.45.6 (45eb6e6f): bline/model_detection.py:1060 (txtfusion.projector -> image_model krea2), bline/supported_models.py:2034 class Krea2, bline/sd.py:2084 CLIPType.KREA2 + Qwen3-VL-4B, nodes.py:1021 CLIPLoader type 'krea2'. Loaders used: UNETLoader, CLIPLoader(type krea2), VAELoader"
+ },
+ "defaults": {
+  "steps": 8,
+  "cfg": 1.0,
+  "sampler": "euler",
+  "scheduler": "simple",
+  "shift": 1.15,
+  "width": 1024,
+  "height": 1024,
+  "frames": null,
+  "fps": null,
+  "negative": "",
+  "enhancer": false
+ },
+ "expected_passes": "steps * (2 if cfg > 1 else 1)",
+ "formats": {
+  "bf16": {
+   "studio": {
+    "model_path": "krea/Krea-2-Turbo",
+    "transformer_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format bf16: transformer_quant='none'; krea/Krea-2-Turbo transformer/ shards bf16 (fp32 norms kept, diffusion.py:10546)"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": null,
+      "evidence": "Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1321 krea-2 te_quant_auto='int8' -> diffusion_te_prequant.py:97-102 hosted unsloth/Krea-2-Turbo-FP8 Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors (header: {'BF16': 461, 'U8': 252, 'I8': 252, 'F32': 252}, bline_quant layout); compute not traced (diffusion_te_prequant.py:45 calls the int8 path 'ConvRot weight-only')"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "krea/Krea-2-Turbo vae/ stored fp32 (header {'F32': 194}); pipeline torch_dtype bf16, no krea-2 VAE override in the family entry (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1302-1335)"
+     }
+    },
+    "sources": {
+     "krea/Krea-2-Turbo": {
+      "repo": "krea/Krea-2-Turbo",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot (Studio family base_repo, Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1308; mirrored to unsloth/Krea-2-Turbo, :1910); int8 / fp8 DiT and the int8 TE come from the hosted unsloth/Krea-2-Turbo-FP8 prequant (:1309-1312)"
+     },
+     "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/Krea-2-Turbo-FP8",
+      "file": "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "06da1dfad4a028b49c48b2331f13b569b443507a1fd3a66a82a78b26c6245baa",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "krea2_turbo_bf16.safetensors",
+     "te": "qwen3vl_4b_int8_convrot.safetensors",
+     "vae": "qwen_image_vae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "krea2_turbo_bf16.safetensors header: {'F32': 174, 'BF16': 256}; Krea2 supported_inference_dtypes [bf16, fp16, fp32] (bline/supported_models.py:2048)"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "qwen3vl_4b_int8_convrot.safetensors header: {'F32': 253, 'BF16': 460, 'I8': 253, 'U8': 253}, per-layer bline_quant config (same file and evidence as flux.3-klein int8)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "qwen_image_vae.safetensors header: {'BF16': 194}; Wan 2.1 VAE working_dtypes [bf16, fp16, fp32] (BlineUI v0.45.6 bline/sd.py:885)"
+     }
+    },
+    "sources": {
+     "krea2_turbo_bf16.safetensors": {
+      "repo": "krea/Krea-2-Turbo",
+      "file": "turbo.safetensors",
+      "build": null,
+      "sha256": "78bbf8f4165eda19cea3cb06c78089221932a39e2eed8af9da741f942c47ffb3",
+      "note": "Krea's own single-file DiT; sha256 identical to Bline-Org/Krea-2 diffusion_models/krea2_turbo_bf16.safetensors (HF tree API, 2026-11-18), so it is the baseline UI's bf16 file under its template-family name"
+     },
+     "qwen3vl_4b_int8_convrot.safetensors": {
+      "repo": "black-forest-labs/flux-3-image-klein-bline",
+      "file": "text_encoders/qwen3vl_4b_int8_convrot.safetensors",
+      "build": null,
+      "sha256": "32de113cbf8282b02cbff0794b637b9d6676da09314a1db5a30bcea9bf4ee01c",
+      "note": "BFL's own BlineUI repo (the FLUX.3 klein card's TE): the same stock Qwen3-VL-4B encoder Krea 2 uses (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1329 'the text encoder is stock Qwen3-VL-4B, shared with FLUX.3'); sha256 identical to Bline-Org/Krea-2 text_encoders/qwen3vl_4b_int8_convrot.safetensors (HF tree API, 2026-11-18)"
+     },
+     "qwen_image_vae.safetensors": {
+      "repo": "Qwen/Qwen-Image-Edit-2511",
+      "file": "vae/",
+      "build": "scripts/imgcmp_nov5/build_bline.py --group qe --only vae",
+      "note": "the template's qwen_image_vae.safetensors (Bline-Org/Krea-2 vae/, sha256 a70580f0...) is byte-identical to Bline-Org/Qwen-Image_BlineUI split_files/vae/qwen_image_vae.safetensors, the file the qwen-image-2512 / edit-2511 cards build from Qwen's vae/ with this step (bf16, 194 tensors)"
+     }
+    }
+   },
+   "source": "Krea's official turbo.safetensors (byte-identical to the template family's bf16 DiT) + BFL's int8 ConvRot Qwen3-VL-4B (Studio's te_quant_auto) + the Qwen-Image VAE build",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round. Not given a VRAM floor: the bf16 DiT alone is 26.3 GB = 24.5 GiB (diffusion_auto_policy.py:73), above L4 / T4, where both stacks run it offloaded; a resident size used as a floor would wrongly refuse those targets",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "int8": {
+   "studio": {
+    "model_path": "krea/Krea-2-Turbo",
+    "transformer_quant": "int8",
+    "precision": {
+     "transformer": {
+      "weights": "int8",
+      "compute": "int8",
+      "evidence": "format int8: transformer_quant='int8' -> hosted unsloth/Krea-2-Turbo-FP8 Krea-2-Turbo-INT8.safetensors (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1310): torchao Int8Tensor, per-row int8 weights + dynamic per-row int8 activations (header {'F32': 130, 'BF16': 300, 'I8': 258}; unsloth_metadata has no activation_rotation, so NOT ConvRot)"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": null,
+      "evidence": "Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1321 krea-2 te_quant_auto='int8' -> diffusion_te_prequant.py:97-102 hosted unsloth/Krea-2-Turbo-FP8 Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors (header: {'BF16': 461, 'U8': 252, 'I8': 252, 'F32': 252}, bline_quant layout); compute not traced (diffusion_te_prequant.py:45 calls the int8 path 'ConvRot weight-only')"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "krea/Krea-2-Turbo vae/ stored fp32 (header {'F32': 194}); pipeline torch_dtype bf16, no krea-2 VAE override in the family entry (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1302-1335)"
+     }
+    },
+    "sources": {
+     "krea/Krea-2-Turbo": {
+      "repo": "krea/Krea-2-Turbo",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot (Studio family base_repo, Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1308; mirrored to unsloth/Krea-2-Turbo, :1910); int8 / fp8 DiT and the int8 TE come from the hosted unsloth/Krea-2-Turbo-FP8 prequant (:1309-1312)"
+     },
+     "unsloth/Krea-2-Turbo-FP8": {
+      "repo": "unsloth/Krea-2-Turbo-FP8",
+      "file": null,
+      "build": null,
+      "note": "hosted prequant Studio fetches for int8 / fp8 (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1309-1312) and for the int8 TE"
+     },
+     "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/Krea-2-Turbo-FP8",
+      "file": "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "06da1dfad4a028b49c48b2331f13b569b443507a1fd3a66a82a78b26c6245baa",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "krea2_turbo_int8_convrot.safetensors",
+     "te": "qwen3vl_4b_int8_convrot.safetensors",
+     "vae": "qwen_image_vae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "krea2_turbo_int8_convrot.safetensors header: {'F32': 354, 'BF16': 76, 'I8': 224, 'U8': 224}, per-layer bline_quant config (blocks.*.bline_quant; first / last / tmlp / tproj / txtfusion stay bf16)"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "qwen3vl_4b_int8_convrot.safetensors header: {'F32': 253, 'BF16': 460, 'I8': 253, 'U8': 253}, per-layer bline_quant config (same file and evidence as flux.3-klein int8)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "qwen_image_vae.safetensors header: {'BF16': 194}; Wan 2.1 VAE working_dtypes [bf16, fp16, fp32] (BlineUI v0.45.6 bline/sd.py:885)"
+     }
+    },
+    "sources": {
+     "krea2_turbo_int8_convrot.safetensors": {
+      "source": null,
+      "reason": "only published by Bline-Org: Bline-Org/Krea-2 diffusion_models/krea2_turbo_int8_convrot.safetensors (sha256 8e4eeda70dd5037ab1ba2bef6b417f9f901e26093117cf397f741fc1fdaaf3f1); krea/Krea-2-Turbo ships no such file and diffusion_bench/builders has no Krea 2 step. An official-route alternative would be an int8 ConvRot build of krea/Krea-2-Turbo turbo.safetensors (same sha256 as the bf16 file) with bline-model-tools quant_int8_convrot.py, never written or checked against this file. A round can stage it with a request \"downloads\" entry for this name -> {\"repo\": \"Bline-Org/Krea-2\", \"file\": \"diffusion_models/krea2_turbo_int8_convrot.safetensors\"}"
+     },
+     "qwen3vl_4b_int8_convrot.safetensors": {
+      "repo": "black-forest-labs/flux-3-image-klein-bline",
+      "file": "text_encoders/qwen3vl_4b_int8_convrot.safetensors",
+      "build": null,
+      "sha256": "32de113cbf8282b02cbff0794b637b9d6676da09314a1db5a30bcea9bf4ee01c",
+      "note": "BFL's own BlineUI repo (the FLUX.3 klein card's TE): the same stock Qwen3-VL-4B encoder Krea 2 uses (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1329 'the text encoder is stock Qwen3-VL-4B, shared with FLUX.3'); sha256 identical to Bline-Org/Krea-2 text_encoders/qwen3vl_4b_int8_convrot.safetensors (HF tree API, 2026-11-18)"
+     },
+     "qwen_image_vae.safetensors": {
+      "repo": "Qwen/Qwen-Image-Edit-2511",
+      "file": "vae/",
+      "build": "scripts/imgcmp_nov5/build_bline.py --group qe --only vae",
+      "note": "the template's qwen_image_vae.safetensors (Bline-Org/Krea-2 vae/, sha256 a70580f0...) is byte-identical to Bline-Org/Qwen-Image_BlineUI split_files/vae/qwen_image_vae.safetensors, the file the qwen-image-2512 / edit-2511 cards build from Qwen's vae/ with this step (bf16, 194 tensors)"
+     }
+    }
+   },
+   "source": "template int8 DiT (UNETLoader krea2_turbo_int8_convrot) with the TE swapped from the template's qwen3vl_4b_fp8_scaled to qwen3vl_4b_int8_convrot (Studio's te_quant_auto int8, same scheme), template VAE",
+   "template_default": true,
+   "min_vram_gib": 13.5,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round. min_vram_gib = Studio's own steady-resident estimate of the hosted int8 DiT: diffusion_auto_policy.py:73 krea-2 bf16 DiT 26.3 GB x _QUANT_STEADY_FACTOR['int8'] 0.55 (:20-25) = 14.47 GB = 13.5 GiB (estimate_dense_quant, :258-292). Text encoder (8.9 GB bf16, 4.79 GiB int8 per Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1320) and VAE (0.5 GB) are companions Studio can offload, so this is a planning floor, not a measured minimum; host RAM never measured",
+    "cite": [
+     "Studio ee57a65b4 studio/backend/core/inference/diffusion_auto_policy.py:20-25,73,258-292"
+    ],
+    "studio_refused": []
+   }
+  },
+  "fp8": {
+   "studio": {
+    "model_path": "krea/Krea-2-Turbo",
+    "transformer_quant": "fp8",
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "format fp8: transformer_quant='fp8' -> hosted unsloth/Krea-2-Turbo-FP8 Krea-2-Turbo-FP8.safetensors (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1311): torchao Float8Tensor per-row (block_size [1, 6144]) with fp8 activation quant (header {'F32': 390, 'BF16': 40, 'F8_E4M3': 260})"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": null,
+      "evidence": "Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1321 krea-2 te_quant_auto='int8' -> diffusion_te_prequant.py:97-102 hosted unsloth/Krea-2-Turbo-FP8 Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors (header: {'BF16': 461, 'U8': 252, 'I8': 252, 'F32': 252}, bline_quant layout); compute not traced (diffusion_te_prequant.py:45 calls the int8 path 'ConvRot weight-only')"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "krea/Krea-2-Turbo vae/ stored fp32 (header {'F32': 194}); pipeline torch_dtype bf16, no krea-2 VAE override in the family entry (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1302-1335)"
+     }
+    },
+    "sources": {
+     "krea/Krea-2-Turbo": {
+      "repo": "krea/Krea-2-Turbo",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot (Studio family base_repo, Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1308; mirrored to unsloth/Krea-2-Turbo, :1910); int8 / fp8 DiT and the int8 TE come from the hosted unsloth/Krea-2-Turbo-FP8 prequant (:1309-1312)"
+     },
+     "unsloth/Krea-2-Turbo-FP8": {
+      "repo": "unsloth/Krea-2-Turbo-FP8",
+      "file": null,
+      "build": null,
+      "note": "hosted prequant Studio fetches for int8 / fp8 (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1309-1312) and for the int8 TE"
+     },
+     "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors": {
+      "repo": "unsloth/Krea-2-Turbo-FP8",
+      "file": "Krea-2-Turbo-text_encoder-INT8-ConvRot.safetensors",
+      "build": null,
+      "sha256": "06da1dfad4a028b49c48b2331f13b569b443507a1fd3a66a82a78b26c6245baa",
+      "note": "Studio's hosted encoder for this family (unsloth main 8b7cde79eb diffusion_te_prequant.py TE_INT8_CONVROT_FILES, published list): a Studio cell loads offline (local_files_only), so the VM prefetches it; without it Studio kept the dense bf16 encoder and the parity gate voided the pair (val_nov21 A100 trial: 'diffusion.te_prequant: int8:text_encoder:repo failed: Cannot find the requested files in the disk cache')"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "krea2_turbo_fp8_scaled.safetensors",
+     "te": "qwen3vl_4b_int8_convrot.safetensors",
+     "vae": "qwen_image_vae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp8_scaled",
+      "compute": null,
+      "evidence": "krea2_turbo_fp8_scaled.safetensors header: {'F32': 256, 'BF16': 174, 'F8_E4M3': 256}, _quantization_metadata float8_e4m3fn per layer with full_precision_matrix_mult on blocks.*.attn.gate / attn.wo (bf16 matmul there); compute of the rest not traced"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "qwen3vl_4b_int8_convrot.safetensors header: {'F32': 253, 'BF16': 460, 'I8': 253, 'U8': 253}, per-layer bline_quant config (same file and evidence as flux.3-klein int8)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "qwen_image_vae.safetensors header: {'BF16': 194}; Wan 2.1 VAE working_dtypes [bf16, fp16, fp32] (BlineUI v0.45.6 bline/sd.py:885)"
+     }
+    },
+    "sources": {
+     "krea2_turbo_fp8_scaled.safetensors": {
+      "source": null,
+      "reason": "only published by Bline-Org: Bline-Org/Krea-2 diffusion_models/krea2_turbo_fp8_scaled.safetensors (sha256 eb4dd8c612cfd10f64f25b057e6e6bbcb5737c94a7372177e456dbf7579502f1); krea/Krea-2-Turbo ships no such file and diffusion_bench/builders has no Krea 2 step. No builder reproduces Bline-Org's per-layer fp8 map (full_precision_matrix_mult on attn.gate / attn.wo). A round can stage it with a request \"downloads\" entry for this name -> {\"repo\": \"Bline-Org/Krea-2\", \"file\": \"diffusion_models/krea2_turbo_fp8_scaled.safetensors\"}"
+     },
+     "qwen3vl_4b_int8_convrot.safetensors": {
+      "repo": "black-forest-labs/flux-3-image-klein-bline",
+      "file": "text_encoders/qwen3vl_4b_int8_convrot.safetensors",
+      "build": null,
+      "sha256": "32de113cbf8282b02cbff0794b637b9d6676da09314a1db5a30bcea9bf4ee01c",
+      "note": "BFL's own BlineUI repo (the FLUX.3 klein card's TE): the same stock Qwen3-VL-4B encoder Krea 2 uses (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1329 'the text encoder is stock Qwen3-VL-4B, shared with FLUX.3'); sha256 identical to Bline-Org/Krea-2 text_encoders/qwen3vl_4b_int8_convrot.safetensors (HF tree API, 2026-11-18)"
+     },
+     "qwen_image_vae.safetensors": {
+      "repo": "Qwen/Qwen-Image-Edit-2511",
+      "file": "vae/",
+      "build": "scripts/imgcmp_nov5/build_bline.py --group qe --only vae",
+      "note": "the template's qwen_image_vae.safetensors (Bline-Org/Krea-2 vae/, sha256 a70580f0...) is byte-identical to Bline-Org/Qwen-Image_BlineUI split_files/vae/qwen_image_vae.safetensors, the file the qwen-image-2512 / edit-2511 cards build from Qwen's vae/ with this step (bf16, 194 tensors)"
+     }
+    }
+   },
+   "source": "template fp8 DiT (image_krea2_turbo_t2i.json UNETLoader krea2_turbo_fp8_scaled) with the TE swapped to qwen3vl_4b_int8_convrot (Studio's te_quant_auto int8), template VAE",
+   "template_default": false,
+   "min_vram_gib": 13.5,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round. min_vram_gib = Studio's own steady-resident estimate of the hosted fp8 DiT: diffusion_auto_policy.py:73 krea-2 bf16 DiT 26.3 GB x _QUANT_STEADY_FACTOR['fp8'] 0.55 (:20-25) = 14.47 GB = 13.5 GiB (estimate_dense_quant, :258-292). Text encoder (8.9 GB bf16, 4.79 GiB int8 per Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1320) and VAE (0.5 GB) are companions Studio can offload, so this is a planning floor, not a measured minimum; host RAM never measured",
+    "cite": [
+     "Studio ee57a65b4 studio/backend/core/inference/diffusion_auto_policy.py:20-25,73,258-292"
+    ],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "krea/Krea-2-Turbo"
+  },
+  "gen": {
+   "steps": 8,
+   "guidance": 0.0
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID. Turbo: 8 per render on both (cfg 1 / guidance 0, no uncond pass)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache); the default tier never skips. State the tier."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's te_quant_auto int8 ConvRot TE differs from the templates' qwen3vl_4b_fp8_scaled, so the card's formats load qwen3vl_4b_int8_convrot on the baseline UI arm."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "enhancer_off",
+   "check": "enhancer_off",
+   "note": "Both Krea 2 templates set the subgraph instance's prompt_enhance input TRUE (instance widgets_values[1]): a TextGenerate node (the Qwen3-VL-4B TE as an LLM, 512 tokens) rewrites the prompt before CLIPTextEncode. Benchmarks switch it off (the krea2 graph has no TextGenerate) and send the raw prompt to both stacks."
+  },
+  {
+   "id": "lora_off",
+   "check": null,
+   "note": "The templates carry a LoraLoaderModelOnly (krea2_darkbrush, 0.8) behind enable_lora = false (BlineSwitchNode on_false = the bare UNETLoader model); the graph omits it."
+  },
+  {
+   "id": "guidance_meaning",
+   "check": "guidance_semantics",
+   "note": "Krea 2 guidance is cond + g * (cond - uncond), enabled when g > 0 (diffusers Krea2Pipeline do_classifier_free_guidance = guidance_scale > 0): Studio guidance 0.0 (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:2316 ('krea', 8, 0.0)) = baseline cfg 1.0 (g = cfg - 1, as Z-Image)."
+  },
+  {
+   "id": "sigmas",
+   "check": "sigmas_equal",
+   "note": "Studio: FlowMatch Euler, sigmas linspace(1, 1/8, 8) with fixed mu 1.15 (is_distilled); baseline: euler / simple over ModelSamplingFlux shift 1.15. Same exponential time shift; the simple scheduler samples a 10000-entry table, so expect agreement to ~1e-4, not bit-equal: dump both."
+  },
+  {
+   "id": "cfg_batch_rows",
+   "check": "cfg_batch_rows",
+   "note": "Only relevant if a cell raises cfg above 1: Studio may batch cond + uncond (diffusion_cfg_batch.py:36 lists Krea2Transformer2DModel); evaluation counts are per sample row."
+  },
+  {
+   "id": "template_te_fp8",
+   "check": null,
+   "note": "Template TE is qwen3vl_4b_fp8_scaled in BOTH templates (int8 and fp8), not int8 ConvRot; Studio's family note (Studio ee57a65b4 studio/backend/core/inference/diffusion_families.py:1318-1320) measured layerwise fp8 TE LPIPS 0.110 vs int8 ConvRot 0.047 against bf16 and picked int8. The card's baseline arm runs the int8 ConvRot TE; a template-faithful TE run needs Bline-Org/Krea-2 text_encoders/qwen3vl_4b_fp8_scaled.safetensors staged by a request downloads entry."
+  },
+  {
+   "id": "accepted_precision_dit_int8",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "transformer"
+   ],
+   "formats": [
+    "int8"
+   ],
+   "note": "Both stacks run int8 weights with int8 matmuls, but the schemes differ: Studio's hosted INT8 DiT is torchao per-row W8A8 without rotation; the template file is int8 ConvRot (Hadamard-rotated, bline_quant). Equal work for a timing pair; expect a cross-stack quality gap from the scheme alone."
+  },
+  {
+   "id": "accepted_precision_dit_fp8",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "transformer"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "Studio's hosted FP8 DiT is torchao per-row Float8 with fp8 activations; the template file is fp8_scaled with attn.gate / attn.wo at full-precision matmul."
+  },
+  {
+   "id": "no_nvfp4_gguf",
+   "check": null,
+   "note": "Not carded: nvfp4 (Studio diffusion_nvfp4_policy.py has no krea-2 policy, so resolve_policy() is None; the baseline file Bline-Org/Krea-2 krea2_turbo_nvfp4 is Bline-Org only) and gguf (no krea2 arch in BlineUI-GGUF's IMG_ARCH_LIST per bline_graphs.GGUF_REFUSED's notes; unverified for this pin)."
+  }
+ ],
+ "sources": [
+  "temp/dbv/krea/wt/templates/image_krea2_turbo_t2i_int8.json (Bline-Org/workflow_templates v0.11.111, blob 1b2d5925)",
+  "temp/dbv/krea/wt/templates/image_krea2_turbo_t2i.json (v0.11.111, blob 64849302)",
+  "temp/dbv/unsloth/studio/backend/core/inference/diffusion_families.py:1302-1335 (krea-2 family), :2306-2316 (steps / guidance), :2491-2494 (mu 1.15)",
+  "temp/dbv/unsloth/studio/backend/core/inference/diffusion_auto_policy.py:20-25,73",
+  "temp/dbv/unsloth/studio/backend/core/inference/diffusion_te_prequant.py:45,97-102",
+  "temp/dbv/unsloth/studio/backend/core/inference/diffusion_krea2.py:4-18",
+  "temp/dbv/krea/BlineUI (v0.45.6 45eb6e6f) bline/supported_models.py:2034-2060, bline/model_detection.py:1060, bline/sd.py:885,2084",
+  "temp/audit_pkgs/d0.39.0/diffusers/pipelines/krea2/pipeline_krea2.py:426-427,487-492,613",
+  "temp/dbv/krea/headers/*.json (safetensors headers read by HTTP range, no weights)",
+  "HF tree API sha256: krea/Krea-2-Turbo, Bline-Org/Krea-2, unsloth/Krea-2-Turbo-FP8, black-forest-labs/flux-3-image-klein-bline (2026-11-18)"
+ ]
+}

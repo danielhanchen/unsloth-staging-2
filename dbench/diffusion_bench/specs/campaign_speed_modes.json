@@ -1,0 +1,405 @@
+{
+ "name": "campaign_speed_modes",
+ "description": "Speed tiers and compile tax (June PR 6658 G0_eager / G1_default / G1_max; Qwen-Image-2.1 max tier, PR 11731 / 11677): speed_mode off (no patches, the bit-identity reference; rule 21), eager (patches, no compile), default (regional compile), max (max-autotune-no-cudagraphs) per model, plus int8 at max and Z-Image-Turbo GGUF Q4_K_M eager vs compiled (the June table's baseline arm). Compile cost is reported separately (rule 4): cold_s = first image with a FRESH inductor cache, new_s = new prompts (Studio recompiles per new text length, ~14 s), steady_s = repeated prompt; compile tax = cold_s - steady_s, break-even images = tax / (off - steady). The per-cell inductor dirs are fresh on the first run only: delete them before re-measuring. The GGUF cells download unsloth/Z-Image-Turbo-GGUF (local_files_only false; pre-fetch it with hf download --local-dir and set DBENCH_MODEL_ZIMAGE_TURBO_GGUF to keep the download out of load_s) and pass base_repo as the local Z-Image-Turbo dir, TODO(verify) Studio accepts a local path there.",
+ "models": {
+  "flux_schnell": {
+   "repo": "black-forest-labs/FLUX.1-schnell",
+   "local": "$WORKSPACE/hf_local_bases/black-forest-labs/FLUX.1-schnell"
+  },
+  "qwen_image_21": {
+   "repo": "Qwen/Qwen-Image-2.1",
+   "revision": "790c92633540aa0cb11d9abf19eb46d861714758",
+   "local": "$WORKSPACE/temp/qwen_image_21"
+  },
+  "zimage_turbo": {
+   "repo": "Tongyi-MAI/Z-Image-Turbo",
+   "local": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo"
+  },
+  "zimage_turbo_gguf": {
+   "repo": "unsloth/Z-Image-Turbo-GGUF"
+  }
+ },
+ "defaults": {
+  "backend": "studio",
+  "venv": {
+   "profile": "studio"
+  },
+  "kind": "image",
+  "width": 1024,
+  "height": 1024,
+  "prompts": "image_24",
+  "n": 8,
+  "warmup": 1,
+  "short_n": 3,
+  "options": {
+   "model_kind": "pipeline",
+   "transformer_quant": "none",
+   "speed_mode": "default",
+   "memory_mode": "fast",
+   "transformer_cache": "off",
+   "local_files_only": true
+  }
+ },
+ "gate": {
+  "max_util": 10,
+  "min_free_mib": 90000,
+  "timeout_s": 1800
+ },
+ "baseline": {
+  "source": "diffusion_bench_knowledge.md 1.1 (compile tax L11905, modes), 1.4 E/G",
+  "june_warm_s_per_image_b200_1024": {
+   "zimage_turbo": {
+    "gguf_eager": 1.83,
+    "gguf_compile": 0.71
+   },
+   "flux_schnell": {
+    "gguf_eager": 1.46,
+    "gguf_compile": 0.57
+   }
+  },
+  "compile_tax_warm_cold_s": {
+   "zit_gguf_compile": [
+    0.72,
+    25.5,
+    "tax 24.7, break-even 22 images"
+   ],
+   "zit_int8": [
+    0.51,
+    32.5
+   ],
+   "schnell": [
+    0.57,
+    31.7
+   ],
+   "qwen_int8": [
+    1.82,
+    22.1,
+    "break-even 3 images"
+   ]
+  },
+  "zimage_q4_8step_compile_modes": {
+   "default_dynamic": [
+    0.8,
+    "5.7 s compile"
+   ],
+   "max_autotune_no_cudagraphs": [
+    0.78,
+    "66.2 s compile"
+   ],
+   "reduce_overhead_and_max_autotune": "crash (CUDA graph output overwritten)"
+  },
+  "q21_max_tier": {
+   "static_shape_recompiles": "5-6x at 4.8-22 s each",
+   "auto_dynamic": "compiles once",
+   "torch212_torchao018_dynamic_true": "InductorError CantSplit (fix dynamic=None, PR 11677)"
+  },
+  "q21_allopt_studio": {
+   "bf16_T0_steady_s": [
+    1.7,
+    1.67
+   ],
+   "bf16_max_steady_s": [
+    1.64,
+    1.61
+   ],
+   "int8_max_steady_s": [
+    1.26,
+    1.27
+   ],
+   "cold_first_image_s": {
+    "bf16_max": 9.0,
+    "int8_max": 16.2
+   }
+  },
+  "eager_patches_speedup": {
+   "zit": 1.18,
+   "qwen": 1.07,
+   "klein": 1.05
+  }
+ },
+ "cells": [
+  {
+   "tag": "zimg_off",
+   "model": "@zimage_turbo",
+   "ref": "zimg_off",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "speed_mode": "off"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/zimg_off",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/zimg_off"
+   }
+  },
+  {
+   "tag": "zimg_eager",
+   "model": "@zimage_turbo",
+   "ref": "zimg_off",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "speed_mode": "eager"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/zimg_eager",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/zimg_eager"
+   }
+  },
+  {
+   "tag": "zimg_default",
+   "model": "@zimage_turbo",
+   "ref": "zimg_off",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "speed_mode": "default"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/zimg_default",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/zimg_default"
+   }
+  },
+  {
+   "tag": "zimg_max",
+   "model": "@zimage_turbo",
+   "ref": "zimg_off",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "speed_mode": "max"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/zimg_max",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/zimg_max"
+   }
+  },
+  {
+   "tag": "zimg_int8_max",
+   "model": "@zimage_turbo",
+   "ref": "zimg_off",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "speed_mode": "max",
+    "transformer_quant": "int8"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/zimg_int8_max",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/zimg_int8_max"
+   }
+  },
+  {
+   "tag": "flux_off",
+   "model": "@flux_schnell",
+   "ref": "flux_off",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "off"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/flux_off",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/flux_off"
+   }
+  },
+  {
+   "tag": "flux_eager",
+   "model": "@flux_schnell",
+   "ref": "flux_off",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "eager"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/flux_eager",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/flux_eager"
+   }
+  },
+  {
+   "tag": "flux_default",
+   "model": "@flux_schnell",
+   "ref": "flux_off",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "default"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/flux_default",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/flux_default"
+   }
+  },
+  {
+   "tag": "flux_max",
+   "model": "@flux_schnell",
+   "ref": "flux_off",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "max"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/flux_max",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/flux_max"
+   }
+  },
+  {
+   "tag": "flux_int8_max",
+   "model": "@flux_schnell",
+   "ref": "flux_off",
+   "steps": 4,
+   "short_steps": 1,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "flux.1",
+    "speed_mode": "max",
+    "transformer_quant": "int8"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/flux_int8_max",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/flux_int8_max"
+   }
+  },
+  {
+   "tag": "q21_off",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "off"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/q21_off",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/q21_off"
+   }
+  },
+  {
+   "tag": "q21_eager",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "eager"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/q21_eager",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/q21_eager"
+   }
+  },
+  {
+   "tag": "q21_default",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "default"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/q21_default",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/q21_default"
+   }
+  },
+  {
+   "tag": "q21_max",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "max"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/q21_max",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/q21_max"
+   }
+  },
+  {
+   "tag": "q21_int8_max",
+   "model": "@qwen_image_21",
+   "ref": "q21_off",
+   "steps": 25,
+   "short_steps": 5,
+   "guidance": 1.0,
+   "options": {
+    "family_override": "qwen-image-2.1",
+    "speed_mode": "max",
+    "transformer_quant": "int8"
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/q21_int8_max",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/q21_int8_max"
+   }
+  },
+  {
+   "tag": "zimg_gguf_off",
+   "model": "@zimage_turbo_gguf",
+   "ref": "zimg_off",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "speed_mode": "off",
+    "model_kind": "gguf",
+    "gguf_filename": "z-image-turbo-Q4_K_M.gguf",
+    "base_repo": "@zimage_turbo",
+    "local_files_only": false
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/zimg_gguf_off",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/zimg_gguf_off"
+   }
+  },
+  {
+   "tag": "zimg_gguf_default",
+   "model": "@zimage_turbo_gguf",
+   "ref": "zimg_off",
+   "steps": 9,
+   "short_steps": 3,
+   "guidance": 0.0,
+   "options": {
+    "family_override": "z-image",
+    "speed_mode": "default",
+    "model_kind": "gguf",
+    "gguf_filename": "z-image-turbo-Q4_K_M.gguf",
+    "base_repo": "@zimage_turbo",
+    "local_files_only": false
+   },
+   "env": {
+    "TORCHINDUCTOR_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/inductor/zimg_gguf_default",
+    "TRITON_CACHE_DIR": "$WORKSPACE/temp/diffusion_bench/triton/zimg_gguf_default"
+   }
+  }
+ ]
+}

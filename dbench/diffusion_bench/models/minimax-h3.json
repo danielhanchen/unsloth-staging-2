@@ -1,0 +1,659 @@
+{
+ "family": "minimax-h3",
+ "kind": "video",
+ "aliases": [
+  "h3",
+  "minimax_h3",
+  "minimax-h3-video"
+ ],
+ "bline": {
+  "graph": "minimax-h3",
+  "template": "video_minimax_h3_t2v.json",
+  "template_sha": "0eb8f1bd1116a85609b1e44847a2cfcbc9069637",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+   "te": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+   "vae": "minimax_h3_video_vae_int8_convrot.safetensors",
+   "audio_vae": "minimax_h3_audio_vae_fp32.safetensors"
+  },
+  "shift_in_graph": false,
+  "alt_graphs": [
+   "o22-h3 (the external tester's verbatim API graph, CreateVideo + SaveVideo)"
+  ]
+ },
+ "defaults": {
+  "steps": 20,
+  "cfg": 1.0,
+  "sampler": "res_multistep",
+  "scheduler": "simple",
+  "shift": 12.0,
+  "width": 864,
+  "height": 480,
+  "frames": 124,
+  "fps": 24,
+  "negative": "",
+  "enhancer": false,
+  "audio_shift": 3.0
+ },
+ "expected_passes": "steps",
+ "formats": {
+  "int8": {
+   "studio": {
+    "model_path": "MiniMaxAI/MiniMax-H3",
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "format int8 (Studio auto = hosted INT8 ConvRot): transformer_quant=None"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "settings_audit_nov10/h3.md TE row: INT8 ConvRot, 50 of 64 layers"
+     },
+     "vae": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "settings_audit_nov10/h3.md video VAE row: released decoder cast to fp16"
+     },
+     "audio_vae": {
+      "weights": "fp32",
+      "compute": "fp32",
+      "evidence": "traced at unsloth main 8b7cde79eb: the diffusers path loads every component with load_components_strict(dtype = target.dtype) (video.py _load_h3_modular_pipeline), and diffusers 0.42.1 (Studio's pin for Python >= 3.11, studio/backend/requirements/diffusers-pin.txt) keeps AutoencoderKLMiniMaxH3Audio in fp32 (_keep_in_fp32_modules encoder / decoder / pre_block / dec_in_proj / mean_proj / logs_proj, autoencoder_kl_minimax_h3_audio.py: 'a pipeline-level torch_dtype=torch.bfloat16 must not downcast the weights'; the released audio_vae/ is F32, 605 MB); the native GGUF path loads vae/official/minimax_h3_audio_vae_fp32.safetensors (video_minimax_h3.py H3_AUDIO_VAE) with no --type override, so sd.cpp keeps the F32 tensors"
+     }
+    },
+    "sources": {
+     "MiniMaxAI/MiniMax-H3": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+     "te": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+     "vae": "minimax_h3_video_vae_int8_convrot.safetensors",
+     "audio_vae": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "header: {'F32': 210, 'BF16': 220, 'F16': 102, 'I8': 200, 'U8': 200}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "nvfp4_awq",
+      "compute": "mixed(nvfp4 awq)",
+      "evidence": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors: header: {'F32': 351, 'BF16': 651, 'F8_E4M3': 350, 'I8': 1, 'U8': 701}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "int8_convrot",
+      "compute": "fp16",
+      "evidence": "header: {'F32': 527, 'F16': 35, 'I8': 144, 'U8': 144}, per-layer quant config; compute from bline/sd.py working_dtypes"
+     },
+     "audio_vae": {
+      "weights": "fp32",
+      "compute": "fp32",
+      "evidence": "header: {'F32': 917} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "minimax_h3_fl2va_pruned_int8_convrot.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/transformer/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only dit (curve adaLN, qkv per-head -> thirds regroup = models.convert.h3_qkv_regroup, int8_convrot)"
+     },
+     "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors": {
+      "source": null,
+      "reason": "an NVFP4 AWQ quantisation published only by the baseline UI's mirror repos (Bline-Org/MiniMax-H3 and Bline-Org/MiniMax-H3-Image text_encoders/, LFS sha256 35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6, checked 2026-11-20); MiniMaxAI/MiniMax-H3 publishes only the bf16 Qwen3-VL shards (FL2VA/text_encoder/), and a quantised derivative can be neither hash- nor tensor-verified against them (mirror.py); the AWQ calibration recipe is not public (build_bline.py docstring)",
+      "unblock": "MiniMaxAI publishing this file (or its sha256) in MiniMaxAI/MiniMax-H3, or a public AWQ recipe a builder from the official shards can follow; until then run the int8_teint8 format (scripts/vidcmp_nov5/build_bline.py --group h3 --only te, int8_convrot from the official shards)"
+     },
+     "minimax_h3_video_vae_int8_convrot.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/video_vae/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only vae"
+     },
+     "minimax_h3_audio_vae_fp32.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/audio_vae/model.safetensors",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only avae (weight_norm folded)"
+     }
+    }
+   },
+   "source": "template files (pruned int8 ConvRot DiT, NVFP4-AWQ TE, int8 video VAE, fp32 audio VAE); Studio auto = hosted pruned INT8 ConvRot (20.3 GB)",
+   "template_default": true,
+   "min_vram_gib": 12.0,
+   "min_host_ram_gib": 64.0,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": 382.95,
+    "A100-40": 106.71,
+    "G4": 58.55
+   },
+   "planning": {
+    "basis": "slower stack's steady s/clip at 960x544x124, 20 steps; 12 GiB is the smallest budget that ran (both stacks offloaded), host = its peak (Studio 63.5 GiB): a 12.7 GB-host Colab T4 or a 31 GB Kaggle T4 cannot hold it",
+    "cite": [
+     "outputs/video_vs_bline_nov5/README.md#MiniMax-H3 by format",
+     "outputs/dbench_validation r2 A100 (2026-11-18): building the baseline DiT from the 13 official FL2VA transformer shards (67 GB) ran a 236 GB Colab disk out of space after Studio's own H3 files"
+    ],
+    "studio_refused": []
+   },
+   "min_disk_gib": 180.0,
+   "min_disk_basis": "peak on one VM with builders/build_bline_files.py --drop-sources (own fetches freed before the quant tool, TE shards 12 of 14): Studio int8 54.4 GiB (hosted INT8 ConvRot DiT 18.9 + int8 TE 25.3 + vae 9.7 + audio 0.6) + baseline TE build 53.1 shards + 48.0 merged source over the built DiT 19.5 = ~175 GiB; was ~271 GiB with every official shard (dit 61.7 + te 62.1 + vae 9.7) kept in the hub cache until the comparison ended"
+  },
+  "int8_teint8": {
+   "studio": {
+    "model_path": "MiniMaxAI/MiniMax-H3",
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "format int8_teint8 (Studio auto = hosted INT8 ConvRot): transformer_quant=None"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "settings_audit_nov10/h3.md TE row: INT8 ConvRot, 50 of 64 layers"
+     },
+     "vae": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "settings_audit_nov10/h3.md video VAE row: released decoder cast to fp16"
+     },
+     "audio_vae": {
+      "weights": "fp32",
+      "compute": "fp32",
+      "evidence": "traced at unsloth main 8b7cde79eb: the diffusers path loads every component with load_components_strict(dtype = target.dtype) (video.py _load_h3_modular_pipeline), and diffusers 0.42.1 (Studio's pin for Python >= 3.11, studio/backend/requirements/diffusers-pin.txt) keeps AutoencoderKLMiniMaxH3Audio in fp32 (_keep_in_fp32_modules encoder / decoder / pre_block / dec_in_proj / mean_proj / logs_proj, autoencoder_kl_minimax_h3_audio.py: 'a pipeline-level torch_dtype=torch.bfloat16 must not downcast the weights'; the released audio_vae/ is F32, 605 MB); the native GGUF path loads vae/official/minimax_h3_audio_vae_fp32.safetensors (video_minimax_h3.py H3_AUDIO_VAE) with no --type override, so sd.cpp keeps the F32 tensors"
+     }
+    },
+    "sources": {
+     "MiniMaxAI/MiniMax-H3": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "minimax_h3_fl2va_pruned_int8_convrot.safetensors",
+     "te": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+     "vae": "minimax_h3_video_vae_int8_convrot.safetensors",
+     "audio_vae": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "header: {'F32': 210, 'BF16': 220, 'F16': 102, 'I8': 200, 'U8': 200}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors: header: {'F32': 350, 'BF16': 552, 'I8': 350, 'U8': 350}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "int8_convrot",
+      "compute": "fp16",
+      "evidence": "header: {'F32': 527, 'F16': 35, 'I8': 144, 'U8': 144}, per-layer quant config; compute from bline/sd.py working_dtypes"
+     },
+     "audio_vae": {
+      "weights": "fp32",
+      "compute": "fp32",
+      "evidence": "header: {'F32': 917} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "minimax_h3_fl2va_pruned_int8_convrot.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/transformer/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only dit (curve adaLN, qkv per-head -> thirds regroup = models.convert.h3_qkv_regroup, int8_convrot)"
+     },
+     "qwen3vl_32b_minimax_h3_int8_convrot.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/text_encoder/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only te (first 50 layers, int8_convrot)"
+     },
+     "minimax_h3_video_vae_int8_convrot.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/video_vae/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only vae"
+     },
+     "minimax_h3_audio_vae_fp32.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/audio_vae/model.safetensors",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only avae (weight_norm folded)"
+     }
+    }
+   },
+   "source": "r5 configs h_int8_teint8: the like-for-like TE (Studio's TE is INT8 ConvRot)",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [
+     "outputs/dbench_validation r2 A100 (2026-11-18): building the baseline DiT from the 13 official FL2VA transformer shards (67 GB) ran a 236 GB Colab disk out of space after Studio's own H3 files"
+    ],
+    "studio_refused": []
+   },
+   "min_disk_gib": 180.0,
+   "min_disk_basis": "peak on one VM with builders/build_bline_files.py --drop-sources (own fetches freed before the quant tool, TE shards 12 of 14): Studio int8 54.4 GiB (hosted INT8 ConvRot DiT 18.9 + int8 TE 25.3 + vae 9.7 + audio 0.6) + baseline TE build 53.1 shards + 48.0 merged source over the built DiT 19.5 = ~175 GiB; was ~271 GiB with every official shard (dit 61.7 + te 62.1 + vae 9.7) kept in the hub cache until the comparison ended",
+   "est_load_s": {
+    "A100-40": {
+     "blineui": 147.5,
+     "studio": 284.8
+    }
+   },
+   "est_load_basis": [
+    "A100-40 blineui: median of load_s + first-render excess over fresh-process timed runs in dbench_nov19",
+    "A100-40 studio: median of load_s + first-render excess over fresh-process timed runs in dbench_nov19"
+   ]
+  },
+  "fp8": {
+   "studio": {
+    "model_path": "Bline-Org/MiniMax-H3",
+    "model_kind": "single_file",
+    "gguf_filename": "diffusion_models/minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+    "precision": {
+     "transformer": {
+      "weights": "fp8_scaled",
+      "compute": "fp8",
+      "evidence": "the baseline-UI file loaded single-file by Studio"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "settings_audit_nov10/h3.md TE row: INT8 ConvRot, 50 of 64 layers"
+     },
+     "vae": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "settings_audit_nov10/h3.md video VAE row: released decoder cast to fp16"
+     },
+     "audio_vae": {
+      "weights": "fp32",
+      "compute": "fp32",
+      "evidence": "traced at unsloth main 8b7cde79eb: the diffusers path loads every component with load_components_strict(dtype = target.dtype) (video.py _load_h3_modular_pipeline), and diffusers 0.42.1 (Studio's pin for Python >= 3.11, studio/backend/requirements/diffusers-pin.txt) keeps AutoencoderKLMiniMaxH3Audio in fp32 (_keep_in_fp32_modules encoder / decoder / pre_block / dec_in_proj / mean_proj / logs_proj, autoencoder_kl_minimax_h3_audio.py: 'a pipeline-level torch_dtype=torch.bfloat16 must not downcast the weights'; the released audio_vae/ is F32, 605 MB); the native GGUF path loads vae/official/minimax_h3_audio_vae_fp32.safetensors (video_minimax_h3.py H3_AUDIO_VAE) with no --type override, so sd.cpp keeps the F32 tensors"
+     }
+    },
+    "sources": {
+     "minimax_h3_fl2va_pruned_fp8_scaled.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/transformer/",
+      "build": "scripts/vidcmp_nov5/h3fmt_bline_build.py (fp8_scaled, from the build_bline h3_dit curve + regroup)"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "minimax_h3_fl2va_pruned_fp8_scaled.safetensors",
+     "te": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+     "vae": "minimax_h3_video_vae_int8_convrot.safetensors",
+     "audio_vae": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp8_scaled",
+      "compute": "fp8",
+      "evidence": "header: {'F32': 360, 'BF16': 220, 'F8_E4M3': 200, 'U8': 200, 'F16': 102}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "nvfp4_awq",
+      "compute": "mixed(nvfp4 awq)",
+      "evidence": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors: header: {'F32': 351, 'BF16': 651, 'F8_E4M3': 350, 'I8': 1, 'U8': 701}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "int8_convrot",
+      "compute": "fp16",
+      "evidence": "header: {'F32': 527, 'F16': 35, 'I8': 144, 'U8': 144}, per-layer quant config; compute from bline/sd.py working_dtypes"
+     },
+     "audio_vae": {
+      "weights": "fp32",
+      "compute": "fp32",
+      "evidence": "header: {'F32': 917} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "minimax_h3_fl2va_pruned_fp8_scaled.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/transformer/",
+      "build": "scripts/vidcmp_nov5/h3fmt_bline_build.py (fp8_scaled, from the build_bline h3_dit curve + regroup)"
+     },
+     "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors": {
+      "source": null,
+      "reason": "an NVFP4 AWQ quantisation published only by the baseline UI's mirror repos (Bline-Org/MiniMax-H3 and Bline-Org/MiniMax-H3-Image text_encoders/, LFS sha256 35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6, checked 2026-11-20); MiniMaxAI/MiniMax-H3 publishes only the bf16 Qwen3-VL shards (FL2VA/text_encoder/), and a quantised derivative can be neither hash- nor tensor-verified against them (mirror.py); the AWQ calibration recipe is not public (build_bline.py docstring)",
+      "unblock": "MiniMaxAI publishing this file (or its sha256) in MiniMaxAI/MiniMax-H3, or a public AWQ recipe a builder from the official shards can follow; until then run the int8_teint8 format (scripts/vidcmp_nov5/build_bline.py --group h3 --only te, int8_convrot from the official shards)"
+     },
+     "minimax_h3_video_vae_int8_convrot.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/video_vae/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only vae"
+     },
+     "minimax_h3_audio_vae_fp32.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/audio_vae/model.safetensors",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only avae (weight_norm folded)"
+     }
+    }
+   },
+   "source": "r5 configs h_fp8 / h_bline_fp8",
+   "template_default": false,
+   "min_vram_gib": 12.0,
+   "min_host_ram_gib": 63.0,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": 414.7,
+    "A100-40": null,
+    "G4": 61.61
+   },
+   "planning": {
+    "basis": "slower stack's steady s/render (median over new prompts); VRAM / host = the larger stack's peak at the smallest budget that ran",
+    "cite": [
+     "outputs/video_vs_bline_nov5/README.md#MiniMax-H3 by format",
+     "outputs/dbench_validation r2 A100 (2026-11-18): building the baseline DiT from the 13 official FL2VA transformer shards (67 GB) ran a 236 GB Colab disk out of space after Studio's own H3 files"
+    ],
+    "studio_refused": []
+   },
+   "min_disk_gib": 180.0,
+   "min_disk_basis": "peak on one VM with builders/build_bline_files.py --drop-sources (own fetches freed before the quant tool, TE shards 12 of 14): Studio int8 54.4 GiB (hosted INT8 ConvRot DiT 18.9 + int8 TE 25.3 + vae 9.7 + audio 0.6) + baseline TE build 53.1 shards + 48.0 merged source over the built DiT 19.5 = ~175 GiB; was ~271 GiB with every official shard (dit 61.7 + te 62.1 + vae 9.7) kept in the hub cache until the comparison ended"
+  },
+  "w6a8": {
+   "studio": {
+    "model_path": "Bline-Org/MiniMax-H3",
+    "model_kind": "single_file",
+    "gguf_filename": "diffusion_models/minimax_h3_fl2va_pruned_w6a8.safetensors",
+    "precision": {
+     "transformer": {
+      "weights": "w6a8",
+      "compute": "mixed(fp8/int8)",
+      "evidence": "the baseline-UI file loaded single-file by Studio"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "settings_audit_nov10/h3.md TE row: INT8 ConvRot, 50 of 64 layers"
+     },
+     "vae": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "settings_audit_nov10/h3.md video VAE row: released decoder cast to fp16"
+     },
+     "audio_vae": {
+      "weights": "fp32",
+      "compute": "fp32",
+      "evidence": "traced at unsloth main 8b7cde79eb: the diffusers path loads every component with load_components_strict(dtype = target.dtype) (video.py _load_h3_modular_pipeline), and diffusers 0.42.1 (Studio's pin for Python >= 3.11, studio/backend/requirements/diffusers-pin.txt) keeps AutoencoderKLMiniMaxH3Audio in fp32 (_keep_in_fp32_modules encoder / decoder / pre_block / dec_in_proj / mean_proj / logs_proj, autoencoder_kl_minimax_h3_audio.py: 'a pipeline-level torch_dtype=torch.bfloat16 must not downcast the weights'; the released audio_vae/ is F32, 605 MB); the native GGUF path loads vae/official/minimax_h3_audio_vae_fp32.safetensors (video_minimax_h3.py H3_AUDIO_VAE) with no --type override, so sd.cpp keeps the F32 tensors"
+     }
+    },
+    "sources": {
+     "minimax_h3_fl2va_pruned_w6a8.safetensors": {
+      "source": null,
+      "reason": "the w6a8 recipe is not public; only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "minimax_h3_fl2va_pruned_w6a8.safetensors",
+     "te": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors",
+     "vae": "minimax_h3_video_vae_int8_convrot.safetensors",
+     "audio_vae": "minimax_h3_audio_vae_fp32.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "w6a8",
+      "compute": "mixed(fp8/int8)",
+      "evidence": "header: {'F32': 218, 'BF16': 212, 'F16': 102, 'F8_E4M3': 201, 'I8': 209, 'U8': 209}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "nvfp4_awq",
+      "compute": "mixed(nvfp4 awq)",
+      "evidence": "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors: header: {'F32': 351, 'BF16': 651, 'F8_E4M3': 350, 'I8': 1, 'U8': 701}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "int8_convrot",
+      "compute": "fp16",
+      "evidence": "header: {'F32': 527, 'F16': 35, 'I8': 144, 'U8': 144}, per-layer quant config; compute from bline/sd.py working_dtypes"
+     },
+     "audio_vae": {
+      "weights": "fp32",
+      "compute": "fp32",
+      "evidence": "header: {'F32': 917} (name token confirmed by the header); compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "minimax_h3_fl2va_pruned_w6a8.safetensors": {
+      "source": null,
+      "reason": "the w6a8 recipe is not public; only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors": {
+      "source": null,
+      "reason": "an NVFP4 AWQ quantisation published only by the baseline UI's mirror repos (Bline-Org/MiniMax-H3 and Bline-Org/MiniMax-H3-Image text_encoders/, LFS sha256 35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6, checked 2026-11-20); MiniMaxAI/MiniMax-H3 publishes only the bf16 Qwen3-VL shards (FL2VA/text_encoder/), and a quantised derivative can be neither hash- nor tensor-verified against them (mirror.py); the AWQ calibration recipe is not public (build_bline.py docstring)",
+      "unblock": "MiniMaxAI publishing this file (or its sha256) in MiniMaxAI/MiniMax-H3, or a public AWQ recipe a builder from the official shards can follow; until then run the int8_teint8 format (scripts/vidcmp_nov5/build_bline.py --group h3 --only te, int8_convrot from the official shards)"
+     },
+     "minimax_h3_video_vae_int8_convrot.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/video_vae/",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only vae"
+     },
+     "minimax_h3_audio_vae_fp32.safetensors": {
+      "repo": "MiniMaxAI/MiniMax-H3",
+      "file": "FL2VA/audio_vae/model.safetensors",
+      "build": "scripts/vidcmp_nov5/build_bline.py --group h3 --only avae (weight_norm folded)"
+     }
+    }
+   },
+   "source": "r5 configs h_w6a8",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [
+     "outputs/dbench_validation r2 A100 (2026-11-18): building the baseline DiT from the 13 official FL2VA transformer shards (67 GB) ran a 236 GB Colab disk out of space after Studio's own H3 files"
+    ],
+    "studio_refused": []
+   },
+   "min_disk_gib": 180.0,
+   "min_disk_basis": "peak on one VM with builders/build_bline_files.py --drop-sources (own fetches freed before the quant tool, TE shards 12 of 14): Studio int8 54.4 GiB (hosted INT8 ConvRot DiT 18.9 + int8 TE 25.3 + vae 9.7 + audio 0.6) + baseline TE build 53.1 shards + 48.0 merged source over the built DiT 19.5 = ~175 GiB; was ~271 GiB with every official shard (dit 61.7 + te 62.1 + vae 9.7) kept in the hub cache until the comparison ended"
+  },
+  "gguf": {
+   "studio": {
+    "model_path": "unsloth/MiniMax-H3-GGUF",
+    "gguf_filename": "minimax_h3_fl2va_pruned-Q8_0.gguf",
+    "precision": {
+     "transformer": {
+      "weights": "gguf:Q8_0",
+      "compute": "bf16",
+      "evidence": "GGUF weights dequantized per layer (Studio GGUF kept / sd.cpp)"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "settings_audit_nov10/h3.md TE row: INT8 ConvRot, 50 of 64 layers"
+     },
+     "vae": {
+      "weights": "fp16",
+      "compute": "fp16",
+      "evidence": "settings_audit_nov10/h3.md video VAE row: released decoder cast to fp16"
+     },
+     "audio_vae": {
+      "weights": "fp32",
+      "compute": "fp32",
+      "evidence": "traced at unsloth main 8b7cde79eb: the diffusers path loads every component with load_components_strict(dtype = target.dtype) (video.py _load_h3_modular_pipeline), and diffusers 0.42.1 (Studio's pin for Python >= 3.11, studio/backend/requirements/diffusers-pin.txt) keeps AutoencoderKLMiniMaxH3Audio in fp32 (_keep_in_fp32_modules encoder / decoder / pre_block / dec_in_proj / mean_proj / logs_proj, autoencoder_kl_minimax_h3_audio.py: 'a pipeline-level torch_dtype=torch.bfloat16 must not downcast the weights'; the released audio_vae/ is F32, 605 MB); the native GGUF path loads vae/official/minimax_h3_audio_vae_fp32.safetensors (video_minimax_h3.py H3_AUDIO_VAE) with no --type override, so sd.cpp keeps the F32 tensors"
+     }
+    },
+    "sources": {
+     "minimax_h3_fl2va_pruned-Q8_0.gguf": {
+      "repo": "unsloth/MiniMax-H3-GGUF",
+      "file": "minimax_h3_fl2va_pruned-Q8_0.gguf",
+      "build": null
+     }
+    }
+   },
+   "bline": null,
+   "source": "Studio / sd.cpp only: BlineUI-GGUF refuses H3 (r5 configs h_gguf_*)",
+   "template_default": false,
+   "min_vram_gib": 11.0,
+   "min_host_ram_gib": 48.0,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": 113.76
+   },
+   "planning": {
+    "basis": "Studio only (no baseline-UI GGUF path); Q8_0 at a 12 GiB budget",
+    "cite": [
+     "outputs/video_vs_bline_nov5/README.md#MiniMax-H3 by format"
+    ],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "MiniMaxAI/MiniMax-H3"
+  },
+  "gen": {
+   "steps": 20,
+   "guidance": 1.0,
+   "width": 864,
+   "height": 480,
+   "num_frames": 124,
+   "fps": 24
+  },
+  "default_sampler": "res_multistep"
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "enhancer_off",
+   "check": "enhancer_off",
+   "note": "The template ships a prompt enhancer / upsampler; benchmarks switch it off on the baseline UI arm and send the raw prompt to both stacks."
+  },
+  {
+   "id": "h3_qkv_regroup",
+   "check": "h3_qkv_regroup",
+   "note": "Released H3 qkv_proj rows run per head ([q;k;v] of head 0, ...); the baseline UI's Attention splits by thirds. A baseline-UI file built from the release WITHOUT the regroup loads and renders noise (the 'BlineUI H3 decoding noise' mistake). Use Bline-Org's files or build with models.convert.h3_qkv_regroup (from scripts/vidcmp_nov5/build_bline.py h3_dit)."
+  },
+  {
+   "id": "gguf_refused",
+   "check": "gguf_bline_refused",
+   "note": "BlineUI-GGUF has no MiniMax-H3 architecture (loader.py:105 'Unknown model architecture'); bline_graphs refuses an H3 .gguf DiT. H3 GGUF is Studio / sd.cpp only (video_vs_bline_nov5 README:411). BlineUI-GGUF @ 6ea2651e (upstream HEAD) loader.py:12 IMG_ARCH_LIST has no H3 entry and tools/convert.py detect_arch no H3 template, so H3-Image GGUF is refused too (code-read)."
+  },
+  {
+   "id": "h3_19_vs_20",
+   "check": "h3_steps_are_evaluations",
+   "note": "Studio's diffusers H3 path ran N-1 evaluations for N steps (19 for 20) until the steps-are-evaluations fix (UNSLOTH_H3_STEP_EVALUATIONS, default on; =0 restores N-1). Every pre-fix H3 cell was 1-5% unfair (settings_audit_nov10/h3.md 2(a); h3_bline_audit/video_core.md row 5)."
+  },
+  {
+   "id": "sampler",
+   "check": "settings_equal",
+   "note": "Template res_multistep; Studio's diffusers H3 path runs res_multistep too for non-PDD banks (video_minimax_h3_sampling.h3_sampler; Euler only for PDD / turbo banks or UNSLOTH_H3_SAMPLER=euler), so the pair matches with no exception. studio.default_sampler names it for the HTTP backend, which cannot see the per-render recipe (h3.md (b)3 predates the Studio change)."
+  },
+  {
+   "id": "resolution",
+   "check": "resolution_equal",
+   "note": "Template 864x480 (ResolutionSelector 16:9 0.4 MP) vs Studio's 1344x768 default (2.5x pixels); the tester's H1 used 960x544 on both. Pin the size (h3.md (b)1)."
+  },
+  {
+   "id": "te_precision",
+   "check": "precision_equal",
+   "note": "Template TE is NVFP4-AWQ, Studio's INT8 ConvRot: use the int8_teint8 format for a like-for-like pair (h3.md (b)2; r5 h_int8_teint8)."
+  },
+  {
+   "id": "video_save",
+   "check": null,
+   "note": "This graph saves PNG frames (SaveImage) + PreviewAudio, not the template's CreateVideo -> SaveVideo MP4 export; o22-h3 keeps the MP4 export. Record which ran."
+  },
+  {
+   "id": "pruned_vs_full",
+   "check": "precision_equal",
+   "note": "Template DiT is the _pruned_ fl2va model; Studio's family default is the FULL fl2va: different models, quality not comparable (minimax_h3.py docstring)."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "text_encoder"
+   ],
+   "formats": [
+    "int8"
+   ],
+   "note": "template TE is qwen3vl_32b NVFP4-AWQ; Studio's is INT8 ConvRot (NVFP4 deliberately absent in Studio); the int8_teint8 format is the like-for-like TE"
+  },
+  {
+   "id": "accepted_precision_1",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "vae"
+   ],
+   "formats": [
+    "int8",
+    "int8_teint8",
+    "fp8",
+    "w6a8"
+   ],
+   "note": "template video VAE is int8 ConvRot weights (computed fp16); Studio casts the released decoder to fp16 (+ an optional int8 decoder lever)"
+  }
+ ],
+ "sources": [
+  "outputs/settings_audit_nov10/h3.md#1",
+  "outputs/h3_bline_audit/video_core.md#rows 1-6",
+  "outputs/bline_r5_nov17/archive/configs.json#bline.h_*",
+  "outputs/bline_r5_nov17/archive/bench.py#WORKLOADS#H1,H2",
+  "outputs/bline_r5_nov17/archive/bench.py#bline_graph_*#bline_graph_h3",
+  "outputs/video_vs_bline_nov5/README.md#MiniMax-H3",
+  "temp/settings_audit/workflow_templates/templates/video_minimax_h3_t2v.json"
+ ],
+ "standing": {
+  "format": "int8_teint8",
+  "why": "the template's int8 format cannot run on the baseline UI from official sources: its text encoder qwen3vl_32b_..._nvfp4_awq has no public recipe (only a Bline-Org file, which the toolkit never fetches). int8_teint8 puts the baseline on an INT8 ConvRot text encoder built from the official release with the public tool, which is what Studio's te_quant_auto runs (INT8 ConvRot), so DiT, TE and VAE precision match like for like; the template's own TE would be a different (nvfp4) encoder on one side only",
+  "decided": "2026-11-21 (scripts#876 open question 3)"
+ }
+}

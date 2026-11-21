@@ -1,0 +1,12 @@
+{
+ "black-forest-labs/flux-3-image-klein": {
+  "ae.safetensors": "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3",
+  "model.safetensors": "c3e9813cdd049c831c836b2e9db61150e49a93fc1a4c63b256494642fee0bd7c",
+  "variants/nvfp4/model.safetensors": "30b110b0675249cf0461247b4613240312c8064ccc4ef486f4d025c9ff65fb83"
+ },
+ "black-forest-labs/flux-3-image-klein-base": {
+  "ae.safetensors": "868fe7b343cc8f3a19dbcfcafbc3d5f888802be3f89bd81b65b3621a066ce8f3",
+  "model.safetensors": "5c921759dc03663dbb67df11d8e3d317d2d5b893b31b969c95dc77ebf861b19c",
+  "variants/nvfp4/model.safetensors": "fa3341c15644cbcbae9416c40349b82d8dc20bdd9224a64f4d63818b1116df3e"
+ }
+}

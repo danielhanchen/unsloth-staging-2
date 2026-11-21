@@ -1,0 +1,16 @@
+{
+ "tag": "v0.46.0",
+ "sha": "a277b5bf213e8a44fa34817b7770b54f86ef4cea",
+ "repo": "blineanonymous/BlineUI",
+ "tag_date": "2026-11-18",
+ "workflow_templates": "blineui-workflow-templates==0.11.111 (requirements.txt at v0.46.0, unchanged from v0.45.6) = Bline-Org/workflow_templates tag v0.11.111 @ 85984c2",
+ "rule": "pin the newest version TAG, not GitHub's 'latest release' (releases/latest still returned v0.45.0 while tags reached v0.45.6)",
+ "resolved_by": "gh api 'repos/blineanonymous/BlineUI/tags?per_page=5' (highest vX.Y.Z = first entry); gh api repos/blineanonymous/BlineUI/contents/requirements.txt?ref=v0.46.0",
+ "resolved_on": "2026-11-19",
+ "previous_rounds": {
+  "round5": "v0.45.4 (2aa4d535)",
+  "nov5": "v0.44.0 (2c75dc1b)",
+  "nov18_validation": "v0.45.6 (45eb6e6f)"
+ },
+ "cards_read_against": "workflow_templates v0.11.111; every card template is byte-identical to 0.11.106 (a8bc07a), the first read"
+}

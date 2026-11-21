@@ -1,0 +1,149 @@
+{
+ "description": "16 calibration + 8 held-out image prompts. Seeds 20260920+i: the set every Qwen-Image-2.1 / Studio vs BlineUI comparison used, so new runs stay comparable with old records.",
+ "rows": [
+  {
+   "id": "c00",
+   "prompt": "a golden retriever puppy playing in autumn leaves, shallow depth of field, warm afternoon light",
+   "split": "calib",
+   "seed": 20260920
+  },
+  {
+   "id": "c01",
+   "prompt": "a neon-lit ramen shop in a rainy Tokyo alley at night, reflections on wet pavement, cinematic",
+   "split": "calib",
+   "seed": 20260921
+  },
+  {
+   "id": "c02",
+   "prompt": "an elderly woman knitting a colorful scarf by a fireplace, cozy interior, soft lamp light",
+   "split": "calib",
+   "seed": 20260922
+  },
+  {
+   "id": "c03",
+   "prompt": "a red vintage pickup truck parked beside a wheat field, clear blue sky, film photography look",
+   "split": "calib",
+   "seed": 20260923
+  },
+  {
+   "id": "c04",
+   "prompt": "a chalkboard menu that says \"FRESH COFFEE 2.50\" in neat handwriting, cafe interior",
+   "split": "calib",
+   "seed": 20260924
+  },
+  {
+   "id": "c05",
+   "prompt": "macro photograph of a honeybee on a sunflower, visible pollen grains, extreme detail",
+   "split": "calib",
+   "seed": 20260925
+  },
+  {
+   "id": "c06",
+   "prompt": "a minimalist watercolor painting of mountains at dawn, pastel colors, negative space",
+   "split": "calib",
+   "seed": 20260926
+  },
+  {
+   "id": "c07",
+   "prompt": "a medieval knight in ornate engraved armor holding a banner, castle courtyard, overcast day",
+   "split": "calib",
+   "seed": 20260927
+  },
+  {
+   "id": "c08",
+   "prompt": "a stack of old leather-bound books next to a brass telescope on a wooden desk",
+   "split": "calib",
+   "seed": 20260928
+  },
+  {
+   "id": "c09",
+   "prompt": "an astronaut riding a horse on the moon, earth visible in the black sky, surreal digital art",
+   "split": "calib",
+   "seed": 20260929
+  },
+  {
+   "id": "c10",
+   "prompt": "a close-up of sliced citrus fruits on a marble cutting board, bright kitchen light",
+   "split": "calib",
+   "seed": 20260930
+  },
+  {
+   "id": "c11",
+   "prompt": "a dense pine forest in heavy fog, sun rays breaking through, moody atmosphere",
+   "split": "calib",
+   "seed": 20260931
+  },
+  {
+   "id": "c12",
+   "prompt": "a robot barista pouring latte art in a futuristic cafe, chrome surfaces, studio light",
+   "split": "calib",
+   "seed": 20260932
+  },
+  {
+   "id": "c13",
+   "prompt": "an intricate persian carpet pattern, top-down view, rich reds and blues, high detail",
+   "split": "calib",
+   "seed": 20260933
+  },
+  {
+   "id": "c14",
+   "prompt": "a child's crayon drawing of a family in front of a house with a big yellow sun",
+   "split": "calib",
+   "seed": 20260934
+  },
+  {
+   "id": "c15",
+   "prompt": "a stormy ocean wave crashing against a lighthouse, dramatic spray, long exposure feel",
+   "split": "calib",
+   "seed": 20260935
+  },
+  {
+   "id": "h_portrait_face",
+   "prompt": "a photoreal close-up portrait of an older fisherman, weathered skin, sharp catchlights in the eyes, natural window light, 85mm lens",
+   "split": "heldout",
+   "seed": 20260936
+  },
+  {
+   "id": "h_text_rendering",
+   "prompt": "a storefront sign that says \"UNSLOTH\" in bold clean letters, daytime, sharp focus",
+   "split": "heldout",
+   "seed": 20260937
+  },
+  {
+   "id": "h_hands",
+   "prompt": "a close-up of two human hands carefully folding an origami crane, anatomically correct fingers, soft studio light",
+   "split": "heldout",
+   "seed": 20260938
+  },
+  {
+   "id": "h_high_freq_texture",
+   "prompt": "extreme close-up of a woven wicker basket next to coarse tweed fabric and cracked dry earth, intricate high-frequency detail",
+   "split": "heldout",
+   "seed": 20260939
+  },
+  {
+   "id": "h_long_prompt",
+   "prompt": "a sweeping cinematic landscape at golden hour showing a winding cobblestone road that climbs through terraced vineyards toward a distant medieval hilltop village, warm amber light raking across the stone walls, a lone cyclist in a red jacket pedaling uphill, cypress trees casting long shadows, scattered wildflowers in the foreground, soft volumetric haze in the valley below, ultra detailed, rich color grading, shot on a full frame camera with a wide angle lens",
+   "split": "heldout",
+   "seed": 20260940
+  },
+  {
+   "id": "h_simple_object",
+   "prompt": "a single red apple on a plain white background, centered, soft even light",
+   "split": "heldout",
+   "seed": 20260941
+  },
+  {
+   "id": "h_steampunk_watch",
+   "prompt": "a hyperdetailed steampunk pocket watch with exposed brass gears, dramatic rim lighting, dark background, high contrast",
+   "split": "heldout",
+   "seed": 20260942
+  },
+  {
+   "id": "h_anime_style",
+   "prompt": "an anime illustration of a girl with silver hair holding a glowing paper lantern on a wooden bridge at dusk, fireflies, detailed background art",
+   "split": "heldout",
+   "seed": 20260943
+  }
+ ]
+}

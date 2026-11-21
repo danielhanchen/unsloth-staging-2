@@ -1,0 +1,440 @@
+{
+ "family": "ideogram-4",
+ "kind": "image",
+ "aliases": [
+  "ideogram4"
+ ],
+ "bline": {
+  "graph": "ideogram-4",
+  "template": "image_ideogram4_t2i.json",
+  "template_sha": "19903e4357ab01b4c4a3df8a8564b55a25883692",
+  "template_repo": "Bline-Org/workflow_templates v0.11.111 @ 85984c2 (the blineui-workflow-templates pin of BlineUI v0.45.6); every card template is byte-identical to 0.11.106 / a8bc07a",
+  "template_faithful": true,
+  "files": {
+   "dit": "ideogram4_fp8_scaled.safetensors",
+   "dit2": "ideogram4_unconditional_fp8_scaled.safetensors",
+   "te": "qwen3vl_8b_fp8_scaled.safetensors",
+   "vae": "flux2-vae.safetensors"
+  },
+  "shift_in_graph": true,
+  "graph_extra": {
+   "mu": 0.0,
+   "std": 1.75
+  }
+ },
+ "defaults": {
+  "steps": 20,
+  "cfg": 7.0,
+  "sampler": "euler",
+  "scheduler": "ideogram4",
+  "shift": null,
+  "width": 768,
+  "height": 1376,
+  "frames": null,
+  "fps": null,
+  "negative": "",
+  "enhancer": false,
+  "schedule": {
+   "mu": 0.0,
+   "std": 1.75
+  },
+  "cfg_override": {
+   "cfg": 3.0,
+   "start": 0.7,
+   "end": 1.0
+  }
+ },
+ "expected_passes": "steps * 2",
+ "formats": {
+  "fp8": {
+   "studio": {
+    "model_path": "ideogram-ai/ideogram-4-fp8",
+    "transformer_quant": "fp8",
+    "precision": {
+     "transformer": {
+      "weights": "fp8",
+      "compute": "fp8",
+      "evidence": "format fp8: transformer_quant='fp8'"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df ideogram-4: no te_quant_auto; vendor fp8 TE dequantized to bf16"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "ideogram-ai/ideogram-4-fp8": {
+      "repo": "ideogram-ai/ideogram-4-fp8",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "ideogram4_fp8_scaled.safetensors",
+     "dit2": "ideogram4_unconditional_fp8_scaled.safetensors",
+     "te": "qwen3vl_8b_fp8_scaled.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "fp8_scaled",
+      "compute": "fp8",
+      "evidence": "header: {'F32': 211, 'BF16': 247, 'F8_E4M3': 211, 'U8': 211}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "fp8_scaled",
+      "compute": "fp8",
+      "evidence": "qwen3vl_8b_fp8_scaled.safetensors: header: {'F32': 252, 'BF16': 498, 'F8_E4M3': 252, 'U8': 252}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "fp32",
+      "compute": "bf16",
+      "evidence": "header: {'I64': 1, 'F32': 250}; compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "ideogram4_fp8_scaled.safetensors": {
+      "source": null,
+      "reason": "never built from ideogram-ai/ideogram-4-fp8 (Ideogram 4 was never timed against the baseline UI); only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "ideogram4_unconditional_fp8_scaled.safetensors": {
+      "source": null,
+      "reason": "never built from ideogram-ai/ideogram-4-fp8 (Ideogram 4 was never timed against the baseline UI); only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "qwen3vl_8b_fp8_scaled.safetensors": {
+      "source": null,
+      "reason": "never built from ideogram-ai/ideogram-4-fp8 (Ideogram 4 was never timed against the baseline UI); only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "flux2-vae.safetensors": {
+      "repo": "black-forest-labs/flux-3-image-klein-bline",
+      "file": "vae/flux2-vae.safetensors",
+      "build": null,
+      "note": "BFL's own BlineUI repo; = BFL ae.safetensors of flux-3-image-klein (same sha256, build_q5.py vae role)"
+     }
+    }
+   },
+   "source": "template files. Studio: base_repo ideogram-ai/ideogram-4-fp8 (mirror unsloth/ideogram-4-fp8), pipeline-only (two DiTs assembled per component, no single-file / GGUF load); its fp8 DiT shards are DEQUANTIZED to bf16 on load (diffusion_ideogram4.py), so fp8 compute needs transformer_quant fp8 (the dense quant path, applied to BOTH DiTs: diffusion_transformer_quant.DENOISER_ATTRS)",
+   "template_default": true,
+   "min_vram_gib": null,
+   "min_host_ram_gib": 88,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "min_host_ram_gib: Studio assembles both DiTs and the Qwen3-VL-8B text encoder on the CPU at load (diffusion_ideogram4.py dequantises the vendor fp8 files to bf16): peak RSS 79.8 GiB on B200 (outputs/imgsweep/main/ideogram__t211__default), and the r2 Colab L4 (52 GB, no swap) Studio probe was OOM-killed (rc -9, no record; the baseline probe on the same VM ran). G4 (177 GB) is the only fp8 target that fits.",
+    "cite": [
+     "temp/dbv/r2l4c_attempt_michael.log",
+     "outputs/imgsweep/main/ideogram__t211__default/record.json"
+    ],
+    "studio_refused": []
+   }
+  },
+  "bf16": {
+   "studio": {
+    "model_path": "ideogram-ai/ideogram-4-fp8",
+    "transformer_quant": "none",
+    "text_encoder_quant": "none",
+    "precision": {
+     "transformer": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "format bf16: transformer_quant='none'"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "text_encoder_quant none"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "ideogram-ai/ideogram-4-fp8": {
+      "repo": "ideogram-ai/ideogram-4-fp8",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": null,
+   "source": "Studio default: dequantized vendor fp8 -> bf16 DiTs and TE (no te_quant_auto for Ideogram 4)",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  },
+  "int8": {
+   "studio": {
+    "model_path": "ideogram-ai/ideogram-4-fp8",
+    "transformer_quant": "int8",
+    "text_encoder_quant": "int8",
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "format int8: transformer_quant='int8'"
+     },
+     "text_encoder": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "text_encoder_quant int8 (hosted ConvRot prequant)"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "ideogram-ai/ideogram-4-fp8": {
+      "repo": "ideogram-ai/ideogram-4-fp8",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": {
+    "files": {
+     "dit": "ideogram4_int8_convrot.safetensors",
+     "dit2": "ideogram4_unconditional_int8_convrot.safetensors",
+     "te": "qwen3vl_8b_fp8_scaled.safetensors",
+     "vae": "flux2-vae.safetensors"
+    },
+    "precision": {
+     "transformer": {
+      "weights": "int8_convrot",
+      "compute": "int8",
+      "evidence": "header: {'F32': 204, 'BF16': 254, 'I8': 204, 'U8': 204}, per-layer quant config"
+     },
+     "text_encoder": {
+      "weights": "fp8_scaled",
+      "compute": "fp8",
+      "evidence": "qwen3vl_8b_fp8_scaled.safetensors: header: {'F32': 252, 'BF16': 498, 'F8_E4M3': 252, 'U8': 252}, per-layer quant config"
+     },
+     "vae": {
+      "weights": "fp32",
+      "compute": "bf16",
+      "evidence": "header: {'I64': 1, 'F32': 250}; compute from bline/sd.py working_dtypes"
+     }
+    },
+    "sources": {
+     "ideogram4_int8_convrot.safetensors": {
+      "source": null,
+      "reason": "never built from ideogram-ai/ideogram-4-fp8 (Ideogram 4 was never timed against the baseline UI); only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "ideogram4_unconditional_int8_convrot.safetensors": {
+      "source": null,
+      "reason": "never built from ideogram-ai/ideogram-4-fp8 (Ideogram 4 was never timed against the baseline UI); only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "qwen3vl_8b_fp8_scaled.safetensors": {
+      "source": null,
+      "reason": "never built from ideogram-ai/ideogram-4-fp8 (Ideogram 4 was never timed against the baseline UI); only published by Bline-Org (the rounds that used it downloaded it from there, which the rule now forbids) and no builder from the official repo exists yet"
+     },
+     "flux2-vae.safetensors": {
+      "repo": "black-forest-labs/flux-3-image-klein-bline",
+      "file": "vae/flux2-vae.safetensors",
+      "build": null,
+      "note": "BFL's own BlineUI repo; = BFL ae.safetensors of flux-3-image-klein (same sha256, build_q5.py vae role)"
+     }
+    }
+   },
+   "source": "image_ideogram4_t2i_int8 template (its canvas is 1:1 1024^2). Studio: dense int8 quant of both DiTs; TE int8 ConvRot prequant unsloth/ideogram-4-FP8 ideogram-4-text_encoder-INT8-ConvRot.safetensors (diffusion_te_prequant.py TE_INT8_CONVROT_FILES; opt-in, LPIPS 0.081 vs dense TE)",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": 88,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "min_host_ram_gib: Studio assembles both DiTs and the Qwen3-VL-8B text encoder on the CPU at load (diffusion_ideogram4.py dequantises the vendor fp8 files to bf16): peak RSS 79.8 GiB on B200 (outputs/imgsweep/main/ideogram__t211__default), and the r2 Colab L4 (52 GB, no swap) Studio probe was OOM-killed (rc -9, no record; the baseline probe on the same VM ran). G4 (177 GB) is the only fp8 target that fits.",
+    "cite": [
+     "temp/dbv/r2l4c_attempt_michael.log",
+     "outputs/imgsweep/main/ideogram__t211__default/record.json"
+    ],
+    "studio_refused": []
+   }
+  },
+  "nf4": {
+   "studio": {
+    "model_path": "ideogram-ai/ideogram-4-nf4",
+    "precision": {
+     "transformer": {
+      "weights": "nf4",
+      "compute": "bf16",
+      "evidence": "bitsandbytes nf4 repo, dequantized per layer to bf16"
+     },
+     "text_encoder": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "Studio origin/main beb98536df ideogram-4: no te_quant_auto; vendor fp8 TE dequantized to bf16"
+     },
+     "vae": {
+      "weights": "bf16",
+      "compute": "bf16",
+      "evidence": "pipeline torch_dtype bf16 (no family VAE override)"
+     }
+    },
+    "sources": {
+     "ideogram-ai/ideogram-4-nf4": {
+      "repo": "ideogram-ai/ideogram-4-nf4",
+      "file": null,
+      "build": null,
+      "note": "repo snapshot; Studio fetches its hosted prequant (unsloth/*-FP8, INT8 ConvRot) itself when the format asks for it"
+     }
+    }
+   },
+   "bline": null,
+   "source": "Studio trusted repos ideogram-ai/ideogram-4-nf4 / -nf4-diffusers; no baseline-UI nf4 file",
+   "template_default": false,
+   "min_vram_gib": null,
+   "min_host_ram_gib": null,
+   "est_s_per_render": {
+    "T4": null,
+    "L4": null,
+    "A100-40": null,
+    "G4": null
+   },
+   "planning": {
+    "basis": "no measured round for this family and format",
+    "cite": [],
+    "studio_refused": []
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "ideogram-ai/ideogram-4-fp8"
+  },
+  "gen": {
+   "steps": 20,
+   "guidance": 7.0,
+   "width": 768,
+   "height": 1376
+  }
+ },
+ "traps": [
+  {
+   "id": "passes_equal",
+   "check": "passes_equal",
+   "note": "Count denoiser evaluations on both stacks per render; a mismatch makes the pair VOID (plan: H3 19 vs 20, LTX-2.3 8 vs 11, FLUX.3 base edit 50 vs 100)."
+  },
+  {
+   "id": "speed_tier",
+   "check": "speed_tier_stated",
+   "note": "Studio's 'max' speed tier auto-skips steps (static skip / FBCache, e.g. Qwen 25 -> ~13 computed); the default tier never skips. State the tier (settings SUMMARY A.5)."
+  },
+  {
+   "id": "precision_equal",
+   "check": "precision_equal",
+   "note": "Pin DiT, TE and VAE precision on both stacks: Studio's auto picks (bf16-when-fits, hosted INT8 ConvRot) differ from the template files (settings SUMMARY B.7)."
+  },
+  {
+   "id": "gpu_vs_cpu_noise",
+   "check": "shared_cpu_noise",
+   "note": "The baseline UI draws initial noise on the CPU (torch.manual_seed, bline/sample.py); Studio diffusers draws it with a GPU generator. Same seed != same noise: cross-stack LPIPS needs a shared CPU fp32 noise tensor, otherwise score each stack only against its own bf16 (h3_image.md #7; moss REPORT: 0.69 LPIPS across stacks on different samplers)."
+  },
+  {
+   "id": "cache_defeated",
+   "check": "cache_defeated",
+   "note": "The baseline UI caches node outputs: every timed request carries a nonce (bline_graphs.apply_nonce) and must show an execution count > 0."
+  },
+  {
+   "id": "t4_fp16",
+   "check": "fp16_only_dtype",
+   "note": "On an fp16-only card (T4, sm75) the stacks resolve different compute dtypes (Studio fp16 or fp32 promote; the baseline UI fp32 for Qwen / Ideogram, fp16 first for Wan / HV1.5); record the resolved dtype per stack (bline_defaults_audit.md 'dtype on fp16-only GPUs')."
+  },
+  {
+   "id": "cfg_batch_rows",
+   "check": "cfg_batch_rows",
+   "note": "CFG > 1: Studio may run cond + uncond as ONE batch-2 forward (diffusion_cfg_batch) where the baseline UI runs two; evaluation counts are per sample row, so a forward-call hook undercounts Studio by 2x (settings_audit_nov10/flux.md, 'Not verified')."
+  },
+  {
+   "id": "preset_vs_widget",
+   "check": "template_note_vs_sampler",
+   "note": "The Ideogram4Scheduler widgets [20,1024,1024,0.5,1.75] are stale; the 'Default' preset (CustomCombo -> JsonExtractString) runs 20 steps, mu 0.0, std 1.75, and CFGOverride(3, 0.7..1.0) sits before DualModelGuider 7: guidance 7 then 3 for sigma <= 0.3 (bline_defaults_audit.md ideogram-4 row, corrected 57c1366abd)."
+  },
+  {
+   "id": "canvas",
+   "check": "resolution_equal",
+   "note": "The fp8 t2i template's ResolutionSelector is 9:16 at 1 MP, multiple 8 = 768x1368, rounded up to 16 inside the subgraph = 768x1376 (the int8 template is 1:1 = 1024^2); Studio's UI default is 1024^2: pin 768x1376 on both stacks."
+  },
+  {
+   "id": "no_negative_prompt",
+   "check": null,
+   "note": "Studio's family has uses_negative_prompt False; the template's negative is ConditioningZeroOut on the unconditional model: equal."
+  },
+  {
+   "id": "accepted_precision_0",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "text_encoder"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "template TE is qwen3vl_8b fp8_scaled; Studio dequantizes the vendor fp8 TE to bf16 (no te_quant_auto)"
+  },
+  {
+   "id": "accepted_precision_1",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "vae"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "flux2-vae fp32 file computed bf16; Studio bf16"
+  },
+  {
+   "id": "accepted_precision_2",
+   "check": "precision_equal",
+   "accepted_difference": true,
+   "components": [
+    "transformer"
+   ],
+   "formats": [
+    "fp8"
+   ],
+   "note": "Studio's fp8 repo is dequantized to bf16 unless transformer_quant fp8 is requested; this format requests it"
+  }
+ ],
+ "sources": [
+  "outputs/bline_defaults_audit.md#ideogram-4",
+  "outputs/bline_defaults_audit.md#Re-audit",
+  "temp/settings_audit/workflow_templates/templates/image_ideogram4_t2i.json",
+  "unsloth@beb98536df studio/backend/core/inference/diffusion_families.py:1455-1478 (ideogram-4 family)",
+  "unsloth@beb98536df studio/backend/core/inference/diffusion_te_prequant.py:113-117"
+ ],
+ "expected_passes_note": "two models per step (conditional + unconditional) through DualModelGuider; not counter-verified"
+}

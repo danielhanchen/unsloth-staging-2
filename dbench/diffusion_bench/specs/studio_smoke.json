@@ -1,0 +1,40 @@
+{
+ "name": "studio_smoke",
+ "description": "Small-model speed / quality smoke through Unsloth Studio, in process (studio) and over HTTP (studio_http), image and video. Same prompts, seeds and settings on both surfaces, so the pair measures what the HTTP path (auth, routing, gallery PNG/MP4 round trip) costs and proves the pixels match. The Studio tree comes from $DIFFUSION_BENCH_STUDIO_SRC (or options.studio_src); DIFFUSION_BENCH_STUDIO_PYTHON reuses an existing interpreter instead of building the studio venv. Over HTTP, Wan2.2-TI2V-5B only accepts its presets (1280x704 / 704x1280), so its HTTP cell renders 1280x704; the in-process cell at the same size is the like-for-like pair, the 480x320 one is the cheap in-process smoke.",
+ "defaults": {
+  "venv": {"profile": "studio"},
+  "prompts": "image_24",
+  "n": 4,
+  "warmup": 1,
+  "short_n": 2,
+  "options": {"speed_mode": "off", "memory_mode": "fast"}
+ },
+ "gate": {"max_util": 30, "min_free_mib": 40000, "timeout_s": 600},
+ "reference": {"studio": "sdxl_turbo_512", "studio_http": "sdxl_turbo_512_http"},
+ "cells": [
+  {"tag": "sdxl_turbo_512", "backend": "studio", "model": "$WORKSPACE/sdxl_turbo_base",
+   "width": 512, "height": 512, "steps": 4, "short_steps": 1, "guidance": 0.0,
+   "options": {"family_override": "sdxl"}},
+  {"tag": "sdxl_turbo_512_http", "backend": "studio_http", "model": "$WORKSPACE/sdxl_turbo_base",
+   "width": 512, "height": 512, "steps": 4, "short_steps": 1, "guidance": 0.0,
+   "options": {"family_override": "sdxl"}},
+  {"tag": "zimage_turbo_768", "backend": "studio", "model": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo",
+   "width": 768, "height": 768, "steps": 8, "short_steps": 2, "guidance": 0.0,
+   "options": {"family_override": "z-image"}},
+  {"tag": "zimage_turbo_768_http", "backend": "studio_http", "model": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo",
+   "width": 768, "height": 768, "steps": 8, "short_steps": 2, "guidance": 0.0,
+   "options": {"family_override": "z-image"}},
+  {"tag": "zimage_turbo_768_speed_default", "backend": "studio", "model": "$WORKSPACE/hf_local_bases/Tongyi-MAI/Z-Image-Turbo",
+   "width": 768, "height": 768, "steps": 8, "short_steps": 2, "guidance": 0.0, "warmup": 2,
+   "options": {"family_override": "z-image", "speed_mode": "default"}},
+  {"tag": "wan5b_480x320_17f", "backend": "studio", "kind": "video", "model": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "prompts": "video_3", "n": 2, "width": 480, "height": 320, "frames": 17, "fps": 16, "steps": 6, "short_steps": 2,
+   "guidance": 1.0, "short_n": 1, "options": {"family_override": "wan2.2-ti2v-5b"}},
+  {"tag": "wan5b_1280x704_17f", "backend": "studio", "kind": "video", "model": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "prompts": "video_3", "n": 2, "width": 1280, "height": 704, "frames": 17, "fps": 16, "steps": 6, "short_steps": 2,
+   "guidance": 1.0, "short_n": 1, "save_frames_every": 2, "options": {"family_override": "wan2.2-ti2v-5b"}},
+  {"tag": "wan5b_1280x704_17f_http", "backend": "studio_http", "kind": "video", "model": "$WORKSPACE/hf_local_bases/Wan-AI/Wan2.2-TI2V-5B-Diffusers",
+   "prompts": "video_3", "n": 2, "width": 1280, "height": 704, "frames": 17, "fps": 16, "steps": 6, "short_steps": 2,
+   "guidance": 1.0, "short_n": 1, "save_frames_every": 2, "options": {"family_override": "wan2.2-ti2v-5b"}}
+ ]
+}

@@ -1,0 +1,84 @@
+name: dbench-mac-mac-macos-15-1
+on:
+  push:
+    branches: ['dbench-mac-mac-macos-15-1']
+permissions:
+  contents: read
+env:
+  STUDIO_SHA: 8b7cde79ebf5a901b2fd936bbee214fb8c7562c7
+  BASELINE_REF: v0.46.2
+  BASELINE_REPO: ${{ vars.BASELINE_REPO }}
+  BASELINE_GGUF_SHA: 
+  # one HF cache for the fetch step (Studio prefetch) and the bench step (Studio loads with local_files_only)
+  HF_HOME: ${{ github.workspace }}/hf_home
+jobs:
+  bench:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: head}
+      - name: Host
+        run: |
+          mkdir -p results
+          { sysctl hw.model hw.memsize hw.ncpu hw.perflevel0.physicalcpu machdep.cpu.brand_string; sw_vers; system_profiler SPDisplaysDataType; vm_stat; df -h .; } > results/host.txt 2>&1 || true
+          cat results/host.txt
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - name: Studio venv (unsloth ${{ env.STUDIO_SHA }}, Mac pins)
+        run: |
+          set -eux
+          python -m pip install -q uv
+          git init -q unsloth && git -C unsloth remote add origin https://github.com/unslothai/unsloth
+          git -C unsloth fetch -q --depth 1 origin $STUDIO_SHA && git -C unsloth checkout -q FETCH_HEAD
+          uv venv -q --python "$(which python)" venv_studio
+          R=unsloth/studio/backend/requirements
+          O="--override $R/single-env/overrides-darwin-arm64.txt"
+          PY=venv_studio/bin/python
+          uv pip install -q --python $PY "torch>=2.4,<2.12.0" "torchvision>=0.19,<0.27.0"
+          uv pip install -q --python $PY $O -r $R/no-torch-runtime.txt
+          uv pip install -q --python $PY $O --no-deps -r $R/extras-no-deps.txt
+          uv pip install -q --python $PY $O -r $R/studio.txt
+          uv pip install -q --python $PY $O -r $R/diffusers-pin.txt
+          grep -qv '^#' $R/diffusers-main.txt && uv pip install -q --python $PY $O -r $R/diffusers-main.txt || true
+          uv pip install -q --python $PY $O "mlx==0.32.4" "mlx-metal==0.32.4" || true
+          uv pip install -q --python $PY --no-deps "mflux==0.22.0" "pillow>=12.3.0,<13" "piexif>=1.1.3,<2" "platformdirs>=4,<5" "toml>=0.10.2,<1" || true
+          uv pip install -q --python $PY gguf aiohttp psutil huggingface_hub scikit-image
+          $PY -c "import torch, diffusers, transformers; print('STUDIO_VERSIONS', torch.__version__, diffusers.__version__, transformers.__version__, 'mps', torch.backends.mps.is_available())" | tee results/studio_versions.txt
+      - name: Baseline UI venv (${{ env.BASELINE_REF }} + GGUF loader node)
+        run: |
+          set -eux
+          python head/dbench/diffusion_bench/baseline_src.py --dir refrt --ref "$BASELINE_REF" \
+            --gguf-sha "$BASELINE_GGUF_SHA" --commit-out results/baseline_commit.txt --reqs-out ref_req.txt
+          uv venv -q --python "$(which python)" venv_ref
+          PY=venv_ref/bin/python
+          uv pip install -q --python $PY "torch>=2.4,<2.12.0" "torchvision>=0.19,<0.27.0" torchaudio
+          uv pip install -q --python $PY -r ref_req.txt aiohttp psutil
+          $PY -c "import torch; print('BASELINE_VERSIONS', torch.__version__, 'mps', torch.backends.mps.is_available())" | tee results/ref_versions.txt
+      - name: Model files + cell localisation
+        run: |
+          set -eux
+          venv_studio/bin/python head/dbench/diffusion_bench/targets/fetch_files.py --spec head/dbench/plan_vm.json \
+            --root "$PWD/models" --write plan_local.json --venv "$PWD/venv_studio/bin/python" --studio-src "$PWD/unsloth" \
+            --baseline-python "$PWD/venv_ref/bin/python" --baseline-dir "$PWD/refrt"
+          ls -la models || true; df -h .
+      - name: Bench (one stack process at a time)
+        env:
+          HF_HUB_DISABLE_PROGRESS_BARS: "1"
+          PYTORCH_ENABLE_MPS_FALLBACK: "0"
+          DIFFUSION_BENCH_SDCPP_METHOD: prebuilt
+          DIFFUSION_BENCH_SDCPP_BACKEND: metal
+        run: |
+          set -o pipefail
+          export WORKSPACE="$PWD" DIFFUSION_BENCH_BASELINE_PYTHON="$PWD/venv_ref/bin/python" DIFFUSION_BENCH_BASELINE_DIR="$PWD/refrt"
+          export UNSLOTH_STUDIO_HOME="$PWD/studio_home" DBENCH_SCRIPTS_SHA=3316ac4927948a58179f84e9dba55421f05254e5
+          venv_studio/bin/python -u head/dbench/diffusion_bench/matrix.py --plan plan_local.json --vm mac-macos-15-1 \
+            --out results/cells --no-gate --timeout 3600 2>&1 | tee results/matrix.log
+          vm_stat | head -12
+      - name: CPU-fallback check (VOID on fallback)
+        if: always()
+        run: |
+          venv_studio/bin/python head/dbench/diffusion_bench/targets/mac_check.py results/cells --write | tee results/mac_check.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: "dbench-mac-mac-macos-15-1", path: results/, retention-days: 7}

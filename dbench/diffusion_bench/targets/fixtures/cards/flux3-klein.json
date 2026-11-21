@@ -1,0 +1,68 @@
+{
+ "family": "flux3-klein",
+ "kind": "image",
+ "bline": {
+  "graph": "flux3-klein",
+  "template": "image_flux3_klein",
+  "template_sha": null
+ },
+ "defaults": {
+  "steps": 16,
+  "cfg": 1.0,
+  "sampler": "euler",
+  "scheduler": "simple",
+  "width": 1024,
+  "height": 1024,
+  "negative": "",
+  "enhancer": false
+ },
+ "formats": {
+  "int8": {
+   "studio": {
+    "transformer_quant": "int8"
+   },
+   "bline": {
+    "files": {
+     "dit": {
+      "repo": "Bline-Org/flux3",
+      "file": "flux3-image-klein-int8-convrot.safetensors"
+     }
+    }
+   },
+   "sdcpp": {
+    "files": {
+     "dit": "$CM/flux3-klein-Q8_0.gguf"
+    }
+   }
+  },
+  "gguf": {
+   "studio": {
+    "gguf_filename": "flux3-klein-Q4_K_M.gguf"
+   },
+   "bline": {
+    "files": {
+     "dit": "$CM/flux3-klein-Q4_K_M.gguf"
+    }
+   },
+   "sdcpp": {
+    "files": {
+     "dit": "$CM/flux3-klein-Q4_K_M.gguf"
+    }
+   }
+  }
+ },
+ "studio": {
+  "load": {
+   "model_path": "black-forest-labs/FLUX.3-klein"
+  },
+  "gen": {}
+ },
+ "est": {
+  "render_s_l4": 6,
+  "load_s": 90
+ },
+ "traps": [],
+ "sources": [
+  "fixture"
+ ]
+}
