@@ -46,8 +46,15 @@ jobs:
               pillow regex requests filelock importlib_metadata pyyaml
             pip install fastapi pydantic structlog attrs cryptography pyjwt email-validator python-multipart \
               httpx psutil pytest pytest-asyncio pytest-timeout
+            # torch 2.15 skips the runner's paravirtual GPU (no Metal 2.0 trigonometric support): newest torch that keeps it.
+            chosen=""
+            for v in 2.14.1 2.13.0 2.12.1 2.11.0 2.10.0 2.9.1 2.8.0; do
+              pip install -q "torch==$v" || continue
+              if python bench/probe.py head/studio/backend; then chosen=$v; break; fi
+            done
+            echo "chosen torch: ${chosen:-none}"
+            test -n "$chosen"
             pip freeze
-            python -c "import torch; print('torch', torch.__version__, 'mps', torch.backends.mps.is_available()); print(torch.mps.recommended_max_memory()/2**30)"
           } 2>&1 | tee out/logs/install.log
           { sysctl -n machdep.cpu.brand_string hw.memsize hw.ncpu; sw_vers; system_profiler SPDisplaysDataType || true; } 2>&1 | tee out/logs/env.txt
       - name: Head CPU unit tests (and the patch registry parity)
