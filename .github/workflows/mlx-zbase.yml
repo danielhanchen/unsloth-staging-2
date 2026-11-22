@@ -1,4 +1,4 @@
-name: mlx-zbase-bisect
+name: mlx-zbase-verify
 
 on:
   push:
@@ -32,13 +32,16 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Studio tree
+      - name: Studio trees (main and head = main + fix)
         run: |
           set -euo pipefail
           mkdir -p out/logs
           git init -q base && git -C base remote add origin https://github.com/unslothai/unsloth
           git -C base fetch -q --depth 1 origin "$STUDIO_SHA" && git -C base checkout -q FETCH_HEAD
-          git -C base log -1 --format='studio %H %cI' | tee out/revisions.txt
+          git -C base log -1 --format='main %H %cI' | tee out/revisions.txt
+          cp -R base head
+          git -C head apply --whitespace=nowarn ../patches/head.patch
+          git -C head diff --stat | tee -a out/revisions.txt
       - name: Install
         run: |
           set -euo pipefail
@@ -62,49 +65,59 @@ jobs:
           import time
           from huggingface_hub import hf_hub_download, snapshot_download
           t = time.time()
+          pats = ["text_encoder/*", "tokenizer/*", "vae/*", "scheduler/*", "model_index.json"]
           print(hf_hub_download("unsloth/Z-Image-GGUF", "z-image-Q4_0.gguf"), round(time.time() - t), flush=True)
-          print(snapshot_download("Tongyi-MAI/Z-Image", allow_patterns=["text_encoder/*", "tokenizer/*", "vae/*", "scheduler/*", "model_index.json"]), round(time.time() - t), flush=True)
+          print(snapshot_download("Tongyi-MAI/Z-Image", allow_patterns=pats), round(time.time() - t), flush=True)
+          print(hf_hub_download("unsloth/Z-Image-Turbo-GGUF", "z-image-turbo-Q4_0.gguf"), round(time.time() - t), flush=True)
+          print(snapshot_download("Tongyi-MAI/Z-Image-Turbo", allow_patterns=pats), round(time.time() - t), flush=True)
           EOF
+          df -h . | tee -a out/logs/env.txt
       - name: Arms
         run: |
           set +e -uo pipefail
-          arm() { tag=$1; shift
-            env "$@" python -u bench/zb_arm.py --backend-dir base/studio/backend --out out --tag $tag $ARGS > out/logs/$tag.log 2>&1
-            echo "$tag rc=$?" | tee -a out/rc.txt; grep -E " (load|text|probe|gen|steps) " out/logs/$tag.log | cut -c1-600; }
-          ARGS="--guidance 3.0"; arm s_bf16_cfg3 UNSLOTH_DIFFUSION_MLX_PRECISION=bf16 UNSLOTH_DIFFUSION_MLX_DENSE_BITS=4 UNSLOTH_DIFFUSION_MLX_TE_BITS=4
-          ARGS="--guidance 1.0"; arm s_bf16_cfg1 UNSLOTH_DIFFUSION_MLX_PRECISION=bf16 UNSLOTH_DIFFUSION_MLX_DENSE_BITS=4 UNSLOTH_DIFFUSION_MLX_TE_BITS=4
-          ARGS="--guidance 3.0"; arm s_bf16_d0 UNSLOTH_DIFFUSION_MLX_PRECISION=bf16 UNSLOTH_DIFFUSION_MLX_DENSE_BITS=0 UNSLOTH_DIFFUSION_MLX_TE_BITS=4
-          ARGS="--guidance 3.0"; arm s_bf16_te8 UNSLOTH_DIFFUSION_MLX_PRECISION=bf16 UNSLOTH_DIFFUSION_MLX_DENSE_BITS=4 UNSLOTH_DIFFUSION_MLX_TE_BITS=8
-          ARGS="--guidance 3.0"; arm s_fp16_cfg3 UNSLOTH_DIFFUSION_MLX_PRECISION=fp16 UNSLOTH_DIFFUSION_MLX_DENSE_BITS=4 UNSLOTH_DIFFUSION_MLX_TE_BITS=4
-          ARGS="--guidance 3.0 --scheduler linear"; arm s_bf16_linear UNSLOTH_DIFFUSION_MLX_PRECISION=bf16 UNSLOTH_DIFFUSION_MLX_DENSE_BITS=4 UNSLOTH_DIFFUSION_MLX_TE_BITS=4
+          rmconv() { python -c "import json,shutil,sys; d=json.load(open(sys.argv[1])).get('convert_dir'); d and shutil.rmtree(d, ignore_errors=True); print('removed', d)" "$1"; }
+          arm() { tag=$1; tree=$2; shift 2
+            env "$@" python -u bench/zb_arm.py --backend-dir $tree/studio/backend --out out --tag $tag $ARGS > out/logs/$tag.log 2>&1
+            echo "$tag rc=$?" | tee -a out/rc.txt; grep -E " (load|text|probe|gen|steps) " out/logs/$tag.log | cut -c1-500; }
+          UNSLOTH_DIFFUSION_MLX_DENSE_BITS=0 UNSLOTH_DIFFUSION_MLX_PRECISION=bf16 python -u bench/zb_ablate.py \
+            --backend-dir head/studio/backend --out out > out/logs/ablate.log 2>&1
+          echo "ablate rc=$?" | tee -a out/rc.txt; grep -E "ablate (ref|.*@)" out/logs/ablate.log | cut -c1-400; rmconv out/ablate.json
+          ZB="--guidance 3.0 --steps 12"
+          ARGS="$ZB"; arm vb_main_def base; rmconv out/vb_main_def.json
+          ARGS="$ZB"; arm vb_head_def head
+          ARGS="$ZB"; arm vb_head_fp16 head UNSLOTH_DIFFUSION_MLX_PRECISION=fp16
+          TB="--repo unsloth/Z-Image-Turbo-GGUF --gguf z-image-turbo-Q4_0.gguf --base-repo Tongyi-MAI/Z-Image-Turbo --guidance 0 --steps 9 --no-probe --fox"
+          ARGS="$TB"; arm vt_main base
+          ARGS="$TB"; arm vt_head head
+          ARGS="$TB"; arm vt_main_2 base
+          rmconv out/vt_main.json
+          ARGS="--guidance 3.0 --steps 25 --no-probe"; arm vb_head_def_25 head
+          rmconv out/vb_head_def.json
           cat out/rc.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: zbase-studio
+          name: zverify-studio
           path: out
           retention-days: 14
-      - name: mflux-only reference (Hub bf16 weights, quantize 4) + weight check
+      - name: mflux-only reference (Hub bf16 weights, mflux quantize 4)
         run: |
           set +e -uo pipefail
-          rm -rf out/*.png.tmp
           python - <<'EOF' 2>&1 | tee -a out/logs/download.log
-          import time
-          from huggingface_hub import snapshot_download
+          import shutil, time
+          from huggingface_hub import scan_cache_dir, snapshot_download
+          for repo in scan_cache_dir().repos:
+              if repo.repo_id in ("Tongyi-MAI/Z-Image-Turbo", "unsloth/Z-Image-Turbo-GGUF"):
+                  shutil.rmtree(repo.repo_path, ignore_errors=True); print("removed", repo.repo_id)
           t = time.time()
           print(snapshot_download("Tongyi-MAI/Z-Image", allow_patterns=["transformer/*"]), round(time.time() - t), flush=True)
           EOF
-          python -u bench/zb_arm.py --mode mflux --quantize 4 --out out --tag m_ref_q4 --guidance 3.0 > out/logs/m_ref_q4.log 2>&1
-          echo "m_ref_q4 rc=$?" | tee -a out/rc.txt; grep -E " (load|text|probe|gen|steps) " out/logs/m_ref_q4.log | cut -c1-600
-          HFD=$(python -c "from huggingface_hub import snapshot_download as s; print(s('Tongyi-MAI/Z-Image', allow_patterns=['transformer/*'], local_files_only=True))")/transformer
-          for d in 4 0; do
-            CD=$(python -c "import json,sys; d=json.load(open('out/s_bf16_$([ $d = 4 ] && echo cfg3 || echo d0).json')); print(d.get('convert_dir',''))")
-            [ -n "$CD" ] && python -u bench/wcheck.py --converted "$CD/transformer/0.safetensors" --hf-dir "$HFD" --out out/wcheck_d$d.json > out/logs/wcheck_d$d.log 2>&1
-            echo "wcheck_d$d rc=$?" | tee -a out/rc.txt; head -c 3000 out/logs/wcheck_d$d.log
-          done
+          df -h . | tee -a out/logs/env.txt
+          python -u bench/zb_arm.py --mode mflux --quantize 4 --out out --tag m_ref_q4 --guidance 3.0 --steps 12 > out/logs/m_ref_q4.log 2>&1
+          echo "m_ref_q4 rc=$?" | tee -a out/rc.txt; grep -E " (load|text|probe|gen|steps) " out/logs/m_ref_q4.log | cut -c1-500; tail -3 out/logs/m_ref_q4.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: zbase-all
+          name: zverify-all
           path: out
           retention-days: 14

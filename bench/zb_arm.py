@@ -32,7 +32,10 @@ ap.add_argument("--scheduler", default = None)
 ap.add_argument("--quantize", type = int, default = 4)
 ap.add_argument("--prompt", default = "A red apple on a wooden table, soft window light, shallow depth of field, photograph")
 ap.add_argument("--no-probe", action = "store_true")
+ap.add_argument("--fox", action = "store_true", help = "the Turbo arm prompt of the earlier cache-limit runs")
 args = ap.parse_args()
+if args.fox:
+    args.prompt = "A red fox resting in fresh snow under soft winter light, detailed fur, gentle bokeh"
 os.makedirs(args.out, exist_ok = True)
 if args.backend_dir:
     sys.path.insert(0, os.path.abspath(args.backend_dir))
@@ -102,8 +105,14 @@ else:
     from mflux.models.common.config.model_config import ModelConfig
     from mflux.models.z_image import ZImage
 
+    from mlx.utils import tree_flatten
+
     model = ZImage(model_config = ModelConfig.z_image(), quantize = args.quantize)
-    mx.eval(model.parameters())
+    # Materialize in slices (as Studio's build does): one eval of the whole lazy tree times out the Metal queue here.
+    for component in (model.transformer, model.vae, model.text_encoder):
+        arrays = [a for _n, a in tree_flatten(component.parameters())]
+        for start in range(0, len(arrays), 32):
+            mx.eval(arrays[start : start + 32])
     rec["load"] = {"wall_s": round(time.perf_counter() - t0, 1), "bits": getattr(model, "bits", None), **sampler.phase()}
     dump()
 log("load", rec["load"])
