@@ -50,7 +50,8 @@ jobs:
             chosen=""
             for v in 2.14.1 2.13.0 2.12.1 2.11.0 2.10.0 2.9.1 2.8.0; do
               pip install -q "torch==$v" || continue
-              if python bench/probe.py head/studio/backend; then chosen=$v; break; fi
+              rm -f mps_ok; python bench/probe.py head/studio/backend || echo "probe rc=$?"
+              if [ -f mps_ok ]; then chosen=$v; break; fi
             done
             echo "chosen torch: ${chosen:-none}"
             test -n "$chosen"

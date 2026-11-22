@@ -7,6 +7,7 @@ if not ok:
     sys.exit(3)
 x = torch.randn(256, 256, device = "mps", dtype = torch.bfloat16)
 print("bf16 matmul ok", float((x @ x).float().abs().mean()), flush = True)
+open("mps_ok", "w").write(torch.__version__)
 sys.path.insert(0, sys.argv[1])
 from core.inference import diffusion_qwenimage21_mps as m
 lib = m._library()
