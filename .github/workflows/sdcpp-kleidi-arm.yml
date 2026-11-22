@@ -1,0 +1,88 @@
+name: sdcpp-kleidi-arm
+on:
+  push:
+    branches: [sdcpp-kleidi-arm-bench]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  PIN: 27b9ddca07be0c25ace3d1a560bcbad281eb660d
+  GGML: d803c238f67915fb825a9aa4df27b99356d51597
+jobs:
+  build:
+    name: build-${{ matrix.name }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {name: base, defs: ""}
+          - {name: head, defs: "-DGGML_CPU_KLEIDIAI=ON"}
+    steps:
+      - name: Source (pin + its 44 ggml patches + buffer-type log)
+        run: |
+          set -eux
+          git clone -q https://github.com/unslothai/stable-diffusion.cpp src && git -C src checkout -q "$PIN"
+          rmdir src/ggml 2>/dev/null || true
+          git clone -q https://github.com/leejet/ggml src/ggml && git -C src/ggml checkout -q "$GGML"
+          n=0; for p in src/scripts/unsloth/ggml-patches/*.patch; do git -C src/ggml apply "../../$p"; n=$((n+1)); done; echo "applied $n"
+          python3 - <<'EOF'
+          p = 'src/src/model_manager.cpp'; s = open(p).read()
+          a = '        if (repack_buft != nullptr) {\n'
+          assert s.count(a) == 1
+          s = s.replace(a, a + '            if (std::getenv("SD_BUFT_STATS")) { LOG_INFO("buft-stat %s %s", ggml_type_name(state.tensor->type), ggml_backend_buft_name(repack_buft)); }\n')
+          open(p, 'w').write(s)
+          EOF
+          git -C src diff --stat
+      - name: Build (Linux aarch64 release flags)
+        working-directory: src
+        run: |
+          set -euo pipefail
+          cmake -B build -DCMAKE_BUILD_TYPE=Release -DSD_BUILD_EXAMPLES=ON -DSD_SERVER_BUILD_FRONTEND=OFF -DSD_WEBP=OFF -DSD_WEBM=OFF \
+            -DGGML_NATIVE=OFF -DGIT_EXE= -DSD_BUILD_SHARED_LIBS=ON -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON '-DCMAKE_INSTALL_RPATH=$ORIGIN' \
+            -DSD_BUILD_SHARED_GGML_LIB=ON -DBUILD_SHARED_LIBS=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 ${{ matrix.defs }} 2>&1 | tee ../cmake.log | grep -Ei "kleidi|variant" || true
+          cmake --build build --config Release -j "$(nproc)" --target sd-cli > ../build.log 2>&1 || { grep -E "error" ../build.log | head -40; tail -50 ../build.log; exit 1; }
+          mkdir -p ../out && cp -a build/bin/. ../out/ && ls -la ../out
+      - uses: actions/upload-artifact@v4
+        with: {name: "bin-${{ matrix.name }}", path: out/, retention-days: 3}
+  bench:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with: {path: tool}
+      - uses: actions/download-artifact@v4
+        with: {name: bin-base, path: bin-base}
+      - uses: actions/download-artifact@v4
+        with: {name: bin-head, path: bin-head}
+      - name: Host
+        run: |
+          set -x
+          chmod +x bin-*/sd-cli; lscpu; grep -m1 Features /proc/cpuinfo; nproc; free -g; df -h . /mnt || true
+          cat /proc/sys/abi/sve_default_vector_length 2>/dev/null || true
+          ls bin-head | grep -i cpu
+          pip install -q numpy pillow huggingface_hub 2>&1 | tail -1
+      - name: Models
+        run: |
+          set -eux
+          python3 -c "
+          from huggingface_hub import hf_hub_download as d
+          for r, f in [('unsloth/Qwen3-4B-GGUF', 'Qwen3-4B-Q8_0.gguf'), ('Comfy-Org/z_image_turbo', 'split_files/vae/ae.safetensors'), ('unsloth/Z-Image-Turbo-GGUF', 'z-image-turbo-Q4_K_M.gguf')]:
+              print(d(r, f, local_dir='models'))
+          "
+          df -h .
+      - name: Bench Q4_K_M DiT (Studio default)
+        env: {LLM: models/Qwen3-4B-Q8_0.gguf, VAE: models/split_files/vae/ae.safetensors}
+        run: python3 tool/bench.py res models/z-image-turbo-Q4_K_M.gguf q4km
+      - name: Bench Q8_0 DiT
+        env: {LLM: models/Qwen3-4B-Q8_0.gguf, VAE: models/split_files/vae/ae.safetensors}
+        run: |
+          rm -f models/z-image-turbo-Q4_K_M.gguf
+          python3 -c "from huggingface_hub import hf_hub_download as d; print(d('unsloth/Z-Image-Turbo-GGUF', 'z-image-turbo-Q8_0.gguf', local_dir='models'))"
+          python3 tool/bench.py res models/z-image-turbo-Q8_0.gguf q80
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: {name: res, path: res/, retention-days: 7}
