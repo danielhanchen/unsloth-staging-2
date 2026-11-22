@@ -1,0 +1,85 @@
+name: q21-mps-fuse-bench
+
+on:
+  push:
+    branches: ["mps-q21fuse-*"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: q21-mps-fuse-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  MERGE_BASE: 0c1fef29be09c2b738f2c3738b5a31738f1612be
+
+jobs:
+  bench:
+    runs-on: macos-15
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Base and head trees
+        run: |
+          set -euo pipefail
+          mkdir -p out/logs
+          git init -q base && git -C base remote add origin https://github.com/unslothai/unsloth
+          git -C base fetch -q --depth 1 origin "$MERGE_BASE" && git -C base checkout -q FETCH_HEAD
+          git -C base log -1 --format='base %H %cI' | tee out/revisions.txt
+          cp -R base head
+          git -C head apply --whitespace=nowarn ../patches/head.patch
+          git -C head status --short | tee -a out/revisions.txt
+      - name: Install
+        run: |
+          set -euo pipefail
+          {
+            python -m pip install --upgrade pip
+            pip install torch "diffusers==0.42.1" "transformers>=5.5.0,<6" "huggingface_hub>=1.1.6,<2" safetensors numpy \
+              pillow regex requests filelock importlib_metadata pyyaml
+            pip install fastapi pydantic structlog attrs cryptography pyjwt email-validator python-multipart \
+              httpx psutil pytest pytest-asyncio pytest-timeout
+            pip freeze
+            python -c "import torch; print('torch', torch.__version__, 'mps', torch.backends.mps.is_available()); print(torch.mps.recommended_max_memory()/2**30)"
+          } 2>&1 | tee out/logs/install.log
+          { sysctl -n machdep.cpu.brand_string hw.memsize hw.ncpu; sw_vers; system_profiler SPDisplaysDataType || true; } 2>&1 | tee out/logs/env.txt
+      - name: Head CPU unit tests (and the patch registry parity)
+        run: |
+          set +e -o pipefail
+          cd head/studio/backend
+          python -m pytest -p no:cacheprovider -q -rfEs tests/test_diffusion_qwenimage21_mps.py tests/test_diffusion_qwenimage21_math.py \
+            tests/test_diffusion_autoopt_core.py 2>&1 | tee ../../../out/logs/pytest_head.log
+          echo "pytest rc=${PIPESTATUS[0]}" | tee -a ../../../out/logs/pytest_head.log
+      - name: Arms
+        run: |
+          set +e -uo pipefail
+          run() { tag=$1; tree=$2; shift 2
+            env "$@" python -u bench/arm.py --backend-dir $tree/studio/backend --out out --tag $tag $EXTRA > out/logs/$tag.log 2>&1; rc=$?
+            echo "$tag rc=$rc" | tee -a out/rc.txt; tail -3 out/logs/$tag.log; }
+          EXTRA=""
+          run base_1 base X=1
+          run head_1 head X=1
+          run base_2 base X=1
+          run head_2 head X=1
+          run head_mod head UNSLOTH_DIFFUSION_Q21_MPS_RESIDUAL=0 UNSLOTH_DIFFUSION_Q21_MPS_ROPE=0
+          run head_res head UNSLOTH_DIFFUSION_Q21_MPS_MODULATE=0 UNSLOTH_DIFFUSION_Q21_MPS_ROPE=0
+          run head_rope head UNSLOTH_DIFFUSION_Q21_MPS_MODULATE=0 UNSLOTH_DIFFUSION_Q21_MPS_RESIDUAL=0
+          run head_off head UNSLOTH_DIFFUSION_Q21_MPS_FUSED=0
+          run base_3 base X=1
+          EXTRA="--ops"
+          run head_ops head X=1
+          cat out/rc.txt
+          python bench/summarize.py out | tee out/summary.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: q21-mps-fuse
+          path: out
+          retention-days: 14

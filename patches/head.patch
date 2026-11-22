@@ -1,0 +1,972 @@
+diff --git a/studio/backend/core/inference/diffusion_autoopt/patches.py b/studio/backend/core/inference/diffusion_autoopt/patches.py
+index 52d1592db9..6f4e0fb76d 100644
+--- a/studio/backend/core/inference/diffusion_autoopt/patches.py
++++ b/studio/backend/core/inference/diffusion_autoopt/patches.py
+@@ -422,6 +422,14 @@ def _builtin_specs() -> list[PatchSpec]:
+             off = str(ctx.speed_mode or "").strip().lower() == "off"
+         return install_for_pipe(ctx.pipe, ctx.logger, explicit_off = bool(off))
+ 
++    def q21_mps(ctx: PatchContext) -> bool:
++        from ..diffusion_qwenimage21_mps import install_for_pipe
++
++        off = ctx.explicit_off
++        if off is None:
++            off = str(ctx.speed_mode or "").strip().lower() == "off"
++        return install_for_pipe(ctx.pipe, ctx.logger, explicit_off = bool(off))
++
+     def flux2_rope(ctx: PatchContext) -> bool:
+         from ..diffusion_flux2_rope import install_for_pipe
+         return install_for_pipe(ctx.pipe, ctx.dtype, ctx.device, ctx.logger)
+@@ -587,6 +595,15 @@ def _builtin_specs() -> list[PatchSpec]:
+             backends = ("image",),
+             env = "UNSLOTH_DIFFUSION_KREA2_TEXT_TRIM",
+         ),
++        # MPS only (gates itself on the denoiser's device); every tier but an explicit off; per instance.
++        PatchSpec(
++            "qwenimage21_mps_fused",
++            STAGE_LOAD,
++            q21_mps,
++            classes = ("QwenImage21Transformer2DModel",),
++            backends = ("image",),
++            env = "UNSLOTH_DIFFUSION_Q21_MPS_FUSED",
++        ),
+         PatchSpec(
+             "flux2_rope",
+             STAGE_LOAD,
+diff --git a/studio/backend/core/inference/diffusion_qwenimage21_math.py b/studio/backend/core/inference/diffusion_qwenimage21_math.py
+index eb151ec0b8..4f2070619f 100644
+--- a/studio/backend/core/inference/diffusion_qwenimage21_math.py
++++ b/studio/backend/core/inference/diffusion_qwenimage21_math.py
+@@ -137,7 +137,9 @@ def _processor_class():
+                     segments,
+                     key_valid,
+                 )
+-            query, key, value, seq_len_q = _qwenimage21_prepare_qkv(
++            # diffusion_qwenimage21_mps sets a one-pass q/k RMSNorm + RoPE prepare on MPS attention modules only.
++            prepare = attn.__dict__.get("_unsloth_q21_mps_prepare") or _qwenimage21_prepare_qkv
++            query, key, value, seq_len_q = prepare(
+                 attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, cache_write_slice
+             )
+             if segments is None:
+diff --git a/studio/backend/core/inference/diffusion_qwenimage21_mps.py b/studio/backend/core/inference/diffusion_qwenimage21_mps.py
+new file mode 100644
+index 0000000000..f0519dc015
+--- /dev/null
++++ b/studio/backend/core/inference/diffusion_qwenimage21_mps.py
+@@ -0,0 +1,581 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Apple Silicon (MPS) Qwen-Image-2.1 block: modulation and gated residual read their per-row scale / gate from the
++small parameter rows instead of a ``torch.where``-expanded (batch, seq, dim) copy (bit-identical), the gated residual
++runs as one Metal pass, and q/k RMSNorm + RoPE run as one Metal pass per tensor (fp32 sum of squares may differ in
++the last bit). Per transformer instance, MPS only; CUDA / ROCm / CPU never reach this code.
++Kill switch UNSLOTH_DIFFUSION_Q21_MPS_FUSED=0; per part UNSLOTH_DIFFUSION_Q21_MPS_{MODULATE,RESIDUAL,ROPE}=0."""
++
++from __future__ import annotations
++
++import os
++import threading
++import types
++import weakref
++from typing import Any, Optional
++
++from .diffusion_autoopt.patches import source_digest
++
++FUSED_ENV = "UNSLOTH_DIFFUSION_Q21_MPS_FUSED"
++PART_ENV = "UNSLOTH_DIFFUSION_Q21_MPS_"
++PARTS = ("MODULATE", "RESIDUAL", "ROPE")
++
++_CLASS = "QwenImage21Transformer2DModel"
++# diffusers 0.41.0 / 0.42.1; the block forward below restates 0.42.1's block, the prepare restates its qkv split.
++_FINGERPRINTS: dict[str, frozenset] = {
++    "_qwenimage21_prepare_qkv": frozenset({"574bacc8f355456d", "4c3830595aef56a0"}),
++    "apply_rotary_emb_qwen": frozenset({"ba81dd3fc907c23a"}),
++    "RMSNorm.forward": frozenset({"2633294611ed3bdf"}),
++    "_select_modulation_rows": frozenset({"7e12608919321d40"}),
++    "QwenImage21TransformerBlock.forward": frozenset({"f2cdd58b41ad3441"}),
++    "QwenImage21TransformerBlock._modulate": frozenset({"3bf1998487634f22"}),
++}
++
++_BLOCK_ATTR = "_unsloth_q21_mps_block"
++# Read by diffusion_qwenimage21_math's MPS processor: the per-attention q/k/v prepare.
++PREPARE_ATTR = "_unsloth_q21_mps_prepare"
++
++_LOCK = threading.Lock()
++_LIB: list = [None, False]  # compiled library, failed
++_PROBED: dict = {}  # kernel name -> passed its first-use probe
++_MASKS: dict = {}  # id(mask) -> (weakref, version, prefix_len or None)
++_FREQS: dict = {}  # id(freqs) -> (weakref, real view with storage offset 0)
++STATS = {"block": 0, "mod_split": 0, "residual_metal": 0, "residual_split": 0, "rope_metal": 0}
++
++_METAL = r"""
++#include <metal_stdlib>
++using namespace metal;
++
++// bfloat16 travels as its bit pattern: the paravirtual and older GPUs have no bfloat type.
++inline float q21_f(ushort b) { return as_type<float>(uint(b) << 16); }
++inline ushort q21_b(float f) {
++    uint u = as_type<uint>(f);
++    if ((u & 0x7fffffffu) > 0x7f800000u) { return ushort((u >> 16) | 0x40u); }
++    u += 0x7fffu + ((u >> 16) & 1u);  // round to nearest even
++    return ushort(u >> 16);
++}
++
++// out = h + bf16(gate[row] * y): rows before `prefix` read gate row `zero_row`, the rest read their batch row.
++kernel void q21_gated_residual(
++    device const ushort* h [[buffer(0)]],
++    device const ushort* y [[buffer(1)]],
++    device const ushort* gate [[buffer(2)]],
++    device ushort* out [[buffer(3)]],
++    constant long& dim [[buffer(4)]],
++    constant long& seq [[buffer(5)]],
++    constant long& prefix [[buffer(6)]],
++    constant long& zero_row [[buffer(7)]],
++    uint i [[thread_position_in_grid]]) {
++    long idx = long(i);
++    long token = idx / dim;
++    long d = idx - token * dim;
++    long s = token % seq;
++    long row = s < prefix ? zero_row : token / seq;
++    float prod = q21_f(q21_b(q21_f(gate[row * dim + d]) * q21_f(y[idx])));
++    out[idx] = q21_b(q21_f(h[idx]) + prod);
++}
++
++// One threadgroup per (batch, token, head) row, one thread per rotary pair: diffusers' RMSNorm (fp32 statistics,
++// bf16 after the rsqrt and after the weight) then the complex RoPE multiply in fp32, rounded once.
++kernel void q21_qk_norm_rope(
++    device const ushort* x [[buffer(0)]],
++    device const ushort* w [[buffer(1)]],
++    device const float* freqs [[buffer(2)]],
++    device ushort* out [[buffer(3)]],
++    constant long& heads [[buffer(4)]],
++    constant long& seq [[buffer(5)]],
++    constant long& half_dim [[buffer(6)]],
++    constant float& eps [[buffer(7)]],
++    uint row [[threadgroup_position_in_grid]],
++    uint tid [[thread_position_in_threadgroup]]) {
++    threadgroup float part[512];
++    long s = (long(row) / heads) % seq;
++    long base = long(row) * 2 * half_dim + 2 * long(tid);
++    float a = q21_f(x[base]);
++    float c = q21_f(x[base + 1]);
++    part[tid] = a * a + c * c;
++    threadgroup_barrier(mem_flags::mem_threadgroup);
++    for (uint stride = uint(half_dim) / 2; stride > 0; stride >>= 1) {
++        if (tid < stride) { part[tid] += part[tid + stride]; }
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++    }
++    float r = precise::rsqrt(part[0] / float(2 * half_dim) + eps);
++    float na = q21_f(q21_b(q21_f(q21_b(a * r)) * q21_f(w[2 * tid])));
++    float nc = q21_f(q21_b(q21_f(q21_b(c * r)) * q21_f(w[2 * tid + 1])));
++    long f = (s * half_dim + long(tid)) * 2;
++    float fr = freqs[f];
++    float fi = freqs[f + 1];
++    out[base] = q21_b(na * fr - nc * fi);
++    out[base + 1] = q21_b(na * fi + nc * fr);
++}
++"""
++
++
++def _device_ok(x: Any) -> bool:
++    return x.is_mps
++
++
++def disabled() -> bool:
++    return (os.environ.get(FUSED_ENV) or "").strip().lower() in ("0", "off", "false", "no")
++
++
++def part_enabled(part: str) -> bool:
++    return (os.environ.get(PART_ENV + part) or "").strip().lower() not in ("0", "off", "false", "no")
++
++
++def why_unsupported(mod: Any) -> Optional[str]:
++    for name, want in _FINGERPRINTS.items():
++        obj = mod
++        for piece in name.split("."):
++            obj = getattr(obj, piece, None)
++        got = source_digest(obj)
++        if got not in want:
++            return f"{name} differs from the version this was written against ({got})"
++    return None
++
++
++def _library() -> Any:
++    if _LIB[0] is None and not _LIB[1]:
++        with _LOCK:
++            if _LIB[0] is None and not _LIB[1]:
++                try:
++                    import torch
++                    _LIB[0] = torch.mps.compile_shader(_METAL)
++                except Exception:  # noqa: BLE001 - no Metal compiler / old torch: the eager ops
++                    _LIB[1] = True
++    return _LIB[0]
++
++
++# --------------------------------------------------------------------------------------------- row layout
++
++def prefix_len(mask: Any, seq: int) -> Optional[int]:
++    """``p`` when ``mask`` is ``[False] * p + [True] * (seq - p)`` (non-target prefix, then target rows); None for
++    any other layout. One host read per mask tensor (the fast step builds one per render)."""
++    import torch
++
++    if not torch.is_tensor(mask) or mask.dtype != torch.bool or tuple(mask.shape) != (seq,):
++        return None
++    key = id(mask)
++    hit = _MASKS.get(key)
++    if hit is not None and hit[0]() is mask and hit[1] == mask._version:
++        return hit[2]
++    host = mask.detach().to("cpu")
++    p = int((~host).sum())
++    ok = bool(torch.equal(host, torch.arange(seq) >= p))
++    out = p if ok else None
++    if len(_MASKS) > 64:
++        _MASKS.clear()
++    try:
++        _MASKS[key] = (weakref.ref(mask), mask._version, out)
++    except TypeError:
++        pass
++    return out
++
++
++def _real_rows(rows: Any, masked: bool) -> Any:
++    """The per-sample rows as ``(batch, 1, dim)``: with a mask the trailing row is the t = 0 row."""
++    return (rows[:-1] if masked else rows).unsqueeze(1)
++
++
++def modulate(x: Any, one_plus: Any, masked: bool, p: int) -> Any:
++    """``x * (1 + scale)`` with ``scale`` selected per row, bit-identical to diffusers' ``_modulate``; ``one_plus``
++    is ``1 + scale`` on the parameter rows (the same elementwise add, before the selection)."""
++    import torch
++
++    real = _real_rows(one_plus, masked)
++    if not masked or p == 0:
++        return x * real
++    out = torch.empty_like(x)
++    torch.mul(x[:, :p], one_plus[-1], out = out[:, :p])
++    if p < x.shape[1]:
++        torch.mul(x[:, p:], real, out = out[:, p:])
++    STATS["mod_split"] += 1
++    return out
++
++
++def _residual_metal_ok(h: Any, y: Any, gate: Any) -> bool:
++    import torch
++
++    return (
++        h.dtype == torch.bfloat16
++        and y.dtype == torch.bfloat16
++        and gate.dtype == torch.bfloat16
++        and h.shape == y.shape
++        and h.dim() == 3
++        and h.is_contiguous()
++        and y.is_contiguous()
++        and gate.is_contiguous()
++        and h.storage_offset() == 0
++        and y.storage_offset() == 0
++        and gate.storage_offset() == 0
++        and 0 < h.numel() < 2**31
++    )
++
++
++def gated_residual(h: Any, y: Any, tanh_gate: Any, masked: bool, p: int, out: Any = None, metal: bool = True) -> Any:
++    """``h + gate.tanh() * y`` with the gate selected per row; ``tanh_gate`` is the tanh of the parameter rows."""
++    import torch
++
++    if metal and _residual_metal_ok(h, y, tanh_gate) and _probe("q21_gated_residual", h.device):
++        if out is None:
++            out = torch.empty_like(h)
++        batch, seq, dim = h.shape
++        _library().q21_gated_residual(
++            h,
++            y,
++            tanh_gate,
++            out,
++            dim,
++            seq,
++            p if masked else 0,
++            tanh_gate.shape[0] - 1,
++            threads = h.numel(),
++            group_size = 256,
++        )
++        STATS["residual_metal"] += 1
++        return out
++    real = _real_rows(tanh_gate, masked)
++    if not masked or p == 0:
++        return h + real * y
++    prod = torch.empty_like(y)
++    torch.mul(tanh_gate[-1], y[:, :p], out = prod[:, :p])
++    if p < y.shape[1]:
++        torch.mul(real, y[:, p:], out = prod[:, p:])
++    STATS["residual_split"] += 1
++    return h + prod
++
++
++# --------------------------------------------------------------------------------------------- q/k norm + RoPE
++
++def _stock_norm(norm: Any) -> bool:
++    """diffusers' RMSNorm forward (or the eager tier's F.rms_norm one, which differs only in rounding)."""
++    import inspect
++
++    forward = getattr(type(norm), "forward", None)
++    want = _STOCK_NORM[0]
++    if want is None or forward is None:
++        return False
++    if forward is want:
++        return True
++    from .diffusion_eager_patches import _rmsnorm_forward
++
++    return getattr(inspect.unwrap(forward), "__code__", None) is _rmsnorm_forward.__code__
++
++
++_STOCK_NORM: list = [None]
++
++
++def _freqs_real(freqs: Any) -> Any:
++    import torch
++
++    key = id(freqs)
++    hit = _FREQS.get(key)
++    if hit is not None and hit[0]() is freqs:
++        return hit[1]
++    real = torch.view_as_real(freqs)
++    if real.storage_offset() != 0 or not real.is_contiguous():
++        real = real.clone(memory_format = torch.contiguous_format)
++    if len(_FREQS) > 16:
++        _FREQS.clear()
++    try:
++        _FREQS[key] = (weakref.ref(freqs), real)
++    except TypeError:
++        pass
++    return real
++
++
++def _rope_ok(x: Any, norm: Any, freqs: Any) -> bool:
++    import torch
++
++    if x.dim() != 4 or x.dtype != torch.bfloat16 or not x.is_contiguous() or x.storage_offset() != 0:
++        return False
++    dim = x.shape[-1]
++    weight = getattr(norm, "weight", None)
++    return (
++        dim in (64, 128, 256, 512, 1024)
++        and 0 < x.numel() < 2**31
++        and _stock_norm(norm)
++        and getattr(norm, "bias", None) is None
++        and weight is not None
++        and weight.dtype == x.dtype
++        and weight.device == x.device
++        and tuple(weight.shape) == (dim,)
++        and weight.is_contiguous()
++        and weight.storage_offset() == 0
++        and torch.is_tensor(freqs)
++        and freqs.dtype == torch.complex64
++        and freqs.device == x.device
++        and freqs.dim() == 2
++        and freqs.shape[0] == x.shape[1]
++        and freqs.shape[1] * 2 == dim
++    )
++
++
++def norm_rope(x: Any, norm: Any, freqs: Any) -> Optional[Any]:
++    """``apply_rotary_emb_qwen(norm(x), freqs, use_real=False)`` in one Metal pass, or None to run the stock pair."""
++    import torch
++
++    if not _rope_ok(x, norm, freqs) or not _probe("q21_qk_norm_rope", x.device):
++        return None
++    batch, seq, heads, dim = x.shape
++    out = torch.empty_like(x)
++    half = dim // 2
++    _library().q21_qk_norm_rope(
++        x,
++        norm.weight,
++        _freqs_real(freqs),
++        out,
++        heads,
++        seq,
++        half,
++        float(norm.eps),
++        threads = batch * seq * heads * half,
++        group_size = half,
++    )
++    STATS["rope_metal"] += 1
++    return out
++
++
++def _stock_norm_rope(mod: Any, x: Any, norm: Any, freqs: Any, dtype: Any) -> Any:
++    return mod.apply_rotary_emb_qwen(norm(x).to(dtype), freqs, use_real = False)
++
++
++def make_prepare(mod: Any) -> Any:
++    stock = mod._qwenimage21_prepare_qkv
++
++    def prepare(attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, cache_write_slice):
++        import torch
++
++        if rotary_emb is None or torch.is_grad_enabled() or not _device_ok(hidden_states):
++            return stock(attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, cache_write_slice)
++        query = attn.to_q(hidden_states)
++        key = attn.to_k(hidden_states)
++        value = attn.to_v(hidden_states)
++        head_dim = attn.inner_dim // attn.heads
++        query = query.unflatten(-1, (-1, head_dim))
++        key = key.unflatten(-1, (-1, head_dim))
++        value = value.unflatten(-1, (-1, head_dim))
++        fused_q = norm_rope(query, attn.norm_q, rotary_emb) if query.dtype == value.dtype else None
++        fused_k = norm_rope(key, attn.norm_k, rotary_emb) if fused_q is not None else None
++        query = fused_q if fused_q is not None else _stock_norm_rope(mod, query, attn.norm_q, rotary_emb, value.dtype)
++        key = fused_k if fused_k is not None else _stock_norm_rope(mod, key, attn.norm_k, rotary_emb, value.dtype)
++
++        if layer_cache is not None:
++            if kv_cache_mode == "extract" and cache_write_slice is not None:
++                layer_cache.store(key[:, cache_write_slice].clone(), value[:, cache_write_slice].clone())
++            elif kv_cache_mode == "cached":
++                cached_k, cached_v = layer_cache.get()
++                key = torch.cat([cached_k, key], dim = 1)
++                value = torch.cat([cached_v, value], dim = 1)
++        return query, key, value, query.shape[1]
++
++    prepare.__unsloth_q21_mps__ = True
++    return prepare
++
++
++# --------------------------------------------------------------------------------------------- probes
++
++def _probe(name: str, device: Any) -> bool:
++    """First use of a kernel compares it with the eager math on a small input; a mismatch disables that kernel."""
++    hit = _PROBED.get(name)
++    if hit is not None:
++        return hit
++    ok = False
++    try:
++        if _library() is not None:
++            ok = _run_probe(name, device)
++    except Exception:  # noqa: BLE001 - a Metal / driver failure keeps the eager ops
++        ok = False
++    _PROBED[name] = ok
++    return ok
++
++
++def _run_probe(name: str, device: Any) -> bool:
++    import torch
++
++    g = torch.Generator().manual_seed(7)
++    if name == "q21_gated_residual":
++        h = torch.randn(1, 37, 256, generator = g).to(device, torch.bfloat16)
++        y = torch.randn(1, 37, 256, generator = g).to(device, torch.bfloat16)
++        gate = torch.tanh(torch.randn(2, 256, generator = g)).to(device, torch.bfloat16)
++        out = torch.empty_like(h)
++        _library().q21_gated_residual(h, y, gate, out, 256, 37, 5, 1, threads = h.numel(), group_size = 256)
++        want = h + torch.where(
++            (torch.arange(37, device = device) >= 5).view(1, -1, 1), gate[:1].unsqueeze(1), gate[1:].unsqueeze(0)
++        ) * y
++        return bool(torch.equal(out, want))
++    if name == "q21_qk_norm_rope":
++        from diffusers.models.normalization import RMSNorm
++        from diffusers.models.transformers.transformer_qwenimage21 import apply_rotary_emb_qwen
++
++        x = torch.randn(1, 9, 3, 128, generator = g).to(device, torch.bfloat16)
++        norm = RMSNorm(128, eps = 1e-6).to(device, torch.bfloat16)
++        with torch.no_grad():
++            norm.weight.copy_(1 + 0.1 * torch.randn(128, generator = g))
++        angles = torch.randn(9, 64, generator = g)
++        freqs = torch.polar(torch.ones_like(angles), angles).to(device)
++        out = torch.empty_like(x)
++        _library().q21_qk_norm_rope(
++            x, norm.weight, torch.view_as_real(freqs).contiguous(), out, 3, 9, 64, 1e-6,
++            threads = 9 * 3 * 64, group_size = 64,
++        )
++        with torch.no_grad():
++            want = apply_rotary_emb_qwen(norm(x).to(x.dtype), freqs, use_real = False)
++        # fp32 sum-of-squares order may differ in the last bit: one bf16 step of the output's magnitude.
++        return bool(((out.float() - want.float()).abs() <= want.float().abs() * 2**-7 + 1e-6).all())
++    return False
++
++
++# --------------------------------------------------------------------------------------------- block forward
++
++def _block_forward(
++    self,
++    hidden_states,
++    modulation,
++    rotary_emb = None,
++    attention_mask = None,
++    target_token_mask = None,
++    layer_cache = None,
++    kv_cache_mode = None,
++    cache_write_slice = None,
++    segments = None,
++    key_valid = None,
++):
++    import torch
++
++    stock = type(self).forward
++    flags = self.__dict__.get(_BLOCK_ATTR)
++    p = 0
++    masked = target_token_mask is not None
++    if masked:
++        p = prefix_len(target_token_mask, hidden_states.shape[1])
++    if (
++        flags is None
++        or p is None
++        or torch.is_grad_enabled()
++        or torch.compiler.is_compiling()
++        or not _device_ok(hidden_states)
++        or hidden_states.dim() != 3
++        or modulation.dim() != 2
++        or modulation.shape[0] != hidden_states.shape[0] + (1 if masked else 0)
++    ):
++        return stock(
++            self, hidden_states, modulation, rotary_emb, attention_mask, target_token_mask,
++            layer_cache, kv_cache_mode, cache_write_slice, segments, key_valid,
++        )
++    use_mod, use_res = flags
++    STATS["block"] += 1
++    mod1, mod2 = modulation.chunk(2, dim = -1)
++    scale1, gate1 = mod1.chunk(2, dim = -1)
++    scale2, gate2 = mod2.chunk(2, dim = -1)
++
++    def _mod(x, scale):
++        if use_mod:
++            return modulate(x, 1 + scale, masked, p)
++        return x * (1 + self_rows(scale))
++
++    def self_rows(params):
++        return _module()._select_modulation_rows(params, target_token_mask)
++
++    def _res(h, y, gate, out = None):
++        if use_res:
++            return gated_residual(h, y, gate.tanh().contiguous(), masked, p, out = out)
++        return h + self_rows(gate).tanh() * y
++
++    attn_output = self.attn(
++        hidden_states = _mod(self.img_norm1(hidden_states), scale1),
++        attention_mask = attention_mask,
++        rotary_emb = rotary_emb,
++        layer_cache = layer_cache,
++        kv_cache_mode = kv_cache_mode,
++        cache_write_slice = cache_write_slice,
++        segments = segments,
++        key_valid = key_valid,
++    )
++    hidden_states = _res(hidden_states, attn_output, gate1)
++    mlp_output = self.img_mlp(_mod(self.img_norm2(hidden_states), scale2))
++    # The first residual allocated a fresh tensor this block owns, so the second writes over it.
++    hidden_states = _res(hidden_states, mlp_output, gate2, out = hidden_states if use_res else None)
++
++    if hidden_states.dtype == torch.float16:
++        hidden_states = hidden_states.clip(-65504, 65504)
++    return hidden_states
++
++
++_block_forward.__unsloth_q21_mps__ = True
++
++
++def _module() -> Any:
++    from diffusers.models.transformers import transformer_qwenimage21 as mod
++    return mod
++
++
++def installed(transformer: Any) -> bool:
++    blocks = getattr(transformer, "transformer_blocks", None) or ()
++    return any(_BLOCK_ATTR in getattr(b, "__dict__", {}) for b in blocks)
++
++
++def uninstall(transformer: Any) -> None:
++    for block in getattr(transformer, "transformer_blocks", None) or ():
++        d = getattr(block, "__dict__", {})
++        d.pop(_BLOCK_ATTR, None)
++        if getattr(d.get("forward"), "__unsloth_q21_mps__", False):
++            d.pop("forward", None)
++        attn = getattr(block, "attn", None)
++        if attn is not None:
++            attn.__dict__.pop(PREPARE_ATTR, None)
++
++
++def _on_mps(transformer: Any) -> bool:
++    try:
++        return _device_ok(next(transformer.parameters()))
++    except Exception:  # noqa: BLE001
++        return False
++
++
++def install_for_pipe(pipe: Any, logger: Any = None, explicit_off: bool = False) -> bool:
++    """Per transformer instance (dies with the pipe); an explicit speed ``off`` load keeps the stock block."""
++    transformer = getattr(pipe, "transformer", None)
++    if type(transformer).__name__ != _CLASS:
++        return False
++    if explicit_off or disabled() or not _on_mps(transformer):
++        uninstall(transformer)
++        return False
++    try:
++        mod = _module()
++    except Exception:  # noqa: BLE001 - diffusers without Qwen-Image 2.1
++        return False
++    why = why_unsupported(mod)
++    if why is not None:
++        if logger is not None:
++            logger.info("diffusion.q21_mps: stock block kept: %s", why)
++        return False
++    _STOCK_NORM[0] = _STOCK_NORM[0] or mod.RMSNorm.forward
++    cls = mod.QwenImage21TransformerBlock
++    flags = (part_enabled("MODULATE"), part_enabled("RESIDUAL"))
++    rope = part_enabled("ROPE")
++    prepare = make_prepare(mod) if rope else None
++    count = 0
++    for block in getattr(transformer, "transformer_blocks", None) or ():
++        current = block.__dict__.get("forward")
++        # Another wrapper (offload hooks) owns the instance forward: leave that block stock.
++        if type(block) is not cls or (current is not None and not getattr(current, "__unsloth_q21_mps__", False)):
++            continue
++        block.__dict__[_BLOCK_ATTR] = flags
++        block.__dict__["forward"] = types.MethodType(_block_forward, block)
++        attn = getattr(block, "attn", None)
++        if attn is not None:
++            if prepare is not None:
++                attn.__dict__[PREPARE_ATTR] = prepare
++            else:
++                attn.__dict__.pop(PREPARE_ATTR, None)
++        count += 1
++    if logger is not None and count:
++        logger.info(
++            "diffusion.q21_mps: %d blocks run row-level modulation%s%s",
++            count,
++            ", one-pass gated residual" if flags[1] else "",
++            ", one-pass q/k RMSNorm + RoPE" if rope else "",
++        )
++    return count > 0
+diff --git a/studio/backend/tests/fixtures/diffusion_autoopt_parity.json b/studio/backend/tests/fixtures/diffusion_autoopt_parity.json
+index 259efdaed8..f94f7e1a17 100644
+--- a/studio/backend/tests/fixtures/diffusion_autoopt_parity.json
++++ b/studio/backend/tests/fixtures/diffusion_autoopt_parity.json
+@@ -353,38 +353,38 @@
+   "image|lumina-2|off|float16|offload=0|gguf=1": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":false,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+   "image|lumina-2|off|float16|offload=1|gguf=0": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":false,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+   "image|lumina-2|off|float16|offload=1|gguf=1": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":false,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|default|bfloat16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":true,"options":"{'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":false,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|default|bfloat16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled_dequant","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|default|bfloat16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":true,"options":"{'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":false,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|default|bfloat16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled_dequant","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|default|float16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":true,"options":"{'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":false,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|default|float16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled_dequant","cudnn_benchmark","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|default|float16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":true,"options":"{'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":false,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|default|float16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled_dequant","cudnn_benchmark","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|eager|bfloat16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark","fp16_accum"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|eager|bfloat16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark","fp16_accum"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|eager|bfloat16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark","fp16_accum"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|eager|bfloat16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark","fp16_accum"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|eager|float16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|eager|float16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|eager|float16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|eager|float16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|max|bfloat16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|max|bfloat16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|max|bfloat16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|max|bfloat16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|max|float16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|max|float16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|max|float16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|max|float16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|off|bfloat16|offload=0|gguf=0": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|off|bfloat16|offload=0|gguf=1": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|off|bfloat16|offload=1|gguf=0": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|off|bfloat16|offload=1|gguf=1": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|off|float16|offload=0|gguf=0": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|off|float16|offload=0|gguf=1": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|off|float16|offload=1|gguf=0": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+-  "image|qwen-image-2.1|off|float16|offload=1|gguf=1": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|default|bfloat16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":true,"options":"{'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":false,"int8_gemm":false}}},
++  "image|qwen-image-2.1|default|bfloat16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled_dequant","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|default|bfloat16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":true,"options":"{'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":false,"int8_gemm":false}}},
++  "image|qwen-image-2.1|default|bfloat16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled_dequant","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|default|float16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":true,"options":"{'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":false,"int8_gemm":false}}},
++  "image|qwen-image-2.1|default|float16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled_dequant","cudnn_benchmark","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|default|float16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":true,"options":"{'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":false,"int8_gemm":false}}},
++  "image|qwen-image-2.1|default|float16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled_dequant","cudnn_benchmark","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|eager|bfloat16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark","fp16_accum"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|eager|bfloat16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark","fp16_accum"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|eager|bfloat16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark","fp16_accum"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|eager|bfloat16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark","fp16_accum"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|eager|float16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|eager|float16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|eager|float16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|eager|float16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["cudnn_benchmark"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|max|bfloat16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
++  "image|qwen-image-2.1|max|bfloat16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
++  "image|qwen-image-2.1|max|bfloat16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
++  "image|qwen-image-2.1|max|bfloat16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
++  "image|qwen-image-2.1|max|float16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
++  "image|qwen-image-2.1|max|float16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
++  "image|qwen-image-2.1|max|float16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
++  "image|qwen-image-2.1|max|float16|offload=1|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[["compiled","cudnn_benchmark","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"QwenImage21Transformer2DModel forward is not capture-safe (its pipeline passes the prefix KV cache as a Python object on every step; the Unsloth fast step that replays decode steps from tensors is not installed)","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":null,"options":"{'max_autotune': True, 'coordinate_descent_tuning': False, 'test_configs.force_filter_reduction_configs': True}"}],"static":false,"auto_dynamic":true,"int8_gemm":false}}},
++  "image|qwen-image-2.1|off|bfloat16|offload=0|gguf=0": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|off|bfloat16|offload=0|gguf=1": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|off|bfloat16|offload=1|gguf=0": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|off|bfloat16|offload=1|gguf=1": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|off|float16|offload=0|gguf=0": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|off|float16|offload=0|gguf=1": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|off|float16|offload=1|gguf=0": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
++  "image|qwen-image-2.1|off|float16|offload=1|gguf=1": {"patches":{"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_mps_fused":false,"qwenimage21_fast_step":true,"rocm_fused":false},"applied":[[]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":null,"graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+   "image|qwen-image-edit|default|bfloat16|offload=0|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":false,"rocm_fused":false},"applied":[["compiled","cuda_graph","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"eligible","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[{"fullgraph":true,"dynamic":true}],"static":false,"auto_dynamic":false,"int8_gemm":false}}},
+   "image|qwen-image-edit|default|bfloat16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":false,"rocm_fused":false},"applied":[["compiled_dequant","cuda_graph","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"eligible","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
+   "image|qwen-image-edit|default|bfloat16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":false,"rocm_fused":false},"applied":[["compiled","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"armed after placement","graph_after_placement":true,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":true}],"static":false,"auto_dynamic":false,"int8_gemm":false}}},
+diff --git a/studio/backend/tests/test_diffusion_autoopt_parity.py b/studio/backend/tests/test_diffusion_autoopt_parity.py
+index 250c148528..8531fc7917 100644
+--- a/studio/backend/tests/test_diffusion_autoopt_parity.py
++++ b/studio/backend/tests/test_diffusion_autoopt_parity.py
+@@ -240,6 +240,11 @@ def legacy_entry(
+             patches["krea2_text_trim"] = _engaged(
+                 krea2_trim(pipe, None, explicit_off = speed == "off")
+             )
++        if type(getattr(pipe, "transformer", None)).__name__ == "QwenImage21Transformer2DModel":
++            from core.inference.diffusion_qwenimage21_mps import install_for_pipe as q21_mps
++            patches["qwenimage21_mps_fused"] = _engaged(
++                q21_mps(pipe, None, explicit_off = speed == "off")
++            )
+         patches["flux2_rope"] = _engaged(flux2(pipe, target.dtype, target.device, None))
+         patches["flux3_rope"] = _engaged(flux3(pipe, target.device, None))
+         from core.inference.diffusion_flux3_half_attn import install_for_pipe as flux3_attn
+diff --git a/studio/backend/tests/test_diffusion_qwenimage21_mps.py b/studio/backend/tests/test_diffusion_qwenimage21_mps.py
+new file mode 100644
+index 0000000000..0196d8cead
+--- /dev/null
++++ b/studio/backend/tests/test_diffusion_qwenimage21_mps.py
+@@ -0,0 +1,238 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""CPU checks of the MPS Qwen-Image-2.1 block: row-level modulation / residual are bit-identical to diffusers, the
++Metal kernels' arithmetic (emulated in torch) matches the stock ops, and nothing installs off MPS."""
++
++from types import SimpleNamespace
++
++import pytest
++
++torch = pytest.importorskip("torch")
++qmod = pytest.importorskip("diffusers.models.transformers.transformer_qwenimage21")
++
++from core.inference import diffusion_qwenimage21_mps as mps  # noqa: E402
++
++
++def _bf(x):
++    return x.to(torch.bfloat16).float()
++
++
++def _emulated_residual(h, y, gate_rows, p, zero_row):
++    """The q21_gated_residual kernel's arithmetic: bf16(h + bf16(gate[row] * y))."""
++    batch, seq, dim = h.shape
++    rows = torch.arange(seq) < p
++    g = torch.where(rows.view(1, -1, 1), gate_rows[zero_row].float(), gate_rows[:batch].float().unsqueeze(1))
++    return (h.float() + _bf(g * y.float())).to(torch.bfloat16)
++
++
++def _emulated_norm_rope(x, weight, eps, freqs):
++    """The q21_qk_norm_rope kernel's arithmetic, pairwise fp32 sum of squares."""
++    xf = x.float()
++    pairs = xf.unflatten(-1, (-1, 2))
++    ss = (pairs[..., 0] * pairs[..., 0] + pairs[..., 1] * pairs[..., 1]).sum(-1, keepdim = True)
++    r = torch.rsqrt(ss / x.shape[-1] + eps)
++    n = _bf(_bf(xf * r) * weight.float()).unflatten(-1, (-1, 2))
++    fr = freqs.real[None, :, None, :]
++    fi = freqs.imag[None, :, None, :]
++    a, c = n[..., 0], n[..., 1]
++    return torch.stack([a * fr - c * fi, a * fi + c * fr], dim = -1).flatten(-2).to(torch.bfloat16)
++
++
++@pytest.mark.parametrize("p", [0, 1, 7, 40])
++def test_prefix_len_reads_split_masks(p):
++    mask = torch.arange(40) >= p
++    assert mps.prefix_len(mask, 40) == p
++    assert mps.prefix_len(mask, 41) is None
++
++
++def test_prefix_len_rejects_interleaved_mask():
++    mask = torch.ones(16, dtype = torch.bool)
++    mask[:3] = False
++    mask[9] = False
++    assert mps.prefix_len(mask, 16) is None
++    assert mps.prefix_len(mask.float(), 16) is None
++
++
++def test_prefix_len_rereads_after_in_place_write():
++    mask = torch.arange(12) >= 4
++    assert mps.prefix_len(mask, 12) == 4
++    mask[:6] = False
++    assert mps.prefix_len(mask, 12) == 6
++
++
++def _block_case(batch, seq, dim, p, seed):
++    g = torch.Generator().manual_seed(seed)
++    x = torch.randn(batch, seq, dim, generator = g).to(torch.bfloat16)
++    y = torch.randn(batch, seq, dim, generator = g).to(torch.bfloat16)
++    masked = p is not None
++    rows = torch.randn(batch + (1 if masked else 0), 2 * dim, generator = g).to(torch.bfloat16)
++    mask = (torch.arange(seq) >= p) if masked else None
++    return x, y, rows, mask
++
++
++@pytest.mark.parametrize("batch,p", [(1, None), (1, 0), (1, 5), (2, 5), (2, None), (1, 33)])
++def test_modulate_bit_identical_to_diffusers(batch, p):
++    x, _, rows, mask = _block_case(batch, 33, 64, p, 3)
++    block = SimpleNamespace()
++    want, want_gate = qmod.QwenImage21TransformerBlock._modulate(block, x, rows, mask)
++    scale, gate = rows.chunk(2, dim = -1)
++    got = mps.modulate(x, 1 + scale, mask is not None, p or 0)
++    assert torch.equal(got, want)
++
++
++@pytest.mark.parametrize("batch,p", [(1, None), (1, 0), (1, 5), (2, 5), (2, None), (1, 33)])
++def test_residual_split_bit_identical_to_diffusers(batch, p):
++    h, y, rows, mask = _block_case(batch, 33, 64, p, 4)
++    _, gate = rows.chunk(2, dim = -1)
++    want = h + qmod._select_modulation_rows(gate, mask).tanh() * y
++    got = mps.gated_residual(h, y, gate.tanh().contiguous(), mask is not None, p or 0, metal = False)
++    assert torch.equal(got, want)
++
++
++@pytest.mark.parametrize("batch,p", [(1, None), (1, 0), (1, 5), (2, 9)])
++def test_residual_kernel_arithmetic_matches_diffusers(batch, p):
++    h, y, rows, mask = _block_case(batch, 33, 256, p, 5)
++    _, gate = rows.chunk(2, dim = -1)
++    tg = gate.tanh().contiguous()
++    want = h + qmod._select_modulation_rows(gate, mask).tanh() * y
++    got = _emulated_residual(h, y, tg, p or 0, tg.shape[0] - 1)
++    assert torch.equal(got, want)
++
++
++@pytest.mark.parametrize("seed", [0, 1, 2])
++def test_norm_rope_kernel_arithmetic_within_one_bf16_step(seed):
++    from diffusers.models.normalization import RMSNorm
++
++    g = torch.Generator().manual_seed(seed)
++    x = (3 * torch.randn(1, 64, 4, 128, generator = g)).to(torch.bfloat16)
++    norm = RMSNorm(128, eps = 1e-6).to(torch.bfloat16)
++    with torch.no_grad():
++        norm.weight.copy_(1 + 0.2 * torch.randn(128, generator = g))
++    angles = 50 * torch.randn(64, 64, generator = g)
++    freqs = torch.polar(torch.ones_like(angles), angles)
++    with torch.no_grad():
++        want = qmod.apply_rotary_emb_qwen(norm(x).to(x.dtype), freqs, use_real = False)
++    got = _emulated_norm_rope(x, norm.weight, norm.eps, freqs)
++    diff = (got.float() - want.float()).abs()
++    assert bool((diff <= want.float().abs() * 2**-7 + 1e-6).all())
++    # the sum-of-squares order is the only difference: nearly every element is bit-equal
++    assert (diff == 0).float().mean() > 0.97
++
++
++def _blocks(n = 2, dim = 64, heads = 2):
++    torch.manual_seed(0)
++    return [
++        qmod.QwenImage21TransformerBlock(dim, heads, dim // heads).to(torch.bfloat16).eval()
++        for _ in range(n)
++    ]
++
++
++class QwenImage21Transformer2DModel:
++    def __init__(self, blocks):
++        self.transformer_blocks = blocks
++
++    def parameters(self):
++        return self.transformer_blocks[0].parameters()
++
++
++def _pipe(blocks):
++    return SimpleNamespace(transformer = QwenImage21Transformer2DModel(blocks))
++
++
++def _run_blocks(blocks, x, modulation, mask, freqs):
++    with torch.no_grad():
++        for b in blocks:
++            x = b(hidden_states = x, modulation = modulation, rotary_emb = freqs, target_token_mask = mask)
++    return x
++
++
++@pytest.mark.parametrize("p", [None, 0, 6])
++def test_block_forward_bit_identical_on_eager_paths(monkeypatch, p):
++    """With the device gate opened on CPU, the block (row modulation + split residual, stock RoPE) equals diffusers."""
++    monkeypatch.setattr(mps, "_device_ok", lambda x: True)
++    monkeypatch.setattr(mps, "_library", lambda: None)
++    mps._PROBED.clear()
++    blocks = _blocks()
++    g = torch.Generator().manual_seed(9)
++    seq, dim = 20, 64
++    x = torch.randn(1, seq, dim, generator = g).to(torch.bfloat16)
++    masked = p is not None
++    modulation = torch.randn(1 + (1 if masked else 0), 4 * dim, generator = g).to(torch.bfloat16)
++    mask = (torch.arange(seq) >= p) if masked else None
++    angles = torch.randn(seq, dim // 4, generator = g)
++    freqs = torch.polar(torch.ones_like(angles), angles)
++    want = _run_blocks(blocks, x, modulation, mask, freqs)
++
++    pipe = _pipe(blocks)
++    assert mps.install_for_pipe(pipe)
++    before = dict(mps.STATS)
++    got = _run_blocks(blocks, x, modulation, mask, freqs)
++    assert mps.STATS["block"] - before["block"] == len(blocks)
++    if p:
++        assert mps.STATS["mod_split"] > before["mod_split"]
++        assert mps.STATS["residual_split"] > before["residual_split"]
++    assert torch.equal(got, want)
++    mps.uninstall(pipe.transformer)
++    assert all("forward" not in b.__dict__ for b in blocks)
++    mps._PROBED.clear()
++
++
++def test_install_declines_off_mps_and_leaves_blocks_untouched():
++    blocks = _blocks(1)
++    pipe = _pipe(blocks)
++    assert not mps.install_for_pipe(pipe)
++    assert "forward" not in blocks[0].__dict__
++    assert mps.PREPARE_ATTR not in blocks[0].attn.__dict__
++
++
++def test_explicit_off_and_kill_switch_uninstall(monkeypatch):
++    monkeypatch.setattr(mps, "_device_ok", lambda x: True)
++    blocks = _blocks(1)
++    pipe = _pipe(blocks)
++    assert mps.install_for_pipe(pipe)
++    assert mps.PREPARE_ATTR in blocks[0].attn.__dict__
++    assert not mps.install_for_pipe(pipe, explicit_off = True)
++    assert "forward" not in blocks[0].__dict__
++    assert mps.install_for_pipe(pipe)
++    monkeypatch.setenv(mps.FUSED_ENV, "0")
++    assert not mps.install_for_pipe(pipe)
++    assert "forward" not in blocks[0].__dict__
++
++
++def test_install_skips_a_block_another_hook_wraps(monkeypatch):
++    monkeypatch.setattr(mps, "_device_ok", lambda x: True)
++    blocks = _blocks(2)
++    hook = lambda *a, **k: None  # noqa: E731
++    blocks[0].__dict__["forward"] = hook
++    pipe = _pipe(blocks)
++    assert mps.install_for_pipe(pipe)
++    assert blocks[0].__dict__["forward"] is hook
++    assert getattr(blocks[1].__dict__["forward"], "__unsloth_q21_mps__", False)
++    mps.uninstall(pipe.transformer)
++    assert blocks[0].__dict__["forward"] is hook
++
++
++def test_part_switches(monkeypatch):
++    monkeypatch.setattr(mps, "_device_ok", lambda x: True)
++    monkeypatch.setenv("UNSLOTH_DIFFUSION_Q21_MPS_ROPE", "0")
++    monkeypatch.setenv("UNSLOTH_DIFFUSION_Q21_MPS_RESIDUAL", "0")
++    blocks = _blocks(1)
++    pipe = _pipe(blocks)
++    assert mps.install_for_pipe(pipe)
++    assert mps.PREPARE_ATTR not in blocks[0].attn.__dict__
++    assert blocks[0].__dict__[mps._BLOCK_ATTR] == (True, False)
++    mps.uninstall(pipe.transformer)
++
++
++def test_fingerprints_match_pinned_diffusers():
++    assert mps.why_unsupported(qmod) is None
++
++
++def test_bounded_processor_uses_the_stock_prepare_without_the_attribute():
++    from core.inference import diffusion_qwenimage21_math as bounded
++    import inspect
++
++    src = inspect.getsource(bounded._processor_class)
++    assert '__dict__.get("_unsloth_q21_mps_prepare") or _qwenimage21_prepare_qkv' in src
++    assert mps.PREPARE_ATTR == "_unsloth_q21_mps_prepare"
