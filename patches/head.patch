@@ -50,17 +50,17 @@ index eb151ec0b8..4f2070619f 100644
              if segments is None:
 diff --git a/studio/backend/core/inference/diffusion_qwenimage21_mps.py b/studio/backend/core/inference/diffusion_qwenimage21_mps.py
 new file mode 100644
-index 0000000000..f0519dc015
+index 0000000000..883a1b1fec
 --- /dev/null
 +++ b/studio/backend/core/inference/diffusion_qwenimage21_mps.py
-@@ -0,0 +1,581 @@
+@@ -0,0 +1,690 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
-+"""Apple Silicon (MPS) Qwen-Image-2.1 block: modulation and gated residual read their per-row scale / gate from the
-+small parameter rows instead of a ``torch.where``-expanded (batch, seq, dim) copy (bit-identical), the gated residual
-+runs as one Metal pass, and q/k RMSNorm + RoPE run as one Metal pass per tensor (fp32 sum of squares may differ in
-+the last bit). Per transformer instance, MPS only; CUDA / ROCm / CPU never reach this code.
++"""Apple Silicon (MPS) Qwen-Image-2.1 block as Metal passes: modulation and gated residual each one pass that reads
++its per-row scale / gate from the small parameter rows instead of a ``torch.where``-expanded (batch, seq, dim) copy
++(bit-identical), and q/k RMSNorm + RoPE one pass per tensor (fp32 sum of squares may differ in the last bit); any
++kernel that cannot run (fp16, layout, compiler, failed first-use probe) keeps the stock ops. Per transformer instance, MPS only; CUDA / ROCm / CPU never reach this code.
 +Kill switch UNSLOTH_DIFFUSION_Q21_MPS_FUSED=0; per part UNSLOTH_DIFFUSION_Q21_MPS_{MODULATE,RESIDUAL,ROPE}=0."""
 +
 +from __future__ import annotations
@@ -97,7 +97,7 @@ index 0000000000..f0519dc015
 +_PROBED: dict = {}  # kernel name -> passed its first-use probe
 +_MASKS: dict = {}  # id(mask) -> (weakref, version, prefix_len or None)
 +_FREQS: dict = {}  # id(freqs) -> (weakref, real view with storage offset 0)
-+STATS = {"block": 0, "mod_split": 0, "residual_metal": 0, "residual_split": 0, "rope_metal": 0}
++STATS = {"block": 0, "modulate_metal": 0, "residual_metal": 0, "rope_metal": 0}
 +
 +_METAL = r"""
 +#include <metal_stdlib>
@@ -112,58 +112,88 @@ index 0000000000..f0519dc015
 +    return ushort(u >> 16);
 +}
 +
-+// out = h + bf16(gate[row] * y): rows before `prefix` read gate row `zero_row`, the rest read their batch row.
++// Grid (dim / 4, batch * seq): rows before `prefix` read parameter row `zero_row`, the rest their batch row.
++inline uint q21_row(uint token, uint seq, uint prefix, uint zero_row) {
++    uint s = token % seq;
++    return s < prefix ? zero_row : token / seq;
++}
++
++// out = bf16(x * one_plus[row]): diffusers' x * (1 + scale) with the scale selected per row.
++kernel void q21_modulate(
++    device const ushort4* x [[buffer(0)]],
++    device const ushort4* one_plus [[buffer(1)]],
++    device ushort4* out [[buffer(2)]],
++    constant long& dim4_ [[buffer(3)]],
++    constant long& seq_ [[buffer(4)]],
++    constant long& prefix_ [[buffer(5)]],
++    constant long& zero_row_ [[buffer(6)]],
++    uint2 pos [[thread_position_in_grid]]) {
++    uint dim4 = uint(dim4_);
++    if (pos.x >= dim4) { return; }
++    uint row = q21_row(pos.y, uint(seq_), uint(prefix_), uint(zero_row_));
++    uint idx = pos.y * dim4 + pos.x;
++    ushort4 a = x[idx];
++    ushort4 m = one_plus[row * dim4 + pos.x];
++    ushort4 o;
++    for (uint k = 0; k < 4; ++k) { o[k] = q21_b(q21_f(a[k]) * q21_f(m[k])); }
++    out[idx] = o;
++}
++
++// out = bf16(h + bf16(gate[row] * y)): diffusers' h + gate.tanh() * y, gate = tanh of the parameter rows.
 +kernel void q21_gated_residual(
-+    device const ushort* h [[buffer(0)]],
-+    device const ushort* y [[buffer(1)]],
-+    device const ushort* gate [[buffer(2)]],
-+    device ushort* out [[buffer(3)]],
-+    constant long& dim [[buffer(4)]],
-+    constant long& seq [[buffer(5)]],
-+    constant long& prefix [[buffer(6)]],
-+    constant long& zero_row [[buffer(7)]],
-+    uint i [[thread_position_in_grid]]) {
-+    long idx = long(i);
-+    long token = idx / dim;
-+    long d = idx - token * dim;
-+    long s = token % seq;
-+    long row = s < prefix ? zero_row : token / seq;
-+    float prod = q21_f(q21_b(q21_f(gate[row * dim + d]) * q21_f(y[idx])));
-+    out[idx] = q21_b(q21_f(h[idx]) + prod);
++    device const ushort4* h [[buffer(0)]],
++    device const ushort4* y [[buffer(1)]],
++    device const ushort4* gate [[buffer(2)]],
++    device ushort4* out [[buffer(3)]],
++    constant long& dim4_ [[buffer(4)]],
++    constant long& seq_ [[buffer(5)]],
++    constant long& prefix_ [[buffer(6)]],
++    constant long& zero_row_ [[buffer(7)]],
++    uint2 pos [[thread_position_in_grid]]) {
++    uint dim4 = uint(dim4_);
++    if (pos.x >= dim4) { return; }
++    uint row = q21_row(pos.y, uint(seq_), uint(prefix_), uint(zero_row_));
++    uint idx = pos.y * dim4 + pos.x;
++    ushort4 a = h[idx];
++    ushort4 b = y[idx];
++    ushort4 g = gate[row * dim4 + pos.x];
++    ushort4 o;
++    for (uint k = 0; k < 4; ++k) { o[k] = q21_b(q21_f(a[k]) + q21_f(q21_b(q21_f(g[k]) * q21_f(b[k])))); }
++    out[idx] = o;
 +}
 +
 +// One threadgroup per (batch, token, head) row, one thread per rotary pair: diffusers' RMSNorm (fp32 statistics,
 +// bf16 after the rsqrt and after the weight) then the complex RoPE multiply in fp32, rounded once.
 +kernel void q21_qk_norm_rope(
-+    device const ushort* x [[buffer(0)]],
-+    device const ushort* w [[buffer(1)]],
-+    device const float* freqs [[buffer(2)]],
-+    device ushort* out [[buffer(3)]],
-+    constant long& heads [[buffer(4)]],
-+    constant long& seq [[buffer(5)]],
-+    constant long& half_dim [[buffer(6)]],
++    device const ushort2* x [[buffer(0)]],
++    device const ushort2* w [[buffer(1)]],
++    device const float2* freqs [[buffer(2)]],
++    device ushort2* out [[buffer(3)]],
++    constant long& heads_ [[buffer(4)]],
++    constant long& seq_ [[buffer(5)]],
++    constant long& half_ [[buffer(6)]],
 +    constant float& eps [[buffer(7)]],
 +    uint row [[threadgroup_position_in_grid]],
 +    uint tid [[thread_position_in_threadgroup]]) {
 +    threadgroup float part[512];
-+    long s = (long(row) / heads) % seq;
-+    long base = long(row) * 2 * half_dim + 2 * long(tid);
-+    float a = q21_f(x[base]);
-+    float c = q21_f(x[base + 1]);
++    uint half_dim = uint(half_);
++    uint s = (row / uint(heads_)) % uint(seq_);
++    uint idx = row * half_dim + tid;
++    ushort2 v = x[idx];
++    float a = q21_f(v.x);
++    float c = q21_f(v.y);
 +    part[tid] = a * a + c * c;
 +    threadgroup_barrier(mem_flags::mem_threadgroup);
-+    for (uint stride = uint(half_dim) / 2; stride > 0; stride >>= 1) {
++    for (uint stride = half_dim / 2; stride > 0; stride >>= 1) {
 +        if (tid < stride) { part[tid] += part[tid + stride]; }
 +        threadgroup_barrier(mem_flags::mem_threadgroup);
 +    }
 +    float r = precise::rsqrt(part[0] / float(2 * half_dim) + eps);
-+    float na = q21_f(q21_b(q21_f(q21_b(a * r)) * q21_f(w[2 * tid])));
-+    float nc = q21_f(q21_b(q21_f(q21_b(c * r)) * q21_f(w[2 * tid + 1])));
-+    long f = (s * half_dim + long(tid)) * 2;
-+    float fr = freqs[f];
-+    float fi = freqs[f + 1];
-+    out[base] = q21_b(na * fr - nc * fi);
-+    out[base + 1] = q21_b(na * fi + nc * fr);
++    ushort2 wv = w[tid];
++    float na = q21_f(q21_b(q21_f(q21_b(a * r)) * q21_f(wv.x)));
++    float nc = q21_f(q21_b(q21_f(q21_b(c * r)) * q21_f(wv.y)));
++    float2 f = freqs[s * half_dim + tid];
++    out[idx] = ushort2(q21_b(na * f.x - nc * f.y), q21_b(na * f.y + nc * f.x));
 +}
 +"""
 +
@@ -177,7 +207,12 @@ index 0000000000..f0519dc015
 +
 +
 +def part_enabled(part: str) -> bool:
-+    return (os.environ.get(PART_ENV + part) or "").strip().lower() not in ("0", "off", "false", "no")
++    return (os.environ.get(PART_ENV + part) or "").strip().lower() not in (
++        "0",
++        "off",
++        "false",
++        "no",
++    )
 +
 +
 +def why_unsupported(mod: Any) -> Optional[str]:
@@ -205,6 +240,7 @@ index 0000000000..f0519dc015
 +
 +# --------------------------------------------------------------------------------------------- row layout
 +
++
 +def prefix_len(mask: Any, seq: int) -> Optional[int]:
 +    """``p`` when ``mask`` is ``[False] * p + [True] * (seq - p)`` (non-target prefix, then target rows); None for
 +    any other layout. One host read per mask tensor (the fast step builds one per render)."""
@@ -229,80 +265,98 @@ index 0000000000..f0519dc015
 +    return out
 +
 +
-+def _real_rows(rows: Any, masked: bool) -> Any:
-+    """The per-sample rows as ``(batch, 1, dim)``: with a mask the trailing row is the t = 0 row."""
-+    return (rows[:-1] if masked else rows).unsqueeze(1)
-+
-+
-+def modulate(x: Any, one_plus: Any, masked: bool, p: int) -> Any:
-+    """``x * (1 + scale)`` with ``scale`` selected per row, bit-identical to diffusers' ``_modulate``; ``one_plus``
-+    is ``1 + scale`` on the parameter rows (the same elementwise add, before the selection)."""
++def _rows_ok(
++    x: Any,
++    rows: Any,
++    masked: bool = True,
++) -> bool:
++    """bf16, contiguous, offset 0 (the kernels index the raw buffers), dim a multiple of 4, rows ``(R, dim)`` with
++    one row per sample plus the t = 0 row when masked."""
 +    import torch
-+
-+    real = _real_rows(one_plus, masked)
-+    if not masked or p == 0:
-+        return x * real
-+    out = torch.empty_like(x)
-+    torch.mul(x[:, :p], one_plus[-1], out = out[:, :p])
-+    if p < x.shape[1]:
-+        torch.mul(x[:, p:], real, out = out[:, p:])
-+    STATS["mod_split"] += 1
-+    return out
-+
-+
-+def _residual_metal_ok(h: Any, y: Any, gate: Any) -> bool:
-+    import torch
-+
 +    return (
-+        h.dtype == torch.bfloat16
-+        and y.dtype == torch.bfloat16
-+        and gate.dtype == torch.bfloat16
-+        and h.shape == y.shape
-+        and h.dim() == 3
-+        and h.is_contiguous()
-+        and y.is_contiguous()
-+        and gate.is_contiguous()
-+        and h.storage_offset() == 0
-+        and y.storage_offset() == 0
-+        and gate.storage_offset() == 0
-+        and 0 < h.numel() < 2**31
++        x.dtype == torch.bfloat16
++        and rows.dtype == torch.bfloat16
++        and x.dim() == 3
++        and rows.dim() == 2
++        and x.shape[-1] % 4 == 0
++        and rows.shape[-1] == x.shape[-1]
++        and rows.shape[0] == x.shape[0] + (1 if masked else 0)
++        and x.is_contiguous()
++        and rows.is_contiguous()
++        and x.storage_offset() == 0
++        and rows.storage_offset() == 0
++        and 0 < x.numel() < 2**31
 +    )
 +
 +
-+def gated_residual(h: Any, y: Any, tanh_gate: Any, masked: bool, p: int, out: Any = None, metal: bool = True) -> Any:
-+    """``h + gate.tanh() * y`` with the gate selected per row; ``tanh_gate`` is the tanh of the parameter rows."""
++def _grid(x: Any) -> dict:
++    batch, seq, dim = x.shape
++    dim4 = dim // 4
++    return {"threads": (dim4, batch * seq, 1), "group_size": (min(256, dim4), 1, 1)}
++
++
++def modulate(x: Any, one_plus: Any, masked: bool, p: int) -> Optional[Any]:
++    """``x * (1 + scale)`` with ``scale`` selected per row in one Metal pass, bit-identical to diffusers'
++    ``_modulate``; ``one_plus`` is ``1 + scale`` on the parameter rows. None: run the stock ops."""
 +    import torch
 +
-+    if metal and _residual_metal_ok(h, y, tanh_gate) and _probe("q21_gated_residual", h.device):
-+        if out is None:
-+            out = torch.empty_like(h)
-+        batch, seq, dim = h.shape
-+        _library().q21_gated_residual(
-+            h,
-+            y,
-+            tanh_gate,
-+            out,
-+            dim,
-+            seq,
-+            p if masked else 0,
-+            tanh_gate.shape[0] - 1,
-+            threads = h.numel(),
-+            group_size = 256,
-+        )
-+        STATS["residual_metal"] += 1
-+        return out
-+    real = _real_rows(tanh_gate, masked)
-+    if not masked or p == 0:
-+        return h + real * y
-+    prod = torch.empty_like(y)
-+    torch.mul(tanh_gate[-1], y[:, :p], out = prod[:, :p])
-+    if p < y.shape[1]:
-+        torch.mul(real, y[:, p:], out = prod[:, p:])
-+    STATS["residual_split"] += 1
-+    return h + prod
++    if not _rows_ok(x, one_plus, masked) or not _probe("q21_modulate", x.device):
++        return None
++    out = torch.empty_like(x)
++    _library().q21_modulate(
++        x,
++        one_plus,
++        out,
++        x.shape[-1] // 4,
++        x.shape[1],
++        p if masked else 0,
++        one_plus.shape[0] - 1,
++        **_grid(x),
++    )
++    STATS["modulate_metal"] += 1
++    return out
++
++
++def gated_residual(
++    h: Any,
++    y: Any,
++    tanh_gate: Any,
++    masked: bool,
++    p: int,
++    out: Any = None,
++) -> Optional[Any]:
++    """``h + gate.tanh() * y`` with the gate selected per row in one Metal pass, bit-identical to diffusers;
++    ``tanh_gate`` is the tanh of the parameter rows. ``out`` may alias ``h``. None: run the stock ops."""
++    import torch
++
++    if (
++        not _rows_ok(h, tanh_gate, masked)
++        or y.dtype != h.dtype
++        or y.shape != h.shape
++        or not y.is_contiguous()
++        or y.storage_offset() != 0
++        or not _probe("q21_gated_residual", h.device)
++    ):
++        return None
++    if out is None:
++        out = torch.empty_like(h)
++    _library().q21_gated_residual(
++        h,
++        y,
++        tanh_gate,
++        out,
++        h.shape[-1] // 4,
++        h.shape[1],
++        p if masked else 0,
++        tanh_gate.shape[0] - 1,
++        **_grid(h),
++    )
++    STATS["residual_metal"] += 1
++    return out
 +
 +
 +# --------------------------------------------------------------------------------------------- q/k norm + RoPE
++
 +
 +def _stock_norm(norm: Any) -> bool:
 +    """diffusers' RMSNorm forward (or the eager tier's F.rms_norm one, which differs only in rounding)."""
@@ -344,7 +398,12 @@ index 0000000000..f0519dc015
 +def _rope_ok(x: Any, norm: Any, freqs: Any) -> bool:
 +    import torch
 +
-+    if x.dim() != 4 or x.dtype != torch.bfloat16 or not x.is_contiguous() or x.storage_offset() != 0:
++    if (
++        x.dim() != 4
++        or x.dtype != torch.bfloat16
++        or not x.is_contiguous()
++        or x.storage_offset() != 0
++    ):
 +        return False
 +    dim = x.shape[-1]
 +    weight = getattr(norm, "weight", None)
@@ -404,7 +463,9 @@ index 0000000000..f0519dc015
 +        import torch
 +
 +        if rotary_emb is None or torch.is_grad_enabled() or not _device_ok(hidden_states):
-+            return stock(attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, cache_write_slice)
++            return stock(
++                attn, hidden_states, rotary_emb, layer_cache, kv_cache_mode, cache_write_slice
++            )
 +        query = attn.to_q(hidden_states)
 +        key = attn.to_k(hidden_states)
 +        value = attn.to_v(hidden_states)
@@ -414,12 +475,22 @@ index 0000000000..f0519dc015
 +        value = value.unflatten(-1, (-1, head_dim))
 +        fused_q = norm_rope(query, attn.norm_q, rotary_emb) if query.dtype == value.dtype else None
 +        fused_k = norm_rope(key, attn.norm_k, rotary_emb) if fused_q is not None else None
-+        query = fused_q if fused_q is not None else _stock_norm_rope(mod, query, attn.norm_q, rotary_emb, value.dtype)
-+        key = fused_k if fused_k is not None else _stock_norm_rope(mod, key, attn.norm_k, rotary_emb, value.dtype)
++        query = (
++            fused_q
++            if fused_q is not None
++            else _stock_norm_rope(mod, query, attn.norm_q, rotary_emb, value.dtype)
++        )
++        key = (
++            fused_k
++            if fused_k is not None
++            else _stock_norm_rope(mod, key, attn.norm_k, rotary_emb, value.dtype)
++        )
 +
 +        if layer_cache is not None:
 +            if kv_cache_mode == "extract" and cache_write_slice is not None:
-+                layer_cache.store(key[:, cache_write_slice].clone(), value[:, cache_write_slice].clone())
++                layer_cache.store(
++                    key[:, cache_write_slice].clone(), value[:, cache_write_slice].clone()
++                )
 +            elif kv_cache_mode == "cached":
 +                cached_k, cached_v = layer_cache.get()
 +                key = torch.cat([cached_k, key], dim = 1)
@@ -431,6 +502,7 @@ index 0000000000..f0519dc015
 +
 +
 +# --------------------------------------------------------------------------------------------- probes
++
 +
 +def _probe(name: str, device: Any) -> bool:
 +    """First use of a kernel compares it with the eager math on a small input; a mismatch disables that kernel."""
@@ -447,19 +519,29 @@ index 0000000000..f0519dc015
 +    return ok
 +
 +
++def qmod_select(params: Any, mask: Any) -> Any:
++    return _module()._select_modulation_rows(params, mask)
++
++
 +def _run_probe(name: str, device: Any) -> bool:
 +    import torch
 +
 +    g = torch.Generator().manual_seed(7)
-+    if name == "q21_gated_residual":
-+        h = torch.randn(1, 37, 256, generator = g).to(device, torch.bfloat16)
-+        y = torch.randn(1, 37, 256, generator = g).to(device, torch.bfloat16)
-+        gate = torch.tanh(torch.randn(2, 256, generator = g)).to(device, torch.bfloat16)
++    if name in ("q21_gated_residual", "q21_modulate"):
++        # 2 batch rows + the t = 0 row, 5 prefix rows: covers the row select and a partial last threadgroup.
++        h = torch.randn(2, 37, 1032, generator = g).to(device, torch.bfloat16)
++        y = torch.randn(2, 37, 1032, generator = g).to(device, torch.bfloat16)
++        rows = torch.randn(3, 1032, generator = g).to(device, torch.bfloat16)
++        mask = torch.arange(37, device = device) >= 5
 +        out = torch.empty_like(h)
-+        _library().q21_gated_residual(h, y, gate, out, 256, 37, 5, 1, threads = h.numel(), group_size = 256)
-+        want = h + torch.where(
-+            (torch.arange(37, device = device) >= 5).view(1, -1, 1), gate[:1].unsqueeze(1), gate[1:].unsqueeze(0)
-+        ) * y
++        if name == "q21_modulate":
++            one_plus = 1 + rows
++            _library().q21_modulate(h, one_plus, out, 258, 37, 5, 2, **_grid(h))
++            want = h * (1 + qmod_select(rows, mask))
++        else:
++            gate = rows.tanh()
++            _library().q21_gated_residual(h, y, gate, out, 258, 37, 5, 2, **_grid(h))
++            want = h + qmod_select(rows, mask).tanh() * y
 +        return bool(torch.equal(out, want))
 +    if name == "q21_qk_norm_rope":
 +        from diffusers.models.normalization import RMSNorm
@@ -473,8 +555,16 @@ index 0000000000..f0519dc015
 +        freqs = torch.polar(torch.ones_like(angles), angles).to(device)
 +        out = torch.empty_like(x)
 +        _library().q21_qk_norm_rope(
-+            x, norm.weight, torch.view_as_real(freqs).contiguous(), out, 3, 9, 64, 1e-6,
-+            threads = 9 * 3 * 64, group_size = 64,
++            x,
++            norm.weight,
++            torch.view_as_real(freqs).contiguous(),
++            out,
++            3,
++            9,
++            64,
++            1e-6,
++            threads = 9 * 3 * 64,
++            group_size = 64,  # one threadgroup per row
 +        )
 +        with torch.no_grad():
 +            want = apply_rotary_emb_qwen(norm(x).to(x.dtype), freqs, use_real = False)
@@ -484,6 +574,7 @@ index 0000000000..f0519dc015
 +
 +
 +# --------------------------------------------------------------------------------------------- block forward
++
 +
 +def _block_forward(
 +    self,
@@ -517,8 +608,17 @@ index 0000000000..f0519dc015
 +        or modulation.shape[0] != hidden_states.shape[0] + (1 if masked else 0)
 +    ):
 +        return stock(
-+            self, hidden_states, modulation, rotary_emb, attention_mask, target_token_mask,
-+            layer_cache, kv_cache_mode, cache_write_slice, segments, key_valid,
++            self,
++            hidden_states,
++            modulation,
++            rotary_emb,
++            attention_mask,
++            target_token_mask,
++            layer_cache,
++            kv_cache_mode,
++            cache_write_slice,
++            segments,
++            key_valid,
 +        )
 +    use_mod, use_res = flags
 +    STATS["block"] += 1
@@ -526,18 +626,21 @@ index 0000000000..f0519dc015
 +    scale1, gate1 = mod1.chunk(2, dim = -1)
 +    scale2, gate2 = mod2.chunk(2, dim = -1)
 +
-+    def _mod(x, scale):
-+        if use_mod:
-+            return modulate(x, 1 + scale, masked, p)
-+        return x * (1 + self_rows(scale))
-+
-+    def self_rows(params):
++    def rows(params):
 +        return _module()._select_modulation_rows(params, target_token_mask)
 +
-+    def _res(h, y, gate, out = None):
-+        if use_res:
-+            return gated_residual(h, y, gate.tanh().contiguous(), masked, p, out = out)
-+        return h + self_rows(gate).tanh() * y
++    def _mod(x, scale):
++        out = modulate(x, 1 + scale, masked, p) if use_mod else None
++        return x * (1 + rows(scale)) if out is None else out
++
++    def _res(
++        h,
++        y,
++        gate,
++        out = None,
++    ):
++        res = gated_residual(h, y, gate.tanh(), masked, p, out = out) if use_res else None
++        return h + rows(gate).tanh() * y if res is None else res
 +
 +    attn_output = self.attn(
 +        hidden_states = _mod(self.img_norm1(hidden_states), scale1),
@@ -551,8 +654,8 @@ index 0000000000..f0519dc015
 +    )
 +    hidden_states = _res(hidden_states, attn_output, gate1)
 +    mlp_output = self.img_mlp(_mod(self.img_norm2(hidden_states), scale2))
-+    # The first residual allocated a fresh tensor this block owns, so the second writes over it.
-+    hidden_states = _res(hidden_states, mlp_output, gate2, out = hidden_states if use_res else None)
++    # Either first residual path returns a fresh tensor this block owns, so the second may write over it.
++    hidden_states = _res(hidden_states, mlp_output, gate2, out = hidden_states)
 +
 +    if hidden_states.dtype == torch.float16:
 +        hidden_states = hidden_states.clip(-65504, 65504)
@@ -590,7 +693,11 @@ index 0000000000..f0519dc015
 +        return False
 +
 +
-+def install_for_pipe(pipe: Any, logger: Any = None, explicit_off: bool = False) -> bool:
++def install_for_pipe(
++    pipe: Any,
++    logger: Any = None,
++    explicit_off: bool = False,
++) -> bool:
 +    """Per transformer instance (dies with the pipe); an explicit speed ``off`` load keeps the stock block."""
 +    transformer = getattr(pipe, "transformer", None)
 +    if type(transformer).__name__ != _CLASS:
@@ -616,7 +723,9 @@ index 0000000000..f0519dc015
 +    for block in getattr(transformer, "transformer_blocks", None) or ():
 +        current = block.__dict__.get("forward")
 +        # Another wrapper (offload hooks) owns the instance forward: leave that block stock.
-+        if type(block) is not cls or (current is not None and not getattr(current, "__unsloth_q21_mps__", False)):
++        if type(block) is not cls or (
++            current is not None and not getattr(current, "__unsloth_q21_mps__", False)
++        ):
 +            continue
 +        block.__dict__[_BLOCK_ATTR] = flags
 +        block.__dict__["forward"] = types.MethodType(_block_forward, block)
@@ -728,10 +837,10 @@ index 250c148528..8531fc7917 100644
          from core.inference.diffusion_flux3_half_attn import install_for_pipe as flux3_attn
 diff --git a/studio/backend/tests/test_diffusion_qwenimage21_mps.py b/studio/backend/tests/test_diffusion_qwenimage21_mps.py
 new file mode 100644
-index 0000000000..0196d8cead
+index 0000000000..607f7b7c46
 --- /dev/null
 +++ b/studio/backend/tests/test_diffusion_qwenimage21_mps.py
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,258 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -756,7 +865,9 @@ index 0000000000..0196d8cead
 +    """The q21_gated_residual kernel's arithmetic: bf16(h + bf16(gate[row] * y))."""
 +    batch, seq, dim = h.shape
 +    rows = torch.arange(seq) < p
-+    g = torch.where(rows.view(1, -1, 1), gate_rows[zero_row].float(), gate_rows[:batch].float().unsqueeze(1))
++    g = torch.where(
++        rows.view(1, -1, 1), gate_rows[zero_row].float(), gate_rows[:batch].float().unsqueeze(1)
++    )
 +    return (h.float() + _bf(g * y.float())).to(torch.bfloat16)
 +
 +
@@ -805,23 +916,40 @@ index 0000000000..0196d8cead
 +    return x, y, rows, mask
 +
 +
++def _emulated_modulate(x, one_plus, p, zero_row):
++    """The q21_modulate kernel's arithmetic: bf16(x * one_plus[row])."""
++    batch, seq, dim = x.shape
++    rows = torch.arange(seq) < p
++    m = torch.where(
++        rows.view(1, -1, 1), one_plus[zero_row].float(), one_plus[:batch].float().unsqueeze(1)
++    )
++    return (x.float() * m).to(torch.bfloat16)
++
++
 +@pytest.mark.parametrize("batch,p", [(1, None), (1, 0), (1, 5), (2, 5), (2, None), (1, 33)])
-+def test_modulate_bit_identical_to_diffusers(batch, p):
++def test_modulate_kernel_arithmetic_bit_identical_to_diffusers(batch, p):
 +    x, _, rows, mask = _block_case(batch, 33, 64, p, 3)
-+    block = SimpleNamespace()
-+    want, want_gate = qmod.QwenImage21TransformerBlock._modulate(block, x, rows, mask)
-+    scale, gate = rows.chunk(2, dim = -1)
-+    got = mps.modulate(x, 1 + scale, mask is not None, p or 0)
-+    assert torch.equal(got, want)
++    want, _ = qmod.QwenImage21TransformerBlock._modulate(SimpleNamespace(), x, rows, mask)
++    scale, _ = rows.chunk(2, dim = -1)
++    one_plus = 1 + scale
++    assert torch.equal(_emulated_modulate(x, one_plus, p or 0, one_plus.shape[0] - 1), want)
 +
 +
-+@pytest.mark.parametrize("batch,p", [(1, None), (1, 0), (1, 5), (2, 5), (2, None), (1, 33)])
-+def test_residual_split_bit_identical_to_diffusers(batch, p):
-+    h, y, rows, mask = _block_case(batch, 33, 64, p, 4)
-+    _, gate = rows.chunk(2, dim = -1)
-+    want = h + qmod._select_modulation_rows(gate, mask).tanh() * y
-+    got = mps.gated_residual(h, y, gate.tanh().contiguous(), mask is not None, p or 0, metal = False)
-+    assert torch.equal(got, want)
++def test_row_ops_decline_off_metal(monkeypatch):
++    monkeypatch.setattr(mps, "_library", lambda: None)
++    mps._PROBED.clear()
++    x, y, rows, _ = _block_case(1, 8, 64, 2, 1)
++    r = rows[:, :64].contiguous()
++    assert mps._rows_ok(x, r)
++    assert mps.modulate(x, r, True, 2) is None
++    assert mps.gated_residual(x, y, r, True, 2) is None
++    mps._PROBED.clear()
++    # fp16, strided, offset inputs and a row count that does not match the batch never reach a kernel
++    assert not mps._rows_ok(x.half(), r)
++    assert not mps._rows_ok(x.transpose(1, 2).contiguous().transpose(1, 2), r)
++    assert not mps._rows_ok(x[:, 1:], r)
++    assert not mps._rows_ok(x.transpose(0, 1), r)
++    assert not mps._rows_ok(x, r, masked = False)
 +
 +
 +@pytest.mark.parametrize("batch,p", [(1, None), (1, 0), (1, 5), (2, 9)])
@@ -854,7 +982,11 @@ index 0000000000..0196d8cead
 +    assert (diff == 0).float().mean() > 0.97
 +
 +
-+def _blocks(n = 2, dim = 64, heads = 2):
++def _blocks(
++    n = 2,
++    dim = 64,
++    heads = 2,
++):
 +    torch.manual_seed(0)
 +    return [
 +        qmod.QwenImage21TransformerBlock(dim, heads, dim // heads).to(torch.bfloat16).eval()
@@ -883,7 +1015,7 @@ index 0000000000..0196d8cead
 +
 +@pytest.mark.parametrize("p", [None, 0, 6])
 +def test_block_forward_bit_identical_on_eager_paths(monkeypatch, p):
-+    """With the device gate opened on CPU, the block (row modulation + split residual, stock RoPE) equals diffusers."""
++    """With the device gate opened on CPU and no Metal library, every part falls back to the stock ops exactly."""
 +    monkeypatch.setattr(mps, "_device_ok", lambda x: True)
 +    monkeypatch.setattr(mps, "_library", lambda: None)
 +    mps._PROBED.clear()
@@ -903,9 +1035,6 @@ index 0000000000..0196d8cead
 +    before = dict(mps.STATS)
 +    got = _run_blocks(blocks, x, modulation, mask, freqs)
 +    assert mps.STATS["block"] - before["block"] == len(blocks)
-+    if p:
-+        assert mps.STATS["mod_split"] > before["mod_split"]
-+        assert mps.STATS["residual_split"] > before["residual_split"]
 +    assert torch.equal(got, want)
 +    mps.uninstall(pipe.transformer)
 +    assert all("forward" not in b.__dict__ for b in blocks)

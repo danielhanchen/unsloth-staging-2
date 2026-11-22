@@ -182,7 +182,6 @@ if args.ops and fused is not None and head:
     fused_mod = lambda: fused.modulate(xn, 1 + scale, True, 0)  # noqa: E731
     stock_res = lambda: x0 + qmod._select_modulation_rows(gate, mask).tanh() * y  # noqa: E731
     fused_res = lambda: fused.gated_residual(x0, y, gate.tanh().contiguous(), True, 0)  # noqa: E731
-    split_res = lambda: fused.gated_residual(x0, y, gate.tanh().contiguous(), True, 0, metal = False)  # noqa: E731
     stock_rope = lambda: qmod.apply_rotary_emb_qwen(b.attn.norm_q(q).to(q.dtype), rot, use_real = False)  # noqa: E731
     fused_rope = lambda: fused.norm_rope(q, b.attn.norm_q, rot)  # noqa: E731
     ops = {}
@@ -190,7 +189,6 @@ if args.ops and fused is not None and head:
         for name, (s_fn, f_fn) in {
             "modulate": (stock_mod, fused_mod),
             "residual_metal": (stock_res, fused_res),
-            "residual_eager_rows": (stock_res, split_res),
             "rope_metal": (stock_rope, fused_rope),
         }.items():
             a, bb = s_fn(), f_fn()
