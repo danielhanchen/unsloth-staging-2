@@ -1543,9 +1543,7 @@ def _restore_tied_weights_keys(originals):
 _TP_IN_PLACE_MERGES = ("merged_4bit", "merged_4bit_forced", "forced_merged_4bit")
 
 
-def _refuse_tp_in_place_merge(fn, method, args, kwargs):
-    """merged_4bit merges the LoRA weights into the loaded 4-bit base (merge_and_unload): under tensor parallel
-    only rank 0 would hold that merged model. Refused on every rank (every rank makes the same call)."""
+def _is_in_place_merge(fn, args, kwargs):
     import inspect
 
     try:
@@ -1558,6 +1556,15 @@ def _refuse_tp_in_place_merge(fn, method, args, kwargs):
         isinstance(save_method, str)
         and save_method.lower().strip().replace("-", "_").replace(" ", "_") in _TP_IN_PLACE_MERGES
     ):
+        return save_method
+    return None
+
+
+def _refuse_tp_in_place_merge(fn, method, args, kwargs):
+    """merged_4bit merges the LoRA weights into the loaded 4-bit base (merge_and_unload): under tensor parallel
+    only rank 0 would hold that merged model. Refused on every rank (every rank makes the same call)."""
+    save_method = _is_in_place_merge(fn, args, kwargs)
+    if save_method is not None:
         raise RuntimeError(
             f'Unsloth: `{method}(save_method = "{save_method}")` merges the LoRA weights into the 4-bit base in '
             "place (merge_and_unload). On a tensor parallel model only rank 0 would end up with that merged "
@@ -5343,6 +5350,8 @@ def unsloth_save_pretrained_gguf(
 
     if tokenizer is None:
         raise ValueError("Unsloth: Saving to GGUF must have a tokenizer.")
+    if _defer_to_main_process(is_main_process):
+        return None
     if isinstance(tokenizer, (PreTrainedTokenizerBase, ProcessorMixin)):
         tokenizer = patch_saving_functions(tokenizer)
     # Read before the processor is unwrapped to its tokenizer below.
@@ -5351,8 +5360,6 @@ def unsloth_save_pretrained_gguf(
 
     # save_method="lora" exports the adapter itself as a GGUF LoRA, not a merged model.
     if save_method is not None and str(save_method).lower() == "lora":
-        if not is_main_process:
-            return None
         if push_to_hub:
             raise ValueError(
                 "Unsloth: Please use .push_to_hub_gguf(save_method='lora') instead of "
@@ -5965,7 +5972,40 @@ def _free_merge_if_disk_is_tight(
     return freed
 
 
+def _defer_to_main_process(is_main_process):
+    """A non-main rank skips the export, except the FSDP2 writer (any rank of its mesh), which
+    reaches it inside the gather that chose it. A function, not an inline import, so callers that
+    snapshot locals() forward no extra name."""
+    if is_main_process:
+        return False
+    from .models.fsdp2_save import fsdp2_gather_active
+
+    return not fsdp2_gather_active()
+
+
+def _ddp_push_on_rank0(method):
+    """Plain DDP merged / GGUF Hub upload: rank 0 alone merges, converts and uploads, the others
+    return None without waiting (as `_tp_collective_save` does for push_to_hub)."""
+
+    def decorate(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            # merged_4bit merges into the live model: every replica runs it, as before.
+            if (
+                _plain_data_parallel_push(self, method, fn, args, kwargs)
+                and _is_in_place_merge(fn, (self, *args), kwargs) is None
+            ):
+                from .models.tp_replica import tp_world_push
+                return tp_world_push(method, lambda: fn(self, *args, **kwargs))
+            return fn(self, *args, **kwargs)
+
+        return wrapper
+
+    return decorate
+
+
 @_model_parallel_refuses_save("push_to_hub_gguf")
+@_ddp_push_on_rank0("push_to_hub")
 @_fsdp2_export_on_rank0("push_to_hub_gguf", adapter_only = _gguf_lora_only)
 def unsloth_push_to_hub_gguf(
     self,
@@ -6001,7 +6041,7 @@ def unsloth_push_to_hub_gguf(
     _assert_export_target_is_not_base_with_lora_layers(self)
     if tokenizer is None:
         raise ValueError("Unsloth: Saving to GGUF must have a tokenizer.")
-    if not is_main_process:
+    if _defer_to_main_process(is_main_process):
         return None
 
     # save_method="lora" exports the adapter itself as a GGUF LoRA, not a merged model.
@@ -6929,7 +6969,7 @@ def _push_merged_to_hub_revision(save_kwargs):
     from huggingface_hub.errors import EntryNotFoundError, HfHubHTTPError, LocalEntryNotFoundError
     from unsloth_zoo.saving_utils import get_original_model_id
 
-    if not save_kwargs["is_main_process"]:
+    if _defer_to_main_process(save_kwargs["is_main_process"]):
         return
     token = save_kwargs["token"]
     if token is None:
@@ -6952,8 +6992,15 @@ def _push_merged_to_hub_revision(save_kwargs):
             if not save_kwargs["create_pr"] or error.response.status_code != 403:
                 raise
     with tempfile.TemporaryDirectory(prefix = "unsloth-merged-") as directory:
+        # Past the gate this rank is the writer: the staged save must not skip itself.
         unsloth_generic_save(
-            **{**save_kwargs, "save_directory": directory, "push_to_hub": False, "token": token}
+            **{
+                **save_kwargs,
+                "save_directory": directory,
+                "push_to_hub": False,
+                "token": token,
+                "is_main_process": True,
+            }
         )
         card_path = Path(directory) / "README.md"
         try:
@@ -7430,7 +7477,7 @@ def unsloth_generic_save(
     # Full-finetuned models have no adapters to merge, so fall back to save_pretrained, mirroring the torchao and GGUF save paths.
     _is_peft = isinstance(model, PeftModel)
     if not _is_peft:
-        if not is_main_process:
+        if _defer_to_main_process(is_main_process):
             return
 
         _save_kwargs = dict(
@@ -7566,6 +7613,10 @@ def unsloth_generic_save(
     else:
         raise_if_merging_mistral_format_view(model, save_method)
         raise_if_merging_inkling2(model, save_method)
+        # merged_4bit merges into the live model (no conversion), so every replica must run it.
+        in_place = save_method in ("merged_4bit", "forced_merged_4bit")
+        if not in_place and _defer_to_main_process(is_main_process):
+            return
         from unsloth_zoo.saving_utils import merge_and_overwrite_lora
 
         # An older unsloth_zoo accepts `output_dtype` but still writes the base dtype.
@@ -7587,8 +7638,6 @@ def unsloth_generic_save(
             )
         _prewarm_base_model_hub_cache(model, save_method = save_method, token = token)
 
-        # merged_4bit merges into the loaded (already residual) weights, so it needs no conversion.
-        in_place = save_method == "merged_4bit"
         # Under FSDP2 the gathered packed 4-bit base waits on the CPU: merge it one layer at a time on
         # its GPU first, so the merge below only unloads those layers.
         streamed = []
@@ -7841,6 +7890,7 @@ def _fsdp2_merged_gather_options(model, args, kwargs):
 
 
 @_model_parallel_refuses_save("save_pretrained_merged")
+@_ddp_push_on_rank0("save_pretrained")
 @_fsdp2_collective_save(
     lambda self, args, kwargs: isinstance(self, PeftModel)
     and _is_adapter_save_method(_merged_save_method(args, kwargs)),
@@ -8006,6 +8056,7 @@ def unsloth_generic_save_pretrained_merged(
 
 # Like save_pretrained_merged: every rank calls it, rank 0 gathers, merges and uploads.
 @_model_parallel_refuses_save("push_to_hub_merged")
+@_ddp_push_on_rank0("push_to_hub")
 @_fsdp2_collective_save(
     lambda self, args, kwargs: isinstance(self, PeftModel)
     and _is_adapter_save_method(_merged_save_method(args, kwargs)),

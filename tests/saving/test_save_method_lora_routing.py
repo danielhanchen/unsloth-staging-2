@@ -214,6 +214,7 @@ _GENERIC_SAVE_REAL_HELPERS = (
 _GENERIC_SAVE_STUBBED_HELPERS = frozenset(
     {
         "patch_saving_functions",
+        "_defer_to_main_process",
         "_push_merged_to_hub_revision",
         "_prewarm_base_model_hub_cache",
         "_is_qwen3_5_vlm",
@@ -262,6 +263,7 @@ def _routing_environment(monkeypatch, model):
         PreTrainedTokenizerBase = type("Tokenizer", (), {}),
         ProcessorMixin = type("Processor", (), {}),
         patch_saving_functions = lambda tokenizer: tokenizer,
+        _defer_to_main_process = lambda is_main_process: not is_main_process,
         get_token = lambda: "fixture-token",
         get_model_name = lambda name: name,
         _push_merged_to_hub_revision = lambda kwargs: calls.setdefault("revision", []).append(kwargs),
@@ -419,6 +421,7 @@ def test_the_fsdp2_gather_placement_reads_the_canonical_method(spelling, canonic
 def test_a_respelled_in_place_merge_is_refused_under_tensor_parallel(spelling):
     refuse = _load(
         "_refuse_tp_in_place_merge",
+        "_is_in_place_merge",
         _TP_IN_PLACE_MERGES = ("merged_4bit", "merged_4bit_forced", "forced_merged_4bit"),
     )["_refuse_tp_in_place_merge"]
 
@@ -611,6 +614,7 @@ def _adapter_save_environment(monkeypatch):
         PreTrainedTokenizerBase = type("Tokenizer", (), {}),
         ProcessorMixin = type("Processor", (), {}),
         patch_saving_functions = lambda tokenizer: tokenizer,
+        _defer_to_main_process = lambda is_main_process: not is_main_process,
         get_token = lambda: "fixture-token",
         upload_to_huggingface = upload_to_huggingface,
         logger = types.SimpleNamespace(warning_once = lambda *a, **k: None),
