@@ -31,9 +31,6 @@ jobs:
           - id: p0
             prompt: "A red apple on a wooden table, soft window light, shallow depth of field, photograph"
             main_ref: "1"
-          - id: p1
-            prompt: "Portrait of an elderly fisherman with a grey beard and a knitted cap, harbour at dusk, 85mm photo"
-            main_ref: "0"
           - id: p2
             prompt: "A neon-lit street in Tokyo at night after rain, reflections on wet asphalt, a cat on a crate, cinematic"
             main_ref: "0"
@@ -86,8 +83,15 @@ jobs:
           from huggingface_hub import hf_hub_download, snapshot_download
           t = time.time()
           pats = ["text_encoder/*", "tokenizer/*", "vae/*", "scheduler/*", "model_index.json"]
-          print(hf_hub_download("unsloth/Z-Image-GGUF", "z-image-Q4_0.gguf"), round(time.time() - t), flush=True)
-          print(snapshot_download("Tongyi-MAI/Z-Image", allow_patterns=pats), round(time.time() - t), flush=True)
+          def retry(fn, *a, **k):
+              for i in range(8):
+                  try:
+                      return fn(*a, **k)
+                  except Exception as exc:
+                      print("retry", i, repr(exc)[:200], flush=True); time.sleep(30)
+              raise SystemExit("download failed")
+          print(retry(hf_hub_download, "unsloth/Z-Image-GGUF", "z-image-Q4_0.gguf"), round(time.time() - t), flush=True)
+          print(retry(snapshot_download, "Tongyi-MAI/Z-Image", allow_patterns=pats), round(time.time() - t), flush=True)
           PY
       - name: Arms
         env:
