@@ -1,0 +1,664 @@
+diff --git a/studio/backend/core/inference/mlx_diffusion_backend.py b/studio/backend/core/inference/mlx_diffusion_backend.py
+index 77d5a1aaa6..4abe9f1e84 100644
+--- a/studio/backend/core/inference/mlx_diffusion_backend.py
++++ b/studio/backend/core/inference/mlx_diffusion_backend.py
+@@ -8,6 +8,7 @@ Same duck-typed surface as the other image engines; selected only by ``diffusion
+ 
+ from __future__ import annotations
+ 
++import contextlib
+ import gc
+ import json
+ import os
+@@ -42,6 +43,7 @@ from core.inference.diffusion_families import (
+     supported_family_names,
+ )
+ from core.inference import mlx_diffusion_convert as convert
++from core.inference import mlx_diffusion_teacache as teacache
+ from core.inference.mlx_diffusion_routing import mlx_capabilities
+ from core.inference.diffusion_batched import SEED_MASK
+ from loggers import get_logger
+@@ -541,6 +543,7 @@ class MfluxRuntime:
+         height: int,
+         guidance: Optional[float],
+         on_step: Callable[[int], None],
++        teacache_threshold: Optional[float] = None,
+     ) -> Any:
+         import mlx.core as mx
+         from mflux.utils.exceptions import StopImageGenerationException
+@@ -558,16 +561,25 @@ class MfluxRuntime:
+         model.callbacks.register(callback)
+         cancelled = False
+         image = None
++        self.last_teacache = None
++        step_cache = (
++            teacache.engaged(model, teacache_threshold, int(steps))
++            if teacache_threshold
++            else contextlib.nullcontext()
++        )
+         try:
+-            image = model.generate_image(
+-                seed = int(seed),
+-                prompt = prompt,
+-                negative_prompt = negative_prompt,
+-                num_inference_steps = int(steps),
+-                width = int(width),
+-                height = int(height),
+-                guidance = guidance,
+-            ).image
++            with step_cache as stats:
++                image = model.generate_image(
++                    seed = int(seed),
++                    prompt = prompt,
++                    negative_prompt = negative_prompt,
++                    num_inference_steps = int(steps),
++                    width = int(width),
++                    height = int(height),
++                    guidance = guidance,
++                ).image
++            if stats is not None:
++                self.last_teacache = stats.as_dict()
+         except StopImageGenerationException as exc:
+             # The unwound mflux frames hold the model; uncleared, it survives unload().
+             drop_exception_frames(exc)
+@@ -696,6 +708,8 @@ class _MlxState:
+     gguf_path: Optional[str] = None
+     hf_token: Optional[str] = None
+     loras: tuple = ()
++    # TeaCache threshold the load opted into (mlx_diffusion_teacache); None = every step computes.
++    teacache_threshold: Optional[float] = None
+ 
+ 
+ @dataclass
+@@ -1116,6 +1130,9 @@ class MlxDiffusionBackend:
+                     _load_token = token,
+                     _cancel_event = cancel_event,
+                     explicit_base = bool((base_repo or "").strip()),
++                    teacache_threshold = teacache.requested_threshold(
++                        transformer_cache, transformer_cache_threshold
++                    ),
+                 ),
+                 daemon = True,
+             )
+@@ -1149,6 +1166,7 @@ class MlxDiffusionBackend:
+         _load_token: int,
+         _cancel_event: threading.Event,
+         explicit_base: bool = True,
++        teacache_threshold: Optional[float] = None,
+     ) -> None:
+         timings: dict[str, Any] = {}
+         model = state = displaced = None
+@@ -1279,6 +1297,7 @@ class MlxDiffusionBackend:
+                 timings = timings,
+                 gguf_path = str(gguf_path),
+                 hf_token = hf_token,
++                teacache_threshold = teacache_threshold,
+             )
+             with self._lock:
+                 if self._load_token != _load_token:
+@@ -1509,6 +1528,9 @@ class MlxDiffusionBackend:
+ 
+                     if cancel.is_set():
+                         raise MlxCancelled("cancelled")
++                    step_cache = {}
++                    if teacache.applies(state.model, steps, state.teacache_threshold):
++                        step_cache["teacache_threshold"] = state.teacache_threshold
+                     image = runtime.generate(
+                         state.model,
+                         prompt = prompt,
+@@ -1519,12 +1541,16 @@ class MlxDiffusionBackend:
+                         height = h,
+                         guidance = cfg,
+                         on_step = _on_step,
++                        **step_cache,
+                     )
+                     total = time.perf_counter() - started
+                     timing = {"total_s": round(total, 3)}
+                     vae_tiled = getattr(runtime, "vae_tiled", None)
+                     if callable(vae_tiled):
+                         timing["vae_tiled"] = bool(vae_tiled())
++                    cache_stats = getattr(runtime, "last_teacache", None) if step_cache else None
++                    if cache_stats:
++                        timing["teacache_skipped"] = int(cache_stats["skipped"])
+                     if len(marks) >= 2:
+                         # Exclude the first step: it includes prompt encoding.
+                         timing["s_per_step"] = round((marks[-1] - marks[0]) / (len(marks) - 1), 4)
+@@ -1564,6 +1590,9 @@ class MlxDiffusionBackend:
+                     "speed_mode": None,
+                     "cpu_offload": False,
+                     "workflow": "txt2img",
++                    "transformer_cache": (
++                        teacache.MODE if any("teacache_skipped" in t for t in per_image) else None
++                    ),
+                     "reference_resolution": None,
+                     "localized_edit": None,
+                 }
+@@ -1778,7 +1807,7 @@ class MlxDiffusionBackend:
+             "text_encoder_quant": _te_quant_name(state.te_bits),
+             "transformer_quant": _dense_quant_name(state.dense_bits),
+             "attention_backend": None,
+-            "transformer_cache": None,
++            "transformer_cache": teacache.MODE if state.teacache_threshold else None,
+             "resolved": None,
+             "engine": ENGINE_NAME,
+             "native_mode": None,
+diff --git a/studio/backend/core/inference/mlx_diffusion_teacache.py b/studio/backend/core/inference/mlx_diffusion_teacache.py
+new file mode 100644
+index 0000000000..b29429e7cc
+--- /dev/null
++++ b/studio/backend/core/inference/mlx_diffusion_teacache.py
+@@ -0,0 +1,293 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Opt-in TeaCache step reuse for the undistilled Z-Image base on the MLX engine.
++
++Port of the Z-Image base gate from mlx-teacache (https://github.com/IonDen/mlx-teacache, Apache-2.0, Copyright
++IonDen): the gate signal is the first main layer's residual, its step-to-step relative L1 is priced by a calibrated
++polynomial and accumulated, and while the sum stays under the threshold the other 29 main layers are replaced by the
++residual cached on the last computed step (one per CFG branch). The coefficients and calibrated range are theirs,
++verbatim (variants/z_image_base/config.py, 2026-05-31 calibration: 50 steps, CFG 4, 512x512).
++
++Opt-in: ``transformer_cache="fbcache"`` at load (the request's first-block cache), or
++``UNSLOTH_DIFFUSION_MLX_TEACACHE=1`` / a threshold. Never on a distilled model (Turbo skips ~nothing) or below
++``MIN_STEPS``. The forward re-walks mflux's ``ZImageTransformer.__call__`` (identical in mflux 0.22 and 0.24); a
++transformer missing any piece of it runs unwrapped. mlx is imported lazily.
++"""
++
++from __future__ import annotations
++
++import math
++import os
++from dataclasses import dataclass, field
++from typing import Any, Optional
++
++ENV = "UNSLOTH_DIFFUSION_MLX_TEACACHE"
++MODE = "teacache"
++# The request value that opts in: diffusers' first-block cache is the same idea (gate on the first block's residual).
++REQUEST_MODES = ("fbcache", "teacache")
++DEFAULT_THRESHOLD = 0.12
++# == diffusion_cache.FBCACHE_MIN_STEPS: fewer steps leave nothing to reuse.
++MIN_STEPS = 20
++MAX_CONSECUTIVE_SKIPS = 8
++SKIP_FIRST = 1
++SKIP_LAST = 1
++COEFFICIENTS = (-898.9907628349583, 367.7086118008557, -45.41511572598643, 3.95114319842774, 0.0)
++CALIBRATED_RANGE = (0.027887196237753466, 0.25914120883567665)
++
++_REQUIRED = (
++    "t_embedder",
++    "t_scale",
++    "patch_size",
++    "f_patch_size",
++    "out_channels",
++    "all_x_embedder",
++    "all_final_layer",
++    "x_pad_token",
++    "cap_pad_token",
++    "cap_embedder",
++    "noise_refiner",
++    "context_refiner",
++    "layers",
++    "rope_embedder",
++)
++
++
++def requested_threshold(
++    transformer_cache: Optional[str],
++    threshold: Optional[float],
++    env: Optional[dict] = None,
++) -> Optional[float]:
++    """The threshold the load asked for, or None. The env wins: ``0`` / ``off`` disables, ``1`` / ``on`` takes the
++    default, a positive number is the threshold."""
++    raw = str((os.environ if env is None else env).get(ENV, "") or "").strip().lower()
++    if raw in ("0", "off", "false", "no"):
++        return None
++    if raw in ("1", "on", "true", "yes"):
++        return float(threshold) if threshold and threshold > 0 else DEFAULT_THRESHOLD
++    if raw:
++        try:
++            value = float(raw)
++        except ValueError:
++            value = 0.0
++        return value if value > 0 else None
++    mode = str(transformer_cache or "").strip().lower()
++    if mode not in REQUEST_MODES:
++        return None
++    return float(threshold) if threshold and threshold > 0 else DEFAULT_THRESHOLD
++
++
++def applies(model: Any, steps: int, threshold: Optional[float]) -> bool:
++    """Undistilled (guidance-capable) Z-Image at ``MIN_STEPS``+ steps whose transformer matches the re-walk."""
++    if not threshold or threshold <= 0 or int(steps) < MIN_STEPS:
++        return False
++    if not bool(getattr(getattr(model, "model_config", None), "supports_guidance", False)):
++        return False
++    transformer = getattr(model, "transformer", None)
++    kind = type(transformer)
++    if not all(hasattr(transformer, name) for name in _REQUIRED):
++        return False
++    return callable(getattr(kind, "_patchify", None)) and callable(
++        getattr(kind, "_unpatchify", None)
++    )
++
++
++def _poly(x: float) -> float:
++    c4, c3, c2, c1, c0 = COEFFICIENTS
++    return ((((c4 * x) + c3) * x + c2) * x + c1) * x + c0
++
++
++@dataclass
++class TeaCacheStats:
++    threshold: float
++    steps: int
++    computed: int = 0
++    skipped: int = 0
++    decisions: list = field(default_factory = list)
++
++    def as_dict(self) -> dict[str, Any]:
++        return {
++            "mode": MODE,
++            "threshold": self.threshold,
++            "steps": self.steps,
++            "computed": self.computed,
++            "skipped": self.skipped,
++        }
++
++
++class _Gate:
++    """Accumulated rescaled rel-L1 of the gate signal; decides per step whether to run the main layers."""
++
++    def __init__(self, threshold: float, steps: int) -> None:
++        self.threshold = float(threshold)
++        self.steps = int(steps)
++        self.step = 0
++        self.previous = None
++        self.accumulated = 0.0
++        self.consecutive = 0
++        self.residual = None
++        self.residual_neg = None
++        # Forced steps (first / last) compute without refreshing the cache, as upstream.
++        self.update = False
++
++    def decide(self, mx: Any, signal: Any) -> bool:
++        """True = compute. Advances the step counter."""
++        index = self.step
++        self.step += 1
++        previous, self.previous = self.previous, signal
++        self.update = False
++        if index < SKIP_FIRST or index >= self.steps - SKIP_LAST:
++            return True
++        self.update = True
++        if previous is None or self.residual is None:
++            return True
++        num = mx.mean(mx.abs(signal - previous).astype(mx.float32))
++        den = mx.mean(mx.abs(previous).astype(mx.float32))
++        mx.eval(num, den)
++        rel = float(num.item()) / max(float(den.item()), 1e-12)
++        if not math.isfinite(rel):
++            self.update = False
++            self.residual = self.residual_neg = None
++            self.accumulated = 0.0
++            self.consecutive = 0
++            return True
++        lo, hi = CALIBRATED_RANGE
++        total = self.accumulated + max(0.0, _poly(min(max(rel, lo), hi)))
++        if rel <= hi and total < self.threshold and self.consecutive < MAX_CONSECUTIVE_SKIPS:
++            self.accumulated = total
++            self.consecutive += 1
++            return False
++        self.accumulated = 0.0
++        self.consecutive = 0
++        return True
++
++
++def _t_emb(mx: Any, transformer: Any, timestep: Any) -> Any:
++    if timestep.ndim == 0:
++        timestep = timestep.reshape((1,))
++    t_emb = transformer.t_embedder(timestep.astype(mx.float32) * transformer.t_scale)
++    stream = getattr(type(transformer), "stream_t_emb", None)
++    if callable(stream):
++        t_emb = stream(t_emb, getattr(transformer, "float32", False))
++    return t_emb
++
++
++def _prelude(mx: Any, transformer: Any, latents: Any, t_emb: Any, cap_feats: Any) -> tuple:
++    kind = type(transformer)
++    key = f"{transformer.patch_size}-{transformer.f_patch_size}"
++    x_emb, cap_emb, x_size, x_pos, cap_pos, x_pad, cap_pad = kind._patchify(
++        image = latents,
++        cap_feats = cap_feats,
++        patch_size = transformer.patch_size,
++        f_patch_size = transformer.f_patch_size,
++    )
++    x_emb = transformer.all_x_embedder[key](x_emb)
++    x_emb = mx.where(x_pad[:, None], transformer.x_pad_token, x_emb)
++    x_freqs = transformer.rope_embedder(x_pos)
++    x_mask = mx.ones((1, x_emb.shape[0]), dtype = mx.bool_)
++    x_emb = mx.expand_dims(x_emb, axis = 0)
++    for layer in transformer.noise_refiner:
++        x_emb = layer(x = x_emb, attn_mask = x_mask, freqs_cis = x_freqs, t_emb = t_emb)
++    cap_emb = transformer.cap_embedder[1](transformer.cap_embedder[0](cap_emb))
++    cap_emb = mx.where(cap_pad[:, None], transformer.cap_pad_token, cap_emb)
++    cap_freqs = transformer.rope_embedder(cap_pos)
++    cap_mask = mx.ones((1, cap_emb.shape[0]), dtype = mx.bool_)
++    cap_emb = mx.expand_dims(cap_emb, axis = 0)
++    for layer in transformer.context_refiner:
++        cap_emb = layer(x = cap_emb, attn_mask = cap_mask, freqs_cis = cap_freqs)
++    unified = mx.concatenate([x_emb, cap_emb], axis = 1)
++    freqs = mx.concatenate([x_freqs, cap_freqs], axis = 0)
++    mask = mx.ones((1, unified.shape[1]), dtype = mx.bool_)
++    return unified, freqs, mask, x_emb.shape[1], x_size
++
++
++def _tail(transformer: Any, main_out: Any, t_emb: Any, x_len: int, x_size: Any) -> Any:
++    key = f"{transformer.patch_size}-{transformer.f_patch_size}"
++    final = transformer.all_final_layer[key](main_out, t_emb)
++    output = type(transformer)._unpatchify(
++        x = final[0, :x_len],
++        size = x_size,
++        patch_size = transformer.patch_size,
++        f_patch_size = transformer.f_patch_size,
++        out_channels = transformer.out_channels,
++    )
++    return -output
++
++
++def make_predict_factory(threshold: float, steps: int, stats: TeaCacheStats) -> Any:
++    """A replacement for ``ZImage._predict``: ``predict = model._predict(model.transformer)`` runs once per
++    generation, so each call starts a fresh gate. Eager (the gate reads a scalar every step)."""
++
++    def factory(transformer: Any) -> Any:
++        import mlx.core as mx
++
++        gate = _Gate(threshold, steps)
++
++        def predict(latents, timestep, sigmas, text_encodings, negative_encodings, guidance):  # noqa: ARG001
++            t_emb = _t_emb(mx, transformer, timestep)
++            branches = [text_encodings] + (
++                [negative_encodings] if negative_encodings is not None else []
++            )
++            preludes = [_prelude(mx, transformer, latents, t_emb, cap) for cap in branches]
++            layers = transformer.layers
++            unified, freqs, mask, _x_len, _x_size = preludes[0]
++            first = layers[0](x = unified, attn_mask = mask, freqs_cis = freqs, t_emb = t_emb)
++            compute = gate.decide(mx, first - unified)
++            outs = []
++            for index, (unified, freqs, mask, x_len, x_size) in enumerate(preludes):
++                if compute:
++                    h = (
++                        first
++                        if index == 0
++                        else layers[0](x = unified, attn_mask = mask, freqs_cis = freqs, t_emb = t_emb)
++                    )
++                    for layer in layers[1:]:
++                        h = layer(x = h, attn_mask = mask, freqs_cis = freqs, t_emb = t_emb)
++                    if gate.update and index == 0:
++                        gate.residual = h - unified
++                    elif gate.update:
++                        gate.residual_neg = h - unified
++                else:
++                    h = unified + (gate.residual if index == 0 else gate.residual_neg)
++                outs.append(_tail(transformer, h, t_emb, x_len, x_size))
++            stats.decisions.append(bool(compute))
++            if compute:
++                stats.computed += 1
++            else:
++                stats.skipped += 1
++            if len(outs) == 1:
++                return outs[0]
++            noise, negative = outs
++            return noise + guidance * (noise - negative)
++
++        return predict
++
++    return factory
++
++
++class engaged:
++    """Context manager: install the gated ``_predict`` on ``model`` for one generation, restore it after."""
++
++    def __init__(self, model: Any, threshold: float, steps: int) -> None:
++        self.model = model
++        self.stats = TeaCacheStats(threshold = float(threshold), steps = int(steps))
++        self._had_instance = False
++        self._previous = None
++
++    def __enter__(self) -> TeaCacheStats:
++        instance = getattr(self.model, "__dict__", {})
++        self._had_instance = "_predict" in instance
++        self._previous = instance.get("_predict")
++        self.model._predict = make_predict_factory(
++            self.stats.threshold, self.stats.steps, self.stats
++        )
++        return self.stats
++
++    def __exit__(self, *exc: Any) -> None:
++        if self._had_instance:
++            self.model._predict = self._previous
++        else:
++            try:
++                del self.model._predict
++            except AttributeError:
++                pass
+diff --git a/studio/backend/tests/test_mlx_diffusion_backend.py b/studio/backend/tests/test_mlx_diffusion_backend.py
+index 98cc5d3ebf..5b2c816ebe 100644
+--- a/studio/backend/tests/test_mlx_diffusion_backend.py
++++ b/studio/backend/tests/test_mlx_diffusion_backend.py
+@@ -2207,3 +2207,53 @@ def test_a_priced_media_model_on_metal_always_tiles(monkeypatch, priced, free_gi
+     model = types.SimpleNamespace(tiling_config = None)
+     runtime._plan_vae_tiling(model, 1024, 1024)
+     assert runtime.vae_tiled() is expected
++
++
++class _TeaCacheRuntime(FakeRuntime):
++    def generate(
++        self,
++        model,
++        *,
++        teacache_threshold = None,
++        **kwargs,
++    ):
++        self.teacache = teacache_threshold
++        self.last_teacache = (
++            {"skipped": 3, "computed": kwargs["steps"] - 3} if teacache_threshold else None
++        )
++        return super().generate(model, **kwargs)
++
++
++def test_teacache_is_opt_in_and_reaches_only_the_runs_it_applies_to(env, monkeypatch):
++    backend, _runtime, _calls = env
++    runtime = _TeaCacheRuntime()
++    backend.runtime_factory = lambda: runtime
++    backend._runtime = None
++    monkeypatch.delenv("UNSLOTH_DIFFUSION_MLX_TEACACHE", raising = False)
++    assert _load(backend, transformer_cache = "fbcache")["phase"] == "ready"
++    assert backend._state.teacache_threshold == mb.teacache.DEFAULT_THRESHOLD
++    assert backend.status()["transformer_cache"] == "teacache"
++    applies = []
++    monkeypatch.setattr(
++        mb.teacache,
++        "applies",
++        lambda model, steps, thr: applies.append((steps, thr)) or steps >= 20,
++    )
++    out = backend.generate(prompt = "p", width = 256, height = 256, steps = 30, seed = 1)
++    assert runtime.teacache == mb.teacache.DEFAULT_THRESHOLD
++    assert out["transformer_cache"] == "teacache"
++    assert backend.last_timings["images"][0]["teacache_skipped"] == 3
++    out = backend.generate(prompt = "p", width = 256, height = 256, steps = 8, seed = 1)
++    assert runtime.teacache is None
++    assert out["transformer_cache"] is None
++    assert applies == [(30, 0.12), (8, 0.12)]
++
++
++def test_teacache_stays_off_without_the_opt_in(env, monkeypatch):
++    backend, runtime, _calls = env
++    monkeypatch.delenv("UNSLOTH_DIFFUSION_MLX_TEACACHE", raising = False)
++    assert _load(backend)["phase"] == "ready"
++    assert backend._state.teacache_threshold is None
++    assert backend.status()["transformer_cache"] is None
++    out = backend.generate(prompt = "p", width = 256, height = 256, steps = 30, seed = 1)
++    assert out["transformer_cache"] is None
+diff --git a/studio/backend/tests/test_mlx_diffusion_teacache.py b/studio/backend/tests/test_mlx_diffusion_teacache.py
+new file mode 100644
+index 0000000000..b9520b6146
+--- /dev/null
++++ b/studio/backend/tests/test_mlx_diffusion_teacache.py
+@@ -0,0 +1,157 @@
++# SPDX-License-Identifier: AGPL-3.0-only
++# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
++
++"""Opt-in TeaCache for Z-Image base on the MLX engine: opt-in rules, wiring, and (with real mlx + mflux) that the
++re-walked forward computes exactly what mflux's own ``_predict`` does."""
++
++from __future__ import annotations
++
++import pytest
++
++from core.inference import mlx_diffusion_teacache as tc
++
++
++@pytest.mark.parametrize(
++    "request_mode, threshold, env, expected",
++    [
++        (None, None, {}, None),
++        ("off", None, {}, None),
++        ("static", None, {}, None),
++        ("auto", None, {}, None),
++        ("fbcache", None, {}, tc.DEFAULT_THRESHOLD),
++        ("FBCache", 0.2, {}, 0.2),
++        ("teacache", 0, {}, tc.DEFAULT_THRESHOLD),
++        ("fbcache", None, {tc.ENV: "0"}, None),
++        (None, None, {tc.ENV: "1"}, tc.DEFAULT_THRESHOLD),
++        (None, 0.3, {tc.ENV: "on"}, 0.3),
++        (None, None, {tc.ENV: "0.05"}, 0.05),
++        (None, None, {tc.ENV: "junk"}, None),
++    ],
++)
++def test_requested_threshold(request_mode, threshold, env, expected):
++    assert tc.requested_threshold(request_mode, threshold, env = env) == expected
++
++
++class _Transformer:
++    @staticmethod
++    def _patchify(**_):
++        raise AssertionError
++
++    @staticmethod
++    def _unpatchify(**_):
++        raise AssertionError
++
++
++for _name in tc._REQUIRED:
++    setattr(_Transformer, _name, None)
++
++
++class _Config:
++    def __init__(self, guidance):
++        self.supports_guidance = guidance
++
++
++class _Model:
++    def __init__(
++        self,
++        guidance = True,
++        transformer = None,
++    ):
++        self.model_config = _Config(guidance)
++        self.transformer = _Transformer() if transformer is None else transformer
++
++
++def test_applies_only_to_the_undistilled_model_at_enough_steps():
++    assert tc.applies(_Model(), 50, 0.12)
++    assert tc.applies(_Model(), tc.MIN_STEPS, 0.12)
++    assert not tc.applies(_Model(), tc.MIN_STEPS - 1, 0.12)
++    # Turbo (distilled, no guidance) never engages.
++    assert not tc.applies(_Model(guidance = False), 50, 0.12)
++    assert not tc.applies(_Model(), 50, None)
++    assert not tc.applies(_Model(), 50, 0.0)
++    # A transformer the re-walk does not recognise runs unwrapped.
++    assert not tc.applies(_Model(transformer = object()), 50, 0.12)
++
++
++def test_engaged_restores_the_class_predict():
++    class _M:
++        @staticmethod
++        def _predict(transformer):
++            return "stock"
++
++    model = _M()
++    with tc.engaged(model, 0.12, 50) as stats:
++        assert model._predict is not _M._predict
++        assert stats.threshold == 0.12
++    assert "_predict" not in model.__dict__
++    assert model._predict(None) == "stock"
++
++
++def _mx():
++    mx = pytest.importorskip("mlx.core")
++    return mx
++
++
++def test_gate_skips_slow_change_and_never_the_first_or_last_step():
++    mx = _mx()
++    gate = tc._Gate(0.12, 10)
++    base = mx.ones((1, 8, 4))
++    decisions = []
++    for i in range(10):
++        compute = gate.decide(mx, base * (1.0 + 0.03 * i))
++        if compute and gate.update:
++            gate.residual = gate.residual_neg = base
++        decisions.append(compute)
++    assert decisions[0] and decisions[-1]
++    assert not all(decisions)
++    # A big jump always computes.
++    gate = tc._Gate(0.12, 10)
++    for i in range(10):
++        compute = gate.decide(mx, base * (10.0**i))
++        if compute and gate.update:
++            gate.residual = base
++        assert compute
++
++
++def test_rewalk_matches_mflux_predict_bit_for_bit():
++    mx = _mx()
++    transformer_mod = pytest.importorskip(
++        "mflux.models.z_image.model.z_image_transformer.transformer"
++    )
++    z_image = pytest.importorskip("mflux.models.z_image.variants.z_image")
++    from mlx.utils import tree_map
++
++    mx.random.seed(0)
++    transformer = transformer_mod.ZImageTransformer(
++        dim = 128, n_layers = 4, n_heads = 4, cap_feat_dim = 64, axes_dims = [8, 12, 12]
++    )
++    transformer.update(
++        tree_map(
++            lambda a: (mx.random.normal(a.shape) * 0.05).astype(a.dtype),
++            transformer.parameters(),
++        )
++    )
++    mx.eval(transformer.parameters())
++    latents = mx.random.normal((16, 1, 16, 16))
++    cap = mx.random.normal((20, 64))
++    neg = mx.random.normal((7, 64))
++    sigmas = mx.linspace(1, 0, 11)
++    # mflux compiles its predict off M1/M2; compare against the eager closure it builds on M1/M2.
++    stock_factory = z_image.ZImage._predict
++    monkey = pytest.MonkeyPatch()
++    monkey.setattr(z_image.AppleSiliconUtil, "is_m1_or_m2", staticmethod(lambda: True))
++    try:
++        stock = stock_factory(transformer)
++    finally:
++        monkey.undo()
++    stats = tc.TeaCacheStats(threshold = 0.12, steps = 10)
++    ours = tc.make_predict_factory(0.12, 10, stats)(transformer)
++    for t in range(10):
++        timestep = (1 - sigmas[t]).reshape((1,))
++        a = stock(latents, timestep, sigmas, cap, neg, 4.0)
++        b = ours(latents, timestep, sigmas, cap, neg, 4.0)
++        mx.eval(a, b)
++        if stats.decisions[-1]:
++            assert mx.array_equal(a, b).item(), t
++    assert stats.computed + stats.skipped == 10
++    assert stats.decisions[0] and stats.decisions[-1]

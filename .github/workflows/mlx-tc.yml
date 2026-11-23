@@ -1,0 +1,139 @@
+name: mlx-tc-zbase
+
+on:
+  push:
+    branches: ["mlx-tc-*"]
+  workflow_dispatch: {}
+
+concurrency:
+  group: mlx-tc-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONUNBUFFERED: "1"
+  PYTHONDONTWRITEBYTECODE: "1"
+  HF_HUB_DISABLE_PROGRESS_BARS: "1"
+  HF_HUB_DISABLE_TELEMETRY: "1"
+  HF_HUB_DISABLE_XET: "1"
+  HF_HUB_DOWNLOAD_TIMEOUT: "60"
+  TOKENIZERS_PARALLELISM: "false"
+  UNSLOTH_DIFFUSION_NO_MIRROR: "1"
+  STUDIO_SHA: 2b4921d41c443ef62de6d96f2b466c95759d05e7
+
+jobs:
+  render:
+    runs-on: macos-15
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: p0
+            prompt: "A red apple on a wooden table, soft window light, shallow depth of field, photograph"
+            main_ref: "1"
+          - id: p1
+            prompt: "Portrait of an elderly fisherman with a grey beard and a knitted cap, harbour at dusk, 85mm photo"
+            main_ref: "0"
+          - id: p2
+            prompt: "A neon-lit street in Tokyo at night after rain, reflections on wet asphalt, a cat on a crate, cinematic"
+            main_ref: "0"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Studio trees (main and head = main + TeaCache patch)
+        run: |
+          set -euo pipefail
+          mkdir -p out/logs
+          git init -q base && git -C base remote add origin https://github.com/unslothai/unsloth
+          git -C base fetch -q --depth 1 origin "$STUDIO_SHA" && git -C base checkout -q FETCH_HEAD
+          git -C base log -1 --format='main %H %cI' | tee out/revisions.txt
+          cp -R base head
+          git -C head apply --whitespace=nowarn ../patches/head.patch
+          git -C head diff --stat | tee -a out/revisions.txt
+      - name: Install
+        run: |
+          set -euo pipefail
+          {
+            python -m pip install --upgrade pip
+            pip install "mlx>=0.32.0,<0.33.0"
+            pip install "mflux==0.24.0" --no-deps
+            pip install "transformers>=5.5.0,<6" tokenizers "huggingface_hub>=1.1.6,<2" piexif platformdirs regex \
+              toml tqdm pyyaml rich sentencepiece safetensors numpy gguf requests jinja2 filelock
+            pip install fastapi pydantic structlog attrs cryptography pyjwt email-validator python-multipart \
+              sqlite-vec httpx psutil pytest pytest-asyncio pytest-timeout
+            pip install "pillow>=12.3.0,<13"
+            python -c "import PIL._typing, jinja2, mflux.models.z_image; print('imports ok')"
+            pip freeze
+          } 2>&1 | tee out/logs/install.log
+          { sysctl -n machdep.cpu.brand_string hw.memsize hw.ncpu; sw_vers; df -h .; } | tee out/logs/env.txt
+      - name: TeaCache tests on Metal (head)
+        if: matrix.id == 'p0'
+        run: |
+          set +e -o pipefail
+          cd head/studio/backend
+          python -m pytest -p no:cacheprovider -q -rfEs tests/test_mlx_diffusion_teacache.py 2>&1 | tee ../../../out/logs/pytest_tc.log
+          echo "pytest rc=${PIPESTATUS[0]}" | tee -a ../../../out/logs/pytest_tc.log
+      - name: Downloads (no XET)
+        run: |
+          set -euo pipefail
+          python - <<'PY' 2>&1 | tee out/logs/download.log
+          import time
+          from huggingface_hub import hf_hub_download, snapshot_download
+          t = time.time()
+          pats = ["text_encoder/*", "tokenizer/*", "vae/*", "scheduler/*", "model_index.json"]
+          print(hf_hub_download("unsloth/Z-Image-GGUF", "z-image-Q4_0.gguf"), round(time.time() - t), flush=True)
+          print(snapshot_download("Tongyi-MAI/Z-Image", allow_patterns=pats), round(time.time() - t), flush=True)
+          PY
+      - name: Arms
+        env:
+          PROMPT: ${{ matrix.prompt }}
+          PID: ${{ matrix.id }}
+          MAIN_REF: ${{ matrix.main_ref }}
+        run: |
+          set +e -uo pipefail
+          if [ "$MAIN_REF" = "1" ]; then
+            python -u bench/tc_arm.py --backend-dir base/studio/backend --out out --tag ${PID}_main --prompt "$PROMPT" \
+              --ref-only --rounds 1 > out/logs/${PID}_main.log 2>&1
+            echo "${PID}_main rc=$?" | tee -a out/rc.txt
+          fi
+          python -u bench/tc_arm.py --backend-dir head/studio/backend --out out --tag ${PID}_head --prompt "$PROMPT" \
+            --deadline-min 170 > out/logs/${PID}_head.log 2>&1
+          echo "${PID}_head rc=$?" | tee -a out/rc.txt
+          grep -E " (load|gate|done)|'label'" out/logs/${PID}_head.log | cut -c1-700
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tc-${{ matrix.id }}
+          path: out
+          retention-days: 14
+
+  score:
+    needs: render
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tc-*
+          path: out
+      - name: LPIPS on CPU
+        run: |
+          set -euo pipefail
+          pip install -q torch torchvision --index-url https://download.pytorch.org/whl/cpu
+          pip install -q lpips pillow numpy
+          python bench/score.py out | tee out/scores.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tc-score
+          path: out/scores*
+          retention-days: 14
