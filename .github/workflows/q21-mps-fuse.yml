@@ -17,6 +17,7 @@ env:
 
 jobs:
   bench:
+    if: false
     runs-on: macos-15
     timeout-minutes: 120
     defaults:

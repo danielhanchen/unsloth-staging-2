@@ -52,10 +52,10 @@ index eb151ec0b8..4f2070619f 100644
              if segments is None:
 diff --git a/studio/backend/core/inference/diffusion_qwenimage21_mps.py b/studio/backend/core/inference/diffusion_qwenimage21_mps.py
 new file mode 100644
-index 0000000000..e0387002cc
+index 0000000000..6afa2a7c9c
 --- /dev/null
 +++ b/studio/backend/core/inference/diffusion_qwenimage21_mps.py
-@@ -0,0 +1,746 @@
+@@ -0,0 +1,756 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -268,16 +268,26 @@ index 0000000000..e0387002cc
 +# --------------------------------------------------------------------------------------------- row layout
 +
 +
++def _version(t: Any) -> Any:
++    """The in-place write counter; inference-mode tensors (Studio's renders) have none, and nothing writes into the
++    fast step's per-layout mask, so they key on identity and storage alone."""
++    try:
++        return t._version
++    except RuntimeError:
++        return ("inference", t.data_ptr())
++
++
 +def prefix_len(mask: Any, seq: int) -> Optional[int]:
 +    """``p`` when ``mask`` is ``[False] * p + [True] * (seq - p)`` (non-target prefix, then target rows); None for
-+    any other layout. One host read per mask tensor (the fast step builds one per render)."""
++    any other layout. One host read per mask tensor (the fast step builds one per layout and reuses it)."""
 +    import torch
 +
 +    if not torch.is_tensor(mask) or mask.dtype != torch.bool or tuple(mask.shape) != (seq,):
 +        return None
 +    key = id(mask)
++    version = _version(mask)
 +    hit = _MASKS.get(key)
-+    if hit is not None and hit[0]() is mask and hit[1] == mask._version:
++    if hit is not None and hit[0]() is mask and hit[1] == version:
 +        return hit[2]
 +    host = mask.detach().to("cpu")
 +    p = int((~host).sum())
@@ -286,7 +296,7 @@ index 0000000000..e0387002cc
 +    if len(_MASKS) > 64:
 +        _MASKS.clear()
 +    try:
-+        _MASKS[key] = (weakref.ref(mask), mask._version, out)
++        _MASKS[key] = (weakref.ref(mask), version, out)
 +    except TypeError:
 +        pass
 +    return out
@@ -895,10 +905,10 @@ index 250c148528..a0b47654e3 100644
          from core.inference.diffusion_flux3_half_attn import install_for_pipe as flux3_attn
 diff --git a/studio/backend/tests/test_diffusion_qwenimage21_mps.py b/studio/backend/tests/test_diffusion_qwenimage21_mps.py
 new file mode 100644
-index 0000000000..b1c549095a
+index 0000000000..68291b4acf
 --- /dev/null
 +++ b/studio/backend/tests/test_diffusion_qwenimage21_mps.py
-@@ -0,0 +1,335 @@
+@@ -0,0 +1,345 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -962,6 +972,16 @@ index 0000000000..b1c549095a
 +    assert mps.prefix_len(mask, 12) == 4
 +    mask[:6] = False
 +    assert mps.prefix_len(mask, 12) == 6
++
++
++def test_prefix_len_accepts_inference_mode_masks():
++    """Studio renders under torch.inference_mode, whose tensors carry no version counter."""
++    with torch.inference_mode():
++        mask = torch.arange(20) >= 3
++        assert mps.prefix_len(mask, 20) == 3
++        assert mps.prefix_len(mask, 20) == 3
++        other = torch.arange(20) >= 0
++        assert mps.prefix_len(other, 20) == 0
 +
 +
 +def _block_case(batch, seq, dim, p, seed):
@@ -1071,7 +1091,7 @@ index 0000000000..b1c549095a
 +
 +
 +def _run_blocks(blocks, x, modulation, mask, freqs):
-+    with torch.no_grad():
++    with torch.inference_mode():
 +        for b in blocks:
 +            x = b(hidden_states = x, modulation = modulation, rotary_emb = freqs, target_token_mask = mask)
 +    return x
