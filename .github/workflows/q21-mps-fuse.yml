@@ -91,3 +91,73 @@ jobs:
           name: q21-mps-fuse
           path: out
           retention-days: 14
+
+  studio_load:
+    runs-on: macos-15
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Base and head trees
+        run: |
+          set -euo pipefail
+          mkdir -p out/logs
+          git init -q base && git -C base remote add origin https://github.com/unslothai/unsloth
+          git -C base fetch -q --depth 1 origin "$MERGE_BASE" && git -C base checkout -q FETCH_HEAD
+          cp -R base head
+          git -C head apply --whitespace=nowarn ../patches/head.patch
+          git -C head status --short | tee out/revisions.txt
+      - name: Install (Studio Mac deps, torch 2.14.1: 2.15 skips the paravirtual GPU)
+        run: |
+          set -euo pipefail
+          {
+            python -m pip install --upgrade pip
+            pip install "torch==2.14.1" "diffusers==0.42.1" "transformers>=5.5.0,<6" "huggingface_hub>=1.1.6,<2" safetensors \
+              numpy pillow regex requests filelock importlib_metadata pyyaml accelerate sentencepiece tokenizers torchvision
+            pip install fastapi pydantic structlog attrs cryptography pyjwt email-validator python-multipart \
+              httpx psutil pytest
+            pip install git+https://github.com/unslothai/unsloth_zoo --no-deps || echo "unsloth_zoo install failed"
+            pip freeze
+          } 2>&1 | tee out/logs/install.log
+      - name: Probes and fast-math check
+        run: |
+          set +e -o pipefail
+          python bench/probe.py head/studio/backend 2>&1 | tee out/logs/probe.log
+      - name: Eager-tier install test with unsloth_zoo (CPU)
+        run: |
+          set +e -o pipefail
+          cd head/studio/backend
+          python -m pytest -p no:cacheprovider -q -rs tests/test_diffusion_qwenimage21_mps.py 2>&1 | tee ../../../out/logs/pytest_zoo.log
+      - name: Build the real-geometry tiny pipeline
+        run: |
+          set -euo pipefail
+          hf download hf-internal-testing/tiny-qwenimage21-pipe --local-dir tiny_pipe > /dev/null
+          python bench/build_pipe.py --src tiny_pipe --out q21_real --heads 32 --layers 2 2>&1 | tail -1 | tee out/logs/build.log
+          du -sh q21_real/transformer | tee -a out/logs/build.log
+      - name: Studio load + generate arms
+        run: |
+          set +e -uo pipefail
+          export HF_HUB_OFFLINE=1
+          run() { tag=$1; tree=$2; shift 2
+            env "$@" python -u bench/studio_load.py --backend-dir $tree/studio/backend --model q21_real --out out --tag $tag \
+              --size 512 --steps 4 --repeats 3 > out/logs/$tag.log 2>&1; rc=$?
+            echo "$tag rc=$rc" | tee -a out/rc.txt
+            grep -h "diffusion.q21_mps\|diffusion.loaded" out/logs/$tag.log | cut -c1-400; }
+          run s_base_1 base X=1
+          run s_head_1 head X=1
+          run s_head_kill head UNSLOTH_DIFFUSION_Q21_MPS_FUSED=0
+          run s_base_2 base X=1
+          run s_head_2 head X=1
+          cat out/rc.txt
+          python bench/summarize_studio.py out | tee out/summary_studio.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: q21-mps-studio
+          path: out
+          retention-days: 14

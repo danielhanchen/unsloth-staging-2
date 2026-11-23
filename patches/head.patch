@@ -1,8 +1,8 @@
 diff --git a/studio/backend/core/inference/diffusion_autoopt/patches.py b/studio/backend/core/inference/diffusion_autoopt/patches.py
-index 52d1592db9..6f4e0fb76d 100644
+index 52d1592db9..9db171637c 100644
 --- a/studio/backend/core/inference/diffusion_autoopt/patches.py
 +++ b/studio/backend/core/inference/diffusion_autoopt/patches.py
-@@ -422,6 +422,14 @@ def _builtin_specs() -> list[PatchSpec]:
+@@ -422,6 +422,16 @@ def _builtin_specs() -> list[PatchSpec]:
              off = str(ctx.speed_mode or "").strip().lower() == "off"
          return install_for_pipe(ctx.pipe, ctx.logger, explicit_off = bool(off))
  
@@ -12,12 +12,14 @@ index 52d1592db9..6f4e0fb76d 100644
 +        off = ctx.explicit_off
 +        if off is None:
 +            off = str(ctx.speed_mode or "").strip().lower() == "off"
-+        return install_for_pipe(ctx.pipe, ctx.logger, explicit_off = bool(off))
++        # The load's target: at STAGE_LOAD the pipe still sits on CPU, placement runs later.
++        device = ctx.device if ctx.device is not None else getattr(ctx.target, "device", None)
++        return install_for_pipe(ctx.pipe, ctx.logger, explicit_off = bool(off), device = device)
 +
      def flux2_rope(ctx: PatchContext) -> bool:
          from ..diffusion_flux2_rope import install_for_pipe
          return install_for_pipe(ctx.pipe, ctx.dtype, ctx.device, ctx.logger)
-@@ -587,6 +595,15 @@ def _builtin_specs() -> list[PatchSpec]:
+@@ -587,6 +597,15 @@ def _builtin_specs() -> list[PatchSpec]:
              backends = ("image",),
              env = "UNSLOTH_DIFFUSION_KREA2_TEXT_TRIM",
          ),
@@ -50,10 +52,10 @@ index eb151ec0b8..4f2070619f 100644
              if segments is None:
 diff --git a/studio/backend/core/inference/diffusion_qwenimage21_mps.py b/studio/backend/core/inference/diffusion_qwenimage21_mps.py
 new file mode 100644
-index 0000000000..883a1b1fec
+index 0000000000..e0387002cc
 --- /dev/null
 +++ b/studio/backend/core/inference/diffusion_qwenimage21_mps.py
-@@ -0,0 +1,690 @@
+@@ -0,0 +1,746 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -98,6 +100,8 @@ index 0000000000..883a1b1fec
 +_MASKS: dict = {}  # id(mask) -> (weakref, version, prefix_len or None)
 +_FREQS: dict = {}  # id(freqs) -> (weakref, real view with storage offset 0)
 +STATS = {"block": 0, "modulate_metal": 0, "residual_metal": 0, "rope_metal": 0}
++
++KERNELS = ("q21_modulate", "q21_gated_residual", "q21_qk_norm_rope")
 +
 +_METAL = r"""
 +#include <metal_stdlib>
@@ -215,11 +219,34 @@ index 0000000000..883a1b1fec
 +    )
 +
 +
++def original_rmsnorm_forward(mod: Any) -> Any:
++    """diffusers' RMSNorm.forward, also while the eager tier's F.rms_norm forward (installed on every speed tier)
++    holds the class attribute."""
++    import inspect
++
++    forward = getattr(getattr(mod, "RMSNorm", None), "forward", None)
++    try:
++        from . import diffusion_eager_patches as eager
++        if (
++            forward is not None
++            and eager._orig_rmsnorm_forward is not None
++            and getattr(inspect.unwrap(forward), "__code__", None)
++            is eager._rmsnorm_forward.__code__
++        ):
++            return eager._orig_rmsnorm_forward
++    except Exception:  # noqa: BLE001 - no eager tier module: the live attribute
++        pass
++    return forward
++
++
 +def why_unsupported(mod: Any) -> Optional[str]:
 +    for name, want in _FINGERPRINTS.items():
 +        obj = mod
-+        for piece in name.split("."):
-+            obj = getattr(obj, piece, None)
++        if name == "RMSNorm.forward":
++            obj = original_rmsnorm_forward(mod)
++        else:
++            for piece in name.split("."):
++                obj = getattr(obj, piece, None)
 +        got = source_digest(obj)
 +        if got not in want:
 +            return f"{name} differs from the version this was written against ({got})"
@@ -408,7 +435,7 @@ index 0000000000..883a1b1fec
 +    dim = x.shape[-1]
 +    weight = getattr(norm, "weight", None)
 +    return (
-+        dim in (64, 128, 256, 512, 1024)
++        dim == 128  # the probed geometry: one 64-thread threadgroup per row
 +        and 0 < x.numel() < 2**31
 +        and _stock_norm(norm)
 +        and getattr(norm, "bias", None) is None
@@ -593,20 +620,23 @@ index 0000000000..883a1b1fec
 +
 +    stock = type(self).forward
 +    flags = self.__dict__.get(_BLOCK_ATTR)
-+    p = 0
 +    masked = target_token_mask is not None
-+    if masked:
-+        p = prefix_len(target_token_mask, hidden_states.shape[1])
-+    if (
++    eligible = not (
 +        flags is None
-+        or p is None
 +        or torch.is_grad_enabled()
 +        or torch.compiler.is_compiling()
 +        or not _device_ok(hidden_states)
 +        or hidden_states.dim() != 3
 +        or modulation.dim() != 2
 +        or modulation.shape[0] != hidden_states.shape[0] + (1 if masked else 0)
-+    ):
++    )
++    # The host read of the mask layout only once everything else qualifies.
++    p = (
++        (prefix_len(target_token_mask, hidden_states.shape[1]) if masked else 0)
++        if eligible
++        else None
++    )
++    if p is None:
 +        return stock(
 +            self,
 +            hidden_states,
@@ -693,16 +723,30 @@ index 0000000000..883a1b1fec
 +        return False
 +
 +
++def _target_is_mps(device: Any, transformer: Any) -> bool:
++    """The load's target device (the pipe is still on CPU at STAGE_LOAD, placement comes later); without one, where
++    the denoiser's weights are."""
++    if device is None:
++        return _on_mps(transformer)
++    try:
++        import torch
++        return torch.device(device).type == "mps"
++    except Exception:  # noqa: BLE001
++        return False
++
++
 +def install_for_pipe(
 +    pipe: Any,
 +    logger: Any = None,
 +    explicit_off: bool = False,
++    device: Any = None,
 +) -> bool:
-+    """Per transformer instance (dies with the pipe); an explicit speed ``off`` load keeps the stock block."""
++    """Per transformer instance (dies with the pipe); an explicit speed ``off`` load keeps the stock block.
++    ``device``: the load's target device; each call still checks its activations are on MPS."""
 +    transformer = getattr(pipe, "transformer", None)
 +    if type(transformer).__name__ != _CLASS:
 +        return False
-+    if explicit_off or disabled() or not _on_mps(transformer):
++    if explicit_off or disabled() or not _target_is_mps(device, transformer):
 +        uninstall(transformer)
 +        return False
 +    try:
@@ -714,10 +758,24 @@ index 0000000000..883a1b1fec
 +        if logger is not None:
 +            logger.info("diffusion.q21_mps: stock block kept: %s", why)
 +        return False
-+    _STOCK_NORM[0] = _STOCK_NORM[0] or mod.RMSNorm.forward
++    _STOCK_NORM[0] = original_rmsnorm_forward(mod)
 +    cls = mod.QwenImage21TransformerBlock
-+    flags = (part_enabled("MODULATE"), part_enabled("RESIDUAL"))
-+    rope = part_enabled("ROPE")
++    # Compile and probe now, at load, not inside the first render; a failed probe keeps that part stock.
++    import torch
++
++    probes = {name: _probe(name, torch.device("mps")) for name in KERNELS}
++    flags = (
++        part_enabled("MODULATE") and probes["q21_modulate"],
++        part_enabled("RESIDUAL") and probes["q21_gated_residual"],
++    )
++    rope = part_enabled("ROPE") and probes["q21_qk_norm_rope"]
++    if not (flags[0] or flags[1] or rope):
++        uninstall(transformer)
++        if logger is not None:
++            logger.info(
++                "diffusion.q21_mps: stock block kept: Metal kernels unavailable (%s)", probes
++            )
++        return False
 +    prepare = make_prepare(mod) if rope else None
 +    count = 0
 +    for block in getattr(transformer, "transformer_blocks", None) or ():
@@ -820,7 +878,7 @@ index 259efdaed8..f94f7e1a17 100644
    "image|qwen-image-edit|default|bfloat16|offload=0|gguf=1": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":false,"rocm_fused":false},"applied":[["compiled_dequant","cuda_graph","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"eligible","graph_after_placement":false,"modules":{"transformer":{"compile_calls":[],"static":false,"auto_dynamic":null,"int8_gemm":false}}},
    "image|qwen-image-edit|default|bfloat16|offload=1|gguf=0": {"patches":{"arch_fusions":true,"eager_fusions":true,"flux2_rope":false,"flux3_fp16_attn":false,"flux3_qk_rope":false,"flux3_rope":false,"fp16_eager_rmsnorm":false,"qwenimage21_fast_step":false,"rocm_fused":false},"applied":[["compiled","fp16_accum","tf32"]],"keys":[["channels_last","compiled","compiled_dequant","compiled_vae_decode","cuda_graph","cudnn_benchmark","fp16_accum","fused_qkv","int8_gemm","rocm_query_chunks","tf32","vae_fp16_decode","vae_fused","vae_single_frame"]],"graph_reason":"armed after placement","graph_after_placement":true,"modules":{"transformer":{"compile_calls":[{"fullgraph":false,"dynamic":true}],"static":false,"auto_dynamic":false,"int8_gemm":false}}},
 diff --git a/studio/backend/tests/test_diffusion_autoopt_parity.py b/studio/backend/tests/test_diffusion_autoopt_parity.py
-index 250c148528..8531fc7917 100644
+index 250c148528..a0b47654e3 100644
 --- a/studio/backend/tests/test_diffusion_autoopt_parity.py
 +++ b/studio/backend/tests/test_diffusion_autoopt_parity.py
 @@ -240,6 +240,11 @@ def legacy_entry(
@@ -830,17 +888,17 @@ index 250c148528..8531fc7917 100644
 +        if type(getattr(pipe, "transformer", None)).__name__ == "QwenImage21Transformer2DModel":
 +            from core.inference.diffusion_qwenimage21_mps import install_for_pipe as q21_mps
 +            patches["qwenimage21_mps_fused"] = _engaged(
-+                q21_mps(pipe, None, explicit_off = speed == "off")
++                q21_mps(pipe, None, explicit_off = speed == "off", device = target.device)
 +            )
          patches["flux2_rope"] = _engaged(flux2(pipe, target.dtype, target.device, None))
          patches["flux3_rope"] = _engaged(flux3(pipe, target.device, None))
          from core.inference.diffusion_flux3_half_attn import install_for_pipe as flux3_attn
 diff --git a/studio/backend/tests/test_diffusion_qwenimage21_mps.py b/studio/backend/tests/test_diffusion_qwenimage21_mps.py
 new file mode 100644
-index 0000000000..607f7b7c46
+index 0000000000..b1c549095a
 --- /dev/null
 +++ b/studio/backend/tests/test_diffusion_qwenimage21_mps.py
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,335 @@
 +# SPDX-License-Identifier: AGPL-3.0-only
 +# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 +
@@ -1006,6 +1064,12 @@ index 0000000000..607f7b7c46
 +    return SimpleNamespace(transformer = QwenImage21Transformer2DModel(blocks))
 +
 +
++def _fake_mps(monkeypatch):
++    """CPU stands in for MPS: the device gate opens and the load-time kernel probes report a pass."""
++    monkeypatch.setattr(mps, "_device_ok", lambda x: True)
++    monkeypatch.setattr(mps, "_PROBED", {name: True for name in mps.KERNELS})
++
++
 +def _run_blocks(blocks, x, modulation, mask, freqs):
 +    with torch.no_grad():
 +        for b in blocks:
@@ -1016,9 +1080,7 @@ index 0000000000..607f7b7c46
 +@pytest.mark.parametrize("p", [None, 0, 6])
 +def test_block_forward_bit_identical_on_eager_paths(monkeypatch, p):
 +    """With the device gate opened on CPU and no Metal library, every part falls back to the stock ops exactly."""
-+    monkeypatch.setattr(mps, "_device_ok", lambda x: True)
-+    monkeypatch.setattr(mps, "_library", lambda: None)
-+    mps._PROBED.clear()
++    _fake_mps(monkeypatch)
 +    blocks = _blocks()
 +    g = torch.Generator().manual_seed(9)
 +    seq, dim = 20, 64
@@ -1032,6 +1094,9 @@ index 0000000000..607f7b7c46
 +
 +    pipe = _pipe(blocks)
 +    assert mps.install_for_pipe(pipe)
++    # no Metal at render time: every kernel declines and the stock ops run
++    monkeypatch.setattr(mps, "_library", lambda: None)
++    mps._PROBED.clear()
 +    before = dict(mps.STATS)
 +    got = _run_blocks(blocks, x, modulation, mask, freqs)
 +    assert mps.STATS["block"] - before["block"] == len(blocks)
@@ -1050,7 +1115,7 @@ index 0000000000..607f7b7c46
 +
 +
 +def test_explicit_off_and_kill_switch_uninstall(monkeypatch):
-+    monkeypatch.setattr(mps, "_device_ok", lambda x: True)
++    _fake_mps(monkeypatch)
 +    blocks = _blocks(1)
 +    pipe = _pipe(blocks)
 +    assert mps.install_for_pipe(pipe)
@@ -1064,7 +1129,7 @@ index 0000000000..607f7b7c46
 +
 +
 +def test_install_skips_a_block_another_hook_wraps(monkeypatch):
-+    monkeypatch.setattr(mps, "_device_ok", lambda x: True)
++    _fake_mps(monkeypatch)
 +    blocks = _blocks(2)
 +    hook = lambda *a, **k: None  # noqa: E731
 +    blocks[0].__dict__["forward"] = hook
@@ -1077,7 +1142,7 @@ index 0000000000..607f7b7c46
 +
 +
 +def test_part_switches(monkeypatch):
-+    monkeypatch.setattr(mps, "_device_ok", lambda x: True)
++    _fake_mps(monkeypatch)
 +    monkeypatch.setenv("UNSLOTH_DIFFUSION_Q21_MPS_ROPE", "0")
 +    monkeypatch.setenv("UNSLOTH_DIFFUSION_Q21_MPS_RESIDUAL", "0")
 +    blocks = _blocks(1)
@@ -1099,3 +1164,73 @@ index 0000000000..607f7b7c46
 +    src = inspect.getsource(bounded._processor_class)
 +    assert '__dict__.get("_unsloth_q21_mps_prepare") or _qwenimage21_prepare_qkv' in src
 +    assert mps.PREPARE_ATTR == "_unsloth_q21_mps_prepare"
++
++
++def test_install_declines_when_no_kernel_passes_its_probe(monkeypatch):
++    monkeypatch.setattr(mps, "_device_ok", lambda x: True)
++    monkeypatch.setattr(mps, "_PROBED", {name: False for name in mps.KERNELS})
++    blocks = _blocks(1)
++    assert not mps.install_for_pipe(_pipe(blocks), device = "mps")
++    assert "forward" not in blocks[0].__dict__
++
++
++def test_install_gates_on_the_load_target_not_the_weights(monkeypatch):
++    """STAGE_LOAD runs before placement: CPU weights with an MPS target install, an MPS-free target does not."""
++    monkeypatch.setattr(mps, "_PROBED", {name: True for name in mps.KERNELS})
++    blocks = _blocks(1)
++    pipe = _pipe(blocks)
++    assert not mps.install_for_pipe(pipe, device = "cpu")
++    assert not mps.install_for_pipe(pipe, device = "cuda:0")
++    assert "forward" not in blocks[0].__dict__
++    assert mps.install_for_pipe(pipe, device = "mps")
++    assert mps.install_for_pipe(pipe, device = torch.device("mps"))
++    mps.uninstall(pipe.transformer)
++
++
++def test_patch_spec_passes_the_load_target(monkeypatch):
++    from core.inference.diffusion_autoopt import patches as ap
++
++    seen = {}
++
++    def fake(
++        pipe,
++        logger = None,
++        explicit_off = False,
++        device = None,
++    ):
++        seen.update(device = device, off = explicit_off)
++        return True
++
++    monkeypatch.setattr(mps, "install_for_pipe", fake)
++    spec = next(s for s in ap.specs(ap.STAGE_LOAD) if s.name == "qwenimage21_mps_fused")
++    spec.install(ap.PatchContext(pipe = None, device = "mps", speed_mode = "default"))
++    assert seen == {"device": "mps", "off": False}
++    spec.install(ap.PatchContext(pipe = None, target = SimpleNamespace(device = "mps"), speed_mode = "off"))
++    assert seen == {"device": "mps", "off": True}
++
++
++def test_installs_after_the_eager_tier_replaced_rmsnorm(monkeypatch):
++    """Every speed tier installs the eager F.rms_norm forward on the class first; the fingerprint reads diffusers'
++    original, so the MPS block still installs (needs unsloth_zoo, which the eager patch goes through)."""
++    pytest.importorskip("unsloth_zoo")
++    from core.inference import diffusion_eager_patches as eager
++    from diffusers.models.normalization import RMSNorm
++
++    stock = RMSNorm.forward
++    monkeypatch.setattr(mps, "_PROBED", {name: True for name in mps.KERNELS})
++    eager.install_compile_safe_patches()
++    try:
++        assert RMSNorm.forward is not stock, "the eager tier did not patch RMSNorm"
++        assert mps.why_unsupported(qmod) is None
++        assert mps.original_rmsnorm_forward(qmod) is stock
++        blocks = _blocks(1)
++        pipe = _pipe(blocks)
++        assert mps.install_for_pipe(pipe, device = "mps")
++        assert mps._STOCK_NORM[0] is stock
++        assert mps._stock_norm(
++            blocks[0].attn.norm_q
++        )  # the eager forward still counts as the RMSNorm the kernel copies
++        mps.uninstall(pipe.transformer)
++    finally:
++        eager.uninstall_patches()
++    assert RMSNorm.forward is stock
