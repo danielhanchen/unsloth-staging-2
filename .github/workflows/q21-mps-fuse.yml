@@ -112,7 +112,7 @@ jobs:
           cp -R base head
           git -C head apply --whitespace=nowarn ../patches/head.patch
           git -C head status --short | tee out/revisions.txt
-      - name: Install (Studio Mac deps, torch 2.14.1: 2.15 skips the paravirtual GPU)
+      - name: Install Studio Mac deps with torch 2.14.1 (2.15 skips the paravirtual GPU)
         run: |
           set -euo pipefail
           {
