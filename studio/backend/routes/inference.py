@@ -30796,7 +30796,7 @@ async def _proxy_to_external_provider(
             request,
             include_api_key = bool(studio_tool_payloads),
         )
-        cancel_event = threading.Event()
+        cancel_event = _chat_cancel_event(request)
         cancel_keys = tuple(
             _account_cancel_key(key) for key in (payload.cancel_id, payload.session_id) if key
         )
@@ -31548,7 +31548,7 @@ async def _proxy_to_external_provider(
             except context_refusal.ContextBudgetExceeded as exc:
                 raise _context_budget_http_error(exc)
 
-    cancel_event = threading.Event()
+    cancel_event = _chat_cancel_event(request)
     cancel_keys = tuple(key for key in (payload.cancel_id, payload.session_id) if key)
 
     async def _watch_disconnect() -> None:
@@ -31710,8 +31710,8 @@ async def _proxy_to_external_provider(
                 gen = cloud_compaction.stream_with_overflow_retry(_plain_turn, _recover_plain)
             else:
                 gen = _plain_turn()
-        if managed is not None:
-            # Stopping the read stops FastFlowLM, which a model swap is waiting on.
+        # Stops FastFlowLM for a waiting swap; a durable run has no client disconnect, so this is its only Stop.
+        if managed is not None or getattr(cancel_event, "durable", False):
             gen = _stop_on_cancel(gen, cancel_event)
         disconnect_task = asyncio.create_task(_watch_disconnect()) if run_studio_tool_loop else None
 
