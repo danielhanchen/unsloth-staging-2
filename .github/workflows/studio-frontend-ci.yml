@@ -3,6 +3,7 @@
 
 # Frontend PR gate. biome is non-blocking until its backlog reaches zero.
 
+# staging A/B base probe
 name: Frontend CI
 
 on:
