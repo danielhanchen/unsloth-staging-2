@@ -273,7 +273,7 @@ jobs:
         # Shared selection lives here so every shard inherits one list; shards differ only in matrix.selection.
         run: |
           timeout --signal=INT --kill-after=60 1500 \
-          python -m pytest ${{ matrix.selection }} -q -rs --tb=short -n 4 --dist loadgroup --timeout=330 \
+          python -m pytest ${{ matrix.selection }} -q -rs --tb=short -n 4 --dist loadgroup --timeout=330 --durations=60 --junitxml="$RUNNER_TEMP/junit/main.xml" \
             --ignore=tests/test_studio_api.py \
             --ignore=tests/test_streaming_stripper.py \
             --ignore=tests/test_llama_cpp_wait_for_vram_settle.py \
@@ -330,6 +330,15 @@ jobs:
             tests/test_third_party_source.py \
             tests/test_recommended_folders_permission.py \
             tests/test_hf_cache_settings.py
+
+      - name: STAGING PROBE upload junit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/junit/
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Why a failure here might already be fixed on the base branch
         # Only on failure; the action reports when the base branch moved since the merge ref.
@@ -487,7 +496,7 @@ jobs:
         # globals. The outer timeout must fire before the job cap.
         run: |
           timeout --signal=INT --kill-after=60 2100 \
-          python -m pytest ${{ matrix.selection }} -q -rs --tb=short -n ${{ matrix.workers || 4 }} --dist loadgroup --timeout=330 \
+          python -m pytest ${{ matrix.selection }} -q -rs --tb=short -n ${{ matrix.workers || 4 }} --dist loadgroup --timeout=330 --durations=60 --junitxml="$RUNNER_TEMP/junit/main.xml" \
             -m 'not server and not e2e'
 
       - name: Hardware-spoof tests (state-sensitive, run in isolation)
@@ -520,6 +529,15 @@ jobs:
         # Not test_*.py so pytest skips it; run explicitly.
         if: matrix.shard == 'rest'
         run: python tests/validate_studio_features.py
+
+      - name: STAGING PROBE upload junit
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
+        with:
+          name: junit-${{ github.job }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/junit/
+          if-no-files-found: ignore
+          retention-days: 3
 
       - name: Why a failure here might already be fixed on the base branch
         # Only on failure; the action reports when the base branch moved since the merge ref.
