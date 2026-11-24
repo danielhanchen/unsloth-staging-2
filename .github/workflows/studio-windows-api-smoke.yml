@@ -113,6 +113,7 @@ jobs:
         background: true
         shell: pwsh
         run: |
+          Write-Host "STAGING PROBE"; exit 1
           pwsh -NoProfile -File tests/studio/test_uninstall_arg_guard.ps1
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           pwsh -NoProfile -File tests/studio/test_uninstall_dual_install_icon.ps1
