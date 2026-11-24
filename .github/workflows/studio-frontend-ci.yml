@@ -1091,7 +1091,12 @@ jobs:
         timeout-minutes: 15
         run: python tests/studio/playwright_long_thread_gate.py
 
+      # In the background from here: after the long-chat typing gate (a timing check that must
+      # not share the CPU), alongside the functional browser checks below; collected before the
+      # failure artifacts, so a red unit test still fails the job.
       - name: Unit tests
+        id: unit-tests
+        background: true
         run: npm test
 
       - name: Install alignment test browsers
@@ -1128,6 +1133,9 @@ jobs:
             echo "::endgroup::"
           done
           exit "$failed"
+
+      - name: Collect the unit tests
+        wait: [unit-tests]
 
       - name: Upload alignment failure artifacts
         if: failure()
