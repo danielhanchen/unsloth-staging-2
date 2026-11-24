@@ -270,6 +270,15 @@ jobs:
       - name: Collect the bubblewrap install
         wait: bubblewrap
 
+      - name: STAGING PROBE env fingerprint
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python -V; which python
+          python -m pip list --format=freeze --all 2>/dev/null | tr 'A-Z_' 'a-z-' | sort > "$RUNNER_TEMP/envlist.txt"
+          echo "PROBE_COUNT $(wc -l < "$RUNNER_TEMP/envlist.txt")"
+          echo "PROBE_SHA $(sha256sum "$RUNNER_TEMP/envlist.txt" | cut -c1-16)"
+          sed 's/^/PROBE_PKG /' "$RUNNER_TEMP/envlist.txt"
       - name: Backend tests
         if: matrix.scope == 'full'
         working-directory: studio/backend
@@ -500,6 +509,15 @@ jobs:
             sleep $((10 << (attempt - 1)))
           done
 
+      - name: STAGING PROBE env fingerprint
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python -V; which python
+          python -m pip list --format=freeze --all 2>/dev/null | tr 'A-Z_' 'a-z-' | sort > "$RUNNER_TEMP/envlist.txt"
+          echo "PROBE_COUNT $(wc -l < "$RUNNER_TEMP/envlist.txt")"
+          echo "PROBE_SHA $(sha256sum "$RUNNER_TEMP/envlist.txt" | cut -c1-16)"
+          sed 's/^/PROBE_PKG /' "$RUNNER_TEMP/envlist.txt"
       - name: Repo tests (CPU, auto-discovered)
         env:
           # tests/python/* import install_python_stack from studio/.
