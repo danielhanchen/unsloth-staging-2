@@ -48,13 +48,30 @@ const IMAGE_EXT = /\.(png|jpe?g|gif|webp|bmp|avif|svg)$/i;
 const MAY_HOLD_CODE_RE = /```|~~~|^(?: {4}|\t)/m;
 
 /** Code blocks as the renderer sees them (CommonMark: lists, indentation, CRLF). */
-export function extractCodeFences(
-  markdown: string,
-): { language: string | null; source: string }[] {
+type CodeFence = { language: string | null; source: string };
+// Keyed on the text itself: the runtime can hand back new message objects for unchanged
+// turns, and a fresh WeakMap miss would re-parse every reply in the thread.
+const fenceCache = new Map<string, CodeFence[]>();
+const FENCE_CACHE_MAX = 4000;
+
+export function extractCodeFences(markdown: string): CodeFence[] {
   if (!MAY_HOLD_CODE_RE.test(markdown)) {
     return [];
   }
-  const blocks: { language: string | null; source: string }[] = [];
+  const hit = fenceCache.get(markdown);
+  if (hit) {
+    return hit;
+  }
+  const parsed = parseCodeFences(markdown);
+  if (fenceCache.size >= FENCE_CACHE_MAX) {
+    fenceCache.clear();
+  }
+  fenceCache.set(markdown, parsed);
+  return parsed;
+}
+
+function parseCodeFences(markdown: string): CodeFence[] {
+  const blocks: CodeFence[] = [];
   const visit = (node: Nodes) => {
     if (node.type === "code") {
       if (node.value.trim()) {
