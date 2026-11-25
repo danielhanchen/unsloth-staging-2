@@ -32,7 +32,7 @@ import {
 } from "@hugeicons/core-free-icons";
 import { HugeiconsIcon } from "@hugeicons/react";
 import { Tooltip as TooltipPrimitive } from "radix-ui";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { create } from "zustand";
 import { useChatProjectScope } from "../chat-project-scope";
 import {
@@ -53,10 +53,15 @@ const KIND_ICON = {
 } as const;
 
 const NO_FOLDERS: ChatFolder[] = [];
+const NO_MESSAGES: never[] = [];
 
 export function ChatFilesBridge() {
-  const messages = useAuiState(({ thread }) => thread.messages);
   const running = useAuiState(({ thread }) => thread.isRunning);
+  // While a reply streams, thread.messages is a new array every token: subscribing to it
+  // re-renders this bridge (and re-checks every message) per chunk. Read it only once settled.
+  const settled = useAuiState(({ thread }) =>
+    thread.isRunning ? null : thread.messages,
+  );
   const remoteId = useAuiState(({ threadListItem }) => threadListItem.remoteId);
   const activeThreadId = useChatRuntimeStore((state) => state.activeThreadId);
   const projectId = useChatProjectScope();
@@ -114,7 +119,9 @@ export function ChatFilesBridge() {
   // The streaming reply changes every token: leave it out until it settles, and reuse the
   // result while the settled messages are the same objects.
   const [collect] = useState(createChatFilesCollector);
-  const files = collect(running ? messages.slice(0, -1) : messages, folders);
+  const lastSettled = useRef<typeof settled>(null);
+  if (settled) lastSettled.current = settled;
+  const files = collect(lastSettled.current ?? NO_MESSAGES, folders);
 
   useEffect(() => {
     useChatFiles.setState({ files });
