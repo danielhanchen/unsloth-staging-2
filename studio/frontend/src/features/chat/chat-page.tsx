@@ -157,7 +157,7 @@ import {
   SaveTemporaryChatMenu,
   TemporaryChatSaveBridge,
 } from "./components/temporary-chat-save";
-import { ChatFilesBridge, ChatFilesMenu } from "./components/chat-files-menu";
+import { ChatFilesMenu } from "./components/chat-files-menu";
 import { useT } from "@/i18n";
 import { Tooltip as TooltipPrimitive } from "radix-ui";
 import {
@@ -5296,7 +5296,6 @@ export function ChatPage({
                       ) : (
                         <>
                           <TemporaryChatSaveBridge />
-                          <ChatFilesBridge />
                           <SingleContent threadId={baseView.threadId} />
                         </>
                       )}
