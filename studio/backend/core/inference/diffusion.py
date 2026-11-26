@@ -20,6 +20,7 @@ in the arbiter the routes call, not here.
 from __future__ import annotations
 
 from contextlib import contextmanager
+import collections
 import contextvars
 import functools
 import inspect
@@ -4944,6 +4945,85 @@ def _converted_shards_pread(dtype: Any, small_host: Any) -> Any:
     return pread_safetensors(convert_to = dtype, keep = keep, every_shard = every)
 
 
+# A slot turn reserved ahead of time (a coalesced batch takes its place in line when it opens), and whether a call
+# is a follow-up pass of a request already admitted (X/Y cells, Detailer crops), which goes to the front of the line.
+_RESERVED_SLOT_TURN: contextvars.ContextVar[Optional[object]] = contextvars.ContextVar(
+    "unsloth_reserved_slot_turn", default = None
+)
+# How long a reserved, unclaimed turn may idle first in line with the slot free before a waiter steps past it.
+_RESERVED_TURN_GRACE_S = 0.5
+_SLOT_FOLLOW_UP: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "unsloth_slot_follow_up", default = False
+)
+
+
+@contextmanager
+def reserved_slot_turn(turn: Optional[object]):
+    """Generations started in this context use ``turn``; once it was admitted, later ones are follow-ups."""
+    token = _RESERVED_SLOT_TURN.set(turn)
+    try:
+        yield
+    finally:
+        _RESERVED_SLOT_TURN.reset(token)
+
+
+@contextmanager
+def slot_follow_up():
+    """Generations started in this context continue a request that already held the slot: they go first."""
+    token = _SLOT_FOLLOW_UP.set(True)
+    try:
+        yield
+    finally:
+        _SLOT_FOLLOW_UP.reset(token)
+
+
+def _clip_chunk_counts(pipe: Any, prompt: str) -> Optional[tuple]:
+    """The conditioning chunks the weighted encode builds for ``prompt`` in each of the pipeline's CLIP encoders,
+    weighted and unweighted (BREAK and comma backtracking included): a batch pads every row to its longest, so
+    members must match exactly. None when there is no encoder to ask."""
+    from .diffusion_prompt_weighting import _encoders, tokenize_chunks
+
+    pairs = _encoders(pipe)
+    if not pairs:
+        return None
+    convert = getattr(pipe, "maybe_convert_prompt", None)
+    return tuple(
+        len(tokenize_chunks(prompt, tokenizer, weighted = weighted, convert = convert))
+        for tokenizer, _ in pairs
+        for weighted in (True, False)
+    )
+
+
+def coalesce_prompt_key(family: Any, pipe: Any, prompt: str) -> Optional[tuple]:
+    """What a prompt must share with its batch neighbours to render as it would alone; None = never batch it.
+
+    MiniMax-H3-Image loops per image when resident, so a batch gains nothing. Qwen-Image-2.1 builds its RoPE
+    layout from row 0, so only equal prompt token lengths match. FLUX.1 / Kontext pad T5 to one bucket (256 or
+    512) per call. SD / SDXL weight and chunk prompts per call, so weighting and the 77-token chunk count must
+    agree."""
+    from .diffusion_families import MINIMAX_H3_IMAGE_FAMILY_NAME
+    from .diffusion_prompt_weighting import has_prompt_syntax
+    from .diffusion_qwenimage21 import _CLASS as QWENIMAGE21_CLASS, _prompt_tokens
+    from .diffusion_text_length import FLUX_T5_FAMILIES, flux_t5_sequence_length
+
+    name = getattr(family, "name", None)
+    if name == MINIMAX_H3_IMAGE_FAMILY_NAME:
+        return None
+    try:
+        if type(getattr(pipe, "transformer", None)).__name__ == QWENIMAGE21_CLASS:
+            tokens = _prompt_tokens(pipe, prompt)
+            return None if tokens is None else ("qwen-image-2.1 tokens", tokens)
+        if name in FLUX_T5_FAMILIES:
+            bucket = flux_t5_sequence_length(getattr(pipe, "tokenizer_2", None), [prompt])
+            return None if bucket is None else ("t5 bucket", bucket)
+        if getattr(family, "textual_inversion", None) is not None:
+            chunks = _clip_chunk_counts(pipe, prompt)
+            return None if chunks is None else ("clip", has_prompt_syntax(prompt), chunks)
+    except Exception:  # noqa: BLE001 - a prompt that cannot be measured renders alone
+        return None
+    return ()
+
+
 class DiffusionBackend:
     """Holds at most one loaded diffusers pipeline. All mutations are serialised."""
 
@@ -4955,6 +5035,13 @@ class DiffusionBackend:
         self._unload_waiters = 0
         # _generate_lock serialises generations and is the ONLY lock the denoise holds.
         self._generate_lock = threading.Lock()
+        # Generations waiting for the slot, in arrival order: only the head competes for _generate_lock.
+        self._slot_turns: collections.deque = collections.deque()
+        self._slot_turn_changed = threading.Condition(threading.Lock())
+        # Called (from any thread) when the line moves or the slot frees: a waiting batch wakes on it, not a poll.
+        self._slot_listeners: list[Callable[[], None]] = []
+        # Reserved turns no generation has claimed yet: a waiter may step past one that idles at the front.
+        self._unclaimed_turns: set = set()
         self._state: Optional[_LoadState] = None
         self._loading: Optional[_LoadingState] = None
         # Bumped on begin_load/unload so a superseded worker neither commits nor stamps progress
@@ -4971,6 +5058,12 @@ class DiffusionBackend:
         self._active_generate_account: Optional[str] = None
         # Queued requests; cancel_generate() decides which Stop may signal.
         self._queued_generate_cancels: set[threading.Event] = set()
+        # Requests whose images render in another request's batch, by account: their own Stop leaves the batch.
+        self._generate_riders: dict[threading.Event, Optional[str]] = {}
+        # Requests waiting to coalesce, by account.
+        self._coalesce_waiters: dict[threading.Event, Optional[str]] = {}
+        # The account of each queued cancel, so a lifecycle Stop reaches only the caller's requests.
+        self._queued_cancel_owners: dict[threading.Event, Optional[str]] = {}
         self._generation_owns_slot = False
 
         self._transition_owns_slot = False
@@ -5062,26 +5155,137 @@ class DiffusionBackend:
             with self._generation_cancel_lock:
                 self._transition_owns_slot = False
                 self._generate_lock.release()
+            self._notify_slot_listeners()
+
+    def add_slot_listener(self, callback: Callable[[], None]) -> Callable[[], None]:
+        """``callback`` runs whenever the line moves or the slot frees; returns its remover."""
+        with self._slot_turn_changed:
+            self._slot_listeners.append(callback)
+
+        def remove() -> None:
+            with self._slot_turn_changed:
+                if callback in self._slot_listeners:
+                    self._slot_listeners.remove(callback)
+
+        return remove
+
+    def _notify_slot_listeners(self) -> None:
+        with self._slot_turn_changed:
+            listeners = list(getattr(self, "_slot_listeners", ()))
+        for callback in listeners:
+            try:
+                callback()
+            except Exception:  # noqa: BLE001 - a listener never breaks the slot
+                pass
+
+    def reserve_slot_turn(self) -> object:
+        """A place at the back of the line, held before the generation that uses it starts (``reserved_slot_turn``).
+        Release it with ``release_slot_turn`` if no generation takes it."""
+        turn = object()
+        with self._slot_turn_changed:
+            self._slot_turns.append(turn)
+            self._unclaimed_turns.add(turn)
+        return turn
+
+    def release_slot_turn(self, turn: object) -> None:
+        self._leave_slot_turn(turn)
+
+    def slot_turn_ready(self, turn: object) -> bool:
+        """The reserved turn is first in line and the slot is free: a generation using it starts at once."""
+        with self._slot_turn_changed:
+            first = (
+                not self._slot_turns or self._slot_turns[0] is turn or turn not in self._slot_turns
+            )
+        return first and not self._generate_lock.locked()
+
+    @contextmanager
+    def jump_slot_queue(self):
+        """A follow-up pass of the request holding the slot (a Detailer crop) takes the lock before anyone waiting."""
+        turn = object()
+        with self._slot_turn_changed:
+            self._slot_turns.appendleft(turn)
+        try:
+            yield
+        finally:
+            self._leave_slot_turn(turn)
+
+    def _leave_slot_turn(self, turn: object) -> None:
+        with self._slot_turn_changed:
+            getattr(self, "_unclaimed_turns", set()).discard(turn)
+            try:
+                self._slot_turns.remove(turn)
+            except ValueError:
+                return
+            self._slot_turn_changed.notify_all()
+        self._notify_slot_listeners()
+
+    def _await_slot_turn(self, turn: object, cancel: threading.Event) -> None:
+        """Blocks until ``turn`` is the oldest waiting generation; a cancel still ends the wait within 0.1 s."""
+        idle_since = None
+        with self._slot_turn_changed:
+            while self._slot_turns[0] is not turn:
+                if cancel.is_set():
+                    raise RuntimeError(DIFFUSION_CANCELLED_MSG)
+                head = self._slot_turns[0]
+                if head in self._unclaimed_turns and not self._generate_lock.locked():
+                    # A reserved turn first in line with the slot free and no generation claiming it: its owner
+                    # may have no worker (every one waits here). After a grace it steps back one place.
+                    now = time.monotonic()
+                    idle_since = idle_since if idle_since is not None else now
+                    if now - idle_since >= _RESERVED_TURN_GRACE_S:
+                        self._slot_turns.popleft()
+                        self._slot_turns.insert(1, head)
+                        self._slot_turn_changed.notify_all()
+                        idle_since = None
+                        continue
+                else:
+                    idle_since = None
+                self._slot_turn_changed.wait(timeout = 0.1)
 
     @contextmanager
     def _generation_slot(self, cancel: threading.Event):
-        """Yields to teardown fences after taking the lock (not FIFO); the zero-fence check and cancel registration must share one _lock section."""
+        """First come, first served: a ticket queues each generation, and only the oldest one takes the lock, so a
+        later arrival cannot overtake it. Yields to teardown fences after taking the lock, keeping its place; the
+        zero-fence check and cancel registration must share one _lock section."""
         admitted = False
+        reserved = _RESERVED_SLOT_TURN.get()
+        with self._slot_turn_changed:
+            if reserved is not None and reserved in self._slot_turns:
+                # A coalesced batch keeps the place it took when it opened.
+                turn = reserved
+                self._unclaimed_turns.discard(turn)
+            else:
+                turn = object()
+                if reserved is not None or _SLOT_FOLLOW_UP.get():
+                    # A follow-up pass of a request already admitted goes first.
+                    self._slot_turns.appendleft(turn)
+                else:
+                    self._slot_turns.append(turn)
         with self._generation_cancel_lock:
             self._queued_generate_cancels.add(cancel)
+            self._queued_cancel_owners[cancel] = current_account_id()
         try:
             while True:
+                self._await_slot_turn(turn, cancel)
                 while True:
                     if cancel.is_set():
                         raise RuntimeError(DIFFUSION_CANCELLED_MSG)
                     if self._generate_lock.acquire(timeout = 0.1):
-                        break
+                        with self._slot_turn_changed:
+                            first = self._slot_turns[0] is turn
+                        if first:
+                            break
+                        # A follow-up pass went to the front while this one waited on the lock.
+                        self._generate_lock.release()
+                        self._notify_slot_listeners()
+                        self._await_slot_turn(turn, cancel)
                 with self._lock:
                     if not self._teardown_waiters:
                         with self._generation_cancel_lock:
                             cancelled = cancel.is_set()
                             if not cancelled and not self._unload_waiters:
                                 self._queued_generate_cancels.discard(cancel)
+                                self._queued_cancel_owners.pop(cancel, None)
                                 self._active_generate_cancel = cancel
                                 self._active_generate_account = current_account_id()
                                 self._generation_owns_slot = True
@@ -5089,6 +5293,8 @@ class DiffusionBackend:
                     else:
                         cancelled = cancel.is_set()
                 if admitted:
+                    # The next waiter becomes the head and waits on the lock this generation now holds.
+                    self._leave_slot_turn(turn)
                     break
                 self._generate_lock.release()
                 if cancelled:
@@ -5114,10 +5320,13 @@ class DiffusionBackend:
                         self._active_generate_account = None
                     self._generation_owns_slot = False
                     self._generate_lock.release()
+                self._notify_slot_listeners()
         finally:
+            self._leave_slot_turn(turn)
             if not admitted:
                 with self._generation_cancel_lock:
                     self._queued_generate_cancels.discard(cancel)
+                    self._queued_cancel_owners.pop(cancel, None)
 
     # Offload policies fixed by the request; `fast`/`auto` are measurements and cannot be judged network-free.
     def assert_precision_available(
@@ -17671,6 +17880,23 @@ class DiffusionBackend:
                 except BaseException:
                     if previewer is not None:
                         previewer.finish()
+                    failure = sys.exc_info()[1]
+                    # A failed batched call keeps the images that finished (in job order), so the requests they
+                    # belong to are not rendered again. Never after a Stop.
+                    if (
+                        isinstance(failure, Exception)
+                        and images
+                        and not cancel.is_set()
+                        and not layer_count
+                        and not latent_output
+                    ):
+                        try:
+                            failure._unsloth_finished_images = {
+                                "images": list(images),
+                                "seeds": list(per_image_seeds),
+                            }
+                        except Exception:  # noqa: BLE001 - an exception that takes no attributes keeps none
+                            pass
                     # A cancelled or failed render may already have generalised a reused graph, so the success path never sees the count grow: dirty it now.
                     try:
                         if (
@@ -17867,13 +18093,114 @@ class DiffusionBackend:
 
     @contextmanager
     def generation_waiter(self, cancel: threading.Event):
+        """A request waiting to coalesce: a lifecycle Stop reaches it, and so does a Stop from its own account."""
+        account = current_account_id()
         with self._generation_cancel_lock:
             self._queued_generate_cancels.add(cancel)
+            self._queued_cancel_owners[cancel] = account
+            self._coalesce_waiters[cancel] = account
         try:
             yield
         finally:
             with self._generation_cancel_lock:
                 self._queued_generate_cancels.discard(cancel)
+                self._queued_cancel_owners.pop(cancel, None)
+                self._coalesce_waiters.pop(cancel, None)
+
+    def coalesce_plan(self, prompt: str, has_loras: bool) -> Optional[tuple[tuple, bool]]:
+        """``(prompt_key, private)`` for joining a batch, or None when this request must render alone. ``private``:
+        a per-account resource (a LoRA, or an embedding this account owns) could apply, so the request batches only
+        with its own account. Runs in the requesting account's context."""
+        state = self._state
+        if state is None:
+            return None
+        prompt_key = coalesce_prompt_key(state.family, state.pipe, prompt)
+        if prompt_key is None:
+            return None
+        private = bool(has_loras)
+        if not private and getattr(state.family, "textual_inversion", None) is not None:
+            # Embeddings come from the leader's folder and match triggers in every member's prompt.
+            try:
+                private = bool(diffusion_embeddings.list_embeddings())
+            except Exception:  # noqa: BLE001 - an unreadable folder may still hold one
+                private = True
+        return prompt_key, private
+
+    def request_batching(self) -> Optional[dict[str, str]]:
+        """How concurrent requests share calls on this load, for status: ``mode`` is ``any`` (any batch size),
+        ``compiled_sizes`` (static compile: only batch sizes this load already compiled) or ``serial`` (CUDA graphs:
+        every request renders alone), with the reason. None when nothing is loaded."""
+        state = self._state
+        if state is None:
+            return None
+        if getattr(state, "cuda_graphs", ()):
+            # A graph replays one batch size: a new size captures (seconds, and its own memory pool) inside the slot
+            # while everyone waits, and an OOM split drops every graph. Graph replay already keeps the card busy,
+            # so a batch measured no faster than serial replay.
+            return {
+                "mode": "serial",
+                "reason": "CUDA graphs replay one batch size; concurrent requests render one at a time",
+            }
+        if "compiled" in (state.speed_optims or ()) and compiled_shapes_are_static(
+            state.pipe, state.speed_mode
+        ):
+            return {
+                "mode": "compiled_sizes",
+                "reason": "static compile: concurrent requests share a call only at batch sizes already compiled",
+            }
+        return {
+            "mode": "any",
+            "reason": "concurrent requests with the same settings share one call",
+        }
+
+    def coalesce_batch_sizes(self, width: int, height: int) -> Optional[frozenset]:
+        """Batch sizes a coalesced txt2img call may use at ``width`` x ``height``: None = any, empty = none (CUDA
+        graphs serve serially; ``request_batching``). A static compile keys its artifacts on the batch, so a new
+        size would compile inside the slot: only sizes this load already compiled at this size are offered."""
+        policy = self.request_batching()
+        state = self._state
+        if policy is None or policy["mode"] == "serial":
+            return frozenset()
+        if policy["mode"] == "any":
+            return None
+        dims = (int(width), int(height))
+        shapes = getattr(state.compile_cache_ctx, "shapes", None) or ()
+        return frozenset(int(shape[2]) for shape in list(shapes) if tuple(shape[:2]) == dims)
+
+    @contextmanager
+    def generation_rider(self, cancel: threading.Event):
+        """A request riding another request's batched call: a Stop from its account sets ``cancel`` even while
+        another account's generation holds the slot."""
+        account = current_account_id()
+        with self._generation_cancel_lock:
+            self._generate_riders[cancel] = account
+        try:
+            yield
+        finally:
+            with self._generation_cancel_lock:
+                self._generate_riders.pop(cancel, None)
+
+    def _stop_waiting_locked(self, account: Optional[str]) -> bool:
+        """This account's batched work (None: every account's): requests riding another request's call and requests
+        waiting to coalesce. Call with ``_generation_cancel_lock`` held."""
+        # getattr: tests build a bare backend with object.__new__.
+        events = [
+            event
+            for pool in (
+                getattr(self, "_generate_riders", {}),
+                getattr(self, "_coalesce_waiters", {}),
+            )
+            for event, owner in pool.items()
+            if account is None or owner == account
+        ]
+        for event in events:
+            event.set()
+        return bool(events)
+
+    def stop_waiting_work(self, account: Optional[str] = None) -> bool:
+        """Stop this account's waiting and riding batched requests; True when there were any."""
+        with self._generation_cancel_lock:
+            return self._stop_waiting_locked(account)
 
     def generation_holder(self) -> Optional[object]:
         with self._generation_cancel_lock:
@@ -17907,17 +18234,21 @@ class DiffusionBackend:
     def cancel_generate(self, expected_account: Optional[str] = None) -> bool:
         """Stops the in-flight generation at the next step callback; returns False when nothing runs; a cancel in VAE decode or encode lands after it."""
         with self._generation_cancel_lock:
-            # Stop targets the denoising generation, not a serialized waiter.
+            # One rule: Stop ends this account's denoising generation and all of its waiting and riding batched
+            # requests; a plain request queued for the slot is not the running one and keeps its place.
             active = self._active_generate_cancel
-            if active is not None:
-                if expected_account is not None and self._active_generate_account not in (
-                    None,
-                    expected_account,
-                ):
-                    return False
+            hit = False
+            if active is not None and (
+                expected_account is None
+                or self._active_generate_account in (None, expected_account)
+            ):
                 active.set()
+                hit = True
+            if self._stop_waiting_locked(expected_account):
+                hit = True
+            if hit:
                 return True
-            if self._generation_owns_slot:
+            if active is not None or self._generation_owns_slot:
                 return False
             # An accepted eject raises _unload_waiters long before teardown; without this Stop answered False.
             if (
@@ -17926,8 +18257,15 @@ class DiffusionBackend:
                 and not self._unload_waiters
             ):
                 return False
-            # Recheck live state so timed waiters observe a replacement handoff.
-            cancels = set(self._queued_generate_cancels)
+            # Recheck live state so timed waiters observe a replacement handoff. Only the caller's own requests:
+            # an unknown owner (registered by older code) counts as the caller's.
+            owners = getattr(self, "_queued_cancel_owners", {})
+            cancels = {
+                cancel
+                for cancel in self._queued_generate_cancels
+                if expected_account is None
+                or owners.get(cancel, expected_account) == expected_account
+            }
             if not cancels:
                 return False
             for cancel in cancels:
@@ -18240,6 +18578,7 @@ class DiffusionBackend:
                 tuple(getattr(state.pipe, "_unsloth_cuda_graphs", ()) or ())
                 or getattr(state, "cuda_graphs", ())
             ),
+            "request_batching": self.request_batching(),
             "cfg_batch": cfg_batch_status(state.pipe),
             "zimage_cfg_split": zimage_cfg_split_status(state.pipe),
             "resolved": resolved,
